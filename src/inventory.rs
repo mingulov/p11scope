@@ -2791,6 +2791,9 @@ fn native_witnesses_json(
 /// `withheld` status while the scan lane runs alone, held states with
 /// `observed` status once the semantic feed materializes any.
 fn budgets_json(budgets: &crate::inventory_present::BudgetView) -> serde_json::Value {
+    let resources = &budgets.instance_semantic_resources;
+    let charges = resources.charges;
+    let usage = resources.occupancy;
     serde_json::json!({
         "callers": {
             "limit": budgets.callers_limit,
@@ -2852,6 +2855,29 @@ fn budgets_json(budgets: &crate::inventory_present::BudgetView) -> serde_json::V
         "instance_negative_state": {
             "limit": budgets.instance_negative_limit, "occupied": budgets.instance_negative_occupied,
             "refused": budgets.instance_negative_refused, "exhausted": budgets.instance_negative_exhausted,
+        },
+        "instance_semantic_resources": {
+            "limit_bytes": charges.limit_bytes,
+            "charged_bytes": charges.charged_bytes,
+            "peak_charged_bytes": charges.peak_charged_bytes,
+            "refused": charges.refused,
+            "occupancy": {
+                "open_bindings": usage.open_bindings,
+                "active_machines": usage.active_machines,
+                "pending_calls": usage.pending_calls,
+                "detached_calls": usage.detached_calls,
+                "mechanisms": usage.mechanisms,
+                "operation_categories": usage.operation_categories,
+                "provenance_functions": usage.provenance_functions,
+                "provenance_function_bytes": usage.provenance_function_bytes,
+                "provenance_function_capacity_bytes": usage.provenance_function_capacity_bytes,
+                "provenance_returns": usage.provenance_returns,
+                "async_function_bytes": usage.async_function_bytes,
+                "async_function_capacity_bytes": usage.async_function_capacity_bytes,
+                "origin_vectors": usage.origin_vectors,
+                "origin_elements": usage.origin_elements,
+                "origin_capacity_elements": usage.origin_capacity_elements,
+            },
         },
         "retained_history": {
             "limit": budgets.retained_limit,

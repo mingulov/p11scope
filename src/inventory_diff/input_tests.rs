@@ -712,3 +712,74 @@ fn instance_s1_additive_arrays_still_obey_parser_limits() {
         .contains("depth limit")
     );
 }
+
+#[test]
+fn native_semantic_resource_additive_budget_limits_and_refusal() {
+    let mut v = fixture();
+    v["budgets"]["instance_semantic_resources"] = json!({
+        "limit_bytes": 67108864, "charged_bytes": 1074691,
+        "peak_charged_bytes": 1079000, "refused": 1,
+        "occupancy": {
+            "open_bindings": 1, "active_machines": 1, "pending_calls": 0, "detached_calls": 1,
+            "mechanisms": 1, "operation_categories": 1, "provenance_functions": 2,
+            "provenance_function_bytes": 16, "provenance_function_capacity_bytes": 16,
+            "provenance_returns": 1, "async_function_bytes": 19, "async_function_capacity_bytes": 19,
+            "origin_vectors": 1, "origin_elements": 2, "origin_capacity_elements": 4,
+        }
+    });
+    v["gaps"][0]["budget"] = json!({
+        "resource": "semantic_resource", "limit": 67108864, "requested": 67109376
+    });
+    let raw = bytes(&v);
+    let mut limits = InputLimits {
+        bytes: raw.len(),
+        nodes: nodes(&v),
+        ..InputLimits::default()
+    };
+    let parsed = parse_with_limits(&raw, limits).unwrap();
+    assert_eq!(
+        (
+            parsed.callers.len(),
+            parsed.modules.len(),
+            parsed.edges.len()
+        ),
+        (1, 1, 1)
+    );
+    let refusal = parsed.gaps[0].budget.as_ref().unwrap();
+    assert_eq!(
+        (&*refusal.resource, refusal.limit, refusal.requested),
+        ("semantic_resource", 67108864, 67109376)
+    );
+    limits.nodes -= 1;
+    assert!(
+        parse_with_limits(&raw, limits)
+            .unwrap_err()
+            .to_string()
+            .contains("node limit")
+    );
+    limits.nodes = nodes(&v);
+    limits.bytes -= 1;
+    assert!(
+        parse_with_limits(&raw, limits)
+            .unwrap_err()
+            .to_string()
+            .contains("byte limit")
+    );
+    let mut deep = json!(0);
+    for _ in 0..12 {
+        deep = json!([deep]);
+    }
+    v["budgets"]["instance_semantic_resources"]["occupancy"]["future"] = deep;
+    assert!(
+        parse_with_limits(
+            &bytes(&v),
+            InputLimits {
+                depth: 9,
+                ..InputLimits::default()
+            }
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("depth limit")
+    );
+}

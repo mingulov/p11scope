@@ -2506,6 +2506,7 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
             instance_negative_occupied: 0,
             instance_negative_refused: 0,
             instance_negative_exhausted: false,
+            instance_semantic_resources: Default::default(),
             retained_limit: 16,
             retained: 1,
             retained_suppressed: 0,

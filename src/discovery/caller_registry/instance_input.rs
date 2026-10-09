@@ -386,6 +386,41 @@ impl Default for InstanceState {
 }
 
 impl CallerRegistry {
+    /// Census at immutable publication, never on the semantic ingress path.
+    /// The byte pool and these counts cover both legacy and instance reducers.
+    pub(crate) fn semantic_resource_occupancy(&self) -> crate::semantics_edge::S1Occupancy {
+        let mut total = crate::semantics_edge::S1Occupancy::default();
+        for reducer in self
+            .edges
+            .values()
+            .filter_map(|edge| edge.semantics.as_ref())
+            .chain(
+                self.instance_state
+                    .semantics
+                    .values()
+                    .filter_map(|edge| edge.semantics.as_ref()),
+            )
+        {
+            let usage = reducer.resource_usage();
+            total.open_bindings += usage.open_bindings;
+            total.active_machines += usage.active_machines;
+            total.pending_calls += usage.pending_calls;
+            total.detached_calls += usage.detached_calls;
+            total.mechanisms += usage.mechanisms;
+            total.operation_categories += usage.operation_categories;
+            total.provenance_functions += usage.provenance_functions;
+            total.provenance_function_bytes += usage.provenance_function_bytes;
+            total.provenance_function_capacity_bytes += usage.provenance_function_capacity_bytes;
+            total.provenance_returns += usage.provenance_returns;
+            total.async_function_bytes += usage.async_function_bytes;
+            total.async_function_capacity_bytes += usage.async_function_capacity_bytes;
+            total.origin_vectors += usage.origin_vectors;
+            total.origin_elements += usage.origin_elements;
+            total.origin_capacity_elements += usage.origin_capacity_elements;
+        }
+        total
+    }
+
     pub(crate) fn instances(&self) -> impl Iterator<Item = &InstanceRecord> {
         self.instance_state.records.values()
     }

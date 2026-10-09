@@ -12,6 +12,266 @@ use crate::semantics_edge::resource_tests::{Memory, measure, run_child};
 use std::mem::size_of;
 
 #[test]
+fn native_semantic_resource_projection_agrees_and_freezes() {
+    use crate::semantics_edge::resources::*;
+    let (mut h, caller, module) = single_edge();
+    let domain = NativeDomainId::mint();
+    let key = instance_key(domain, instance_router_ids(domain, 1)[0], &module);
+    let historical = MECHANISM_CHARGE
+        + CATEGORY_CHARGE
+        + 2 * FUNCTION_CHARGE
+        + "C_SignInitC_Sign".len()
+        + 2 * OWNED_ALLOCATION_PADDING
+        + RETURN_CHARGE;
+    let asynchronous = ASYNC_FACT_CHARGE
+        + "C_SignEncryptUpdate".len()
+        + OWNED_ALLOCATION_PADDING
+        + 4 * 24
+        + OWNED_ALLOCATION_PADDING;
+    let limit = SEMANTIC_TRANSITION_SCRATCH
+        + 2 * REDUCER_BASE_CHARGE
+        + historical
+        + OPEN_BINDING_CHARGE
+        + ACTIVE_MACHINE_CHARGE
+        + asynchronous;
+    h.coordinator_mut()
+        .registry_mut()
+        .reference_semantic_resource_limit(limit);
+    h.observe_semantic(caller, &module, init("C_SignInit", 1, RSA_PSS, 100));
+    h.observe_semantic(caller, &module, op("C_Sign", 1, 110));
+    instance_register(&mut h, &key, caller, 100);
+    instance_feed(&mut h, &key, caller, domain, 1, op("C_OpenSession", 7, 100));
+    instance_feed(
+        &mut h,
+        &key,
+        caller,
+        domain,
+        2,
+        SemanticCall {
+            capture: capture::MECHANISM_UNREADABLE,
+            ..init("C_SignInit", 7, RSA_PSS, 110)
+        },
+    );
+    instance_feed(
+        &mut h,
+        &key,
+        caller,
+        domain,
+        3,
+        SemanticCall {
+            rv: CkRv::PENDING.0,
+            ..op("C_SignEncryptUpdate", 7, 120)
+        },
+    );
+    instance_feed(
+        &mut h,
+        &key,
+        caller,
+        domain,
+        4,
+        SemanticCall {
+            target_function: crate::kinds::function_id("C_SignEncryptUpdate").unwrap(),
+            async_value: 91,
+            ..op("C_AsyncGetID", 7, 130)
+        },
+    );
+    h.coordinator_mut()
+        .registry_mut()
+        .observe_entries(caller, &module, 17, 130);
+    h.commit();
+    let registry = h.coordinator().registry();
+    assert_eq!(
+        registry
+            .edges()
+            .next()
+            .unwrap()
+            .semantics
+            .as_ref()
+            .unwrap()
+            .completed(),
+        1
+    );
+    assert!(
+        registry
+            .instance_semantic_edges()
+            .next()
+            .unwrap()
+            .semantics
+            .as_ref()
+            .unwrap()
+            .has_live_operations()
+    );
+    assert_eq!(registry.semantic_resource_snapshot().charged_bytes, limit);
+    let presentation = Presentation::capture(h.coordinator(), "system", 0, 140, 1);
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    let budget = &document["budgets"]["instance_semantic_resources"];
+    assert!(
+        budget.is_object(),
+        "production budget projection must publish actual shared resource charges"
+    );
+    assert_eq!(
+        crate::inventory_events::started_payload("system", 0, &presentation)["limits"]["instance_semantic_resources"],
+        limit
+    );
+    assert_eq!(
+        budget,
+        &serde_json::json!({
+            "limit_bytes": limit, "charged_bytes": limit, "peak_charged_bytes": limit, "refused": 0,
+            "occupancy": {
+                "open_bindings": 1, "active_machines": 1, "pending_calls": 0, "detached_calls": 1,
+                "mechanisms": 1, "operation_categories": 1, "provenance_functions": 2,
+                "provenance_function_bytes": 16, "provenance_function_capacity_bytes": 16,
+                "provenance_returns": 1, "async_function_bytes": 19, "async_function_capacity_bytes": 19,
+                "origin_vectors": 1, "origin_elements": 2, "origin_capacity_elements": 4,
+            }
+        })
+    );
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let path = dir.path().join("semantic-resource-events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 30, 5).unwrap();
+    emit_snapshot_as_events(&mut writer, &presentation, 140).unwrap();
+    let ended = crate::inventory_events::ended_payload(&presentation, 140, &writer);
+    writer.finish(ended, 140).unwrap();
+    let events: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for kind in ["snapshot", "ended"] {
+        let event = events.iter().find(|event| event["kind"] == kind).unwrap();
+        assert_eq!(
+            &event["event"]["budgets"]["instance_semantic_resources"],
+            budget
+        );
+    }
+    let snapshot = render_snapshot(&presentation);
+    let compact = format!("semantic {limit}/{limit}B peak={limit} refused=0");
+    assert!(snapshot.contains(&compact));
+    let frame = crate::inventory_dashboard::DisplayFrame {
+        presentation: std::sync::Arc::new(presentation.clone()),
+        log: crate::inventory_dashboard::LogTail::bounded().snapshot(),
+    };
+    let wide = String::from_utf8(render_frame(
+        &frame,
+        Viewport {
+            width: 1400,
+            height: 20,
+        },
+        &DashboardState::default(),
+    ))
+    .unwrap();
+    assert!(wide.contains(&compact));
+    for token in [
+        "open=1",
+        "active=1",
+        "pending=0",
+        "detached=1",
+        "mechanisms=1",
+        "categories=1",
+        "functions=2",
+        "function_bytes=16",
+        "function_capacity=16",
+        "returns=1",
+        "async_bytes=19",
+        "async_capacity=19",
+        "origins=1",
+        "origin_elements=2",
+        "origin_capacity=4",
+    ] {
+        assert!(
+            snapshot.contains(token),
+            "snapshot resource occupancy {token}"
+        );
+        assert!(wide.contains(token), "dashboard resource occupancy {token}");
+    }
+    let narrow = String::from_utf8(render_frame(
+        &frame,
+        Viewport {
+            width: 80,
+            height: 14,
+        },
+        &DashboardState::default(),
+    ))
+    .unwrap();
+    assert!(narrow.contains(&compact));
+    assert_eq!(narrow.lines().count(), 14);
+    // A skipped affecting input frees live state, preserves historical
+    // allocation and leaves the already published presentation immutable.
+    instance_feed(
+        &mut h,
+        &key,
+        caller,
+        domain,
+        5,
+        SemanticCall {
+            rv: CkRv::PENDING.0,
+            ..init("C_SignInit", 8, RSA_PSS, 150)
+        },
+    );
+    h.commit();
+    assert_eq!(
+        crate::inventory::render_json_from_presentation(&presentation),
+        document
+    );
+    let after = crate::inventory::render_json_from_presentation(&Presentation::capture(
+        h.coordinator(),
+        "system",
+        0,
+        160,
+        2,
+    ));
+    let current = &after["budgets"]["instance_semantic_resources"];
+    assert_eq!(
+        current["charged_bytes"],
+        SEMANTIC_TRANSITION_SCRATCH + 2 * REDUCER_BASE_CHARGE + historical
+    );
+    assert_eq!(current["peak_charged_bytes"], limit);
+    assert_eq!(current["refused"], 1);
+    for field in [
+        "open_bindings",
+        "active_machines",
+        "pending_calls",
+        "detached_calls",
+        "async_function_bytes",
+        "async_function_capacity_bytes",
+        "origin_vectors",
+        "origin_elements",
+        "origin_capacity_elements",
+    ] {
+        assert_eq!(current["occupancy"][field], 0);
+    }
+    assert_eq!(current["occupancy"]["provenance_functions"], 2);
+    assert_eq!(after["edges"][0]["entries"]["count"], 17);
+    assert_eq!(after["semantic_edges"][0]["api_returns"]["count"], 5);
+    let (empty, _, _) = single_edge();
+    let empty = crate::inventory::render_json_from_presentation(&Presentation::capture(
+        empty.coordinator(),
+        "system",
+        0,
+        1,
+        1,
+    ));
+    let budget = &empty["budgets"]["instance_semantic_resources"];
+    assert_eq!(budget["limit_bytes"], SEMANTIC_RESOURCE_LIMIT);
+    assert_eq!(budget["charged_bytes"], SEMANTIC_TRANSITION_SCRATCH);
+    assert_eq!(budget["peak_charged_bytes"], SEMANTIC_TRANSITION_SCRATCH);
+    assert_eq!(budget["refused"], 0);
+    assert_eq!(budget["occupancy"].as_object().unwrap().len(), 15);
+    assert!(
+        budget["occupancy"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|v| v == 0)
+    );
+}
+
+#[test]
 fn native_semantic_resource_legacy_and_instance_share_one_pool() {
     use crate::semantics_edge::resources::{
         ACTIVE_MACHINE_CHARGE, REDUCER_BASE_CHARGE, SEMANTIC_TRANSITION_SCRATCH,

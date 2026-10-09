@@ -659,7 +659,10 @@ fn render_full(
         ),
         truncate_cell(
             &format!(
-                "budgets: callers {}/{} refused {} | modules {}/{} refused {} | edges {}/{} refused {} | counters observed {} saturated {} | retained {}/{} suppressed {}",
+                "budgets: {} | callers {}/{} refused {} | modules {}/{} refused {} | edges {}/{} refused {} | counters observed {} saturated {} | retained {}/{} suppressed {}",
+                crate::inventory_present::semantic_resource_line(
+                    &budgets.instance_semantic_resources
+                ),
                 budgets.callers_occupied,
                 budgets.callers_limit,
                 budgets.callers_refused,

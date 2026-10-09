@@ -16,7 +16,9 @@ which permits the reviewed bounded trace publication below while its installed
 and cgroup P4 qualification gates remain open,
 and [cgroup trace sampling](#p4-cgroup-trace-sample-attempt-authority),
 which describes its reviewed development implementation with installed gates
-still open.**
+still open,
+and [inventory diagnostics](#inventory-diagnostics-v04), which defines the
+optional userspace decision export without additional target reads.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -618,6 +620,42 @@ saved traversals yield after at most eight visited slots per phase. No terminal
 service registers, samples or restarts a candidate, waits for another CALL, or
 renews the single remaining stop ticket. Deadline equality expires a candidate;
 an overlong syscall supplies no permission for another read or late promotion.
+
+## Inventory diagnostics (v0.4)
+
+**Status: Implemented in v0.4 development source.** This section permits only the
+separate opt-in `inventory --diagnostics` JSONL file. It does not change native
+attribution, capture scope, public inventory coverage or the event-log schema.
+
+- Export actual native count observations, ownership transitions, staging and
+  publication decisions, withholding/refusal reasons and capture health. Copy
+  existing count/base/range values, read PRE/POST intervals, fences and retained
+  decision context at their production source; unavailable context stays unknown.
+  Do not reconstruct an earlier observation from a later maximum or claim that
+  a staged count was published.
+- Reuse retained inventory caller/module IDs, PID/incarnation, executable and
+  module paths. Labels are escaped and limited to 96 input bytes each. Export
+  never reads `/proc`, loads a provider or reads target memory. No command line,
+  arguments, environment, PIN, payload, key material or new BPF data is added.
+- Raw native domain, cookie, exec and object keys remain private in memory.
+  Pair/read/epoch/pending references use capture-local surrogates scoped to their
+  actual source. Equal raw integers do not join unrelated sources. Missing
+  predecessors remain `not_retained`/unknown, with incomplete history disclosed.
+- Two bounded rings retain recent observations: at most 24,576 ordinary and
+  8,192 exceptional records. Requested recorder storage, export indexes and
+  scratch are bounded by 16 MiB; this is not a total-process RSS limit. Fixed
+  coordinator bookkeeping is accounted separately. Export is at most 64 MiB,
+  with data lines at most 1,800 bytes. Filtering, eviction and diagnostic loss
+  are separate from capture loss and do not change coverage or count decisions.
+- Export after capture stops, using the existing private 0600 atomic-file
+  output contract. Reject stdout, pipes, devices, symlinks and report/event-log
+  aliases; preserve an existing destination if delivery fails. Files are
+  optional debugging output and have no mandatory archival or retention rule.
+
+The [diagnostics schema](../schema/inventory-diagnostics-v1.md) describes the
+projection and footer. A complete file can contain incomplete history; neither
+the file nor its diagnostic arithmetic proves exact whole-workload counts.
+The existing v1/v2 exclusions and other v3 sections remain unchanged.
 
 ## Required evidence before activation
 

@@ -1147,6 +1147,17 @@ pub(crate) struct PendingCountDecision {
     pub outcome: PendingCountOutcome,
 }
 
+/// A copy of one direct count mutation and its resulting published edge total.
+/// This carries no pair identity or implication about native ownership.
+#[derive(Clone, Copy)]
+pub(crate) struct CountPublication {
+    pub caller: CallerId,
+    pub module: Option<ModuleId>,
+    pub staged: u64,
+    pub base: u64,
+    pub edge_total: Option<u64>,
+}
+
 /// A pending count's publication-time outcome (P3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PendingCountOutcome {
@@ -2331,6 +2342,13 @@ impl CallerRegistry {
     /// Apply every staged mutation in order and publish the snapshot.
     /// Returns the number of applied mutations.
     pub(crate) fn publish(&mut self) -> usize {
+        self.publish_with_count_observer(None)
+    }
+
+    pub(crate) fn publish_with_count_observer(
+        &mut self,
+        mut observer: Option<&mut dyn FnMut(CountPublication)>,
+    ) -> usize {
         let staged = std::mem::take(&mut self.staged);
         let applied = staged.len();
         // Per-pass activity starts quiet: advances below set it.
@@ -2339,7 +2357,34 @@ impl CallerRegistry {
         }
         self.demoted_place_growth.clear();
         for mutation in staged {
+            let count = if observer.is_some() {
+                match &mutation {
+                    Mutation::NoteCountedUse {
+                        caller,
+                        module,
+                        count,
+                        base,
+                        ..
+                    } => Some(CountPublication {
+                        caller: *caller,
+                        module: self.module_id_for(module),
+                        staged: *count,
+                        base: *base,
+                        edge_total: None,
+                    }),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             self.apply(mutation);
+            if let Some(mut count) = count {
+                count.edge_total = count
+                    .module
+                    .and_then(|module| self.edge(count.caller, module))
+                    .map(|edge| edge.entry_count);
+                observer.as_mut().expect("enabled count observer")(count);
+            }
         }
         self.facts_revision = self.facts_revision.saturating_add(1);
         self.published_revision = self.facts_revision;

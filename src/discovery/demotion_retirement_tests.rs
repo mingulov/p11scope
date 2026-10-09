@@ -797,9 +797,9 @@ fn edge_count(native: &NativeScene, caller: CallerId, name: &str) -> u64 {
         .entry_count
 }
 
-struct Scene {
-    native: NativeScene,
-    caller: CallerId,
+pub(super) struct Scene {
+    pub(super) native: NativeScene,
+    pub(super) caller: CallerId,
     a: PathBuf,
     b: PathBuf,
     pins: crate::discovery::identity::PinnedObjects,
@@ -815,8 +815,17 @@ impl Scene {
         scene
     }
 
-    fn placed() -> Self {
+    pub(super) fn placed() -> Self {
+        Self::placed_with_diagnostics(None)
+    }
+
+    pub(super) fn placed_with_diagnostics(
+        config: Option<crate::inventory_diagnostics::DiagnosticConfig>,
+    ) -> Self {
         let (mut native, caller) = NativeScene::new();
+        if let Some(config) = config {
+            native.scene.coordinator.enable_diagnostics(config).unwrap();
+        }
         native
             .scene
             .coordinator
@@ -895,25 +904,25 @@ impl Scene {
         self.native.scene.coordinator.commit_batch(false).unwrap();
     }
 
-    fn observe(&mut self, a_present: bool, complete: bool, at: u64) {
+    pub(super) fn observe(&mut self, a_present: bool, complete: bool, at: u64) {
         self.apply(self.catalog(a_present, complete, at), at);
     }
 
-    fn count(&mut self, absolute: u64) {
+    pub(super) fn count(&mut self, absolute: u64) {
         QUERY_CLOCK.with(|clock| clock.set(self.native.stamps.tick()));
         self.native
             .counts_read(Vec::new(), vec![(41, 1, 0, absolute)]);
         self.native.scene.coordinator.commit_batch(false).unwrap();
     }
 
-    fn horizons(&mut self) {
+    pub(super) fn horizons(&mut self) {
         QUERY_CLOCK.with(|clock| clock.set(self.native.stamps.tick()));
         self.native.drain();
         self.native.read(Vec::new());
         self.native.scene.coordinator.commit_batch(false).unwrap();
     }
 
-    fn bracketed_count(&mut self, absolute: u64, pre: u64, post: u64, failed: bool) {
+    pub(super) fn bracketed_count(&mut self, absolute: u64, pre: u64, post: u64, failed: bool) {
         QUERY_CLOCK.with(|clock| clock.set(self.native.stamps.tick()));
         let NativeBatch::Witness(mut batch) =
             self.native.stamps.read(self.native.domain, Vec::new())
@@ -937,7 +946,7 @@ impl Scene {
         self.native.scene.coordinator.commit_batch(false).unwrap();
     }
 
-    fn counts(&self) -> (u64, u64) {
+    pub(super) fn counts(&self) -> (u64, u64) {
         (
             edge_count(&self.native, self.caller, "a.so"),
             edge_count(&self.native, self.caller, "b.so"),
@@ -3158,7 +3167,9 @@ fn demotion_retirement_round4_fixed_state_layouts() {
         std::mem::size_of::<PendingCountObservation>(),
         std::mem::size_of::<PendingCountOrigin>()
     );
-    assert_eq!(std::mem::size_of::<PairRecovery>(), 320);
+    // Original R1 payload320, four immutable reads gain16 bytes of refs each,
+    // and the fixed diagnostic transition/suppression projection adds104 bytes.
+    assert_eq!(std::mem::size_of::<PairRecovery>(), 488);
     assert_eq!(std::mem::size_of::<PendingCountOrigin>(), 16);
 }
 

@@ -101,6 +101,8 @@ fn run() -> Result<i32> {
                 a.event_max_files,
                 a.capture,
                 a.attach_backend,
+                a.diagnostics.as_deref(),
+                a.diagnostics_pid,
             )
             .map_err(|error| {
                 if error.is::<pidns::NumberingMismatch>() {

@@ -23,14 +23,21 @@ use crate::discovery::engine::inventory_coordinator::{
 };
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::native_binding::NativeIdentity;
+#[cfg(test)]
+use crate::inventory_capture::run_classic;
 use crate::inventory_capture::{
     FacadeLane, LaneSummary, LaneWindows, LoopClock, NativeLane, PassDriver, Publish, SERVICE_TICK,
-    run_classic,
+    run_classic_finalizing,
 };
 use crate::inventory_dashboard::{
     DashboardIo, Display, DisplayAccount, RESCAN_INTERVAL, RESTORE_RETRY_BUDGET, StderrRoute,
     StopFlag,
 };
+use crate::inventory_diagnostics::{
+    CaptureOutcome, CaptureSettlement, DiagnosticConfig, DiagnosticOutcome, DiagnosticScope,
+    RetainedIdentityView,
+};
+use crate::inventory_diagnostics_output::{DiagnosticsDestination, PrepareError};
 use crate::inventory_event_identity::IdentityIndex;
 use crate::inventory_events::{
     EdgeEmitter, EventWriter, GapEmitter, caller_event_payload, ended_payload, pass_payload,
@@ -52,6 +59,200 @@ const DOC_ID: &str = "p11scope/inventory/v1";
 
 /// Rescan interval inside a `--duration` observation window.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+struct DiagnosticRequest<'a> {
+    path: Option<&'a Path>,
+    pid_filter: Option<u32>,
+    second_signal: &'a dyn Fn() -> bool,
+}
+
+impl DiagnosticRequest<'_> {
+    #[cfg(test)]
+    fn disabled() -> Self {
+        Self {
+            path: None,
+            pid_filter: None,
+            second_signal: &|| false,
+        }
+    }
+}
+
+/// Destination names and filesystem errors can contain target-controlled
+/// text. Keep the single diagnostic notice control-safe and bounded.
+fn diagnostics_notice(line: &str, notice: &mut dyn FnMut(&str)) {
+    let mut end = line.len().min(512);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut safe = crate::render::escape_controls(&line[..end]);
+    if end < line.len() {
+        safe.to_mut().push_str(" [truncated]");
+    }
+    notice(&safe);
+}
+
+/// Requested delivery remains independent from capture and primary sinks.
+/// A refused diagnostics setup is remembered for the final exit status.
+struct DiagnosticsState {
+    path: PathBuf,
+    destination: Option<DiagnosticsDestination>,
+    failed: bool,
+}
+
+impl DiagnosticsState {
+    fn prepare(path: &Path, report: Option<&Path>, event_log: Option<&Path>) -> Result<Self> {
+        let destination = match DiagnosticsDestination::prepare(path, report, event_log) {
+            Ok(destination) => Some(destination),
+            Err(PrepareError::Conflict(error)) => return Err(anyhow::anyhow!(error)),
+            Err(PrepareError::Unavailable(error)) => {
+                diagnostics_notice(
+                    &format!("p11scope: diagnostics {} disabled: {error}", path.display()),
+                    &mut inventory_diagnostic,
+                );
+                None
+            }
+        };
+        Ok(Self {
+            path: path.to_path_buf(),
+            failed: destination.is_none(),
+            destination,
+        })
+    }
+
+    fn enable<Source: ProcessSource>(
+        &mut self,
+        coordinator: &mut InventoryCoordinator<Source>,
+        mode: CaptureMode,
+        scope: InspectScope,
+        pid_filter: Option<u32>,
+    ) {
+        if self.destination.is_none() {
+            return;
+        }
+        let config = DiagnosticConfig {
+            pid_filter,
+            mode: match mode {
+                CaptureMode::Native => crate::inventory_diagnostics::CaptureMode::Native,
+                CaptureMode::Auto => crate::inventory_diagnostics::CaptureMode::Auto,
+                CaptureMode::Scan => unreachable!("scan diagnostics are refused before setup"),
+            },
+            scope: match scope {
+                InspectScope::Pid(_) => DiagnosticScope::Pid,
+                InspectScope::System => DiagnosticScope::System,
+            },
+            ..DiagnosticConfig::default()
+        };
+        if let Err(error) = coordinator.enable_diagnostics(config) {
+            self.destination = None;
+            self.failed = true;
+            diagnostics_notice(
+                &format!(
+                    "p11scope: diagnostics {} disabled: recorder initialization {error:?}",
+                    self.path.display()
+                ),
+                &mut inventory_diagnostic,
+            );
+        }
+    }
+
+    fn finish<Source: ProcessSource>(
+        self,
+        coordinator: &mut InventoryCoordinator<Source>,
+        outcome: DiagnosticOutcome,
+        second_signal: &dyn Fn() -> bool,
+        notice: &mut dyn FnMut(&str),
+    ) -> bool {
+        let Some(destination) = self.destination else {
+            return self.failed;
+        };
+        let Some(finished) = coordinator.take_diagnostics(outcome) else {
+            diagnostics_notice(
+                &format!(
+                    "p11scope: diagnostics {} failed: recorder unavailable",
+                    self.path.display()
+                ),
+                notice,
+            );
+            return true;
+        };
+        let result = destination.deliver(
+            finished,
+            &RetainedDiagnosticsIdentity(coordinator),
+            second_signal,
+        );
+        match result {
+            Ok(summary) => {
+                let evicted = summary
+                    .kinds
+                    .iter()
+                    .fold(0u64, |total, kind| total.saturating_add(kind.evicted));
+                let settlement = match outcome.capture_settlement {
+                    CaptureSettlement::Settled => "settled",
+                    CaptureSettlement::Unsettled => "unsettled",
+                    CaptureSettlement::Unavailable => "unavailable",
+                };
+                diagnostics_notice(
+                    &format!(
+                        "Diagnostics: {}; {} records; {evicted} older records evicted; capture {settlement}",
+                        self.path.display(),
+                        summary.records_written,
+                    ),
+                    notice,
+                );
+                false
+            }
+            Err(error) => {
+                diagnostics_notice(&format!("p11scope: {error}"), notice);
+                true
+            }
+        }
+    }
+}
+
+/// Direct retained-ID lookups borrow labels without cloning catalogs or
+/// rereading target processes during export.
+struct RetainedDiagnosticsIdentity<'a, Source: ProcessSource>(&'a InventoryCoordinator<Source>);
+
+impl<Source: ProcessSource> RetainedIdentityView for RetainedDiagnosticsIdentity<'_, Source> {
+    fn application(&self, caller: u32) -> Option<&str> {
+        self.0
+            .adapter()
+            .record(crate::discovery::caller_registry::CallerId(caller))?
+            .exe
+            .as_ref()?
+            .path
+            .as_deref()
+    }
+
+    fn module(&self, module: u32) -> Option<&str> {
+        self.0
+            .registry()
+            .module(ModuleId(module))?
+            .paths
+            .first()
+            .map(String::as_str)
+    }
+}
+
+fn diagnostic_outcome(native_available: bool, failed: bool, stopped: bool) -> DiagnosticOutcome {
+    DiagnosticOutcome {
+        capture_outcome: if failed {
+            CaptureOutcome::Failed
+        } else if !native_available {
+            CaptureOutcome::NativeUnavailable
+        } else if stopped {
+            CaptureOutcome::Stopped
+        } else {
+            CaptureOutcome::Completed
+        },
+        // Link retirement cannot establish application quiescence.
+        capture_settlement: if native_available {
+            CaptureSettlement::Unsettled
+        } else {
+            CaptureSettlement::Unavailable
+        },
+    }
+}
 
 /// Inventory-local diagnostics must not wait on an aliased stopped terminal.
 fn inventory_diagnostic(line: &str) {
@@ -94,17 +295,41 @@ impl EventLogState {
     ) -> Option<String> {
         let writer = self.writer.as_mut()?;
         if let Err(error) = action(writer) {
-            let error = format!("p11scope: inventory event log {stage} failed: {error}");
-            self.first_error = Some(error.clone());
-            self.writer = None;
-            return Some(error);
+            return Some(self.retire(stage, error));
         }
         None
+    }
+
+    fn retire(&mut self, stage: &'static str, error: String) -> String {
+        let error = format!("p11scope: inventory event log {stage} failed: {error}");
+        self.first_error.get_or_insert_with(|| error.clone());
+        self.writer = None;
+        error
     }
 
     pub(crate) fn first_error(&self) -> Option<&str> {
         self.first_error.as_deref()
     }
+}
+
+/// The event prologue shared by classic and dashboard startup.
+fn start_event_log<Source: ProcessSource>(
+    stream: &mut EventLogState,
+    coordinator: &InventoryCoordinator<Source>,
+    scope_label: &str,
+    started_ns: u64,
+) -> Option<anyhow::Error> {
+    stream.writer.as_ref()?;
+    let prologue = Presentation::capture(coordinator, scope_label, started_ns, started_ns, 0);
+    stream
+        .attempt("startup", |writer| {
+            writer.append(
+                "started",
+                started_payload(scope_label, started_ns, &prologue),
+                started_ns,
+            )
+        })
+        .map(anyhow::Error::msg)
 }
 
 /// None means not requested; false means failed or not sync-confirmed.
@@ -114,11 +339,12 @@ pub(crate) struct FinalOutputOutcome {
     report_committed: Option<bool>,
     stdout_result: Option<StdoutResult>,
     failures: Vec<String>,
+    diagnostics_failed: bool,
 }
 
 impl FinalOutputOutcome {
     pub(crate) fn exit_code(&self) -> i32 {
-        i32::from(!self.failures.is_empty())
+        i32::from(!self.failures.is_empty() || self.diagnostics_failed)
     }
 
     pub(crate) fn stdout_cancelled(&self) -> bool {
@@ -204,6 +430,8 @@ pub fn run(
     event_max_files: Option<usize>,
     capture: CaptureMode,
     attach_backend: crate::attach::BackendSelection,
+    diagnostics: Option<&Path>,
+    diagnostics_pid: Option<u32>,
 ) -> Result<i32> {
     let stdout_tty = crate::inventory_dashboard::fd_is_tty(1);
     // SIGINT/SIGTERM/SIGHUP end the loop, classic or dashboard, through
@@ -211,7 +439,7 @@ pub fn run(
     let stop = StopFlag::install();
     let signals = || stop.signal_count();
     let mut stdout = FdStdout::new(1, &signals);
-    run_with_writer(
+    run_with_terminal_diagnostics(
         scope,
         modules,
         hooks,
@@ -230,9 +458,18 @@ pub fn run(
         &|| stop.exit_on_next_signal(),
         stdout_tty,
         &mut stdout,
+        &DashboardIo::stdio(),
+        DiagnosticRequest {
+            path: diagnostics,
+            pid_filter: diagnostics_pid,
+            second_signal: &|| stop.signal_count() >= 2,
+        },
+        #[cfg(test)]
+        None,
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn run_with_writer(
     scope: InspectScope,
@@ -280,6 +517,7 @@ fn run_with_writer(
 /// `run_with_writer` with the interactive dashboard's terminal named
 /// (production: stdout and stdin; the privileged slow-terminal cell: a
 /// pty).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn run_with_terminal(
     scope: InspectScope,
@@ -327,6 +565,7 @@ fn run_with_terminal(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn run_with_terminal_inner(
     scope: InspectScope,
@@ -350,6 +589,55 @@ fn run_with_terminal_inner(
     terminal: &DashboardIo,
     #[cfg(test)] event_fault: Option<crate::inventory_events::EventFault>,
 ) -> Result<i32> {
+    run_with_terminal_diagnostics(
+        scope,
+        modules,
+        hooks,
+        json,
+        max_scan_pids,
+        max_gaps,
+        duration,
+        out,
+        dashboard,
+        event_log,
+        event_rotate_bytes,
+        event_max_files,
+        capture,
+        attach_backend,
+        stop,
+        outputs_attempted,
+        stdout_tty,
+        stdout,
+        terminal,
+        DiagnosticRequest::disabled(),
+        event_fault,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with_terminal_diagnostics(
+    scope: InspectScope,
+    modules: &[PathBuf],
+    hooks: &HookRegistry,
+    json: bool,
+    max_scan_pids: Option<usize>,
+    max_gaps: Option<usize>,
+    duration: Option<Duration>,
+    out: Option<&Path>,
+    dashboard: bool,
+    event_log: Option<&Path>,
+    event_rotate_bytes: Option<u64>,
+    event_max_files: Option<usize>,
+    capture: CaptureMode,
+    attach_backend: crate::attach::BackendSelection,
+    stop: &dyn Fn() -> bool,
+    outputs_attempted: &dyn Fn(),
+    stdout_tty: bool,
+    stdout: &mut dyn FinalStdout,
+    terminal: &DashboardIo,
+    request: DiagnosticRequest<'_>,
+    #[cfg(test)] event_fault: Option<crate::inventory_events::EventFault>,
+) -> Result<i32> {
     // DR-K8S-1: the kernel-side PID filter numbers tasks in the initial PID
     // namespace; a mismatched observer's --pid would match nothing, so it
     // is refused by name before anything is opened or scanned.
@@ -369,6 +657,13 @@ fn run_with_terminal_inner(
             let _ = crate::discovery::sweep_shards::shard_threads();
         }
     }
+    if request.path.is_some() && capture == CaptureMode::Scan {
+        anyhow::bail!("--diagnostics requires native capture or auto fallback");
+    }
+    let mut diagnostics = request
+        .path
+        .map(|path| DiagnosticsState::prepare(path, out, event_log))
+        .transpose()?;
     // Fail fast before scanning: an unwritable `-o` or event stream
     // must not cost a pass.
     let sink = match out {
@@ -418,7 +713,37 @@ fn run_with_terminal_inner(
     // The scan lane stages no usage coverage: every edge reads
     // `unknown (scan only)`. The native lane stages per-edge coverage
     // notes and witnesses; `auto` falls back to scan with a named gap.
-    let lane = open_native_lane(capture, attach_backend, scope, &mut coordinator)?;
+    if let Some(diagnostics) = diagnostics.as_mut() {
+        diagnostics.enable(&mut coordinator, capture, scope, request.pid_filter);
+    }
+    let lane = match open_native_lane(capture, attach_backend, scope, &mut coordinator) {
+        Ok(lane) => lane,
+        Err(error) => {
+            // There is no native lane to retire, but available diagnostics
+            // still describe the failed startup after primary report attempts.
+            if diagnostics.is_some() {
+                let outcome = finish_failed_startup(
+                    &mut coordinator,
+                    &scope_label,
+                    started_ns,
+                    sink,
+                    &mut stream,
+                    diagnostics,
+                    json,
+                    stdout,
+                    &error,
+                    request.second_signal,
+                    outputs_attempted,
+                );
+                outcome.notices(None, &mut inventory_diagnostic);
+            }
+            return Err(error);
+        }
+    };
+    if capture == CaptureMode::Auto && lane.is_none() {
+        coordinator.note_diagnostics_native_unavailable();
+    }
+    let native_available = lane.is_some();
     // Interactive dashboard takes over stdout's terminal; a pipe
     // degrades honestly to snapshots/JSON below (never ANSI).
     let mut degraded = dashboard.then(|| "needs a terminal on stdout".to_string());
@@ -444,6 +769,9 @@ fn run_with_terminal_inner(
                     outputs_attempted,
                     stdout,
                     terminal,
+                    diagnostics,
+                    request.second_signal,
+                    native_available,
                 );
             }
             // A terminal the run cannot open privately (another user's
@@ -466,16 +794,11 @@ fn run_with_terminal_inner(
             }
         ));
     }
-    if let Some(writer) = stream.writer.as_mut() {
-        let prologue = Presentation::capture(&coordinator, &scope_label, started_ns, started_ns, 0);
-        writer
-            .append(
-                "started",
-                started_payload(&scope_label, started_ns, &prologue),
-                started_ns,
-            )
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-    }
+    let initial_error = start_event_log(&mut stream, &coordinator, &scope_label, started_ns);
+    let initial_error = match (diagnostics.is_some(), initial_error) {
+        (false, Some(error)) => return Err(error),
+        (_, error) => error,
+    };
     let mut stream_state = StreamState::new();
     let deadline = deadline_for_duration(duration);
     let mut driver = ClassicDriver {
@@ -494,10 +817,11 @@ fn run_with_terminal_inner(
         tick: SERVICE_TICK,
         collection_tick: SERVICE_TICK,
     };
-    let stopped = run_classic(
+    let running = run_classic_finalizing(
         &mut driver,
         lane,
         &clock,
+        initial_error,
         &mut |driver: &mut ClassicDriver<'_>, point| {
             let coordinator = &*driver.coordinator;
             match point {
@@ -545,7 +869,10 @@ fn run_with_terminal_inner(
             }
             Ok(())
         },
-    )?;
+    );
+    let stopped = running.stopped;
+    let capture_error = running.error;
+    drop(driver);
     begin_scan_stdout(stdout, stopped.is_some());
     if let Some(stopped) = &stopped {
         inventory_diagnostic(&stop_line(&stopped.summary));
@@ -558,10 +885,15 @@ fn run_with_terminal_inner(
     // block (invariant 5), and a further signal then exits at once
     // (R-C51-4).
     let previously_reported = stream.first_error().map(str::to_string);
+    let diagnostic_outcome = diagnostic_outcome(
+        native_available,
+        capture_error.is_some(),
+        diagnostics.is_some() && stop(),
+    );
     let outcome = crate::inventory_capture::finish_native(
         stopped,
         |summary| {
-            finish_output(
+            finish_runtime_output(
                 sink,
                 &mut stream,
                 &mut stream_state,
@@ -570,6 +902,11 @@ fn run_with_terminal_inner(
                 false,
                 stdout,
                 summary,
+                &mut coordinator,
+                diagnostics,
+                diagnostic_outcome,
+                request.second_signal,
+                &mut inventory_diagnostic,
             )
         },
         outputs_attempted,
@@ -580,7 +917,69 @@ fn run_with_terminal_inner(
     outcome.notices(previously_reported.as_deref(), &mut |line| {
         let _ = crate::sink::try_stderr_line(line);
     });
+    if let Some(error) = capture_error {
+        return Err(error);
+    }
     Ok(outcome.exit_code())
+}
+
+/// A native startup failure still attempts requested final sinks. Capture
+/// never started, so an event stream cannot claim a completed observation.
+#[allow(clippy::too_many_arguments)]
+fn finish_failed_startup<Source: ProcessSource>(
+    coordinator: &mut InventoryCoordinator<Source>,
+    scope_label: &str,
+    started_ns: u64,
+    sink: Option<AtomicFile>,
+    stream: &mut EventLogState,
+    diagnostics: Option<DiagnosticsState>,
+    json: bool,
+    stdout: &mut dyn FinalStdout,
+    error: &anyhow::Error,
+    second_signal: &dyn Fn() -> bool,
+    outputs_attempted: &dyn Fn(),
+) -> FinalOutputOutcome {
+    if stream.writer.is_some() {
+        stream.retire(
+            "startup",
+            format!("capture failed before event stream started: {error:#}"),
+        );
+    }
+    coordinator.note_scope_gap("inventory capture failed".into(), format!("{error:#}"));
+    let _ = coordinator.commit_batch(false);
+    stdout.begin_finalization();
+    let presentation = Presentation::capture(
+        coordinator,
+        scope_label,
+        started_ns,
+        now_ns(),
+        coordinator.passes(),
+    );
+    crate::inventory_capture::finish_native::<FacadeLane, _>(
+        None,
+        |_| {
+            finish_runtime_output(
+                sink,
+                stream,
+                &mut StreamState::new(),
+                &presentation,
+                json,
+                false,
+                stdout,
+                None,
+                coordinator,
+                diagnostics,
+                DiagnosticOutcome {
+                    capture_outcome: CaptureOutcome::Failed,
+                    capture_settlement: CaptureSettlement::Unavailable,
+                },
+                second_signal,
+                &mut inventory_diagnostic,
+            )
+        },
+        outputs_attempted,
+        &mut |line| inventory_diagnostic(&line),
+    )
 }
 
 /// The classic loop's pass side over the production coordinator.
@@ -847,6 +1246,7 @@ pub(crate) fn finish_output(
         writer.finish(payload, presentation.ended_ns)
     });
     let mut outcome = FinalOutputOutcome {
+        diagnostics_failed: false,
         event_log_confirmed: event_requested.then(|| stream.first_error().is_none()),
         report_committed: None,
         stdout_result: None,
@@ -890,6 +1290,42 @@ pub(crate) fn finish_output(
                     error.accepted, error.total, error.total - error.accepted));
         }
         outcome.stdout_result = Some(result);
+    }
+    outcome
+}
+
+/// Primary sinks and diagnostics are attempted independently. Keep this
+/// inside finish_native's write closure: arming the second-signal exit or
+/// dropping native ownership before export would skip useful diagnostics.
+#[allow(clippy::too_many_arguments)]
+fn finish_runtime_output<Source: ProcessSource>(
+    sink: Option<AtomicFile>,
+    stream: &mut EventLogState,
+    stream_state: &mut StreamState,
+    presentation: &Presentation,
+    json: bool,
+    silent_text: bool,
+    stdout: &mut dyn FinalStdout,
+    native: Option<&LaneSummary>,
+    coordinator: &mut InventoryCoordinator<Source>,
+    diagnostics: Option<DiagnosticsState>,
+    diagnostic_outcome: DiagnosticOutcome,
+    second_signal: &dyn Fn() -> bool,
+    notice: &mut dyn FnMut(&str),
+) -> FinalOutputOutcome {
+    let mut outcome = finish_output(
+        sink,
+        stream,
+        stream_state,
+        presentation,
+        json,
+        silent_text,
+        stdout,
+        native,
+    );
+    if let Some(diagnostics) = diagnostics {
+        outcome.diagnostics_failed =
+            diagnostics.finish(coordinator, diagnostic_outcome, second_signal, notice);
     }
     outcome
 }
@@ -1262,6 +1698,9 @@ fn run_dashboard(
     outputs_attempted: &dyn Fn(),
     stdout: &mut dyn FinalStdout,
     terminal: &DashboardIo,
+    diagnostics: Option<DiagnosticsState>,
+    second_signal: &dyn Fn() -> bool,
+    native_available: bool,
 ) -> Result<i32> {
     let DashboardRun {
         scope,
@@ -1274,16 +1713,11 @@ fn run_dashboard(
     } = run;
     let quit = display.quit_flag();
     let mut stream_state = StreamState::new();
-    if let Some(writer) = stream.writer.as_mut() {
-        let prologue = Presentation::capture(&coordinator, &scope_label, started_ns, started_ns, 0);
-        writer
-            .append(
-                "started",
-                started_payload(&scope_label, started_ns, &prologue),
-                started_ns,
-            )
-            .map_err(|error| anyhow::anyhow!("{error}"))?;
-    }
+    let initial_error = start_event_log(&mut stream, &coordinator, &scope_label, started_ns);
+    let initial_error = match (diagnostics.is_some(), initial_error) {
+        (false, Some(error)) => return Err(error),
+        (_, error) => error,
+    };
     let deadline = deadline_for_duration(duration);
     let mut driver = ClassicDriver {
         coordinator: &mut coordinator,
@@ -1302,10 +1736,11 @@ fn run_dashboard(
         tick: SERVICE_TICK,
         collection_tick: SERVICE_TICK,
     };
-    let stopped = run_classic(
+    let running = run_classic_finalizing(
         &mut driver,
         lane,
         &clock,
+        initial_error,
         &mut |driver: &mut ClassicDriver<'_>, point| {
             match point {
                 Publish::Pass { report, now_ns } => {
@@ -1374,12 +1809,15 @@ fn run_dashboard(
             }
             Ok(())
         },
-    )?;
+    );
+    let stopped = running.stopped;
+    let capture_error = running.error;
     begin_scan_stdout(stdout, stopped.is_some());
     let mut display = driver
         .display
         .take()
         .expect("the dashboard driver keeps its display");
+    drop(driver);
     display.restore();
     let failure = display.take_failure();
     if let Some(stopped) = &stopped {
@@ -1391,10 +1829,16 @@ fn run_dashboard(
         Presentation::capture(&coordinator, &scope_label, started_ns, ended_ns, passes);
     // Output attempts first (R-C51-4), silent text: the live view showed it.
     let previously_reported = stream.first_error().map(str::to_string);
+    let diagnostic_outcome = diagnostic_outcome(
+        native_available,
+        capture_error.is_some(),
+        diagnostics.is_some() && ending(),
+    );
+    let display_notices = std::cell::RefCell::new(&mut display);
     let outcome = crate::inventory_capture::finish_native(
         stopped,
         |summary| {
-            finish_output(
+            finish_runtime_output(
                 sink,
                 &mut stream,
                 &mut stream_state,
@@ -1403,10 +1847,15 @@ fn run_dashboard(
                 true,
                 stdout,
                 summary,
+                &mut coordinator,
+                diagnostics,
+                diagnostic_outcome,
+                second_signal,
+                &mut |line| display_notices.borrow_mut().notice(line),
             )
         },
         outputs_attempted,
-        &mut |line| display.notice(&line),
+        &mut |line| display_notices.borrow_mut().notice(&line),
     );
     // A restore the terminal shed (Ctrl-S then `q`) leaves the shell in
     // the alternate screen: after output attempts, it can wait longer.
@@ -1433,6 +1882,9 @@ fn run_dashboard(
     }
     if let Some(slot) = &terminal.account {
         slot.set(Some(display.account()));
+    }
+    if let Some(error) = capture_error {
+        return Err(error);
     }
     // Sink errors use the bounded notices above, including a simultaneous
     // display error. Preserve the existing display-only error policy.
@@ -4638,3 +5090,7 @@ mod privileged_tests;
 #[cfg(test)]
 #[path = "inventory_edge_stream_tests.rs"]
 mod edge_stream_tests;
+
+#[cfg(test)]
+#[path = "inventory_diagnostics_runtime_tests.rs"]
+mod diagnostics_runtime_tests;

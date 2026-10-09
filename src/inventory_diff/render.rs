@@ -10,6 +10,10 @@ use std::collections::BTreeMap;
 use std::io::{self, Write};
 use unicode_width::UnicodeWidthChar as _;
 
+fn optional_number(value: Option<u64>) -> String {
+    value.map_or_else(|| "unknown".to_owned(), |number| number.to_string())
+}
+
 /// Rendering only borrows the pooled report. References never reach the human
 /// output: labels, physical descriptions and separate observations do.
 pub(super) fn render_text(report: &DiffReport, out: &mut dyn Write) -> io::Result<()> {
@@ -498,7 +502,10 @@ impl Human<'_> {
                 plural(count)
             ),
         )?;
-        self.line(4, &format!("Recorded start: {:?}", caller.start_time))?;
+        self.line(
+            4,
+            &format!("Recorded start: {}", optional_number(caller.start_time)),
+        )?;
         self.line(4, &format!("Start time unit: {}", caller.start_time_unit))?;
         self.line(
             4,
@@ -595,8 +602,10 @@ impl Human<'_> {
             self.line(
                 6,
                 &format!(
-                    "Coverage window: since {:?}; until {:?}; first {:?}",
-                    c.since_ns, c.until_ns, c.first_ns
+                    "Coverage window: since {}; until {}; first {}",
+                    optional_number(c.since_ns),
+                    optional_number(c.until_ns),
+                    optional_number(c.first_ns)
                 ),
             )?;
         }

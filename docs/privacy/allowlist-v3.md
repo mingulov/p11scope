@@ -13,7 +13,10 @@ a reviewed scan-local presentation contract whose PID/system implementation
 and installed qualification are tracked separately,
 and [trace executable labels](#trace-executable-labels-p5u-2026-10-09),
 which permits the reviewed bounded trace publication below while its installed
-and cgroup P4 qualification gates remain open.**
+and cgroup P4 qualification gates remain open,
+and [cgroup trace sampling](#p4-cgroup-trace-sample-attempt-authority),
+which describes its reviewed development implementation with installed gates
+still open.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -512,7 +515,7 @@ not a secret scrubber for fabricated or otherwise untrusted saved input.
 **Status: IMPLEMENTED in accepted v0.4 development source by reviewed U2b
 producer/consumer, renderer and parser integration (2026-10-09). This status
 permits only the bounded trace publication below. Installed named-trace scope
-qualification and the separate cgroup P4 source gate remain mandatory and open;
+qualification remains open, including the cgroup P4 installed checks;
 source acceptance does not qualify a release or installed scope coverage.**
 
 This section permits only bounded executable labels in trace text, including
@@ -549,19 +552,72 @@ or counts. An accepted-key duplicate cannot move eligibility backward. Receipt
 teardown releases its one reservation and any bounded nonowning aliases outside
 ledger locks; retained files obey the existing output lifetime and permissions.
 
-**Cgroup source remains unactivated by this B amendment.** The independently
-accepted U2b/P4 two-CALL document defines a separate future source gate for
-sampling an already admitted original task after one authentic CALL and proving
-its historical image with a second same-key post-sample CALL. Its temporary
-nonresidency, two-attempt/cooldown, 60-second registration/sample and accepted-
-interest rules require the explicit reviewed P4 attempt-authority amendment and
-accepted source before activation. Until that gate, cgroup candidates remain
-ProofPending/unknown; B does not silently infer continuous membership or broaden
-scope. This is an open required release obligation, not an optional feature.
+The reviewed cgroup producer uses the separate
+[sample-attempt authority below](#p4-cgroup-trace-sample-attempt-authority).
+It samples an already admitted original task after one authentic CALL and proves
+its historical image with a second same-key post-sample CALL. Pending or refused
+proof remains unknown; this method does not infer continuous cgroup membership.
+Installed named coverage remains an open required release obligation.
 
 V1/v2 bytes/exclusions, U5 inline inventory identity and offline inventory diff
 remain unchanged. Source acceptance and permission to publish these fields do
 not establish installed scope coverage or complete named-trace qualification.
+
+## P4 cgroup trace sample-attempt authority
+
+**Status: IMPLEMENTED in reviewed v0.4 development source. Installed positive,
+negative, privacy, resource and stop checks remain open.** This addition
+reconciles the reviewed U2b/P4 two-CALL method with the trace section above.
+It preserves that section's
+PID/system method, private finite reasons and exact Unknown executable output;
+it adds no reason field.
+
+The accepted trace section remains the publication contract. This cgroup
+supplement describes the accepted producer and attempt authority. Required
+installed checks remain separate; source acceptance does not close P4/U2b
+qualification. All current U4/U5, trace and other
+v3 sections and all v1/v2 exclusions remain unchanged. This is bounded Detailed
+metadata sampling, including attempts that later fail proof, rather than only
+saved-output re-projection.
+
+| Field | Source, authority and validation | Retention and public output | Failure and evidence boundary |
+| --- | --- | --- | --- |
+| Cgroup trace observed executable path/basename; finite private unknown reason | Existing scoped discovery admission supplies an original still-admitted ProcessView and live pidfd. The Detailed producer may attempt bounded `/proc/<pid>/exe` stat/readlink for only `path`, `dev`, `ino`, `mtime_secs`, `mtime_nanos`, with existing original-generation/start-time/namespace checks. PID/system preserves the accepted A sequence: sample under the original admitted view before an eligible authentic CALL witness, then confirm the witness task cookie through the original live pidfd and require the later complete lifecycle/health horizons. This row adds no pre-sample TASK_COOKIE check to PID/system. For cgroup only, the first authentic scoped CALL precedes the sample, same-Session TASK_COOKIE validation through the original live pidfd occurs before and after the executable reads, and a second authentic same-Session exact-key CALL follows the complete validated sample under the documented conditional no-overflow/reset image model. The cgroup retained-task sample-attempt authority explicitly includes temporary movement outside the selected cgroup before ordinary view retirement and samples later discarded when proof fails. It selects no new process and adds no out-of-scope CALL/lifecycle capture or kernel query. No argv, cmdline, environ, comm, argument, payload or new provider-memory read. | Only bounded trace and `run --trace` text, including their stdout/file copies, after exact historical admission, verified receipt and strict event-time eligibility. Path/basename is an observed historical executable label, not current membership/executable or script/package/service identity. Dev/ino/mtime, start-time validation, opaque admission, domain/cookie/exec IDs and witness/sample timing remain private. No new profile/metrics or terminal trace-evidence field. One shared 16384-entry/8-MiB path/work pool includes pending registrations, failed/accepted metadata and all temporary path copies; 16384 work bytes are charged before a sample and shrink to the one retained <=4096 UTF-8-byte path before escaping. No extra FD or event queue. For cgroup only, await-first registration has a fixed 60-second lease; its candidate deadline is separately fixed 60 seconds from first sample-start, with checked arithmetic and earlier view/capture/stop bounds. Cgroup permits at most two transaction starts: one initial attempt and one restart solely for a budget-deferred incomplete sample, never for an actual validation failure. Cgroup failed sample bytes are discarded; its finite parked failure metadata uses the same charge until expiry or earlier cancellation. PID/system retains accepted A pending-sample and retry rules. Accepted historical labels retain the ordinary bounded capture/store lifetime. | Failure or missing proof is finite unknown; no label can be guessed, backdated, reassigned to a successor, published before proof or applied to an already emitted line. Original admission cancellation, historical rejection, later complete-cursor/health checks and saturation/refusal rules remain binding. For cgroup, only the exact-image bracket is claimed, never continuous residency. Required installed controls include positive named calls; same-path/different-path/nonleader exec, PID reuse, leave/exec/re-enter, allowed sample during temporary nonresidency, delayed/old/equal-time witnesses, later exec after the bracket, lost/busy/malformed/unreadable/exhausted health, fixed expiry/retry/fairness, shared capacity, output parity and bounded stop. Unknown-only output cannot close P4/U2b. |
+
+The cross-command output specification defines the precise producer protocol.
+For the cgroup method, an equivalent scan, an old/replayed CALL or a saved
+executable path grants no new sample authority. A cgroup sample after expiry
+requires a fresh charged registration under the still-admitted original view
+and a newly produced CALL strictly after that registration. Actual authoritative view retirement ends
+live sampling. Accepted old-image facts can remain only for events still
+accepted by existing historical reduction. No inventory or offline-diff row is
+reused as permission for this trace sampling/publication.
+
+The retained EVENTS domain and task cookie must be nonzero; exec ID zero is
+valid. Candidate registration completes at G before a first CALL produced at
+T0 > G. Its copy R0 is valid and no earlier than T0; the first external sample
+read starts at S0 > R0, and the second same-key CALL is produced at T1 > S1,
+where S1 ends the complete sample, including both cookie/pin checks. Delayed
+copies of pre-sample calls cannot provide the upper endpoint. Both later
+complete-DISCOVERY and health-read starts must be strictly after the immutable
+arm boundary max(R1, C1), where R1 is the upper CALL copy and C1 is the original
+pidfd/cookie confirmation completion. All health/clock/custody checks remain.
+
+An exec or competing image inside or at either bracket endpoint rejects pending
+proof regardless of arrival order; ordinary later exec strictly after T1 may
+coexist with the historical fact while the same original admission still holds.
+Exit, task-cookie turnover or authoritative view removal cancels pending proof.
+Accepted labels do not receive a 60-second TTL. One nonowning admission-interest
+alias/request bit is charged to the accepted receipt; repetitions of its key
+cause no new sample. A differing newer CALL can request fair re-registration,
+but its own copy precedes the new G and cannot arm that new candidate. Alias
+teardown follows the original reservation/drop discipline, with no second pool.
+
+All cgroup phases share the existing 5-ms/32-visit/32-external-read frame ticket;
+saved traversals yield after at most eight visited slots per phase. No terminal
+service registers, samples or restarts a candidate, waits for another CALL, or
+renews the single remaining stop ticket. Deadline equality expires a candidate;
+an overlong syscall supplies no permission for another read or late promotion.
 
 ## Required evidence before activation
 

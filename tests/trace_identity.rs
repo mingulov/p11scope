@@ -62,6 +62,7 @@ fn trace_identity_public_help_preserves_trace_entrypoints() {
         assert!(stdout.contains("--duration"), "{stdout}");
         if args[0] == "trace" {
             assert!(stdout.contains("--max-events"), "{stdout}");
+            assert!(stdout.contains("--cgroup"), "{stdout}");
         } else {
             assert!(stdout.contains("--trace"), "{stdout}");
         }
@@ -69,6 +70,20 @@ fn trace_identity_public_help_preserves_trace_entrypoints() {
             !stdout.contains("task_cookie") && !stdout.contains("exec_id"),
             "{stdout}"
         );
+    }
+}
+
+// Parser refusal only: no cgroup is opened and no installed capture is claimed.
+#[test]
+fn trace_identity_public_cgroup_conflicting_scope_refuses_before_capture() {
+    for other in [&["--pid", "1"][..], &["--system"][..]] {
+        let mut args = vec!["trace", "--cgroup", "/parser-only-cgroup"];
+        args.extend_from_slice(other);
+        let (code, stdout, stderr) = run(&args);
+        assert_eq!(code, 2, "{stderr}");
+        assert!(stderr.contains("mutually exclusive"), "{stderr}");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(!stderr.contains("capture_ready"), "{stderr}");
     }
 }
 

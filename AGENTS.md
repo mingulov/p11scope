@@ -10,6 +10,29 @@ for build prerequisites. Operator behavior is documented in
 Use these public documents without assuming a maintainer's private workspace
 or internal planning files exist.
 
+## Development workflow
+
+p11scope is in early development. Prioritize useful features, correctness,
+clear output and efficient delivery. Run meaningful tests and normal code
+reviews; keep source changes in commits and record concise results and open
+issues. This does not require an evidence archive.
+
+- Do not routinely create binary archives, source snapshots, hash manifests,
+  custody records, duplicated logs or elaborate review packages. Keep temporary
+  output only while it helps debugging or an active task.
+- Tested binaries and completed build caches are disposable. References to them
+  in old reports do not require preserving or archiving their bytes. Cleanup
+  should protect source history, uncommitted work, active tasks and needed build
+  inputs, without manufacturing new retention requirements.
+- Report what was actually checked and its limitations. Do not turn requests to
+  review, audit, verify or release a development version into requirements for
+  compliance-style documentation or permanent artifact retention.
+- Use heavier assurance or archival workflows only when explicitly requested
+  for the task, or when those artifacts are themselves part of the feature under
+  test. A hash used by the product is different from an archive of agent work.
+- Revisit release assurance with the owner as the project approaches maturity
+  (perhaps v0.9 or v1.0); do not impose it now or activate it solely by version.
+
 ## Code and build boundaries
 
 - `src/` contains the observer CLI, discovery, attachment, event processing
@@ -44,9 +67,10 @@ or internal planning files exist.
 - Loading a module, locating a symbol or matching a manifest digest does
   not establish operator attestation or prove that an application called it.
   Preserve the documented manifest and physical-provider identity checks.
-- Keep measurements bound to the actual commit, binary, kernel and workload.
+- State which revision and kind of test produced a result when relevant.
   Unit tests, controlled provider workloads and real-application captures
-  establish different evidence; state which one was run.
+  check different behavior; do not overstate their coverage. This is a reporting
+  requirement, not a requirement to retain binaries or build caches.
 
 ## Verification
 
@@ -100,5 +124,5 @@ unrelated browser, service, VM, container or another agent's capture.
   Commit reproducible test inputs and public documentation.
 - Stage release work on a branch, integrate the final commit into `main`,
   then follow the release runbook. Prefer a fast-forward when possible to
-  preserve the tested commit. A changed commit or tree needs explicitly
-  reconciled evidence; never relabel an old receipt as a new successful run.
+  preserve the tested commit. Re-run checks affected by later changes; do not
+  report an old successful run as validation of changed behavior.

@@ -1043,7 +1043,7 @@ pub(crate) fn budget_refusal(reason: &str) -> bool {
 
 /// Conservative FD allowance for one collection's attribution stage. The
 /// boundaries depend on this policy, never on actual executor concurrency.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SegmentPolicy {
     pub headroom: usize,
     pub workers: usize,
@@ -1054,8 +1054,97 @@ pub(crate) struct SegmentPolicy {
 const FD_RESERVE: usize = 64;
 const IMMEDIATE_FDS: usize = 3;
 pub(crate) const FD_RESOURCE_REASON: &str = "confirmation file-descriptor headroom is unavailable";
+pub(crate) const FD_CENSUS_REASON: &str = "identity file-descriptor census is unavailable";
+const FD_CENSUS_ENTRIES: usize = 65_536;
+
+#[cfg(test)]
+thread_local! {
+    static CENSUS_CALLS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn count_censuses_for_test<R>(body: impl FnOnce() -> R) -> (R, usize) {
+    struct Restore(Option<usize>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CENSUS_CALLS.set(self.0);
+        }
+    }
+    let restore = Restore(CENSUS_CALLS.replace(Some(0)));
+    let result = body();
+    let count = CENSUS_CALLS.get().expect("census counter is scoped");
+    drop(restore);
+    (result, count)
+}
+
+#[cfg(test)]
+fn record_census_for_test() {
+    CENSUS_CALLS.set(CENSUS_CALLS.get().map(|count| count + 1));
+}
+
+/// A partial count never becomes an allowance. `within` also represents a
+/// unavailable clock or expired enclosing budget in injected callers.
+fn census_allowance<E>(
+    soft: usize,
+    mut entries: impl Iterator<Item = Result<(), E>>,
+    max_entries: usize,
+    mut within: impl FnMut() -> bool,
+) -> Result<usize, String> {
+    let mut count = 0usize;
+    while count < max_entries {
+        if !within() {
+            return Err(FD_CENSUS_REASON.into());
+        }
+        let entry = entries.next();
+        if !within() {
+            return Err(FD_CENSUS_REASON.into());
+        }
+        match entry {
+            None => {
+                drop(entries);
+                let open = count
+                    .checked_sub(1)
+                    .ok_or_else(|| FD_CENSUS_REASON.to_string())?;
+                return Ok(soft.saturating_sub(open).saturating_sub(FD_RESERVE));
+            }
+            Some(Err(_)) => return Err(FD_CENSUS_REASON.into()),
+            Some(Ok(())) => count += 1,
+        }
+    }
+    Err(FD_CENSUS_REASON.into())
+}
 
 impl SegmentPolicy {
+    /// Strict opt-in census, bounded cooperatively by time and entry count.
+    /// All current FDs, including an offered File, count here. The directory
+    /// closes before returning; only its own one descriptor is removed.
+    pub(crate) fn try_snapshot(max_workers: usize, candidates: usize) -> Result<Self, String> {
+        #[cfg(test)]
+        record_census_for_test();
+        let started = std::time::Instant::now();
+        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        // SAFETY: getrlimit initializes the writable limit on success.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
+            return Err(FD_CENSUS_REASON.into());
+        }
+        // SAFETY: the successful getrlimit initialized limit.
+        let soft = usize::try_from(unsafe { limit.assume_init() }.rlim_cur)
+            .map_err(|_| FD_CENSUS_REASON.to_string())?;
+        let census =
+            std::fs::read_dir("/proc/self/fd").map_err(|_| FD_CENSUS_REASON.to_string())?;
+        let headroom = census_allowance(
+            soft,
+            census.map(|entry| entry.map(|_| ())),
+            FD_CENSUS_ENTRIES,
+            || {
+                std::time::Instant::now()
+                    .checked_duration_since(started)
+                    .is_some_and(|elapsed| elapsed <= std::time::Duration::from_millis(10))
+            },
+        )?;
+        Ok(Self::from_headroom(headroom, max_workers, candidates))
+    }
+
     pub(crate) fn from_headroom(headroom: usize, max_workers: usize, candidates: usize) -> Self {
         let workers = (headroom.saturating_sub(IMMEDIATE_FDS) / 3)
             .min(max_workers.min(crate::discovery::sweep_shards::MAX_SHARD_THREADS))
@@ -1078,6 +1167,8 @@ impl SegmentPolicy {
     /// Census is taken at the quiescent attribution boundary. The census
     /// directory counts itself; it is closed before that one FD is removed.
     pub(crate) fn snapshot(max_workers: usize, candidates: usize) -> Self {
+        #[cfg(test)]
+        record_census_for_test();
         fn allowance() -> Option<usize> {
             let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
             // SAFETY: getrlimit initializes the writable limit on success.
@@ -1125,16 +1216,21 @@ enum LeaseClass {
 
 #[derive(Debug, Default)]
 struct ReservationState {
+    policy: SegmentPolicy,
     used: [usize; 4],
     peak: [usize; 4],
     peak_total: usize,
+    examined: usize,
+    peak_examined: usize,
+    examined_limit: usize,
+    census_complete: bool,
+    peak_allowance: usize,
 }
 
 /// All speculative pins, accepted pins, rereads and phase-D operations use
 /// this same physical owner; work-budget shadows never clone its allowance.
 #[derive(Clone)]
 pub(crate) struct ReservationOwner {
-    policy: SegmentPolicy,
     state: Arc<Mutex<ReservationState>>,
 }
 
@@ -1142,28 +1238,101 @@ impl ReservationOwner {
     pub(crate) fn new(policy: SegmentPolicy) -> Self {
         assert!(policy.reserved() <= policy.headroom);
         Self {
-            policy,
-            state: Arc::new(Mutex::new(ReservationState::default())),
+            state: Arc::new(Mutex::new(ReservationState {
+                policy,
+                peak_allowance: policy.reserved(),
+                ..ReservationState::default()
+            })),
         }
     }
 
-    fn reserve(&self, class: LeaseClass, count: usize) -> Result<FdLease, String> {
-        let (cell, limit) = match class {
-            LeaseClass::Retained => (0, self.policy.retained),
-            LeaseClass::Worker => (1, 2 * self.policy.workers),
-            LeaseClass::ImmediatePin => (2, usize::from(self.policy.headroom >= IMMEDIATE_FDS)),
-            LeaseClass::ImmediateIo => (3, usize::from(self.policy.headroom >= IMMEDIATE_FDS) * 2),
-        };
+    /// The deep-scan phase reserves custody without starting confirmation
+    /// workers. Its immediate envelope remains available for scan I/O.
+    pub(crate) fn for_examined(policy: SegmentPolicy, cap: usize) -> Self {
+        assert_eq!((policy.workers, policy.retained), (0, 0));
+        let owner = Self::new(policy);
+        let mut state = owner.state.lock().unwrap();
+        state.examined_limit = cap.min(policy.headroom.saturating_sub(policy.reserved()));
+        state.peak_allowance = policy.reserved() + state.examined_limit;
+        drop(state);
+        owner
+    }
+
+    pub(crate) fn examined_capacity(&self) -> usize {
+        let state = self.state.lock().unwrap();
+        if state.census_complete {
+            0
+        } else {
+            state.examined_limit
+        }
+    }
+
+    pub(crate) fn examined(&self) -> Result<FdLease, String> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.census_complete || state.examined >= state.examined_limit {
+            return Err(FD_RESOURCE_REASON.into());
+        }
+        state.examined += 1;
+        state.peak_examined = state.peak_examined.max(state.examined);
+        state.peak_total = state
+            .peak_total
+            .max(state.examined + state.used.iter().sum::<usize>());
+        drop(state);
+        Ok(FdLease {
+            owner: self.clone(),
+            cell: 4,
+            count: 1,
+            immediate_io: false,
+        })
+    }
+
+    /// The new census already counts all live custody, admitted and session
+    /// FDs. Only additional confirmation handles spend its new allowance.
+    /// No active worker/pin may cross this phase boundary.
+    pub(crate) fn reconcile(&self, policy: SegmentPolicy) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.census_complete || state.used != [0; 4] || policy.reserved() > policy.headroom {
+            return Err("identity FD census requires a quiescent collection boundary".into());
+        }
+        let allowance = policy
+            .reserved()
+            .checked_add(state.examined)
+            .ok_or_else(|| FD_RESOURCE_REASON.to_string())?;
+        state.policy = policy;
+        state.census_complete = true;
+        state.peak_allowance = state.peak_allowance.max(allowance);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn examined_for_test(&self) -> (usize, usize) {
+        let state = self.state.lock().unwrap();
+        (state.examined, state.peak_examined)
+    }
+
+    fn reserve(&self, class: LeaseClass, count: usize) -> Result<FdLease, String> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let policy = state.policy;
+        let (cell, limit) = match class {
+            LeaseClass::Retained => (0, policy.retained),
+            LeaseClass::Worker => (1, 2 * policy.workers),
+            LeaseClass::ImmediatePin => (2, usize::from(policy.headroom >= IMMEDIATE_FDS)),
+            LeaseClass::ImmediateIo => (3, usize::from(policy.headroom >= IMMEDIATE_FDS) * 2),
+        };
         let next = state.used[cell]
             .checked_add(count)
             .filter(|next| *next <= limit)
             .ok_or_else(|| FD_RESOURCE_REASON.to_string())?;
         state.used[cell] = next;
         state.peak[cell] = state.peak[cell].max(next);
-        let total = state.used.iter().sum();
+        let total = state.examined + state.used.iter().sum::<usize>();
         state.peak_total = state.peak_total.max(total);
-        assert!(total <= self.policy.reserved());
+        let custody = if state.census_complete {
+            state.examined
+        } else {
+            state.examined_limit
+        };
+        assert!(total <= policy.reserved() + custody);
         drop(state);
         Ok(FdLease {
             owner: self.clone(),
@@ -1193,7 +1362,7 @@ impl ReservationOwner {
             state.used,
             state.peak,
             state.peak_total,
-            self.policy.reserved(),
+            state.peak_allowance,
         )
     }
 }
@@ -1229,9 +1398,14 @@ impl Drop for FdLease {
             .state
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        state.used[self.cell] = state.used[self.cell]
+        let cell = if self.cell == 4 {
+            &mut state.examined
+        } else {
+            &mut state.used[self.cell]
+        };
+        *cell = cell
             .checked_sub(self.count)
-            .expect("a confirmation lease is returned once");
+            .expect("a physical lease is returned once");
     }
 }
 

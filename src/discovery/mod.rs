@@ -13,6 +13,9 @@ pub mod identity;
 pub(crate) mod instances;
 pub(crate) mod inventory_attach_set;
 pub mod inventory_workload;
+// D3b custody substrate; production backend selection follows in D3c/D3d.
+#[allow(dead_code)]
+pub(crate) mod kernel_identity;
 pub(crate) mod loader;
 pub(crate) mod native_binding;
 pub mod noise;

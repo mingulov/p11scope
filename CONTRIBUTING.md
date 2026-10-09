@@ -30,6 +30,9 @@ freely later; a sign-off alone does not grant it.
 
 ## How to sign
 
+These sign-off instructions apply to external contributors. The repository
+owner's own development commits do not require a sign-off.
+
 Add a `Signed-off-by:` trailer to each commit (`git commit -s`):
 
 ```text

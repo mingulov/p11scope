@@ -6166,6 +6166,87 @@ fn stagea_hook_census_accepts_exact_kernel_names_and_refuses_collisions() {
 }
 
 #[test]
+fn image_entry_native_frame_fits_the_compiled_caller_budget() {
+    let directory = tempfile::tempdir().expect("temporary image entry stack contract");
+    let object = directory.path().join("p11scope-ebpf");
+    fs::write(&object, p11scope::EBPF_OBJECT).expect("write actual embedded BPF object");
+    let output = Command::new("python3")
+        .args([
+            "-I",
+            "-c",
+            r#"
+from pathlib import Path
+import struct, sys
+sys.path.insert(0, str(Path('scripts').resolve()))
+from _loader import load_path
+checker = load_path(Path('scripts/check-bpf-map-defs.py'), 'image_stack_checker')
+
+def verify(data):
+    elf = checker.Elf(data)
+    sections = {elf.indices[name]: (row, body) for name, (row, body) in elf.sections.items()}
+    symbols = {symbol[0]: symbol for symbol in elf.symbols
+               if symbol[1] & 15 == 2 and symbol[5] and symbol[3]}
+    assert 'p11_image_entry' not in symbols, 'nested image entry must be inlined'
+    helper = symbols['p11_instance_entry']
+    def frame(symbol):
+        row, body = sections[symbol[3]]
+        insns = [struct.unpack_from('<BBhi', body, at)
+                 for at in range(symbol[4], symbol[4] + symbol[5], 8)]
+        offsets = []
+        for index, (op, reg, offset, immediate) in enumerate(insns):
+            # Pin LLVM's direct frame loads/stores and frame-address lowering.
+            # This bounded object contract does not replace kernel verification.
+            if ((op & 7 in (2, 3) and reg & 15 == 10)
+                    or (op & 7 == 1 and reg >> 4 == 10)) and offset < 0:
+                offsets.append((row[4] + symbol[4] + index * 8 + 2, -offset))
+            if (index and op == 0x07 and immediate < 0
+                    and insns[index - 1][:2] == (0xbf, 0xa0 | (reg & 15))):
+                offsets.append((row[4] + symbol[4] + index * 8 + 4, -immediate))
+        return max((depth for _, depth in offsets), default=0), offsets, insns
+    helper_depth, helper_offsets, insns = frame(helper)
+    assert helper_depth <= 64, f'native image/stamp frame {helper_depth} exceeds64'
+    assert not any((op, reg) == (0x85, 0x10) for op, reg, _, _ in insns), 'nested native call'
+    roots = [symbol for name, symbol in symbols.items()
+             if name == 'p11_entry' or name.startswith('p11_entry_')]
+    assert roots and 'p11_entry' in symbols, 'missing actual diagnostic entry'
+    for root in roots:
+        depth, _, _ = frame(root)
+        assert ((depth + 31) // 32 + (helper_depth + 31) // 32) * 32 <= 512, root[0] + ' combined stack exceeds512'
+    return helper, helper_offsets, symbols['p11_entry'], frame(symbols['p11_entry'])[1]
+
+data = Path(sys.argv[1]).read_bytes()
+helper, helper_offsets, root, root_offsets = verify(data)
+# Mutate actual emitted addressing/call instructions; each regression must refuse.
+for offsets, depth in [(helper_offsets, 65), (root_offsets, 449)]:
+    bad = bytearray(data)
+    at, _ = max(offsets, key=lambda pair: pair[1])
+    struct.pack_into('<h' if at % 8 == 2 else '<i', bad, at, -depth)
+    try: verify(bad)
+    except AssertionError: pass
+    else: raise AssertionError('over-budget actual frame accepted')
+bad = bytearray(data)
+elf = checker.Elf(data)
+row, body = next(value for name, value in elf.sections.items() if elf.indices[name] == helper[3])
+at = next(at for at in range(helper[4], helper[4] + helper[5], 8) if body[at] == 0x85)
+bad[row[4] + at + 1] = 0x10
+try: verify(bad)
+except AssertionError: pass
+else: raise AssertionError('nested native call accepted')
+print('actual entry roots and native frame budget pass; three mutations refuse')
+"#,
+        ])
+        .arg(&object)
+        .output()
+        .expect("inspect actual native entry frame and caller budgets");
+    assert!(
+        output.status.success(),
+        "compiled image stack contract failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn image_continuity_native_entry_index_poison_and_query() {
     let directory = tempfile::tempdir().expect("temporary native image query test");
     let binary = directory.path().join("image-query-tests");

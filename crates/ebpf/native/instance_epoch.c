@@ -611,18 +611,20 @@ static INST_INLINE void inst_copy_key(struct instance_start_key *dst,
 __attribute__((noinline)) u32 p11_instance_entry(const struct instance_start_key *key, u64 ip,
                                                u64 cookie, u64 exec_id)
 {
-    struct instance_start_key k;
-    struct instance_entry entry;
-
     if (!key)
         return 0;
+    /* Gate scratch expires before either own-stack map key or stamp starts.
+     * The original caller key remains immutable throughout this invocation. */
+    u32 image_ready = p11_image_entry(key->pid_tgid >> 32, cookie, exec_id);
+    struct instance_start_key k;
     /* A global function's pointer argument is generic memory; 5.15 map
      * helpers take keys only from the stack (or a map value). */
     inst_copy_key(&k, key);
-    if (!p11_image_entry(k.pid_tgid >> 32, cookie, exec_id)) {
+    if (!image_ready) {
         inst_map_delete(&INSTANCE_START, &k);
         return 0;
     }
+    struct instance_entry entry;
     entry.entry_ip = ip;
     inst_stamp(k.slot, &entry.entry_stamp);
     if (inst_map_update(&INSTANCE_START, &k, &entry, 0 /* BPF_ANY */)) {

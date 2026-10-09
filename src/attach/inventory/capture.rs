@@ -773,18 +773,21 @@ pub(crate) struct WitnessBatch {
     /// was detected, and — when health is proven, nothing rose, and
     /// custody holds — the latest proven-clean instant.
     pub health_read_ns: u64,
+    /// CLOCK_MONOTONIC before this read's witness-row quantum. Every
+    /// initial count was looked up at or after this batch PRE bound;
+    /// it is not an exact per-pair lookup timestamp. `u64::MAX` means the
+    /// clock failed; `0` means no row read was attempted.
+    pub rows_anchor_ns: u64,
     /// CLOCK_MONOTONIC after this read's rows were read: every row here was
     /// inserted before it (`u64::MAX` when the clock read failed, `0`
     /// when nothing was read). Stamped after the count refresh too, so it
     /// also bounds every count here.
     pub rows_read_ns: u64,
-    /// CLOCK_MONOTONIC when this read's count-refresh lookup began (round
-    /// 5, anchor skew): every count here was observed at or after it
-    /// (`u64::MAX` when the clock read failed, `0` when nothing was
-    /// read). Count anchors (base reads) stamp from here, never from
-    /// the post-quantum `rows_read_ns` — genuine growth between a
-    /// pair's lookup and the late batch stamp must land at or after
-    /// its own anchor, never strictly before it.
+    /// CLOCK_MONOTONIC before this read's count-refresh quantum. Every
+    /// refreshed count was looked up at or after this batch PRE bound;
+    /// it anchors base reads, never observations. `rows_read_ns` is the
+    /// common POST bound for observations. `u64::MAX` means the clock
+    /// failed; `0` means no refresh was attempted.
     pub counts_read_ns: u64,
     /// Held objects whose retained pin no longer matches (modified in
     /// place) or could not be rechecked, first reported in this batch:
@@ -2485,6 +2488,7 @@ fn read_witnesses_from(
         health_unproven: None,
         health_baseline_ns: book.health_ns,
         health_read_ns: 0,
+        rows_anchor_ns: 0,
         rows_read_ns: 0,
         counts_read_ns: 0,
         changed_objects: Vec::new(),
@@ -2592,9 +2596,21 @@ fn read_rows_from_with<I: CallerUseIo>(
     window: ReadWindow,
     capacity: u32,
 ) {
+    read_rows_from_with_clock(io, book, batch, window, capacity, &mut monotonic_ns);
+}
+
+fn read_rows_from_with_clock<I: CallerUseIo>(
+    io: &mut I,
+    book: &mut CaptureBook,
+    batch: &mut WitnessBatch,
+    window: ReadWindow,
+    capacity: u32,
+    clock: &mut impl FnMut() -> u64,
+) {
     let published = &book.published;
     let failed = &book.failed;
     let scope_pid = book.scope_pid();
+    batch.rows_anchor_ns = clock();
     let read = book.cursor.read_with(
         io,
         window.max_rows,
@@ -2608,11 +2624,11 @@ fn read_rows_from_with<I: CallerUseIo>(
     // after it, so a base read anchors at-or-before its own lookup.
     // The batch stamp stays after the quantum — binding horizons
     // prove their starts strictly after the rows' read finished.
-    batch.counts_read_ns = monotonic_ns();
+    batch.counts_read_ns = clock();
     let refreshed = book
         .cursor
         .refresh_with(io, window.max_rows, window.deadline);
-    batch.rows_read_ns = monotonic_ns();
+    batch.rows_read_ns = clock();
     absorb_rows(book, batch, read);
     absorb_counts(book, batch, refreshed);
 }

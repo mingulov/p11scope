@@ -16053,6 +16053,144 @@ mod trace_identity_consumer_tests {
         )
     }
 
+    fn frame(
+        engine: &mut Engine,
+        io: &mut driver::Io,
+        identities: &mut Option<TraceIdentityStore>,
+    ) {
+        with_trace_identity_frame(
+            engine,
+            io,
+            Some(DiscoveryPass::Frame),
+            identities,
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+    }
+
+    // Catches renewed post-tick allowance allowing a lower witness to sample
+    // after ordinary discovery already consumed the actual frame's ticket.
+    #[test]
+    fn cgroup_trace_bracket_frame_only_grants_one_ticket() {
+        let (mut engine, mut io) = driver::cgroup_fixture();
+        let mut identities = Some(TraceIdentityStore::new(io.proof.clone()));
+        let mut exhausted = with_trace_identity_frame(
+            &mut engine,
+            &mut io,
+            Some(DiscoveryPass::Frame),
+            &mut identities,
+            |engine, io, _| {
+                assert_eq!(io.proof.usage(), (1, 0));
+                assert_eq!(counts(io), (0, 0, 0));
+                driver::calls(io, 101, 11, 0);
+                io.cookie.set(Some(11));
+                engine.with_trace_frame(io, |_, io, work| {
+                    let mut reads = 0;
+                    while work.external_read(&io.proof).is_ok() {
+                        reads += 1;
+                    }
+                    assert_eq!(reads, 32);
+                    Ok(work.clone())
+                })
+            },
+        )
+        .unwrap();
+        // The driver counts entry to the health adapter before it checks the
+        // ticket. That denied attempt must produce neither a baseline nor S0.
+        assert_eq!(counts(&io), (0, 0, 1));
+        assert_eq!(io.proof.test_health_interval(), None);
+        assert_eq!(io.proof.usage(), (1, 0));
+        assert_eq!(
+            exhausted.external_read(&io.proof),
+            Err(crate::attach::detailed_identity::TraceWorkError::Deferred),
+            "post-tick service must not replenish the shared read allowance"
+        );
+        frame(&mut engine, &mut io, &mut identities);
+        assert_eq!(io.samples.get(), 1, "only the next actual frame may sample");
+        assert_eq!(io.health_reads.get(), 2);
+        assert!(io.proof.test_health_interval().is_some());
+    }
+
+    // Catches readiness/stop ticks registering or reading before a real Frame.
+    #[test]
+    fn cgroup_trace_bracket_pending_stop_grants_no_ticket() {
+        let (mut engine, mut io) = driver::cgroup_fixture();
+        let mut identities = Some(TraceIdentityStore::new(io.proof.clone()));
+        for pass in [None, Some(DiscoveryPass::PendingStop)] {
+            with_trace_identity_frame(
+                &mut engine,
+                &mut io,
+                pass,
+                &mut identities,
+                |_, _, _| Ok(()),
+            )
+            .unwrap();
+        }
+        assert_eq!(counts(&io), (0, 0, 0));
+        assert_eq!(io.proof.usage(), (0, 0));
+    }
+
+    // Catches stop wrappers sampling an incomplete candidate, failing to publish
+    // an already complete bracket, or renewing its terminal ticket after expiry.
+    #[test]
+    fn cgroup_trace_bracket_terminal_store_settlement_never_samples_or_renews() {
+        for sampled in [false, true] {
+            let (mut engine, mut io) = if sampled {
+                let (engine, io, _) = driver::cgroup_sampled();
+                (engine, io)
+            } else {
+                driver::cgroup_fixture()
+            };
+            let mut identities = Some(TraceIdentityStore::new(io.proof.clone()));
+            if !sampled {
+                frame(&mut engine, &mut io, &mut identities);
+            }
+            let ts = io.proof.test_time() + 10;
+            driver::calls(&io, ts, 11, 0);
+            io.cookie.set(Some(11));
+            let key = semantics::ProcessKey::history(
+                io.proof.test_events_domain().id(),
+                11,
+                0,
+                std::process::id(),
+            );
+            let samples = io.samples.get();
+            let mut terminal = None;
+            begin_trace_identity_stop(
+                &mut engine,
+                &io,
+                &mut identities,
+                &mut terminal,
+                Duration::from_millis(1),
+            );
+            io.proof.test_tick();
+            driver::empty(&io);
+            service_trace_identity_terminal(&mut engine, &io, &mut identities, &mut terminal);
+            assert_eq!(io.samples.get(), samples);
+            assert_eq!(
+                identities.as_ref().unwrap().lookup(key, ts).path(),
+                sampled.then_some("/owned/fixture")
+            );
+            let before = counts(&io);
+            io.proof.test_set_time(2_000_000);
+            for _ in 0..3 {
+                begin_trace_identity_stop(
+                    &mut engine,
+                    &io,
+                    &mut identities,
+                    &mut terminal,
+                    Duration::from_secs(100),
+                );
+                service_trace_identity_terminal(&mut engine, &io, &mut identities, &mut terminal);
+            }
+            assert_eq!(counts(&io), before);
+            assert_eq!(
+                identities.as_ref().unwrap().lookup(key, ts).path(),
+                sampled.then_some("/owned/fixture")
+            );
+        }
+    }
+
     #[test]
     fn trace_identity_frame_only_grants_one_ticket() {
         let (mut engine, mut io) = driver::fixture();
@@ -16211,10 +16349,19 @@ mod trace_identity_consumer_tests {
         (proof, key, store)
     }
 
+    fn cgroup_store_fixture() -> (ProofSession, semantics::ProcessKey, TraceIdentityStore) {
+        let (proof, receipt) = driver::cgroup_verified_fixture();
+        let key = receipt.key();
+        let mut store = TraceIdentityStore::new(proof.clone());
+        store.admit(receipt).unwrap();
+        (proof, key, store)
+    }
+
     struct Consumer {
         state: semantics::State,
         tracker: process::Tracker,
         tracer: trace::Tracer,
+        scope: Scope,
         remaining: Option<u64>,
         stdout: Vec<u8>,
         stdout_open: bool,
@@ -16232,6 +16379,15 @@ mod trace_identity_consumer_tests {
                 ),
                 tracker: process::Tracker::for_producer(domain, 16_384),
                 tracer: trace::Tracer::new(&plan),
+                scope: if proof.is_cgroup() {
+                    Scope::Cgroup {
+                        id: 1,
+                        path: "/retained-only".into(),
+                        dir: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+                    }
+                } else {
+                    Scope::System
+                },
                 remaining: None,
                 stdout: Vec::new(),
                 stdout_open: true,
@@ -16245,15 +16401,28 @@ mod trace_identity_consumer_tests {
             identities: &TraceIdentityStore,
             quantum: Option<usize>,
         ) {
+            self.feed_with_tap(domain, records, identities, quantum, None);
+        }
+        fn feed_with_tap(
+            &mut self,
+            domain: EventsDomain,
+            records: impl IntoIterator<Item = Event>,
+            identities: &TraceIdentityStore,
+            quantum: Option<usize>,
+            proof: Option<&ProofSession>,
+        ) {
             let mut drain =
                 EventDrain::over_domain(ScriptedRecords::events(records, usize::MAX), domain);
+            if let Some(proof) = proof {
+                drain.attach_trace_tap(proof.test_events_tap()).unwrap();
+            }
             drain_trace_events_from_with_identities(
                 &mut drain,
                 (
                     &mut self.remaining,
                     &mut self.state,
                     &mut self.tracker,
-                    &Scope::System,
+                    &self.scope,
                     &mut self.tracer,
                 ),
                 Some(identities),
@@ -16281,14 +16450,269 @@ mod trace_identity_consumer_tests {
         }
     }
 
+    // Catches retroactive repair of emitted warm-up rows, inclusive S1 lookup,
+    // or naming before the producer actually transfers the verified receipt.
+    #[test]
+    fn cgroup_trace_bracket_warmup_rows_and_event_boundary_are_immutable() {
+        let (mut engine, mut io) = driver::cgroup_fixture();
+        let proof = io.proof.clone();
+        let key = semantics::ProcessKey::history(
+            proof.test_events_domain().id(),
+            11,
+            0,
+            std::process::id(),
+        );
+        let mut identities = Some(TraceIdentityStore::new(proof.clone()));
+        let mut c = Consumer::new(&proof);
+        frame(&mut engine, &mut io, &mut identities);
+        c.feed_with_tap(
+            proof.test_events_domain(),
+            [event(key, 99, 7)],
+            identities.as_ref().unwrap(),
+            None,
+            Some(&proof),
+        );
+        frame(&mut engine, &mut io, &mut identities);
+        assert_eq!(counts(&io), (0, 0, 0), "an old CALL is no lower witness");
+
+        proof.test_set_time(102);
+        io.cookie.set(Some(11));
+        c.feed_with_tap(
+            proof.test_events_domain(),
+            [event(key, 101, 8)],
+            identities.as_ref().unwrap(),
+            None,
+            Some(&proof),
+        );
+        frame(&mut engine, &mut io, &mut identities);
+        assert_eq!(io.samples.get(), 1);
+        assert_eq!(proof.test_time(), 106);
+        c.feed_with_tap(
+            proof.test_events_domain(),
+            [event(key, 106, 9)],
+            identities.as_ref().unwrap(),
+            None,
+            Some(&proof),
+        );
+        frame(&mut engine, &mut io, &mut identities);
+        assert_eq!(identities.as_ref().unwrap().lookup(key, 107).path(), None);
+
+        proof.test_set_time(115);
+        c.feed_with_tap(
+            proof.test_events_domain(),
+            [event(key, 114, 10)],
+            identities.as_ref().unwrap(),
+            None,
+            Some(&proof),
+        );
+        let warmup = c.stdout.clone();
+        assert_eq!(c.lines().len(), 4);
+        assert!(
+            c.lines()
+                .iter()
+                .all(|line| line.contains("Unknown executable"))
+        );
+        frame(&mut engine, &mut io, &mut identities);
+        assert_eq!(identities.as_ref().unwrap().lookup(key, 115).path(), None);
+        proof.test_tick();
+        driver::empty(&io);
+        frame(&mut engine, &mut io, &mut identities);
+        let store = identities.as_ref().unwrap();
+        assert_eq!(store.lookup(key, 107).path(), Some("/owned/fixture"));
+        assert_eq!(c.stdout, warmup, "publication emits and rewrites no row");
+
+        c.feed(
+            proof.test_events_domain(),
+            [
+                event(key, 101, 11),
+                event(key, 106, 12),
+                event(key, 107, 13),
+                event(key, 116, 14),
+            ],
+            store,
+            None,
+        );
+        assert!(c.stdout.starts_with(&warmup));
+        assert_eq!(c.stdout, *c.file.as_ref().unwrap());
+        assert_eq!(c.lines().len(), 8);
+        assert_eq!(
+            c.lines()
+                .iter()
+                .filter(|line| line.contains("Unknown executable"))
+                .count(),
+            6
+        );
+        assert_eq!(
+            c.lines()
+                .iter()
+                .filter(|line| line.contains("exe=\"/owned/fixture\""))
+                .count(),
+            2
+        );
+        assert_eq!((c.tracer.raw_calls(), c.state.sessions().opened), (8, 8));
+        assert_eq!(c.state.semantic_evidence().semantic_history_drops, 0);
+    }
+
+    // Catches a store-owned receipt losing accepted-key suppression or a full
+    // shared pool discarding the newer-key request rather than deferring it.
+    #[test]
+    fn cgroup_trace_bracket_store_ownership_defers_new_key_at_shared_capacity() {
+        let (mut engine, mut io, receipt) = driver::cgroup_verified_engine();
+        let key = receipt.key();
+        let boundary = receipt.eligible_after_ns();
+        let mut store = TraceIdentityStore::new(io.proof.clone());
+        store.admit(receipt).unwrap();
+        let mut identities = Some(store);
+        let before = counts(&io);
+        for _ in 0..3 {
+            driver::calls(&io, io.proof.test_time() + 1, 11, 0);
+            frame(&mut engine, &mut io, &mut identities);
+        }
+        assert_eq!(counts(&io), before, "stored same-key calls never resample");
+        let full: Vec<_> = (0..16_383).map(|_| io.proof.reserve(0).unwrap()).collect();
+        let request = io.proof.test_time() + 1;
+        driver::calls(&io, request, 11, 1);
+        io.proof.test_tick();
+        for _ in 0..3 {
+            frame(&mut engine, &mut io, &mut identities);
+        }
+        let newer = semantics::ProcessKey { exec_id: 1, ..key };
+        assert_eq!(counts(&io), before);
+        assert_eq!(io.proof.usage(), (16_384, 14));
+        assert_eq!(
+            identities.as_ref().unwrap().lookup(newer, request).path(),
+            None
+        );
+        drop(full);
+        for _ in 0..3 {
+            frame(&mut engine, &mut io, &mut identities);
+        }
+        assert_eq!(
+            io.samples.get(),
+            1,
+            "the request cannot witness its later registration"
+        );
+        assert_eq!(io.proof.usage(), (2, 14));
+        driver::calls(&io, io.proof.test_time() + 1, 11, 1);
+        for _ in 0..3 {
+            frame(&mut engine, &mut io, &mut identities);
+        }
+        assert_eq!(io.samples.get(), 2);
+        driver::calls(&io, io.proof.test_time() + 10, 11, 1);
+        frame(&mut engine, &mut io, &mut identities);
+        io.proof.test_tick();
+        driver::empty(&io);
+        frame(&mut engine, &mut io, &mut identities);
+        let store = identities.as_ref().unwrap();
+        assert_eq!(
+            store.lookup(newer, io.proof.test_time()).path(),
+            Some("/owned/fixture")
+        );
+        assert_eq!(store.lookup(key, boundary).path(), None);
+        assert_eq!(
+            store.lookup(key, boundary + 1).path(),
+            Some("/owned/fixture")
+        );
+        assert_eq!(io.proof.usage(), (2, 28));
+        drop(identities);
+        assert_eq!(
+            io.proof.usage(),
+            (0, 0),
+            "the store owns both accepted charges"
+        );
+        drop(engine);
+        assert_eq!(io.proof.usage(), (0, 0));
+    }
+
+    // Catches a retired/reused view inheriting old sampling authority, or store
+    // teardown leaving a charged alias after a real redundant-key transfer.
+    #[test]
+    fn cgroup_trace_bracket_store_drop_after_retirement_and_alias_transfer() {
+        let (mut engine, mut io, receipt) = driver::cgroup_verified_engine();
+        let key = receipt.key();
+        let boundary = receipt.eligible_after_ns();
+        let mut store = TraceIdentityStore::new(io.proof.clone());
+        store.admit(receipt).unwrap();
+        let mut identities = Some(store);
+        driver::retire_original_view(&mut engine);
+        let before = counts(&io);
+        driver::calls(&io, io.proof.test_time() + 1, 11, 1);
+        frame(&mut engine, &mut io, &mut identities);
+        assert_eq!(counts(&io), before);
+        assert_eq!(io.proof.usage(), (1, 14));
+        assert_eq!(
+            identities
+                .as_ref()
+                .unwrap()
+                .lookup(key, boundary + 1)
+                .path(),
+            Some("/owned/fixture")
+        );
+
+        driver::reopen_original_view(&mut engine);
+        frame(&mut engine, &mut io, &mut identities);
+        assert_eq!(io.proof.usage(), (2, 14));
+        driver::calls(&io, io.proof.test_time() + 1, 11, 0);
+        for _ in 0..3 {
+            frame(&mut engine, &mut io, &mut identities);
+        }
+        assert_eq!(
+            counts(&io),
+            before,
+            "a known key transfers interest without sample I/O"
+        );
+        assert_eq!(io.proof.usage(), (1, 14));
+        drop(identities);
+        assert_eq!(io.proof.usage(), (0, 0));
+        let mut identities = Some(TraceIdentityStore::new(io.proof.clone()));
+        for _ in 0..3 {
+            frame(&mut engine, &mut io, &mut identities);
+        }
+        assert_eq!(
+            io.proof.usage(),
+            (1, 0),
+            "drop removes accepted-key suppression"
+        );
+        let stale = io.proof.test_time();
+        driver::calls(&io, stale, 11, 0);
+        frame(&mut engine, &mut io, &mut identities);
+        assert_eq!(
+            counts(&io),
+            before,
+            "an old CALL cannot reuse admission authority"
+        );
+        driver::calls(&io, io.proof.test_time() + 1, 11, 0);
+        for _ in 0..3 {
+            frame(&mut engine, &mut io, &mut identities);
+        }
+        assert_eq!(
+            io.samples.get(),
+            2,
+            "a fresh lower CALL can start a new proof"
+        );
+        driver::retire_original_view(&mut engine);
+        assert_eq!(io.proof.usage(), (0, 0));
+    }
+
     #[test]
     fn trace_identity_all_reduction_routes_use_same_store() {
-        let (proof, key, identities) = fixture();
+        assert_reduction_routes(fixture(), 20);
+    }
+
+    #[test]
+    fn cgroup_trace_bracket_all_reduction_routes_use_same_store() {
+        assert_reduction_routes(cgroup_store_fixture(), 115);
+    }
+
+    fn assert_reduction_routes(
+        (proof, key, identities): (ProofSession, semantics::ProcessKey, TraceIdentityStore),
+        ts: u64,
+    ) {
         // These are the actual ordinary/direct-quiesce/terminal poll helper,
         // the bounded Q helper, and the original-root-tail callback/reducer.
         for route in 0..5 {
             let mut c = Consumer::new(&proof);
-            let ev = event(key, 20, 7);
+            let ev = event(key, ts, 7);
             match route {
                 0..=2 => c.feed(
                     proof.test_events_domain(),
@@ -16313,7 +16737,7 @@ mod trace_identity_consumer_tests {
                             &mut c.remaining,
                             &mut c.state,
                             &mut c.tracker,
-                            &Scope::System,
+                            &c.scope,
                             &mut c.tracer,
                             Some(&identities),
                             &mut c.stdout,
@@ -16345,7 +16769,7 @@ mod trace_identity_consumer_tests {
                                     &mut c.remaining,
                                     &mut c.state,
                                     &mut c.tracker,
-                                    &Scope::System,
+                                    &c.scope,
                                     &mut c.tracer,
                                 ),
                                 Some(&identities),
@@ -16373,17 +16797,80 @@ mod trace_identity_consumer_tests {
 
     #[test]
     fn trace_identity_closed_older_foreign_history_stays_unknown() {
-        let (proof, key, identities) = fixture();
+        assert_rejected_history(fixture(), 20);
+    }
+
+    #[test]
+    fn cgroup_trace_bracket_closed_older_foreign_history_stays_unknown() {
+        assert_rejected_history(cgroup_store_fixture(), 115);
+    }
+
+    // Catches receipt admission reopening closed history or accepting an older
+    // exec after that image was already rejected by the real reducer.
+    #[test]
+    fn cgroup_trace_bracket_receipt_cannot_repair_prior_history_rejection() {
+        for closed in [false, true] {
+            let (proof, receipt) = driver::cgroup_verified_fixture();
+            let key = receipt.key();
+            let mut identities = TraceIdentityStore::new(proof.clone());
+            let mut c = Consumer::new(&proof);
+            let first = if closed {
+                key
+            } else {
+                semantics::ProcessKey { exec_id: 1, ..key }
+            };
+            c.feed(
+                proof.test_events_domain(),
+                [event(first, 115, 7)],
+                &identities,
+                None,
+            );
+            if closed {
+                apply_confirmed_retirement(&mut c.tracker, &mut c.state, key);
+            }
+            c.feed(
+                proof.test_events_domain(),
+                [event(key, 116, 8)],
+                &identities,
+                None,
+            );
+            assert_eq!(c.state.semantic_evidence().semantic_history_drops, 1);
+            let rejected = c.stdout.clone();
+            identities.admit(receipt).unwrap();
+            assert_eq!(identities.lookup(key, 117).path(), Some("/owned/fixture"));
+            c.feed(
+                proof.test_events_domain(),
+                [event(key, 117, 9)],
+                &identities,
+                None,
+            );
+            assert!(c.stdout.starts_with(&rejected));
+            assert_eq!(c.stdout, *c.file.as_ref().unwrap());
+            assert_eq!(c.state.semantic_evidence().semantic_history_drops, 2);
+            assert_eq!((c.tracer.raw_calls(), c.state.sessions().opened), (3, 1));
+            assert_eq!(c.lines().len(), 3);
+            assert!(
+                c.lines()
+                    .iter()
+                    .all(|line| line.contains("Unknown executable"))
+            );
+        }
+    }
+
+    fn assert_rejected_history(
+        (proof, key, identities): (ProofSession, semantics::ProcessKey, TraceIdentityStore),
+        ts: u64,
+    ) {
         for case in 0..4 {
             let mut c = Consumer::new(&proof);
             c.feed(
                 proof.test_events_domain(),
-                [event(key, 20, 7)],
+                [event(key, ts, 7)],
                 &identities,
                 None,
             );
             c.assert_named(1);
-            let mut ev = event(key, 22, 8);
+            let mut ev = event(key, ts + 2, 8);
             let mut domain = proof.test_events_domain();
             match case {
                 0 => apply_confirmed_retirement(&mut c.tracker, &mut c.state, key),
@@ -16407,7 +16894,7 @@ mod trace_identity_consumer_tests {
                 "case {case}"
             );
             assert_eq!(
-                identities.lookup(key, 22).path(),
+                identities.lookup(key, ts + 2).path(),
                 Some("/owned/fixture"),
                 "store alone never authorizes history"
             );
@@ -16444,8 +16931,19 @@ mod trace_identity_consumer_tests {
 
     #[test]
     fn trace_identity_output_failure_and_limit_preserve_counts() {
-        let (proof, key, identities) = fixture();
-        let records = || (7..10).map(|s| event(key, 20 + s, s));
+        assert_output_failure_and_limit(fixture(), 20);
+    }
+
+    #[test]
+    fn cgroup_trace_bracket_output_failure_and_limit_preserve_counts() {
+        assert_output_failure_and_limit(cgroup_store_fixture(), 115);
+    }
+
+    fn assert_output_failure_and_limit(
+        (proof, key, identities): (ProofSession, semantics::ProcessKey, TraceIdentityStore),
+        ts: u64,
+    ) {
+        let records = || (7..10).map(|s| event(key, ts + s, s));
         let mut c = Consumer::new(&proof);
         c.remaining = Some(1);
         c.feed(proof.test_events_domain(), records(), &identities, None);
@@ -16464,7 +16962,7 @@ mod trace_identity_consumer_tests {
                 &mut c.remaining,
                 &mut c.state,
                 &mut c.tracker,
-                &Scope::System,
+                &c.scope,
                 &mut c.tracer,
             ),
             Some(&identities),
@@ -16497,7 +16995,7 @@ mod trace_identity_consumer_tests {
                 &mut c.remaining,
                 &mut c.state,
                 &mut c.tracker,
-                &Scope::System,
+                &c.scope,
                 &mut c.tracer,
             ),
             Some(&identities),

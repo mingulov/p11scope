@@ -11,6 +11,10 @@ use crate::discovery::identity::{PinnedObjects, pin_scanned_view_objects};
 use crate::discovery::scan::{
     CaptureWorkBudget, ScanOutcome, ScanRequest, ScannedModule, Skipped, scan_process_view,
 };
+use crate::inspect_identity::{
+    InspectApplicationResult, InspectIdentityUnknown, InspectImageReader, ProcessViewImageReader,
+    application_detail, application_json, application_label, begin_application, finish_application,
+};
 use crate::process::{ProcessView, ProcessViewId};
 use anyhow::Result;
 use std::fmt::Write as _;
@@ -27,6 +31,20 @@ const INITIAL_MAPS_REFUSAL: &str = "memory scan refused: initial mapping validat
 /// Renders a completed scan. Pure: takes the scan result and the pinned identities,
 /// returns the text — so the layout is unit-testable without a target process.
 pub fn render_text(pid: u32, outcome: &ScanOutcome, pinned: &PinnedObjects) -> String {
+    render_text_with_application(
+        pid,
+        outcome,
+        pinned,
+        &InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
+    )
+}
+
+fn render_text_with_application(
+    pid: u32,
+    outcome: &ScanOutcome,
+    pinned: &PinnedObjects,
+    application: &InspectApplicationResult,
+) -> String {
     let modules = outcome.modules();
     let word = if modules.len() == 1 {
         "module"
@@ -34,6 +52,10 @@ pub fn render_text(pid: u32, outcome: &ScanOutcome, pinned: &PinnedObjects) -> S
         "modules"
     };
     let mut out = String::new();
+    let _ = writeln!(out, "{}", application_label(application, pid));
+    if let Some(detail) = application_detail(application) {
+        out.push_str(&detail);
+    }
     let _ = write!(out, "pid {pid} — {} PKCS#11 {word} mapped", modules.len());
     match outcome {
         ScanOutcome::Scanned { scan_ms, .. } => {
@@ -65,7 +87,7 @@ pub fn render_text(pid: u32, outcome: &ScanOutcome, pinned: &PinnedObjects) -> S
             }
         }
     }
-    out.push('\n');
+    out.push_str("Mapped modules only; activity was not captured by inspect.\n\n");
 
     for module in modules {
         render_module(&mut out, module, pinned);
@@ -165,6 +187,20 @@ fn render_module(out: &mut String, module: &ScannedModule, pinned: &PinnedObject
 
 /// Renders a completed scan as JSON. Document id: `p11scope/inspect/v1`.
 pub fn render_json(pid: u32, outcome: &ScanOutcome, pinned: &PinnedObjects) -> serde_json::Value {
+    render_json_with_application(
+        pid,
+        outcome,
+        pinned,
+        &InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
+    )
+}
+
+fn render_json_with_application(
+    pid: u32,
+    outcome: &ScanOutcome,
+    pinned: &PinnedObjects,
+    application: &InspectApplicationResult,
+) -> serde_json::Value {
     let scan = match outcome {
         ScanOutcome::Scanned { scan_ms, .. } => {
             serde_json::json!({ "status": "scanned", "scan_ms": scan_ms })
@@ -183,9 +219,12 @@ pub fn render_json(pid: u32, outcome: &ScanOutcome, pinned: &PinnedObjects) -> s
         .iter()
         .map(|s| serde_json::json!({ "subject": s.subject, "reason": s.reason }))
         .collect();
+    let mut application = application_json(application);
     serde_json::json!({
         "schema": DOC_ID,
         "pid": pid,
+        "application": application["application"].take(),
+        "application_status": application["application_status"].take(),
         "scan": scan,
         "modules": modules,
         "skipped": skipped,
@@ -292,9 +331,38 @@ fn scan_and_pin_retained_with<C, S, P>(
     Ok((scanned, pinned))
 }
 
+// Both samples use this same retained context. Application validation does
+// not alter the physical scan's result, provider pins or refusal semantics.
+fn scan_and_pin_application_with<C: InspectImageReader, S, P>(
+    context: &mut C,
+    still_the_same: impl FnMut(&mut C) -> bool,
+    scan: impl FnOnce(&mut C) -> Result<S, String>,
+    pin: impl FnOnce(&mut C, &S) -> Result<P, String>,
+) -> Result<(S, P, InspectApplicationResult), String> {
+    let pending = begin_application(context);
+    let (scanned, pinned) = scan_and_pin_retained_with(context, still_the_same, scan, pin)?;
+    let application = finish_application(pending, context);
+    Ok((scanned, pinned, application))
+}
+
+impl InspectImageReader for (ProcessViewImageReader<'_>, CaptureWorkBudget) {
+    fn exe_identity(&mut self) -> Option<crate::discovery::caller_registry::ExeIdentity> {
+        self.0.exe_identity()
+    }
+    fn start_time(&mut self) -> Option<u64> {
+        self.0.start_time()
+    }
+    fn still_same(&mut self) -> bool {
+        self.0.still_same()
+    }
+    fn validate_generation(&mut self) -> Result<(), InspectIdentityUnknown> {
+        self.0.validate_generation()
+    }
+}
+
 /// `p11scope inspect` — scans, pins, prints. Exit code: 0 when the scan ran
 /// (even with zero modules), 1 when the target could not be read at all.
-/// `--pid` keeps the single-process scan below byte-compatible; `--system`
+/// `--pid` retains scan-local application presentation; `--system`
 /// catalogs every process on the machine (see `inspect_system`).
 pub fn run(
     scope: crate::cli::InspectScope,
@@ -339,20 +407,25 @@ fn run_with_view(
     view: Result<ProcessView, String>,
 ) -> Result<i32> {
     let view = view.map_err(|reason| unreadable_target_error(pid, &reason))?;
-    let mut context = (&view, CaptureWorkBudget::default());
-    let result = scan_and_pin_retained_with(
+    let mut context = (
+        ProcessViewImageReader::new(&view),
+        CaptureWorkBudget::default(),
+    );
+    let result = scan_and_pin_application_with(
         &mut context,
-        |context| context.0.still_the_same(),
+        |context| context.0.view().still_the_same(),
         |context| {
             scan_process_view(
                 &ScanRequest { pid, hints, hooks },
-                context.0,
+                context.0.view(),
                 &mut context.1,
             )
         },
-        |context, outcome| pin_scanned_view_objects(context.0, outcome.modules(), &mut context.1),
+        |context, outcome| {
+            pin_scanned_view_objects(context.0.view(), outcome.modules(), &mut context.1)
+        },
     );
-    emit_diagnosis(pid, json, out, result)
+    emit_application_diagnosis(pid, json, out, result)
 }
 
 /// Renders a finished — or failed — diagnosis to `out`. Pure over the
@@ -362,13 +435,40 @@ fn run_with_view(
 /// breaking the JSON stream with a text line (F-20). Hard failures (the
 /// view never opened) never reach here: they return `Err`, which `main`
 /// reports on stderr with stdout left empty.
+#[cfg(test)]
 fn emit_diagnosis(
     pid: u32,
     json: bool,
     out: &mut dyn std::io::Write,
     result: Result<(ScanOutcome, (PinnedObjects, Vec<Skipped>)), String>,
 ) -> Result<i32> {
-    let (outcome, (pinned, pin_skips)) = match result {
+    emit_application_diagnosis(
+        pid,
+        json,
+        out,
+        result.map(|(outcome, pins)| {
+            (
+                outcome,
+                pins,
+                InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
+            )
+        }),
+    )
+}
+
+type ApplicationDiagnosis = (
+    ScanOutcome,
+    (PinnedObjects, Vec<Skipped>),
+    InspectApplicationResult,
+);
+
+fn emit_application_diagnosis(
+    pid: u32,
+    json: bool,
+    out: &mut dyn std::io::Write,
+    result: Result<ApplicationDiagnosis, String>,
+) -> Result<i32> {
+    let (outcome, (pinned, pin_skips), application) = match result {
         Ok(result) => result,
         Err(error) => {
             if json {
@@ -389,10 +489,19 @@ fn emit_diagnosis(
     let outcome = with_extra_skips(outcome, pin_skips);
 
     if json {
-        let document = serde_json::to_string_pretty(&render_json(pid, &outcome, &pinned))?;
+        let document = serde_json::to_string_pretty(&render_json_with_application(
+            pid,
+            &outcome,
+            &pinned,
+            &application,
+        ))?;
         writeln!(out, "{document}")?;
     } else {
-        write!(out, "{}", render_text(pid, &outcome, &pinned))?;
+        write!(
+            out,
+            "{}",
+            render_text_with_application(pid, &outcome, &pinned, &application)
+        )?;
     }
     Ok(0)
 }
@@ -433,6 +542,8 @@ fn failure_json(pid: u32, reason: &str) -> serde_json::Value {
     serde_json::json!({
         "schema": DOC_ID,
         "pid": pid,
+        "application": null,
+        "application_status": "not_examined",
         "scan": { "status": "failed", "reason": reason },
         "modules": [],
         "skipped": [],
@@ -849,5 +960,234 @@ mod tests {
         );
         assert_eq!(value["modules"][0]["tables"][0]["version"], "2.40");
         assert_eq!(value["modules"][0]["tables"][0]["entries"], 1);
+    }
+    struct ImageStage {
+        image: Option<crate::discovery::caller_registry::ExeIdentity>,
+        start: Option<u64>,
+        alive: bool,
+    }
+    impl ImageStage {
+        fn new() -> Self {
+            Self {
+                image: Some(crate::discovery::caller_registry::ExeIdentity {
+                    dev: 2,
+                    ino: 3,
+                    mtime_secs: 4,
+                    mtime_nanos: 5,
+                    path: Some("/opt/alpha/python3".into()),
+                }),
+                start: Some(101),
+                alive: true,
+            }
+        }
+    }
+    impl InspectImageReader for ImageStage {
+        fn exe_identity(&mut self) -> Option<crate::discovery::caller_registry::ExeIdentity> {
+            self.image.clone()
+        }
+        fn start_time(&mut self) -> Option<u64> {
+            self.start
+        }
+        fn still_same(&mut self) -> bool {
+            self.alive
+        }
+    }
+    fn staged_diagnosis(
+        state: &mut ImageStage,
+        before_scan: impl FnOnce(&mut ImageStage),
+        during_pin: impl FnOnce(&mut ImageStage),
+    ) -> (serde_json::Value, String) {
+        let result = scan_and_pin_application_with(
+            state,
+            |state| state.alive,
+            |state| {
+                before_scan(state);
+                Ok(sample())
+            },
+            |state, _| {
+                during_pin(state);
+                Ok((PinnedObjects::empty(), Vec::new()))
+            },
+        )
+        .unwrap();
+        let mut json = Vec::new();
+        let mut text = Vec::new();
+        let (outcome, pins, application) = result;
+        assert_eq!(
+            emit_application_diagnosis(
+                4242,
+                true,
+                &mut json,
+                Ok((
+                    outcome.clone(),
+                    (PinnedObjects::empty(), Vec::new()),
+                    application.clone()
+                ))
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            emit_application_diagnosis(4242, false, &mut text, Ok((outcome, pins, application)))
+                .unwrap(),
+            0
+        );
+        (
+            serde_json::from_slice(&json).unwrap(),
+            String::from_utf8(text).unwrap(),
+        )
+    }
+    fn assert_changed(json: &serde_json::Value, text: &str) {
+        assert!(json["application"].is_null());
+        assert_eq!(json["application_status"], "changed");
+        assert!(text.starts_with("Unknown executable (PID 4242)"), "{text}");
+        assert!(!text.contains("/opt/alpha/python3"));
+        assert_eq!(
+            json["modules"][0]["path"],
+            "/usr/lib/softhsm/libsofthsm2.so"
+        );
+        assert!(text.contains("libsofthsm2.so"));
+    }
+
+    // Mutations caught: sampling only after scan, finishing before provider pin,
+    // ignoring live-pidfd exec, or discarding modules when naming is rejected.
+    #[test]
+    fn pid_inspect_exec_before_scan_with_live_pin_is_unknown() {
+        let (json, text) = staged_diagnosis(
+            &mut ImageStage::new(),
+            |s| {
+                s.image.as_mut().unwrap().path = Some("/opt/beta/java".into());
+                s.image.as_mut().unwrap().ino = 88;
+            },
+            |_| {},
+        );
+        assert_changed(&json, &text);
+    }
+    #[test]
+    fn pid_inspect_exec_during_pin_is_unknown() {
+        let (json, text) = staged_diagnosis(
+            &mut ImageStage::new(),
+            |_| {},
+            |s| {
+                s.image.as_mut().unwrap().path = Some("/opt/beta/java".into());
+                s.image.as_mut().unwrap().ino = 88;
+            },
+        );
+        assert_changed(&json, &text);
+    }
+    #[test]
+    fn pid_inspect_final_exe_unreadable_is_unknown() {
+        let (json, text) = staged_diagnosis(&mut ImageStage::new(), |_| {}, |s| s.image = None);
+        assert!(json["application"].is_null());
+        assert_eq!(json["application_status"], "unavailable");
+        assert!(text.starts_with("Unknown executable (PID 4242)"));
+        assert_eq!(json["modules"].as_array().unwrap().len(), 1);
+    }
+    #[test]
+    fn pid_inspect_unchanged_executable_is_named() {
+        let (json, text) = staged_diagnosis(&mut ImageStage::new(), |_| {}, |_| {});
+        assert_eq!(json["application_status"], "observed");
+        assert_eq!(json["application"]["path"], "/opt/alpha/python3");
+        assert_eq!(json["application"]["start_time"], 101);
+        assert!(text.starts_with("python3 (PID 4242)"), "{text}");
+        assert!(text.contains("/opt/alpha/python3"));
+    }
+    #[test]
+    fn inspect_mapping_is_not_usage() {
+        let (json, text) = staged_diagnosis(&mut ImageStage::new(), |_| {}, |_| {});
+        assert!(
+            text.contains("activity was not captured by inspect"),
+            "{text}"
+        );
+        assert!(json.get("calls").is_none());
+        assert!(json["modules"][0].get("entries_observed").is_none());
+        assert_eq!(json["modules"][0]["tables"][0]["entries"], 1);
+    }
+    #[test]
+    fn pid_inspect_os_reader_names_the_owned_process() {
+        let mut bytes = Vec::new();
+        run_with_writer(
+            std::process::id(),
+            &[],
+            &HookRegistry::builtin(),
+            true,
+            &mut bytes,
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let expected = std::fs::read_link("/proc/self/exe")
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(json["application_status"], "observed");
+        assert_eq!(json["application"]["path"], expected);
+        assert_eq!(
+            json["application"]["start_time"],
+            crate::process::process_start_time(std::process::id()).unwrap()
+        );
+    }
+
+    #[test]
+    fn pid_inspect_initial_exe_unreadable_is_never_repaired() {
+        let mut state = ImageStage::new();
+        state.image = None;
+        let (json, text) =
+            staged_diagnosis(&mut state, |s| s.image = ImageStage::new().image, |_| {});
+        assert!(json["application"].is_null());
+        assert_eq!(json["application_status"], "unavailable");
+        assert!(text.starts_with("Unknown executable (PID 4242)"));
+    }
+    #[test]
+    fn pid_inspect_unavailable_memory_preserves_named_mapping() {
+        let mut state = ImageStage::new();
+        let result = scan_and_pin_application_with(
+            &mut state,
+            |s| s.alive,
+            |_| {
+                Ok(ScanOutcome::Unavailable {
+                    reason: "ptrace",
+                    modules: sample().modules().to_vec(),
+                    skipped: Vec::new(),
+                })
+            },
+            |_, _| Ok((PinnedObjects::empty(), Vec::new())),
+        );
+        let mut bytes = Vec::new();
+        assert_eq!(
+            emit_application_diagnosis(4242, true, &mut bytes, result).unwrap(),
+            0
+        );
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["scan"]["status"], "unavailable");
+        assert_eq!(json["application_status"], "observed");
+        assert_eq!(json["application"]["path"], "/opt/alpha/python3");
+        assert_eq!(json["modules"].as_array().unwrap().len(), 1);
+    }
+    #[test]
+    fn pid_inspect_same_path_distinct_provider_inodes_remain_separate() {
+        let mut state = ImageStage::new();
+        let mut outcome = sample();
+        if let ScanOutcome::Scanned { modules, .. } = &mut outcome {
+            let mut second = modules[0].clone();
+            second.key = key(22);
+            modules.push(second);
+        }
+        let result = scan_and_pin_application_with(
+            &mut state,
+            |s| s.alive,
+            |_| Ok(outcome),
+            |_, _| Ok((PinnedObjects::empty(), Vec::new())),
+        );
+        let mut bytes = Vec::new();
+        assert_eq!(
+            emit_application_diagnosis(4242, true, &mut bytes, result).unwrap(),
+            0
+        );
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["application_status"], "observed");
+        assert_eq!(json["modules"].as_array().unwrap().len(), 2);
+        assert_eq!(json["modules"][0]["inode"], 11);
+        assert_eq!(json["modules"][1]["inode"], 22);
+        assert_eq!(json["modules"][0]["path"], json["modules"][1]["path"]);
     }
 }

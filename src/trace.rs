@@ -141,11 +141,51 @@ fn fmt_wall_time(wall_ns: u128) -> String {
 /// testable: given a known `Event` and its resolved wall-clock time,
 /// function name, and session pseudonym, it always renders the same line.
 pub fn format_line(ev: &Event, wall_ns: u128, function: &str, session: Option<u64>) -> String {
+    format_line_with_executable(
+        ev,
+        wall_ns,
+        function,
+        session,
+        crate::trace_identity::TraceExecutableView::unknown(
+            crate::trace_identity::TraceIdentityUnknown::NotSeeded,
+        ),
+    )
+}
+
+fn quote_executable(value: &str) -> String {
+    // JSON Unicode escapes preserve the value while keeping splitlines-based
+    // consumers on the one LF-delimited record the capture actually emitted.
+    serde_json::to_string(&render::escape_controls(value))
+        .expect("JSON string")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+pub(crate) fn format_line_with_executable(
+    ev: &Event,
+    wall_ns: u128,
+    function: &str,
+    session: Option<u64>,
+    executable: crate::trace_identity::TraceExecutableView<'_>,
+) -> String {
     let (pid, tid) = pid_tid(ev.pid_tgid);
-    let mut line = format!(
-        "{} Unknown executable (PID {pid}, TID {tid})",
-        fmt_wall_time(wall_ns)
-    );
+    let mut line = if let Some(path) = executable.path() {
+        let basename = path
+            .rsplit('/')
+            .find(|part| !part.is_empty())
+            .unwrap_or(path);
+        let basename = quote_executable(basename);
+        let path = quote_executable(path);
+        format!(
+            "{} {basename} (PID {pid}, TID {tid}) exe={path}",
+            fmt_wall_time(wall_ns)
+        )
+    } else {
+        format!(
+            "{} Unknown executable (PID {pid}, TID {tid})",
+            fmt_wall_time(wall_ns)
+        )
+    };
     if let Some(n) = session {
         line.push_str(&format!(" sess#{n}"));
     }
@@ -191,7 +231,7 @@ pub fn capture_line(policy: CapturePolicy) -> String {
 /// Context for completed event lines without a producer-backed image label.
 /// This header is human text; terminal EVIDENCE and count records stay intact.
 pub fn identity_note() -> &'static str {
-    "Trace — completed call events in arrival order\nExecutable identity unavailable; event PID/TID remain diagnostic identifiers."
+    "Trace — completed call events in arrival order\nExecutable labels use verified observed paths; event PID/TID remain diagnostic identifiers."
 }
 
 /// Final machine-readable evidence record for a normally stopped trace.
@@ -383,6 +423,23 @@ impl Tracer {
         process: ProcessKey,
         state: &mut State,
     ) -> String {
+        self.on_event_process_with_executable(
+            ev,
+            process,
+            state,
+            crate::trace_identity::TraceExecutableView::unknown(
+                crate::trace_identity::TraceIdentityUnknown::NotSeeded,
+            ),
+        )
+    }
+
+    pub(crate) fn on_event_process_with_executable(
+        &mut self,
+        ev: &Event,
+        process: ProcessKey,
+        state: &mut State,
+        executable: crate::trace_identity::TraceExecutableView<'_>,
+    ) -> String {
         let slot = self
             .slots
             .get(ev.slot as usize)
@@ -406,7 +463,222 @@ impl Tracer {
         if !semantic {
             rendered.capture = 0;
         }
-        format_line(&rendered, wall_ns, &function, session)
+        format_line_with_executable(&rendered, wall_ns, &function, session, executable)
+    }
+}
+
+#[cfg(test)]
+mod trace_identity_renderer_tests {
+    use super::*;
+    use crate::discovery::engine::tests::detailed_proof_driver::verified_fixture_with_link;
+    use crate::trace_identity::TraceIdentityStore;
+
+    fn event(key: ProcessKey, ts_ns: u64) -> Event {
+        Event {
+            pid_tgid: (u64::from(key.pid) << 32) | 8,
+            ts_ns,
+            duration_ns: 3_000,
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: key.generation,
+                exec_id: key.exec_id,
+            },
+            ..Event::default()
+        }
+    }
+
+    #[test]
+    fn trace_identity_renderer_event_time_boundary() {
+        let (proof, receipt) = verified_fixture_with_link(b"/owned/fixture");
+        let key = receipt.key();
+        let mut store = TraceIdentityStore::new(proof);
+        store.admit(receipt).unwrap();
+        for ts in [0, 5, 10, 20, 21, u64::MAX] {
+            let ev = event(key, ts);
+            let line =
+                format_line_with_executable(&ev, 0, "C_GetInfo", None, store.lookup(key, ts));
+            if [20, 21].contains(&ts) {
+                assert!(line.contains("\"fixture\" (PID "), "t={ts}: {line}");
+                assert!(
+                    line.contains("exe=\"/owned/fixture\" C_GetInfo"),
+                    "t={ts}: {line}"
+                );
+            } else {
+                assert_eq!(line, format_line(&ev, 0, "C_GetInfo", None), "t={ts}");
+                assert!(line.contains("Unknown executable"));
+            }
+        }
+    }
+
+    #[test]
+    fn trace_identity_renderer_quotes_controls_deleted_and_basename_collisions() {
+        // These paths pass the actual sampler/producer before reaching the
+        // private view. No renderer test can construct a positive view.
+        for (path, basename, escaped_path) in [
+            ("/first/duplicate", "duplicate", "/first/duplicate"),
+            ("/second/duplicate", "duplicate", "/second/duplicate"),
+            (
+                "/owned/with spaces (deleted)",
+                "with spaces (deleted)",
+                "/owned/with spaces (deleted)",
+            ),
+            (
+                "/owned/q\"u\\ote\n\u{85}",
+                "q\"u\\ote\\n\\u{85}",
+                "/owned/q\"u\\ote\\n\\u{85}",
+            ),
+            (
+                "/owned/(PID 9, TID 8) exe=\"fake\" sess#4",
+                "(PID 9, TID 8) exe=\"fake\" sess#4",
+                "/owned/(PID 9, TID 8) exe=\"fake\" sess#4",
+            ),
+        ] {
+            let (proof, receipt) = verified_fixture_with_link(path.as_bytes());
+            let key = receipt.key();
+            let mut store = TraceIdentityStore::new(proof);
+            store.admit(receipt).unwrap();
+            let line = format_line_with_executable(
+                &event(key, 20),
+                0,
+                "C_GetInfo",
+                Some(7),
+                store.lookup(key, 20),
+            );
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+            let rest = line.strip_prefix("00:00:00.000000 ").unwrap();
+            let mut atoms = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+            assert_eq!(atoms.next().unwrap().unwrap(), basename);
+            let rest = &rest[atoms.byte_offset()..];
+            let marker = format!(" (PID {}, TID 8) exe=", key.pid);
+            let rest = rest.strip_prefix(&marker).unwrap();
+            let mut atoms = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+            assert_eq!(atoms.next().unwrap().unwrap(), escaped_path);
+            assert_eq!(
+                &rest[atoms.byte_offset()..],
+                " sess#7 C_GetInfo → CKR_OK 3.0µs"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_identity_renderer_context_and_public_unknown_wrapper() {
+        assert_eq!(
+            identity_note(),
+            "Trace — completed call events in arrival order\nExecutable labels use verified observed paths; event PID/TID remain diagnostic identifiers."
+        );
+        let ev = Event {
+            pid_tgid: (123u64 << 32) | 456,
+            duration_ns: 3_000,
+            ..Event::default()
+        };
+        assert_eq!(
+            format_line(&ev, 0, "C_GetInfo", None),
+            "00:00:00.000000 Unknown executable (PID 123, TID 456) C_GetInfo → CKR_OK 3.0µs"
+        );
+    }
+
+    #[test]
+    fn trace_identity_renderer_to_actual_python_consumers() {
+        use std::io::{Read, Write};
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let (proof, receipt) = verified_fixture_with_link(
+            "/owned/q\"u\\ote (PID 9, TID 8) sess#4\u{2028}\u{2029} (deleted)".as_bytes(),
+        );
+        let key = receipt.key();
+        let mut store = TraceIdentityStore::new(proof);
+        store.admit(receipt).unwrap();
+        let ev = event(key, 20);
+        let lines = [
+            "C_GenerateRandom",
+            "C_DigestInit",
+            "C_Digest",
+            "C_FindObjectsInit",
+            "C_FindObjects",
+            "C_FindObjectsFinal",
+        ]
+        .map(|function| {
+            format_line_with_executable(&ev, 0, function, Some(7), store.lookup(key, 20))
+        });
+        assert!(lines.iter().all(|line| line.contains(" exe=")), "{lines:?}");
+        let text = format!(
+            "{}\n{}\n{}\nCOUNT_EVIDENCE {}\nEVIDENCE {}\n",
+            capture_line(CapturePolicy::Allowlisted),
+            identity_note(),
+            lines.join("\n"),
+            serde_json::json!({"stats_entered":6, "stats_returned":6, "raw_calls":6}),
+            serde_json::json!({"event_loss":0, "verdict_detail":"attribution_only",
+                "pid_namespace":{"observer":"initial", "kernel_pids":"initial", "proc_pids":"observer"},
+                "gap_classes":{"observation":{"causes":[], "status":"exact"}}})
+        );
+        let program = r#"
+import contextlib,io,json,pathlib,runpy,sys,tempfile
+root=pathlib.Path(sys.argv[1]); pid=int(sys.argv[2]); text=sys.stdin.read()
+measure=runpy.run_path(str(root/'scripts/system-scope-measure.py'))
+assert measure['parse_trace_stream'](text.splitlines())['call_lines_total']==6
+checker=runpy.run_path(str(root/'scripts/check-canary-evidence.py'))
+rest=checker['trace_scannable']('actual renderer',text)
+checker['assert_no_loader_pause_identity']('actual renderer',rest)
+assert '/owned/q"u\\ote (PID 9, TID 8) sess#4\u2028\u2029 (deleted)' in rest
+arguments=sys.argv; sys.argv=['kind-e2e-oracle.py','--self-test']
+kind=runpy.run_path(str(root/'scripts/kind-e2e-oracle.py')); sys.argv=arguments
+assert kind['trace_exact'](text,1)['trace_pids']==[pid]
+source=(root/'scripts/matrix/verify-pidns.sh').read_text()
+block=source.split('  d=$(python3 - "$OUT" "$ITERS" <<\'PY\'\n',1)[1].split('\nPY\n',1)[0]
+with tempfile.TemporaryDirectory() as raw:
+    out=pathlib.Path(raw)
+    (out/'nested-trace.txt').write_text(text)
+    (out/'nested-trace.wl').write_text('READY pid=7\n')
+    (out/'nested-trace.rc').write_text('0\n')
+    sys.argv=['actual-renderer',raw,'1']; output=io.StringIO()
+    with contextlib.redirect_stdout(output): exec(compile(block,str(root/'scripts/matrix/verify-pidns.sh'),'exec'),{})
+    result=json.loads(output.getvalue())
+    assert result['printed_pids']==[pid] and result['call_lines']==6
+"#;
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = Child(
+            Command::new("python3")
+                .args(["-I", "-c", program])
+                .arg(env!("CARGO_MANIFEST_DIR"))
+                .arg(key.pid.to_string())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        child
+            .0
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "actual Python consumer exceeded its owned deadline"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let mut stderr = String::new();
+        child
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert!(status.success(), "{stderr}");
     }
 }
 

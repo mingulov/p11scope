@@ -351,6 +351,10 @@ fn scoped_renderer_uses_only_scope_kinds_and_keeps_legacy_consumer_valid() {
     }
     assert!(trace::identity_note().contains("completed call events in arrival order"));
     assert!(trace::identity_note().contains("PID/TID remain diagnostic identifiers"));
+    assert_eq!(
+        trace::identity_note(),
+        "Trace — completed call events in arrival order\nExecutable labels use verified observed paths; event PID/TID remain diagnostic identifiers."
+    );
 }
 
 // Feed the actual production formatter to the real qualification privacy

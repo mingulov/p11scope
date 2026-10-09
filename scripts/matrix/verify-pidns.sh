@@ -136,9 +136,14 @@ import json,re,sys
 out,n=sys.argv[1],int(sys.argv[2])
 with open(f"{out}/nested-trace.txt",errors="replace") as source:
     text=source.read()
-lines=[l for l in text.splitlines() if " → " in l]
+json_string=r'"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"'
 prefix=re.compile(r"^\d{2}:\d{2}:\d{2}\.\d{6} (?:pid ([0-9]+) tid [0-9]+|"
-                  r"Unknown executable \(PID ([0-9]+), TID [0-9]+\)) (?P<body>.*)$")
+                  r"Unknown executable \(PID ([0-9]+), TID [0-9]+\)|"
+                  rf"{json_string} \(PID ([0-9]+), TID [0-9]+\) exe={json_string}) (?P<body>.*)$")
+context_lines={"Trace — completed call events in arrival order",
+               "Executable identity unavailable; event PID/TID remain diagnostic identifiers.",
+               "Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers."}
+lines=[l for l in text.splitlines() if l not in context_lines and " → " in l]
 pids=set()
 for line in lines:
     match=prefix.match(line)
@@ -147,10 +152,10 @@ for line in lines:
     if body.startswith("sess#"):
         session,separator,body=body.partition(" ")
         assert separator and re.fullmatch(r"sess#[0-9]+",session), f"malformed trace session: {line!r}"
-    assert body and not body.startswith(("pid ","Unknown executable ","sess#")), \
+    assert body and not body.startswith(("pid ","Unknown executable ","sess#",'"')) and not re.match(r"[A-Za-z_][A-Za-z0-9_]*=",body), \
         f"duplicate trace identity/session: {line!r}"
     assert re.fullmatch(r"\S+.* → \S+ .+",body), f"malformed trace call: {line!r}"
-    pids.add(int(match.group(1) or match.group(2)))
+    pids.add(int(match.group(1) or match.group(2) or match.group(3)))
 pids=sorted(pids)
 ev=[json.loads(l[len("EVIDENCE "):]) for l in text.splitlines() if l.startswith("EVIDENCE ")]
 with open(f"{out}/nested-trace.wl") as source:

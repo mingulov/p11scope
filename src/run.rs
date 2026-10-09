@@ -3599,6 +3599,66 @@ enum DiscoveryPass {
     PendingStop,
 }
 
+// Proof service follows the existing discovery cadence. Both sides of the
+// complete tick share the actual frame's ticket and ordinary discovery budget.
+fn with_trace_identity_frame<S: crate::attach::detailed_identity::TraceIo, T>(
+    engine: &mut Engine,
+    session: &mut S,
+    pass: Option<DiscoveryPass>,
+    identities: &mut Option<crate::trace_identity::TraceIdentityStore>,
+    tick: impl FnOnce(
+        &mut Engine,
+        &mut S,
+        &mut Option<crate::trace_identity::TraceIdentityStore>,
+    ) -> Result<T>,
+) -> Result<T> {
+    if !matches!(pass, Some(DiscoveryPass::Frame)) || identities.is_none() {
+        return tick(engine, session, identities);
+    }
+    engine.with_trace_frame(session, |engine, session, work| {
+        if let Some(store) = identities.as_mut() {
+            engine.service_trace_images(session, work, |receipt| {
+                let _ = store.admit(receipt);
+            });
+        }
+        let result = tick(engine, session, identities);
+        if let Some(store) = identities.as_mut() {
+            // The scheduler refuses expired/exhausted/closed work. This second
+            // service cannot create a new allowance or repair an earlier row.
+            engine.service_trace_images(session, work, |receipt| {
+                let _ = store.admit(receipt);
+            });
+        }
+        result
+    })
+}
+
+fn begin_trace_identity_stop<S: crate::attach::detailed_identity::TraceIo>(
+    engine: &mut Engine,
+    session: &S,
+    identities: &mut Option<crate::trace_identity::TraceIdentityStore>,
+    terminal: &mut Option<crate::attach::detailed_identity::TraceWorkTicket>,
+    remaining: Duration,
+) {
+    if identities.is_some() && terminal.is_none() {
+        *terminal = Some(engine.begin_trace_terminal_work(remaining));
+    }
+    service_trace_identity_terminal(engine, session, identities, terminal);
+}
+
+fn service_trace_identity_terminal<S: crate::attach::detailed_identity::TraceIo>(
+    engine: &mut Engine,
+    session: &S,
+    identities: &mut Option<crate::trace_identity::TraceIdentityStore>,
+    terminal: &mut Option<crate::attach::detailed_identity::TraceWorkTicket>,
+) {
+    if let (Some(store), Some(work)) = (identities.as_mut(), terminal.as_mut()) {
+        engine.service_trace_images(session, work, |receipt| {
+            let _ = store.admit(receipt);
+        });
+    }
+}
+
 /// The capture tick's discovery gate.
 ///
 /// The full pass runs once per frame. 64db33a took discovery, the
@@ -4133,6 +4193,7 @@ type TraceTickContext<
     'stdout_ref,
     'stdout_open,
     'out_file,
+    'identities,
 > = (
     &'engine mut Engine,
     &'session mut Session,
@@ -4142,6 +4203,7 @@ type TraceTickContext<
     &'stdout_ref mut crate::sink::SinkWriter<crate::sink::StdoutInner>,
     &'stdout_open mut bool,
     &'out_file mut Option<std::io::BufWriter<std::fs::File>>,
+    &'identities mut Option<crate::trace_identity::TraceIdentityStore>,
 );
 
 #[derive(Debug)]
@@ -5165,6 +5227,15 @@ fn capture_trace(
     stdout_sink.set_cancel_flag(interrupted.cancel_flag());
     let stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner> = &mut stdout_sink;
 
+    // Refusal disables naming only; the existing capture/count path continues.
+    let mut identities = if session.enable_trace_proof().is_ok() {
+        session
+            .trace_proof()
+            .cloned()
+            .map(crate::trace_identity::TraceIdentityStore::new)
+    } else {
+        None
+    };
     let domain = session.events_domain();
     let mut state = semantics::State::for_capture(engine.plan(), policy, domain.clone());
     let mut process_tracker = process::Tracker::for_producer(domain, 16_384);
@@ -5231,7 +5302,10 @@ fn capture_trace(
         ticks += 1;
         let tick_start = Instant::now();
         let elapsed = clock.elapsed();
-        let tick = {
+        let pass = discovery_due(last_frame.elapsed(), drain, || {
+            owned_stop_pending(engine, session, owned.as_deref(), interrupted)
+        });
+        let tick = with_trace_identity_frame(engine, session, pass, &mut identities, |engine, session, identities| {
             let mut context = (
                 &mut *engine,
                 &mut *session,
@@ -5241,6 +5315,7 @@ fn capture_trace(
                 &mut *stdout,
                 &mut stdout_open,
                 &mut *out_file,
+                identities,
             );
             let mut consumers = CaptureConsumers {
                 state: &mut state,
@@ -5265,12 +5340,11 @@ fn capture_trace(
                     '_,
                     '_,
                     '_,
+                    '_,
                 >,
                     consumers: &mut CaptureConsumers<'_>,
                 | {
-                    let Some(pass) = discovery_due(frame_clock.elapsed(), drain, || {
-                        owned_stop_pending(context.0, context.1, context.2.as_deref(), interrupted)
-                    }) else {
+                    let Some(pass) = pass else {
                         return Ok((false, false, context.0.plan()));
                     };
                     advance_trace_frame_clock(frame_clock, pass, Instant::now());
@@ -5311,6 +5385,7 @@ fn capture_trace(
                         consumers.tracker,
                         scope,
                         consumers.tracer.as_deref_mut().expect("trace consumer"),
+                        context.8.as_ref(),
                         context.5,
                         context.6,
                         context.7,
@@ -5355,8 +5430,8 @@ fn capture_trace(
                         Ok(())
                     }
                 },
-            )?
-        };
+            )
+        })?;
         let paused = match tick {
             CaptureTick::Continue { paused, snapshot: () } => paused,
             CaptureTick::End(end) => break Ok(end),
@@ -5393,7 +5468,16 @@ fn capture_trace(
     // First stop observation: request the stop immediately (before child
     // waits, drains and snapshots) and emit the existing stop marker as
     // the acknowledgement, adjacent to the request.
+    let stop_started = Instant::now();
     session.stop_gate().request_stop();
+    let mut terminal = None;
+    begin_trace_identity_stop(
+        engine,
+        session,
+        &mut identities,
+        &mut terminal,
+        STOP_QUIESCE_BUDGET.saturating_sub(stop_started.elapsed()),
+    );
     if matches!(loop_result, Ok(CaptureEnd::Signal)) {
         eprintln!("{}", cancel_marker(interrupted.first_signal(), ticks));
     }
@@ -5441,16 +5525,17 @@ fn capture_trace(
                 }
                 stdout.begin_tick(crate::sink::SINK_TICK_BUDGET);
                 let phase_start = Instant::now();
-                match drain_trace_events_from(
+                match drain_trace_events_from_with_identities(
                     events_drain,
-                    &mut remaining,
-                    &mut state,
-                    &mut process_tracker,
-                    scope,
-                    &mut tracer,
-                    stdout,
-                    &mut stdout_open,
-                    out_file,
+                    (
+                        &mut remaining,
+                        &mut state,
+                        &mut process_tracker,
+                        scope,
+                        &mut tracer,
+                    ),
+                    identities.as_ref(),
+                    (&mut *(stdout), &mut stdout_open, &mut *(out_file)),
                     Some(crate::events::LIVE_POLL_QUANTUM),
                 ) {
                     Ok((malformed, _)) => {
@@ -5496,6 +5581,7 @@ fn capture_trace(
             state.sync_plan(plan);
             tracer.sync_plan(plan);
         }
+        service_trace_identity_terminal(engine, session, &mut identities, &mut terminal);
         Ok((quiesced, stop_quiescence))
     })() {
         Ok(outcome) => outcome,
@@ -5548,6 +5634,7 @@ fn capture_trace(
                 &mut *stdout,
                 &mut stdout_open,
                 &mut *out_file,
+                &mut identities,
             );
             let mut consumers = CaptureConsumers {
                 state: &mut state,
@@ -5562,7 +5649,7 @@ fn capture_trace(
                 &mut consumers,
                 quiesced,
                 &mut std::io::stderr(),
-                |context: &mut TraceTickContext<'_, '_, '_, '_, '_, '_, '_, '_, '_>,
+                |context: &mut TraceTickContext<'_, '_, '_, '_, '_, '_, '_, '_, '_, '_>,
                  consumers: &mut CaptureConsumers<'_>,
                  quiesced| {
                     let phase_start = Instant::now();
@@ -5586,6 +5673,7 @@ fn capture_trace(
                     consumers
                         .scheduling
                         .add_phase(SchedulingPhase::DiscoveryTerminal, phase_start.elapsed());
+                    service_trace_identity_terminal(context.0, context.1, context.8, &mut terminal);
                     Ok((plan_changed, context.0.plan()))
                 },
                 |context, consumers| {
@@ -5596,16 +5684,20 @@ fn capture_trace(
                         context.2.as_deref_mut(),
                         interrupted,
                         |domain, event| {
-                            reduce_trace_event(
+                            reduce_trace_event_with_identities(
                                 domain,
-                                context.3,
-                                consumers.state,
-                                consumers.tracker,
-                                scope,
-                                consumers.tracer.as_deref_mut().expect("trace consumer"),
-                                context.5,
-                                context.6,
-                                context.7,
+                                (
+                                    &mut *(context.3),
+                                    &mut *(consumers.state),
+                                    &mut *(consumers.tracker),
+                                    scope,
+                                    &mut *(consumers
+                                        .tracer
+                                        .as_deref_mut()
+                                        .expect("trace consumer")),
+                                ),
+                                context.8.as_ref(),
+                                (&mut *(context.5), &mut *(context.6), &mut *(context.7)),
                                 &mut root_write_error,
                                 event,
                             )
@@ -5624,6 +5716,7 @@ fn capture_trace(
                         consumers.tracker,
                         scope,
                         consumers.tracer.as_deref_mut().expect("trace consumer"),
+                        context.8.as_ref(),
                         context.5,
                         context.6,
                         context.7,
@@ -6719,6 +6812,7 @@ fn drain_trace_events_to_position<S: crate::events::BoundedRecordSource, W: Writ
     tracker: &mut process::Tracker,
     scope: &Scope,
     tracer: &mut trace::Tracer,
+    identities: Option<&crate::trace_identity::TraceIdentityStore>,
     stdout: &mut dyn Write,
     stdout_open: &mut bool,
     out_file: &mut Option<W>,
@@ -6733,16 +6827,17 @@ fn drain_trace_events_to_position<S: crate::events::BoundedRecordSource, W: Writ
             stop,
             Some(crate::events::TERMINAL_DRAIN_BOUND),
             |ev| {
-                if let Err(error) = reduce_trace_event(
+                if let Err(error) = reduce_trace_event_with_identities(
                     domain,
-                    remaining,
-                    state,
-                    tracker,
-                    scope,
-                    tracer,
-                    stdout,
-                    stdout_open,
-                    out_file,
+                    (
+                        &mut *(remaining),
+                        &mut *(state),
+                        &mut *(tracker),
+                        scope,
+                        &mut *(tracer),
+                    ),
+                    identities,
+                    (&mut *(stdout), &mut *(stdout_open), &mut *(out_file)),
                     &mut write_error,
                     ev,
                 ) {
@@ -6773,6 +6868,7 @@ fn drain_trace_events<W: Write>(
     tracker: &mut process::Tracker,
     scope: &Scope,
     tracer: &mut trace::Tracer,
+    identities: Option<&crate::trace_identity::TraceIdentityStore>,
     stdout: &mut dyn Write,
     stdout_open: &mut bool,
     out_file: &mut Option<W>,
@@ -6800,6 +6896,7 @@ fn drain_trace_events<W: Write>(
             tracker,
             scope,
             tracer,
+            identities,
             stdout,
             stdout_open,
             out_file,
@@ -6830,16 +6927,17 @@ fn drain_trace_events<W: Write>(
                 &mut *drain,
                 |_: &crate::events::OwnedDrain| crate::events::poll_quantum(terminal),
                 |drain, quantum| {
-                    drain_trace_events_from(
+                    drain_trace_events_from_with_identities(
                         drain,
-                        remaining,
-                        state,
-                        tracker,
-                        scope,
-                        tracer,
-                        stdout,
-                        stdout_open,
-                        out_file,
+                        (
+                            &mut *(remaining),
+                            &mut *(state),
+                            &mut *(tracker),
+                            scope,
+                            &mut *(tracer),
+                        ),
+                        identities,
+                        (&mut *(stdout), &mut *(stdout_open), &mut *(out_file)),
                         quantum,
                     )
                 },
@@ -6877,6 +6975,22 @@ fn combine_trace_errors(reduction: Result<()>, write_error: Option<anyhow::Error
     }
 }
 
+// Existing cfg(test) history/root-fence drivers have no identity store. Keep
+// their conservative entrypoints forwarding to the same actual reducer.
+type TraceEventConsumers<'remaining, 'state, 'tracker, 'scope, 'tracer> = (
+    &'remaining mut Option<u64>,
+    &'state mut semantics::State,
+    &'tracker mut process::Tracker,
+    &'scope Scope,
+    &'tracer mut trace::Tracer,
+);
+type TraceEventOutputs<'stdout, 'open, 'file, W> = (
+    &'stdout mut dyn Write,
+    &'open mut bool,
+    &'file mut Option<W>,
+);
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn reduce_trace_event<W: Write>(
     domain: u64,
@@ -6888,6 +7002,59 @@ fn reduce_trace_event<W: Write>(
     stdout: &mut dyn Write,
     stdout_open: &mut bool,
     out_file: &mut Option<W>,
+    write_error: &mut Option<anyhow::Error>,
+    ev: p11scope_ebpf_common::Event,
+) -> Result<()> {
+    reduce_trace_event_with_identities(
+        domain,
+        (
+            &mut *(remaining),
+            &mut *(state),
+            &mut *(tracker),
+            scope,
+            &mut *(tracer),
+        ),
+        None,
+        (&mut *(stdout), &mut *(stdout_open), &mut *(out_file)),
+        write_error,
+        ev,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn drain_trace_events_from<S: crate::events::RecordSource, W: Write>(
+    drain: &mut crate::events::EventDrain<S>,
+    remaining: &mut Option<u64>,
+    state: &mut semantics::State,
+    tracker: &mut process::Tracker,
+    scope: &Scope,
+    tracer: &mut trace::Tracer,
+    stdout: &mut dyn Write,
+    stdout_open: &mut bool,
+    out_file: &mut Option<W>,
+    quantum: Option<usize>,
+) -> Result<(u64, bool)> {
+    drain_trace_events_from_with_identities(
+        drain,
+        (
+            &mut *(remaining),
+            &mut *(state),
+            &mut *(tracker),
+            scope,
+            &mut *(tracer),
+        ),
+        None,
+        (&mut *(stdout), &mut *(stdout_open), &mut *(out_file)),
+        quantum,
+    )
+}
+
+fn reduce_trace_event_with_identities<W: Write>(
+    domain: u64,
+    (remaining, state, tracker, scope, tracer): TraceEventConsumers<'_, '_, '_, '_, '_>,
+    identities: Option<&crate::trace_identity::TraceIdentityStore>,
+    (stdout, stdout_open, out_file): TraceEventOutputs<'_, '_, '_, W>,
     write_error: &mut Option<anyhow::Error>,
     ev: p11scope_ebpf_common::Event,
 ) -> Result<()> {
@@ -6905,7 +7072,16 @@ fn reduce_trace_event<W: Write>(
         let (emitted, error) = emit_bounded_trace_event(
             remaining,
             || match process {
-                Some(process) => tracer.on_event_process(&ev, process, state),
+                Some(process) => {
+                    let executable = identities
+                        .map(|store| store.lookup(process, ev.ts_ns))
+                        .unwrap_or_else(|| {
+                            crate::trace_identity::TraceExecutableView::unknown(
+                                crate::trace_identity::TraceIdentityUnknown::NotSeeded,
+                            )
+                        });
+                    tracer.on_event_process_with_executable(&ev, process, state, executable)
+                }
                 None => tracer.on_rejected_history(&ev),
             },
             stdout,
@@ -6920,33 +7096,28 @@ fn reduce_trace_event<W: Write>(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn drain_trace_events_from<S: crate::events::RecordSource, W: Write>(
+fn drain_trace_events_from_with_identities<S: crate::events::RecordSource, W: Write>(
     drain: &mut crate::events::EventDrain<S>,
-    remaining: &mut Option<u64>,
-    state: &mut semantics::State,
-    tracker: &mut process::Tracker,
-    scope: &Scope,
-    tracer: &mut trace::Tracer,
-    stdout: &mut dyn Write,
-    stdout_open: &mut bool,
-    out_file: &mut Option<W>,
+    (remaining, state, tracker, scope, tracer): TraceEventConsumers<'_, '_, '_, '_, '_>,
+    identities: Option<&crate::trace_identity::TraceIdentityStore>,
+    (stdout, stdout_open, out_file): TraceEventOutputs<'_, '_, '_, W>,
     quantum: Option<usize>,
 ) -> Result<(u64, bool)> {
     let mut write_error = None;
     let mut reduction_error = None;
     let domain = drain.domain_id();
     let may_remain = drain.poll(quantum, |ev| {
-        if let Err(error) = reduce_trace_event(
+        if let Err(error) = reduce_trace_event_with_identities(
             domain,
-            remaining,
-            state,
-            tracker,
-            scope,
-            tracer,
-            stdout,
-            stdout_open,
-            out_file,
+            (
+                &mut *(remaining),
+                &mut *(state),
+                &mut *(tracker),
+                scope,
+                &mut *(tracer),
+            ),
+            identities,
+            (&mut *(stdout), &mut *(stdout_open), &mut *(out_file)),
             &mut write_error,
             ev,
         ) {
@@ -11435,16 +11606,17 @@ mod tests {
         let events = (0..5).map(|_| call_event());
         let mut drain = EventDrain::over_test_domain(ScriptedRecords::events(events, 2), 1);
 
-        let (malformed, may_remain) = drain_trace_events_from(
+        let (malformed, may_remain) = drain_trace_events_from_with_identities(
             &mut drain,
-            &mut remaining,
-            &mut state,
-            &mut tracker,
-            &Scope::Pid(std::process::id()),
-            &mut tracer,
-            &mut stdout,
-            &mut stdout_open,
-            &mut out_file,
+            (
+                &mut remaining,
+                &mut state,
+                &mut tracker,
+                &Scope::Pid(std::process::id()),
+                &mut tracer,
+            ),
+            None,
+            (&mut stdout, &mut stdout_open, &mut out_file),
             Some(LIVE_POLL_QUANTUM),
         )
         .unwrap();
@@ -11476,16 +11648,17 @@ mod tests {
         let mut drain =
             EventDrain::over_test_domain(ScriptedRecords::events(events, LIVE_POLL_QUANTUM), 1);
 
-        drain_trace_events_from(
+        drain_trace_events_from_with_identities(
             &mut drain,
-            &mut remaining,
-            &mut state,
-            &mut tracker,
-            &Scope::Pid(std::process::id()),
-            &mut tracer,
-            &mut stdout,
-            &mut stdout_open,
-            &mut out_file,
+            (
+                &mut remaining,
+                &mut state,
+                &mut tracker,
+                &Scope::Pid(std::process::id()),
+                &mut tracer,
+            ),
+            None,
+            (&mut stdout, &mut stdout_open, &mut out_file),
             Some(LIVE_POLL_QUANTUM),
         )
         .unwrap();
@@ -12029,12 +12202,22 @@ mod tests {
                 1,
                 "{function} must gate discovery once per tick"
             );
+            let pending_stop_check = if function == "capture_trace" {
+                "owned_stop_pending(engine, session, owned.as_deref(), interrupted)"
+            } else {
+                "owned_stop_pending(context.0, context.1, context.2.as_deref(), interrupted)"
+            };
             assert!(
-                tick.contains(
-                    "owned_stop_pending(context.0, context.1, context.2.as_deref(), interrupted)"
-                ),
+                tick.contains(pending_stop_check),
                 "{function} must ask the gate for a pending pause stop"
             );
+            if function == "capture_trace" {
+                assert!(
+                    tick.find(pending_stop_check).unwrap()
+                        < tick.find("with_trace_identity_frame(").unwrap(),
+                    "trace must decide the pending-stop pass before granting frame proof work"
+                );
+            }
             assert_eq!(
                 tick.matches("count_discovery_pass(frame_tick, pass)")
                     .count(),
@@ -12981,16 +13164,17 @@ mod tests {
         let budget = ReadyBudget::for_test(usize::MAX, Duration::from_secs(60));
 
         let outcome = poll_ready(false, &budget, LIVE_POLL_QUANTUM, &mut || false, || {
-            drain_trace_events_from(
+            drain_trace_events_from_with_identities(
                 &mut drain,
-                &mut remaining,
-                &mut state,
-                &mut tracker,
-                &Scope::Pid(std::process::id()),
-                &mut tracer,
-                &mut stdout,
-                &mut stdout_open,
-                &mut out_file,
+                (
+                    &mut remaining,
+                    &mut state,
+                    &mut tracker,
+                    &Scope::Pid(std::process::id()),
+                    &mut tracer,
+                ),
+                None,
+                (&mut stdout, &mut stdout_open, &mut out_file),
                 Some(LIVE_POLL_QUANTUM),
             )
         })
@@ -13015,16 +13199,17 @@ mod tests {
         let mut drain =
             EventDrain::over_test_domain(ScriptedRecords::events(events, usize::MAX), 1);
 
-        drain_trace_events_from(
+        drain_trace_events_from_with_identities(
             &mut drain,
-            &mut remaining,
-            &mut state,
-            &mut tracker,
-            &Scope::Pid(std::process::id()),
-            &mut tracer,
-            &mut stdout,
-            &mut stdout_open,
-            &mut out_file,
+            (
+                &mut remaining,
+                &mut state,
+                &mut tracker,
+                &Scope::Pid(std::process::id()),
+                &mut tracer,
+            ),
+            None,
+            (&mut stdout, &mut stdout_open, &mut out_file),
             None,
         )
         .unwrap();
@@ -13076,20 +13261,21 @@ mod tests {
         let mut drain =
             EventDrain::over_test_domain(ScriptedRecords::events(events, usize::MAX), 1);
 
-        drain_trace_events_from(
+        drain_trace_events_from_with_identities(
             &mut drain,
-            &mut remaining,
-            &mut state,
-            &mut tracker,
-            &Scope::Cgroup {
-                id: 0,
-                path: PathBuf::from("/"),
-                dir: Arc::new(File::open("/").unwrap()),
-            },
-            &mut tracer,
-            &mut stdout,
-            &mut stdout_open,
-            &mut out_file,
+            (
+                &mut remaining,
+                &mut state,
+                &mut tracker,
+                &Scope::Cgroup {
+                    id: 0,
+                    path: PathBuf::from("/"),
+                    dir: Arc::new(File::open("/").unwrap()),
+                },
+                &mut tracer,
+            ),
+            None,
+            (&mut stdout, &mut stdout_open, &mut out_file),
             None,
         )
         .unwrap();
@@ -13142,16 +13328,17 @@ mod tests {
             crate::events::ScriptedRecords::events([call_event()], usize::MAX),
             1,
         );
-        drain_trace_events_from(
+        drain_trace_events_from_with_identities(
             &mut drain,
-            &mut remaining,
-            &mut state,
-            &mut tracker,
-            &Scope::Pid(std::process::id()),
-            &mut tracer,
-            &mut Vec::new(),
-            &mut true,
-            &mut None::<Vec<u8>>,
+            (
+                &mut remaining,
+                &mut state,
+                &mut tracker,
+                &Scope::Pid(std::process::id()),
+                &mut tracer,
+            ),
+            None,
+            (&mut Vec::new(), &mut true, &mut None::<Vec<u8>>),
             None,
         )
         .unwrap();
@@ -13610,16 +13797,17 @@ mod tests {
                     |context, quantum| {
                         assert_eq!(selected.get(), if detached { 2 } else { 1 });
                         if trace {
-                            drain_trace_events_from(
+                            drain_trace_events_from_with_identities(
                                 &mut context.1,
-                                &mut None,
-                                &mut state,
-                                &mut tracker,
-                                &Scope::Pid(7),
-                                &mut tracer,
-                                &mut Vec::new(),
-                                &mut true,
-                                &mut None::<Vec<u8>>,
+                                (
+                                    &mut None,
+                                    &mut state,
+                                    &mut tracker,
+                                    &Scope::Pid(7),
+                                    &mut tracer,
+                                ),
+                                None,
+                                (&mut Vec::new(), &mut true, &mut None::<Vec<u8>>),
                                 quantum,
                             )
                         } else {
@@ -15849,6 +16037,485 @@ mod tests {
 mod history_tests;
 
 #[cfg(test)]
+mod trace_identity_consumer_tests {
+    use super::*;
+    use crate::attach::detailed_identity::ProofSession;
+    use crate::discovery::engine::tests::detailed_proof_driver as driver;
+    use crate::events::{EventDrain, EventsDomain, ScriptedRecords};
+    use crate::trace_identity::TraceIdentityStore;
+    use p11scope_ebpf_common::{Event, ImageIdentity, capture, event_type};
+
+    fn counts(io: &driver::Io) -> (usize, usize, usize) {
+        (
+            io.samples.get(),
+            io.cookie_reads.get(),
+            io.health_reads.get(),
+        )
+    }
+
+    #[test]
+    fn trace_identity_frame_only_grants_one_ticket() {
+        let (mut engine, mut io) = driver::fixture();
+        let mut identities = Some(TraceIdentityStore::new(io.proof.clone()));
+        let before_post = with_trace_identity_frame(
+            &mut engine,
+            &mut io,
+            Some(DiscoveryPass::Frame),
+            &mut identities,
+            |engine, io, _| {
+                assert_eq!(
+                    io.samples.get(),
+                    1,
+                    "the Frame service must preseed before its tick"
+                );
+                driver::exhaust_consumer_frame(engine, io);
+                Ok(counts(io))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            counts(&io),
+            before_post,
+            "post-tick service must share the exhausted ticket"
+        );
+        assert_eq!(
+            io.health_reads.get(),
+            1,
+            "one actual frame has one baseline read"
+        );
+    }
+
+    #[test]
+    fn trace_identity_pending_stop_grants_no_ticket() {
+        let (mut engine, mut io) = driver::fixture();
+        let mut identities = Some(TraceIdentityStore::new(io.proof.clone()));
+        let mut ticks = 0;
+        for pass in [None, Some(DiscoveryPass::PendingStop)]
+            .into_iter()
+            .cycle()
+            .take(100)
+        {
+            with_trace_identity_frame(&mut engine, &mut io, pass, &mut identities, |_, _, _| {
+                ticks += 1;
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(ticks, 100);
+        assert_eq!(
+            counts(&io),
+            (0, 0, 0),
+            "readiness and stop-service ticks do no proof I/O"
+        );
+        assert_eq!(io.proof.usage(), (0, 0));
+    }
+
+    #[test]
+    fn trace_identity_terminal_ticket_starts_once_and_never_renews() {
+        let (mut engine, mut io) = driver::fixture();
+        driver::seed(&mut engine, &mut io);
+        assert_eq!(driver::calls(&io, 20, 11, 0), 1);
+        io.cookie.set(Some(11));
+        let key = semantics::ProcessKey::history(
+            io.proof.test_events_domain().id(),
+            11,
+            0,
+            std::process::id(),
+        );
+        let mut identities = Some(TraceIdentityStore::new(io.proof.clone()));
+        let mut terminal = None;
+        begin_trace_identity_stop(
+            &mut engine,
+            &io,
+            &mut identities,
+            &mut terminal,
+            Duration::from_millis(1),
+        );
+        assert!(
+            terminal.is_some(),
+            "the first stop must own its sole ticket"
+        );
+        driver::empty(&io);
+        service_trace_identity_terminal(&mut engine, &io, &mut identities, &mut terminal);
+        assert_eq!(
+            identities.as_ref().unwrap().lookup(key, 20).path(),
+            Some("/owned/fixture")
+        );
+        assert_eq!(
+            io.samples.get(),
+            1,
+            "terminal work must not seed another view"
+        );
+        let before = counts(&io);
+        io.proof.test_set_time(2_000_021);
+        for _ in 0..100 {
+            begin_trace_identity_stop(
+                &mut engine,
+                &io,
+                &mut identities,
+                &mut terminal,
+                Duration::from_secs(100),
+            );
+            service_trace_identity_terminal(&mut engine, &io, &mut identities, &mut terminal);
+        }
+        assert_eq!(
+            counts(&io),
+            before,
+            "waits, Q and repeated service cannot renew the stop ticket"
+        );
+        assert_eq!(
+            identities.as_ref().unwrap().lookup(key, 20).path(),
+            Some("/owned/fixture")
+        );
+    }
+
+    fn plan() -> crate::plan::AttachPlan {
+        crate::plan::AttachPlan::from_slots(vec![crate::plan::Slot {
+            index: 0,
+            descriptor_index: crate::kinds::function_id("C_OpenSession").unwrap() + 1,
+            object: crate::plan::TEST_PINNED_OBJECT,
+            object_path: "/opt/p11.so".into(),
+            file_offset: 0,
+            names: vec!["C_OpenSession".into()],
+            aliased: false,
+            semantics: crate::kinds::descriptor("C_OpenSession").unwrap(),
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: true,
+            module_ids: vec![crate::plan::ModuleId(0)],
+        }])
+    }
+
+    fn event(key: semantics::ProcessKey, ts_ns: u64, session: u64) -> Event {
+        Event {
+            image: ImageIdentity {
+                task_cookie: key.generation,
+                exec_id: key.exec_id,
+            },
+            event_type: event_type::CALL,
+            pid_tgid: (u64::from(key.pid) << 32) | u64::from(key.pid),
+            ts_ns,
+            duration_ns: 3_000,
+            session,
+            slot_id: 3,
+            capture: capture::OUTPUT_NON_NULL,
+            ..Event::default()
+        }
+    }
+
+    fn fixture() -> (ProofSession, semantics::ProcessKey, TraceIdentityStore) {
+        let (proof, receipt) = driver::verified_fixture();
+        let key = receipt.key();
+        let mut store = TraceIdentityStore::new(proof.clone());
+        store.admit(receipt).unwrap();
+        (proof, key, store)
+    }
+
+    struct Consumer {
+        state: semantics::State,
+        tracker: process::Tracker,
+        tracer: trace::Tracer,
+        remaining: Option<u64>,
+        stdout: Vec<u8>,
+        stdout_open: bool,
+        file: Option<Vec<u8>>,
+    }
+    impl Consumer {
+        fn new(proof: &ProofSession) -> Self {
+            let plan = plan();
+            let domain = proof.test_events_domain();
+            Self {
+                state: semantics::State::for_capture(
+                    &plan,
+                    CapturePolicy::Allowlisted,
+                    domain.clone(),
+                ),
+                tracker: process::Tracker::for_producer(domain, 16_384),
+                tracer: trace::Tracer::new(&plan),
+                remaining: None,
+                stdout: Vec::new(),
+                stdout_open: true,
+                file: Some(Vec::new()),
+            }
+        }
+        fn feed(
+            &mut self,
+            domain: EventsDomain,
+            records: impl IntoIterator<Item = Event>,
+            identities: &TraceIdentityStore,
+            quantum: Option<usize>,
+        ) {
+            let mut drain =
+                EventDrain::over_domain(ScriptedRecords::events(records, usize::MAX), domain);
+            drain_trace_events_from_with_identities(
+                &mut drain,
+                (
+                    &mut self.remaining,
+                    &mut self.state,
+                    &mut self.tracker,
+                    &Scope::System,
+                    &mut self.tracer,
+                ),
+                Some(identities),
+                (&mut self.stdout, &mut self.stdout_open, &mut self.file),
+                quantum,
+            )
+            .unwrap();
+        }
+        fn lines(&self) -> Vec<&str> {
+            std::str::from_utf8(&self.stdout).unwrap().lines().collect()
+        }
+        fn assert_named(&self, expected: usize) {
+            assert_eq!(
+                self.stdout,
+                *self.file.as_ref().unwrap(),
+                "stdout/file bytes must agree"
+            );
+            let lines = self.lines();
+            assert_eq!(lines.len(), expected);
+            for line in lines {
+                assert!(line.contains("\"fixture\" (PID "), "{line}");
+                assert!(line.contains("exe=\"/owned/fixture\" sess#"), "{line}");
+                assert!(line.contains(" C_OpenSession "), "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn trace_identity_all_reduction_routes_use_same_store() {
+        let (proof, key, identities) = fixture();
+        // These are the actual ordinary/direct-quiesce/terminal poll helper,
+        // the bounded Q helper, and the original-root-tail callback/reducer.
+        for route in 0..5 {
+            let mut c = Consumer::new(&proof);
+            let ev = event(key, 20, 7);
+            match route {
+                0..=2 => c.feed(
+                    proof.test_events_domain(),
+                    [ev],
+                    &identities,
+                    match route {
+                        0 => Some(1),
+                        1 => Some(crate::events::LIVE_POLL_QUANTUM),
+                        _ => None,
+                    },
+                ),
+                3 => {
+                    let mut drain = EventDrain::over_domain(
+                        crate::events::root_fence_tests::source([ev]),
+                        proof.test_events_domain(),
+                    );
+                    let stop = crate::events::event_drain_positions(&drain).producer;
+                    assert_eq!(
+                        drain_trace_events_to_position(
+                            &mut drain,
+                            stop,
+                            &mut c.remaining,
+                            &mut c.state,
+                            &mut c.tracker,
+                            &Scope::System,
+                            &mut c.tracer,
+                            Some(&identities),
+                            &mut c.stdout,
+                            &mut c.stdout_open,
+                            &mut c.file
+                        )
+                        .unwrap(),
+                        (0, false)
+                    );
+                }
+                4 => {
+                    let domain = proof.test_events_domain();
+                    let exit = OriginalRootExit::test_reaped(domain.clone());
+                    let mut tail = crate::events::OwnedRootTail::new(
+                        exit,
+                        Instant::now() + Duration::from_secs(1),
+                    );
+                    let mut drain = EventDrain::over_domain(
+                        crate::events::root_fence_tests::source([ev]),
+                        domain,
+                    );
+                    let mut write_error = None;
+                    drain.begin_root_tail(&mut tail).unwrap();
+                    drain
+                        .poll_root_tail(&mut tail, 2, |ev| {
+                            reduce_trace_event_with_identities(
+                                key.domain,
+                                (
+                                    &mut c.remaining,
+                                    &mut c.state,
+                                    &mut c.tracker,
+                                    &Scope::System,
+                                    &mut c.tracer,
+                                ),
+                                Some(&identities),
+                                (&mut c.stdout, &mut c.stdout_open, &mut c.file),
+                                &mut write_error,
+                                ev,
+                            )
+                        })
+                        .unwrap();
+                    assert!(write_error.is_none());
+                    tail.complete().unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(c.tracer.raw_calls(), 1, "route {route}");
+            assert_eq!(c.state.sessions().opened, 1, "route {route}");
+            assert_eq!(
+                c.state.semantic_evidence().semantic_history_drops,
+                0,
+                "route {route}"
+            );
+            c.assert_named(1);
+        }
+    }
+
+    #[test]
+    fn trace_identity_closed_older_foreign_history_stays_unknown() {
+        let (proof, key, identities) = fixture();
+        for case in 0..4 {
+            let mut c = Consumer::new(&proof);
+            c.feed(
+                proof.test_events_domain(),
+                [event(key, 20, 7)],
+                &identities,
+                None,
+            );
+            c.assert_named(1);
+            let mut ev = event(key, 22, 8);
+            let mut domain = proof.test_events_domain();
+            match case {
+                0 => apply_confirmed_retirement(&mut c.tracker, &mut c.state, key),
+                1 => {
+                    let mut newer = ev;
+                    newer.image.exec_id += 1;
+                    c.feed(domain.clone(), [newer], &identities, None);
+                }
+                2 => domain = EventsDomain::test_standin(key.domain + 1),
+                3 => ev.image.task_cookie = 0,
+                _ => unreachable!(),
+            }
+            c.feed(domain, [ev], &identities, None);
+            assert!(
+                c.lines().last().unwrap().contains("Unknown executable"),
+                "case {case}"
+            );
+            assert_eq!(
+                c.state.semantic_evidence().semantic_history_drops,
+                1,
+                "case {case}"
+            );
+            assert_eq!(
+                identities.lookup(key, 22).path(),
+                Some("/owned/fixture"),
+                "store alone never authorizes history"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_identity_verified_exit_preserves_admissible_delayed_name() {
+        let (proof, receipt) = driver::verified_exited_fixture();
+        let key = receipt.key();
+        let mut identities = TraceIdentityStore::new(proof.clone());
+        identities.admit(receipt).unwrap();
+        let mut c = Consumer::new(&proof);
+        c.feed(
+            proof.test_events_domain(),
+            [event(key, 22, 7)],
+            &identities,
+            None,
+        );
+        assert_eq!(c.state.semantic_evidence().semantic_history_drops, 0);
+        assert_eq!(c.tracer.raw_calls(), 1);
+        c.assert_named(1);
+    }
+
+    struct BrokenWriter(std::io::ErrorKind);
+    impl Write for BrokenWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(self.0))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn trace_identity_output_failure_and_limit_preserve_counts() {
+        let (proof, key, identities) = fixture();
+        let records = || (7..10).map(|s| event(key, 20 + s, s));
+        let mut c = Consumer::new(&proof);
+        c.remaining = Some(1);
+        c.feed(proof.test_events_domain(), records(), &identities, None);
+        assert_eq!(c.remaining, Some(0));
+        assert_eq!((c.tracer.raw_calls(), c.state.sessions().opened), (3, 3));
+        c.assert_named(1);
+
+        let mut c = Consumer::new(&proof);
+        let mut drain = EventDrain::over_domain(
+            ScriptedRecords::events(records(), usize::MAX),
+            proof.test_events_domain(),
+        );
+        drain_trace_events_from_with_identities(
+            &mut drain,
+            (
+                &mut c.remaining,
+                &mut c.state,
+                &mut c.tracker,
+                &Scope::System,
+                &mut c.tracer,
+            ),
+            Some(&identities),
+            (
+                &mut BrokenWriter(io::ErrorKind::BrokenPipe),
+                &mut c.stdout_open,
+                &mut c.file,
+            ),
+            None,
+        )
+        .unwrap();
+        assert!(!c.stdout_open);
+        assert_eq!((c.tracer.raw_calls(), c.state.sessions().opened), (3, 3));
+        assert_eq!(
+            std::str::from_utf8(c.file.as_ref().unwrap())
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+
+        let mut c = Consumer::new(&proof);
+        let mut drain = EventDrain::over_domain(
+            ScriptedRecords::events(records(), usize::MAX),
+            proof.test_events_domain(),
+        );
+        let error = drain_trace_events_from_with_identities(
+            &mut drain,
+            (
+                &mut c.remaining,
+                &mut c.state,
+                &mut c.tracker,
+                &Scope::System,
+                &mut c.tracer,
+            ),
+            Some(&identities),
+            (
+                &mut c.stdout,
+                &mut c.stdout_open,
+                &mut Some(BrokenWriter(io::ErrorKind::Other)),
+            ),
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("trace output"));
+        assert_eq!((c.tracer.raw_calls(), c.state.sessions().opened), (3, 3));
+        assert_eq!(drain.source().remaining(), 0);
+    }
+}
+
+#[cfg(test)]
 mod correction1_tests {
     use super::*;
     use crate::events::{EventDrain, ScriptedRecords};
@@ -15970,16 +16637,17 @@ mod correction1_tests {
                 dir: Arc::new(File::open("/").unwrap()),
             };
             if self.trace {
-                drain_trace_events_from(
+                drain_trace_events_from_with_identities(
                     &mut drain,
-                    &mut None,
-                    &mut self.state,
-                    &mut self.tracker,
-                    &scope,
-                    &mut self.tracer,
-                    &mut self.output,
-                    &mut true,
-                    &mut None::<Vec<u8>>,
+                    (
+                        &mut None,
+                        &mut self.state,
+                        &mut self.tracker,
+                        &scope,
+                        &mut self.tracer,
+                    ),
+                    None,
+                    (&mut self.output, &mut true, &mut None::<Vec<u8>>),
                     Some(crate::events::LIVE_POLL_QUANTUM),
                 )
                 .unwrap();

@@ -10,7 +10,10 @@ and [inline inventory identity](#inline-inventory-identity-p5u-2026-10-09),
 which implements the reviewed compact re-projection with no new capture,
 and [inspect presentation identity](#inspect-presentation-identity-p5u-2026-10-09),
 a reviewed scan-local presentation contract whose PID/system implementation
-and installed qualification are tracked separately.**
+and installed qualification are tracked separately,
+and [trace executable labels](#trace-executable-labels-p5u-2026-10-09),
+which permits the reviewed bounded trace publication below while its installed
+and cgroup P4 qualification gates remain open.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -503,6 +506,62 @@ explicit. This re-projection introduces no host ID, boot ID, machine ID,
 executable hash, command line, argument, buffer, handle, or raw address capture.
 Its output remains subject to the input publication's privacy contract; it is
 not a secret scrubber for fabricated or otherwise untrusted saved input.
+
+## Trace executable labels (P5U, 2026-10-09)
+
+**Status: IMPLEMENTED in accepted v0.4 development source by reviewed U2b
+producer/consumer, renderer and parser integration (2026-10-09). This status
+permits only the bounded trace publication below. Installed named-trace scope
+qualification and the separate cgroup P4 source gate remain mandatory and open;
+source acceptance does not qualify a release or installed scope coverage.**
+
+This section permits only bounded executable labels in trace text, including
+`p11scope trace`, `run --trace`, stdout and their existing file copies. It does
+not authorize names or raw PIDs in profile/metrics, and grants no inspect or
+inventory authority. An executable basename is a label of an observed path,
+not a desktop application, script name, package, service or trust identity.
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Trace executable observed path and derived basename | The private same-Session `VerifiedTraceSeed`, minted by the Detailed producer from an already admitted original ProcessView and retained pidfd. For PID/system, a bounded before/after executable/start-time/pin sample precedes the eligible authentic CALL. Exact original-pidfd TASK_COOKIE confirmation, authenticated same-object EVENTS/DISCOVERY domains and strictly later complete lifecycle drain and healthy counter-read starts settle that exact `(domain, task cookie, exec_id)`. A cookie read alone, ProcessKey alone, launch path, inventory row, renderer assertion or late PID lookup supplies no authority. | Only already history-admitted completed call rows in existing bounded trace text/stdout/file output. Lookup requires event completion CLOCK_MONOTONIC `ts_ns` strictly greater than immutable `eligible_after_ns = max(sample completion, validated exec coverage start)`. The path is at most 4096 UTF-8 bytes before escaping; basename derives from that path, preserving an observed deleted marker. Quote and escape both; no terminal controls. Internal `dev`, `ino`, `mtime_secs`, `mtime_nanos`, start-time validation, cookie, domain and exec ID are never added to output. | Missing proof renders the exact Unknown executable form with existing diagnostic PID/TID. Finite private lookup reasons are NotSeeded, AfterEvent, ExecChanged, LifecycleLoss, DomainMismatch, NamespaceMismatch, TargetGone, Unreadable, ProofPending and Budget. These reasons add no trace evidence field. Wrong Session/domain, invalid clock, namespace disagreement, lifecycle loss, conflicting image, invalid history or insufficient budget cannot publish a name. Meaningful production-store/reducer tests and installed nonempty named positives plus zero-false-name controls are mandatory. |
+
+Producer sample attempts may read only the original admitted task's exe link
+and existing filesystem identity, start time and retained-pin/namespace/cookie
+validation facts. Failed or deferred partial samples are discarded within the
+same shared accounting. No command line, argument, environment, `comm`, secret,
+provider-memory or new kernel capture/query is introduced. Rendering performs
+no I/O and holds only an already decided borrowed view.
+
+The whole bridge shares one Session-owned ceiling of 16384 charged entries
+across pending candidates, accepted labels and retained reason/interest state,
+and 8 MiB of owned path capacity including temporary sample work. It permits
+one owned path per accepted image, no uncharged candidate/reason cache and no
+copied pidfd. Sampling uses existing original view/FD reservations. Rejection
+or capacity pressure cannot change event/count admission. Refused proof remains
+unknown; no event is buffered, reordered, or later rewritten for naming.
+
+Accepted labels remain immutable capture-local historical facts while their
+charged receipt remains retained. They may name delayed events only if the
+existing historical reducer still accepts the exact image and its event time
+passes the boundary. Exit/liveness loss does not move the name to a successor;
+closed/older history remains rejected. Equal basenames/paths never merge keys
+or counts. An accepted-key duplicate cannot move eligibility backward. Receipt
+teardown releases its one reservation and any bounded nonowning aliases outside
+ledger locks; retained files obey the existing output lifetime and permissions.
+
+**Cgroup source remains unactivated by this B amendment.** The independently
+accepted U2b/P4 two-CALL document defines a separate future source gate for
+sampling an already admitted original task after one authentic CALL and proving
+its historical image with a second same-key post-sample CALL. Its temporary
+nonresidency, two-attempt/cooldown, 60-second registration/sample and accepted-
+interest rules require the explicit reviewed P4 attempt-authority amendment and
+accepted source before activation. Until that gate, cgroup candidates remain
+ProofPending/unknown; B does not silently infer continuous membership or broaden
+scope. This is an open required release obligation, not an optional feature.
+
+V1/v2 bytes/exclusions, U5 inline inventory identity and offline inventory diff
+remain unchanged. Source acceptance and permission to publish these fields do
+not establish installed scope coverage or complete named-trace qualification.
 
 ## Required evidence before activation
 

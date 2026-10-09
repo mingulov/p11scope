@@ -111,6 +111,15 @@ CALL_LINE = re.compile(r"^\S+ pid (\d+) tid (\d+) (?:sess#\d+ )?(C_\w+)\b.* → 
 UNKNOWN_CALL_LINE = re.compile(
     r"^\d{2}:\d{2}:\d{2}\.\d{6} Unknown executable \(PID ([0-9]+), TID ([0-9]+)\) "
     r"(?:sess#\d+ )?(C_\w+)\b.* → (CKR_\w+)")
+TRACE_JSON_STRING = r'"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"'
+NAMED_CALL_LINE = re.compile(
+    rf"^\d{{2}}:\d{{2}}:\d{{2}}\.\d{{6}} {TRACE_JSON_STRING} \(PID ([0-9]+), TID ([0-9]+)\) exe={TRACE_JSON_STRING} "
+    r"(?:sess#[0-9]+ )?(C_\w+)\b.* → (CKR_\w+)")
+TRACE_CONTEXT_LINES = frozenset((
+    "Trace — completed call events in arrival order",
+    "Executable identity unavailable; event PID/TID remain diagnostic identifiers.",
+    "Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.",
+))
 
 
 def trace_exact(text, iters, expect_observer=None):
@@ -119,13 +128,15 @@ def trace_exact(text, iters, expect_observer=None):
     pids = set()
     evidence = counts = None
     for line in text.splitlines():
+        if line in TRACE_CONTEXT_LINES:
+            continue
         if line.startswith("EVIDENCE "):
             evidence = json.loads(line[len("EVIDENCE "):])
             continue
         if line.startswith("COUNT_EVIDENCE "):
             counts = json.loads(line[len("COUNT_EVIDENCE "):])
             continue
-        match = CALL_LINE.match(line) or UNKNOWN_CALL_LINE.match(line)
+        match = CALL_LINE.match(line) or UNKNOWN_CALL_LINE.match(line) or NAMED_CALL_LINE.match(line)
         if match:
             pid, _tid, name, rv = match.groups()
             assert rv == "CKR_OK", line

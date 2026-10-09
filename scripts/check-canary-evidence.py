@@ -230,14 +230,17 @@ STRING_IDENTITIES = [value for value in LOADER_PAUSE_IDENTITIES.values()
 # one; every observer surface is scanned for all of them.
 WORKLOAD_IDENTITIES = [value for name, value in LOADER_PAUSE_IDENTITIES.items()
                        if name != "interface_name_bytes"]
-# Only the legacy diagnostic prefix and the fixed unknown-executable prefix
-# from src/trace.rs are exempted. Named executables have no authority here.
+# Only diagnostic PID/TID positions are exempted. Named executable atoms stay
+# in the privacy scan in their raw and JSON-decoded forms.
+TRACE_JSON_STRING = r'"(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"'
 TRACE_EVENT = re.compile(
     r"^\d{2}:\d{2}:\d{2}\.\d{6} (?:pid \d+ tid \d+|"
-    r"Unknown executable \(PID [0-9]+, TID [0-9]+\)) (?P<rest>.*)$")
+    r"Unknown executable \(PID [0-9]+, TID [0-9]+\)|"
+    rf"(?P<basename>{TRACE_JSON_STRING}) \(PID [0-9]+, TID [0-9]+\) exe=(?P<path>{TRACE_JSON_STRING})) (?P<rest>.*)$")
 TRACE_CONTEXT_LINES = frozenset((
     "Trace — completed call events in arrival order",
     "Executable identity unavailable; event PID/TID remain diagnostic identifiers.",
+    "Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.",
 ))
 
 
@@ -297,9 +300,20 @@ def trace_scannable(label, text):
             session, separator, body = body.partition(" ")
             assert separator and re.fullmatch(r"sess#[0-9]+", session), \
                 f"{label} rendered a malformed trace session: {line!r}"
-        assert body and not body.startswith(("pid ", "Unknown executable ", "sess#")), \
+        assert body and not body.startswith(("pid ", "Unknown executable ", "sess#", '"')) and not re.match(r"[A-Za-z_][A-Za-z0-9_]*=", body), \
             f"{label} rendered duplicate trace identity/session: {line!r}"
-        kept.append(rest)
+        if event.group("basename") is not None:
+            atoms = [event.group("basename"), event.group("path")]
+            values = [json.loads(atom) for atom in atoms]
+            try:
+                for value in values:
+                    value.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise AssertionError(f"{label} rendered non-UTF-8 executable identity") from error
+            kept.append(f"{atoms[0]} exe={atoms[1]} {rest}")
+            kept.extend(values)
+        else:
+            kept.append(rest)
     return "\n".join(kept)
 
 
@@ -1272,7 +1286,10 @@ def assert_final_artifact_privacy(artifacts):
     leaks = {}
     for path in artifacts:
         content = path.read_bytes()
-        found = sentinel_hits(content, reconstruct(content) if path.suffix == ".json" else b"")
+        decoded = reconstruct(content) if path.suffix == ".json" else b""
+        if path.suffix == ".output" and not content.lstrip().startswith(b"{"):
+            decoded = trace_scannable(str(path), content.decode("utf-8", "surrogateescape")).encode("utf-8", "surrogateescape")
+        found = sentinel_hits(content, decoded)
         if found:
             leaks[str(path)] = sorted(found)
     assert not leaks, f"ordinary pointer canaries leaked: {leaks}"

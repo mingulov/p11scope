@@ -273,6 +273,7 @@ enum RecordedState<Io: ShardableIo> {
 struct Prepared<Io: ShardableIo> {
     state: PreparedState<Io>,
     mapped: MappedIdentities,
+    kernel_proved: bool,
 }
 enum PreparedState<Io: ShardableIo> {
     Settled,
@@ -292,6 +293,7 @@ impl<Io: ShardableIo> Prepared<Io> {
         Self {
             state,
             mapped: MappedIdentities::new(),
+            kernel_proved: false,
         }
     }
     fn requests(&self) -> usize {
@@ -749,6 +751,43 @@ where
     })
 }
 
+/// Only accepted charged preparations can mint these original-pin views.
+fn accepted_batch<'a, Io: ShardableIo>(
+    prepared: &'a [(usize, Prepared<Io>)],
+    sweep: &'a [(u32, Vec<MapEntry>)],
+) -> (AcceptedBatch<'a>, Vec<usize>) {
+    let mut requests = Vec::new();
+    let mut positions = Vec::new();
+    for (position, (at, prepared)) in prepared.iter().enumerate() {
+        let request = match &prepared.state {
+            PreparedState::Confirm { io, plan } => AcceptedRequest {
+                pid: sweep[*at].0,
+                ranges: &plan.ranges,
+                entries: &plan.entries,
+                pidfd: io.borrowed_pidfd(&plan.pin.pin),
+                kind: AcceptedKind::Confirm,
+            },
+            PreparedState::Idle { ranges, .. } => AcceptedRequest {
+                pid: sweep[*at].0,
+                ranges,
+                entries: &sweep[*at].1,
+                pidfd: None,
+                kind: AcceptedKind::Idle,
+            },
+            _ => continue,
+        };
+        requests.push(request);
+        positions.push(position);
+    }
+    (
+        AcceptedBatch {
+            requests,
+            token: Arc::new(()),
+        },
+        positions,
+    )
+}
+
 fn prove_part<Io: ShardableIo>(
     part: Vec<(usize, Prepared<Io>)>,
     sweep: &[(u32, Vec<MapEntry>)],
@@ -762,6 +801,7 @@ fn prove_part<Io: ShardableIo>(
         }
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &mut prepared.state {
+                _ if prepared.kernel_proved => {}
                 PreparedState::Idle { io, ranges } => {
                     prepared.mapped =
                         read_ranges_reserved(io, sweep[position].0, ranges, Some(resources))
@@ -880,6 +920,39 @@ impl MemberProbe for RefusedProbe<'_> {
 
 /// Same fixed policy for serial and parallel executors. Production supplies
 /// one census/owner; tests inject H and range quotas without changing rlimits.
+#[allow(dead_code)] // Dormant until D3d explicitly activates this entry.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attribute_unselected_with_segment_proof<Io, F>(
+    sweep: &[(u32, Vec<MapEntry>)],
+    unavailable: &BTreeSet<u32>,
+    selected: &BTreeSet<u32>,
+    index: &KnownKeyIndex,
+    budget: &mut CaptureWorkBudget,
+    policy: SegmentPolicy,
+    owner: &ReservationOwner,
+    threads: usize,
+    make_io: &F,
+    hook: &mut impl SegmentProof,
+) -> SweepAttribution
+where
+    Io: ShardableIo,
+    Io::Pin: Send,
+    F: Fn() -> Io + Sync,
+{
+    attribute_unselected_with_optional_proof(
+        sweep,
+        unavailable,
+        selected,
+        index,
+        budget,
+        policy,
+        owner,
+        threads,
+        make_io,
+        Some(hook),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn attribute_unselected_with_policy<Io, F>(
     sweep: &[(u32, Vec<MapEntry>)],
@@ -891,6 +964,38 @@ pub(crate) fn attribute_unselected_with_policy<Io, F>(
     owner: &ReservationOwner,
     threads: usize,
     make_io: &F,
+) -> SweepAttribution
+where
+    Io: ShardableIo,
+    Io::Pin: Send,
+    F: Fn() -> Io + Sync,
+{
+    attribute_unselected_with_optional_proof(
+        sweep,
+        unavailable,
+        selected,
+        index,
+        budget,
+        policy,
+        owner,
+        threads,
+        make_io,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attribute_unselected_with_optional_proof<Io, F>(
+    sweep: &[(u32, Vec<MapEntry>)],
+    unavailable: &BTreeSet<u32>,
+    selected: &BTreeSet<u32>,
+    index: &KnownKeyIndex,
+    budget: &mut CaptureWorkBudget,
+    policy: SegmentPolicy,
+    owner: &ReservationOwner,
+    threads: usize,
+    make_io: &F,
+    mut hook: Option<&mut dyn SegmentProof>,
 ) -> SweepAttribution
 where
     Io: ShardableIo,
@@ -942,7 +1047,7 @@ where
             continue;
         }
         let end = position.saturating_add(policy.retained).min(sweep.len());
-        let (prepared, failed) = prepare_segment(
+        let (mut prepared, failed) = prepare_segment(
             sweep,
             position..end,
             unavailable,
@@ -990,9 +1095,40 @@ where
             continue;
         }
         let next = position + prepared.len();
+        // Keep the guard-bound result through every live finish, after the
+        // borrowed request views end and before another batch replaces scope.
+        let decision = if let Some(hook) = hook.as_deref_mut() {
+            let (accepted, positions) = accepted_batch(&prepared, sweep);
+            let decision = hook.prove(&accepted, budget, &batch);
+            let answers: Vec<_> = positions
+                .into_iter()
+                .enumerate()
+                .map(|(request, position)| (position, decision.answer(&accepted, request).cloned()))
+                .collect();
+            drop(accepted);
+            let stopped = budget.check_deadline_now();
+            for (position, answer) in answers {
+                // Nothing in this segment has finished yet. An observed stop
+                // invalidates even its complete kernel answers, closes every
+                // retained pin, and prohibits both finish and fallback I/O.
+                if let Some(reason) = stopped {
+                    prepared[position].1.state = PreparedState::Failed(Confirmation::Lost(
+                        AttributionLoss::Budget,
+                        reason.into(),
+                    ));
+                } else if let Some(mapped) = answer {
+                    prepared[position].1.mapped = mapped;
+                    prepared[position].1.kernel_proved = true;
+                }
+            }
+            Some(decision)
+        } else {
+            None
+        };
         let proven = match prove_segment(prepared, sweep, &batch, threads.min(policy.workers)) {
             Ok(proven) => proven,
             Err(()) => {
+                drop(decision);
                 cancel_segment(
                     &mut out,
                     position..next,
@@ -1048,6 +1184,7 @@ where
                 budget,
             );
         }
+        drop(decision);
         // Every retained batch pin is gone before the immediate envelope
         // is used for phase D, and before the next fixed prefix prepares.
         for (at, mapped) in promotions {

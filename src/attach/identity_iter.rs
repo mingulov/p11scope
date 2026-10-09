@@ -2006,8 +2006,19 @@ pub(crate) struct ScopeBitmap {
 
 impl ScopeBitmap {
     #[cfg(test)]
-    pub(crate) fn fixture_replace(&mut self, tgids: &[u32]) -> Result<(), &'static str> {
-        self.replace_with(tgids, |_, _| Ok(()), || "invalid fixture scope")
+    pub(crate) fn fixture_replace_observed(
+        &mut self,
+        tgids: &[u32],
+        mut write: impl FnMut(u32, u64),
+    ) -> Result<(), &'static str> {
+        self.replace_with(
+            tgids,
+            |word, bits| {
+                write(word, bits);
+                Ok(())
+            },
+            || "invalid fixture scope",
+        )
     }
 
     pub(crate) fn ready(&self) -> bool {

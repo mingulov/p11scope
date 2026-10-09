@@ -267,6 +267,7 @@ impl PassBinding {
 pub(crate) struct InstalledAnchorPass<'s, 'p> {
     pass: Option<AnchorPass<'p>>,
     session: &'s mut IdentitySession,
+    failed_target: Option<RunFailure>,
 }
 
 impl InstalledAnchorPass<'_, '_> {
@@ -311,10 +312,12 @@ impl InstalledAnchorPass<'_, '_> {
                 .replace(&mut loaded.ebpf, tgids)
                 .map_err(|_| RunFailure::Scope),
             #[cfg(test)]
-            SessionObject::Fixture { .. } => self
+            SessionObject::Fixture { scope_words, .. } => self
                 .session
                 .scope
-                .fixture_replace(tgids)
+                .fixture_replace_observed(tgids, |word, bits| {
+                    scope_words.borrow_mut().insert(word, bits);
+                })
                 .map_err(|_| RunFailure::Scope),
         };
         if result.is_err() {
@@ -465,6 +468,9 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
         if !resources.same_owner(&pass.reservations) {
             return ProofDecision::Userspace(RunFailure::FdHeadroom);
         }
+        if let Some(reason) = self.installed.failed_target {
+            return ProofDecision::Userspace(reason);
+        }
         let deadline = match bounded_target_deadline(budget, self.deadline) {
             Ok(deadline) => deadline,
             Err(reason) => return ProofDecision::Userspace(reason),
@@ -552,7 +558,20 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
         }
         let bytes = match self.installed.read_target_typed(None, deadline, max_bytes) {
             Ok(bytes) => bytes,
-            Err(reason) => return ProofDecision::Userspace(reason),
+            Err(reason) => {
+                // Reservation/installation refusals precede target I/O.
+                // Only an attempted run's failure demotes later segments.
+                if matches!(
+                    reason,
+                    RunFailure::Deadline
+                        | RunFailure::Clock
+                        | RunFailure::StreamInvalid
+                        | RunFailure::AttachOrRead
+                ) {
+                    self.installed.failed_target = Some(reason);
+                }
+                return ProofDecision::Userspace(reason);
+            }
         };
         let run = match parse(
             &bytes,
@@ -565,14 +584,19 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
             },
         ) {
             Ok(run) => run,
-            Err(_) => return ProofDecision::Userspace(RunFailure::StreamInvalid),
+            Err(_) => {
+                self.installed.failed_target = Some(RunFailure::StreamInvalid);
+                return ProofDecision::Userspace(RunFailure::StreamInvalid);
+            }
         };
         if let Err(reason) = work.check(budget) {
+            self.installed.failed_target = Some(reason);
             return ProofDecision::Userspace(reason);
         }
         let mut answers = Vec::with_capacity(batch.requests().len());
         for (request, eligible) in batch.requests().iter().zip(eligible) {
             if let Err(reason) = work.step(budget) {
+                self.installed.failed_target = Some(reason);
                 return ProofDecision::Userspace(reason);
             }
             let records = eligible
@@ -586,6 +610,7 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
             let mut mapped = MappedIdentities::new();
             for &range in request.ranges() {
                 if let Err(reason) = work.step(budget) {
+                    self.installed.failed_target = Some(reason);
                     return ProofDecision::Userspace(reason);
                 }
                 let proof = match records.get(&range) {
@@ -602,6 +627,7 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
             answers.push(Some(mapped));
         }
         if let Err(reason) = work.check(budget) {
+            self.installed.failed_target = Some(reason);
             return ProofDecision::Userspace(reason);
         }
         let binding = self
@@ -621,6 +647,10 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
 }
 
 impl<'g, 's, 'p, Io: ConfirmIo> KernelMemberProbe<'g, 's, 'p, Io> {
+    pub(crate) fn segment_proof(&mut self) -> &mut impl SegmentProof {
+        &mut self.proof
+    }
+
     pub(crate) fn new(
         installed: &'g mut InstalledAnchorPass<'s, 'p>,
         io: Io,
@@ -983,7 +1013,25 @@ enum SessionObject {
         config: Option<crate::attach::identity_iter::IdentityConfig>,
         fail_config: bool,
         reads: std::cell::Cell<usize>,
+        target_steps: std::cell::RefCell<std::collections::VecDeque<FixtureTarget>>,
+        target_trace: Arc<std::sync::Mutex<FixtureRunTrace>>,
+        scope_words: std::cell::RefCell<BTreeMap<u32, u64>>,
     },
+}
+
+#[cfg(test)]
+enum FixtureTarget {
+    Bytes(Vec<u8>),
+    Deadline(Vec<u8>),
+    Failure(RunFailure),
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct FixtureRunTrace {
+    scopes: Vec<BTreeSet<u32>>,
+    closed: Vec<(tests::FdToken, tests::FdToken)>,
+    outcomes: Vec<Result<(), RunFailure>>,
 }
 
 fn probe_succeeded(report: &crate::attach::identity_iter::FunctionalProbeReport) -> bool {
@@ -1044,7 +1092,11 @@ impl IdentitySession {
                 .replace(&mut loaded.ebpf, tgids)
                 .map_err(|_| "identity scope is unavailable"),
             #[cfg(test)]
-            SessionObject::Fixture { .. } => self.scope.fixture_replace(tgids),
+            SessionObject::Fixture { scope_words, .. } => {
+                self.scope.fixture_replace_observed(tgids, |word, bits| {
+                    scope_words.borrow_mut().insert(word, bits);
+                })
+            }
         }
     }
 
@@ -1103,26 +1155,63 @@ impl IdentitySession {
                 anchor,
                 target,
                 reads,
+                target_steps,
+                target_trace,
+                scope_words,
                 ..
             } => {
                 use std::os::unix::fs::FileExt;
                 reads.set(reads.get() + 1);
-                let file = tempfile::tempfile().unwrap();
-                file.write_at(
-                    match run {
+                let step = (run == RunKind::Target)
+                    .then(|| target_steps.borrow_mut().pop_front())
+                    .flatten();
+                let scope: BTreeSet<_> = scope_words
+                    .borrow()
+                    .iter()
+                    .flat_map(|(&word, &bits)| {
+                        (0..64).filter_map(move |bit| {
+                            (bits & (1u64 << bit) != 0).then_some(word * 64 + bit)
+                        })
+                    })
+                    .collect();
+                if run == RunKind::Target {
+                    target_trace.lock().unwrap().scopes.push(scope);
+                }
+                if let Some(FixtureTarget::Failure(reason)) = step {
+                    target_trace.lock().unwrap().outcomes.push(Err(reason));
+                    return Err(reason);
+                }
+                let bytes = match &step {
+                    Some(FixtureTarget::Bytes(bytes) | FixtureTarget::Deadline(bytes)) => bytes,
+                    _ => match run {
                         RunKind::Anchor => anchor,
                         RunKind::Target => target,
                     },
-                    0,
-                )
-                .unwrap();
-                crate::attach::identity_iter::consume_owned_run(
+                };
+                let file = tempfile::tempfile().unwrap();
+                file.write_at(bytes, 0).unwrap();
+                let link = tempfile::tempfile().unwrap();
+                let tokens = (tests::FdToken::of(&file), tests::FdToken::of(&link));
+                let read_deadline = if matches!(step, Some(FixtureTarget::Deadline(_))) {
+                    std::time::Instant::now() - std::time::Duration::from_millis(1)
+                } else {
+                    deadline
+                };
+                let result = crate::attach::identity_iter::consume_owned_run(
                     file.into(),
-                    tempfile::tempfile().unwrap().into(),
-                    deadline,
+                    link.into(),
+                    read_deadline,
                     max_bytes,
                 )
-                .map_err(RunFailure::from)
+                .map_err(RunFailure::from);
+                if run == RunKind::Target {
+                    let mut trace = target_trace.lock().unwrap();
+                    trace.closed.push(tokens);
+                    trace
+                        .outcomes
+                        .push(result.as_ref().map(|_| ()).map_err(|reason| *reason));
+                }
+                result
             }
         }
     }
@@ -1139,6 +1228,7 @@ impl IdentitySession {
         Ok(InstalledAnchorPass {
             pass: Some(pass),
             session: self,
+            failed_target: None,
         })
     }
 

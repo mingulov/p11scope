@@ -12,6 +12,7 @@
  * stable scan. All writes are non-fetch adds or bounded compare-exchanges
  * (F1). The hooks read kernel metadata only and emit nothing. */
 #include "instance_epoch.h"
+#include "image_identity_query.h"
 
 #ifndef P11SCOPE_INSTANCE_HOST_TEST
 #define INST_BTF __attribute__((preserve_access_index))
@@ -607,7 +608,8 @@ static INST_INLINE void inst_copy_key(struct instance_start_key *dst,
 /* Entry half: record the private probed address and the entry stamp under
  * the call's START key (whose `slot` is the endpoint slot). A failed update
  * deletes any stale entry for the key, so the return sees absence. */
-__attribute__((noinline)) u32 p11_instance_entry(const struct instance_start_key *key, u64 ip)
+__attribute__((noinline)) u32 p11_instance_entry(const struct instance_start_key *key, u64 ip,
+                                               u64 cookie, u64 exec_id)
 {
     struct instance_start_key k;
     struct instance_entry entry;
@@ -617,6 +619,10 @@ __attribute__((noinline)) u32 p11_instance_entry(const struct instance_start_key
     /* A global function's pointer argument is generic memory; 5.15 map
      * helpers take keys only from the stack (or a map value). */
     inst_copy_key(&k, key);
+    if (!p11_image_entry(k.pid_tgid >> 32, cookie, exec_id)) {
+        inst_map_delete(&INSTANCE_START, &k);
+        return 0;
+    }
     entry.entry_ip = ip;
     inst_stamp(k.slot, &entry.entry_stamp);
     if (inst_map_update(&INSTANCE_START, &k, &entry, 0 /* BPF_ANY */)) {

@@ -58,4 +58,6 @@ SEC("raw_tp/sched_process_exit") int sched_process_exit(void *ctx) {
 SEC("fentry/uprobe_mmap") int p11_inst_vma_map(void *ctx) { return 0; }
 SEC("fentry/uprobe_munmap") int p11_inst_vma_unmap(void *ctx) { return 0; }
 SEC("fexit/copy_vma") int p11_inst_vma_copy(void *ctx) { return 0; }
+SEC("fentry/exec_mm_release") int p11_image_exec_release(void *ctx) { return 0; }
+SEC("iter/task") int p11_image_query(void *ctx) { return 0; }
 #endif

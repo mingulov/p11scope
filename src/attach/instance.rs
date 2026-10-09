@@ -1,8 +1,8 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Task 3 Stage A: the Session side of the load-instance continuity witness.
 //!
-//! - Loads and attaches the three native fentry hooks (`uprobe_mmap`,
-//!   `uprobe_munmap`, `copy_vma`) after the mandatory lifecycle links. Any
+//! - Loads and attaches the four native continuity hooks (`uprobe_mmap`,
+//!   `uprobe_munmap`, `copy_vma`, `exec_mm_release`) after mandatory lifecycle links. Any
 //!   load or attach failure leaves the capture running with instance routing
 //!   **refused** and a named reason; it never degrades the proof. An LTO
 //!   kernel — or one whose LTO status is unverifiable — is refused before
@@ -18,7 +18,7 @@
 //!   hook programs' run/miss statistics.
 
 use super::{BPF_MAP_LOOKUP_ELEM, BpfMapElementAttr, bpf_map_element_syscall};
-use crate::discovery::identity::{PinnedObjectId, PinnedObjects};
+use crate::discovery::identity::{PinnedObjectId, PinnedObjects, RetainedInventoryTarget};
 use crate::discovery::instances::MappedFileIdentity;
 use crate::plan::Slot;
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
@@ -41,10 +41,11 @@ use std::path::{Path, PathBuf};
 /// first argument is a pointer-to-pointer, which no kernel admits as fentry
 /// context, so its hook is an fexit reading the returned new VMA (same file,
 /// same mm; still under the mremap mmap write lock).
-pub(crate) const INSTANCE_PROGRAMS: [(&str, &str); 3] = [
+pub(crate) const INSTANCE_PROGRAMS: [(&str, &str); 4] = [
     ("p11_inst_vma_map", "uprobe_mmap"),
     ("p11_inst_vma_unmap", "uprobe_munmap"),
     ("p11_inst_vma_copy", "copy_vma"),
+    ("p11_image_exec_release", "exec_mm_release"),
 ];
 
 /// Hooks attached as fexit; every other instance hook is fentry.
@@ -57,7 +58,7 @@ enum HookLink {
 }
 
 /// One watched provider file.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct WatchedFile {
     pub(crate) file_slot: u32,
     /// The maps-visible keys this pinned object is known under; the scan
@@ -66,11 +67,30 @@ pub(crate) struct WatchedFile {
     /// The file's map_files `stat()` identity, recorded at calibration; a
     /// scan keeps only ranges with exactly this identity.
     pub(crate) identity: MappedFileIdentity,
+    /// Original opened file and metadata pin, retained independently of the
+    /// discovery store. The calibration and every later scan use this object.
+    target: RetainedInventoryTarget,
+}
+impl Clone for WatchedFile {
+    fn clone(&self) -> Self {
+        Self {
+            file_slot: self.file_slot,
+            maps_keys: self.maps_keys.clone(),
+            identity: self.identity,
+            target: self.target.share(),
+        }
+    }
+}
+impl WatchedFile {
+    pub(super) fn check_unchanged(&self) -> Result<bool, String> {
+        self.target.check_unchanged()
+    }
 }
 
 /// Hook statistics for one fentry program (`BPF_OBJ_GET_INFO_BY_FD`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct HookStats {
+    pub(crate) program_id: u32,
     pub(crate) run_time_ns: u64,
     pub(crate) run_cnt: u64,
     pub(crate) recursion_misses: u64,
@@ -84,6 +104,7 @@ pub(crate) struct InstanceTracking {
     watched: BTreeMap<PinnedObjectId, Result<WatchedFile, String>>,
     keys: BTreeMap<InstanceFileKey, u32>,
     next_slot: u32,
+    program_ids: BTreeMap<&'static str, u32>,
 }
 
 /// Test-only Stage A measurement toggle (Task 1d): `P11SCOPE_T3A_DISABLE_HOOKS`
@@ -162,9 +183,16 @@ impl InstanceTracking {
     /// returned as a refused tracker whose reason names the first error.
     /// Refusal order is measurement toggle, then policy (Task 1d: metrics
     /// never joins per-call records, so it never pays the hooks), then LTO.
-    pub(crate) fn start(ebpf: &mut Ebpf, btf: &Btf, policy: super::CapturePolicy) -> Self {
+    pub(super) fn start(
+        ebpf: &mut Ebpf,
+        btf: &Btf,
+        policy: super::CapturePolicy,
+        coverage: &super::image_query::CoverageControl,
+        image_query_refusal: Option<String>,
+    ) -> Self {
         let mut tracking = Self::default();
         if hooks_disabled_by_env() {
+            coverage.fail();
             tracking.refused = Some(format!(
                 "instance continuity hooks refused: disabled by {DISABLE_HOOKS_ENV}=1 (Stage A overhead measurement)"
             ));
@@ -177,11 +205,24 @@ impl InstanceTracking {
             );
             return tracking;
         }
-        if let Some(reason) = lto_refusal() {
-            tracking.refused = Some(reason);
-            return tracking;
+        let activation =
+            activate_image_coverage_with(coverage, image_query_refusal.as_deref(), || {
+                if let Some(reason) = lto_refusal() {
+                    bail!("{reason}");
+                }
+                tracking.attach_hooks(ebpf, btf)?;
+                validate_hook_health_with(
+                    tracking.links.len(),
+                    None,
+                    || Ok(std::fs::read_to_string("/proc/sys/kernel/ftrace_enabled")?),
+                    || tracking.hook_stats(ebpf),
+                )
+            });
+        if let Ok(ids) = &activation {
+            tracking.program_ids = ids.clone();
         }
-        if let Err(error) = tracking.attach_hooks(ebpf, btf) {
+        if let Err(error) = activation {
+            coverage.fail();
             tracking.refused = Some(format!("instance continuity hooks unavailable: {error:#}"));
             for (program, link) in std::mem::take(&mut tracking.links) {
                 let Some(hook) = ebpf.program_mut(program) else {
@@ -204,7 +245,30 @@ impl InstanceTracking {
         tracking
     }
 
+    pub(super) fn audit(
+        &self,
+        ebpf: &Ebpf,
+        coverage: &super::image_query::CoverageControl,
+    ) -> Result<()> {
+        audit_image_hooks_with(
+            coverage,
+            self.refused.is_none(),
+            self.links.len(),
+            &self.program_ids,
+            || Ok(std::fs::read_to_string("/proc/sys/kernel/ftrace_enabled")?),
+            || self.hook_stats(ebpf),
+            || {
+                let maps = InstanceMaps { ebpf };
+                Ok((maps.sticky()?, maps.fault()?))
+            },
+        )
+    }
+
     fn attach_hooks(&mut self, ebpf: &mut Ebpf, btf: &Btf) -> Result<()> {
+        ensure!(
+            exec_release_proto_is_exact(&btf.to_bytes()),
+            "exec_mm_release must be void(task_struct *, mm_struct *)"
+        );
         for (program, target) in INSTANCE_PROGRAMS {
             let hook = ebpf
                 .program_mut(program)
@@ -308,8 +372,12 @@ impl InstanceTracking {
         object: PinnedObjectId,
         objects: &PinnedObjects,
     ) -> Result<WatchedFile, String> {
-        let path = objects.attach_path_for(object)?;
+        let target = objects.retain_inventory_target(object)?;
+        let path = target.attach_path();
         let (key, identity) = calibrate(ebpf, &path).map_err(|error| format!("{error:#}"))?;
+        if !target.check_unchanged()? {
+            return Err("watched object changed during calibration".into());
+        }
         let file_slot = match self.keys.get(&key) {
             Some(slot) => *slot,
             None => {
@@ -337,6 +405,7 @@ impl InstanceTracking {
             file_slot,
             maps_keys: objects.raw_keys_for(object),
             identity,
+            target,
         })
     }
 
@@ -355,6 +424,87 @@ impl InstanceTracking {
             })
             .collect()
     }
+}
+
+/// Verify the actual BTF prototype rather than accepting the function name
+/// alone. This is separate from the no-LTO cross-file call coverage premise.
+fn exec_release_proto_is_exact(raw: &[u8]) -> bool {
+    let word = |bytes: &[u8], at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(
+            bytes.get(at..at.checked_add(4)?)?.try_into().ok()?,
+        ))
+    };
+    let checked = || -> Option<bool> {
+        if raw.get(..4)? != [0x9f, 0xeb, 1, 0] {
+            return Some(false);
+        }
+        let header = word(raw, 4)? as usize;
+        if header < 24 {
+            return Some(false);
+        }
+        let type_start = header.checked_add(word(raw, 8)? as usize)?;
+        let type_end = type_start.checked_add(word(raw, 12)? as usize)?;
+        let string_start = header.checked_add(word(raw, 16)? as usize)?;
+        let string_end = string_start.checked_add(word(raw, 20)? as usize)?;
+        let types = raw.get(type_start..type_end)?;
+        let strings = raw.get(string_start..string_end)?;
+        let name = |offset: u32| -> Option<&[u8]> {
+            let tail = strings.get(offset as usize..)?;
+            Some(&tail[..tail.iter().position(|byte| *byte == 0)?])
+        };
+        let mut nodes = vec![&[][..]];
+        let mut cursor = 0usize;
+        while cursor < types.len() {
+            let record = types.get(cursor..)?;
+            let info = word(record, 4)?;
+            let kind = (info >> 24) & 31;
+            let count = (info & 65535) as usize;
+            let extra = match kind {
+                0 | 2 | 7 | 8 | 9 | 10 | 11 | 12 | 16 | 18 => 0,
+                1 | 14 | 17 => 4,
+                3 => 12,
+                4 | 5 | 15 | 19 => count.checked_mul(12)?,
+                6 | 13 => count.checked_mul(8)?,
+                _ => return Some(false),
+            };
+            let length = 12usize.checked_add(extra)?;
+            nodes.push(record.get(..length)?);
+            cursor = cursor.checked_add(length)?;
+        }
+        let resolve = |mut id: u32| -> Option<&[u8]> {
+            for _ in 0..32 {
+                let node = *nodes.get(id as usize)?;
+                let kind = (word(node, 4)? >> 24) & 31;
+                if !matches!(kind, 8 | 9 | 10 | 11 | 18) {
+                    return Some(node);
+                }
+                id = word(node, 8)?;
+            }
+            None
+        };
+        let pointee = |id: u32, wanted: &[u8]| -> Option<bool> {
+            let pointer = resolve(id)?;
+            if (word(pointer, 4)? >> 24) & 31 != 2 {
+                return Some(false);
+            }
+            let target = resolve(word(pointer, 8)?)?;
+            Some((word(target, 4)? >> 24) & 31 == 4 && name(word(target, 0)?)? == wanted)
+        };
+        let mut functions = nodes.iter().skip(1).filter(|node| {
+            word(node, 4).is_some_and(|info| (info >> 24) & 31 == 12)
+                && word(node, 0).and_then(name) == Some(b"exec_mm_release".as_slice())
+        });
+        let function = functions.next()?;
+        if functions.next().is_some() {
+            return Some(false);
+        }
+        let proto = resolve(word(function, 8)?)?;
+        if word(proto, 4)? != (13 << 24 | 2) || word(proto, 8)? != 0 {
+            return Some(false);
+        }
+        Some(pointee(word(proto, 16)?, b"task_struct")? && pointee(word(proto, 24)?, b"mm_struct")?)
+    };
+    checked().unwrap_or(false)
 }
 
 /// The calibration protocol: arm `INSTANCE_CALIB` with this thread, map one
@@ -579,7 +729,7 @@ fn prog_stats(fd: BorrowedFd<'_>) -> Result<HookStats> {
         run_cnt: 0,
         recursion_misses: 0,
     };
-    let attr = ObjInfoAttr {
+    let mut attr = ObjInfoAttr {
         bpf_fd: fd.as_raw_fd() as u32,
         info_len: size_of_val(&info) as u32,
         info: (&mut info as *mut ProgInfoPrefix) as u64,
@@ -589,18 +739,123 @@ fn prog_stats(fd: BorrowedFd<'_>) -> Result<HookStats> {
         libc::syscall(
             libc::SYS_bpf,
             15u32,
-            &attr as *const ObjInfoAttr,
+            &mut attr as *mut ObjInfoAttr,
             size_of_val(&attr),
         )
     };
     if rc == -1 {
         return Err(std::io::Error::last_os_error()).context("BPF_OBJ_GET_INFO_BY_FD");
     }
+    decode_prog_stats(&info, attr.info_len)
+}
+
+fn decode_prog_stats(info: &ProgInfoPrefix, reported_len: u32) -> Result<HookStats> {
+    ensure!(
+        reported_len >= 216,
+        "program info omits recursion-miss statistics"
+    );
     Ok(HookStats {
+        program_id: u32::from_ne_bytes(info.head[4..8].try_into().unwrap()),
         run_time_ns: info.run_time_ns,
         run_cnt: info.run_cnt,
         recursion_misses: info.recursion_misses,
     })
+}
+
+/// The production health decision shared by activation and later audits.
+fn validate_hook_health_with(
+    link_count: usize,
+    expected: Option<&BTreeMap<&'static str, u32>>,
+    read_ftrace: impl FnOnce() -> Result<String>,
+    read_stats: impl FnOnce() -> Result<Vec<(&'static str, HookStats)>>,
+) -> Result<BTreeMap<&'static str, u32>> {
+    ensure!(
+        link_count == INSTANCE_PROGRAMS.len(),
+        "partial image hook attachment"
+    );
+    ensure!(
+        read_ftrace()?.trim() == "1",
+        "ftrace must be enabled for image continuity"
+    );
+    let mut ids = BTreeMap::new();
+    for (name, stats) in read_stats()? {
+        ensure!(
+            stats.program_id != 0
+                && stats.recursion_misses == 0
+                && INSTANCE_PROGRAMS
+                    .iter()
+                    .any(|(required, _)| *required == name)
+                && ids.insert(name, stats.program_id).is_none(),
+            "image hook identity/statistics unavailable"
+        );
+        if let Some(expected) = expected {
+            ensure!(
+                expected.get(name) == Some(&stats.program_id),
+                "image hook identity changed"
+            );
+        }
+    }
+    ensure!(
+        ids.len() == INSTANCE_PROGRAMS.len(),
+        "missing image hook statistics"
+    );
+    ensure!(
+        ids.values()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            == ids.len(),
+        "image hook program IDs collide"
+    );
+    Ok(ids)
+}
+
+fn activate_image_coverage_with(
+    coverage: &super::image_query::CoverageControl,
+    query_refusal: Option<&str>,
+    attach_and_read: impl FnOnce() -> Result<BTreeMap<&'static str, u32>>,
+) -> Result<BTreeMap<&'static str, u32>> {
+    let result = (|| {
+        if let Some(reason) = query_refusal {
+            bail!("image continuity query unavailable: {reason}");
+        }
+        let ids = attach_and_read()?;
+        coverage.enable()?;
+        Ok(ids)
+    })();
+    if result.is_err() {
+        coverage.fail();
+    }
+    result
+}
+
+pub(super) fn audit_image_hooks_with(
+    coverage: &super::image_query::CoverageControl,
+    active: bool,
+    link_count: usize,
+    expected: &BTreeMap<&'static str, u32>,
+    read_ftrace: impl FnOnce() -> Result<String>,
+    read_stats: impl FnOnce() -> Result<Vec<(&'static str, HookStats)>>,
+    read_faults: impl FnOnce() -> Result<(u64, u64)>,
+) -> Result<()> {
+    let result = (|| {
+        ensure!(active && coverage.enabled(), "image continuity unavailable");
+        validate_hook_health_with(link_count, Some(expected), read_ftrace, read_stats)?;
+        let (sticky, fault) = read_faults()?;
+        ensure!(
+            sticky == 0 && fault <= u64::from(u32::MAX),
+            "instance continuity fault/exhaustion"
+        );
+        ensure!(
+            coverage.enabled(),
+            "image continuity failed during health audit"
+        );
+        Ok(())
+    })();
+    if result.is_err() {
+        coverage.fail();
+    }
+    result
 }
 
 /// One live (process, watched file) scan source for the router's
@@ -667,7 +922,242 @@ impl crate::discovery::instances::ScanReader for LiveScan<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hooks_disabled_by_env_value, lto_enabled_in_config};
+    use super::{exec_release_proto_is_exact, hooks_disabled_by_env_value, lto_enabled_in_config};
+
+    fn healthy_hook_stats() -> Vec<(&'static str, super::HookStats)> {
+        super::INSTANCE_PROGRAMS
+            .iter()
+            .enumerate()
+            .map(|(index, (name, _))| {
+                let mut info = super::ProgInfoPrefix {
+                    head: [0; 192],
+                    run_time_ns: 0,
+                    run_cnt: 0,
+                    recursion_misses: 0,
+                };
+                info.head[4..8].copy_from_slice(&(index as u32 + 1).to_ne_bytes());
+                (*name, super::decode_prog_stats(&info, 216).unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn production_program_info_refuses_shortened_statistics() {
+        let info = super::ProgInfoPrefix {
+            head: [0; 192],
+            run_time_ns: 0,
+            run_cnt: 0,
+            recursion_misses: 0,
+        };
+        for length in [0, 192, 208, 215] {
+            assert!(super::decode_prog_stats(&info, length).is_err());
+        }
+        assert!(super::decode_prog_stats(&info, 216).is_ok());
+    }
+
+    #[test]
+    fn production_hook_health_failures_permanently_latch_coverage() {
+        let expected = healthy_hook_stats()
+            .into_iter()
+            .map(|(name, stats)| (name, stats.program_id))
+            .collect();
+        for case in 0..11 {
+            let coverage = super::super::image_query::CoverageControl::test_owner(true);
+            let mut stats = healthy_hook_stats();
+            if case == 3 {
+                stats.pop();
+            }
+            if case == 4 {
+                stats[0].1.program_id += 100;
+            }
+            if case == 5 {
+                stats[0].1.program_id = 0;
+            }
+            let result = super::audit_image_hooks_with(
+                &coverage,
+                case != 7,
+                if case == 6 { 3 } else { 4 },
+                &expected,
+                || {
+                    if case == 0 {
+                        Err(anyhow::anyhow!("unreadable ftrace"))
+                    } else {
+                        Ok(if case == 1 { "0" } else { "1" }.into())
+                    }
+                },
+                || {
+                    if case == 2 {
+                        Err(anyhow::anyhow!("unreadable program info"))
+                    } else {
+                        Ok(stats)
+                    }
+                },
+                || {
+                    if case == 10 {
+                        coverage.fail();
+                    }
+                    Ok((
+                        u64::from(case == 8),
+                        if case == 9 {
+                            u64::from(u32::MAX) + 1
+                        } else {
+                            0
+                        },
+                    ))
+                },
+            );
+            assert!(result.is_err(), "health case {case} was accepted");
+            assert!(!coverage.enabled());
+            assert!(coverage.enable().is_err());
+        }
+        for missed in 0..super::INSTANCE_PROGRAMS.len() {
+            let coverage = super::super::image_query::CoverageControl::test_owner(true);
+            let mut stats = healthy_hook_stats();
+            stats[missed].1.recursion_misses = 1;
+            assert!(
+                super::audit_image_hooks_with(
+                    &coverage,
+                    true,
+                    4,
+                    &expected,
+                    || Ok("1".into()),
+                    || Ok(stats),
+                    || Ok((0, 0)),
+                )
+                .is_err()
+            );
+            // Ordinary fault values are separate; a later reset never re-enables.
+            assert!(
+                super::audit_image_hooks_with(
+                    &coverage,
+                    true,
+                    4,
+                    &expected,
+                    || Ok("1".into()),
+                    || Ok(healthy_hook_stats()),
+                    || Ok((0, 0)),
+                )
+                .is_err()
+            );
+            assert!(coverage.enable().is_err());
+        }
+    }
+
+    #[test]
+    fn production_activation_requires_query_all_hooks_and_healthy_reads() {
+        for case in 0..4 {
+            let coverage = super::super::image_query::CoverageControl::test_owner(false);
+            let called = std::cell::Cell::new(false);
+            let result = super::activate_image_coverage_with(
+                &coverage,
+                (case == 0).then_some("iterator verifier refusal"),
+                || {
+                    called.set(true);
+                    if case == 1 {
+                        anyhow::bail!("partial hook load/attach");
+                    }
+                    super::validate_hook_health_with(
+                        if case == 2 { 3 } else { 4 },
+                        None,
+                        || Ok("1".into()),
+                        || Ok(healthy_hook_stats()),
+                    )
+                },
+            );
+            if case == 3 {
+                assert_eq!(result.unwrap().len(), 4);
+                assert!(coverage.enabled());
+            } else {
+                assert!(result.is_err());
+                assert!(!coverage.enabled());
+                assert!(coverage.enable().is_err());
+            }
+            assert_eq!(called.get(), case != 0);
+        }
+    }
+
+    #[test]
+    fn watched_file_retains_unlinked_original_and_rejects_replacement() {
+        use crate::discovery::identity::test_fixture::real_scan_pin;
+        use std::os::unix::fs::MetadataExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("provider");
+        std::fs::write(&path, b"original bytes").unwrap();
+        let pins = real_scan_pin(&path, None, 1, "original-digest");
+        let object = pins.pinned().next().unwrap().id;
+        let original = pins.file_for(object).unwrap().metadata().unwrap();
+        let watched = super::WatchedFile {
+            file_slot: 0,
+            maps_keys: pins.raw_keys_for(object),
+            identity: crate::discovery::instances::MappedFileIdentity {
+                dev: original.dev(),
+                ino: original.ino(),
+            },
+            target: pins.retain_inventory_target(object).unwrap(),
+        };
+        let scan_owner = watched.clone();
+        drop(pins);
+        assert!(watched.check_unchanged().unwrap());
+        assert!(scan_owner.check_unchanged().unwrap());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"replacement bytes").unwrap();
+        let retained = scan_owner.target.retirement_lease();
+        assert_eq!(retained.metadata().unwrap().ino(), original.ino());
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), original.ino());
+        // Unlink changed the original's ctime. Never authorize the replacement
+        // merely because it occupies the old pathname.
+        assert!(!scan_owner.check_unchanged().unwrap());
+        assert!(!watched.check_unchanged().unwrap());
+    }
+
+    #[test]
+    fn image_hook_requires_the_exact_exec_release_prototype() {
+        let strings = b"\0task_struct\0mm_struct\0exec_mm_release\0";
+        let words = [
+            1,
+            4 << 24,
+            1, // task_struct
+            0,
+            2 << 24,
+            1, // pointer to task
+            13,
+            4 << 24,
+            1, // mm_struct
+            0,
+            2 << 24,
+            3, // pointer to mm
+            0,
+            (13 << 24) | 2,
+            0,
+            0,
+            2,
+            0,
+            4, // two-argument void proto
+            23,
+            (12 << 24) | 1,
+            5, // externally defined function
+        ];
+        let types: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let mut bytes = vec![0x9f, 0xeb, 1, 0];
+        for word in [
+            24,
+            0,
+            types.len() as u32,
+            types.len() as u32,
+            strings.len() as u32,
+        ] {
+            bytes.extend(word.to_le_bytes());
+        }
+        bytes.extend(types);
+        bytes.extend(strings);
+        assert!(exec_release_proto_is_exact(&bytes));
+        let mut wrong = bytes.clone();
+        wrong[24 + 48 + 16..24 + 48 + 20].copy_from_slice(&4u32.to_le_bytes());
+        assert!(!exec_release_proto_is_exact(&wrong));
+        for truncated in 0..bytes.len() {
+            assert!(!exec_release_proto_is_exact(&bytes[..truncated]));
+        }
+    }
 
     #[test]
     fn disable_hooks_toggle_reads_only_exact_one() {

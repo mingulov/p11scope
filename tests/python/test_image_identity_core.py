@@ -115,6 +115,7 @@ class IdentityCoreTests(unittest.TestCase):
                          'BpfFlavor::InventoryGlobal => &["task_owner"], '
                          'BpfFlavor::InventoryCallers => &["image_identity", "task_owner"], '
                          'BpfFlavor::Detailed => &[ "image_identity", "image_identity_fork", '
+                         '"image_identity_query", '
                          '"task_owner", "root_affiliation", "instance_epoch", ],')
 
 

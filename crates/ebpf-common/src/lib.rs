@@ -1352,7 +1352,9 @@ pub mod instance {
     pub const GEN_FAULT: u32 = 0;
     pub const GEN_ATTACH: u32 = 1;
     pub const GEN_STICKY: u32 = 2;
-    pub const GEN_CELLS: u32 = 3;
+    /// Image continuity is Disabled=0, Enabled=1 or permanently Failed=2.
+    pub const GEN_IMAGE_COVERAGE: u32 = 3;
+    pub const GEN_CELLS: u32 = 4;
     /// `INSTANCE_GEN[GEN_STICKY]`: a CLONE_VM child could not be marked.
     pub const STICKY_FORK_UNMARKED: u64 = 1;
 

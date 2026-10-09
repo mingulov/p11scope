@@ -7,12 +7,13 @@
 # beside a live `p11scope profile --pid` capture of an idle SoftHSM2 anchor,
 # with the Stage A hooks attached (default) or refused
 # (P11SCOPE_T3A_DISABLE_HOOKS=1, the test-only 1d toggle: same binary, only the
-# three fentry hooks differ). RELEVANT churn maps the watched provider file, so
+# four continuity hooks differ). RELEVANT churn maps the watched provider file, so
 # each event runs the hook's full per-(process,file) path; UNRELATED churn maps
 # a private temp file, so each event costs one WATCHED_FILES hash miss. The
 # churn process makes no PKCS#11 calls, so no entry/return probe fires for it:
-# the with/without delta is exactly the three hooks (uprobe_mmap,
-# uprobe_munmap, copy_vma).
+# the with/without arm includes four hooks (uprobe_mmap,
+# uprobe_munmap, copy_vma, exec_mm_release); mapping churn exercises the
+# three mapping hooks, while the total accounts for every attached hook.
 #
 # Cells (2 arms x ROUNDS rounds of ABBA/BAAB-interleaved samples each):
 #   relevant-mmap / unrelated-mmap (ROUNDS_MMAP, default 3)
@@ -338,38 +339,76 @@ wait_for_observer_attach() {
     done
 }
 
-# hook_prog_count: live p11_inst_vma_* programs system-wide (the preflight
-# proved zero, so the on-arm sample must read exactly 3 and off exactly 0).
-hook_prog_count() {
-    sudo -n bpftool prog show 2>/dev/null | grep -c "p11_inst_vma_" || true
-}
-
-# hook_link_count: tracing links attached to the three p11_inst_vma_*
-# programs (P2-3: loaded programs alone prove nothing — an attach failure
-# detaches links while leaving programs loaded — so the on-arm sample must
-# read exactly 3 attached links and off exactly 0; the preflight proved
-# zero, so these links belong to this observer). Prints the count; fails
-# when bpftool output is unusable.
-hook_link_count() {
+# Exact full/truncated names, shared by program, link and runtime census.
+# The preflight proves zero; an on arm owns exactly four continuity hooks.
+hook_snapshot() {
     sudo -n bpftool -j prog show 2>/dev/null > "$WORK/bpf-prog.json" || return 1
     sudo -n bpftool -j link show 2>/dev/null > "$WORK/bpf-link.json" || return 1
-    python3 -I - "$WORK/bpf-prog.json" "$WORK/bpf-link.json" <<'EOF'
+    python3 -I - "$WORK/bpf-prog.json" "$WORK/bpf-link.json" "$1" <<'EOF'
+# STAGEA_HOOK_CENSUS_BEGIN
 import json, sys
 try:
     progs = json.load(open(sys.argv[1]))
     links = json.load(open(sys.argv[2]))
+    want = {"p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy", "p11_image_exec_release"}
+    aliases = {}
+    for full in want:
+        for alias in {full, full[:15]}:
+            if alias in aliases and aliases[alias] != full:
+                raise ValueError("colliding hook names")
+            aliases[alias] = full
+    found = {}
+    ids = set()
+    for prog in progs:
+        raw = prog.get("name")
+        full = aliases.get(raw)
+        if full is None:
+            if isinstance(raw, str) and raw[:15] in aliases:
+                raise ValueError("colliding kernel hook prefix")
+            continue
+        ident = prog.get("id")
+        if full in found or type(ident) is not int or ident <= 0 or ident in ids:
+            raise ValueError("duplicate or invalid hook program")
+        found[full] = prog
+        ids.add(ident)
+    if found and set(found) != want:
+        raise ValueError("partial hook program set")
+    mode = sys.argv[3]
+    if mode == "programs":
+        print(len(found))
+    elif mode == "links":
+        selected = [link for link in links if link.get("prog_id") in ids]
+        link_ids = [link.get("id") for link in selected]
+        if any(type(ident) is not int or ident <= 0 for ident in link_ids) or len(set(link_ids)) != len(link_ids):
+            raise ValueError("duplicate or invalid hook link")
+        if any(link.get("type") != "tracing" for link in selected):
+            raise ValueError("wrong hook link type")
+        linked = [link.get("prog_id") for link in selected]
+        if len(linked) != len(ids) or set(linked) != ids:
+            raise ValueError("required hook link missing or duplicated")
+        print(len(selected))
+    elif mode == "stats":
+        if set(found) != want:
+            raise ValueError("required hooks unavailable")
+        totals = [0, 0]
+        for prog in found.values():
+            for index, field in enumerate(["run_time_ns", "run_cnt"]):
+                value = prog.get(field)
+                if type(value) is not int or value < 0:
+                    raise ValueError("missing hook statistics")
+                totals[index] += value
+        print(*totals)
+    else:
+        raise ValueError("invalid hook census mode")
 except Exception:
     sys.exit(1)
-want = {"p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy"}
-ids = {p.get("id") for p in progs if p.get("name") in want}
-if not ids:
-    print(0)
-elif len(ids) != 3:
-    sys.exit(1)
-else:
-    print(sum(1 for link in links if link.get("prog_id") in ids))
+# STAGEA_HOOK_CENSUS_END
 EOF
 }
+
+hook_prog_count() { hook_snapshot programs; }
+hook_link_count() { hook_snapshot links; }
+bpf_hook_totals() { hook_snapshot stats; }
 
 # watched_file_count: entries in this observer's WATCHED_FILES map (P2-3:
 # hooks without a watched file never take the per-(process,file) path, so
@@ -399,29 +438,6 @@ try:
 except Exception:
     sys.exit(1)
 print(len(entries) if isinstance(entries, list) else 0)
-'
-}
-
-# bpf_hook_totals: "<run_time_ns sum> <run_cnt sum>" over the three hooks
-# (kernel.bpf_stats_enabled=1 for the campaign). Fails unless all three are
-# present with counters.
-bpf_hook_totals() {
-    sudo -n bpftool -j prog show 2>/dev/null | python3 -I -c '
-import json, sys
-try:
-    progs = json.load(sys.stdin)
-except Exception:
-    sys.exit(1)
-want = {"p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy"}
-ns, cnt, seen = 0, 0, set()
-for prog in progs:
-    if prog.get("name") in want:
-        seen.add(prog["name"])
-        ns += prog.get("run_time_ns", 0)
-        cnt += prog.get("run_cnt", 0)
-if seen != want:
-    sys.exit(1)
-print(f"{ns} {cnt}")
 '
 }
 
@@ -589,17 +605,17 @@ run_sample() {
     fi
     rs_hooks=$(hook_prog_count)
     if [ "$rs_arm" = on ]; then
-        [ "$rs_hooks" = 3 ] || { echo "on-arm sample has $rs_hooks hook programs, want 3" >&2; return 1; }
+        [ "$rs_hooks" = 4 ] || { echo "on-arm sample has $rs_hooks hook programs, want 4" >&2; return 1; }
     else
         [ "$rs_hooks" = 0 ] || { echo "off-arm sample has $rs_hooks hook programs, want 0" >&2; return 1; }
     fi
     # P2-3: loaded programs alone prove nothing — an attach failure detaches
     # links while leaving programs loaded — so the on-arm sample must also
-    # hold exactly this observer's 3 attached links and a watched file.
+    # hold exactly this observer's 4 attached links and a watched file.
     rs_links=$(hook_link_count) || { echo "hook link query failed" >&2; return 1; }
     rs_watched=$(watched_file_count) || { echo "watched-file query failed" >&2; return 1; }
     if [ "$rs_arm" = on ]; then
-        [ "$rs_links" = 3 ] || { echo "on-arm sample has $rs_links hook links, want 3 (loaded but unattached?)" >&2; return 1; }
+        [ "$rs_links" = 4 ] || { echo "on-arm sample has $rs_links hook links, want 4 (loaded but unattached?)" >&2; return 1; }
         [ "$rs_watched" -ge 1 ] || { echo "on-arm sample watches $rs_watched files, want >= 1" >&2; return 1; }
     else
         [ "$rs_links" = 0 ] || { echo "off-arm sample has $rs_links hook links, want 0" >&2; return 1; }

@@ -23,6 +23,7 @@ skip-attribution = []
 [dependencies]
 anyhow = "1"
 aya = "=0.14.0"
+aya-obj = "=0.3.0"
 cryptoki-sys = "0.5"
 libc = "0.2"
 p11scope-bpf-multi = { version = "0.0.0", path = "crates/bpf-multi" }
@@ -36,7 +37,6 @@ signal-hook = { version = "0.4.4", default-features = false }
 unicode-width = { version = "=0.2.2", default-features = false }
 
 [dev-dependencies]
-aya-obj = "=0.3.0"
 p11scope-discover = { version = "0.3.0", path = "crates/discover" }
 sha2 = "=0.11.0"
 tempfile = "3"

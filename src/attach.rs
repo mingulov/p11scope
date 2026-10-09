@@ -55,6 +55,23 @@ pub(crate) use stop_gate::{StopGate, stop_gate_map_data, validate_stop_gate};
 pub(crate) mod image_query;
 #[allow(dead_code)]
 mod instance;
+#[cfg(test)]
+pub(crate) fn raise_fault_test_cell(cell: &std::sync::atomic::AtomicU64) -> Result<u64> {
+    instance::raise_fault_cell(cell)
+}
+#[cfg(test)]
+pub(crate) fn semantic_receipt_readback_test(
+    policy: CapturePolicy,
+    descriptors: Result<Vec<SlotSemantics>>,
+) -> std::result::Result<(), crate::semantic_capture::CurrentReceiptRefusal> {
+    semantic_receipt_readback(policy, descriptors)
+}
+#[cfg(test)]
+pub(crate) fn semantic_receipt_query_refusal_test(
+    error: image_query::ImageQueryRefusal,
+) -> crate::semantic_capture::CurrentReceiptRefusal {
+    semantic_receipt_query_refusal(error)
+}
 #[allow(unused_imports)]
 pub(crate) use instance::{
     HookStats, INSTANCE_PROGRAMS, InstanceMaps, InstanceTracking, WatchedFile,
@@ -1772,6 +1789,33 @@ fn seal_attached_subset_with(
     let attached = AttachedSemanticSet { domain, subset };
     attached.validate_with(domain, policy, descriptors, retained, owned_sides, watched)?;
     Ok(attached)
+}
+
+fn semantic_receipt_readback(
+    policy: CapturePolicy,
+    descriptors: Result<Vec<SlotSemantics>>,
+) -> std::result::Result<(), crate::semantic_capture::CurrentReceiptRefusal> {
+    use crate::semantic_capture::CurrentReceiptRefusal as Refusal;
+    if policy != CapturePolicy::Allowlisted
+        || descriptors.map_err(|_| Refusal::Attachment)? != *crate::kinds::DESCRIPTORS
+    {
+        return Err(Refusal::Attachment);
+    }
+    Ok(())
+}
+
+fn semantic_receipt_query_refusal(
+    error: image_query::ImageQueryRefusal,
+) -> crate::semantic_capture::CurrentReceiptRefusal {
+    use crate::semantic_capture::CurrentReceiptRefusal as Refusal;
+    match error {
+        image_query::ImageQueryRefusal::Unknown | image_query::ImageQueryRefusal::Unstable => {
+            Refusal::Epoch
+        }
+        image_query::ImageQueryRefusal::Deadline => Refusal::Deadline,
+        image_query::ImageQueryRefusal::Custody => Refusal::Custody,
+        _ => Refusal::Audit,
+    }
 }
 
 impl AttachedSemanticSet {
@@ -4588,6 +4632,109 @@ impl Session {
             file_slot: watched.file_slot,
             offset: target.slot.file_offset,
         })
+    }
+
+    /// Retained current attachment and exact descriptor readback, obtained
+    /// by the Session itself. No caller-supplied positive attachment facts.
+    pub(crate) fn semantic_receipt_target(
+        &self,
+        slot: u32,
+    ) -> std::result::Result<
+        crate::discovery::identity::RetainedInventoryTarget,
+        crate::semantic_capture::CurrentReceiptRefusal,
+    > {
+        use crate::semantic_capture::CurrentReceiptRefusal as Refusal;
+        semantic_receipt_readback(self.policy, self.semantic_descriptors())?;
+        let sides = self.current_static_sides();
+        if !sides.contains(&(slot, ProbeSide::Entry)) || !sides.contains(&(slot, ProbeSide::Return))
+        {
+            return Err(Refusal::Attachment);
+        }
+        let retained = self.retained_static.get(&slot).ok_or(Refusal::Attachment)?;
+        if retained.slot.index != slot {
+            return Err(Refusal::Attachment);
+        }
+        let watched = self
+            .instance
+            .watched(retained.slot.object)
+            .ok_or(Refusal::Attachment)?;
+        let target = watched.retained_target();
+        if target.check_unchanged() != Ok(true) {
+            return Err(Refusal::Attachment);
+        }
+        Ok(target)
+    }
+
+    /// Read current identity and complete epochs under the original custody;
+    /// these are I/O results, not a constructor for registration authority.
+    pub(crate) fn semantic_receipt_state(
+        &mut self,
+        pin: &crate::process::PidPin,
+        image: p11scope_ebpf_common::ImageIdentity,
+        endpoint: crate::semantic_capture::Endpoint,
+        slot: u32,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<
+        (
+            p11scope_ebpf_common::ImageIdentity,
+            image_query::CompleteEpochs,
+            crate::discovery::identity::RetainedInventoryTarget,
+        ),
+        crate::semantic_capture::CurrentReceiptRefusal,
+    > {
+        use crate::semantic_capture::CurrentReceiptRefusal as Refusal;
+        let budget = || {
+            if std::time::Instant::now() < deadline {
+                Ok(())
+            } else {
+                Err(Refusal::Deadline)
+            }
+        };
+        budget()?;
+        if self.instance_endpoint(slot) != Some(endpoint) {
+            return Err(Refusal::Attachment);
+        }
+        let target = self.semantic_receipt_target(slot)?;
+        let window = capture::ReadWindow::new(16_384, deadline).map_err(|_| Refusal::Deadline)?;
+        let before = self
+            .query_images(&[pin], window)
+            .map_err(semantic_receipt_query_refusal)?;
+        let before_image = before.image(image.task_cookie).ok_or(Refusal::Epoch)?;
+        budget()?;
+        let first = self
+            .instance_maps()
+            .complete_epochs(
+                pin.pidfd().map_err(|_| Refusal::Custody)?,
+                endpoint.file_slot,
+            )
+            .map_err(|_| Refusal::Audit)?;
+        budget()?;
+        let second = self
+            .instance_maps()
+            .complete_epochs(
+                pin.pidfd().map_err(|_| Refusal::Custody)?,
+                endpoint.file_slot,
+            )
+            .map_err(|_| Refusal::Audit)?;
+        let after = self
+            .query_images(&[pin], window)
+            .map_err(semantic_receipt_query_refusal)?;
+        let after_image = after.image(image.task_cookie).ok_or(Refusal::Epoch)?;
+        budget()?;
+        let current_target = self.semantic_receipt_target(slot)?;
+        if self.instance_endpoint(slot) != Some(endpoint)
+            || !Arc::ptr_eq(
+                &target.retirement_lease(),
+                &current_target.retirement_lease(),
+            )
+            || target.check_unchanged() != Ok(true)
+        {
+            return Err(Refusal::Attachment);
+        }
+        if first != second || before_image != after_image {
+            return Err(Refusal::Epoch);
+        }
+        Ok((after_image, second, current_target))
     }
 
     /// The continuity hooks' run/miss statistics.

@@ -32,7 +32,7 @@
 //! [`UnknownReason`]s leave this module.
 
 use crate::attach::capture::NativeDomainId;
-use crate::attach::image_query::ImageScanProof;
+use crate::attach::image_query::{CompleteEpochs, ImageScanProof};
 use p11scope_ebpf_common::{ImageIdentity, InstanceStamp, instance};
 use p11scope_manifest::maps::MapEntry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -690,6 +690,56 @@ impl InstanceRouter {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Registration needs the newest exact accepted observation. Historical
+    /// epoch keys remain usable for call history, never for this authority.
+    pub(crate) fn current_partition_matches(
+        &self,
+        domain: NativeDomainId,
+        image: ImageIdentity,
+        file: u32,
+        epochs: CompleteEpochs,
+        fence: u64,
+        ids: &[InstanceId],
+    ) -> bool {
+        let image = ImageKey::from(image);
+        if domain != self.domain
+            || RetirementLedger::index(image.cookie).is_none()
+            || file >= instance::FILE_SLOTS
+            || self.authority_failed
+            || self.image_failed
+            || self.sticky != 0
+            || self.miss_latched
+            || self.image_retired(image)
+            || self.faulted.contains(&(image, file))
+            || fence != self.fence
+            || epochs.fault != self.fault
+            || epochs.sticky != 0
+            || epochs.record_flags != 0
+            || [epochs.local, epochs.global, epochs.fault]
+                .into_iter()
+                .any(|value| value > u64::from(u32::MAX))
+            || ids.is_empty()
+        {
+            return false;
+        }
+        self.observed
+            .get(&(image, file))
+            .and_then(|list| list.back())
+            .is_some_and(|current| {
+                current.epochs
+                    == EpochKey {
+                        local: epochs.local,
+                        global: epochs.global,
+                        fault: epochs.fault,
+                    }
+                    && current
+                        .partitions
+                        .iter()
+                        .filter_map(|(_, id)| *id)
+                        .eq(ids.iter().copied())
+            })
     }
 
     pub(crate) fn take_observation_losses(&mut self) -> Vec<ObservationLoss> {

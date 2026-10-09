@@ -456,11 +456,7 @@ fn j4_bad_flag_values_name_flag_exit_2() {
         first,
         "--mode: invalid value \"frobnicate\" (expected profile|metrics)"
     );
-    assert!(
-        mode.stderr.contains("[--mode profile|metrics]"),
-        "{}",
-        mode.stderr
-    );
+    assert_scoped_hint(&mode.stderr, "profile");
 }
 
 #[test]

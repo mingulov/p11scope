@@ -585,6 +585,41 @@ def window_count(use, since_ns, window):
     return lo, hi
 
 
+def demoted_window_count(use, since_ns, window):
+    """Candidate demoted upper bound, without a first-insert recording call.
+
+    A demoted base uses a PRE bound rather than the row's first insert.
+    Aggregate coverage may retain an earlier since_ns across placement
+    changes, and the count may include earlier edge history. These
+    existing bounds cannot prove the later segment's base or equality;
+    satisfying them must remain explicitly nonqualifying.
+    """
+    start, end = max(since_ns, window[0]), window[1]
+    lo = hi = 0
+    arming = (since_ns, legacy_end_before_since(use.lines, since_ns))
+    for e in use.lines:
+        if e["t1"] < start or e["t0"] > end:
+            continue
+        hi += e["n"]
+        if e["t0"] > since_ns and e["t0"] >= window[0] and e["t1"] <= end \
+                and is_table_call(e["fn"], e.get("phase"), e, arming):
+            lo += e["n"]
+    return lo, hi
+
+
+def demoted_timing_uncertainty(edge, use, since_ns, window):
+    """Explain why inventory-v1 cannot qualify a demoted aggregate count.
+
+    first_seen_ns and coverage.since_ns are historical minima, not the
+    later segment's first observation or base-read interval. No existing
+    public field proves the receiving edge is new or separates its old
+    count from later growth. A disjoint ledger against those aggregate
+    timestamps therefore supplies no segment authority either.
+    """
+    return ("inventory-v1 omits segment/base-read provenance; aggregate first_seen_ns and "
+            "coverage.since_ns cannot bound the later base read or prove the receiving edge is new")
+
+
 def endpoint_coverage_ok(lines, admission_endpoints):
     """O1 pigeonhole: every distinctly-called endpoint needs an admitted
     endpoint. The caller proves the count is an int first: a missing
@@ -607,15 +642,16 @@ def has_partial_attach(view, edge):
 
 def has_demoted_edge(view, edge):
     """Whether a demotion marker clouds the edge (round 4, R4-N2): a
-    caller-AND-module-scoped gap naming exactly this edge — its count
-    is segment-relative growth from the base read, so the window
-    judges the upper bound only and exactness is explicitly
-    nonqualifying. Sibling edges keep full judgment (no run-wide or
-    module-wide poison). The marker matches the subject only (round
+    caller-AND-module-scoped gap naming exactly this edge. Its count may
+    combine historical edge counts with later growth; without segment
+    provenance, satisfying the bounds remains explicitly nonqualifying.
+    Sibling edges keep full judgment (no run-wide or module-wide poison).
+    The marker matches the subject only (round
     5, sol-N2): reasons embed provider paths, so an adversarial path
     naming the marker must not demote an ordinary edge."""
     for gap in view.doc.get("gaps", []):
-        if not DEMOTED_PLACED.search(gap.get("subject", "")):
+        subject = gap.get("subject")
+        if not isinstance(subject, str) or not DEMOTED_PLACED.search(subject):
             continue
         if gap.get("caller") == edge.get("caller") and gap.get("module") == edge.get("module"):
             return True
@@ -671,11 +707,12 @@ def exact_window_count(use, since_ns, window, until_ns, caller_first_seen_ns,
     (tests/fixtures/public-cli/inventory-ledger.c:229), so since_ns
     lands strictly after the recording call's entry stamp on every
     real run and since_ns <= t_first can never gate exactness.
-    Demoted edges are the exception (round 4, R4-N2): their since_ns
-    is the base-observing read (pass resolution, not a BPF insert)
-    and their count is post-base growth — judged upper-bound-only
-    with COUNT-EXACT explicitly nonqualifying (see has_demoted_edge),
-    never by this function."""
+    Demoted edges are the exception (round 4, R4-N2): their base uses
+    a pass-resolution read rather than a BPF insert, but aggregate
+    since_ns may retain earlier coverage and the count may retain prior
+    edge history. Segment provenance is absent, so satisfying bounds
+    and COUNT-EXACT stay nonqualifying (see has_demoted_edge), never
+    equated by this function."""
     arming = (since_ns, legacy_end_before_since(use.lines, since_ns))
     attach = [e for e in use.lines if is_table_call(e["fn"], e.get("phase"), e, arming)]
     # Structural, legacy-verbatim: frozen, empty, or unadmitted (a
@@ -1792,7 +1829,10 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, image, attested_de
         window = (view.window[0], min(view.window[1], until)) if until is not None else view.window
         admitted = view.callers.get(edge["caller"], {}).get("first_seen_ns")
         mapping_first = edge.get("mapping", {}).get("first_seen_ns")
-        lo, hi = window_count(use, cov.get("since_ns") or 0, window)
+        since = cov.get("since_ns") or 0
+        demoted = has_demoted_edge(view, edge)
+        lo, hi = (demoted_window_count if demoted else window_count)(use, since, window)
+        uncertainty = demoted_timing_uncertainty(edge, use, since, window) if demoted else None
         count = edge["entries"].get("count", 0)
         total = ledger_total_table_calls(image, prov["path"], cov.get("since_ns"))
         res.ok(run, cell, "COUNT-TOTAL", count <= total,
@@ -1801,10 +1841,14 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, image, attested_de
             loss_gaps = [g for g in view.doc.get("gaps", [])
                          if LOSS_GAP.search(f"{g.get('subject', '')} {g.get('reason', '')}")]
             label = edge["entries"].get("observation")
-            res.ok(run, cell, "COUNT-LOSSY",
-                   bool(loss_gaps) and count <= hi and (count > 0 or label == OBSERVATION_LOSSY_ZERO),
-                   f"{ctag}: lossy count {count} (upper bound {hi}) needs a loss gap "
-                   f"({len(loss_gaps)} found) and, at zero, observation {OBSERVATION_LOSSY_ZERO!r} (got {label!r})")
+            valid = bool(loss_gaps) and count <= hi and (count > 0 or label == OBSERVATION_LOSSY_ZERO)
+            if valid and uncertainty:
+                res.add(run, cell, "COUNT-LOSSY", "nonqualifying",
+                        f"{ctag}: demoted count {count} is below upper bound {hi}, but {uncertainty}")
+            else:
+                res.ok(run, cell, "COUNT-LOSSY", valid,
+                       f"{ctag}: lossy count {count} (upper bound {hi}) needs a loss gap "
+                       f"({len(loss_gaps)} found) and, at zero, observation {OBSERVATION_LOSSY_ZERO!r} (got {label!r})")
         else:
             # O7: only a production-shaped saturated triple (fixed
             # u64::MAX cap, u64 count, Boolean flag, saturated at the
@@ -1818,29 +1862,33 @@ def check_bound_edge(view, cell, ctag, role, prov, edge, use, image, attested_de
             # explicitly nonqualifying rather than trusted or failed.
             saturated = is_saturated_artifact(edge["entries"])
             partial = has_partial_attach(view, edge)
-            demoted = has_demoted_edge(view, edge)
             suppressed = view.doc.get("gaps_suppressed") or 0
             # A malformed counter fails closed (F3-07, F2-08 style): a
             # concealment may hide behind it — never raises.
             concealed = suppressed > 0 if type(suppressed) is int else True
-            res.ok(run, cell, "COUNT-WINDOW", count_window_ok(count, saturated or partial or concealed or demoted, lo, hi),
-                   f"{ctag}: count {count} outside ledger window [{lo}, {hi}] since {cov.get('since_ns')}"
-                   + (" (saturated: lower bound clamped at the cap)" if saturated else "")
-                   + (" (partial attach: lower bound clamped; counted uses are lower bounds)"
-                      if partial and not saturated else "")
-                   + (" (demoted: lower bound clamped; the edge carries post-base-read growth only)"
-                      if demoted and not saturated and not partial else "")
-                   + (f" ({suppressed} gaps suppressed: a partial-attach gap may be concealed; "
-                       "lower bound clamped)"
-                      if concealed and not saturated and not partial and not demoted else ""))
+            valid = count_window_ok(count, saturated or partial or concealed or demoted, lo, hi)
+            if valid and uncertainty:
+                res.add(run, cell, "COUNT-WINDOW", "nonqualifying",
+                        f"{ctag}: demoted count {count} is below upper bound {hi}, but {uncertainty}")
+            else:
+                res.ok(run, cell, "COUNT-WINDOW", valid,
+                       f"{ctag}: count {count} outside ledger window [{lo}, {hi}] since {cov.get('since_ns')}"
+                       + (" (saturated: lower bound clamped at the cap)" if saturated else "")
+                       + (" (partial attach: lower bound clamped; counted uses are lower bounds)"
+                          if partial and not saturated else "")
+                       + (" (demoted: lower bound clamped; segment/base-read provenance unavailable)"
+                          if demoted and not saturated and not partial else "")
+                       + (f" ({suppressed} gaps suppressed: a partial-attach gap may be concealed; "
+                           "lower bound clamped)"
+                          if concealed and not saturated and not partial and not demoted else ""))
             doc_module = view.modules.get(edge["module"], {})
             verdict, expected, detail = exact_window_count(
                 use, cov.get("since_ns") or 0, window, until, admitted,
                 mapping_first, doc_module.get("admission", {}).get("endpoints"), partial)
             if demoted and not saturated:
                 res.add(run, cell, "COUNT-EXACT", "nonqualifying",
-                        f"{ctag}: insufficient evidence for exactness: a demoted edge carries "
-                        f"post-base-read growth, so no whole-workload equality holds")
+                        f"{ctag}: insufficient evidence for exactness: a demoted edge may retain "
+                        f"historical counts alongside later growth; segment/base-read provenance unavailable")
             elif verdict == "exact" and not saturated and concealed:
                 res.add(run, cell, "COUNT-EXACT", "nonqualifying",
                         f"{ctag}: insufficient evidence for exactness: {suppressed} gaps suppressed, "
@@ -3842,10 +3890,9 @@ def self_test():
         # Round 4 (R4-N2): a demoted edge carries segment-relative
         # growth (post-base-read calls only) and marks itself with the
         # production demotion gap (DEMOTED_COUNT_PLACED in
-        # src/discovery/caller_registry.rs). The ledger window judges
-        # the upper bound only (the lower bound cannot hold a
-        # segment), and COUNT-EXACT is explicitly nonqualifying (no
-        # segment equality to judge).
+        # src/discovery/caller_registry.rs). Even this fresh-shaped
+        # fixture cannot publicly prove segment/base provenance, so
+        # satisfying the bounds and COUNT-EXACT remain nonqualifying.
         def demoted_segment_genuine(s, d, dash):
             kw = realistic_since_ledger(s, d)
             edge = _edge(d, cid(s, "P1"), s.mid["A"])
@@ -3857,11 +3904,12 @@ def self_test():
                               "reason": "a demoted count placed post-demotion growth on this edge",
                               "budget": None, "repeats": 1})
             return kw
-        res = case("demoted-growth-window-passes-exact-nonqualifying", None, demoted_segment_genuine)
+        res = case("demoted-growth-window-and-exact-nonqualifying", None, demoted_segment_genuine)
         row = next((r for r in res.rows
                     if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-WINDOW"), None)
-        if row is None or row["status"] != "pass":
-            failures.append("demoted-growth-window-not-passing")
+        if row is None or row["status"] != "nonqualifying":
+            print(f"self-test FAIL demoted-growth-window-authority: expected nonqualifying, got {row}")
+            failures.append("demoted-growth-window-not-nonqualifying")
         row = next((r for r in res.rows
                     if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"), None)
         if row is None or row["status"] != "nonqualifying" or "demot" not in row["detail"]:
@@ -3876,11 +3924,12 @@ def self_test():
                               "subject": "demoted count placed",
                               "reason": "a demoted count placed post-demotion growth on this edge",
                               "budget": None, "repeats": 1})
-        res = case("demoted-growth-setup-shape-window-passes", None, demoted_segment_setup_shape)
+        res = case("demoted-growth-setup-shape-window-nonqualifying", None, demoted_segment_setup_shape)
         row = next((r for r in res.rows
                     if r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-WINDOW"), None)
-        if row is None or row["status"] != "pass":
-            failures.append("demoted-growth-setup-window-not-passing")
+        if row is None or row["status"] != "nonqualifying":
+            print(f"self-test FAIL demoted-growth-setup-authority: expected nonqualifying, got {row}")
+            failures.append("demoted-growth-setup-window-not-nonqualifying")
 
         # The upper bound still judges demoted edges: an absolute
         # count re-installed on a demoted edge (37 over a 34 window)
@@ -3892,6 +3941,143 @@ def self_test():
                               "reason": "a demoted count placed post-demotion growth on this edge",
                               "budget": None, "repeats": 1})
         case("demoted-growth-absolute-fails-upper", "COUNT-WINDOW", demoted_segment_corrupt)
+
+        # Task 1: one restored, definitely pre-base recording call must
+        # fail the demoted segment upper bound despite remaining below
+        # COUNT-TOTAL. Ordinary first-insert controls above retain +1.
+        def demoted_restored_recording(s, d, dash):
+            demoted_segment_setup_shape(s, d, dash)
+            _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["count"] = 34
+        res = case("demoted-restored-pre-base-call-fails-segment", "COUNT-WINDOW",
+                   demoted_restored_recording)
+        if not any(r["check"] == "COUNT-TOTAL" and r["cell"] == "P1" and r["status"] == "pass"
+                   for r in res.rows):
+            failures.append("demoted-restored-pre-base-total-must-stay-valid")
+
+        def demoted_lossy_restored_recording(s, d, dash):
+            demoted_restored_recording(s, d, dash)
+            _edge(d, cid(s, "P1"), s.mid["A"])["entries"]["coverage"]["lossy"] = True
+            d["gaps"].append({"caller": cid(s, "P1"), "module": s.mid["A"], "pid": None,
+                              "subject": "native count refresh loss",
+                              "reason": "count refresh lookup failed", "budget": None, "repeats": 1})
+        case("demoted-lossy-restored-pre-base-call-fails-segment", "COUNT-LOSSY",
+             demoted_lossy_restored_recording)
+
+        # Mid-quantum base: PRE is in the setup/main gap, but the
+        # baseline lookup includes C_DigestInit's three calls. This
+        # segment correctly carries 30 calls; restoring one of those
+        # three baseline calls claims 31, still below global total and
+        # the possible-PRE upper bound. Current public fields do not
+        # carry the base POST. Both must refuse a qualifying claim.
+        def demoted_mid_quantum(s, d, dash, corrupt=False, lossy=False):
+            demoted_segment_setup_shape(s, d, dash)
+            edge = _edge(d, cid(s, "P1"), s.mid["A"])
+            line = re.search(r"fn=C_DigestInit mech=0x250 n=3 bad=0 phase=main t0=\d+ t1=(\d+)",
+                             s.ledgers["P1"])
+            edge["entries"]["first_seen_ns"] = int(line.group(1)) + 1500
+            edge["entries"]["count"] = 31 if corrupt else 30
+            if lossy:
+                edge["entries"]["coverage"]["lossy"] = True
+                d["gaps"].append({"caller": cid(s, "P1"), "module": s.mid["A"], "pid": None,
+                                  "subject": "native count refresh loss",
+                                  "reason": "count refresh lookup failed", "budget": None, "repeats": 1})
+
+        for corrupt, lossy in ((False, False), (True, False), (True, True)):
+            name = f"demoted-mid-quantum-{'corrupt' if corrupt else 'valid'}-{'lossy' if lossy else 'window'}-nonqualifying"
+            res = case(name, None, lambda s, d, dash: demoted_mid_quantum(s, d, dash, corrupt, lossy))
+            check = "COUNT-LOSSY" if lossy else "COUNT-WINDOW"
+            row = next((r for r in res.rows if r["run"] == "system" and r["cell"] == "P1"
+                        and r["check"] == check), None)
+            if row is None or row["status"] != "nonqualifying" or "base-read" not in row["detail"]:
+                print(f"self-test FAIL {name}: expected explicit base-read timing uncertainty, got {row}")
+                failures.append(name)
+            if not lossy and not any(r["run"] == "system" and r["cell"] == "P1"
+                                     and r["check"] == "COUNT-EXACT" and r["status"] == "nonqualifying"
+                                     for r in res.rows):
+                failures.append(name + "-exact")
+
+        # P1 re-placement: first_seen and coverage.since retain their
+        # historical minima. They cannot bound a later base lookup or
+        # prove this is a new receiving edge. Old count 1 plus growth 1
+        # is healthy 2; restoring the based call at 140 gives corrupt 3.
+        # Both fit the candidate upper bound and must remain nonqualifying.
+        # These source-derived fixture times are not public segment receipts.
+        def reentry_result(count, first_seen=100, lossy=False, demoted=True):
+            from types import SimpleNamespace
+            image = SimpleNamespace(entries=[
+                {"module": "/provider.so", "fn": "C_Initialize", "phase": "setup",
+                 "mech": "-", "n": 1, "t0": t, "t1": t} for t in (90, 120, 140, 160)])
+            use = use_in(image, "/provider.so", (0, 200))
+            edge = Synth.edge("c", "m", True, 0, 200)
+            edge["entries"].update(count=count, first_seen_ns=first_seen, last_seen_ns=180,
+                                   observation=OBSERVATION_OBSERVED)
+            edge["entries"]["coverage"].update(state="counted", since_ns=100, lossy=lossy)
+            gaps = ([{"caller": "c", "module": "m", "subject": "demoted count placed",
+                      "reason": "growth added to an edge that may already have history"}] if demoted else [])
+            if lossy:
+                gaps.append({"caller": "c", "module": "m", "subject": "native count refresh loss",
+                             "reason": "count refresh lookup failed"})
+            view = SimpleNamespace(name="system", window=(0, 200), doc={"gaps": gaps},
+                                   callers={"c": {"first_seen_ns": 0}},
+                                   modules={"m": {"admission": {"endpoints": 1}}})
+            role = SimpleNamespace(native_states=("counted",), require_counted_when_attested=False,
+                                   require_counted=True)
+            result = Results("native")
+            check_bound_edge(view, "P1", "P1", role, {"path": "/provider.so"},
+                             edge, use, image, False, result)
+            return result
+
+        def reentry_case(name, result, wanted):
+            statuses = {r["check"]: r["status"] for r in result.rows}
+            mismatch = {check: (status, statuses.get(check)) for check, status in wanted.items()
+                        if statuses.get(check) != status}
+            print(f"self-test {'FAIL' if mismatch else 'ok  '} {name}"
+                  + (f": expected/actual {mismatch}" if mismatch else ""))
+            if mismatch:
+                failures.append(name)
+
+        for first_seen, placement in ((100, "retained-history"), (180, "later-looking-observation")):
+            for count, kind in ((2, "healthy"), (3, "corrupt-restored-base")):
+                for lossy in (False, True):
+                    check = "COUNT-LOSSY" if lossy else "COUNT-WINDOW"
+                    wanted = {"COUNT-TOTAL": "pass", check: "nonqualifying"}
+                    if not lossy:
+                        wanted["COUNT-EXACT"] = "nonqualifying"
+                    reentry_case(f"demoted-{placement}-{kind}-{'lossy' if lossy else 'window'}",
+                                 reentry_result(count, first_seen, lossy), wanted)
+
+        for count in (4, 5):
+            for lossy in (False, True):
+                reentry_case(f"demoted-reentry-contradiction-{count}-{'lossy' if lossy else 'window'}",
+                             reentry_result(count, lossy=lossy),
+                             {"COUNT-TOTAL": "pass" if count == 4 else "fail",
+                              "COUNT-LOSSY" if lossy else "COUNT-WINDOW": "fail"})
+        reentry_case("ordinary-reentry-fixture-first-recording", reentry_result(4, demoted=False),
+                     {"COUNT-TOTAL": "pass", "COUNT-WINDOW": "pass", "COUNT-EXACT": "pass"})
+        reentry_case("ordinary-reentry-fixture-first-recording-lossy",
+                     reentry_result(4, lossy=True, demoted=False),
+                     {"COUNT-TOTAL": "pass", "COUNT-LOSSY": "pass"})
+
+        # Malformed marker subjects must be ignored without regex
+        # exceptions. Their reason text cannot demote a sibling edge.
+        for malformed in (None, 7):
+            def malformed_subject(s, d, dash):
+                kw = realistic_since_ledger(s, d)
+                d["gaps"].append({"caller": cid(s, "P1"), "module": s.mid["A"], "pid": None,
+                                  "subject": malformed,
+                                  "reason": "/lib/demoted count placed/provider.so",
+                                  "budget": None, "repeats": 1})
+                return kw
+            name = f"demotion-malformed-subject-{type(malformed).__name__}"
+            try:
+                res = case(name, None, malformed_subject)
+            except (TypeError, ValueError) as exc:
+                print(f"self-test FAIL {name}: {type(exc).__name__}: {exc}")
+                failures.append(name)
+                continue
+            if not any(r["run"] == "system" and r["cell"] == "P1" and r["check"] == "COUNT-EXACT"
+                       and r["status"] == "pass" for r in res.rows):
+                failures.append(name + "-ordinary-exactness")
 
         # Round 5 (sol-N2): the demotion marker matches the gap subject
         # only — an ordinary "module admission changed" gap whose

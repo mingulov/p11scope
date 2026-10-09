@@ -362,6 +362,7 @@ impl CaptureLane<Pin> for ScriptedLane {
             health_unproven,
             health_baseline_ns: 0,
             health_read_ns,
+            rows_anchor_ns: rows_read_ns,
             rows_read_ns,
             counts_read_ns: rows_read_ns,
             changed_objects: Vec::new(),

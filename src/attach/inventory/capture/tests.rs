@@ -3338,6 +3338,68 @@ fn count_lookup_stamp_precedes_the_batch_stamp() {
 }
 
 #[test]
+fn row_and_refresh_brackets_bound_interleaved_counts() {
+    // Independent hand-scripted instants: row PRE=100, row lookup=120,
+    // refresh PRE=140, refresh lookup=160, common POST=180. A count read
+    // during either quantum cannot be observed before that lookup.
+    let mut book = test_book(8, 8, None);
+    let mut fixture = SetFixture::new(8);
+    let delta = fixture.pass("a.so", 2);
+    for endpoint in &delta.endpoints {
+        book.published.insert(endpoint.id.0, endpoint.object);
+    }
+    struct InterleavedRows<'a> {
+        inner: FakeRows,
+        clock: &'a std::cell::Cell<u64>,
+        lookups: std::collections::VecDeque<(u64, u64)>,
+    }
+    impl CallerUseIo for InterleavedRows<'_> {
+        fn next_key(&mut self, after: Option<&CallerObjectKey>) -> Result<Option<CallerObjectKey>> {
+            self.inner.next_key(after)
+        }
+
+        fn lookup(&mut self, key: &CallerObjectKey) -> Result<Option<CallerObjectUse>> {
+            let (lookup_ns, count) = self.lookups.pop_front().expect("scripted count lookup");
+            let mut value = self.inner.lookup(key)?;
+            value.as_mut().unwrap().entry_count = count;
+            self.clock.set(lookup_ns + 20);
+            Ok(value)
+        }
+    }
+    let clock = std::cell::Cell::new(100);
+    let mut rows = InterleavedRows {
+        inner: FakeRows::default(),
+        clock: &clock,
+        lookups: [(120, 5), (160, 6)].into(),
+    };
+    rows.inner.insert(key(1, 0), Some(value(40, 0)));
+    let window = ReadWindow::new(16, Instant::now() + Duration::from_secs(5)).unwrap();
+    let mut batch = read_witnesses_from(None, &mut book, CapturePhase::Active, window);
+    read_rows_from_with_clock(&mut rows, &mut book, &mut batch, window, 8, &mut || {
+        clock.get()
+    });
+    assert_eq!(batch.rows[0].entry_count, 5);
+    assert_eq!(
+        batch.counts[0].count, 6,
+        "a call between lookups advances the count"
+    );
+    assert_eq!(batch.rows_anchor_ns, 100, "row PRE precedes its lookup");
+    assert_eq!(
+        batch.counts_read_ns, 140,
+        "refresh PRE precedes its own lookup"
+    );
+    assert!(
+        batch.counts_read_ns > 120,
+        "refresh PRE follows the row lookup"
+    );
+    assert!(
+        batch.rows_read_ns >= 160,
+        "observation POST bounds the refresh lookup"
+    );
+    assert_eq!(batch.rows_read_ns, 180);
+}
+
+#[test]
 fn count_refresh_with_a_zero_row_bound_reads_nothing() {
     let mut rows = FakeRows {
         batch_supported: true,

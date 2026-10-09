@@ -1877,6 +1877,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let held = self.pair_counts.entry(key).or_insert(PairCount {
                 count: 0,
                 first_ns: row.recorded_at_ns,
+                anchor_ns: batch.rows_anchor_ns,
                 last_ns: batch.rows_read_ns,
             });
             // The row sets its first record whatever arrived before: a
@@ -1884,6 +1885,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             held.first_ns = row.recorded_at_ns;
             if row.entry_count > held.count {
                 held.count = row.entry_count;
+                held.anchor_ns = batch.rows_anchor_ns;
                 held.last_ns = batch.rows_read_ns;
             }
         }
@@ -1897,19 +1899,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             ) {
                 continue;
             }
-            // Count-side stamps come from the lookup stamp (round 5,
-            // anchor skew): the refresh observed every update here at
-            // or after it, so a base read anchors at-or-before its
-            // own lookup — never after the whole quantum.
+            // Keep the refresh PRE bound for future base coverage and
+            // the common POST bound for this count's observation. Neither
+            // claims exactly when this particular pair was looked up.
             let held = {
                 let held = self.pair_counts.entry(key).or_insert(PairCount {
                     count: 0,
-                    first_ns: batch.counts_read_ns,
-                    last_ns: batch.counts_read_ns,
+                    first_ns: batch.rows_read_ns,
+                    anchor_ns: batch.counts_read_ns,
+                    last_ns: batch.rows_read_ns,
                 });
                 if update.count > held.count {
                     held.count = update.count;
-                    held.last_ns = batch.counts_read_ns;
+                    held.anchor_ns = batch.counts_read_ns;
+                    held.last_ns = batch.rows_read_ns;
                 }
                 *held
             };
@@ -1973,7 +1976,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }) = self.pair_targets.get_mut(&key)
                 {
                     *was = count.count;
-                    *was_ns = count.last_ns;
+                    *was_ns = count.anchor_ns;
                 }
             }
         }
@@ -2030,8 +2033,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     {
                         *base = count.count;
                         *staged = count.count;
-                        *staged_ns = count.last_ns;
-                        *base_since = count.last_ns;
+                        *staged_ns = count.anchor_ns;
+                        *base_since = count.anchor_ns;
                     }
                 }
                 continue;
@@ -2072,7 +2075,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }) = self.pair_targets.get_mut(&key)
                 {
                     *was = count.count;
-                    *was_ns = count.last_ns;
+                    *was_ns = count.anchor_ns;
                 }
             }
         }
@@ -2202,7 +2205,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }) = self.pair_targets.get_mut(&key)
             {
                 *staged = count.count;
-                *staged_ns = count.last_ns;
+                *staged_ns = count.anchor_ns;
             }
         }
     }
@@ -2215,7 +2218,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// past (0 for a first-sight pair): a nonzero base marks a
     /// re-resolved pair, whose rejection the publication discloses
     /// (F3-02) and whose placement accumulates by segment. `since_ns`
-    /// is the read that observed `base`: a placement windows its
+    /// is the PRE bound for the `base` read: a placement windows its
     /// coverage from there (round 4, window anchor). The minted handle
     /// maps the publication's decision back to the pair.
     fn stage_pending_count(
@@ -2316,7 +2319,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let (base, base_since) = self
             .pair_counts
             .get(&key)
-            .map(|count| (count.count, count.last_ns))
+            .map(|count| (count.count, count.anchor_ns))
             .unwrap_or((0, 0));
         self.pair_targets
             .insert(key, PairTarget::Dropped { base, base_since });
@@ -2680,6 +2683,9 @@ impl PairKey {
 struct PairCount {
     count: u64,
     first_ns: u64,
+    /// Batch PRE lower bound on the lookup that observed this absolute.
+    /// Kept separately from POST observation time when it becomes a base.
+    anchor_ns: u64,
     last_ns: u64,
 }
 
@@ -2696,6 +2702,7 @@ fn rebased_count(count: PairCount, base: u64) -> PairCount {
         } else {
             count.last_ns
         },
+        anchor_ns: count.anchor_ns,
         last_ns: count.last_ns,
     }
 }
@@ -2723,10 +2730,10 @@ enum PairTarget {
         endpoint: EndpointId,
         base: u64,
         staged: u64,
-        /// The read that observed `staged` (round 4, window anchor):
+        /// The PRE bound on the read that observed `staged`:
         /// demotion re-roots the base (and its anchor) here.
         staged_ns: u64,
-        /// The read that observed `base` (round 4, window anchor):
+        /// The PRE bound on the read that observed `base`:
         /// demoted growth stages with this as its coverage anchor, so
         /// the ledger window covers the segment the growth executed
         /// in. 0 only when `base` is 0 (nothing accounted yet).
@@ -2746,12 +2753,12 @@ enum PairTarget {
         caller: CallerId,
         modules: Vec<ModuleKey>,
         staged: u64,
-        /// The read that observed `staged` (round 4, window anchor):
+        /// The PRE bound on the read that observed `staged`:
         /// finalization folds it into the new base's anchor.
         staged_ns: u64,
         endpoint: EndpointId,
         base: u64,
-        /// The read that observed `base` (round 4, window anchor):
+        /// The PRE bound on the read that observed `base`:
         /// demoted growth stages with this as its coverage anchor.
         /// The pair's first record while unbased.
         base_since: u64,
@@ -2761,7 +2768,7 @@ enum PairTarget {
     /// but `base` remembers the absolute count through the drop
     /// (attributed or disclosed history), so a later witness row for
     /// the same pair rebinds past it instead of re-absorbing it (round
-    /// 4, rebind). `base_since` is the read that observed `base`: a
+    /// 4, rebind). `base_since` is the PRE bound for the `base` read: a
     /// revival's growth windows from the drop.
     Dropped { base: u64, base_since: u64 },
 }
@@ -4556,6 +4563,7 @@ mod tests {
             health_unproven: None,
             health_baseline_ns: 0,
             health_read_ns: 150,
+            rows_anchor_ns: 151,
             rows_read_ns: 151,
             counts_read_ns: 151,
             changed_objects: Vec::new(),
@@ -5251,6 +5259,7 @@ mod tests {
             read.rows = rows;
             read.health.discovery_counters = Some([0; 5]);
             read.health_read_ns = at;
+            read.rows_anchor_ns = at + 1;
             read.rows_read_ns = at + 1;
             read.counts_read_ns = at + 1;
             NativeBatch::Witness(Box::new(read))
@@ -5362,6 +5371,7 @@ mod tests {
                 .collect();
             batch.health.discovery_counters = Some([0; 5]);
             batch.health_read_ns = at;
+            batch.rows_anchor_ns = at + 1;
             batch.rows_read_ns = at + 1;
             batch.counts_read_ns = at + 1;
             self.stage(NativeBatch::Witness(Box::new(batch)))
@@ -5739,6 +5749,7 @@ mod tests {
             PairCount {
                 count: 5,
                 first_ns: 100,
+                anchor_ns: 100,
                 last_ns: 200,
             },
             100,
@@ -7482,6 +7493,164 @@ mod tests {
             },
             "the demoted edge windows from the base lookup, not the late batch stamp"
         );
+    }
+
+    fn assert_demoted_read_brackets(initial_row: bool) {
+        // A baseline lookup sees five calls; growth after that lookup
+        // must transfer once. The pre-read anchor and post-read observation
+        // bound are different instants on both first-row and refresh paths.
+        use crate::discovery::inventory_attach_set::tests as fx;
+        let (mut native, caller) = NativeScene::new();
+        native.answer(7, 500, 41);
+        if !initial_row {
+            let row_a = native.row(41, 1, 7, 100, 0);
+            native.witness(vec![row_a]);
+        }
+        // History while A is the sole owner, at a skewed read: looked
+        // up at `h`, batch-stamped after the quantum.
+        let h = native.stamps.tick();
+        let mut history = witness_batch();
+        history.domain = native.domain;
+        if initial_row {
+            let mut row = native.row(41, 1, 7, 100, 0);
+            row.entry_count = 5;
+            history.rows = vec![row];
+        } else {
+            history.counts = vec![crate::attach::capture::CallerCountUpdate {
+                image: p11scope_ebpf_common::ImageIdentity {
+                    task_cookie: 41,
+                    exec_id: 1,
+                },
+                object: native.scene.delta.endpoints[0].object,
+                count: 5,
+            }];
+        }
+        history.health.discovery_counters = Some([0; 5]);
+        history.health_read_ns = h;
+        history.rows_anchor_ns = h;
+        let base_lookup = h + 10;
+        let base_post = h + 30;
+        history.rows_read_ns = base_post;
+        history.counts_read_ns = if initial_row { h + 20 } else { h };
+        native.stage(NativeBatch::Witness(Box::new(history)));
+        if initial_row {
+            // Binding needs a lifecycle drain strictly after this read's
+            // POST, followed by its count horizon. The skewed POST is later
+            // than the next ordinary fixture tick.
+            native.stamps.0.set(base_post);
+            native.drain();
+            native.read(Vec::new());
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let b = fx::provider(&native.scene._dir, "b.so", "provider-b");
+        let a_path = native.scene.path.clone();
+        native.scene.pins = fx::pass_pins(&[(&a_path, "sha-a"), (&b, "sha-b")]);
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let absorbed_b = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module_with_targets(
+                    &native.scene.pins,
+                    &b,
+                    &[(&a_path, 0x1000)],
+                )),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(absorbed_b.verdicts);
+        let shared = native.scene.delta.endpoints[0];
+        native.scene.project_paths(7, &[&a_path, &b], 200);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let policy =
+            crate::plan::AdmissionPolicy::Inventory(native.scene.coordinator.attach_set.budget());
+        let relowered = native.scene.coordinator.attach_set.absorb(
+            &fx::lower_named(
+                std::slice::from_ref(&fx::module(&native.scene.pins, &a_path, &[])),
+                &native.scene.pins,
+                policy,
+            ),
+            &native.scene.pins,
+        );
+        native.scene.verdicts.extend(relowered.verdicts);
+        // One advance past the history, at a later read.
+        let at = native.stamps.tick();
+        let mut batch = witness_batch();
+        batch.domain = native.domain;
+        batch.counts = vec![crate::attach::capture::CallerCountUpdate {
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+            object: shared.object,
+            count: 6,
+        }];
+        batch.health.discovery_counters = Some([0; 5]);
+        batch.health_read_ns = at;
+        let growth_lookup = at + 20;
+        let growth_post = at + 30;
+        batch.rows_read_ns = growth_post;
+        batch.counts_read_ns = at + 10;
+        native.stage(NativeBatch::Witness(Box::new(batch)));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let edge_of = |needle: &str| {
+            registry
+                .edges()
+                .find(|edge| {
+                    edge.caller == caller
+                        && registry.module(edge.module).is_some_and(|module| {
+                            module.paths.iter().any(|path| path.contains(needle))
+                        })
+                })
+                .unwrap()
+        };
+        let edge_b = edge_of("b.so");
+        assert_eq!(edge_b.entry_count, 1, "B carries only post-demotion growth");
+        let edge_a = edge_of("a.so");
+        assert_eq!(
+            edge_a.entry_count, 5,
+            "A keeps exactly its historical count"
+        );
+        assert_eq!(
+            edge_a.entry_count + edge_b.entry_count,
+            6,
+            "no growth duplication"
+        );
+        let UseCoverage::Counted { since_ns, lossy } = registry.coverage(edge_b) else {
+            panic!("the demoted growth must retain counted coverage");
+        };
+        assert!(!lossy);
+        assert!(
+            since_ns <= base_lookup,
+            "coverage cannot begin after its base lookup"
+        );
+        assert_eq!(
+            since_ns, h,
+            "coverage keeps the base PRE bound, not its observation POST"
+        );
+        assert!(
+            edge_a.entry_last_seen_ns.unwrap() >= base_lookup,
+            "the history observation cannot predate its baseline lookup"
+        );
+        assert_eq!(edge_a.entry_last_seen_ns, Some(base_post));
+        assert!(
+            edge_b.entry_first_seen_ns.unwrap() >= growth_lookup,
+            "the growth observation cannot predate its own lookup"
+        );
+        assert_eq!(edge_b.entry_first_seen_ns, Some(growth_post));
+        assert_eq!(edge_b.entry_last_seen_ns, Some(growth_post));
+    }
+
+    #[test]
+    fn demoted_initial_row_keeps_anchor_before_lookup_and_observation_after_lookup() {
+        assert_demoted_read_brackets(true);
+    }
+
+    #[test]
+    fn demoted_refresh_keeps_anchor_before_lookup_and_observation_after_lookup() {
+        assert_demoted_read_brackets(false);
     }
 
     #[test]

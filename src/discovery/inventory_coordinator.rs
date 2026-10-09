@@ -27,9 +27,11 @@ use super::inventory::{
     RefreshCause, ScanReceipt,
 };
 use super::*;
+#[cfg(test)]
+use crate::attach::capture::ScopeIncarnation;
 use crate::attach::capture::{
-    CallerCountUpdate, DiscoveryBatch, DomainCookie, ExtendReceipt, LifecycleLoss, NativeDomainId,
-    ScopeCustody, ScopeIncarnation, WitnessBatch, WitnessRow,
+    CallerCountUpdate, CaptureScopeCoverage, DiscoveryBatch, DomainCookie, ExtendReceipt,
+    LifecycleLoss, NativeDomainId, ScopeCustody, WitnessBatch, WitnessRow,
 };
 use crate::capacity::InventoryBudget;
 use crate::discovery::caller_registry::{
@@ -847,11 +849,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     /// Native capture starts: from now on each scan projection stages a
     /// coverage note per mapped edge from the capture's attach receipts.
-    /// `scope` is the capture's PID incarnation (`None` for the machine):
+    /// `scope` is explicitly System, Cgroup, or the capture's PID incarnation:
     /// only a caller of that pid whose start time matches, and the first
     /// such caller (image) only, is in scope — a reused pid never is.
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 starts native capture.
-    pub(crate) fn begin_capture_coverage(&mut self, scope: Option<ScopeIncarnation>) {
+    pub(crate) fn begin_capture_coverage(&mut self, scope: CaptureScopeCoverage) {
         self.capture = Some(CaptureCoverage {
             scope,
             bound: None,
@@ -1048,7 +1050,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return;
         };
         let (at_ns, reason) = match custody {
-            ScopeCustody::System | ScopeCustody::PidHeld => return,
+            ScopeCustody::System | ScopeCustody::PidHeld | ScopeCustody::CgroupHeld => return,
             ScopeCustody::PidUnproven { at_ns, reason } => (*at_ns, reason.clone()),
             ScopeCustody::PidLost { at_ns, reason } => (*at_ns, reason.clone()),
         };
@@ -1156,7 +1158,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         capture
             .changed_objects
             .extend(batch.changed_objects.iter().copied());
-        let custody_held = matches!(batch.custody, ScopeCustody::System | ScopeCustody::PidHeld);
+        let custody_held = matches!(
+            batch.custody,
+            ScopeCustody::System | ScopeCustody::PidHeld | ScopeCustody::CgroupHeld
+        );
         // Only a completed, gap-free CALLER_USE sweep has visited every row
         // present when it began, so it proves that sweep's first health
         // read; a bounded read that stopped mid-sweep proves nothing.
@@ -1308,8 +1313,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let Some(capture) = self.capture.as_mut() else {
             return ScopeVerdict::Outside;
         };
-        let Some(scope) = capture.scope else {
-            return ScopeVerdict::Inside;
+        let scope = match capture.scope {
+            CaptureScopeCoverage::System => return ScopeVerdict::Inside,
+            CaptureScopeCoverage::Cgroup => return ScopeVerdict::Cgroup,
+            CaptureScopeCoverage::Pid(scope) => scope,
         };
         if scope.pid != pid {
             return ScopeVerdict::Outside;
@@ -1365,7 +1372,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     "a later image of the PID target: its scope custody covers the first image only",
                 );
             }
-            ScopeVerdict::Inside => {}
+            ScopeVerdict::Inside | ScopeVerdict::Cgroup => {}
         }
         if let Some(reason) = &capture.unproven {
             return loss(reason);
@@ -1418,6 +1425,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return unknown(UnknownReason::Uncounted(reason.clone()));
         }
         match since_ns {
+            Some(_) if scope == ScopeVerdict::Cgroup => {
+                unknown(UnknownReason::ScopeMembershipUnproven)
+            }
             Some(_) if capture.health_unproven.is_some() || capture.pairs_unproven.is_some() => {
                 None
             }
@@ -4827,7 +4837,7 @@ impl PairRecovery {
 /// Per-endpoint attach state from the capture facade's receipts. Bounded by
 /// the endpoint budget N: each endpoint is attached or failed at most once.
 struct CaptureCoverage {
-    scope: Option<ScopeIncarnation>,
+    scope: CaptureScopeCoverage,
     /// The first caller proven to be the scope incarnation.
     bound: Option<CallerId>,
     attached_at: BTreeMap<EndpointId, u64>,
@@ -4993,6 +5003,8 @@ fn pair_precondition_failure(batch: &WitnessBatch) -> Option<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScopeVerdict {
     Inside,
+    /// Admitted cgroup caller, with no continuous-membership timeline.
+    Cgroup,
     /// Another process (a different pid, or a reused one).
     Outside,
     /// The pid matches but a start time is unreadable: unprovable.
@@ -6022,7 +6034,7 @@ mod tests {
         );
 
         // A capture scoped to another process stages nothing for this one.
-        coordinator.begin_capture_coverage(Some(ScopeIncarnation {
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::Pid(ScopeIncarnation {
             pid: pid + 1,
             start_time: crate::process::process_start_time(pid).ok(),
         }));
@@ -6033,7 +6045,7 @@ mod tests {
             UseCoverage::Unknown(UnknownReason::ScanOnly)
         );
 
-        coordinator.begin_capture_coverage(Some(ScopeIncarnation {
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::Pid(ScopeIncarnation {
             pid,
             start_time: crate::process::process_start_time(pid).ok(),
         }));
@@ -6138,7 +6150,7 @@ mod tests {
             exe: crate::discovery::caller_registry::read_exe_identity(pid),
         });
         let catalog = capture_catalog(&pins, &[&a], pid, generation);
-        coordinator.begin_capture_coverage(None);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
         coordinator.project_catalog(&catalog, &verdicts, 60);
         coordinator.registry.publish();
         let endpoint = |id: u32| absorbed.delta.endpoints[id as usize];
@@ -6241,7 +6253,7 @@ mod tests {
             exe: crate::discovery::caller_registry::read_exe_identity(pid),
         });
         let catalog = capture_catalog(&pins, &[&a], pid, generation);
-        coordinator.begin_capture_coverage(None);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
         coordinator.project_catalog(&catalog, &verdicts, 60);
         coordinator.registry.publish();
         let endpoint = |id: u32| absorbed.delta.endpoints[id as usize];
@@ -6343,7 +6355,7 @@ mod tests {
         // A commits; B's mapping stages but does NOT publish before its
         // deferred receipt.
         let catalog_a = capture_catalog(&pins, &[&a], pid, generation.clone());
-        coordinator.begin_capture_coverage(None);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
         coordinator.project_catalog(&catalog_a, &verdicts, 60);
         coordinator.registry.publish();
         let catalog_b = capture_catalog(&pins, &[&b], pid, generation);
@@ -6425,7 +6437,7 @@ mod tests {
             &pins,
         );
         let key = absorbed.verdicts.keys().next().unwrap().clone();
-        coordinator.begin_capture_coverage(None);
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::System);
         coordinator.note_extend_receipt(&ExtendReceipt {
             attached: absorbed
                 .delta
@@ -6588,8 +6600,8 @@ mod tests {
         )
     }
 
-    fn incarnation(pid: u32, start_time: u64) -> Option<ScopeIncarnation> {
-        Some(ScopeIncarnation {
+    fn incarnation(pid: u32, start_time: u64) -> CaptureScopeCoverage {
+        CaptureScopeCoverage::Pid(ScopeIncarnation {
             pid,
             start_time: Some(start_time),
         })
@@ -6632,6 +6644,99 @@ mod tests {
             lifecycle_loss: None,
             unsettled: false,
         }
+    }
+
+    #[test]
+    fn cgroup_receipts_and_clean_reads_never_claim_quiet_membership() {
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn(7, 500);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        scene.attach_all(100, ScopeCustody::CgroupHeld);
+        let mut clean = witness_batch();
+        clean.custody = ScopeCustody::CgroupHeld;
+        for at in [120, 180] {
+            scene.coordinator.note_witness_batch(&clean);
+            scene.project(7, at);
+            scene.coordinator.commit_batch(false).unwrap();
+            assert_eq!(
+                scene.coverage(caller),
+                UseCoverage::Unknown(UnknownReason::ScopeMembershipUnproven)
+            );
+        }
+        assert_eq!(
+            scene.coordinator.capture_scope_verdict(caller, 7),
+            ScopeVerdict::Cgroup
+        );
+        scene.coordinator.end_capture_coverage(200);
+        scene.project(7, 250);
+        scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            scene.coverage(caller),
+            UseCoverage::Unknown(UnknownReason::ScopeMembershipUnproven)
+        );
+    }
+
+    #[test]
+    fn cgroup_membership_uncertainty_preserves_counted_positive_history() {
+        let (mut native, caller) = NativeScene::new();
+        native
+            .scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        native.scene.attach_all(100, ScopeCustody::CgroupHeld);
+        native.scene.project(7, 120);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Unknown(UnknownReason::ScopeMembershipUnproven)
+        );
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 100, 0);
+        let cgroup_read = |native: &NativeScene, rows| {
+            let NativeBatch::Witness(mut batch) = native.stamps.read(native.domain, rows) else {
+                unreachable!("the scripted read constructs a witness batch")
+            };
+            batch.custody = ScopeCustody::CgroupHeld;
+            batch
+        };
+        native.stage(NativeBatch::Witness(cgroup_read(&native, vec![row])));
+        native.drain();
+        native.stage(NativeBatch::Witness(cgroup_read(&native, Vec::new())));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let mut refreshed = cgroup_read(&native, Vec::new());
+        refreshed.counts = vec![crate::attach::capture::CallerCountUpdate {
+            image: p11scope_ebpf_common::ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+            object: native.scene.delta.endpoints[0].object,
+            count: 7,
+        }];
+        native.stage(NativeBatch::Witness(refreshed));
+        native.scene.project(7, 2000);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Counted {
+                since_ns: 100,
+                lossy: false
+            }
+        );
+        let edge = native
+            .scene
+            .coordinator
+            .registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .unwrap();
+        assert_eq!(edge.entry_count, 7);
     }
 
     #[test]
@@ -6758,7 +6863,7 @@ mod tests {
             .unwrap();
         blind
             .coordinator
-            .begin_capture_coverage(Some(ScopeIncarnation {
+            .begin_capture_coverage(CaptureScopeCoverage::Pid(ScopeIncarnation {
                 pid: 11,
                 start_time: None,
             }));
@@ -7171,7 +7276,9 @@ mod tests {
             .adapter
             .admit(7, ImageAuthority::ScanPinned, 50)
             .unwrap();
-        scene.coordinator.begin_capture_coverage(None);
+        scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
         scene.attach_all(100, ScopeCustody::System);
         scene.project(7, 120);
         let mut clean = witness_batch();
@@ -7642,7 +7749,10 @@ mod tests {
         // C7 C4: a count is a positive fact like its witness, so it
         // stages after stop too.
         let (mut native, caller) = NativeScene::new();
-        native.scene.coordinator.begin_capture_coverage(None);
+        native
+            .scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
         native.scene.coordinator.end_capture_coverage(90);
         native.answer(7, 500, 41);
         let row = native.row(41, 1, 7, 100, 0);
@@ -10300,7 +10410,10 @@ mod tests {
         let (mut native, caller) = NativeScene::new();
         // Production order: capture coverage begins before the reads, so
         // witness batches run the coverage half (health, freshness).
-        native.scene.coordinator.begin_capture_coverage(None);
+        native
+            .scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
         native.answer(7, 500, 41);
         let row = native.row(41, 1, 7, 100, 0);
         native.witness(vec![row]);
@@ -10385,7 +10498,10 @@ mod tests {
         // stale count.
         use crate::inventory_present::{Activity, Presentation};
         let (mut native, caller) = NativeScene::new();
-        native.scene.coordinator.begin_capture_coverage(None);
+        native
+            .scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
         native.answer(7, 500, 41);
         let row = native.row(41, 1, 7, 100, 0);
         native.witness(vec![row]);
@@ -10452,7 +10568,10 @@ mod tests {
         // is withheld even though no live loss was ever recorded.
         use crate::inventory_present::{Activity, Presentation};
         let (mut native, caller) = NativeScene::new();
-        native.scene.coordinator.begin_capture_coverage(None);
+        native
+            .scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
         native.answer(7, 500, 41);
         let row = native.row(41, 1, 7, 100, 0);
         native.witness(vec![row]);
@@ -10618,7 +10737,10 @@ mod tests {
             "the display goes quiet past its window"
         );
         // Unreadable: the refresh fails persistently.
-        native.scene.coordinator.begin_capture_coverage(None);
+        native
+            .scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
         for _ in 0..2 {
             let at = native.stamps.tick();
             let mut batch = witness_batch();
@@ -11368,7 +11490,9 @@ mod tests {
             .adapter
             .admit(7, ImageAuthority::ScanPinned, 50)
             .unwrap();
-        scene.coordinator.begin_capture_coverage(None);
+        scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::System);
         let mut native = NativeScene::over(scene, 0);
         native.scene.attach_all(100, ScopeCustody::System);
         native.scene.project(7, 120);

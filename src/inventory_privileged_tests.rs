@@ -7,8 +7,8 @@
 
 use super::*;
 use crate::attach::capture::{
-    CaptureTargets, CleanupSummary, CookieQuery, DiscoveryBatch, ExtendReceipt, ExtendWindow,
-    NativeDomainId, ReadWindow, ScopeIncarnation, WitnessBatch,
+    CaptureScopeCoverage, CaptureTargets, CleanupSummary, CookieQuery, DiscoveryBatch,
+    ExtendReceipt, ExtendWindow, NativeDomainId, ReadWindow, WitnessBatch,
 };
 use crate::discovery::caller_registry::UseCoverage;
 use crate::discovery::inventory_attach_set::TargetDelta;
@@ -251,8 +251,8 @@ impl<L: CaptureLane<PidPin>> CaptureLane<PidPin> for Probe<L> {
         self.inner.live_links()
     }
 
-    fn incarnation(&self) -> Option<ScopeIncarnation> {
-        self.inner.incarnation()
+    fn scope_coverage(&self) -> CaptureScopeCoverage {
+        self.inner.scope_coverage()
     }
 
     fn extend(

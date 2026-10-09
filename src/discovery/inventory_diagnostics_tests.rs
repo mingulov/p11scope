@@ -333,7 +333,11 @@ fn global_refresh_loss_and_stop_remain_visible_under_pid_filter() {
         ..DiagnosticConfig::default()
     }));
     for scene in [&mut disabled, &mut filtered] {
-        scene.native.scene.coordinator.begin_capture_coverage(None);
+        scene
+            .native
+            .scene
+            .coordinator
+            .begin_capture_coverage(crate::attach::capture::CaptureScopeCoverage::System);
         scene
             .native
             .scene

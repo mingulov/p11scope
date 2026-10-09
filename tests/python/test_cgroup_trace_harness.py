@@ -20,6 +20,31 @@ ROOT = Path(__file__).resolve().parents[2]
 HARNESS = runpy.run_path(str(ROOT / 'scripts/qualify-cgroup-trace.py'))
 
 
+class CleanupTests(unittest.TestCase):
+    def test_process_cleanup_attempts_every_owner_and_retains_every_error(self):
+        owners = [mock.Mock(), mock.Mock()]
+        failures = [ValueError('wrong birth'), OSError('pidfd refused')]
+        namespace = HARNESS['cleanup_processes'].__globals__
+        with mock.patch.dict(namespace, terminate=mock.Mock(side_effect=failures)):
+            with self.assertRaises(RuntimeError) as raised:
+                HARNESS['cleanup_processes'](owners)
+            self.assertEqual(raised.exception.errors, tuple(failures))
+            self.assertEqual(namespace['terminate'].call_count, 2)
+        for owner in owners:
+            owner.close.assert_called_once_with()
+
+    def test_cgroup_cleanup_attempts_every_group_and_retains_every_error(self):
+        groups = [mock.Mock(), mock.Mock()]
+        failures = [OSError('parent replaced'), ValueError('still populated')]
+        groups[1].remove.side_effect = failures[0]
+        groups[0].remove.side_effect = failures[1]
+        with self.assertRaises(RuntimeError) as raised:
+            HARNESS['cleanup_cgroups'](groups)
+        self.assertEqual(raised.exception.errors, tuple(failures))
+        for group in groups:
+            group.remove.assert_called_once_with()
+
+
 class ReadinessTests(unittest.TestCase):
     # Replay the installed run's actual startup shape: initial zero provider
     # probes, complete native setup, and dynamically captured setup completion.
@@ -205,7 +230,7 @@ class AcquisitionTests(unittest.TestCase):
                     HARNESS['create_cgroup'](path, groups)
                 path.rename(original)
                 path.mkdir()
-                with self.assertRaises(ExceptionGroup):
+                with self.assertRaises(HARNESS['CleanupError']):
                     HARNESS['cleanup_cgroups'](groups)
                 self.assertTrue(path.is_dir())
                 self.assertTrue(original.is_dir())

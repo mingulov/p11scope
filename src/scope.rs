@@ -17,6 +17,10 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::path::Path;
 use std::sync::Arc;
 
+// The bounded inventory collector is wired by the cgroup integration packages.
+#[allow(dead_code)]
+pub(crate) mod inventory_cgroup;
+
 /// Opens and retains a cgroup directory for userspace walking and kernel publication.
 /// Every path component must be a real directory: symlinks are refused
 /// (ELOOP surfaces as a loud error) so scope can never silently wander.

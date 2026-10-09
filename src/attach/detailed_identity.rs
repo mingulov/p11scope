@@ -65,6 +65,7 @@ struct Authority {
     coverage: TraceCoverage,
     numbering_agrees: bool,
     ledger: Mutex<ProofLedger>,
+    cgroup_clock: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     clock: std::sync::atomic::AtomicU64,
     #[cfg(test)]
@@ -83,6 +84,56 @@ struct ProofLedger {
     pending: BTreeMap<SeedId, PendingSlot>,
     pids: BTreeMap<u32, SeedId>,
     cgroup_views: BTreeMap<ProcessViewId, (SeedId, ViewAdmission)>,
+    accepted: BTreeMap<SeedId, AcceptedSlot>,
+    accepted_keys: BTreeMap<ProcessKey, SeedId>,
+}
+struct AcceptedSlot {
+    pid: u32,
+    view: ProcessViewId,
+    admission: ViewAdmission,
+    key: ProcessKey,
+    requested_after: Option<u64>,
+    interest_serial: u64,
+}
+/// A session-bound nonowning alias. Never extends receipt or pidfd lifetime.
+pub(crate) struct CgroupInterest {
+    authority: std::sync::Weak<Authority>,
+    id: SeedId,
+    view: ProcessViewId,
+    admission: ViewAdmission,
+    serial: u64,
+}
+impl CgroupInterest {
+    fn detach(&self) {
+        let Some(authority) = self.authority.upgrade() else {
+            return;
+        };
+        let mut ledger = authority.ledger.lock().unwrap_or_else(|e| e.into_inner());
+        if ledger
+            .accepted
+            .get(&self.id)
+            .is_some_and(|slot| slot.interest_serial == self.serial)
+            && ledger
+                .cgroup_views
+                .get(&self.view)
+                .is_some_and(|(id, admission)| {
+                    *id == self.id && admission.same_allocation(&self.admission)
+                })
+        {
+            ledger.cgroup_views.remove(&self.view);
+            if let Some(accepted) = ledger.accepted.get(&self.id) {
+                let pid = accepted.pid;
+                if ledger.pids.get(&pid) == Some(&self.id) {
+                    ledger.pids.remove(&pid);
+                }
+            }
+        }
+    }
+}
+impl Drop for CgroupInterest {
+    fn drop(&mut self) {
+        self.detach();
+    }
 }
 
 #[derive(Clone)]
@@ -113,6 +164,7 @@ impl ProofSession {
                 coverage,
                 numbering_agrees,
                 ledger: Mutex::new(ProofLedger::default()),
+                cgroup_clock: std::sync::atomic::AtomicU64::new(0),
                 #[cfg(test)]
                 clock: std::sync::atomic::AtomicU64::new(100),
                 #[cfg(test)]
@@ -199,6 +251,29 @@ impl ProofSession {
     }
 }
 impl EntryReservation {
+    fn grow_work(&mut self) -> Result<(), TraceProofUnknown> {
+        let mut ledger = self
+            .authority
+            .ledger
+            .lock()
+            .map_err(|_| TraceProofUnknown::Unreadable)?;
+        if ledger.exhausted || ledger.loss_epoch != self.epoch {
+            return Err(TraceProofUnknown::LifecycleLoss);
+        }
+        let extra = SAMPLE_WORK_BYTES
+            .checked_sub(self.bytes)
+            .ok_or(TraceProofUnknown::Budget)?;
+        let total = ledger
+            .path_bytes
+            .checked_add(extra)
+            .ok_or(TraceProofUnknown::Budget)?;
+        if total > PATH_CAP {
+            return Err(TraceProofUnknown::Budget);
+        }
+        ledger.path_bytes = total;
+        self.bytes = SAMPLE_WORK_BYTES;
+        Ok(())
+    }
     fn shrink(&mut self, bytes: usize) -> Result<(), TraceProofUnknown> {
         if bytes > self.bytes || bytes > IMAGE_PATH_CAP {
             return Err(TraceProofUnknown::Budget);
@@ -270,7 +345,40 @@ enum PendingTiming {
         registered_ns: u64,
         deadline: u64,
         view: ProcessViewId,
+        state: CgroupState,
     },
+}
+#[derive(Default)]
+struct CgroupState {
+    first_start: Option<u64>,
+    completed: Option<u64>,
+    starts: u8,
+    second: Option<Witness>,
+    contradiction: Option<u64>,
+    parked: bool,
+    redundant: Option<SeedId>,
+}
+pub(crate) enum CgroupAction {
+    Idle,
+    Sample,
+    Confirm,
+    Parked,
+}
+pub(crate) struct CgroupStatus {
+    pub(crate) action: CgroupAction,
+    pub(crate) needs_health: bool,
+    pub(crate) ready_to_transfer: bool,
+    pub(crate) deadline: u64,
+}
+#[cfg(test)]
+pub(crate) struct CgroupSnapshot {
+    pub(crate) first_start: Option<u64>,
+    pub(crate) completed: Option<u64>,
+    pub(crate) starts: u8,
+    pub(crate) upper: Option<u64>,
+    pub(crate) contradiction: Option<u64>,
+    pub(crate) arm: Option<u64>,
+    pub(crate) parked: bool,
 }
 impl PendingTiming {
     fn start(&self) -> u64 {
@@ -305,6 +413,7 @@ impl TraceSeed {
 pub(crate) struct CgroupCandidate {
     view: ProcessViewId,
     admission: ViewAdmission,
+    identity: Option<ExeIdentity>,
     entry: EntryReservation,
 }
 impl CgroupCandidate {
@@ -315,18 +424,21 @@ impl CgroupCandidate {
 pub(crate) enum TraceCandidateBody {
     PidSystem(TraceSeed),
     Cgroup(CgroupCandidate),
+    Accepted(CgroupInterest),
 }
 impl TraceCandidateBody {
     pub(crate) fn id(&self) -> SeedId {
         match self {
             Self::PidSystem(seed) => seed.id(),
             Self::Cgroup(candidate) => candidate.id(),
+            Self::Accepted(interest) => interest.id,
         }
     }
     pub(crate) fn view_id(&self) -> ProcessViewId {
         match self {
             Self::PidSystem(seed) => seed.view_id(),
             Self::Cgroup(candidate) => candidate.view,
+            Self::Accepted(interest) => interest.view,
         }
     }
 }
@@ -342,7 +454,11 @@ impl ProofTap {
         self.proof.authority.discovery.same_allocation(domain)
     }
     pub(crate) fn read_started(&self) -> Option<u64> {
-        self.proof.now()
+        if self.proof.is_cgroup() {
+            self.proof.cgroup_now()
+        } else {
+            self.proof.now()
+        }
     }
     pub(crate) fn observe_call(&self, event: &Event) {
         if event.event_type == p11scope_ebpf_common::event_type::CALL {
@@ -351,7 +467,11 @@ impl ProofTap {
                 event.ts_ns,
                 event.image.task_cookie,
                 event.image.exec_id,
-                self.proof.now(),
+                if self.proof.is_cgroup() {
+                    self.proof.cgroup_now()
+                } else {
+                    self.proof.now()
+                },
             );
         }
     }
@@ -439,6 +559,23 @@ impl ProofLedger {
                 self.cgroup_views.remove(&view);
             }
         }
+        if let Some(slot) = self.accepted.remove(&id) {
+            if self.accepted_keys.get(&slot.key) == Some(&id) {
+                self.accepted_keys.remove(&slot.key);
+            }
+            if self.pids.get(&slot.pid) == Some(&id) {
+                self.pids.remove(&slot.pid);
+            }
+            if self
+                .cgroup_views
+                .get(&slot.view)
+                .is_some_and(|(seed, admission)| {
+                    *seed == id && admission.same_allocation(&slot.admission)
+                })
+            {
+                self.cgroup_views.remove(&slot.view);
+            }
+        }
     }
 }
 impl Drop for TraceSeed {
@@ -474,6 +611,44 @@ impl ProofSession {
     pub(crate) fn same_allocation(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.authority, &other.authority)
     }
+    pub(crate) fn cgroup_now(&self) -> Option<u64> {
+        let now = self.now()?;
+        let prior = self
+            .authority
+            .cgroup_clock
+            .fetch_max(now, std::sync::atomic::Ordering::Relaxed);
+        (now >= prior).then_some(now)
+    }
+    pub(crate) fn invalidate_cgroup_work(&self) {
+        if self.is_cgroup()
+            && let Ok(mut ledger) = self.ledger()
+        {
+            ledger.advance_epoch();
+        }
+    }
+    pub(crate) fn cgroup_read_status(&self, id: SeedId) -> Result<(), TraceProofUnknown> {
+        let ledger = self.ledger()?;
+        let slot = ledger
+            .pending
+            .get(&id)
+            .ok_or(TraceProofUnknown::TargetGone)?;
+        if let Some(reason) = ledger.slot_problem(slot) {
+            return Err(reason);
+        }
+        let PendingTiming::Cgroup { view, state, .. } = &slot.timing else {
+            return Err(TraceProofUnknown::DomainMismatch);
+        };
+        if state.parked
+            || !ledger
+                .cgroup_views
+                .get(view)
+                .is_some_and(|(seed, _)| *seed == id)
+            || ledger.pids.get(&slot.pid) != Some(&id)
+        {
+            return Err(TraceProofUnknown::TargetGone);
+        }
+        Ok(())
+    }
     pub(crate) fn is_cgroup(&self) -> bool {
         matches!(self.authority.coverage.scope, CoveredScope::Cgroup)
     }
@@ -493,7 +668,21 @@ impl ProofSession {
             .pidfd()
             .map_err(|_| TraceProofUnknown::Unreadable)?;
         view.start_time().ok_or(TraceProofUnknown::Unreadable)?;
-        work.cgroup_check(self, u64::MAX)?;
+        let now = work.cgroup_check(self, u64::MAX)?;
+        {
+            let ledger = self.ledger()?;
+            if let Some((id, admission)) = ledger.cgroup_views.get(&view.id()) {
+                let accepted = ledger
+                    .accepted
+                    .get(id)
+                    .ok_or(TraceProofUnknown::ProofPending)?;
+                if !admission.same_allocation(&view.view_admission())
+                    || !accepted.requested_after.is_some_and(|copy| now > copy)
+                {
+                    return Err(TraceProofUnknown::ProofPending.into());
+                }
+            }
+        }
         let entry = self.reserve(0)?;
         // G is the fresh checked completion stamp after acquiring the sole charge.
         let registered_ns = work.cgroup_check(self, u64::MAX)?;
@@ -509,7 +698,10 @@ impl ProofSession {
             if ledger.exhausted || entry.epoch != ledger.loss_epoch {
                 return Err(TraceProofUnknown::LifecycleLoss.into());
             }
-            if ledger.pids.contains_key(&view.pid()) || ledger.cgroup_views.contains_key(&view.id())
+            if ledger
+                .pids
+                .get(&view.pid())
+                .is_some_and(|id| !ledger.accepted.contains_key(id))
             {
                 return Err(TraceProofUnknown::ProofPending.into());
             }
@@ -522,6 +714,7 @@ impl ProofSession {
                         registered_ns,
                         deadline,
                         view: view.id(),
+                        state: CgroupState::default(),
                     },
                     epoch,
                     witness: None,
@@ -538,6 +731,7 @@ impl ProofSession {
             view: view.id(),
             admission,
             entry,
+            identity: None,
         })
     }
     pub(crate) fn cgroup_registration_status(
@@ -591,6 +785,236 @@ impl ProofSession {
             && admission.same_allocation(&candidate.admission)
         {
             ledger.remove(candidate.id());
+        }
+    }
+    pub(crate) fn cgroup_interest_status(
+        &self,
+        interest: &CgroupInterest,
+        view: &crate::process::ProcessView,
+    ) -> Result<bool, TraceProofUnknown> {
+        if !std::sync::Weak::ptr_eq(&interest.authority, &Arc::downgrade(&self.authority))
+            || interest.view != view.id()
+            || !interest.admission.same_allocation(&view.view_admission())
+        {
+            return Err(TraceProofUnknown::TargetGone);
+        }
+        let ledger = self.ledger()?;
+        if !ledger
+            .accepted
+            .get(&interest.id)
+            .is_some_and(|slot| slot.interest_serial == interest.serial)
+        {
+            return Err(TraceProofUnknown::NotSeeded);
+        }
+        let Some((id, admission)) = ledger.cgroup_views.get(&interest.view) else {
+            return Err(TraceProofUnknown::NotSeeded);
+        };
+        if *id != interest.id || !admission.same_allocation(&interest.admission) {
+            return Err(TraceProofUnknown::NotSeeded);
+        }
+        Ok(ledger
+            .accepted
+            .get(id)
+            .ok_or(TraceProofUnknown::NotSeeded)?
+            .requested_after
+            .is_some())
+    }
+    pub(crate) fn redirect_cgroup(
+        &self,
+        candidate: &CgroupCandidate,
+        view: &crate::process::ProcessView,
+    ) -> Option<CgroupInterest> {
+        if !self.owns(&candidate.entry)
+            || view.id() != candidate.view
+            || !view.view_admission().same_allocation(&candidate.admission)
+        {
+            return None;
+        }
+        let mut ledger = self.ledger().ok()?;
+        let slot = ledger.pending.get(&candidate.id())?;
+        let PendingTiming::Cgroup { state, .. } = &slot.timing else {
+            return None;
+        };
+        let id = state.redundant?;
+        let accepted = ledger.accepted.get_mut(&id)?;
+        let serial = accepted.interest_serial.checked_add(1)?;
+        accepted.interest_serial = serial;
+        accepted.pid = view.pid();
+        accepted.view = candidate.view;
+        accepted.admission = candidate.admission.clone();
+        accepted.requested_after = None;
+        ledger
+            .cgroup_views
+            .insert(candidate.view, (id, candidate.admission.clone()));
+        ledger.pids.insert(view.pid(), id);
+        Some(CgroupInterest {
+            authority: Arc::downgrade(&self.authority),
+            id,
+            view: candidate.view,
+            admission: candidate.admission.clone(),
+            serial,
+        })
+    }
+    pub(crate) fn cgroup_status(
+        &self,
+        candidate: &CgroupCandidate,
+        view: &crate::process::ProcessView,
+        work: &TraceWorkTicket,
+    ) -> Result<CgroupStatus, TraceWorkError> {
+        // Custody and expiry always win; ordinary failures instead cool down in
+        // the charged slot and cannot be re-created by busy CALL traffic.
+        if !self.owns(&candidate.entry)
+            || candidate.view != view.id()
+            || !candidate.admission.same_allocation(&view.view_admission())
+        {
+            return Err(TraceProofUnknown::TargetGone.into());
+        }
+        let ledger = self.ledger()?;
+        let slot = ledger
+            .pending
+            .get(&candidate.id())
+            .ok_or(TraceProofUnknown::NotSeeded)?;
+        let PendingTiming::Cgroup {
+            deadline, state, ..
+        } = &slot.timing
+        else {
+            return Err(TraceProofUnknown::DomainMismatch.into());
+        };
+        work.cgroup_check(self, *deadline)?;
+        if state.redundant.is_some() {
+            return Err(TraceProofUnknown::NotSeeded.into());
+        }
+        if !ledger
+            .cgroup_views
+            .get(&candidate.view)
+            .is_some_and(|(id, admission)| {
+                *id == candidate.id() && admission.same_allocation(&candidate.admission)
+            })
+        {
+            return Err(TraceProofUnknown::TargetGone.into());
+        }
+        if slot.problem == Some(TraceProofUnknown::TargetGone) {
+            return Err(TraceProofUnknown::TargetGone.into());
+        }
+        if state.parked || ledger.slot_problem(slot).is_some() {
+            return Ok(CgroupStatus {
+                action: CgroupAction::Parked,
+                needs_health: false,
+                ready_to_transfer: false,
+                deadline: *deadline,
+            });
+        }
+        let needs_health = slot
+            .armed
+            .is_some_and(|arm| !ledger.health.is_some_and(|(start, _)| start > arm));
+        let ready_to_transfer = slot.armed.is_some_and(|arm| {
+            ledger.health.is_some_and(|(start, _)| start > arm)
+                && ledger.horizon.is_some_and(|start| start > arm)
+        });
+        Ok(CgroupStatus {
+            action: if state.completed.is_none() && slot.witness.is_some() && !work.terminal() {
+                CgroupAction::Sample
+            } else if state.second.is_some() && slot.armed.is_none() {
+                CgroupAction::Confirm
+            } else {
+                CgroupAction::Idle
+            },
+            needs_health,
+            ready_to_transfer,
+            deadline: *deadline,
+        })
+    }
+    pub(crate) fn park_cgroup(&self, candidate: &mut CgroupCandidate, reason: TraceProofUnknown) {
+        if !self.owns(&candidate.entry) {
+            return;
+        }
+        candidate.identity = None;
+        let _ = candidate.entry.shrink(0);
+        if let Ok(mut ledger) = self.ledger()
+            && let Some(slot) = ledger.pending.get_mut(&candidate.id())
+            && let PendingTiming::Cgroup { state, .. } = &mut slot.timing
+        {
+            state.parked = true;
+            slot.problem.get_or_insert(reason);
+        }
+    }
+    pub(crate) fn verify_cgroup(
+        &self,
+        candidate: CgroupCandidate,
+        view: &crate::process::ProcessView,
+        work: &TraceWorkTicket,
+    ) -> Result<(VerifiedTraceSeed, CgroupInterest), (CgroupCandidate, TraceWorkError)> {
+        let result = (|| {
+            if !self
+                .cgroup_status(&candidate, view, work)?
+                .ready_to_transfer
+            {
+                return Err(TraceProofUnknown::ProofPending.into());
+            }
+            let mut ledger = self.ledger()?;
+            let slot = ledger
+                .pending
+                .get(&candidate.id())
+                .ok_or(TraceProofUnknown::NotSeeded)?;
+            if let Some(reason) = ledger.slot_problem(slot) {
+                return Err(reason.into());
+            }
+            let PendingTiming::Cgroup {
+                deadline, state, ..
+            } = &slot.timing
+            else {
+                return Err(TraceProofUnknown::DomainMismatch.into());
+            };
+            work.cgroup_check(self, *deadline)?;
+            let completed = state.completed.ok_or(TraceProofUnknown::ProofPending)?;
+            let key = slot.witness.ok_or(TraceProofUnknown::ProofPending)?.key;
+            let arm = slot.armed.ok_or(TraceProofUnknown::ProofPending)?;
+            if state.parked
+                || state
+                    .contradiction
+                    .is_some_and(|t| t <= state.second.unwrap().event_ns)
+                || !ledger.health.is_some_and(|(start, _)| start > arm)
+                || !ledger.horizon.is_some_and(|start| start > arm)
+            {
+                return Err(TraceProofUnknown::ProofPending.into());
+            }
+            if ledger.accepted_keys.contains_key(&key) {
+                return Err(TraceProofUnknown::ProofPending.into());
+            }
+            ledger.pending.remove(&candidate.id());
+            ledger.accepted_keys.insert(key, candidate.id());
+            ledger.accepted.insert(
+                candidate.id(),
+                AcceptedSlot {
+                    pid: view.pid(),
+                    view: candidate.view,
+                    admission: candidate.admission.clone(),
+                    key,
+                    requested_after: None,
+                    interest_serial: 1,
+                },
+            );
+            Ok((completed, key))
+        })();
+        match result {
+            Ok((completed, key)) => {
+                let interest = CgroupInterest {
+                    authority: Arc::downgrade(&self.authority),
+                    id: candidate.id(),
+                    view: candidate.view,
+                    admission: candidate.admission.clone(),
+                    serial: 1,
+                };
+                let seed = TraceSeed {
+                    identity: candidate.identity.expect("complete cgroup path"),
+                    view: candidate.view,
+                    admission: candidate.admission,
+                    sample_completed: completed,
+                    entry: candidate.entry,
+                };
+                Ok((VerifiedTraceSeed { seed, key }, interest))
+            }
+            Err(error) => Err((candidate, error)),
         }
     }
     pub(crate) fn can_seed(
@@ -822,6 +1246,24 @@ impl ProofSession {
         let Some(id) = ledger.pids.get(&pid).copied() else {
             return;
         };
+        let key = ProcessKey::history(self.authority.events.id(), cookie, exec, pid);
+        if let Some(accepted) = ledger.accepted.get_mut(&id) {
+            if key == accepted.key {
+                return;
+            }
+            if cookie != accepted.key.generation {
+                let view = accepted.view;
+                ledger.pids.remove(&pid);
+                ledger.cgroup_views.remove(&view);
+            } else if exec > accepted.key.exec_id
+                && let Some(copy) = copied.filter(|copy| *copy >= timestamp)
+            {
+                accepted.requested_after =
+                    Some(accepted.requested_after.map_or(copy, |old| old.max(copy)));
+            }
+            return;
+        }
+        let accepted_id = ledger.accepted_keys.get(&key).copied();
         let Some(slot) = ledger.pending.get_mut(&id) else {
             return;
         };
@@ -836,17 +1278,74 @@ impl ProofSession {
             slot.problem = Some(TraceProofUnknown::Unreadable);
             return;
         };
-        if let PendingTiming::Cgroup { deadline, .. } = slot.timing
-            && copied >= deadline
-        {
-            slot.problem = Some(TraceProofUnknown::AfterEvent);
-            return;
-        }
         if cookie == 0 || (self.is_cgroup() && self.authority.events.id() == 0) {
             slot.problem = Some(TraceProofUnknown::Unreadable);
             return;
         }
-        let key = ProcessKey::history(self.authority.events.id(), cookie, exec, pid);
+        if let PendingTiming::Cgroup {
+            deadline,
+            state,
+            view,
+            ..
+        } = &mut slot.timing
+        {
+            if copied >= *deadline {
+                slot.problem = Some(TraceProofUnknown::AfterEvent);
+                return;
+            }
+            if let Some(first) = slot.witness {
+                if first.key.generation != cookie {
+                    slot.problem = Some(TraceProofUnknown::TargetGone);
+                } else if first.key != key {
+                    if timestamp == 0 {
+                        slot.problem = Some(TraceProofUnknown::Unreadable);
+                    } else if timestamp >= first.event_ns {
+                        state.contradiction = Some(
+                            state
+                                .contradiction
+                                .map_or(timestamp, |old| old.min(timestamp)),
+                        );
+                        if state
+                            .second
+                            .is_some_and(|upper| timestamp <= upper.event_ns)
+                        {
+                            slot.problem = Some(TraceProofUnknown::ExecChanged);
+                        }
+                    }
+                } else if state.second.is_none()
+                    && state.completed.is_some_and(|end| timestamp > end)
+                {
+                    state.second = Some(Witness {
+                        key,
+                        event_ns: timestamp,
+                        copied_ns: copied,
+                    });
+                    if state
+                        .contradiction
+                        .is_some_and(|change| change <= timestamp)
+                    {
+                        slot.problem = Some(TraceProofUnknown::ExecChanged);
+                    }
+                }
+            } else if let Some(accepted) = accepted_id {
+                // Exact retained keys suppress a redundant sample even after
+                // interest moved. Mapping updates never replace the key index.
+                state.redundant = Some(accepted);
+                let view_id = *view;
+                let admission = ledger.cgroup_views.get(&view_id).map(|(_, a)| a.clone());
+                if let Some(admission) = admission {
+                    ledger.cgroup_views.insert(view_id, (accepted, admission));
+                    ledger.pids.insert(pid, accepted);
+                }
+            } else {
+                slot.witness = Some(Witness {
+                    key,
+                    event_ns: timestamp,
+                    copied_ns: copied,
+                });
+            }
+            return;
+        }
         if let Some(witness) = slot.witness {
             if witness.key.generation != cookie {
                 slot.problem = Some(TraceProofUnknown::DomainMismatch);
@@ -868,9 +1367,40 @@ impl ProofSession {
         let Some(id) = ledger.pids.get(&pid).copied() else {
             return;
         };
+        if ledger.accepted.contains_key(&id) {
+            if !exec {
+                let view = ledger.accepted[&id].view;
+                ledger.pids.remove(&pid);
+                ledger.cgroup_views.remove(&view);
+            }
+            return;
+        }
         let Some(slot) = ledger.pending.get_mut(&id) else {
             return;
         };
+        if let PendingTiming::Cgroup { state, .. } = &mut slot.timing {
+            if !exec {
+                slot.problem = Some(TraceProofUnknown::TargetGone);
+            } else if timestamp == 0 {
+                slot.problem = Some(TraceProofUnknown::Unreadable);
+            } else if slot
+                .witness
+                .is_some_and(|first| timestamp >= first.event_ns)
+            {
+                state.contradiction = Some(
+                    state
+                        .contradiction
+                        .map_or(timestamp, |old| old.min(timestamp)),
+                );
+                if state
+                    .second
+                    .is_some_and(|upper| timestamp <= upper.event_ns)
+                {
+                    slot.problem = Some(TraceProofUnknown::ExecChanged);
+                }
+            }
+            return;
+        }
         if timestamp >= slot.timing.start() && slot.problem.is_none() {
             slot.problem = Some(if exec {
                 TraceProofUnknown::ExecChanged
@@ -1000,6 +1530,23 @@ impl ProofSession {
             .get(&id)?
             .witness
             .map(|w| (w.key.generation, w.key.exec_id, w.event_ns))
+    }
+    #[cfg(test)]
+    pub(crate) fn test_cgroup_snapshot(&self, id: SeedId) -> Option<CgroupSnapshot> {
+        let ledger = self.ledger().ok()?;
+        let slot = ledger.pending.get(&id)?;
+        let PendingTiming::Cgroup { state, .. } = &slot.timing else {
+            return None;
+        };
+        Some(CgroupSnapshot {
+            first_start: state.first_start,
+            completed: state.completed,
+            starts: state.starts,
+            upper: state.second.map(|w| w.event_ns),
+            contradiction: state.contradiction,
+            arm: slot.armed,
+            parked: state.parked,
+        })
     }
     #[cfg(test)]
     pub(crate) fn test_problem(&self, id: SeedId) -> Option<TraceProofUnknown> {
@@ -1140,6 +1687,18 @@ pub(crate) trait TraceIo {
         view: &crate::process::ProcessView,
         work: &mut TraceWorkTicket,
     ) -> Result<TraceSeed, TraceWorkError>;
+    fn sample_cgroup(
+        &self,
+        candidate: &mut CgroupCandidate,
+        view: &crate::process::ProcessView,
+        work: &mut TraceWorkTicket,
+    ) -> Result<(), TraceWorkError>;
+    fn confirm_cgroup(
+        &self,
+        candidate: &mut CgroupCandidate,
+        view: &crate::process::ProcessView,
+        work: &mut TraceWorkTicket,
+    ) -> Result<(), TraceWorkError>;
 }
 impl TraceIo for Session {
     fn proof(&self) -> Option<&ProofSession> {
@@ -1162,6 +1721,47 @@ impl TraceIo for Session {
     ) -> Result<TraceSeed, TraceWorkError> {
         let proof = self.trace_proof().ok_or(TraceProofUnknown::Unreadable)?;
         proof.sample_from(view, work, &mut OsSample { view })
+    }
+    fn sample_cgroup(
+        &self,
+        candidate: &mut CgroupCandidate,
+        view: &crate::process::ProcessView,
+        work: &mut TraceWorkTicket,
+    ) -> Result<(), TraceWorkError> {
+        let proof = self.trace_proof().ok_or(TraceProofUnknown::Unreadable)?;
+        proof.sample_cgroup_from(
+            candidate,
+            view,
+            work,
+            &mut OsSample { view },
+            || {
+                self.instance_maps()
+                    .cookie(
+                        view.retained_pin()
+                            .pidfd()
+                            .map_err(|_| TraceProofUnknown::Unreadable)?,
+                    )
+                    .map_err(|_| TraceProofUnknown::Unreadable)
+            },
+            |work| self.refresh_trace_health(work),
+        )
+    }
+    fn confirm_cgroup(
+        &self,
+        candidate: &mut CgroupCandidate,
+        view: &crate::process::ProcessView,
+        work: &mut TraceWorkTicket,
+    ) -> Result<(), TraceWorkError> {
+        let proof = self.trace_proof().ok_or(TraceProofUnknown::Unreadable)?;
+        proof.confirm_cgroup_from(candidate, view, work, || {
+            self.instance_maps()
+                .cookie(
+                    view.retained_pin()
+                        .pidfd()
+                        .map_err(|_| TraceProofUnknown::Unreadable)?,
+                )
+                .map_err(|_| TraceProofUnknown::Unreadable)
+        })
     }
 }
 impl ProofSession {
@@ -1216,6 +1816,41 @@ impl ProofSession {
         self.test_sample_view_with_link(view, work, b"/owned/fixture")
     }
     #[cfg(test)]
+    pub(crate) fn test_sample_cgroup<'a>(
+        &'a self,
+        candidate: &mut CgroupCandidate,
+        view: &'a crate::process::ProcessView,
+        work: &mut TraceWorkTicket,
+        sample: (&'a [u8], Option<&'a mut dyn FnMut()>),
+        cookie: impl FnMut() -> Result<Option<u64>, TraceProofUnknown>,
+        health: impl FnOnce(&mut TraceWorkTicket) -> Result<(), TraceWorkError>,
+    ) -> Result<(), TraceWorkError> {
+        let (link, after) = sample;
+        self.sample_cgroup_from(
+            candidate,
+            view,
+            work,
+            &mut FixtureSample {
+                view,
+                proof: self,
+                link,
+                after_first_link: after,
+            },
+            cookie,
+            health,
+        )
+    }
+    #[cfg(test)]
+    pub(crate) fn test_confirm_cgroup(
+        &self,
+        candidate: &mut CgroupCandidate,
+        view: &crate::process::ProcessView,
+        work: &mut TraceWorkTicket,
+        cookie: impl FnOnce() -> Result<Option<u64>, TraceProofUnknown>,
+    ) -> Result<(), TraceWorkError> {
+        self.confirm_cgroup_from(candidate, view, work, cookie)
+    }
+    #[cfg(test)]
     pub(crate) fn test_sample_view_with_link(
         &self,
         view: &crate::process::ProcessView,
@@ -1265,7 +1900,7 @@ impl ProofSession {
         cookie: Option<u64>,
         after: impl FnOnce(),
     ) -> Result<u64, TraceWorkError> {
-        self.cookie_from(pin, work, || {
+        self.cookie_from(pin, work, None, || {
             after();
             Ok(cookie)
         })
@@ -1295,7 +1930,7 @@ impl ProofSession {
         work: &mut TraceWorkTicket,
         cookie: Option<u64>,
     ) -> Result<u64, TraceWorkError> {
-        self.cookie_from(pin, work, || Ok(cookie))
+        self.cookie_from(pin, work, None, || Ok(cookie))
     }
 }
 
@@ -1306,7 +1941,7 @@ impl Session {
         work: &mut TraceWorkTicket,
     ) -> Result<u64, TraceWorkError> {
         let proof = self.trace_proof().ok_or(TraceProofUnknown::Unreadable)?;
-        proof.cookie_from(pin, work, || {
+        proof.cookie_from(pin, work, None, || {
             self.instance_maps()
                 .cookie(pin.pidfd().map_err(|_| TraceProofUnknown::Unreadable)?)
                 .map_err(|_| TraceProofUnknown::Unreadable)
@@ -1341,6 +1976,7 @@ impl ProofSession {
         &self,
         pin: &crate::process::PidPin,
         work: &mut TraceWorkTicket,
+        expected_cgroup_cookie: Option<u64>,
         read: impl FnOnce() -> Result<Option<u64>, TraceProofUnknown>,
     ) -> Result<u64, TraceWorkError> {
         pin.pidfd().map_err(|_| TraceProofUnknown::Unreadable)?;
@@ -1353,6 +1989,16 @@ impl ProofSession {
         }
         work.external_read(self)?;
         let cookie = read()?;
+        // A completed cgroup lookup is decisive before a later allowance can
+        // defer work. PID/system keeps its existing original-pin ordering.
+        if let Some(expected) = expected_cgroup_cookie {
+            let observed = cookie
+                .filter(|cookie| *cookie != 0)
+                .ok_or(TraceProofUnknown::Unreadable)?;
+            if observed != expected {
+                return Err(TraceProofUnknown::TargetGone.into());
+            }
+        }
         work.external_read(self)?;
         let after = pin
             .original_exited()
@@ -1395,6 +2041,236 @@ impl ProofSession {
         let epoch = observation?;
         let mut ledger = self.ledger()?;
         Self::complete_health(&mut ledger, epoch, start, completed).map_err(Into::into)
+    }
+    fn sample_cgroup_from(
+        &self,
+        candidate: &mut CgroupCandidate,
+        view: &crate::process::ProcessView,
+        work: &mut TraceWorkTicket,
+        source: &mut impl SampleSource,
+        mut cookie_read: impl FnMut() -> Result<Option<u64>, TraceProofUnknown>,
+        health_read: impl FnOnce(&mut TraceWorkTicket) -> Result<(), TraceWorkError>,
+    ) -> Result<(), TraceWorkError> {
+        if work.terminal() {
+            return Err(TraceProofUnknown::ProofPending.into());
+        }
+        let status = self.cgroup_status(candidate, view, work)?;
+        if !matches!(status.action, CgroupAction::Sample) {
+            return Err(TraceProofUnknown::ProofPending.into());
+        }
+        // The original charge grows before baseline, cookie or executable I/O.
+        // Capacity refusal is neither a transaction start nor a failed sample.
+        match candidate.entry.grow_work() {
+            Ok(()) => {}
+            Err(TraceProofUnknown::Budget) => return Err(TraceWorkError::Deferred),
+            Err(reason) => {
+                self.park_cgroup(candidate, reason);
+                return Err(reason.into());
+            }
+        }
+        let mut started = false;
+        let result = (|| {
+            let (deadline, first, starts) = {
+                let ledger = self.ledger()?;
+                let slot = &ledger.pending[&candidate.id()];
+                let PendingTiming::Cgroup {
+                    deadline, state, ..
+                } = &slot.timing
+                else {
+                    return Err(TraceProofUnknown::DomainMismatch.into());
+                };
+                (
+                    *deadline,
+                    slot.witness.ok_or(TraceProofUnknown::ProofPending)?,
+                    state.starts,
+                )
+            };
+            let mut reader = work.cgroup_reader(deadline, Some(candidate.id()));
+            if !self.has_baseline() {
+                health_read(&mut reader)?;
+            }
+            reader.check(self)?;
+            let baseline_end = self
+                .ledger()?
+                .health
+                .ok_or(TraceProofUnknown::Unreadable)?
+                .1;
+            #[cfg(test)]
+            self.test_tick();
+            // Check the first read allowance before consuming a transaction start.
+            // This permit is the original-pidfd pre-cookie exit check below.
+            let start = reader.cgroup_external_read(self, deadline)?;
+            if start <= first.copied_ns || start <= baseline_end || starts >= 2 {
+                return Err(TraceProofUnknown::Unreadable.into());
+            }
+            let fixed_deadline = {
+                let mut ledger = self.ledger()?;
+                let slot = ledger
+                    .pending
+                    .get_mut(&candidate.id())
+                    .ok_or(TraceProofUnknown::NotSeeded)?;
+                let PendingTiming::Cgroup {
+                    deadline, state, ..
+                } = &mut slot.timing
+                else {
+                    return Err(TraceProofUnknown::DomainMismatch.into());
+                };
+                if state.first_start.is_none() {
+                    *deadline = start
+                        .checked_add(CGROUP_REGISTRATION_LEASE_NS)
+                        .ok_or(TraceProofUnknown::Unreadable)?;
+                    state.first_start = Some(start);
+                }
+                state.starts += 1;
+                started = true;
+                *deadline
+            };
+            let mut reader = work.cgroup_reader(fixed_deadline, Some(candidate.id()));
+            view.retained_pin()
+                .pidfd()
+                .map_err(|_| TraceProofUnknown::Unreadable)?;
+            if view
+                .retained_pin()
+                .original_exited()
+                .map_err(|_| TraceProofUnknown::Unreadable)?
+            {
+                return Err(TraceProofUnknown::TargetGone.into());
+            }
+            reader.external_read(self)?;
+            let cookie = cookie_read()?
+                .filter(|cookie| *cookie != 0)
+                .ok_or(TraceProofUnknown::Unreadable)?;
+            if cookie != first.key.generation {
+                return Err(TraceProofUnknown::TargetGone.into());
+            }
+            reader.external_read(self)?;
+            if view
+                .retained_pin()
+                .original_exited()
+                .map_err(|_| TraceProofUnknown::Unreadable)?
+            {
+                return Err(TraceProofUnknown::TargetGone.into());
+            }
+            let identity = sample_identity(self, view, &mut reader, source)?;
+            let after = self.cookie_from(
+                view.retained_pin(),
+                &mut reader,
+                Some(first.key.generation),
+                &mut cookie_read,
+            )?;
+            if after != first.key.generation {
+                return Err(TraceProofUnknown::TargetGone.into());
+            }
+            #[cfg(test)]
+            self.test_tick();
+            let completed = reader.cgroup_check(self, fixed_deadline)?;
+            if completed < start {
+                return Err(TraceProofUnknown::Unreadable.into());
+            }
+            self.cgroup_registration_status(candidate, view, &reader)?;
+            {
+                let mut ledger = self.ledger()?;
+                let slot = ledger
+                    .pending
+                    .get_mut(&candidate.id())
+                    .ok_or(TraceProofUnknown::NotSeeded)?;
+                let PendingTiming::Cgroup { state, .. } = &mut slot.timing else {
+                    return Err(TraceProofUnknown::DomainMismatch.into());
+                };
+                state.completed = Some(completed);
+            }
+            // sample_identity's fixed buffers have left scope before shrinking.
+            candidate.entry.shrink(
+                identity
+                    .path
+                    .as_ref()
+                    .ok_or(TraceProofUnknown::Unreadable)?
+                    .len(),
+            )?;
+            candidate.identity = Some(identity);
+            Ok(())
+        })();
+        if let Err(error) = result {
+            candidate.identity = None;
+            let _ = candidate.entry.shrink(0);
+            match error {
+                TraceWorkError::Deferred => {
+                    let attempts = self
+                        .ledger()?
+                        .pending
+                        .get(&candidate.id())
+                        .and_then(|slot| {
+                            if let PendingTiming::Cgroup { state, .. } = &slot.timing {
+                                Some(state.starts)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(2);
+                    if started && attempts >= 2 {
+                        self.park_cgroup(candidate, TraceProofUnknown::Budget);
+                    }
+                }
+                TraceWorkError::Unknown(reason) => self.park_cgroup(candidate, reason),
+            }
+        }
+        result
+    }
+    fn confirm_cgroup_from(
+        &self,
+        candidate: &mut CgroupCandidate,
+        view: &crate::process::ProcessView,
+        work: &mut TraceWorkTicket,
+        read: impl FnOnce() -> Result<Option<u64>, TraceProofUnknown>,
+    ) -> Result<(), TraceWorkError> {
+        if !matches!(
+            self.cgroup_status(candidate, view, work)?.action,
+            CgroupAction::Confirm
+        ) {
+            return Err(TraceProofUnknown::ProofPending.into());
+        }
+        let (deadline, expected_cookie) = {
+            let ledger = self.ledger()?;
+            let slot = &ledger.pending[&candidate.id()];
+            let PendingTiming::Cgroup { deadline, .. } = slot.timing else {
+                return Err(TraceProofUnknown::DomainMismatch.into());
+            };
+            let first = slot.witness.ok_or(TraceProofUnknown::ProofPending)?;
+            (deadline, first.key.generation)
+        };
+        let mut reader = work.cgroup_reader(deadline, Some(candidate.id()));
+        let result = (|| {
+            let cookie = self.cookie_from(
+                view.retained_pin(),
+                &mut reader,
+                Some(expected_cookie),
+                read,
+            )?;
+            let completed = reader.cgroup_check(self, deadline)?;
+            self.cgroup_registration_status(candidate, view, &reader)?;
+            let mut ledger = self.ledger()?;
+            let slot = ledger
+                .pending
+                .get_mut(&candidate.id())
+                .ok_or(TraceProofUnknown::NotSeeded)?;
+            let first = slot.witness.ok_or(TraceProofUnknown::ProofPending)?;
+            let PendingTiming::Cgroup { state, .. } = &slot.timing else {
+                return Err(TraceProofUnknown::DomainMismatch.into());
+            };
+            let upper = state.second.ok_or(TraceProofUnknown::ProofPending)?;
+            if cookie != first.key.generation {
+                return Err(TraceProofUnknown::TargetGone.into());
+            }
+            if completed < upper.copied_ns {
+                return Err(TraceProofUnknown::Unreadable.into());
+            }
+            slot.armed.get_or_insert(completed.max(upper.copied_ns));
+            Ok(())
+        })();
+        if let Err(TraceWorkError::Unknown(reason)) = result {
+            self.park_cgroup(candidate, reason);
+        }
+        result
     }
     fn sample_from(
         &self,
@@ -1523,8 +2399,12 @@ fn sample_identity(
     if last_len == 0 || last_len > IMAGE_PATH_CAP {
         return Err(TraceProofUnknown::Budget.into());
     }
+    let links_changed = first[..first_len] != last[..last_len];
+    if proof.is_cgroup() && links_changed {
+        return Err(TraceProofUnknown::ExecChanged.into());
+    }
     work.external_read(proof)?;
-    if source.stat()? != before || first[..first_len] != last[..last_len] {
+    if source.stat()? != before || links_changed {
         return Err(TraceProofUnknown::ExecChanged.into());
     }
     work.external_read(proof)?;

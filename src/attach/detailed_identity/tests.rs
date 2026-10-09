@@ -1,6 +1,561 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 
+fn cgroup_ready_fixture() -> (ProofSession, crate::process::ProcessView, CgroupCandidate) {
+    let scope = Scope::Cgroup {
+        id: 1,
+        path: "/retained-only".into(),
+        dir: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+    };
+    let proof = ProofSession::test_scope(&scope, true);
+    proof.test_set_time(100);
+    let view = crate::process::ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let mut work = TraceWorkTicket::test_new(proof.clone(), 100, 5_000_100);
+    let candidate = proof.register_cgroup(&view, &mut work).unwrap();
+    proof.test_set_time(200);
+    let event = Event {
+        pid_tgid: u64::from(view.pid()) << 32,
+        ts_ns: 101,
+        image: p11scope_ebpf_common::ImageIdentity {
+            task_cookie: 11,
+            exec_id: 0,
+        },
+        ..Event::default()
+    };
+    let mut drain = crate::events::EventDrain::over_domain(
+        crate::events::ScriptedRecords::events([event], 1),
+        proof.test_events_domain(),
+    );
+    drain.attach_trace_tap(proof.test_events_tap()).unwrap();
+    drain.poll(None, |_| std::ops::ControlFlow::Continue(()));
+    (proof, view, candidate)
+}
+#[test]
+fn cgroup_trace_bracket_reader_first_permit_and_cookie_sandwich() {
+    let (proof, view, mut candidate) = cgroup_ready_fixture();
+    let mut spent = TraceWorkTicket::test_new(proof.clone(), 200, 5_000_200);
+    proof.test_health(Ok(0), 7, 8).unwrap();
+    for _ in 0..32 {
+        spent.external_read(&proof).unwrap();
+    }
+    assert_eq!(
+        proof.test_sample_cgroup(
+            &mut candidate,
+            &view,
+            &mut spent,
+            (b"/owned/fixture", None),
+            || panic!("no cookie after read allowance exhausted"),
+            |_| panic!("baseline already exists")
+        ),
+        Err(TraceWorkError::Deferred)
+    );
+    let before = proof.test_cgroup_snapshot(candidate.id()).unwrap();
+    assert_eq!(before.starts, 0);
+    assert!(before.first_start.is_none());
+    assert_eq!(proof.usage(), (1, 0));
+    let cookies = std::cell::Cell::new(0);
+    let mut after = || {
+        assert_eq!(
+            cookies.get(),
+            1,
+            "original cookie precedes executable reads"
+        )
+    };
+    let mut work = TraceWorkTicket::test_new(
+        proof.clone(),
+        proof.test_time(),
+        proof.test_time() + 5_000_000,
+    );
+    proof
+        .test_sample_cgroup(
+            &mut candidate,
+            &view,
+            &mut work,
+            (b"/owned/fixture", Some(&mut after)),
+            || {
+                cookies.set(cookies.get() + 1);
+                Ok(Some(11))
+            },
+            |_| panic!("no redundant baseline"),
+        )
+        .unwrap();
+    assert_eq!(
+        cookies.get(),
+        2,
+        "same original cookie is read again after all executable validation"
+    );
+    let after = proof.test_cgroup_snapshot(candidate.id()).unwrap();
+    assert_eq!(after.starts, 1);
+    assert!(after.completed.unwrap() >= after.first_start.unwrap());
+    assert_eq!(proof.usage(), (1, 14));
+}
+#[test]
+fn cgroup_trace_bracket_nonbudget_failures_cannot_restart_or_keep_path() {
+    for fault in 0..4 {
+        let (proof, view, mut candidate) = cgroup_ready_fixture();
+        let mut work = TraceWorkTicket::test_new(proof.clone(), 200, 5_000_200);
+        let cookies = std::cell::Cell::new(0);
+        let mut after = || match fault {
+            0 => proof.test_set_time(u64::MAX),
+            1 => proof.test_set_time(1),
+            2 => proof.test_events_tap().observe_failure(),
+            _ => proof.test_set_time(60_000_000_500),
+        };
+        let result = proof.test_sample_cgroup(
+            &mut candidate,
+            &view,
+            &mut work,
+            (b"/owned/fixture", Some(&mut after)),
+            || {
+                cookies.set(cookies.get() + 1);
+                Ok(Some(11))
+            },
+            |work| proof.test_refresh_read(work, Ok(0)),
+        );
+        assert!(matches!(result, Err(TraceWorkError::Unknown(_))));
+        assert_eq!(
+            cookies.get(),
+            1,
+            "a read-observed failure stops before the post-executable cookie read"
+        );
+        assert_eq!(proof.usage(), (1, 0));
+        let snapshot = proof.test_cgroup_snapshot(candidate.id()).unwrap();
+        assert!(snapshot.parked && snapshot.completed.is_none());
+        assert_eq!(snapshot.starts, 1);
+        proof.test_set_time(1_000);
+        let mut fresh = TraceWorkTicket::test_new(proof.clone(), 1_000, 5_001_000);
+        assert!(
+            proof
+                .test_sample_cgroup(
+                    &mut candidate,
+                    &view,
+                    &mut fresh,
+                    (b"/owned/fixture", None),
+                    || panic!("actual failure cannot restart"),
+                    |_| panic!("no health after parked failure")
+                )
+                .is_err()
+        );
+        assert_eq!(
+            proof.test_cgroup_snapshot(candidate.id()).unwrap().starts,
+            1
+        );
+    }
+}
+#[test]
+fn cgroup_trace_bracket_utf8_and_path_caps_remain_shared() {
+    for (link, fits) in [
+        (vec![b'a'; 4096], true),
+        (vec![b'a'; 4097], false),
+        (vec![0xff; 1365], true),
+        (vec![0xff; 1366], false),
+    ] {
+        let (proof, view, mut candidate) = cgroup_ready_fixture();
+        let mut work = TraceWorkTicket::test_new(proof.clone(), 200, 5_000_200);
+        let result = proof.test_sample_cgroup(
+            &mut candidate,
+            &view,
+            &mut work,
+            (&link, None),
+            || Ok(Some(11)),
+            |work| proof.test_refresh_read(work, Ok(0)),
+        );
+        assert_eq!(result.is_ok(), fits);
+        assert_eq!(
+            proof.usage(),
+            (
+                1,
+                if fits {
+                    String::from_utf8_lossy(&link).len()
+                } else {
+                    0
+                }
+            )
+        );
+    }
+}
+#[test]
+fn cgroup_trace_bracket_baseline_loss_forbids_the_first_cookie_read() {
+    let (proof, view, candidate) = cgroup_ready_fixture();
+    let mut baseline = TraceWorkTicket::test_new(proof.clone(), 200, 5_000_200);
+    proof.test_refresh_read(&mut baseline, Ok(0)).unwrap();
+    let mut malformed = crate::events::DiscoveryDrain::over_domain(
+        crate::events::ScriptedRecords::records([vec![0]], 1),
+        proof.test_discovery_domain(),
+    );
+    malformed
+        .attach_trace_tap(proof.test_discovery_tap())
+        .unwrap();
+    assert!(matches!(
+        malformed.dequeue(),
+        Some(crate::events::DiscoveryItem::Malformed)
+    ));
+    drop(candidate);
+    proof.test_set_time(300);
+    let mut work = TraceWorkTicket::test_new(proof.clone(), 300, 5_000_300);
+    let mut candidate = proof.register_cgroup(&view, &mut work).unwrap();
+    proof.test_set_time(400);
+    let event = Event {
+        pid_tgid: u64::from(view.pid()) << 32,
+        ts_ns: 301,
+        image: p11scope_ebpf_common::ImageIdentity {
+            task_cookie: 11,
+            exec_id: 0,
+        },
+        ..Event::default()
+    };
+    let mut events = crate::events::EventDrain::over_domain(
+        crate::events::ScriptedRecords::events([event], 1),
+        proof.test_events_domain(),
+    );
+    events.attach_trace_tap(proof.test_events_tap()).unwrap();
+    events.poll(None, |_| std::ops::ControlFlow::Continue(()));
+    let mut work = TraceWorkTicket::test_new(proof.clone(), 400, 5_000_400);
+    let cookies = std::cell::Cell::new(0);
+    let result = proof.test_sample_cgroup(
+        &mut candidate,
+        &view,
+        &mut work,
+        (b"/owned/fixture", None),
+        || {
+            cookies.set(cookies.get() + 1);
+            Ok(Some(11))
+        },
+        |work| proof.test_refresh_read(work, Ok(1)),
+    );
+    assert_eq!(
+        result,
+        Err(TraceWorkError::Unknown(TraceProofUnknown::LifecycleLoss))
+    );
+    assert_eq!(
+        cookies.get(),
+        0,
+        "loss observed by the baseline refuses sample I/O immediately"
+    );
+    assert_eq!(
+        proof.test_cgroup_snapshot(candidate.id()).unwrap().starts,
+        0
+    );
+    assert_eq!(proof.usage(), (1, 0));
+}
+#[test]
+fn cgroup_trace_bracket_poisoned_accepted_drop_cleans_all_nonowning_indexes() {
+    let (proof, receipt) =
+        crate::discovery::engine::tests::detailed_proof_driver::cgroup_verified_fixture();
+    assert_eq!(proof.usage(), (1, 14));
+    let authority = proof.authority.clone();
+    let _ = std::panic::catch_unwind(|| {
+        let _guard = authority.ledger.lock().unwrap();
+        panic!("poison genuine accepted authority");
+    });
+    drop(receipt);
+    assert_eq!(proof.usage(), (0, 0));
+    let ledger = authority
+        .ledger
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    assert!(
+        ledger.pending.is_empty() && ledger.accepted.is_empty() && ledger.accepted_keys.is_empty()
+    );
+    assert!(ledger.pids.is_empty() && ledger.cgroup_views.is_empty());
+}
+#[test]
+fn cgroup_trace_bracket_exit_inside_sample_stops_all_later_reads() {
+    let (proof, view, mut candidate) = cgroup_ready_fixture();
+    let mut work = TraceWorkTicket::test_new(proof.clone(), 200, 5_000_200);
+    let cookies = std::cell::Cell::new(0);
+    let mut after = || {
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.pid_tgid = u64::from(view.pid()) << 32;
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+        record.hook_ts_ns = proof.test_time();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&record as *const DiscoveryRecord).cast::<u8>(),
+                std::mem::size_of::<DiscoveryRecord>(),
+            )
+        }
+        .to_vec();
+        let mut drain = crate::events::DiscoveryDrain::over_domain(
+            crate::events::ScriptedRecords::records([bytes], 1),
+            proof.test_discovery_domain(),
+        );
+        drain.attach_trace_tap(proof.test_discovery_tap()).unwrap();
+        assert!(matches!(
+            drain.dequeue(),
+            Some(crate::events::DiscoveryItem::Record(_))
+        ));
+    };
+    let result = proof.test_sample_cgroup(
+        &mut candidate,
+        &view,
+        &mut work,
+        (b"/owned/fixture", Some(&mut after)),
+        || {
+            cookies.set(cookies.get() + 1);
+            Ok(Some(11))
+        },
+        |work| proof.test_refresh_read(work, Ok(0)),
+    );
+    assert_eq!(
+        result,
+        Err(TraceWorkError::Unknown(TraceProofUnknown::TargetGone))
+    );
+    assert_eq!(
+        cookies.get(),
+        1,
+        "actual retained lifecycle cancellation stops before the second cookie read"
+    );
+    assert_eq!(proof.usage(), (1, 0));
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Exhaustion {
+    Reads,
+    Frame,
+}
+fn exhaust_ticket(
+    proof: &ProofSession,
+    work: &mut TraceWorkTicket,
+    exhaustion: Exhaustion,
+    deadline: u64,
+) {
+    match exhaustion {
+        Exhaustion::Reads => while work.external_read(proof).is_ok() {},
+        Exhaustion::Frame => proof.test_set_time(deadline),
+    }
+}
+#[test]
+fn cgroup_trace_bracket_post_cookie_failure_wins_over_exhausted_allowance() {
+    for exhaustion in [Exhaustion::Reads, Exhaustion::Frame] {
+        for (bad_cookie, reason) in [
+            (None, TraceProofUnknown::Unreadable),
+            (Some(0), TraceProofUnknown::Unreadable),
+            (Some(12), TraceProofUnknown::TargetGone),
+        ] {
+            let (proof, view, mut candidate) = cgroup_ready_fixture();
+            proof.test_health(Ok(0), 7, 8).unwrap();
+            let deadline = 5_000_200;
+            let mut work = TraceWorkTicket::test_new(proof.clone(), 200, deadline);
+            let mut shared = work.clone();
+            let mut cookies = 0;
+            let result = proof.test_sample_cgroup(
+                &mut candidate,
+                &view,
+                &mut work,
+                (b"/owned/fixture", None),
+                || {
+                    cookies += 1;
+                    if cookies == 1 {
+                        Ok(Some(11))
+                    } else {
+                        exhaust_ticket(&proof, &mut shared, exhaustion, deadline);
+                        Ok(bad_cookie)
+                    }
+                },
+                |_| panic!("baseline already exists"),
+            );
+            assert_eq!(
+                result,
+                Err(TraceWorkError::Unknown(reason)),
+                "{exhaustion:?} {bad_cookie:?}"
+            );
+            assert_eq!(cookies, 2);
+            assert_eq!(proof.usage(), (1, 0));
+            let snapshot = proof.test_cgroup_snapshot(candidate.id()).unwrap();
+            assert!(snapshot.parked && snapshot.completed.is_none());
+            proof.test_tick();
+            let now = proof.test_time();
+            let mut fresh = TraceWorkTicket::test_new(proof.clone(), now, now + 5_000_000);
+            assert!(
+                proof
+                    .test_sample_cgroup(
+                        &mut candidate,
+                        &view,
+                        &mut fresh,
+                        (b"/owned/fixture", None),
+                        || panic!("failed cookie cannot restart"),
+                        |_| panic!("parked sample cannot read health")
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                proof.test_cgroup_snapshot(candidate.id()).unwrap().starts,
+                1
+            );
+        }
+    }
+}
+#[test]
+fn cgroup_trace_bracket_confirmation_cookie_failure_wins_over_exhausted_allowance() {
+    for exhaustion in [Exhaustion::Reads, Exhaustion::Frame] {
+        for (bad_cookie, reason) in [
+            (None, TraceProofUnknown::Unreadable),
+            (Some(0), TraceProofUnknown::Unreadable),
+            (Some(12), TraceProofUnknown::TargetGone),
+        ] {
+            let (proof, view, mut candidate) = cgroup_ready_fixture();
+            proof.test_health(Ok(0), 7, 8).unwrap();
+            let mut sample = TraceWorkTicket::test_new(proof.clone(), 200, 5_000_200);
+            proof
+                .test_sample_cgroup(
+                    &mut candidate,
+                    &view,
+                    &mut sample,
+                    (b"/owned/fixture", None),
+                    || Ok(Some(11)),
+                    |_| panic!("baseline already exists"),
+                )
+                .unwrap();
+            let upper = proof.test_time() + 1;
+            proof.test_set_time(upper + 1);
+            let event = Event {
+                pid_tgid: u64::from(view.pid()) << 32,
+                ts_ns: upper,
+                image: p11scope_ebpf_common::ImageIdentity {
+                    task_cookie: 11,
+                    exec_id: 0,
+                },
+                ..Event::default()
+            };
+            let mut drain = crate::events::EventDrain::over_domain(
+                crate::events::ScriptedRecords::events([event], 1),
+                proof.test_events_domain(),
+            );
+            drain.attach_trace_tap(proof.test_events_tap()).unwrap();
+            drain.poll(None, |_| std::ops::ControlFlow::Continue(()));
+            let now = proof.test_time();
+            let deadline = now + 5_000_000;
+            let mut work = TraceWorkTicket::test_new(proof.clone(), now, deadline);
+            let mut shared = work.clone();
+            let mut cookies = 0;
+            let result = proof.test_confirm_cgroup(&mut candidate, &view, &mut work, || {
+                cookies += 1;
+                exhaust_ticket(&proof, &mut shared, exhaustion, deadline);
+                Ok(bad_cookie)
+            });
+            assert_eq!(
+                result,
+                Err(TraceWorkError::Unknown(reason)),
+                "{exhaustion:?} {bad_cookie:?}"
+            );
+            assert_eq!(cookies, 1);
+            assert_eq!(proof.usage(), (1, 0));
+            let snapshot = proof.test_cgroup_snapshot(candidate.id()).unwrap();
+            assert!(snapshot.parked && snapshot.arm.is_none());
+            proof.test_tick();
+            let now = proof.test_time();
+            let mut fresh = TraceWorkTicket::test_new(proof.clone(), now, now + 5_000_000);
+            assert!(
+                proof
+                    .test_confirm_cgroup(&mut candidate, &view, &mut fresh, || panic!(
+                        "failed confirmation cannot retry"
+                    ))
+                    .is_err()
+            );
+        }
+    }
+}
+struct ChangedLinkSample<'a> {
+    inner: FixtureSample<'a>,
+    links: usize,
+    stats: usize,
+    after_second_link: &'a mut dyn FnMut(),
+}
+impl SampleSource for ChangedLinkSample<'_> {
+    fn exited(&mut self) -> Result<bool, TraceProofUnknown> {
+        self.inner.exited()
+    }
+    fn stat(&mut self) -> Result<ExeStat, TraceProofUnknown> {
+        self.stats += 1;
+        self.inner.stat()
+    }
+    fn link(&mut self, buf: &mut [u8; IMAGE_PATH_CAP + 1]) -> Result<usize, TraceProofUnknown> {
+        let n = self.inner.link(buf)?;
+        self.links += 1;
+        if self.links == 2 {
+            buf[0] = b'!';
+            (self.after_second_link)();
+        }
+        Ok(n)
+    }
+    fn birth(
+        &mut self,
+        proof: &ProofSession,
+        work: &mut TraceWorkTicket,
+    ) -> Result<u64, TraceWorkError> {
+        self.inner.birth(proof, work)
+    }
+    fn namespace(&mut self) -> Result<crate::process::MountNamespaceId, TraceProofUnknown> {
+        self.inner.namespace()
+    }
+}
+#[test]
+fn cgroup_trace_bracket_completed_path_change_wins_over_exhausted_allowance() {
+    for exhaustion in [Exhaustion::Reads, Exhaustion::Frame] {
+        let (proof, view, mut candidate) = cgroup_ready_fixture();
+        proof.test_health(Ok(0), 7, 8).unwrap();
+        let deadline = 5_000_200;
+        let mut work = TraceWorkTicket::test_new(proof.clone(), 200, deadline);
+        let mut shared = work.clone();
+        let mut boundary = || exhaust_ticket(&proof, &mut shared, exhaustion, deadline);
+        let mut source = ChangedLinkSample {
+            inner: FixtureSample {
+                view: &view,
+                proof: &proof,
+                link: b"/owned/fixture",
+                after_first_link: None,
+            },
+            links: 0,
+            stats: 0,
+            after_second_link: &mut boundary,
+        };
+        let mut cookies = 0;
+        let result = proof.sample_cgroup_from(
+            &mut candidate,
+            &view,
+            &mut work,
+            &mut source,
+            || {
+                cookies += 1;
+                Ok(Some(11))
+            },
+            |_| panic!("baseline already exists"),
+        );
+        assert_eq!(
+            result,
+            Err(TraceWorkError::Unknown(TraceProofUnknown::ExecChanged)),
+            "{exhaustion:?}"
+        );
+        assert_eq!(
+            (source.links, source.stats, cookies),
+            (2, 1, 1),
+            "completed differing paths stop before any later read"
+        );
+        assert_eq!(proof.usage(), (1, 0));
+        assert!(proof.test_cgroup_snapshot(candidate.id()).unwrap().parked);
+        proof.test_tick();
+        let now = proof.test_time();
+        let mut fresh = TraceWorkTicket::test_new(proof.clone(), now, now + 5_000_000);
+        assert!(
+            proof
+                .test_sample_cgroup(
+                    &mut candidate,
+                    &view,
+                    &mut fresh,
+                    (b"/owned/fixture", None),
+                    || panic!("completed path failure cannot restart"),
+                    |_| panic!("parked sample cannot read health")
+                )
+                .is_err()
+        );
+        assert_eq!(
+            proof.test_cgroup_snapshot(candidate.id()).unwrap().starts,
+            1
+        );
+    }
+}
+
 #[test]
 fn detailed_proof_foreign_session_equal_cookie_refused() {
     let a = ProofSession::test_session();

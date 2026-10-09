@@ -154,6 +154,9 @@ impl LedgerProcess {
 
 impl Drop for LedgerProcess {
     fn drop(&mut self) {
+        if let Ok(Some(_)) = self.child.try_wait() {
+            return;
+        }
         // SIGTERM lets a --hold ledger tear its session down; then reap.
         unsafe {
             libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
@@ -893,6 +896,546 @@ fn stream_ended(stream: &str) -> bool {
         .last()
         .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
         .is_some_and(|line| line["kind"] == "ended")
+}
+
+/// Builds the existing owned retirement fixture: two distinct provider tables
+/// point at one physical Initialize body. Its ledger counts actual calls only.
+struct DemotionWorkload {
+    process: LedgerProcess,
+    control: std::fs::File,
+    dir: tempfile::TempDir,
+}
+
+impl DemotionWorkload {
+    fn spawn() -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir()?;
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/public-cli/demotion-ledger.c");
+        for (name, mode) in [
+            ("libdemotion-common.so", Some("DEMOTION_COMMON")),
+            ("provider-A.so", Some("DEMOTION_PROVIDER_A")),
+            ("provider-B.so", Some("DEMOTION_PROVIDER_B")),
+            ("workload", None),
+        ] {
+            let mut command = Command::new("cc");
+            command.args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"]);
+            if let Some(mode) = mode {
+                command.args(["-shared", "-fPIC"]).arg(format!("-D{mode}"));
+            } else {
+                command.arg("-DDEMOTION_PHASED_LEDGER");
+            }
+            command.arg(&source).arg("-o").arg(dir.path().join(name));
+            if mode.is_some_and(|mode| mode != "DEMOTION_COMMON") {
+                command.arg("-L").arg(dir.path()).args([
+                    "-ldemotion-common",
+                    "-Wl,-rpath,$ORIGIN",
+                    "-Wl,-z,defs",
+                ]);
+            } else if mode.is_none() {
+                command.arg("-ldl");
+            }
+            ensure!(command.status()?.success(), "building {name} failed");
+        }
+        let fifo = dir.path().join("control");
+        ensure!(
+            Command::new("mkfifo")
+                .arg("-m")
+                .arg("600")
+                .arg(&fifo)
+                .status()?
+                .success(),
+            "creating the owned control FIFO failed"
+        );
+        let out = dir.path().join("workload.out");
+        let child = Command::new(dir.path().join("workload"))
+            .args([
+                dir.path().join("provider-A.so"),
+                dir.path().join("provider-B.so"),
+                dir.path().join("libdemotion-common.so"),
+                fifo.clone(),
+                dir.path().join("calls.jsonl"),
+            ])
+            .args(["0123456789abcdef0123456789abcdef", "110000"])
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(&out)?)
+            .stderr(std::fs::File::create(dir.path().join("workload.err"))?)
+            .spawn()?;
+        let process = LedgerProcess { child, out };
+        process.wait_for("{\"event\":\"prepared\"", Duration::from_secs(5))?;
+        let control = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(fifo)?;
+        Ok(Self {
+            dir,
+            process,
+            control,
+        })
+    }
+
+    fn command(&self, command: &str, acknowledgement: &str) -> Result<()> {
+        writeln!(&self.control, "{command}")?;
+        self.process.wait_for(
+            &format!("{{\"event\":\"{acknowledgement}\""),
+            Duration::from_secs(5),
+        )
+    }
+
+    fn calls(&self) -> Result<Vec<serde_json::Value>> {
+        jsonl_records(&self.dir.path().join("calls.jsonl"))
+    }
+
+    /// Compare held and loaded files through their vm_file identities, never
+    /// through fstat's device versus the device printed by /proc/maps.
+    fn check_mapping(&self, name: &str) -> Result<()> {
+        use crate::discovery::identity::{map_files_identity, self_mapped_identity};
+        use std::os::unix::ffi::OsStrExt;
+        let path = self.dir.path().join(name);
+        let file = std::fs::File::open(&path)?;
+        let held = self_mapped_identity(&file).map_err(anyhow::Error::msg)?;
+        let maps = p11scope_manifest::maps::parse_maps(&std::fs::read(format!(
+            "/proc/{}/maps",
+            self.process.pid()
+        ))?)
+        .map_err(anyhow::Error::msg)?;
+        let loaded = maps
+            .iter()
+            .find(|entry| {
+                entry.permissions[2] == b'x'
+                    && entry.raw_path.as_deref() == Some(path.as_os_str().as_bytes())
+            })
+            .context(format!("{name} has no owned executable mapping"))?;
+        let target = map_files_identity(self.process.pid(), loaded.start, loaded.end)?;
+        ensure!(
+            held == target,
+            "held and loaded fixture file differ: {name}"
+        );
+        Ok(())
+    }
+}
+
+fn jsonl_records(path: &Path) -> Result<Vec<serde_json::Value>> {
+    std::fs::read_to_string(path)?
+        .lines()
+        .map(|line| serde_json::from_str(line).map_err(anyhow::Error::from))
+        .collect()
+}
+
+fn phase_calls(ledger: &[serde_json::Value], phase: &str) -> u64 {
+    ledger
+        .iter()
+        .filter(|row| row["kind"] == "call" && row["phase"] == phase)
+        .count() as u64
+}
+
+fn check_demotion_ledger(ledger: &[serde_json::Value]) -> Result<()> {
+    let calls: Vec<_> = ledger.iter().filter(|row| row["kind"] == "call").collect();
+    for (index, call) in calls.iter().enumerate() {
+        ensure!(
+            call["sequence"] == index as u64 + 1,
+            "call sequence: {call}"
+        );
+        ensure!(
+            call["entered"] == true
+                && call["completed"] == true
+                && matches!((call["before_call_ns"].as_u64(), call["after_return_ns"].as_u64()),
+                    (Some(before), Some(after)) if after > before),
+            "incomplete call: {call}"
+        );
+        ensure!(
+            matches!(call["return_status"].as_u64(), Some(0 | 7)),
+            "return: {call}"
+        );
+    }
+    for (phase, expected) in [("a", 5), ("shared", 2), ("fence", 1), ("proof", 2)] {
+        ensure!(
+            phase_calls(ledger, phase) == expected,
+            "workload phase {phase} missing"
+        );
+    }
+    ensure!(calls.len() == 10, "workload call total: {}", calls.len());
+    let terminal = ledger.last().context("empty workload ledger")?;
+    ensure!(
+        terminal["kind"] == "complete"
+            && terminal["complete"] == true
+            && terminal["calls"] == calls.len() as u64,
+        "workload terminal: {terminal}"
+    );
+    Ok(())
+}
+
+#[test]
+fn demotion_fixture_records_phased_calls() -> Result<()> {
+    let mut workload = DemotionWorkload::spawn()?;
+    for (command, ack) in [
+        ("ready", "a-done"),
+        ("load-b", "b-ready"),
+        ("shared", "shared-done"),
+        ("unload-a", "a-unmapped"),
+        ("fence", "fence-done"),
+        ("proof", "final-calls"),
+        ("stop", "done"),
+    ] {
+        workload.command(command, ack)?;
+    }
+    ensure!(
+        workload.process.child.wait()?.success(),
+        "workload exit failed"
+    );
+    let ledger = workload.calls()?;
+    check_demotion_ledger(&ledger)?;
+    let mut incomplete = ledger.clone();
+    incomplete.last_mut().context("terminal row")?["complete"] = false.into();
+    ensure!(
+        check_demotion_ledger(&incomplete).is_err(),
+        "accepted an incomplete workload"
+    );
+    let mut missing_phase = ledger;
+    let call = missing_phase
+        .iter_mut()
+        .find(|row| row["phase"] == "shared")
+        .context("shared call")?;
+    call["phase"] = serde_json::Value::Null;
+    ensure!(
+        check_demotion_ledger(&missing_phase).is_err(),
+        "accepted a missing shared call phase"
+    );
+    Ok(())
+}
+
+fn demotion_edge<'a>(
+    stream: &'a [serde_json::Value],
+    pid: u32,
+    suffix: &str,
+) -> Option<&'a serde_json::Value> {
+    stream.iter().rev().find_map(|row| {
+        let event = &row["event"];
+        (row["kind"] == "edge_observed"
+            && event["identity_context"]["caller"]["pid"] == pid
+            && event["identity_context"]["module"]["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with(suffix)))
+        .then_some(event)
+    })
+}
+
+/// The real PID capture must preserve A's published history, withhold shared
+/// calls and the first post-retirement read, then allocate only later B calls.
+/// FIFO milestones use public capture state; the C call ledger is the oracle.
+#[test]
+#[ignore = "root-owned live BPF lane; real provider retirement recovers B and exports diagnostics"]
+fn privileged_native_lane_pid_provider_retirement_diagnostics_lp64() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut workload = DemotionWorkload::spawn()?;
+    let pid = workload.process.pid();
+    workload.check_mapping("provider-A.so")?;
+    workload.check_mapping("libdemotion-common.so")?;
+    let root = workload.dir.path();
+    let events = root.join("events.jsonl");
+    let diagnostics = root.join("diagnostics.jsonl");
+    let started = Instant::now();
+    let stage = Cell::new(0u8);
+    let failure = RefCell::new(None::<anyhow::Error>);
+    let stop = || {
+        let advance = || -> Result<bool> {
+            ensure!(
+                started.elapsed() < Duration::from_secs(95),
+                "retirement workload did not reach capture milestone {}",
+                stage.get()
+            );
+            if stage.get() == 7 {
+                return Ok(true);
+            }
+            let stream = if events.exists() {
+                jsonl_records(&events)?
+            } else {
+                Vec::new()
+            };
+            // A partial event publication is not a committed observer milestone.
+            if !stream
+                .last()
+                .is_some_and(|row| row["kind"] == "pass_committed")
+            {
+                return Ok(false);
+            }
+            let a = demotion_edge(&stream, pid, "provider-A.so");
+            let b = demotion_edge(&stream, pid, "provider-B.so");
+            let ledger = workload.calls()?;
+            let a_calls = phase_calls(&ledger, "a");
+            let shared = phase_calls(&ledger, "shared");
+            let has_gap = |text: &str| {
+                stream.iter().any(|row| {
+                    row["kind"] == "gap_recorded"
+                        && row["event"]["subject"] == "rejected demoted count"
+                        && row["event"]["reason"]
+                            .as_str()
+                            .is_some_and(|reason| reason.contains(text))
+                })
+            };
+            match stage.get() {
+                0 if a.is_some_and(|edge| {
+                    edge["presence"] == "mapped" && edge["capture"] == "armed"
+                }) =>
+                {
+                    workload.command("ready", "a-done")?;
+                    stage.set(1);
+                }
+                1 if a_calls > 0 && a.is_some_and(|edge| edge["entries"]["count"] == a_calls) => {
+                    // This stop callback quiesces the observer between passes;
+                    // B's unselected acquisition call precedes its attachment.
+                    workload.command("load-b", "b-ready")?;
+                    workload.check_mapping("provider-B.so")?;
+                    stage.set(2);
+                }
+                2 if b.is_some_and(|edge| {
+                    edge["presence"] == "mapped" && edge["capture"] == "armed"
+                }) =>
+                {
+                    workload.command("shared", "shared-done")?;
+                    stage.set(3);
+                }
+                3 if shared > 0
+                    && (has_gap(&format!(
+                        "{shared} unattributed calls after sharing appeared"
+                    )) || has_gap(&format!(
+                        "absolute count range ({a_calls}, {}]",
+                        a_calls + shared
+                    ))) =>
+                {
+                    ensure!(
+                        a.is_some_and(|edge| edge["entries"]["count"] == a_calls)
+                            && b.is_some_and(|edge| edge["entries"]["count"] == 0),
+                        "shared calls escaped withholding: A={a:?}, B={b:?}"
+                    );
+                    workload.command("unload-a", "a-unmapped")?;
+                    stage.set(4);
+                }
+                4 if a.is_some_and(|edge| edge["presence"] == "unloaded") => {
+                    workload.command("fence", "fence-done")?;
+                    stage.set(5);
+                }
+                5 if has_gap(&format!(
+                    "absolute count range ({}, {}]",
+                    a_calls + shared,
+                    a_calls + shared + phase_calls(&ledger, "fence")
+                )) =>
+                {
+                    ensure!(
+                        b.is_some_and(|edge| edge["entries"]["count"] == 0),
+                        "the fence was attributed: B={b:?}"
+                    );
+                    workload.command("proof", "final-calls")?;
+                    stage.set(6);
+                }
+                6 if phase_calls(&ledger, "proof") > 0
+                    && b.is_some_and(|edge| {
+                        edge["entries"]["count"] == phase_calls(&ledger, "proof")
+                    }) =>
+                {
+                    stage.set(7);
+                    return Ok(true);
+                }
+                _ => {}
+            }
+            Ok(false)
+        };
+        match advance() {
+            Ok(done) => done,
+            Err(error) => {
+                *failure.borrow_mut() = Some(error);
+                true
+            }
+        }
+    };
+    let mut stdout = Vec::new();
+    let code = run_with_terminal_diagnostics(
+        InspectScope::Pid(pid),
+        // Ownership retirement needs a complete inventory of this owned
+        // caller. Explicit module hints deliberately cannot prove absence.
+        &[],
+        &HookRegistry::builtin(),
+        true,
+        None,
+        None,
+        Some(Duration::from_secs(100)),
+        None,
+        false,
+        Some(&events),
+        None,
+        None,
+        CaptureMode::Native,
+        crate::attach::BackendSelection::Auto,
+        &stop,
+        &|| {},
+        false,
+        &mut WriterStdout(&mut stdout),
+        &DashboardIo::stdio(),
+        DiagnosticRequest {
+            path: Some(&diagnostics),
+            pid_filter: Some(pid),
+            second_signal: &|| false,
+        },
+        None,
+    )?;
+    if let Some(error) = failure.into_inner() {
+        eprintln!("RETIREMENT_FAILURE workload={:?}", workload.process.lines());
+        let records = jsonl_records(&diagnostics).unwrap_or_default();
+        for row in records.iter().rev().take(32).rev() {
+            eprintln!("RETIREMENT_DIAGNOSTIC {row}");
+        }
+        return Err(error);
+    }
+    ensure!(
+        code == 0 && stage.get() == 7,
+        "exit={code}, capture milestone={}",
+        stage.get()
+    );
+    workload.command("stop", "done")?;
+    ensure!(
+        workload.process.child.wait()?.success(),
+        "workload exit failed"
+    );
+    let ledger = workload.calls()?;
+    check_demotion_ledger(&ledger)?;
+    let document: serde_json::Value = serde_json::from_slice(&stdout)?;
+    let stream = std::fs::read_to_string(&events)?;
+    ensure!(stream_ended(&stream), "event stream did not end");
+    ensure!(
+        document["observation"]["lane"] == "native"
+            && document["observation"]["settlement"] == "unsettled",
+        "{}",
+        document["observation"]
+    );
+    ensure!(
+        !ab_lifecycle_loss_detected(&document),
+        "lifecycle loss invalidated retirement recovery"
+    );
+    let edges = doc_edges(&document, pid);
+    ensure!(edges.len() == 2, "owned caller edges: {edges:?}");
+    let doc_modules = document["modules"].as_array().context("modules")?;
+    let edge_for = |suffix: &str| -> Result<&serde_json::Value> {
+        edges
+            .iter()
+            .copied()
+            .find(|edge| {
+                doc_modules.iter().any(|module| {
+                    module["id"] == edge["module"]
+                        && module["paths"].as_array().is_some_and(|paths| {
+                            paths.iter().any(|path| {
+                                path.as_str().is_some_and(|path| path.ends_with(suffix))
+                            })
+                        })
+                })
+            })
+            .context(format!("missing owned edge {suffix}"))
+    };
+    let a = edge_for("provider-A.so")?;
+    let b = edge_for("provider-B.so")?;
+    let a_calls = phase_calls(&ledger, "a");
+    let shared = phase_calls(&ledger, "shared");
+    let fence = phase_calls(&ledger, "fence");
+    let proof = phase_calls(&ledger, "proof");
+    ensure!(a["entries"]["count"] == a_calls, "A history changed: {a}");
+    ensure!(
+        b["entries"]["count"] == proof && b["entries"]["coverage"]["state"] == "counted",
+        "B did not recover the independent proof calls: {b}"
+    );
+    let records = jsonl_records(&diagnostics)?;
+    ensure!(
+        std::fs::metadata(&diagnostics)?.permissions().mode() & 0o777 == 0o600,
+        "diagnostic destination is not private"
+    );
+    ensure!(
+        records.first().is_some_and(|row| row["kind"] == "header")
+            && records.last().is_some_and(|row| row["kind"] == "footer"
+                && row["capture_settlement"] == "unsettled"
+                && row["diagnostics_complete"] == true),
+        "diagnostic envelope incomplete"
+    );
+    let header = &records[0];
+    let footer = records.last().expect("checked diagnostic footer");
+    ensure!(
+        header["pid_filter"] == pid && header["scope"] == "pid" && header["mode"] == "native",
+        "focused diagnostic request changed: {header}"
+    );
+    ensure!(
+        footer["records_written"] == records.len() as u64 - 2
+            && footer["bytes_written"] == std::fs::metadata(&diagnostics)?.len()
+            && footer["kinds"].as_array().is_some_and(|kinds| kinds
+                .iter()
+                .all(|kind| kind["evicted"] == 0 && kind["omitted"] == 0)),
+        "diagnostic records missing: {footer}"
+    );
+    let recovered = records
+        .iter()
+        .find(|row| {
+            row["decision"] == "placed"
+                && row["module_id"] == b["module"]
+                && row["edge_total"] == proof
+                && row["staged"] == proof
+        })
+        .context("actual recovered-B placement missing")?;
+    let pair = &recovered["pair"];
+    ensure!(!pair.is_null(), "recovered placement has no pair");
+    ensure!(
+        records
+            .iter()
+            .any(|row| row["pair"] == *pair && row["new_eligibility"] == "shared_owner")
+            && records.iter().any(|row| row["pair"] == *pair
+                && row["new_eligibility"] == "sole_owner"
+                && row["module_id"] == b["module"]),
+        "actual shared-to-B ownership transition missing"
+    );
+    let fence_decision = records
+        .iter()
+        .find(|row| {
+            row["pair"] == *pair
+                && row["decision"] == "withheld"
+                && row["reason"] == "awaiting_fence"
+                && row["after"] == a_calls + shared
+                && row["through"] == a_calls + shared + fence
+        })
+        .context("the fence prefix was not withheld")?;
+    ensure!(
+        fence_decision["observation_ref"]["status"] == "retained",
+        "the selected fence read is not retained: {fence_decision}"
+    );
+    let observation_seq = fence_decision["observation_ref"]["seq"]
+        .as_u64()
+        .context("selected fence observation reference missing")?;
+    let fence_read = records
+        .iter()
+        .find(|row| {
+            row["seq"] == observation_seq
+                && row["kind"] == "count_observation"
+                && row["pair"] == *pair
+                && row["absolute"] == a_calls + shared + fence
+        })
+        .context("actual selected fence observation missing")?;
+    ensure!(
+        (fence_read["origin"] == "initial" || fence_read["origin"] == "refresh")
+            && fence_read["pre"]
+                .as_u64()
+                .is_some_and(|pre| fence_read["post"]
+                    .as_u64()
+                    .is_some_and(|post| pre > 0 && post > pre)),
+        "the selected fence read lacks its actual origin/bracket: {fence_read}"
+    );
+    ensure!(
+        recovered["base"] == a_calls + shared + fence
+            && recovered["absolute"] == a_calls + shared + fence + proof
+            && recovered["baseline_pre"] == fence_read["pre"]
+            && recovered["baseline_post"] == fence_read["post"],
+        "recovery lost actual fence context: {recovered}"
+    );
+    eprintln!(
+        "RETIREMENT_LIVE pid={pid} passes={} a={a_calls} shared_withheld={shared} fence_withheld={fence} b={proof} diagnostics={} elapsed_ms={}",
+        document["observation"]["passes"],
+        records.len(),
+        started.elapsed().as_millis()
+    );
+    Ok(())
 }
 
 /// C5.1 cell 2: `--system`, production path. A process that dlopens the

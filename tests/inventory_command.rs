@@ -47,6 +47,41 @@ fn fixture_source(rel: &str) -> PathBuf {
         .join(rel)
 }
 
+#[test]
+fn native_semantic_scan_manifest_rejects_before_sinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let report = dir.path().join("report.json");
+    let events = dir.path().join("events.jsonl");
+    let diagnostics = dir.path().join("diagnostics.jsonl");
+    let marker = b"owned-sink-must-not-change\n";
+    for path in [&report, &events, &diagnostics] {
+        std::fs::write(path, marker).unwrap();
+    }
+    // The missing input must never be opened: this is an argument conflict.
+    let output = Command::new(env!("CARGO_BIN_EXE_p11scope"))
+        .args(["inventory", "--pid", "1", "--capture", "scan", "--manifest"])
+        .arg(dir.path().join("missing-manifest.json"))
+        .arg("-o")
+        .arg(&report)
+        .arg("--event-log")
+        .arg(&events)
+        .arg("--diagnostics")
+        .arg(&diagnostics)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty());
+    let refusal = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        refusal.contains("--manifest requires --capture auto or native"),
+        "{refusal}"
+    );
+    for path in [&report, &events, &diagnostics] {
+        assert_eq!(std::fs::read(path).unwrap(), marker);
+    }
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
+}
+
 fn matrix_source() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/discover/tests/fixture/version_matrix.c")
 }

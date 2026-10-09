@@ -719,6 +719,11 @@ Limits that matter in pods:
   not a desktop or package identity: an interpreter remains `python3`,
   `java`, etc. Caller/module IDs and PID/incarnation are secondary detail;
   equal basenames remain separate rows for their existing identities.
+  Repeatable `--manifest <m.json>` retains explicit operator inputs for
+  preparation of a separate attested Detailed subset under `--capture auto`
+  or `native`. `scan` plus a manifest is an argument error before output
+  files open. Subset preparation preserves broad physical counting; this
+  preparation gate alone does not activate positive Inventory instance delivery.
   Missing retained names read `Unknown executable` or `Unknown module`;
   an observed ` (deleted)` path marker stays on the executable label.
   Retired images say `Application executed a new image`, and exited

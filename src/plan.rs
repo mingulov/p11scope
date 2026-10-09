@@ -751,6 +751,73 @@ pub struct AttachDelta {
 }
 
 impl AttachPlan {
+    /// Initial subset only: retain descriptor decisions made with every rival
+    /// claim still present, then allocate a fresh dense slot space.
+    pub(crate) fn attested_subset(
+        &self,
+        providers: &BTreeSet<PinnedObjectId>,
+        degraded: &BTreeSet<AttachKey>,
+    ) -> Result<Self, String> {
+        if !self.retired_slots.is_empty() || !self.provisional_get_function_list.is_empty() {
+            return Err("semantic subsets require a fresh initial plan".into());
+        }
+        let selected: BTreeSet<_> = self
+            .modules
+            .iter()
+            .filter(|module| providers.contains(&module.object))
+            .map(|module| module.id)
+            .collect();
+        let mut slots: Vec<_> = self
+            .slots
+            .iter()
+            .filter(|slot| slot.module_ids.iter().any(|id| selected.contains(id)))
+            .cloned()
+            .collect();
+        let referenced: BTreeSet<_> = slots
+            .iter()
+            .flat_map(|slot| slot.module_ids.iter().copied())
+            .collect();
+        let ids: BTreeMap<_, _> = self
+            .modules
+            .iter()
+            .filter(|module| referenced.contains(&module.id))
+            .enumerate()
+            .map(|(index, module)| (module.id, ModuleId(index as u32)))
+            .collect();
+        for (index, slot) in slots.iter_mut().enumerate() {
+            slot.index = index as u32;
+            if degraded.contains(&AttachKey::of(slot)) {
+                slot.descriptor_index = 0;
+                slot.semantics = SlotSemantics::COUNT_ONLY;
+                slot.semantic_authorized = false;
+                slot.semantic_ambiguous = true;
+            }
+            for id in &mut slot.module_ids {
+                *id = ids[id];
+            }
+        }
+        let mut subset = Self::from_slots_with_policy(slots, AdmissionPolicy::Detailed)?;
+        subset.modules = self
+            .modules
+            .iter()
+            .filter(|module| referenced.contains(&module.id))
+            .cloned()
+            .map(|mut module| {
+                module.id = ids[&module.id];
+                module
+            })
+            .collect();
+        subset.slot_ordinals = self
+            .slot_ordinals
+            .iter()
+            .filter(|(key, _)| subset.slot_by_key.contains_key(key))
+            .map(|(key, value)| (*key, value.clone()))
+            .collect();
+        subset.object_identities = self.object_identities.clone();
+        subset.validate_slot_index()?;
+        Ok(subset)
+    }
+
     pub fn from_slots(slots: Vec<Slot>) -> Self {
         Self::from_indexed_slots(slots, AdmissionPolicy::detailed())
             .expect("slots must have dense indices and unique exact targets")
@@ -2686,6 +2753,130 @@ pub fn build_from_sources_for_policy_scoped(
         admission_policy,
         admission_scope,
     )
+}
+
+/// Complete target requirements before table/slot admission. These are negative
+/// completeness and ambiguity facts, never permission to read arguments.
+pub(crate) struct SemanticSourceClaims {
+    pub(crate) providers: BTreeMap<PinnedObjectId, BTreeSet<AttachKey>>,
+    pub(crate) degraded: BTreeSet<AttachKey>,
+    pub(crate) incomplete: BTreeSet<PinnedObjectId>,
+}
+
+pub(crate) fn semantic_source_claims(
+    scanned: &[ReconciledModule],
+    manifests: &[Manifest],
+    pinned: &PinnedObjects,
+) -> SemanticSourceClaims {
+    let affecting = |name: &str| {
+        crate::kinds::descriptor(name)
+            .is_none_or(|descriptor| descriptor != SlotSemantics::COUNT_ONLY)
+    };
+    let mut incomplete: BTreeSet<_> = scanned
+        .iter()
+        .filter(|module| {
+            module
+                .scanned
+                .tables
+                .iter()
+                .any(|table| table.unpinned.iter().any(|entry| affecting(&entry.subject)))
+        })
+        .map(|module| module.object)
+        .collect();
+    let mut pieces: Vec<_> = scanned.iter().map(lower_scanned).collect();
+    let mut selection_claims = Vec::new();
+    for manifest in manifests {
+        let (piece, _) = lower_manifest(
+            manifest,
+            |key, path| pinned.id_for_manifest(key, path),
+            // A retained target rejected by ordinary ABI admission still
+            // belongs to the complete demand; omitting it cannot certify a prefix.
+            |_, _| true,
+        );
+        if let Some(piece) = &piece {
+            if manifest.surfaces.iter().any(|surface| {
+                (matches!(surface.acquisition, Acquisition::Ok)
+                    && !matches!(surface.walk, WalkOutcome::Full | WalkOutcome::KnownPrefix))
+                    || surface.functions.iter().any(|function| {
+                        affecting(&function.name)
+                            && !matches!(
+                                function.resolution,
+                                Resolution::Resolved { .. } | Resolution::NullPointer
+                            )
+                    })
+            }) {
+                // Only typed null/absent entries prove optional absence.
+                // A successfully acquired undecoded table is incomplete;
+                // diagnostic strings cannot stand in for either fact.
+                incomplete.insert(piece.object);
+            }
+            for (_, targets) in
+                crate::discovery::engine::manifest_selection_targets(manifest, pinned)
+            {
+                selection_claims.extend(targets.into_iter().map(|target| (piece.object, target)));
+            }
+        }
+        pieces.extend(piece);
+    }
+    let mut providers = BTreeMap::<_, BTreeSet<_>>::new();
+    let mut owners = BTreeMap::<_, BTreeSet<_>>::new();
+    let mut names = BTreeMap::<_, BTreeMap<String, bool>>::new();
+    for piece in pieces {
+        for target in piece.targets {
+            let key = AttachKey {
+                object: target.object,
+                file_offset: target.file_offset,
+            };
+            providers.entry(piece.object).or_default().insert(key);
+            owners.entry(key).or_default().insert(piece.object);
+            let claims = names.entry(key).or_default();
+            for name in std::iter::once(presented_name(target.name_authorized, target.name))
+                .chain(target.aliases)
+            {
+                claims
+                    .entry(name.to_owned())
+                    .and_modify(|attested| *attested |= target.semantic_authorized)
+                    .or_insert(target.semantic_authorized);
+            }
+        }
+    }
+    let mut selection_keys = BTreeSet::new();
+    for (provider, target) in selection_claims {
+        let key = AttachKey {
+            object: target.object,
+            file_offset: target.file_offset,
+        };
+        providers.entry(provider).or_default().insert(key);
+        owners.entry(key).or_default().insert(provider);
+        names
+            .entry(key)
+            .or_default()
+            .entry(target.name.to_owned())
+            .or_insert(false);
+        // Selection-only input grants no semantic authority, even when a
+        // target also has a trusted name. Keep that negative claim before
+        // provider selection/admission can hide it.
+        selection_keys.insert(key);
+    }
+    let degraded = names
+        .into_iter()
+        .filter_map(|(key, mut names)| {
+            if names.len() > 1 {
+                names.remove(UNKNOWN_FUNCTION_NAME);
+            }
+            let labels = names.keys().cloned().collect::<Vec<_>>();
+            (selection_keys.contains(&key)
+                || owners[&key].len() > 1
+                || names.values().any(|attested| !attested)
+                || crate::kinds::descriptor_index(&labels).1)
+                .then_some(key)
+        })
+        .collect();
+    SemanticSourceClaims {
+        providers,
+        degraded,
+        incomplete,
+    }
 }
 
 fn build_from_sources_with_policy(

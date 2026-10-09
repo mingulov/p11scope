@@ -66,6 +66,16 @@ fn help_routes_and_channels() {
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("Choose a task"), "{text}");
     assert!(text.contains("p11scope inventory diff"), "{text}");
+    let inventory = String::from_utf8(invoke(&["inventory", "--help"]).stdout).unwrap();
+    for line in inventory
+        .lines()
+        .filter(|line| line.starts_with("  p11scope inventory --"))
+    {
+        if line.contains("[--module") {
+            assert!(line.contains("[--manifest <m.json>]..."), "{line}");
+        }
+    }
+    assert!(inventory.contains("requires auto or native"), "{inventory}");
 }
 
 #[test]
@@ -90,6 +100,19 @@ fn usage_error_is_scoped() {
         (
             vec!["inventory", "--pid", "1", "--system"],
             "mutually exclusive",
+            "inventory",
+        ),
+        (
+            vec![
+                "inventory",
+                "--pid",
+                "1",
+                "--capture",
+                "scan",
+                "--manifest",
+                "m.json",
+            ],
+            "--manifest requires --capture auto or native",
             "inventory",
         ),
         (

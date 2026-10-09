@@ -1748,6 +1748,100 @@ struct RetainedStaticTarget {
     abi: ElfAbi,
 }
 
+/// Session-owned attachment authority. Fields and constructor stay private.
+pub(crate) struct AttachedSemanticSet {
+    domain: crate::attach::capture::NativeDomainId,
+    subset: crate::inventory_semantics::AttestedSubset,
+}
+
+impl std::fmt::Debug for AttachedSemanticSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AttachedSemanticSet(<retained>)")
+    }
+}
+
+fn seal_attached_subset_with(
+    subset: crate::inventory_semantics::AttestedSubset,
+    domain: crate::attach::capture::NativeDomainId,
+    policy: CapturePolicy,
+    descriptors: Result<Vec<SlotSemantics>>,
+    retained: &BTreeMap<u32, RetainedStaticTarget>,
+    owned_sides: &BTreeSet<StaticEndpoint>,
+    watched: impl Fn(PinnedObjectId) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
+) -> std::result::Result<AttachedSemanticSet, crate::inventory_semantics::SemanticRefusal> {
+    let attached = AttachedSemanticSet { domain, subset };
+    attached.validate_with(domain, policy, descriptors, retained, owned_sides, watched)?;
+    Ok(attached)
+}
+
+impl AttachedSemanticSet {
+    fn validate_with(
+        &self,
+        domain: crate::attach::capture::NativeDomainId,
+        policy: CapturePolicy,
+        descriptors: Result<Vec<SlotSemantics>>,
+        retained: &BTreeMap<u32, RetainedStaticTarget>,
+        owned_sides: &BTreeSet<StaticEndpoint>,
+        watched: impl Fn(PinnedObjectId) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
+    ) -> std::result::Result<(), crate::inventory_semantics::SemanticRefusal> {
+        use crate::inventory_semantics::SemanticRefusal;
+        if domain != self.domain || policy != CapturePolicy::Allowlisted {
+            return Err(SemanticRefusal::Attachment);
+        }
+        if descriptors.map_err(|_| SemanticRefusal::Descriptor)? != *crate::kinds::DESCRIPTORS {
+            return Err(SemanticRefusal::Descriptor);
+        }
+        let plan = self.subset.plan();
+        let pins = self.subset.pins();
+        if plan.validate_slot_index().is_err() || self.subset.required().is_empty() {
+            return Err(SemanticRefusal::IncompleteProvider);
+        }
+        if pins.check_unchanged() != Ok(true) {
+            return Err(SemanticRefusal::ProviderInstanceUnproven);
+        }
+        let mut checked = BTreeSet::new();
+        for (provider, required) in self.subset.required() {
+            if required.is_empty() {
+                return Err(SemanticRefusal::IncompleteProvider);
+            }
+            for index in required {
+                let slot = plan
+                    .slots
+                    .get(*index as usize)
+                    .ok_or(SemanticRefusal::Attachment)?;
+                let actual = retained.get(index).ok_or(SemanticRefusal::Attachment)?;
+                if actual.slot != *slot
+                    || !owned_sides.contains(&(*index, ProbeSide::Entry))
+                    || !owned_sides.contains(&(*index, ProbeSide::Return))
+                    || Some(actual.abi) != pins.abi_for(slot.object)
+                    || Some(&actual.path) != pins.attach_path_for(slot.object).as_ref().ok()
+                {
+                    return Err(SemanticRefusal::Attachment);
+                }
+                // One watched dependency image cannot establish the provider's
+                // load instance. Equal digests/local IDs never replace held custody.
+                let target =
+                    watched(slot.object).ok_or(SemanticRefusal::ProviderInstanceUnproven)?;
+                if slot.object != *provider
+                    || !target.same_object_as(pins, *provider)
+                    || target.check_unchanged() != Ok(true)
+                {
+                    return Err(SemanticRefusal::ProviderInstanceUnproven);
+                }
+                checked.insert(*index);
+            }
+        }
+        if checked.len() != plan.slots.len() {
+            return Err(SemanticRefusal::IncompleteProvider);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[path = "inventory_semantics_tests.rs"]
+mod inventory_semantics_tests;
+
 /// Retains exact reattach facts for every requested slot that gained a
 /// link. Reattach overwrites: a replacement's new descriptor supersedes
 /// the frozen one the rebuild pruned.
@@ -2995,6 +3089,96 @@ impl Session {
         session.selection = selection;
         session.backend_fallback = fallback;
         Ok(session)
+    }
+
+    /// The receipt is minted from this new Session's maps and retained links;
+    /// the caller supplies only the coordinator's move-only accepted subset.
+    #[expect(
+        dead_code,
+        reason = "H3 runtime wiring follows the attested subset gate"
+    )]
+    pub(crate) fn start_attested(
+        subset: crate::inventory_semantics::AttestedSubset,
+        scope: &Scope,
+        selection: BackendSelection,
+    ) -> Result<(Self, AttachedSemanticSet)> {
+        let session = Self::start(
+            subset.plan(),
+            scope,
+            subset.pins(),
+            CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            selection,
+        )?;
+        let domain = session
+            .native_domain()
+            .context("Detailed image domain unavailable")?;
+        let attached = seal_attached_subset_with(
+            subset,
+            domain,
+            session.policy,
+            session.semantic_descriptors(),
+            &session.retained_static,
+            &session.current_static_sides(),
+            |object| {
+                session
+                    .instance
+                    .watched(object)
+                    .map(|watched| watched.retained_target())
+            },
+        )
+        .map_err(|reason| anyhow!("attested semantic attachment refused: {reason}"))?;
+        Ok((session, attached))
+    }
+
+    fn semantic_descriptors(&self) -> Result<Vec<SlotSemantics>> {
+        let descriptors: Array<_, SlotSemantics> =
+            Array::try_from(self.ebpf.map("DESCRIPTORS").context("DESCRIPTORS map")?)?;
+        descriptors
+            .iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::from)
+    }
+
+    fn current_static_sides(&self) -> BTreeSet<StaticEndpoint> {
+        self.links
+            .iter()
+            .flat_map(|link| {
+                let side = match link.producer() {
+                    ProducerProgram::UProbe(program) => static_probe_side(program),
+                    _ => None,
+                };
+                link.slots()
+                    .iter()
+                    .filter_map(move |slot| side.map(|side| (*slot, side)))
+            })
+            .collect()
+    }
+
+    #[expect(
+        dead_code,
+        reason = "H3 runtime wiring follows the attested subset gate"
+    )]
+    pub(crate) fn validate_semantic_set(&self, attached: &AttachedSemanticSet) -> Result<()> {
+        let domain = self
+            .native_domain()
+            .context("Detailed image domain unavailable")?;
+        attached
+            .validate_with(
+                domain,
+                self.policy,
+                self.semantic_descriptors(),
+                &self.retained_static,
+                &self.current_static_sides(),
+                |object| {
+                    self.instance
+                        .watched(object)
+                        .map(|watched| watched.retained_target())
+                },
+            )
+            .map_err(|reason| anyhow!("attested semantic attachment refused: {reason}"))
     }
 
     #[allow(clippy::too_many_arguments)]

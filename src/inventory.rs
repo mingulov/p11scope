@@ -421,6 +421,7 @@ fn registry_limits(max_gaps: Option<usize>) -> RegistryLimits {
 pub fn run(
     scope: impl Into<crate::cli::ScopeArg>,
     modules: &[PathBuf],
+    manifests: &[PathBuf],
     hooks: &HookRegistry,
     json: bool,
     max_scan_pids: Option<usize>,
@@ -437,6 +438,9 @@ pub fn run(
     diagnostics: Option<&Path>,
     diagnostics_pid: Option<u32>,
 ) -> Result<i32> {
+    if !manifests.is_empty() && capture == CaptureMode::Scan {
+        anyhow::bail!("--manifest requires --capture auto or native");
+    }
     let scope: crate::cli::ScopeArg = scope.into();
     let endpoint_budget = inventory_endpoint_budget(max_endpoints).map_err(anyhow::Error::msg)?;
     let stdout_tty = crate::inventory_dashboard::fd_is_tty(1);
@@ -448,6 +452,7 @@ pub fn run(
     run_with_terminal_budget(
         scope,
         modules,
+        manifests,
         hooks,
         json,
         max_scan_pids,
@@ -650,6 +655,7 @@ fn run_with_terminal_diagnostics(
     run_with_terminal_budget(
         scope,
         modules,
+        &[],
         hooks,
         json,
         max_scan_pids,
@@ -678,6 +684,7 @@ fn run_with_terminal_diagnostics(
 fn run_with_terminal_budget(
     scope: impl Into<InventorySelection>,
     modules: &[PathBuf],
+    manifests: &[PathBuf],
     hooks: &HookRegistry,
     json: bool,
     max_scan_pids: Option<usize>,
@@ -769,6 +776,7 @@ fn run_with_terminal_budget(
         registry_limits(max_gaps),
         endpoint_budget,
     )?;
+    coordinator.set_semantic_manifests(manifests.to_vec());
     // F4 (review): a document with no `exact` flag still says, as a
     // scope-level gap, that /proc PIDs are not the kernel's here.
     stage_numbering_gap(&mut coordinator, &numbering);
@@ -2978,6 +2986,7 @@ mod tests {
             for dashboard in [false, true] {
                 let error = run(
                     InspectScope::System,
+                    &[],
                     &[],
                     &HookRegistry::builtin(),
                     true,

@@ -49,7 +49,7 @@ static long (*image_update)(void *, const void *, const void *, u64) = (void *)2
 static u64 (*image_pid_tgid)(void) = (void *)14;
 static u64 (*image_ktime)(void) = (void *)5;
 static void *(*image_storage_get)(void *, void *, void *, u64) = (void *)156;
-static long (*image_seq_write)(void *, const void *, u32) = (void *)126;
+static long (*image_seq_write)(void *, const void *, u32) = (void *)127;
 #ifdef P11SCOPE_IMAGE_QUERY_HOST_TEST
 #define IMG_READ(cell) __atomic_load_n(&(cell), __ATOMIC_SEQ_CST)
 #define IMG_STORE(cell, value) __atomic_store_n(&(cell), (value), __ATOMIC_SEQ_CST)

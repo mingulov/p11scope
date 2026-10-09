@@ -64,7 +64,8 @@ typedef unsigned long long u64;
 #define INST_GEN_FAULT 0U
 #define INST_GEN_ATTACH 1U
 #define INST_GEN_STICKY 2U
-#define INST_GEN_CELLS 3U
+#define INST_GEN_IMAGE_COVERAGE 3U
+#define INST_GEN_CELLS 4U
 /* INSTANCE_GEN[STICKY] bits: conditions that disable routing for the rest
  * of the capture (a later epoch cannot repair them). */
 #define INST_STICKY_FORK_UNMARKED 1ULL

@@ -54,8 +54,8 @@ class MapDefsTests(unittest.TestCase):
 
         BPF_OBJ_NAME_LEN truncates map names to 15 chars; the stopped
         canary compares those truncated names against FROZEN_INVENTORY.
-        Only task_storage names have a canonical remap
-        (dump-owned-bpf-maps.canonical_map_name), so every other frozen
+        Only the exact task-storage and private image-hash names have a
+        canonical remap, so every other frozen
         name must fit, and no two names in a flavor may share a prefix.
         """
         dumper = load_path(ROOT / "scripts/dump-owned-bpf-maps.py", "map_dumper")
@@ -64,10 +64,10 @@ class MapDefsTests(unittest.TestCase):
                 prefixes = {}
                 for name in maps:
                     if len(name) > 15:
-                        self.assertIn(name, dumper.TASK_STORAGE_NAMES,
+                        canonical_type = ("task_storage" if maps[name]["type"] == 29 else
+                                          "hash" if maps[name]["type"] == 1 else "other")
+                        self.assertEqual(name, dumper.canonical_map_name({"name": name[:15], "type": canonical_type}),
                                       f"{name} exceeds 15 chars without a canonical remap")
-                        # The remap only fires for task_storage rows.
-                        self.assertEqual(maps[name]["type"], 29, f"{name} remap needs task_storage type")
                     truncated = name[:15]
                     self.assertNotIn(truncated, prefixes,
                                      f"{name} collides with {prefixes.get(truncated)}")
@@ -193,7 +193,8 @@ class MapDefsTests(unittest.TestCase):
                        check=True, capture_output=True)
         _, programs, symbols = checker.inspect(obj)
         self.assertEqual(programs, {"probe", "task_newtask", "sched_process_exec", "sched_process_exit",
-                                   "p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy"})
+                                   "p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy",
+                                   "p11_image_exec_release", "p11_image_query"})
         self.assertTrue(checker.REQUIRED_GLOBAL_HELPERS <= symbols)
         body, elf, _ = self.metadata(obj)
         symbase = elf.sections[".symtab"][0][4]

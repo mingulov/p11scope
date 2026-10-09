@@ -155,8 +155,8 @@ static INST_INLINE void inst_count(u64 *cell)
         inst_add(cell);
 }
 
-/* The fault generation ends every incarnation. A bounded CAS raise: a lost
- * race means another raise already moved the cell, which is the same fact. */
+/* The first value outside the u32 stamp representation is permanent refusal.
+ * Never increment it again or wrap a wider value into an earlier fault era. */
 static INST_INLINE void inst_fault(struct instance_counters *counters)
 {
     u32 key = INST_GEN_FAULT;
@@ -169,6 +169,8 @@ static INST_INLINE void inst_fault(struct instance_counters *counters)
 #pragma unroll
     for (int i = 0; i < INST_CAS_TRIES; i++) {
         u64 seen = *(volatile u64 *)gen;
+        if (seen > 0xffffffffULL)
+            return;
         if (__sync_val_compare_and_swap(gen, seen, seen + 1) == seen)
             return;
     }

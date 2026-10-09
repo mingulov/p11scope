@@ -596,6 +596,19 @@ int main(void)
     assert(cas_calls == INST_CAS_TRIES && gen[INST_GEN_FAULT] == 1);
     cas_lose = 0;
 
+    /* Fault identity has only a u32 transport representation. The first
+     * unrepresentable value is a permanent refusal, never another era that
+     * can increment through u64 wrap and alias an earlier stamp. */
+    reset();
+    gen[INST_GEN_FAULT] = 0xffffffffULL;
+    inst_fault(&counters);
+    assert(gen[INST_GEN_FAULT] == 0x100000000ULL);
+    inst_fault(&counters);
+    assert(gen[INST_GEN_FAULT] == 0x100000000ULL);
+    gen[INST_GEN_FAULT] = ~0ULL;
+    inst_fault(&counters);
+    assert(gen[INST_GEN_FAULT] == ~0ULL);
+
     puts("instance epoch hooks: local/global/fault/sticky/calibration/stamp paths verified");
     return 0;
 }

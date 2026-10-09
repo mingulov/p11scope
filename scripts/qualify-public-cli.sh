@@ -42,13 +42,13 @@ mkdir -p "$OUT" && chmod 755 "$OUT" && OUT=$(realpath -e -- "$OUT") && cd "$OUT"
 declare -A CHILDREN
 register() { local gen; gen=$(generation "$1") || return 1; CHILDREN[$1]=$gen; }
 generation() {
-  local line rest; IFS= read -r line < "/proc/$1/stat" 2>/dev/null || return 1
+  local line rest; IFS= read -r line 2>/dev/null < "/proc/$1/stat" || return 1
   rest=${line##*) }; read -ra fields <<< "$rest"
   [ ${#fields[@]} -ge 20 ] || return 1
   printf '%s\n' "${fields[19]}"
 }
 alive() {
-  local line rest; IFS= read -r line < "/proc/$1/stat" 2>/dev/null || return 1
+  local line rest; IFS= read -r line 2>/dev/null < "/proc/$1/stat" || return 1
   rest=${line##*) }; read -ra fields <<< "$rest"
   [ "${fields[0]:-Z}" != Z ] && [ "${fields[19]:-}" = "${CHILDREN[$1]:-unknown}" ]
 }
@@ -94,15 +94,7 @@ asuser() {
   exec setpriv --reuid="$RUNUID" --regid="$RUNGID" --clear-groups env SOFTHSM2_CONF="$SOFTHSM2_CONF" "$@"
 }
 pin() {
-  python3 - "$MODULE" <<'PY'
-import hashlib,json,os,sys
-with open(sys.argv[1],'rb') as f:
- a=os.fstat(f.fileno()); h=hashlib.sha256()
- for chunk in iter(lambda:f.read(1024*1024),b''): h.update(chunk)
- digest=h.hexdigest(); b=os.fstat(f.fileno())
- if (a.st_dev,a.st_ino,a.st_size,a.st_mtime_ns,a.st_ctime_ns)!=(b.st_dev,b.st_ino,b.st_size,b.st_mtime_ns,b.st_ctime_ns): raise RuntimeError('provider changed during hash')
- print(json.dumps({'dev':[os.major(a.st_dev),os.minor(a.st_dev)],'ino':a.st_ino,'sha256':digest}))
-PY
+  python3 -I "$HERE/mapped-provider-pin.py" "$MODULE"
 }
 receipt() {
   python3 - "$cell" "$scope" "$wl" "$gen" "$readygen" "$ready" "$capturing" "$released" "$observer_rc" "$workload_rc" "$before" "$after" <<'PY' > "$cell.receipt.json"

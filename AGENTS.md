@@ -67,6 +67,12 @@ issues. This does not require an evidence archive.
 - Loading a module, locating a symbol or matching a manifest digest does
   not establish operator attestation or prove that an application called it.
   Preserve the documented manifest and physical-provider identity checks.
+- Keep file-descriptor identity and `/proc/maps` identity in their own device
+  domains: Btrfs `st_dev` can differ from the mapped device. Qualification
+  scripts use `scripts/mapped-provider-pin.py` to hash and privately map the
+  same held FD, following `src/discovery/identity.rs` and the manifest's
+  `KernelSelfMappingProbe`. Never copy the expected device from the fixture
+  or capture, drop device checks, or reopen a held object by its pathname.
 - State which revision and kind of test produced a result when relevant.
   Unit tests, controlled provider workloads and real-application captures
   check different behavior; do not overstate their coverage. This is a reporting

@@ -251,6 +251,7 @@ class MatrixContract(unittest.TestCase):
         repo = self.base / "source-clone"
         for name in ("scripts/release-matrix-contract.py", "scripts/qualify-release-matrix.sh",
                      "scripts/run-privileged-lib-tests.sh", "scripts/qualify-public-cli.sh",
+                     "scripts/mapped-provider-pin.py",
                      "scripts/qualify-inventory-native.sh", "scripts/inventory-native-oracle.py",
                      "tests/fixtures/public-cli/gated.c", "tests/fixtures/public-cli/mt.c",
                      "tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c"):
@@ -279,6 +280,20 @@ class MatrixContract(unittest.TestCase):
         data["bindings"].pop("artifacts/source/tests/fixtures/public-cli/inventory-ledger.c", None)
         self.contract.write_text(json.dumps(data) + "\n")
         result = command(sys.executable, "-I", str(CHECKER), "--verify-inputs", str(self.stage), "--contract", str(self.contract))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+    def test_missing_mapped_provider_pin_binding_fails(self):
+        data = json.loads(self.contract.read_text())
+        data["bindings"].pop("artifacts/source/scripts/mapped-provider-pin.py", None)
+        self.contract.write_text(json.dumps(data) + "\n")
+        result = command(sys.executable, "-I", str(CHECKER), "--verify-inputs", str(self.stage), "--contract", str(self.contract))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
+    def test_changed_mapped_provider_pin_runtime_source_fails(self):
+        repo, stage = self.clone_source()
+        helper = repo / "scripts/mapped-provider-pin.py"
+        helper.write_text(helper.read_text() + "\n# changed runtime helper\n")
+        result = command(sys.executable, "-I", str(repo / "scripts" / CHECKER.name), "--verify-inputs", str(stage), "--contract", str(stage / "contract.json"))
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
 
     def test_prebuilt_candidate_without_build_root_receipt_is_refused(self):
@@ -508,7 +523,8 @@ class MatrixContract(unittest.TestCase):
             path = repo / "scripts" / name
             path.write_text("#!/bin/bash\nprintf '%s\\n' \"$THREADS\" \"$@\" > \"$CONTROL_ARGS/" + name + ".args\"\necho 'SUMMARY pass=1 fail=0 skipped=0'\nexit 0\n" if name == "qualify-public-cli.sh" else "#!/bin/bash\nprintf '%s\\n' \"$@\" > \"$CONTROL_ARGS/" + name + ".args\"\necho 'SUMMARY pass=1 fail=0 skipped=0'\nexit 0\n")
             path.chmod(0o755)
-        for name in ("scripts/inventory-native-oracle.py", "tests/fixtures/public-cli/gated.c", "tests/fixtures/public-cli/mt.c",
+        for name in ("scripts/inventory-native-oracle.py", "scripts/mapped-provider-pin.py",
+                     "tests/fixtures/public-cli/gated.c", "tests/fixtures/public-cli/mt.c",
                      "tests/fixtures/public-cli/inventory-ledger.c", "scripts/fixtures/exec_churn.c"):
             path = repo / name; path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("controlled external fixture\n")
@@ -566,7 +582,7 @@ class MatrixContract(unittest.TestCase):
 
     def test_existing_campaign_is_preserved_before_candidate_or_guest_setup(self):
         out = self.base / "campaign-out"
-        previous = out / "existing"
+        previous = out / "HEAD"
         previous.mkdir(parents=True)
         (previous / "summary.md").write_text("preserved earlier evidence\n")
         stubs = self.base / "stubs"
@@ -575,11 +591,12 @@ class MatrixContract(unittest.TestCase):
             path = stubs / name; path.write_text(f"#!/bin/sh\nexit {rc}\n"); path.chmod(0o755)
         env = os.environ.copy(); env["PATH"] = str(stubs) + ":" + env["PATH"]
         stage_base = self.base / "campaign-stage"
-        result = subprocess.run([str(RUNNER), "--rev", "existing", "--bin-dir", str(self.bins),
+        result = subprocess.run([str(RUNNER), "--rev", "HEAD",
                                  "--out-base", str(out), "--stage-base", str(stage_base), "--kernels", "6.1"],
                                 cwd=ROOT, text=True, capture_output=True, env=env, timeout=20)
         retain_command(result.args, result)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("refusing existing campaign output/stage", result.stderr)
         self.assertEqual((previous / "summary.md").read_text(), "preserved earlier evidence\n")
         self.assertFalse(stage_base.exists())
 

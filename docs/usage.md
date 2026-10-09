@@ -24,6 +24,7 @@ implementation limits are code contracts, not measurements.
 - [What it does](#what-it-does)
 - [What it does NOT intentionally decode](#what-it-does-not-intentionally-decode)
 - [Quickstart](#quickstart)
+- [Inventory diagnostics](#inventory-diagnostics)
 - [Offline inventory comparison](#offline-inventory-comparison)
 - [PKCS #11 versions and interface names](#pkcs-11-versions-and-interface-names)
 - [Privileges, per environment](#privileges-per-environment)
@@ -1019,6 +1020,68 @@ changing capture behavior, it joins the table above and the `--help` list.
   be read.
 - `2` — a CLI usage error (unknown flag, missing value, mutually exclusive
   options, removed subcommand).
+
+## Inventory diagnostics
+
+In v0.4 development builds, `inventory --diagnostics <f.jsonl>` requests a
+separate JSONL file explaining native count reads, ownership changes, allocations
+and withheld growth. Use `--capture native` or `auto`; explicit `scan` is refused. If `auto`
+falls back to scanning, the file reports `native_unavailable` without inventing
+native decisions.
+
+```sh
+p11scope inventory --system --capture native --duration 30s \
+  --diagnostics inventory-debug.jsonl --diagnostics-pid 4242 -o inventory.json
+```
+
+4242 is an example PID. Optional `--diagnostics-pid <n>` selects that numeric
+PID's admitted process incarnations without changing capture scope, admission
+or attribution. Global health and lifecycle-loss records remain included;
+records whose PID is unknown may be filtered out, with counters. The filter
+requires a diagnostics destination and a positive PID. Diagnostics also work
+with `inventory --pid` and `--dashboard`.
+
+The file contains recent history, rather than a replay of the whole capture:
+two rolling buffers retain up to 24,576 ordinary records and 8,192 transition,
+exceptional-decision and health records. Older records can be evicted; the footer
+reports retained spans, eviction, filtering, omission, capture outcome and
+settlement independently. Missing predecessors make `history_complete` false.
+A complete file can contain incomplete history, and neither establishes exact
+whole-workload counts. Sequences and opaque decision/read identifiers belong
+to this capture; timestamps use its monotonic clock. Application/module labels
+come from retained inventory identities, with unknown names left explicit.
+
+The recorder storage and export-index budget is 16 MiB, with at most 32,768
+data records, 1,800 bytes per data line and a 64 MiB file limit. Fixed diagnostic
+metadata in the inventory coordinator is separate: at the default inventory
+limits it can add up to 11 MiB on x86-64, including when recording is disabled.
+These payload budgets exclude allocator overhead and are not process RSS limits.
+Diagnostic omissions do not become BPF loss or change public coverage. The
+[diagnostics schema](schema/inventory-diagnostics-v1.md) defines the fields,
+limits and privacy projection; diagnostics capture no arguments, PINs,
+payloads or additional target memory.
+
+Use a separate regular file: publication is atomic and private (0600).
+Stdout (`-`), pipes, devices, symlinks and aliases of `-o` or the event-log
+file/rotation namespace are refused. Export happens after capture stops and
+the primary report is attempted, including normal duration, signal and dashboard
+quit paths; available records are also attempted on ordinary capture errors.
+There is no periodic persistence, so abrupt kill or panic need not produce a
+file or footer. Regular-file writes and sync can block in the kernel; export
+has no hard wall-clock deadline. A second signal cancels export between records.
+
+Checking an existing destination for hardlinks to event-log rotations examines
+at most 4,096 directory entries. If that check cannot finish, diagnostics are
+disabled with a warning; capture can continue. Keeping event logs in a dedicated
+directory avoids spending this limit on unrelated files.
+
+Diagnostics-only setup failures warn and let capture continue. Delivery is
+attempted independently of other final sinks; a diagnostic write, serialization
+or publication failure preserves an existing destination and is reported by
+name. Requested diagnostic delivery failure gives exit 1 after normal report
+attempts; an existing capture failure keeps precedence. Ring eviction and
+filtering alone do not fail capture. A normal stderr/dashboard-log summary
+names the destination, records retained, older records evicted and settlement.
 
 ## Offline inventory comparison
 

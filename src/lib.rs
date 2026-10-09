@@ -42,6 +42,8 @@ pub mod inspect_system;
 pub mod inventory;
 pub(crate) mod inventory_capture;
 pub mod inventory_dashboard;
+pub(crate) mod inventory_diagnostics;
+pub(crate) mod inventory_diagnostics_output;
 pub mod inventory_diff;
 pub(crate) mod inventory_event_identity;
 pub mod inventory_events;

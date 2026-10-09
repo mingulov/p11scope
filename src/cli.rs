@@ -6,6 +6,7 @@ use crate::attach::BackendSelection;
 use crate::discovery::caller_registry::MAX_MAX_GAPS;
 use crate::discovery::hooks::HookRegistry;
 use std::ffi::OsString;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -187,6 +188,14 @@ impl CaptureMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InventoryDiffArgs {
+    pub before: PathBuf,
+    pub after: PathBuf,
+    pub json: bool,
+    pub out: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Version,
     Profile(CaptureArgs),
@@ -195,6 +204,7 @@ pub enum Command {
     Inspect(InspectArgs),
     Doctor(DoctorArgs),
     Inventory(InventoryArgs),
+    InventoryDiff(InventoryDiffArgs),
 }
 
 /// Which help text `--help` asked for: the global usage or one subcommand's
@@ -208,6 +218,7 @@ pub enum HelpTopic {
     Inspect,
     Doctor,
     Inventory,
+    InventoryDiff,
 }
 
 impl HelpTopic {
@@ -220,6 +231,7 @@ impl HelpTopic {
             HelpTopic::Inspect => INSPECT_HELP,
             HelpTopic::Doctor => DOCTOR_HELP,
             HelpTopic::Inventory => INVENTORY_HELP,
+            HelpTopic::InventoryDiff => INVENTORY_DIFF_HELP,
         }
     }
 }
@@ -260,6 +272,7 @@ pub const USAGE: &str = "usage:
   p11scope inspect --system [--module <provider.so>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
   p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
   p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+  p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
   p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
 
@@ -467,6 +480,7 @@ capture evidence records the active value of each (evidence.p11scope_env); docs/
 const INVENTORY_HELP: &str = "usage:
   p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
   p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+  p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
 --module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
@@ -492,6 +506,20 @@ trace without --max-events still stops at a 10,000,000-event default cap; the TR
 environment: P11SCOPE_BROAD_ADMIT=1 enables experiment-only broad provider admission (anything else keeps the narrow default).
 P11SCOPE_LOADER_ENV_SANITIZED is the offline discover helper's loader-environment marker (forged values are rejected).
 capture evidence records the active value of each (evidence.p11scope_env); docs/usage.md documents every P11SCOPE_* input.
+";
+
+/// Offline diff help is separate from capture scope and privileges.
+const INVENTORY_DIFF_HELP: &str = "usage:
+  p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
+
+Compare saved p11scope/inventory/v1 files offline, without privileges.
+Default stdout is readable text; --json writes one inventory-diff/v1 JSON document.
+-o saves the same JSON atomically before stdout. Use -- before dash-prefixed inputs.
+Stdin (-) and -o - are unsupported; use --json for JSON on stdout.
+Differences and unknown evidence exit 0; input/output failures exit 1; usage exits 2.
+Counts describe independent windows; absence does not prove removal.
+Per input: 64 MiB read, 250,000 rows, 16,384 decoded bytes per string/key,
+nesting depth 64, and 2,000,000 JSON values plus object keys.
 ";
 
 const REMOVED_FLAG_HINT: &str = "removed in productization slice 1a: the observer pins provider \
@@ -760,7 +788,15 @@ pub fn parse(argv: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Comm
         Some("run") => Ok(Command::Run(parse_run(argv)?)),
         Some("inspect") => Ok(Command::Inspect(parse_inspect(argv)?)),
         Some("doctor") => Ok(Command::Doctor(parse_doctor(argv)?)),
-        Some("inventory") => Ok(Command::Inventory(parse_inventory(argv)?)),
+        Some("inventory") => {
+            let mut args = argv.peekable();
+            if args.peek().is_some_and(|value| value == "diff") {
+                args.next();
+                Ok(Command::InventoryDiff(parse_inventory_diff(args)?))
+            } else {
+                Ok(Command::Inventory(parse_inventory(args)?))
+            }
+        }
         Some("--help" | "-h") => Err(CliError::Help(HelpTopic::Global)),
         Some("discover") => Err(usage_err(
             "`p11scope discover` was removed: run `p11scope-discover --module <provider.so> \
@@ -829,9 +865,87 @@ fn parse_inspect(mut args: impl Iterator<Item = OsString>) -> Result<InspectArgs
     })
 }
 
-/// `p11scope inventory`: inspect's scope and discovery options, plus a
-/// `--duration` observation window and a `-o` JSON document. `-o -` is
-/// refused: the inventory report requires a file, like profile's.
+/// Offline comparison options are parsed before capture scope requirements.
+fn parse_inventory_diff(
+    mut args: impl Iterator<Item = OsString>,
+) -> Result<InventoryDiffArgs, CliError> {
+    let error = |message: &str| {
+        CliError::Usage(format!(
+            "{}\n{INVENTORY_DIFF_HELP}",
+            crate::render::escape_controls(message)
+        ))
+    };
+    let mut inputs = Vec::new();
+    let mut json = false;
+    let mut out = None;
+    let mut positional = false;
+    while let Some(value) = args.next() {
+        if !positional {
+            match value.to_str() {
+                Some("--help" | "-h") => return Err(CliError::Help(HelpTopic::InventoryDiff)),
+                Some("--") => {
+                    positional = true;
+                    continue;
+                }
+                Some("--json") => {
+                    if json {
+                        return Err(error("--json given twice"));
+                    }
+                    json = true;
+                    continue;
+                }
+                Some("-o") => {
+                    if out.is_some() {
+                        return Err(error("-o given twice"));
+                    }
+                    let path = args.next().ok_or_else(|| error("-o requires a path"))?;
+                    if path == "-" {
+                        return Err(error("-o - is unsupported; use --json for JSON on stdout"));
+                    }
+                    if path.is_empty() || path.as_bytes().starts_with(b"-") {
+                        return Err(error("-o requires a path (prefix a leading dash with ./)"));
+                    }
+                    out = Some(PathBuf::from(path));
+                    continue;
+                }
+                _ if value.as_bytes().starts_with(b"-") && value != "-" => {
+                    return Err(error(&format!("unknown inventory diff option: {value:?}")));
+                }
+                _ => {}
+            }
+        }
+        if value == "-" {
+            return Err(error(
+                "stdin is unsupported; pass two regular inventory files",
+            ));
+        }
+        if value.is_empty() {
+            return Err(error("inventory diff requires non-empty input paths"));
+        }
+        inputs.push(PathBuf::from(value));
+        if inputs.len() > 2 {
+            return Err(error(
+                "inventory diff requires exactly BEFORE and AFTER files",
+            ));
+        }
+    }
+    if inputs.len() != 2 {
+        return Err(error(
+            "inventory diff requires exactly BEFORE and AFTER files",
+        ));
+    }
+    let after = inputs.pop().expect("two input paths validated");
+    let before = inputs.pop().expect("two input paths validated");
+    Ok(InventoryDiffArgs {
+        before,
+        after,
+        json,
+        out,
+    })
+}
+
+/// `p11scope inventory`: capture scope/discovery options plus a duration and
+/// saved JSON report. Diff parsing above never changes this capture path.
 fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<InventoryArgs, CliError> {
     let mut pid: Option<u32> = None;
     let mut system = false;
@@ -1725,13 +1839,42 @@ mod tests {
         for text in [USAGE, INVENTORY_HELP] {
             let lines: Vec<&str> = text
                 .lines()
-                .filter(|line| line.contains("p11scope inventory"))
+                .filter(|line| line.contains("p11scope inventory --"))
                 .collect();
             assert_eq!(lines.len(), 2, "{text}");
             for line in lines {
                 assert!(line.contains("[--capture auto|scan|native]"), "{line}");
             }
         }
+    }
+
+    #[test]
+    fn inventory_diff_parser_accepts_offline_files_and_scoped_options() {
+        for words in [
+            vec!["inventory", "diff", "before.json", "after.json"],
+            vec![
+                "inventory",
+                "diff",
+                "--json",
+                "before.json",
+                "after.json",
+                "-o",
+                "report.json",
+            ],
+            vec!["inventory", "diff", "--", "-before.json", "-after.json"],
+        ] {
+            let command = parse(args(&words)).unwrap();
+            assert!(format!("{command:?}").starts_with("InventoryDiff("));
+        }
+    }
+
+    #[test]
+    fn inventory_diff_help_has_its_own_offline_topic() {
+        let Err(CliError::Help(topic)) = parse(args(&["inventory", "diff", "--help"])) else {
+            panic!("diff help must select an offline help topic")
+        };
+        assert!(topic.text().contains("inventory diff BEFORE"));
+        assert!(!topic.text().contains("--pid"));
     }
 
     /// C5.11: `inventory --attach-backend` selects the native lane's attach
@@ -1769,7 +1912,7 @@ mod tests {
         for help in [USAGE, INVENTORY_HELP] {
             let lines: Vec<&str> = help
                 .lines()
-                .filter(|line| line.contains("p11scope inventory"))
+                .filter(|line| line.contains("p11scope inventory --"))
                 .collect();
             assert_eq!(lines.len(), 2);
             assert!(
@@ -2587,8 +2730,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 4521);
-        assert_eq!(hash, 0xff1ef03b_58fc47b9);
+        assert_eq!(USAGE.len(), 4594);
+        assert_eq!(hash, 0x3ee72b02aa337f40);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

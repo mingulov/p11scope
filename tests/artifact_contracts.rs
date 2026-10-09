@@ -6166,6 +6166,81 @@ fn stagea_hook_census_accepts_exact_kernel_names_and_refuses_collisions() {
 }
 
 #[test]
+fn image_query_iterator_uses_seq_write_with_the_binary_row_abi() {
+    let directory = tempfile::tempdir().expect("temporary image iterator ABI contract");
+    let object = directory.path().join("p11scope-ebpf");
+    fs::write(&object, p11scope::EBPF_OBJECT).expect("write actual embedded BPF object");
+    let output = Command::new("python3")
+        .args([
+            "-I",
+            "-c",
+            r#"
+from pathlib import Path
+import struct, sys
+sys.path.insert(0, str(Path('scripts').resolve()))
+from _loader import load_path
+checker = load_path(Path('scripts/check-bpf-map-defs.py'), 'image_query_abi_checker')
+
+def verify(data):
+    elf = checker.Elf(data)
+    symbols = [symbol for symbol in elf.symbols if symbol[0] == 'p11_image_query']
+    assert len(symbols) == 1, 'missing/duplicate image query program'
+    symbol = symbols[0]
+    assert symbol[3] == elf.indices['iter/task'], 'image query must be a task iterator'
+    row, body = elf.sections['iter/task']
+    insns = [struct.unpack_from('<BBhi', body, at)
+             for at in range(symbol[4], symbol[4] + symbol[5], 8)]
+    helpers = {immediate for op, reg, _, immediate in insns if (op, reg) == (0x85, 0)}
+    # Linux UAPI: lookup1, ktime5, seq_write127, task_storage_get156.
+    # seq_printf126 has five arguments and cannot write this binary row ABI.
+    assert 126 not in helpers, 'binary row must never call seq_printf126'
+    assert helpers == {1, 5, 127, 156}, f'unexpected iterator helper ABI: {helpers}'
+    writes = [index for index, insn in enumerate(insns) if insn == (0x85, 0, 0, 127)]
+    assert writes, 'missing actual seq_write127 call'
+    first_call = next(index for index, insn in enumerate(insns) if insn[0] == 0x85)
+    saved_context = {reg & 15 for op, reg, offset, immediate in insns[:first_call]
+                     if op == 0xbf and reg >> 4 == 1 and 6 <= reg & 15 <= 9
+                     and offset == immediate == 0}
+    assert saved_context, 'missing saved iterator context in prologue'
+    for at in writes:
+        # Pin the emitted three arguments: meta->seq, own-stack row, size40.
+        # This lowering contract supplements the actual kernel verifier gate.
+        assert at >= 5, 'truncated writer argument window'
+        meta, seq, stack, row_address, length = insns[at - 5:at]
+        assert (meta[0] == 0x79 and meta[1] & 15 == 1
+                and meta[1] >> 4 in saved_context and meta[2:] == (0, 0)
+                and seq == (0x79, 0x11, 0, 0)
+                and stack == (0xbf, 0xa2, 0, 0)
+                and row_address[:3] == (0x07, 2, 0)
+                and -512 <= row_address[3] <= -40 and row_address[3] % 8 == 0
+                and length == (0xb7, 3, 0, 40)
+                ), 'seq_write requires seq pointer, aligned stack row and exact40-byte length'
+    return row[4] + symbol[4], writes
+
+data = Path(sys.argv[1]).read_bytes()
+base, writes = verify(data)
+for at, field, value in [(writes[0], 4, 126), (writes[0] - 1, 4, 41),
+                          (writes[0] - 3, 1, 0x62)]:
+    bad = bytearray(data)
+    struct.pack_into('<i' if field == 4 else '<B', bad, base + at * 8 + field, value)
+    try: verify(bad)
+    except AssertionError: pass
+    else: raise AssertionError('wrong compiled writer ABI accepted')
+print('actual seq_write127 binary row ABI passes; three mutations refuse')
+"#,
+        ])
+        .arg(&object)
+        .output()
+        .expect("inspect actual task iterator writer helper ABI");
+    assert!(
+        output.status.success(),
+        "compiled image writer contract failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn image_entry_native_frame_fits_the_compiled_caller_budget() {
     let directory = tempfile::tempdir().expect("temporary image entry stack contract");
     let object = directory.path().join("p11scope-ebpf");

@@ -15833,6 +15833,13 @@ impl Engine {
             if !retained_exploratory {
                 continue;
             }
+            // Optional polls wait for queue capacity; no producer record was
+            // dropped. Keep the cursor after the last admitted poll so this
+            // candidate gets its turn when capacity becomes available.
+            if self.refresh_requested.len() >= MAX_PENDING_REFRESH {
+                self.note_frame_deferral();
+                break;
+            }
             self.request_refresh(pid, crate::attach::monotonic_ns());
             if self.refresh_requested.contains_key(&pid) {
                 polling += 1;

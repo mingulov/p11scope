@@ -50,6 +50,15 @@ use p11scope_ebpf_common::{
 use pkcs11_types::CkRv;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[path = "semantics_edge/resources.rs"]
+pub(crate) mod resources;
+use resources::{ResourceLease, ScratchLease, SemanticResourcePool, SemanticResourceRefusal};
+
+struct PreparedResourceTransition {
+    reservation: ResourceLease,
+    _scratch: ScratchLease,
+}
+
 /// Per-edge bounds. New keys past a bound are REFUSED (counted in
 /// [`EdgeProjection::dropped`] and the registry's `semantic_refused`),
 /// never evicting retained facts — the inventory rule that refusal
@@ -188,11 +197,13 @@ struct CallOrigin {
 /// A `CKR_PENDING` call awaiting its `C_AsyncComplete`: the pending
 /// call's facts, its originating operation lifetime (F2), plus a
 /// sequence for oldest-first eviction.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PendingCall {
     call: SemanticCall,
     origin: CallOrigin,
     sequence: u64,
+    // Payload fields precede the move-only owner: refund after destruction.
+    resource: Option<ResourceLease>,
 }
 
 /// An issued async id: which session holds it (`None` floats —
@@ -200,12 +211,13 @@ struct PendingCall {
 /// itself and its queue-time operation lifetime (F2, carried over
 /// from the pending record — never re-snapshotted, so a completion
 /// cannot adopt a machine created after the call was queued).
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct AsyncId {
     owner: Option<u64>,
     call: SemanticCall,
     origin: CallOrigin,
     sequence: u64,
+    resource: Option<ResourceLease>,
 }
 
 /// One mechanism id's per-edge aggregates. The id stays verbatim
@@ -303,6 +315,20 @@ pub(crate) struct EdgeSemantics {
     double_load_detected: bool,
     /// Any fully-authorized call with effective semantic content.
     seen_claim_capable: bool,
+    resource_transition: Option<PreparedResourceTransition>,
+    // Drop order is declaration order. Keep the base/history owner after
+    // every container, so a different reducer cannot spend an early refund.
+    resource_owner: Option<ResourceLease>,
+}
+
+impl Drop for EdgeSemantics {
+    fn drop(&mut self) {
+        // Pop owned async facts only after BTreeMap has finished removal and
+        // rebalancing. BTreeMap::clear drops values while destroying nodes;
+        // a value-local lease must not refund against that unfinished drop.
+        self.invalidate();
+        self.mechs.clear();
+    }
 }
 
 impl std::fmt::Debug for EdgeSemantics {
@@ -344,6 +370,228 @@ pub(crate) struct S1Occupancy {
 }
 
 impl EdgeSemantics {
+    pub(crate) fn with_resources(
+        pool: &SemanticResourcePool,
+    ) -> Result<Self, SemanticResourceRefusal> {
+        let owner = pool.reserve(resources::REDUCER_BASE_CHARGE)?;
+        let mut reducer = Self::default();
+        reducer.resource_owner = Some(owner);
+        Ok(reducer)
+    }
+
+    pub(crate) fn observe_with_resources(
+        &mut self,
+        call: &SemanticCall,
+    ) -> Result<u64, SemanticResourceRefusal> {
+        let prepared = match self.prepare_resource_transition(call) {
+            Ok(prepared) => prepared,
+            Err(refusal) => {
+                self.invalidate();
+                return Err(refusal);
+            }
+        };
+        assert!(self.resource_transition.is_none());
+        self.resource_transition = Some(prepared);
+        let refused = self.observe(call);
+        drop(self.resource_transition.take());
+        Ok(refused)
+    }
+
+    fn prepare_resource_transition(
+        &self,
+        call: &SemanticCall,
+    ) -> Result<PreparedResourceTransition, SemanticResourceRefusal> {
+        let owner = self
+            .resource_owner
+            .as_ref()
+            .expect("budgeted ingress requires an admitted reducer");
+        Ok(PreparedResourceTransition {
+            _scratch: owner.scratch()?,
+            reservation: owner.reserve(self.preflight_growth(call))?,
+        })
+    }
+
+    fn take_resource_charge(&mut self, bytes: usize) -> Option<ResourceLease> {
+        self.resource_transition
+            .as_mut()
+            .map(|prepared| prepared.reservation.split(bytes))
+    }
+
+    fn retain_resource_charge(&mut self, bytes: usize) {
+        if let Some(lease) = self.take_resource_charge(bytes) {
+            self.resource_owner
+                .as_mut()
+                .expect("admitted owner")
+                .absorb(lease);
+        }
+    }
+
+    fn release_resource_charge(&mut self, bytes: usize) {
+        if let Some(owner) = self.resource_owner.as_mut() {
+            owner.release(bytes);
+        }
+    }
+
+    // Inspect the incoming descriptor and touched keys only. No allocation,
+    // accumulated provenance scan, deletion credit or cloned reducer.
+    fn preflight_growth(&self, call: &SemanticCall) -> usize {
+        if !call.attributable || !call.authorized || !call.unambiguous || call.count_only {
+            return 0;
+        }
+        let descriptor =
+            crate::kinds::descriptor(&call.function).unwrap_or(SlotSemantics::COUNT_ONLY);
+        if descriptor == SlotSemantics::COUNT_ONLY {
+            return 0;
+        }
+        if descriptor.lifecycle == lifecycle::ASYNC_COMPLETE {
+            if call.rv == CkRv::PENDING.0
+                || call.target_function == FUNCTION_NONE
+                || call.capture & capture::ASYNC_VALUE_UNREADABLE != 0
+            {
+                return 0;
+            }
+            let original = self
+                .pending
+                .get(&(call.session, call.target_function))
+                .map(|p| (&p.call, &p.origin))
+                .or_else(|| {
+                    self.detached.iter().find_map(|(key, id)| {
+                        (id.owner == Some(call.session) && key.1 == call.target_function)
+                            .then_some((&id.call, &id.origin))
+                    })
+                });
+            return original
+                .filter(|(_, origin)| self.origin_matches(call.session, origin))
+                .map_or(0, |(original, _)| {
+                    self.completed_growth(original, call.session, call.rv)
+                });
+        }
+        if matches!(
+            descriptor.lifecycle,
+            lifecycle::ASYNC_GET_ID | lifecycle::ASYNC_JOIN
+        ) {
+            return 0;
+        }
+        if call.rv == CkRv::PENDING.0 {
+            if crate::kinds::function_id(&call.function).is_none()
+                || (descriptor.lifecycle == lifecycle::OPEN_SESSION && call.session == SESSION_NONE)
+            {
+                return 0;
+            }
+            return Self::async_charge(call, &descriptor);
+        }
+        self.completed_growth(call, call.session, call.rv)
+    }
+
+    fn async_charge(call: &SemanticCall, descriptor: &SlotSemantics) -> usize {
+        let count = descriptor.operations.count_ones() as usize;
+        let origin = if count == 0 {
+            0
+        } else {
+            count.next_power_of_two().max(4) * std::mem::size_of::<(u16, Option<u64>)>()
+                + resources::OWNED_ALLOCATION_PADDING
+        };
+        resources::ASYNC_FACT_CHARGE
+            + call.function.len()
+            + resources::OWNED_ALLOCATION_PADDING
+            + origin
+    }
+
+    fn provenance_growth(&self, mechanism: u64, call: &SemanticCall, rv: u64) -> usize {
+        let stat = self.mechs.get(&mechanism);
+        if stat.is_none() && self.mechs.len() >= MAX_EDGE_MECHANISMS {
+            return 0;
+        }
+        let mut bytes = if stat.is_none() {
+            resources::MECHANISM_CHARGE
+        } else {
+            0
+        };
+        if stat.is_none_or(|s| {
+            !s.functions.contains(&call.function)
+                && s.functions.len() < MAX_EDGE_PROVENANCE_FUNCTIONS
+        }) {
+            bytes += resources::FUNCTION_CHARGE
+                + call.function.len()
+                + resources::OWNED_ALLOCATION_PADDING;
+        }
+        if stat.is_none_or(|s| {
+            !s.returns.contains(&rv) && s.returns.len() < MAX_EDGE_PROVENANCE_RETURNS
+        }) {
+            bytes += resources::RETURN_CHARGE;
+        }
+        bytes
+    }
+
+    fn completed_growth(&self, call: &SemanticCall, session: u64, rv: u64) -> usize {
+        let descriptor =
+            crate::kinds::descriptor(&call.function).unwrap_or(SlotSemantics::COUNT_ONLY);
+        let init = descriptor.transition == transition::INITIALIZE;
+        let mut bytes = 0;
+        // Claims precede reconciliation in the real transition pipeline.
+        if (init || descriptor.direct != direct::NONE)
+            && rv == CkRv::OK.0
+            && call.mechanism_capture() == capture::MECHANISM_VALUE
+            && (self.mechs.contains_key(&call.mechanism) || self.mechs.len() < MAX_EDGE_MECHANISMS)
+        {
+            bytes += self.provenance_growth(call.mechanism, call, rv);
+            let stat = self.mechs.get(&call.mechanism);
+            for (_, name) in crate::semantics::operation_bits(descriptor.operations) {
+                if stat.is_none_or(|s| !s.ops.contains(name)) {
+                    bytes += resources::CATEGORY_CHARGE;
+                }
+            }
+            if let Some(name) = crate::semantics::direct_name(descriptor.direct)
+                && stat.is_none_or(|s| !s.ops.contains(name))
+            {
+                bytes += resources::CATEGORY_CHARGE;
+            }
+        }
+        if matches!(rv, x if x == CkRv::OPERATION_NOT_INITIALIZED.0 || x == CkRv::SESSION_CLOSED.0
+            || x == CkRv::SESSION_HANDLE_INVALID.0 || x == CkRv::CRYPTOKI_NOT_INITIALIZED.0)
+        {
+            return bytes;
+        }
+        if descriptor.lifecycle == lifecycle::OPEN_SESSION
+            && rv == CkRv::OK.0
+            && session != SESSION_NONE
+            && (self.open.contains_key(&session) || self.open.len() < MAX_EDGE_SESSIONS)
+        {
+            bytes += resources::OPEN_BINDING_CHARGE;
+        }
+        if init
+            && rv == CkRv::OK.0
+            && session != SESSION_NONE
+            && !(call.mechanism_capture() == capture::MECHANISM_NULL
+                && descriptor.semantic_flags & semantic_flags::NULL_MECHANISM_CANCEL != 0)
+        {
+            let mut additions = 0;
+            for (bit, _) in crate::semantics::operation_bits(descriptor.operations) {
+                if !self.active.contains_key(&(session, bit))
+                    && self.active.len() + additions < MAX_EDGE_ACTIVE_OPS
+                {
+                    bytes += resources::ACTIVE_MACHINE_CHARGE;
+                    additions += 1;
+                }
+            }
+        } else if !init && descriptor.direct == direct::NONE && descriptor.operations != 0 {
+            // A descriptor can touch multiple machines carrying one mechanism.
+            // Fixed scalar storage deduplicates only this call's bounded bits.
+            let mut seen = [None; 16];
+            let mut count = 0;
+            for (bit, _) in crate::semantics::operation_bits(descriptor.operations) {
+                if let Some(mechanism) = self.active.get(&(session, bit)).and_then(|m| m.mechanism)
+                    && !seen[..count].contains(&Some(mechanism))
+                {
+                    seen[count] = Some(mechanism);
+                    count += 1;
+                    bytes += self.provenance_growth(mechanism, call, rv);
+                }
+            }
+        }
+        bytes
+    }
+
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "Task 4 measurement precedes aggregate admission")
@@ -385,6 +633,10 @@ impl EdgeSemantics {
 #[cfg(all(test, target_os = "linux", target_env = "gnu"))]
 #[path = "semantics_edge/resource_tests.rs"]
 pub(crate) mod resource_tests;
+
+#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
+#[path = "semantics_edge/budget_tests.rs"]
+mod budget_tests;
 
 /// Published per-edge semantic labels. `observed` iff the edge holds
 /// at least one mechanism or operation claim AND no double-load
@@ -506,6 +758,19 @@ impl EdgeSemantics {
             self.dropped = self.dropped.saturating_add(1);
             return;
         }
+        let mut charge = self.provenance_growth(call.mechanism, call, call.rv);
+        let prior = self.mechs.get(&call.mechanism);
+        for (_, name) in crate::semantics::operation_bits(descriptor.operations) {
+            if prior.is_none_or(|stat| !stat.ops.contains(name)) {
+                charge += resources::CATEGORY_CHARGE;
+            }
+        }
+        if let Some(name) = crate::semantics::direct_name(descriptor.direct)
+            && prior.is_none_or(|stat| !stat.ops.contains(name))
+        {
+            charge += resources::CATEGORY_CHARGE;
+        }
+        self.retain_resource_charge(charge);
         let stat = self.mechs.entry(call.mechanism).or_default();
         stat.calls = stat.calls.saturating_add(1);
         for (_, name) in crate::semantics::operation_bits(descriptor.operations) {
@@ -527,6 +792,7 @@ impl EdgeSemantics {
             self.dropped = self.dropped.saturating_add(1);
             return;
         }
+        self.retain_resource_charge(self.provenance_growth(mechanism, call, call.rv));
         let stat = self.mechs.entry(mechanism).or_default();
         stat.calls = stat.calls.saturating_add(1);
         if call.rv != CkRv::OK.0 {
@@ -608,11 +874,15 @@ impl EdgeSemantics {
                 if !self.open.contains_key(&call.session) && self.open.len() >= MAX_EDGE_SESSIONS {
                     self.dropped = self.dropped.saturating_add(1);
                 } else {
+                    self.retain_resource_charge(resources::OPEN_BINDING_CHARGE);
                     self.open.insert(call.session, call.slot_id);
                 }
             }
             lifecycle::CLOSE_SESSION if call.rv == CkRv::OK.0 => {
                 let existed = self.open.remove(&call.session).is_some();
+                if existed {
+                    self.release_resource_charge(resources::OPEN_BINDING_CHARGE);
+                }
                 self.end_session_machines(call.session, EndState::Cancelled);
                 self.pending.retain(|(owner, _), _| *owner != call.session);
                 self.float_session_async(call.session);
@@ -648,7 +918,9 @@ impl EdgeSemantics {
                     .map(|(session, _)| *session)
                     .collect();
                 for session in owned {
-                    self.open.remove(&session);
+                    if self.open.remove(&session).is_some() {
+                        self.release_resource_charge(resources::OPEN_BINDING_CHARGE);
+                    }
                     self.end_session_machines(session, EndState::Cancelled);
                     self.pending.retain(|(owner, _), _| *owner != session);
                     self.float_session_async(session);
@@ -741,6 +1013,7 @@ impl EdgeSemantics {
             .collect();
         for key in doomed {
             self.active.remove(&key);
+            self.release_resource_charge(resources::ACTIVE_MACHINE_CHARGE);
             self.cancelled = self.cancelled.saturating_add(1);
         }
         self.pending.retain(|(owner, _), pending| {
@@ -805,6 +1078,9 @@ impl EdgeSemantics {
         if !self.active.contains_key(&key) && self.active.len() >= MAX_EDGE_ACTIVE_OPS {
             self.dropped = self.dropped.saturating_add(1);
             return;
+        }
+        if !self.active.contains_key(&key) {
+            self.retain_resource_charge(resources::ACTIVE_MACHINE_CHARGE);
         }
         self.machine_seq = self.machine_seq.wrapping_add(1);
         let generation = self.machine_seq;
@@ -898,6 +1174,7 @@ impl EdgeSemantics {
     /// machine was actually ended.
     fn end_machine(&mut self, session: u64, bit: u16, end: EndState) -> bool {
         if self.active.remove(&(session, bit)).is_some() {
+            self.release_resource_charge(resources::ACTIVE_MACHINE_CHARGE);
             match end {
                 EndState::Completed => self.completed = self.completed.saturating_add(1),
                 EndState::Cancelled => self.cancelled = self.cancelled.saturating_add(1),
@@ -921,6 +1198,7 @@ impl EdgeSemantics {
         let changed = !doomed.is_empty();
         for key in doomed {
             self.active.remove(&key);
+            self.release_resource_charge(resources::ACTIVE_MACHINE_CHARGE);
             match end {
                 EndState::Completed => self.completed = self.completed.saturating_add(1),
                 EndState::Cancelled => self.cancelled = self.cancelled.saturating_add(1),
@@ -936,6 +1214,9 @@ impl EdgeSemantics {
     /// Returns whether the scope held any state.
     fn retire_session(&mut self, session: u64, end: EndState) -> bool {
         let mut changed = self.open.remove(&session).is_some();
+        if changed {
+            self.release_resource_charge(resources::OPEN_BINDING_CHARGE);
+        }
         changed |= self.end_session_machines(session, end);
         let pending_before = self.pending.len();
         self.pending.retain(|(owner, _), _| *owner != session);
@@ -951,12 +1232,12 @@ impl EdgeSemantics {
     /// the scope held any state.
     fn retire_all(&mut self, end: EndState) -> bool {
         let mut changed = !self.open.is_empty();
+        let open_charge = self.open.len() * resources::OPEN_BINDING_CHARGE;
         self.open.clear();
+        self.release_resource_charge(open_charge);
         changed |= self.end_session_machines_all(end);
-        changed |= !self.pending.is_empty();
-        self.pending.clear();
-        changed |= !self.detached.is_empty();
-        self.detached.clear();
+        changed |= !self.pending.is_empty() || !self.detached.is_empty();
+        self.clear_async_payloads();
         changed
     }
 
@@ -964,6 +1245,7 @@ impl EdgeSemantics {
         let changed = !self.active.is_empty();
         let count = self.active.len() as u64;
         self.active.clear();
+        self.release_resource_charge(count as usize * resources::ACTIVE_MACHINE_CHARGE);
         match end {
             EndState::Completed => self.completed = self.completed.saturating_add(count),
             EndState::Cancelled => self.cancelled = self.cancelled.saturating_add(count),
@@ -986,6 +1268,19 @@ impl EdgeSemantics {
         changed
     }
 
+    fn clear_async_payloads(&mut self) {
+        while let Some((_, fact)) = self.pending.pop_first() {
+            drop(fact);
+        }
+        while let Some((_, fact)) = self.detached.pop_first() {
+            drop(fact);
+        }
+        // Empty roots are covered by the retained base charge, and their
+        // actual destruction completes before the whole reducer refunds it.
+        self.pending.clear();
+        self.detached.clear();
+    }
+
     /// Capture-loss boundary / retirement / eviction (C2): every live
     /// machine ends unknown with explicit accounting — never silently
     /// completed, never silently dropped — and outstanding custody
@@ -999,9 +1294,10 @@ impl EdgeSemantics {
     /// now", not the observed past.
     pub(crate) fn invalidate(&mut self) {
         self.end_session_machines_all(EndState::Unknown);
-        self.pending.clear();
-        self.detached.clear();
+        self.clear_async_payloads();
+        let open_charge = self.open.len() * resources::OPEN_BINDING_CHARGE;
         self.open.clear();
+        self.release_resource_charge(open_charge);
     }
 
     /// Same-file double-load detection (F7b/F7c): live operations end
@@ -1043,7 +1339,15 @@ impl EdgeSemantics {
                     return;
                 }
                 if let Some(pending) = self.pending.remove(&(call.session, call.target_function)) {
-                    self.complete_pending(call, pending.call, &pending.origin);
+                    let PendingCall {
+                        call: original,
+                        origin,
+                        resource,
+                        ..
+                    } = pending;
+                    self.complete_pending(call, original, &origin);
+                    drop(origin);
+                    drop(resource);
                     return;
                 }
                 let detached_key = self.detached.iter().find_map(|(key, id)| {
@@ -1058,7 +1362,15 @@ impl EdgeSemantics {
                     self.orphans = self.orphans.saturating_add(1);
                     return;
                 };
-                self.complete_pending(call, id.call, &id.origin);
+                let AsyncId {
+                    call: original,
+                    origin,
+                    resource,
+                    ..
+                } = id;
+                self.complete_pending(call, original, &origin);
+                drop(origin);
+                drop(resource);
             }
             lifecycle::ASYNC_GET_ID if call.rv == CkRv::OK.0 => {
                 let Some(slot) = self.open.get(&call.session).copied() else {
@@ -1081,6 +1393,7 @@ impl EdgeSemantics {
                             call: pending.call,
                             origin: pending.origin,
                             sequence,
+                            resource: pending.resource,
                         },
                     )
                     .is_some()
@@ -1130,6 +1443,7 @@ impl EdgeSemantics {
         }
         self.sequence = self.sequence.wrapping_add(1);
         let sequence = self.sequence;
+        let resource = self.take_resource_charge(Self::async_charge(call, &descriptor));
         let origin = self.capture_origin(call.session, &descriptor);
         if self
             .pending
@@ -1139,6 +1453,7 @@ impl EdgeSemantics {
                     call: call.clone(),
                     origin,
                     sequence,
+                    resource,
                 },
             )
             .is_some()
@@ -1231,29 +1546,29 @@ impl EdgeSemantics {
             .iter()
             .min_by_key(|(_, value)| value.sequence)
             .map(|(key, value)| (*key, value.sequence));
-        let evicted: Option<(u64, CallOrigin)> = match (pending, detached) {
+        let evicted: Option<(u64, CallOrigin, Option<ResourceLease>)> = match (pending, detached) {
             (Some(key), Some((detached_key, detached_sequence))) => {
                 if self.pending[&key].sequence <= detached_sequence {
                     self.pending
                         .remove(&key)
-                        .map(|record| (key.0, record.origin))
+                        .map(|record| (key.0, record.origin, record.resource))
                 } else {
                     self.detached
                         .remove(&detached_key)
-                        .map(|id| (id.call.session, id.origin))
+                        .map(|id| (id.call.session, id.origin, id.resource))
                 }
             }
             (Some(key), None) => self
                 .pending
                 .remove(&key)
-                .map(|record| (key.0, record.origin)),
+                .map(|record| (key.0, record.origin, record.resource)),
             (None, Some((key, _))) => self
                 .detached
                 .remove(&key)
-                .map(|id| (id.call.session, id.origin)),
+                .map(|id| (id.call.session, id.origin, id.resource)),
             (None, None) => return,
         };
-        let Some((session, origin)) = evicted else {
+        let Some((session, origin, resource)) = evicted else {
             return;
         };
         for (bit, generation) in &origin.bits {
@@ -1268,6 +1583,8 @@ impl EdgeSemantics {
             }
         }
         self.evidence.async_evictions = self.evidence.async_evictions.saturating_add(1);
+        drop(origin);
+        drop(resource);
     }
 }
 

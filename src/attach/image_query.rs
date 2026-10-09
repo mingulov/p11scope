@@ -615,6 +615,33 @@ impl Drop for CoverageControl {
     }
 }
 
+fn read_fd_access_mode(fd: std::os::fd::RawFd) -> std::io::Result<libc::c_int> {
+    // SAFETY: F_GETFL takes no pointer argument; an invalid FD returns EBADF.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(flags & libc::O_ACCMODE)
+}
+
+fn validate_image_map_contract(
+    name: &str,
+    actual: super::ExactMapMetadata,
+    expected: super::ExactMapMetadata,
+    original_fd: BorrowedFd<'_>,
+) -> anyhow::Result<()> {
+    use anyhow::{Context as _, ensure};
+    super::compare_map_metadata(name, actual, expected)?;
+    if matches!(name, "IMAGE_CONTINUITY" | "IMAGE_TGID_INDEX") {
+        // Linux retains NO_PREALLOC on the map object but moves WRONLY to
+        // the created FD. Check the original owned FD, without reopening it.
+        let mode = read_fd_access_mode(original_fd.as_raw_fd())
+            .with_context(|| format!("reading {name} map FD access mode"))?;
+        ensure!(mode == libc::O_WRONLY, "{name} map FD must be write-only");
+    }
+    Ok(())
+}
+
 pub(super) fn prepare_maps(ebpf: &aya::Ebpf, full: bool) -> anyhow::Result<()> {
     use anyhow::Context as _;
     let hashes = if full { 16_384 } else { 1 };
@@ -625,7 +652,7 @@ pub(super) fn prepare_maps(ebpf: &aya::Ebpf, full: bool) -> anyhow::Result<()> {
             8,
             24,
             hashes,
-            17,
+            1,
         ),
         (
             "IMAGE_TGID_INDEX",
@@ -633,7 +660,7 @@ pub(super) fn prepare_maps(ebpf: &aya::Ebpf, full: bool) -> anyhow::Result<()> {
             8,
             8,
             hashes,
-            17,
+            1,
         ),
         (
             "IMAGE_QUERY_REQUESTS",
@@ -648,10 +675,11 @@ pub(super) fn prepare_maps(ebpf: &aya::Ebpf, full: bool) -> anyhow::Result<()> {
     ] {
         let map = ebpf.map(name).with_context(|| format!("{name} map"))?;
         let data = super::policy_map_data(name, map)?;
-        super::validate_map_metadata(
+        validate_image_map_contract(
             name,
-            data,
+            super::read_map_metadata(name, data)?,
             super::map_metadata(kind, key, value, count, flags),
+            data.fd().as_fd(),
         )?;
         if matches!(name, "IMAGE_CONTINUITY" | "IMAGE_TGID_INDEX") {
             super::freeze_map(name, map)?;
@@ -896,6 +924,64 @@ mod tests {
     fn pidfd_zero_selector_never_means_all_tasks() {
         assert_eq!(selector_pidfd(0), Err(ImageQueryRefusal::Custody));
         assert_eq!(selector_pidfd(1), Ok(1));
+    }
+    #[test]
+    fn private_image_hash_requires_permanent_flags_and_original_write_only_fd() {
+        use std::fs::{File, OpenOptions};
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let write_only = OpenOptions::new().write(true).open(file.path()).unwrap();
+        let read_only = File::open(file.path()).unwrap();
+        let read_write = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(file.path())
+            .unwrap();
+        assert_eq!(
+            read_fd_access_mode(write_only.as_raw_fd()).unwrap(),
+            libc::O_WRONLY
+        );
+        assert!(read_fd_access_mode(-1).is_err());
+        for (name, value) in [("IMAGE_CONTINUITY", 24), ("IMAGE_TGID_INDEX", 8)] {
+            for count in [1, 16_384] {
+                let expected =
+                    super::super::map_metadata(aya::maps::MapType::Hash, 8, value, count, 1);
+                validate_image_map_contract(name, expected, expected, write_only.as_fd()).unwrap();
+                for fd in [read_only.as_fd(), read_write.as_fd()] {
+                    assert!(validate_image_map_contract(name, expected, expected, fd).is_err());
+                }
+                for actual in [
+                    super::super::ExactMapMetadata {
+                        flags: 0,
+                        ..expected
+                    },
+                    super::super::ExactMapMetadata {
+                        flags: 17,
+                        ..expected
+                    },
+                    super::super::ExactMapMetadata {
+                        key_size: 9,
+                        ..expected
+                    },
+                    super::super::ExactMapMetadata {
+                        value_size: value + 1,
+                        ..expected
+                    },
+                    super::super::ExactMapMetadata {
+                        max_entries: count + 1,
+                        ..expected
+                    },
+                    super::super::ExactMapMetadata {
+                        map_type: aya::maps::MapType::Array,
+                        ..expected
+                    },
+                ] {
+                    assert!(
+                        validate_image_map_contract(name, actual, expected, write_only.as_fd())
+                            .is_err()
+                    );
+                }
+            }
+        }
     }
     #[test]
     fn image_query_rejects_foreign_cookie_duplicate_and_stale_generation() {

@@ -15428,6 +15428,7 @@ impl Engine {
                     }
                     continue;
                 };
+                let retained_pid = retained.pid();
                 // A frame-budget deferral must not let EXEC refresh retire
                 // a context still needed by this view's collected records.
                 // The persistent intent is retried after their dispatch.
@@ -15486,6 +15487,19 @@ impl Engine {
                 changed |= retirement_changed;
                 if !complete {
                     continue;
+                }
+                // Retirement can finish after a consumed EXEC failed to queue
+                // its rescan. Keep that intent until a retry fits; no new
+                // producer record was lost by this retry. Leave inventory
+                // running so it can free capacity instead of deferring the
+                // whole frame behind the full queue.
+                if cause == RetirementCause::ExecRefresh
+                    && !self.refresh_requested.contains_key(&retained_pid)
+                {
+                    if self.refresh_requested.len() >= MAX_PENDING_REFRESH {
+                        continue;
+                    }
+                    self.request_refresh(retained_pid, crate::attach::monotonic_ns());
                 }
                 // The conservative replay this queues drops every pin the view
                 // owns. That is right for a generation that is gone, and wrong

@@ -6364,8 +6364,20 @@ fn an_exec_refresh_never_queues_its_live_view_for_conservative_retirement() {
         .unwrap();
     let mut session = ScriptedSession::with_records([], 0);
 
-    apply_ordinary_batch(&mut engine, &mut session, Vec::new())
-        .expect("an ordinary retirement batch");
+    // This overlay names a synthetic provider absent from the process maps.
+    // Check retirement before the owed inventory rescan can remove it; the
+    // native provider fixture separately checks that rescan and reattachment.
+    let mut collect = Engine::collect_discovery_records;
+    engine
+        .process_discovery_records(
+            &mut session,
+            &mut Vec::new(),
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("an ordinary retirement record pass");
 
     assert!(
         engine
@@ -6380,6 +6392,11 @@ fn an_exec_refresh_never_queues_its_live_view_for_conservative_retirement() {
              fresh ID allocates a second slot set for targets that already have one"
     );
     assert_eq!(engine.plan.modules.len(), 1);
+    assert!(
+        engine.pending_retirements.is_empty(),
+        "the retained view must never enter conservative retirement replay"
+    );
+    assert!(engine.refresh_requested.contains_key(&pid));
 }
 
 /// Task 9.2b defect E, second half, in the *capture* path this time.
@@ -8795,6 +8812,104 @@ fn exec_refresh_attaches_provider_exports_before_readiness() {
         .collect(),
         "readiness requires all configured exports from the refreshed provider"
     );
+}
+
+/// A consumed EXEC still publishes genuine overflow, but retiring its old
+/// loader must not forget the rescan owed to this retained provider owner.
+/// Owned views never use exploratory polling to recover missing loader hooks.
+#[test]
+fn overflowing_retained_exec_refresh_rearms_after_queue_capacity_returns() {
+    let (fixture, mut engine, mut session) = initial_export_route();
+    let pid = engine.views[0].pid();
+    let view_id = engine.views[0].id();
+    let retired = engine.loader_registry.ids_for_view(view_id)[0];
+    let scope_dir = tempfile::tempdir().unwrap();
+    e06_write_listing(scope_dir.path(), &[pid]);
+    engine.scope = crate::scope::cgroup(scope_dir.path()).unwrap();
+    engine.seed_initial_cgroup_views();
+    engine.module_hints = vec![fixture._dir.path().join("seed-provider.so")];
+    engine.frame_work_budget_ns = u64::MAX;
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    assert!(
+        engine
+            .modules
+            .iter()
+            .any(|module| module.scanned.view == view_id)
+    );
+    assert!(!engine.exploratory_evictable(view_id));
+
+    // Model earlier in-scope EXEC arrivals whose discovery requests still
+    // occupy the queue; those short-lived generations are absent at this tick.
+    let mut pending = PendingViewRetirements::new();
+    for offset in 0..MAX_PENDING_REFRESH as u32 {
+        let earlier_pid = 4_000_000 + offset;
+        assert_ne!(earlier_pid, pid, "the owned generation is not queued yet");
+        engine.dispatch_lifecycle_record(&exec_record_for(earlier_pid), &mut pending);
+    }
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    assert_eq!(engine.discovery_truncated, 0);
+
+    apply_ordinary_batch(&mut engine, &mut session, vec![exec_record_for(pid)]).unwrap();
+
+    assert_eq!(
+        engine.discovery_truncated, 1,
+        "the consumed EXEC overflow stays visible"
+    );
+    assert_eq!(engine.newcomer_ages.dropped_unknown, 1);
+    assert!(
+        engine.loader_registry.context(retired).is_none(),
+        "the old loader retired"
+    );
+    assert!(
+        engine
+            .views
+            .iter()
+            .any(|view| view.id() == view_id && view.pid() == pid)
+    );
+
+    // The first inventory pass can settle absent arrivals. Another accepted
+    // EXEC burst keeps the next ordinary batch full: retrying the same owed
+    // refresh must neither count another lost record nor stall inventory.
+    for offset in 0..MAX_PENDING_REFRESH as u32 {
+        engine.dispatch_lifecycle_record(&exec_record_for(4_000_000 + offset), &mut pending);
+    }
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+    assert!(
+        engine.refresh_requested.len() < MAX_PENDING_REFRESH,
+        "inventory must free capacity while the retained refresh waits"
+    );
+    assert_eq!(
+        engine.discovery_truncated, 1,
+        "a full-queue retry is not a new consumed EXEC"
+    );
+    assert_eq!(engine.newcomer_ages.dropped_unknown, 1);
+
+    // Free capacity after the earlier work settles. No fresh lifecycle event
+    // rescues the owner: ordinary later batches must service its owed refresh.
+    engine
+        .refresh_requested
+        .retain(|queued_pid, _| *queued_pid == pid);
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+
+    let contexts = engine.loader_registry.ids_for_view(view_id);
+    assert_eq!(
+        contexts.len(),
+        1,
+        "the retained owner must regain a loader context"
+    );
+    assert_ne!(contexts[0], retired);
+    assert_eq!(
+        session.dynamic_attach_calls.len(),
+        3,
+        "all provider exports rearm"
+    );
+    assert_eq!(
+        engine.discovery_truncated, 1,
+        "retrying owed work loses no new record"
+    );
+    assert_eq!(engine.newcomer_ages.dropped_unknown, 1);
 }
 
 #[test]

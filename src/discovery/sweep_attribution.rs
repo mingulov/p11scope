@@ -328,6 +328,11 @@ impl KnownKeyIndex {
         Ok(())
     }
 
+    pub(crate) fn clear_kernel_slots(&mut self) {
+        self.match_slots.clear();
+        self.examined_slots.clear();
+    }
+
     /// Whether any range under `key` is its file without a per-range stat.
     fn key_is_identity(&self, key: ObjectKey) -> bool {
         self.identity_keys.contains(&key)
@@ -339,6 +344,13 @@ impl KnownKeyIndex {
 
     fn examined_identities(&self, key: ObjectKey) -> Option<&BTreeSet<FileIdentity>> {
         self.examined.get(&key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn kernel_slots_for_test(&self, key: ObjectKey) -> Option<&BTreeSet<Slot>> {
+        self.match_slots
+            .get(&key)
+            .or_else(|| self.examined_slots.get(&key))
     }
 }
 
@@ -1416,6 +1428,9 @@ pub(crate) struct IoResources {
 }
 
 impl IoResources {
+    pub(crate) fn same_owner(&self, owner: &ReservationOwner) -> bool {
+        Arc::ptr_eq(&self.owner.state, &owner.state)
+    }
     pub(crate) fn pin(&self) -> Result<FdLease, String> {
         self.owner.reserve(
             if self.immediate {
@@ -1457,6 +1472,11 @@ pub(crate) struct PreparedConfirmation<P> {
 /// decision order is unit-testable.
 pub(crate) trait ConfirmIo {
     type Pin;
+    /// Borrow the original retained pin for a per-PID iterator. A missing
+    /// pidfd requires userspace; never reopen one from a numeric PID.
+    fn borrowed_pidfd<'a>(&self, _pin: &'a Self::Pin) -> Option<std::os::fd::BorrowedFd<'a>> {
+        None
+    }
     /// The `map_files` identity of `[start, end)` in `pid`; `Err` equal to
     /// [`RANGE_NOT_MAPPED`] when no mapping (or no process) is there now.
     fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String>;
@@ -1563,6 +1583,37 @@ pub(crate) fn stat_unpinned<Io: ConfirmIo>(
         charged.push(range);
     }
     read_ranges(io, pid, &charged)
+}
+
+/// The opt-in adapter's idle fallback charges once and closes proof-directory
+/// custody under the same owner. The default userspace function is unchanged.
+pub(crate) fn stat_unpinned_reserved<Io: ConfirmIo>(
+    io: &mut Io,
+    pid: u32,
+    ranges: &[(u64, u64)],
+    budget: &mut CaptureWorkBudget,
+    resources: &IoResources,
+) -> MappedIdentities {
+    let mut charged = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut answers = MappedIdentities::new();
+    for &range in ranges {
+        if !seen.insert(range) {
+            continue;
+        }
+        if budget.spend(1).is_err() {
+            break;
+        }
+        if budget.has_collection_work() {
+            answers.extend(read_ranges_reserved(io, pid, &[range], Some(resources)));
+        } else {
+            charged.push(range);
+        }
+    }
+    if !budget.has_collection_work() {
+        answers = read_ranges_reserved(io, pid, &charged, Some(resources));
+    }
+    answers
 }
 
 /// One confirmation: pin, exe, maps re-read, exe again, then the pin must
@@ -1959,6 +2010,10 @@ impl ConfirmIo for OsConfirmIo<'_> {
 
     fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
         crate::process::PidPin::open(pid)
+    }
+
+    fn borrowed_pidfd<'a>(&self, pin: &'a Self::Pin) -> Option<std::os::fd::BorrowedFd<'a>> {
+        pin.pidfd().ok()
     }
 
     fn start_time(&self, pin: &Self::Pin) -> Option<u64> {

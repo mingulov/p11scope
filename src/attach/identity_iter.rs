@@ -2109,12 +2109,34 @@ pub fn attach_and_read_run(
     deadline: Instant,
     max_bytes: usize,
 ) -> Result<Vec<u8>, ProbeError> {
-    let link = link_create_task_vma(prog_fd, pid_fd).map_err(|error| probe_io("link", error))?;
-    let iter = iter_create(link.as_fd()).map_err(|error| probe_io("iter", error))?;
-    consume_owned_run(iter, link, deadline, max_bytes).map_err(|error| ProbeError {
-        stage: "read",
-        detail: format!("{error:?}"),
+    attach_and_read_run_typed(prog_fd, pid_fd, deadline, max_bytes).map_err(|error| match error {
+        OwnedRunError::Attach(error) => error,
+        OwnedRunError::Read(error) => ProbeError {
+            stage: "read",
+            detail: format!("{error:?}"),
+        },
     })
+}
+
+#[derive(Debug)]
+pub(crate) enum OwnedRunError {
+    Attach(ProbeError),
+    Read(ReadError),
+}
+
+/// The same owned attach/read/close path, retaining the finite read cause for
+/// private backend demotion. Existing probe diagnostics keep their wrapper.
+pub(crate) fn attach_and_read_run_typed(
+    prog_fd: BorrowedFd<'_>,
+    pid_fd: Option<BorrowedFd<'_>>,
+    deadline: Instant,
+    max_bytes: usize,
+) -> Result<Vec<u8>, OwnedRunError> {
+    let link = link_create_task_vma(prog_fd, pid_fd)
+        .map_err(|error| OwnedRunError::Attach(probe_io("link", error)))?;
+    let iter = iter_create(link.as_fd())
+        .map_err(|error| OwnedRunError::Attach(probe_io("iter", error)))?;
+    consume_owned_run(iter, link, deadline, max_bytes).map_err(OwnedRunError::Read)
 }
 
 /// Return only completed bytes or failure after both concrete run descriptors

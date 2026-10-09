@@ -2,7 +2,13 @@
 //! Pass-local scanner custody and anchor installation. Runtime proof selection
 //! is a later slice; these owners never change default userspace collection.
 
+use super::confirm_shards::{AcceptedBatch, SegmentProof, prove_and_finish_prepared};
 use super::identity::{ExaminedObject, HeldExaminedObject, PinnedObjectId, PinnedObjects};
+use super::scan::CaptureWorkBudget;
+use super::sweep_attribution::{
+    ConfirmIo, Confirmation, IoResources, KnownKeyIndex, MappedIdentities, MemberProbe,
+    prepare_confirmation, stat_unpinned_reserved,
+};
 use super::sweep_attribution::{ReservationOwner, SegmentPolicy, Slot};
 use crate::attach::identity_iter::{
     AnchorArena, Expect, RunKind, RunMode, ScopeBitmap, StrictIdentity, parse,
@@ -201,14 +207,14 @@ impl ExaminedCustody {
 }
 
 enum AnchorFile<'p> {
-    Pinned(&'p File),
+    Pinned { id: PinnedObjectId, file: &'p File },
     Examined(HeldExaminedObject),
 }
 
 impl AnchorFile<'_> {
     fn file(&self) -> &File {
         match self {
-            Self::Pinned(file) => file,
+            Self::Pinned { file, .. } => file,
             Self::Examined(held) => &held.file,
         }
     }
@@ -230,7 +236,10 @@ pub(crate) struct AnchorPass<'p> {
     #[cfg(test)]
     after_files: Option<DropObserver>,
     pub(crate) fallback: BTreeMap<ObjectKey, AnchorDeny>,
-    pub(crate) expected: BTreeMap<ObjectKey, BTreeSet<Slot>>,
+    expected_matches: BTreeMap<(ObjectKey, PinnedObjectId), BTreeSet<Slot>>,
+    expected_examined: BTreeMap<ObjectKey, BTreeSet<Slot>>,
+    #[cfg(test)] // Custody/alias observations only; never proof authority.
+    expected: BTreeMap<ObjectKey, BTreeSet<Slot>>,
     reservations: ReservationOwner,
     binding: Option<PassBinding>,
 }
@@ -267,17 +276,103 @@ impl InstalledAnchorPass<'_, '_> {
         deadline: std::time::Instant,
         max_bytes: usize,
     ) -> Result<Vec<u8>, &'static str> {
+        self.read_target_typed(pid, deadline, max_bytes)
+            .map_err(|_| "identity target run is unavailable")
+    }
+
+    fn read_target_typed(
+        &mut self,
+        pid: Option<std::os::fd::BorrowedFd<'_>>,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, RunFailure> {
         let pass = self.pass.as_mut().expect("installed guard owns its pass");
         let lease = pass
             .reservations
             .immediate()
             .transient()
-            .map_err(|_| "identity target FD headroom is unavailable")?;
-        let result = pass.read_run(self.session, RunKind::Target, pid, deadline, max_bytes);
+            .map_err(|_| RunFailure::FdHeadroom)?;
+        let result = pass.read_run_typed(self.session, RunKind::Target, pid, deadline, max_bytes);
         // The concrete read closes iterator/link before this lease or the
         // enclosing guard can release the arena and examined files.
         drop(lease);
         result
+    }
+
+    fn replace_target_scope(&mut self, tgids: &[u32]) -> Result<(), RunFailure> {
+        let pass = self.pass.as_ref().expect("installed guard owns its pass");
+        if !pass.owns_installation(self.session) {
+            return Err(RunFailure::Scope);
+        }
+        let result = match &mut self.session.object {
+            SessionObject::Kernel(loaded) => self
+                .session
+                .scope
+                .replace(&mut loaded.ebpf, tgids)
+                .map_err(|_| RunFailure::Scope),
+            #[cfg(test)]
+            SessionObject::Fixture { .. } => self
+                .session
+                .scope
+                .fixture_replace(tgids)
+                .map_err(|_| RunFailure::Scope),
+        };
+        if result.is_err() {
+            self.session.binding = None;
+            self.session.scope.invalidate();
+        }
+        result
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunFailure {
+    Scope,
+    AnchorNotInstalled,
+    FdHeadroom,
+    Deadline,
+    Clock,
+    StreamInvalid,
+    AttachOrRead,
+}
+
+impl From<crate::attach::identity_iter::ReadError> for RunFailure {
+    fn from(error: crate::attach::identity_iter::ReadError) -> Self {
+        match error {
+            crate::attach::identity_iter::ReadError::Deadline => Self::Deadline,
+            crate::attach::identity_iter::ReadError::TooLarge => Self::StreamInvalid,
+            crate::attach::identity_iter::ReadError::Errno(_) => Self::AttachOrRead,
+        }
+    }
+}
+
+/// Only this module can mint a complete target result. The borrow prevents
+/// reconfiguration/release while the shared driver finishes this batch.
+pub(crate) struct ValidatedTargetSegment<'r> {
+    binding: &'r PassBinding,
+    batch: Arc<()>,
+    answers: Vec<Option<MappedIdentities>>,
+}
+
+pub(crate) enum ProofDecision<'r> {
+    Kernel(ValidatedTargetSegment<'r>),
+    Userspace(RunFailure),
+}
+
+impl ProofDecision<'_> {
+    pub(crate) fn answer(
+        &self,
+        batch: &AcceptedBatch<'_>,
+        position: usize,
+    ) -> Option<&MappedIdentities> {
+        match self {
+            Self::Kernel(segment)
+                if Arc::ptr_eq(&segment.batch, batch.token()) && segment.binding.generation > 0 =>
+            {
+                segment.answers.get(position).and_then(Option::as_ref)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -288,6 +383,336 @@ impl Drop for InstalledAnchorPass<'_, '_> {
         // Explicit Drop keeps the exclusive session borrow alive through
         // arena -> examined File destruction, even when the guard is unused.
         drop(self.pass.take());
+    }
+}
+
+/// Dormant adapter for the shared charged preparation and live finish path.
+/// Target evidence and same-pin fallback share one charged request batch.
+pub(crate) struct KernelMemberProbe<'g, 's, 'p, Io> {
+    proof: KernelPassProof<'g, 's, 'p>,
+    io: Io,
+    resources: IoResources,
+}
+
+struct KernelPassProof<'g, 's, 'p> {
+    installed: &'g mut InstalledAnchorPass<'s, 'p>,
+    deadline: std::time::Instant,
+    eligible_keys: BTreeSet<ObjectKey>,
+}
+
+struct TargetWorkDeadline {
+    deadline: std::time::Instant,
+    steps: u32,
+}
+
+impl TargetWorkDeadline {
+    fn check(&self, budget: &mut CaptureWorkBudget) -> Result<(), RunFailure> {
+        if std::time::Instant::now() >= self.deadline || budget.check_deadline_now().is_some() {
+            Err(RunFailure::Deadline)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn step(&mut self, budget: &mut CaptureWorkBudget) -> Result<(), RunFailure> {
+        self.steps += 1;
+        if self.steps == 32 {
+            self.steps = 0;
+            self.check(budget)?;
+        }
+        Ok(())
+    }
+}
+
+fn bounded_target_deadline(
+    budget: &mut CaptureWorkBudget,
+    outer: std::time::Instant,
+) -> Result<std::time::Instant, RunFailure> {
+    if budget.check_deadline_now().is_some() {
+        return Err(RunFailure::Deadline);
+    }
+    let now = std::time::Instant::now();
+    let mut deadline = outer.min(now + std::time::Duration::from_millis(500));
+    if let Some(limit) = budget.effective_deadline_ns() {
+        let clock = crate::attach::monotonic_ns().ok_or(RunFailure::Clock)?;
+        let left = limit.checked_sub(clock).ok_or(RunFailure::Deadline)?;
+        deadline = deadline.min(
+            now.checked_add(std::time::Duration::from_nanos(left))
+                .ok_or(RunFailure::Clock)?,
+        );
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err(RunFailure::Deadline);
+    }
+    Ok(deadline)
+}
+
+impl SegmentProof for KernelPassProof<'_, '_, '_> {
+    fn prove<'r>(
+        &'r mut self,
+        batch: &AcceptedBatch<'_>,
+        budget: &mut CaptureWorkBudget,
+        resources: &IoResources,
+    ) -> ProofDecision<'r> {
+        let pass = self
+            .installed
+            .pass
+            .as_ref()
+            .expect("installed guard owns its pass");
+        if !pass.owns_installation(self.installed.session) {
+            return ProofDecision::Userspace(RunFailure::Scope);
+        }
+        if !resources.same_owner(&pass.reservations) {
+            return ProofDecision::Userspace(RunFailure::FdHeadroom);
+        }
+        let deadline = match bounded_target_deadline(budget, self.deadline) {
+            Ok(deadline) => deadline,
+            Err(reason) => return ProofDecision::Userspace(reason),
+        };
+        let mut work = TargetWorkDeadline { deadline, steps: 0 };
+        // Exclude a PID before running if any required whole-key expectation
+        // is absent. A consumed valid NONE from eligible PIDs is never retried.
+        let mut eligible = Vec::with_capacity(batch.requests().len());
+        let mut scope = BTreeSet::new();
+        let mut examined_entries = 0usize;
+        let mut requested_ranges = 0usize;
+        let mut maps = 0usize;
+        for request in batch.requests() {
+            if let Err(reason) = work.check(budget) {
+                return ProofDecision::Userspace(reason);
+            }
+            examined_entries = match examined_entries.checked_add(request.entries().len()) {
+                Some(total) if total <= super::scan::MapsReadLimits::LIVE.max_entries => total,
+                _ => return ProofDecision::Userspace(RunFailure::FdHeadroom),
+            };
+            requested_ranges = match requested_ranges.checked_add(request.ranges().len()) {
+                Some(total) if total <= super::scan::MapsReadLimits::LIVE.max_entries => total,
+                _ => return ProofDecision::Userspace(RunFailure::FdHeadroom),
+            };
+            // Exact-range lookup is built once from the original prepared maps.
+            // Duplicate ranges cannot supply an unambiguous kernel request.
+            let mut by_range = BTreeMap::new();
+            for entry in request.entries() {
+                #[cfg(test)]
+                tests::note_eligibility_visit(budget);
+                if let Err(reason) = work.step(budget) {
+                    return ProofDecision::Userspace(reason);
+                }
+                if by_range.insert((entry.start, entry.end), entry).is_some() {
+                    return ProofDecision::Userspace(RunFailure::StreamInvalid);
+                }
+            }
+            let mut complete = !request.ranges().is_empty();
+            for range in request.ranges() {
+                let entry = by_range.get(range);
+                #[cfg(test)]
+                if entry.is_some() {
+                    tests::note_eligibility_visit(budget);
+                }
+                if let Err(reason) = work.step(budget) {
+                    return ProofDecision::Userspace(reason);
+                }
+                if !entry.is_some_and(|entry| self.eligible_keys.contains(&ObjectKey::of(entry))) {
+                    complete = false;
+                    break;
+                }
+            }
+            if complete {
+                scope.insert(request.pid());
+                maps += request.entries().len(); // Bounded by examined_entries above.
+            }
+            eligible.push(complete);
+        }
+        if let Err(reason) = work.check(budget) {
+            return ProofDecision::Userspace(reason);
+        }
+        if scope.is_empty() {
+            return ProofDecision::Userspace(RunFailure::AnchorNotInstalled);
+        }
+        let binding = pass
+            .binding
+            .as_ref()
+            .expect("owned installation has a binding");
+        let generation = binding.generation;
+        let slots = (binding.arena_len / crate::attach::identity_iter::ANCHOR_STRIDE) as u32;
+        let max_bytes = maps
+            .checked_add(slots as usize + 1)
+            .and_then(|records| records.checked_mul(crate::attach::identity_iter::RECORD_LEN));
+        let Some(max_bytes) = max_bytes else {
+            return ProofDecision::Userspace(RunFailure::FdHeadroom);
+        };
+        if let Err(reason) = self
+            .installed
+            .replace_target_scope(&scope.iter().copied().collect::<Vec<_>>())
+        {
+            return ProofDecision::Userspace(reason);
+        }
+        if let Err(reason) = work.check(budget) {
+            return ProofDecision::Userspace(reason);
+        }
+        let bytes = match self.installed.read_target_typed(None, deadline, max_bytes) {
+            Ok(bytes) => bytes,
+            Err(reason) => return ProofDecision::Userspace(reason),
+        };
+        let run = match parse(
+            &bytes,
+            &Expect {
+                generation,
+                slots,
+                scope: &scope,
+                mode: RunMode::WholeSystem,
+                run: RunKind::Target,
+            },
+        ) {
+            Ok(run) => run,
+            Err(_) => return ProofDecision::Userspace(RunFailure::StreamInvalid),
+        };
+        if let Err(reason) = work.check(budget) {
+            return ProofDecision::Userspace(reason);
+        }
+        let mut answers = Vec::with_capacity(batch.requests().len());
+        for (request, eligible) in batch.requests().iter().zip(eligible) {
+            if let Err(reason) = work.step(budget) {
+                return ProofDecision::Userspace(reason);
+            }
+            let records = eligible
+                .then(|| run.by_pid.get(&request.pid()))
+                .flatten()
+                .filter(|_| !run.demoted_pids.contains(&request.pid()));
+            let Some(records) = records else {
+                answers.push(None);
+                continue;
+            };
+            let mut mapped = MappedIdentities::new();
+            for &range in request.ranges() {
+                if let Err(reason) = work.step(budget) {
+                    return ProofDecision::Userspace(reason);
+                }
+                let proof = match records.get(&range) {
+                    Some(crate::attach::identity_iter::TargetVerdict::Slot(slot)) => {
+                        super::sweep_attribution::RangeProof::Kernel(Slot(*slot))
+                    }
+                    Some(crate::attach::identity_iter::TargetVerdict::Unmatched) => {
+                        super::sweep_attribution::RangeProof::KernelNone
+                    }
+                    None => super::sweep_attribution::RangeProof::NotMapped,
+                };
+                mapped.insert(range, proof);
+            }
+            answers.push(Some(mapped));
+        }
+        if let Err(reason) = work.check(budget) {
+            return ProofDecision::Userspace(reason);
+        }
+        let binding = self
+            .installed
+            .pass
+            .as_ref()
+            .expect("installed guard owns its pass")
+            .binding
+            .as_ref()
+            .expect("owned installation has a binding");
+        ProofDecision::Kernel(ValidatedTargetSegment {
+            binding,
+            batch: batch.token().clone(),
+            answers,
+        })
+    }
+}
+
+impl<'g, 's, 'p, Io: ConfirmIo> KernelMemberProbe<'g, 's, 'p, Io> {
+    pub(crate) fn new(
+        installed: &'g mut InstalledAnchorPass<'s, 'p>,
+        io: Io,
+        deadline: std::time::Instant,
+    ) -> Self {
+        let resources = installed
+            .pass
+            .as_ref()
+            .expect("installed guard owns its pass")
+            .reservations
+            .immediate();
+        Self {
+            proof: KernelPassProof {
+                installed,
+                deadline,
+                eligible_keys: BTreeSet::new(),
+            },
+            io,
+            resources,
+        }
+    }
+
+    pub(crate) fn install_expectations(
+        &mut self,
+        index: &mut KnownKeyIndex,
+    ) -> Result<(), &'static str> {
+        let pass = self
+            .proof
+            .installed
+            .pass
+            .as_ref()
+            .expect("installed guard owns its pass");
+        index.clear_kernel_slots();
+        self.proof.eligible_keys.clear();
+        // The held object's role is part of the expectation. An examined
+        // file under a colliding key must never become its admitted provider.
+        for (&(key, id), slots) in &pass.expected_matches {
+            if index.classify(key) == super::sweep_attribution::KeyClass::Match(id) {
+                index.set_kernel_slots(key, slots.clone())?;
+                self.proof.eligible_keys.insert(key);
+            }
+        }
+        for (&key, slots) in &pass.expected_examined {
+            if index.classify(key) == super::sweep_attribution::KeyClass::Examined {
+                index.set_kernel_slots(key, slots.clone())?;
+                self.proof.eligible_keys.insert(key);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<Io: ConfirmIo> MemberProbe for KernelMemberProbe<'_, '_, '_, Io> {
+    fn confirm(
+        &mut self,
+        pid: u32,
+        prove: &BTreeSet<ObjectKey>,
+        budget: &mut CaptureWorkBudget,
+    ) -> Confirmation {
+        // Scoped collection keeps its established per-read cancellation and
+        // charging boundary; this opt-in substrate does not activate there.
+        if budget.has_collection_work() {
+            return super::sweep_attribution::confirm_with_resources(
+                &mut self.io,
+                pid,
+                prove,
+                budget,
+                Some(&self.resources),
+            );
+        }
+        let prepared =
+            match prepare_confirmation(&mut self.io, pid, prove, budget, Some(&self.resources)) {
+                Ok(prepared) => prepared,
+                Err(confirmation) => return confirmation,
+            };
+        prove_and_finish_prepared(
+            &mut self.io,
+            pid,
+            prepared,
+            &mut self.proof,
+            &self.resources,
+            budget,
+        )
+    }
+
+    fn stat_ranges(
+        &mut self,
+        pid: u32,
+        ranges: &[(u64, u64)],
+        budget: &mut CaptureWorkBudget,
+    ) -> MappedIdentities {
+        stat_unpinned_reserved(&mut self.io, pid, ranges, budget, &self.resources)
     }
 }
 
@@ -336,6 +761,9 @@ impl<'p> AnchorPass<'p> {
                 .into_iter()
                 .map(|((_, key), reason)| (key, reason))
                 .collect(),
+            expected_matches: BTreeMap::new(),
+            expected_examined: BTreeMap::new(),
+            #[cfg(test)]
             expected: BTreeMap::new(),
             reservations: custody.owner.clone(),
             binding: None,
@@ -360,7 +788,7 @@ impl<'p> AnchorPass<'p> {
             pass.candidates.push(Candidate {
                 keys,
                 slot: Slot(pass.candidates.len() as u32),
-                file: AnchorFile::Pinned(file),
+                file: AnchorFile::Pinned { id, file },
             });
         }
         let callers = &custody.callers;
@@ -416,6 +844,9 @@ impl<'p> AnchorPass<'p> {
     }
 
     fn accept_anchor_run(&mut self, bytes: &[u8], generation: u64) -> Result<(), String> {
+        self.expected_matches.clear();
+        self.expected_examined.clear();
+        #[cfg(test)]
         self.expected.clear();
         let run = parse(
             bytes,
@@ -455,9 +886,26 @@ impl<'p> AnchorPass<'p> {
                 continue;
             }
             for key in &candidate.keys {
+                match &candidate.file {
+                    AnchorFile::Pinned { id, .. } => {
+                        self.expected_matches
+                            .entry((*key, *id))
+                            .or_default()
+                            .insert(root);
+                    }
+                    AnchorFile::Examined(_) => {
+                        self.expected_examined.entry(*key).or_default().insert(root);
+                    }
+                }
+                #[cfg(test)]
                 self.expected.entry(*key).or_default().insert(root);
             }
         }
+        self.expected_matches
+            .retain(|(key, _), _| !self.fallback.contains_key(key));
+        self.expected_examined
+            .retain(|key, _| !self.fallback.contains_key(key));
+        #[cfg(test)]
         self.expected
             .retain(|key, _| !self.fallback.contains_key(key));
         Ok(())
@@ -471,22 +919,34 @@ impl<'p> AnchorPass<'p> {
         deadline: std::time::Instant,
         max_bytes: usize,
     ) -> Result<Vec<u8>, &'static str> {
+        self.read_run_typed(session, run, pid, deadline, max_bytes)
+            .map_err(|_| "identity pass installation is unavailable")
+    }
+
+    fn owns_installation(&self, session: &IdentitySession) -> bool {
         let Some(binding) = &self.binding else {
-            return Err("identity pass is not installed");
+            return false;
         };
-        let owned = session.binding.as_ref().is_some_and(|installed| {
+        session.binding.as_ref().is_some_and(|installed| {
             binding.same_installation(installed)
                 && Arc::ptr_eq(&binding.session, &session.token)
                 && binding.generation == session.generation
                 && self.arena.as_ref().is_some_and(|arena| {
                     arena.base() == binding.arena_base && arena.len() == binding.arena_len
                 })
-        });
-        if !owned {
-            return Err("identity pass installation is unavailable");
-        }
-        if !session.scope.ready() {
-            return Err("identity scope is unavailable");
+        })
+    }
+
+    fn read_run_typed(
+        &mut self,
+        session: &IdentitySession,
+        run: RunKind,
+        pid: Option<std::os::fd::BorrowedFd<'_>>,
+        deadline: std::time::Instant,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, RunFailure> {
+        if !self.owns_installation(session) || !session.scope.ready() {
+            return Err(RunFailure::Scope);
         }
         session.read(run, pid, deadline, max_bytes)
     }
@@ -618,20 +1078,25 @@ impl IdentitySession {
         pid: Option<std::os::fd::BorrowedFd<'_>>,
         deadline: std::time::Instant,
         max_bytes: usize,
-    ) -> Result<Vec<u8>, &'static str> {
+    ) -> Result<Vec<u8>, RunFailure> {
         match &self.object {
             SessionObject::Kernel(loaded) => {
                 let program = match run {
                     RunKind::Anchor => &loaded.anchor_fd,
                     RunKind::Target => &loaded.target_fd,
                 };
-                crate::attach::identity_iter::attach_and_read_run(
+                crate::attach::identity_iter::attach_and_read_run_typed(
                     program.as_fd(),
                     pid,
                     deadline,
                     max_bytes,
                 )
-                .map_err(|_| "identity iterator run failed")
+                .map_err(|error| match error {
+                    crate::attach::identity_iter::OwnedRunError::Attach(_) => {
+                        RunFailure::AttachOrRead
+                    }
+                    crate::attach::identity_iter::OwnedRunError::Read(error) => error.into(),
+                })
             }
             #[cfg(test)]
             SessionObject::Fixture {
@@ -657,7 +1122,7 @@ impl IdentitySession {
                     deadline,
                     max_bytes,
                 )
-                .map_err(|_| "identity iterator run failed")
+                .map_err(RunFailure::from)
             }
         }
     }
@@ -699,6 +1164,9 @@ impl IdentitySession {
         generation: u64,
         deadline: std::time::Instant,
     ) -> Result<AnchorPass<'p>, &'static str> {
+        pass.expected_matches.clear();
+        pass.expected_examined.clear();
+        #[cfg(test)]
         pass.expected.clear();
         if generation <= self.generation || generation >= u64::from(u32::MAX) {
             return Err("identity generation is unavailable");

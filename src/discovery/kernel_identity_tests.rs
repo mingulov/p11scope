@@ -714,3 +714,765 @@ fn d3b_probe_report_requires_every_functional_outcome() {
         );
     }
 }
+
+// These cells exercise the dormant production adapter, shared charged
+// preparation and live finish. Target bytes script a kernel response; the
+// fixture's actual held Files and owned run FDs do not prove a live BPF join.
+const ADAPTER_PID: u32 = 4100;
+const ADAPTER_RANGES: [(u64, u64); 2] = [(0x1000, 0x2000), (0x3000, 0x4000)];
+
+fn target_stream(records: &[(u32, (u64, u64), u32)]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for &(pid, (start, end), verdict) in records {
+        let mut record = [0u8; 32];
+        record[..2].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
+        record[2] = RECORD_VERSION;
+        record[3] = crate::attach::identity_iter::KIND_VMA;
+        record[4..8].copy_from_slice(&pid.to_le_bytes());
+        record[8..16].copy_from_slice(&start.to_le_bytes());
+        record[16..24].copy_from_slice(&end.to_le_bytes());
+        record[24..28].copy_from_slice(&verdict.to_le_bytes());
+        record[28..32].copy_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&record);
+    }
+    bytes.extend_from_slice(&anchor_stream(&[]));
+    bytes
+}
+
+fn complete_target() -> Vec<u8> {
+    target_stream(&ADAPTER_RANGES.map(|range| (ADAPTER_PID, range, 0)))
+}
+
+#[derive(Default)]
+struct AdapterCell {
+    target: Vec<u8>,
+    alias: bool,
+    distinct_examined_same_key: bool,
+    ranges: Option<Vec<(u64, u64)>>,
+    page_offset: bool,
+    exec_changed: bool,
+    pid_changed: bool,
+}
+
+#[derive(Default)]
+struct AdapterTrace {
+    opens: usize,
+    closes: usize,
+    reads: Vec<(u32, u64, u64)>,
+    events: Vec<&'static str>,
+    pin: Option<FdToken>,
+}
+
+struct AdapterPin {
+    file: File,
+    trace: Rc<RefCell<AdapterTrace>>,
+}
+impl Drop for AdapterPin {
+    fn drop(&mut self) {
+        assert!(fd_open(FdToken::of(&self.file)));
+        let mut trace = self.trace.borrow_mut();
+        trace.closes += 1;
+        trace.events.push("close-pin");
+    }
+}
+
+struct AdapterIo {
+    entries: Vec<p11scope_manifest::maps::MapEntry>,
+    identity: FileIdentity,
+    trace: Rc<RefCell<AdapterTrace>>,
+    exe_reads: Cell<usize>,
+    exec_changed: bool,
+    pid_changed: bool,
+}
+impl ConfirmIo for AdapterIo {
+    type Pin = AdapterPin;
+    fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
+        assert_eq!(pid, ADAPTER_PID);
+        let file = tempfile::tempfile().unwrap();
+        let mut trace = self.trace.borrow_mut();
+        trace.opens += 1;
+        trace.events.push("pin");
+        trace.pin = Some(FdToken::of(&file));
+        drop(trace);
+        Ok(AdapterPin {
+            file,
+            trace: self.trace.clone(),
+        })
+    }
+    fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
+        let mut trace = self.trace.borrow_mut();
+        assert!(
+            fd_open(trace.pin.unwrap()),
+            "fallback lost its original process pin"
+        );
+        trace.reads.push((pid, start, end));
+        trace.events.push("map-files");
+        Ok(self.identity)
+    }
+    fn start_time(&self, pin: &Self::Pin) -> Option<u64> {
+        assert!(fd_open(FdToken::of(&pin.file)));
+        self.trace.borrow_mut().events.push("start-time");
+        Some(42)
+    }
+    fn still_the_same(&self, pin: &Self::Pin) -> bool {
+        assert!(fd_open(FdToken::of(&pin.file)));
+        self.trace.borrow_mut().events.push("generation");
+        !self.pid_changed
+    }
+    fn exe(&self, _: u32) -> Option<crate::discovery::caller_registry::ExeIdentity> {
+        let reads = self.exe_reads.get();
+        self.exe_reads.set(reads + 1);
+        self.trace.borrow_mut().events.push(if reads == 0 {
+            "exe-before"
+        } else {
+            "exe-after"
+        });
+        Some(crate::discovery::caller_registry::ExeIdentity {
+            dev: 1,
+            ino: if reads > 0 && self.exec_changed { 3 } else { 2 },
+            mtime_secs: 0,
+            mtime_nanos: 0,
+            path: Some("fixture-executable".into()),
+        })
+    }
+    fn maps(
+        &mut self,
+        _: u32,
+        _: &mut crate::discovery::scan::CaptureWorkBudget,
+    ) -> Result<Vec<p11scope_manifest::maps::MapEntry>, String> {
+        self.trace.borrow_mut().events.push("maps");
+        Ok(self.entries.clone())
+    }
+    fn gone(&self, _: u32) -> bool {
+        false
+    }
+}
+
+struct AdapterChecks(FileIdentity);
+impl super::super::sweep_attribution::ObjectChecks for AdapterChecks {
+    fn nonunique_inodes(&self, _: PinnedObjectId) -> Result<Option<&'static str>, String> {
+        Ok(None)
+    }
+    fn unchanged(&self, _: PinnedObjectId) -> Result<bool, String> {
+        Ok(true)
+    }
+    fn mapped_identity(
+        &self,
+        _: PinnedObjectId,
+    ) -> Result<super::super::identity::MappedFile, String> {
+        Ok(super::super::identity::MappedFile {
+            identity: self.0,
+            fs_magic: None,
+        })
+    }
+}
+
+struct AdapterObservation {
+    out: super::super::sweep_attribution::SweepAttribution,
+    trace: Rc<RefCell<AdapterTrace>>,
+    target_reads: usize,
+    charges: u64,
+}
+
+fn adapter_cell(cell: AdapterCell) -> AdapterObservation {
+    let dir = tempfile::tempdir().unwrap();
+    let (file, examined) = opened(dir.path(), "provider.so");
+    drop(file);
+    let pins = super::super::identity::test_fixture::real_scan_pin(
+        &dir.path().join("provider.so"),
+        None,
+        1,
+        "scripted-adapter-fixture",
+    );
+    let id = pins.pinned().next().unwrap().id;
+    let owner = ReservationOwner::for_examined(SegmentPolicy::from_headroom(16, 0, 0), 1);
+    let mut custody = ExaminedCustody::new(owner.clone(), BTreeMap::new());
+    if cell.alias {
+        let file = File::open(dir.path().join("provider.so")).unwrap();
+        let scan = custody.begin_scan();
+        assert!(custody.offer_for_test(scan, examined, file));
+    }
+    if cell.distinct_examined_same_key {
+        let (file, mut distinct) = opened(dir.path(), "distinct.so");
+        assert_ne!(distinct.identity, examined.identity);
+        // Script only the mapped-key collision. These remain two independently
+        // opened actual Files; this is not a claim of a live kernel collision.
+        distinct.key = examined.key;
+        let scan = custody.begin_scan();
+        assert!(custody.offer_for_test(scan, distinct, file));
+    }
+    let pass = AnchorPass::prepare(&pins, [(examined.key, id)], custody);
+    let mut session = fixture_session();
+    if let SessionObject::Fixture { anchor, target, .. } = &mut session.object {
+        *target = cell.target;
+        if cell.alias {
+            *anchor = anchor_stream(&[(0, ANCHOR_OK, 0), (1, ANCHOR_DUP, 0)]);
+        } else if cell.distinct_examined_same_key {
+            *anchor = anchor_stream(&[(0, ANCHOR_OK, 0), (1, ANCHOR_OK, 0)]);
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut installed = session.install_anchors(pass, 1, deadline).unwrap();
+    assert!(installed.pass.as_ref().unwrap().expected[&examined.key].contains(&Slot(0)));
+    let entries: Vec<_> = cell
+        .ranges
+        .unwrap_or_else(|| ADAPTER_RANGES.to_vec())
+        .into_iter()
+        .map(|(start, end)| p11scope_manifest::maps::MapEntry {
+            start,
+            end,
+            permissions: *b"r-xp",
+            file_offset: if cell.page_offset { 4096 } else { 0 },
+            device: examined.key.device,
+            inode: examined.key.inode,
+            raw_path: Some(b"/fixture/provider.so".to_vec()),
+        })
+        .collect();
+    let trace = Rc::new(RefCell::new(AdapterTrace::default()));
+    let io = AdapterIo {
+        entries: entries.clone(),
+        identity: examined.identity,
+        trace: trace.clone(),
+        exe_reads: Cell::new(0),
+        exec_changed: cell.exec_changed,
+        pid_changed: cell.pid_changed,
+    };
+    let (mut index, refused) = KnownKeyIndex::build(
+        [(examined.key, Some(id))],
+        &BTreeMap::from([(examined.key, id)]),
+        [],
+        &AdapterChecks(examined.identity),
+    );
+    assert!(refused.is_empty());
+    let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+    let mut probe = KernelMemberProbe::new(&mut installed, io, deadline);
+    probe.install_expectations(&mut index).unwrap();
+    let out = super::super::sweep_attribution::attribute_unselected(
+        &[(ADAPTER_PID, entries)],
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &index,
+        &mut probe,
+        &mut budget,
+    );
+    drop(probe);
+    let target_reads = match &installed.session.object {
+        SessionObject::Fixture { reads, .. } => reads.get() - 1,
+        _ => unreachable!(),
+    };
+    let charges = budget.work_units_count();
+    assert_eq!(owner.state_for_test().0, [0; 4]);
+    let trace_state = trace.borrow();
+    assert_eq!((trace_state.opens, trace_state.closes), (1, 1));
+    assert!(!fd_open(trace_state.pin.unwrap()));
+    assert_eq!(&trace_state.events[..3], &["pin", "exe-before", "maps"]);
+    drop(trace_state);
+    drop(installed);
+    AdapterObservation {
+        out,
+        trace,
+        target_reads,
+        charges,
+    }
+}
+
+fn assert_adapter_attempt(observation: &AdapterObservation, fallback: bool) {
+    assert_eq!(
+        observation.charges, 2,
+        "fallback charged the logical ranges again"
+    );
+    assert_eq!(
+        observation.target_reads, 1,
+        "actual adapter did not consume its target run"
+    );
+    let reads = observation.trace.borrow().reads.clone();
+    let expected = if fallback {
+        ADAPTER_RANGES
+            .map(|(start, end)| (ADAPTER_PID, start, end))
+            .to_vec()
+    } else {
+        Vec::new()
+    };
+    assert_eq!(
+        reads, expected,
+        "kernel evidence retried or reopened userspace proof"
+    );
+}
+
+#[derive(Default)]
+struct EligibilityVisits {
+    count: usize,
+    expire_after: Option<usize>,
+}
+
+thread_local! {
+    static ELIGIBILITY_VISITS: RefCell<Option<EligibilityVisits>> = const { RefCell::new(None) };
+}
+
+// Counts actual MapEntry visits in production eligibility preparation. The
+// injected expiry uses the existing budget deadline, not a separate fake stop.
+pub(super) fn note_eligibility_visit(budget: &mut crate::discovery::scan::CaptureWorkBudget) {
+    ELIGIBILITY_VISITS.with(|visits| {
+        let mut visits = visits.borrow_mut();
+        if let Some(visits) = visits.as_mut() {
+            visits.count += 1;
+            if visits.expire_after == Some(visits.count) {
+                budget.set_deadline(Some(0));
+            }
+        }
+    });
+}
+
+fn measured_eligibility(
+    cell: AdapterCell,
+    expire_after: Option<usize>,
+) -> (AdapterObservation, usize) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ELIGIBILITY_VISITS.with(|visits| *visits.borrow_mut() = None);
+        }
+    }
+    ELIGIBILITY_VISITS.with(|visits| {
+        assert!(visits.borrow().is_none());
+        *visits.borrow_mut() = Some(EligibilityVisits {
+            count: 0,
+            expire_after,
+        });
+    });
+    let reset = Reset;
+    let observation = adapter_cell(cell);
+    let count = ELIGIBILITY_VISITS.with(|visits| visits.borrow().as_ref().unwrap().count);
+    drop(reset);
+    (observation, count)
+}
+
+#[test]
+fn d3c_matched_key_rejects_distinct_examined_file_under_same_key() {
+    let admitted = adapter_cell(AdapterCell {
+        target: complete_target(),
+        distinct_examined_same_key: true,
+        ..Default::default()
+    });
+    assert_eq!(
+        admitted.out.members.len(),
+        1,
+        "admitted A lost its own anchor"
+    );
+    assert_adapter_attempt(&admitted, false);
+    let distinct = adapter_cell(AdapterCell {
+        target: target_stream(&ADAPTER_RANGES.map(|range| (ADAPTER_PID, range, 1))),
+        distinct_examined_same_key: true,
+        ..Default::default()
+    });
+    assert!(
+        distinct.out.members.is_empty(),
+        "examined B's slot was accepted as admitted provider A"
+    );
+    assert_eq!(
+        distinct.out.losses,
+        BTreeMap::from([(
+            super::super::sweep_attribution::AttributionLoss::IdentityMismatch,
+            1
+        )])
+    );
+    assert_adapter_attempt(&distinct, false);
+}
+
+#[test]
+fn d3c_validated_alias_keeps_admitted_object_positive() {
+    let observation = adapter_cell(AdapterCell {
+        target: complete_target(),
+        alias: true,
+        ..Default::default()
+    });
+    assert_eq!(observation.out.members.len(), 1);
+    assert!(observation.out.losses.is_empty());
+    assert_adapter_attempt(&observation, false);
+}
+
+fn large_adapter_cell() -> AdapterCell {
+    let ranges: Vec<_> = (0..2048)
+        .map(|n| (0x1000 + n * 0x2000, 0x2000 + n * 0x2000))
+        .collect();
+    AdapterCell {
+        target: target_stream(
+            &ranges
+                .iter()
+                .map(|&range| (ADAPTER_PID, range, 0))
+                .collect::<Vec<_>>(),
+        ),
+        ranges: Some(ranges),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn d3c_large_ranges_use_bounded_eligibility_work() {
+    let (observation, visits) = measured_eligibility(large_adapter_cell(), None);
+    assert_eq!(
+        observation.out.members.len(),
+        1,
+        "large exact-range proof failed"
+    );
+    assert!(observation.out.losses.is_empty());
+    assert_eq!(observation.target_reads, 1);
+    assert_eq!(observation.charges, 2048);
+    assert!(observation.trace.borrow().reads.is_empty());
+    assert!(
+        visits <= 4096,
+        "eligibility visited {visits} entries for 2048 exact ranges"
+    );
+}
+
+#[test]
+fn d3c_eligibility_honors_injected_deadline_before_unbounded_work() {
+    let (observation, visits) = measured_eligibility(large_adapter_cell(), Some(16));
+    assert!(observation.out.members.is_empty());
+    assert_eq!(observation.target_reads, 0);
+    assert!(observation.trace.borrow().reads.is_empty());
+    assert_eq!(observation.charges, 2048);
+    assert_eq!(
+        observation.out.losses,
+        BTreeMap::from([(super::super::sweep_attribution::AttributionLoss::Budget, 1)])
+    );
+    assert!(
+        visits <= 64,
+        "deadline expired at visit 16 but eligibility continued through {visits} entries"
+    );
+}
+
+#[test]
+fn d3c_complete_slots_and_validated_alias_match_all_ranges() {
+    for alias in [false, true] {
+        let observation = adapter_cell(AdapterCell {
+            target: complete_target(),
+            alias,
+            ..Default::default()
+        });
+        assert_eq!(
+            observation
+                .out
+                .members
+                .iter()
+                .map(|member| member.pid)
+                .collect::<Vec<_>>(),
+            [ADAPTER_PID]
+        );
+        assert!(observation.out.losses.is_empty());
+        assert_adapter_attempt(&observation, false);
+    }
+}
+
+#[test]
+fn d3c_valid_none_is_negative_without_userspace_retry() {
+    let observation = adapter_cell(AdapterCell {
+        target: target_stream(&[
+            (ADAPTER_PID, ADAPTER_RANGES[0], 0),
+            (
+                ADAPTER_PID,
+                ADAPTER_RANGES[1],
+                crate::attach::identity_iter::VERDICT_NONE,
+            ),
+        ]),
+        ..Default::default()
+    });
+    assert!(
+        observation.out.members.is_empty(),
+        "NONE became a userspace-positive edge"
+    );
+    assert_eq!(
+        observation.out.losses,
+        BTreeMap::from([(
+            super::super::sweep_attribution::AttributionLoss::IdentityMismatch,
+            1
+        )])
+    );
+    assert_adapter_attempt(&observation, false);
+}
+
+#[test]
+fn d3c_page_offset_keeps_file_identity_but_join_requires_exact_range() {
+    let exact = adapter_cell(AdapterCell {
+        target: complete_target(),
+        page_offset: true,
+        ..Default::default()
+    });
+    assert_eq!(exact.out.members.len(), 1);
+    assert_adapter_attempt(&exact, false);
+    let shifted = adapter_cell(AdapterCell {
+        target: target_stream(&[
+            (ADAPTER_PID, (0x2000, 0x3000), 0),
+            (ADAPTER_PID, ADAPTER_RANGES[1], 0),
+        ]),
+        page_offset: true,
+        ..Default::default()
+    });
+    assert!(
+        shifted.out.members.is_empty(),
+        "an adjacent range answered the requested range"
+    );
+    assert_eq!(
+        shifted.out.losses,
+        BTreeMap::from([(
+            super::super::sweep_attribution::AttributionLoss::MappingChanged,
+            1
+        )])
+    );
+    assert_adapter_attempt(&shifted, false);
+}
+
+#[test]
+fn d3c_present_pid_missing_range_is_mapping_changed() {
+    let observation = adapter_cell(AdapterCell {
+        target: target_stream(&[(ADAPTER_PID, ADAPTER_RANGES[0], 0)]),
+        ..Default::default()
+    });
+    assert!(
+        observation.out.members.is_empty(),
+        "one proved range admitted an incomplete group"
+    );
+    assert_eq!(
+        observation.out.losses,
+        BTreeMap::from([(
+            super::super::sweep_attribution::AttributionLoss::MappingChanged,
+            1
+        )])
+    );
+    assert_adapter_attempt(&observation, false);
+}
+
+#[test]
+fn d3c_unvisited_pid_uses_same_prepared_pin_without_recharge() {
+    let observation = adapter_cell(AdapterCell {
+        target: target_stream(&[]),
+        ..Default::default()
+    });
+    assert_eq!(
+        observation.out.members.len(),
+        1,
+        "unvisited PID silently disappeared"
+    );
+    assert_adapter_attempt(&observation, true);
+}
+
+#[test]
+fn d3c_conflicting_duplicate_falls_back_with_same_prepared_pin() {
+    let observation = adapter_cell(AdapterCell {
+        target: target_stream(&[
+            (ADAPTER_PID, ADAPTER_RANGES[0], 0),
+            (
+                ADAPTER_PID,
+                ADAPTER_RANGES[0],
+                crate::attach::identity_iter::VERDICT_NONE,
+            ),
+            (ADAPTER_PID, ADAPTER_RANGES[1], 0),
+        ]),
+        ..Default::default()
+    });
+    assert_eq!(observation.out.members.len(), 1);
+    assert_adapter_attempt(&observation, true);
+}
+
+#[test]
+fn d3c_malformed_or_truncated_run_discards_all_partial_verdicts() {
+    for kind in 0..3 {
+        let mut target = target_stream(&[
+            (
+                ADAPTER_PID,
+                ADAPTER_RANGES[0],
+                crate::attach::identity_iter::VERDICT_NONE,
+            ),
+            (ADAPTER_PID, ADAPTER_RANGES[1], 0),
+        ]);
+        match kind {
+            0 => target[0] = 0,
+            1 => {
+                target.truncate(target.len() - 32);
+            }
+            _ => {
+                target.pop();
+            }
+        }
+        let observation = adapter_cell(AdapterCell {
+            target,
+            ..Default::default()
+        });
+        assert_eq!(
+            observation.out.members.len(),
+            1,
+            "partial negative survived invalid whole run"
+        );
+        assert_adapter_attempt(&observation, true);
+    }
+}
+
+#[test]
+fn d3c_kernel_verdict_cannot_bypass_final_exec_or_pid_generation_checks() {
+    for pid_changed in [false, true] {
+        let observation = adapter_cell(AdapterCell {
+            target: complete_target(),
+            exec_changed: !pid_changed,
+            pid_changed,
+            ..Default::default()
+        });
+        assert!(observation.out.members.is_empty());
+        let loss = if pid_changed {
+            super::super::sweep_attribution::AttributionLoss::GenerationChanged
+        } else {
+            super::super::sweep_attribution::AttributionLoss::ExecChanged
+        };
+        assert_eq!(observation.out.losses, BTreeMap::from([(loss, 1)]));
+        assert_adapter_attempt(&observation, false);
+    }
+}
+
+#[test]
+fn d3c_successive_pass_same_slot_different_file_clears_old_kernel_authority() {
+    for second_has_anchor in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, old) = opened(dir.path(), "old-provider.so");
+        drop(first);
+        let pins = super::super::identity::test_fixture::real_scan_pin(
+            &dir.path().join("old-provider.so"),
+            None,
+            1,
+            "old-adapter-fixture",
+        );
+        let id = pins.pinned().next().unwrap().id;
+        let (second, new) = opened(dir.path(), "new-provider.so");
+        let (third, missing) = opened(dir.path(), "uninstalled-provider.so");
+        assert_ne!(
+            old.identity, new.identity,
+            "successive slots must name distinct real Files"
+        );
+        let (mut index, refused) = KnownKeyIndex::build(
+            [(old.key, Some(id))],
+            &BTreeMap::from([(old.key, id)]),
+            [new, missing],
+            &AdapterChecks(old.identity),
+        );
+        assert!(refused.is_empty());
+        let mut session = fixture_session();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let pass = AnchorPass::prepare(&pins, [(old.key, id)], custody(0, BTreeMap::new()));
+        {
+            let mut installed = session.install_anchors(pass, 1, deadline).unwrap();
+            let mut probe = KernelMemberProbe::new(
+                &mut installed,
+                AdapterIo {
+                    entries: Vec::new(),
+                    identity: old.identity,
+                    trace: Rc::new(RefCell::new(AdapterTrace::default())),
+                    exe_reads: Cell::new(0),
+                    exec_changed: false,
+                    pid_changed: false,
+                },
+                deadline,
+            );
+            probe.install_expectations(&mut index).unwrap();
+            assert_eq!(
+                index.kernel_slots_for_test(old.key),
+                Some(&BTreeSet::from([Slot(0)]))
+            );
+        }
+        // The same loaded Session gets a distinct pass/generation. Slot zero
+        // now belongs to another actual File; partial and no-anchor outcomes
+        // must both retire every prior numeric expectation in the reused index.
+        let mut held = custody(2, BTreeMap::from([(new.key, 1)]));
+        let scan = held.begin_scan();
+        assert!(held.offer_for_test(scan, new, second));
+        assert!(held.offer_for_test(scan, missing, third));
+        let pass = AnchorPass::prepare(&pins, [], held);
+        assert!(pass.candidates[0].keys.contains(&new.key));
+        if let SessionObject::Fixture {
+            anchor,
+            target,
+            reads,
+            ..
+        } = &mut session.object
+        {
+            *anchor = anchor_stream(&[
+                (
+                    0,
+                    if second_has_anchor {
+                        ANCHOR_OK
+                    } else {
+                        crate::attach::identity_iter::ANCHOR_BAD_SHAPE
+                    },
+                    0,
+                ),
+                (1, crate::attach::identity_iter::ANCHOR_BAD_SHAPE, 0),
+            ]);
+            *target = complete_target();
+            for record in anchor
+                .as_chunks_mut::<32>()
+                .0
+                .iter_mut()
+                .chain(target.as_chunks_mut::<32>().0)
+            {
+                record[28..32].copy_from_slice(&2u32.to_le_bytes());
+            }
+            reads.set(0);
+        }
+        let mut installed = session.install_anchors(pass, 2, deadline).unwrap();
+        let entries: Vec<_> = ADAPTER_RANGES
+            .into_iter()
+            .map(|(start, end)| p11scope_manifest::maps::MapEntry {
+                start,
+                end,
+                file_offset: 0,
+                permissions: *b"r-xp",
+                device: old.key.device,
+                inode: old.key.inode,
+                raw_path: Some(b"/fixture/old-provider.so".to_vec()),
+            })
+            .collect();
+        let trace = Rc::new(RefCell::new(AdapterTrace::default()));
+        let io = AdapterIo {
+            entries: entries.clone(),
+            identity: old.identity,
+            trace: trace.clone(),
+            exe_reads: Cell::new(0),
+            exec_changed: false,
+            pid_changed: false,
+        };
+        let mut probe = KernelMemberProbe::new(&mut installed, io, deadline);
+        probe.install_expectations(&mut index).unwrap();
+        assert!(
+            index.kernel_slots_for_test(old.key).is_none(),
+            "released pass left independent scalar slot authority"
+        );
+        assert_eq!(
+            index.kernel_slots_for_test(new.key).is_some(),
+            second_has_anchor
+        );
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+        let out = super::super::sweep_attribution::attribute_unselected(
+            &[(ADAPTER_PID, entries)],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &index,
+            &mut probe,
+            &mut budget,
+        );
+        drop(probe);
+        assert_eq!(
+            out.members.len(),
+            1,
+            "unanchored prior key must use ordinary same-pin proof"
+        );
+        assert_eq!(
+            trace.borrow().reads,
+            ADAPTER_RANGES.map(|(start, end)| (ADAPTER_PID, start, end))
+        );
+        assert_eq!(budget.work_units_count(), 2);
+        if let SessionObject::Fixture { reads, .. } = &installed.session.object {
+            assert_eq!(
+                reads.get(),
+                1,
+                "a new file's same-numbered slot proved an old key"
+            );
+        }
+    }
+}

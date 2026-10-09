@@ -2435,6 +2435,9 @@ mod c1b {
         };
         let mut processes: Vec<ProcessRecord> = (REP..REP + CALLERS)
             .map(|pid| ProcessRecord {
+                application: crate::inspect_identity::InspectApplicationResult::Unknown(
+                    crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+                ),
                 complete_scan: None,
                 pid,
                 status: if pid == REP {
@@ -2454,6 +2457,9 @@ mod c1b {
             })
             .collect();
         processes.extend((20_000..20_000 + IDLE).map(|pid| ProcessRecord {
+            application: crate::inspect_identity::InspectApplicationResult::Unknown(
+                crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+            ),
             complete_scan: None,
             pid,
             status: MemberStatus::NotSelected { loss: None },

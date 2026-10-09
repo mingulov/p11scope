@@ -4,6 +4,7 @@
 from collections import Counter
 import os
 import json
+import io
 from pathlib import Path
 import runpy
 import select
@@ -17,6 +18,87 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 HARNESS = runpy.run_path(str(ROOT / 'scripts/qualify-cgroup-trace.py'))
+
+
+class ReadinessTests(unittest.TestCase):
+    # Replay the installed run's actual startup shape: initial zero provider
+    # probes, complete native setup, and dynamically captured setup completion.
+    # Image/provider inputs stand for the separately verified held-FD receipts;
+    # these stream controls never use a candidate name as expected identity.
+    def setUp(self):
+        self.scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self.scratch.cleanup)
+        self.readers = []
+        self.image = dict(image=0, pid=2399485)
+        self.provider = dict(dev=[0, 35], ino=356176)
+        self.target = dict(kind='target', image=0, fn='C_OpenSession',
+                           dev=[0, 35], ino=356176, file_offset=163168)
+        self.call = dict(kind='call', image=0, pid=2399485, tid=2399485,
+                         fn='C_OpenSession', rv=0, phase='setup', scope='selected',
+                         t0=80770110210158, t1=80770110220397)
+        self.ready = dict(kind='ready', image=0, t=80770110222431)
+
+    def reader(self, lines):
+        reader = HARNESS['Reader'](io.StringIO(''.join(lines)),
+                                   Path(self.scratch.name) / str(len(self.readers)))
+        self.readers.append(reader)
+        self.addCleanup(reader.finish)
+        return reader
+
+    def capture(self, event=None, target=None, call=None):
+        records = [self.target if target is None else target,
+                   self.call if call is None else call, self.ready]
+        lines = ['N3LEDGER ' + json.dumps(row) + '\n' for row in records]
+        if event is not None:
+            lines.append(event)
+        return self.reader(lines)
+
+    def event(self, pid=2399485, tid=2399485, rv='CKR_OK'):
+        return (f'11:53:22.120433 Unknown executable (PID {pid}, TID {tid}) '
+                f'C_OpenSession [semantics unverified] → {rv} 6.3µs\n')
+
+    def test_observed_zero_start_then_authentic_dynamic_setup_is_ready(self):
+        errors = self.reader([
+            'p11scope: discovery: 0 module(s), 0 attach slot(s), scan 1ms, conflicts 0, uncorroborated 0\n',
+            'p11scope: capturing: 0 probe(s) attached; stop with Ctrl-C\n'])
+        self.assertTrue(HARNESS['wait_capture_started'](errors, allow_empty=True, seconds=0.2))
+        capture = self.capture(self.event())
+        self.assertEqual(HARNESS['wait_run_provider_ready'](
+            capture, self.image, self.provider, seconds=0.2), self.call)
+
+    def test_zero_capture_banner_is_still_refused_for_cgroup(self):
+        errors = self.reader(['p11scope: capturing: 0 probe(s) attached; stop with Ctrl-C\n'])
+        with self.assertRaises(TimeoutError):
+            HARNESS['wait_capture_started'](errors, seconds=0.2)
+
+    def test_positive_cgroup_start_still_passes(self):
+        errors = self.reader(['p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C\n'])
+        self.assertTrue(HARNESS['wait_capture_started'](errors, seconds=0.2))
+
+    def test_native_ready_without_dynamic_completion_cannot_release_gate(self):
+        with self.assertRaises(TimeoutError):
+            HARNESS['wait_run_provider_ready'](self.capture(), self.image,
+                                                self.provider, seconds=0.2)
+
+    def test_completion_for_another_pid_cannot_release_gate(self):
+        with self.assertRaises(TimeoutError):
+            HARNESS['wait_run_provider_ready'](self.capture(self.event(pid=2399486)),
+                                                self.image, self.provider, seconds=0.2)
+
+    def test_unsuccessful_completion_cannot_release_gate(self):
+        with self.assertRaises(TimeoutError):
+            HARNESS['wait_run_provider_ready'](self.capture(self.event(rv='CKR_GENERAL_ERROR')),
+                                                self.image, self.provider, seconds=0.2)
+
+    def test_setup_target_must_match_the_independent_provider(self):
+        with self.assertRaises(ValueError):
+            HARNESS['wait_run_provider_ready'](self.capture(self.event(),
+                target=dict(self.target, ino=356177)), self.image, self.provider, seconds=0.2)
+
+    def test_setup_call_must_match_the_owned_caller_tuple(self):
+        with self.assertRaises(ValueError):
+            HARNESS['wait_run_provider_ready'](self.capture(self.event(),
+                call=dict(self.call, tid=2399486)), self.image, self.provider, seconds=0.2)
 
 
 class OwnershipTests(unittest.TestCase):

@@ -37,6 +37,7 @@ must translate ledger times by the namespace offset before running this oracle.
 
 usage:
   inventory-native-oracle.py check RUNDIR        full oracle (exit codes above)
+  inventory-native-oracle.py capacity-check DIR independent capacity population oracle
   inventory-native-oracle.py demotion-segment DIR   private one-pair accounting proof
   inventory-native-oracle.py ledgers RUNDIR      ledger self-consistency only
   inventory-native-oracle.py count-kind JSONL KIND   events of KIND (EVENT_KINDS key) so far
@@ -6243,11 +6244,819 @@ def self_test():
         case("ledger-unflushed", "LEDGER-PARSE", lambda s, d, dash: {"ledgers": {
             "P1": s.ledgers["P1"] + "LEDGER_UNFLUSHED cell=P1 pid=1 reason=lock-held\n"}})
     failures.extend(demotion_self_test())
+    if not capacity_self_test():
+        failures.append("capacity-self-test")
     if failures:
         print(f"{ORACLE_ID} self-test FAILED: {failures}")
         return 1
     print(f"{ORACLE_ID} self-test passed")
     return 0
+
+
+CAPACITY_MANIFEST = "p11scope-inventory-capacity/1"
+
+
+class CapacityCleanupError(ValueError):
+    """Retain workload and resource failures after attempting every owned cleanup."""
+
+    def __init__(self, original, failures):
+        self.original, self.failures = original, tuple(failures)
+        detail = f"{original}; " if original is not None else ""
+        detail += "capacity cleanup failures: " + "; ".join(
+            f"{label}: {type(error).__name__}: {error}" for label, error in self.failures)
+        super().__init__(detail)
+
+
+class CapacityCustody:
+    """Enroll owned resources before validation and defer signals until safe checkpoints."""
+
+    def __init__(self):
+        self.children, self.files, self.handlers = [], [], {}
+        self.interrupted, self.raised, self.depth = None, False, 0
+
+    def __enter__(self):
+        import signal
+
+        self.depth += 1
+        try:
+            for number in (signal.SIGTERM, signal.SIGINT):
+                self.handlers[number] = signal.getsignal(number)
+                signal.signal(number, self.record_signal)
+            self.depth -= 1
+            self.checkpoint()
+        except BaseException:
+            for number, handler in self.handlers.items():
+                signal.signal(number, handler)
+            raise
+        finally:
+            self.depth = 0
+        return self
+
+    def record_signal(self, number, _frame):
+        if self.interrupted is None:
+            self.interrupted = number
+        self.checkpoint()
+
+    def checkpoint(self):
+        if self.interrupted is not None and not self.raised and self.depth == 0:
+            self.raised = True
+            raise ValueError(f"capacity runner interrupted by signal{self.interrupted}")
+
+    def launch(self, arguments, **kwargs):
+        import subprocess
+
+        self.checkpoint()
+        self.depth += 1
+        try:
+            child = subprocess.Popen(arguments, **kwargs)
+            self.children.append(child)
+        finally:
+            self.depth -= 1
+        self.checkpoint()
+        return child
+
+    def run(self, arguments, **kwargs):
+        import subprocess
+
+        check = kwargs.pop("check", False)
+        timeout = kwargs.pop("timeout", None)
+        data = kwargs.pop("input", None)
+        if data is not None:
+            kwargs["stdin"] = subprocess.PIPE
+        if kwargs.pop("capture_output", False):
+            kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        child = self.launch(arguments, **kwargs)
+        stdout, stderr = child.communicate(input=data, timeout=timeout)
+        self.checkpoint()
+        result = subprocess.CompletedProcess(arguments, child.returncode, stdout, stderr)
+        if check:
+            result.check_returncode()
+        return result
+
+    def open(self, path):
+        self.checkpoint()
+        self.depth += 1
+        try:
+            handle = open(path, "w", encoding="utf-8")
+            self.files.append(handle)
+        finally:
+            self.depth -= 1
+        self.checkpoint()
+        return handle
+
+    def __exit__(self, _kind, original, _traceback):
+        import signal
+        import subprocess
+        import time
+
+        errors = []
+
+        def attempt(label, operation):
+            try:
+                return True, operation()
+            except BaseException as error:
+                errors.append((label, error))
+                return False, None
+
+        self.depth += 1
+        try:
+            for child in self.children:
+                ok, status = attempt(f"poll pid{child.pid}", child.poll)
+                if not ok or status is None:
+                    attempt(f"terminate pid{child.pid}", child.terminate)
+            deadline = time.monotonic() + 3
+            for child in self.children:
+                try:
+                    child.wait(timeout=max(0, deadline - time.monotonic()))
+                    continue
+                except subprocess.TimeoutExpired:
+                    pass
+                except BaseException as error:
+                    errors.append((f"wait pid{child.pid}", error))
+                attempt(f"kill pid{child.pid}", child.kill)
+            deadline = time.monotonic() + 5
+            for child in self.children:
+                attempt(f"reap pid{child.pid}", lambda child=child: child.wait(timeout=max(0, deadline - time.monotonic())))
+                for name in ("stdin", "stdout", "stderr"):
+                    ok, handle = attempt(f"get {name} pid{child.pid}", lambda child=child, name=name: getattr(child, name))
+                    if ok and handle is not None:
+                        attempt(f"close {name} pid{child.pid}", handle.close)
+            for handle in self.files:
+                attempt("close output", handle.close)
+        finally:
+            for number, handler in self.handlers.items():
+                attempt(f"restore signal{number}", lambda number=number, handler=handler: signal.signal(number, handler))
+            self.depth -= 1
+        if errors:
+            raise CapacityCleanupError(original, errors) from original
+        if original is None:
+            self.checkpoint()
+        return False
+
+
+def capacity_prepare(directory, population, demand=8192, custody=None):
+    """Build owned target inputs; never execute or inspect an observer here."""
+    from pathlib import Path
+    import runpy
+    import shutil
+    import subprocess
+
+    run = custody.run if custody else subprocess.run
+
+    root = Path(__file__).resolve().parents[1]
+    output = Path(directory)
+    output.mkdir(mode=0o755, parents=True)
+    output.chmod(0o755)
+    binaries = output / "bin"
+    binaries.mkdir(mode=0o755)
+    binaries.chmod(0o755)
+    provider_dir = output / "providers"
+    provider_dir.mkdir(mode=0o755)
+    provider_dir.chmod(0o755)
+    pin = runpy.run_path(str(root / "scripts/mapped-provider-pin.py"))["pin"]
+
+    def compile_fixture(name, source, flags):
+        path = binaries / name
+        run(["gcc", "-std=c11", "-Wall", "-Wextra", "-Werror", *flags,
+             "-o", str(path), str(root / source)], check=True, timeout=30)
+        path.chmod(0o755)
+        return path
+
+    driver = compile_fixture("driver", "tests/fixtures/catalog-driver.c", ["-ldl"])
+
+    def enumerate_surface(path, label):
+        ledger = output / f"surface-{label}.jsonl"
+        completed = run([str(driver), "--ready", str(output / f"ready-{label}"),
+                         "--call", "--surface", str(ledger), "--control", str(path)],
+                        input="quit\n", text=True, capture_output=True, timeout=15)
+        if completed.returncode:
+            raise ValueError(f"independent surface enumeration failed:{completed.stderr}")
+        surface = next(row for row in load_jsonl(ledger) if row["kind"] == "surface")
+        held_pin = pin(str(path))
+        if capacity_object(surface) != capacity_object(held_pin):
+            raise ValueError("target surface and independent held-FD mapping differ")
+        return surface["offsets"]
+
+    manifest = {"manifest": CAPACITY_MANIFEST, "population": population, "limit": 8192,
+                "expect_lane": "scan", "providers": [], "owners": [], "phases": [],
+                "native_owner_activation": False}
+
+    def copy_provider(template, offsets, index, implementation=None):
+        path = provider_dir / f"provider-{index:03d}.so"
+        shutil.copyfile(template, path)
+        path.chmod(0o755)
+        facts = {"key": f"p{index}", "path": str(path), "pin": pin(str(path)), "offsets": offsets}
+        if implementation:
+            facts["implementation"] = implementation
+        manifest["providers"].append(facts)
+        return facts
+
+    if population == "real":
+        soft = Path(os.environ.get("MODULE", "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"))
+        trust = Path(os.environ.get("TRUST_MODULE", "/usr/lib/x86_64-linux-gnu/pkcs11/p11-kit-trust.so"))
+        if not soft.is_file() or not trust.is_file():
+            raise ValueError("real capacity cell needs installed SoftHSM and p11-kit-trust")
+        soft_offsets = enumerate_surface(soft, "softhsm")
+        trust_offsets = enumerate_surface(trust, "trust")
+        distinct = len(set(soft_offsets))
+        count = (6530 - len(set(trust_offsets))) // distinct + 1
+        for index in range(count):
+            copy_provider(soft, soft_offsets, index, "SoftHSM")
+        manifest["providers"].append({"key": "trust", "path": str(trust), "pin": pin(str(trust)),
+                                      "offsets": trust_offsets, "implementation": "p11-kit-trust"})
+        compile_fixture("ledger", "tests/fixtures/public-cli/inventory-ledger.c", ["-O1", "-ldl", "-lpthread"])
+    else:
+        if population == "boundary" and demand not in (4097, 6531, 8192):
+            raise ValueError("boundary demand must be4097,6531,8192")
+        if population not in ("boundary", "growth", "owners"):
+            raise ValueError("unknown capacity population")
+        full_unique = 1 if population == "owners" else 68
+        template = compile_fixture("full.so", "crates/discover/tests/fixture/version_matrix.c",
+                                   ["-shared", "-fPIC", f"-DCAPACITY_UNIQUE={full_unique}"])
+        offsets = enumerate_surface(template, "full")
+        if len(set(offsets)) != full_unique:
+            raise ValueError("full canonical surface includes unexpected physical targets")
+        if population == "owners":
+            count, remainder = 257, 0
+            manifest["owner_demand"] = 257
+        elif population == "growth":
+            count, remainder = 97, 0
+        else:
+            count, remainder = divmod(demand, len(set(offsets)))
+        for index in range(count):
+            copy_provider(template, offsets, index)
+        if remainder:
+            tail = compile_fixture("tail.so", "crates/discover/tests/fixture/version_matrix.c",
+                                   ["-shared", "-fPIC", f"-DCAPACITY_UNIQUE={remainder}"])
+            tail_offsets = enumerate_surface(tail, "tail")
+            if len(set(tail_offsets)) != remainder:
+                raise ValueError("tail includes unexpected acquisition exports/table targets")
+            copy_provider(tail, tail_offsets, count)
+        if population == "growth":
+            replacement = copy_provider(template, offsets, count)
+            replacement["replacement_source"] = replacement["path"]
+            replacement["path"] = manifest["providers"][0]["path"]
+    manifest["demand"] = len({(*capacity_object(provider["pin"]), offset)
+                              for provider in manifest["providers"] for offset in provider["offsets"]})
+    if population == "boundary" and manifest["demand"] != demand:
+        raise ValueError("independent mapped object/offset union does not equal requested boundary")
+    with open(output / "capacity.json", "w", encoding="utf-8") as stream:
+        json.dump(manifest, stream)
+    return manifest
+
+
+def capacity_run(binary, base, lane, population, limit, demand, uid, gid):
+    """Root-scheduled public runner. Task2 prepares this; Task3 executes it."""
+    with CapacityCustody() as custody:
+        return capacity_run_owned(binary, base, lane, population, limit, demand, uid, gid, custody)
+
+
+def capacity_run_owned(binary, base, lane, population, limit, demand, uid, gid, custody):
+    """Real mechanisms retain the existing four-module-per-process ledger."""
+    from pathlib import Path
+    import select
+    import signal
+    import subprocess
+    import time
+
+    directory = Path(tempfile.mkdtemp(prefix="capacity-", dir=base))
+    directory.chmod(0o755)
+    manifest = capacity_prepare(directory / "inputs", population, demand, custody)
+    inputs = directory / "inputs"
+    manifest.update(limit=limit, expect_lane=lane, require_retirement="closed", require_reload=population == "growth",
+                    event_log="inventory.jsonl")
+    providers = {provider["key"]: provider for provider in manifest["providers"]}
+    duration = int(os.environ.get("CAPACITY_DURATION", "180"))
+    wait_seconds = int(os.environ.get("CAPACITY_WAIT_S", "60"))
+    if not 1 <= duration <= 600 or not 1 <= wait_seconds <= 120:
+        raise ValueError("capacity duration/wait outside bounded runner ranges")
+    controllers, ledger_targets = [], []
+    observer = None
+    stream = directory / "inventory.jsonl"
+    report_path = directory / "inventory.json"
+
+    def open_log(name):
+        return custody.open(directory / name)
+
+    def wait_for(predicate, label):
+        deadline = time.monotonic() + wait_seconds
+        while time.monotonic() < deadline:
+            custody.checkpoint()
+            if predicate():
+                return
+            if observer is not None and observer.poll() is not None:
+                raise ValueError(f"observer exited before{label}")
+            time.sleep(0.1)
+        raise ValueError(f"bounded wait failed:{label}")
+
+    def events():
+        if not stream.exists():
+            return []
+        rows = []
+        for line in stream.read_text().splitlines():
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                break  # writer's current final line
+        return rows
+
+    def passes():
+        return sum(row["kind"] == "pass_committed" and not row["event"].get("final") for row in events())
+
+    def settle():
+        wanted = passes() + 2
+        wait_for(lambda: passes() >= wanted, "two completed passes")
+
+    def command(child, text):
+        custody.checkpoint()
+        if child.poll() is not None:
+            raise ValueError("capacity target exited")
+        child.stdin.write(text + "\n")
+        child.stdin.flush()
+        readable, _, _ = select.select([child.stdout], [], [], wait_seconds)
+        if not readable or child.stdout.readline().strip() != "OK":
+            raise ValueError(f"target command did not complete:{text}")
+
+    def workload_directory(name):
+        path = directory / name
+        path.mkdir(mode=0o700)
+        os.chown(path, uid, gid)
+        return path
+
+    def target_prefix(conf=None):
+        # A direct unprivileged fixture self-test uses its own identity. The
+        # public shell runner still requires a root observer and nonroot UID.
+        prefix = ([] if uid == os.geteuid() and gid == os.getegid() else
+                  ["setpriv", f"--reuid={uid}", f"--regid={gid}", "--clear-groups", "--no-new-privs"])
+        prefix += ["env", "-i", "PATH=/usr/bin:/bin", "HOME=/nonexistent", "LC_ALL=C"]
+        if conf:
+            prefix.append(f"SOFTHSM2_CONF={conf}")
+        return prefix
+
+    def catalog(name, keys):
+        path = workload_directory(name)
+        ledger = path / "surface.jsonl"
+        ready = path / "ready"
+        child = custody.launch([*target_prefix(), str(inputs / "bin/driver"), "--ready", str(ready),
+                                  "--surface", str(ledger), "--control", "--call", "--sleep", str(duration + 120),
+                                  *[providers[key]["path"] for key in keys]], stdin=subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=open_log(f"{name}.stderr"), text=True)
+        wait_for(lambda: ready.exists() or child.poll() is not None, f"target{name}ready")
+        if child.poll() is not None:
+            raise ValueError(f"target{name}failed")
+        identity = next(row for row in load_jsonl(ledger) if row["kind"] == "owner")
+        manifest["owners"].append({**identity, "providers": keys, "ledger": str(ledger.relative_to(directory))})
+        controllers.append(child)
+        return child, manifest["owners"][-1]
+
+    def record_phase(name, keys):
+        settle()
+        manifest["phases"].append({"name": name, "providers": list(keys),
+                                    "stream": "inventory.jsonl", "until_ns": time.monotonic_ns()})
+
+    def save_manifest():
+        with open(directory / "capacity.json", "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle)
+
+    custody.checkpoint()
+    keys = list(providers)
+    if manifest["demand"] > limit:
+        raise ValueError("positive population exceeds selected budget; N+1 is a separate Task3 refusal cell")
+    if population == "owners":
+        for index, key in enumerate(keys):
+            catalog(f"owner-{index:03d}", [key])
+    elif population == "growth":
+        growth, owner = catalog("growth", keys[:32])
+        owner["providers"] = keys
+    elif population == "boundary":
+        catalog("boundary", keys)
+    else:
+        # The already installed trust provider has a valid read-only
+        # Initialize/GetInfo/Finalize protocol; no hardware token login.
+        trust_child, _owner = catalog("trust", ["trust"])
+        soft_keys = [key for key in keys if key != "trust"]
+        for index in range(0, len(soft_keys), 4):
+            group = soft_keys[index:index + 4]
+            path = workload_directory(f"real-{index // 4:03d}")
+            tokens = path / "tokens"
+            tokens.mkdir(mode=0o700)
+            os.chown(tokens, uid, gid)
+            conf = path / "softhsm2.conf"
+            conf.write_text(f"directories.tokendir = {tokens}\nobjectstore.backend = file\nlog.level = ERROR\n")
+            conf.chmod(0o644)
+            initialized = custody.run([*target_prefix(conf), "softhsm2-util", "--init-token", "--free",
+                                          "--label", "capacity", "--so-pin", "5678", "--pin", "1234"],
+                                         stdout=open_log(f"real-{index}.token"), stderr=subprocess.STDOUT, timeout=15)
+            if initialized.returncode:
+                raise ValueError("private SoftHSM token initialization failed")
+            gate = path / "gate"
+            ledger = path / "ledger.out"
+            command_line = [*target_prefix(conf), str(inputs / "bin/ledger"), "mech", "--cell", f"R{index}",
+                            "--gate", str(gate), "--iters", os.environ.get("ITERS", "4"), "--hold"]
+            for key in group:
+                command_line += ["--module", providers[key]["path"]]
+            ledger_output = custody.open(ledger)
+            child = custody.launch(command_line, stdout=ledger_output, stderr=open_log(f"real-{index}.stderr"))
+            wait_for(lambda: "READY " in ledger.read_text() or child.poll() is not None, "real ledger readiness")
+            if child.poll() is not None:
+                raise ValueError("real mechanism setup failed")
+            ledger_targets.append((child, ledger, gate, group))
+    observer_args = ["env", "--default-signal=INT", "--default-signal=QUIT", binary,
+                     "inventory", "--system", "--capture", lane, "--max-endpoints", str(limit),
+                     "--max-scan-pids", "512", "--duration", str(duration), "-o", str(report_path),
+                     "--event-log", str(stream), "--event-rotate-bytes", "1024M"]
+    for path in sorted({provider["path"] for provider in providers.values()}):
+        observer_args += ["--module", path]
+    backend = os.environ.get("CAPACITY_ATTACH_BACKEND")
+    if backend:
+        if backend not in ("singles", "multi", "auto"):
+            raise ValueError("invalid capacity attach backend")
+        observer_args += ["--attach-backend", backend]
+    observer = custody.launch(observer_args, stdout=open_log("inventory.stdout"), stderr=open_log("inventory.stderr"))
+    wait_for(lambda: passes() >= 2, "observer initial discovery")
+    manifest["started_ns"] = next(row["event"]["started_ns"] for row in events() if row["kind"] == "started")
+    if population == "growth":
+        command(growth, "call initial 7")
+        record_phase("initial", keys[:32])
+        for phase_name, begin, end, count in (("middle", 32, 61, 13), ("late", 61, 97, 17)):
+            for key in keys[begin:end]:
+                command(growth, f"load {providers[key]['path']}")
+            settle()
+            command(growth, f"call {phase_name} {count}")
+            record_phase(phase_name, keys[:end])
+        first = providers[keys[0]]["path"]
+        command(growth, f"close {first}")
+        settle()
+        command(growth, f"load {first}")
+        settle()
+        command(growth, "call reloaded 19")
+        record_phase("reloaded", keys[:97])
+        command(growth, f"close {first}")
+        settle()
+        os.replace(providers[keys[-1]]["replacement_source"], first)
+        command(growth, f"load {first}")
+        settle()
+        command(growth, "call replaced 23")
+        record_phase("replaced", keys)
+    elif population == "real":
+        command(trust_child, "init activity 1")
+        command(trust_child, "info activity 11")
+        command(trust_child, "final activity 1")
+        for _child, _ledger, gate, _group in ledger_targets:
+            gate.touch()
+        for child, ledger, _gate, _group in ledger_targets:
+            wait_for(lambda: "DONE " in ledger.read_text() or child.poll() is not None, "real mechanism completion")
+        record_phase("activity", keys)
+    else:
+        for child in controllers:
+            command(child, "call activity 11")
+        record_phase("activity", keys)
+    observer.send_signal(signal.SIGINT)
+    try:
+        observer.wait(timeout=wait_seconds)
+    except subprocess.TimeoutExpired:
+        raise ValueError("observer did not finish within bounded output/cleanup wait") from None
+    if observer.returncode != 0 or not report_path.exists():
+        raise ValueError(f"observer failed:{observer.returncode}")
+    manifest["phases"][-1].pop("stream")
+    manifest["phases"][-1].pop("until_ns")
+    manifest["phases"][-1]["snapshot"] = "inventory.json"
+    for child, ledger, _gate, group in ledger_targets:
+        errors = []
+        images = parse_ledger(ledger.read_text(), errors)
+        if errors or len(images) != 1:
+            raise ValueError("real workload ledger has no unique intact owner")
+        image = next(iter(images.values()))
+        if image.done != "ok" or len(group) > 4:
+            raise ValueError("real workload did not complete its bounded group")
+        normalized = directory / f"real-{child.pid}.jsonl"
+        rows = [{"kind": "owner", "pid": image.pid, "start_time": image.start, "exe": image.exe}]
+        # Public v2.40 ABI ordinals used by the unchanged real ledger.
+        ordinals = {"C_Initialize": 0, "C_Finalize": 1, "C_GetFunctionList": 3, "C_GetSlotList": 4,
+                    "C_OpenSession": 12, "C_CloseSession": 13, "C_Login": 18, "C_Logout": 19,
+                    "C_DestroyObject": 22, "C_EncryptInit": 29, "C_Encrypt": 30,
+                    "C_DigestInit": 37, "C_Digest": 38, "C_SignInit": 42, "C_Sign": 43, "C_GenerateKey": 58}
+        maps = Path(f"/proc/{image.pid}/maps").read_text().splitlines()
+        for key in group:
+            provider = providers[key]
+            mapped = [line.split() for line in maps if len(line.split()) >= 6 and line.split()[5] == provider["path"]
+                      and "x" in line.split()[1]]
+            if not mapped or image.mapped.get(provider["path"]) != provider["pin"]["ino"] or any(
+                    (*[int(part, 16) for part in fields[3].split(":")], int(fields[4])) != capacity_object(provider["pin"])
+                    for fields in mapped):
+                raise ValueError("real owner's executable mapping differs from independent held-FD pin")
+            rows.append({"kind": "surface", "pid": image.pid, "start_time": image.start,
+                         "path": provider["path"], "dev": provider["pin"]["dev"], "ino": provider["pin"]["ino"],
+                         "offsets": provider["offsets"]})
+        for entry in image.entries:
+            provider = next(providers[key] for key in group if providers[key]["path"] == entry["module"])
+            if entry["bad"]:
+                raise ValueError("real provider call returned an error")
+            if entry["phase"] == "setup" and entry["t1"] >= manifest["started_ns"]:
+                raise ValueError("disclosed pre-admission setup overlapped capture")
+            rows.append({"kind": "call", "pid": image.pid, "start_time": image.start, "path": entry["module"],
+                         "dev": provider["pin"]["dev"], "ino": provider["pin"]["ino"],
+                         "offset": provider["offsets"][ordinals[entry["fn"]]], "n": entry["n"], "rv": 0,
+                         "t0": entry["t0"], "t1": entry["t1"],
+                         "phase": "pre_admission" if entry["phase"] == "setup" else "activity"})
+        normalized.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        manifest["owners"].append({"pid": image.pid, "start_time": image.start, "exe": image.exe,
+                                   "providers": group, "ledger": normalized.name})
+    save_manifest()
+    result = capacity_oracle(directory)
+    for row in result.rows:
+        if row["check"] == "CAPACITY-DENOMINATORS":
+            print(f"{row['run']}: {row['detail']}")
+    print(f"capacity run:{directory}")
+    return report(result, str(directory / "capacity-oracle.jsonl"))
+
+
+def capacity_object(pin):
+    device = pin["dev"]
+    if not isinstance(device, list) or len(device) != 2 or any(type(part) is not int or part < 0 for part in device):
+        raise ValueError("capacity pin has no mapped device")
+    if type(pin["ino"]) is not int or pin["ino"] <= 0:
+        raise ValueError("capacity pin has no inode")
+    return (*device, pin["ino"])
+
+
+def capacity_stream_view(path, until_ns, final):
+    """Production streams publish compact identity and lower-bound counts.
+
+    They do not publish intermediate admission/budget snapshots. Never invent
+    those fields from the target demand, or equate a bucketed count with the
+    exact terminal total. Terminal JSON independently checks full admission.
+    """
+    rows = [row for row in load_jsonl(path) if row["at_ns"] <= until_ns]
+    if not rows or rows[0]["kind"] != "started" or [row["seq"] for row in rows] != list(range(len(rows))):
+        raise ValueError("capacity stream prefix is incomplete")
+    callers, modules, edges, gaps = {}, {}, {}, []
+    for row in rows:
+        event = row["event"]
+        if row["kind"] == "edge_observed":
+            context = event.get("identity_context", {})
+            caller, module = context.get("caller", {}), context.get("module", {})
+            if caller.get("pid") is None or module.get("inode") is None:
+                raise ValueError("capacity stream edge lacks its independent identity context")
+            callers[caller["id"]] = {"id": caller["id"], "pid": caller["pid"], "start_time": caller["start_time"]}
+            modules[module["id"]] = {"id": module["id"], "paths": [module["path"]], "identity": {
+                "device": {"major": module["device_major"], "minor": module["device_minor"]},
+                "inode": module["inode"]}}
+            edges[(event["caller"], event["module"])] = event
+        elif row["kind"] == "gap_recorded":
+            gaps.append(event)
+    return {"schema": SCHEMAS["inventory"], "callers": list(callers.values()), "modules": list(modules.values()),
+            "edges": list(edges.values()), "gaps": gaps, "stream_only": True,
+            "budgets": {"inventory_endpoints": {"limit": rows[0]["event"]["limits"]["inventory_endpoints"]}},
+            "observation": final.get("observation", {})}
+
+
+def capacity_oracle(directory):
+    """Private workload facts establish demand; output only supplies observations.
+
+    Physical endpoints are (mapped device, inode, file offset), deduplicated
+    across aliases and paths. An owner exists only in a target-produced ledger.
+    No count of snapshot callers or JSON admission slots can supply either
+    population. Calls made before attachment remain a separate population.
+    """
+    manifest = load_json(os.path.join(directory, "capacity.json"))
+    if manifest.get("manifest") != CAPACITY_MANIFEST:
+        raise ValueError("unsupported capacity manifest")
+    lane = manifest["expect_lane"]
+    limit = manifest["limit"]
+    if lane not in ("scan", "native") or type(limit) is not int or not 1 <= limit <= 8192:
+        raise ValueError("invalid capacity lane or selected limit")
+    population = manifest["population"]
+    if population not in ("boundary", "growth", "owners", "real"):
+        raise ValueError("unknown capacity population")
+    result = Results(lane)
+    providers = {}
+    union = set()
+    for provider in manifest["providers"]:
+        key = provider["key"]
+        if key in providers:
+            raise ValueError("duplicate capacity provider key")
+        identity = capacity_object(provider["pin"])
+        offsets = provider["offsets"]
+        if not offsets or any(type(offset) is not int or offset < 0 for offset in offsets):
+            raise ValueError("provider has no bounded physical surface")
+        providers[key] = (provider, identity, set(offsets))
+        union.update((*identity, offset) for offset in offsets)
+    result.ok("capacity", "*", "CAPACITY-UNION", len(union) == manifest["demand"],
+              f"independent physical union={len(union)}, declared={manifest['demand']}")
+    if population == "boundary":
+        result.ok("capacity", "*", "CAPACITY-BOUNDARY", len(union) in (4097, 6531, 8192),
+                  f"exact boundary must be4097,6531,8192; got{len(union)}")
+    elif population in ("growth", "real"):
+        result.ok("capacity", "*", "CAPACITY-WIDE", len(union) > 6530,
+                  f"wide workload has only{len(union)} physical endpoints")
+    result.ok("capacity", "*", "CAPACITY-ENVELOPE", len(union) <= limit,
+              f"positive population{len(union)} exceeds selected limit{limit}")
+    owners = {}
+    calls = []
+    all_calls = []
+    for owner in manifest["owners"]:
+        identity = (owner["pid"], owner["start_time"])
+        if identity in owners:
+            raise ValueError("duplicate workload owner")
+        rows = load_jsonl(os.path.join(directory, owner["ledger"]))
+        identities = [row for row in rows if row.get("kind") == "owner"
+                      and (row.get("pid"), row.get("start_time")) == identity]
+        valid = len(identities) == 1 and all(identities[0].get(key) == owner[key]
+                                         for key in ("pid", "start_time", "exe"))
+        result.ok("capacity", str(identity), "CAPACITY-OWNERS", valid,
+                  "owner has no unique independent process identity")
+        if not valid:
+            continue
+        owners[identity] = owner
+        for key in owner["providers"]:
+            provider, mapped_identity, offsets = providers[key]
+            surfaces = [row for row in rows if row.get("kind") == "surface" and row.get("path") == provider["path"]]
+            valid_surface = any((row.get("pid"), row.get("start_time")) == identity
+                                and capacity_object(row) == mapped_identity
+                                and set(row.get("offsets", [])) == offsets for row in surfaces)
+            result.ok("capacity", key, "CAPACITY-SURFACE", valid_surface,
+                      "target's executable table surface does not match its held mapped object")
+        for row in rows:
+            if row.get("kind") != "call":
+                continue
+            if (row.get("pid"), row.get("start_time")) != identity:
+                continue
+            matches = [key for key in owner["providers"] if providers[key][0]["path"] == row.get("path")
+                       and ("dev" not in row or capacity_object(row) == providers[key][1])]
+            valid_call = ((row.get("pid"), row.get("start_time")) == identity and len(matches) == 1
+                          and type(row.get("n")) is int and row["n"] > 0 and row.get("rv") == 0
+                          and type(row.get("t0")) is int and row["t0"] <= row.get("t1", -1)
+                          and row.get("offset") in providers[matches[0]][2])
+            result.ok("capacity", str(identity), "CAPACITY-CALL-LEDGER", valid_call,
+                      f"invalid target-produced call:{row}")
+            if valid_call:
+                all_calls.append(row)
+            if valid_call and row.get("phase") != "pre_admission":
+                calls.append((identity, matches[0], row))
+    if population == "owners":
+        result.ok("capacity", "*", "CAPACITY-OWNERS", len(owners) == manifest.get("owner_demand") == 257,
+                  f"independent owner count={len(owners)}; public owner cell requires257")
+        if not manifest.get("native_owner_activation", False):
+            result.add("capacity", "*", "CAPACITY-NATIVE-OWNERS", "nonqualifying",
+                       "retained native-owner activation unavailable untilP2")
+    if population == "real":
+        implementations = {providers[key][0].get("implementation") for _owner, key, _call in calls}
+        result.ok("capacity", "*", "CAPACITY-IMPLEMENTATIONS", None not in implementations and len(implementations) >= 2,
+                  f"actual calls require two declared provider implementations; got{implementations}")
+    phase_names = [phase["name"] for phase in manifest["phases"]]
+    if len(set(phase_names)) != len(phase_names) or not phase_names:
+        raise ValueError("capacity phases must be unique and nonempty")
+    previous = {}
+    demands = []
+    deep_scanned = set()
+    if manifest.get("event_log"):
+        events = load_jsonl(os.path.join(directory, manifest["event_log"]))
+        result.ok("capacity", "*", "CAPACITY-STREAM", bool(events) and events[0].get("kind") == "started"
+                  and events[-1].get("kind") == "ended" and [event.get("seq") for event in events] == list(range(len(events)))
+                  and not any(event.get("kind") in ("rotated", "evicted") for event in events),
+                  "public stream lacks a complete unrotated contiguous lifetime")
+        for event in events:
+            row = event.get("event", {})
+            if event.get("kind") == "edge_observed" and row.get("mapping", {}).get("evidence") == "deep_scan":
+                context = row.get("identity_context", {})
+                caller, module = context.get("caller", {}), context.get("module", {})
+                deep_scanned.add(((caller.get("pid"), caller.get("start_time")),
+                                  module.get("device_major"), module.get("device_minor"), module.get("inode")))
+    final = load_json(os.path.join(directory, manifest["phases"][-1]["snapshot"]))
+    started = final.get("observation", {}).get("started_ns")
+    ended = final.get("observation", {}).get("ended_ns")
+    clock_valid = final.get("clock") == {"basis": "CLOCK_MONOTONIC", "unit": "ns"} and \
+        type(started) is int and type(ended) is int and 0 < started < ended
+    result.ok("capacity", "*", "CAPACITY-WINDOW", clock_valid,
+              "terminal report has no valid monotonic capture window")
+    if clock_valid:
+        result.ok("capacity", "*", "CAPACITY-WINDOW", all(
+            call["t1"] < started if call["phase"] == "pre_admission" else started <= call["t0"] <= call["t1"] <= ended
+            for call in all_calls), "disclosed pre-admission or claimed captured calls overlap the wrong window")
+    for phase_index, phase in enumerate(manifest["phases"]):
+        name = phase["name"]
+        keys = phase["providers"]
+        phase_union = {(*providers[key][1], offset) for key in keys for offset in providers[key][2]}
+        demands.append(len(phase_union))
+        doc = (capacity_stream_view(os.path.join(directory, phase["stream"]), phase["until_ns"], final)
+               if "stream" in phase else load_json(os.path.join(directory, phase["snapshot"])))
+        stream_only = doc.get("stream_only", False)
+        result.ok(name, "*", "CAPACITY-SCHEMA", doc.get("schema") == SCHEMAS["inventory"], "wrong inventory schema")
+        budget = doc.get("budgets", {}).get("inventory_endpoints", {})
+        result.ok(name, "*", "CAPACITY-BUDGET", budget.get("limit") == limit and
+                  (stream_only or (budget.get("occupied") == len(phase_union) and budget.get("refused") == 0)),
+                  f"selected budget / exact physical demand mismatch:{budget}; expected{len(phase_union)}")
+        owned_paths = {provider[0]["path"] for provider in providers.values()}
+        harmful = [gap for gap in doc.get("gaps", []) if LOSS_GAP.search(str(gap.get("reason", "")))
+                   or LOSS_GAP.search(str(gap.get("subject", ""))) or
+                   ((any(path in str(gap) for path in owned_paths) or gap.get("budget")) and
+                    re.search(r"refus|fail|partial|unavailable", str(gap), re.I))]
+        result.ok(name, "*", "CAPACITY-LOSS", not harmful and doc.get("gaps_suppressed", 0) == 0,
+                  f"controlled capacity population has harmful/suppressed gaps:{harmful[:3]}")
+        module_keys = {}
+        for key in keys:
+            provider, identity, offsets = providers[key]
+            matching = [module for module in doc.get("modules", [])
+                        if (module.get("identity", {}).get("device", {}).get("major"),
+                            module.get("identity", {}).get("device", {}).get("minor"),
+                            module.get("identity", {}).get("inode")) == identity]
+            if not result.ok(name, key, "CAPACITY-PROVIDER", len(matching) == 1,
+                             f"expected exactly one module for independently pinned{identity}; got{len(matching)}"):
+                continue
+            module = matching[0]
+            module_keys[module["id"]] = key
+            result.ok(name, key, "CAPACITY-PROVIDER", provider["path"] in module.get("paths", []) and
+                      (stream_only or module["identity"].get("sha256") == provider["pin"]["sha256"]), "provider path/hash mismatch")
+            admission = module.get("admission", {})
+            if not stream_only:
+                result.ok(name, key, "CAPACITY-ADMISSION", admission.get("state") == "admitted" and
+                          admission.get("endpoints") == len(offsets), f"owned provider refused or incorrect endpoint count:{admission}")
+        caller_keys = {caller["id"]: (caller.get("pid"), caller.get("start_time")) for caller in doc.get("callers", [])}
+        caller_authorities = {caller["id"]: caller.get("image", {}).get("authority") for caller in doc.get("callers", [])}
+        edges = {}
+        for edge in doc.get("edges", []):
+            key = (caller_keys.get(edge.get("caller")), module_keys.get(edge.get("module")))
+            entries = edge.get("entries", {})
+            if entries.get("count", 0) > 0:
+                result.ok(name, "*", "CAPACITY-FOREIGN", key[0] in owners and key[1] in owners[key[0]]["providers"],
+                          f"positive on an unexpected caller/provider pair:{key}")
+                if lane == "native" and not stream_only:
+                    result.ok(name, str(key), "CAPACITY-AUTHORITY", caller_authorities.get(edge.get("caller")) == "native_exact",
+                              "native positive has no exact caller authority")
+            if key in edges:
+                result.add(name, "*", "CAPACITY-PAIR", "fail", f"duplicate edge:{key}")
+            edges[key] = edge
+        expected = {}
+        called_union = set()
+        for owner_identity, key, call in calls:
+            if call["phase"] in phase_names[:phase_index + 1]:
+                pair = (owner_identity, key)
+                expected[pair] = expected.get(pair, 0) + call["n"]
+                called_union.add((*providers[key][1], call["offset"]))
+        result.ok(name, "*", "CAPACITY-NONEMPTY", bool(expected), "no independent post-admission calls")
+        result.ok(name, "*", "CAPACITY-CALL-POPULATION", {pair[1] for pair in expected} >= set(keys),
+                  "some demanded physical providers have no independent post-admission activity")
+        for pair, count in expected.items():
+            edge = edges.get(pair)
+            if lane == "native":
+                entries = edge.get("entries", {}) if edge else {}
+                actual = entries.get("count", 0)
+                result.ok(name, str(pair), "CAPACITY-COUNT", (0 < actual <= count if stream_only else actual == count) and
+                          entries.get("observation") == "observed" and
+                          entries.get("coverage", {}).get("state") == "counted" and
+                          entries.get("coverage", {}).get("lossy") is False,
+                          f"exact cumulative count expected{count}, got{entries.get('count')}")
+            if pair in previous:
+                result.ok(name, str(pair), "CAPACITY-HISTORY", edge is not None and
+                          edge.get("entries", {}).get("count", 0) >= previous[pair], "old observed count reset")
+            if edge:
+                previous[pair] = edge.get("entries", {}).get("count", 0)
+        if population == "owners":
+            for owner_identity, owner in owners.items():
+                for key in owner["providers"]:
+                    edge = edges.get((owner_identity, key))
+                    actually_scanned = (edge is not None and edge.get("mapping", {}).get("evidence") == "deep_scan"
+                                        or (owner_identity, *providers[key][1]) in deep_scanned)
+                    result.ok(name, str(owner_identity), "CAPACITY-DEEP-SCAN", actually_scanned,
+                              "owner was not actually decoded by a deep scan")
+        if not stream_only and lane == "native":
+            observation = doc.get("observation", {})
+            result.ok(name, "*", "CAPACITY-LANE", observation.get("lane") == "native", "required native lane absent")
+            if manifest.get("require_retirement"):
+                result.ok(name, "*", "CAPACITY-RETIREMENT", observation.get("retirement") == manifest["require_retirement"]
+                          and observation.get("settlement") == "unsettled",
+                          "required retirement gate or current semantic-settlement contract changed")
+        result.add(name, "*", "CAPACITY-DENOMINATORS", "pass",
+                   f"{'demanded' if stream_only else 'attached'} physical endpoints={len(phase_union)}; actually called physical endpoints={len(called_union)}")
+    if population == "growth":
+        result.ok("capacity", "*", "CAPACITY-GROWTH", demands[0] < 4096 and any(4096 < value <= 6530 for value in demands[1:-1])
+                  and demands[-1] > 6530, f"one lifetime did not cross4096and6530:{demands}")
+        if manifest.get("require_reload"):
+            all_rows = [row for owner in manifest["owners"] for row in load_jsonl(os.path.join(directory, owner["ledger"]))]
+            unloads = [row for row in all_rows if row.get("kind") == "unload"]
+            surfaces = [row for row in all_rows if row.get("kind") == "surface"]
+            reloaded = any(sum(other.get("path") == row.get("path") and capacity_object(other) == capacity_object(row)
+                               for other in surfaces) >= 2 for row in unloads)
+            replaced = any(other.get("path") == row.get("path") and capacity_object(other) != capacity_object(row)
+                           for row in unloads for other in surfaces)
+            result.ok("capacity", "*", "CAPACITY-RELOAD", reloaded and replaced,
+                      "one lifetime lacks same-object reload or changed-inode path replacement")
+    if lane == "scan":
+        result.add("capacity", "*", "CAPACITY-NATIVE", "nonqualifying", "scan proves discovery/admission only")
+    return result
+
+
+def capacity_self_test():
+    """Run independent pure oracle mutations; fixture executions live in shell self-test."""
+    from pathlib import Path
+    import runpy
+    import unittest
+
+    namespace = runpy.run_path(str(Path(__file__).resolve().parents[1] / "tests/python/test_inventory_capacity_oracle.py"))
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(namespace["CapacityOracleTests"])
+    result = unittest.TextTestRunner(stream=sys.stdout).run(suite)
+    return result.testsRun > 0 and result.wasSuccessful()
 
 
 def main(argv):
@@ -6257,6 +7066,27 @@ def main(argv):
         code, result = demotion_segment(argv[1])
         print(json.dumps(result, sort_keys=True))
         return code
+    if len(argv) == 2 and argv[0] == "capacity-check":
+        try:
+            result = capacity_oracle(argv[1])
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            print(f"FAILED CAPACITY-INPUT: {error}")
+            return EXIT["failed"]
+        return report(result)
+    if len(argv) == 4 and argv[0] == "capacity-prepare":
+        try:
+            manifest = capacity_prepare(argv[1], argv[2], int(argv[3]))
+        except (OSError, ValueError) as error:
+            print(f"capacity preparation failed:{error}", file=sys.stderr)
+            return EXIT["failed"]
+        print(f"independently measured demand={manifest['demand']} providers={len(manifest['providers'])}")
+        return 0
+    if len(argv) == 9 and argv[0] == "capacity-run":
+        try:
+            return capacity_run(argv[1], argv[2], argv[3], argv[4], *[int(value) for value in argv[5:]])
+        except (OSError, ValueError) as error:
+            print(f"capacity runner failed:{error}", file=sys.stderr)
+            return EXIT["failed"]
     if len(argv) == 2 and argv[0] in ("check", "ledgers"):
         res = oracle(argv[1], ledgers_only=argv[0] == "ledgers")
         return report(res, os.path.join(argv[1], f"oracle-{argv[0]}.jsonl"), argv[0] == "ledgers")

@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # qualify-inventory-native.sh — installed `p11scope inventory` acceptance (Task 6 C8).
 #
-#   qualify-inventory-native.sh P11SCOPE [--lane scan|native] [--base DIR] [--no-dashboard]
+#   qualify-inventory-native.sh P11SCOPE [--lane scan|native] [--base DIR] [--no-dashboard] [--max-endpoints N]
+#   qualify-inventory-native.sh P11SCOPE --capacity boundary|growth|owners|real --max-endpoints N [--demand 4097|6531|8192]
 #   qualify-inventory-native.sh --self-test
 #
 # Host runs need a ROOT-OWNED --base (not group/other-writable); the default
@@ -24,6 +25,13 @@
 #                    harness releases it), SIGINT while the call is held
 # --lane names the lane the run must prove (default native). --no-dashboard is
 # recorded in run.json as a skipped run, which makes the verdict non-qualifying.
+# Capacity populations use independent owned table/call ledgers and a separate
+# capacity.json manifest. Synthetic boundaries and real SoftHSM/trust activity
+# are separate cells. The real ledger still uses at most4 modules/process.
+# The owners cell requires257 independently ledgered deep scans; retained
+# native-owner activation remains unavailable untilP2. Candidate8192 is not a
+# measured release envelope. CAPACITY_DURATION (1..600 seconds, default180),
+# CAPACITY_WAIT_S (1..120, default60) and CAPACITY_ATTACH_BACKEND bound this runner.
 #
 # Exit codes are the oracle's: 0 qualified, 1 failed, 2 non-qualifying (no
 # failure, but native assertions absent — every `--lane scan` plumbing run — or a
@@ -186,6 +194,7 @@ print(json.dumps({"name":n,"cells":cells.split(","),"json":j or None,"jsonl":jl 
 self_test() {
     need_tools
     timeout 300 python3 -I "$ORACLE" --self-test || die "oracle self-test failed"
+    timeout 60 python3 -I "$REPO/tests/python/test_inventory_capacity_oracle.py" CapacityFixtureTests || die "capacity fixture self-test failed"
     SELFTEST_TMP=$(mktemp -d "${TMPDIR:-/tmp}/c8-selftest.XXXXXX") || die "mktemp"
     SELFTEST_HELD=""
     trap 'release_held "$SELFTEST_TMP/release"; [ -z "$SELFTEST_HELD" ] || kill -KILL "$SELFTEST_HELD" 2>/dev/null; rm -rf "$SELFTEST_TMP"' EXIT
@@ -253,22 +262,45 @@ fi
 P=$(realpath -e "$1") || { echo "binary not found: $1" >&2; exit 64; }
 shift
 LANE=native BASE=/var/tmp/p11scope-ws-tmp/c8-root DASHBOARD=1
+CAPACITY= ENDPOINT_LIMIT=4096 ENDPOINT_SELECTED=0 CAPACITY_DEMAND=8192
 while [ $# -gt 0 ]; do
     case $1 in
         --lane) LANE=$2; shift 2 ;;
         --base) BASE=$2; shift 2 ;;
         --no-dashboard) DASHBOARD=0; shift ;;
+        --capacity|--max-endpoints|--demand)
+            [ $# -ge 2 ] || { echo "missing value for $1" >&2; exit 64; }
+            case $1 in
+                --capacity) CAPACITY=$2 ;;
+                --max-endpoints) ENDPOINT_LIMIT=$2; ENDPOINT_SELECTED=1 ;;
+                --demand) CAPACITY_DEMAND=$2 ;;
+            esac
+            shift 2 ;;
         *) echo "unknown argument $1" >&2; exit 64 ;;
     esac
 done
 case $LANE in scan|native) ;; *) echo "--lane must be scan or native" >&2; exit 64 ;; esac
+case $ENDPOINT_LIMIT in ''|*[!0-9]*|??????????*) echo "--max-endpoints must be in1..8192" >&2; exit 64 ;; esac
+[ "$ENDPOINT_LIMIT" -ge 1 ] && [ "$ENDPOINT_LIMIT" -le 8192 ] || { echo "--max-endpoints must be in1..8192" >&2; exit 64; }
+case $CAPACITY in ''|boundary|growth|owners|real) ;; *) echo "unknown capacity population $CAPACITY" >&2; exit 64 ;; esac
+case $CAPACITY_DEMAND in 4097|6531|8192) ;; *) echo "--demand must be4097,6531,8192" >&2; exit 64 ;; esac
+if [ -n "$CAPACITY" ] && [ "$ENDPOINT_SELECTED" = 0 ]; then
+    echo "--capacity requires --max-endpoints" >&2; exit 64
+fi
+ENDPOINT_ARGS=()
+if [ "$ENDPOINT_SELECTED" = 1 ]; then ENDPOINT_ARGS=(--max-endpoints "$ENDPOINT_LIMIT"); fi
 RUNUID=${RUNUID:-1000} RUNGID=${RUNGID:-1000}
 DURATION=${DURATION:-90} LATE_MS=${LATE_MS:-2500} STOP_WAIT_S=${STOP_WAIT_S:-60}
 read -r -a SYSTEM_EXTRA <<< "${SYSTEM_ARGS:-}"
 positive_controls
 [ "$(id -u)" = 0 ] || die "must run as root (the observer needs it; workloads drop to RUNUID)"
 [ "$RUNUID" != 0 ] || die "RUNUID must not be root"
-need_tools setpriv stat install
+if [ -n "$CAPACITY" ]; then
+    for tool in gcc python3 timeout setpriv stat install; do command -v "$tool" >/dev/null 2>&1 || die "missing tool:$tool"; done
+    if [ "$CAPACITY" = real ]; then command -v softhsm2-util >/dev/null 2>&1 || die "missing softhsm2-util"; fi
+else
+    need_tools setpriv stat install
+fi
 umask 077
 if [ ! -e "$BASE" ]; then
     { mkdir -p "$(dirname "$BASE")" && mkdir -m 0711 "$BASE"; } || die "cannot create $BASE"
@@ -285,6 +317,10 @@ while [ "$dir" != / ]; do
     fi
     dir=$(dirname "$dir")
 done
+if [ -n "$CAPACITY" ]; then
+    python3 -I "$ORACLE" capacity-run "$P" "$BASE" "$LANE" "$CAPACITY" "$ENDPOINT_LIMIT" "$CAPACITY_DEMAND" "$RUNUID" "$RUNGID"
+    exit "$?"
+fi
 OBS=$(mktemp -d "$BASE/c8-obs.XXXXXX") || die "mktemp obs"
 WL=$(mktemp -d "$BASE/c8-wl.XXXXXX") || die "mktemp workload"
 { chmod 0711 "$WL" && install -d -m 0755 "$WL/bin" && install -d -m 0711 "$WL/gates" "$WL/cells" "$OBS/ledgers"; } \
@@ -368,7 +404,7 @@ echo "probe: capture_args=${CAPTURE_ARGS[*]:-none} manifest=${MANIFEST_ARGS[*]:-
 
 # ---- run "system" ----
 "${OBSERVER[@]}" inventory --system --duration "$DURATION" -o "$OBS/system.json" --event-log "$OBS/system.jsonl" \
-    "${EVENTS[@]}" "${SYSTEM_EXTRA[@]}" "${CAPTURE_ARGS[@]}" "${MANIFEST_ARGS[@]}" \
+    "${EVENTS[@]}" "${SYSTEM_EXTRA[@]}" "${CAPTURE_ARGS[@]}" "${MANIFEST_ARGS[@]}" "${ENDPOINT_ARGS[@]}" \
     > "$OBS/system.stdout" 2> "$OBS/system.stderr" &
 SYS=$!
 OBSERVERS+=("$SYS")
@@ -413,7 +449,7 @@ if [ "$DASHBOARD" = 1 ]; then
     # frame; the run is still --system scope.
     python3 -I "$ORACLE" record-pty "$OBS/dashboard.pty" 120 250 90 0 -- "$P" inventory --system --dashboard \
         --module "$A" --module "$B" --module "$C" "${SYSTEM_EXTRA[@]}" --duration 15 -o "$OBS/dashboard.json" \
-        --event-log "$OBS/dashboard.jsonl" "${EVENTS[@]}" "${CAPTURE_ARGS[@]}" "${MANIFEST_ARGS[@]}" \
+        --event-log "$OBS/dashboard.jsonl" "${EVENTS[@]}" "${CAPTURE_ARGS[@]}" "${MANIFEST_ARGS[@]}" "${ENDPOINT_ARGS[@]}" \
         > "$OBS/dashboard.rc" 2>&1
     DASH_RC=$(sed -n 's/^rc=//p' "$OBS/dashboard.rc")
     run_entry dashboard P1,P2,P3,P7 dashboard.json dashboard.jsonl dashboard.pty "${DASH_RC:-255}" ""
@@ -427,7 +463,7 @@ P6=${WORKLOADS[-1]}
 waitfor "$OBS/ledgers/P6.out" '^READY ' 30 || die "P6 never became ready"
 P6PID=$(sed -n 's/^READY .* pid=\([0-9]*\) .*/\1/p' "$OBS/ledgers/P6.out" | head -1)
 "${OBSERVER[@]}" inventory --pid "$P6PID" --duration 600 -o "$OBS/stop.json" --event-log "$OBS/stop.jsonl" \
-    "${EVENTS[@]}" "${CAPTURE_ARGS[@]}" > "$OBS/stop.stdout" 2> "$OBS/stop.stderr" &
+    "${EVENTS[@]}" "${CAPTURE_ARGS[@]}" "${ENDPOINT_ARGS[@]}" > "$OBS/stop.stdout" 2> "$OBS/stop.stderr" &
 STOP=$!
 OBSERVERS+=("$STOP")
 wait_kind "$OBS/stop.jsonl" pass 2 120 || echo "stop observer slow to start" >&2

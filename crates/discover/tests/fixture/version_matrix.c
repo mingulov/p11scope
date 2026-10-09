@@ -38,6 +38,16 @@ typedef struct { CK_VERSION version; void *functions[104]; } Table;
 #ifndef UNTRUSTED_TARGETS
 #define UNTRUSTED_TARGETS 0
 #endif
+/* Capacity-only canonical2.40 surface: one getter plus distinct stubs,
+ * with remaining slots aliasing the getter. Unused tables/entry points
+ * are not populated or exported, so the declared physical tail is exact.
+ * The ordinary ABI matrix is unchanged when this opt-in is absent. */
+#ifndef CAPACITY_UNIQUE
+#define CAPACITY_UNIQUE 0
+#endif
+#if CAPACITY_UNIQUE < 0 || CAPACITY_UNIQUE > 68
+#error "CAPACITY_UNIQUE must be0..68"
+#endif
 
 #if PRIVACY_FIXTURE
 #define TEN_ARGS CK_ULONG a0, CK_ULONG a1, CK_ULONG a2, CK_ULONG a3, CK_ULONG a4, CK_ULONG a5, CK_ULONG a6, CK_ULONG a7, CK_ULONG a8, CK_ULONG a9
@@ -61,10 +71,18 @@ static void *stubs[104] = {
 };
 
 CK_RV C_GetFunctionList(void **out);
+#if !CAPACITY_UNIQUE
 CK_RV C_GetInterfaceList(CK_INTERFACE *out, CK_ULONG *count);
 CK_RV C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags);
+#endif
 
+#if CAPACITY_UNIQUE
+#define legacy p11scope_capacity_table
+Table legacy;
+#else
 static Table legacy;
+#endif
+#if !CAPACITY_UNIQUE
 static Table t240;
 static Table t30;
 static Table t31;
@@ -72,17 +90,27 @@ static Table t32;
 static Table tfuture;
 static Table tunknown;
 static Table tbad;
+#endif
 static void *short_legacy;
+#if !CAPACITY_UNIQUE
 static char *boundary_name;
+#endif
 
 static void fill_table(Table *table, CK_BYTE major, CK_BYTE minor, int anchors) {
     table->version = (CK_VERSION){major, minor};
     for (int i = 0; i < 104; i++) table->functions[i] = stubs[i];
     table->functions[3] = (void *)C_GetFunctionList;
+#if CAPACITY_UNIQUE
+    (void)anchors;
+    for (int i = 0; i < 104; i++) table->functions[i] = (void *)C_GetFunctionList;
+    for (int i = 0; i < CAPACITY_UNIQUE - 1; i++)
+        table->functions[i < 3 ? i : i + 1] = stubs[i];
+#else
     if (anchors) {
         table->functions[68] = (void *)C_GetInterfaceList;
         table->functions[69] = (void *)C_GetInterface;
     }
+#endif
 #if UNTRUSTED_TARGETS
     table->functions[0] = (void *)write; /* preloaded libc, not provider-owned */
     table->functions[1] = (void *)&legacy; /* mapped, but not executable */
@@ -101,6 +129,7 @@ static void make_short_legacy(void) {
     short_legacy = base;
 }
 
+#if !CAPACITY_UNIQUE
 static void make_boundary_name(void) {
     long page = sysconf(_SC_PAGESIZE);
     unsigned char *region = mmap(0, (size_t)page * 2, PROT_READ | PROT_WRITE,
@@ -110,12 +139,14 @@ static void make_boundary_name(void) {
     memcpy(boundary_name, "PKCS 11", sizeof("PKCS 11"));
     if (munmap(region + page, (size_t)page) != 0) __builtin_trap();
 }
+#endif
 
 static void fill(void) {
     static int done;
     if (done) return;
     done = 1;
     fill_table(&legacy, LEGACY_MAJOR, LEGACY_MINOR, 0);
+#if !CAPACITY_UNIQUE
     fill_table(&t240, 2, 40, 0);
     fill_table(&t30, 3, 0, 1);
     fill_table(&t31, 3, 1, 1);
@@ -124,6 +155,7 @@ static void fill(void) {
     fill_table(&tunknown, 4, 0, 1);
     fill_table(&tbad, 3, 2, 0);
     make_boundary_name();
+#endif
     if (SHORT_LEGACY) make_short_legacy();
 }
 
@@ -134,6 +166,14 @@ CK_RV C_GetFunctionList(void **out) {
     return CKR_OK;
 }
 
+#if CAPACITY_UNIQUE
+/* A reload must not perform an unledgered acquisition through an old probe.
+ * The controlled target can read this same published table as data, while
+ * deliberate C_GetFunctionList activity stays separately gated/ledgered. */
+__attribute__((constructor)) static void capacity_initialize(void) { fill(); }
+#endif
+
+#if !CAPACITY_UNIQUE
 static char exact[] = "PKCS 11";
 static char alternate[] = "Acme Standard ABI";
 static char deceptive[] = "Vendor Pretend";
@@ -179,3 +219,4 @@ CK_RV C_GetInterface(void *name, void *version, void **out, CK_FLAGS flags) {
     *out = &selected;
     return CKR_OK;
 }
+#endif

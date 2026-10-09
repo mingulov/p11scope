@@ -191,7 +191,7 @@ fn invalid_inventory_endpoint_budget_precedes_every_sink() {
     );
 }
 
-/// Independently enumerate the owned fixture's published 3.0 table. The
+/// Independently enumerate the owned fixture's published canonical table. The
 /// observer never executes this code: this is the test application calling
 /// its own provider, then translating its function addresses through its
 /// own executable mappings. No attach plan or observer result supplies the
@@ -200,7 +200,7 @@ fn fixture_endpoint_offsets(provider: &Path) -> BTreeSet<u64> {
     #[repr(C)]
     struct Table {
         version: [u8; 2],
-        functions: [*mut libc::c_void; 92],
+        functions: [*mut libc::c_void; 104],
     }
     struct Library(*mut libc::c_void);
     impl Drop for Library {
@@ -224,10 +224,13 @@ fn fixture_endpoint_offsets(provider: &Path) -> BTreeSet<u64> {
     let mut table = std::ptr::null_mut();
     assert_eq!(unsafe { get_list(&mut table) }, 0);
     let table = unsafe { table.as_ref() }.unwrap();
-    assert_eq!(table.version, [3, 0]);
+    let slots = match table.version {
+        [2, 40] => 68,
+        [3, 0] => 92,
+        version => panic!("unsupported owned fixture surface {version:?}"),
+    };
     let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
-    table
-        .functions
+    table.functions[..slots]
         .iter()
         .map(|function| {
             assert!(!function.is_null());
@@ -247,6 +250,190 @@ fn fixture_endpoint_offsets(provider: &Path) -> BTreeSet<u64> {
                 .expect("each published fixture endpoint has a file-backed executable mapping")
         })
         .collect()
+}
+
+/// Pin the fixture through the same held-FD mapping helper as the public
+/// qualification runners. Btrfs's fstat device is a different identity domain.
+fn fixture_mapped_key(provider: &Path) -> (u64, u64, u64) {
+    let output = Command::new("python3")
+        .arg("-I")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/mapped-provider-pin.py"))
+        .arg(provider)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "held provider pin: {:?}", output);
+    let pin: Value = serde_json::from_slice(&output.stdout).unwrap();
+    (
+        pin["dev"][0].as_u64().unwrap(),
+        pin["dev"][1].as_u64().unwrap(),
+        pin["ino"].as_u64().unwrap(),
+    )
+}
+
+#[test]
+fn inventory_capacity_public_exact_discoverable_boundaries() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-exact-capacity-boundaries");
+    let driver = gcc(
+        &dir,
+        "driver",
+        &fixture_source("catalog-driver.c"),
+        &["-O2", "-Wall", "-Wextra", "-Werror"],
+        &["-ldl"],
+    );
+    let full = gcc(
+        &dir,
+        "full.so",
+        &matrix_source(),
+        &["-shared", "-fPIC", "-DCAPACITY_UNIQUE=68"],
+        &[],
+    );
+    let full_offsets = fixture_endpoint_offsets(&full);
+    assert_eq!(
+        full_offsets.len(),
+        68,
+        "one canonical table; unused interface exports are absent"
+    );
+    for demand in [4097, 6531, 8192] {
+        let population = dir.join(demand.to_string());
+        std::fs::create_dir(&population).unwrap();
+        let count = demand / full_offsets.len();
+        let remainder = demand % full_offsets.len();
+        let unique_flag = format!("-DCAPACITY_UNIQUE={remainder}");
+        let tail = gcc(
+            &population,
+            "tail.so",
+            &matrix_source(),
+            &["-shared", "-fPIC", &unique_flag],
+            &[],
+        );
+        let tail_offsets = fixture_endpoint_offsets(&tail);
+        assert_eq!(tail_offsets.len(), remainder, "independent physical tail");
+        let mut providers = Vec::new();
+        let mut union = BTreeSet::new();
+        let mut identities = BTreeSet::new();
+        for index in 0..=count {
+            let provider = population.join(format!("provider-{index:03}.so"));
+            let (template, offsets) = if index == count {
+                (&tail, &tail_offsets)
+            } else {
+                (&full, &full_offsets)
+            };
+            std::fs::copy(template, &provider).unwrap();
+            let identity = fixture_mapped_key(&provider);
+            assert!(
+                identities.insert(identity),
+                "each copy has a distinct mapped inode"
+            );
+            for offset in offsets {
+                union.insert((identity, *offset));
+            }
+            providers.push(provider);
+        }
+        assert_eq!(
+            union.len(),
+            demand,
+            "deduplicated mapped object/offset union before observer execution"
+        );
+        let alias = population.join("hardlink-alias.so");
+        std::fs::hard_link(&providers[0], &alias).unwrap();
+        assert_eq!(
+            fixture_mapped_key(&alias),
+            fixture_mapped_key(&providers[0])
+        );
+        let mut loaded = providers.clone();
+        loaded.push(alias);
+        let ready = population.join("ready");
+        let output_path = population.join("inventory.json");
+        let stderr = population.join("inventory.stderr");
+        let mut command = Command::new("sh");
+        command
+            .arg(fixture_source("inventory-scale-observe.sh"))
+            .args([
+                "--system",
+                "--json",
+                "--capture",
+                "scan",
+                "--max-scan-pids",
+                "64",
+                "--max-endpoints",
+                "8192",
+            ]);
+        for provider in &loaded {
+            command.arg("--module").arg(provider);
+        }
+        command
+            .env("INV_DRIVER", &driver)
+            .env("INV_COUNT", "1")
+            .env(
+                "INV_PROVIDERS",
+                loaded
+                    .iter()
+                    .map(|path| path.to_str().unwrap())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+            .env("INV_READY", &ready)
+            .env("INV_OUT", &output_path)
+            .env("P11SCOPE_BIN", env!("CARGO_BIN_EXE_p11scope"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped());
+        let (output, peak) = spawn_with_peak(&mut command, &stderr);
+        let _fixture = FixtureGuard {
+            pids: vec![ready_pid(&ready.join("S001.ready"))],
+        };
+        assert!(
+            output.status.success(),
+            "boundary{demand}: {}",
+            std::fs::read_to_string(&stderr).unwrap()
+        );
+        assert!(
+            peak < OBSERVER_RSS_BOUND_BYTES,
+            "boundary{demand}: peak RSS{peak}"
+        );
+        let document: Value =
+            serde_json::from_slice(&std::fs::read(&output_path).unwrap()).unwrap();
+        assert_eq!(document["budgets"]["inventory_endpoints"]["limit"], 8192);
+        assert_eq!(
+            document["budgets"]["inventory_endpoints"]["occupied"],
+            demand
+        );
+        assert_eq!(document["budgets"]["inventory_endpoints"]["refused"], 0);
+        assert_eq!(
+            document["modules"].as_array().unwrap().len(),
+            providers.len(),
+            "hardlink alias does not add a physical module"
+        );
+        for provider in &providers {
+            let identity = fixture_mapped_key(provider);
+            let module = document["modules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|module| {
+                    module["identity"]["device"]["major"].as_u64() == Some(identity.0)
+                        && module["identity"]["device"]["minor"].as_u64() == Some(identity.1)
+                        && module["identity"]["inode"].as_u64() == Some(identity.2)
+                })
+                .expect("each independently pinned provider is retained");
+            assert!(
+                module["paths"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|path| path.as_str() == provider.to_str())
+            );
+            assert_eq!(module["admission"]["state"], "admitted");
+            assert_eq!(
+                module["admission"]["endpoints"],
+                if provider == providers.last().unwrap() {
+                    remainder
+                } else {
+                    full_offsets.len()
+                }
+            );
+        }
+    }
 }
 
 #[test]

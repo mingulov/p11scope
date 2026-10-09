@@ -27,7 +27,7 @@ fn main() {
             // progress and "cleanup incomplete", and exits 130 like any
             // shell-interrupted command (SG-I7).
             if !failure_already_reported(&e) {
-                let _ = writeln!(std::io::stderr(), "p11scope: {e:#}");
+                let _ = p11scope::try_stderr_line(&format!("p11scope: {e:#}"));
             }
             std::process::exit(failure_exit_code(&e));
         }
@@ -112,8 +112,8 @@ fn run() -> Result<i32> {
         }
         // Exit-0 help goes to stdout, so `p11scope --help | grep …` works.
         Err(CliError::Help(topic)) => print_stdout(format_args!("{}\n", topic.text())),
-        Err(CliError::Usage(msg)) => {
-            let _ = writeln!(std::io::stderr(), "{msg}");
+        Err(CliError::Usage { message, topic }) => {
+            let _ = p11scope::try_stderr_line(&format!("{message}\n{}", topic.hint()));
             Ok(2)
         }
     }

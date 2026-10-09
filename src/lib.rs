@@ -66,6 +66,13 @@ pub mod timing;
 pub mod trace;
 pub(crate) mod uretprobe_hazard;
 
+/// Best-effort frontend diagnostic through the existing bounded stderr sink.
+/// A full or closed descriptor may drop some or all text; successful return
+/// does not guarantee delivery. Diagnostic delivery never determines exit status.
+pub fn try_stderr_line(line: &str) -> std::io::Result<()> {
+    sink::try_stderr_line(line).map(|_| ())
+}
+
 /// The whole public production surface of the capture loops. `run` stays a
 /// crate-private module: the owned child, the pause coordinator, its clocks,
 /// maps, drains, guards and injected actions are unreachable from outside.

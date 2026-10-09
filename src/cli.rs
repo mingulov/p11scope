@@ -207,8 +207,7 @@ pub enum Command {
     InventoryDiff(InventoryDiffArgs),
 }
 
-/// Which help text `--help` asked for: the global usage or one subcommand's
-/// scoped section plus the shared notes footer.
+/// Which help text `--help` asked for: global usage or task-oriented scoped guidance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HelpTopic {
     Global,
@@ -222,6 +221,19 @@ pub enum HelpTopic {
 }
 
 impl HelpTopic {
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Global => "Try 'p11scope --help'.",
+            Self::Profile => "Try 'p11scope profile --help'.",
+            Self::Trace => "Try 'p11scope trace --help'.",
+            Self::Run => "Try 'p11scope run --help'.",
+            Self::Inspect => "Try 'p11scope inspect --help'.",
+            Self::Doctor => "Try 'p11scope doctor --help'.",
+            Self::Inventory => "Try 'p11scope inventory --help'.",
+            Self::InventoryDiff => "Try 'p11scope inventory diff --help'.",
+        }
+    }
+
     pub fn text(self) -> &'static str {
         match self {
             HelpTopic::Global => USAGE,
@@ -247,11 +259,32 @@ impl Kind {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CliError {
-    Usage(String),
+    Usage { message: String, topic: HelpTopic },
     Help(HelpTopic),
 }
 
-pub const USAGE: &str = "usage:
+impl CliError {
+    /// Scope a usage refusal without changing successful help routing.
+    pub fn with_topic(self, topic: HelpTopic) -> Self {
+        match self {
+            Self::Usage { message, .. } => Self::Usage { message, topic },
+            error @ Self::Help(_) => error,
+        }
+    }
+}
+
+pub const USAGE: &str = "Choose a task:
+  doctor: check observation capability for the requested target.
+  inspect: list mapped providers; mapping is not evidence of calls.
+  profile: summarize aggregate completed calls, return values and latency.
+  profile --mode metrics: collect lighter aggregate counter maps.
+  trace: show completed call events and diagnostic PID/TID.
+  run: start and observe your own command after --.
+  inventory: separate mapped modules from observed usage entries.
+  inventory diff: compare two saved inventory files offline.
+Use p11scope <command> --help for examples and mode-specific guidance.
+
+usage:
   p11scope --version
   p11scope profile [--pid <n> | --cgroup <path> | --system] [--module <provider.so>]... [--manifest <m.json>]...
                    [--mode profile|metrics] [--duration <30|30s|5m|1h>] [-o <out.json>]
@@ -293,17 +326,16 @@ wherever a functional probe links one (under --pid, only where the kernel pid fi
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
 every descendant (kernel >= 5.15). --system requests whole-machine capture with
-no cgroup path; per-process and per-module attribution is still recorded. Provider
-identity is pinned by SHA-256 at attach and
+no cgroup path. Aggregate across the selected scope; counts are not per application.
+Inventory usage entries and trace completed events have separate attribution rules.
+Provider identity is pinned by SHA-256 at attach and
 checked for in-place change during capture (evidence.provider_changed).
 trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
 environment: P11SCOPE_BROAD_ADMIT=1 enables experiment-only broad provider admission (anything else keeps the narrow default).
 P11SCOPE_LOADER_ENV_SANITIZED is the offline discover helper's loader-environment marker (forged values are rejected).
 capture evidence records the active value of each (evidence.p11scope_env); docs/usage.md documents every P11SCOPE_* input.
 ";
-/// `p11scope profile --help`: that subcommand's usage section plus the
-/// shared notes footer. Every line is verbatim from [`USAGE`]; update
-/// both together when the CLI changes.
+/// `p11scope profile --help`: scoped syntax, examples and evidence limits.
 const PROFILE_HELP: &str = "usage:
   p11scope profile [--pid <n> | --cgroup <path> | --system] [--module <provider.so>]... [--manifest <m.json>]...
                    [--mode profile|metrics] [--duration <30|30s|5m|1h>] [-o <out.json>]
@@ -314,198 +346,104 @@ const PROFILE_HELP: &str = "usage:
                    [--attach-backend auto|multi|singles]
                    [--max-scan-pids <n>]
 
+examples (4242 is an example PID, not a detected target):
+  p11scope profile --pid 4242 --duration 30s -o profile.json
+  p11scope profile --system --mode metrics --duration 30s -o metrics.json
+
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
---module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
-scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
-run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system. --pause
-selects what run may do to its own child while it observes loading: never (default) touches
-nothing, auto only when the child would otherwise load unobserved, always on every load.
---kill-on-timeout ends the child when --duration expires instead of leaving it running.
---attach-backend selects the static probe backend: auto (default) uses one
-multi-uprobe link per attach group wherever a functional probe links one (under
---pid, only where the kernel pid filter covers every thread; the links then name
-the target) and per-offset links elsewhere, multi forces multi (needs 6.6+; under
---pid also a proven pid filter), singles forces per-offset. Dynamic loader and
-export probes always use per-offset links. inventory --attach-backend auto picks multi
-wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
---mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
-ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
-every descendant (kernel >= 5.15). --system requests whole-machine capture with
-no cgroup path; per-process and per-module attribution is still recorded. Provider
-identity is pinned by SHA-256 at attach and
-checked for in-place change during capture (evidence.provider_changed).
-trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
-environment: P11SCOPE_BROAD_ADMIT=1 enables experiment-only broad provider admission (anything else keeps the narrow default).
-P11SCOPE_LOADER_ENV_SANITIZED is the offline discover helper's loader-environment marker (forged values are rejected).
-capture evidence records the active value of each (evidence.p11scope_env); docs/usage.md documents every P11SCOPE_* input.
+--module narrows the scan to named providers.
+--manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation.
+scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available.
+Aggregate across the selected scope; counts are not per application.
+--mode metrics is the lighter maps-only profile mode; metrics is not a subcommand.
+Exactly one of --pid, --cgroup, or --system is required; --cgroup includes descendants.
+Ctrl-C or SIGTERM ends capture cleanly and writes the final -o report.
 ";
 
-/// `p11scope trace --help`: that subcommand's usage section plus the
-/// shared notes footer. Every line is verbatim from [`USAGE`]; update
-/// both together when the CLI changes.
+/// `p11scope trace --help`: scoped syntax, examples and evidence limits.
 const TRACE_HELP: &str = "usage:
   p11scope trace   [same scope and discovery options] [--duration <…>] [--max-events <n>] [-o <out.file>]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
                    [--attach-backend auto|multi|singles]
 
+example (4242 is an example PID, not a detected target):
+  p11scope trace --pid 4242 --duration 10s --max-events 1000
+
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
---module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
-scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
-run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system. --pause
-selects what run may do to its own child while it observes loading: never (default) touches
-nothing, auto only when the child would otherwise load unobserved, always on every load.
---kill-on-timeout ends the child when --duration expires instead of leaving it running.
---attach-backend selects the static probe backend: auto (default) uses one
-multi-uprobe link per attach group wherever a functional probe links one (under
---pid, only where the kernel pid filter covers every thread; the links then name
-the target) and per-offset links elsewhere, multi forces multi (needs 6.6+; under
---pid also a proven pid filter), singles forces per-offset. Dynamic loader and
-export probes always use per-offset links. inventory --attach-backend auto picks multi
-wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
---mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
-ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
-every descendant (kernel >= 5.15). --system requests whole-machine capture with
-no cgroup path; per-process and per-module attribution is still recorded. Provider
-identity is pinned by SHA-256 at attach and
-checked for in-place change during capture (evidence.provider_changed).
-trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
-environment: P11SCOPE_BROAD_ADMIT=1 enables experiment-only broad provider admission (anything else keeps the narrow default).
-P11SCOPE_LOADER_ENV_SANITIZED is the offline discover helper's loader-environment marker (forged values are rejected).
-capture evidence records the active value of each (evidence.p11scope_env); docs/usage.md documents every P11SCOPE_* input.
+--module narrows the scan to named providers.
+--manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation.
+scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available.
+Trace reports completed call events; PID/TID are diagnostic identifiers.
+Executable names require verified event-image evidence; missing identity stays unknown.
+Exactly one of --pid, --cgroup, or --system is required; --cgroup includes descendants.
+Without --max-events, trace stops at a 10,000,000-event default cap; TRUNCATED names the effective cap.
+-o copies the trace to a file; -o - uses stdout only.
 ";
 
-/// `p11scope run --help`: that subcommand's usage section plus the
-/// shared notes footer. Every line is verbatim from [`USAGE`]; update
-/// both together when the CLI changes.
+/// `p11scope run --help`: scoped syntax, examples and evidence limits.
 const RUN_HELP: &str = "usage:
   p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--duration <…>]
                    [-o <out>] [--pause never|auto|always] [--kill-on-timeout]
                    [--attach-backend auto|multi|singles]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
 
+example (replace the example program path with your command):
+  p11scope run --trace -- /absolute/path/to/program
+
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
---module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
-scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
-run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system. --pause
-selects what run may do to its own child while it observes loading: never (default) touches
-nothing, auto only when the child would otherwise load unobserved, always on every load.
+--module narrows the scan to named providers.
+--manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation.
+scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available.
+run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system.
+Everything after -- belongs to CMD, including its flags and non-UTF-8 arguments.
+Profile and metrics counts are aggregate, not per application; --trace selects completed events.
+--pause never (default) does not pause the child; auto pauses only when it would load unobserved; always pauses on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
---attach-backend selects the static probe backend: auto (default) uses one
-multi-uprobe link per attach group wherever a functional probe links one (under
---pid, only where the kernel pid filter covers every thread; the links then name
-the target) and per-offset links elsewhere, multi forces multi (needs 6.6+; under
---pid also a proven pid filter), singles forces per-offset. Dynamic loader and
-export probes always use per-offset links. inventory --attach-backend auto picks multi
-wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
---mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
-ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
-every descendant (kernel >= 5.15). --system requests whole-machine capture with
-no cgroup path; per-process and per-module attribution is still recorded. Provider
-identity is pinned by SHA-256 at attach and
-checked for in-place change during capture (evidence.provider_changed).
-trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
-environment: P11SCOPE_BROAD_ADMIT=1 enables experiment-only broad provider admission (anything else keeps the narrow default).
-P11SCOPE_LOADER_ENV_SANITIZED is the offline discover helper's loader-environment marker (forged values are rejected).
-capture evidence records the active value of each (evidence.p11scope_env); docs/usage.md documents every P11SCOPE_* input.
 ";
 
-/// `p11scope inspect --help`: that subcommand's usage section plus the
-/// shared notes footer. Every line is verbatim from [`USAGE`]; update
-/// both together when the CLI changes.
+/// `p11scope inspect --help`: scoped syntax, examples and evidence limits.
 const INSPECT_HELP: &str = "usage:
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
   p11scope inspect --system [--module <provider.so>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
 
+example (4242 is an example PID, not a detected target):
+  p11scope inspect --pid 4242 --json
+
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
---module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
-scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
-run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system. --pause
-selects what run may do to its own child while it observes loading: never (default) touches
-nothing, auto only when the child would otherwise load unobserved, always on every load.
---kill-on-timeout ends the child when --duration expires instead of leaving it running.
---attach-backend selects the static probe backend: auto (default) uses one
-multi-uprobe link per attach group wherever a functional probe links one (under
---pid, only where the kernel pid filter covers every thread; the links then name
-the target) and per-offset links elsewhere, multi forces multi (needs 6.6+; under
---pid also a proven pid filter), singles forces per-offset. Dynamic loader and
-export probes always use per-offset links. inventory --attach-backend auto picks multi
-wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
---mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
-ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
-every descendant (kernel >= 5.15). --system requests whole-machine capture with
-no cgroup path; per-process and per-module attribution is still recorded. Provider
-identity is pinned by SHA-256 at attach and
-checked for in-place change during capture (evidence.provider_changed).
-trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
-environment: P11SCOPE_BROAD_ADMIT=1 enables experiment-only broad provider admission (anything else keeps the narrow default).
-P11SCOPE_LOADER_ENV_SANITIZED is the offline discover helper's loader-environment marker (forged values are rejected).
-capture evidence records the active value of each (evidence.p11scope_env); docs/usage.md documents every P11SCOPE_* input.
+--module narrows the scan to named providers.
+Inspect reports mapped providers and discovery evidence; a mapping does not prove a call.
+Choose --pid or --system. --json preserves the same discovery facts for scripts.
+Unreadable or unexamined identities remain unknown.
 ";
 
-/// `p11scope doctor --help`: that subcommand's usage section plus the
-/// shared notes footer. Every line is verbatim from [`USAGE`]; update
-/// both together when the CLI changes.
+/// `p11scope doctor --help`: scoped syntax, examples and evidence limits.
 const DOCTOR_HELP: &str = "usage:
   p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
 
-notes: discovery scans the target's mapped memory — no manifest and no helper are required.
---module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
-scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
-run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system. --pause
-selects what run may do to its own child while it observes loading: never (default) touches
-nothing, auto only when the child would otherwise load unobserved, always on every load.
---kill-on-timeout ends the child when --duration expires instead of leaving it running.
---attach-backend selects the static probe backend: auto (default) uses one
-multi-uprobe link per attach group wherever a functional probe links one (under
---pid, only where the kernel pid filter covers every thread; the links then name
-the target) and per-offset links elsewhere, multi forces multi (needs 6.6+; under
---pid also a proven pid filter), singles forces per-offset. Dynamic loader and
-export probes always use per-offset links. inventory --attach-backend auto picks multi
-wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
---mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
-ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
-every descendant (kernel >= 5.15). --system requests whole-machine capture with
-no cgroup path; per-process and per-module attribution is still recorded. Provider
-identity is pinned by SHA-256 at attach and
-checked for in-place change during capture (evidence.provider_changed).
-trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
-environment: P11SCOPE_BROAD_ADMIT=1 enables experiment-only broad provider admission (anything else keeps the narrow default).
-P11SCOPE_LOADER_ENV_SANITIZED is the offline discover helper's loader-environment marker (forged values are rejected).
-capture evidence records the active value of each (evidence.p11scope_env); docs/usage.md documents every P11SCOPE_* input.
+example (4242 is an example PID, not a detected target):
+  p11scope doctor --pid 4242
+
+Check host and requested-target capability before capture.
+Without --pid or --cgroup, target readiness is unassessed.
+--extra-strict also treats warnings as failure; see docs/usage.md for privilege requirements.
 ";
 
-/// `p11scope inventory --help`: that subcommand's usage section plus the
-/// shared notes footer. Every line is verbatim from [`USAGE`]; update
-/// both together when the CLI changes.
+/// `p11scope inventory --help`: scoped syntax, examples and evidence limits.
 const INVENTORY_HELP: &str = "usage:
   p11scope inventory --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
   p11scope inventory --system [--module <provider.so>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
 
+example (4242 is an example PID, not a detected target):
+  p11scope inventory --pid 4242 --capture scan --json -o inventory.json
+
 notes: discovery scans the target's mapped memory — no manifest and no helper are required.
---module narrows the scan to named providers. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
-scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
-run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system. --pause
-selects what run may do to its own child while it observes loading: never (default) touches
-nothing, auto only when the child would otherwise load unobserved, always on every load.
---kill-on-timeout ends the child when --duration expires instead of leaving it running.
---attach-backend selects the static probe backend: auto (default) uses one
-multi-uprobe link per attach group wherever a functional probe links one (under
---pid, only where the kernel pid filter covers every thread; the links then name
-the target) and per-offset links elsewhere, multi forces multi (needs 6.6+; under
---pid also a proven pid filter), singles forces per-offset. Dynamic loader and
-export probes always use per-offset links. inventory --attach-backend auto picks multi
-wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
---mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
-ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
-every descendant (kernel >= 5.15). --system requests whole-machine capture with
-no cgroup path; per-process and per-module attribution is still recorded. Provider
-identity is pinned by SHA-256 at attach and
-checked for in-place change during capture (evidence.provider_changed).
-trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
-environment: P11SCOPE_BROAD_ADMIT=1 enables experiment-only broad provider admission (anything else keeps the narrow default).
-P11SCOPE_LOADER_ENV_SANITIZED is the offline discover helper's loader-environment marker (forged values are rejected).
-capture evidence records the active value of each (evidence.p11scope_env); docs/usage.md documents every P11SCOPE_* input.
+--module narrows the scan to named providers.
+Inventory separates mapped modules from observed usage entries; entries are not completed calls.
+--capture scan uses no BPF and leaves usage unknown. auto prefers native and reports fallback gaps; native fails if unavailable.
+--json and -o contain the same inventory facts; --event-log appends bounded JSONL history with rotation.
+A missing observation or incomplete retained history does not establish zero activity.
+Compare saved files offline with inventory diff; see docs/usage.md.
 ";
 
 /// Offline diff help is separate from capture scope and privileges.
@@ -526,7 +464,10 @@ const REMOVED_FLAG_HINT: &str = "removed in productization slice 1a: the observe
 identity by SHA-256 and fstat; see docs/usage.md";
 
 fn usage_err(msg: impl Into<String>) -> CliError {
-    CliError::Usage(format!("{}\n{USAGE}", msg.into()))
+    CliError::Usage {
+        message: crate::render::escape_controls(&msg.into()).into_owned(),
+        topic: HelpTopic::Global,
+    }
 }
 
 /// A textual option value (a number, a keyword, a hook spec). Linux hands
@@ -783,18 +724,32 @@ pub fn parse(argv: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Comm
             None => Ok(Command::Version),
             Some(_) => Err(usage_err("--version takes no arguments")),
         },
-        Some("profile") => Ok(Command::Profile(parse_capture(Kind::Profile, argv)?)),
-        Some("trace") => Ok(Command::Trace(parse_capture(Kind::Trace, argv)?)),
-        Some("run") => Ok(Command::Run(parse_run(argv)?)),
-        Some("inspect") => Ok(Command::Inspect(parse_inspect(argv)?)),
-        Some("doctor") => Ok(Command::Doctor(parse_doctor(argv)?)),
+        Some("profile") => parse_capture(Kind::Profile, argv)
+            .map(Command::Profile)
+            .map_err(|error| error.with_topic(HelpTopic::Profile)),
+        Some("trace") => parse_capture(Kind::Trace, argv)
+            .map(Command::Trace)
+            .map_err(|error| error.with_topic(HelpTopic::Trace)),
+        Some("run") => parse_run(argv)
+            .map(Command::Run)
+            .map_err(|error| error.with_topic(HelpTopic::Run)),
+        Some("inspect") => parse_inspect(argv)
+            .map(Command::Inspect)
+            .map_err(|error| error.with_topic(HelpTopic::Inspect)),
+        Some("doctor") => parse_doctor(argv)
+            .map(Command::Doctor)
+            .map_err(|error| error.with_topic(HelpTopic::Doctor)),
         Some("inventory") => {
             let mut args = argv.peekable();
             if args.peek().is_some_and(|value| value == "diff") {
                 args.next();
-                Ok(Command::InventoryDiff(parse_inventory_diff(args)?))
+                parse_inventory_diff(args)
+                    .map(Command::InventoryDiff)
+                    .map_err(|error| error.with_topic(HelpTopic::InventoryDiff))
             } else {
-                Ok(Command::Inventory(parse_inventory(args)?))
+                parse_inventory(args)
+                    .map(Command::Inventory)
+                    .map_err(|error| error.with_topic(HelpTopic::Inventory))
             }
         }
         Some("--help" | "-h") => Err(CliError::Help(HelpTopic::Global)),
@@ -869,12 +824,7 @@ fn parse_inspect(mut args: impl Iterator<Item = OsString>) -> Result<InspectArgs
 fn parse_inventory_diff(
     mut args: impl Iterator<Item = OsString>,
 ) -> Result<InventoryDiffArgs, CliError> {
-    let error = |message: &str| {
-        CliError::Usage(format!(
-            "{}\n{INVENTORY_DIFF_HELP}",
-            crate::render::escape_controls(message)
-        ))
-    };
+    let error = |message: &str| usage_err(message).with_topic(HelpTopic::InventoryDiff);
     let mut inputs = Vec::new();
     let mut json = false;
     let mut out = None;
@@ -1498,7 +1448,7 @@ mod tests {
             vec!["run", "-o", "-", "--", "/bin/true"],
         ] {
             assert!(
-                matches!(parse(args(&argv)), Err(CliError::Usage(m)) if m.contains("-o -") && m.contains("omit -o")),
+                matches!(parse(args(&argv)), Err(CliError::Usage { message: m, .. }) if m.contains("-o -") && m.contains("omit -o")),
                 "{argv:?}"
             );
         }
@@ -1611,7 +1561,7 @@ mod tests {
             ),
         ] {
             assert!(
-                matches!(parse(args(&argv)), Err(CliError::Usage(m)) if m.contains(&format!("{flag} given twice"))),
+                matches!(parse(args(&argv)), Err(CliError::Usage { message: m, .. }) if m.contains(&format!("{flag} given twice"))),
                 "{argv:?}"
             );
         }
@@ -1651,14 +1601,14 @@ mod tests {
             vec!["inspect", "--pid", "42", "--module", ""],
         ] {
             assert!(
-                matches!(parse(args(&argv)), Err(CliError::Usage(m)) if m.contains("requires a non-empty value")),
+                matches!(parse(args(&argv)), Err(CliError::Usage { message: m, .. }) if m.contains("requires a non-empty value")),
                 "{argv:?}"
             );
         }
         // `--hook-symbol` already refuses an empty name; pin the usage error.
         assert!(matches!(
             parse(args(&["profile", "--pid", "42", "--hook-symbol", ""])),
-            Err(CliError::Usage(m)) if m.contains("empty symbol name")
+            Err(CliError::Usage { message: m, .. }) if m.contains("empty symbol name")
         ));
     }
 
@@ -1671,7 +1621,7 @@ mod tests {
             vec!["doctor", "--pid", "0"],
         ] {
             assert!(
-                matches!(parse(args(&argv)), Err(CliError::Usage(m)) if m.contains("--pid must be greater than zero")),
+                matches!(parse(args(&argv)), Err(CliError::Usage { message: m, .. }) if m.contains("--pid must be greater than zero")),
                 "{argv:?}"
             );
         }
@@ -1685,7 +1635,7 @@ mod tests {
         assert_eq!((i.scope, i.json), (InspectScope::Pid(7), true));
         assert_eq!(i.max_scan_pids, None);
         assert!(
-            matches!(parse(args(&["inspect"])), Err(CliError::Usage(m)) if m.contains("--pid"))
+            matches!(parse(args(&["inspect"])), Err(CliError::Usage { message: m, .. }) if m.contains("--pid"))
         );
 
         let Command::Doctor(d) = parse(args(&["doctor"])).unwrap() else {
@@ -1710,15 +1660,17 @@ mod tests {
         assert!(i.json);
         assert_eq!(i.max_scan_pids, Some(8));
         // No scope at all names both spellings.
-        assert!(matches!(parse(args(&["inspect"])), Err(CliError::Usage(m))
-                if m.contains("--pid") && m.contains("--system")));
+        assert!(
+            matches!(parse(args(&["inspect"])), Err(CliError::Usage { message: m, .. })
+                if m.contains("--pid") && m.contains("--system"))
+        );
         // The mutual-exclusion refusal names both flags, whichever order.
         for argv in [
             vec!["inspect", "--pid", "7", "--system"],
             vec!["inspect", "--system", "--pid", "7"],
         ] {
             assert!(
-                matches!(parse(args(&argv)), Err(CliError::Usage(m))
+                matches!(parse(args(&argv)), Err(CliError::Usage { message: m, .. })
                     if m.contains("--pid") && m.contains("--system") && m.contains("mutually exclusive")),
                 "{argv:?}"
             );
@@ -1726,7 +1678,7 @@ mod tests {
         // `--max-scan-pids` keeps the capture validation wording.
         assert!(matches!(
             parse(args(&["inspect", "--system", "--max-scan-pids", "0"])),
-            Err(CliError::Usage(m)) if m.contains("--max-scan-pids must be greater than zero")
+            Err(CliError::Usage { message: m, .. }) if m.contains("--max-scan-pids must be greater than zero")
         ));
         assert!(matches!(
             parse(args(&[
@@ -1737,7 +1689,7 @@ mod tests {
                 "--max-scan-pids",
                 "2"
             ])),
-            Err(CliError::Usage(m)) if m.contains("--max-scan-pids given twice")
+            Err(CliError::Usage { message: m, .. }) if m.contains("--max-scan-pids given twice")
         ));
     }
 
@@ -1778,7 +1730,7 @@ mod tests {
         assert_eq!(i.out, None);
         // No scope at all names both spellings.
         assert!(
-            matches!(parse(args(&["inventory"])), Err(CliError::Usage(m))
+            matches!(parse(args(&["inventory"])), Err(CliError::Usage { message: m, .. })
                 if m.contains("--pid") && m.contains("--system"))
         );
         // The mutual-exclusion refusal names both flags, whichever order.
@@ -1787,7 +1739,7 @@ mod tests {
             vec!["inventory", "--system", "--pid", "7"],
         ] {
             assert!(
-                matches!(parse(args(&argv)), Err(CliError::Usage(m))
+                matches!(parse(args(&argv)), Err(CliError::Usage { message: m, .. })
                     if m.contains("--pid") && m.contains("--system") && m.contains("mutually exclusive")),
                 "{argv:?}"
             );
@@ -1817,17 +1769,17 @@ mod tests {
         }
         assert!(matches!(
             parse(args(&["inventory", "--system", "--capture", "bpf"])),
-            Err(CliError::Usage(m)) if m.contains("--capture") && m.contains("auto, scan or native")
+            Err(CliError::Usage { message: m, .. }) if m.contains("--capture") && m.contains("auto, scan or native")
         ));
         assert!(matches!(
             parse(args(&["inventory", "--system", "--capture"])),
-            Err(CliError::Usage(m)) if m.contains("--capture")
+            Err(CliError::Usage { message: m, .. }) if m.contains("--capture")
         ));
         assert!(matches!(
             parse(args(&[
                 "inventory", "--system", "--capture", "scan", "--capture", "native"
             ])),
-            Err(CliError::Usage(m)) if m.contains("--capture given twice")
+            Err(CliError::Usage { message: m, .. }) if m.contains("--capture given twice")
         ));
     }
 
@@ -1839,7 +1791,7 @@ mod tests {
         for text in [USAGE, INVENTORY_HELP] {
             let lines: Vec<&str> = text
                 .lines()
-                .filter(|line| line.contains("p11scope inventory --"))
+                .filter(|line| line.contains("p11scope inventory --") && line.contains("[--"))
                 .collect();
             assert_eq!(lines.len(), 2, "{text}");
             for line in lines {
@@ -1901,18 +1853,18 @@ mod tests {
         }
         assert!(matches!(
             parse(args(&["inventory", "--system", "--attach-backend", "both"])),
-            Err(CliError::Usage(_))
+            Err(CliError::Usage { .. })
         ));
         assert!(matches!(
             parse(args(&[
                 "inventory", "--system", "--attach-backend", "multi", "--attach-backend", "singles"
             ])),
-            Err(CliError::Usage(m)) if m.contains("given twice")
+            Err(CliError::Usage { message: m, .. }) if m.contains("given twice")
         ));
         for help in [USAGE, INVENTORY_HELP] {
             let lines: Vec<&str> = help
                 .lines()
-                .filter(|line| line.contains("p11scope inventory --"))
+                .filter(|line| line.contains("p11scope inventory --") && line.contains("[--"))
                 .collect();
             assert_eq!(lines.len(), 2);
             assert!(
@@ -1947,21 +1899,21 @@ mod tests {
     fn inventory_refuses_bad_max_gaps() {
         assert!(matches!(
             parse(args(&["inventory", "--pid", "7", "--max-gaps", "0"])),
-            Err(CliError::Usage(m)) if m.contains("--max-gaps must be greater than zero")
+            Err(CliError::Usage { message: m, .. }) if m.contains("--max-gaps must be greater than zero")
         ));
         assert!(matches!(
             parse(args(&["inventory", "--pid", "7", "--max-gaps", "many"])),
-            Err(CliError::Usage(m)) if m.contains("--max-gaps: invalid number")
+            Err(CliError::Usage { message: m, .. }) if m.contains("--max-gaps: invalid number")
         ));
         assert!(matches!(
             parse(args(&[
                 "inventory", "--pid", "7", "--max-gaps", "8", "--max-gaps", "9"
             ])),
-            Err(CliError::Usage(m)) if m.contains("--max-gaps given twice")
+            Err(CliError::Usage { message: m, .. }) if m.contains("--max-gaps given twice")
         ));
         assert!(matches!(
             parse(args(&["inventory", "--pid", "7", "--max-gaps", "65537"])),
-            Err(CliError::Usage(m)) if m.contains("--max-gaps must not exceed 65536")
+            Err(CliError::Usage { message: m, .. }) if m.contains("--max-gaps must not exceed 65536")
         ));
         // The ceiling itself parses.
         let Command::Inventory(i) =
@@ -1976,30 +1928,30 @@ mod tests {
     fn inventory_refuses_bad_duration_and_stdout_report() {
         assert!(matches!(
             parse(args(&["inventory", "--pid", "7", "--duration", "0"])),
-            Err(CliError::Usage(m)) if m.contains("--duration must be greater than zero")
+            Err(CliError::Usage { message: m, .. }) if m.contains("--duration must be greater than zero")
         ));
         assert!(matches!(
             parse(args(&[
                 "inventory", "--pid", "7", "--duration", "10", "--duration", "20"
             ])),
-            Err(CliError::Usage(m)) if m.contains("--duration given twice")
+            Err(CliError::Usage { message: m, .. }) if m.contains("--duration given twice")
         ));
         assert!(matches!(
             parse(args(&["inventory", "--pid", "7", "--duration", "soon"])),
-            Err(CliError::Usage(m)) if m.contains("--duration: invalid value")
+            Err(CliError::Usage { message: m, .. }) if m.contains("--duration: invalid value")
         ));
         assert!(matches!(
             parse(args(&["inventory", "--pid", "7", "-o", "a", "-o", "b"])),
-            Err(CliError::Usage(m)) if m.contains("-o given twice")
+            Err(CliError::Usage { message: m, .. }) if m.contains("-o given twice")
         ));
         // The report requires a file, like profile's.
         assert!(matches!(
             parse(args(&["inventory", "--pid", "7", "-o", "-"])),
-            Err(CliError::Usage(m)) if m.contains("-o - writes to stdout")
+            Err(CliError::Usage { message: m, .. }) if m.contains("-o - writes to stdout")
         ));
         assert!(matches!(
             parse(args(&["inventory", "--system", "--bogus"])),
-            Err(CliError::Usage(m)) if m.contains("unknown argument: --bogus")
+            Err(CliError::Usage { message: m, .. }) if m.contains("unknown argument: --bogus")
         ));
     }
 
@@ -2043,7 +1995,7 @@ mod tests {
             vec!["inventory", "--pid", "7", "--event-max-files", "3"],
         ] {
             assert!(
-                matches!(parse(args(&argv)), Err(CliError::Usage(m))
+                matches!(parse(args(&argv)), Err(CliError::Usage { message: m, .. })
                     if m.contains("require --event-log")),
                 "{argv:?}"
             );
@@ -2054,7 +2006,7 @@ mod tests {
                 "--event-log", "e.jsonl",
                 "--event-rotate-bytes", "0",
             ])),
-            Err(CliError::Usage(m)) if m.contains("--event-rotate-bytes: invalid value")
+            Err(CliError::Usage { message: m, .. }) if m.contains("--event-rotate-bytes: invalid value")
         ));
         assert!(matches!(
             parse(args(&[
@@ -2062,7 +2014,7 @@ mod tests {
                 "--event-log", "e.jsonl",
                 "--event-max-files", "0",
             ])),
-            Err(CliError::Usage(m)) if m.contains("--event-max-files must be greater than zero")
+            Err(CliError::Usage { message: m, .. }) if m.contains("--event-max-files must be greater than zero")
         ));
         assert!(matches!(
             parse(args(&[
@@ -2070,7 +2022,7 @@ mod tests {
                 "--event-log", "a",
                 "--event-log", "b",
             ])),
-            Err(CliError::Usage(m)) if m.contains("--event-log given twice")
+            Err(CliError::Usage { message: m, .. }) if m.contains("--event-log given twice")
         ));
     }
 
@@ -2096,7 +2048,7 @@ mod tests {
     fn doctor_rejects_unsupported_module_option() {
         assert!(matches!(
             parse(args(&["doctor", "--module", "/opt/provider.so"])),
-            Err(CliError::Usage(m)) if m.contains("doctor --module is not supported")
+            Err(CliError::Usage { message: m, .. }) if m.contains("doctor --module is not supported")
         ));
     }
 
@@ -2123,22 +2075,22 @@ mod tests {
     fn doctor_rejects_system_scope_with_a_named_reason() {
         assert!(matches!(
             parse(args(&["doctor", "--system"])),
-            Err(CliError::Usage(m)) if m.contains("doctor --system is not supported")
+            Err(CliError::Usage { message: m, .. }) if m.contains("doctor --system is not supported")
         ));
     }
 
     #[test]
     fn scope_is_still_exactly_one_of_pid_or_cgroup_and_removed_flags_still_hint() {
         assert!(
-            matches!(parse(args(&["profile"])), Err(CliError::Usage(m)) if m.contains("exactly one"))
+            matches!(parse(args(&["profile"])), Err(CliError::Usage { message: m, .. }) if m.contains("exactly one"))
         );
         assert!(matches!(
             parse(args(&["profile", "--pid", "1", "--cgroup", "/sys/fs/cgroup/x"])),
-            Err(CliError::Usage(m)) if m.contains("mutually exclusive")
+            Err(CliError::Usage { message: m, .. }) if m.contains("mutually exclusive")
         ));
         assert!(matches!(
             parse(args(&["profile", "--pid", "1", "--provenance-module", "/opt/x.so"])),
-            Err(CliError::Usage(m)) if m.contains("removed in productization slice 1a")
+            Err(CliError::Usage { message: m, .. }) if m.contains("removed in productization slice 1a")
         ));
     }
 
@@ -2166,12 +2118,12 @@ mod tests {
             let mut argv = vec!["profile", "--system"];
             argv.extend(extra);
             assert!(
-                matches!(parse(args(&argv)), Err(CliError::Usage(m)) if m.contains("mutually exclusive")),
+                matches!(parse(args(&argv)), Err(CliError::Usage { message: m, .. }) if m.contains("mutually exclusive")),
                 "{argv:?}"
             );
         }
         assert!(
-            matches!(parse(args(&["profile"])), Err(CliError::Usage(m)) if m.contains("--system"))
+            matches!(parse(args(&["profile"])), Err(CliError::Usage { message: m, .. }) if m.contains("--system"))
         );
     }
 
@@ -2179,7 +2131,7 @@ mod tests {
     fn a_malformed_hook_symbol_is_a_usage_error_naming_the_spec() {
         assert!(matches!(
             parse(args(&["profile", "--pid", "1", "--hook-symbol", "X:bogus"])),
-            Err(CliError::Usage(m)) if m.contains("functionlist")
+            Err(CliError::Usage { message: m, .. }) if m.contains("functionlist")
         ));
     }
 
@@ -2247,7 +2199,7 @@ mod tests {
             vec!["inventory", "--system", "--duration", "99999999999999999h"],
         ] {
             assert!(
-                matches!(parse(args(&argv)), Err(CliError::Usage(m)) if m.contains("--duration: invalid value")),
+                matches!(parse(args(&argv)), Err(CliError::Usage { message: m, .. }) if m.contains("--duration: invalid value")),
                 "{argv:?}"
             );
         }
@@ -2263,7 +2215,7 @@ mod tests {
             vec!["run", "--duration", "0h", "--", "/bin/true"],
         ] {
             assert!(
-                matches!(parse(args(&argv)), Err(CliError::Usage(m)) if m.contains("--duration must be greater than zero")),
+                matches!(parse(args(&argv)), Err(CliError::Usage { message: m, .. }) if m.contains("--duration must be greater than zero")),
                 "{argv:?}"
             );
         }
@@ -2302,10 +2254,10 @@ mod tests {
             crate::discovery::hooks::HookRegistry::builtin()
         );
         assert!(
-            matches!(parse_capture(Kind::Profile, args(&["--manifest", "m", "--pid", "1", "--cgroup", "/sys/fs/cgroup/x"])), Err(CliError::Usage(m)) if m.contains("mutually exclusive"))
+            matches!(parse_capture(Kind::Profile, args(&["--manifest", "m", "--pid", "1", "--cgroup", "/sys/fs/cgroup/x"])), Err(CliError::Usage { message: m, .. }) if m.contains("mutually exclusive"))
         );
         assert!(
-            matches!(parse_capture(Kind::Profile, args(&["--manifest", "m"])), Err(CliError::Usage(m)) if m.contains("exactly one of --pid, --cgroup, or --system"))
+            matches!(parse_capture(Kind::Profile, args(&["--manifest", "m"])), Err(CliError::Usage { message: m, .. }) if m.contains("exactly one of --pid, --cgroup, or --system"))
         );
     }
 
@@ -2318,12 +2270,12 @@ mod tests {
             )
             .unwrap_err();
             assert!(
-                matches!(err, CliError::Usage(m) if m.contains("removed in productization slice 1a")),
+                matches!(err, CliError::Usage { message: m, .. } if m.contains("removed in productization slice 1a")),
                 "{flag}"
             );
         }
         assert!(
-            matches!(parse_capture(Kind::Profile, args(&["--manifest", "m", "--pid", "1", "--mode", "trace"])), Err(CliError::Usage(m)) if m.contains("trace is a subcommand"))
+            matches!(parse_capture(Kind::Profile, args(&["--manifest", "m", "--pid", "1", "--mode", "trace"])), Err(CliError::Usage { message: m, .. }) if m.contains("trace is a subcommand"))
         );
     }
 
@@ -2334,7 +2286,7 @@ mod tests {
                 Kind::Trace,
                 args(&["--manifest", "m", "--pid", "1", "--mode", "metrics"])
             ),
-            Err(CliError::Usage(_))
+            Err(CliError::Usage { .. })
         ));
         let a = parse_capture(
             Kind::Trace,
@@ -2360,15 +2312,15 @@ mod tests {
                 Kind::Profile,
                 args(&["--pid", "1", "--max-events", "1"])
             ),
-            Err(CliError::Usage(m)) if m.contains("--max-events is a trace option")
+            Err(CliError::Usage { message: m, .. }) if m.contains("--max-events is a trace option")
         ));
         assert!(matches!(
             parse_capture(Kind::Trace, args(&["--pid", "1", "--max-events", "x"])),
-            Err(CliError::Usage(m)) if m.contains("invalid number")
+            Err(CliError::Usage { message: m, .. }) if m.contains("invalid number")
         ));
         assert!(matches!(
             parse_capture(Kind::Trace, args(&["--pid", "1", "--max-events", "0"])),
-            Err(CliError::Usage(m)) if m.contains("must be greater than zero")
+            Err(CliError::Usage { message: m, .. }) if m.contains("must be greater than zero")
         ));
     }
 
@@ -2403,11 +2355,11 @@ mod tests {
         assert_eq!(r.max_scan_pids, Some(64));
         assert!(matches!(
             parse(args(&["profile", "--pid", "42", "--max-scan-pids", "x"])),
-            Err(CliError::Usage(m)) if m.contains("invalid number")
+            Err(CliError::Usage { message: m, .. }) if m.contains("invalid number")
         ));
         assert!(matches!(
             parse(args(&["profile", "--pid", "42", "--max-scan-pids", "0"])),
-            Err(CliError::Usage(m)) if m.contains("must be greater than zero")
+            Err(CliError::Usage { message: m, .. }) if m.contains("must be greater than zero")
         ));
         assert!(
             USAGE.contains("--max-scan-pids"),
@@ -2451,7 +2403,7 @@ mod tests {
         assert_eq!(a.attach_backend, BackendSelection::Auto);
         assert!(matches!(
             parse(args(&["profile", "--pid", "42", "--attach-backend", "uprobe-multi"])),
-            Err(CliError::Usage(m)) if m.contains("--attach-backend: invalid value")
+            Err(CliError::Usage { message: m, .. }) if m.contains("--attach-backend: invalid value")
         ));
         assert!(
             USAGE.contains("--attach-backend"),
@@ -2557,7 +2509,7 @@ mod tests {
             ],
         ] {
             assert!(
-                matches!(parse(argv.clone()), Err(CliError::Usage(_))),
+                matches!(parse(argv.clone()), Err(CliError::Usage { .. })),
                 "{argv:?}"
             );
         }
@@ -2580,7 +2532,7 @@ mod tests {
             vec!["run", "--mode", "metrics", "--trace", "--", "/bin/true"],
         ] {
             assert!(
-                matches!(parse(args(&both)), Err(CliError::Usage(m)) if m.contains("has no --mode")),
+                matches!(parse(args(&both)), Err(CliError::Usage { message: m, .. }) if m.contains("has no --mode")),
                 "{both:?}"
             );
         }
@@ -2594,7 +2546,7 @@ mod tests {
             vec!["run", "--system", "--", "/bin/true"],
         ] {
             assert!(
-                matches!(parse(args(&scoped)), Err(CliError::Usage(m)) if m.contains("run has no --pid, --cgroup, or --system")),
+                matches!(parse(args(&scoped)), Err(CliError::Usage { message: m, .. }) if m.contains("run has no --pid, --cgroup, or --system")),
                 "{scoped:?}"
             );
         }
@@ -2605,17 +2557,17 @@ mod tests {
             vec!["run", "--", ""],
         ] {
             assert!(
-                matches!(parse(args(&empty)), Err(CliError::Usage(m)) if m.contains("-- CMD [ARGS...]")),
+                matches!(parse(args(&empty)), Err(CliError::Usage { message: m, .. }) if m.contains("-- CMD [ARGS...]")),
                 "{empty:?}"
             );
         }
         assert!(matches!(
             parse(args(&["run", "--pause", "sometimes", "--", "/bin/true"])),
-            Err(CliError::Usage(m)) if m.contains("never|auto|always")
+            Err(CliError::Usage { message: m, .. }) if m.contains("never|auto|always")
         ));
         assert!(matches!(
             parse(args(&["run", "--pause"])),
-            Err(CliError::Usage(m)) if m.contains("--pause requires a value")
+            Err(CliError::Usage { message: m, .. }) if m.contains("--pause requires a value")
         ));
         assert_eq!(
             parse(args(&["run", "--help"])).unwrap_err(),
@@ -2632,7 +2584,7 @@ mod tests {
             vec!["doctor", "--pause", "auto"],
         ] {
             assert!(
-                matches!(parse(args(&elsewhere)), Err(CliError::Usage(m)) if m.contains("`p11scope run`")),
+                matches!(parse(args(&elsewhere)), Err(CliError::Usage { message: m, .. }) if m.contains("`p11scope run`")),
                 "{elsewhere:?}"
             );
         }
@@ -2680,6 +2632,11 @@ mod tests {
             (vec!["run", "--help"], HelpTopic::Run),
             (vec!["inspect", "--help"], HelpTopic::Inspect),
             (vec!["doctor", "--help"], HelpTopic::Doctor),
+            (vec!["inventory", "--help"], HelpTopic::Inventory),
+            (
+                vec!["inventory", "diff", "--help"],
+                HelpTopic::InventoryDiff,
+            ),
             (vec!["--help"], HelpTopic::Global),
             (vec!["-h"], HelpTopic::Global),
         ] {
@@ -2689,7 +2646,7 @@ mod tests {
                 "{argv:?}"
             );
         }
-        // Every scoped help carries the shared notes footer and nothing else.
+        // Scoped guidance carries its own example and no helper workflow.
         for topic in [
             HelpTopic::Profile,
             HelpTopic::Trace,
@@ -2698,13 +2655,13 @@ mod tests {
             HelpTopic::Doctor,
         ] {
             let text = topic.text();
-            assert!(text.contains("notes: discovery scans"), "{topic:?}");
+            assert!(text.contains("example"), "{topic:?}");
             assert!(!text.contains("p11scope-discover"), "{topic:?}");
         }
     }
 
     #[test]
-    fn scoped_help_lines_are_verbatim_from_global_usage() {
+    fn scoped_help_syntax_lines_are_verbatim_from_global_usage() {
         let global: Vec<&str> = USAGE.lines().collect();
         for topic in [
             HelpTopic::Profile,
@@ -2712,8 +2669,15 @@ mod tests {
             HelpTopic::Run,
             HelpTopic::Inspect,
             HelpTopic::Doctor,
+            HelpTopic::Inventory,
+            HelpTopic::InventoryDiff,
         ] {
-            for line in topic.text().lines() {
+            for line in topic
+                .text()
+                .lines()
+                .skip(1)
+                .take_while(|line| !line.is_empty())
+            {
                 assert!(
                     global.contains(&line),
                     "{topic:?}: {line:?} is not verbatim from USAGE"
@@ -2730,8 +2694,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 4594);
-        assert_eq!(hash, 0x3ee72b02aa337f40);
+        assert_eq!(USAGE.len(), 5289);
+        assert_eq!(hash, 0x8bce676b37fea12c);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

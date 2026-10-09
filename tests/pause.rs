@@ -169,7 +169,7 @@ fn no_external_target_can_be_paused() {
     ] {
         let parsed = p11scope::cli::parse(external.iter().map(|a| a.to_string()));
         assert!(
-            matches!(parsed, Err(p11scope::cli::CliError::Usage(m)) if m.contains("`p11scope run`")),
+            matches!(parsed, Err(p11scope::cli::CliError::Usage { message: m, .. }) if m.contains("`p11scope run`")),
             "{external:?}"
         );
     }

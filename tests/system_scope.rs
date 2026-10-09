@@ -142,7 +142,7 @@ fn system_scope_parses_for_profile_and_trace() {
 #[test]
 fn system_scope_is_one_of_three_and_mutually_exclusive() {
     assert!(
-        matches!(parse(argv(&["profile"])), Err(CliError::Usage(message))
+        matches!(parse(argv(&["profile"])), Err(CliError::Usage { message, .. })
             if message.contains("exactly one of --pid, --cgroup, or --system"))
     );
     for extra in [
@@ -153,21 +153,21 @@ fn system_scope_is_one_of_three_and_mutually_exclusive() {
         let mut words = vec!["profile", "--system"];
         words.extend(extra.clone());
         assert!(
-            matches!(parse(argv(&words)), Err(CliError::Usage(message))
+            matches!(parse(argv(&words)), Err(CliError::Usage { message, .. })
                 if message.contains("mutually exclusive")),
             "{words:?}"
         );
         let mut words = vec!["trace", "--system"];
         words.extend(extra);
         assert!(
-            matches!(parse(argv(&words)), Err(CliError::Usage(message))
+            matches!(parse(argv(&words)), Err(CliError::Usage { message, .. })
                 if message.contains("mutually exclusive")),
             "{words:?}"
         );
     }
     assert!(matches!(
         parse(argv(&["run", "--system", "--", "/bin/true"])),
-        Err(CliError::Usage(message)) if message.contains("run has no --pid, --cgroup, or --system")
+        Err(CliError::Usage { message, .. }) if message.contains("run has no --pid, --cgroup, or --system")
     ));
 }
 

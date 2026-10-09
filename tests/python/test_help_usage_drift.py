@@ -2,8 +2,8 @@
 """Help/usage/parser flag agreement (SYSPLAN residual F-30).
 
 Three artifacts name the CLI surface: the parser in src/cli.rs, the USAGE
-and scoped help texts, and docs/usage.md. Excerpt equality between the help
-texts is pinned in Rust (`scoped_help_lines_are_verbatim_from_global_usage`);
+and scoped help texts, and docs/usage.md. Syntax equality between the help
+texts is pinned in Rust (`scoped_help_syntax_lines_are_verbatim_from_global_usage`);
 these tests pin the other two directions statically, without building:
 
 - every `--flag` the parser accepts appears in USAGE (a silent flag fails);

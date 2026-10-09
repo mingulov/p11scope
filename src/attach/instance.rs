@@ -740,6 +740,33 @@ impl InstanceMaps<'_> {
         };
         raise_mmapped_fault(data.fd().as_fd())
     }
+
+    /// Full cells from this object's original pidfd and watched file. The
+    /// owner brackets these reads with same-domain image/health checks.
+    pub(crate) fn complete_epochs(
+        &self,
+        pidfd: BorrowedFd<'_>,
+        file: u32,
+    ) -> Result<super::image_query::CompleteEpochs> {
+        ensure!(file < instance::FILE_SLOTS, "invalid watched file slot");
+        let (local, record_flags) = self.record(pidfd)?.map_or((0, 0), |record| {
+            (
+                record
+                    .slot_plus1
+                    .iter()
+                    .position(|slot| *slot == u64::from(file) + 1)
+                    .map_or(0, |index| record.epoch[index]),
+                record.flags,
+            )
+        });
+        Ok(super::image_query::CompleteEpochs {
+            local,
+            record_flags,
+            global: self.global(file)?,
+            fault: self.fault()?,
+            sticky: self.sticky()?,
+        })
+    }
 }
 
 /// Bounded checked CAS on the mmapable fault cell, the only userspace writer
@@ -770,7 +797,7 @@ fn raise_mmapped_fault(fd: BorrowedFd<'_>) -> Result<u64> {
     raised
 }
 
-fn raise_fault_cell(cell: &std::sync::atomic::AtomicU64) -> Result<u64> {
+pub(super) fn raise_fault_cell(cell: &std::sync::atomic::AtomicU64) -> Result<u64> {
     use std::sync::atomic::Ordering;
     let mut seen = cell.load(Ordering::SeqCst);
     for _ in 0..8 {

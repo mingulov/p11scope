@@ -154,6 +154,9 @@ impl ProofSession {
     fn owns(&self, entry: &EntryReservation) -> bool {
         Arc::ptr_eq(&self.authority, &entry.authority)
     }
+    pub(crate) fn owns_verified(&self, receipt: &VerifiedTraceSeed) -> bool {
+        self.owns(&receipt.seed.entry)
+    }
     #[cfg(test)]
     pub(crate) fn test_session() -> Self {
         Self::new(
@@ -998,13 +1001,22 @@ impl ProofSession {
         view: &crate::process::ProcessView,
         work: &mut TraceWorkTicket,
     ) -> Result<TraceSeed, TraceWorkError> {
+        self.test_sample_view_with_link(view, work, b"/owned/fixture")
+    }
+    #[cfg(test)]
+    pub(crate) fn test_sample_view_with_link(
+        &self,
+        view: &crate::process::ProcessView,
+        work: &mut TraceWorkTicket,
+        link: &[u8],
+    ) -> Result<TraceSeed, TraceWorkError> {
         self.sample_from(
             view,
             work,
             &mut FixtureSample {
                 view,
                 proof: self,
-                link: b"/owned/fixture",
+                link,
                 after_first_link: None,
             },
         )

@@ -66,6 +66,7 @@ pub mod shapes;
 pub(crate) mod sink;
 pub mod timing;
 pub mod trace;
+pub(crate) mod trace_identity;
 pub(crate) mod uretprobe_hazard;
 
 /// Best-effort frontend diagnostic through the existing bounded stderr sink.

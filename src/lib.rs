@@ -49,6 +49,7 @@ pub(crate) mod inventory_event_identity;
 pub mod inventory_events;
 pub(crate) mod inventory_output;
 pub mod inventory_present;
+pub(crate) mod inventory_semantics;
 pub mod kinds;
 pub mod longrun;
 pub mod manifest_input;

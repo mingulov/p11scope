@@ -90,6 +90,7 @@ fn run() -> Result<i32> {
             inventory::run(
                 a.scope,
                 &a.modules,
+                &a.manifests,
                 &a.hooks,
                 a.json,
                 a.max_scan_pids,

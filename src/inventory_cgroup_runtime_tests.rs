@@ -629,6 +629,7 @@ fn run_public_selection(
     run_with_terminal_budget(
         selection,
         modules,
+        &[],
         &HookRegistry::builtin(),
         true,
         Some(2),

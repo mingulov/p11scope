@@ -129,6 +129,10 @@ impl WatchedFile {
     pub(super) fn check_unchanged(&self) -> Result<bool, String> {
         self.target.check_unchanged()
     }
+
+    pub(super) fn retained_target(&self) -> RetainedInventoryTarget {
+        self.target.share()
+    }
 }
 
 /// Hook statistics for one fentry program (`BPF_OBJ_GET_INFO_BY_FD`).

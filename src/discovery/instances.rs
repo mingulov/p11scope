@@ -31,7 +31,9 @@
 //! have no `Serialize`/`Display`, and only [`InstanceId`]s and finite
 //! [`UnknownReason`]s leave this module.
 
-use p11scope_ebpf_common::{InstanceStamp, instance};
+use crate::attach::capture::NativeDomainId;
+use crate::attach::image_query::ImageScanProof;
+use p11scope_ebpf_common::{ImageIdentity, InstanceStamp, instance};
 use p11scope_manifest::maps::MapEntry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -45,19 +47,11 @@ pub(crate) const MAX_PENDING: usize = 1_024;
 /// Retained epoch keys per (process, file): older keys are evicted and their
 /// late calls become [`UnknownReason::Evicted`].
 pub(crate) const KEYS_PER_PROCESS_FILE: usize = 4;
-/// Capture-wide registry ceilings (allowlist-v3 bounds): retained
-/// (process, file) observation keys, coverage-faulted keys and retired
-/// process cookies. Each is bounded at the instance-record ceiling; a full
-/// registry evicts its smallest key first (cookies mint in capture order,
-/// so the stalest process goes first) with a saturating counter.
-/// Observed eviction degrades late calls to Pending/Unobserved, never a
-/// join; a faulted eviction latches capture-sticky refusal for every
-/// unknown key (P2-1), since an evicted tombstone is indistinguishable
-/// from a new key; a retired eviction advances a per-era watermark that
-/// preserves retirement refusal for evicted cookies while newer cookies
-/// keep joining; and a fault-era advance bumps the observation
-/// publication fence, refusing scans acquired before the reset (even at
-/// the new fault) while fresh scans re-observe freely.
+/// Capture-wide exact-registry ceilings. Observed eviction degrades late
+/// calls; a coverage tombstone eviction latches unknown-key refusal. Retired
+/// image eviction compresses permanent per-cookie refusals into132KiB bounded
+/// negative metadata. Ordinary era changes clear positive observations and
+/// advance a checked original-scan fence, never resetting negative metadata.
 pub(crate) const MAX_OBSERVED_KEYS: usize = 4_096;
 pub(crate) const MAX_FAULTED_KEYS: usize = 4_096;
 pub(crate) const MAX_RETIRED_COOKIES: usize = 4_096;
@@ -276,8 +270,9 @@ pub(crate) fn stable_scan(
 pub(crate) struct CallFacts {
     /// Opaque caller token returned with a deferred resolution.
     pub(crate) token: u64,
-    /// The call's image cookie (entry identity).
-    pub(crate) cookie: u64,
+    pub(crate) domain: NativeDomainId,
+    /// The call's complete native entry identity.
+    pub(crate) image: ImageIdentity,
     pub(crate) entry: InstanceStamp,
     pub(crate) ret: InstanceStamp,
     pub(crate) ip: EntryIp,
@@ -298,6 +293,9 @@ impl fmt::Debug for CallFacts {
 /// Why a call has no instance. Finite and public-safe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum UnknownReason {
+    ForeignDomain,
+    AuthorityExhausted,
+    InvalidImage,
     /// The call carries no valid stamp (not stamped, or no task).
     Unstamped,
     /// The endpoint has no watched file (calibration refused or tracking off).
@@ -372,6 +370,8 @@ impl Default for RouterLimits {
 /// Outcome of one [`InstanceRouter::observe`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ObserveOutcome {
+    ForeignDomain,
+    InvalidImage,
     /// First stable observation of these epochs: partitions were minted.
     New,
     /// Same epochs and no new range: the same instances continue.
@@ -394,6 +394,77 @@ struct EpochKey {
     fault: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ImageKey {
+    cookie: u64,
+    exec: u64,
+}
+
+impl From<ImageIdentity> for ImageKey {
+    fn from(image: ImageIdentity) -> Self {
+        Self {
+            cookie: image.task_cookie,
+            exec: image.exec_id,
+        }
+    }
+}
+
+impl fmt::Debug for ImageKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ImageKey(<private>)")
+    }
+}
+
+const COOKIE_LIMIT: usize = p11scope_ebpf_common::IMAGE_IDENTITY_TICKET_LIMIT as usize;
+
+/// Permanent negative metadata, bounded by the owning native domain's lifetime
+/// tickets: 128 KiB exec watermarks plus two 2 KiB bitsets. Exec0 is valid.
+struct RetirementLedger {
+    through: Box<[u64]>,
+    valid: Box<[u64]>,
+    dead: Box<[u64]>,
+}
+
+impl RetirementLedger {
+    fn new() -> Self {
+        Self {
+            through: vec![0; COOKIE_LIMIT].into_boxed_slice(),
+            valid: vec![0; COOKIE_LIMIT / 64].into_boxed_slice(),
+            dead: vec![0; COOKIE_LIMIT / 64].into_boxed_slice(),
+        }
+    }
+
+    fn index(cookie: u64) -> Option<usize> {
+        if cookie == 0 || cookie > p11scope_ebpf_common::IMAGE_IDENTITY_TICKET_LIMIT {
+            None
+        } else {
+            Some(cookie as usize - 1)
+        }
+    }
+
+    fn retire_image(&mut self, image: ImageKey) {
+        if let Some(index) = Self::index(image.cookie) {
+            self.through[index] = self.through[index].max(image.exec);
+            self.valid[index / 64] |= 1 << (index % 64);
+        }
+    }
+
+    fn retire_task(&mut self, cookie: u64) {
+        if let Some(index) = Self::index(cookie) {
+            self.dead[index / 64] |= 1 << (index % 64);
+        }
+    }
+
+    fn retired(&self, image: ImageKey) -> bool {
+        let Some(index) = Self::index(image.cookie) else {
+            return true;
+        };
+        let bit = 1 << (index % 64);
+        self.dead[index / 64] & bit != 0
+            || self.valid[index / 64] & bit != 0 && image.exec <= self.through[index]
+    }
+}
+
 impl fmt::Debug for EpochKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("EpochKey(<private>)")
@@ -409,28 +480,20 @@ impl EpochKey {
         }
     }
 
-    /// Low-32 matching (N4): stamps carry only the low words, so identity
-    /// assumes fewer than 2^32 bumps per (process, file, global, fault)
-    /// component per capture — 4 billion file-VMA events against one
-    /// watched file. A stamp from exactly 2^32 bumps ago would match; that
-    /// rate sustained against one file is outside the capture envelope, and
-    /// the assumption is pinned by review, not by a counter.
+    /// Full observed values are validated against the stamp representation
+    /// before retention. Equality cannot truncate an unrepresentable value.
     fn matches(&self, stamp: &InstanceStamp) -> bool {
-        self.local as u32 == stamp.epoch
-            && self.global as u32 == stamp.global
-            && self.fault as u32 == stamp.fault
+        self.local == u64::from(stamp.epoch)
+            && self.global == u64::from(stamp.global)
+            && self.fault == u64::from(stamp.fault)
     }
 
-    /// Whether `stamp` names epochs strictly older than these in some
-    /// component (epochs only grow, so no later scan can observe it). The
-    /// 2^31 wrapping window reads stamps more than 2^31 behind as "future":
-    /// they wait as [`Route::Pending`] and expire [`UnknownReason::Unobserved`],
-    /// never evicted or joined — fail closed on the far past.
+    /// Complete retained epochs are monotonic and representable; an older
+    /// stamp can no longer gain an observation in this image and fault era.
     fn supersedes(&self, stamp: &InstanceStamp) -> bool {
-        let older = |current: u64, stamped: u32| (current as u32).wrapping_sub(stamped) as i32 > 0;
-        older(self.local, stamp.epoch)
-            || older(self.global, stamp.global)
-            || older(self.fault, stamp.fault)
+        self.local > u64::from(stamp.epoch)
+            || self.global > u64::from(stamp.global)
+            || self.fault > u64::from(stamp.fault)
     }
 }
 
@@ -470,8 +533,8 @@ pub(crate) struct RouterCounters {
     pub(crate) miss_eras: u64,
     /// Saturating registry evictions (F3): keys dropped from a full
     /// registry. Observed late calls degrade to Pending/Unobserved; a
-    /// faulted eviction latches refusal (P2-1); a retired eviction advances
-    /// the retirement watermark, which preserves refusal for the evicted.
+    /// faulted eviction latches refusal; a retired eviction compacts its
+    /// negative identity into the permanent per-cookie ledger.
     pub(crate) observed_evictions: u64,
     pub(crate) faulted_evictions: u64,
     pub(crate) retired_evictions: u64,
@@ -482,10 +545,11 @@ pub(crate) struct RouterCounters {
 /// private epoch, so only lengths, limits, finite flags and public-safe
 /// counters render.
 pub(crate) struct InstanceRouter {
+    domain: NativeDomainId,
     limits: RouterLimits,
-    /// (cookie, file slot) -> retained observations, oldest first.
-    observed: BTreeMap<(u64, u32), VecDeque<Observed>>,
-    faulted: BTreeSet<(u64, u32)>,
+    /// (full image, file slot) -> retained observations, oldest first.
+    observed: BTreeMap<(ImageKey, u32), VecDeque<Observed>>,
+    faulted: BTreeSet<(ImageKey, u32)>,
     /// P2-1: a coverage-fault tombstone was evicted under capacity pressure.
     /// The router can no longer name the discredited key, so every unknown
     /// key (no retained observation) is refused with `CoverageFault` — fail
@@ -498,29 +562,13 @@ pub(crate) struct InstanceRouter {
     /// forgotten tombstones could be any of the cleared keys), and it is
     /// the documented price of bounding the fault registry.
     faulted_overflowed: bool,
-    retired: BTreeSet<u64>,
-    /// The greatest retired cookie evicted under capacity pressure in this
-    /// fault era (0 when none: cookie 0 is never assigned, so the watermark
-    /// refuses nothing while unset). Eviction pops the smallest cookie
-    /// first and cookies mint in capture order, so every evicted cookie is
-    /// at or below this mark: a cookie at or below it with no retained
-    /// observation is refused as `Retired` — either it was retired and
-    /// forgotten, or it is a live process the router never observed, and
-    /// refusing is sound for both. Cookies above the mark and cookies with
-    /// a retained observation keep joining, so unlike the faulted latch
-    /// this costs new and continuing processes nothing. A fault-era advance
-    /// resets it: old-era evidence is `StaleEra`-refused anyway, and a
-    /// scan cached before the reset — even one whose fault reading
-    /// already matches the new era — is `StaleEra`-refused by the
-    /// publication fence, so no delayed observation slips through.
-    retired_watermark: u64,
-    /// Observation publication fence: bumped on every fault-era advance.
-    /// Scans stamp this value at acquisition time (see [`stable_scan`]);
-    /// [`InstanceRouter::observe`] refuses any observation whose stamp is
-    /// not current. Retirement implies death and cookies are never
-    /// reassigned, so a post-reset scan of an evicted-retired cookie
-    /// cannot exist — only pre-reset cached scans need refusing, and the
-    /// fence refuses all of them while fresh scans re-observe freely.
+    retired: BTreeSet<ImageKey>,
+    /// Evicted image refusals and terminal task death remain permanent in
+    /// this native domain. Ordinary fault eras never clear this ledger.
+    retirement: RetirementLedger,
+    authority_failed: bool,
+    image_failed: bool,
+    /// Original publication fence; checked advance or permanent refusal.
     fence: u64,
     pending: VecDeque<PendingCall>,
     fault: u64,
@@ -563,14 +611,17 @@ impl fmt::Debug for InstanceRouter {
 }
 
 impl InstanceRouter {
-    pub(crate) fn new(limits: RouterLimits) -> Self {
+    pub(crate) fn new(domain: NativeDomainId, limits: RouterLimits) -> Self {
         Self {
+            domain,
             limits,
             observed: BTreeMap::new(),
             faulted: BTreeSet::new(),
             faulted_overflowed: false,
             retired: BTreeSet::new(),
-            retired_watermark: 0,
+            retirement: RetirementLedger::new(),
+            authority_failed: false,
+            image_failed: false,
             fence: 0,
             pending: VecDeque::new(),
             fault: 0,
@@ -587,6 +638,10 @@ impl InstanceRouter {
 
     pub(crate) fn instances_minted(&self) -> usize {
         self.minted
+    }
+
+    pub(crate) fn domain(&self) -> NativeDomainId {
+        self.domain
     }
 
     pub(crate) fn ranges_retained(&self) -> usize {
@@ -611,22 +666,21 @@ impl InstanceRouter {
         &self.unknown
     }
 
-    /// Batch audit, before routing a drained batch: the current fault
-    /// generation (which the capture loop also raises on hook-program
-    /// misses), the sticky bits, and the hook programs' summed
-    /// `recursion_misses`. A changed fault ends every retained observation
-    /// and every pending call, and releases the miss latch. While the P2-1
-    /// overflow latch is set, this clearing refuses every later observation
-    /// and route until router recreation (see `faulted_overflowed`). A changed miss
-    /// total WITHOUT a changed fault means the loop has not raised for those
-    /// misses: the era latches (no joins, no observations) until a fault
-    /// raise re-coheres it. Any miss change latches, including a decrease
-    /// (a reloaded hook set starts its counters over). Returns the resolved
-    /// pending calls.
+    /// Apply the full current fault/sticky cells before routing. Required-hook
+    /// health is audited by the Session owner; its failure calls
+    /// `fail_image_coverage` and is never repaired by an ordinary era change.
     pub(crate) fn audit(&mut self, fault: u64, sticky: u64, misses: u64) -> Vec<(u64, Route)> {
+        if self.authority_failed {
+            return self.fail_pending(|_| true, UnknownReason::AuthorityExhausted);
+        }
+        if fault > u64::from(u32::MAX) || fault < self.fault {
+            self.authority_failed = true;
+            self.observed.clear();
+            self.ranges = 0;
+            return self.fail_pending(|_| true, UnknownReason::AuthorityExhausted);
+        }
         let mut resolved = Vec::new();
         if sticky != 0 && self.sticky == 0 {
-            self.sticky = sticky;
             resolved.extend(self.fail_pending(|_| true, UnknownReason::Sticky));
         }
         self.sticky |= sticky;
@@ -634,28 +688,26 @@ impl InstanceRouter {
         let misses_moved = misses != self.misses;
         self.misses = misses;
         if fault_moved {
+            let Some(next_fence) = self.fence.checked_add(1) else {
+                self.authority_failed = true;
+                self.observed.clear();
+                self.ranges = 0;
+                resolved.extend(self.fail_pending(|_| true, UnknownReason::AuthorityExhausted));
+                return resolved;
+            };
             self.fault = fault;
+            self.fence = next_fence;
             self.miss_latched = false;
-            // The retirement watermark is per-era: old-era evidence is
-            // StaleEra-refused from here on, so forgetting the evicted
-            // cookies reopens no gap — and long-lived processes re-observe
-            // freely in the new era. But a scan cached before this reset
-            // may already carry the NEW fault, so the reset also bumps the
-            // publication fence: only scans acquired after it observe.
-            // (The miss latch below keeps both: the fault is unchanged, so
-            // old-era evidence would still match, and the latched era
-            // refuses every observation until a fault raise re-coheres it —
-            // at which point this path bumps the fence.)
-            self.retired_watermark = 0;
-            self.fence = self.fence.wrapping_add(1);
-            self.counters.eras += 1;
+            self.counters.eras = self.counters.eras.saturating_add(1);
             self.observed.clear();
             self.ranges = 0;
             resolved.extend(self.fail_pending(|_| true, UnknownReason::FaultEra));
         } else if misses_moved {
+            // Legacy scalar backstop only: production uses complete same-object
+            // Session health, and permanently fails on any required hook miss.
             self.miss_latched = true;
-            self.counters.eras += 1;
-            self.counters.miss_eras += 1;
+            self.counters.eras = self.counters.eras.saturating_add(1);
+            self.counters.miss_eras = self.counters.miss_eras.saturating_add(1);
             self.observed.clear();
             self.ranges = 0;
             resolved.extend(self.fail_pending(|_| true, UnknownReason::FaultEra));
@@ -663,37 +715,48 @@ impl InstanceRouter {
         resolved
     }
 
-    /// Whether `cookie` retired before its tombstone was evicted (or was
-    /// never observed at all): at or below the watermark with no retained
-    /// observation. Cookie 0 is never assigned, so it never matches.
-    fn retired_before_eviction(&self, cookie: u64) -> bool {
-        cookie != 0
-            && cookie <= self.retired_watermark
-            && self
-                .observed
-                .range((cookie, 0)..=(cookie, u32::MAX))
-                .next()
-                .is_none()
+    pub(crate) fn fail_image_coverage(&mut self) -> Vec<(u64, Route)> {
+        self.image_failed = true;
+        self.observed.clear();
+        self.ranges = 0;
+        self.fail_pending(|_| true, UnknownReason::CoverageFault)
     }
 
-    /// Ends a process incarnation (exit or exec reported by lifecycle):
-    /// frees its observations; its pending calls become unknown. A
-    /// retirement evicted under capacity pressure advances the per-era
-    /// watermark, which preserves refusal for the evicted cookie.
-    pub(crate) fn retire_process(&mut self, cookie: u64) -> Vec<(u64, Route)> {
-        if let Some(evicted) = evict_for_insert(
-            &mut self.retired,
-            &cookie,
-            self.limits.retired_cookies,
-            &mut self.counters.retired_evictions,
-        ) {
-            self.retired_watermark = self.retired_watermark.max(evicted);
+    pub(crate) fn refuse_exhaustion(&mut self) -> Vec<(u64, Route)> {
+        self.authority_failed = true;
+        self.observed.clear();
+        self.ranges = 0;
+        self.fail_pending(|_| true, UnknownReason::AuthorityExhausted)
+    }
+
+    fn image_retired(&self, image: ImageKey) -> bool {
+        self.retired.contains(&image) || self.retirement.retired(image)
+    }
+
+    /// Ends this image only. Eviction compresses its refusal into permanent
+    /// per-cookie metadata, without retiring a surviving task or successor.
+    pub(crate) fn retire_image(&mut self, image: ImageIdentity) -> Vec<(u64, Route)> {
+        if RetirementLedger::index(image.task_cookie).is_none() {
+            return Vec::new();
         }
-        self.retired.insert(cookie);
+        let key = ImageKey::from(image);
+        if self.limits.retired_cookies == 0 {
+            self.retirement.retire_image(key);
+        } else {
+            if let Some(evicted) = evict_for_insert(
+                &mut self.retired,
+                &key,
+                self.limits.retired_cookies,
+                &mut self.counters.retired_evictions,
+            ) {
+                self.retirement.retire_image(evicted);
+            }
+            self.retired.insert(key);
+        }
         let keys: Vec<_> = self
             .observed
             .keys()
-            .filter(|(owner, _)| *owner == cookie)
+            .filter(|(owner, _)| *owner == key)
             .copied()
             .collect();
         for key in keys {
@@ -701,34 +764,111 @@ impl InstanceRouter {
                 self.ranges -= list.iter().map(|o| o.ranges.len()).sum::<usize>();
             }
         }
-        self.fail_pending(|call| call.facts.cookie == cookie, UnknownReason::Retired)
+        self.fail_pending(|call| call.facts.image == image, UnknownReason::Retired)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retire_process(&mut self, cookie: u64) -> Vec<(u64, Route)> {
+        self.retire_task_cookie(cookie)
+    }
+
+    // Accessible in production only through the future adapter's sealed
+    // original-pidfd terminal proof; tests exercise the same retirement body.
+    fn retire_task_cookie(&mut self, cookie: u64) -> Vec<(u64, Route)> {
+        if RetirementLedger::index(cookie).is_none() {
+            return Vec::new();
+        }
+        self.retirement.retire_task(cookie);
+        let mut resolved = self.retire_image(ImageIdentity {
+            task_cookie: cookie,
+            exec_id: 0,
+        });
+        let keys: Vec<_> = self
+            .observed
+            .keys()
+            .filter(|(owner, _)| owner.cookie == cookie)
+            .copied()
+            .collect();
+        for key in keys {
+            if let Some(list) = self.observed.remove(&key) {
+                self.ranges -= list.iter().map(|o| o.ranges.len()).sum::<usize>();
+            }
+        }
+        resolved.extend(self.fail_pending(
+            |call| call.facts.image.task_cookie == cookie,
+            UnknownReason::Retired,
+        ));
+        resolved
     }
 
     /// Records one stable observation and resolves pending calls that it
     /// decides. Same epochs + no new range = continuity.
-    pub(crate) fn observe(
+    pub(crate) fn observe(&mut self, proof: ImageScanProof) -> (ObserveOutcome, Vec<(u64, Route)>) {
+        if proof.domain() != self.domain {
+            return (ObserveOutcome::ForeignDomain, Vec::new());
+        }
+        let image = ImageKey::from(proof.image());
+        let epochs = proof.epochs();
+        self.observe_reading(
+            image,
+            StableObservation {
+                file_slot: proof.file_slot(),
+                reading: EpochReading {
+                    cookie: proof.image().task_cookie,
+                    local: epochs.local,
+                    record_flags: epochs.record_flags,
+                    global: epochs.global,
+                    fault: epochs.fault,
+                    sticky: epochs.sticky,
+                },
+                ranges: proof.ranges().to_vec(),
+                fence: proof.fence(),
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_legacy(
         &mut self,
         observation: StableObservation,
     ) -> (ObserveOutcome, Vec<(u64, Route)>) {
-        let cookie = observation.reading.cookie;
+        let image = ImageKey {
+            cookie: observation.reading.cookie,
+            exec: 0,
+        };
+        self.observe_reading(image, observation)
+    }
+
+    fn observe_reading(
+        &mut self,
+        image: ImageKey,
+        observation: StableObservation,
+    ) -> (ObserveOutcome, Vec<(u64, Route)>) {
         let file = observation.file_slot;
-        if self.retired.contains(&cookie) {
-            return (ObserveOutcome::Retired, Vec::new());
+        if RetirementLedger::index(image.cookie).is_none() || file >= instance::FILE_SLOTS {
+            return (ObserveOutcome::InvalidImage, Vec::new());
         }
-        if self.retired_before_eviction(cookie) {
-            // A delayed observation for a retirement lost to capacity
-            // pressure: refuse, never accept as a new incarnation. Cookies
-            // with a retained observation keep continuity below.
-            return (ObserveOutcome::Retired, Vec::new());
-        }
-        if observation.fence != self.fence
+        if self.authority_failed
+            || self.image_failed
+            || self.sticky != 0
+            || observation.fence != self.fence
             || observation.reading.fault != self.fault
             || self.miss_latched
         {
-            // A scan acquired before the last fault-era reset is stale even
-            // when its fault reading already matches the new era: the reset
-            // cleared the observations and the retirement watermark it was
-            // validated against. Fresh scans re-observe below.
+            return (ObserveOutcome::StaleEra, Vec::new());
+        }
+        if self.image_retired(image) {
+            return (ObserveOutcome::Retired, Vec::new());
+        }
+        if [
+            observation.reading.local,
+            observation.reading.global,
+            observation.reading.fault,
+        ]
+        .into_iter()
+        .any(|value| value > u64::from(u32::MAX))
+            || observation.reading.record_flags != 0
+        {
             return (ObserveOutcome::StaleEra, Vec::new());
         }
         if observation.reading.sticky != 0 {
@@ -737,7 +877,7 @@ impl InstanceRouter {
         }
         self.counters.observations += 1;
         let epochs = EpochKey::of(&observation.reading);
-        let key = (cookie, file);
+        let key = (image, file);
         if self.faulted.contains(&key) {
             return (ObserveOutcome::CoverageFault, Vec::new());
         }
@@ -781,7 +921,10 @@ impl InstanceRouter {
                         self.ranges -= list.iter().map(|o| o.ranges.len()).sum::<usize>();
                     }
                     let resolved = self.fail_pending(
-                        |call| call.facts.cookie == cookie && stamp_file(&call.facts) == Some(file),
+                        |call| {
+                            ImageKey::from(call.facts.image) == image
+                                && stamp_file(&call.facts) == Some(file)
+                        },
                         UnknownReason::CoverageFault,
                     );
                     return (ObserveOutcome::CoverageFault, resolved);
@@ -793,7 +936,7 @@ impl InstanceRouter {
                 if self.ranges + observation.ranges.len() > self.limits.ranges {
                     let resolved = self.fail_pending(
                         |call| {
-                            call.facts.cookie == cookie
+                            ImageKey::from(call.facts.image) == image
                                 && stamp_file(&call.facts) == Some(file)
                                 && epochs.matches(&call.facts.entry)
                         },
@@ -832,7 +975,7 @@ impl InstanceRouter {
                 ObserveOutcome::New
             }
         };
-        let resolved = self.resolve_pending(cookie, file);
+        let resolved = self.resolve_pending(image, file);
         (outcome, resolved)
     }
 
@@ -856,38 +999,34 @@ impl InstanceRouter {
         }
     }
 
-    /// Reason precedence (N2): first match wins, in this order —
-    /// 1. capture-sticky refusal; 2. the ENTRY stamp's refusal flags
-    ///    (`Unstamped` covers `NO_TASK`, which also means "never stamped");
-    /// 3. entry/return inequality (`Straddle` — a refusal flag on the RETURN
-    ///    stamp only therefore surfaces as `Straddle`, never as its flag);
-    /// 4. the ambient era (stale fault generation or the latched miss era);
-    /// 5. process state (`Retired` — remembered tombstones plus, after a
-    ///    retired eviction, the per-era watermark for cookies with no
-    ///    retained observation — then the sticky `CoverageFault`:
-    ///    remembered tombstones and, after a faulted eviction, the P2-1
-    ///    overflow latch for every unknown key);
-    /// 6. epoch knowledge (`Pending` while a newer-or-equal epoch may still
-    ///    be observed — including evicted epochs, which resolve only when a
-    ///    later observation arrives (no fail-on-evict) — else `Unobserved`
-    ///    or `Evicted`); 7. the IP checks (`IpOutside`, `NotExecutable`,
-    ///    `OffsetMismatch`, `Unpartitionable`, `InstanceCapacity`).
-    ///
-    /// Per-call facts beat ambient state; ambient state beats process state.
-    /// (`observe` has its own gate order: `Retired`, stale era (scan
-    /// fence, fault, or miss latch), then a sticky reading, which audits
-    /// the sticky bits and reports `StaleEra`. Calls refused by
-    /// `RangeCapacity` pend and expire as `Unobserved`.)
+    /// Domain/identity and permanent authority failure precede call flags;
+    /// clean equal stamps then require the current fault, a live full image,
+    /// retained matching epochs and an executable range at the exact offset.
     fn decide(&self, facts: &CallFacts, may_wait: bool) -> Route {
         use UnknownReason as U;
         let entry = facts.entry;
+        if facts.domain != self.domain {
+            return Route::Unknown(U::ForeignDomain);
+        }
+        if RetirementLedger::index(facts.image.task_cookie).is_none() {
+            return Route::Unknown(U::InvalidImage);
+        }
+        if self.authority_failed {
+            return Route::Unknown(U::AuthorityExhausted);
+        }
+        if self.image_failed {
+            return Route::Unknown(U::CoverageFault);
+        }
         if self.sticky != 0 {
             return Route::Unknown(U::Sticky);
         }
         if entry.flags & instance::STAMP_VALID == 0 || entry.flags & instance::STAMP_NO_TASK != 0 {
             return Route::Unknown(U::Unstamped);
         }
-        if entry.flags & instance::STAMP_NO_FILE != 0 || entry.file_slot_plus1 == 0 {
+        if entry.flags & instance::STAMP_NO_FILE != 0
+            || entry.file_slot_plus1 == 0
+            || u32::from(entry.file_slot_plus1) > instance::FILE_SLOTS
+        {
             return Route::Unknown(U::NoFile);
         }
         if entry.flags & instance::STAMP_SHARED_MM != 0 {
@@ -908,16 +1047,12 @@ impl InstanceRouter {
         if entry.fault != self.fault as u32 || self.miss_latched {
             return Route::Unknown(U::FaultEra);
         }
-        if self.retired.contains(&facts.cookie) {
-            return Route::Unknown(U::Retired);
-        }
-        if self.retired_before_eviction(facts.cookie) {
-            // The P2-1 analogue for retirements: an evicted tombstone
-            // refuses its cookie's calls, never Pendings them.
+        let image = ImageKey::from(facts.image);
+        if self.image_retired(image) {
             return Route::Unknown(U::Retired);
         }
         let file = u32::from(entry.file_slot_plus1) - 1;
-        let key = (facts.cookie, file);
+        let key = (image, file);
         if self.faulted.contains(&key) {
             return Route::Unknown(U::CoverageFault);
         }
@@ -953,12 +1088,12 @@ impl InstanceRouter {
         }
     }
 
-    fn resolve_pending(&mut self, cookie: u64, file: u32) -> Vec<(u64, Route)> {
+    fn resolve_pending(&mut self, image: ImageKey, file: u32) -> Vec<(u64, Route)> {
         let mut resolved = Vec::new();
         let mut kept = VecDeque::with_capacity(self.pending.len());
         let pending = std::mem::take(&mut self.pending);
         for call in pending {
-            if call.facts.cookie != cookie || stamp_file(&call.facts) != Some(file) {
+            if ImageKey::from(call.facts.image) != image || stamp_file(&call.facts) != Some(file) {
                 kept.push_back(call);
                 continue;
             }
@@ -980,9 +1115,18 @@ impl InstanceRouter {
 
     /// Ends every pending call that a scan could not decide (for example the
     /// process exited before any stable scan): returns them as unknown.
+    pub(crate) fn expire_image(&mut self, image: ImageIdentity) -> Vec<(u64, Route)> {
+        self.fail_pending(|call| call.facts.image == image, UnknownReason::Unobserved)
+    }
+
+    #[cfg(test)]
     pub(crate) fn expire_pending(&mut self, cookie: u64) -> Vec<(u64, Route)> {
+        self.expire_cookie(cookie)
+    }
+
+    fn expire_cookie(&mut self, cookie: u64) -> Vec<(u64, Route)> {
         self.fail_pending(
-            |call| call.facts.cookie == cookie,
+            |call| call.facts.image.task_cookie == cookie,
             UnknownReason::Unobserved,
         )
     }
@@ -1006,7 +1150,7 @@ impl InstanceRouter {
     }
 
     fn mint(&mut self) -> Option<InstanceId> {
-        if self.minted >= self.limits.instances {
+        if self.minted >= self.limits.instances || self.next_id == 0 {
             return None;
         }
         let id = InstanceId(self.next_id);

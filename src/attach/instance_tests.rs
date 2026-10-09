@@ -325,9 +325,10 @@ impl Harness {
             .iter()
             .map(|slot| (slot.index, slot.file_offset))
             .collect();
+        let domain = session.native_domain().context("native router domain")?;
         Ok(Self {
             session,
-            router: InstanceRouter::new(RouterLimits::default()),
+            router: InstanceRouter::new(domain, RouterLimits::default()),
             file_slot: watched.file_slot,
             maps_keys: watched.maps_keys,
             identity: watched.identity,
@@ -382,7 +383,7 @@ impl Harness {
                 return Ok(None);
             }
         };
-        let (outcome, resolved) = self.router.observe(observation);
+        let (outcome, resolved) = self.router.observe_legacy(observation);
         *self
             .scan
             .outcomes
@@ -439,7 +440,8 @@ impl Harness {
             self.awaiting.insert(token, (event.slot, event.slot_id));
             let route = self.router.route(CallFacts {
                 token,
-                cookie: event.image.task_cookie,
+                domain: self.router.domain(),
+                image: event.image,
                 entry: continuity.entry_stamp,
                 ret: continuity.return_stamp,
                 ip: EntryIp::new(continuity.entry_ip),
@@ -726,7 +728,10 @@ fn native_full_image_multi_query_and_scan(abi: ElfAbi) -> Result<()> {
         .map(|(name, stats)| (name, stats.program_id))
         .collect::<BTreeMap<_, _>>();
     ensure!(hook_ids.len() == 4 && session.instance_tracking().hook_link_count() == 4);
-    let router = InstanceRouter::new(RouterLimits::default());
+    let router = InstanceRouter::new(
+        session.native_domain().context("native router domain")?,
+        RouterLimits::default(),
+    );
     let fence = router.fence();
     let scan = session
         .scan_image(&target.pin, plan.slots[0].object, window()?, fence, || {

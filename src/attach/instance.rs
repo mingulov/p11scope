@@ -760,10 +760,105 @@ fn raise_mmapped_fault(fd: BorrowedFd<'_>) -> Result<u64> {
     // SAFETY: cell 0 is an aligned u64 inside the mapped page; the kernel
     // side uses compare-exchange on the same cell.
     let cell = unsafe { &*(address as *const std::sync::atomic::AtomicU64) };
-    let raised = cell.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    let raised = raise_fault_cell(cell);
     // SAFETY: exactly the mapping created above.
     unsafe { libc::munmap(address, 4096) };
-    Ok(raised)
+    raised
+}
+
+fn raise_fault_cell(cell: &std::sync::atomic::AtomicU64) -> Result<u64> {
+    use std::sync::atomic::Ordering;
+    let mut seen = cell.load(Ordering::SeqCst);
+    for _ in 0..8 {
+        ensure!(
+            seen <= u64::from(u32::MAX),
+            "instance fault generation exhausted"
+        );
+        let next = seen + 1;
+        match cell.compare_exchange(seen, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => {
+                ensure!(
+                    next <= u64::from(u32::MAX),
+                    "instance fault generation exhausted"
+                );
+                return Ok(next);
+            }
+            Err(current) => seen = current,
+        }
+    }
+    bail!("instance fault generation contention")
+}
+
+#[cfg(test)]
+mod fault_raise_tests {
+    use super::raise_fault_cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    #[test]
+    fn healthy_fault_raise_updates_the_real_atomic_cell() {
+        let cell = AtomicU64::new(41);
+        assert_eq!(raise_fault_cell(&cell).unwrap(), 42);
+        assert_eq!(cell.load(Ordering::SeqCst), 42);
+    }
+
+    #[test]
+    fn last_representable_fault_raise_then_sentinel_refuses() {
+        let cell = AtomicU64::new(u64::from(u32::MAX) - 1);
+        assert_eq!(raise_fault_cell(&cell).unwrap(), u64::from(u32::MAX));
+        assert!(raise_fault_cell(&cell).is_err());
+        assert_eq!(cell.load(Ordering::SeqCst), u64::from(u32::MAX) + 1);
+        assert!(raise_fault_cell(&cell).is_err());
+        assert_eq!(cell.load(Ordering::SeqCst), u64::from(u32::MAX) + 1);
+    }
+
+    #[test]
+    fn fault_raise_never_moves_an_unrepresentable_cell() {
+        let cell = AtomicU64::new(u64::from(u32::MAX) + 1);
+        assert!(raise_fault_cell(&cell).is_err());
+        assert_eq!(cell.load(Ordering::SeqCst), u64::from(u32::MAX) + 1);
+    }
+
+    #[test]
+    fn fault_raise_u64_max_returns_an_error_without_panic_or_wrap() {
+        let cell = AtomicU64::new(u64::MAX);
+        let result = std::panic::catch_unwind(|| raise_fault_cell(&cell));
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "exhaustion must return an ordinary refusal"
+        );
+        assert_eq!(cell.load(Ordering::SeqCst), u64::MAX);
+    }
+
+    #[test]
+    fn competing_fault_writers_never_reopen_an_exhausted_era() {
+        let cell = Arc::new(AtomicU64::new(u64::from(u32::MAX) - 1));
+        let barrier = Arc::new(Barrier::new(4));
+        let writers: Vec<_> = (0..3)
+            .map(|_| {
+                let cell = Arc::clone(&cell);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    raise_fault_cell(&cell)
+                })
+            })
+            .collect();
+        barrier.wait();
+        let results: Vec<_> = writers
+            .into_iter()
+            .map(|writer| writer.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().ok())
+                .all(|raised| *raised == u64::from(u32::MAX))
+        );
+        assert_eq!(cell.load(Ordering::SeqCst), u64::from(u32::MAX) + 1);
+        assert!(raise_fault_cell(&cell).is_err());
+    }
 }
 
 fn task_storage_lookup<T: Copy + Default>(

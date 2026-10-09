@@ -63,6 +63,15 @@ pub fn bpf_cargo_command(
     Ok(command)
 }
 
+pub fn isolate_bpf_output(command: &mut Command, target_dir: &Path) {
+    // Modern Cargo separates intermediate output; sharing a release build lock
+    // with the parent can deadlock its build-script child.
+    command
+        .arg("--target-dir")
+        .arg(target_dir)
+        .env("CARGO_BUILD_BUILD_DIR", target_dir);
+}
+
 fn selected_rustc_library_path(rustc: &Path) -> Result<PathBuf, String> {
     let output = Command::new(rustc)
         .args(["--print", "sysroot"])

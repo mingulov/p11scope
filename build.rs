@@ -293,9 +293,8 @@ fn build_variant(
         "build-std=core",
         "--manifest-path",
     ])
-    .arg(&ebpf_manifest)
-    .arg("--target-dir")
-    .arg(&target_dir);
+    .arg(&ebpf_manifest);
+    bpf_tools::isolate_bpf_output(&mut cmd, &target_dir);
     let mut features = Vec::new();
     match flavor {
         BpfFlavor::Detailed if wide_detailed => features.push("wide-detailed-2112"),

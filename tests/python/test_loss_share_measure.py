@@ -6,8 +6,14 @@ scripts/system-scope-measure.py, never copied.
 Run: python3 -I tests/python/test_loss_share_measure.py -v
 """
 
+import contextlib
+import io
+import json
 import runpy
+import tempfile
+import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -39,6 +45,132 @@ def trace_fixture(*, lost_values=(), truncated=False, functions=(),
         '"completeness": "PARTIAL", "attached_probes": 136, "slots": 68, '
         '"event_loss": %d}' % (lost_values[-1] if lost_values else 0))
     return "\n".join(lines) + "\n"
+
+
+class TraceIdentityConsumerTests(unittest.TestCase):
+    def test_unknown_and_legacy_rows_keep_exact_stream_counts(self):
+        text = trace_fixture(functions=["C_Sign", "C_Sign"])
+        text = text.replace("pid 111 tid 111", "Unknown executable (PID 111, TID 111)", 1)
+        text = text.replace("CAPTURE privacy=allowlisted\n", "CAPTURE privacy=allowlisted\n"
+            "Trace — completed call events in arrival order\n"
+            "Executable identity unavailable; event PID/TID remain diagnostic identifiers.\n")
+        result = MEASURE["parse_trace_stream"](text.splitlines())
+        self.assertEqual(result["call_lines_total"], 2)
+        self.assertEqual(result["per_function"], {"C_Sign": 2})
+
+    def test_unknown_prefix_cannot_hide_malformed_or_named_identity(self):
+        text = trace_fixture(functions=["C_Sign"])
+        for prefix in [
+            "Unknown executable (PID 111 TID 111)",
+            "Unknown executable (PID 111, TID 111", "python3 (PID 111, TID 111)",
+            "Unknown executable (PID -1, TID 111)",
+            "Unknown executable (PID 111, TID 111) pid 111 tid 111",
+            "pid 111 tid 111 Unknown executable (PID 111, TID 111)",
+        ]:
+            with self.subTest(prefix=prefix), self.assertRaises(ValueError):
+                MEASURE["parse_trace_stream"](text.replace("pid 111 tid 111", prefix).splitlines())
+
+    def test_canary_scanner_strips_only_diagnostic_prefix(self):
+        checker = runpy.run_path(str(ROOT / "scripts/check-canary-evidence.py"))
+        line = "00:00:00.000000 Unknown executable (PID 111, TID 112) C_Sign → CKR_OK 12.0µs"
+        rest = checker["trace_scannable"]("fixture", line)
+        self.assertEqual(rest, "C_Sign → CKR_OK 12.0µs")
+        for prefix in ["python3 (PID 111, TID 112)",
+            "Unknown executable (PID 111 TID 112)",
+            "Unknown executable (PID 111, TID 112) pid 111 tid 112",
+            "pid 111 tid 112 Unknown executable (PID 111, TID 112)"]:
+            with self.subTest(prefix=prefix), self.assertRaises(AssertionError):
+                checker["trace_scannable"]("fixture", line.replace("Unknown executable (PID 111, TID 112)", prefix))
+        # Only diagnostic positions are exempted; private sentinel spellings in
+        # the function/payload suffix still reach the actual privacy scanner.
+        sentinel = next(iter(checker["LOADER_PAUSE_IDENTITIES"].values()))
+        bad = line + " " + str(sentinel)
+        with self.assertRaises(AssertionError):
+            checker["assert_no_loader_pause_identity"]("fixture", checker["trace_scannable"]("fixture", bad))
+
+    def test_kind_oracle_preserves_pid_extraction_and_rejects_mixed_rows(self):
+        with mock.patch.object(sys, "argv", ["kind-e2e-oracle.py", "--self-test"]):
+            oracle = runpy.run_path(str(ROOT / "scripts/kind-e2e-oracle.py"))
+        legacy = oracle["good_trace"](2)
+        new = legacy.replace("pid 77 tid 77", "Unknown executable (PID 77, TID 77)")
+        result = oracle["trace_exact"](new, 2)
+        self.assertEqual(result["trace_pids"], [77])
+        self.assertEqual(result["calls"], 2 * len(oracle["LEDGER_FUNCTIONS"]))
+        mixed = legacy.replace("pid 77 tid 77", "Unknown executable (PID 77, TID 77)", 1)
+        self.assertEqual(oracle["trace_exact"](mixed, 2), result)
+        for prefix in ["python3 (PID 77, TID 77)", "Unknown executable (PID 77 TID 77)",
+            "Unknown executable (PID 77, TID 77) pid 77 tid 77",
+            "pid 77 tid 77 Unknown executable (PID 77, TID 77)"]:
+            line = f"03:48:03.000000 {prefix} C_Digest → CKR_OK 1.0µs\n"
+            with self.subTest(prefix=prefix), self.assertRaises(AssertionError):
+                oracle["trace_exact"](new + line, 2)
+
+
+    def test_session_identity_duplicates_fail_after_deterministic_session_parse(self):
+        checker = runpy.run_path(str(ROOT / "scripts/check-canary-evidence.py"))
+        outer = ["pid 111 tid 111", "Unknown executable (PID 111, TID 111)"]
+        inner = ["pid 111 tid 111", "Unknown executable (PID 111, TID 111)"]
+        for first in outer:
+            for session in ["", "sess#7 "]:
+                for second in inner:
+                    prefix = f"{first} {session}{second}"
+                    text = trace_fixture(functions=["C_Sign"]).replace("pid 111 tid 111", prefix)
+                    line = text.splitlines()[1]
+                    with self.subTest(prefix=prefix, consumer="measurement"), self.assertRaises(ValueError):
+                        MEASURE["parse_trace_stream"](text.splitlines())
+                    with self.subTest(prefix=prefix, consumer="privacy"), self.assertRaises(AssertionError):
+                        checker["trace_scannable"]("fixture", line)
+        for first in outer:
+            for function in ["C_Sign", "unknown#11|unknown#24", r"C_Sign\n\u{1b}[2J"]:
+                text = trace_fixture(functions=[function]).replace("pid 111 tid 111", f"{first} sess#7")
+                self.assertEqual(MEASURE["parse_trace_stream"](text.splitlines())["per_function"], {function: 1})
+                self.assertTrue(checker["trace_scannable"]("fixture", text.splitlines()[1]).startswith("sess#7 " + function))
+            sentinel = next(iter(checker["LOADER_PAUSE_IDENTITIES"].values()))
+            line = f"03:15:44.123456 {first} sess#7 C_Sign {sentinel} → CKR_OK 1.0µs"
+            with self.assertRaises(AssertionError):
+                checker["assert_no_loader_pause_identity"]("fixture", checker["trace_scannable"]("fixture", line))
+
+    def test_actual_pidns_extraction_and_namespace_condition_accept_both_formats(self):
+        source = (ROOT / "scripts/matrix/verify-pidns.sh").read_text()
+        block = source.split('  d=$(python3 - "$OUT" "$ITERS" <<\'PY\'\n', 1)[1].split("\nPY\n", 1)[0]
+        condition = next(line for line in source.splitlines() if line.startswith("  result nested-trace "))
+        condition = condition.split("python3 -c '", 1)[1].split("'", 1)[0]
+
+        def extract(prefix, *, nested=7, copies=6):
+            with tempfile.TemporaryDirectory() as raw:
+                tmp = Path(raw)
+                event = f"00:00:00.000000 {prefix} C_Sign → CKR_OK 12.0µs\n"
+                evidence = {"pid_namespace": {"observer": "nested", "kernel_pids": "initial"},
+                            "gap_classes": {"observation": {"status": "lossy"}}}
+                (tmp / "nested-trace.txt").write_text(event * copies + "EVIDENCE " + json.dumps(evidence) + "\n")
+                (tmp / "nested-trace.wl").write_text(f"READY pid={nested}\n")
+                (tmp / "nested-trace.rc").write_text("0\n")
+                output = io.StringIO()
+                with mock.patch.object(sys, "argv", ["fixture", str(tmp), "1"]), contextlib.redirect_stdout(output):
+                    exec(compile(block, str(ROOT / "scripts/matrix/verify-pidns.sh"), "exec"), {})
+                record = json.loads(output.getvalue())
+                output = io.StringIO()
+                with mock.patch.object(sys, "argv", ["fixture", json.dumps(record)]), contextlib.redirect_stdout(output):
+                    exec(compile(condition, "pidns namespace condition", "exec"), {})
+                return record, output.getvalue().strip()
+
+        for first in ["pid 111 tid 112", "Unknown executable (PID 111, TID 112)"]:
+            for session in ["", " sess#7"]:
+                with self.subTest(prefix=first + session):
+                    record, verdict = extract(first + session)
+                    self.assertEqual(record["printed_pids"], [111])
+                    self.assertEqual(record["call_lines"], 6)
+                    self.assertEqual(verdict, "1")
+            self.assertEqual(extract(first, nested=111)[1], "0")
+            self.assertEqual(extract(first, copies=0)[1], "0")
+            for session in ["", " sess#7"]:
+                for second in ["pid 111 tid 112", "Unknown executable (PID 111, TID 112)"]:
+                    with self.subTest(prefix=first + session + " " + second), self.assertRaises(AssertionError):
+                        extract(first + session + " " + second)
+        for prefix in ["python3 (PID 111, TID 112)", "Unknown executable (PID 111 TID 112)",
+                       "Unknown executable (PID 111, TID 112", "pid -1 tid 112"]:
+            with self.subTest(prefix=prefix), self.assertRaises(AssertionError):
+                extract(prefix)
 
 
 class TraceStreamTests(unittest.TestCase):

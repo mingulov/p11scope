@@ -1594,8 +1594,73 @@ pub(crate) fn fmt_ns(ns: Option<u64>) -> String {
     }
 }
 
-/// One refreshing screen. Rows with no activity are omitted; the evidence
-/// line is always present.
+fn scope_label(scope: &str) -> &'static str {
+    match scope {
+        "pid" => "PID",
+        "cgroup" => "cgroup",
+        "system" => "system",
+        _ => "selected",
+    }
+}
+
+/// Human context from aggregate map rows and the existing evidence verdict.
+/// Scope is a kind, never a target PID, path or application identity.
+pub fn scope_summary(scope: &str, reports: &[SlotReport], ev: &Evidence) -> String {
+    let sum = |field: fn(&SlotReport) -> u64| {
+        reports
+            .iter()
+            .fold(0u64, |total, row| total.saturating_add(field(row)))
+    };
+    let calls = sum(|row| row.calls);
+    let errors = sum(|row| row.errors);
+    let open = sum(|row| row.in_flight);
+    let mut text = format!(
+        "Scope: {} scope\nAggregate across the selected scope; counts are not per application.\n",
+        scope_label(scope)
+    );
+    if calls == 0 {
+        text.push_str(if ev.completeness == "COMPLETE" {
+            "No completed calls observed during this window.\n"
+        } else {
+            "No completed calls observed; coverage incomplete.\n"
+        });
+    }
+    text.push_str(&format!(
+        "{calls} completed calls; {errors} returned errors; {open} entries without an observed return.\n"
+    ));
+    text.push_str(&format!(
+        "Coverage {}{}\n",
+        escape_controls(ev.completeness),
+        escape_controls(&verdict_reasons(ev)),
+    ));
+    if ev.event_loss > 0 {
+        text.push_str(
+            "Coverage partial: event detail was lost. Aggregate counts use the counter maps.\n",
+        );
+    }
+    for (has_owner_gap, total, description) in [
+        (
+            reports.iter().any(|row| row.module_ambiguous),
+            sum(|row| if row.module_ambiguous { row.calls } else { 0 }),
+            "ambiguous",
+        ),
+        (
+            reports.iter().any(|row| row.module_unresolved),
+            sum(|row| if row.module_unresolved { row.calls } else { 0 }),
+            "unresolved",
+        ),
+    ] {
+        if has_owner_gap {
+            text.push_str(&format!(
+                "{total} completed calls have {description} module ownership.\n"
+            ));
+        }
+    }
+    text
+}
+
+/// One refreshing screen for consumers without a retained scope kind.
+/// Rows with no activity are omitted; the evidence line is always present.
 pub fn live(
     reports: &[SlotReport],
     ev: &Evidence,
@@ -1604,14 +1669,33 @@ pub fn live(
     mode: &str,
     policy: CapturePolicy,
 ) -> String {
+    live_scoped(reports, ev, elapsed, module, mode, policy, "selected")
+}
+
+/// The capture renderer receives only the validated scope kind.
+pub fn live_scoped(
+    reports: &[SlotReport],
+    ev: &Evidence,
+    elapsed: Duration,
+    module: &str,
+    mode: &str,
+    policy: CapturePolicy,
+    scope: &str,
+) -> String {
     let mut s = String::new();
     s.push_str(&format!(
-        "p11scope — {module} — up {:02}:{:02}:{:02} — mode {mode} — privacy={}\n",
+        "p11scope — {} scope — up {:02}:{:02}:{:02} — mode {} — privacy={} — {}\n",
+        scope_label(scope),
         elapsed.as_secs() / 3600,
         (elapsed.as_secs() % 3600) / 60,
         elapsed.as_secs() % 60,
+        escape_controls(mode),
         policy.privacy_mode(),
+        escape_controls(module),
     ));
+    s.push_str(&scope_summary(scope, reports, ev));
+    s.push_str("CALLS = completed calls; ERR = returned errors; IN-FLIGHT = entries without an observed return.\n");
+    s.push_str("Latency units: ns/us/ms/s (us displayed as µs); ~ = log2-bucket approximation, lower bound.\n");
     s.push_str(&format!(
         "{:<28} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
         "FUNCTION", "CALLS", "ERR", "p50~", "p95~", "p99~", "IN-FLIGHT"
@@ -1624,7 +1708,7 @@ pub fn live(
     for r in rows {
         s.push_str(&format!(
             "{:<28} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
-            label(r),
+            escape_controls(&label(r)),
             r.calls,
             r.errors,
             fmt_ns(percentile_ns(&r.buckets, 0.50)),
@@ -1671,7 +1755,8 @@ pub fn live(
     // F-13: why the verdict is what it is, from the classes the verdict used,
     // so a gate can never force PARTIAL without being named here.
     evidence_line.push_str(&format!(" → {}{}\n", ev.completeness, verdict_reasons(ev)));
-    s.push_str(&evidence_line);
+    s.push_str(&escape_controls(evidence_line.trim_end()));
+    s.push('\n');
     s
 }
 
@@ -3628,7 +3713,9 @@ pub(crate) mod tests {
             let ordinal = crate::discovery::scan::standard_ordinal("C_OpenSession").unwrap();
             assert_eq!(
                 &line[15..],
-                format!(" pid 100 tid 1 unknown#{ordinal} [semantics unverified] → {rv} 100ns"),
+                format!(
+                    " Unknown executable (PID 100, TID 1) unknown#{ordinal} [semantics unverified] → {rv} 100ns"
+                ),
                 "the generated trace must retain every aggregate RV without semantic payload"
             );
         }

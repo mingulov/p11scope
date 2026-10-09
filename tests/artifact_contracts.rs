@@ -9465,8 +9465,11 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
             "ev.apply_stop_quiescence(consumers.stop_quiescence);",
             "ev.settle_terminal(profile);",
         ),
-        ("ev.settle_terminal(profile);", "let frame = render::live("),
-        ("let frame = render::live(", "write_stdout("),
+        (
+            "ev.settle_terminal(profile);",
+            "let frame = render::live_scoped(",
+        ),
+        ("let frame = render::live_scoped(", "write_stdout("),
     ] {
         require_before(
             profile_terminal,

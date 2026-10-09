@@ -109,6 +109,71 @@ def owner_population(manifest, ledger, initial, last):
     initial.update(copy.deepcopy(last))
 
 
+def refusal_case(limit=4096):
+    """Single-shot N+1 refusal: demand exactly one past the selected budget.
+
+    Sixty full 68-endpoint copies plus a 17-endpoint tail make 4,097; the
+    tail is refused whole with the lowering wording observed on a real N+1
+    run, and the admitted 4,080 endpoints keep exact native counts.
+    """
+    demand = limit + 1
+    full, tail = divmod(demand, 68)
+    providers = []
+    for index in range(full + 1):
+        unique = 68 if index < full else tail
+        offsets = [4096 + 16 * offset for offset in range(unique)]
+        providers.append({"key": f"p{index}", "path": f"/owned/{index}.so",
+                          "pin": {"dev": [0, 35], "ino": 100 + index, "sha256": "a" * 64},
+                          "offsets": offsets})
+    refused_key = providers[-1]["key"]
+    owner = {"pid": 4000, "start_time": 50, "exe": "/owned/driver",
+             "providers": [provider["key"] for provider in providers], "ledger": "owner.jsonl"}
+    ledger = [{"kind": "owner", "pid": 4000, "start_time": 50, "exe": "/owned/driver"}]
+    for provider in providers:
+        ledger.append({"kind": "surface", "pid": 4000, "start_time": 50,
+                       "path": provider["path"], "dev": [0, 35],
+                       "ino": provider["pin"]["ino"], "offsets": provider["offsets"]})
+        ledger.append({"kind": "call", "pid": 4000, "start_time": 50,
+                       "path": provider["path"], "offset": 4096, "phase": "activity",
+                       "n": 11, "rv": 0, "t0": 100, "t1": 110})
+    admitted_endpoints = sum(len(provider["offsets"]) for provider in providers[:-1])
+    document = {"schema": "p11scope/inventory/v1", "scope": "system",
+                "budgets": {"inventory_endpoints": {"limit": limit, "occupied": admitted_endpoints, "refused": 0},
+                            "inventory_attach_modules": {"limit": limit, "occupied": full, "refused": 0},
+                            "endpoints": {"limit": 1048576, "occupied": admitted_endpoints, "refused": 0}},
+                "clock": {"basis": "CLOCK_MONOTONIC", "unit": "ns"},
+                "observation": {"lane": "native", "started_ns": 50, "ended_ns": 500,
+                                "retirement": "closed", "settlement": "unsettled"},
+                "gaps": [], "gaps_suppressed": 0, "modules": [],
+                "callers": [{"id": "c0", "pid": 4000, "start_time": 50,
+                             "image": {"authority": "native_exact"}}], "edges": []}
+    for index, provider in enumerate(providers):
+        unique = len(provider["offsets"])
+        if provider["key"] == refused_key:
+            admission = {"state": "refused", "endpoints": None,
+                         "reasons": [f"module needs {unique} more; only {limit} attach slots are available; "
+                                     f"{admitted_endpoints} are in use ({admitted_endpoints} active, 0 retired; "
+                                     f"held by /owned/0.so 68) \u2014 refusing to attach a prefix; to capture one "
+                                     f"provider, name it with --module <path>"]}
+        else:
+            admission = {"state": "admitted", "endpoints": unique, "reasons": []}
+        document["modules"].append({"id": f"m{index}", "paths": [provider["path"]],
+                                    "identity": {"device": {"major": 0, "minor": 35},
+                                                 "inode": 100 + index, "sha256": "a" * 64},
+                                    "admission": admission})
+        count = 0 if provider["key"] == refused_key else 11
+        document["edges"].append({"caller": "c0", "module": f"m{index}",
+                                  "mapping": {"state": "mapped", "evidence": "deep_scan"},
+                                  "entries": {"count": count, "observation": "observed",
+                                              "coverage": {"state": "counted", "lossy": False}}})
+    manifest = {"manifest": "p11scope-inventory-capacity/1", "population": "refusal",
+                "expect_lane": "native", "limit": limit, "demand": demand, "refusal_limit": limit,
+                "require_retirement": "closed", "providers": providers, "owners": [owner],
+                "phases": [{"name": "activity", "providers": [p["key"] for p in providers],
+                            "snapshot": "late.json"}]}
+    return manifest, ledger, document
+
+
 class CapacityOracleTests(unittest.TestCase):
     def run_case(self, mutate=None, want=0, check=None):
         manifest, ledger, initial, late = population()
@@ -241,6 +306,116 @@ class CapacityOracleTests(unittest.TestCase):
                 if row.get("phase") == "middle":
                     row["phase"] = "late"
         self.run_case(skipped, 1, "CAPACITY-GROWTH")
+
+    def run_refusal_case(self, mutate=None, want=0, check=None):
+        manifest, ledger, late = refusal_case()
+        if mutate:
+            mutate(manifest, ledger, late)
+        with tempfile.TemporaryDirectory(prefix="inventory-capacity-refusal-") as temporary:
+            directory = Path(temporary)
+            (directory / "capacity.json").write_text(json.dumps(manifest))
+            (directory / "late.json").write_text(json.dumps(late))
+            (directory / "owner.jsonl").write_text("".join(json.dumps(row) + "\n" for row in ledger))
+            result = subprocess.run([sys.executable, "-I", str(ORACLE), "capacity-check", temporary],
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, want, result.stdout + result.stderr)
+            if check:
+                self.assertIn(check, result.stdout)
+
+    def test_refusal_pair_accepts_named_whole_refusal(self):
+        self.run_refusal_case()
+
+    def test_refusal_accepts_absent_edge_for_refused_demand(self):
+        self.run_refusal_case(lambda _m, _l, late: late["edges"].pop())
+
+    def test_refusal_accepts_lifetime_wording_with_budget_gap(self):
+        def lifetime(_manifest, _ledger, late):
+            path = "/owned/60.so"
+            late["modules"][-1]["admission"]["reasons"] = [
+                f"{path} needs 17 more endpoints; the inventory attach set holds 4080 of 4096 "
+                f"capture-lifetime endpoints and never reuses an endpoint ID \u2014 refusing to add a prefix"]
+            late["gaps"].append({"caller": None, "module": "m60", "pid": None,
+                                 "subject": "inventory attach set refused module",
+                                 "reason": late["modules"][-1]["admission"]["reasons"][0],
+                                 "budget": {"resource": "inventory_endpoints", "limit": 4096,
+                                            "requested": 4097}, "repeats": 1})
+        self.run_refusal_case(lifetime)
+
+    def test_refusal_rejects_over_limit_occupation(self):
+        self.run_refusal_case(
+            lambda _m, _l, late: late["budgets"]["inventory_endpoints"].update(occupied=4097),
+            1, "CAPACITY-REFUSAL-BUDGET")
+
+    def test_refusal_rejects_silent_drop(self):
+        self.run_refusal_case(lambda _m, _l, late: late["modules"].pop(), 1, "CAPACITY-PROVIDER")
+
+    def test_refusal_rejects_truncated_admission(self):
+        self.run_refusal_case(
+            lambda _m, _l, late: late["modules"][0]["admission"].update(endpoints=67),
+            1, "CAPACITY-REFUSAL-VERDICT")
+
+    def test_refusal_rejects_partial_admission_reasons(self):
+        self.run_refusal_case(
+            lambda _m, _l, late: late["modules"][0]["admission"].update(reasons=["kept 60 of 68"]),
+            1, "CAPACITY-REFUSAL-VERDICT")
+
+    def test_refusal_rejects_unnamed_refusal(self):
+        self.run_refusal_case(
+            lambda _m, _l, late: late["modules"][-1]["admission"].update(reasons=["the set is full"]),
+            1, "CAPACITY-REFUSAL-VERDICT")
+
+    def test_refusal_rejects_wrong_needed_count(self):
+        def miscount(_manifest, _ledger, late):
+            reason = late["modules"][-1]["admission"]["reasons"][0]
+            late["modules"][-1]["admission"]["reasons"] = [reason.replace("needs 17 more", "needs 16 more")]
+        self.run_refusal_case(miscount, 1, "CAPACITY-REFUSAL-VERDICT")
+
+    def test_refusal_rejects_endpoints_on_refused_verdict(self):
+        self.run_refusal_case(
+            lambda _m, _l, late: late["modules"][-1]["admission"].update(endpoints=17),
+            1, "CAPACITY-REFUSAL-VERDICT")
+
+    def test_refusal_rejects_positive_on_refused_demand(self):
+        self.run_refusal_case(
+            lambda _m, _l, late: late["edges"][-1]["entries"].update(count=11),
+            1, "CAPACITY-REFUSAL-NO-COUNT")
+
+    def test_refusal_rejects_mismatched_pair(self):
+        self.run_refusal_case(lambda m, _l, _b: m.update(limit=4095), 1, "CAPACITY-REFUSAL-PAIR")
+
+    def test_refusal_rejects_stream_phase(self):
+        def streamed(manifest, _ledger, _late):
+            manifest["phases"] = [{"name": "activity", "providers": manifest["phases"][0]["providers"],
+                                   "stream": "events.jsonl", "until_ns": 2}]
+        self.run_refusal_case(streamed, 1, "CAPACITY-REFUSAL-SINGLE-SNAPSHOT")
+
+    def test_refusal_rejects_malformed_budget_gap(self):
+        def gap(_manifest, _ledger, late):
+            late["gaps"].append({"caller": None, "module": "m60", "pid": None,
+                                 "subject": "inventory attach set refused module",
+                                 "reason": "/owned/60.so needs 17 more endpoints",
+                                 "budget": {"resource": "inventory_endpoints", "limit": 4096,
+                                            "requested": 4096}, "repeats": 1})
+        self.run_refusal_case(gap, 1, "CAPACITY-REFUSAL-GAP")
+
+    def test_refusal_requires_gap_for_lifetime_wording(self):
+        def unrecorded(_manifest, _ledger, late):
+            path = "/owned/60.so"
+            late["modules"][-1]["admission"]["reasons"] = [
+                f"{path} needs 17 more endpoints; the inventory attach set holds 4080 of 4096 "
+                f"capture-lifetime endpoints and never reuses an endpoint ID \u2014 refusing to add a prefix"]
+        self.run_refusal_case(unrecorded, 1, "CAPACITY-REFUSAL-GAP")
+
+    def test_refusal_rejects_wrong_module_records(self):
+        self.run_refusal_case(
+            lambda _m, _l, late: late["budgets"]["inventory_attach_modules"].update(occupied=61),
+            1, "CAPACITY-REFUSAL-RECORDS")
+
+    def test_refusal_scan_lane_is_nonqualifying(self):
+        def scan(manifest, _ledger, late):
+            manifest["expect_lane"] = "scan"
+            late["observation"]["lane"] = "scan"
+        self.run_refusal_case(scan, 2, "CAPACITY-NATIVE")
 
 
 class CapacityFixtureTests(unittest.TestCase):
@@ -431,6 +606,66 @@ class CapacityFixtureTests(unittest.TestCase):
                             for provider in manifest["providers"] for offset in provider["offsets"]}
                 self.assertEqual(len(physical), demand)
                 self.assertGreater(len({provider["pin"]["ino"] for provider in manifest["providers"]}), 1)
+
+    def test_prepared_refusal_demands_are_exactly_one_past_their_limits(self):
+        with tempfile.TemporaryDirectory(prefix="inventory-capacity-refusal-") as temporary:
+            for limit, demand in ((4096, 4097), (6530, 6531), (8191, 8192)):
+                directory = Path(temporary) / str(demand)
+                result = subprocess.run([sys.executable, "-I", str(ORACLE), "capacity-prepare",
+                                         str(directory), "refusal", str(demand)],
+                                        text=True, capture_output=True, timeout=120)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                manifest = json.loads((directory / "capacity.json").read_text())
+                self.assertEqual(manifest["demand"], demand)
+                self.assertEqual(manifest["refusal_limit"], limit)
+                physical = {(*provider["pin"]["dev"], provider["pin"]["ino"], offset)
+                            for provider in manifest["providers"] for offset in provider["offsets"]}
+                self.assertEqual(len(physical), demand)
+                self.assertGreater(len({provider["pin"]["ino"] for provider in manifest["providers"]}), 1)
+
+    def test_refusal_runner_rejects_mismatched_limit_without_launching(self):
+        namespace = runpy.run_path(str(ORACLE))
+        manifest = {"demand": 4097, "refusal_limit": 4096, "providers": [], "owners": [], "phases": []}
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("mismatched refusal selection must fail before any launch")
+        with tempfile.TemporaryDirectory(prefix="inventory-capacity-refusal-guard-") as temporary:
+            with mock.patch.dict(namespace["capacity_run_owned"].__globals__, capacity_prepare=lambda *_: manifest):
+                with mock.patch.object(subprocess, "Popen", side_effect=forbidden):
+                    with namespace["CapacityCustody"]() as custody:
+                        with self.assertRaises(ValueError) as caught:
+                            namespace["capacity_run_owned"]("/owned/observer", temporary, "scan", "refusal",
+                                                           4095, 4097, os.getuid(), os.getgid(), custody)
+        self.assertIn("exactly one above", str(caught.exception))
+
+    def test_failed_refusal_observer_reaps_its_owned_capacity_target(self):
+        with tempfile.TemporaryDirectory(prefix="inventory-capacity-refusal-cleanup-") as temporary:
+            directory = Path(temporary)
+            observer = directory / "failed-observer"
+            observer.write_text("#!/bin/sh\nexit 7\n")
+            observer.chmod(0o755)
+            environment = dict(os.environ, CAPACITY_DURATION="1", CAPACITY_WAIT_S="1")
+            result = subprocess.run([sys.executable, "-I", str(ORACLE), "capacity-run", str(observer),
+                                     str(directory), "scan", "refusal", "4096", "4097",
+                                     str(os.getuid()), str(os.getgid())],
+                                    env=environment, capture_output=True, text=True, timeout=180)
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("observer exited", result.stderr)
+            ready = next(directory.glob("capacity-*/refusal/ready"))
+            pid = int(ready.read_text().split()[1])
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_runner_pairs_refusal_demand_with_its_limit(self):
+        matched = subprocess.run(["bash", str(SHELL), sys.executable,
+                                  "--capacity", "refusal", "--max-endpoints", "4096", "--demand", "4097"],
+                                 capture_output=True, text=True, timeout=5)
+        self.assertEqual(matched.returncode, 70, matched.stdout + matched.stderr)
+        self.assertIn("must run as root", matched.stderr)
+        mismatched = subprocess.run(["bash", str(SHELL), sys.executable,
+                                     "--capacity", "refusal", "--max-endpoints", "4096", "--demand", "6531"],
+                                    capture_output=True, text=True, timeout=5)
+        self.assertEqual(mismatched.returncode, 64, mismatched.stdout + mismatched.stderr)
+        self.assertIn("exactly one above", mismatched.stderr)
 
     def test_alias_surface_and_bounded_control_calls(self):
         with tempfile.TemporaryDirectory(prefix="inventory-capacity-fixture-") as temporary:

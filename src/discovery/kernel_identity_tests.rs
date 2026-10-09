@@ -58,6 +58,9 @@ fn fixture_session() -> IdentitySession {
             config: None,
             fail_config: false,
             reads: Cell::new(0),
+            target_steps: RefCell::new(std::collections::VecDeque::new()),
+            target_trace: Arc::new(std::sync::Mutex::new(FixtureRunTrace::default())),
+            scope_words: RefCell::new(BTreeMap::new()),
         },
         scope: crate::attach::identity_iter::ScopeBitmap::default(),
         generation: 0,
@@ -286,13 +289,13 @@ fn d3b_cap_losing_offer_does_not_enumerate_fds() {
 }
 
 #[derive(Clone, Copy)]
-struct FdToken {
+pub(super) struct FdToken {
     raw: i32,
     dev: u64,
     ino: u64,
 }
 impl FdToken {
-    fn of(file: &File) -> Self {
+    pub(super) fn of(file: &File) -> Self {
         let meta = file.metadata().unwrap();
         Self {
             raw: file.as_raw_fd(),
@@ -1475,4 +1478,544 @@ fn d3c_successive_pass_same_slot_different_file_clears_old_kernel_authority() {
             );
         }
     }
+}
+
+#[derive(Default)]
+struct SegmentEvents {
+    pins: BTreeMap<u32, FdToken>,
+    opens: Vec<u32>,
+    closes: Vec<u32>,
+    maps: Vec<u32>,
+    fallback: Vec<(u32, u64, u64)>,
+    fallback_after_runs: Vec<usize>,
+    finishes: Vec<u32>,
+}
+
+struct SegmentPin {
+    pid: u32,
+    file: File,
+    events: Arc<std::sync::Mutex<SegmentEvents>>,
+}
+impl Drop for SegmentPin {
+    fn drop(&mut self) {
+        let mut events = self.events.lock().unwrap();
+        assert!(fd_open(FdToken::of(&self.file)));
+        assert!(events.pins.remove(&self.pid).is_some());
+        events.closes.push(self.pid);
+    }
+}
+
+struct SegmentIo<'w> {
+    world: &'w BTreeMap<u32, Vec<p11scope_manifest::maps::MapEntry>>,
+    identities: &'w BTreeMap<ObjectKey, FileIdentity>,
+    events: Arc<std::sync::Mutex<SegmentEvents>>,
+    runs: Arc<std::sync::Mutex<FixtureRunTrace>>,
+    owner: ReservationOwner,
+    exe_reads: Cell<usize>,
+}
+impl ConfirmIo for SegmentIo<'_> {
+    type Pin = SegmentPin;
+    fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
+        // This is an actual owned self-pidfd, while the target PID/maps are
+        // scripted. The test proves custody/order, not a live target identity.
+        let file =
+            File::from(crate::attach::identity_iter::open_pidfd(std::process::id()).unwrap());
+        let mut events = self.events.lock().unwrap();
+        assert!(events.pins.insert(pid, FdToken::of(&file)).is_none());
+        events.opens.push(pid);
+        Ok(SegmentPin {
+            pid,
+            file,
+            events: self.events.clone(),
+        })
+    }
+    fn borrowed_pidfd<'a>(&self, pin: &'a Self::Pin) -> Option<std::os::fd::BorrowedFd<'a>> {
+        Some(pin.file.as_fd())
+    }
+    fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
+        let runs = self.runs.lock().unwrap();
+        assert!(
+            runs.closed
+                .iter()
+                .all(|&(iterator, link)| !fd_open(iterator) && !fd_open(link)),
+            "userspace worker started before an iterator/link closed"
+        );
+        assert_eq!(
+            self.owner.state_for_test().0[3],
+            0,
+            "iterator envelope remained leased during fallback"
+        );
+        let mut events = self.events.lock().unwrap();
+        assert!(
+            fd_open(events.pins[&pid]),
+            "fallback lost its original prepared pin"
+        );
+        events.fallback.push((pid, start, end));
+        events.fallback_after_runs.push(runs.scopes.len());
+        let entry = self.world[&pid]
+            .iter()
+            .find(|entry| (entry.start, entry.end) == (start, end))
+            .unwrap();
+        Ok(self.identities[&ObjectKey::of(entry)])
+    }
+    fn start_time(&self, pin: &Self::Pin) -> Option<u64> {
+        assert!(fd_open(FdToken::of(&pin.file)));
+        Some(u64::from(pin.pid))
+    }
+    fn still_the_same(&self, pin: &Self::Pin) -> bool {
+        fd_open(FdToken::of(&pin.file))
+    }
+    fn exe(&self, pid: u32) -> Option<crate::discovery::caller_registry::ExeIdentity> {
+        if self.exe_reads.get() > 0 {
+            self.events.lock().unwrap().finishes.push(pid);
+        }
+        self.exe_reads.set(self.exe_reads.get() + 1);
+        Some(crate::discovery::caller_registry::ExeIdentity {
+            dev: 1,
+            ino: u64::from(pid),
+            mtime_secs: 0,
+            mtime_nanos: 0,
+            path: None,
+        })
+    }
+    fn maps(
+        &mut self,
+        pid: u32,
+        budget: &mut crate::discovery::scan::CaptureWorkBudget,
+    ) -> Result<Vec<p11scope_manifest::maps::MapEntry>, String> {
+        let file =
+            <Self as super::super::confirm_shards::ShardableIo>::open_maps(self, pid).unwrap();
+        crate::discovery::scan::read_maps_or_refuse(file, budget, crate::attach::monotonic_ns)
+    }
+    fn gone(&self, _: u32) -> bool {
+        false
+    }
+}
+impl super::super::confirm_shards::ShardableIo for SegmentIo<'_> {
+    type Maps = std::io::Cursor<Vec<u8>>;
+    fn open_maps(&mut self, pid: u32) -> std::io::Result<Self::Maps> {
+        self.events.lock().unwrap().maps.push(pid);
+        let text: String = self.world[&pid]
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{:x}-{:x} r-xp 00000000 {:02x}:{:02x} {} /fixture/provider.so\n",
+                    entry.start, entry.end, entry.device.major, entry.device.minor, entry.inode
+                )
+            })
+            .collect();
+        Ok(std::io::Cursor::new(text.into_bytes()))
+    }
+    fn maps_now(&self) -> Option<u64> {
+        crate::attach::monotonic_ns()
+    }
+}
+
+fn segment_range(key_number: usize) -> (u64, u64) {
+    let start = 0x1000 + key_number as u64 * 0x2000;
+    (start, start + 0x1000)
+}
+fn segment_target(pids: &[u32], verdict: u32) -> Vec<u8> {
+    target_stream(
+        &pids
+            .iter()
+            .map(|&pid| (pid, segment_range(0), verdict))
+            .collect::<Vec<_>>(),
+    )
+}
+
+struct SegmentObservation {
+    out: super::super::sweep_attribution::SweepAttribution,
+    events: Arc<std::sync::Mutex<SegmentEvents>>,
+    runs: Arc<std::sync::Mutex<FixtureRunTrace>>,
+    charges: u64,
+    remaining_steps: usize,
+}
+
+fn segment_cell(
+    pids: &[(u32, Vec<usize>)],
+    headroom: usize,
+    steps: Vec<FixtureTarget>,
+) -> SegmentObservation {
+    segment_cell_with_deadline(pids, headroom, steps, None)
+}
+
+struct ExpireAfterPositive<'h, H> {
+    hook: &'h mut H,
+    calls: usize,
+    expire_on: Option<usize>,
+}
+impl<H: SegmentProof> SegmentProof for ExpireAfterPositive<'_, H> {
+    fn prove<'r>(
+        &'r mut self,
+        batch: &AcceptedBatch<'_>,
+        budget: &mut crate::discovery::scan::CaptureWorkBudget,
+        resources: &IoResources,
+    ) -> ProofDecision<'r> {
+        self.calls += 1;
+        let expire = self.expire_on == Some(self.calls);
+        let decision = self.hook.prove(batch, budget, resources);
+        if expire {
+            let answer = decision
+                .answer(batch, 0)
+                .expect("deadline injection lacked a genuine kernel answer");
+            assert!(!answer.is_empty());
+            assert!(answer.values().all(|proof| matches!(
+                proof,
+                super::super::sweep_attribution::RangeProof::Kernel(Slot(0))
+            )));
+            budget.set_deadline(Some(0));
+        }
+        decision
+    }
+}
+
+fn segment_cell_with_deadline(
+    pids: &[(u32, Vec<usize>)],
+    headroom: usize,
+    steps: Vec<FixtureTarget>,
+    expire_on: Option<usize>,
+) -> SegmentObservation {
+    let dir = tempfile::tempdir().unwrap();
+    let (file, provider) = opened(dir.path(), "provider.so");
+    drop(file);
+    let pins = super::super::identity::test_fixture::real_scan_pin(
+        &dir.path().join("provider.so"),
+        None,
+        1,
+        "segment-custody-fixture",
+    );
+    let id = pins.pinned().next().unwrap().id;
+    let (held, examined) = opened(dir.path(), "examined.so");
+    let held_fd = FdToken::of(&held);
+    let (missing_file, missing) = opened(dir.path(), "not-held.so");
+    drop(missing_file);
+    let facts = [provider, examined, missing];
+    let world: BTreeMap<_, Vec<_>> = pids
+        .iter()
+        .map(|(pid, keys)| {
+            (
+                *pid,
+                keys.iter()
+                    .map(|&number| {
+                        let (start, end) = segment_range(number);
+                        p11scope_manifest::maps::MapEntry {
+                            start,
+                            end,
+                            permissions: *b"r-xp",
+                            file_offset: 0,
+                            device: facts[number].key.device,
+                            inode: facts[number].key.inode,
+                            raw_path: Some(b"/fixture/provider.so".to_vec()),
+                        }
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    let identities = facts
+        .into_iter()
+        .map(|fact| (fact.key, fact.identity))
+        .collect();
+    let sweep: Vec<_> = world
+        .iter()
+        .map(|(&pid, entries)| (pid, entries.clone()))
+        .collect();
+    let policy = SegmentPolicy::from_headroom(headroom, 2, pids.len());
+    let owner = ReservationOwner::for_examined(SegmentPolicy::from_headroom(16, 0, 0), 1);
+    let mut custody = ExaminedCustody::new(owner.clone(), BTreeMap::new());
+    let scan = custody.begin_scan();
+    assert!(custody.offer_for_test(scan, examined, held));
+    let mut session = fixture_session();
+    let runs = if let SessionObject::Fixture {
+        anchor,
+        target_steps,
+        target_trace,
+        ..
+    } = &mut session.object
+    {
+        *anchor = anchor_stream(&[(0, ANCHOR_OK, 0), (1, ANCHOR_OK, 0)]);
+        *target_steps.borrow_mut() = steps.into();
+        target_trace.clone()
+    } else {
+        unreachable!()
+    };
+    // The deterministic second census counts existing custody/session files
+    // already; the original owner supplies the driver's new reservations.
+    custody.reconcile(policy).unwrap();
+    let pass = AnchorPass::prepare(&pins, [(provider.key, id)], custody);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut installed = session.install_anchors(pass, 1, deadline).unwrap();
+    let (mut index, refused) = KnownKeyIndex::build(
+        [(provider.key, Some(id))],
+        &BTreeMap::from([(provider.key, id)]),
+        [examined, missing],
+        &AdapterChecks(provider.identity),
+    );
+    assert!(refused.is_empty());
+    let events = Arc::new(std::sync::Mutex::new(SegmentEvents::default()));
+    let make_io = || SegmentIo {
+        world: &world,
+        identities: &identities,
+        events: events.clone(),
+        runs: runs.clone(),
+        owner: owner.clone(),
+        exe_reads: Cell::new(0),
+    };
+    let mut probe = KernelMemberProbe::new(&mut installed, make_io(), deadline);
+    probe.install_expectations(&mut index).unwrap();
+    let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+    let mut hook = ExpireAfterPositive {
+        hook: probe.segment_proof(),
+        calls: 0,
+        expire_on,
+    };
+    let out = super::super::confirm_shards::attribute_unselected_with_segment_proof(
+        &sweep,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &index,
+        &mut budget,
+        policy,
+        &owner,
+        2,
+        &make_io,
+        &mut hook,
+    );
+    drop(probe);
+    assert!(fd_open(held_fd));
+    assert_eq!(owner.state_for_test().0, [0; 4]);
+    let state = events.lock().unwrap();
+    assert!(state.pins.is_empty());
+    for (pid, _) in pids {
+        assert_eq!(
+            state.opens.iter().filter(|&&opened| opened == *pid).count(),
+            1
+        );
+        assert_eq!(
+            state
+                .closes
+                .iter()
+                .filter(|&&closed| closed == *pid)
+                .count(),
+            1
+        );
+        assert_eq!(
+            state.maps.iter().filter(|&&mapped| mapped == *pid).count(),
+            1
+        );
+    }
+    drop(state);
+    let charges = budget.work_units_count();
+    let remaining_steps = match &installed.session.object {
+        SessionObject::Fixture { target_steps, .. } => target_steps.borrow().len(),
+        _ => unreachable!(),
+    };
+    drop(installed);
+    assert!(!fd_open(held_fd));
+    assert_eq!(owner.examined_for_test().0, 0);
+    SegmentObservation {
+        out,
+        events,
+        runs,
+        charges,
+        remaining_steps,
+    }
+}
+
+#[test]
+fn d3c_segments_keep_finished_prefix_and_fallback_inside_original_pins() {
+    for failure in 0..3 {
+        let bad = match failure {
+            0 => {
+                let mut bytes = segment_target(&[5101], 0);
+                bytes[0] = 0;
+                FixtureTarget::Bytes(bytes)
+            }
+            1 => FixtureTarget::Deadline(segment_target(&[5101], 0)),
+            _ => FixtureTarget::Failure(RunFailure::AttachOrRead),
+        };
+        let observation = segment_cell(
+            &[(5100, vec![0]), (5101, vec![0]), (5102, vec![0])],
+            6,
+            vec![
+                FixtureTarget::Bytes(segment_target(&[5100], 0)),
+                bad,
+                FixtureTarget::Bytes(segment_target(
+                    &[5102],
+                    crate::attach::identity_iter::VERDICT_NONE,
+                )),
+            ],
+        );
+        assert_eq!(
+            observation
+                .out
+                .members
+                .iter()
+                .map(|member| member.pid)
+                .collect::<Vec<_>>(),
+            [5100, 5101, 5102]
+        );
+        assert!(observation.out.losses.is_empty());
+        assert_eq!(
+            observation.charges, 3,
+            "logical ranges were recharged across fallback"
+        );
+        assert_eq!(
+            observation.runs.lock().unwrap().scopes.len(),
+            2,
+            "accepted driver did not use kernel segments or retried after failure"
+        );
+        assert_eq!(
+            observation.remaining_steps, 1,
+            "rest-pass demotion consumed the third-run NONE sentinel"
+        );
+        assert_eq!(
+            observation.events.lock().unwrap().fallback,
+            [
+                (5101, segment_range(0).0, segment_range(0).1),
+                (5102, segment_range(0).0, segment_range(0).1),
+            ],
+            "a completed earlier PID was reread or current same-pin fallback was lost"
+        );
+    }
+}
+
+#[test]
+fn d3c_segments_replace_scope_between_accepted_batches() {
+    let observation = segment_cell(
+        &[(6100, vec![0]), (6200, vec![0]), (8000, vec![0])],
+        7,
+        vec![
+            FixtureTarget::Bytes(segment_target(&[6100, 6200], 0)),
+            FixtureTarget::Bytes(segment_target(&[8000], 0)),
+        ],
+    );
+    assert_eq!(observation.out.members.len(), 3);
+    assert_eq!(observation.charges, 3);
+    assert_eq!(
+        observation.runs.lock().unwrap().scopes,
+        [BTreeSet::from([6100, 6200]), BTreeSet::from([8000])],
+        "scope retained prior target/observer bitmap bits"
+    );
+    assert!(observation.events.lock().unwrap().fallback.is_empty());
+}
+
+#[test]
+fn d3c_segments_mixed_missing_anchor_keeps_none_and_positive() {
+    let observation = segment_cell(
+        &[(7100, vec![0, 2]), (7101, vec![0]), (7102, vec![0])],
+        16,
+        vec![FixtureTarget::Bytes(target_stream(&[
+            (
+                7101,
+                segment_range(0),
+                crate::attach::identity_iter::VERDICT_NONE,
+            ),
+            (7102, segment_range(0), 0),
+        ]))],
+    );
+    assert_eq!(
+        observation
+            .out
+            .members
+            .iter()
+            .map(|member| member.pid)
+            .collect::<Vec<_>>(),
+        [7100, 7102],
+        "a valid kernel NONE was retried into a userspace positive"
+    );
+    assert_eq!(
+        observation.out.losses,
+        BTreeMap::from([(
+            super::super::sweep_attribution::AttributionLoss::IdentityMismatch,
+            1
+        )])
+    );
+    assert_eq!(
+        observation.runs.lock().unwrap().scopes,
+        [BTreeSet::from([7101, 7102])]
+    );
+    assert_eq!(observation.charges, 4);
+    assert_eq!(
+        observation.events.lock().unwrap().fallback,
+        [
+            (7100, segment_range(0).0, segment_range(0).1),
+            (7100, segment_range(2).0, segment_range(2).1),
+        ]
+    );
+}
+
+#[test]
+fn d3c_segments_iterator_fds_close_before_fallback_workers() {
+    let mut invalid = segment_target(&[8100, 8101], 0);
+    invalid[0] = 0;
+    let observation = segment_cell(
+        &[(8100, vec![0]), (8101, vec![0])],
+        16,
+        vec![FixtureTarget::Bytes(invalid)],
+    );
+    assert_eq!(observation.out.members.len(), 2);
+    assert_eq!(observation.charges, 2);
+    let trace = observation.runs.lock().unwrap();
+    assert_eq!(
+        trace.closed.len(),
+        1,
+        "no concrete iterator/link was consumed before fallback"
+    );
+    assert!(
+        trace
+            .closed
+            .iter()
+            .all(|&(iterator, link)| !fd_open(iterator) && !fd_open(link))
+    );
+    assert_eq!(
+        observation.events.lock().unwrap().fallback_after_runs,
+        [1, 1]
+    );
+}
+
+#[test]
+fn d3c_segments_postproof_capture_deadline_discards_current_positive() {
+    let observation = segment_cell_with_deadline(
+        &[(9100, vec![0]), (9101, vec![0])],
+        6,
+        vec![
+            FixtureTarget::Bytes(segment_target(&[9100], 0)),
+            FixtureTarget::Bytes(segment_target(&[9101], 0)),
+        ],
+        Some(2),
+    );
+    assert_eq!(
+        observation.runs.lock().unwrap().scopes,
+        [BTreeSet::from([9100]), BTreeSet::from([9101])]
+    );
+    assert_eq!(
+        observation.charges, 2,
+        "deadline changed already committed logical charges"
+    );
+    assert_eq!(
+        observation
+            .out
+            .members
+            .iter()
+            .map(|member| member.pid)
+            .collect::<Vec<_>>(),
+        [9100],
+        "a stopped current segment published its not-yet-finished positive"
+    );
+    assert_eq!(
+        observation.out.losses,
+        BTreeMap::from([(super::super::sweep_attribution::AttributionLoss::Budget, 1)])
+    );
+    let events = observation.events.lock().unwrap();
+    assert_eq!(
+        events.finishes,
+        [9100],
+        "current segment ran final live checks after its observed stop"
+    );
+    assert!(
+        events.fallback.is_empty(),
+        "a stopped current segment started fallback I/O"
+    );
 }

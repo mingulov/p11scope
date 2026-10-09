@@ -41,7 +41,7 @@ pub(super) struct ImageQueryOwner {
     pidfd_selector: bool,
 }
 impl ImageQueryOwner {
-    pub(super) fn start(
+    pub(super) fn load(
         ebpf: &mut aya::Ebpf,
         btf: &aya::Btf,
         domain: NativeDomainId,

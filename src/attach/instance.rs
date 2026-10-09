@@ -1,8 +1,9 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Task 3 Stage A: the Session side of the load-instance continuity witness.
 //!
-//! - Loads and attaches the four native continuity hooks (`uprobe_mmap`,
-//!   `uprobe_munmap`, `copy_vma`, `exec_mm_release`) after mandatory lifecycle links. Any
+//! - Loads the four native continuity hooks (`uprobe_mmap`, `uprobe_munmap`,
+//!   `copy_vma`, `exec_mm_release`) before deferred policy freezes, and attaches
+//!   them after all freezes and mandatory lifecycle links. Any
 //!   load or attach failure leaves the capture running with instance routing
 //!   **refused** and a named reason; it never degrades the proof. An LTO
 //!   kernel — or one whose LTO status is unverifiable — is refused before
@@ -51,10 +52,53 @@ pub(crate) const INSTANCE_PROGRAMS: [(&str, &str); 4] = [
 /// Hooks attached as fexit; every other instance hook is fentry.
 const EXIT_PROGRAMS: [&str; 1] = ["p11_inst_vma_copy"];
 
+/// Only the loader constructs this token. It stays inside one Session's
+/// preparation/activation path and is consumed by attachment.
+struct LoadedInstancePrograms {
+    program_ids: BTreeMap<&'static str, u32>,
+}
+
+fn load_instance_programs_with<S>(
+    state: &mut S,
+    mut load: impl FnMut(&mut S, &'static str, &'static str) -> Result<u32>,
+) -> Result<LoadedInstancePrograms> {
+    let mut program_ids = BTreeMap::new();
+    for (program, target) in INSTANCE_PROGRAMS {
+        let id = load(state, program, target)?;
+        ensure!(
+            id != 0 && !program_ids.values().any(|existing| *existing == id),
+            "loaded image hook program IDs unavailable or collide"
+        );
+        program_ids.insert(program, id);
+    }
+    Ok(LoadedInstancePrograms { program_ids })
+}
+
+fn attach_loaded_instance_programs_with<S>(
+    _loaded: LoadedInstancePrograms,
+    state: &mut S,
+    mut attach: impl FnMut(&mut S, &'static str, &'static str) -> Result<()>,
+) -> Result<()> {
+    for (program, target) in INSTANCE_PROGRAMS {
+        attach(state, program, target)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 enum HookLink {
     Entry(FEntryLinkId),
     Exit(FExitLinkId),
+}
+
+/// Produced once during same-object preparation, consumed once after freezes
+/// and mandatory lifecycle attachment. No constructor escapes this owner.
+pub(super) struct PreparedInstanceTracking {
+    programs: std::result::Result<LoadedInstancePrograms, HookPreparationRefusal>,
+}
+struct HookPreparationRefusal {
+    reason: String,
+    fail_coverage: bool,
 }
 
 /// One watched provider file.
@@ -179,45 +223,82 @@ impl InstanceTracking {
         self.links.len()
     }
 
-    /// Loads and attaches the hooks. Never fails the session: a failure is
-    /// returned as a refused tracker whose reason names the first error.
+    /// Loads hooks only. Never fails ordinary capture: the retained result
+    /// names the first refusal and cannot authorize attachment or coverage.
     /// Refusal order is measurement toggle, then policy (Task 1d: metrics
     /// never joins per-call records, so it never pays the hooks), then LTO.
-    pub(super) fn start(
+    pub(super) fn prepare(
         ebpf: &mut Ebpf,
         btf: &Btf,
         policy: super::CapturePolicy,
-        coverage: &super::image_query::CoverageControl,
         image_query_refusal: Option<String>,
-    ) -> Self {
-        let mut tracking = Self::default();
+    ) -> PreparedInstanceTracking {
+        let refused = |reason, fail_coverage| PreparedInstanceTracking {
+            programs: Err(HookPreparationRefusal {
+                reason,
+                fail_coverage,
+            }),
+        };
         if hooks_disabled_by_env() {
-            coverage.fail();
-            tracking.refused = Some(format!(
-                "instance continuity hooks refused: disabled by {DISABLE_HOOKS_ENV}=1 (Stage A overhead measurement)"
-            ));
-            return tracking;
+            return refused(
+                format!(
+                    "instance continuity hooks refused: disabled by {DISABLE_HOOKS_ENV}=1 (Stage A overhead measurement)"
+                ),
+                true,
+            );
         }
         if !policy.wants_instance_hooks() {
-            tracking.refused = Some(
+            return refused(
                 "instance continuity hooks refused: aggregate-only (metrics) sessions never join per-call records to load instances (Task 1d overhead gate)"
                     .to_string(),
+                false,
             );
-            return tracking;
         }
-        let activation =
-            activate_image_coverage_with(coverage, image_query_refusal.as_deref(), || {
-                if let Some(reason) = lto_refusal() {
-                    bail!("{reason}");
+        let preparation = (|| {
+            if let Some(reason) = image_query_refusal {
+                bail!("image continuity query unavailable: {reason}");
+            }
+            if let Some(reason) = lto_refusal() {
+                bail!("{reason}");
+            }
+            Self::load_hooks(ebpf, btf)
+        })();
+        PreparedInstanceTracking {
+            programs: preparation.map_err(|error| HookPreparationRefusal {
+                reason: format!("instance continuity hooks unavailable: {error:#}"),
+                fail_coverage: true,
+            }),
+        }
+    }
+
+    /// Consumes the same-object load result. Performs no program loads;
+    /// attachment, exact ID/health validation and enable happen only here.
+    pub(super) fn start(
+        ebpf: &mut Ebpf,
+        coverage: &super::image_query::CoverageControl,
+        prepared: PreparedInstanceTracking,
+    ) -> Self {
+        let mut tracking = Self::default();
+        let loaded = match prepared.programs {
+            Ok(loaded) => loaded,
+            Err(refusal) => {
+                if refusal.fail_coverage {
+                    coverage.fail();
                 }
-                tracking.attach_hooks(ebpf, btf)?;
-                validate_hook_health_with(
-                    tracking.links.len(),
-                    None,
-                    || Ok(std::fs::read_to_string("/proc/sys/kernel/ftrace_enabled")?),
-                    || tracking.hook_stats(ebpf),
-                )
-            });
+                tracking.refused = Some(refusal.reason);
+                return tracking;
+            }
+        };
+        let expected = loaded.program_ids.clone();
+        let activation = activate_image_coverage_with(coverage, None, || {
+            tracking.attach_hooks(ebpf, loaded)?;
+            validate_hook_health_with(
+                tracking.links.len(),
+                Some(&expected),
+                || Ok(std::fs::read_to_string("/proc/sys/kernel/ftrace_enabled")?),
+                || tracking.hook_stats(ebpf),
+            )
+        });
         if let Ok(ids) = &activation {
             tracking.program_ids = ids.clone();
         }
@@ -264,12 +345,12 @@ impl InstanceTracking {
         )
     }
 
-    fn attach_hooks(&mut self, ebpf: &mut Ebpf, btf: &Btf) -> Result<()> {
+    fn load_hooks(ebpf: &mut Ebpf, btf: &Btf) -> Result<LoadedInstancePrograms> {
         ensure!(
             exec_release_proto_is_exact(&btf.to_bytes()),
             "exec_mm_release must be void(task_struct *, mm_struct *)"
         );
-        for (program, target) in INSTANCE_PROGRAMS {
+        load_instance_programs_with(ebpf, |ebpf, program, target| {
             let hook = ebpf
                 .program_mut(program)
                 .with_context(|| format!("program {program} missing from object"))?;
@@ -282,8 +363,16 @@ impl InstanceTracking {
                     .load(target, btf)
                     .with_context(|| format!("loading fentry {program} on {target}"))?;
             }
-        }
-        for (program, target) in INSTANCE_PROGRAMS {
+            let fd = ebpf
+                .program(program)
+                .context("loaded image hook program")?
+                .fd()?;
+            Ok(prog_stats(fd.as_fd())?.program_id)
+        })
+    }
+
+    fn attach_hooks(&mut self, ebpf: &mut Ebpf, loaded: LoadedInstancePrograms) -> Result<()> {
+        attach_loaded_instance_programs_with(loaded, ebpf, |ebpf, program, target| {
             let hook = ebpf
                 .program_mut(program)
                 .with_context(|| format!("program {program} missing from object"))?;
@@ -301,8 +390,8 @@ impl InstanceTracking {
                 )
             };
             self.links.push((program, link));
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// The refusal reason, when instance routing is unavailable.
@@ -1041,6 +1130,90 @@ mod tests {
             );
             assert!(coverage.enable().is_err());
         }
+    }
+
+    #[test]
+    fn optional_hook_load_refusal_never_attaches_and_complete_load_waits_for_activation() {
+        for fail in 0..=super::INSTANCE_PROGRAMS.len() {
+            let coverage = super::super::image_query::CoverageControl::test_owner(false);
+            let mut calls = Vec::new();
+            let mut loaded_count = 0;
+            let prepared = super::load_instance_programs_with(&mut calls, |calls, program, _| {
+                assert!(calls.iter().all(|(operation, _)| *operation == "load"));
+                calls.push(("load", program));
+                if loaded_count == fail {
+                    anyhow::bail!("owned load refusal: {program}");
+                }
+                loaded_count += 1;
+                Ok(loaded_count as u32)
+            });
+            assert!(!coverage.enabled());
+            let health_called = std::cell::Cell::new(false);
+            let result = super::activate_image_coverage_with(&coverage, None, || {
+                let loaded = prepared?;
+                let expected = loaded.program_ids.clone();
+                super::attach_loaded_instance_programs_with(
+                    loaded,
+                    &mut calls,
+                    |calls, program, _| {
+                        assert_eq!(loaded_count, super::INSTANCE_PROGRAMS.len());
+                        calls.push(("attach", program));
+                        Ok(())
+                    },
+                )?;
+                health_called.set(true);
+                super::validate_hook_health_with(
+                    super::INSTANCE_PROGRAMS.len(),
+                    Some(&expected),
+                    || Ok("1".into()),
+                    || Ok(healthy_hook_stats()),
+                )
+            });
+            if fail < super::INSTANCE_PROGRAMS.len() {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    format!("owned load refusal: {}", super::INSTANCE_PROGRAMS[fail].0)
+                );
+                assert_eq!(calls.len(), fail + 1);
+                assert!(!health_called.get());
+                assert!(!coverage.enabled());
+                assert!(coverage.enable().is_err());
+            } else {
+                assert_eq!(result.unwrap().len(), super::INSTANCE_PROGRAMS.len());
+                assert_eq!(calls.len(), super::INSTANCE_PROGRAMS.len() * 2);
+                assert!(health_called.get());
+                assert!(coverage.enabled());
+            }
+        }
+    }
+
+    #[test]
+    fn loaded_hook_identity_change_refuses_activation_before_enable() {
+        let coverage = super::super::image_query::CoverageControl::test_owner(false);
+        let mut next = 0;
+        let loaded = super::load_instance_programs_with(&mut next, |next, _, _| {
+            *next += 1;
+            Ok(*next)
+        })
+        .unwrap();
+        let expected = loaded.program_ids.clone();
+        let result = super::activate_image_coverage_with(&coverage, None, || {
+            super::attach_loaded_instance_programs_with(loaded, &mut (), |_, _, _| Ok(()))?;
+            let mut stats = healthy_hook_stats();
+            stats[3].1.program_id += 100;
+            super::validate_hook_health_with(
+                super::INSTANCE_PROGRAMS.len(),
+                Some(&expected),
+                || Ok("1".into()),
+                || Ok(stats),
+            )
+        });
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "image hook identity changed"
+        );
+        assert!(!coverage.enabled());
+        assert!(coverage.enable().is_err());
     }
 
     #[test]

@@ -2707,7 +2707,7 @@ fn expected_programs(unsafe_enabled: bool) -> BTreeSet<&'static str> {
 fn validate_program_inventory(ebpf: &Ebpf, unsafe_enabled: bool) -> Result<()> {
     let mut expected = expected_programs(unsafe_enabled);
     // The continuity hooks are present in every Detailed object but load
-    // after activation, optionally (`InstanceTracking::start`).
+    // before deferred freezes, optionally (`InstanceTracking::prepare`).
     expected.extend(INSTANCE_PROGRAMS.iter().map(|(program, _)| *program));
     expected.insert("p11_image_query");
     let actual: BTreeSet<_> = ebpf.programs().map(|(name, _)| name).collect();
@@ -2732,6 +2732,7 @@ enum SessionPreparation {
     FreezePublished,
     SelectScope,
     LoadProgram(&'static str),
+    LoadImagePrograms,
     FreezeDeferred(&'static str),
     PublishTailCalls,
     PrepareEventsDomain,
@@ -2763,6 +2764,7 @@ fn prepare_session_with(
     for name in expected_programs(object_has_unsafe) {
         operation(LoadProgram(name))?;
     }
+    operation(LoadImagePrograms)?;
     for (name, meta) in BASE_POLICY_MAPS {
         if defers_freeze_until_loaded(name, &meta) && name != TAIL_POLICY_MAP {
             operation(FreezeDeferred(name))?;
@@ -3093,6 +3095,8 @@ impl Session {
         let mut prepared_domain = None;
         let mut prepared_discovery_domain = None;
         let mut root_seed = None;
+        let mut image_query = None;
+        let mut prepared_instance = None;
         let preparation = prepare_session_with(object_has_unsafe, |step| {
             match step {
                 SessionPreparation::ValidatePolicy => {
@@ -3201,6 +3205,26 @@ impl Session {
                         }
                     }
                 }
+                SessionPreparation::LoadImagePrograms => {
+                    let query_refusal = match domain {
+                        Some(domain) => {
+                            match image_query::ImageQueryOwner::load(&mut ebpf, &btf, domain) {
+                                Ok(owner) => {
+                                    image_query = Some(owner);
+                                    None
+                                }
+                                Err(error) => Some(format!("{error:#}")),
+                            }
+                        }
+                        None => None,
+                    };
+                    prepared_instance = Some(InstanceTracking::prepare(
+                        &mut ebpf,
+                        &btf,
+                        policy,
+                        query_refusal,
+                    ));
+                }
                 SessionPreparation::FreezeDeferred(name) => {
                     freeze_map(name, ebpf.map(name).with_context(|| format!("{name} map"))?)
                         .with_context(|| format!("freezing {name}"))?;
@@ -3262,22 +3286,10 @@ impl Session {
         let trace_coverage =
             detailed_identity::TraceCoverage::after_activation(scope, monotonic_ns());
         let image_coverage = image_query::CoverageControl::new(&ebpf)?;
-        let (image_query, image_query_refusal) = match domain {
-            Some(domain) => match image_query::ImageQueryOwner::start(&mut ebpf, &btf, domain) {
-                Ok(owner) => (Some(owner), None),
-                Err(error) => {
-                    image_coverage.fail();
-                    (None, Some(format!("{error:#}")))
-                }
-            },
-            None => (None, None),
-        };
         let instance = InstanceTracking::start(
             &mut ebpf,
-            &btf,
-            policy,
             &image_coverage,
-            image_query_refusal,
+            prepared_instance.expect("preparation established image program load result"),
         );
 
         Ok(Self {
@@ -5549,12 +5561,44 @@ mod tests {
             LoadProgram("sched_process_exec"),
             LoadProgram("sched_process_exit"),
             LoadProgram("task_newtask"),
+            LoadImagePrograms,
             FreezeDeferred("CONFIG"),
             FreezeDeferred("DESCRIPTORS"),
             PublishTailCalls,
             PrepareEventsDomain,
         ]);
         steps
+    }
+
+    #[test]
+    fn image_program_load_precedes_deferred_freeze_and_lifecycle_activation() {
+        for unsafe_object in [false, true] {
+            let image_loaded = std::cell::Cell::new(false);
+            let deferred_frozen = std::cell::Cell::new(0);
+            let activation_called = std::cell::Cell::new(false);
+            let preparation = prepare_session_with(unsafe_object, |step| {
+                if step == SessionPreparation::LoadImagePrograms {
+                    assert_eq!(deferred_frozen.get(), 0);
+                    image_loaded.set(true);
+                }
+                if let SessionPreparation::FreezeDeferred(_) = step {
+                    anyhow::ensure!(
+                        image_loaded.get(),
+                        "native query/hooks must load before deferred policy freeze"
+                    );
+                    deferred_frozen.set(deferred_frozen.get() + 1);
+                }
+                Ok(())
+            });
+            activate_after_preparation_with(preparation, || {
+                assert!(image_loaded.get());
+                assert_eq!(deferred_frozen.get(), 2);
+                activation_called.set(true);
+                Ok(())
+            })
+            .unwrap();
+            assert!(activation_called.get());
+        }
     }
 
     #[test]

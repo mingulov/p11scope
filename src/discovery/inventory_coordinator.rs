@@ -34,7 +34,7 @@ use crate::attach::capture::{
 use crate::capacity::InventoryBudget;
 use crate::discovery::caller_registry::{
     AdmissionState, BudgetRefusal, CallerAdapter, CallerEvent, CallerId, CallerRegistry,
-    CoverageNote, EdgeRecord, ImageAuthority, MappingState, ModuleInfo, ModuleKey,
+    CoverageNote, EdgeRecord, ImageAuthority, MappingState, ModuleId, ModuleInfo, ModuleKey,
     PendingCountOutcome, ProcessSource, RegistryGap, RegistryLimits, UnknownReason, UseCoverage,
 };
 use crate::discovery::inventory_attach_set::{
@@ -42,7 +42,8 @@ use crate::discovery::inventory_attach_set::{
     InventoryAttachSet, MEMBERSHIP_RESOURCE, ModuleMembers, TargetDelta,
 };
 use crate::discovery::native_binding::{
-    BinderLimits, Binding, Decision, ExecTransition, NativeBinder, NativeIdentity, UnboundReason,
+    BinderLimits, Binding, CurrentBindingCheck, CurrentBindingRequest, CurrentBindingSighting,
+    Decision, ExecTransition, NativeBinder, NativeIdentity, UnboundReason,
 };
 use crate::discovery::scan::{
     InventoryDiscoveryLimits, InventoryRetainedLimits, InventoryWindowLimits, WindowId,
@@ -52,6 +53,13 @@ use p11scope_ebpf_common::inventory_callers::CallerEvidence;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+#[path = "inventory_count_eligibility.rs"]
+mod count_eligibility;
+use count_eligibility::{
+    CountOwnership, CurrentCandidates, OwnershipEpoch, OwnershipScan, ReceiptDisposition,
+    ReceiptView, ReceiptWork, RecoveryWorkBudget,
+};
 
 /// What one inventory pass scans: one named process, or the machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,7 +185,12 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Outstanding publication-time count placements (P3): each staged
     /// pending count's opaque handle back to its pair. Drained with the
     /// publication's decisions; one entry per staged pending count.
-    pending_ids: HashMap<u64, PairKey>,
+    pending_ids: HashMap<u64, PendingCountObservation>,
+    placement_generations: HashMap<PairKey, Option<u64>>,
+    count_ownership: CountOwnership,
+    recoveries: HashMap<PairKey, PairRecovery>,
+    recovery_order: Vec<PairKey>,
+    recovery_cursor: usize,
     /// The next pending-count handle (P3): minted in staging order.
     next_pending_id: u64,
     owners: BTreeMap<CallerId, ProcessViewId>,
@@ -236,6 +249,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pair_counts: HashMap::new(),
             pair_targets: HashMap::new(),
             pending_ids: HashMap::new(),
+            placement_generations: HashMap::new(),
+            count_ownership: CountOwnership::new(registry_limits),
+            recoveries: HashMap::new(),
+            recovery_order: Vec::new(),
+            recovery_cursor: 0,
             next_pending_id: 0,
             owners: BTreeMap::new(),
             pending_owners: BTreeMap::new(),
@@ -1149,6 +1167,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }
             }
         }
+        self.reconcile_count_eligibility(identity, &mut RecoveryWorkBudget::new());
         let native_callers = native.len();
         let pass = self.passes;
         self.passes += 1;
@@ -1178,6 +1197,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         reason: &str,
         now_ns: u64,
     ) -> PassReport {
+        self.count_ownership.begin_catalog_pass();
         let mut resolver = AuthorityResolver {
             engine: &mut self.engine,
             pending: &mut self.pending_owners,
@@ -1210,6 +1230,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             reason: reason.to_string(),
             budget: None,
         });
+        self.reconcile_count_eligibility(identity, &mut RecoveryWorkBudget::new());
         let native_callers = live
             .iter()
             .filter(|caller| self.owners.contains_key(caller))
@@ -1334,6 +1355,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     fn retire_caller_in_registry(&mut self, id: CallerId, now_ns: u64) {
+        self.count_ownership.forget_live(id);
         let reason = self
             .adapter
             .record(id)
@@ -1575,6 +1597,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         now_ns: u64,
     ) {
         use crate::inspect_system::{MemberStatus, ObservationEvidence};
+        self.count_ownership.begin_catalog_pass();
+        self.count_ownership
+            .invalidate_memberships(self.attach_set.count_revision());
         let mut by_pid: BTreeMap<u32, Vec<(usize, usize)>> = BTreeMap::new();
         for (object_index, object) in catalog.objects.iter().enumerate() {
             for (observation_index, observation) in object.observations.iter().enumerate() {
@@ -1591,6 +1616,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             };
             if !process.status.attributable() {
                 self.registry.note_member_unscanned(caller);
+                self.count_ownership
+                    .queue_observation(caller, Vec::new(), None);
                 continue;
             }
             if let Err(loss) = self.generation_join(caller, process) {
@@ -1598,8 +1625,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // The collected mappings belong to another generation or
                 // image: they neither confirm nor refute this caller's.
                 self.registry.note_member_unscanned(caller);
+                self.count_ownership
+                    .queue_observation(caller, Vec::new(), None);
                 continue;
             }
+            let mut retirement_admission_known = true;
             // One mapping note per observation (not per object path):
             // aliased objects are observed under several paths and the
             // registry accumulates every spelling.
@@ -1612,6 +1642,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     sha256: sha256.clone(),
                 });
                 let verdict = attach_key.as_ref().and_then(|key| verdicts.get(key));
+                retirement_admission_known &= !observation.double_loaded
+                    && matches!(verdict, Some(AttachVerdict::Admitted { reasons, .. }) if reasons.is_empty());
                 let mut info = catalog_module_info(object, verdict);
                 info.path = observation.path.clone();
                 info.double_loaded = observation.double_loaded;
@@ -1662,6 +1694,32 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         .note_module_absent(caller, module, complete, now_ns);
                     absent = complete && mapping == MappingState::Mapped;
                 }
+            }
+            let complete_scan = process
+                .complete_scan
+                .as_ref()
+                .filter(|receipt| {
+                    retirement_admission_known
+                        && matches!(process.status, MemberStatus::Scanned)
+                        && process.generation.as_ref() == Some(receipt.generation())
+                        && self.adapter.record(caller).is_some_and(|record| {
+                            !record.retired
+                                && record.start_time.is_some()
+                                && record.start_time == receipt.generation().start_time
+                                && record.exe.is_some()
+                                && record.exe == receipt.generation().exe
+                                && record.first_seen_ns <= receipt.started_ns()
+                        })
+                        && receipt.started_ns() > 0
+                        && receipt.finished_ns() > receipt.started_ns()
+                })
+                .cloned();
+            if !self.count_ownership.queue_observation(
+                caller,
+                shown.into_iter().collect(),
+                complete_scan,
+            ) {
+                self.registry.record_gap(RegistryGap { caller: Some(caller), module: None, pid: Some(process.pid), subject: "current count ownership storage refused".into(), reason: "the bounded ownership observation could not be retained; historical evidence remains, current count eligibility is unknown".into(), budget: Some(BudgetRefusal { resource: "inventory_count_observations", limit: self.registry.limits().max_edges, requested: self.registry.limits().max_edges.saturating_add(1) }) });
             }
             if absent && let Some(owner) = self.owners.get(&caller).copied() {
                 self.churned_owners.insert(owner);
@@ -1769,7 +1827,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
             NativeBatch::Finish { domain } => self.binder.finish(domain),
         }
-        self.stage_binder_output(identity, now_ns)
+        let receipt = self.stage_binder_output(identity, now_ns);
+        self.reconcile_count_eligibility(identity, &mut RecoveryWorkBudget::new());
+        receipt
     }
 
     /// The exec-coverage revalidation (C1 ruling): for every domain whose
@@ -1879,6 +1939,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 first_ns: row.recorded_at_ns,
                 anchor_ns: batch.rows_anchor_ns,
                 last_ns: batch.rows_read_ns,
+                retirement_usable: false,
             });
             // The row sets its first record whatever arrived before: a
             // refresh can only precede it in a scripted batch.
@@ -1887,6 +1948,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 held.count = row.entry_count;
                 held.anchor_ns = batch.rows_anchor_ns;
                 held.last_ns = batch.rows_read_ns;
+                held.retirement_usable = false;
             }
         }
         let mut recheck = Vec::new();
@@ -1902,20 +1964,27 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // Keep the refresh PRE bound for future base coverage and
             // the common POST bound for this count's observation. Neither
             // claims exactly when this particular pair was looked up.
-            let held = {
+            let (held, advanced) = {
                 let held = self.pair_counts.entry(key).or_insert(PairCount {
                     count: 0,
                     first_ns: batch.rows_read_ns,
                     anchor_ns: batch.counts_read_ns,
                     last_ns: batch.rows_read_ns,
+                    retirement_usable: false,
                 });
-                if update.count > held.count {
+                let advanced = update.count > held.count;
+                if advanced {
                     held.count = update.count;
                     held.anchor_ns = batch.counts_read_ns;
                     held.last_ns = batch.rows_read_ns;
+                    held.retirement_usable = valid_retirement_refresh(batch, update.count);
                 }
-                *held
+                (*held, advanced)
             };
+            // The rotating proof service may not visit this pair before the next
+            // read. Preserve its first eligible actual advance at this accounting
+            // boundary, before a later held maximum can replace the read bracket.
+            self.remember_retirement_advance(key, held, advanced);
             match self.pair_targets.get(&key) {
                 Some(PairTarget::Bound {
                     caller,
@@ -1960,15 +2029,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // advance past what is staged re-stages pending; the publication
         // decides, and its decisions finalize the target.
         for (key, caller, modules, count, staged, base, base_since) in retry {
+            if self.recoveries.get(&key).is_some_and(|recovery| {
+                recovery.deferred_count || (recovery.blocked && recovery.epoch.is_some())
+            }) {
+                continue;
+            }
             if count.count > staged {
-                self.stage_pending_count(
-                    key,
-                    caller,
-                    &modules,
-                    rebased_count(count, base),
-                    base_since,
-                    base,
-                );
+                self.stage_pending_count(key, caller, &modules, count, base_since, base);
                 if let Some(PairTarget::Pending {
                     staged: was,
                     staged_ns: was_ns,
@@ -1988,6 +2055,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // stages, so a repeated refresh is free and several reads per
         // commit stay sound.
         for (key, caller, module, endpoint, object, count, staged_abs, staged_ns) in recheck {
+            // Once current retirement authority is involved, its exact guards and
+            // immutable fence decide growth in the single reconciliation slice.
+            if self
+                .recoveries
+                .get(&key)
+                .is_some_and(|recovery| recovery.blocked || recovery.deferred_count)
+            {
+                continue;
+            }
             let admitted = self.update_modules_for_endpoint(endpoint, object);
             let confirmed = match &admitted {
                 Ok(modules) => {
@@ -2023,6 +2099,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 if count.count > staged_abs {
                     let growth = rebased_count(count, staged_abs);
                     self.stage_pair_count(caller, &module, growth, staged_ns, staged_abs);
+                    if let Some(recovery) = self.recoveries.get_mut(&key) {
+                        recovery.watermark = recovery.watermark.max(count.count);
+                    }
                     if let Some(PairTarget::Bound {
                         base,
                         staged,
@@ -2047,6 +2126,27 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // growth executed after the staged read, so it windows
             // from there (round 4, window anchor).
             let new_base = staged_abs;
+            if !self.recoveries.contains_key(&key) {
+                // A successful ordinary placement may have no optional retirement
+                // metadata. It keeps counting while confirmed above; a changed
+                // carrier cannot recover without that bounded state.
+                self.note_retirement_metadata_refusal(caller);
+                self.registry
+                    .note_retirement_count_gap(caller, new_base, count.count);
+                self.pair_targets.insert(
+                    key,
+                    PairTarget::Dropped {
+                        base: count.count,
+                        base_since: count.anchor_ns,
+                    },
+                );
+                self.pair_counts.remove(&key);
+                continue;
+            }
+            self.bump_placement_generation(key);
+            if let Some(recovery) = self.recoveries.get_mut(&key) {
+                recovery.blocked = modules.len() != 1;
+            }
             self.pair_targets.insert(
                 key,
                 PairTarget::Pending {
@@ -2060,14 +2160,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 },
             );
             if count.count > new_base {
-                self.stage_pending_count(
-                    key,
-                    caller,
-                    &modules,
-                    rebased_count(count, new_base),
-                    staged_ns,
-                    new_base,
-                );
+                self.stage_pending_count(key, caller, &modules, count, staged_ns, new_base);
                 if let Some(PairTarget::Pending {
                     staged: was,
                     staged_ns: was_ns,
@@ -2079,6 +2172,118 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }
             }
         }
+    }
+
+    /// Constant indexed work for this actual update only: normalize at most
+    /// three receipt tags before capturing the current receipt's first advance.
+    fn remember_retirement_advance(&mut self, key: PairKey, count: PairCount, advanced: bool) {
+        let Some(recovery) = self.recoveries.get(&key) else {
+            return;
+        };
+        let ownership = self
+            .count_ownership
+            .ordinary_view(recovery.caller, key.object);
+        let sole = match ownership.candidate {
+            Some(CurrentCandidates::Sole { module, epoch, .. }) => Some((module, *epoch)),
+            _ => None,
+        };
+        let deferred = self.count_ownership.deferred(recovery.caller, key.object);
+        let changed = sole.is_some_and(|(module, _)| {
+            self.registry.module_id_for(module) != Some(recovery.carrier)
+        });
+        let continuing = sole.is_some_and(|(_, epoch)| recovery.epoch == Some(epoch));
+        let continuity = recovery.ordinary_checkpoint != 0
+            && recovery.ordinary_checkpoint == ownership.sequence
+            && (ownership.startup || sole.is_some() && !changed)
+            && !deferred;
+        let ordinary = !recovery.blocked
+            && !recovery.recovered
+            && continuity
+            && (recovery.epoch.is_none() || recovery.epoch_pending && continuing);
+        let view = self.count_ownership.receipt_view(recovery.caller);
+        let scan = if continuing {
+            recovery.scan.clone()
+        } else {
+            self.count_ownership.supporting_scan(recovery.caller)
+        };
+        let recovery = self.recoveries.get_mut(&key).expect("checked exact pair");
+        let mut work = ReceiptWork::new();
+        // Candidate lookup already visits the caller, index and summary. Charge
+        // the additional failure, checkpoint and publication-interlock guards.
+        work.spend(3);
+        recovery.deferred_count |= deferred || changed || !continuity;
+        let was_refused = recovery.receipt_refused;
+        recovery.normalize_reads(&view, continuing || ordinary, &mut work);
+        if !was_refused && recovery.receipt_refused {
+            self.registry.record_gap(RegistryGap {
+                caller: Some(recovery.caller), module: None, pid: None,
+                subject: "count retirement earlier read invariant refused".into(),
+                reason: "a late earlier equivalent read contradicts a finalized boundary; history remains immutable and future retirement attribution is refused".into(), budget: None,
+            });
+        }
+        if recovery.receipt_refused || ordinary {
+            return;
+        }
+        let Some(scan) = scan else { return };
+        // Historical Pending requests retain their observation and generation.
+        // Deferral protects newer reads even when blocked=true and epoch=None.
+        if (continuing && recovery.fence.is_some())
+            || !advanced
+            || !count.retirement_usable
+            || count.count <= recovery.watermark
+            || count.anchor_ns <= scan.finished_ns()
+        {
+            return;
+        }
+        let mut vacant = None;
+        for index in 0..3 {
+            work.visit();
+            match &recovery.pending_reads[index] {
+                Some(tag) if Arc::ptr_eq(&tag.scan, &scan) || tag.scan.equivalent(&scan) => return,
+                None => vacant = Some(index),
+                _ => {}
+            }
+        }
+        work.visit();
+        if let Some(index) = vacant {
+            recovery.pending_reads[index] = Some(TaggedCountRead { scan, read: count });
+        } else {
+            // Three identities are the caller's entire retained receipt view.
+            // A fourth after normalization is an invariant failure, not a spill
+            // queue, an overwritten first read or a successful conservative path.
+            recovery.receipt_refused = true;
+            recovery.deferred_count = true;
+            recovery.withhold_reads();
+            recovery.discarded_through = recovery.discarded_through.max(count.count);
+            if let Some(read) = recovery.fence.take() {
+                recovery.withheld_through = recovery.withheld_through.max(read.count);
+            }
+            recovery.epoch = None;
+            recovery.scan = None;
+            recovery.sighting = None;
+            self.registry.record_gap(RegistryGap {
+                caller: Some(recovery.caller), module: None, pid: None,
+                subject: "count retirement receipt invariant refused".into(),
+                reason: "a fourth unresolved current receipt remained after fixed-slot normalization; future retirement attribution is refused".into(),
+                budget: Some(BudgetRefusal { resource: "inventory_count_retirements", limit: 3, requested: 4 }),
+            });
+        }
+    }
+
+    fn note_retirement_metadata_refusal(&mut self, caller: CallerId) {
+        let limit = self.registry.limits().max_edges;
+        self.registry.record_gap(RegistryGap {
+            caller: Some(caller),
+            module: None,
+            pid: None,
+            subject: "count retirement metadata refused".into(),
+            reason: "the bounded retirement metadata was not retained; ordinary exact single-owner counting continues, but a later ownership change has unknown count eligibility and cannot recover".into(),
+            budget: Some(BudgetRefusal {
+                resource: "inventory_count_retirements",
+                limit,
+                requested: limit.saturating_add(1),
+            }),
+        });
     }
 
     /// The admitted modules a count update's endpoint resolves to (F7):
@@ -2172,11 +2377,25 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 base_since,
                 ..
             }) => (*base, *staged, *staged_ns, *base_since),
-            Some(PairTarget::Dropped { base, base_since }) => {
-                (*base, *base, *base_since, *base_since)
-            }
+            Some(
+                PairTarget::Dropped { base, base_since }
+                | PairTarget::Suspended {
+                    base, base_since, ..
+                },
+            ) => (*base, *base, *base_since, *base_since),
             None => (0, 0, 0, held_first),
         };
+        // A new, generically bound witness still owns its ordinary publication
+        // placement. It does not borrow or discharge an armed retirement proof.
+        if modules.len() == 1
+            && let Some(recovery) = self
+                .recoveries
+                .get_mut(&key)
+                .filter(|recovery| recovery.epoch.is_none())
+        {
+            recovery.blocked = false;
+        }
+        self.bump_placement_generation(key);
         self.pair_targets.insert(
             key,
             PairTarget::Pending {
@@ -2192,14 +2411,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if let Some(count) = self.pair_counts.get(&key).copied()
             && count.count > staged
         {
-            self.stage_pending_count(
-                key,
-                caller,
-                modules,
-                rebased_count(count, base),
-                base_since,
-                base,
-            );
+            self.stage_pending_count(key, caller, modules, count, base_since, base);
             if let Some(PairTarget::Pending {
                 staged, staged_ns, ..
             }) = self.pair_targets.get_mut(&key)
@@ -2226,16 +2438,90 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         key: PairKey,
         caller: CallerId,
         modules: &[ModuleKey],
-        count: PairCount,
+        observation: PairCount,
         since_ns: u64,
         base: u64,
-    ) {
+    ) -> bool {
+        let count = rebased_count(observation, base);
         if count.count == 0 {
-            return;
+            return false;
         }
+        let generation = *self.placement_generations.entry(key).or_insert(Some(0));
+        let Some(next) = self.next_pending_id.checked_add(1) else {
+            self.registry
+                .note_retirement_count_gap(caller, base, observation.count);
+            if let Some(recovery) = self.recoveries.get_mut(&key) {
+                recovery.watermark = recovery.watermark.max(observation.count);
+            }
+            self.placement_generations.insert(key, None);
+            return false;
+        };
+        if generation.is_none() || self.pending_ids.len() >= self.registry.limits().max_edges {
+            self.registry
+                .note_retirement_count_gap(caller, base, observation.count);
+            if let Some(recovery) = self.recoveries.get_mut(&key) {
+                recovery.watermark = recovery.watermark.max(observation.count);
+            }
+            return false;
+        }
+        let endpoint = match self.pair_targets.get(&key) {
+            Some(
+                PairTarget::Pending {
+                    caller: bound,
+                    endpoint,
+                    ..
+                }
+                | PairTarget::Bound {
+                    caller: bound,
+                    endpoint,
+                    ..
+                }
+                | PairTarget::Suspended {
+                    caller: bound,
+                    endpoint,
+                    ..
+                },
+            ) if *bound == caller => *endpoint,
+            _ => return false,
+        };
+        let mut work = ReceiptWork::new();
+        let origin = if let Some(recovery) = self.recoveries.get(&key) {
+            work.visit();
+            match recovery.epoch.filter(|_| recovery.blocked) {
+                Some(epoch) => PendingCountOrigin::Recovered(epoch),
+                None => PendingCountOrigin::Ordinary(recovery.ordinary_checkpoint),
+            }
+        } else {
+            // Registration moves before the original immutable handle. Its
+            // cell/tombstone remains charged even if placement later rejects.
+            work.spend(7); // bounded registration/caller barrier and three origin lookups
+            if self.count_ownership.register_pair(caller, key.object) {
+                let ownership = self.count_ownership.ordinary_view(caller, key.object);
+                if ownership.initial_metadata_refused {
+                    // Optional index storage failed before any accepted source
+                    // or completed result. Preserve generic physical admission;
+                    // this exception cannot erase established failure history.
+                    PendingCountOrigin::Untracked
+                } else {
+                    PendingCountOrigin::Ordinary(ownership.checkpoint(observation.anchor_ns))
+                }
+            } else {
+                PendingCountOrigin::Untracked
+            }
+        };
         let pending_id = self.next_pending_id;
-        self.next_pending_id = self.next_pending_id.wrapping_add(1);
-        self.pending_ids.insert(pending_id, key);
+        self.next_pending_id = next;
+        self.pending_ids.insert(
+            pending_id,
+            PendingCountObservation {
+                key,
+                caller,
+                endpoint,
+                observation,
+                generation,
+                origin,
+            },
+        );
         self.registry.note_pending_count(
             pending_id,
             caller,
@@ -2246,65 +2532,610 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             since_ns,
             base,
         );
+        true
     }
 
-    /// Finalizes pending pair placements from the publication's
-    /// decisions (P3): a placed pair caches `Bound` — only now, after
-    /// the publication decided — so later advances stage to its edge,
-    /// folding the absolute staged into the new base (round 4,
-    /// re-place: the base is the accounted absolute, so later growth
-    /// rebases past everything placed); a rejected pair (ambiguity, no
-    /// edge) finalizes `Dropped` with its held count removed, so a
-    /// later mapping can never promote a count whose witness already
-    /// went module-level. An unadmitted single stays pending and
-    /// re-resolves on the next advance. Unknown handles (a pair
-    /// re-bound after its decision staged) are ignored: the newer
-    /// bind's own decision finalizes it.
+    fn bump_placement_generation(&mut self, key: PairKey) {
+        let generation = self.placement_generations.entry(key).or_insert(Some(0));
+        *generation = generation.and_then(|generation| generation.checked_add(1));
+    }
+
+    /// Finalization consumes only the immutable observation that produced the decision.
+    /// Stale decisions may preserve registry history but never authorize newer growth.
     fn finalize_pending_counts(&mut self) {
         for decision in self.registry.take_pending_count_decisions() {
-            let Some(key) = self.pending_ids.remove(&decision.pending_id) else {
+            let Some(pending) = self.pending_ids.remove(&decision.pending_id) else {
                 continue;
             };
+            let key = pending.key;
+            if pending.generation.is_none()
+                || self.placement_generations.get(&key).copied().flatten() != pending.generation
+            {
+                continue;
+            }
+            if let PendingCountOrigin::Recovered(epoch) = pending.origin {
+                let valid = self.recovery_is_current(key, epoch);
+                if !valid {
+                    continue;
+                }
+            }
+            let accounted = match self.pair_targets.get(&key) {
+                Some(
+                    PairTarget::Bound { base, .. }
+                    | PairTarget::Suspended { base, .. }
+                    | PairTarget::Pending { base, .. },
+                ) => *base,
+                _ => continue,
+            };
+            if pending.observation.count < accounted {
+                continue;
+            }
             match decision.outcome {
                 PendingCountOutcome::Placed { module } => {
-                    if let Some(PairTarget::Pending {
-                        caller,
-                        endpoint,
-                        staged,
-                        staged_ns,
-                        ..
-                    }) = self.pair_targets.get(&key)
-                    {
-                        let (caller, endpoint, staged, staged_ns) =
-                            (*caller, *endpoint, *staged, *staged_ns);
-                        self.pair_targets.insert(
-                            key,
-                            PairTarget::Bound {
-                                caller,
-                                module,
-                                endpoint,
-                                base: staged,
-                                staged,
-                                staged_ns,
-                                base_since: staged_ns,
-                            },
-                        );
+                    if !self.recoveries.contains_key(&key) {
+                        if self.recoveries.len() < self.registry.limits().max_edges
+                            && matches!(pending.origin, PendingCountOrigin::Ordinary(_))
+                        {
+                            self.recoveries.insert(
+                                key,
+                                PairRecovery {
+                                    caller: pending.caller,
+                                    endpoint: pending.endpoint,
+                                    carrier: self
+                                        .registry
+                                        .module_id_for(&module)
+                                        .expect("placed module is registered"),
+                                    ordinary_checkpoint: match pending.origin {
+                                        PendingCountOrigin::Ordinary(checkpoint) => checkpoint,
+                                        _ => unreachable!("checked original token"),
+                                    },
+                                    epoch: None,
+                                    scan: None,
+                                    sighting: None,
+                                    fence: None,
+                                    pending_reads: [None, None, None],
+                                    withheld_through: pending.observation.count,
+                                    discarded_through: pending.observation.count,
+                                    watermark: pending.observation.count,
+                                    blocked: false,
+                                    recovered: false,
+                                    deferred_count: false,
+                                    receipt_refused: false,
+                                    epoch_pending: false,
+                                },
+                            );
+                            self.recovery_order.push(key);
+                        } else {
+                            // Retirement metadata is optional for this ordinary
+                            // successful placement, not a physical-pair admission cap.
+                            self.note_retirement_metadata_refusal(pending.caller);
+                        }
                     }
+                    if let Some(recovery) = self.recoveries.get_mut(&key) {
+                        recovery.carrier = self
+                            .registry
+                            .module_id_for(&module)
+                            .expect("placed module is registered");
+                        recovery.watermark = recovery.watermark.max(pending.observation.count);
+                        recovery.recovered |=
+                            matches!(pending.origin, PendingCountOrigin::Recovered(_));
+                        recovery.blocked =
+                            matches!(pending.origin, PendingCountOrigin::Recovered(_));
+                    }
+                    self.pair_targets.insert(
+                        key,
+                        PairTarget::Bound {
+                            caller: pending.caller,
+                            module,
+                            endpoint: pending.endpoint,
+                            base: pending.observation.count,
+                            staged: pending.observation.count,
+                            staged_ns: pending.observation.anchor_ns,
+                            base_since: pending.observation.anchor_ns,
+                        },
+                    );
                 }
                 PendingCountOutcome::Rejected { .. } => {
-                    if let Some(PairTarget::Pending {
-                        staged, staged_ns, ..
-                    }) = self.pair_targets.get(&key)
-                    {
-                        // The drop remembers the absolute staged so far:
-                        // a later row rebinds past it (round 4, rebind).
-                        let (base, base_since) = (*staged, *staged_ns);
-                        self.pair_targets
-                            .insert(key, PairTarget::Dropped { base, base_since });
+                    if let Some(recovery) = self.recoveries.get_mut(&key) {
+                        recovery.blocked = true;
+                        recovery.recovered = false;
+                        recovery.watermark = recovery.watermark.max(pending.observation.count);
+                        self.pair_targets.insert(
+                            key,
+                            PairTarget::Suspended {
+                                caller: pending.caller,
+                                endpoint: pending.endpoint,
+                                base: pending.observation.count,
+                                base_since: pending.observation.anchor_ns,
+                            },
+                        );
+                    } else {
+                        self.pair_targets.insert(
+                            key,
+                            PairTarget::Dropped {
+                                base: pending.observation.count,
+                                base_since: pending.observation.anchor_ns,
+                            },
+                        );
                         self.pair_counts.remove(&key);
                     }
                 }
                 PendingCountOutcome::Unadmitted { .. } => {}
+            }
+        }
+    }
+
+    fn recovery_is_current(&self, key: PairKey, epoch: OwnershipEpoch) -> bool {
+        let Some(recovery) = self.recoveries.get(&key) else {
+            return false;
+        };
+        if recovery.epoch != Some(epoch) || recovery.epoch_pending || recovery.receipt_refused {
+            return false;
+        }
+        let Some(record) = self.adapter.record(recovery.caller) else {
+            return false;
+        };
+        if record.retired
+            || self.adapter.live_id(record.pid) != Some(recovery.caller)
+            || self
+                .adapter
+                .live_pin(record.pid)
+                .is_none_or(|(_, pin)| !self.adapter.source().still_the_same(pin))
+            || !self.binder.domain_active(key.image.domain())
+        {
+            return false;
+        }
+        let Some(scan) = recovery.scan.as_ref() else {
+            return false;
+        };
+        if record.start_time != scan.generation().start_time
+            || record.exe != scan.generation().exe
+            || record.first_seen_ns > scan.started_ns()
+        {
+            return false;
+        }
+        if self.capture.as_ref().is_some_and(|capture| {
+            capture.stopped
+                || capture.unproven.is_some()
+                || self
+                    .attach_set
+                    .endpoint(recovery.endpoint)
+                    .is_none_or(|endpoint| {
+                        endpoint.object.index() != key.object
+                            || capture.changed_objects.contains(&endpoint.object)
+                    })
+        }) {
+            return false;
+        }
+        matches!(self.count_ownership.candidates(recovery.caller, key.object), CurrentCandidates::Sole { epoch: current, module, .. }
+            if current == epoch && self.registry.module_id_for(&module)
+                .and_then(|id| self.registry.module(id).zip(self.registry.edge(recovery.caller, id)))
+                .is_some_and(|(module, edge)| module.admission == AdmissionState::Admitted
+                    && edge.mapping == MappingState::Mapped && !edge.double_loaded))
+            && recovery.sighting.as_ref().is_some_and(|sighting| {
+                matches!(
+                    self.binder.check_current_binding(sighting),
+                    CurrentBindingCheck::Proven
+                )
+            })
+    }
+
+    fn suspend_recovery(&mut self, key: PairKey, recovery: &mut PairRecovery) {
+        recovery.blocked = true;
+        recovery.recovered = false;
+        self.pair_targets.insert(
+            key,
+            PairTarget::Suspended {
+                caller: recovery.caller,
+                endpoint: recovery.endpoint,
+                base: recovery.watermark,
+                base_since: recovery.fence.map_or(0, |fence| fence.anchor_ns),
+            },
+        );
+    }
+
+    /// A bounded comparison resolved to the carrier that already placed this
+    /// pair. Resume its full ordinary growth, with its original staged base.
+    fn resume_deferred_count(
+        &mut self,
+        key: PairKey,
+        recovery: &mut PairRecovery,
+        module: &ModuleKey,
+        held: Option<PairCount>,
+    ) {
+        recovery.deferred_count = false;
+        recovery.clear_reads();
+        recovery.epoch_pending = false;
+        recovery.epoch = None;
+        recovery.scan = None;
+        recovery.sighting = None;
+        recovery.fence = None;
+        let Some(PairTarget::Bound {
+            staged, staged_ns, ..
+        }) = self.pair_targets.get(&key)
+        else {
+            return;
+        };
+        let (staged, staged_ns) = (*staged, *staged_ns);
+        let Some(count) = held.filter(|count| count.count > staged) else {
+            return;
+        };
+        self.stage_pair_count(
+            recovery.caller,
+            module,
+            rebased_count(count, staged),
+            staged_ns,
+            staged,
+        );
+        recovery.watermark = recovery.watermark.max(count.count);
+        if let Some(PairTarget::Bound {
+            base,
+            staged,
+            staged_ns,
+            base_since,
+            ..
+        }) = self.pair_targets.get_mut(&key)
+        {
+            *base = count.count;
+            *staged = count.count;
+            *staged_ns = count.anchor_ns;
+            *base_since = count.anchor_ns;
+        }
+    }
+
+    /// Only a classified contiguous unknown prefix is disclosed here. Callers
+    /// first resolve historical generic decisions and continuing ownership.
+    fn flush_withheld_prefix(&mut self, recovery: &mut PairRecovery) {
+        self.registry.note_retirement_count_gap(
+            recovery.caller,
+            recovery.watermark,
+            recovery.withheld_through,
+        );
+        recovery.watermark = recovery.watermark.max(recovery.withheld_through);
+        recovery.withheld_through = recovery.watermark;
+    }
+
+    fn generic_predecessor(&self, key: PairKey, recovery: &PairRecovery) -> bool {
+        (recovery.epoch.is_none() || recovery.epoch_pending)
+            && matches!(self.pair_targets.get(&key), Some(PairTarget::Pending { base, staged, .. }) if staged > base)
+    }
+
+    fn cancel_retirement_candidate(
+        &mut self,
+        key: PairKey,
+        recovery: &mut PairRecovery,
+        held: Option<PairCount>,
+    ) {
+        let predecessor = self.generic_predecessor(key, recovery);
+        let protected = recovery.deferred_count
+            || recovery.epoch.is_some()
+            || recovery.scan.is_some()
+            || recovery.pending_reads.iter().any(Option::is_some);
+        recovery.withhold_reads();
+        if let Some(read) = recovery.fence.take() {
+            recovery.withheld_through = recovery.withheld_through.max(read.count);
+        }
+        recovery.epoch = None;
+        recovery.epoch_pending = false;
+        recovery.scan = None;
+        recovery.sighting = None;
+        recovery.deferred_count = predecessor && protected;
+        if !predecessor {
+            // No surviving allocation candidate remains after genuine revocation.
+            recovery.withheld_through = recovery.withheld_through.max(recovery.discarded_through);
+            recovery.discarded_through = recovery.watermark;
+            self.flush_withheld_prefix(recovery);
+            if let Some(held) = held {
+                self.registry.note_retirement_count_gap(
+                    recovery.caller,
+                    recovery.watermark,
+                    held.count,
+                );
+                recovery.watermark = recovery.watermark.max(held.count);
+                recovery.withheld_through = recovery.watermark;
+            }
+            self.suspend_recovery(key, recovery);
+        }
+    }
+
+    /// One top-level call shares a single visit/query allowance. Reserved proof
+    /// work prevents a large observation/index rebuild from starving later pairs.
+    fn reconcile_count_eligibility(
+        &mut self,
+        identity: &mut dyn NativeIdentity<Source::Pin>,
+        budget: &mut RecoveryWorkBudget,
+    ) {
+        budget.limit_visits(64);
+        self.count_ownership
+            .advance(&self.attach_set, &self.registry, budget);
+        budget.limit_visits(128);
+        let mut serviced = 0;
+        while budget.remaining() >= 48 && serviced < self.recovery_order.len() {
+            let key = self.recovery_order[self.recovery_cursor];
+            self.recovery_cursor = (self.recovery_cursor + 1) % self.recovery_order.len();
+            serviced += 1;
+            // 16 existing exact target/count/caller/pin/domain guards plus 32
+            // fixed receipt resolution operations, including refused branches.
+            // The allowance is reserved once, never refilled for another pair.
+            budget.spend(48);
+            let Some(mut recovery) = self.recoveries.remove(&key) else {
+                continue;
+            };
+            let held = self.pair_counts.get(&key).copied();
+            let ownership = self
+                .count_ownership
+                .ordinary_view(recovery.caller, key.object);
+            let candidate = ownership
+                .candidate
+                .cloned()
+                .unwrap_or(CurrentCandidates::Unknown);
+            let continuing = matches!(&candidate, CurrentCandidates::Sole { epoch, .. } if recovery.epoch == Some(*epoch));
+            let ordinary = matches!(&candidate, CurrentCandidates::Sole { module, .. }
+                if !recovery.blocked && self.registry.module_id_for(module) == Some(recovery.carrier)
+                    && !recovery.recovered
+                    && (recovery.epoch.is_none() || recovery.epoch_pending && continuing)
+                    && recovery.ordinary_checkpoint != 0
+                    && recovery.ordinary_checkpoint == ownership.sequence);
+            let mut work = ReceiptWork::new();
+            work.spend(3); // ordinary source/checkpoint guards within the fixed reservation
+            let was_refused = recovery.receipt_refused;
+            recovery.normalize_reads(
+                &self.count_ownership.receipt_view(recovery.caller),
+                continuing || ordinary,
+                &mut work,
+            );
+            if !was_refused && recovery.receipt_refused {
+                self.registry.record_gap(RegistryGap {
+                    caller: Some(recovery.caller), module: None, pid: None,
+                    subject: "count retirement earlier read invariant refused".into(),
+                    reason: "a late earlier equivalent read contradicts a finalized boundary; history remains immutable and future retirement attribution is refused".into(), budget: None,
+                });
+            }
+            let live = self
+                .adapter
+                .record(recovery.caller)
+                .filter(|record| {
+                    !record.retired
+                        && self.adapter.live_id(record.pid) == Some(recovery.caller)
+                        && self
+                            .adapter
+                            .live_pin(record.pid)
+                            .is_some_and(|(_, pin)| self.adapter.source().still_the_same(pin))
+                })
+                .cloned();
+            let canceled = recovery.receipt_refused
+                || live.is_none()
+                || !self.binder.domain_active(key.image.domain())
+                || self.capture.as_ref().is_some_and(|capture| {
+                    capture.stopped
+                        || capture.unproven.is_some()
+                        || self
+                            .attach_set
+                            .endpoint(recovery.endpoint)
+                            .is_none_or(|endpoint| {
+                                endpoint.object.index() != key.object
+                                    || capture.changed_objects.contains(&endpoint.object)
+                            })
+                });
+            if canceled {
+                self.cancel_retirement_candidate(key, &mut recovery, held);
+                self.recoveries.insert(key, recovery);
+                continue;
+            }
+            let predecessor = self.generic_predecessor(key, &recovery);
+            let CurrentCandidates::Sole {
+                module,
+                epoch,
+                scan,
+            } = candidate
+            else {
+                if !self.count_ownership.deferred(recovery.caller, key.object)
+                    && (recovery.blocked || recovery.deferred_count || recovery.epoch.is_some())
+                {
+                    self.cancel_retirement_candidate(key, &mut recovery, held);
+                }
+                self.recoveries.insert(key, recovery);
+                continue;
+            };
+            if ordinary {
+                if predecessor {
+                    self.recoveries.insert(key, recovery);
+                    continue;
+                }
+                if recovery.deferred_count || recovery.epoch_pending {
+                    self.resume_deferred_count(key, &mut recovery, &module, held);
+                } else {
+                    recovery.clear_reads();
+                }
+                self.recoveries.insert(key, recovery);
+                continue;
+            }
+            if recovery.epoch != Some(epoch) {
+                let selected = recovery.take_read(&scan, &mut work);
+                if let Some(read) = recovery.fence.take() {
+                    recovery.withheld_through = recovery.withheld_through.max(read.count);
+                }
+                recovery.epoch = Some(epoch);
+                recovery.scan = Some(
+                    selected
+                        .as_ref()
+                        .map_or_else(|| scan.clone(), |tag| tag.scan.clone()),
+                );
+                recovery.fence = selected.map(|tag| tag.read);
+                recovery.sighting = None;
+                recovery.deferred_count = true;
+                recovery.epoch_pending = true;
+            } else if recovery.fence.is_none()
+                && let Some(selected) = recovery.take_read(&scan, &mut work)
+            {
+                // The bounded current summary established this continuing
+                // logical epoch, including any unrelated global revision.
+                recovery.fence = Some(selected.read);
+                if recovery
+                    .scan
+                    .as_ref()
+                    .is_none_or(|old| selected.scan.started_ns() < old.started_ns())
+                {
+                    recovery.scan = Some(selected.scan);
+                }
+            }
+            // Ownership selection above may coexist with old generic handles.
+            // It changes neither their generation/target nor any H/D disposition.
+            if predecessor {
+                self.recoveries.insert(key, recovery);
+                continue;
+            }
+            if recovery.epoch_pending {
+                self.bump_placement_generation(key);
+                self.suspend_recovery(key, &mut recovery);
+                recovery.epoch_pending = false;
+                recovery.deferred_count = false;
+            }
+            // Classify surviving full current candidates BEFORE D conversion.
+            // A later detached11 cannot consume valid new-epoch10 at rollover.
+            if let Some(read) = recovery.fence {
+                if recovery.discarded_through <= read.count {
+                    // This actually saved obsolete prefix precedes the full
+                    // source-validated boundary. H is independent old history.
+                    recovery.withheld_through =
+                        recovery.withheld_through.max(recovery.discarded_through);
+                }
+                // A qualifying full tag/selected epoch independently proves
+                // current sampled continuation. D above it supplies no loss.
+                recovery.discarded_through = recovery.watermark;
+                if recovery.withheld_through > read.count
+                    && recovery.withheld_through > recovery.watermark
+                {
+                    // Independently unknown H contradicts this candidate. All
+                    // affected future claims are revoked before true loss.
+                    recovery.fence = None;
+                    recovery.withhold_reads();
+                    recovery.withheld_through =
+                        recovery.withheld_through.max(recovery.discarded_through);
+                    recovery.discarded_through = recovery.watermark;
+                    self.registry.record_gap(RegistryGap {
+                        caller: Some(recovery.caller), module: None, pid: None,
+                        subject: "count retirement candidate revoked".into(),
+                        reason: "independently unknown historical coverage crosses the retained candidate after genuine revocation; future recovery needs a new actual advancing read".into(),
+                        budget: None,
+                    });
+                }
+            } else {
+                // All conditional tags are detached from this new current
+                // authority and no full surviving candidate claims their range.
+                recovery.withheld_through =
+                    recovery.withheld_through.max(recovery.discarded_through);
+                recovery.discarded_through = recovery.watermark;
+            }
+            self.flush_withheld_prefix(&mut recovery);
+            let scan = recovery
+                .scan
+                .as_ref()
+                .expect("epoch owns its original scan")
+                .clone();
+            let record = live.expect("checked live caller");
+            if record.start_time != scan.generation().start_time
+                || record.exe != scan.generation().exe
+                || record.first_seen_ns > scan.started_ns()
+            {
+                self.cancel_retirement_candidate(key, &mut recovery, held);
+                self.recoveries.insert(key, recovery);
+                continue;
+            }
+            if recovery.sighting.is_none() {
+                if !budget.query() {
+                    self.recoveries.insert(key, recovery);
+                    continue;
+                }
+                let request = CurrentBindingRequest {
+                    caller: recovery.caller,
+                    pid: record.pid,
+                    image: key.image,
+                    exec_id: key.exec,
+                };
+                match self
+                    .binder
+                    .sight_current_binding(request, &self.adapter, identity)
+                {
+                    Ok(sighting) => {
+                        if sighting.sighted_ns() > scan.finished_ns() {
+                            recovery.sighting = Some(sighting);
+                        }
+                    }
+                    Err(UnboundReason::CookieUnavailable) => {}
+                    Err(
+                        UnboundReason::NoLiveCaller
+                        | UnboundReason::CallerExited
+                        | UnboundReason::CookieMismatch
+                        | UnboundReason::BeforeAdmission
+                        | UnboundReason::ExecAfterAdmission
+                        | UnboundReason::LifecycleLoss
+                        | UnboundReason::ExecAmbiguous
+                        | UnboundReason::ExecTransition
+                        | UnboundReason::ExecCoverageGap
+                        | UnboundReason::EvidenceIncomplete
+                        | UnboundReason::Capacity,
+                    ) => {
+                        // A failed completion clock also supplies no authority.
+                        // Preserve history, but never retry a rejected read as
+                        // though its original identity proof merely waited.
+                        self.cancel_retirement_candidate(key, &mut recovery, held);
+                        self.recoveries.insert(key, recovery);
+                        continue;
+                    }
+                }
+            }
+            // Selection above retained an unproven candidate only. A genuine
+            // post-scan sighting now permits classifying the saved prefix and
+            // first-read uncertainty. Allocation still waits for Proven horizons.
+            if recovery.sighting.is_some()
+                && let Some(read) = recovery.fence.filter(|read| {
+                    read.count > recovery.watermark
+                        && read.retirement_usable
+                        && read.anchor_ns > scan.finished_ns()
+                })
+            {
+                self.flush_withheld_prefix(&mut recovery);
+                self.registry.note_retirement_count_gap(
+                    recovery.caller,
+                    recovery.watermark,
+                    read.count,
+                );
+                recovery.watermark = read.count;
+                recovery.withheld_through = recovery.watermark;
+                self.suspend_recovery(key, &mut recovery);
+            }
+            let proof = recovery
+                .sighting
+                .as_ref()
+                .map(|sighting| self.binder.check_current_binding(sighting));
+            if matches!(proof, Some(CurrentBindingCheck::Rejected(_))) {
+                self.cancel_retirement_candidate(key, &mut recovery, held);
+            }
+            let stage = matches!(proof, Some(CurrentBindingCheck::Proven))
+                && recovery.fence.is_some()
+                && held
+                    .is_some_and(|held| held.count > recovery.watermark && held.retirement_usable);
+            self.recoveries.insert(key, recovery);
+            if stage && self.recovery_is_current(key, epoch) {
+                let held = held.expect("stage has held observation");
+                let recovery = self.recoveries.get(&key).expect("retained recovery");
+                let caller = recovery.caller;
+                let base = recovery.watermark;
+                let since = recovery.fence.expect("stage has fence").anchor_ns;
+                if self.stage_pending_count(
+                    key,
+                    caller,
+                    std::slice::from_ref(&module),
+                    held,
+                    since,
+                    base,
+                ) {
+                    self.recoveries
+                        .get_mut(&key)
+                        .expect("retained recovery")
+                        .watermark = held.count;
+                }
             }
         }
     }
@@ -2687,6 +3518,8 @@ struct PairCount {
     /// Kept separately from POST observation time when it becomes a base.
     anchor_ns: u64,
     last_ns: u64,
+    /// The original strict advance had a valid, healthy observation bracket.
+    retirement_usable: bool,
 }
 
 /// Rebase one held absolute count past `base` (F3-03): what stages is
@@ -2704,7 +3537,20 @@ fn rebased_count(count: PairCount, base: u64) -> PairCount {
         },
         anchor_ns: count.anchor_ns,
         last_ns: count.last_ns,
+        retirement_usable: count.retirement_usable,
     }
+}
+
+fn valid_retirement_refresh(batch: &WitnessBatch, count: u64) -> bool {
+    batch.counts_read_ns > 0
+        && batch.rows_read_ns >= batch.counts_read_ns
+        && batch.rows_read_ns != u64::MAX
+        && count < u64::MAX
+        && batch.health_unproven.is_none()
+        && batch.health_regression.is_none()
+        && batch.read_failures.is_empty()
+        && !batch.refresh_sweep_gaps
+        && !batch.refresh_deadline_reached
 }
 
 /// Where one decided pair's counts go (C7 C4).
@@ -2771,6 +3617,193 @@ enum PairTarget {
     /// 4, rebind). `base_since` is the PRE bound for the `base` read: a
     /// revival's growth windows from the drop.
     Dropped { base: u64, base_since: u64 },
+    /// Exact, previously placed history remains; future ownership needs a fresh fence.
+    Suspended {
+        caller: CallerId,
+        endpoint: EndpointId,
+        base: u64,
+        base_since: u64,
+    },
+}
+
+/// One immutable publication request. A decision cannot borrow a newer held maximum.
+struct PendingCountObservation {
+    key: PairKey,
+    caller: CallerId,
+    endpoint: EndpointId,
+    observation: PairCount,
+    generation: Option<u64>,
+    origin: PendingCountOrigin,
+}
+
+#[derive(Clone, Copy)]
+enum PendingCountOrigin {
+    Untracked,
+    Ordinary(u64),
+    Recovered(OwnershipEpoch),
+}
+
+/// Fixed-size recovery state per exact pair with successfully placed history.
+struct PairRecovery {
+    caller: CallerId,
+    endpoint: EndpointId,
+    carrier: ModuleId,
+    /// Frozen with this exact pair's original ordinary observation. Historical
+    /// handles never refresh it; selected recovery has its independent epoch.
+    ordinary_checkpoint: u64,
+    epoch: Option<OwnershipEpoch>,
+    scan: Option<Arc<OwnershipScan>>,
+    sighting: Option<CurrentBindingSighting>,
+    /// Ownership-selected original read. Retention is unproven: until a genuine
+    /// sighting exists it causes no accounting, gap or allocation side effect.
+    /// Only the subsequent Proven binding check permits new-owner allocation.
+    fence: Option<PairCount>,
+    pending_reads: [Option<TaggedCountRead>; 3],
+    /// Actual saved obsolete reads can justify an unknown prefix after any
+    /// historical generic predecessor finishes. At/below watermark it is only
+    /// normalized storage: watermark may include an immutable staged request,
+    /// not successful placement. Only its excess can be new unknown coverage.
+    /// This never supplies a fence.
+    withheld_through: u64,
+    /// Conditional actual detached reads: no known loss or read authority.
+    /// Current logical-epoch classification precedes any historical conversion.
+    discarded_through: u64,
+    watermark: u64,
+    blocked: bool,
+    recovered: bool,
+    deferred_count: bool,
+    receipt_refused: bool,
+    /// Selected ownership may wait for original generic publication handles.
+    /// Its placement generation and target are untouched until those finish.
+    epoch_pending: bool,
+}
+
+struct TaggedCountRead {
+    scan: Arc<OwnershipScan>,
+    read: PairCount,
+}
+impl PairRecovery {
+    fn clear_reads(&mut self) {
+        self.pending_reads = [None, None, None];
+        self.withheld_through = self.watermark;
+        self.discarded_through = self.watermark;
+    }
+    fn withhold_reads(&mut self) {
+        for slot in &mut self.pending_reads {
+            if let Some(tag) = slot.take() {
+                self.discarded_through = self.discarded_through.max(tag.read.count);
+            }
+        }
+    }
+    fn normalize_reads(
+        &mut self,
+        view: &ReceiptView<'_>,
+        continuing: bool,
+        work: &mut ReceiptWork,
+    ) {
+        if continuing {
+            // Only speculative D is resolved by proven current continuation.
+            // Independently justified old H remains until predecessor settlement.
+            self.discarded_through = self.watermark;
+        }
+        let mut retained = 0;
+        for slot in &mut self.pending_reads {
+            work.visit();
+            let Some(tag) = slot else { continue };
+            let disposition = view.disposition(&tag.scan, work);
+            work.visit();
+            let selected_equivalent = self
+                .scan
+                .as_ref()
+                .is_some_and(|scan| tag.scan.equivalent(scan));
+            if disposition == ReceiptDisposition::Retained
+                && selected_equivalent
+                && self.fence.is_some()
+            {
+                work.visit();
+                if let Some(fence) = self.fence.as_mut()
+                    && tag.read.count < fence.count
+                {
+                    if fence.count > self.watermark {
+                        // Full read and brackets move together before first use.
+                        *fence = tag.read;
+                        if self
+                            .scan
+                            .as_ref()
+                            .is_none_or(|scan| tag.scan.started_ns() < scan.started_ns())
+                        {
+                            self.scan = Some(tag.scan.clone());
+                        }
+                    } else {
+                        self.receipt_refused = true;
+                        self.deferred_count = true;
+                    }
+                }
+                *slot = None;
+                continue;
+            }
+            if disposition == ReceiptDisposition::Obsolete || tag.read.count <= self.watermark {
+                work.visit();
+                if !continuing && tag.read.count > self.watermark {
+                    self.discarded_through = self.discarded_through.max(tag.read.count);
+                }
+                *slot = None;
+            } else {
+                retained += 1;
+            }
+        }
+        // The slot visits already established cardinality. Empty/singleton
+        // sets have no pair comparison to perform. With the added continuity
+        // guards, the full capture/service branch still fits 32 operations.
+        if retained < 2 {
+            return;
+        }
+        // Three constant comparisons, never a position-based overwrite.
+        for (left, right) in [(0, 1), (0, 2), (1, 2)] {
+            work.visit();
+            let equal = match (&self.pending_reads[left], &self.pending_reads[right]) {
+                (Some(left), Some(right)) => {
+                    Arc::ptr_eq(&left.scan, &right.scan) || left.scan.equivalent(&right.scan)
+                }
+                _ => false,
+            };
+            if equal {
+                work.visit();
+                let right = self.pending_reads[right]
+                    .take()
+                    .expect("equal occupied tag");
+                let left = self.pending_reads[left]
+                    .as_mut()
+                    .expect("equal occupied tag");
+                if right.read.count < left.read.count {
+                    left.read = right.read;
+                }
+                if right.scan.started_ns() < left.scan.started_ns() {
+                    left.scan = right.scan;
+                }
+            }
+        }
+    }
+    fn take_read(
+        &mut self,
+        scan: &Arc<OwnershipScan>,
+        work: &mut ReceiptWork,
+    ) -> Option<TaggedCountRead> {
+        let mut selected = None;
+        for index in 0..3 {
+            work.visit();
+            if self.pending_reads[index]
+                .as_ref()
+                .is_some_and(|tag| tag.scan.equivalent(scan))
+            {
+                selected = Some(index);
+            }
+        }
+        selected.and_then(|index| {
+            work.visit();
+            self.pending_reads[index].take()
+        })
+    }
 }
 
 /// Per-endpoint attach state from the capture facade's receipts. Bounded by
@@ -3794,7 +4827,7 @@ mod tests {
 
     /// One catalog object per path, each observed by `pid`, plus that
     /// member's complete scan record.
-    fn capture_catalog(
+    pub(super) fn capture_catalog(
         pins: &crate::discovery::identity::PinnedObjects,
         paths: &[&std::path::Path],
         pid: u32,
@@ -3845,6 +4878,7 @@ mod tests {
             cap: 1,
             scan_ms: 0,
             processes: vec![crate::inspect_system::ProcessRecord {
+                complete_scan: None,
                 pid,
                 status: crate::inspect_system::MemberStatus::Scanned,
                 objects: (0..objects.len()).collect(),
@@ -4423,18 +5457,19 @@ mod tests {
     /// A coordinator over a scripted process source, its attach set holding
     /// one provider with `endpoints` entries, and that provider's catalog
     /// for `pid`.
-    struct CaptureScene {
-        _dir: tempfile::TempDir,
-        source: crate::discovery::caller_registry::tests::ScriptedSource,
-        coordinator: InventoryCoordinator<crate::discovery::caller_registry::tests::ScriptedSource>,
-        delta: TargetDelta,
-        verdicts: BTreeMap<AttachModuleKey, AttachVerdict>,
-        pins: crate::discovery::identity::PinnedObjects,
-        path: PathBuf,
+    pub(super) struct CaptureScene {
+        pub(super) _dir: tempfile::TempDir,
+        pub(super) source: crate::discovery::caller_registry::tests::ScriptedSource,
+        pub(super) coordinator:
+            InventoryCoordinator<crate::discovery::caller_registry::tests::ScriptedSource>,
+        pub(super) delta: TargetDelta,
+        pub(super) verdicts: BTreeMap<AttachModuleKey, AttachVerdict>,
+        pub(super) pins: crate::discovery::identity::PinnedObjects,
+        pub(super) path: PathBuf,
     }
 
     impl CaptureScene {
-        fn new(endpoints: u64) -> Self {
+        pub(super) fn new(endpoints: u64) -> Self {
             use crate::discovery::inventory_attach_set::tests as fx;
             let dir = tempfile::tempdir().unwrap();
             let path = fx::provider(&dir, "a.so", "provider-a");
@@ -4465,7 +5500,7 @@ mod tests {
             }
         }
 
-        fn attach_all(&mut self, at_ns: u64, custody: ScopeCustody) {
+        pub(super) fn attach_all(&mut self, at_ns: u64, custody: ScopeCustody) {
             let receipt = ExtendReceipt {
                 attached: self
                     .delta
@@ -4483,12 +5518,12 @@ mod tests {
             self.coordinator.note_extend_receipt(&receipt);
         }
 
-        fn project(&mut self, pid: u32, now_ns: u64) {
+        pub(super) fn project(&mut self, pid: u32, now_ns: u64) {
             let path = self.path.clone();
             self.project_paths(pid, &[&path], now_ns);
         }
 
-        fn project_paths(&mut self, pid: u32, paths: &[&std::path::Path], now_ns: u64) {
+        pub(super) fn project_paths(&mut self, pid: u32, paths: &[&std::path::Path], now_ns: u64) {
             // Collected under the incarnation reconcile holds for the pid.
             let generation = self
                 .coordinator
@@ -4504,7 +5539,10 @@ mod tests {
                 .project_catalog(&catalog, &self.verdicts, now_ns);
         }
 
-        fn coverage(&self, caller: CallerId) -> crate::discovery::caller_registry::UseCoverage {
+        pub(super) fn coverage(
+            &self,
+            caller: CallerId,
+        ) -> crate::discovery::caller_registry::UseCoverage {
             let registry = &self.coordinator.registry;
             let edge = registry
                 .edges()
@@ -5215,8 +6253,9 @@ mod tests {
 
     /// Scripted cookie answers per (pin, domain); never a host read.
     #[derive(Default)]
-    struct ScriptedCookies {
+    pub(super) struct ScriptedCookies {
         answers: std::collections::HashMap<(ScriptedPin, NativeDomainId), CookieQuery>,
+        pub(super) queries: usize,
     }
 
     impl NativeIdentity<ScriptedPin> for ScriptedCookies {
@@ -5225,6 +6264,7 @@ mod tests {
         }
 
         fn query_cookie(&mut self, domain: NativeDomainId, pin: &ScriptedPin) -> CookieQuery {
+            self.queries += 1;
             self.answers
                 .get(&(*pin, domain))
                 .cloned()
@@ -5237,14 +6277,14 @@ mod tests {
 
     /// Facade stamps for scripted native batches: strictly increasing, so
     /// each batch follows the one staged before it.
-    struct Stamps(std::cell::Cell<u64>);
+    pub(super) struct Stamps(std::cell::Cell<u64>);
 
     impl Stamps {
-        fn from(start: u64) -> Self {
+        pub(super) fn from(start: u64) -> Self {
             Self(std::cell::Cell::new(start))
         }
 
-        fn tick(&self) -> u64 {
+        pub(super) fn tick(&self) -> u64 {
             let at = self.0.get() + 10;
             self.0.set(at);
             at
@@ -5252,7 +6292,7 @@ mod tests {
 
         /// One readable witness read of `domain`: health at the stamp, rows
         /// read just after it.
-        fn read(&self, domain: NativeDomainId, rows: Vec<WitnessRow>) -> NativeBatch {
+        pub(super) fn read(&self, domain: NativeDomainId, rows: Vec<WitnessRow>) -> NativeBatch {
             let at = self.tick();
             let mut read = witness_batch();
             read.domain = domain;
@@ -5266,22 +6306,22 @@ mod tests {
         }
 
         /// One complete lifecycle drain of `domain`.
-        fn drain(&self, domain: NativeDomainId) -> NativeBatch {
+        pub(super) fn drain(&self, domain: NativeDomainId) -> NativeBatch {
             NativeBatch::Lifecycle(DiscoveryBatch::scripted(domain, Vec::new(), self.tick()))
         }
     }
 
-    struct NativeScene {
-        scene: CaptureScene,
-        domain: NativeDomainId,
-        cookies: ScriptedCookies,
-        stamps: Stamps,
+    pub(super) struct NativeScene {
+        pub(super) scene: CaptureScene,
+        pub(super) domain: NativeDomainId,
+        pub(super) cookies: ScriptedCookies,
+        pub(super) stamps: Stamps,
     }
 
     impl NativeScene {
         /// One provider with two endpoints in the attach set, pid 7
         /// spawned (start 500) and admitted at 50 and mapped.
-        fn new() -> (Self, CallerId) {
+        pub(super) fn new() -> (Self, CallerId) {
             let mut scene = CaptureScene::new(2);
             scene.source.spawn(7, 500);
             let caller = scene
@@ -5297,7 +6337,7 @@ mod tests {
         /// A native lane over `scene` whose exec coverage began at
         /// `coverage_ns`, forwarded the way C5 forwards it: through the
         /// activating extend receipt.
-        fn over(mut scene: CaptureScene, coverage_ns: u64) -> Self {
+        pub(super) fn over(mut scene: CaptureScene, coverage_ns: u64) -> Self {
             let domain = NativeDomainId::mint();
             scene.coordinator.note_extend_receipt(&ExtendReceipt {
                 activated_roots: true,
@@ -5312,14 +6352,39 @@ mod tests {
             }
         }
 
-        fn answer(&mut self, pid: u32, start: u64, ticket: u64) {
+        pub(super) fn answer(&mut self, pid: u32, start: u64, ticket: u64) {
             self.cookies.answers.insert(
                 ((pid, start), self.domain),
                 CookieQuery::Cookie(DomainCookie::scripted(self.domain, ticket)),
             );
         }
 
-        fn row(&self, ticket: u64, exec: u64, tgid: u32, t0: u64, member: usize) -> WitnessRow {
+        pub(super) fn forget_answer(&mut self, pid: u32, start: u64) {
+            self.cookies.answers.remove(&((pid, start), self.domain));
+        }
+
+        pub(super) fn query_answer(&mut self, pid: u32, start: u64, answer: CookieQuery) {
+            self.cookies
+                .answers
+                .insert(((pid, start), self.domain), answer);
+        }
+
+        pub(super) fn unavailable_answer(&mut self, pid: u32, start: u64) {
+            self.query_answer(
+                pid,
+                start,
+                CookieQuery::Unavailable("scripted temporary cookie-query failure".into()),
+            );
+        }
+
+        pub(super) fn row(
+            &self,
+            ticket: u64,
+            exec: u64,
+            tgid: u32,
+            t0: u64,
+            member: usize,
+        ) -> WitnessRow {
             let endpoint = self.scene.delta.endpoints[member];
             WitnessRow::scripted(
                 self.domain,
@@ -5332,14 +6397,14 @@ mod tests {
             )
         }
 
-        fn stage(&mut self, batch: NativeBatch) -> NativeReceipt {
+        pub(super) fn stage(&mut self, batch: NativeBatch) -> NativeReceipt {
             let now = self.stamps.tick();
             self.scene
                 .coordinator
                 .stage_native(batch, &mut self.cookies, now)
         }
 
-        fn read(&mut self, rows: Vec<WitnessRow>) -> NativeReceipt {
+        pub(super) fn read(&mut self, rows: Vec<WitnessRow>) -> NativeReceipt {
             let batch = self.stamps.read(self.domain, rows);
             self.stage(batch)
         }
@@ -5347,7 +6412,7 @@ mod tests {
         /// One witness read carrying `counts` (C4): each `(ticket, exec,
         /// member, count)` names the image, the member's object, and the
         /// re-read count. `rows` ride along: a read may carry both.
-        fn counts_read(
+        pub(super) fn counts_read(
             &mut self,
             rows: Vec<WitnessRow>,
             counts: Vec<(u64, u64, usize, u64)>,
@@ -5377,13 +6442,13 @@ mod tests {
             self.stage(NativeBatch::Witness(Box::new(batch)))
         }
 
-        fn drain(&mut self) -> NativeReceipt {
+        pub(super) fn drain(&mut self) -> NativeReceipt {
             let batch = self.stamps.drain(self.domain);
             self.stage(batch)
         }
 
         /// Read `rows`, then both horizons, then publish.
-        fn witness(&mut self, rows: Vec<WitnessRow>) -> Vec<CallerEvent> {
+        pub(super) fn witness(&mut self, rows: Vec<WitnessRow>) -> Vec<CallerEvent> {
             let mut events = self.read(rows).events;
             events.extend(self.drain().events);
             events.extend(self.read(Vec::new()).events);
@@ -5391,7 +6456,7 @@ mod tests {
             events
         }
 
-        fn module_unbound(&self) -> Option<UnboundUse> {
+        pub(super) fn module_unbound(&self) -> Option<UnboundUse> {
             self.scene
                 .coordinator
                 .registry
@@ -5400,11 +6465,11 @@ mod tests {
                 .and_then(|module| module.unbound_use.clone())
         }
 
-        fn preadmission(&self) -> PreadmissionCounters {
+        pub(super) fn preadmission(&self) -> PreadmissionCounters {
             self.scene.coordinator.preadmission_counters().unwrap()
         }
 
-        fn gap_subjects(&self) -> Vec<String> {
+        pub(super) fn gap_subjects(&self) -> Vec<String> {
             self.scene
                 .coordinator
                 .registry
@@ -5751,6 +6816,7 @@ mod tests {
                 first_ns: 100,
                 anchor_ns: 100,
                 last_ns: 200,
+                retirement_usable: false,
             },
             100,
             0,
@@ -8110,10 +9176,10 @@ mod tests {
     }
 
     #[test]
-    fn an_ambiguous_count_finalizes_dropped_and_stays_there() {
+    fn a_previously_placed_ambiguous_count_suspends_without_retirement_authority() {
         // P3 finalization (sol#2): a shared-endpoint use both edges hold
-        // reads ambiguous — its count finalizes Dropped with its held
-        // count removed, so later advances can never attribute it.
+        // reads ambiguous. Its successfully placed prefix remains recoverable
+        // only through private retirement authority, absent from this fixture.
         use crate::discovery::inventory_attach_set::tests as fx;
         let (mut native, caller) = NativeScene::new();
         native.answer(7, 500, 41);
@@ -8154,18 +9220,18 @@ mod tests {
             placement.ambiguous, 1,
             "the shared-endpoint witness reads ambiguous: {placement:?}"
         );
-        // The rejection finalizes: Dropped, held count removed.
+        // The rejection suspends the previously placed exact pair.
         assert!(
             matches!(
                 native.scene.coordinator.pair_targets.get(&key),
-                Some(PairTarget::Dropped { .. })
+                Some(PairTarget::Suspended { .. })
             ),
-            "the ambiguous pair finalizes Dropped: {:?}",
+            "the previously placed pair suspends: {:?}",
             native.scene.coordinator.pair_targets.get(&key)
         );
         assert!(
-            !native.scene.coordinator.pair_counts.contains_key(&key),
-            "the rejected held count is removed"
+            native.scene.coordinator.pair_counts.contains_key(&key),
+            "the recoverable exact pair keeps its bounded held maximum"
         );
         // Permanence: a later advance attributes nowhere.
         let at = native.stamps.tick();
@@ -9685,3 +10751,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "demotion_retirement_tests.rs"]
+mod demotion_retirement_tests;

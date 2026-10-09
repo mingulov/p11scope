@@ -963,3 +963,183 @@ fn a_drain_that_ended_at_a_busy_head_never_covers_a_read() {
     run.settle();
     assert_eq!(run.verdicts(), vec![bound(x)]);
 }
+
+// A cached historical binding must still take a fresh current-image query.
+#[test]
+fn demotion_retirement_current_binding_waits_for_fresh_horizons() {
+    let mut run = Run::new();
+    let caller = run.world.admit(7, 500, 1, 50);
+    run.world.answer(7, 500, run.domain, cookie(run.domain, 41));
+    run.read(vec![row(run.domain, 41, 1, 7, 100)]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![Binding::Bound(caller)]);
+    let request = CurrentBindingRequest {
+        caller,
+        pid: 7,
+        image: DomainCookie::scripted(run.domain, 41),
+        exec_id: 1,
+    };
+    let World {
+        live,
+        answers,
+        queries,
+    } = &mut run.world;
+    let lookup = Lookup(live);
+    let mut identity = AnswerTable { answers, queries };
+    let sighting = run
+        .binder
+        .sight_current_binding_at(request, &lookup, &mut identity, || Some(2_000))
+        .expect("fresh exact sighting");
+    assert_eq!(*queries, 2, "history cannot bypass the fresh query");
+    assert!(matches!(
+        run.binder.check_current_binding(&sighting),
+        CurrentBindingCheck::Pending
+    ));
+    run.binder
+        .absorb_lifecycle(&drained(run.domain, &[], 2_001));
+    run.read_domain(run.domain, Vec::new(), Some(0));
+    assert!(
+        matches!(
+            run.binder.check_current_binding(&sighting),
+            CurrentBindingCheck::Pending
+        ),
+        "older readable health cannot settle it"
+    );
+    let World {
+        live,
+        answers,
+        queries,
+    } = &mut run.world;
+    run.binder.absorb_witnesses(
+        &read_at(run.domain, Vec::new(), 2_002, Some(0)),
+        &Lookup(live),
+        &mut AnswerTable { answers, queries },
+    );
+    assert!(matches!(
+        run.binder.check_current_binding(&sighting),
+        CurrentBindingCheck::Proven
+    ));
+    assert_eq!(
+        run.binder.census().rows,
+        1,
+        "current proof is not another witness"
+    );
+    run.binder.finish(run.domain);
+    assert!(matches!(
+        run.binder.check_current_binding(&sighting),
+        CurrentBindingCheck::Rejected(_)
+    ));
+    let World {
+        live,
+        answers,
+        queries,
+    } = &mut run.world;
+    assert!(
+        run.binder
+            .sight_current_binding_at(
+                request,
+                &Lookup(live),
+                &mut AnswerTable { answers, queries },
+                || Some(3_000)
+            )
+            .is_err()
+    );
+    let World {
+        live,
+        answers,
+        queries,
+    } = &mut run.world;
+    run.binder.absorb_witnesses(
+        &read_at(
+            run.domain,
+            vec![row(run.domain, 41, 1, 7, 110)],
+            3_001,
+            Some(0),
+        ),
+        &Lookup(live),
+        &mut AnswerTable { answers, queries },
+    );
+    assert_eq!(
+        run.verdicts(),
+        vec![Binding::Bound(caller)],
+        "Finish cancels current proof but preserves exact cached historical binding"
+    );
+}
+
+#[test]
+fn demotion_retirement_current_binding_rejects_exec_loss_and_identity_uncertainty() {
+    for control in 0..7 {
+        let mut run = Run::new();
+        let caller = run.world.admit(7, 500, 1, 50);
+        run.world.answer(7, 500, run.domain, cookie(run.domain, 41));
+        run.read(vec![row(run.domain, 41, 1, 7, 100)]);
+        run.settle();
+        assert_eq!(run.verdicts(), vec![Binding::Bound(caller)]);
+        let request = CurrentBindingRequest {
+            caller,
+            pid: 7,
+            image: DomainCookie::scripted(run.domain, 41),
+            exec_id: 1,
+        };
+        match control {
+            0 => run.world.answer(7, 500, run.domain, CookieQuery::Exited),
+            1 => run.world.answer(7, 500, run.domain, CookieQuery::NoCookie),
+            2 => run.world.answer(
+                7,
+                500,
+                run.domain,
+                CookieQuery::Unavailable("unavailable".into()),
+            ),
+            3 => run
+                .world
+                .answer(7, 500, run.domain, cookie(NativeDomainId::mint(), 41)),
+            _ => {}
+        }
+        let World {
+            live,
+            answers,
+            queries,
+        } = &mut run.world;
+        let result = run.binder.sight_current_binding_at(
+            request,
+            &Lookup(live),
+            &mut AnswerTable { answers, queries },
+            || if control == 4 { None } else { Some(2_000) },
+        );
+        if control <= 4 {
+            assert!(
+                result.is_err(),
+                "unavailable/mismatched identity or clock cannot yield a sighting"
+            );
+        } else {
+            let sighting = result.expect("exact fresh sighting before lifecycle uncertainty");
+            run.binder.absorb_lifecycle(&drained(
+                run.domain,
+                if control == 5 { &[(7, 1_500)] } else { &[] },
+                2_001,
+            ));
+            let World {
+                live,
+                answers,
+                queries,
+            } = &mut run.world;
+            run.binder.absorb_witnesses(
+                &read_at(
+                    run.domain,
+                    Vec::new(),
+                    2_002,
+                    Some(if control == 6 { 1 } else { 0 }),
+                ),
+                &Lookup(live),
+                &mut AnswerTable { answers, queries },
+            );
+            assert!(
+                matches!(
+                    run.binder.check_current_binding(&sighting),
+                    CurrentBindingCheck::Rejected(_)
+                ),
+                "same-binary exec and loss reject saved proof"
+            );
+        }
+    }
+}

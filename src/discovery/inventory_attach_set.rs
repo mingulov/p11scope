@@ -50,6 +50,55 @@ use p11scope_manifest::elf::ElfAbi;
 use p11scope_manifest::maps::ObjectKey;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Checked identity of the attachment membership view; exhaustion is terminal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AttachRevision(Option<u64>);
+impl AttachRevision {
+    pub(crate) fn sequence(self) -> Option<u64> {
+        self.0
+    }
+}
+
+pub(crate) struct CountMembershipCursor {
+    revision: AttachRevision,
+    endpoint: usize,
+    after: Option<AttachModuleKey>,
+    modules_after: Option<AttachModuleKey>,
+    modules_done: bool,
+    header_seen: bool,
+}
+impl CountMembershipCursor {
+    #[cfg(test)]
+    pub(crate) fn retained_keys(&self) -> usize {
+        usize::from(self.after.is_some()) + usize::from(self.modules_after.is_some())
+    }
+}
+
+pub(crate) enum CountMembershipItem {
+    Endpoint {
+        object: AttachObjectId,
+        unknown: bool,
+    },
+    Module {
+        object: AttachObjectId,
+        module: AttachModuleKey,
+    },
+    Unknown,
+    Skipped,
+}
+
+pub(crate) struct CountMembershipPage {
+    pub items: Vec<CountMembershipItem>,
+    pub cursor: Option<CountMembershipCursor>,
+    pub visited: usize,
+}
+
+pub(crate) enum CountMembershipRefusal {
+    Stale,
+    Exhausted,
+    Refused,
+}
+
 /// One physical endpoint's capture-lifetime ID: dense, append-only, never
 /// reused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -183,6 +232,7 @@ struct RetainedObject {
 }
 
 pub(crate) struct InventoryAttachSet {
+    count_revision: AttachRevision,
     budget: InventoryBudget,
     endpoints: Vec<AttachEndpoint>,
     by_endpoint: BTreeMap<(AttachObjectId, u64), EndpointId>,
@@ -221,6 +271,7 @@ pub(crate) struct InventoryAttachSet {
 impl InventoryAttachSet {
     pub(crate) fn new(budget: InventoryBudget) -> Self {
         Self {
+            count_revision: AttachRevision(Some(0)),
             budget,
             endpoints: Vec::new(),
             by_endpoint: BTreeMap::new(),
@@ -292,6 +343,107 @@ impl InventoryAttachSet {
 
     pub(crate) fn endpoints(&self) -> impl Iterator<Item = &AttachEndpoint> {
         self.endpoints.iter()
+    }
+
+    pub(crate) fn count_revision(&self) -> AttachRevision {
+        self.count_revision
+    }
+
+    pub(crate) fn count_membership_page(
+        &self,
+        cursor: Option<CountMembershipCursor>,
+        revision: AttachRevision,
+        item_limit: usize,
+    ) -> Result<CountMembershipPage, CountMembershipRefusal> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        if self.count_revision.0.is_none() {
+            return Err(CountMembershipRefusal::Exhausted);
+        }
+        if revision != self.count_revision
+            || cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.revision != revision)
+        {
+            return Err(CountMembershipRefusal::Stale);
+        }
+        let limit = item_limit.min(128);
+        if limit == 0 {
+            return Err(CountMembershipRefusal::Refused);
+        }
+        let mut cursor = cursor.unwrap_or(CountMembershipCursor {
+            revision,
+            endpoint: 0,
+            after: None,
+            modules_after: None,
+            modules_done: false,
+            header_seen: false,
+        });
+        let mut items = Vec::with_capacity(limit);
+        while items.len() < limit {
+            if !cursor.modules_done {
+                let next = match &cursor.modules_after {
+                    Some(after) => self.modules.range((Excluded(after), Unbounded)).next(),
+                    None => self.modules.first_key_value(),
+                };
+                if let Some((key, record)) = next {
+                    cursor.modules_after = Some(key.clone());
+                    items.push(if record.members.is_none() {
+                        CountMembershipItem::Unknown
+                    } else {
+                        CountMembershipItem::Skipped
+                    });
+                    continue;
+                }
+                cursor.modules_done = true;
+            }
+            let Some(endpoint) = self.endpoints.get(cursor.endpoint) else {
+                break;
+            };
+            if !cursor.header_seen {
+                items.push(CountMembershipItem::Endpoint {
+                    object: endpoint.object,
+                    unknown: self
+                        .objects
+                        .get(endpoint.object.0 as usize)
+                        .is_none_or(|object| object.changed.is_some()),
+                });
+                cursor.header_seen = true;
+                continue;
+            }
+            let next = self
+                .by_member
+                .get(&endpoint.id)
+                .and_then(|members| match &cursor.after {
+                    Some(after) => members.range((Excluded(after), Unbounded)).next(),
+                    None => members.first(),
+                });
+            if let Some(module) = next {
+                cursor.after = Some(module.clone());
+                items.push(CountMembershipItem::Module {
+                    object: endpoint.object,
+                    module: module.clone(),
+                });
+            } else {
+                cursor.endpoint += 1;
+                cursor.after = None;
+                cursor.header_seen = false;
+            }
+        }
+        let visited = items.len();
+        let cursor =
+            (cursor.endpoint < self.endpoints.len() || !cursor.modules_done).then_some(cursor);
+        Ok(CountMembershipPage {
+            items,
+            cursor,
+            visited,
+        })
+    }
+
+    fn invalidate_count_memberships(&mut self) {
+        self.count_revision.0 = self
+            .count_revision
+            .0
+            .and_then(|revision| revision.checked_add(1));
     }
 
     /// The retained pin of one object: what the capture facade attaches
@@ -515,6 +667,7 @@ impl InventoryAttachSet {
                 summary.path, summary.key.device.major, summary.key.device.minor, summary.key.inode
             );
             retained.changed = Some(reason.clone());
+            self.invalidate_count_memberships();
             gaps.push(AttachGap {
                 subject: CHANGED_SUBJECT.into(),
                 reason: reason.clone(),
@@ -789,6 +942,7 @@ impl InventoryAttachSet {
             };
             self.by_endpoint
                 .insert((retained, file_offset), endpoint.id);
+            self.invalidate_count_memberships();
             self.endpoints.push(endpoint);
             delta.endpoints.push(endpoint);
         }
@@ -831,6 +985,13 @@ impl InventoryAttachSet {
         let bound = self.limit().saturating_mul(MEMBERSHIP_FACTOR);
         let others = self.memberships - previous;
         let members = (others + members.len() <= bound).then_some(members);
+        if self
+            .modules
+            .get(key)
+            .is_none_or(|previous| previous.endpoints != endpoints || previous.members != members)
+        {
+            self.invalidate_count_memberships();
+        }
         self.memberships = others + members.as_ref().map_or(0, Vec::len);
         if let Some(previous) = self
             .modules
@@ -2098,5 +2259,35 @@ pub(crate) mod tests {
         assert_eq!(set.module_record_refusals(), 1);
         assert_eq!(set.endpoint_refusals(), 0);
         assert_eq!(set.module_records(), 2);
+    }
+    #[test]
+    fn demotion_retirement_membership_revision_exhaustion_is_sticky() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = provider(&dir, "a.so", "provider-a");
+        let pins = pass_pins(&[(&a, "sha-a")]);
+        let mut set = InventoryAttachSet::new(budget(8));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let plan = lower_named(&[module(&pins, &a, &offsets(2))], &pins, policy);
+        set.absorb(&plan, &pins);
+        set.count_revision = AttachRevision(Some(u64::MAX));
+        set.absorb(&plan, &pins);
+        assert!(
+            set.count_revision.0.is_some(),
+            "equivalent observations do not consume revisions"
+        );
+        let changed = lower_named(&[module(&pins, &a, &offsets(1))], &pins, policy);
+        set.absorb(&changed, &pins);
+        for _ in 0..3 {
+            let revision = set.count_revision();
+            assert!(matches!(
+                set.count_membership_page(None, revision, 128),
+                Err(CountMembershipRefusal::Exhausted)
+            ));
+            set.absorb(&plan, &pins);
+        }
+        assert!(
+            set.count_revision.0.is_none(),
+            "actual mutation exhaustion cannot wrap or recover"
+        );
     }
 }

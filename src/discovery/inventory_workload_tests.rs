@@ -2435,6 +2435,7 @@ mod c1b {
         };
         let mut processes: Vec<ProcessRecord> = (REP..REP + CALLERS)
             .map(|pid| ProcessRecord {
+                complete_scan: None,
                 pid,
                 status: if pid == REP {
                     MemberStatus::Scanned
@@ -2453,6 +2454,7 @@ mod c1b {
             })
             .collect();
         processes.extend((20_000..20_000 + IDLE).map(|pid| ProcessRecord {
+            complete_scan: None,
             pid,
             status: MemberStatus::NotSelected { loss: None },
             objects: Vec::new(),

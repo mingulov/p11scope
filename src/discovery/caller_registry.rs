@@ -3158,6 +3158,20 @@ impl CallerRegistry {
         }
     }
 
+    /// A retirement boundary is uncertainty, never a witness or a count.
+    /// The coordinator supplies disjoint absolute ranges through its watermark.
+    pub(crate) fn note_retirement_count_gap(&mut self, caller: CallerId, base: u64, absolute: u64) {
+        if absolute <= base {
+            return;
+        }
+        self.record_gap(RegistryGap {
+            caller: Some(caller), module: None, pid: None,
+            subject: DEMOTED_COUNT_REJECTED.into(),
+            reason: format!("the current physical owner is not proven for absolute count range ({base}, {absolute}] ({} unattributed calls); historical counts remain and no witness or module-level use is recorded", absolute - base),
+            budget: None,
+        });
+    }
+
     /// One row whose endpoint several admitted modules share, with no
     /// single module (or single caller edge) to carry it: a gap per module,
     /// no edge, no module-level use.
@@ -3803,6 +3817,17 @@ impl CallerRegistry {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// Deliver only decisions produced by the real registry, in an adversarial
+    /// order or more than once. This utility manufactures no outcome/handle.
+    pub(crate) fn deliver_pending_decisions(
+        registry: &mut CallerRegistry,
+        decisions: &[PendingCountDecision],
+    ) {
+        registry
+            .pending_count_decisions
+            .extend_from_slice(decisions);
+    }
     use std::cell::RefCell;
     use std::collections::HashMap;
     use std::rc::Rc;

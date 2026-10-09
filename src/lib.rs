@@ -61,6 +61,7 @@ pub mod process;
 pub mod render;
 pub(crate) mod run;
 pub mod scope;
+pub(crate) mod semantic_capture;
 pub mod semantics;
 pub mod semantics_edge;
 pub(crate) mod semantics_objects;

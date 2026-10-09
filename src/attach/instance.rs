@@ -36,7 +36,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::mem::size_of_val;
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The native hook programs and their kernel attach targets. `copy_vma`'s
 /// first argument is a pointer-to-pointer, which no kernel admits as fentry
@@ -738,7 +738,7 @@ impl InstanceMaps<'_> {
     }
 }
 
-/// Atomic fetch-add on the mmapable fault cell, the only userspace writer
+/// Bounded checked CAS on the mmapable fault cell, the only userspace writer
 /// path that cannot lose a concurrent native compare-exchange raise.
 fn raise_mmapped_fault(fd: BorrowedFd<'_>) -> Result<u64> {
     // SAFETY: a shared mapping of the BPF_F_MMAPABLE array's first page.
@@ -1040,68 +1040,6 @@ pub(super) fn audit_image_hooks_with(
         coverage.fail();
     }
     result
-}
-
-/// One live (process, watched file) scan source for the router's
-/// [`stable_scan`](crate::discovery::instances::stable_scan): the record and
-/// cookie through the retained pidfd, the global/fault/sticky cells, and the
-/// file's ranges from `/proc/PID/maps` selected by its maps-visible keys.
-pub(crate) struct LiveScan<'a> {
-    pub(crate) maps: InstanceMaps<'a>,
-    pub(crate) pidfd: BorrowedFd<'a>,
-    pub(crate) pid: u32,
-    pub(crate) file_slot: u32,
-    pub(crate) maps_keys: &'a [ObjectKey],
-    pub(crate) identity: MappedFileIdentity,
-}
-
-impl crate::discovery::instances::ScanReader for LiveScan<'_> {
-    fn epochs(&mut self) -> std::result::Result<crate::discovery::instances::EpochReading, String> {
-        let read = || -> Result<crate::discovery::instances::EpochReading> {
-            let cookie = self.maps.cookie(self.pidfd)?.unwrap_or(0);
-            let (local, record_flags) = match self.maps.record(self.pidfd)? {
-                None => (0, 0),
-                Some(record) => (
-                    record
-                        .slot_plus1
-                        .iter()
-                        .position(|slot| *slot == u64::from(self.file_slot) + 1)
-                        .map_or(0, |index| record.epoch[index]),
-                    record.flags,
-                ),
-            };
-            Ok(crate::discovery::instances::EpochReading {
-                cookie,
-                local,
-                record_flags,
-                global: self.maps.global(self.file_slot)?,
-                fault: self.maps.fault()?,
-                sticky: self.maps.sticky()?,
-            })
-        };
-        read().map_err(|error| format!("{error:#}"))
-    }
-
-    fn ranges(
-        &mut self,
-    ) -> std::result::Result<Vec<crate::discovery::instances::MapRange>, String> {
-        let bytes = std::fs::read(format!("/proc/{}/maps", self.pid))
-            .map_err(|error| format!("reading maps: {error}"))?;
-        let entries = p11scope_manifest::maps::parse_maps(&bytes)?;
-        let mut ranges = Vec::new();
-        for key in self.maps_keys {
-            ranges.extend(crate::discovery::instances::ranges_for(
-                &entries,
-                key.device.major,
-                key.device.minor,
-                key.inode,
-            ));
-        }
-        let map_files = PathBuf::from(format!("/proc/{}/map_files", self.pid));
-        crate::discovery::instances::confirm_identity(ranges, self.identity, |start, end| {
-            map_file_identity(&map_files, start, end)
-        })
-    }
 }
 
 #[cfg(test)]

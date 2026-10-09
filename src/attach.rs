@@ -57,7 +57,7 @@ pub(crate) mod image_query;
 mod instance;
 #[allow(unused_imports)]
 pub(crate) use instance::{
-    HookStats, INSTANCE_PROGRAMS, InstanceMaps, InstanceTracking, LiveScan, WatchedFile,
+    HookStats, INSTANCE_PROGRAMS, InstanceMaps, InstanceTracking, WatchedFile,
 };
 mod cleanup_worker;
 pub mod identity_iter;
@@ -4392,6 +4392,18 @@ impl Session {
     #[allow(dead_code)] // Task 6 native seam (DR-T3A-1); privileged gates today.
     pub(crate) fn instance_maps(&self) -> InstanceMaps<'_> {
         InstanceMaps { ebpf: &self.ebpf }
+    }
+
+    /// Exact metadata retained by the current owned static attachment, never
+    /// reconstructed from a pathname or caller-supplied offset.
+    pub(crate) fn instance_endpoint(&self, slot: u32) -> Option<crate::semantic_capture::Endpoint> {
+        let target = self.retained_static.get(&slot)?;
+        let watched = self.instance.watched(target.slot.object)?;
+        Some(crate::semantic_capture::Endpoint {
+            object: target.slot.object,
+            file_slot: watched.file_slot,
+            offset: target.slot.file_offset,
+        })
     }
 
     /// The continuity hooks' run/miss statistics.

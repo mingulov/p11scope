@@ -11,7 +11,7 @@ use anyhow::{Context as _, Result};
 use p11scope::cli::{self, CliError, Command};
 use p11scope::{
     capture, capture_startup_signal_dispositions, doctor, failure_already_reported,
-    failure_exit_code, inspect, inventory, pidns, run_owned,
+    failure_exit_code, inspect, inventory, inventory_diff, pidns, run_owned,
 };
 
 fn main() {
@@ -75,6 +75,7 @@ fn run() -> Result<i32> {
                 .with_context(|| scope)
         }
         Ok(Command::Doctor(a)) => doctor::run(a.pid, a.cgroup.as_deref(), a.extra_strict),
+        Ok(Command::InventoryDiff(a)) => inventory_diff::run(&a),
         // `inventory`'s hard failures — an unreadable target, an
         // unwritable `-o` — mean "nothing could be observed": one line
         // here, exit 1, never a panic and never an empty-success report.

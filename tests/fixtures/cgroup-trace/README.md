@@ -70,7 +70,7 @@ BPF behavior.
 ```sh
 TMPDIR=/var/tmp/p11scope-ws-tmp timeout 120 python3 -I tests/python/test_cgroup_trace_oracle.py -v
 TMPDIR=/var/tmp/p11scope-ws-tmp timeout 120 python3 -I tests/python/test_cgroup_trace_harness.py -v
-gcc -std=c11 -O2 -Wall -Wextra -Werror -o /var/tmp/p11scope-ws-tmp/n3-prep/caller tests/fixtures/cgroup-trace/caller.c -ldl
+gcc -std=c11 -O2 -Wall -Wextra -Werror -pthread -o /var/tmp/p11scope-ws-tmp/n3-prep/caller tests/fixtures/cgroup-trace/caller.c -ldl
 ```
 
 ## Separate installed lane
@@ -117,13 +117,64 @@ limits and the remaining matrix explicit.
 
 ## Still required
 
-- Sparse intervals at 1 s, 10 s, 59 s and greater than 60 s; no promise of names
-  at the 59/60-second deadline.
-- Short-lived callers and the unchanged leave/sample/reenter case with an
+- Installed execution of the prepared matrix below, and independent evidence
+  of the actual fixed registration/sample deadline and equality refusal.
+- The unchanged leave/sample/reenter case with an
   independently observed sample during the leave, rather than a migration alone.
-- Same-path and nonleader exec; PID reuse; namespace/numbering/domain controls.
+- PID reuse; namespace/numbering/domain controls.
 - Event/discovery loss, full entry/path/interest capacity and fairness.
 - Long CPU/RSS/FD/read plateau, isolated-host performance and broader stop faults.
+
+## Prepared next matrix, separate live grant
+
+The default remains the original six cells. These seven additional cells require
+an explicit `--cells sparse1,sparse10,sparse59,sparse61,short,reexec,nonleader`
+choice and a separate installed lane grant. Source preparation and unprivileged
+native controls do not qualify their live behavior.
+
+| Cell | Actual caller schedule | ACK limit | Observer duration | Naming condition |
+|---|---|---:|---:|---|
+| sparse1 | 5 calls with at least 1 s between completion and next entry |14 s|34 s|Nonempty correct names; actual gaps and unknown share |
+| sparse10 | 4 calls with at least 10 s gaps |40 s|60 s|Nonempty correct names; actual gaps and unknown share |
+| sparse59 | 3 calls with at least 59 s gaps |128 s|148 s|Report observed names/unknowns; no deadline proof |
+| sparse61 | 3 calls with at least 61 s gaps |132 s|152 s|Report observed names/unknowns; no deadline proof |
+| short | Fresh selected child: setup4 + main1 + teardown2, then exit |One total second|20 s|Exact population and truth; no promised name |
+| reexec | Selected A, outside same-path exec/setup, selected B |10 s per phase|30 s|Both generations named; first B scoped CALL unknown |
+| nonleader | Selected A, outside different-path exec by worker TID, selected B |10 s per phase|30 s|Both generations named; distinct exec TID; first B scoped CALL unknown |
+
+`spaced` sleeps only between calls and bounds any command to a 125-second work
+span. The oracle checks the independently issued count and minimum gap against
+real monotonic entry/completion stamps, and reports actual gaps. The 59/61 cells
+explicitly report `deadline_boundary_proof=not_exposed_by_public_output`: the
+public route does not expose registration G or first sample S0/D. Correct names
+in these observations do not prove a receipt existed at a fixed deadline, and
+Unknown is never forced from a cell label alone.
+
+The short cell attaches using a separate owned idle provider seed. Its setup
+finishes before observation and teardown follows observer reap, both ledgered.
+The new child starts behind a pre-provider gate, is independently validated and
+moved into the selected scope, then the gate opens. Spawn-start to actual pidfd
+exit is an upper bound on its whole lifetime and must be at most one second;
+loaded-host delay fails this condition. All seven short provider calls remain
+mandatory, including initialization and teardown.
+
+Exec requests record actual executing TID, original birth, target path and scope;
+the controller records the command interval and verifies the new image through
+its held expected file and original process identity. A uses GenerateRandom and
+B GetSessionInfo, so event keys map uniquely to generations even when the path
+and file are identical. Required positives and first scoped CALL checks use
+separate image-generation populations; A's names cannot satisfy B. Equal paths
+do not rescue a key spanning more than one generation. Provider setup outside
+the selected scope is fully ledgered and never silently omitted.
+
+The four sparse workload spans total 274 seconds; the two exec schedules add
+about 17 seconds and short at most one. Observer durations reserve 30 seconds
+beyond each sparse span, phase acknowledgements reserve 10 seconds, and normal
+observer stop remains bounded by five seconds. A future combined command uses
+a 600-second outer guard plus its existing 20-second TERM cleanup grace, covering
+startup, final drain and owned cleanup beyond workload. The guard is a failure
+bound, not a promise that every loaded-host run succeeds. No live command is
+authorized by this documentation.
 
 Successful first-package cells close only the facts they actually demonstrate.
 The complete N3/U2b/U6 installed gate remains open until that matrix is exercised.

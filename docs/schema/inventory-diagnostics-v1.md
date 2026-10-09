@@ -8,7 +8,8 @@ They do not replay attribution or prove exact whole-workload counts.
 Each line is a JSON object with `schema: "p11scope/inventory-diagnostics/v1"`.
 A `header` precedes data records; a `footer` closes a successfully exported file.
 The header gives tool version, requested capture mode/scope, optional PID filter,
-record/byte/heap limits, and clock basis. Sequences order diagnostic events within
+record/byte/heap limits, and clock basis. Scope labels are `system`, `pid`, or
+`cgroup`; they do not contain a cgroup path or inode. Sequences order diagnostic events within
 one capture; gaps are allowed, and sequences are not wall-clock timestamps.
 A sequence can identify a filtered record; assignment does not imply retention
 or successful export.

@@ -80,9 +80,10 @@ fn run() -> Result<i32> {
         // unwritable `-o` — mean "nothing could be observed": one line
         // here, exit 1, never a panic and never an empty-success report.
         Ok(Command::Inventory(a)) => {
-            let scope = match a.scope {
-                cli::InspectScope::Pid(pid) => format!("inventory --pid {pid}"),
-                cli::InspectScope::System => "inventory --system".to_string(),
+            let scope = match &a.scope {
+                cli::ScopeArg::Pid(pid) => format!("inventory --pid {pid}"),
+                cli::ScopeArg::System => "inventory --system".to_string(),
+                cli::ScopeArg::Cgroup(_) => "inventory --cgroup".to_string(),
             };
             // DR-K8S-1: `inventory::run` refuses a mismatched --pid by
             // name before anything runs; that line is already complete.

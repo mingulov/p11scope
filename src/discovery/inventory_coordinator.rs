@@ -118,6 +118,8 @@ pub(crate) struct CgroupCompletion {
     pub(crate) outcome: ScopedCollectionOutcome,
     pub(crate) events: Vec<CallerEvent>,
     pub(crate) admitted: usize,
+    /// Validated callers in this pass, including already-published same images.
+    pub(crate) scan_callers: usize,
 }
 
 /// Static reason carried when a scan defers past its deadline. The
@@ -4518,6 +4520,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut publishing_cgroup = self.pending_cgroup.take();
         let mut scoped_events = Vec::new();
         let mut scoped_admitted = 0;
+        let mut scoped_scan_callers = 0;
         if let Some((collection, now_ns)) = &mut publishing_cgroup {
             let work = collection.work();
             let pids: Vec<u32> = if work.charge(
@@ -4605,6 +4608,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     }),
                 }
             }
+            scoped_scan_callers = allowed.len();
             let mut catalog = collection.catalog(&allowed);
             let absorbed = match (provider, catalog.lowering.take()) {
                 (Some(provider), Some(lowering)) => {
@@ -4681,6 +4685,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 outcome,
                 events: scoped_events,
                 admitted: scoped_admitted,
+                scan_callers: scoped_scan_callers,
             });
         }
         Ok(BatchReceipt {
@@ -5426,7 +5431,7 @@ fn catalog_module_info(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::super::inventory::{ImageCheck, UnavailableImageGuard};
     use super::*;
     use crate::discovery::caller_registry::OsProcessSource;
@@ -7335,7 +7340,7 @@ mod tests {
         (fixture, child, coordinator)
     }
 
-    fn cgroup_provider_scene() -> (
+    pub(crate) fn cgroup_provider_scene() -> (
         tempfile::TempDir,
         crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild,
         InventoryCoordinator<OsProcessSource>,
@@ -7408,6 +7413,7 @@ mod tests {
         successful: std::rc::Rc<std::cell::Cell<usize>>,
         stop_on_return: bool,
         proc_fallback: bool,
+        signal_on_return: Option<Arc<std::sync::atomic::AtomicUsize>>,
     }
 
     impl crate::discovery::caller_registry::ProcessSource for ReturningLivenessSource {
@@ -7431,7 +7437,11 @@ mod tests {
                     self.successful.set(self.successful.get() + 1);
                 }
                 if self.stop_on_return {
-                    self.control.cancel();
+                    if let Some(signals) = &self.signal_on_return {
+                        signals.store(1, std::sync::atomic::Ordering::SeqCst);
+                    } else {
+                        self.control.cancel();
+                    }
                 }
             }
             same
@@ -7447,11 +7457,21 @@ mod tests {
         }
     }
 
-    fn cgroup_returning_liveness_control(stop_on_return: bool, proc_fallback: bool) {
+    fn cgroup_returning_liveness_control(
+        stop_on_return: bool,
+        proc_fallback: bool,
+        original_signal_source: bool,
+    ) {
         use crate::discovery::inventory_attach_set::provider_read_test;
         let (fixture, child, old_coordinator) = cgroup_provider_scene();
         drop(old_coordinator);
-        let control = CollectionControl::new(None);
+        let signal_flag = original_signal_source
+            .then(crate::inventory_dashboard::StopFlag::test_without_handlers);
+        let signals = signal_flag.as_ref().map(|flag| flag.signal_source());
+        let control = signals.as_ref().map_or_else(
+            || CollectionControl::new(None),
+            |source| CollectionControl::new(None).with_operator_stop_source(Arc::clone(source)),
+        );
         let armed = std::rc::Rc::new(std::cell::Cell::new(false));
         let returned = std::rc::Rc::new(std::cell::Cell::new(0));
         let successful = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -7462,6 +7482,7 @@ mod tests {
             successful: successful.clone(),
             stop_on_return,
             proc_fallback,
+            signal_on_return: signals,
         };
         let mut coordinator = InventoryCoordinator::new(
             crate::scope::cgroup(fixture.path()).unwrap(),
@@ -7503,6 +7524,9 @@ mod tests {
             1,
             "the retained child remained the same generation"
         );
+        if let Some(flag) = &signal_flag {
+            assert_eq!(flag.signal_count(), usize::from(stop_on_return));
+        }
         let completion = coordinator.take_cgroup_completion().unwrap();
         if stop_on_return {
             assert_eq!(
@@ -7529,17 +7553,99 @@ mod tests {
 
     #[test]
     fn cgroup_returning_liveness_stop_prevents_caller_mint() {
-        cgroup_returning_liveness_control(true, false);
+        cgroup_returning_liveness_control(true, false, false);
     }
 
     #[test]
     fn cgroup_returning_liveness_proc_fallback_stop_prevents_caller_mint() {
-        cgroup_returning_liveness_control(true, true);
+        cgroup_returning_liveness_control(true, true, false);
     }
 
     #[test]
     fn cgroup_returning_liveness_healthy_child_keeps_admission() {
-        cgroup_returning_liveness_control(false, false);
+        cgroup_returning_liveness_control(false, false, false);
+    }
+
+    #[test]
+    fn cgroup_runtime_original_signal_after_returning_liveness_prevents_mint() {
+        cgroup_returning_liveness_control(true, false, true);
+    }
+
+    #[test]
+    fn cgroup_runtime_original_signal_liveness_healthy_keeps_admission() {
+        cgroup_returning_liveness_control(false, false, true);
+    }
+
+    fn cgroup_original_signal_retention_control(stop_on_return: bool) {
+        use crate::discovery::inventory_attach_set::provider_read_test;
+        let (_fixture, child, mut coordinator) = cgroup_provider_scene();
+        let flag = crate::inventory_dashboard::StopFlag::test_without_handlers();
+        let original_source = flag.signal_source();
+        let control =
+            CollectionControl::new(None).with_operator_stop_source(Arc::clone(&original_source));
+        let collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                control,
+                None,
+            )
+            .unwrap()();
+        assert!(
+            collection
+                .preparation(child.id())
+                .is_some_and(|preparation| preparation.check()),
+            "real provider child has attributable facts"
+        );
+        coordinator
+            .apply_cgroup_collection(collection, 1_000)
+            .unwrap();
+        let returned = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = returned.clone();
+        provider_read_test::observe(
+            move || {
+                count.set(count.get() + 1);
+                if stop_on_return {
+                    original_source.store(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            },
+            || coordinator.commit_batch(false).unwrap(),
+        );
+        assert!(
+            returned.get() > 0,
+            "actual held provider metadata read returned"
+        );
+        assert_eq!(flag.signal_count(), usize::from(stop_on_return));
+        let completion = coordinator.take_cgroup_completion().unwrap();
+        if stop_on_return {
+            assert_eq!(
+                completion.admitted, 0,
+                "original signal during final preparation must stop ID mint"
+            );
+            assert_eq!(coordinator.adapter.live_id(child.id()), None);
+            assert_eq!(coordinator.attach_set.len(), 0);
+            assert_eq!(coordinator.registry.caller_count(), 0);
+            assert_eq!(
+                completion.outcome,
+                ScopedCollectionOutcome::Cancelled(
+                    crate::scope::inventory_cgroup::CollectionStop::OperatorStop
+                )
+            );
+        } else {
+            assert_eq!(completion.admitted, 1);
+            assert!(coordinator.attach_set.len() > 0);
+            assert!(coordinator.registry.edges().next().is_some());
+        }
+    }
+
+    #[test]
+    fn cgroup_runtime_original_signal_after_returning_provider_prevents_mint() {
+        cgroup_original_signal_retention_control(true);
+    }
+
+    #[test]
+    fn cgroup_runtime_original_signal_provider_healthy_keeps_admission() {
+        cgroup_original_signal_retention_control(false);
     }
 
     #[test]

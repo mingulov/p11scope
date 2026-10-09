@@ -59,7 +59,9 @@ use crate::discovery::engine::inventory_coordinator::{
 use crate::discovery::inventory_attach_set::TargetDelta;
 use crate::discovery::native_binding::{NativeIdentity, ScanOnlyIdentity};
 use crate::inspect_system::Catalog;
+use crate::inspect_system::inventory_cgroup::CgroupCollection;
 use crate::process::PidPin;
+use crate::scope::inventory_cgroup::CollectionControl;
 use anyhow::{Result, anyhow};
 use p11scope_ebpf_common::ImageIdentity;
 use std::time::{Duration, Instant};
@@ -656,6 +658,37 @@ impl<L> NativeLane<L> {
         H: LaneHost<Pin> + ?Sized,
     {
         self.passes += 1;
+        self.extend_targets(host);
+        self.stage_pass_evidence(host)
+    }
+
+    /// Scoped admission needs the held lifecycle and witness transitions
+    /// before its final sample; this phase takes no new target delta.
+    pub(crate) fn before_cgroup_commit<Pin, H>(&mut self, host: &mut H) -> Vec<CallerEvent>
+    where
+        L: CaptureLane<Pin>,
+        H: LaneHost<Pin> + ?Sized,
+    {
+        self.passes += 1;
+        self.stage_pass_evidence(host)
+    }
+
+    /// Only a published scoped transaction can supply this pass's delta.
+    /// The caller publishes this receipt/evidence in a second normal commit.
+    pub(crate) fn after_cgroup_commit<Pin, H>(&mut self, host: &mut H) -> Vec<CallerEvent>
+    where
+        L: CaptureLane<Pin>,
+        H: LaneHost<Pin> + ?Sized,
+    {
+        self.extend_targets(host);
+        self.stage_pass_evidence(host)
+    }
+
+    fn extend_targets<Pin, H>(&mut self, host: &mut H)
+    where
+        L: CaptureLane<Pin>,
+        H: LaneHost<Pin> + ?Sized,
+    {
         let mut delta = std::mem::take(&mut self.backlog);
         delta.append(host.take_target_delta());
         let receipt = self
@@ -677,6 +710,13 @@ impl<L> NativeLane<L> {
             );
         }
         self.backlog = receipt.deferred;
+    }
+
+    fn stage_pass_evidence<Pin, H>(&mut self, host: &mut H) -> Vec<CallerEvent>
+    where
+        L: CaptureLane<Pin>,
+        H: LaneHost<Pin> + ?Sized,
+    {
         let mut events = std::mem::take(&mut self.pending_events);
         // What the collection ticks drained stages here, where the ring's
         // own records of that window always staged: after the scan applied
@@ -839,6 +879,27 @@ impl<L> NativeLane<L> {
         H: LaneHost<Pin> + ?Sized,
     {
         debug_assert!(self.passes > 0, "stop before any pass after activation");
+        self.stop_after_error(host)
+    }
+
+    /// A scoped startup stop retires the activated capture without
+    /// collecting or inventing a pass. Legacy successful stops still need
+    /// their first pass; errors use the separate failure path below.
+    fn stop_cancelled_scoped_startup<Pin, H>(
+        self,
+        host: &mut H,
+        control: &CollectionControl,
+    ) -> Stopped<L>
+    where
+        L: CaptureLane<Pin>,
+        H: LaneHost<Pin> + ?Sized,
+    {
+        debug_assert_eq!(self.passes, 0);
+        debug_assert!(matches!(
+            self.capture.scope_coverage(),
+            CaptureScopeCoverage::Cgroup
+        ));
+        debug_assert!(control.check().is_err(), "scoped startup must be cancelled");
         self.stop_after_error(host)
     }
 
@@ -1035,7 +1096,109 @@ impl LoopClock<'_> {
 /// inputs and hands back its catalog. It runs on a worker thread, so it
 /// shares nothing with the host or the capture; the catalog is the only
 /// thing that crosses back.
-pub(crate) type CollectJob = Box<dyn FnOnce() -> Result<Catalog> + Send>;
+pub(crate) type LegacyCollectJob = Box<dyn FnOnce() -> Result<Catalog> + Send>;
+pub(crate) type CgroupCollectJob = Box<dyn FnOnce() -> CgroupCollection + Send>;
+
+pub(crate) enum CollectJob {
+    Legacy(LegacyCollectJob),
+    Cgroup {
+        control: CollectionControl,
+        task: Result<CgroupCollectJob, CgroupJobFailure>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CgroupJobFailure {
+    Preparation,
+    Spawn,
+    Panic,
+}
+
+impl CgroupJobFailure {
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::Preparation => "cgroup collection preparation failed",
+            Self::Spawn => "cgroup collection worker could not be spawned",
+            Self::Panic => "cgroup collection worker panicked",
+        }
+    }
+}
+
+pub(crate) enum CollectedPass {
+    Legacy(Result<Box<Catalog>>),
+    Cgroup(Result<Box<CgroupCollection>, CgroupJobFailure>),
+}
+
+#[cfg(test)]
+impl CollectedPass {
+    pub(crate) fn legacy(self) -> Result<Catalog> {
+        match self {
+            Self::Legacy(catalog) => catalog.map(|catalog| *catalog),
+            Self::Cgroup(_) => {
+                anyhow::bail!("a scoped result cannot be applied as a legacy catalog")
+            }
+        }
+    }
+}
+
+fn collect_job_off_thread(
+    job: CollectJob,
+    tick: Duration,
+    service: &mut dyn FnMut(),
+) -> CollectedPass {
+    match job {
+        CollectJob::Legacy(job) => {
+            CollectedPass::Legacy(collect_off_thread(job, tick, service).map(Box::new))
+        }
+        CollectJob::Cgroup { control, task } => match task {
+            Ok(job) => {
+                let _ = control.check();
+                CollectedPass::Cgroup(collect_cgroup_off_thread(job, tick, service).map(Box::new))
+            }
+            Err(failure) => CollectedPass::Cgroup(Err(failure)),
+        },
+    }
+}
+
+/// Scoped jobs never run inline. Join the owned worker on every outcome;
+/// a returning filesystem operation still determines the next checkpoint.
+fn collect_cgroup_off_thread(
+    job: CgroupCollectJob,
+    tick: Duration,
+    service: &mut dyn FnMut(),
+) -> Result<CgroupCollection, CgroupJobFailure> {
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    std::thread::scope(|scope| {
+        let (sender, results) = mpsc::sync_channel(1);
+        let worker = if worker_spawn_test_failure() {
+            Err(std::io::Error::other("injected collection spawn failure"))
+        } else {
+            std::thread::Builder::new()
+                .name("p11scope-cgroup-collect".into())
+                .spawn_scoped(scope, move || {
+                    let _ = sender.send(job());
+                })
+        }
+        .map_err(|_| CgroupJobFailure::Spawn)?;
+        let mut schedule = TickSchedule::starting(Instant::now(), tick);
+        loop {
+            match results.recv_timeout(schedule.wait(Instant::now())) {
+                Ok(value) => {
+                    worker.join().map_err(|_| CgroupJobFailure::Panic)?;
+                    return Ok(value);
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    service();
+                    schedule.advance(Instant::now());
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    let _ = worker.join();
+                    return Err(CgroupJobFailure::Panic);
+                }
+            }
+        }
+    })
+}
 
 /// The classic loop's pass side: one pass's collection, its application at
 /// `now`, and the batch commit.
@@ -1044,15 +1207,22 @@ pub(crate) trait PassDriver<Pin> {
     fn host(&mut self) -> &mut Self::Host;
     /// The pass's collection job, built on the loop's thread.
     fn collector(&mut self) -> CollectJob;
+    fn collection_control(&self) -> Option<CollectionControl> {
+        None
+    }
     /// Applies what the collection returned (an error goes through the
     /// pass failure policy), with `identity` as the native identity.
     fn apply(
         &mut self,
-        collected: Result<Catalog>,
+        collected: CollectedPass,
         identity: &mut dyn NativeIdentity<Pin>,
         now_ns: u64,
     ) -> Result<PassReport>;
     fn commit(&mut self, engine_changed: bool) -> Result<()>;
+    /// Consume a scoped completion after its real registry publication.
+    fn finish_pass(&mut self, _report: &mut PassReport) -> Result<()> {
+        Ok(())
+    }
     /// Once per service tick, after the lane's own service (C5.3: the
     /// interactive dashboard draws here). It must return within a small
     /// bound: it shares the tick.
@@ -1080,13 +1250,17 @@ pub(crate) fn collect_off_thread<T: Send>(
     std::thread::scope(|scope| {
         let (sender, results) = mpsc::sync_channel(1);
         let slot = &slot;
-        let spawned = std::thread::Builder::new()
-            .name("p11scope-collect".into())
-            .spawn_scoped(scope, move || {
-                if let Some(job) = take(slot) {
-                    let _ = sender.send(job());
-                }
-            });
+        let spawned = if worker_spawn_test_failure() {
+            Err(std::io::Error::other("injected collection spawn failure"))
+        } else {
+            std::thread::Builder::new()
+                .name("p11scope-collect".into())
+                .spawn_scoped(scope, move || {
+                    if let Some(job) = take(slot) {
+                        let _ = sender.send(job());
+                    }
+                })
+        };
         let worker = match spawned {
             Ok(worker) => worker,
             Err(error) => {
@@ -1113,6 +1287,38 @@ pub(crate) fn collect_off_thread<T: Send>(
             }
         }
     })
+}
+
+fn worker_spawn_test_failure() -> bool {
+    #[cfg(test)]
+    {
+        worker_spawn_test::take_failure()
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod worker_spawn_test {
+    use std::cell::Cell;
+    thread_local! {
+        static FAIL: Cell<bool> = const { Cell::new(false) };
+    }
+    pub(super) fn take_failure() -> bool {
+        FAIL.with(|flag| flag.replace(false))
+    }
+    pub(crate) fn fail_next<R>(run: impl FnOnce() -> R) -> R {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                FAIL.with(|flag| flag.set(self.0));
+            }
+        }
+        let _restore = Restore(FAIL.with(|flag| flag.replace(true)));
+        run()
+    }
 }
 
 /// A fixed-rate tick schedule (C5.3): each tick falls due one period after
@@ -1214,8 +1420,30 @@ where
             let mut passes: u64 = 0;
             let mut rescan = false;
             loop {
-                // At least one full pass after activation: a stop that arrived
-                // during startup (activation included) still gets one.
+                let control = driver.collection_control();
+                if let Some(control) = &control
+                    && latch_collection_stop(control, clock)
+                {
+                    if passes == 0 {
+                        let reason = match control.check() {
+                            Err(crate::scope::inventory_cgroup::CollectionStop::OperatorStop) => {
+                                "operator stop"
+                            }
+                            Err(crate::scope::inventory_cgroup::CollectionStop::Deadline) => {
+                                "collection deadline"
+                            }
+                            Ok(()) => unreachable!("collection cancellation is sticky"),
+                        };
+                        driver.host().note_scope_gap(
+                            "cgroup collection cancelled before launch".into(),
+                            reason.into(),
+                        );
+                        driver.commit(false)?;
+                    }
+                    break;
+                }
+                // Legacy activation still gets one pass. Scoped startup
+                // honors an already requested stop before scanner work.
                 if passes > 0 && clock.ending() {
                     break;
                 }
@@ -1229,20 +1457,46 @@ where
                 let job = driver.collector();
                 // The ring first, then the display (C5.3): on a fixed-rate schedule,
                 // so the draw never delays the next ring service.
-                let collected = collect_off_thread(job, clock.collection_tick, &mut || {
+                let collected = collect_job_off_thread(job, clock.collection_tick, &mut || {
                     if let Some(lane) = lane.as_mut() {
                         lane.collecting_tick();
                     }
                     driver.on_tick();
+                    if let Some(control) = &control {
+                        latch_collection_stop(control, clock);
+                    }
                 });
+                if let Some(control) = &control {
+                    latch_collection_stop(control, clock);
+                }
                 let mut report = match lane.as_mut() {
                     Some(lane) => driver.apply(collected, lane.identity(), now)?,
                     None => driver.apply(collected, &mut ScanOnlyIdentity, now)?,
                 };
                 if let Some(lane) = lane.as_mut() {
-                    report.events.extend(lane.after_pass(driver.host()));
+                    report.events.extend(if control.is_some() {
+                        lane.before_cgroup_commit(driver.host())
+                    } else {
+                        lane.after_pass(driver.host())
+                    });
+                }
+                if let Some(control) = &control {
+                    latch_collection_stop(control, clock);
                 }
                 driver.commit(report.engine_changed)?;
+                if let Some(control) = &control {
+                    driver.finish_pass(&mut report)?;
+                    if !latch_collection_stop(control, clock)
+                        && let Some(lane) = lane.as_mut()
+                    {
+                        report
+                            .events
+                            .extend(lane.after_cgroup_commit(driver.host()));
+                    }
+                    // No pending scoped transaction remains here. This commits
+                    // delayed receipt/native facts without rerunning collection.
+                    driver.commit(false)?;
+                }
                 passes += 1;
                 // Publication time is sampled AFTER collection, refresh, and
                 // commit: rows this pass stamped (rows_read_ns) must not read as
@@ -1265,7 +1519,12 @@ where
                 let mut schedule = TickSchedule::starting(Instant::now(), clock.tick);
                 loop {
                     let now = Instant::now();
-                    if clock.ending() || now >= next {
+                    if clock.ending()
+                        || now >= next
+                        || control
+                            .as_ref()
+                            .is_some_and(|control| control.check().is_err())
+                    {
                         break;
                     }
                     std::thread::sleep(schedule.wait(now).min(next - now));
@@ -1275,6 +1534,9 @@ where
                         lane.tick(driver.host());
                     }
                     driver.on_tick();
+                    if let Some(control) = &control {
+                        latch_collection_stop(control, clock);
+                    }
                     schedule.advance(Instant::now());
                 }
             }
@@ -1314,6 +1576,11 @@ where
     }
     let stopped = if error.is_some() {
         lane.stop_after_error(driver.host())
+    } else if lane.passes == 0
+        && let Some(control) = driver.collection_control()
+        && control.check().is_err()
+    {
+        lane.stop_cancelled_scoped_startup(driver.host(), &control)
     } else {
         lane.stop(driver.host())
     };
@@ -1333,6 +1600,13 @@ where
         stopped: Some(stopped),
         error,
     }
+}
+
+fn latch_collection_stop(control: &CollectionControl, clock: &LoopClock<'_>) -> bool {
+    if (clock.stop)() {
+        control.cancel();
+    }
+    control.check().is_err()
 }
 
 /// The production lane: the owned facade across its typestates.
@@ -1529,4 +1803,4 @@ pub(crate) fn finish_native<L, T>(
 
 #[cfg(test)]
 #[path = "inventory_capture_tests.rs"]
-mod tests;
+pub(crate) mod tests;

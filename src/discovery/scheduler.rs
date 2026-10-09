@@ -75,6 +75,12 @@ pub(crate) enum InventoryCadence {
     Reconcile,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InventoryScanClass {
+    Retained,
+    Newcomer,
+}
+
 /// The per-capture discovery schedule. Reconciliation, polling and new-view
 /// admission have independent cursors so failed candidates cannot monopolize
 /// a bounded tick, including when the whole scope fits under the view cap.
@@ -98,6 +104,9 @@ pub(crate) struct DiscoveryScheduler {
     cooldown_sweeps: u64,
     max_new_views: usize,
     new_view_cursor: Option<u32>,
+    retained_view_cursor: Option<u32>,
+    first_scan_class: InventoryScanClass,
+    tick_scan_started: bool,
     tick_quantum_ns: u64,
     under_cap_ticks: u64,
     poll_cursor: Option<u32>,
@@ -120,6 +129,9 @@ impl DiscoveryScheduler {
             cooldown_sweeps: RECONCILE_EVICTION_COOLDOWN_SWEEPS,
             max_new_views: MAX_NEW_VIEWS_PER_TICK,
             new_view_cursor: None,
+            retained_view_cursor: None,
+            first_scan_class: InventoryScanClass::Retained,
+            tick_scan_started: false,
             tick_quantum_ns: TICK_DEEP_SCAN_QUANTUM_NS,
             tick_deadline_ns: None,
             under_cap_ticks: 0,
@@ -219,6 +231,35 @@ impl DiscoveryScheduler {
     /// Work deferred before an attempt keeps its place for the next tick.
     pub(crate) fn note_new_view_attempt(&mut self, pid: u32) {
         self.new_view_cursor = Some(pid);
+        self.note_scan_attempt(InventoryScanClass::Newcomer);
+    }
+
+    /// Rotate retained views by their capture-local IDs. Failures advance
+    /// the cursor; views deferred before an actual scan keep their turn.
+    pub(crate) fn retained_view_order(&self, ids: &[u32]) -> Vec<u32> {
+        Self::rotated_after(ids, self.retained_view_cursor)
+    }
+
+    pub(crate) fn note_retained_view_attempt(&mut self, id: u32) {
+        self.retained_view_cursor = Some(id);
+        self.note_scan_attempt(InventoryScanClass::Retained);
+    }
+
+    /// When both classes are ready, give the other class the first chance
+    /// after the class that actually started the preceding service pass.
+    /// An expired tick or an absent candidate does not consume a turn.
+    pub(crate) fn newcomers_first(&self, retained_ready: bool, newcomer_ready: bool) -> bool {
+        newcomer_ready && (!retained_ready || self.first_scan_class == InventoryScanClass::Newcomer)
+    }
+
+    fn note_scan_attempt(&mut self, class: InventoryScanClass) {
+        if !self.tick_scan_started {
+            self.tick_scan_started = true;
+            self.first_scan_class = match class {
+                InventoryScanClass::Retained => InventoryScanClass::Newcomer,
+                InventoryScanClass::Newcomer => InventoryScanClass::Retained,
+            };
+        }
     }
 
     /// Counts one under-cap inventory tick and reports whether it runs a
@@ -248,6 +289,7 @@ impl DiscoveryScheduler {
     /// already-expired deadline: with no clock there is no bounded phase,
     /// so new scan work defers rather than running blind.
     pub(crate) fn begin_deep_scan_tick(&mut self, now_ns: Option<u64>) {
+        self.tick_scan_started = false;
         self.tick_deadline_ns =
             Some(now_ns.map_or(0, |now| now.saturating_add(self.tick_quantum_ns)));
     }
@@ -583,6 +625,56 @@ mod tests {
             scheduler.tick_expired(Some(u64::MAX)),
             "a clock failure at install defers the whole phase"
         );
+    }
+
+    #[test]
+    fn retained_attempt_cursor_rotates_wraps_and_survives_departure() {
+        let mut scheduler = DiscoveryScheduler::new();
+        assert_eq!(scheduler.retained_view_order(&[0, 2, 4]), [0, 2, 4]);
+        scheduler.note_retained_view_attempt(0);
+        assert_eq!(scheduler.retained_view_order(&[0, 2, 4]), [2, 4, 0]);
+        scheduler.note_retained_view_attempt(2);
+        assert_eq!(scheduler.retained_view_order(&[0, 4]), [4, 0]);
+        scheduler.note_retained_view_attempt(4);
+        assert_eq!(scheduler.retained_view_order(&[0, 2, 4]), [0, 2, 4]);
+        assert!(scheduler.retained_view_order(&[]).is_empty());
+    }
+
+    #[test]
+    fn ready_scan_classes_alternate_after_the_first_actual_attempt() {
+        let mut scheduler = DiscoveryScheduler::new();
+        scheduler.begin_deep_scan_tick(Some(0));
+        assert!(!scheduler.newcomers_first(true, true));
+        scheduler.note_retained_view_attempt(1);
+        scheduler.note_new_view_attempt(10);
+        scheduler.begin_deep_scan_tick(Some(0));
+        assert!(scheduler.newcomers_first(true, true));
+        scheduler.note_new_view_attempt(10);
+        scheduler.note_retained_view_attempt(2);
+        scheduler.begin_deep_scan_tick(Some(0));
+        assert!(!scheduler.newcomers_first(true, true));
+        assert!(scheduler.newcomers_first(false, true));
+        assert!(!scheduler.newcomers_first(true, false));
+        assert!(!scheduler.newcomers_first(false, false));
+    }
+
+    #[test]
+    fn expired_ticks_preserve_attempt_cursor_and_class_turn() {
+        let mut scheduler = DiscoveryScheduler::new();
+        scheduler.note_retained_view_attempt(1);
+        scheduler.set_tick_quantum_ns_for_test(0);
+        for now in [Some(0), None] {
+            scheduler.begin_deep_scan_tick(now);
+            assert!(scheduler.tick_expired(now));
+            assert_eq!(scheduler.retained_view_order(&[1, 2]), [2, 1]);
+            assert!(scheduler.newcomers_first(true, true));
+        }
+        scheduler.set_tick_quantum_ns_for_test(1);
+        scheduler.begin_deep_scan_tick(Some(0));
+        assert!(!scheduler.tick_expired(Some(0)));
+        scheduler.note_new_view_attempt(10);
+        scheduler.begin_deep_scan_tick(Some(0));
+        assert!(!scheduler.newcomers_first(true, true));
     }
 
     /// Under-cap ticks poll every fourth, mirroring the reconcile cadence,

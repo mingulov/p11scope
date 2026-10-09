@@ -91,7 +91,7 @@ fn unvalidated_discovery_accounting_changes_only_bounded_loss_evidence() {
     engine.timings.observe(&timing, 1_000_000);
     engine.timings.complete(&timing, 2_000_000);
     engine.discovery_truncated = 1;
-    engine.refresh_requested.insert(std::process::id(), None);
+    engine.request_refresh(std::process::id(), None);
     engine.pending_retirements.insert(view);
     engine.ready_expected_removals.insert(view);
     engine.expected_target_exit_pending = Some(view);
@@ -397,7 +397,7 @@ fn shallow_idle_predicate_covers_pending_refresh_staged_and_scope() {
     assert!(!engine.discovery_shallow_idle());
     engine.pending_retirements.clear();
 
-    engine.refresh_requested.insert(std::process::id(), None);
+    engine.request_refresh(std::process::id(), None);
     assert!(!engine.discovery_shallow_idle());
     engine.refresh_requested.clear();
 
@@ -3658,7 +3658,7 @@ fn leader_exit_loss_closes_only_the_owned_selection_view() {
         },
     );
     engine.pending_leader_exit_views.insert(ProcessViewId(25));
-    engine.refresh_requested.insert(std::process::id(), None);
+    engine.request_refresh(std::process::id(), None);
     let mut pending_views = PendingViewRetirements::new();
     let mut additions_allowed = true;
     let mut closure = PauseClosure::new(true);
@@ -5102,7 +5102,7 @@ fn a_sticky_refresh_request_does_not_excuse_a_live_armed_mapping() {
 
     let (mut engine, context, _) = engine_with_exec_refreshed_loader(armed);
     engine.retirement_intents.clear();
-    engine.refresh_requested.insert(pid, None);
+    engine.request_refresh(pid, None);
     let mut record = loader_record_for(context, pid);
     record.table_ptr = 0x1000;
     let mut session = ScriptedSession::with_records([], 1);
@@ -5646,8 +5646,9 @@ fn ordinary_over_cap_refresh_performs_no_maps_sweep() {
 #[test]
 fn refresh_request_queue_is_bounded_with_explicit_overflow() {
     let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    let mut pending = PendingViewRetirements::new();
     for pid in 1..=(MAX_PENDING_REFRESH as u32 + 44) {
-        engine.request_refresh(pid, None);
+        engine.dispatch_lifecycle_record(&exec_record_for(pid), &mut pending);
     }
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     assert_eq!(engine.discovery_truncated, 44);
@@ -6461,8 +6462,8 @@ fn refresh_requests_survive_allocation_exhaustion() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     engine.max_scan_pids = 2;
     // Queue event-driven refreshes for the two unknown members.
-    engine.refresh_requested.insert(pids[3], None);
-    engine.refresh_requested.insert(pids[4], None);
+    engine.request_refresh(pids[3], None);
+    engine.request_refresh(pids[4], None);
 
     refresh_inventory_once(&mut engine);
 
@@ -29387,7 +29388,7 @@ fn newcomer_arrival_to_admission_samples_queue_ages() {
     }
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     let truncated_before = engine.discovery_truncated;
-    engine.request_refresh(60_000, Some(4_001_000_000));
+    engine.request_refresh_consumed(60_000, Some(4_001_000_000));
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     assert_eq!(engine.discovery_truncated, truncated_before + 1);
     let stats = engine.newcomer_stats(Some(4_002_000_000));
@@ -31608,4 +31609,476 @@ pub(crate) mod detailed_proof_driver {
             Err(CgroupWorkRefusal::Refused(TraceProofUnknown::Unreadable))
         );
     }
+}
+
+/// Real held providers, exact retained generations and the normal inventory
+/// transaction; only the kernel-link adapter is scripted.
+struct RefreshFairnessFixture {
+    _dir: tempfile::TempDir,
+    listing: tempfile::TempDir,
+    providers: Vec<PathBuf>,
+    children: Vec<SystemScopeChildGuard>,
+    engine: Engine,
+}
+
+impl RefreshFairnessFixture {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let providers = vec![
+            system_scope_build_fixture(dir.path(), "refresh-retained"),
+            system_scope_build_fixture(dir.path(), "refresh-newcomer"),
+        ];
+        let driver = system_scope_build_driver(dir.path());
+        let children: Vec<_> = providers
+            .iter()
+            .map(|provider| system_scope_spawn_loaded(&driver, provider))
+            .collect();
+        let listing = tempfile::tempdir().unwrap();
+        e06_write_listing(listing.path(), &[children[0].pid()]);
+        let scope = crate::scope::cgroup(listing.path()).unwrap();
+        let args = e06_cgroup_args(listing.path(), providers.clone(), Some(4));
+        let mut engine = Engine::discover(&args, &scope, None).unwrap();
+        assert!(!engine.plan.slots.is_empty(), "a real initial provider");
+        assert!(
+            engine
+                .modules
+                .iter()
+                .any(|module| { module.scanned.path == providers[0].display().to_string() })
+        );
+        engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+        Self {
+            _dir: dir,
+            listing,
+            providers,
+            children,
+            engine,
+        }
+    }
+
+    fn include_newcomer(&self) {
+        e06_write_listing(
+            self.listing.path(),
+            &[self.children[0].pid(), self.children[1].pid()],
+        );
+    }
+
+    fn run(&mut self, mut records: Vec<QueuedDiscoveryRecord>, clock: &mut TickClock<'_>) {
+        let mut session = ScriptedSession::default();
+        self.engine
+            .refresh_inventory(
+                &mut session,
+                &mut true,
+                &mut records,
+                &mut PendingViewRetirements::new(),
+                &mut Engine::collect_discovery_records,
+                &mut PauseClosure::new(true),
+                clock,
+            )
+            .unwrap();
+        assert!(
+            !session.attached_slots.is_empty(),
+            "the candidate was applied"
+        );
+    }
+}
+
+fn refresh_exec(pid: u32) -> QueuedDiscoveryRecord {
+    let mut record = exec_record_for(pid);
+    // Later than either exact admission: this models a fresh record held
+    // across the transaction, rather than a delayed old EXEC.
+    record.hook_ts_ns = u64::MAX;
+    QueuedDiscoveryRecord {
+        record,
+        terminal_owner: None,
+        terminal_exports: Vec::new(),
+    }
+}
+
+fn refresh_completion_interleaving(same_pid: bool) {
+    let mut fixture = RefreshFairnessFixture::new();
+    fixture.include_newcomer();
+    let retained_pid = fixture.children[0].pid();
+    let newcomer_pid = fixture.children[1].pid();
+    fixture.engine.request_refresh(retained_pid, Some(10));
+    if same_pid {
+        fixture.engine.request_refresh(newcomer_pid, Some(20));
+    }
+    let scans_before = fixture.engine.deep_scans;
+    fixture.run(vec![refresh_exec(newcomer_pid)], &mut || Some(0));
+    assert!(fixture.engine.deep_scans > scans_before);
+    assert!(
+        fixture
+            .engine
+            .views
+            .iter()
+            .any(|view| view.pid() == newcomer_pid)
+    );
+    assert!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .any(|module| { module.scanned.path == fixture.providers[1].display().to_string() }),
+        "the newcomer really published its distinct physical provider"
+    );
+    assert!(
+        !fixture.engine.refresh_requested.contains_key(&retained_pid),
+        "older serviced work completes"
+    );
+    assert!(
+        fixture.engine.refresh_requested.contains_key(&newcomer_pid),
+        "post-apply EXEC was not serviced by the older inventory pass"
+    );
+    if same_pid {
+        assert_eq!(
+            fixture.engine.refresh_requested[&newcomer_pid].first_seen_ns,
+            Some(20)
+        );
+    }
+}
+
+#[test]
+fn refresh_retry_preserves_newer_serial_and_first_seen() {
+    let mut engine = Engine::empty();
+    assert!(engine.request_refresh_consumed(42, Some(10)));
+    let first = engine.refresh_requested[&42];
+    assert!(engine.request_refresh_consumed(42, Some(20)));
+    let newer = engine.refresh_requested[&42];
+    assert!(newer.serial > first.serial);
+    assert_eq!(newer.first_seen_ns, Some(10));
+    assert!(engine.request_refresh(42, Some(30)));
+    assert!(engine.request_refresh(42, None));
+    assert_eq!(engine.refresh_requested[&42], newer);
+    engine.complete_refresh_requests(&BTreeMap::from([(42, first.serial)]), &BTreeSet::new());
+    assert_eq!(engine.refresh_requested[&42], newer);
+    assert!(engine.request_refresh_consumed(43, None));
+    assert!(engine.request_refresh_consumed(43, Some(40)));
+    assert_eq!(engine.refresh_requested[&43].first_seen_ns, None);
+
+    // A refused setup retry has a live owner and original loader authority.
+    // Reuse the existing bounded retirement-intent replay, which cannot
+    // overtake the already-collected old-context record.
+    let (_fixture, mut engine, context, record, mut session) = armed_seed_route(1);
+    let pid = engine.views[0].pid();
+    let view = engine.views[0].id();
+    let mut pending = PendingViewRetirements::new();
+    for offset in 0..MAX_PENDING_REFRESH as u32 {
+        engine.dispatch_lifecycle_record(&exec_record_for(4_000_000 + offset), &mut pending);
+    }
+    let requested = engine.refresh_requested.clone();
+    for _ in 0..2 {
+        assert!(!engine.request_refresh(pid, Some(50)));
+        assert_eq!(engine.refresh_requested, requested);
+        assert_eq!(engine.retirement_intents.len(), 1);
+        assert_eq!(
+            engine.retirement_intents.get(&view),
+            Some(&RetirementCause::ExecRefresh)
+        );
+    }
+    assert_eq!(engine.discovery_truncated, 0);
+    engine.frame_work_budget_ns = 0;
+    session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(record)))].into();
+    engine.drain_discovery_from(&mut session).unwrap();
+    assert_eq!(engine.pending_discovery_records.len(), 1);
+    assert!(engine.loader_registry.context(context).is_some());
+    assert!(
+        session.detached.is_empty(),
+        "owed setup cannot retire ahead of the collected record"
+    );
+    assert_eq!(engine.loader_records_accepted, 0);
+    engine.refresh_requested.remove(&4_000_000);
+    engine.frame_work_budget_ns = u64::MAX;
+    engine.drain_discovery_from(&mut session).unwrap();
+    assert!(engine.pending_discovery_records.is_empty());
+    assert_eq!(engine.loader_records_accepted, 1);
+    assert!(!engine.retirement_intents.contains_key(&view));
+    assert_eq!(
+        session.detached.iter().filter(|id| **id == context).count(),
+        1
+    );
+    assert_eq!(engine.discovery_truncated, 0);
+    let scans = engine.deep_scans;
+    let detached = session.detached.len();
+    engine.drain_discovery_from(&mut session).unwrap();
+    assert_eq!(
+        engine.deep_scans, scans,
+        "completed retry does not perpetuate itself"
+    );
+    assert_eq!(session.detached.len(), detached);
+
+    // A normal shallow cgroup frame frees the absent requests while the
+    // retained owner's retry is still waiting. That intent must itself
+    // force the next quiet frame to perform the actual rescan/setup.
+    let mut fixture = RefreshFairnessFixture::new();
+    let mut session = ScriptedSession::default();
+    let engine = &mut fixture.engine;
+    let pid = engine.views[0].pid();
+    let view = engine.views[0].id();
+    engine
+        .arm_loader_or_partial(
+            0,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .unwrap();
+    let context = engine.loader_registry.ids_for_view(view)[0];
+    engine.frame_work_budget_ns = u64::MAX;
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    assert!(!engine.plan.slots.is_empty());
+    for offset in 0..MAX_PENDING_REFRESH as u32 {
+        engine.dispatch_lifecycle_record(&exec_record_for(4_000_000 + offset), &mut pending);
+    }
+    assert!(!engine.request_refresh(pid, Some(50)));
+    let before = engine.deep_scans;
+    engine
+        .drain_discovery_shallow_from(&mut session, false)
+        .unwrap();
+    assert!(engine.refresh_requested.is_empty());
+    assert_eq!(
+        engine.retirement_intents.get(&view),
+        Some(&RetirementCause::ExecRefresh)
+    );
+    assert!(engine.loader_registry.context(context).is_none());
+    assert_eq!(
+        engine.deep_scans, before,
+        "the full-queue pass did not scan its refused retry"
+    );
+    engine
+        .drain_discovery_shallow_from(&mut session, false)
+        .unwrap();
+    assert!(
+        engine.deep_scans > before,
+        "an owed retry upgrades the next quiet shallow frame"
+    );
+    assert!(!engine.retirement_intents.contains_key(&view));
+    assert!(!engine.refresh_requested.contains_key(&pid));
+    assert!(!engine.loader_registry.ids_for_view(view).is_empty());
+    assert!(!engine.plan.slots.is_empty());
+    assert_eq!(engine.discovery_truncated, 0);
+    let after = engine.deep_scans;
+    let detached = session.detached.len();
+    assert!(
+        !engine
+            .drain_discovery_shallow_from(&mut session, false)
+            .unwrap()
+    );
+    assert_eq!(engine.deep_scans, after);
+    assert_eq!(session.detached.len(), detached);
+}
+
+#[test]
+fn refresh_serial_exhaustion_refuses_without_reuse() {
+    let mut engine = Engine::empty();
+    engine.last_refresh_serial = u64::MAX - 1;
+    assert!(engine.request_refresh_consumed(42, Some(10_000_000)));
+    let last = engine.refresh_requested[&42];
+    assert_eq!(last.serial, u64::MAX);
+    assert!(!engine.request_refresh_consumed(42, Some(20_000_000)));
+    assert!(!engine.request_refresh_consumed(43, Some(30_000_000)));
+    assert_eq!(engine.last_refresh_serial, u64::MAX);
+    assert_eq!(engine.refresh_requested, BTreeMap::from([(42, last)]));
+    assert_eq!(engine.discovery_truncated, 2);
+    assert_eq!(engine.newcomer_ages.dropped, 1);
+    assert_eq!(engine.newcomer_ages.max_dropped_age_ms, Some(10));
+    assert_eq!(engine.newcomer_ages.dropped_unknown, 1);
+    assert!(engine.request_refresh(42, Some(40)));
+    assert!(!engine.request_refresh(43, Some(40)));
+    assert_eq!(engine.refresh_requested, BTreeMap::from([(42, last)]));
+    assert_eq!(
+        engine.discovery_truncated, 2,
+        "a retry is not another consumed record"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| { skip.reason.contains("serials were exhausted") })
+    );
+}
+
+#[test]
+fn refresh_completion_clears_only_serviced_stale_requests() {
+    let mut engine = Engine::empty();
+    for pid in 40..44 {
+        assert!(engine.request_refresh_consumed(pid, Some(10)));
+    }
+    let serviced = engine.refresh_request_snapshot();
+    assert!(engine.request_refresh_consumed(41, Some(20)));
+    assert!(engine.request_refresh_consumed(44, Some(20)));
+    engine.complete_refresh_requests(&serviced, &BTreeSet::from([42]));
+    assert_eq!(
+        engine.refresh_requested.keys().copied().collect::<Vec<_>>(),
+        [41, 42, 44]
+    );
+    assert_eq!(engine.refresh_requested[&41].first_seen_ns, Some(10));
+
+    // Expected-exit/link-loss cleanup is owned by its exact retained view,
+    // and cannot clear an unmatched replacement request for the same PID.
+    let mut children = e06_spawn_sleeps(1);
+    let pid = children[0].pid();
+    let view = ProcessViewId(0);
+    engine.views.push(ProcessView::open(view, pid).unwrap());
+    assert!(engine.request_refresh_consumed(pid, Some(30)));
+    assert_eq!(engine.refresh_requested[&pid].owner, Some(view));
+    engine.clear_refresh_for_view(view, pid);
+    assert!(!engine.refresh_requested.contains_key(&pid));
+    children[0].reap().unwrap();
+    engine.dispatch_lifecycle_record(&exec_record_for(pid), &mut PendingViewRetirements::new());
+    let replacement = engine.refresh_requested[&pid];
+    assert_eq!(replacement.owner, None);
+    engine.queue_retirement(
+        view,
+        RetirementCause::ExpectedRemoval,
+        &mut PendingViewRetirements::new(),
+    );
+    assert_eq!(engine.refresh_requested[&pid], replacement);
+
+    // Exercise the actual empty inventory path on a populated provider plan.
+    let mut fixture = RefreshFairnessFixture::new();
+    fixture.engine.request_refresh_consumed(4_000_000, Some(10));
+    let scans = fixture.engine.deep_scans;
+    let mut session = ScriptedSession::default();
+    assert!(
+        !fixture
+            .engine
+            .refresh_inventory(
+                &mut session,
+                &mut true,
+                &mut Vec::new(),
+                &mut PendingViewRetirements::new(),
+                &mut Engine::collect_discovery_records,
+                &mut PauseClosure::new(true),
+                &mut || Some(0),
+            )
+            .unwrap()
+    );
+    assert!(fixture.engine.refresh_requested.is_empty());
+    assert_eq!(fixture.engine.deep_scans, scans);
+    assert!(!fixture.engine.plan.slots.is_empty());
+}
+
+#[test]
+fn refresh_completion_preserves_new_pid_exec_during_apply() {
+    refresh_completion_interleaving(false);
+}
+
+#[test]
+fn refresh_completion_preserves_same_pid_exec_during_apply() {
+    refresh_completion_interleaving(true);
+}
+
+#[test]
+fn retained_refresh_failures_rotate_with_one_scan_quantum() {
+    let mut fixture = RefreshFairnessFixture::new();
+    let mut failing = e06_spawn_sleeps(1);
+    let failed_view = ProcessView::open(ProcessViewId(0), failing[0].pid()).unwrap();
+    failing[0].reap().unwrap();
+    let successful_view = ProcessView::open(ProcessViewId(1), fixture.children[0].pid()).unwrap();
+    fixture.engine.views = vec![failed_view, successful_view];
+    fixture.engine.scheduler.set_tick_quantum_ns_for_test(1);
+    let views = BTreeSet::from([ProcessViewId(0), ProcessViewId(1)]);
+    let mut successful = Vec::new();
+    let mut failures = BTreeSet::new();
+    for _ in 0..2 {
+        fixture.engine.scheduler.begin_deep_scan_tick(Some(0));
+        let mut polls = 0;
+        let (scans, failed, _, _) =
+            fixture
+                .engine
+                .scan_inventory_views(&views, "scripted retained failure", &mut || {
+                    polls += 1;
+                    Some(u64::from(polls > 1))
+                });
+        successful.extend(scans);
+        failures.extend(failed);
+    }
+    assert!(
+        failures.contains(&failing[0].pid()),
+        "lower-ID scan genuinely failed"
+    );
+    assert!(
+        successful.iter().any(|(view, modules, pins)| {
+            *view == ProcessViewId(1)
+                && modules.iter().any(|module| !module.tables.is_empty())
+                && pins.pinned().next().is_some()
+        }),
+        "a failing low view cannot consume every finite scan turn"
+    );
+}
+
+#[test]
+fn busy_retained_refreshes_share_one_scan_ticks_with_newcomers() {
+    let mut fixture = RefreshFairnessFixture::new();
+    fixture.include_newcomer();
+    let retained_pid = fixture.children[0].pid();
+    let newcomer_pid = fixture.children[1].pid();
+    fixture.engine.scheduler.set_tick_quantum_ns_for_test(1);
+    fixture.engine.scheduler.set_max_new_views_for_test(1);
+    fixture.engine.request_refresh(retained_pid, Some(10));
+    fixture.engine.request_refresh(newcomer_pid, Some(20));
+    for _ in 0..2 {
+        let mut polls = 0;
+        fixture.run(Vec::new(), &mut || {
+            polls += 1;
+            Some(u64::from(polls > 2))
+        });
+    }
+    assert!(
+        fixture
+            .engine
+            .views
+            .iter()
+            .any(|view| view.pid() == newcomer_pid),
+        "a ready newcomer gets a real attempt within two one-scan service passes"
+    );
+    assert!(
+        fixture
+            .engine
+            .modules
+            .iter()
+            .any(|module| { module.scanned.path == fixture.providers[1].display().to_string() }),
+        "the newcomer published its independently held provider"
+    );
+    assert_eq!(fixture.engine.discovery_truncated, 0);
+}
+
+#[test]
+fn zero_or_failed_clock_keeps_refresh_order_and_requests() {
+    let mut fixture = RefreshFairnessFixture::new();
+    let view = fixture.engine.views[0].id();
+    let pid = fixture.children[0].pid();
+    fixture.engine.request_refresh(pid, Some(10));
+    let requested = fixture.engine.refresh_requested.clone();
+    let scans_before = fixture.engine.deep_scans;
+    fixture.engine.scheduler.set_tick_quantum_ns_for_test(0);
+    fixture.engine.scheduler.begin_deep_scan_tick(Some(0));
+    let (scans, _, deferred, _) =
+        fixture
+            .engine
+            .scan_inventory_views(&BTreeSet::from([view]), "zero quantum", &mut || Some(0));
+    assert!(scans.is_empty());
+    assert!(deferred.contains(&pid));
+    fixture.engine.scheduler.begin_deep_scan_tick(None);
+    let (scans, _, deferred, _) =
+        fixture
+            .engine
+            .scan_inventory_views(&BTreeSet::from([view]), "failed clock", &mut || None);
+    assert!(scans.is_empty());
+    assert!(deferred.contains(&pid));
+    assert_eq!(fixture.engine.deep_scans, scans_before);
+    assert_eq!(fixture.engine.refresh_requested, requested);
+    fixture.engine.scheduler.set_tick_quantum_ns_for_test(1);
+    fixture.engine.scheduler.begin_deep_scan_tick(Some(0));
+    let (scans, _, _, _) = fixture.engine.scan_inventory_views(
+        &BTreeSet::from([view]),
+        "retry after clock deferral",
+        &mut || Some(0),
+    );
+    assert!(
+        scans
+            .iter()
+            .any(|(id, modules, _)| *id == view && !modules.is_empty())
+    );
 }

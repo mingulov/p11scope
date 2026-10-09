@@ -66,6 +66,9 @@ fn fixture_session() -> IdentitySession {
         generation: 0,
         token: Arc::new(()),
         binding: None,
+        sticky: None,
+        consecutive_deadlines: 0,
+        fallback: KernelFallbackLedger::default(),
     }
 }
 
@@ -1483,6 +1486,7 @@ fn d3c_successive_pass_same_slot_different_file_clears_old_kernel_authority() {
 #[derive(Default)]
 struct SegmentEvents {
     pins: BTreeMap<u32, FdToken>,
+    pin_fds: BTreeMap<u32, i32>,
     opens: Vec<u32>,
     closes: Vec<u32>,
     maps: Vec<u32>,
@@ -1512,6 +1516,9 @@ struct SegmentIo<'w> {
     runs: Arc<std::sync::Mutex<FixtureRunTrace>>,
     owner: ReservationOwner,
     exe_reads: Cell<usize>,
+    /// Immediate-envelope occupancy already held when this handle was made
+    /// (a resource test's deliberate occupant). Fallback must add none.
+    imm_base: usize,
 }
 impl ConfirmIo for SegmentIo<'_> {
     type Pin = SegmentPin;
@@ -1522,6 +1529,7 @@ impl ConfirmIo for SegmentIo<'_> {
             File::from(crate::attach::identity_iter::open_pidfd(std::process::id()).unwrap());
         let mut events = self.events.lock().unwrap();
         assert!(events.pins.insert(pid, FdToken::of(&file)).is_none());
+        events.pin_fds.insert(pid, file.as_raw_fd());
         events.opens.push(pid);
         Ok(SegmentPin {
             pid,
@@ -1542,7 +1550,7 @@ impl ConfirmIo for SegmentIo<'_> {
         );
         assert_eq!(
             self.owner.state_for_test().0[3],
-            0,
+            self.imm_base,
             "iterator envelope remained leased during fallback"
         );
         let mut events = self.events.lock().unwrap();
@@ -1630,6 +1638,9 @@ struct SegmentObservation {
     runs: Arc<std::sync::Mutex<FixtureRunTrace>>,
     charges: u64,
     remaining_steps: usize,
+    attempts: u32,
+    failed_target: Option<RunFailure>,
+    fallback: KernelFallbackTotals,
 }
 
 fn segment_cell(
@@ -1637,7 +1648,7 @@ fn segment_cell(
     headroom: usize,
     steps: Vec<FixtureTarget>,
 ) -> SegmentObservation {
-    segment_cell_with_deadline(pids, headroom, steps, None)
+    segment_cell_with_deadline(pids, headroom, steps, None, None)
 }
 
 struct ExpireAfterPositive<'h, H> {
@@ -1675,6 +1686,7 @@ fn segment_cell_with_deadline(
     headroom: usize,
     steps: Vec<FixtureTarget>,
     expire_on: Option<usize>,
+    threshold: Option<usize>,
 ) -> SegmentObservation {
     let dir = tempfile::tempdir().unwrap();
     let (file, provider) = opened(dir.path(), "provider.so");
@@ -1761,8 +1773,12 @@ fn segment_cell_with_deadline(
         runs: runs.clone(),
         owner: owner.clone(),
         exe_reads: Cell::new(0),
+        imm_base: owner.state_for_test().0[3],
     };
     let mut probe = KernelMemberProbe::new(&mut installed, make_io(), deadline);
+    if let Some(threshold) = threshold {
+        probe = probe.with_auto_threshold(threshold);
+    }
     probe.install_expectations(&mut index).unwrap();
     let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
     let mut hook = ExpireAfterPositive {
@@ -1811,15 +1827,23 @@ fn segment_cell_with_deadline(
         SessionObject::Fixture { target_steps, .. } => target_steps.borrow().len(),
         _ => unreachable!(),
     };
+    let attempts = installed.target_attempts;
+    let failed_target = installed.failed_target;
     drop(installed);
     assert!(!fd_open(held_fd));
     assert_eq!(owner.examined_for_test().0, 0);
+    // The guard drop rolls the pass into the session ledger, so the totals
+    // below include this cell's complete pass.
+    let fallback = session.fallback.totals();
     SegmentObservation {
         out,
         events,
         runs,
         charges,
         remaining_steps,
+        attempts,
+        failed_target,
+        fallback,
     }
 }
 
@@ -1985,6 +2009,7 @@ fn d3c_segments_postproof_capture_deadline_discards_current_positive() {
             FixtureTarget::Bytes(segment_target(&[9101], 0)),
         ],
         Some(2),
+        None,
     );
     assert_eq!(
         observation.runs.lock().unwrap().scopes,
@@ -2018,4 +2043,1551 @@ fn d3c_segments_postproof_capture_deadline_discards_current_positive() {
         events.fallback.is_empty(),
         "a stopped current segment started fallback I/O"
     );
+}
+
+fn ledger_key(inode: u64) -> ObjectKey {
+    ObjectKey {
+        device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+        inode,
+    }
+}
+
+#[test]
+fn d3c_fallback_counts_distinct_passes_pids_keys() {
+    let (key_a, key_b) = (ledger_key(11), ledger_key(12));
+    let mut ledger = KernelFallbackLedger::default();
+    ledger.begin_pass();
+    ledger.note_fallback(100, [key_a, key_b], KernelFallbackReason::StreamInvalid);
+    ledger.note_fallback(100, [key_a], KernelFallbackReason::Deadline);
+    ledger.note_fallback(101, [key_b], KernelFallbackReason::Deadline);
+    ledger.end_pass();
+    assert_eq!(
+        ledger.totals(),
+        KernelFallbackTotals {
+            passes: 1,
+            pids: 2,
+            keys: 2,
+            first_reason: Some(KernelFallbackReason::StreamInvalid),
+        }
+    );
+    // A pass with no fallback requests adds zero at every unit.
+    ledger.begin_pass();
+    ledger.end_pass();
+    assert_eq!(ledger.totals().passes, 1);
+    assert_eq!((ledger.totals().pids, ledger.totals().keys), (2, 2));
+    // A later pass sums its own distinct units and keeps the first reason.
+    ledger.begin_pass();
+    ledger.note_fallback(100, [key_a], KernelFallbackReason::BelowThreshold);
+    ledger.end_pass();
+    assert_eq!(
+        ledger.totals(),
+        KernelFallbackTotals {
+            passes: 2,
+            pids: 3,
+            keys: 3,
+            first_reason: Some(KernelFallbackReason::StreamInvalid),
+        }
+    );
+
+    // Integration: a positive first segment is retained while the second
+    // segment's actual affected requests count once at their own units.
+    let mut bad = segment_target(&[5702], 0);
+    bad[0] = 0;
+    let observation = segment_cell(
+        &[(5701, vec![0]), (5702, vec![0])],
+        6,
+        vec![
+            FixtureTarget::Bytes(segment_target(&[5701], 0)),
+            FixtureTarget::Bytes(bad),
+        ],
+    );
+    assert_eq!(
+        observation
+            .out
+            .members
+            .iter()
+            .map(|member| member.pid)
+            .collect::<Vec<_>>(),
+        [5701, 5702]
+    );
+    assert_eq!(observation.charges, 2);
+    assert_eq!(
+        observation.events.lock().unwrap().fallback,
+        [(5702, segment_range(0).0, segment_range(0).1)],
+        "the finished positive was reread or the fallback was lost"
+    );
+    assert_eq!(
+        observation.fallback,
+        KernelFallbackTotals {
+            passes: 1,
+            pids: 1,
+            keys: 1,
+            first_reason: Some(KernelFallbackReason::StreamInvalid),
+        }
+    );
+}
+
+#[test]
+fn d3c_proof_selection_threshold_and_labels() {
+    assert_eq!(AUTO_KERNEL_PROOF_PID_THRESHOLD, 2_400);
+    assert!(matches!(
+        select_proof_run(2_400, Some(AUTO_KERNEL_PROOF_PID_THRESHOLD)),
+        SegmentSelection::Kernel
+    ));
+    assert!(matches!(
+        select_proof_run(2_399, Some(AUTO_KERNEL_PROOF_PID_THRESHOLD)),
+        SegmentSelection::Userspace(KernelFallbackReason::BelowThreshold)
+    ));
+    // Forced kernel bypasses the cost threshold only; resources and run caps
+    // are still enforced where the run is attempted.
+    assert!(matches!(
+        select_proof_run(1, None),
+        SegmentSelection::Kernel
+    ));
+    for (reason, label, detail) in [
+        (
+            KernelFallbackReason::BelowThreshold,
+            "below_threshold",
+            None,
+        ),
+        (KernelFallbackReason::FdHeadroom, "fd_headroom", None),
+        (
+            KernelFallbackReason::TargetLimit,
+            "fd_headroom",
+            Some("target_run_limit"),
+        ),
+        (
+            KernelFallbackReason::AnchorNotInstalled,
+            "anchor_not_installed",
+            None,
+        ),
+        (KernelFallbackReason::Scope, "scope_unavailable", None),
+        (KernelFallbackReason::Deadline, "deadline", None),
+        (KernelFallbackReason::Clock, "clock_unavailable", None),
+        (KernelFallbackReason::StreamInvalid, "stream_invalid", None),
+        (
+            KernelFallbackReason::TargetUnavailable,
+            "target_unavailable",
+            None,
+        ),
+        (KernelFallbackReason::Unvisited, "unvisited", None),
+        (
+            KernelFallbackReason::ConflictingDuplicate,
+            "conflicting_duplicate",
+            None,
+        ),
+    ] {
+        assert_eq!(reason.label(), label);
+        assert_eq!(reason.detail(), detail);
+    }
+}
+
+fn set_stream_gen(bytes: &mut [u8], generation: u64) {
+    for record in bytes.as_chunks_mut::<32>().0 {
+        record[28..32].copy_from_slice(&(generation as u32).to_le_bytes());
+    }
+}
+
+fn gen_target(generation: u64, records: &[(u32, (u64, u64), u32)]) -> Vec<u8> {
+    let mut bytes = target_stream(records);
+    set_stream_gen(&mut bytes, generation);
+    bytes
+}
+
+/// A reusable provider/examined world for multi-pass session cells. Each
+/// pass opens its own examined hold; pins stay borrowed across passes.
+struct D3cWorld {
+    dir: tempfile::TempDir,
+    pins: PinnedObjects,
+    provider_id: PinnedObjectId,
+    provider: ExaminedObject,
+    examined: ExaminedObject,
+}
+
+fn d3c_world() -> D3cWorld {
+    let dir = tempfile::tempdir().unwrap();
+    let (file, provider) = opened(dir.path(), "provider.so");
+    drop(file);
+    let pins = super::super::identity::test_fixture::real_scan_pin(
+        &dir.path().join("provider.so"),
+        None,
+        1,
+        "d3c-world-fixture",
+    );
+    let provider_id = pins.pinned().next().unwrap().id;
+    let (held, examined) = opened(dir.path(), "examined.so");
+    drop(held);
+    D3cWorld {
+        dir,
+        pins,
+        provider_id,
+        provider,
+        examined,
+    }
+}
+
+fn d3c_policy(headroom: usize, candidates: usize) -> SegmentPolicy {
+    SegmentPolicy::from_headroom(headroom, 2, candidates)
+}
+
+struct D3cPass {
+    owner: ReservationOwner,
+    runs: Arc<std::sync::Mutex<FixtureRunTrace>>,
+}
+
+/// Install one pass on a shared session: per-pass custody, owner and anchor
+/// bytes at `generation`, with scripted target steps for this pass only.
+#[allow(clippy::too_many_arguments)]
+fn d3c_install<'s, 'p>(
+    world: &'p D3cWorld,
+    session: &'s mut IdentitySession,
+    generation: u64,
+    headroom: usize,
+    candidates: usize,
+    anchor: &[(u32, u32, u64)],
+    mut steps: Vec<FixtureTarget>,
+    deadline: std::time::Instant,
+) -> (InstalledAnchorPass<'s, 'p>, D3cPass) {
+    for step in &mut steps {
+        match step {
+            FixtureTarget::Bytes(bytes) | FixtureTarget::Deadline(bytes) => {
+                set_stream_gen(bytes, generation);
+            }
+            FixtureTarget::Failure(_) => {}
+        }
+    }
+    let mut anchor_bytes = anchor_stream(anchor);
+    set_stream_gen(&mut anchor_bytes, generation);
+    let runs = if let SessionObject::Fixture {
+        anchor,
+        target_steps,
+        target_trace,
+        ..
+    } = &mut session.object
+    {
+        *anchor = anchor_bytes;
+        *target_steps.borrow_mut() = steps.into();
+        target_trace.clone()
+    } else {
+        unreachable!()
+    };
+    let owner = ReservationOwner::for_examined(SegmentPolicy::from_headroom(16, 0, 0), 1);
+    let mut custody = ExaminedCustody::new(owner.clone(), BTreeMap::new());
+    let scan = custody.begin_scan();
+    let held = File::open(world.dir.path().join("examined.so")).unwrap();
+    assert!(custody.offer_for_test(scan, world.examined, held));
+    custody.reconcile(d3c_policy(headroom, candidates)).unwrap();
+    let pass = AnchorPass::prepare(
+        &world.pins,
+        [(world.provider.key, world.provider_id)],
+        custody,
+    );
+    let installed = session.install_anchors(pass, generation, deadline).unwrap();
+    (installed, D3cPass { owner, runs })
+}
+
+fn d3c_world_map(
+    world: &D3cWorld,
+    pids: &[(u32, Vec<usize>)],
+) -> (
+    BTreeMap<u32, Vec<p11scope_manifest::maps::MapEntry>>,
+    BTreeMap<ObjectKey, super::super::identity::FileIdentity>,
+) {
+    let facts = [world.provider, world.examined];
+    let entries = |number: usize| {
+        let (start, end) = segment_range(number);
+        p11scope_manifest::maps::MapEntry {
+            start,
+            end,
+            permissions: *b"r-xp",
+            file_offset: 0,
+            device: facts[number].key.device,
+            inode: facts[number].key.inode,
+            raw_path: Some(b"/fixture/provider.so".to_vec()),
+        }
+    };
+    let world_map = pids
+        .iter()
+        .map(|(pid, keys)| (*pid, keys.iter().map(|&number| entries(number)).collect()))
+        .collect();
+    let identities = facts
+        .into_iter()
+        .map(|fact| (fact.key, fact.identity))
+        .collect();
+    (world_map, identities)
+}
+
+fn d3c_index(
+    world: &D3cWorld,
+) -> (
+    KnownKeyIndex,
+    Vec<super::super::sweep_attribution::RefusedObject>,
+) {
+    KnownKeyIndex::build(
+        [(world.provider.key, Some(world.provider_id))],
+        &BTreeMap::from([(world.provider.key, world.provider_id)]),
+        [world.examined],
+        &AdapterChecks(world.provider.identity),
+    )
+}
+
+thread_local! {
+    static POST_PARSE_EXPIRE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Arm one deterministic cooperative-deadline crossing right after the next
+/// successful target parse. The capture budget stays live, so the discard
+/// must fall back inside the original pins rather than stop the segment.
+pub(super) fn arm_post_parse_expiry() {
+    POST_PARSE_EXPIRE.set(true);
+}
+
+pub(super) fn maybe_cross_work_deadline(work: &mut TargetWorkDeadline) {
+    if POST_PARSE_EXPIRE.take() {
+        work.deadline = std::time::Instant::now() - std::time::Duration::from_millis(1);
+    }
+}
+
+/// One direct promotion packet: shared charged preparation on the original
+/// pin, then the kernel hook, then live finish. The hook is the installed
+/// probe's; the packet I/O is a fresh handle on the shared world/events.
+#[allow(clippy::too_many_arguments)]
+fn d3c_packet_with(
+    hook: &mut impl SegmentProof,
+    world_map: &BTreeMap<u32, Vec<p11scope_manifest::maps::MapEntry>>,
+    identities: &BTreeMap<ObjectKey, super::super::identity::FileIdentity>,
+    events: &Arc<std::sync::Mutex<SegmentEvents>>,
+    runs: &Arc<std::sync::Mutex<FixtureRunTrace>>,
+    owner: &ReservationOwner,
+    resources: &IoResources,
+    prove_set: &BTreeSet<ObjectKey>,
+    pid: u32,
+    budget: &mut CaptureWorkBudget,
+) -> Confirmation {
+    let mut segio = SegmentIo {
+        world: world_map,
+        identities,
+        events: events.clone(),
+        runs: runs.clone(),
+        owner: owner.clone(),
+        exe_reads: Cell::new(0),
+        imm_base: owner.state_for_test().0[3],
+    };
+    let prepared = super::super::sweep_attribution::prepare_confirmation(
+        &mut segio,
+        pid,
+        prove_set,
+        budget,
+        Some(resources),
+    )
+    .unwrap();
+    super::super::confirm_shards::prove_and_finish_prepared(
+        &mut segio, pid, prepared, hook, resources, budget,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn d3c_packet(
+    hook: &mut impl SegmentProof,
+    world_map: &BTreeMap<u32, Vec<p11scope_manifest::maps::MapEntry>>,
+    identities: &BTreeMap<ObjectKey, super::super::identity::FileIdentity>,
+    events: &Arc<std::sync::Mutex<SegmentEvents>>,
+    runs: &Arc<std::sync::Mutex<FixtureRunTrace>>,
+    owner: &ReservationOwner,
+    prove_set: &BTreeSet<ObjectKey>,
+    pid: u32,
+    budget: &mut CaptureWorkBudget,
+) -> Confirmation {
+    let resources = owner.batch();
+    d3c_packet_with(
+        hook, world_map, identities, events, runs, owner, &resources, prove_set, pid, budget,
+    )
+}
+
+fn confirmed_mapped(confirmation: &Confirmation) -> &MappedIdentities {
+    match confirmation {
+        Confirmation::Confirmed(read) => &read.mapped,
+        other => panic!("expected a confirmed read, got {other:?}"),
+    }
+}
+
+fn assert_kernel_slot(confirmation: &Confirmation, slot: Slot) {
+    let mapped = confirmed_mapped(confirmation);
+    assert!(!mapped.is_empty(), "kernel proof answered no range");
+    assert!(
+        mapped
+            .values()
+            .all(|proof| *proof == super::super::sweep_attribution::RangeProof::Kernel(slot)),
+        "a promotion packet did not prove every range by kernel: {mapped:?}"
+    );
+}
+
+fn assert_userspace_mapped(confirmation: &Confirmation) {
+    let mapped = confirmed_mapped(confirmation);
+    assert!(!mapped.is_empty(), "fallback answered no range");
+    assert!(
+        mapped.values().all(|proof| matches!(
+            proof,
+            super::super::sweep_attribution::RangeProof::MapFiles(_)
+        )),
+        "fallback reused kernel evidence: {mapped:?}"
+    );
+}
+
+#[test]
+fn d3c_three_target_attempts_include_phase_d() {
+    // Mixed shapes on one guard: two whole-system segments, then two
+    // per-PID promotion packets. The fourth request falls back inside its
+    // original pin; the cap reason is the run-limit detail.
+    let world = d3c_world();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut session = fixture_session();
+    let (world_map, identities) = d3c_world_map(
+        &world,
+        &[
+            (5100, vec![0]),
+            (5101, vec![0]),
+            (5102, vec![0]),
+            (5103, vec![0]),
+        ],
+    );
+    let events = Arc::new(std::sync::Mutex::new(SegmentEvents::default()));
+    let (mut installed, pass) = d3c_install(
+        &world,
+        &mut session,
+        1,
+        6,
+        4,
+        &[(0, ANCHOR_OK, 0), (1, ANCHOR_OK, 0)],
+        vec![
+            FixtureTarget::Bytes(gen_target(1, &[(5100, segment_range(0), 0)])),
+            FixtureTarget::Bytes(gen_target(1, &[(5101, segment_range(0), 0)])),
+            FixtureTarget::Bytes(gen_target(1, &[(5102, segment_range(0), 0)])),
+        ],
+        deadline,
+    );
+    let (mut index, refused) = d3c_index(&world);
+    assert!(refused.is_empty());
+    let prove_set = index.map_files_keys();
+    let make_seg = || SegmentIo {
+        world: &world_map,
+        identities: &identities,
+        events: events.clone(),
+        runs: pass.runs.clone(),
+        owner: pass.owner.clone(),
+        exe_reads: Cell::new(0),
+        imm_base: pass.owner.state_for_test().0[3],
+    };
+    let mut budget = CaptureWorkBudget::default();
+    let mut probe = KernelMemberProbe::new(&mut installed, make_seg(), deadline);
+    probe.install_expectations(&mut index).unwrap();
+    let sweep: Vec<(u32, Vec<p11scope_manifest::maps::MapEntry>)> = [
+        (5100, world_map[&5100].clone()),
+        (5101, world_map[&5101].clone()),
+    ]
+    .to_vec();
+    let out = super::super::confirm_shards::attribute_unselected_with_segment_proof(
+        &sweep,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &index,
+        &mut budget,
+        d3c_policy(6, 4),
+        &pass.owner,
+        2,
+        &make_seg,
+        probe.segment_proof(),
+    );
+    assert_eq!(
+        out.members
+            .iter()
+            .map(|member| member.pid)
+            .collect::<Vec<_>>(),
+        [5100, 5101]
+    );
+    let third = d3c_packet(
+        probe.segment_proof(),
+        &world_map,
+        &identities,
+        &events,
+        &pass.runs,
+        &pass.owner,
+        &prove_set,
+        5102,
+        &mut budget,
+    );
+    assert_kernel_slot(&third, Slot(0));
+    let fourth = d3c_packet(
+        probe.segment_proof(),
+        &world_map,
+        &identities,
+        &events,
+        &pass.runs,
+        &pass.owner,
+        &prove_set,
+        5103,
+        &mut budget,
+    );
+    assert_userspace_mapped(&fourth);
+    assert_eq!(budget.work_units_count(), 4);
+    let pin5100 = events.lock().unwrap().pin_fds[&5100];
+    let pin5101 = events.lock().unwrap().pin_fds[&5101];
+    let pin5102 = events.lock().unwrap().pin_fds[&5102];
+    let trace = pass.runs.lock().unwrap();
+    assert_eq!(trace.scopes.len(), 3, "a fourth target run was attempted");
+    assert_eq!(
+        trace.pidfds,
+        [Some(pin5100), Some(pin5101), Some(pin5102)],
+        "a counted run did not borrow its original pin"
+    );
+    drop(trace);
+    drop(probe);
+    assert_eq!(installed.target_attempts, 3);
+    assert_eq!(installed.failed_target, None);
+    drop(installed);
+    assert_eq!(
+        events.lock().unwrap().fallback,
+        [(5103, segment_range(0).0, segment_range(0).1)],
+        "the capped request did not fall back inside its original pin"
+    );
+    assert_eq!(
+        session.fallback.totals(),
+        KernelFallbackTotals {
+            passes: 1,
+            pids: 1,
+            keys: 1,
+            first_reason: Some(KernelFallbackReason::TargetLimit),
+        }
+    );
+
+    // Four uniform segments: the fourth falls back, its step stays queued.
+    let uniform = segment_cell(
+        &[
+            (5110, vec![0]),
+            (5111, vec![0]),
+            (5112, vec![0]),
+            (5113, vec![0]),
+        ],
+        6,
+        vec![
+            FixtureTarget::Bytes(segment_target(&[5110], 0)),
+            FixtureTarget::Bytes(segment_target(&[5111], 0)),
+            FixtureTarget::Bytes(segment_target(&[5112], 0)),
+            FixtureTarget::Bytes(segment_target(&[5113], 0)),
+        ],
+    );
+    assert_eq!(uniform.attempts, 3);
+    assert_eq!(uniform.runs.lock().unwrap().scopes.len(), 3);
+    assert_eq!(uniform.remaining_steps, 1);
+    assert_eq!(uniform.out.members.len(), 4);
+    assert_eq!(uniform.charges, 4);
+    assert_eq!(
+        uniform.events.lock().unwrap().fallback,
+        [(5113, segment_range(0).0, segment_range(0).1)]
+    );
+    assert_eq!(
+        uniform.fallback,
+        KernelFallbackTotals {
+            passes: 1,
+            pids: 1,
+            keys: 1,
+            first_reason: Some(KernelFallbackReason::TargetLimit),
+        }
+    );
+
+    // A failed run consumes an attempt too, then demotes the rest of the pass.
+    let mut bad = segment_target(&[5121], 0);
+    bad[0] = 0;
+    let failed = segment_cell(
+        &[(5120, vec![0]), (5121, vec![0]), (5122, vec![0])],
+        6,
+        vec![
+            FixtureTarget::Bytes(segment_target(&[5120], 0)),
+            FixtureTarget::Bytes(bad),
+            FixtureTarget::Bytes(segment_target(&[5122], 0)),
+        ],
+    );
+    assert_eq!(failed.attempts, 2);
+    assert_eq!(failed.failed_target, Some(RunFailure::StreamInvalid));
+    assert_eq!(failed.runs.lock().unwrap().scopes.len(), 2);
+    assert_eq!(failed.remaining_steps, 1);
+    assert_eq!(failed.out.members.len(), 3);
+    assert_eq!(failed.charges, 3);
+}
+
+#[test]
+fn d3c_phase_d_borrows_original_pidfd() {
+    // A promotion for a PID that cannot be reopened numerically must still
+    // prove by kernel on the original retained pidfd.
+    const BOGUS: u32 = 4_000_000;
+    assert!(crate::attach::identity_iter::scope_word_bit(BOGUS).is_some());
+    assert!(
+        crate::attach::identity_iter::open_pidfd(BOGUS).is_err(),
+        "the bogus promotion PID exists; this cell proves nothing"
+    );
+    let world = d3c_world();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut session = fixture_session();
+    let (world_map, identities) = d3c_world_map(
+        &world,
+        &[(BOGUS, vec![0]), (5301, vec![0]), (5302, vec![0])],
+    );
+    let events = Arc::new(std::sync::Mutex::new(SegmentEvents::default()));
+    let (mut installed, pass) = d3c_install(
+        &world,
+        &mut session,
+        1,
+        16,
+        1,
+        &[(0, ANCHOR_OK, 0), (1, ANCHOR_OK, 0)],
+        vec![FixtureTarget::Bytes(gen_target(
+            1,
+            &[(BOGUS, segment_range(0), 0)],
+        ))],
+        deadline,
+    );
+    let (mut index, refused) = d3c_index(&world);
+    assert!(refused.is_empty());
+    let prove_set = index.map_files_keys();
+    let mut budget = CaptureWorkBudget::default();
+    let mut probe = KernelMemberProbe::new(
+        &mut installed,
+        SegmentIo {
+            world: &world_map,
+            identities: &identities,
+            events: events.clone(),
+            runs: pass.runs.clone(),
+            owner: pass.owner.clone(),
+            exe_reads: Cell::new(0),
+            imm_base: pass.owner.state_for_test().0[3],
+        },
+        deadline,
+    );
+    probe.install_expectations(&mut index).unwrap();
+    let promoted = d3c_packet(
+        probe.segment_proof(),
+        &world_map,
+        &identities,
+        &events,
+        &pass.runs,
+        &pass.owner,
+        &prove_set,
+        BOGUS,
+        &mut budget,
+    );
+    assert_kernel_slot(&promoted, Slot(0));
+    assert_eq!(budget.work_units_count(), 1);
+    assert!(
+        events.lock().unwrap().fallback.is_empty(),
+        "the borrowed-fd promotion fell back to userspace"
+    );
+    let bogus_pin = events.lock().unwrap().pin_fds[&BOGUS];
+    assert_eq!(
+        pass.runs.lock().unwrap().pidfds,
+        [Some(bogus_pin)],
+        "the promotion did not run on its original retained pidfd"
+    );
+    drop(probe);
+    assert_eq!(installed.target_attempts, 1);
+    drop(installed);
+
+    // The shared reservation guard refuses a foreign owner without any run.
+    let (mut installed, pass) = d3c_install(
+        &world,
+        &mut session,
+        2,
+        16,
+        1,
+        &[(0, ANCHOR_OK, 0), (1, ANCHOR_OK, 0)],
+        vec![FixtureTarget::Bytes(gen_target(
+            2,
+            &[(5301, segment_range(0), 0)],
+        ))],
+        deadline,
+    );
+    let runs_before = pass.runs.lock().unwrap().scopes.len();
+    let (mut index, _) = d3c_index(&world);
+    let prove_set = index.map_files_keys();
+    let mut budget = CaptureWorkBudget::default();
+    let mut probe = KernelMemberProbe::new(
+        &mut installed,
+        SegmentIo {
+            world: &world_map,
+            identities: &identities,
+            events: events.clone(),
+            runs: pass.runs.clone(),
+            owner: pass.owner.clone(),
+            exe_reads: Cell::new(0),
+            imm_base: pass.owner.state_for_test().0[3],
+        },
+        deadline,
+    );
+    probe.install_expectations(&mut index).unwrap();
+    let foreign = ReservationOwner::new(SegmentPolicy::from_headroom(16, 2, 1));
+    let foreign_resources = foreign.batch();
+    let refused = d3c_packet_with(
+        probe.segment_proof(),
+        &world_map,
+        &identities,
+        &events,
+        &pass.runs,
+        &pass.owner,
+        &foreign_resources,
+        &prove_set,
+        5301,
+        &mut budget,
+    );
+    assert_userspace_mapped(&refused);
+    assert_eq!(
+        pass.runs.lock().unwrap().scopes.len(),
+        runs_before,
+        "a foreign reservation reached the target iterator"
+    );
+    drop(probe);
+    assert_eq!(installed.target_attempts, 0);
+    drop(installed);
+
+    // The pass guard refuses a released installation without any run.
+    let (mut installed, pass) = d3c_install(
+        &world,
+        &mut session,
+        3,
+        16,
+        1,
+        &[(0, ANCHOR_OK, 0), (1, ANCHOR_OK, 0)],
+        vec![FixtureTarget::Bytes(gen_target(
+            3,
+            &[(5302, segment_range(0), 0)],
+        ))],
+        deadline,
+    );
+    installed.session.binding = None;
+    let runs_before = pass.runs.lock().unwrap().scopes.len();
+    let (mut index, _) = d3c_index(&world);
+    let prove_set = index.map_files_keys();
+    let mut budget = CaptureWorkBudget::default();
+    let mut probe = KernelMemberProbe::new(
+        &mut installed,
+        SegmentIo {
+            world: &world_map,
+            identities: &identities,
+            events: events.clone(),
+            runs: pass.runs.clone(),
+            owner: pass.owner.clone(),
+            exe_reads: Cell::new(0),
+            imm_base: pass.owner.state_for_test().0[3],
+        },
+        deadline,
+    );
+    probe.install_expectations(&mut index).unwrap();
+    let unowned = d3c_packet(
+        probe.segment_proof(),
+        &world_map,
+        &identities,
+        &events,
+        &pass.runs,
+        &pass.owner,
+        &prove_set,
+        5302,
+        &mut budget,
+    );
+    assert_userspace_mapped(&unowned);
+    assert_eq!(
+        pass.runs.lock().unwrap().scopes.len(),
+        runs_before,
+        "a released installation reached the target iterator"
+    );
+    drop(probe);
+    assert_eq!(installed.target_attempts, 0);
+    drop(installed);
+}
+
+#[test]
+fn d3c_wrong_batch_or_pass_cannot_reuse_verdict() {
+    // Batch 2 must not serve batch 1's verdicts: its PID is unvisited, so
+    // it falls back inside its own pin while batch 1 stays kernel-positive.
+    let batches = segment_cell(
+        &[(5501, vec![0]), (5502, vec![0])],
+        6,
+        vec![
+            FixtureTarget::Bytes(segment_target(&[5501], 0)),
+            FixtureTarget::Bytes(target_stream(&[])),
+        ],
+    );
+    assert_eq!(
+        batches
+            .out
+            .members
+            .iter()
+            .map(|member| member.pid)
+            .collect::<Vec<_>>(),
+        [5501, 5502]
+    );
+    assert_eq!(batches.charges, 2);
+    assert_eq!(batches.attempts, 2);
+    assert_eq!(batches.runs.lock().unwrap().scopes.len(), 2);
+    assert_eq!(
+        batches.events.lock().unwrap().fallback,
+        [(5502, segment_range(0).0, segment_range(0).1)],
+        "the second batch reused the first batch's verdicts"
+    );
+    assert_eq!(
+        batches.fallback,
+        KernelFallbackTotals {
+            passes: 1,
+            pids: 1,
+            keys: 1,
+            first_reason: Some(KernelFallbackReason::Unvisited),
+        }
+    );
+
+    // A new pass with a new installation cannot serve the old verdicts: its
+    // slot is uninstalled, so it falls back without running at all.
+    let world = d3c_world();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut session = fixture_session();
+    let (world_map, identities) = d3c_world_map(&world, &[(5601, vec![0]), (5602, vec![0])]);
+    let events = Arc::new(std::sync::Mutex::new(SegmentEvents::default()));
+    let (mut installed, pass) = d3c_install(
+        &world,
+        &mut session,
+        1,
+        16,
+        1,
+        &[(0, ANCHOR_OK, 0), (1, ANCHOR_OK, 0)],
+        vec![FixtureTarget::Bytes(gen_target(
+            1,
+            &[(5601, segment_range(0), 0)],
+        ))],
+        deadline,
+    );
+    let (mut index, _) = d3c_index(&world);
+    let prove_set = index.map_files_keys();
+    let mut budget = CaptureWorkBudget::default();
+    let mut probe = KernelMemberProbe::new(
+        &mut installed,
+        SegmentIo {
+            world: &world_map,
+            identities: &identities,
+            events: events.clone(),
+            runs: pass.runs.clone(),
+            owner: pass.owner.clone(),
+            exe_reads: Cell::new(0),
+            imm_base: pass.owner.state_for_test().0[3],
+        },
+        deadline,
+    );
+    probe.install_expectations(&mut index).unwrap();
+    let first = d3c_packet(
+        probe.segment_proof(),
+        &world_map,
+        &identities,
+        &events,
+        &pass.runs,
+        &pass.owner,
+        &prove_set,
+        5601,
+        &mut budget,
+    );
+    assert_kernel_slot(&first, Slot(0));
+    drop(probe);
+    drop(installed);
+    let bad_shape = crate::attach::identity_iter::ANCHOR_BAD_SHAPE;
+    let (mut installed, pass) = d3c_install(
+        &world,
+        &mut session,
+        2,
+        16,
+        1,
+        &[(0, bad_shape, 0), (1, bad_shape, 0)],
+        vec![FixtureTarget::Bytes(gen_target(
+            2,
+            &[(5602, segment_range(0), 0)],
+        ))],
+        deadline,
+    );
+    let runs_before = pass.runs.lock().unwrap().scopes.len();
+    let (mut index, _) = d3c_index(&world);
+    let prove_set = index.map_files_keys();
+    let mut budget = CaptureWorkBudget::default();
+    let mut probe = KernelMemberProbe::new(
+        &mut installed,
+        SegmentIo {
+            world: &world_map,
+            identities: &identities,
+            events: events.clone(),
+            runs: pass.runs.clone(),
+            owner: pass.owner.clone(),
+            exe_reads: Cell::new(0),
+            imm_base: pass.owner.state_for_test().0[3],
+        },
+        deadline,
+    );
+    probe.install_expectations(&mut index).unwrap();
+    let second = d3c_packet(
+        probe.segment_proof(),
+        &world_map,
+        &identities,
+        &events,
+        &pass.runs,
+        &pass.owner,
+        &prove_set,
+        5602,
+        &mut budget,
+    );
+    assert_userspace_mapped(&second);
+    assert_eq!(
+        pass.runs.lock().unwrap().scopes.len(),
+        runs_before,
+        "the new pass served the old installation's verdicts"
+    );
+    drop(probe);
+    assert_eq!(installed.target_attempts, 0);
+    drop(installed);
+    assert_eq!(
+        session.fallback.totals(),
+        KernelFallbackTotals {
+            passes: 1,
+            pids: 1,
+            keys: 1,
+            first_reason: Some(KernelFallbackReason::AnchorNotInstalled),
+        }
+    );
+}
+
+#[test]
+fn d3c_invalid_stream_sticks_across_passes() {
+    let world = d3c_world();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut session = fixture_session();
+    let (world_map, identities) = d3c_world_map(&world, &[(5201, vec![0]), (5202, vec![0])]);
+    let events = Arc::new(std::sync::Mutex::new(SegmentEvents::default()));
+    let mut bad = gen_target(1, &[(5201, segment_range(0), 0)]);
+    bad[0] = 0;
+    let (mut installed, pass) = d3c_install(
+        &world,
+        &mut session,
+        1,
+        16,
+        1,
+        &[(0, ANCHOR_OK, 0), (1, ANCHOR_OK, 0)],
+        vec![FixtureTarget::Bytes(bad)],
+        deadline,
+    );
+    let runs = pass.runs.clone();
+    let (mut index, _) = d3c_index(&world);
+    let prove_set = index.map_files_keys();
+    let mut budget = CaptureWorkBudget::default();
+    let mut probe = KernelMemberProbe::new(
+        &mut installed,
+        SegmentIo {
+            world: &world_map,
+            identities: &identities,
+            events: events.clone(),
+            runs: runs.clone(),
+            owner: pass.owner.clone(),
+            exe_reads: Cell::new(0),
+            imm_base: pass.owner.state_for_test().0[3],
+        },
+        deadline,
+    );
+    probe.install_expectations(&mut index).unwrap();
+    let poisoned = d3c_packet(
+        probe.segment_proof(),
+        &world_map,
+        &identities,
+        &events,
+        &runs,
+        &pass.owner,
+        &prove_set,
+        5201,
+        &mut budget,
+    );
+    assert_userspace_mapped(&poisoned);
+    assert_eq!(budget.work_units_count(), 1);
+    drop(probe);
+    assert_eq!(installed.failed_target, Some(RunFailure::StreamInvalid));
+    assert_eq!(installed.target_attempts, 1);
+    drop(installed);
+    assert_eq!(session.sticky, Some(KernelSticky::StreamInvalid));
+
+    // The next pass installs cleanly and offers valid bytes, but the sticky
+    // session failure refuses every target run.
+    let (mut installed, pass) = d3c_install(
+        &world,
+        &mut session,
+        2,
+        16,
+        1,
+        &[(0, ANCHOR_OK, 0), (1, ANCHOR_OK, 0)],
+        vec![FixtureTarget::Bytes(gen_target(
+            2,
+            &[(5202, segment_range(0), 0)],
+        ))],
+        deadline,
+    );
+    let (mut index, _) = d3c_index(&world);
+    let prove_set = index.map_files_keys();
+    let mut budget = CaptureWorkBudget::default();
+    let mut probe = KernelMemberProbe::new(
+        &mut installed,
+        SegmentIo {
+            world: &world_map,
+            identities: &identities,
+            events: events.clone(),
+            runs: runs.clone(),
+            owner: pass.owner.clone(),
+            exe_reads: Cell::new(0),
+            imm_base: pass.owner.state_for_test().0[3],
+        },
+        deadline,
+    );
+    probe.install_expectations(&mut index).unwrap();
+    let stuck = d3c_packet(
+        probe.segment_proof(),
+        &world_map,
+        &identities,
+        &events,
+        &runs,
+        &pass.owner,
+        &prove_set,
+        5202,
+        &mut budget,
+    );
+    assert_userspace_mapped(&stuck);
+    assert_eq!(budget.work_units_count(), 1);
+    drop(probe);
+    assert_eq!(installed.target_attempts, 0);
+    drop(installed);
+    assert_eq!(
+        runs.lock().unwrap().scopes.len(),
+        1,
+        "a sticky invalid stream attempted another target run"
+    );
+    assert_eq!(
+        events.lock().unwrap().fallback.len(),
+        2,
+        "sticky fallback did not stay inside the original pins"
+    );
+    assert_eq!(
+        session.fallback.totals(),
+        KernelFallbackTotals {
+            passes: 2,
+            pids: 2,
+            keys: 2,
+            first_reason: Some(KernelFallbackReason::StreamInvalid),
+        }
+    );
+}
+
+#[test]
+fn d3c_three_attempted_deadlines_become_sticky() {
+    let world = d3c_world();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut session = fixture_session();
+    let pids: Vec<(u32, Vec<usize>)> = (0..4).map(|i| (5210 + i, vec![0])).collect();
+    let (world_map, identities) = d3c_world_map(&world, &pids);
+    let events = Arc::new(std::sync::Mutex::new(SegmentEvents::default()));
+    let mut runs_seen = 0usize;
+    for (pass_no, pid) in [5210, 5211, 5212].into_iter().enumerate() {
+        let generation = pass_no as u64 + 1;
+        let (mut installed, pass) = d3c_install(
+            &world,
+            &mut session,
+            generation,
+            16,
+            1,
+            &[(0, ANCHOR_OK, 0), (1, ANCHOR_OK, 0)],
+            vec![FixtureTarget::Deadline(gen_target(
+                generation,
+                &[(pid, segment_range(0), 0)],
+            ))],
+            deadline,
+        );
+        let (mut index, _) = d3c_index(&world);
+        let prove_set = index.map_files_keys();
+        let mut budget = CaptureWorkBudget::default();
+        let mut probe = KernelMemberProbe::new(
+            &mut installed,
+            SegmentIo {
+                world: &world_map,
+                identities: &identities,
+                events: events.clone(),
+                runs: pass.runs.clone(),
+                owner: pass.owner.clone(),
+                exe_reads: Cell::new(0),
+                imm_base: pass.owner.state_for_test().0[3],
+            },
+            deadline,
+        );
+        probe.install_expectations(&mut index).unwrap();
+        let late = d3c_packet(
+            probe.segment_proof(),
+            &world_map,
+            &identities,
+            &events,
+            &pass.runs,
+            &pass.owner,
+            &prove_set,
+            pid,
+            &mut budget,
+        );
+        runs_seen = pass.runs.lock().unwrap().scopes.len();
+        assert_userspace_mapped(&late);
+        assert_eq!(budget.work_units_count(), 1);
+        drop(probe);
+        assert_eq!(installed.failed_target, Some(RunFailure::Deadline));
+        assert_eq!(installed.target_attempts, 1);
+        drop(installed);
+        assert_eq!(session.consecutive_deadlines, generation as u32);
+    }
+    assert_eq!(
+        session.sticky,
+        Some(KernelSticky::Deadlines),
+        "three consecutive attempted deadlines did not stick"
+    );
+    assert_eq!(runs_seen, 3);
+
+    // The fourth pass offers valid bytes but must not run.
+    let (mut installed, pass) = d3c_install(
+        &world,
+        &mut session,
+        4,
+        16,
+        1,
+        &[(0, ANCHOR_OK, 0), (1, ANCHOR_OK, 0)],
+        vec![FixtureTarget::Bytes(gen_target(
+            4,
+            &[(5213, segment_range(0), 0)],
+        ))],
+        deadline,
+    );
+    let (mut index, _) = d3c_index(&world);
+    let prove_set = index.map_files_keys();
+    let mut budget = CaptureWorkBudget::default();
+    let mut probe = KernelMemberProbe::new(
+        &mut installed,
+        SegmentIo {
+            world: &world_map,
+            identities: &identities,
+            events: events.clone(),
+            runs: pass.runs.clone(),
+            owner: pass.owner.clone(),
+            exe_reads: Cell::new(0),
+            imm_base: pass.owner.state_for_test().0[3],
+        },
+        deadline,
+    );
+    probe.install_expectations(&mut index).unwrap();
+    let stuck = d3c_packet(
+        probe.segment_proof(),
+        &world_map,
+        &identities,
+        &events,
+        &pass.runs,
+        &pass.owner,
+        &prove_set,
+        5213,
+        &mut budget,
+    );
+    assert_userspace_mapped(&stuck);
+    drop(probe);
+    assert_eq!(installed.target_attempts, 0);
+    drop(installed);
+    assert_eq!(
+        pass.runs.lock().unwrap().scopes.len(),
+        3,
+        "the deadline-stuck session attempted another target run"
+    );
+    assert_eq!(
+        session.fallback.totals(),
+        KernelFallbackTotals {
+            passes: 4,
+            pids: 4,
+            keys: 4,
+            first_reason: Some(KernelFallbackReason::Deadline),
+        }
+    );
+}
+
+#[test]
+fn d3c_no_attempt_preserves_deadline_streak() {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Packet {
+        Threshold,
+        Foreign,
+        Expired,
+        Deadline,
+        Valid,
+    }
+    // Streak after each pass: no-attempt cases neither create a streak from
+    // zero nor reset an existing one; only attempted runs move it.
+    let plan: [(u32, Packet, u32, usize); 8] = [
+        (5401, Packet::Threshold, 0, 0),
+        (5402, Packet::Deadline, 1, 1),
+        (5403, Packet::Threshold, 1, 0),
+        (5404, Packet::Foreign, 1, 0),
+        (5405, Packet::Expired, 1, 0),
+        (5406, Packet::Deadline, 2, 1),
+        (5407, Packet::Deadline, 3, 1),
+        (5408, Packet::Valid, 3, 0),
+    ];
+    let world = d3c_world();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut session = fixture_session();
+    let pids: Vec<(u32, Vec<usize>)> = plan.iter().map(|(pid, _, _, _)| (*pid, vec![0])).collect();
+    let (world_map, identities) = d3c_world_map(&world, &pids);
+    let events = Arc::new(std::sync::Mutex::new(SegmentEvents::default()));
+    for (i, (pid, kind, streak, new_runs)) in plan.into_iter().enumerate() {
+        let generation = i as u64 + 1;
+        let step = match kind {
+            Packet::Deadline => {
+                FixtureTarget::Deadline(gen_target(generation, &[(pid, segment_range(0), 0)]))
+            }
+            _ => FixtureTarget::Bytes(gen_target(generation, &[(pid, segment_range(0), 0)])),
+        };
+        let (mut installed, pass) = d3c_install(
+            &world,
+            &mut session,
+            generation,
+            16,
+            1,
+            &[(0, ANCHOR_OK, 0), (1, ANCHOR_OK, 0)],
+            vec![step],
+            deadline,
+        );
+        let runs_before = pass.runs.lock().unwrap().scopes.len();
+        let (mut index, _) = d3c_index(&world);
+        let prove_set = index.map_files_keys();
+        let mut budget = CaptureWorkBudget::default();
+        let mut probe = KernelMemberProbe::new(
+            &mut installed,
+            SegmentIo {
+                world: &world_map,
+                identities: &identities,
+                events: events.clone(),
+                runs: pass.runs.clone(),
+                owner: pass.owner.clone(),
+                exe_reads: Cell::new(0),
+                imm_base: pass.owner.state_for_test().0[3],
+            },
+            deadline,
+        );
+        if kind == Packet::Threshold {
+            probe = probe.with_auto_threshold(usize::MAX);
+        }
+        probe.install_expectations(&mut index).unwrap();
+        match kind {
+            Packet::Foreign => {
+                let foreign = ReservationOwner::new(SegmentPolicy::from_headroom(16, 2, 1));
+                let foreign_resources = foreign.batch();
+                let refused = d3c_packet_with(
+                    probe.segment_proof(),
+                    &world_map,
+                    &identities,
+                    &events,
+                    &pass.runs,
+                    &pass.owner,
+                    &foreign_resources,
+                    &prove_set,
+                    pid,
+                    &mut budget,
+                );
+                assert_userspace_mapped(&refused);
+            }
+            Packet::Expired => {
+                let mut segio = SegmentIo {
+                    world: &world_map,
+                    identities: &identities,
+                    events: events.clone(),
+                    runs: pass.runs.clone(),
+                    owner: pass.owner.clone(),
+                    exe_reads: Cell::new(0),
+                    imm_base: pass.owner.state_for_test().0[3],
+                };
+                let resources = pass.owner.batch();
+                let prepared = super::super::sweep_attribution::prepare_confirmation(
+                    &mut segio,
+                    pid,
+                    &prove_set,
+                    &mut budget,
+                    Some(&resources),
+                )
+                .unwrap();
+                budget.set_deadline(Some(0));
+                let stopped = super::super::confirm_shards::prove_and_finish_prepared(
+                    &mut segio,
+                    pid,
+                    prepared,
+                    probe.segment_proof(),
+                    &resources,
+                    &mut budget,
+                );
+                assert!(
+                    matches!(
+                        stopped,
+                        Confirmation::Lost(
+                            super::super::sweep_attribution::AttributionLoss::Budget,
+                            _
+                        )
+                    ),
+                    "an already expired deadline attempted proof: {stopped:?}"
+                );
+                assert_eq!(budget.work_units_count(), 1);
+            }
+            _ => {
+                let out = d3c_packet(
+                    probe.segment_proof(),
+                    &world_map,
+                    &identities,
+                    &events,
+                    &pass.runs,
+                    &pass.owner,
+                    &prove_set,
+                    pid,
+                    &mut budget,
+                );
+                assert_userspace_mapped(&out);
+                assert_eq!(budget.work_units_count(), 1);
+            }
+        }
+        assert_eq!(
+            pass.runs.lock().unwrap().scopes.len() - runs_before,
+            new_runs,
+            "pass {generation} attempted an unexpected run count"
+        );
+        drop(probe);
+        drop(installed);
+        assert_eq!(
+            session.consecutive_deadlines, streak,
+            "pass {generation} moved the deadline streak unexpectedly"
+        );
+    }
+    assert_eq!(session.sticky, Some(KernelSticky::Deadlines));
+    assert_eq!(
+        session.fallback.totals(),
+        KernelFallbackTotals {
+            passes: 8,
+            pids: 8,
+            keys: 8,
+            first_reason: Some(KernelFallbackReason::BelowThreshold),
+        }
+    );
+}
+
+#[test]
+fn d3c_postparse_deadline_discards_complete_run() {
+    // The first segment parses a complete valid run, then the cooperative
+    // deadline crosses before any PID finishes: the entire run is discarded
+    // and both segments fall back inside their original pins.
+    arm_post_parse_expiry();
+    let observation = segment_cell(
+        &[(9200, vec![0]), (9201, vec![0])],
+        6,
+        vec![
+            FixtureTarget::Bytes(segment_target(&[9200], 0)),
+            FixtureTarget::Bytes(segment_target(&[9201], 0)),
+        ],
+    );
+    assert_eq!(observation.attempts, 1);
+    assert_eq!(observation.failed_target, Some(RunFailure::Deadline));
+    assert_eq!(
+        observation.runs.lock().unwrap().scopes.len(),
+        1,
+        "the demoted pass retried after a post-parse deadline"
+    );
+    assert_eq!(observation.remaining_steps, 1);
+    assert_eq!(
+        observation
+            .out
+            .members
+            .iter()
+            .map(|member| member.pid)
+            .collect::<Vec<_>>(),
+        [9200, 9201]
+    );
+    assert!(observation.out.losses.is_empty());
+    assert_eq!(observation.charges, 2);
+    assert_eq!(
+        observation.events.lock().unwrap().fallback,
+        [
+            (9200, segment_range(0).0, segment_range(0).1),
+            (9201, segment_range(0).0, segment_range(0).1),
+        ],
+        "a parsed-but-unfinished run kept partial kernel answers"
+    );
+    assert_eq!(
+        observation.fallback,
+        KernelFallbackTotals {
+            passes: 1,
+            pids: 2,
+            keys: 1,
+            first_reason: Some(KernelFallbackReason::Deadline),
+        }
+    );
+}
+
+#[test]
+fn d3c_auto_below_threshold_skips_run_with_actual_fallback() {
+    // More total proof PIDs than the injected threshold, but every
+    // resource-bounded segment is sub-threshold: auto attempts no
+    // production kernel run and discloses actual userspace fallback.
+    let observation = segment_cell_with_deadline(
+        &[(6101, vec![0]), (6102, vec![0]), (6103, vec![0])],
+        6,
+        vec![
+            FixtureTarget::Bytes(segment_target(&[6101], 0)),
+            FixtureTarget::Bytes(segment_target(&[6102], 0)),
+            FixtureTarget::Bytes(segment_target(&[6103], 0)),
+        ],
+        None,
+        Some(2),
+    );
+    assert_eq!(observation.attempts, 0);
+    assert_eq!(observation.failed_target, None);
+    assert!(
+        observation.runs.lock().unwrap().scopes.is_empty(),
+        "a sub-threshold segment attempted a kernel target run"
+    );
+    assert_eq!(observation.remaining_steps, 3);
+    assert_eq!(
+        observation
+            .out
+            .members
+            .iter()
+            .map(|member| member.pid)
+            .collect::<Vec<_>>(),
+        [6101, 6102, 6103]
+    );
+    assert_eq!(observation.charges, 3);
+    assert_eq!(
+        observation.events.lock().unwrap().fallback,
+        [
+            (6101, segment_range(0).0, segment_range(0).1),
+            (6102, segment_range(0).0, segment_range(0).1),
+            (6103, segment_range(0).0, segment_range(0).1),
+        ]
+    );
+    assert_eq!(
+        observation.fallback,
+        KernelFallbackTotals {
+            passes: 1,
+            pids: 3,
+            keys: 1,
+            first_reason: Some(KernelFallbackReason::BelowThreshold),
+        }
+    );
+}
+
+#[test]
+fn d3c_forced_kernel_obeys_resource_and_run_caps() {
+    // Forced shape (no cost gate) with no iterator headroom: the run is
+    // refused before I/O and falls back inside the original pin.
+    let world = d3c_world();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut session = fixture_session();
+    let (world_map, identities) = d3c_world_map(&world, &[(6201, vec![0])]);
+    let events = Arc::new(std::sync::Mutex::new(SegmentEvents::default()));
+    let (mut installed, pass) = d3c_install(
+        &world,
+        &mut session,
+        1,
+        16,
+        1,
+        &[(0, ANCHOR_OK, 0), (1, ANCHOR_OK, 0)],
+        vec![FixtureTarget::Bytes(gen_target(
+            1,
+            &[(6201, segment_range(0), 0)],
+        ))],
+        deadline,
+    );
+    let (mut index, _) = d3c_index(&world);
+    let prove_set = index.map_files_keys();
+    let mut budget = CaptureWorkBudget::default();
+    let mut probe = KernelMemberProbe::new(
+        &mut installed,
+        SegmentIo {
+            world: &world_map,
+            identities: &identities,
+            events: events.clone(),
+            runs: pass.runs.clone(),
+            owner: pass.owner.clone(),
+            exe_reads: Cell::new(0),
+            imm_base: pass.owner.state_for_test().0[3],
+        },
+        deadline,
+    );
+    probe.install_expectations(&mut index).unwrap();
+    let held = pass.owner.immediate().transient().unwrap();
+    let refused = d3c_packet(
+        probe.segment_proof(),
+        &world_map,
+        &identities,
+        &events,
+        &pass.runs,
+        &pass.owner,
+        &prove_set,
+        6201,
+        &mut budget,
+    );
+    drop(held);
+    assert_userspace_mapped(&refused);
+    assert_eq!(budget.work_units_count(), 1);
+    assert!(
+        pass.runs.lock().unwrap().scopes.is_empty(),
+        "an over-headroom run reached the target iterator"
+    );
+    drop(probe);
+    assert_eq!(installed.target_attempts, 0);
+    assert_eq!(installed.failed_target, None);
+    drop(installed);
+    assert_eq!(session.consecutive_deadlines, 0);
+    assert_eq!(
+        events.lock().unwrap().fallback,
+        [(6201, segment_range(0).0, segment_range(0).1)]
+    );
+    assert_eq!(
+        session.fallback.totals(),
+        KernelFallbackTotals {
+            passes: 1,
+            pids: 1,
+            keys: 1,
+            first_reason: Some(KernelFallbackReason::FdHeadroom),
+        }
+    );
+}
+
+#[test]
+fn d3c_generation_rollover_refuses_reuse() {
+    let world = d3c_world();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut session = fixture_session();
+    let ok = [(0, ANCHOR_OK, 0), (1, ANCHOR_OK, 0)];
+    let (installed, _) = d3c_install(&world, &mut session, 1, 16, 1, &ok, vec![], deadline);
+    drop(installed);
+    assert_eq!(session.generation, 1);
+    // A reused, rolled-over, or record-ambiguous generation is refused, and
+    // the refusal leaves the session usable for the next generation.
+    for bad in [1, u64::from(u32::MAX), u64::MAX] {
+        let owner = ReservationOwner::for_examined(SegmentPolicy::from_headroom(16, 0, 0), 1);
+        let mut custody = ExaminedCustody::new(owner, BTreeMap::new());
+        let scan = custody.begin_scan();
+        let held = File::open(world.dir.path().join("examined.so")).unwrap();
+        assert!(custody.offer_for_test(scan, world.examined, held));
+        custody.reconcile(d3c_policy(16, 1)).unwrap();
+        let pass = AnchorPass::prepare(
+            &world.pins,
+            [(world.provider.key, world.provider_id)],
+            custody,
+        );
+        assert!(
+            session.install_anchors(pass, bad, deadline).is_err(),
+            "generation {bad} was accepted"
+        );
+        assert_eq!(session.generation, 1);
+        assert!(session.binding.is_none());
+    }
+    let (installed, _) = d3c_install(&world, &mut session, 2, 16, 1, &ok, vec![], deadline);
+    drop(installed);
+    assert_eq!(session.generation, 2);
 }

@@ -666,3 +666,49 @@ fn cgroup_membership_uncertainty_is_a_known_label_with_nonempty_evidence() {
         "the current producer's finite cgroup uncertainty must be recognized"
     );
 }
+
+#[test]
+fn instance_s1_additive_arrays_still_obey_parser_limits() {
+    let mut v = fixture();
+    v["instances"] = json!([{"id":"i0"}]);
+    v["semantic_edges"] = json!([{"instance":"i0","extra":[null,true,1]}]);
+    let raw = bytes(&v);
+    let mut limits = InputLimits {
+        bytes: raw.len(),
+        nodes: nodes(&v),
+        ..InputLimits::default()
+    };
+    assert!(parse_with_limits(&raw, limits).is_ok());
+    limits.nodes -= 1;
+    assert!(
+        parse_with_limits(&raw, limits)
+            .unwrap_err()
+            .to_string()
+            .contains("node limit")
+    );
+    limits.nodes = nodes(&v);
+    limits.bytes -= 1;
+    assert!(
+        parse_with_limits(&raw, limits)
+            .unwrap_err()
+            .to_string()
+            .contains("byte limit")
+    );
+    let mut deep = json!(0);
+    for _ in 0..12 {
+        deep = json!([deep]);
+    }
+    v["semantic_edges"] = deep;
+    assert!(
+        parse_with_limits(
+            &bytes(&v),
+            InputLimits {
+                depth: 9,
+                ..InputLimits::default()
+            }
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("depth limit")
+    );
+}

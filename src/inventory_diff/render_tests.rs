@@ -590,6 +590,11 @@ fn review_r3_shared_unknown_clock_unit_is_not_repeated_per_transition() {
 
 fn args() -> (tempfile::TempDir, InventoryDiffArgs) {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
     let before = dir.path().join("before.json");
     let after = dir.path().join("after.json");
     std::fs::write(&before, FIXTURE).unwrap();

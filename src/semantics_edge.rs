@@ -67,7 +67,7 @@ pub(crate) const MAX_EDGE_PROVENANCE_RETURNS: usize = 32;
 /// observed them. Every field below already exists in the trusted
 /// capture path (`Event` + the producing slot's effective semantics);
 /// the boundary copies, never invents.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct SemanticCall {
     /// Verbatim function name — provenance and the
     /// [`kinds::descriptor`](crate::kinds::descriptor) lookup key.
@@ -105,6 +105,12 @@ pub(crate) struct SemanticCall {
     pub attributable: bool,
     /// Observation time (the edge's clock, nanoseconds).
     pub ts_ns: u64,
+}
+
+impl std::fmt::Debug for SemanticCall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SemanticCall(<private facts>)")
+    }
 }
 
 impl Default for SemanticCall {
@@ -242,7 +248,7 @@ pub(crate) struct EdgeEvidence {
 }
 
 /// The per-edge semantic reducer. Not `Clone`: edges own theirs.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct EdgeSemantics {
     /// Open sessions: raw handle → PKCS#11 slot id. Raw handles are
     /// internal keys only (S2 owns session identity).
@@ -297,6 +303,22 @@ pub(crate) struct EdgeSemantics {
     double_load_detected: bool,
     /// Any fully-authorized call with effective semantic content.
     seen_claim_capable: bool,
+}
+
+impl std::fmt::Debug for EdgeSemantics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EdgeSemantics")
+            .field("open_bindings", &self.open.len())
+            .field("active_machines", &self.active.len())
+            .field("pending_calls", &self.pending.len())
+            .field("detached_calls", &self.detached.len())
+            .field("mechanisms", &self.mechs.len())
+            .field("calls", &self.calls)
+            .field("started", &self.started)
+            .field("completed", &self.completed)
+            .field("unknown", &self.unknown)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Published per-edge semantic labels. `observed` iff the edge holds

@@ -18,6 +18,12 @@
 //! behind a publication revision and become visible only at `publish`, so
 //! inventory facts cross the same batch boundary as discovery facts.
 
+pub(crate) mod instance_input;
+
+use instance_input::{
+    AdmittedInstance, AdmittedInstanceCall, InstanceRetirement, InstanceSemanticLoss,
+};
+
 use crate::discovery::native_binding::{BindingCensus, UnboundReason};
 use crate::process::{PidPin, generation_gone, process_is_zombie, process_start_time};
 use crate::semantics_edge::{EdgeSemantics, SemanticCall};
@@ -1637,8 +1643,12 @@ pub(crate) enum EntryOutcome {
     UnknownEdge,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 enum Mutation {
+    NoteInstance(AdmittedInstance),
+    ObserveInstanceSemantic(AdmittedInstanceCall),
+    InstanceSemanticLoss(InstanceSemanticLoss),
+    RetireInstance(InstanceRetirement),
     NoteMapping {
         caller: CallerId,
         pid: u32,
@@ -1795,6 +1805,7 @@ enum Mutation {
 /// one consistent snapshot per batch and the ordering test can pin that
 /// facts publish synchronously with the batch return.
 pub(crate) struct CallerRegistry {
+    instance_state: instance_input::InstanceState,
     limits: RegistryLimits,
     next_module: u32,
     callers: BTreeSet<CallerId>,
@@ -1859,6 +1870,7 @@ pub(crate) struct CallerRegistry {
 impl CallerRegistry {
     pub(crate) fn new(limits: RegistryLimits) -> Self {
         Self {
+            instance_state: instance_input::InstanceState::default(),
             limits,
             next_module: 0,
             callers: BTreeSet::new(),
@@ -2678,6 +2690,10 @@ impl CallerRegistry {
 
     fn apply(&mut self, mutation: Mutation) {
         match mutation {
+            Mutation::NoteInstance(input) => self.apply_instance(input),
+            Mutation::ObserveInstanceSemantic(input) => self.apply_instance_call(input),
+            Mutation::InstanceSemanticLoss(input) => self.apply_instance_loss(input),
+            Mutation::RetireInstance(input) => self.apply_instance_retirement(input),
             Mutation::NoteMapping {
                 caller,
                 pid,
@@ -2955,6 +2971,7 @@ impl CallerRegistry {
                     modules.insert(edge.module);
                 }
                 for module in modules {
+                    self.invalidate_physical_instances(caller, Some(module), false);
                     self.recompute_module(module);
                 }
             }
@@ -3960,12 +3977,14 @@ impl CallerRegistry {
             .get(&(caller, id))
             .is_some_and(|edge| edge.semantics.is_none());
         if needs_materialize {
-            if self.semantic_occupied >= self.limits.max_semantic_states {
+            if self.semantic_occupied + self.instance_semantic_occupied()
+                >= self.limits.max_semantic_states
+            {
                 self.semantic_refused = self.semantic_refused.saturating_add(1);
                 let refusal = BudgetRefusal {
                     resource: "semantic_state",
                     limit: self.limits.max_semantic_states,
-                    requested: self.semantic_occupied + 1,
+                    requested: self.semantic_occupied + self.instance_semantic_occupied() + 1,
                 };
                 self.push_gap(RegistryGap {
                     caller: Some(caller),
@@ -4013,6 +4032,7 @@ impl CallerRegistry {
     fn apply_retire(&mut self, caller: CallerId, reason: String, at_ns: u64) {
         let _ = at_ns;
         self.retired.insert(caller, reason.clone());
+        self.invalidate_physical_instances(caller, None, true);
         let mut modules = BTreeSet::new();
         for edge in self
             .edges
@@ -4097,6 +4117,7 @@ impl CallerRegistry {
                 state.invalidate();
             }
         }
+        self.invalidate_physical_instances(caller, Some(module), complete_scan);
         // The module unloaded only when no edge still maps it or could:
         // mapped and uncertain edges both block the verdict (an
         // incomplete scan just marked this edge uncertain, so it

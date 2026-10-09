@@ -333,15 +333,19 @@ fn scan_and_pin_retained_with<C, S, P>(
 
 // Both samples use this same retained context. Application validation does
 // not alter the physical scan's result, provider pins or refusal semantics.
-fn scan_and_pin_application_with<C: InspectImageReader, S, P>(
+fn scan_and_pin_application_with<C: InspectImageReader, P>(
     context: &mut C,
     still_the_same: impl FnMut(&mut C) -> bool,
-    scan: impl FnOnce(&mut C) -> Result<S, String>,
-    pin: impl FnOnce(&mut C, &S) -> Result<P, String>,
-) -> Result<(S, P, InspectApplicationResult), String> {
+    scan: impl FnOnce(&mut C) -> Result<ScanOutcome, String>,
+    pin: impl FnOnce(&mut C, &ScanOutcome) -> Result<P, String>,
+) -> Result<(ScanOutcome, P, InspectApplicationResult), String> {
     let pending = begin_application(context);
     let (scanned, pinned) = scan_and_pin_retained_with(context, still_the_same, scan, pin)?;
-    let application = finish_application(pending, context);
+    let application = if scanned.mapping_scan_completed() {
+        finish_application(pending, context)
+    } else {
+        InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined)
+    };
     Ok((scanned, pinned, application))
 }
 
@@ -1189,5 +1193,111 @@ mod tests {
         assert_eq!(json["modules"][0]["inode"], 11);
         assert_eq!(json["modules"][1]["inode"], 22);
         assert_eq!(json["modules"][0]["path"], json["modules"][1]["path"]);
+    }
+
+    #[test]
+    fn pid_inspect_final_mapping_failure_with_stable_exe_withholds_identity() {
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        for read_failure in [false, true] {
+            let mut context = (
+                ProcessViewImageReader::new(&view),
+                CaptureWorkBudget::default(),
+            );
+            let (outcome, (pins, skips), application) = scan_and_pin_application_with(
+                &mut context,
+                |context| context.0.view().still_the_same(),
+                |context| {
+                    Ok(crate::discovery::scan::final_maps_refusal_for_test(
+                        context.0.view(),
+                        &mut context.1,
+                        read_failure,
+                    ))
+                },
+                |context, outcome| {
+                    pin_scanned_view_objects(context.0.view(), outcome.modules(), &mut context.1)
+                },
+            )
+            .unwrap();
+            assert!(view.still_the_same());
+            assert!(outcome.modules().is_empty());
+            assert!(
+                outcome
+                    .skipped()
+                    .iter()
+                    .any(|gap| gap.reason.contains("final mapping validation unavailable"))
+            );
+            let mut json = Vec::new();
+            let mut text = Vec::new();
+            assert_eq!(
+                emit_application_diagnosis(
+                    view.pid(),
+                    true,
+                    &mut json,
+                    Ok((
+                        outcome.clone(),
+                        (PinnedObjects::empty(), skips.clone()),
+                        application.clone(),
+                    ))
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(
+                emit_application_diagnosis(
+                    view.pid(),
+                    false,
+                    &mut text,
+                    Ok((outcome, (pins, skips), application))
+                )
+                .unwrap(),
+                0
+            );
+            let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+            let text = String::from_utf8(text).unwrap();
+            assert_eq!(json["application_status"], "not_examined");
+            assert!(json["application"].is_null());
+            assert!(text.starts_with(&format!("Unknown executable (PID {})", view.pid())));
+            assert!(text.contains("final mapping validation unavailable"));
+        }
+    }
+
+    #[test]
+    fn pid_inspect_completed_empty_scans_retain_observed_identity() {
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        for outcome in [
+            ScanOutcome::Scanned {
+                modules: Vec::new(),
+                skipped: Vec::new(),
+                scan_ms: 0,
+            },
+            ScanOutcome::Unavailable {
+                reason: "ptrace",
+                modules: Vec::new(),
+                skipped: Vec::new(),
+            },
+        ] {
+            let mut context = (
+                ProcessViewImageReader::new(&view),
+                CaptureWorkBudget::default(),
+            );
+            let (_, _, application) = scan_and_pin_application_with(
+                &mut context,
+                |context| context.0.view().still_the_same(),
+                |_| Ok(outcome),
+                |context, outcome| {
+                    pin_scanned_view_objects(context.0.view(), outcome.modules(), &mut context.1)
+                },
+            )
+            .unwrap();
+            let json = application_json(&application);
+            assert_eq!(json["application_status"], "observed");
+            assert_eq!(
+                json["application"]["path"],
+                crate::discovery::caller_registry::read_exe_identity(view.pid())
+                    .unwrap()
+                    .path
+                    .unwrap()
+            );
+        }
     }
 }

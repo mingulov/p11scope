@@ -1683,6 +1683,24 @@ pub enum ScanOutcome {
 }
 
 impl ScanOutcome {
+    /// Presentation requires the scanner's complete initial/final mapping
+    /// bracket. This grants no absence, provider or call-attribution authority.
+    /// Memory-unavailable and successfully empty scans can complete that bracket.
+    pub(crate) fn mapping_scan_completed(&self) -> bool {
+        let skipped = match self {
+            Self::Scanned { skipped, .. } | Self::Unavailable { skipped, .. } => skipped,
+        };
+        !skipped.iter().any(|skip| {
+            [
+                INITIAL_MAPS_UNAVAILABLE_REASON,
+                FINAL_MAPS_UNAVAILABLE_REASON,
+                SCAN_GENERATION_CHANGED_REASON,
+            ]
+            .iter()
+            .any(|reason| skip.reason.starts_with(reason))
+        })
+    }
+
     pub fn modules(&self) -> &[ScannedModule] {
         match self {
             Self::Scanned { modules, .. } | Self::Unavailable { modules, .. } => modules,
@@ -4086,8 +4104,39 @@ pub(crate) fn bracket_refusal_for_test(
 }
 
 #[cfg(test)]
+pub(crate) fn final_maps_refusal_for_test(
+    view: &ProcessView,
+    budget: &mut CaptureWorkBudget,
+    read_failure: bool,
+) -> ScanOutcome {
+    tests::final_maps_refusal(view, budget, read_failure)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(super) fn final_maps_refusal(
+        view: &ProcessView,
+        budget: &mut CaptureWorkBudget,
+        read_failure: bool,
+    ) -> ScanOutcome {
+        let mut fixture = BracketFixture::new(8, true);
+        fixture.fail_open_b = !read_failure;
+        fixture.fail_read_b = read_failure;
+        let hints = [fixture.path.clone()];
+        scan_process_view_with_io(
+            &ScanRequest {
+                pid: view.pid(),
+                hints: &hints,
+                hooks: &HookRegistry::builtin(),
+            },
+            view,
+            budget,
+            &mut fixture,
+        )
+        .unwrap()
+    }
 
     pub(super) fn bracket_refusal(
         view: &ProcessView,

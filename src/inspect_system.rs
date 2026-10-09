@@ -48,6 +48,11 @@ use crate::discovery::sweep_attribution::{
     is_caller_range, retain_unchanged,
 };
 use crate::discovery::sweep_shards::{shard_count, shard_threads};
+use crate::inspect_identity::{
+    InspectApplicationResult, InspectIdentityUnknown, InspectImageReader, ProcessViewImageReader,
+    application_detail, application_from_confirmed_member, application_json, application_label,
+    begin_application, finish_application,
+};
 use crate::plan::{self, AdmissionPolicy, AdmissionScope};
 use crate::process::{ProcessView, ProcessViewId, generation_gone};
 use crate::timing::{StageKind, StageTimings};
@@ -285,6 +290,10 @@ struct MemberResult {
     status: MemberStatus,
     generation: Option<MemberGeneration>,
     complete_scan: Option<CompleteMemberScan>,
+    /// Completed presentation receipt, separate from physical/absence authority.
+    application: InspectApplicationResult,
+    /// Scanner-owned presentation fact, never an absence receipt or render input.
+    mapping_scan_completed: bool,
     modules: Vec<ScannedModule>,
     /// Objects this member's own deep scan examined without finding a
     /// module (C1b "examined" keys; empty unless the scan completed).
@@ -442,7 +451,6 @@ fn scan_member(
 ) -> MemberResult {
     let started_ns = monotonic_ns();
     let budget_before = (budget.stopped_reason(), budget.refusal_counts());
-    let mut gaps = Vec::new();
     let opened = ProcessView::open(view, pid);
     let view_handle = match opened {
         Ok(view_handle) => view_handle,
@@ -452,10 +460,37 @@ fn scan_member(
                 view,
                 &format!("the process generation could not be pinned: {error}"),
                 noise,
-                gaps,
+                Vec::new(),
             );
         }
     };
+    let mut reader = ProcessViewImageReader::new(&view_handle);
+    scan_member_application_with(&mut reader, |reader| {
+        scan_pinned_member(
+            reader.view(),
+            hints,
+            hooks,
+            budget,
+            noise,
+            started_ns,
+            budget_before,
+        )
+    })
+}
+
+/// The existing physical scan/absence authority remains independent of naming.
+fn scan_pinned_member(
+    view_handle: &ProcessView,
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
+    budget: &mut CaptureWorkBudget,
+    noise: &mut DiscoveryNoiseAggregator,
+    started_ns: Option<u64>,
+    budget_before: (Option<&'static str>, (u64, u64)),
+) -> MemberResult {
+    let pid = view_handle.pid();
+    let view = view_handle.id();
+    let mut gaps = Vec::new();
     // The generation this member's mappings belong to: the pin's start
     // time and the exe identity, read while the pin holds. The
     // coordinator joins both against the caller incarnation it admits.
@@ -475,22 +510,19 @@ fn scan_member(
             gaps,
         );
     }
-    let (outcome, examined) = match scan_process_view_examined(
-        &ScanRequest { pid, hints, hooks },
-        &view_handle,
-        budget,
-    ) {
-        Ok(scanned) => scanned,
-        Err(error) => {
-            return member_not_scanned(
-                pid,
-                view,
-                &format!("the process could not be scanned: {error}"),
-                noise,
-                gaps,
-            );
-        }
-    };
+    let (outcome, examined) =
+        match scan_process_view_examined(&ScanRequest { pid, hints, hooks }, view_handle, budget) {
+            Ok(scanned) => scanned,
+            Err(error) => {
+                return member_not_scanned(
+                    pid,
+                    view,
+                    &format!("the process could not be scanned: {error}"),
+                    noise,
+                    gaps,
+                );
+            }
+        };
     if !view_handle.still_the_same() {
         return member_not_scanned(
             pid,
@@ -500,8 +532,7 @@ fn scan_member(
             gaps,
         );
     }
-    let (pins, pin_skips) = match pin_scanned_view_objects(&view_handle, outcome.modules(), budget)
-    {
+    let (pins, pin_skips) = match pin_scanned_view_objects(view_handle, outcome.modules(), budget) {
         Ok(pinned) => pinned,
         Err(error) => {
             return member_not_scanned(
@@ -557,6 +588,7 @@ fn scan_member(
     for skip in pin_skips {
         gaps.push(PidGap::member(pid, skip));
     }
+    let mapping_scan_completed = outcome.mapping_scan_completed();
     let (modules, status) = match outcome {
         ScanOutcome::Scanned { modules, .. } => (modules, MemberStatus::Scanned),
         ScanOutcome::Unavailable {
@@ -564,6 +596,8 @@ fn scan_member(
         } => (modules, MemberStatus::MemoryUnavailable { reason }),
     };
     MemberResult {
+        mapping_scan_completed,
+        application: InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
         complete_scan,
         pid,
         view,
@@ -620,6 +654,8 @@ fn member_not_scanned(
         None => MemberStatus::Exited,
     };
     MemberResult {
+        mapping_scan_completed: false,
+        application: InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
         complete_scan: None,
         pid,
         view,
@@ -798,6 +834,24 @@ pub(crate) struct ProcessRecord {
     /// maps matches); `None` when no read reached it.
     pub generation: Option<MemberGeneration>,
     pub complete_scan: Option<CompleteMemberScan>,
+    /// Scan-local presentation only; never use this as event naming authority.
+    pub application: InspectApplicationResult,
+}
+
+/// Both samples use the same retained reader and enclose the full physical
+/// scan plus provider pinning. Naming rejection cannot discard those results.
+fn scan_member_application_with<C: InspectImageReader>(
+    context: &mut C,
+    scan_and_pin: impl FnOnce(&mut C) -> MemberResult,
+) -> MemberResult {
+    let pending = begin_application(context);
+    let mut member = scan_and_pin(context);
+    member.application = if member.status.inventoried() && member.mapping_scan_completed {
+        finish_application(pending, context)
+    } else {
+        InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined)
+    };
+    member
 }
 
 /// A discovered relationship between catalog objects: two observations of
@@ -1434,6 +1488,13 @@ fn assemble(
             (MemberStatus::NotSelected { loss }, Vec::new(), None)
         };
         processes.push(ProcessRecord {
+            application: if let Some(member) = members_by_pid.get(pid) {
+                member.application.clone()
+            } else if let Some(swept) = swept_by_pid.get(pid) {
+                application_from_confirmed_member(swept)
+            } else {
+                InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined)
+            },
             complete_scan: members_by_pid
                 .get(pid)
                 .and_then(|member| member.complete_scan.clone()),
@@ -1834,6 +1895,9 @@ fn render_json(catalog: &Catalog) -> serde_json::Value {
                 "status": process.status.label(),
                 "objects": process.objects,
             });
+            let application = application_json(&process.application);
+            record["application"] = application["application"].clone();
+            record["application_status"] = application["application_status"].clone();
             if let Some(reason) = process.status.reason() {
                 record["reason"] = serde_json::Value::String(reason.to_string());
             }
@@ -2042,9 +2106,15 @@ fn render_text(catalog: &Catalog) -> String {
         catalog.scan_ms,
         catalog.scan_status,
     );
+    out.push_str("Mapped objects are scan evidence; activity was not captured by inspect.\n");
     out.push('\n');
+    let processes: BTreeMap<u32, &ProcessRecord> = catalog
+        .processes
+        .iter()
+        .map(|process| (process.pid, process))
+        .collect();
     for (index, object) in catalog.objects.iter().enumerate() {
-        render_object(&mut out, index, object);
+        render_object(&mut out, index, object, &processes);
         out.push('\n');
     }
     if !catalog.relationships.is_empty() {
@@ -2105,7 +2175,12 @@ fn render_text(catalog: &Catalog) -> String {
     out
 }
 
-fn render_object(out: &mut String, index: usize, object: &CatalogObject) {
+fn render_object(
+    out: &mut String,
+    index: usize,
+    object: &CatalogObject,
+    processes: &BTreeMap<u32, &ProcessRecord>,
+) {
     let _ = writeln!(
         out,
         "object[{index}]  {}",
@@ -2123,9 +2198,16 @@ fn render_object(out: &mut String, index: usize, object: &CatalogObject) {
     let mappings: Vec<String> = object
         .mappings
         .iter()
-        .map(|(pid, view)| match view {
-            Some(view) => format!("pid {pid} (view {})", view.0),
-            None => format!("pid {pid} (maps match)"),
+        .map(|(pid, view)| {
+            let unknown = InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined);
+            let application = processes
+                .get(pid)
+                .map_or(&unknown, |process| &process.application);
+            let label = application_label(application, *pid);
+            match view {
+                Some(view) => format!("{label} (view {})", view.0),
+                None => format!("{label} (maps match)"),
+            }
         })
         .collect();
     let _ = writeln!(out, "  mapped by  {}", mappings.join(", "));
@@ -2227,6 +2309,31 @@ fn render_process_summary(out: &mut String, catalog: &Catalog) {
         .map(|(status, count)| format!("{count} {status}"))
         .collect();
     let _ = writeln!(out, "processes: {}", parts.join(", "));
+    for process in &catalog.processes {
+        let objects = process
+            .objects
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let _ = writeln!(
+            out,
+            "  {} — {}; objects [{}]",
+            application_label(&process.application, process.pid),
+            process.status.label(),
+            objects,
+        );
+        if let Some(detail) = application_detail(&process.application) {
+            out.push_str(&detail);
+        }
+        if let Some(reason) = process.status.reason() {
+            let _ = writeln!(
+                out,
+                "  reason      {}",
+                crate::render::escape_controls(reason)
+            );
+        }
+    }
     let _ = writeln!(
         out,
         "admission: {} admitted, {} refused, {} unresolved ({} uncorroborated candidates, {} \
@@ -2266,6 +2373,416 @@ fn render_gaps(out: &mut String, title: &str, gaps: &[PidGap]) {
 mod tests {
     use super::*;
     use crate::discovery::scan::{ScannedEntry, ScannedInterface, ScannedTable};
+
+    mod application {
+        use super::*;
+        use crate::inspect_identity::{
+            InspectApplicationResult, InspectIdentityUnknown, InspectImageReader,
+            ProcessViewImageReader, application_from_confirmed_member, application_json,
+        };
+        use std::io::{BufRead, Write};
+        use std::process::{Child, Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        struct OwnedExec(Child);
+        impl OwnedExec {
+            fn new() -> Self {
+                let mut child = Command::new("/bin/sh")
+                    .args(["-c", "printf 'ready\\n'; read trigger; exec /bin/sleep 30"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let mut ready = String::new();
+                std::io::BufReader::new(child.stdout.take().unwrap())
+                    .read_line(&mut ready)
+                    .unwrap();
+                assert_eq!(ready, "ready\n");
+                Self(child)
+            }
+            fn exec(&mut self, before: &ExeIdentity) {
+                self.0.stdin.as_mut().unwrap().write_all(b"go\n").unwrap();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                loop {
+                    if read_exe_identity(self.0.id()).is_some_and(|exe| exe != *before) {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "owned child did not exec");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        impl Drop for OwnedExec {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        struct OsReader<'a> {
+            os: ProcessViewImageReader<'a>,
+            unreadable: bool,
+        }
+        impl InspectImageReader for OsReader<'_> {
+            fn exe_identity(&mut self) -> Option<ExeIdentity> {
+                if self.unreadable {
+                    None
+                } else {
+                    self.os.exe_identity()
+                }
+            }
+            fn start_time(&mut self) -> Option<u64> {
+                self.os.start_time()
+            }
+            fn still_same(&mut self) -> bool {
+                self.os.still_same()
+            }
+            fn validate_generation(&mut self) -> Result<(), InspectIdentityUnknown> {
+                self.os.validate_generation()
+            }
+        }
+
+        fn member(pid: u32) -> MemberResult {
+            MemberResult {
+                mapping_scan_completed: true,
+                pid,
+                view: ProcessViewId(0),
+                status: MemberStatus::Scanned,
+                generation: None,
+                complete_scan: None,
+                application: InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
+                modules: Vec::new(),
+                examined: Vec::new(),
+                pins: PinnedObjects::empty(),
+                gaps: Vec::new(),
+                scan_ms: 0,
+            }
+        }
+
+        fn catalog_for(member: MemberResult) -> Catalog {
+            let mut catalog = super::catalog_with(vec![super::object(
+                "/opt/vendor/libprovider.so",
+                42,
+                None,
+                member.pid,
+                AdmissionRecord::Unresolved {
+                    reasons: vec!["fixture".into()],
+                },
+            )]);
+            let pid = member.pid;
+            catalog.objects[0].mappings = vec![(pid, Some(member.view))];
+            catalog.objects[0].observations[0].pid = pid;
+            catalog.processes = vec![ProcessRecord {
+                pid,
+                status: member.status,
+                objects: vec![0],
+                generation: member.generation,
+                complete_scan: member.complete_scan,
+                application: member.application,
+            }];
+            catalog.skipped = member.gaps;
+            catalog
+        }
+
+        fn os_diagnosis(
+            exec_before_scan: bool,
+            exec_during_pin: bool,
+            unreadable: bool,
+        ) -> (serde_json::Value, String, String) {
+            let mut child = OwnedExec::new();
+            let pid = child.0.id();
+            let pin = crate::process::PidPin::open(pid).unwrap();
+            assert!(pin.pidfd().is_ok(), "live pidfd control is required");
+            let view = ProcessView::open(ProcessViewId(0), pid).unwrap();
+            let before = read_exe_identity(pid).unwrap();
+            let birth = crate::process::process_start_time(pid).unwrap();
+            let mut reader = OsReader {
+                os: ProcessViewImageReader::new(&view),
+                unreadable: false,
+            };
+            let member = scan_member_application_with(&mut reader, |reader| {
+                if exec_before_scan {
+                    child.exec(&before);
+                }
+                assert!(view.still_the_same());
+                // The production closure scans mappings, then pins providers.
+                let scanned = member(pid);
+                if exec_during_pin {
+                    child.exec(&before);
+                }
+                reader.unreadable = unreadable;
+                assert!(view.still_the_same());
+                scanned
+            });
+            assert_eq!(crate::process::process_start_time(pid).unwrap(), birth);
+            assert!(view.still_the_same(), "exec kept the original pin live");
+            let catalog = catalog_for(member);
+            (
+                render_json(&catalog),
+                render_text(&catalog),
+                before.path.unwrap(),
+            )
+        }
+
+        fn assert_unknown(json: &serde_json::Value, text: &str, initial_path: &str, reason: &str) {
+            let process = &json["processes"][0];
+            assert!(process["application"].is_null());
+            assert_eq!(process["application_status"], reason);
+            assert!(text.contains(&format!("Unknown executable (PID {})", process["pid"])));
+            assert!(!text.contains(initial_path));
+            assert_eq!(json["objects"][0]["path"], "/opt/vendor/libprovider.so");
+            assert!(text.contains("libprovider.so"));
+        }
+
+        #[test]
+        fn system_inspect_exec_before_scan_with_live_pin_is_unknown() {
+            let (json, text, initial) = os_diagnosis(true, false, false);
+            assert_unknown(&json, &text, &initial, "changed");
+        }
+        #[test]
+        fn system_inspect_exec_during_pin_is_unknown() {
+            let (json, text, initial) = os_diagnosis(false, true, false);
+            assert_unknown(&json, &text, &initial, "changed");
+        }
+        #[test]
+        fn system_inspect_final_exe_unreadable_is_unknown() {
+            let (json, text, initial) = os_diagnosis(false, false, true);
+            assert_unknown(&json, &text, &initial, "unavailable");
+        }
+        #[test]
+        fn system_inspect_unchanged_executable_is_named_in_text_and_json() {
+            let (json, text, initial) = os_diagnosis(false, false, false);
+            assert_eq!(json["processes"][0]["application_status"], "observed");
+            assert_eq!(json["processes"][0]["application"]["path"], initial);
+            assert!(text.contains(&initial));
+            let basename = std::path::Path::new(&initial)
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            assert!(text.contains(&format!("{basename} (PID ")));
+            assert!(text.contains("activity was not captured by inspect"));
+            assert!(json["objects"][0].get("calls").is_none());
+        }
+        #[test]
+        fn system_inspect_os_scan_adapter_retains_the_owned_executable() {
+            let pid = std::process::id();
+            let result = scan_member(
+                pid,
+                ProcessViewId(0),
+                &[],
+                &HookRegistry::builtin(),
+                &mut CaptureWorkBudget::default(),
+                &mut DiscoveryNoiseAggregator::default(),
+            );
+            assert!(result.status.inventoried());
+            let json = application_json(&result.application);
+            assert_eq!(json["application_status"], "observed");
+            assert_eq!(
+                json["application"]["path"],
+                read_exe_identity(pid).unwrap().path.unwrap()
+            );
+        }
+        #[test]
+        fn system_inspect_memory_unavailable_can_retain_a_valid_receipt() {
+            let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+            let result =
+                scan_member_application_with(&mut ProcessViewImageReader::new(&view), |_| {
+                    let mut row = member(view.pid());
+                    row.mapping_scan_completed = ScanOutcome::Unavailable {
+                        reason: "ptrace",
+                        modules: Vec::new(),
+                        skipped: Vec::new(),
+                    }
+                    .mapping_scan_completed();
+                    row.status = MemberStatus::MemoryUnavailable { reason: "ptrace" };
+                    row
+                });
+            assert_eq!(
+                application_json(&result.application)["application_status"],
+                "observed"
+            );
+        }
+
+        #[test]
+        fn system_inspect_final_mapping_failure_with_stable_exe_withholds_identity() {
+            let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+            for read_failure in [false, true] {
+                let result = scan_member_application_with(
+                    &mut ProcessViewImageReader::new(&view),
+                    |reader| {
+                        let mut budget = CaptureWorkBudget::default();
+                        let outcome = crate::discovery::scan::final_maps_refusal_for_test(
+                            reader.view(),
+                            &mut budget,
+                            read_failure,
+                        );
+                        assert!(outcome.modules().is_empty());
+                        let (pins, skips) =
+                            pin_scanned_view_objects(reader.view(), outcome.modules(), &mut budget)
+                                .unwrap();
+                        assert!(skips.is_empty());
+                        assert!(!retirement_scan_allows_absence(
+                            &[],
+                            &outcome,
+                            &skips,
+                            (None, (0, 0)),
+                            (budget.stopped_reason(), budget.refusal_counts())
+                        ));
+                        let mut row = member(view.pid());
+                        row.mapping_scan_completed = outcome.mapping_scan_completed();
+                        row.modules = outcome.modules().to_vec();
+                        row.gaps = outcome
+                            .skipped()
+                            .iter()
+                            .cloned()
+                            .map(|skip| PidGap::member(view.pid(), skip))
+                            .collect();
+                        row.status = match outcome {
+                            ScanOutcome::Scanned { .. } => MemberStatus::Scanned,
+                            ScanOutcome::Unavailable { reason, .. } => {
+                                MemberStatus::MemoryUnavailable { reason }
+                            }
+                        };
+                        row.pins = pins;
+                        row
+                    },
+                );
+                assert!(view.still_the_same());
+                assert!(result.complete_scan.is_none());
+                let mut catalog = catalog_for(result);
+                catalog.objects.clear();
+                catalog.processes[0].objects.clear();
+                let json = render_json(&catalog);
+                let text = render_text(&catalog);
+                assert_eq!(json["processes"][0]["application_status"], "not_examined");
+                assert!(json["processes"][0]["application"].is_null());
+                assert!(text.contains(&format!("Unknown executable (PID {})", view.pid())));
+                assert!(text.contains("final mapping validation unavailable"));
+                assert!(
+                    catalog
+                        .skipped
+                        .iter()
+                        .any(|gap| gap.reason.contains("final mapping validation unavailable"))
+                );
+            }
+        }
+        #[test]
+        fn system_inspect_failed_or_unexamined_rows_never_gain_names() {
+            let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+            for status in [
+                MemberStatus::Exited,
+                MemberStatus::Unreadable {
+                    reason: "denied".into(),
+                },
+                MemberStatus::NotSelected { loss: None },
+            ] {
+                let result =
+                    scan_member_application_with(&mut ProcessViewImageReader::new(&view), |_| {
+                        let mut row = member(view.pid());
+                        row.status = status;
+                        row
+                    });
+                assert_eq!(
+                    application_json(&result.application)["application_status"],
+                    "not_examined"
+                );
+            }
+            let result =
+                scan_member_application_with(&mut ProcessViewImageReader::new(&view), |_| {
+                    let mut row = member(view.pid());
+                    let skipped = Skipped {
+                        subject: "capture discovery".into(),
+                        reason:
+                            "memory scan refused: initial mapping validation unavailable: denied"
+                                .into(),
+                    };
+                    row.mapping_scan_completed = ScanOutcome::Scanned {
+                        modules: Vec::new(),
+                        skipped: vec![skipped.clone()],
+                        scan_ms: 0,
+                    }
+                    .mapping_scan_completed();
+                    row.gaps.push(PidGap::member(view.pid(), skipped));
+                    row
+                });
+            assert_eq!(
+                application_json(&result.application)["application_status"],
+                "not_examined"
+            );
+        }
+        #[test]
+        fn system_inspect_confirmed_maps_match_requires_a_retained_path() {
+            let member = SweptMember {
+                pid: 7,
+                start_time: 11,
+                exe: ExeIdentity {
+                    dev: 1,
+                    ino: 2,
+                    mtime_secs: 3,
+                    mtime_nanos: 4,
+                    path: None,
+                },
+                objects: Vec::new(),
+                unexamined: 0,
+            };
+            assert_eq!(
+                application_json(&application_from_confirmed_member(&member))["application_status"],
+                "unavailable"
+            );
+        }
+
+        #[test]
+        fn system_inspect_colliding_basenames_and_provider_paths_stay_separate() {
+            let confirmed = |path: &str, ino: u64| {
+                application_from_confirmed_member(&SweptMember {
+                    pid: 7,
+                    start_time: 11,
+                    exe: ExeIdentity {
+                        dev: 1,
+                        ino,
+                        mtime_secs: 3,
+                        mtime_nanos: 4,
+                        path: Some(path.into()),
+                    },
+                    objects: Vec::new(),
+                    unexamined: 0,
+                })
+            };
+            let mut catalog = super::catalog_with(vec![
+                super::object(
+                    "/opt/libprovider.so",
+                    42,
+                    None,
+                    100,
+                    AdmissionRecord::Unresolved {
+                        reasons: Vec::new(),
+                    },
+                ),
+                super::object(
+                    "/opt/libprovider.so",
+                    43,
+                    None,
+                    200,
+                    AdmissionRecord::Unresolved {
+                        reasons: Vec::new(),
+                    },
+                ),
+            ]);
+            catalog.processes[0].application = confirmed("/opt/a/app", 2);
+            catalog.processes[1].application = confirmed("/opt/b/app", 3);
+            let json = render_json(&catalog);
+            let text = render_text(&catalog);
+            assert_eq!(json["processes"][0]["application"]["path"], "/opt/a/app");
+            assert_eq!(json["processes"][1]["application"]["path"], "/opt/b/app");
+            assert_eq!(json["objects"].as_array().unwrap().len(), 2);
+            assert_ne!(json["objects"][0]["inode"], json["objects"][1]["inode"]);
+            assert!(text.contains("app (PID 100)"));
+            assert!(text.contains("app (PID 200)"));
+            assert!(text.contains("/opt/a/app"));
+            assert!(text.contains("/opt/b/app"));
+        }
+    }
     use p11scope_manifest::maps::{Device, ObjectKey};
 
     fn key(inode: u64) -> ObjectKey {
@@ -2356,6 +2873,9 @@ mod tests {
             scan_ms: 7,
             processes: vec![
                 ProcessRecord {
+                    application: InspectApplicationResult::Unknown(
+                        InspectIdentityUnknown::NotExamined,
+                    ),
                     complete_scan: None,
                     pid: 100,
                     status: MemberStatus::Scanned,
@@ -2363,6 +2883,9 @@ mod tests {
                     generation: None,
                 },
                 ProcessRecord {
+                    application: InspectApplicationResult::Unknown(
+                        InspectIdentityUnknown::NotExamined,
+                    ),
                     complete_scan: None,
                     pid: 200,
                     status: MemberStatus::Scanned,
@@ -2525,6 +3048,8 @@ mod tests {
             pins: PinnedObjects,
         ) -> MemberResult {
             MemberResult {
+                mapping_scan_completed: true,
+                application: InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
                 complete_scan: None,
                 pid,
                 view: ProcessViewId(view),
@@ -2615,6 +3140,48 @@ mod tests {
                 .notes
                 .iter()
                 .any(|note| note.reason.starts_with("attribution complete"))
+        }
+
+        #[test]
+        fn system_inspect_confirmed_maps_match_identity() {
+            let catalog = catalog_of(over_cap(&[]), HashMap::new(), false);
+            let matched = catalog
+                .processes
+                .iter()
+                .find(|row| row.pid == 10_001)
+                .unwrap();
+            assert_eq!(matched.status, MemberStatus::MapsMatched);
+            let json = render_json(&catalog);
+            let row = json["processes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["pid"] == 10_001)
+                .unwrap();
+            assert_eq!(row["application_status"], "observed");
+            assert_eq!(row["application"]["path"], exe().path.unwrap());
+            assert_eq!(row["application"]["start_time"], 19_001);
+            assert!(!matched.objects.is_empty());
+            assert!(render_text(&catalog).contains("(PID 10001) (maps match)"));
+
+            let refused = catalog_of(
+                over_cap(&[]),
+                HashMap::from([(
+                    10_001,
+                    Confirmation::Lost(AttributionLoss::ExecChanged, "exec changed".into()),
+                )]),
+                false,
+            );
+            let row = refused
+                .processes
+                .iter()
+                .find(|row| row.pid == 10_001)
+                .unwrap();
+            assert!(matches!(row.status, MemberStatus::NotSelected { .. }));
+            assert!(
+                crate::inspect_identity::application_json(&row.application)["application"]
+                    .is_null()
+            );
         }
 
         /// Review fix (Important 2): "examined" comes from the deep scan's
@@ -3047,6 +3614,10 @@ mod tests {
             cap_hit: false,
             members: vec![
                 MemberResult {
+                    mapping_scan_completed: false,
+                    application: InspectApplicationResult::Unknown(
+                        InspectIdentityUnknown::NotExamined,
+                    ),
                     complete_scan: None,
                     pid: 1,
                     view: ProcessViewId(0),
@@ -3063,6 +3634,10 @@ mod tests {
                     scan_ms: 0,
                 },
                 MemberResult {
+                    mapping_scan_completed: false,
+                    application: InspectApplicationResult::Unknown(
+                        InspectIdentityUnknown::NotExamined,
+                    ),
                     complete_scan: None,
                     pid: 2,
                     view: ProcessViewId(1),
@@ -3472,7 +4047,10 @@ mod tests {
         assert!(text.contains("system — 1 PKCS#11 object"), "{text}");
         assert!(text.contains("/opt/provider.so"), "{text}");
         assert!(text.contains("sha256 aa"), "{text}");
-        assert!(text.contains("pid 100 (view 0)"), "{text}");
+        assert!(
+            text.contains("Unknown executable (PID 100) (view 0)"),
+            "{text}"
+        );
         assert!(
             text.contains("refused (closure_array): module needs 388 more"),
             "{text}"

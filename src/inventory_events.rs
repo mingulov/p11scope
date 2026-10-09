@@ -10,8 +10,9 @@
 //! are explicit events, never silent loss.
 //!
 //! Privacy bounds and loss accounting apply EXACTLY as to snapshots:
-//! events carry the same caller/module/edge/gap shapes the snapshot
-//! document carries (plus derived presentation states, never new
+//! events carry the same caller/module/edge/gap facts the snapshot
+//! document carries (plus derived presentation states and bounded identity
+//! context from that revision, never new
 //! capture), and every dropped/rotated/evicted event is accounted in
 //! a retained event. Edge records are change-driven and capped per
 //! pass ([`EdgeEmitter`]); deferred ones are counted, never dropped.
@@ -19,6 +20,7 @@
 use crate::discovery::caller_registry::{CallerEvent, CallerId, ModuleId, UseCoverage};
 use crate::discovery::engine::inventory_coordinator::PassReport;
 use crate::inventory::{edge_json, render_json_from_presentation};
+use crate::inventory_event_identity::{IdentityIndex, bounded_context, context_budget_caller};
 use crate::inventory_present::GapView;
 use crate::inventory_present::{Activity, Capture, EdgeView, Presence, Presentation};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -91,6 +93,30 @@ pub(crate) struct EventFault {
 }
 
 impl EventWriter {
+    /// Supply a real anonymous disk-file sink for producer controls. This
+    /// bypasses no production filesystem gate: those have separate tests.
+    /// Rotation is disabled; create/rename/eviction are not qualified here.
+    #[cfg(test)]
+    pub(crate) fn anonymous_test_sink(file: File) -> Self {
+        Self {
+            path: PathBuf::from("anonymous-producer-control"),
+            file,
+            current_bytes: 0,
+            events_in_file: 0,
+            max_bytes: u64::MAX,
+            max_files: 1,
+            rotation_seq: 0,
+            next_seq: 0,
+            retained: VecDeque::new(),
+            rotations: 0,
+            evicted_events: 0,
+            evicted_bytes: 0,
+            live_covered_events: 0,
+            live_covered_bytes: 0,
+            fault: None,
+        }
+    }
+
     /// Open (or truncate) the live stream file. `max_bytes` must be
     /// non-zero; `max_files` counts the live file plus retained
     /// rotations (minimum 1). Pre-existing `<path>.<N>` rotations are
@@ -668,8 +694,11 @@ pub(crate) fn started_payload(
 
 /// One [`CallerEvent`] as a stream payload: admissions, retirements,
 /// and failures with the same budget shape snapshot gaps carry.
-pub(crate) fn caller_event_payload(event: &CallerEvent) -> serde_json::Value {
-    match event {
+pub(crate) fn caller_event_payload(
+    event: &CallerEvent,
+    identities: &IdentityIndex<'_>,
+) -> serde_json::Value {
+    let mut payload = match event {
         CallerEvent::Admitted { id } => serde_json::json!({
             "event": "admitted",
             "caller": id.label(),
@@ -703,7 +732,38 @@ pub(crate) fn caller_event_payload(event: &CallerEvent) -> serde_json::Value {
                 "requested": refusal.requested,
             })).unwrap_or(serde_json::Value::Null),
         }),
-    }
+    };
+    let context = match event {
+        CallerEvent::Admitted { id } | CallerEvent::Exited { id, .. } => serde_json::json!({
+            "version": 1,
+            "caller": identities.caller_context(*id),
+        }),
+        CallerEvent::ExecRetired { old, new } | CallerEvent::Reused { old, new } => {
+            serde_json::json!({
+                "version": 1,
+                "old": identities.caller_context(*old),
+                "new": identities.caller_context(*new),
+            })
+        }
+        CallerEvent::AdmitFailed { .. } => return payload,
+    };
+    payload["identity_context"] = bounded_context(context, || match event {
+        CallerEvent::Admitted { id } | CallerEvent::Exited { id, .. } => serde_json::json!({
+            "version": 1,
+            "caller": context_budget_caller(*id),
+        }),
+        CallerEvent::ExecRetired { old, new } | CallerEvent::Reused { old, new } => {
+            serde_json::json!({
+                "version": 1,
+                "old": context_budget_caller(*old),
+                "new": context_budget_caller(*new),
+            })
+        }
+        CallerEvent::AdmitFailed { .. } => {
+            unreachable!("admission failure has no identity context")
+        }
+    });
+    payload
 }
 
 /// Emit one full presentation as snapshot-equivalent events: every
@@ -730,6 +790,7 @@ pub(crate) fn emit_snapshot_as_events(
     EdgeEmitter::new().sweep(
         writer,
         &presentation.edges,
+        &IdentityIndex::new(presentation),
         presentation.budgets.edges_limit,
         at_ns,
         0,
@@ -748,14 +809,15 @@ pub(crate) fn emit_snapshot_as_events(
 }
 
 /// One edge as an `edge_observed` payload: the snapshot `edges[]` entry
-/// verbatim plus ONLY the three derived presentation states the
+/// verbatim plus the three derived presentation states the
 /// dashboard renders from the same view (`presence`, `capture`,
-/// `activity`) — never new capture.
-pub(crate) fn edge_payload(edge: &EdgeView) -> serde_json::Value {
+/// `activity`) and reviewed compact identity context — never new capture.
+pub(crate) fn edge_payload(edge: &EdgeView, identities: &IdentityIndex<'_>) -> serde_json::Value {
     let mut payload = edge_json(edge);
     payload["presence"] = serde_json::Value::from(edge.presence.label());
     payload["capture"] = serde_json::Value::from(edge.capture.label());
     payload["activity"] = serde_json::Value::from(edge.activity.label());
+    payload["identity_context"] = identities.edge_context(edge);
     payload
 }
 
@@ -788,6 +850,7 @@ type EdgeKey = (CallerId, ModuleId);
 /// (count by power-of-two bucket, so a busy counter costs O(log calls)
 /// records, plus saturation, in-flight and the observation label), its
 /// full usage coverage, and the presence, capture and activity states.
+/// Compact identity changes are checked separately from this edge class.
 /// Activity is read from the presentation the stream is given, which must
 /// be the classic whole-run-window one (the dashboard display's trailing
 /// window is for frames only). Anything else (mapping instants,
@@ -820,7 +883,8 @@ impl EdgeClass {
     }
 }
 
-/// What the stream last carried for one edge: its class, a 128-bit keyed
+/// What the stream last carried for one edge: its class and identity digest,
+/// a 128-bit keyed
 /// digest of the exact payload (the sweep's comparison), where and
 /// how large that record is (the retention checks), and the count and
 /// instant it carried (the 10 s count cadence: every record carries
@@ -828,6 +892,7 @@ impl EdgeClass {
 #[derive(Debug)]
 struct EdgeDigest {
     class: EdgeClass,
+    identity: (u64, u64),
     exact: (u64, u64),
     generation: u64,
     bytes: u64,
@@ -861,7 +926,7 @@ pub(crate) struct EdgeSweep {
 /// directly**, or the replayed stream diverges from the snapshot.
 ///
 /// Per pass ([`EdgeEmitter::emit`]) an edge is due when it is new, when
-/// its [`EdgeClass`] differs from the one the stream last carried, when
+/// its [`EdgeClass`] or compact identity differs from the last record, when
 /// its count drifted past the last carried count and the 10 s count
 /// cadence expired ([`EDGE_COUNT_EMIT_INTERVAL_NS`]), or when retention
 /// evicted its last record while the edges' records fit the retention
@@ -986,6 +1051,7 @@ impl EdgeEmitter {
         at_ns: u64,
     ) -> Result<(), String> {
         let exact = self.digest(&payload);
+        let identity = self.digest(&payload["identity_context"]);
         let bytes = writer.append_sized("edge_observed", payload, at_ns)?;
         self.largest_line = self.largest_line.max(bytes);
         let key = (edge.caller, edge.module);
@@ -994,6 +1060,7 @@ impl EdgeEmitter {
         }
         let digest = EdgeDigest {
             class: EdgeClass::of(edge),
+            identity,
             exact,
             generation: writer.generation(),
             bytes,
@@ -1007,7 +1074,7 @@ impl EdgeEmitter {
         Ok(())
     }
 
-    /// One pass: queue every new, class-changed, count-due or (while
+    /// One pass: queue every new, class/identity-changed, count-due or (while
     /// the records fit the retention) evicted edge, then write up to the
     /// per-pass cap from the queue's head. `edges` is the presentation's
     /// (sorted by (caller, module)); `limit` its edge limit.
@@ -1015,6 +1082,7 @@ impl EdgeEmitter {
         &mut self,
         writer: &mut EventWriter,
         edges: &[EdgeView],
+        identities: &IdentityIndex<'_>,
         limit: usize,
         at_ns: u64,
     ) -> Result<EdgeEmission, String> {
@@ -1028,6 +1096,7 @@ impl EdgeEmitter {
                 None => true,
                 Some(digest) => {
                     digest.class != EdgeClass::of(edge)
+                        || digest.identity != self.digest(&identities.edge_context(edge))
                         || (refresh && digest.generation < writer.oldest_generation())
                         || Self::count_due(digest, edge, at_ns)
                 }
@@ -1051,12 +1120,14 @@ impl EdgeEmitter {
             // A change that reverted while it waited is already carried,
             // unless its record has since been evicted.
             if self.digests.get(&key).is_some_and(|digest| {
-                digest.class == EdgeClass::of(edge) && edge.entry_count == digest.emitted_count
+                digest.class == EdgeClass::of(edge)
+                    && edge.entry_count == digest.emitted_count
+                    && digest.identity == self.digest(&identities.edge_context(edge))
             }) && !self.evicted(&key, writer)
             {
                 continue;
             }
-            self.write(writer, edge, edge_payload(edge), limit, at_ns)?;
+            self.write(writer, edge, edge_payload(edge, identities), limit, at_ns)?;
             emitted += 1;
         }
         Ok(EdgeEmission {
@@ -1080,6 +1151,7 @@ impl EdgeEmitter {
         &mut self,
         writer: &mut EventWriter,
         edges: &[EdgeView],
+        identities: &IdentityIndex<'_>,
         limit: usize,
         at_ns: u64,
         tail: u64,
@@ -1089,7 +1161,7 @@ impl EdgeEmitter {
         let mut emitted = 0;
         for edge in edges {
             let key = (edge.caller, edge.module);
-            let payload = edge_payload(edge);
+            let payload = edge_payload(edge, identities);
             let carried = self.digests.get(&key).is_some_and(|digest| {
                 digest.exact == self.digest(&payload)
                     && digest.generation >= writer.oldest_generation()
@@ -1105,7 +1177,7 @@ impl EdgeEmitter {
             self.unretained_after(writer, edges, tail) > 0 && self.fits_with_tail(writer, tail);
         if dumped {
             for edge in edges {
-                self.write(writer, edge, edge_payload(edge), limit, at_ns)?;
+                self.write(writer, edge, edge_payload(edge, identities), limit, at_ns)?;
                 emitted += 1;
             }
             // No second reserve: the fit bound already holds the tail.

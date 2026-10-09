@@ -41,6 +41,10 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   `{event: admit_failed, pid, reason, budget}` where `budget` is
   `{resource, limit, requested}` or null (the same budget shape
   snapshot gaps carry).
+  The additive `identity_context` has `version: 1` and `caller` for
+  admitted/exited, or `old` and `new` for exec-retired/reused. Each subject
+  uses the compact caller projection below from the same publication revision.
+  `admit_failed` has no identity context or invented incarnation.
 - `gap_recorded`: `{index, caller, module, pid, subject, reason,
   budget}` — a snapshot `gaps[]` entry minus `repeats`, plus its
   ordinal `index` (equal to its snapshot `gaps[]` index): gap identity
@@ -86,7 +90,7 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   `edge_observed`).
 - `edge_observed`: one edge as the snapshot `edges[]` entry verbatim,
   plus the three derived presentation states `presence`, `capture`,
-  `activity` — computed from the same model the dashboard renders,
+  `activity` and additive `identity_context` — computed from the same model the dashboard renders,
   never new capture. Production streams emit it (both lanes, classic
   and `--dashboard` paths) change-driven:
   - During the run a commit writes a record for an edge that is new or
@@ -98,7 +102,12 @@ Every line carries the same envelope plus its `kind`-specific `event`:
     count rose since the previous pass — except an in-flight edge, or
     one with active operations, which reads `operation initialized /
     in flight` instead: in-flight and operation state take precedence
-    over a rise). Other fields (mapping instants
+    over a rise). A change to compact identity context also makes the edge
+    due, including a metadata-only change with an unchanged count/class.
+    Both ordinary checks and changes that revert while queued compare this
+    context; a reverted queued record is omitted only when its class, count
+    and context are already carried and that record is still retained.
+    Other fields (mapping instants
     and interruptions, semantics) do not trigger a record by
     themselves. The recorded `activity` is window-free; only the
     dashboard display renders its own trailing 5 s `recently observed`
@@ -145,7 +154,8 @@ Every line carries the same envelope plus its `kind`-specific `event`:
     fresh file to take it) and only that.
   - Replay guarantee: when `ended.edges_unretained` is 0, the last
     retained `edge_observed` per (`caller`, `module`) equals the
-    snapshot's `edges[]` entry (plus the three states) and every
+    snapshot's `edges[]` entry (plus the three states and the compact context
+    of the final immutable revision) and every
     snapshot edge has one. That always holds for a stream with no
     `retention_evicted`, where also
     `sum(pass_committed.edge_events) + ended.edge_events` equals the
@@ -159,17 +169,27 @@ Every line carries the same envelope plus its `kind`-specific `event`:
     deleted (the loss is also accounted in `retention_evicted`); read
     the snapshot, or raise the retention. A stream without `ended` was
     cut short; its last records may lag the run's end.
-  - Volume: a record is typically 0.7–0.8 KiB, more with semantic
+  - Volume: the original edge facts are typically 0.7–0.8 KiB, more with semantic
     mechanisms and operations. A commit writes at most 4,096 records
-    (about 3 MB), which happens only while that many edges change class
+    (about 3 MB of the original edge facts, plus context), which happens
+    only while that many edges change class or identity context
     or drift past their 10 s count cadence every pass (for example
     repeated health regressions demoting and restarting every watch).
     The sweep writes up to one record per edge
-    (32,768 at the limit, about 24 MB), twice in the fallback above.
+    (32,768 at the limit, about 24 MB of the original edge facts, plus
+    context), twice in the fallback above.
     Size `--event-rotate-bytes` × (`--event-max-files` − 1) to at least
     the live edges × the record size, plus that margin, for the replay
     guarantee to hold under retention; the defaults (1 MiB × 5 files)
-    cover about 5,000 edges.
+    must be sized for the actual contextual records. Compact identity adds
+    at most 65,536 encoded bytes per emitted edge (typically much less);
+    this bound does not apply to the existing semantic edge facts. Escaping
+    and context bytes participate in the line-size, capacity, final-tail
+    reservation and exact `edges_unretained` accounting above.
+    The additional context bound alone permits up to 256 MiB per capped
+    commit or 2 GiB per 32,768-edge sweep, twice when a fallback dump is
+    required; these are limits, not typical volume or a bound on the full
+    existing semantic payload. Use actual line sizes when choosing retention.
   - The producer keeps one digest per edge, bounded by the edge limit.
   - Order: a commit writes its `caller_event` lines, its gap lines, its
     `edge_observed` records, then its `pass_committed`; at the end the
@@ -189,6 +209,45 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   (nothing covers the edge's usage), or `unknown` (no live mapping, or
   a watch that ended: its interval stays in `entries.coverage`). The
   dashboard shows a watch that ended as `entries ?`.
+
+### Compact identity context
+
+An edge's `identity_context` contains exactly `{version: 1, caller, module}`.
+Caller turnover contexts contain `{version: 1, caller}` or
+`{version: 1, old, new}`. The caller projection contains exactly
+`{id, pid, incarnation, start_time, authority, lifecycle, executable, status}`;
+`executable` is null or `{dev, ino, mtime_secs, mtime_nanos, path}`. Authority
+is `scan_pinned` or `native_exact`, never inferred from a path. Lifecycle is
+`mapped`, `exited`, `exec_retired`, or `unknown`, as of this revision. PID
+uses the existing observer `/proc` numbering; start time is the existing
+clock ticks since boot. The module projection contains exactly
+`{id, device_major, device_minor, inode, path, status}`. The IDs are the
+existing capture-local caller/module join keys; names and paths are display
+facts only.
+
+Each subject's status is `observed`, `unavailable`, `path_budget`, or
+`context_budget`. Only one path is included per subject: the caller's observed
+exe path or the lexicographically first retained module path. A path exceeding
+4,096 UTF-8 bytes before escaping becomes null with `path_budget`, preserving
+the physical metadata. An absent path/executable is null with `unavailable`;
+a missing subject retains its ID and makes its other fields null. If the
+whole encoded context would exceed 65,536 bytes, subjects retain only their
+IDs, with the other fields null and `context_budget`. No full module/caller
+record, path array, hash/build ID, reason/history, semantic tree or object graph
+is copied into context. No late live PID lookup fills missing identity.
+
+The context belongs to the same immutable revision as its record, including
+old/new caller retirement. It names a retained observation without depending
+on an earlier dictionary record. Production does not replay full caller/module
+dictionaries. A retained old edge cannot describe a later exit whose turnover
+was evicted. Contextless earlier v1 records require their matching snapshot
+for names; updated consumers must show unavailable rather than guessing, and
+older additive consumers may ignore the new context.
+
+A suffix with missing `started`/`ended`, evictions, a partial final line or
+nonzero `edges_unretained` does not prove complete history or final state.
+Order observations by `seq`, keep cumulative counts as lower bounds, and
+never sum successive cumulative records for an edge.
 - `caller_observed` / `module_observed`: full snapshot record shapes
   (test/sync emission only; production streams caller turnover as
   `caller_event` instead).
@@ -238,11 +297,16 @@ creation and the initial `started` append remain fail-fast.
 ## Privacy and loss accounting
 
 Privacy bounds and loss accounting apply EXACTLY as to snapshots:
-caller/module payloads carry exactly the snapshot caller/module keys;
-edge payloads add only the three derived states; gap payloads equal
+caller/module dictionary payloads carry exactly the snapshot caller/module keys;
+edge payloads add the three derived states and the reviewed compact identity
+projection from the same revision; gap payloads equal
 snapshot gaps' identity fields (`repeats` replays from `gap_repeated`); no new capture exists anywhere in the stream. Gap
 retention (`gaps_suppressed`) and budget refusals mirror the snapshot
 document pass for pass.
+Inline placement and bounded rotation lifetime are authorized by the
+[P5U amendment](../privacy/allowlist-v3.md#inline-inventory-identity-p5u-2026-10-09).
+It adds no reads or capture and publishes no command line, environment, `comm`,
+raw native tgid, task cookie or exec ID in these compact contexts.
 
 ## Example (abridged)
 

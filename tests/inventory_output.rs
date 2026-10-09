@@ -134,3 +134,24 @@ fn signal_stall_without_report() {
 fn signal_progress_without_report() {
     control_mode("signal-progress", true);
 }
+
+#[test]
+fn additive_inline_identity_preserves_legacy_event_fields() {
+    #[derive(serde::Deserialize)]
+    struct LegacyEdge {
+        caller: String,
+        module: String,
+        entries: serde_json::Value,
+    }
+    let legacy = r#"{"caller":"c7","module":"m2","entries":{"count":9}}"#;
+    let additive = r#"{"caller":"c7","module":"m2","entries":{"count":9},"identity_context":{"version":1,"caller":{"id":"c7","status":"unavailable"},"module":{"id":"m2","status":"unavailable"}}}"#;
+    for record in [legacy, additive] {
+        let edge: LegacyEdge = serde_json::from_str(record).unwrap();
+        assert_eq!(edge.caller, "c7");
+        assert_eq!(edge.module, "m2");
+        assert_eq!(edge.entries["count"], 9);
+    }
+    // A retained suffix with only legacy records still has no name authority.
+    let old: serde_json::Value = serde_json::from_str(legacy).unwrap();
+    assert!(old.get("identity_context").is_none());
+}

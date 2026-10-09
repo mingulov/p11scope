@@ -318,14 +318,14 @@ fn stream_privacy_bounds_match_snapshots_exactly() {
             .collect();
         assert_eq!(keys, module_keys, "module payload == snapshot keys");
     }
-    // Edge payloads add ONLY the three derived presentation states.
+    // Edge facts preserve snapshot keys; the additive context is independently allowlisted.
     let mut edge_keys: BTreeSet<&str> = document["edges"][0]
         .as_object()
         .unwrap()
         .keys()
         .map(String::as_str)
         .collect();
-    edge_keys.extend(["presence", "capture", "activity"]);
+    edge_keys.extend(["presence", "capture", "activity", "identity_context"]);
     for (_, line) in lines
         .iter()
         .filter(|(_, line)| line["kind"] == "edge_observed")
@@ -336,7 +336,10 @@ fn stream_privacy_bounds_match_snapshots_exactly() {
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(keys, edge_keys, "edge payload == snapshot keys + states");
+        assert_eq!(
+            keys, edge_keys,
+            "edge payload == snapshot keys + states + compact context"
+        );
     }
 }
 
@@ -371,9 +374,14 @@ fn incremental_pass_events_match_the_final_snapshot() {
         Presentation::capture(harness.coordinator(), "workload", started, ended, passes);
     // Emit the pass the way production does (caller turnover, new
     // gaps, pass marker).
+    let identities = IdentityIndex::new(&presentation);
     for event in &events {
         writer
-            .append("caller_event", caller_event_payload(event), now)
+            .append(
+                "caller_event",
+                caller_event_payload(event, &identities),
+                now,
+            )
             .unwrap();
     }
     let emitted_gaps = GapEmitter::new()
@@ -752,7 +760,13 @@ fn the_dump_fit_bound_is_exact_at_its_boundary() {
     let mut writer = EventWriter::create(&dir.path().join("big.jsonl"), 1 << 20, 2).unwrap();
     let mut emitter = EdgeEmitter::new();
     emitter
-        .emit(&mut writer, &presentation.edges, 64, 1)
+        .emit(
+            &mut writer,
+            &presentation.edges,
+            &IdentityIndex::new(&presentation),
+            64,
+            1,
+        )
         .unwrap();
     let edges = presentation.edges.len() as u64;
     let need = emitter.carried_bytes + DUMP_LINE_SLACK * edges + DUMP_TAIL_RESERVE;

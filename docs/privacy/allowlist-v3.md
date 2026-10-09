@@ -5,7 +5,9 @@
 except [Inventory caller identity](#inventory-caller-identity-owner-ruling-fb-priv),
 which is IMPLEMENTED in v0.2.0 by owner ruling FB-PRIV (2026-10-03), and
 [offline inventory diff re-projection](#offline-inventory-diff-re-projection),
-which describes the implemented offline report and grants no capture authority.**
+which describes the implemented offline report and grants no capture authority,
+and [inline inventory identity](#inline-inventory-identity-p5u-2026-10-09),
+which implements the reviewed compact re-projection with no new capture.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -436,6 +438,37 @@ new kernel-side state is the per-pair entry counter BPF already keeps.
 | Field | Source, authority and validation | Retention and public output | Failure and required evidence |
 | --- | --- | --- | --- |
 | Per-edge entry count and last activity (C7 C4) | The uprobe firing on an admitted endpoint, counted in BPF against the existing CALLER_USE key for the (caller image, provider object) pair. No target-memory read, no argument read, no BPF timestamp: recency is derived in userspace from the read instant. | Public per (caller incarnation × module) edge in `p11scope/inventory/v1` (`edges[].entries`: saturating lower-bound `count` of entries on attached endpoints since the pair's first record, including calls that returned errors, with `last_seen_ns` at pass resolution), the inventory event stream's `edge_observed` records, and the inventory dashboard/pager. Never per function, per thread, or per call time. A pair with no row reads `unknown (uncounted)` and names the `PairInsertFailure` evidence, never 0. | A count read mid-capture is a lower bound; only the post-stop read is final, and settlement stays `unsettled`. An unreadable health cell withholds watches without inventing counts. Documented in [inventory v1](../schema/inventory-v1.md) (`edges[].entries.coverage`) and [inventory events v1](../schema/inventory-events-v1.md) (`edge_observed`). |
+
+## Inline inventory identity (P5U, 2026-10-09)
+
+**Status: IMPLEMENTED inline re-projection; root reviewed the concrete
+amendment on 2026-10-09 before publication activation. Installed-file and
+privacy qualification remain separate gates.**
+This placement and retention amendment reprojects only inventory caller and
+module identity already retained in one immutable `Presentation` revision.
+It authorizes no additional collection, `/proc` lookup, target-memory or
+argument read. The caller authority and observer `/proc` PID numbering remain
+those of the inventory caller row above; `scan_pinned` never becomes
+`native_exact`. Capture-local IDs remain the join keys, never names or paths.
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| `edge_observed.identity_context` | Only the same immutable publication revision's referenced caller/module records; no late PID lookup. `version: 1`; `caller` contains exactly `id`, `pid`, `incarnation`, `start_time`, `authority`, `lifecycle`, `executable`, `status`. A non-null `executable` contains exactly `dev`, `ino`, `mtime_secs`, `mtime_nanos`, `path`. `module` contains exactly `id`, `device_major`, `device_minor`, `inode`, `path`, `status`. | One compact context in the edge's own JSONL record, for the existing bounded event-file rotation/retention lifetime only. One observed UTF-8 path per subject, at most 4096 bytes before escaping; module path is the lexicographically first retained path. No path array or duplicated full caller/module record. Total encoded context is at most 65536 bytes. | Subject `status` is exactly `observed`, `unavailable`, `path_budget`, or `context_budget`. Missing referenced records retain their capture-local ID with every other subject field null and status `unavailable`. An absent executable/path is null and unavailable. An overlong path becomes null with `path_budget`; physical metadata remains. Encoded overflow retains IDs only, nulls all other fields and sets both statuses to `context_budget`. Exact key-set and forbidden-neighbor controls run through real commit, stop and sweep; actual rotation/ended accounting includes context bytes. |
+| `caller_event.identity_context` | Same revision and caller projection as above. `version: 1`; admitted/exited records contain `caller`; exec-retired/reused records contain `old` and `new`, matching their existing capture-local references. | The context accompanies the turnover record, including retirement; lifecycle describes that revision only. `admit_failed` retains its existing PID/reason/budget shape with no identity context or invented incarnation. The same path/context bounds and bounded file lifetime apply. | Missing old/new/caller records stay explicitly unavailable. Tests require nonempty expected executable positives, old/new preservation, metadata-only changes and queued reversion under the existing per-pass cap. |
+
+Earlier records are observations of their own revision; a retained suffix does
+not establish complete capture history or a later final state. Missing
+`started`/`ended`, eviction, a partial last line, or nonzero `edges_unretained`
+retain their existing incomplete-history meaning. Contextless older records
+require their matching snapshot for names; consumers must not guess. Counts
+remain cumulative lower bounds and successive records must never be summed.
+
+This amendment publishes no command line, arguments, environment, `comm`, raw
+native tgid, task cookie or exec ID, hash/build ID, module admission reasons or
+history, semantic subtree, or object graph. It adds no other mode or unbounded
+history retention. V1/v2 bytes and exclusions and the offline comparison
+amendment below remain unchanged. Installed/privacy qualification remains a
+separate gate; a source-level producer test is not an installed-file receipt.
 
 ## Offline inventory diff re-projection
 

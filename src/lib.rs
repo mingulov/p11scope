@@ -42,6 +42,7 @@ pub mod inventory;
 pub(crate) mod inventory_capture;
 pub mod inventory_dashboard;
 pub mod inventory_diff;
+pub(crate) mod inventory_event_identity;
 pub mod inventory_events;
 pub(crate) mod inventory_output;
 pub mod inventory_present;

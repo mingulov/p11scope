@@ -709,6 +709,23 @@ impl Engine {
             .last_complete_revision)
     }
 
+    /// Exhaust one owner's checked claim revision (H6 slice 2 tests): the
+    /// next validated-exec invalidation must refuse permanently at this
+    /// boundary with history intact. Unreachable in production except by
+    /// counter exhaustion.
+    #[cfg(test)]
+    pub(crate) fn test_exhaust_owner_revision(&mut self, owner: ProcessViewId) -> Result<()> {
+        self.inventory_state()?;
+        self.inventory
+            .as_mut()
+            .expect("checked Inventory state")
+            .owners
+            .get_mut(&owner)
+            .ok_or_else(|| anyhow!("inventory owner is no longer retained"))?
+            .revision = u64::MAX;
+        Ok(())
+    }
+
     /// Owner bookkeeping snapshot for tests: refresh epochs, dirty
     /// causes, image state, and the last complete revision. Production
     /// learns the same facts through commit receipts.

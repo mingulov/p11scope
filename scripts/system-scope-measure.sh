@@ -290,16 +290,22 @@ collect_receipt() {
 # wait_attach <cond_dir> <observer_pid> <observer_birth> <timeout_s> — hold the go file
 # until discovery is done (marker on the timestamped stderr passthrough)
 # AND the attach session is complete: the observer prints
-# "p11scope: attached N probe(s)" on stderr once the attach session
-# completes, strictly before the capture loop (0801e79c), so that line is
-# the in-observer attach-end signal. The old first-live-frame stdout
-# signal died with M-10 (7eb86f0d made live frames terminal-only) while
-# the harness captures observer stdout to a file, so a frame gate could
-# never fire. An fd plateau is NOT the gate — under load attach stalls
-# for seconds mid-ramp and a plateau detector fires early, releasing the
-# workload burst into a half-attached observer (observed once: 1/20000
-# calls). Returns 2 if the observer is terminal and 3 if its exact
-# identity cannot be inspected.
+# "p11scope: capturing: N probe(s) attached; stop with Ctrl-C" on stderr
+# once probes are attached and the capture loop starts (capture_ready_line
+# in src/run.rs — "the one readiness line ... scripts and supervisors
+# wait for this line"), so that line is the in-observer attach-end signal.
+# The 0801e79c "p11scope: attached N probe(s)" line is dead: merge
+# 79a54f53 dropped it as a duplicate of the capturing line, so gating on
+# it waits forever. The old first-live-frame stdout signal died with M-10
+# (7eb86f0d made live frames terminal-only) while the harness captures
+# observer stdout to a file, so a frame gate could never fire. An fd
+# plateau is NOT the gate — under load attach stalls for seconds mid-ramp
+# and a plateau detector fires early, releasing the workload burst into a
+# half-attached observer (observed once: 1/20000 calls). A zero-probe
+# capturing line still fires the gate (unlike bench-overhead.sh's
+# zero-probe refusal): readiness means the attach session completed, and
+# post-hoc counts prove the window. Returns 2 if the observer is terminal
+# and 3 if its exact identity cannot be inspected.
 wait_attach() {
     end=$(( $(date +%s) + $4 ))
     while :; do
@@ -308,7 +314,7 @@ wait_attach() {
         case "$owned_live_status" in 0) ;; 1) return 2 ;; *) return 3 ;; esac
         [ "$(date +%s)" -lt "$end" ] || return 1
         if grep -q "p11scope: discovery:" "$1/stderr.txt" 2>/dev/null \
-            && grep -q -E "p11scope: attached [0-9]+ probes?" "$1/stderr.txt" 2>/dev/null; then
+            && grep -q -E "p11scope: capturing: [0-9]+ probe\(s\) attached" "$1/stderr.txt" 2>/dev/null; then
             return 0
         fi
         sleep 0.2

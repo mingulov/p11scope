@@ -400,11 +400,13 @@ def bpftool_dump_timed(map_id, reps=3):
 # Observer run + attach gate.
 # --------------------------------------------------------------------------
 
-# Attach-complete signal: the observer prints one stderr line once the
-# attach session completes (src/run.rs format_attach_complete, 0801e79c),
-# strictly before the capture loop — 'p11scope: attached N probe' for one
-# probe, 'p11scope: attached N probes' otherwise. Both spellings match.
-_ATTACH_COMPLETE_RE = re.compile(r"p11scope: attached [0-9]+ probes?")
+# Attach-complete signal: the observer prints one stderr readiness line once
+# probes are attached and the capture loop starts (capture_ready_line in
+# src/run.rs) — 'p11scope: capturing: N probe(s) attached; stop with
+# Ctrl-C'. The 0801e79c 'p11scope: attached N probe(s)' spelling is dead:
+# merge 79a54f53 dropped it as a duplicate of the capturing line.
+_ATTACH_COMPLETE_RE = re.compile(
+    r"p11scope: capturing: [0-9]+ probe\(s\) attached")
 
 
 def has_attach_complete_line(stderr_text):

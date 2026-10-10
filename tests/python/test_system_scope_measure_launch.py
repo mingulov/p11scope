@@ -108,7 +108,8 @@ class SystemScopeMeasureLaunchTests(unittest.TestCase):
             condition.mkdir()
             (condition / "stderr.txt").write_text(
                 "p11scope: discovery:\n"
-                "p11scope: attached 136 probes\n", encoding="utf-8")
+                "p11scope: capturing: 136 probe(s) attached; stop with "
+                "Ctrl-C\n", encoding="utf-8")
             (condition / "observer.stdout").write_text(
                 "probes attached\n", encoding="utf-8")
             live = subprocess.Popen(["sleep", "30"])
@@ -414,22 +415,24 @@ class SystemScopeMeasureLaunchTests(unittest.TestCase):
 
 
 class PrivilegedAttachGateTests(unittest.TestCase):
-    """Both wait_attach copies gate on the stderr attach-complete line.
+    """Both wait_attach copies gate on the stderr capturing line.
 
     Since M-10 (7eb86f0d) live frames render only on a terminal while the
     harness captures observer stdout to a file, the old stdout "probes
     attached" frame signal can never fire. The gate is the discovery
-    marker AND the product's stderr attach-complete line (0801e79c).
+    marker AND the product's stderr readiness line (capture_ready_line in
+    src/run.rs). The 0801e79c "p11scope: attached N probe(s)" line is
+    dead: merge 79a54f53 dropped it as a duplicate of the capturing line.
     """
 
     maxDiff = None
 
     # Exact spellings pinned by the product test
-    # attach_complete_line_names_the_probe_count (src/run.rs).
+    # capture_ready_line_names_probes_and_how_to_stop (src/run.rs).
     ATTACH_SPELLINGS = (
-        "p11scope: attached 0 probes",
-        "p11scope: attached 1 probe",
-        "p11scope: attached 136 probes",
+        "p11scope: capturing: 0 probe(s) attached; stop with Ctrl-C",
+        "p11scope: capturing: 1 probe(s) attached; stop with Ctrl-C",
+        "p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C",
     )
     DISCOVERY = ("p11scope: discovery: 1 module(s), 68 attach slot(s), "
                  "scan 8ms, conflicts 0, uncorroborated 0")

@@ -1260,15 +1260,37 @@ fn running_as_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-/// The observation keys the scan lane has always carried; the native lane
-/// adds `lane`, `settlement` and `retirement`.
-const SCAN_OBSERVATION_KEYS: [&str; 5] = [
+/// The observation keys the scan lane carries: the five historical keys
+/// plus the `semantic_capture` summary (disabled in the scan lane, which
+/// has no Detailed lane). The native lane adds `lane`, `settlement` and
+/// `retirement`.
+const SCAN_OBSERVATION_KEYS: [&str; 6] = [
     "ended_ns",
     "native_witnesses",
     "passes",
+    "semantic_capture",
     "started_ns",
     "usage_feed",
 ];
+
+/// The scan lane's `observation.semantic_capture` value: no Detailed lane
+/// and no startup failure, so status `disabled` with zero counts,
+/// `stop_quiescence` `not_requested`, and `final_drain` null.
+fn assert_scan_semantic_capture(doc: &Value, context: &str) {
+    assert_eq!(
+        doc["observation"]["semantic_capture"],
+        serde_json::json!({
+            "status": "disabled",
+            "admitted_endpoints": 0,
+            "refused_endpoints": 0,
+            "continuity_cuts": 0,
+            "unrouted_returns": 0,
+            "stop_quiescence": "not_requested",
+            "final_drain": null,
+        }),
+        "{context}"
+    );
+}
 
 fn observation_keys(doc: &Value) -> Vec<String> {
     let mut keys: Vec<String> = doc["observation"]
@@ -1343,6 +1365,7 @@ fn capture_auto_without_privilege_falls_back_to_scan_with_a_named_gap() {
         assert!(gap["caller"].is_null() && gap["module"].is_null() && gap["pid"].is_null());
         assert!(!gap["reason"].as_str().unwrap().is_empty());
         assert_eq!(observation_keys(&doc), SCAN_OBSERVATION_KEYS, "{args:?}");
+        assert_scan_semantic_capture(&doc, &format!("{args:?}"));
         for edge in doc["edges"].as_array().unwrap() {
             assert_eq!(edge["entries"]["coverage"]["reason"], "scan_only", "{edge}");
         }
@@ -1365,6 +1388,7 @@ fn capture_scan_keeps_the_scan_lane_document() {
     );
     let doc: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
     assert_eq!(observation_keys(&doc), SCAN_OBSERVATION_KEYS);
+    assert_scan_semantic_capture(&doc, "--capture scan");
     assert!(
         !gap_subjects(&doc)
             .iter()

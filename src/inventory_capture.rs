@@ -411,6 +411,15 @@ pub(crate) trait LaneHost<Pin> {
     /// The lane's terminal count refresh never completed: demote the
     /// retained counts to lower bounds (P1-5 terminal-first).
     fn note_refresh_loss(&mut self, reason: String);
+    /// The pass loop ended: gate the host before the (possibly slow)
+    /// retirement runs. The gate refuses every NEW scan, attach,
+    /// successor/name admission and retry; it never blocks the drain —
+    /// the stop's terminal `stage_native` quanta (witness counts,
+    /// lifecycle evidence including leader-exit link loss, and staged
+    /// semantic batches) still absorb and publish through the final
+    /// commit. The classic loop calls this exactly once per run, right
+    /// after the driver's own prompt gate.
+    fn stop_coordinator(&mut self) {}
 }
 
 impl<S: ProcessSource> LaneHost<S::Pin> for InventoryCoordinator<S> {
@@ -461,6 +470,10 @@ impl<S: ProcessSource> LaneHost<S::Pin> for InventoryCoordinator<S> {
 
     fn note_refresh_loss(&mut self, reason: String) {
         InventoryCoordinator::note_refresh_loss(self, reason);
+    }
+
+    fn stop_coordinator(&mut self) {
+        InventoryCoordinator::stop(self);
     }
 }
 
@@ -1562,6 +1575,9 @@ where
     // retirement. A scan run gates too: a refused native lane never
     // implies a refused semantic lane elsewhere.
     driver.on_stop_requested();
+    // The host gate runs with the driver's: terminal EXEC records retire
+    // without minting successors, while terminal staging still drains.
+    driver.host().stop_coordinator();
     let Some(lane) = lane else {
         // Publish the failure gap without repeating the failed scan/pass.
         if error.is_some() {

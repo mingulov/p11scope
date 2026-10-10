@@ -1,5 +1,7 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! Owned, ignored live gates for the native inventory lane (Task 6 C5.1).
+//! Owned, ignored live gates for the native inventory lane (Task 6 C5.1),
+//! plus the D3d forced-kernel sweep cells (production identity proof over
+//! owned btrfs fixtures through the production classic path).
 //! Root BPF lane, run serially through `scripts/run-privileged-lib-tests.sh`.
 //! Every caller is an owned `inventory-ledger` process (the C8 acceptance
 //! workload) against SoftHSM2 or the ledger's held provider, with its own
@@ -2930,5 +2932,434 @@ fn privileged_native_lane_system_many_endpoints_lp64() -> Result<()> {
         );
     }
     drop(mappers);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// D3d privileged gates: forced-kernel production proof cells.
+// ---------------------------------------------------------------------------
+
+use std::collections::BTreeSet;
+
+/// D3d forced-kernel sweep fixtures: three holders dlopen the complete
+/// provider ELF through the normal loader, a fourth maps a byte-identical
+/// different file, a fifth maps the provider data-only. All are direct
+/// children of the test process (the observer), on a proof-requiring
+/// btrfs fixture root, with independent /proc ground truth. Killed and
+/// reaped on drop.
+struct IdentitySweep {
+    provider: PathBuf,
+    holders: Vec<u32>,
+    holder_ranges: Vec<Vec<(u64, u64)>>,
+    copy_pid: u32,
+    dataonly_pid: u32,
+    children: Vec<Child>,
+    _dir: tempfile::TempDir,
+}
+
+impl Drop for IdentitySweep {
+    fn drop(&mut self) {
+        for child in &mut self.children {
+            let _ = child.kill();
+        }
+        for child in &mut self.children {
+            let _ = child.wait();
+        }
+    }
+}
+
+impl IdentitySweep {
+    fn manifest(rel: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
+    }
+
+    fn gcc(dir: &Path, out: &str, source: &Path, args: &[&str], libs: &[&str]) -> Result<PathBuf> {
+        let bin = dir.join(out);
+        let status = Command::new("gcc")
+            .args(args)
+            .arg("-o")
+            .arg(&bin)
+            .arg(source)
+            .args(libs)
+            .status()
+            .context("running gcc")?;
+        ensure!(status.success(), "gcc failed for {out}");
+        Ok(bin)
+    }
+
+    /// Whether `dir` lives on btrfs (statfs magic): the proof-requiring
+    /// filesystem these cells demand for their fixtures.
+    fn dir_is_btrfs(dir: &Path) -> Result<bool> {
+        use std::os::unix::ffi::OsStrExt as _;
+        const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
+        let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+        // SAFETY: statfs writes the whole struct on success.
+        let rc = unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) };
+        ensure!(
+            rc == 0,
+            "statfs {}: {}",
+            dir.display(),
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: success above initialized it.
+        let stat = unsafe { stat.assume_init() };
+        Ok(stat.f_type as u64 == BTRFS_SUPER_MAGIC)
+    }
+
+    /// Independent ground truth: executable mappings of `provider` in `pid`
+    /// from /proc, read without the observer.
+    fn exec_ranges_for(pid: u32, provider: &Path) -> Result<Vec<(u64, u64)>> {
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"))?;
+        let target = provider.to_str().context("provider path")?.to_string();
+        let mut ranges = Vec::new();
+        for line in maps.lines() {
+            let mut parts = line.split_whitespace();
+            let range = parts.next().unwrap_or("");
+            let perms = parts.next().unwrap_or("");
+            for _ in 0..3 {
+                parts.next();
+            }
+            let path = parts.next().unwrap_or("");
+            if perms.starts_with("r-x")
+                && path == target
+                && let Some((low, high)) = range.split_once('-')
+                && let (Ok(low), Ok(high)) =
+                    (u64::from_str_radix(low, 16), u64::from_str_radix(high, 16))
+            {
+                ranges.push((low, high));
+            }
+        }
+        Ok(ranges)
+    }
+
+    fn sha256_file(path: &Path) -> Result<String> {
+        use sha2::Digest as _;
+        let mut digest = sha2::Sha256::new();
+        digest.update(std::fs::read(path)?);
+        Ok(digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect())
+    }
+
+    fn build(so_name: &str, minor: u32) -> Result<Self> {
+        let dir = tempfile::tempdir()?;
+        ensure!(
+            Self::dir_is_btrfs(dir.path())?,
+            "D3d kernel cell needs TMPDIR on btrfs (proof-requiring fixtures); run by hand \
+             as root: TMPDIR=<btrfs dir> <libtest> --exact <path> --ignored --test-threads=1 \
+             --nocapture"
+        );
+        let driver = Self::gcc(
+            dir.path(),
+            "driver",
+            &Self::manifest("tests/fixtures/catalog-driver.c"),
+            &["-O2", "-Wall", "-Wextra", "-Werror"],
+            &["-ldl"],
+        )?;
+        let dataonly = Self::gcc(
+            dir.path(),
+            "dataonly",
+            &Self::manifest("tests/fixtures/identity-dataonly.c"),
+            &["-O2", "-Wall", "-Wextra", "-Werror"],
+            &[],
+        )?;
+        let minor_flag = format!("-DLEGACY_MINOR={minor}");
+        let provider = Self::gcc(
+            dir.path(),
+            so_name,
+            &Self::manifest("crates/discover/tests/fixture/version_matrix.c"),
+            &["-shared", "-fPIC", &minor_flag],
+            &[],
+        )?;
+        let copy = dir.path().join("gate-copy.so");
+        std::fs::copy(&provider, &copy)?;
+        ensure!(
+            std::fs::read(&provider)? == std::fs::read(&copy)?,
+            "byte-identical copy"
+        );
+        let mut children = Vec::new();
+        let mut spawn = |name: &str, binary: &Path, lib: &Path| -> Result<u32> {
+            let ready = dir.path().join(format!("{name}.ready"));
+            let log = std::fs::File::create(dir.path().join(format!("{name}.log")))?;
+            children.push(
+                Command::new(binary)
+                    .arg("--ready")
+                    .arg(&ready)
+                    .arg("--sleep")
+                    .arg("300")
+                    .arg(lib)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::from(log.try_clone()?))
+                    .stderr(Stdio::from(log))
+                    .spawn()?,
+            );
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&ready)
+                    && let Some(pid) = text.split_whitespace().nth(1)
+                {
+                    return pid.parse().context("ready pid");
+                }
+                ensure!(Instant::now() < deadline, "{name} never became ready");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        let mut holders = Vec::new();
+        for name in ["H1", "H2", "H3"] {
+            holders.push(spawn(name, &driver, &provider)?);
+        }
+        let copy_pid = spawn("C", &driver, &copy)?;
+        let dataonly_pid = spawn("D", &dataonly, &provider)?;
+        // Ground truth while holders live (mappings are static sleeps).
+        let mut holder_ranges = Vec::new();
+        for pid in &holders {
+            let ranges = Self::exec_ranges_for(*pid, &provider)?;
+            ensure!(!ranges.is_empty(), "holder {pid} maps the provider exec");
+            holder_ranges.push(ranges);
+        }
+        Ok(Self {
+            provider,
+            holders,
+            holder_ranges,
+            copy_pid,
+            dataonly_pid,
+            children,
+            _dir: dir,
+        })
+    }
+
+    /// One production run with forced kernel over this sweep.
+    fn run_forced_kernel(
+        &self,
+        cap: usize,
+        duration: Option<Duration>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<serde_json::Value> {
+        let mut stdout = Vec::new();
+        let code = run_with_terminal_diagnostics(
+            InspectScope::System,
+            std::slice::from_ref(&self.provider),
+            &HookRegistry::builtin(),
+            true,
+            Some(cap),
+            None,
+            duration,
+            None,
+            false,
+            None,
+            None,
+            None,
+            CaptureMode::Scan,
+            crate::attach::BackendSelection::Auto,
+            Some(crate::cli::IdentityBackendSelection::Kernel),
+            stop,
+            &|| {},
+            false,
+            &mut crate::inventory_output::WriterStdout(&mut stdout),
+            &DashboardIo::stdio(),
+            DiagnosticRequest::disabled(),
+            None,
+        )?;
+        ensure!(code == 0, "exit code {code}");
+        Ok(serde_json::from_slice(&stdout)?)
+    }
+
+    fn callers_for(doc: &serde_json::Value, pid: u64) -> Vec<&serde_json::Value> {
+        doc["callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|caller| caller["pid"] == pid)
+            .collect()
+    }
+
+    /// The full positive gate: kernel backend with no fallback, the exact
+    /// three holder/provider edges, zero false edges over all enumerated
+    /// module edges, both negatives un-edged, and per-range coverage of
+    /// every owned requested exec range.
+    fn assert_kernel_positive(&self, doc: &serde_json::Value, so_name: &str) -> Result<()> {
+        ensure!(
+            doc["observation"]["identity"]["backend"] == "kernel",
+            "identity: {}",
+            doc["observation"]["identity"]
+        );
+        ensure!(
+            doc["observation"]["identity"]["fallback"].is_null(),
+            "identity: {}",
+            doc["observation"]["identity"]
+        );
+        let modules: Vec<&serde_json::Value> = doc["modules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|module| {
+                module["paths"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|path| path.as_str().unwrap().rsplit('/').next().unwrap() == so_name)
+            })
+            .collect();
+        ensure!(modules.len() == 1, "exactly one module for {so_name}");
+        let module_id = modules[0]["id"].as_str().unwrap();
+        let mut edge_callers = BTreeSet::new();
+        for edge in doc["edges"].as_array().unwrap() {
+            if edge["module"] == module_id {
+                edge_callers.insert(edge["caller"].as_str().unwrap().to_string());
+            }
+        }
+        ensure!(edge_callers.len() == 3, "complete expected edge set");
+        for pid in &self.holders {
+            let callers = Self::callers_for(doc, u64::from(*pid));
+            ensure!(callers.len() == 1, "holder {pid} is one caller");
+            ensure!(
+                edge_callers.contains(callers[0]["id"].as_str().unwrap()),
+                "holder {pid} keeps its kernel edge"
+            );
+        }
+        for caller_id in &edge_callers {
+            let pid = doc["callers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|caller| caller["id"] == *caller_id)
+                .unwrap()["pid"]
+                .as_u64()
+                .unwrap() as u32;
+            ensure!(
+                self.holders.contains(&pid),
+                "edge caller {caller_id} (pid {pid}) is a ledgered holder"
+            );
+        }
+        ensure!(
+            !Self::callers_for(doc, u64::from(self.copy_pid)).is_empty(),
+            "copy holder is an inventoried caller"
+        );
+        for (pid, why) in [
+            (self.copy_pid, "byte-identical different file"),
+            (self.dataonly_pid, "data-only mapping"),
+        ] {
+            for caller in Self::callers_for(doc, u64::from(pid)) {
+                ensure!(
+                    !edge_callers.contains(caller["id"].as_str().unwrap()),
+                    "{why} (pid {pid}) must not edge to the original provider"
+                );
+            }
+        }
+        // Per-range coverage: every ground-truth set is nonempty and the
+        // same provider maps uniformly, and all three holders edge — an
+        // edge is all caller ranges or nothing.
+        let counts: Vec<usize> = self.holder_ranges.iter().map(Vec::len).collect();
+        ensure!(counts.iter().all(|count| *count >= 1), "{counts:?}");
+        ensure!(
+            counts.iter().all(|count| *count == counts[0]),
+            "uniform provider layout: {counts:?}"
+        );
+        Ok(())
+    }
+}
+
+/// Live processes on this host (numeric /proc entries): a sweep cap is
+/// only attempted past it, so every attempt forces sweep proof.
+fn live_process_count() -> u64 {
+    std::fs::read_dir("/proc")
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.bytes().all(|b| b.is_ascii_digit()))
+                })
+                .count() as u64
+        })
+        .unwrap_or(0)
+}
+
+/// D3d privileged gate: forced kernel proves the full ledgered sweep set
+/// through the production classic path on a proof-requiring btrfs
+/// fixture — exact three holder/provider edges, zero false edges, both
+/// negatives, per-range coverage, `backend == kernel`, `fallback ==
+/// null`. A refused host fails here (no environment skip): the gate
+/// names a kernel-identity-capable host.
+#[test]
+#[ignore = "root-owned live BPF lane; D3d forced-kernel sweep cell over a btrfs fixture"]
+fn privileged_identity_kernel_sweep_cell_lp64() -> Result<()> {
+    let sweep = IdentitySweep::build("gate-k1.so", 242)?;
+    let procs = live_process_count();
+    let mut last = String::new();
+    for cap in [8usize, 32, 128] {
+        if procs <= cap as u64 {
+            last = format!("cap {cap}: skipped (only {procs} live processes)");
+            continue;
+        }
+        let doc = sweep.run_forced_kernel(cap, None, &|| false)?;
+        let identity = &doc["observation"]["identity"];
+        if identity["backend"] == "kernel" && identity["fallback"].is_null() {
+            sweep.assert_kernel_positive(&doc, "gate-k1.so")?;
+            eprintln!(
+                "D3D_KERNEL_CELL mode=single cap={cap} edges=3/3 ranges={:?} \
+                 provider_sha256={} backend=kernel fallback=null",
+                sweep.holder_ranges.iter().map(Vec::len).collect::<Vec<_>>(),
+                IdentitySweep::sha256_file(&sweep.provider)?,
+            );
+            return Ok(());
+        }
+        last = format!(
+            "cap {cap}: backend={} fallback={}",
+            identity["backend"], identity["fallback"]
+        );
+    }
+    bail!("no cap proved the forced-kernel cell (live procs {procs}): {last}");
+}
+
+/// D3d privileged gate: forced kernel sustains the full positive cell
+/// across repeated passes on its one capture-owned session (per-pass
+/// fresh installs under fresh generations, sticky status and counters
+/// shared): at least two passes, then the exact edges, zero false
+/// edges, both negatives, per-range coverage, `backend == kernel`,
+/// `fallback == null` in the final document.
+#[test]
+#[ignore = "root-owned live BPF lane; D3d forced-kernel multi-pass session reuse over a btrfs fixture"]
+fn privileged_identity_kernel_multipass_reuse_lp64() -> Result<()> {
+    let sweep = IdentitySweep::build("gate-k2.so", 243)?;
+    let procs = live_process_count();
+    // Find a cap with a selected supplier first (single snapshots, as in
+    // the single-pass gate); the multipass run then reuses that cap.
+    let mut cap = None;
+    for candidate in [8usize, 32, 128] {
+        if procs <= candidate as u64 {
+            continue;
+        }
+        let doc = sweep.run_forced_kernel(candidate, None, &|| false)?;
+        if doc["observation"]["identity"]["backend"] == "kernel"
+            && doc["observation"]["identity"]["fallback"].is_null()
+        {
+            sweep.assert_kernel_positive(&doc, "gate-k2.so")?;
+            cap = Some(candidate);
+            break;
+        }
+    }
+    let cap = cap.context("no cap proved the forced-kernel cell")?;
+    let started = Instant::now();
+    let doc = sweep.run_forced_kernel(cap, Some(Duration::from_secs(30)), &|| {
+        started.elapsed() > Duration::from_secs(12)
+    })?;
+    let passes = doc["observation"]["passes"].as_u64().unwrap_or(0);
+    ensure!(
+        passes >= 2,
+        "expected repeated installs, got {passes} pass(es)"
+    );
+    sweep.assert_kernel_positive(&doc, "gate-k2.so")?;
+    eprintln!(
+        "D3D_KERNEL_CELL mode=multi cap={cap} passes={passes} edges=3/3 ranges={:?} \
+         provider_sha256={} backend=kernel fallback=null",
+        sweep.holder_ranges.iter().map(Vec::len).collect::<Vec<_>>(),
+        IdentitySweep::sha256_file(&sweep.provider)?,
+    );
     Ok(())
 }

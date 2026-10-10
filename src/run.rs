@@ -3597,6 +3597,12 @@ enum DiscoveryPass {
     /// Between frames, the pause service alone, for a stop the helper has
     /// already requested: `service_pending_stop` (F-T4-2).
     PendingStop,
+    /// Between frames, one bounded retained-FIFO quantum — at most 256
+    /// ordinary dispatches or one selected pressure-service transaction —
+    /// then yield: `service_backlog_quantum` (H5 Decision 3). Never rearms
+    /// or claims an owned pause, never changes the frame clock/counter,
+    /// never reads aggregate maps or renders.
+    Backlog,
 }
 
 // Proof service follows the existing discovery cadence. Both sides of the
@@ -3675,11 +3681,14 @@ fn discovery_due(
     since_frame: Duration,
     drain: Duration,
     stop_pending: impl FnOnce() -> bool,
+    backlog_pending: impl FnOnce() -> bool,
 ) -> Option<DiscoveryPass> {
     if since_frame >= drain {
         Some(DiscoveryPass::Frame)
     } else if stop_pending() {
         Some(DiscoveryPass::PendingStop)
+    } else if backlog_pending() {
+        Some(DiscoveryPass::Backlog)
     } else {
         None
     }
@@ -3990,8 +3999,8 @@ fn advance_trace_frame_clock(frame_clock: &mut Instant, pass: DiscoveryPass, now
 }
 
 /// Counts one gated discovery pass: only a frame pass counts a frame, and
-/// its forced-sweep verdict travels with it, so a pending-stop pass
-/// neither shifts the cadence nor forces a sweep.
+/// its forced-sweep verdict travels with it, so a pending-stop or backlog
+/// pass neither shifts the cadence nor forces a sweep.
 fn count_discovery_pass(frame_tick: &mut u64, pass: DiscoveryPass) -> CountedPass {
     match pass {
         DiscoveryPass::Frame => {
@@ -4002,6 +4011,10 @@ fn count_discovery_pass(frame_tick: &mut u64, pass: DiscoveryPass) -> CountedPas
             }
         }
         DiscoveryPass::PendingStop => CountedPass {
+            pass,
+            force_full: false,
+        },
+        DiscoveryPass::Backlog => CountedPass {
             pass,
             force_full: false,
         },
@@ -4114,8 +4127,9 @@ fn discovery_stage_quantum(staged_len: usize, engine_held: usize) -> usize {
 /// Stages one quiescence poll's discovery items up to the shared allowance.
 /// Stops at the cap with `overflow` set instead of growing past it; the
 /// first unstaged record stays unread in the ring, and the caller stops
-/// draining discovery on later polls once `overflow` is set. Malformed items
-/// count as transport evidence, never as held records.
+/// draining discovery on later polls once `overflow` is set. Staged
+/// malformed items hold credits like staged records until the quiesced
+/// batch accounts them.
 fn stage_quiesced_discovery_items(
     mut next: impl FnMut() -> Option<crate::events::DiscoveryItem>,
     staged_records: &mut Vec<p11scope_ebpf_common::DiscoveryRecord>,
@@ -4124,7 +4138,11 @@ fn stage_quiesced_discovery_items(
     overflow: &mut bool,
 ) {
     for _ in 0..crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM {
-        if staged_records.len() >= cap {
+        if staged_records
+            .len()
+            .saturating_add(*staged_malformed as usize)
+            >= cap
+        {
             *overflow = true;
             return;
         }
@@ -4648,9 +4666,18 @@ fn capture_profile(
                 &mut context,
                 &mut consumers,
                 |context: &mut ProfileTickContext<'_, '_>, consumers: &mut CaptureConsumers<'_>| {
+                    // Fresh every tick: only this tick's backlog pass may
+                    // schedule a zero sleep below.
+                    consumers.scheduling.note_discovery_backlog(false);
+                    // Eager, not lazy: a second gate closure would fight the
+                    // stop closure for the context borrow, and this reads no
+                    // clock — the tick's one frame read stays the gate's.
+                    let discovery_pending = context
+                        .0
+                        .discovery_backlog_pending(context.1.staged_discovery_len());
                     let Some(pass) = discovery_due(tick_frame.since_frame, drain, || {
                         owned_stop_pending(context.0, context.1, context.2.as_deref(), interrupted)
-                    }) else {
+                    }, || discovery_pending) else {
                         return Ok((false, false, context.0.plan()));
                     };
                     #[cfg(test)]
@@ -4674,6 +4701,19 @@ fn capture_profile(
                             context.2.as_deref_mut(),
                             interrupted,
                         )?,
+                        DiscoveryPass::Backlog => {
+                            // One bounded retained quantum, then yield: the
+                            // outcome's dispatch flag is the same resync
+                            // signal a frame carries. Only a pass that both
+                            // progressed and left more work schedules a zero
+                            // sleep; a stuck pass returns to the wait.
+                            let outcome =
+                                context.0.service_backlog_quantum(context.1)?;
+                            consumers
+                                .scheduling
+                                .note_discovery_backlog(outcome.pending && outcome.progressed);
+                            (outcome.changed, false)
+                        }
                     };
                     consumers
                         .scheduling
@@ -4809,15 +4849,20 @@ fn capture_profile(
         // per drain interval, and a busy host overflows the ring in between
         // (RB-2). Staging applies nothing. The quantum and the readiness
         // poll share one allowance with what the Engine still holds (H5).
-        session.stage_discovery(discovery_stage_quantum(
-            session.staged_discovery_len(),
+        // The session enforces the shared allowance structurally from
+        // the same Engine-held count the quantum was sized from.
+        session.stage_discovery(
+            discovery_stage_quantum(
+                session.staged_discovery_len(),
+                engine.discovery_held_len(),
+            ),
             engine.discovery_held_len(),
-        ))?;
+        )?;
         wait_until_ready(
             &session.readiness_fds_with_held(engine.discovery_held_len()),
             ready_sleep_duration(
                 paused,
-                scheduling.last_drain_had_backlog(),
+                scheduling.last_drain_had_backlog() || scheduling.last_discovery_backlog(),
                 drain.saturating_sub(last_frame.elapsed()),
             ),
         );
@@ -5352,9 +5397,15 @@ fn capture_trace(
         ticks += 1;
         let tick_start = Instant::now();
         let elapsed = clock.elapsed();
+        // Fresh every tick: only this tick's backlog pass may
+        // schedule a zero sleep below.
+        scheduling.note_discovery_backlog(false);
+        // Eager, not lazy: a second gate closure would fight the stop
+        // closure for the engine/session borrow, and this reads no clock.
+        let discovery_pending = engine.discovery_backlog_pending(session.staged_discovery_len());
         let pass = discovery_due(last_frame.elapsed(), drain, || {
             owned_stop_pending(engine, session, owned.as_deref(), interrupted)
-        });
+        }, || discovery_pending);
         let tick = with_trace_identity_frame(engine, session, pass, &mut identities, |engine, session, identities| {
             let mut context = (
                 &mut *engine,
@@ -5414,6 +5465,19 @@ fn capture_trace(
                             context.2.as_deref_mut(),
                             interrupted,
                         )?,
+                        DiscoveryPass::Backlog => {
+                            // One bounded retained quantum, then yield: the
+                            // outcome's dispatch flag is the same resync
+                            // signal a frame carries. Only a pass that both
+                            // progressed and left more work schedules a zero
+                            // sleep; a stuck pass returns to the wait.
+                            let outcome =
+                                context.0.service_backlog_quantum(context.1)?;
+                            consumers
+                                .scheduling
+                                .note_discovery_backlog(outcome.pending && outcome.progressed);
+                            (outcome.changed, false)
+                        }
                     };
                     consumers
                         .scheduling
@@ -5505,15 +5569,20 @@ fn capture_trace(
         // per drain interval, and a busy host overflows the ring in between
         // (RB-2). Staging applies nothing. The quantum and the readiness
         // poll share one allowance with what the Engine still holds (H5).
-        session.stage_discovery(discovery_stage_quantum(
-            session.staged_discovery_len(),
+        // The session enforces the shared allowance structurally from
+        // the same Engine-held count the quantum was sized from.
+        session.stage_discovery(
+            discovery_stage_quantum(
+                session.staged_discovery_len(),
+                engine.discovery_held_len(),
+            ),
             engine.discovery_held_len(),
-        ))?;
+        )?;
         wait_until_ready(
             &session.readiness_fds_with_held(engine.discovery_held_len()),
             ready_sleep_duration(
                 paused,
-                scheduling.last_drain_had_backlog(),
+                scheduling.last_drain_had_backlog() || scheduling.last_discovery_backlog(),
                 drain.saturating_sub(last_frame.elapsed()),
             ),
         );
@@ -6305,6 +6374,10 @@ pub(crate) struct SchedulingAccumulator {
     drain_repolls: u64,
     drain_budget_exhaustions: u64,
     last_backlog: bool,
+    /// This tick's discovery-backlog pass both progressed and left more
+    /// retained work: the tick sleeps nothing, like a drain backlog. Reset
+    /// at every gate decision; only the tick's own backlog pass sets it.
+    last_discovery_backlog: bool,
     last_drain_end: Option<Instant>,
     loop_ended: bool,
     max_inter_drain_gap_ms: u64,
@@ -6354,6 +6427,7 @@ impl Default for SchedulingAccumulator {
             drain_repolls: 0,
             drain_budget_exhaustions: 0,
             last_backlog: false,
+            last_discovery_backlog: false,
             last_drain_end: None,
             loop_ended: false,
             max_inter_drain_gap_ms: 0,
@@ -6450,6 +6524,14 @@ impl SchedulingAccumulator {
     pub(crate) fn note_terminal_drain(&mut self, may_remain: bool) {
         self.terminal_drain_truncated = may_remain;
         self.last_backlog = false;
+    }
+
+    /// Records this tick's discovery-backlog outcome for the idle wait:
+    /// `more` is true only when the pass both progressed and left retained
+    /// work, which sleeps nothing like a drain backlog. A stuck pass
+    /// reports false and returns to the normal readiness wait.
+    pub(crate) fn note_discovery_backlog(&mut self, more: bool) {
+        self.last_discovery_backlog = more;
     }
 
     /// Carries the engine's live-discovery frame-deferral count (F4) into
@@ -6587,6 +6669,10 @@ impl SchedulingAccumulator {
 
     pub(crate) fn last_drain_had_backlog(&self) -> bool {
         self.last_backlog
+    }
+
+    pub(crate) fn last_discovery_backlog(&self) -> bool {
+        self.last_discovery_backlog
     }
 
     pub(crate) fn snapshot(&self, terminal_bound: u64) -> render::SchedulingEvidence {
@@ -10616,7 +10702,12 @@ mod tests {
         coordinator: &mut PauseCoordinator,
         io: &mut HeldPauseIo<'_>,
     ) -> (Option<DiscoveryPass>, Result<(bool, bool)>) {
-        let pass = discovery_due(since_frame, drain, || pause_stop_due(coordinator, io));
+        let pass = discovery_due(
+            since_frame,
+            drain,
+            || pause_stop_due(coordinator, io),
+            || false,
+        );
         let handed = match pass {
             None => Ok((false, false)),
             Some(DiscoveryPass::PendingStop) => pending_stop_pass(coordinator, io),
@@ -10625,6 +10716,11 @@ mod tests {
                     .unwrap_or_else(|error| panic!("a frame pass failed: {error}"));
                 assert!(serviced, "a frame pass must service an armed pause");
                 Ok((io.plan_changed(), true))
+            }
+            // The held-child harness never stages discovery backlog: the
+            // gate above always reports none, so this arm is unreachable.
+            Some(DiscoveryPass::Backlog) => {
+                unreachable!("held harness admits no backlog pass")
             }
         };
         (pass, handed)
@@ -12139,10 +12235,15 @@ mod tests {
             loop {
                 since_frame += READY_IDLE_POLL;
                 let mut asked = false;
-                let pass = discovery_due(since_frame, drain, || {
-                    asked = true;
-                    hook.is_some_and(|hook| since_frame >= hook)
-                });
+                let pass = discovery_due(
+                    since_frame,
+                    drain,
+                    || {
+                        asked = true;
+                        hook.is_some_and(|hook| since_frame >= hook)
+                    },
+                    || false,
+                );
                 if let Some(pass) = pass {
                     return (since_frame, pass, asked && pass == DiscoveryPass::Frame);
                 }
@@ -12348,8 +12449,8 @@ mod tests {
             let mut reads = reads.into_iter();
             let frame =
                 profile_frame_decisions(|| reads.next().expect("at most three reads"), drain);
-            let discovery =
-                discovery_due(frame.since_frame, drain, || false) == Some(DiscoveryPass::Frame);
+            let discovery = discovery_due(frame.since_frame, drain, || false, || false)
+                == Some(DiscoveryPass::Frame);
             (discovery, frame.fresh_snapshot, frame.render)
         };
         let crossing = drain + Duration::from_millis(29);
@@ -12402,7 +12503,7 @@ mod tests {
                     },
                     drain,
                 );
-                let pass = discovery_due(frame.since_frame, drain, || tick.stop_pending);
+                let pass = discovery_due(frame.since_frame, drain, || tick.stop_pending, || false);
                 if frame.render {
                     last_frame = start + tick.work;
                 }
@@ -12542,7 +12643,7 @@ mod tests {
                 },
                 drain,
             );
-            let pass = discovery_due(frame.since_frame, drain, || tick.stop_pending);
+            let pass = discovery_due(frame.since_frame, drain, || tick.stop_pending, || false);
             let mut force_full = false;
             if let Some(pass) = pass {
                 let counted = count_discovery_pass(&mut frames, pass);
@@ -12555,6 +12656,10 @@ mod tests {
                     }
                     DiscoveryPass::PendingStop => {
                         totals.pending_stops += 1;
+                    }
+                    // This harness gates with no backlog, so no pass here.
+                    DiscoveryPass::Backlog => {
+                        unreachable!("profile cadence harness admits no backlog pass")
                     }
                 }
             }
@@ -12628,7 +12733,12 @@ mod tests {
         let mut effects = Vec::new();
         for tick in ticks {
             let now = start + drain + tick.start;
-            let pass = discovery_due(now.duration_since(last_frame), drain, || tick.stop_pending);
+            let pass = discovery_due(
+                now.duration_since(last_frame),
+                drain,
+                || tick.stop_pending,
+                || false,
+            );
             let mut force_full = false;
             if let Some(pass) = pass {
                 advance_trace_frame_clock(&mut last_frame, pass, now);
@@ -12642,6 +12752,10 @@ mod tests {
                     }
                     DiscoveryPass::PendingStop => {
                         totals.pending_stops += 1;
+                    }
+                    // This harness gates with no backlog, so no pass here.
+                    DiscoveryPass::Backlog => {
+                        unreachable!("trace cadence harness admits no backlog pass")
                     }
                 }
             }
@@ -16198,6 +16312,381 @@ mod tests {
         );
         assert!(staged.is_empty() && malformed == 0 && overflow);
         assert_eq!(script.len(), 1);
+    }
+
+    /// H5 Decision 3: backlog service between frames keeps frame cadence.
+    /// The gate prioritizes a due frame, then a pending owned stop, then
+    /// backlog; a backlog pass counts no frame, forces no sweep and moves
+    /// no frame clock. Live: 600 staged renewals behind a long frame
+    /// interval drain in bounded 256-item quanta with a quiet end, pure
+    /// renewals report no plan change, and nothing is truncated. Both
+    /// loop arms service through the shared quantum and hand its dispatch
+    /// flag to the existing resync branch, without touching maps, the
+    /// snapshot, the render or the frame counter.
+    #[test]
+    fn discovery_backlog_service_keeps_frame_cadence() {
+        use crate::discovery::engine::EngineSession as _;
+        use crate::discovery::engine::session_fixture::ScriptedSession;
+
+        // Due priority over one read: a due frame wins over everything, a
+        // pending owned stop wins over backlog, backlog wins over idleness.
+        let drain = Duration::from_secs(1);
+        assert_eq!(
+            discovery_due(drain, drain, || true, || true),
+            Some(DiscoveryPass::Frame)
+        );
+        assert_eq!(
+            discovery_due(Duration::ZERO, drain, || true, || true),
+            Some(DiscoveryPass::PendingStop)
+        );
+        assert_eq!(
+            discovery_due(Duration::ZERO, drain, || false, || true),
+            Some(DiscoveryPass::Backlog)
+        );
+        assert_eq!(
+            discovery_due(Duration::ZERO, drain, || false, || false),
+            None
+        );
+
+        // A backlog pass is cadence-free: no frame counted, no forced
+        // sweep, no frame-clock move.
+        let mut frames = 41u64;
+        let counted = count_discovery_pass(&mut frames, DiscoveryPass::Backlog);
+        assert_eq!((frames, counted.force_full), (41, false));
+        let tick = Instant::now();
+        let mut frame_clock = tick;
+        advance_trace_frame_clock(&mut frame_clock, DiscoveryPass::Backlog, tick + drain);
+        assert_eq!(frame_clock, tick);
+
+        // Live backlog behind a long frame interval: 600 staged EXEC
+        // renewals over 200 pids stay under the 256-entry request map, so
+        // every quantum is ordinary FIFO dispatch with no pressure episode.
+        let mut engine = Engine::empty_for_test();
+        let records = (0..600u32).map(|offset| {
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+            record.pid_tgid = u64::from(5_000_000 + offset % 200) << 32;
+            record.hook_ts_ns = u64::MAX;
+            record
+        });
+        let mut session = ScriptedSession::with_records(records, 0);
+        session
+            .stage_discovery(600, engine.discovery_held_len())
+            .unwrap();
+        assert_eq!(session.staged_discovery_len(), 600);
+        assert!(
+            engine.discovery_backlog_pending(session.staged_discovery_len()),
+            "staged transfers are schedulable backlog"
+        );
+        assert_eq!(
+            discovery_due(
+                Duration::ZERO,
+                drain,
+                || false,
+                || engine.discovery_backlog_pending(session.staged_discovery_len())
+            ),
+            Some(DiscoveryPass::Backlog)
+        );
+
+        // One bounded quantum per opportunity: 256, then 256, then the 88
+        // remainder. Each service returns with work outstanding instead of
+        // draining internally, so the loop keeps its EVENTS/cancellation
+        // turn between quanta.
+        for (pass, expected) in [(1, 344), (2, 88), (3, 0)] {
+            let outcome = engine.service_backlog_quantum(&mut session).unwrap();
+            assert!(outcome.progressed, "pass {pass} moves retained work");
+            assert_eq!(
+                outcome.pending,
+                expected != 0,
+                "pass {pass} reports its remainder"
+            );
+            assert!(
+                !outcome.changed,
+                "pass {pass}: pure renewals change no plan, so no consumer resync"
+            );
+            assert_eq!(session.staged_discovery_len(), expected);
+            assert_eq!(
+                engine.pending_discovery_records_for_test(),
+                0,
+                "pass {pass} sheds nothing back"
+            );
+        }
+        // The quiet end: nothing pending, no work, no signal.
+        let quiet = engine.service_backlog_quantum(&mut session).unwrap();
+        assert_eq!(
+            (quiet.changed, quiet.progressed, quiet.pending),
+            (false, false, false)
+        );
+        assert_eq!(
+            engine.unvalidated_discovery_for_test(),
+            0,
+            "the staged drain loses nothing"
+        );
+
+        // Both loop arms share the contract: service through the bounded
+        // quantum, schedule a zero sleep only on progressed remainder, hand
+        // the dispatch flag to the existing resync branch, and touch no
+        // maps, snapshot, render or frame count.
+        let source = include_str!("run.rs");
+        let profile = source
+            .split_once("fn capture_profile(")
+            .unwrap()
+            .1
+            .split_once("fn write_json_report")
+            .unwrap()
+            .0;
+        let trace = source
+            .split_once("fn capture_trace(")
+            .unwrap()
+            .1
+            .split_once("fn terminal_trace_count_line")
+            .unwrap()
+            .0;
+        for (function, tick) in [("capture_profile", profile), ("capture_trace", trace)] {
+            let arm = tick
+                .split_once("DiscoveryPass::Backlog =>")
+                .unwrap_or_else(|| panic!("{function} must match a backlog pass"))
+                .1
+                .split_once(".add_phase(SchedulingPhase::Discovery")
+                .unwrap_or_else(|| {
+                    panic!("{function}: backlog arm ends at the shared phase charge")
+                })
+                .0;
+            assert!(
+                arm.contains("service_backlog_quantum("),
+                "{function}: the backlog arm services through the shared quantum"
+            );
+            assert!(
+                arm.contains("note_discovery_backlog(outcome.pending && outcome.progressed)"),
+                "{function}: only progressed remainder schedules a zero sleep"
+            );
+            assert!(
+                arm.contains("(outcome.changed, false)"),
+                "{function}: the dispatch flag reaches the existing resync branch"
+            );
+            for forbidden in [
+                "metrics::read",
+                "profile_tick_snapshot",
+                "live_display",
+                "frame_tick",
+                "render",
+                "drain_discovery_tick",
+            ] {
+                assert!(
+                    !arm.contains(forbidden),
+                    "{function}: the backlog arm touches no {forbidden}"
+                );
+            }
+            assert_eq!(
+                tick.matches("discovery_backlog_pending(").count(),
+                1,
+                "{function} reads the backlog predicate once per tick"
+            );
+            assert!(
+                tick.contains("note_discovery_backlog(false)"),
+                "{function} resets the backlog sleep flag every tick"
+            );
+        }
+        // The cadence survived the whole scenario: counting the backlog
+        // passes above moved nothing.
+        assert_eq!(frames, 41);
+    }
+
+    /// H5 storage: quiescence staging is bounded in both modes. The
+    /// production splitter stages a live tick prefix, then repeated
+    /// production polls stage N+1 input up to the shared cap: peak
+    /// occupancy never exceeds it, the first unstaged record stays
+    /// unread, malformed items hold credits like records, and the owned
+    /// prefix drains in order. Unresolved N+1 reports truncation failure;
+    /// an empty quiescence stages nothing and reports nothing. Both
+    /// capture loops stage through the shared helper — never a test-only
+    /// duplicate — and skip discovery polling once overflow trips while
+    /// EVENTS/stop polling continues.
+    #[test]
+    fn quiescence_discovery_storage_is_bounded_in_both_modes() {
+        use crate::discovery::engine::DISCOVERY_HELD_CAP;
+        use crate::events::DiscoveryItem;
+
+        fn record(pid: u32) -> p11scope_ebpf_common::DiscoveryRecord {
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.pid_tgid = (u64::from(pid)) << 32;
+            record
+        }
+
+        // A live tick prefix through the production splitter: 4,095
+        // staged records as if the ticks staged them, with the engine
+        // holding nothing else, so the quiescence cap is the full 4,096.
+        let engine = Engine::empty_for_test();
+        let quiesce_cap = DISCOVERY_HELD_CAP.saturating_sub(engine.discovery_held_len());
+        assert_eq!(quiesce_cap, 4_096);
+        let prefix: Vec<DiscoveryItem> = (0..4_095u32)
+            .map(|pid| DiscoveryItem::Record(record(pid)))
+            .collect();
+        let (mut staged_records, mut staged_malformed) = split_staged_discovery(prefix);
+        assert_eq!((staged_records.len(), staged_malformed), (4_095, 0));
+
+        // N+1 across repeated polls: room for exactly one more unit. The
+        // first poll stages it; the second record stays unread and the
+        // overflow trips; a third poll stages nothing further.
+        let mut script = vec![
+            Some(DiscoveryItem::Record(record(4_095))),
+            Some(DiscoveryItem::Record(record(4_096))),
+        ]
+        .into_iter();
+        let mut overflow = false;
+        stage_quiesced_discovery_items(
+            || script.next().unwrap(),
+            &mut staged_records,
+            &mut staged_malformed,
+            quiesce_cap,
+            &mut overflow,
+        );
+        assert_eq!(staged_records.len(), 4_096, "peak occupancy is the cap");
+        assert_eq!(staged_malformed, 0);
+        assert!(overflow, "N+1 trips overflow");
+        assert_eq!(script.len(), 1, "the first unstaged record stays unread");
+        let mut script = vec![Some(DiscoveryItem::Record(record(4_097)))].into_iter();
+        stage_quiesced_discovery_items(
+            || script.next().unwrap(),
+            &mut staged_records,
+            &mut staged_malformed,
+            quiesce_cap,
+            &mut overflow,
+        );
+        assert_eq!(staged_records.len(), 4_096, "no poll grows past the cap");
+        assert_eq!(script.len(), 1, "a full poll consumes nothing");
+        // The owned prefix drains in order: tick-staged items first, then
+        // the quiesced item in arrival order.
+        let order: Vec<u32> = staged_records
+            .iter()
+            .map(|record| (record.pid_tgid >> 32) as u32)
+            .collect();
+        assert_eq!(order, (0..4_096u32).collect::<Vec<_>>());
+
+        // Malformed N+1 holds a credit like a record: it stages, trips
+        // overflow, and the record behind it stays unread.
+        let (mut staged_records, mut staged_malformed) = split_staged_discovery(
+            (0..4_095u32)
+                .map(|pid| DiscoveryItem::Record(record(pid)))
+                .collect(),
+        );
+        let mut script = vec![
+            Some(DiscoveryItem::Malformed),
+            Some(DiscoveryItem::Record(record(4_200))),
+        ]
+        .into_iter();
+        let mut overflow = false;
+        stage_quiesced_discovery_items(
+            || script.next().unwrap(),
+            &mut staged_records,
+            &mut staged_malformed,
+            quiesce_cap,
+            &mut overflow,
+        );
+        assert_eq!((staged_records.len(), staged_malformed), (4_095, 1));
+        assert!(overflow);
+        assert_eq!(script.len(), 1, "the record behind malformed stays unread");
+
+        // A simulated 96-item engine hold shrinks the same cap: the helper
+        // bounds prefix plus polls against 4,000, not 4,096.
+        let held_cap = DISCOVERY_HELD_CAP.saturating_sub(96);
+        let (mut staged_records, mut staged_malformed) = split_staged_discovery(
+            (0..3_999u32)
+                .map(|pid| DiscoveryItem::Record(record(pid)))
+                .collect(),
+        );
+        let mut script = vec![
+            Some(DiscoveryItem::Record(record(3_999))),
+            Some(DiscoveryItem::Record(record(4_000))),
+        ]
+        .into_iter();
+        let mut overflow = false;
+        for _ in 0..3 {
+            stage_quiesced_discovery_items(
+                || script.next().unwrap(),
+                &mut staged_records,
+                &mut staged_malformed,
+                held_cap,
+                &mut overflow,
+            );
+        }
+        assert_eq!(staged_records.len(), 4_000);
+        assert!(overflow);
+        assert_eq!(script.len(), 1);
+
+        // Unresolved N+1 reports failure through the production note: the
+        // sticky truncation fails a strict lossless verdict.
+        let mut engine = Engine::empty_for_test();
+        assert_eq!(engine.unvalidated_discovery_for_test(), 0);
+        engine.note_quiesced_discovery_overflow();
+        assert_eq!(engine.unvalidated_discovery_for_test(), 1);
+        engine.note_quiesced_discovery_overflow();
+        assert_eq!(
+            engine.unvalidated_discovery_for_test(),
+            2,
+            "each unresolved quiescence is sticky evidence"
+        );
+
+        // The empty-Q positive: empty polls stage nothing, trip nothing,
+        // and report nothing.
+        let (mut staged_records, mut staged_malformed) = split_staged_discovery(Vec::new());
+        let mut overflow = false;
+        for _ in 0..3 {
+            stage_quiesced_discovery_items(
+                || None,
+                &mut staged_records,
+                &mut staged_malformed,
+                quiesce_cap,
+                &mut overflow,
+            );
+        }
+        assert!(staged_records.is_empty() && staged_malformed == 0 && !overflow);
+        let engine = Engine::empty_for_test();
+        assert_eq!(
+            engine.unvalidated_discovery_for_test(),
+            0,
+            "no overflow means no failure to report"
+        );
+
+        // Both modes stage through the shared helper: exactly one call per
+        // loop, the per-poll overflow guard plus the report guard, exactly
+        // one failure report, and the shared-allowance cap computation.
+        let source = include_str!("run.rs");
+        let profile = source
+            .split_once("fn capture_profile(")
+            .unwrap()
+            .1
+            .split_once("fn write_json_report")
+            .unwrap()
+            .0;
+        let trace = source
+            .split_once("fn capture_trace(")
+            .unwrap()
+            .1
+            .split_once("fn terminal_trace_count_line")
+            .unwrap()
+            .0;
+        for (function, tick) in [("capture_profile", profile), ("capture_trace", trace)] {
+            assert_eq!(
+                tick.matches("stage_quiesced_discovery_items(").count(),
+                1,
+                "{function} stages quiescence through the shared helper"
+            );
+            assert_eq!(
+                tick.matches("if quiesce_overflow {").count(),
+                2,
+                "{function} guards both the poll and the report on overflow"
+            );
+            assert_eq!(
+                tick.matches("note_quiesced_discovery_overflow()").count(),
+                1,
+                "{function} reports unresolved N+1 exactly once"
+            );
+            assert!(
+                tick.contains("DISCOVERY_HELD_CAP"),
+                "{function} caps quiescence against the shared allowance"
+            );
+        }
     }
 }
 

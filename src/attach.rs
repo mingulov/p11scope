@@ -2774,12 +2774,22 @@ pub(crate) fn discovery_ring_bytes(scope: &Scope) -> u32 {
 /// emptied into this FIFO on every capture tick and between startup phases,
 /// so a slow frame or a long startup no longer overflows it. Every consumer
 /// dequeues through the session, which serves this FIFO first: ring order
-/// is preserved and no item is ever dropped here. Staging stops at
-/// `CAPACITY`; beyond it records wait in the kernel ring, where overflow is
-/// counted by the producer as ring loss.
+/// is preserved and no item is ever dropped here. Staging stops at the
+/// shared allowance; beyond it records wait in the kernel ring, where
+/// overflow is counted by the producer as ring loss.
 #[derive(Default)]
 pub(crate) struct DiscoveryStage {
     items: std::collections::VecDeque<events::DiscoveryItem>,
+}
+
+/// What one staging call moved: how many items entered the FIFO, and
+/// whether staging stopped at the shared allowance with the quantum
+/// unspent (the ring still holds whatever it holds; only the next drain
+/// settles the FIFO and frees the allowance).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DiscoveryStageOutcome {
+    pub(crate) staged: usize,
+    pub(crate) capacity_blocked: bool,
 }
 
 impl DiscoveryStage {
@@ -2787,20 +2797,43 @@ impl DiscoveryStage {
     /// ring.
     pub(crate) const CAPACITY: usize = 4096;
 
-    /// Moves up to `quantum` items from `next` into the FIFO; returns how
-    /// many were staged.
+    /// Moves up to `quantum` items from `next` into the FIFO without
+    /// letting the FIFO exceed `shared_cap` — the shared 4,096-item
+    /// allowance minus whatever the Engine already holds, computed by the
+    /// caller. The cap is enforced here, structurally: no caller quantum
+    /// can stage past it, and the outcome reports whether the allowance
+    /// (rather than the quantum or an empty ring) stopped the move.
     pub(crate) fn stage(
         &mut self,
         quantum: usize,
+        shared_cap: usize,
         mut next: impl FnMut() -> Option<events::DiscoveryItem>,
-    ) -> usize {
+    ) -> DiscoveryStageOutcome {
         let mut staged = 0;
-        while staged < quantum && self.items.len() < Self::CAPACITY {
-            let Some(item) = next() else { break };
+        while staged < quantum && self.items.len() < shared_cap.min(Self::CAPACITY) {
+            let Some(item) = next() else {
+                return DiscoveryStageOutcome {
+                    staged,
+                    capacity_blocked: false,
+                };
+            };
             self.items.push_back(item);
             staged += 1;
         }
-        staged
+        let capacity_blocked =
+            staged < quantum && self.items.len() >= shared_cap.min(Self::CAPACITY);
+        DiscoveryStageOutcome {
+            staged,
+            capacity_blocked,
+        }
+    }
+
+    /// Whether the idle wait polls DISCOVERY beside EVENTS: only while
+    /// the staged FIFO plus what the Engine still holds leaves room under
+    /// the shared allowance. A snapshot per call: staging past the call
+    /// flips the next decision, never the returned set.
+    pub(crate) fn poll_discovery(staged_len: usize, engine_held: usize) -> bool {
+        staged_len.saturating_add(engine_held) < Self::CAPACITY
     }
 
     pub(crate) fn pop(&mut self) -> Option<events::DiscoveryItem> {
@@ -3246,7 +3279,9 @@ impl Session {
             .map_err(unsupported_environment_context)?;
         // The lifecycle producers ran through the whole static attach: stage
         // what they produced before the Engine's per-view phases (RB-2).
-        session.stage_discovery(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM)?;
+        // The Engine holds nothing yet; whatever does not fit waits in the
+        // kernel ring for the next staging call after the first batch.
+        session.stage_discovery(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM, 0)?;
         // The error path drops `session`, which detaches every probe.
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!(
@@ -4360,21 +4395,31 @@ impl Session {
     /// records cannot be staged yet.
     pub(crate) fn readiness_fds_with_held(&self, engine_held: usize) -> Vec<BorrowedFd<'_>> {
         let mut fds = vec![self.events_readiness_fd()];
-        if self.discovery_staged.len().saturating_add(engine_held) < DiscoveryStage::CAPACITY {
+        if DiscoveryStage::poll_discovery(self.discovery_staged.len(), engine_held) {
             fds.push(self.discovery_readiness_fd());
         }
         fds
     }
 
     /// Moves up to `quantum` DISCOVERY items off the kernel ring into the
-    /// session's FIFO without applying any (RB-2); returns how many.
-    pub(crate) fn stage_discovery(&mut self, quantum: usize) -> Result<usize> {
+    /// session's FIFO without applying any (RB-2), without letting staged
+    /// plus `engine_held` exceed the shared 4,096-item allowance. The cap
+    /// is enforced structurally by the FIFO; the outcome reports whether
+    /// the allowance stopped the move.
+    pub(crate) fn stage_discovery(
+        &mut self,
+        quantum: usize,
+        engine_held: usize,
+    ) -> Result<DiscoveryStageOutcome> {
         self.ensure_discovery_consumer()?;
         let consumer = self
             .discovery_consumer
             .as_mut()
             .context("retained DISCOVERY consumer vanished after creation")?;
-        Ok(self.discovery_staged.stage(quantum, || consumer.dequeue()))
+        let shared_cap = DiscoveryStage::CAPACITY.saturating_sub(engine_held);
+        Ok(self
+            .discovery_staged
+            .stage(quantum, shared_cap, || consumer.dequeue()))
     }
 
     /// Every staged item, in ring order, leaving the FIFO empty.
@@ -8656,17 +8701,23 @@ mod tests {
     }
 
     /// RB-2 staging keeps ring order and drops nothing: it stages at most a
-    /// quantum per call, stops at its capacity leaving the rest in the ring,
-    /// and serves every staged item before anything newer.
+    /// quantum per call, stops at the shared allowance leaving the rest in
+    /// the ring, and serves every staged item before anything newer.
     #[test]
     fn discovery_staging_keeps_ring_order_and_leaves_overflow_in_the_ring() {
         let mut ring: std::collections::VecDeque<_> = discovery_items(0, 10).into();
         ring.insert(3, events::DiscoveryItem::Malformed);
         let mut stage = DiscoveryStage::default();
 
-        assert_eq!(stage.stage(4, || ring.pop_front()), 4);
-        assert_eq!(stage.stage(100, || ring.pop_front()), 7, "the ring ran dry");
-        assert_eq!(stage.stage(100, || ring.pop_front()), 0);
+        let outcome = stage.stage(4, DiscoveryStage::CAPACITY, || ring.pop_front());
+        assert_eq!(outcome.staged, 4);
+        assert!(!outcome.capacity_blocked);
+        let outcome = stage.stage(100, DiscoveryStage::CAPACITY, || ring.pop_front());
+        assert_eq!(outcome.staged, 7, "the ring ran dry");
+        assert!(!outcome.capacity_blocked);
+        let outcome = stage.stage(100, DiscoveryStage::CAPACITY, || ring.pop_front());
+        assert_eq!(outcome.staged, 0);
+        assert!(!outcome.capacity_blocked);
         let first = stage.pop().unwrap();
         let rest = stage.take();
         let mut all = vec![first];
@@ -8691,15 +8742,192 @@ mod tests {
 
         let mut ring: std::collections::VecDeque<_> =
             discovery_items(0, DiscoveryStage::CAPACITY as u64 + 5).into();
-        assert_eq!(
-            stage.stage(usize::MAX, || ring.pop_front()),
-            DiscoveryStage::CAPACITY
+        let outcome = stage.stage(usize::MAX, DiscoveryStage::CAPACITY, || ring.pop_front());
+        assert_eq!(outcome.staged, DiscoveryStage::CAPACITY);
+        assert!(
+            outcome.capacity_blocked,
+            "the shared allowance stops the move, not the quantum"
         );
         assert_eq!(ring.len(), 5, "overflow waits in the ring, never dropped");
+        let outcome = stage.stage(1, DiscoveryStage::CAPACITY, || ring.pop_front());
+        assert_eq!(outcome.staged, 0, "a full FIFO stages nothing");
+        assert!(outcome.capacity_blocked);
+    }
+
+    /// I2: the shared cap is enforced structurally by the FIFO, not by
+    /// caller quanta. No quantum stages past `shared_cap`, however large,
+    /// and the outcome says whether the allowance stopped the move.
+    #[test]
+    fn discovery_staging_enforces_the_shared_cap_structurally() {
+        let mut ring: std::collections::VecDeque<_> = discovery_items(0, 100).into();
+        let mut stage = DiscoveryStage::default();
+        let outcome = stage.stage(usize::MAX, 10, || ring.pop_front());
+        assert_eq!(outcome.staged, 10);
+        assert!(outcome.capacity_blocked);
+        assert_eq!(stage.len(), 10);
+        assert_eq!(ring.len(), 90);
+        // A zero share stages nothing and reports blocked, never empty.
+        let outcome = stage.stage(usize::MAX, 0, || ring.pop_front());
+        assert_eq!(outcome.staged, 0);
+        assert!(outcome.capacity_blocked);
+        assert_eq!(ring.len(), 90, "nothing was consumed from the ring");
+        // Draining the FIFO frees the same share again.
+        stage.pop();
+        let outcome = stage.stage(usize::MAX, 10, || ring.pop_front());
+        assert_eq!(outcome.staged, 1);
+        assert!(outcome.capacity_blocked);
+        assert_eq!(stage.len(), 10);
+    }
+
+    /// H5 storage: staging and readiness stop exactly at the shared
+    /// allowance. One mode stages the full share in a single quantum;
+    /// the twin repeats small quanta to the same boundary with malformed
+    /// items interleaved. The readiness predicate polls DISCOVERY only
+    /// while staged plus engine-held leaves room — a snapshot per call,
+    /// so a stale decision never changes under the waiter — with exact
+    /// boundary, overflow-safe arithmetic and honest null cases. The ring
+    /// cursor advances exactly per staged item, never past the stop.
+    #[test]
+    fn discovery_shared_capacity_gates_staging_and_readiness() {
+        // Mode one: a single quantum fills the whole share exactly.
+        let mut ring: std::collections::VecDeque<_> =
+            discovery_items(0, DiscoveryStage::CAPACITY as u64 + 904).into();
+        let mut stage = DiscoveryStage::default();
+        let outcome = stage.stage(usize::MAX, DiscoveryStage::CAPACITY, || ring.pop_front());
+        assert_eq!(outcome.staged, DiscoveryStage::CAPACITY);
+        assert!(outcome.capacity_blocked);
+        assert_eq!(ring.len(), 904, "overflow waits in the ring, never dropped");
+        assert_eq!(stage.len(), DiscoveryStage::CAPACITY);
+        // The boundary is exact, not off by one in either direction.
+        let mut stage = DiscoveryStage::default();
+        let mut ring: std::collections::VecDeque<_> = discovery_items(0, 100).into();
+        let outcome = stage.stage(usize::MAX, 4_095, || ring.pop_front());
+        assert_eq!((outcome.staged, outcome.capacity_blocked), (100, false));
+        let mut stage = DiscoveryStage::default();
+        let mut ring: std::collections::VecDeque<_> = discovery_items(0, 5_000).into();
+        let outcome = stage.stage(usize::MAX, 4_095, || ring.pop_front());
+        assert_eq!((outcome.staged, outcome.capacity_blocked), (4_095, true));
+        assert_eq!(ring.len(), 905);
+
+        // Twin: repeated small quanta reach the same boundary, malformed
+        // items holding credits like records, order preserved.
+        let mut items = discovery_items(0, 4_000);
+        for at in [10, 1_000, 2_000, 3_000, 3_999] {
+            items.insert(at, events::DiscoveryItem::Malformed);
+        }
+        let mut ring: std::collections::VecDeque<_> = items.into();
+        ring.extend(discovery_items(4_000, 1_000));
+        let mut stage = DiscoveryStage::default();
+        let mut calls = 0u32;
+        let mut total = 0usize;
+        for _ in 0..17 {
+            let outcome = stage.stage(256, DiscoveryStage::CAPACITY, || ring.pop_front());
+            calls += 1;
+            total += outcome.staged;
+            if outcome.staged < 256 {
+                assert!(
+                    outcome.capacity_blocked,
+                    "only the allowance shortens a quantum"
+                );
+            } else {
+                assert!(!outcome.capacity_blocked);
+            }
+        }
+        assert_eq!((calls, total), (17, DiscoveryStage::CAPACITY));
+        assert_eq!(ring.len(), 909, "5,005 scripted minus 4,096 staged");
+        let rest = stage.take();
+        assert_eq!(rest.len(), DiscoveryStage::CAPACITY);
+        let mut scripted = discovery_items(0, 4_000);
+        for at in [10, 1_000, 2_000, 3_000, 3_999] {
+            scripted.insert(at, events::DiscoveryItem::Malformed);
+        }
+        scripted.extend(discovery_items(4_000, 1_000));
         assert_eq!(
-            stage.stage(1, || ring.pop_front()),
-            0,
-            "a full FIFO stages nothing"
+            stamps(&rest),
+            stamps(&scripted[..DiscoveryStage::CAPACITY]),
+            "repeated quanta preserve ring order with malformed inline"
+        );
+
+        // The ring cursor advances exactly per staged item: no lookahead
+        // past the stop, even against an endless ring.
+        let mut reads = 0usize;
+        let mut stage = DiscoveryStage::default();
+        let outcome = stage.stage(usize::MAX, 10, || {
+            reads += 1;
+            Some(events::DiscoveryItem::Malformed)
+        });
+        assert_eq!((outcome.staged, outcome.capacity_blocked), (10, true));
+        assert_eq!(reads, 10, "the stop reads nothing past the share");
+
+        // Readiness polls DISCOVERY only while staged plus engine-held
+        // leaves room: exact boundary, overflow-safe.
+        for (staged, held, poll) in [
+            (0usize, 0usize, true),
+            (4_095, 0, true),
+            (4_096, 0, false),
+            (4_000, 95, true),
+            (4_000, 96, false),
+            (0, 4_095, true),
+            (0, 4_096, false),
+            (100, usize::MAX, false),
+            (usize::MAX, 0, false),
+            (usize::MAX, usize::MAX, false),
+        ] {
+            assert_eq!(
+                DiscoveryStage::poll_discovery(staged, held),
+                poll,
+                "staged={staged} held={held}"
+            );
+        }
+
+        // Stale readiness is a snapshot: decisions flip only on fresh
+        // calls as staging fills and draining frees the share.
+        let mut ring: std::collections::VecDeque<_> = discovery_items(0, 4_200).into();
+        let mut stage = DiscoveryStage::default();
+        assert!(DiscoveryStage::poll_discovery(stage.len(), 0));
+        let outcome = stage.stage(usize::MAX, DiscoveryStage::CAPACITY, || ring.pop_front());
+        assert_eq!(outcome.staged, DiscoveryStage::CAPACITY);
+        let stale = DiscoveryStage::poll_discovery(stage.len(), 0);
+        assert!(!stale, "a full share stops the poll");
+        stage.pop();
+        assert!(
+            DiscoveryStage::poll_discovery(stage.len(), 0),
+            "one freed credit reopens the poll"
+        );
+        assert!(!stale, "the earlier decision is unchanged");
+
+        // Null cases: an empty ring stages nothing without blocking, and a
+        // null quantum is the caller's choice, never a capacity stop.
+        let mut ring: std::collections::VecDeque<events::DiscoveryItem> =
+            std::collections::VecDeque::new();
+        let mut stage = DiscoveryStage::default();
+        let outcome = stage.stage(100, DiscoveryStage::CAPACITY, || ring.pop_front());
+        assert_eq!((outcome.staged, outcome.capacity_blocked), (0, false));
+        let mut ring: std::collections::VecDeque<_> = discovery_items(0, 10).into();
+        let outcome = stage.stage(0, DiscoveryStage::CAPACITY, || ring.pop_front());
+        assert_eq!((outcome.staged, outcome.capacity_blocked), (0, false));
+        assert_eq!(ring.len(), 10, "a null quantum reads nothing");
+        let mut stage = DiscoveryStage::default();
+        let mut ring: std::collections::VecDeque<_> = discovery_items(0, 4_100).into();
+        stage.stage(usize::MAX, DiscoveryStage::CAPACITY, || ring.pop_front());
+        let outcome = stage.stage(0, DiscoveryStage::CAPACITY, || ring.pop_front());
+        assert_eq!(
+            (outcome.staged, outcome.capacity_blocked),
+            (0, false),
+            "a null quantum reports the caller's choice even when full"
+        );
+
+        // Both production seams use the shared helpers: staging subtracts
+        // the engine hold for its share, readiness polls through the
+        // predicate. (Real-sessions seams; the behavior above pins them.)
+        let source = include_str!("attach.rs");
+        assert!(
+            source.contains("DiscoveryStage::CAPACITY.saturating_sub(engine_held)"),
+            "staging sizes its share from the engine hold"
+        );
+        assert!(
+            source.contains("DiscoveryStage::poll_discovery("),
+            "readiness polls through the shared predicate"
         );
     }
 }

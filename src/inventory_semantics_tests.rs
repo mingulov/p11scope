@@ -1067,7 +1067,7 @@ use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
 use crate::discovery::engine::inventory_coordinator::NativeBatch;
 use crate::discovery::engine::inventory_coordinator::semantics::SemanticBindingRefusal;
 use crate::discovery::hooks::HookRegistry;
-use crate::discovery::instances::MAX_PENDING;
+use crate::discovery::instances::{MAX_INSTANCES, MAX_PENDING};
 use crate::discovery::inventory_attach_set::{AttachObjectId, EndpointId};
 use crate::discovery::native_binding::{NativeIdentity, UnboundReason};
 use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
@@ -1310,6 +1310,10 @@ impl BindingScene {
 #[test]
 fn native_semantic_domain_binding_uses_retained_custody() {
     assert_eq!(MAX_PENDING, 1_024, "one tick serves at most 1,024 targets");
+    assert_eq!(
+        MAX_INSTANCES, 4_096,
+        "the default binding cap holds 4,096 callers"
+    );
     set_sight(1_005);
     let mut scene = BindingScene::new();
     let pid = std::process::id();
@@ -2582,10 +2586,11 @@ fn native_semantic_convert_refuses_unproven_call() {
     );
 
     // `prepare` admits no unauthorized slots in reachable shapes (it
-    // refuses the subset instead), so the conversion's
+    // refuses the subset instead): no endpoint, unknown slot index, and
+    // object/offset mismatch all refuse above. The conversion's
     // authorized/unambiguous/count-only checks are defense-in-depth above
-    // the proven Slot paths: no endpoint, unknown slot index, and
-    // object/offset mismatch all refuse above.
+    // those proven Slot paths, pinned by scripted descriptor shapes in
+    // `native_semantic_convert_refuses_unauthorized_descriptor_shapes`.
 }
 
 #[test]
@@ -2864,9 +2869,11 @@ fn native_semantic_physical_gap_finalization_fences_unpublished_calls() {
     assert_eq!(conv.edge_rows(), vec![(Some(2), 0, false, 1, 1)]);
     assert_eq!(conv.instance_states(), vec![InstanceLifecycle::Observed]);
 
-    // A pre-minted call that never stages is fenced out by the cut: it
-    // never surfaces, while the published flesh stays intact and the
-    // loss is disclosed exactly once.
+    // Conversion admits the call pre-cut (admission evidence only): the
+    // converted input drops without staging, so this leg cannot evidence
+    // finalizer fencing of a pre-minted call.
+    // TASK5-CARRYOVER: preminted-through-finalizer fencing needs the
+    // H0-driven batch test once the lane loop stages queued calls.
     let preminted = conv.convert(
         conv.evidence(3, r0, conv.init_slot, conv.init_event(130)),
         CallStanding::Current(&coverage),
@@ -2884,7 +2891,7 @@ fn native_semantic_physical_gap_finalization_fences_unpublished_calls() {
     assert_eq!(
         conv.scene.coordinator.registry().instances().count(),
         1,
-        "the pre-minted call never surfaces"
+        "an unstaged input stages no record"
     );
     assert_eq!(conv.edge_rows(), vec![(Some(2), 0, true, 1, 1)]);
     assert_eq!(conv.edge_reasons(0), vec![InstanceReason::SemanticLoss]);
@@ -3381,4 +3388,695 @@ fn native_semantic_cgroup_provisional_unscanned_remap_recovers_without_erasing_g
         gaps_before,
         "complete passes add no gaps once suppressed"
     );
+}
+
+// ---- H3 Task 3 fix loop: bounded retention and adjudication arms ----
+
+#[test]
+fn native_semantic_proven_images_bounded_by_live_bindings() {
+    let mut conv = ConversionScene::new();
+    let detailed = conv.detailed();
+    let module = conv.scene.module.clone();
+
+    // Bind/retire churn: a second caller binds and proves, then its
+    // process exits and the incarnation retires (the binding persists).
+    let child = OwnedStoppedChild::new();
+    let churned = conv.scene.admit(child.id(), 200);
+    conv.scene.map(churned, child.id(), 210);
+    conv.scene.answer(child.id(), detailed, 21);
+    conv.scene
+        .bind_image(detailed, vec![(21, 1, child.id(), 300)], 3_000);
+    let churned_image = ImageIdentity {
+        task_cookie: 21,
+        exec_id: 1,
+    };
+    assert_eq!(
+        conv.scene.bind(churned, &module, detailed, churned_image),
+        Ok(())
+    );
+    conv.scene
+        .coordinator
+        .reference_prove_image(detailed, churned_image);
+    drop(child);
+    conv.scene.coordinator.adapter_mut().reconcile(
+        &std::collections::BTreeSet::new(),
+        &mut |_| ImageAuthority::ScanPinned,
+        4_000,
+    );
+    conv.scene.coordinator.commit_batch(false).unwrap();
+    assert!(
+        conv.scene
+            .coordinator
+            .adapter()
+            .record(churned)
+            .unwrap()
+            .retired,
+        "the reaped child retires"
+    );
+    assert_eq!(conv.scene.coordinator.semantic_bindings().len(), 2);
+
+    // Fill far beyond the binding cap with unbound tickets: none persist.
+    for ticket in 1_000..1_000 + MAX_INSTANCES as u64 + 64 {
+        conv.scene.coordinator.reference_prove_image(
+            detailed,
+            ImageIdentity {
+                task_cookie: ticket,
+                exec_id: 1,
+            },
+        );
+    }
+    assert!(
+        conv.scene.coordinator.proven_image_count()
+            <= conv.scene.coordinator.semantic_bindings().len(),
+        "proven images stay bounded by live bindings, got {} over {}",
+        conv.scene.coordinator.proven_image_count(),
+        conv.scene.coordinator.semantic_bindings().len()
+    );
+
+    // Gap minting still works for the bound survivor.
+    conv.prove_and_mark_tail();
+    conv.lane.script_cut_barrier(2);
+    conv.commit_with_lane();
+    assert_eq!(
+        conv.lane.take_recorded_gaps().len(),
+        1,
+        "one proven bound caller mints exactly one gap"
+    );
+    assert!(
+        conv.scene.coordinator.proven_image_count()
+            <= conv.scene.coordinator.semantic_bindings().len(),
+        "minting keeps the bound"
+    );
+}
+
+#[test]
+fn native_semantic_adjudicator_stages_genuine_unscanned() {
+    let mut conv = ConversionScene::new();
+    let pid = std::process::id();
+    let detailed = conv.detailed();
+    let image = conv.image;
+    let mid = conv
+        .scene
+        .coordinator
+        .registry()
+        .module_id_for(&conv.scene.module.clone())
+        .unwrap();
+    let mapping = |conv: &ConversionScene| {
+        conv.scene
+            .coordinator
+            .registry()
+            .edge(conv.caller, mid)
+            .unwrap()
+            .mapping
+    };
+
+    // Control: with no marker the adjudicator stages nothing.
+    conv.scene
+        .coordinator
+        .adjudicate_provisional_unscanned(false);
+    conv.commit();
+    assert_eq!(mapping(&conv), MappingState::Mapped);
+
+    // A live marker in an incomplete publication stages the genuine
+    // uncertainty itself: the edge demotes with its reason.
+    conv.scene
+        .coordinator
+        .reference_stage_adjudication(conv.caller, pid);
+    conv.scene
+        .coordinator
+        .adjudicate_provisional_unscanned(false);
+    conv.commit();
+    assert_eq!(
+        mapping(&conv),
+        MappingState::Uncertain,
+        "the genuine arm demotes the unscanned member"
+    );
+    assert_eq!(
+        conv.scene
+            .coordinator
+            .registry()
+            .edge(conv.caller, mid)
+            .unwrap()
+            .mapping_reason
+            .as_deref(),
+        Some("member was not scanned this pass; the mapping is neither confirmed nor refuted")
+    );
+
+    // The same arm stages the tail too: adjudicating twice still mints
+    // exactly one gap (markers drain; the tail never duplicates).
+    conv.scene
+        .coordinator
+        .reference_stage_adjudication(conv.caller, pid);
+    conv.scene
+        .coordinator
+        .adjudicate_provisional_unscanned(false);
+    conv.scene
+        .coordinator
+        .adjudicate_provisional_unscanned(false);
+    conv.scene
+        .coordinator
+        .reference_prove_image(detailed, image);
+    conv.lane.script_cut_barrier(2);
+    conv.commit_with_lane();
+    assert_eq!(
+        conv.lane.take_recorded_gaps().len(),
+        1,
+        "the adjudicated tail mints exactly one gap"
+    );
+}
+
+#[test]
+fn native_semantic_finalize_invalidation_covers_domain_reasons() {
+    // Each positioned domain scope stages one domain loss with its own
+    // reason and retires nothing: no fake retirement, no silent revival.
+    let scopes: Vec<(InvalidationScope, Vec<InstanceReason>, Vec<InstanceReason>)> = vec![
+        (
+            InvalidationScope::CoverageFailed,
+            vec![InstanceReason::SemanticLoss],
+            vec![
+                InstanceReason::CaptureStopped,
+                InstanceReason::TaskRetired,
+                InstanceReason::AuthorityExhausted,
+            ],
+        ),
+        (
+            InvalidationScope::AuthorityExhausted,
+            vec![InstanceReason::AuthorityExhausted],
+            vec![InstanceReason::SemanticLoss],
+        ),
+        (
+            InvalidationScope::Stopped,
+            vec![InstanceReason::SemanticLoss, InstanceReason::CaptureStopped],
+            vec![
+                InstanceReason::TaskRetired,
+                InstanceReason::AuthorityExhausted,
+            ],
+        ),
+        (
+            InvalidationScope::TaskRetired(7),
+            vec![InstanceReason::SemanticLoss, InstanceReason::TaskRetired],
+            vec![
+                InstanceReason::CaptureStopped,
+                InstanceReason::AuthorityExhausted,
+            ],
+        ),
+    ];
+    for (scope, present, absent) in scopes {
+        let name = match scope {
+            InvalidationScope::CoverageFailed => "coverage_failed",
+            InvalidationScope::AuthorityExhausted => "authority_exhausted",
+            InvalidationScope::Stopped => "stopped",
+            InvalidationScope::TaskRetired(_) => "task_retired",
+            _ => unreachable!("domain-scope legs only"),
+        };
+        let mut conv = ConversionScene::new();
+        let r0 = conv.ids[0];
+        let coverage = conv.coverage(vec![r0]);
+        conv.register(&coverage, r0, 100, None);
+        conv.commit();
+        let (losses, retirements) =
+            finalize_invalidation(&scope, Some(5), conv.detailed(), None, &[]).unwrap();
+        assert!(retirements.is_empty(), "{name} never retires");
+        assert_eq!(losses.len(), 1, "{name} stages one domain loss");
+        for loss in losses {
+            conv.scene
+                .coordinator
+                .registry_mut()
+                .note_instance_semantic_loss(loss);
+        }
+        conv.commit();
+        let reasons = conv.edge_reasons(0);
+        for reason in &present {
+            assert!(
+                reasons.contains(reason),
+                "{name} discloses {reason:?}, got {reasons:?}"
+            );
+        }
+        for reason in &absent {
+            assert!(
+                !reasons.contains(reason),
+                "{name} discloses no {reason:?}, got {reasons:?}"
+            );
+        }
+        assert_eq!(
+            conv.instance_states(),
+            vec![InstanceLifecycle::Uncertain],
+            "{name} ends the operation unknown"
+        );
+    }
+}
+
+/// Map one more provider module for the same caller, so partition-scope
+/// legs can tell module-narrow losses from image-wide ones.
+fn map_sibling_module(conv: &mut ConversionScene, key: &ModuleKey, path: &str, at_ns: u64) {
+    let info = ModuleInfo {
+        path: path.into(),
+        key: key.clone(),
+        double_loaded: false,
+        build_id: None,
+        identity_source: Some("task3".into()),
+        admission: AdmissionState::Admitted,
+        admission_class: Some("exact".into()),
+        admission_endpoints: Some(1),
+        admission_reasons: Vec::new(),
+    };
+    conv.scene.coordinator.registry_mut().note_mapping(
+        conv.caller,
+        std::process::id(),
+        info,
+        at_ns,
+    );
+    conv.scene.coordinator.commit_batch(false).unwrap();
+}
+
+#[test]
+fn native_semantic_finalize_invalidation_narrows_partition_scopes() {
+    let other = ModuleKey::physical(7, 7, 778, None, "/task3/other.so");
+
+    // File invalidation with a position narrows to the bound module:
+    // only that module's edge fences, the sibling module stays clean.
+    let mut conv = ConversionScene::new();
+    let (r0, r1) = (conv.ids[0], conv.ids[1]);
+    map_sibling_module(&mut conv, &other, "/task3/other.so", 70);
+    let coverage = conv.coverage(vec![r0]);
+    conv.register(&coverage, r0, 100, None);
+    let sibling_binding = SemanticCallerBinding::scripted(
+        conv.caller,
+        other.clone(),
+        conv.detailed(),
+        conv.image,
+        conv.binding().pin(),
+    );
+    let sibling_coverage = LaneCoverage::scripted(
+        conv.detailed(),
+        conv.image,
+        conv.endpoint(conv.init_slot),
+        vec![r1],
+    );
+    let input =
+        admit_registration_from_coverage(&sibling_coverage, &sibling_binding, r1, 100, None)
+            .expect("sibling module registers");
+    conv.scene.coordinator.registry_mut().note_instance(input);
+    conv.commit();
+    let (losses, retirements) = {
+        let binding = conv.binding();
+        finalize_invalidation(
+            &InvalidationScope::File {
+                image: conv.image,
+                file_slot: 0,
+            },
+            Some(5),
+            conv.detailed(),
+            Some(binding),
+            &[],
+        )
+        .unwrap()
+    };
+    assert!(retirements.is_empty());
+    assert_eq!(losses.len(), 1);
+    for loss in losses {
+        conv.scene
+            .coordinator
+            .registry_mut()
+            .note_instance_semantic_loss(loss);
+    }
+    conv.commit();
+    assert_eq!(
+        conv.edge_rows().iter().map(|row| row.2).collect::<Vec<_>>(),
+        vec![true, false],
+        "module narrowing fences only the bound module"
+    );
+    assert_eq!(
+        conv.instance_states(),
+        vec![InstanceLifecycle::Uncertain, InstanceLifecycle::Observed]
+    );
+
+    // Without a binding the same file scope widens to the image: both
+    // modules fence.
+    let mut conv = ConversionScene::new();
+    let (r0, r1) = (conv.ids[0], conv.ids[1]);
+    map_sibling_module(&mut conv, &other, "/task3/other.so", 70);
+    let coverage = conv.coverage(vec![r0]);
+    conv.register(&coverage, r0, 100, None);
+    let sibling_binding = SemanticCallerBinding::scripted(
+        conv.caller,
+        other.clone(),
+        conv.detailed(),
+        conv.image,
+        conv.binding().pin(),
+    );
+    let sibling_coverage = LaneCoverage::scripted(
+        conv.detailed(),
+        conv.image,
+        conv.endpoint(conv.init_slot),
+        vec![r1],
+    );
+    let input =
+        admit_registration_from_coverage(&sibling_coverage, &sibling_binding, r1, 100, None)
+            .expect("sibling module registers");
+    conv.scene.coordinator.registry_mut().note_instance(input);
+    conv.commit();
+    let (losses, retirements) = finalize_invalidation(
+        &InvalidationScope::File {
+            image: conv.image,
+            file_slot: 0,
+        },
+        Some(5),
+        conv.detailed(),
+        None,
+        &[],
+    )
+    .unwrap();
+    assert!(retirements.is_empty());
+    assert_eq!(losses.len(), 1);
+    for loss in losses {
+        conv.scene
+            .coordinator
+            .registry_mut()
+            .note_instance_semantic_loss(loss);
+    }
+    conv.commit();
+    assert_eq!(
+        conv.edge_rows().iter().map(|row| row.2).collect::<Vec<_>>(),
+        vec![true, true],
+        "imageless file scope fences the whole image"
+    );
+    assert_eq!(
+        conv.instance_states(),
+        vec![InstanceLifecycle::Uncertain, InstanceLifecycle::Uncertain]
+    );
+
+    // A superseded partition without fresh proof is exact loss per id,
+    // never retirement: listed ids fence, the sibling stays clean.
+    let mut conv = ConversionScene::new();
+    let (p0, p1, s0) = (conv.ids[0], conv.ids[1], conv.ids[2]);
+    let coverage = conv.coverage(vec![p0, p1, s0]);
+    conv.register(&coverage, p0, 100, None);
+    conv.register(&coverage, p1, 100, None);
+    conv.register(&coverage, s0, 100, None);
+    conv.commit();
+    let (losses, retirements) = {
+        let binding = conv.binding();
+        finalize_invalidation(
+            &InvalidationScope::InstancesRetired {
+                image: conv.image,
+                file_slot: 0,
+                ids: vec![p0, p1],
+            },
+            Some(7),
+            conv.detailed(),
+            Some(binding),
+            &[],
+        )
+        .unwrap()
+    };
+    assert!(retirements.is_empty(), "no fresh proof retires nothing");
+    assert_eq!(losses.len(), 2, "one exact loss per superseded id");
+    for loss in losses {
+        conv.scene
+            .coordinator
+            .registry_mut()
+            .note_instance_semantic_loss(loss);
+    }
+    conv.commit();
+    assert_eq!(
+        conv.edge_rows().iter().map(|row| row.2).collect::<Vec<_>>(),
+        vec![true, true, false],
+        "exact loss spares the sibling"
+    );
+    assert_eq!(
+        conv.instance_states(),
+        vec![
+            InstanceLifecycle::Uncertain,
+            InstanceLifecycle::Uncertain,
+            InstanceLifecycle::Observed
+        ]
+    );
+
+    // Without a binding even a fresh partition cannot retire: the
+    // fallback is one wide image loss, never exact retirement.
+    let mut conv = ConversionScene::new();
+    let (r0, r1) = (conv.ids[0], conv.ids[1]);
+    let coverage = conv.coverage(vec![r0, r1]);
+    conv.register(&coverage, r0, 100, None);
+    conv.register(&coverage, r1, 100, None);
+    conv.commit();
+    let fresh = conv.coverage(vec![conv.ids[9]]);
+    let (losses, retirements) = finalize_invalidation(
+        &InvalidationScope::InstancesRetired {
+            image: conv.image,
+            file_slot: 0,
+            ids: vec![r0],
+        },
+        Some(7),
+        conv.detailed(),
+        None,
+        std::slice::from_ref(&fresh),
+    )
+    .unwrap();
+    assert!(
+        retirements.is_empty(),
+        "no binding mints no exact retirement"
+    );
+    assert_eq!(losses.len(), 1, "the fallback is one image loss");
+    for loss in losses {
+        conv.scene
+            .coordinator
+            .registry_mut()
+            .note_instance_semantic_loss(loss);
+    }
+    conv.commit();
+    assert_eq!(
+        conv.edge_rows().iter().map(|row| row.2).collect::<Vec<_>>(),
+        vec![true, true],
+        "the image fallback is deliberately wide"
+    );
+}
+
+#[test]
+fn native_semantic_convert_refuses_unbound_module_and_foreign_coverage() {
+    let conv = ConversionScene::new();
+    let r0 = conv.ids[0];
+    let coverage = conv.coverage(vec![r0]);
+    let subset = conv.lane.subset();
+    let binding = conv.binding();
+    let good = conv.evidence(1, r0, conv.init_slot, conv.init_event(110));
+
+    // A binding without an identified module refuses before any
+    // descriptor work: production proof never accepts such bindings,
+    // so conversion must not either.
+    let unidentified = SemanticCallerBinding::scripted(
+        conv.caller,
+        ModuleKey::Unidentified {
+            path: "/task3/unknown.so".into(),
+        },
+        conv.detailed(),
+        conv.image,
+        conv.binding().pin(),
+    );
+    assert_eq!(
+        refusal(admit_call_from_evidence(
+            good,
+            &unidentified,
+            subset,
+            CallStanding::Current(&coverage),
+            None
+        )),
+        Err(ConversionRefusal::Module)
+    );
+
+    // A coverage from another domain proves nothing here.
+    let foreign = NativeDomainId::mint();
+    let foreign_coverage =
+        LaneCoverage::scripted(foreign, conv.image, conv.endpoint(conv.init_slot), vec![r0]);
+    assert_eq!(
+        refusal(admit_call_from_evidence(
+            conv.evidence(1, r0, conv.init_slot, conv.init_event(110)),
+            binding,
+            subset,
+            CallStanding::Current(&foreign_coverage),
+            None
+        )),
+        Err(ConversionRefusal::Coverage)
+    );
+}
+
+/// The attested plan with one scripted init-slot shape: descriptor
+/// degradations `prepare` never admits, for the defense-in-depth arms.
+fn subset_with_init_shape(
+    conv: &ConversionScene,
+    shape: impl FnOnce(&mut crate::plan::Slot),
+) -> AttestedSubset {
+    let lane_subset = conv.lane.subset();
+    let mut plan = lane_subset.plan().clone();
+    let slot = plan
+        .slots
+        .iter_mut()
+        .find(|slot| slot.index == conv.init_slot)
+        .expect("attested init slot");
+    shape(slot);
+    AttestedSubset::scripted(
+        plan,
+        lane_subset.pins().clone(),
+        lane_subset.required().clone(),
+    )
+}
+
+#[test]
+fn native_semantic_convert_refuses_unauthorized_descriptor_shapes() {
+    let conv = ConversionScene::new();
+    let r0 = conv.ids[0];
+    let coverage = conv.coverage(vec![r0]);
+    let binding = conv.binding();
+
+    // Control: the unmodified attested plan converts.
+    let proven = subset_with_init_shape(&conv, |_| {});
+    assert!(
+        admit_call_from_evidence(
+            conv.evidence(1, r0, conv.init_slot, conv.init_event(110)),
+            binding,
+            &proven,
+            CallStanding::Current(&coverage),
+            None
+        )
+        .is_ok()
+    );
+
+    // Each degraded shape refuses through the slot arm.
+    let unauthorized = subset_with_init_shape(&conv, |slot| slot.semantic_authorized = false);
+    assert_eq!(
+        refusal(admit_call_from_evidence(
+            conv.evidence(1, r0, conv.init_slot, conv.init_event(110)),
+            binding,
+            &unauthorized,
+            CallStanding::Current(&coverage),
+            None
+        )),
+        Err(ConversionRefusal::Slot),
+        "an unauthorized descriptor refuses"
+    );
+    let aliased = subset_with_init_shape(&conv, |slot| slot.aliased = true);
+    assert_eq!(
+        refusal(admit_call_from_evidence(
+            conv.evidence(1, r0, conv.init_slot, conv.init_event(110)),
+            binding,
+            &aliased,
+            CallStanding::Current(&coverage),
+            None
+        )),
+        Err(ConversionRefusal::Slot),
+        "an aliased descriptor refuses"
+    );
+    let ambiguous = subset_with_init_shape(&conv, |slot| slot.semantic_ambiguous = true);
+    assert_eq!(
+        refusal(admit_call_from_evidence(
+            conv.evidence(1, r0, conv.init_slot, conv.init_event(110)),
+            binding,
+            &ambiguous,
+            CallStanding::Current(&coverage),
+            None
+        )),
+        Err(ConversionRefusal::Slot),
+        "an ambiguous descriptor refuses"
+    );
+    let nameless = subset_with_init_shape(&conv, |slot| slot.names.clear());
+    assert_eq!(
+        refusal(admit_call_from_evidence(
+            conv.evidence(1, r0, conv.init_slot, conv.init_event(110)),
+            binding,
+            &nameless,
+            CallStanding::Current(&coverage),
+            None
+        )),
+        Err(ConversionRefusal::Slot),
+        "a nameless descriptor refuses"
+    );
+    let count_only =
+        subset_with_init_shape(&conv, |slot| slot.semantics = SlotSemantics::COUNT_ONLY);
+    assert_eq!(
+        refusal(admit_call_from_evidence(
+            conv.evidence(1, r0, conv.init_slot, conv.init_event(110)),
+            binding,
+            &count_only,
+            CallStanding::Current(&coverage),
+            None
+        )),
+        Err(ConversionRefusal::Slot),
+        "a count-only descriptor refuses"
+    );
+}
+
+#[test]
+fn native_semantic_register_refuses_domain_and_custody_mismatch() {
+    let conv = ConversionScene::new();
+    let r0 = conv.ids[0];
+    let binding = conv.binding();
+
+    // A foreign domain's coverage never registers here.
+    let foreign = NativeDomainId::mint();
+    let foreign_coverage =
+        LaneCoverage::scripted(foreign, conv.image, conv.endpoint(conv.init_slot), vec![r0]);
+    assert_eq!(
+        refusal(admit_registration_from_coverage(
+            &foreign_coverage,
+            binding,
+            r0,
+            100,
+            None
+        )),
+        Err(ConversionRefusal::Domain)
+    );
+
+    // A superseded exec proves nothing for this binding either.
+    let stale = LaneCoverage::scripted(
+        conv.detailed(),
+        ImageIdentity {
+            task_cookie: 7,
+            exec_id: 99,
+        },
+        conv.endpoint(conv.init_slot),
+        vec![r0],
+    );
+    assert_eq!(
+        refusal(admit_registration_from_coverage(
+            &stale, binding, r0, 100, None
+        )),
+        Err(ConversionRefusal::Custody)
+    );
+}
+
+#[test]
+fn native_semantic_binding_refuses_domain_conflict() {
+    set_sight(1_005);
+    let mut scene = BindingScene::new();
+    let pid = std::process::id();
+    let module = scene.module.clone();
+    let (detailed, inventory) = (scene.detailed, scene.inventory);
+    let caller = scene.admit(pid, 50);
+    scene.map(caller, pid, 60);
+    let image = ImageIdentity {
+        task_cookie: 7,
+        exec_id: 1,
+    };
+    scene.answer(pid, detailed, 7);
+    scene.bind_image(detailed, vec![(7, 1, pid, 100)], 1_000);
+    assert_eq!(scene.bind(caller, &module, detailed, image), Ok(()));
+
+    // The same caller under a second domain refuses: one binding per
+    // caller mirrors H0's per-cookie association.
+    assert_eq!(
+        scene.bind(caller, &module, inventory, image),
+        Err(SemanticBindingRefusal::DomainConflict)
+    );
+    assert_eq!(
+        scene
+            .coordinator
+            .semantic_bindings()
+            .get(caller)
+            .unwrap()
+            .domain(),
+        detailed,
+        "the refused rebind keeps the original domain"
+    );
+    assert_eq!(scene.bind(caller, &module, detailed, image), Ok(()));
 }

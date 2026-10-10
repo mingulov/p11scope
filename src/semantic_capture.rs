@@ -563,10 +563,6 @@ impl SemanticCapture {
     pub(crate) fn continuity_cuts(&self) -> u64 {
         self.continuity_cuts
     }
-    #[expect(
-        dead_code,
-        reason = "H3 final adjudication wiring consumes this actual-owner validator"
-    )]
     pub(crate) fn validate_current(
         &mut self,
         session: &mut Session,
@@ -682,10 +678,6 @@ impl SemanticCapture {
             &receipt.ids,
         )
     }
-    #[expect(
-        dead_code,
-        reason = "H3 final physical adjudicator supplies the staged opaque gap factory"
-    )]
     pub(crate) fn apply_physical_gaps(
         &mut self,
         session: &mut Session,

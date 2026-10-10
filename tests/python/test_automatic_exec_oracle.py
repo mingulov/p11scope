@@ -13,6 +13,7 @@ No privilege, no fixtures, no observer: every input is synthetic.
 """
 
 import copy
+import inspect
 import json
 import runpy
 import sys
@@ -447,6 +448,138 @@ class TraceTest(unittest.TestCase):
         self.assertFalse(result["pass"])
         self.assertTrue(any("captured rows" in error for error in result["errors"]),
                         result["errors"])
+
+
+def group_death_inputs():
+    """Group-death leg: 2 named pre-death calls, proven death, long dwell."""
+    meas0 = READY + 100_000_000
+    death = READY + 5_000_000_000
+    ledger = [
+        image_record(0, "/w/caller-a", READY - 500_000_000),
+        target_record(0, "C_GenerateRandom"),
+        call_record(0, "C_GenerateRandom", 0, "measured", "selected", meas0, meas0 + 10),
+        call_record(0, "C_GenerateRandom", 0, "measured", "selected", meas0 + 20, meas0 + 30),
+    ]
+    receipt = base_receipt(
+        cell="rapid-chain", leg="group-death/singles", caller_rc=-9,
+        images=[image_record(0, "/w/caller-a", READY - 500_000_000)],
+        phases=[{"image": 0, "fn": "C_GenerateRandom", "phase": "measured",
+                 "scope": "selected", "count": 2, "t0": meas0 - 1, "t1": meas0 + 40}],
+        measured={"label": "pre-death", "t0": meas0 - 1, "t1": meas0 + 40,
+                  "expected_calls": 2, "phases": ["measured"]},
+        warmup={"label": "none", "t0": meas0 - 1, "t1": meas0 - 1,
+                "expected_calls": 0, "phases": []},
+        exec_transitions=[],
+        require_named=True, require_named_images=[0], first_unknown_images=[],
+        group_death={"kill": "SIGKILL/killpg", "group_size_before": 1,
+                     "kill_ns": death - 1000, "death_ns": death,
+                     "reaped": True, "proc_gone": True,
+                     "manufactured_reuse": False, "replacement_leg": "reuse/singles",
+                     "min_dwell_ns": 2_000_000_000, "observer_self_ended": False})
+    rows = [named_row(1000, 1000, "/w/caller-a", "C_GenerateRandom"),
+            named_row(1000, 1000, "/w/caller-a", "C_GenerateRandom")]
+    text = trace_text(rows, 2, 2, evidence())
+    return text, ledger, receipt
+
+
+class GroupDeathTest(unittest.TestCase):
+    maxDiff = 4000
+
+    def test_accept_group_death_control(self):
+        text, ledger, receipt = group_death_inputs()
+        result = H6["evaluate_trace_h6"](text, ledger, receipt)
+        self.assertTrue(result["pass"], result["errors"])
+        self.assertEqual(result["calls"], 2)
+        self.assertEqual(result["named"], 2)
+        self.assertEqual(result["physical_entered"], 2)
+        self.assertEqual(result["api_returned"], 2)
+
+    def test_accept_self_ended_observer(self):
+        text, ledger, receipt = group_death_inputs()
+        receipt = copy.deepcopy(receipt)
+        receipt["group_death"]["observer_self_ended"] = True
+        result = H6["evaluate_trace_h6"](text, ledger, receipt)
+        self.assertTrue(result["pass"], result["errors"])
+
+    def test_reject_post_death_row(self):
+        _, ledger, receipt = group_death_inputs()
+        rows = [named_row(1000, 1000, "/w/caller-a", "C_GenerateRandom"),
+                named_row(1000, 1000, "/w/caller-a", "C_GenerateRandom"),
+                named_row(1000, 1000, "/w/caller-a", "C_GenerateRandom")]
+        text = trace_text(rows, 2, 2, evidence())
+        result = H6["evaluate_trace_h6"](text, ledger, receipt)
+        self.assertFalse(result["pass"])
+        self.assertTrue(any("duplicate return" in error for error in result["errors"]),
+                        result["errors"])
+
+    def test_reject_call_at_or_after_death(self):
+        _, ledger, receipt = group_death_inputs()
+        ledger = copy.deepcopy(ledger)
+        receipt = copy.deepcopy(receipt)
+        death = receipt["group_death"]["death_ns"]
+        receipt["phases"][0]["t1"] = death + 100
+        receipt["measured"]["t1"] = death + 100
+        ledger[-1]["t1"] = death
+        text, _, _ = group_death_inputs()
+        result = H6["evaluate_trace_h6"](text, ledger, receipt)
+        self.assertFalse(result["pass"])
+        self.assertTrue(any("at or after the proven death" in error
+                            for error in result["errors"]), result["errors"])
+
+    def test_reject_short_dwell(self):
+        text, ledger, receipt = group_death_inputs()
+        receipt = copy.deepcopy(receipt)
+        receipt["group_death"]["kill_ns"] = STOP - 2
+        receipt["group_death"]["death_ns"] = STOP - 1
+        result = H6["evaluate_trace_h6"](text, ledger, receipt)
+        self.assertFalse(result["pass"])
+        self.assertTrue(any("dwell is too short" in error for error in result["errors"]),
+                        result["errors"])
+
+    def test_reject_clean_caller_rc(self):
+        text, ledger, receipt = group_death_inputs()
+        receipt = copy.deepcopy(receipt)
+        receipt["caller_rc"] = 0
+        result = H6["evaluate_trace_h6"](text, ledger, receipt)
+        self.assertFalse(result["pass"])
+        self.assertTrue(any("whole-group SIGKILLed" in error for error in result["errors"]),
+                        result["errors"])
+
+    def test_reject_manufactured_reuse(self):
+        text, ledger, receipt = group_death_inputs()
+        receipt = copy.deepcopy(receipt)
+        receipt["group_death"]["manufactured_reuse"] = True
+        result = H6["evaluate_trace_h6"](text, ledger, receipt)
+        self.assertFalse(result["pass"])
+        self.assertTrue(any("never be manufactured" in error for error in result["errors"]),
+                        result["errors"])
+
+    def test_reject_unproven_death(self):
+        text, ledger, receipt = group_death_inputs()
+        receipt = copy.deepcopy(receipt)
+        receipt["group_death"]["proc_gone"] = False
+        result = H6["evaluate_trace_h6"](text, ledger, receipt)
+        self.assertFalse(result["pass"])
+        self.assertTrue(any("not proven by waitpid" in error for error in result["errors"]),
+                        result["errors"])
+
+
+class GroupDeathWiringTest(unittest.TestCase):
+    """The group-death leg is registered alongside the reuse control."""
+
+    def test_leg_registered_in_rapid_chain(self):
+        self.assertIn("run_group_death_leg", H6)
+        self.assertEqual(H6["CELL_RUNNERS"]["rapid-chain"], H6["run_rapid_chain"])
+        source = inspect.getsource(H6["run_rapid_chain"])
+        self.assertIn("run_group_death_leg", source)
+        self.assertIn("run_reuse_control", source)
+        self.assertEqual(H6["CELLS"],
+                         ("pid-leader", "pid-reexec", "pid-nonleader-cold", "pid-failed-exec",
+                          "leader-exit-exec", "rapid-chain", "cgroup-reentry", "system-mixed"))
+
+    def test_dwell_bounds(self):
+        self.assertGreaterEqual(H6["GROUP_DEATH_DWELL_NS"], H6["GROUP_DEATH_MIN_DWELL_NS"])
+        self.assertGreater(H6["GROUP_DEATH_MIN_DWELL_NS"], 0)
 
 
 def profile_doc(functions, mode="profile", scope="pid"):

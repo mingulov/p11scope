@@ -162,8 +162,17 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
         if not canary or any(canary in output for output in
                              (trace, file_trace or "", receipt.get("observer_stderr", ""))):
             errors.append("private fixture canary appears in capture output")
-    if receipt.get("observer_rc") != 0 or receipt.get("caller_rc") != 0:
-        errors.append("observer or caller did not exit successfully")
+    # H6-DELTA: group-death legs. The caller is SIGKILLed as a whole
+    # group, so its reaped rc is -SIGKILL, never 0; death is proven by
+    # the harness via waitpid plus /proc disappearance, never from
+    # p11scope output. The exact per-key population agreement below is
+    # then the no-post-death-rows proof.
+    death = receipt.get("group_death")
+    if death is None:
+        if receipt.get("observer_rc") != 0 or receipt.get("caller_rc") != 0:
+            errors.append("observer or caller did not exit successfully")
+    else:
+        errors.extend(_check_group_death_proof(death, receipt))
     if not 0 <= receipt.get("stop_latency_seconds", -1) <= receipt.get("stop_limit_seconds", 5):
         errors.append("normal stop exceeded the bounded cell limit")
     before, after = receipt["provider_before"], receipt["provider_after"]
@@ -272,6 +281,12 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
     in_window, pre_ready, post_stop, out_of_scope, boundary_errors = _select_in_window(
         calls, receipt, ready, stop)
     errors.extend(boundary_errors)
+    # H6-DELTA: group-death legs ledger nothing at or after the
+    # independently proven death; any post-death row then fails the
+    # exact population agreement below as a duplicate/foreign count.
+    if death is not None and isinstance(death.get("death_ns"), int):
+        if any(call["t1"] >= death["death_ns"] for call in in_window):
+            errors.append("group-death leg ledgered a call at or after the proven death")
     mandatory: Counter = Counter()
     expected_images: dict = defaultdict(set)
     expected_calls: dict = defaultdict(deque)
@@ -450,6 +465,40 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
             "phase_populations": {key: dict(value) for key, value in phase_populations.items()},
             "mandatory_calls": sum(mandatory.values()), "counts": counts,
             "evidence": evidence, "errors": errors}
+
+
+def _check_group_death_proof(death, receipt):
+    """Group-death-ends-capture gate (brief line 101, death half).
+
+    All inputs are harness receipts (waitpid, /proc, monotonic clock),
+    never p11scope output. Returns a list of error strings.
+    """
+    errors = []
+    if receipt.get("observer_rc") != 0:
+        errors.append("observer did not exit successfully")
+    if receipt.get("caller_rc") != -signal.SIGKILL:
+        errors.append("group-death caller was not reaped as whole-group SIGKILLed")
+    if death.get("kill") != "SIGKILL/killpg":
+        errors.append("group death was not a whole-group SIGKILL via killpg")
+    if not isinstance(death.get("group_size_before"), int) or death["group_size_before"] < 1:
+        errors.append("group-death leg lacks a live-group pre-kill receipt")
+    if death.get("reaped") is not True or death.get("proc_gone") is not True:
+        errors.append("group death is not proven by waitpid plus /proc disappearance")
+    if death.get("manufactured_reuse") is not False:
+        errors.append("numeric PID reuse must never be manufactured via sysctl")
+    if not death.get("replacement_leg"):
+        errors.append("group-death leg names no independently admitted replacement control")
+    ready, stop = receipt.get("observer_ready_ns"), receipt.get("observer_stopped_ns")
+    kill_ns, death_ns = death.get("kill_ns"), death.get("death_ns")
+    if not (isinstance(kill_ns, int) and isinstance(death_ns, int)
+            and isinstance(ready, int) and isinstance(stop, int)
+            and ready < kill_ns <= death_ns < stop):
+        errors.append("group-death kill/death stamps are not inside the observer interval")
+    else:
+        min_dwell = death.get("min_dwell_ns", 0)
+        if not isinstance(min_dwell, int) or stop - death_ns < min_dwell:
+            errors.append("post-death dwell is too short to prove capture ended")
+    return errors
 
 
 def _check_measured_warmup(calls, receipt, ready, stop, start):
@@ -2093,7 +2142,7 @@ def run_leader_exit_exec(ctx, cell_dir, backend):
 
 
 def run_rapid_chain(ctx, cell_dir, backend):
-    """Bounded 3-exec leader chain (A->B->A->B) plus the reuse control."""
+    """Bounded 3-exec leader chain (A->B->A->B) plus reuse and group-death legs."""
     leg_dir = Path(cell_dir) / backend / "trace"
     (leg_dir / "workload").mkdir(mode=0o755, parents=True, exist_ok=True)
     env = init_token(leg_dir / "workload", ctx.args.uid, ctx.args.gid, "h6-rapid")
@@ -2173,7 +2222,9 @@ def run_rapid_chain(ctx, cell_dir, backend):
     write_json(leg_dir / "result.json", result)
     control = run_reuse_control(ctx, Path(cell_dir) / backend / "reuse", backend, env,
                                 dead_pid, pins["caller-a"])
-    return [result, control]
+    death = run_group_death_leg(ctx, Path(cell_dir) / backend / "group-death",
+                                backend, env, pins["caller-a"])
+    return [result, control, death]
 
 
 def run_reuse_control(ctx, leg_dir, backend, env, dead_pid, image_pin):
@@ -2229,6 +2280,108 @@ def run_reuse_control(ctx, leg_dir, backend, env, dead_pid, image_pin):
         "require_named": True, "require_named_images": [0], "first_unknown_images": [],
         "manual_rebind": False, "abandoned_expected": 0, "abandoned_by_fn": {},
         "reuse_expected": {}, "requested_backend": backend,
+    }
+    result = evaluate_trace_h6("".join(capture.lines), ledger, receipt,
+                               (leg_dir / "trace.file.txt").read_text())
+    write_json(leg_dir / "receipt.json", receipt)
+    write_json(leg_dir / "result.json", result)
+    return result
+
+
+GROUP_DEATH_DWELL_NS = 3_000_000_000
+GROUP_DEATH_MIN_DWELL_NS = 2_000_000_000
+
+
+def run_group_death_leg(ctx, leg_dir, backend, env, image_pin):
+    """Whole-group death ends --pid capture: no post-death rows.
+
+    Brief line 101, death half: drive a nonempty named pre-death phase
+    under --pid, SIGKILL the entire owned process group at once, prove
+    death via waitpid plus /proc disappearance, keep the observer up
+    through a bounded post-death dwell, then require the capture to
+    hold only pre-death rows. Numeric PID reuse is never manufactured
+    (no sysctl); the real independently admitted replacement is the
+    sibling reuse leg, named in the receipt.
+    """
+    leg_dir = Path(leg_dir)
+    leg_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+    provider = ctx.provider_pin
+    caller, stdout, _ = spawn_caller(ctx.owners, ctx.readers, leg_dir, image_pin,
+                                     provider, ctx.args.uid, ctx.args.gid, env,
+                                     tag="doomed")
+    stdout.record("ready", 0)
+    images = [image_pin.image_receipt(stdout.record("image", 0), caller)]
+    argv = [str(ctx.binary.path), "trace", "--pid", str(caller.pid),
+           "--module", str(provider.path), "--attach-backend", backend,
+           "--duration", "120s", "-o", str(leg_dir / "trace.file.txt")]
+    owned, capture, errors, started = spawn_observer(
+        ctx.owners, ctx.readers, leg_dir, argv, env)
+    try:
+        ready = observer_ready(owned, errors, backend)
+    except BackendRefused as refused:
+        stop_caller(caller, stdout, 0)
+        receipt = {"cell": "rapid-chain", "leg": f"group-death/{backend}",
+                   "backend_refused": str(refused)}
+        result = evaluate_trace_h6("", [], receipt)
+        write_json(leg_dir / "result.json", result)
+        return result
+    phases = []
+    n3_command(caller, stdout, "C_GenerateRandom", 5, 100, "measured", "selected",
+               0, None, phases)
+    # Whole-group kill: the caller is an owned session/group leader, so
+    # killpg reaches every thread at once; nothing survives to keep the
+    # PID capture alive. Liveness before and death after are proven by
+    # the harness (pidfd identity, waitpid, /proc), never by p11scope.
+    caller.verify()
+    group_size_before = len(list((Path("/proc") / str(caller.pid) / "task").iterdir()))
+    dead_pid = caller.pid
+    kill_ns = monotonic_ns()
+    os.killpg(caller.pid, signal.SIGKILL)
+    caller_rc = caller.popen.wait(timeout=10)
+    proc_gone = not (Path("/proc") / str(dead_pid)).exists()
+    death_ns = monotonic_ns()
+    deadline = death_ns + GROUP_DEATH_DWELL_NS
+    while monotonic_ns() < deadline:
+        time.sleep(0.05)
+    dwell_end = monotonic_ns()
+    if owned.popen.poll() is None:
+        observer_self_ended = False
+        obs_rc, stopped, latency = stop_observer(owned)
+    else:
+        # The observer ended capture by itself after the group death.
+        observer_self_ended = True
+        obs_rc, stopped, latency = owned.popen.poll(), dwell_end, 0.0
+    finish_readers([stdout, capture, errors])
+    ledger = list(stdout.records)
+    measured = phases[0]
+    receipt = {
+        "cell": "rapid-chain", "leg": f"group-death/{backend}", "scope_kind": "pid",
+        "pid": dead_pid, "known_tids": [dead_pid], "owned_pids": [dead_pid],
+        "images": images, "provider_before": provider_receipt(provider),
+        "provider_after": provider_receipt(provider),
+        "privacy_canaries": list(CANARIES), "observer_stderr": "".join(errors.lines),
+        "observer_rc": obs_rc, "caller_rc": caller_rc,
+        "observer_started_ns": started, "observer_ready_ns": ready,
+        "observer_stopped_ns": stopped, "scope_created_ns": ctx.scope_created_ns,
+        "stop_latency_seconds": latency, "stop_limit_seconds": 60,
+        "pid_namespace": caller.identity["pid_namespace"],
+        "time_namespace": caller.identity["time_namespace"],
+        "measured": {"label": "pre-death", "t0": measured["t0"], "t1": measured["t1"],
+                     "expected_calls": 5, "phases": ["measured"]},
+        "warmup": {"label": "none", "t0": measured["t0"], "t1": measured["t0"],
+                   "expected_calls": 0, "phases": []},
+        "exec_transitions": [], "phases": phases,
+        "require_named": True, "require_named_images": [0], "first_unknown_images": [],
+        "manual_rebind": False, "abandoned_expected": 0, "abandoned_by_fn": {},
+        "reuse_expected": {}, "requested_backend": backend,
+        "group_death": {
+            "kill": "SIGKILL/killpg", "group_size_before": group_size_before,
+            "kill_ns": kill_ns, "death_ns": death_ns,
+            "reaped": caller.popen.returncode is not None, "proc_gone": proc_gone,
+            "manufactured_reuse": False, "replacement_leg": f"reuse/{backend}",
+            "min_dwell_ns": GROUP_DEATH_MIN_DWELL_NS,
+            "observer_self_ended": observer_self_ended,
+        },
     }
     result = evaluate_trace_h6("".join(capture.lines), ledger, receipt,
                                (leg_dir / "trace.file.txt").read_text())

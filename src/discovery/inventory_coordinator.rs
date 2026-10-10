@@ -13023,8 +13023,7 @@ pub(crate) mod tests {
         let mut hinted = DiscoveryBatch::scripted(domain, Vec::new(), now + 20);
         // SAFETY: DiscoveryRecord contains only integer fields; this is the
         // same fixed, zero-reserved lifecycle wire shape the real producer emits.
-        let mut hint_record: p11scope_ebpf_common::DiscoveryRecord =
-            unsafe { std::mem::zeroed() };
+        let mut hint_record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
         hint_record.hook_ts_ns = now + 20;
         hint_record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
         hint_record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
@@ -13125,18 +13124,17 @@ pub(crate) mod tests {
             .binder
             .note_exec_coverage(ExecCoverage::scripted(proof_domain, 0));
         let proof_stamps = Stamps::from(now);
-        let mut proof_stage =
-            |prover: &mut InventoryCoordinator<OsProcessSource>, rows: Vec<WitnessRow>| {
-                for batch in [
-                    proof_stamps.read(proof_domain, rows),
-                    proof_stamps.drain(proof_domain),
-                    proof_stamps.read(proof_domain, Vec::new()),
-                ] {
-                    prover.stage_native(batch, &mut proof_identity, now + 10);
-                }
-            };
-        let proof_object =
-            crate::discovery::inventory_attach_set::AttachObjectId::scripted(0);
+        let mut proof_stage = |prover: &mut InventoryCoordinator<OsProcessSource>,
+                               rows: Vec<WitnessRow>| {
+            for batch in [
+                proof_stamps.read(proof_domain, rows),
+                proof_stamps.drain(proof_domain),
+                proof_stamps.read(proof_domain, Vec::new()),
+            ] {
+                prover.stage_native(batch, &mut proof_identity, now + 10);
+            }
+        };
+        let proof_object = crate::discovery::inventory_attach_set::AttachObjectId::scripted(0);
         proof_stage(
             &mut prover,
             vec![WitnessRow::scripted(
@@ -13178,10 +13176,7 @@ pub(crate) mod tests {
         let transitions = prover.binder.take_transitions();
         assert_eq!(transitions.len(), 1, "one proven transition captured");
         let stale_owner = ProcessViewId(999_999);
-        let before = coordinator
-            .engine
-            .inventory_owner_epochs(owner2)
-            .unwrap();
+        let before = coordinator.engine.inventory_owner_epochs(owner2).unwrap();
         assert!(
             coordinator
                 .engine

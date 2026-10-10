@@ -223,6 +223,7 @@ fn the_final_sweep_makes_the_replayed_edges_equal_the_snapshot() {
         false,
         &mut crate::inventory_output::WriterStdout(&mut text),
         None,
+        None,
     );
     assert_eq!(outcome.exit_code(), 0);
     assert_eq!(outcome.event_log_confirmed, Some(true));
@@ -1043,6 +1044,7 @@ fn a_dashboard_pass_streams_the_classic_view_when_the_display_window_expires() {
             false,
             true,
             &mut crate::inventory_output::WriterStdout(&mut sink),
+            None,
             None,
         );
         assert_eq!(outcome.exit_code(), 0);

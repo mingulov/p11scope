@@ -180,6 +180,13 @@ pub struct InventoryArgs {
     /// `--attach-backend`: how the native lane attaches its usage entries
     /// (C5.11); `auto` by default. The scan lane attaches nothing.
     pub attach_backend: BackendSelection,
+    /// `--identity-backend`: the system sweep identity proof backend
+    /// (D3d); `auto` by default. System scope only.
+    pub identity_backend: IdentityBackendSelection,
+    /// Whether `--identity-backend` was given explicitly. An explicit
+    /// selection outside `--system` is a usage error; the implicit
+    /// default under `--pid`/`--cgroup` loads nothing and emits no field.
+    pub identity_backend_explicit: bool,
 }
 
 /// `inventory --capture`: the usage lane (Task 6 C5.1, plan §10 ruling D1).
@@ -200,6 +207,41 @@ impl CaptureMode {
             CaptureMode::Auto => "auto",
             CaptureMode::Scan => "scan",
             CaptureMode::Native => "native",
+        }
+    }
+}
+
+/// `inventory --identity-backend` (D3d): the system sweep identity proof
+/// backend. `auto` (default) defers any identity load until the first
+/// nonempty proof plan, then uses kernel proof when eligible; `userspace`
+/// never loads identity BPF; `kernel` validates numbering/BTF, strict
+/// load and functional probe before capture starts, or refuses with a
+/// named nonzero error. System scope only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IdentityBackendSelection {
+    #[default]
+    Auto,
+    Userspace,
+    Kernel,
+}
+
+impl IdentityBackendSelection {
+    pub fn from_cli(value: &str) -> Result<Self, String> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "userspace" => Ok(Self::Userspace),
+            "kernel" => Ok(Self::Kernel),
+            _ => Err(format!(
+                "--identity-backend: invalid value {value:?} (expected auto|userspace|kernel)"
+            )),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Userspace => "userspace",
+            Self::Kernel => "kernel",
         }
     }
 }
@@ -322,7 +364,7 @@ usage:
   p11scope inspect --system [--module <provider.so>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
   p11scope inventory --pid <n> [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory --cgroup <path> [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
   p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
@@ -341,6 +383,10 @@ the target) and per-offset links elsewhere, multi forces multi (needs 6.6+; unde
 --pid also a proven pid filter), singles forces per-offset. Dynamic loader and
 export probes always use per-offset links. inventory --attach-backend auto picks multi
 wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
+inventory --identity-backend selects the system sweep identity proof backend: auto (default)
+defers any identity load until the first nonempty proof plan, userspace never loads identity
+BPF, kernel validates numbering/BTF, strict load and functional probe before capture starts
+(system scope only; explicit use under --pid/--cgroup is refused).
 --mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
 ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
 every descendant (kernel >= 5.15). --system requests whole-machine capture with
@@ -450,7 +496,7 @@ Without --pid or --cgroup, target readiness is unassessed.
 const INVENTORY_HELP: &str = "usage:
   p11scope inventory --pid <n> [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory --cgroup <path> [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
 
 example (4242 is an example PID, not a detected target):
@@ -468,6 +514,10 @@ Subset preparation preserves broad physical counting; positive instance delivery
 Inventory separates mapped modules from observed usage entries; entries are not completed calls.
 --max-endpoints selects capture-lifetime physical endpoint IDs: 1..=8192, default 4096; unloading does not refund IDs.
 --capture scan uses no BPF and leaves usage unknown. auto prefers native and reports fallback gaps; native fails if unavailable.
+--identity-backend selects the system sweep identity proof backend: auto (default) defers any
+identity load until the first nonempty proof plan, userspace never loads identity BPF, kernel
+validates numbering/BTF, strict load and functional probe before capture starts. System scope
+only; explicit use under --pid/--cgroup is refused.
 --json and -o contain the same inventory facts; --event-log appends bounded JSONL history with rotation.
 --diagnostics writes bounded native count decisions after capture stops; requires auto or native and a separate regular file.
 --diagnostics-pid selects that PID's diagnostics without changing capture scope; global health records remain included.
@@ -946,6 +996,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     let mut diagnostics_pid: Option<u32> = None;
     let mut capture: Option<CaptureMode> = None;
     let mut attach_backend: Option<BackendSelection> = None;
+    let mut identity_backend: Option<IdentityBackendSelection> = None;
     while let Some(a) = args.next() {
         match word(&a).as_ref() {
             "--help" | "-h" => return Err(CliError::Help(HelpTopic::Inventory)),
@@ -972,6 +1023,13 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
                 let v = require_value(&mut args, "--attach-backend")?;
                 attach_backend =
                     Some(BackendSelection::from_cli(&v).map_err(|e| usage_err(format!("{e:#}")))?);
+            }
+            "--identity-backend" => {
+                if identity_backend.is_some() {
+                    return Err(usage_err("--identity-backend given twice"));
+                }
+                let v = require_value(&mut args, "--identity-backend")?;
+                identity_backend = Some(IdentityBackendSelection::from_cli(&v).map_err(usage_err)?);
             }
             "--pid" => {
                 if pid.is_some() {
@@ -1148,6 +1206,20 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     if diagnostics.is_some() && capture == Some(CaptureMode::Scan) {
         return Err(usage_err("--diagnostics requires --capture auto or native"));
     }
+    // D3d: identity selection affects system inventory only. An explicit
+    // value under --pid or --cgroup is refused by name; the implicit
+    // default elsewhere loads nothing and emits no field.
+    if identity_backend.is_some() && !matches!(scope, ScopeArg::System) {
+        let with = match &scope {
+            ScopeArg::Pid(_) => "--pid",
+            ScopeArg::Cgroup(_) => "--cgroup",
+            ScopeArg::System => unreachable!("system scope accepts identity selection"),
+        };
+        return Err(usage_err(format!(
+            "--identity-backend cannot be used with {with} (system inventory only; \
+             use inventory --system)"
+        )));
+    }
     Ok(InventoryArgs {
         scope,
         modules,
@@ -1167,6 +1239,8 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
         diagnostics_pid,
         capture: capture.unwrap_or(CaptureMode::Auto),
         attach_backend: attach_backend.unwrap_or_default(),
+        identity_backend_explicit: identity_backend.is_some(),
+        identity_backend: identity_backend.unwrap_or_default(),
     })
 }
 
@@ -2097,6 +2171,84 @@ mod tests {
         };
         assert!(topic.text().contains("inventory diff BEFORE"));
         assert!(!topic.text().contains("--pid"));
+    }
+
+    /// D3d RED: `inventory --identity-backend` selects the system sweep
+    /// identity backend; `auto` by default, system scope only.
+    #[test]
+    fn d3d_identity_backend_defaults_to_auto_and_parses_each_value() {
+        let Command::Inventory(plain) = parse(args(&["inventory", "--system"])).unwrap() else {
+            panic!("expected inventory")
+        };
+        assert_eq!(
+            plain.identity_backend,
+            IdentityBackendSelection::Auto,
+            "default identity selection is auto"
+        );
+        assert!(
+            !plain.identity_backend_explicit,
+            "implicit default is not an explicit selection"
+        );
+        for (word, expected) in [
+            ("auto", IdentityBackendSelection::Auto),
+            ("userspace", IdentityBackendSelection::Userspace),
+            ("kernel", IdentityBackendSelection::Kernel),
+        ] {
+            let Command::Inventory(i) =
+                parse(args(&["inventory", "--system", "--identity-backend", word])).unwrap()
+            else {
+                panic!("expected inventory")
+            };
+            assert_eq!(i.identity_backend, expected, "word {word}");
+            assert!(i.identity_backend_explicit, "word {word} is explicit");
+        }
+    }
+
+    /// D3d RED: duplicate/missing/invalid identity selection and explicit
+    /// use outside system scope are usage errors.
+    #[test]
+    fn d3d_identity_backend_refuses_duplicate_missing_invalid_and_pid_scope() {
+        assert!(matches!(
+            parse(args(&["inventory", "--system", "--identity-backend", "both"])),
+            Err(CliError::Usage { message: m, .. })
+                if m.contains("--identity-backend: invalid value")
+        ));
+        assert!(matches!(
+            parse(args(&[
+                "inventory",
+                "--system",
+                "--identity-backend",
+                "kernel",
+                "--identity-backend",
+                "userspace",
+            ])),
+            Err(CliError::Usage { message: m, .. }) if m.contains("--identity-backend given twice")
+        ));
+        assert!(matches!(
+            parse(args(&["inventory", "--system", "--identity-backend"])),
+            Err(CliError::Usage { message: m, .. })
+                if m.contains("--identity-backend requires a value")
+        ));
+        assert!(matches!(
+            parse(args(&["inventory", "--pid", "7", "--identity-backend", "kernel"])),
+            Err(CliError::Usage { message: m, .. }) if m.contains("--identity-backend")
+        ));
+        assert!(matches!(
+            parse(args(&[
+                "inventory",
+                "--cgroup",
+                "/sys/fs/cgroup/owned.scope",
+                "--identity-backend",
+                "kernel",
+            ])),
+            Err(CliError::Usage { message: m, .. }) if m.contains("--identity-backend")
+        ));
+        // Implicit default under --pid parses and stays non-explicit.
+        let Command::Inventory(pid) = parse(args(&["inventory", "--pid", "7"])).unwrap() else {
+            panic!("expected inventory")
+        };
+        assert_eq!(pid.identity_backend, IdentityBackendSelection::Auto);
+        assert!(!pid.identity_backend_explicit);
     }
 
     /// C5.11: `inventory --attach-backend` selects the native lane's attach
@@ -3172,8 +3324,8 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        assert_eq!(USAGE.len(), 5914);
-        assert_eq!(hash, 0x75b71be6c7ce4af2);
+        assert_eq!(USAGE.len(), 6302);
+        assert_eq!(hash, 0xfed448e4052076d3);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

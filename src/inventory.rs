@@ -450,11 +450,18 @@ pub fn run(
     attach_backend: crate::attach::BackendSelection,
     diagnostics: Option<&Path>,
     diagnostics_pid: Option<u32>,
+    identity_backend: crate::cli::IdentityBackendSelection,
+    identity_backend_explicit: bool,
 ) -> Result<i32> {
     if !manifests.is_empty() && capture == CaptureMode::Scan {
         anyhow::bail!("--manifest requires --capture auto or native");
     }
     let scope: crate::cli::ScopeArg = scope.into();
+    if identity_backend_explicit && !matches!(scope, crate::cli::ScopeArg::System) {
+        anyhow::bail!(
+            "--identity-backend cannot be used outside system inventory (use inventory --system)"
+        );
+    }
     let endpoint_budget = inventory_endpoint_budget(max_endpoints).map_err(anyhow::Error::msg)?;
     let stdout_tty = crate::inventory_dashboard::fd_is_tty(1);
     // SIGINT/SIGTERM/SIGHUP end the loop, classic or dashboard, through
@@ -462,6 +469,7 @@ pub fn run(
     let stop = StopFlag::install();
     let signals = || stop.signal_count();
     let mut stdout = FdStdout::new(1, &signals);
+    let identity = matches!(scope, crate::cli::ScopeArg::System).then_some(identity_backend);
     run_with_terminal_budget(
         scope,
         modules,
@@ -479,6 +487,7 @@ pub fn run(
         event_max_files,
         capture,
         attach_backend,
+        identity,
         &|| stop.stopped(),
         &|| stop.exit_on_next_signal(),
         stdout_tty,
@@ -490,6 +499,8 @@ pub fn run(
             second_signal: &|| stop.signal_count() >= 2,
         },
         Some(stop.signal_source()),
+        #[cfg(test)]
+        None,
         #[cfg(test)]
         None,
     )
@@ -682,6 +693,7 @@ fn run_with_terminal_diagnostics(
         event_max_files,
         capture,
         attach_backend,
+        None,
         stop,
         outputs_attempted,
         stdout_tty,
@@ -690,6 +702,7 @@ fn run_with_terminal_diagnostics(
         request,
         None,
         event_fault,
+        None,
     )
 }
 
@@ -711,6 +724,7 @@ fn run_with_terminal_budget(
     event_max_files: Option<usize>,
     capture: CaptureMode,
     attach_backend: crate::attach::BackendSelection,
+    identity: Option<crate::cli::IdentityBackendSelection>,
     stop: &dyn Fn() -> bool,
     outputs_attempted: &dyn Fn(),
     stdout_tty: bool,
@@ -719,6 +733,7 @@ fn run_with_terminal_budget(
     request: DiagnosticRequest<'_>,
     operator_stop_source: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(test)] event_fault: Option<crate::inventory_events::EventFault>,
+    #[cfg(test)] identity_checks: Option<Box<dyn crate::inspect_system::IdentityChecks>>,
 ) -> Result<i32> {
     let (engine_scope, numbering) = scope.into().resolve()?;
     let scope = InventoryRunScope::from(&engine_scope);
@@ -744,6 +759,28 @@ fn run_with_terminal_budget(
     if request.path.is_some() && capture == CaptureMode::Scan {
         anyhow::bail!("--diagnostics requires native capture or auto fallback");
     }
+    // D3d: forced-kernel preflight before any sink exists. A refused
+    // kernel is a named nonzero error, never a successful empty
+    // capture; no `-o`, event, or diagnostics file is created.
+    let identity_shared: Option<crate::inspect_system::IdentityShared> = match (scope, identity) {
+        (InventoryRunScope::System, Some(selection)) => {
+            #[cfg(test)]
+            let checks: Box<dyn crate::inspect_system::IdentityChecks> = identity_checks
+                .unwrap_or_else(|| Box::new(crate::inspect_system::LiveIdentityChecks));
+            #[cfg(not(test))]
+            let checks: Box<dyn crate::inspect_system::IdentityChecks> =
+                Box::new(crate::inspect_system::LiveIdentityChecks);
+            if selection == crate::cli::IdentityBackendSelection::Kernel
+                && let Err(reason) = crate::inspect_system::preflight_forced_kernel(checks.as_ref())
+            {
+                anyhow::bail!("{}", crate::inspect_system::forced_kernel_refusal(reason));
+            }
+            Some(std::sync::Arc::new(std::sync::Mutex::new(
+                crate::inspect_system::IdentityRunShared::new(selection, checks),
+            )))
+        }
+        _ => None,
+    };
     let mut diagnostics = request
         .path
         .map(|path| DiagnosticsState::prepare(path, out, event_log))
@@ -812,6 +849,12 @@ fn run_with_terminal_budget(
             // There is no native lane to retire, but available diagnostics
             // still describe the failed startup after primary report attempts.
             if diagnostics.is_some() {
+                let identity_summary = identity_shared.as_ref().map(|shared| {
+                    shared
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .summary()
+                });
                 let outcome = finish_failed_startup(
                     &mut coordinator,
                     &scope_label,
@@ -824,6 +867,7 @@ fn run_with_terminal_budget(
                     &error,
                     request.second_signal,
                     outputs_attempted,
+                    identity_summary.as_ref(),
                 );
                 outcome.notices(None, &mut inventory_diagnostic);
             }
@@ -872,6 +916,7 @@ fn run_with_terminal_budget(
                     request.second_signal,
                     native_available,
                     semantic,
+                    identity_shared,
                 );
             }
             // A terminal the run cannot open privately (another user's
@@ -914,6 +959,7 @@ fn run_with_terminal_budget(
         display: None,
         semantic,
         semantic_staged: false,
+        identity: identity_shared.clone(),
     };
     let clock = LoopClock {
         deadline,
@@ -1003,6 +1049,12 @@ fn run_with_terminal_budget(
         capture_error.is_some(),
         diagnostics.is_some() && stop(),
     );
+    let identity_summary = identity_shared.as_ref().map(|shared| {
+        shared
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .summary()
+    });
     let outcome = crate::inventory_capture::finish_native(
         stopped,
         |summary| {
@@ -1015,6 +1067,7 @@ fn run_with_terminal_budget(
                 false,
                 stdout,
                 summary,
+                identity_summary.as_ref(),
                 &mut coordinator,
                 diagnostics,
                 diagnostic_outcome,
@@ -1052,6 +1105,7 @@ fn finish_failed_startup<Source: ProcessSource>(
     error: &anyhow::Error,
     second_signal: &dyn Fn() -> bool,
     outputs_attempted: &dyn Fn(),
+    identity: Option<&crate::inspect_system::IdentitySummary>,
 ) -> FinalOutputOutcome {
     if stream.writer.is_some() {
         stream.retire(
@@ -1081,6 +1135,7 @@ fn finish_failed_startup<Source: ProcessSource>(
                 false,
                 stdout,
                 None,
+                identity,
                 coordinator,
                 diagnostics,
                 DiagnosticOutcome {
@@ -1219,6 +1274,9 @@ struct ClassicDriver<'a> {
     max_scan_pids: Option<usize>,
     guard: UnavailableImageGuard,
     deadline: Option<Instant>,
+    /// D3d capture-owned identity state (`--system` only): shared with
+    /// each collection job, read for the final document after the loop.
+    identity: Option<crate::inspect_system::IdentityShared>,
     /// The interactive dashboard's display (C5.3): it draws on the loop's
     /// service ticks and takes the pass warnings into its log tail.
     display: Option<Display>,
@@ -1461,9 +1519,20 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             };
         }
         match self.inventory_scope {
-            Some(scope) => CollectJob::Legacy(Box::new(
-                self.coordinator.collector(scope, self.max_scan_pids),
-            )),
+            Some(scope) => {
+                let job = match (&scope, self.identity.clone()) {
+                    // D3d: `--system` collections share the capture-owned
+                    // identity state; `--pid` stays on the plain path.
+                    (InventoryScope::System, Some(shared)) => Box::new(
+                        self.coordinator
+                            .collector_with_identity(scope, self.max_scan_pids, shared),
+                    )
+                        as crate::inventory_capture::LegacyCollectJob,
+                    _ => Box::new(self.coordinator.collector(scope, self.max_scan_pids))
+                        as crate::inventory_capture::LegacyCollectJob,
+                };
+                CollectJob::Legacy(job)
+            }
             None => CollectJob::Cgroup {
                 control: crate::scope::inventory_cgroup::CollectionControl::new(self.deadline),
                 task: Err(CgroupJobFailure::Preparation),
@@ -1868,10 +1937,14 @@ pub(crate) fn finish_output(
     silent_text: bool,
     stdout: &mut dyn FinalStdout,
     native: Option<&LaneSummary>,
+    identity: Option<&crate::inspect_system::IdentitySummary>,
 ) -> FinalOutputOutcome {
     let mut document = render_json_from_presentation(presentation);
     if let Some(summary) = native {
         note_native_observation(&mut document, summary);
+    }
+    if let Some(summary) = identity {
+        note_identity_observation(&mut document, summary);
     }
     // Render the immutable JSON payload once. Both destinations receive
     // exactly these bytes; one transport cannot suppress the other's attempt.
@@ -2019,6 +2092,7 @@ fn finish_runtime_output<Source: ProcessSource>(
     silent_text: bool,
     stdout: &mut dyn FinalStdout,
     native: Option<&LaneSummary>,
+    identity: Option<&crate::inspect_system::IdentitySummary>,
     coordinator: &mut InventoryCoordinator<Source>,
     diagnostics: Option<DiagnosticsState>,
     diagnostic_outcome: DiagnosticOutcome,
@@ -2034,6 +2108,7 @@ fn finish_runtime_output<Source: ProcessSource>(
         silent_text,
         stdout,
         native,
+        identity,
     );
     if let Some(diagnostics) = diagnostics {
         outcome.diagnostics_failed =
@@ -2327,6 +2402,16 @@ fn note_native_observation(document: &mut serde_json::Value, summary: &LaneSumma
     });
 }
 
+/// A system run's identity statement (D3d): the resolved sweep proof
+/// backend and its first finite fallback, or null. Absent under
+/// `--pid`/`--cgroup`, whose implicit default loads nothing.
+fn note_identity_observation(
+    document: &mut serde_json::Value,
+    summary: &crate::inspect_system::IdentitySummary,
+) {
+    document["observation"]["identity"] = summary.json();
+}
+
 /// What the interactive dashboard run is over.
 struct DashboardRun {
     scope: InventoryRunScope,
@@ -2457,6 +2542,7 @@ fn run_dashboard(
     second_signal: &dyn Fn() -> bool,
     native_available: bool,
     semantic: Option<crate::inventory_semantics::AttestedSemanticLane>,
+    identity_shared: Option<crate::inspect_system::IdentityShared>,
 ) -> Result<i32> {
     let DashboardRun {
         scope,
@@ -2489,6 +2575,7 @@ fn run_dashboard(
         display: Some(display),
         semantic,
         semantic_staged: false,
+        identity: identity_shared.clone(),
     };
     let ending = || stop() || quit.get();
     let clock = LoopClock {
@@ -2602,6 +2689,12 @@ fn run_dashboard(
         diagnostics.is_some() && ending(),
     );
     let display_notices = std::cell::RefCell::new(&mut display);
+    let identity_summary = identity_shared.as_ref().map(|shared| {
+        shared
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .summary()
+    });
     let outcome = crate::inventory_capture::finish_native(
         stopped,
         |summary| {
@@ -2614,6 +2707,7 @@ fn run_dashboard(
                 true,
                 stdout,
                 summary,
+                identity_summary.as_ref(),
                 &mut coordinator,
                 diagnostics,
                 diagnostic_outcome,
@@ -3462,6 +3556,8 @@ mod tests {
                     crate::attach::BackendSelection::Auto,
                     Some(&diagnostics),
                     None,
+                    crate::cli::IdentityBackendSelection::Auto,
+                    false,
                 )
                 .unwrap_err();
                 assert!(
@@ -3678,6 +3774,7 @@ mod tests {
             false,
             &mut WriterStdout(&mut out),
             None,
+            None,
         );
         assert_eq!(result.exit_code(), 1);
         let total = out.total;
@@ -3795,6 +3892,7 @@ mod tests {
                     json,
                     silent_text,
                     &mut stdout,
+                    None,
                     None,
                 );
                 let requested = json || !silent_text;
@@ -3931,6 +4029,7 @@ mod tests {
                             json,
                             silent,
                             &mut stdout,
+                            None,
                             None,
                         );
                         let requested = json || !silent;
@@ -4336,6 +4435,7 @@ mod tests {
                 false,
                 &mut WriterStdout(&mut stdout),
                 None,
+                None,
             );
             assert_eq!(result.exit_code(), 1);
             assert_eq!(result.event_log_confirmed, Some(false));
@@ -4405,6 +4505,7 @@ mod tests {
             false,
             &mut WriterStdout(&mut stdout),
             None,
+            None,
         );
         assert_eq!(result.exit_code(), 1);
         assert_eq!(result.event_log_confirmed, Some(true));
@@ -4454,6 +4555,7 @@ mod tests {
             true,
             false,
             &mut WriterStdout(&mut stdout),
+            None,
             None,
         );
         assert_eq!(result.exit_code(), 1);
@@ -4860,6 +4962,140 @@ mod tests {
         }
     }
 
+    /// D3d: a system document discloses the sweep identity backend
+    /// and its finite fallback in `-o` and on stdout alike (exact
+    /// bytes); without identity the key is absent.
+    #[test]
+    fn d3d_system_document_discloses_identity_backend_and_fallback() {
+        use crate::inspect_system::{IdentityBackend, IdentitySummary};
+        let mut coordinator = coordinator();
+        coordinator.commit_batch(false).unwrap();
+        let presentation = Presentation::capture(&coordinator, "system", 1, 2, 1);
+        for (summary, backend, fallback) in [
+            (
+                IdentitySummary {
+                    backend: IdentityBackend::Userspace,
+                    fallback: None,
+                },
+                "userspace",
+                serde_json::Value::Null,
+            ),
+            (
+                IdentitySummary {
+                    backend: IdentityBackend::Kernel,
+                    fallback: None,
+                },
+                "kernel",
+                serde_json::Value::Null,
+            ),
+            (
+                IdentitySummary {
+                    backend: IdentityBackend::Kernel,
+                    fallback: Some("below_threshold".into()),
+                },
+                "kernel",
+                serde_json::json!("below_threshold"),
+            ),
+            (
+                IdentitySummary {
+                    backend: IdentityBackend::Userspace,
+                    fallback: Some("no_btf".into()),
+                },
+                "userspace",
+                serde_json::json!("no_btf"),
+            ),
+        ] {
+            let dir = private_tempdir();
+            let out = dir.path().join("doc.json");
+            let sink = AtomicFile::create(&out).unwrap();
+            let mut stdout = Vec::new();
+            assert_eq!(
+                finish_output(
+                    Some(sink),
+                    &mut EventLogState::new(None),
+                    &mut StreamState::new(),
+                    &presentation,
+                    true,
+                    false,
+                    &mut WriterStdout(&mut stdout),
+                    None,
+                    Some(&summary),
+                )
+                .exit_code(),
+                0
+            );
+            let file = std::fs::read(&out).unwrap();
+            assert_eq!(file, stdout, "-o and stdout agree for {backend}/{fallback}");
+            let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+            let identity = &document["observation"]["identity"];
+            assert_eq!(identity["backend"], backend, "{fallback}");
+            assert_eq!(identity["fallback"], fallback, "{backend}");
+            // Approved shape only: no counters, no lifecycle, no events.
+            assert_eq!(identity.as_object().unwrap().len(), 2, "{identity}");
+            let text = identity.to_string();
+            assert!(!text.contains('/'), "{text}");
+            assert!(!text.contains("pid"), "{text}");
+        }
+        // Absent without identity (e.g. `--pid`): no key at all.
+        let mut stdout = Vec::new();
+        assert_eq!(
+            finish_output(
+                None,
+                &mut EventLogState::new(None),
+                &mut StreamState::new(),
+                &presentation,
+                true,
+                false,
+                &mut WriterStdout(&mut stdout),
+                None,
+                None,
+            )
+            .exit_code(),
+            0
+        );
+        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert!(
+            document["observation"].get("identity").is_none(),
+            "{}",
+            document["observation"]
+        );
+    }
+
+    /// D3d: the fixed target-run-limit detail renders as
+    /// `fd_headroom: target_run_limit`, still finite.
+    #[test]
+    fn d3d_identity_target_limit_detail_is_finite() {
+        use crate::inspect_system::{IdentityBackend, IdentitySummary};
+        let mut coordinator = coordinator();
+        coordinator.commit_batch(false).unwrap();
+        let presentation = Presentation::capture(&coordinator, "system", 1, 2, 1);
+        let summary = IdentitySummary {
+            backend: IdentityBackend::Kernel,
+            fallback: Some("fd_headroom: target_run_limit".into()),
+        };
+        let mut stdout = Vec::new();
+        assert_eq!(
+            finish_output(
+                None,
+                &mut EventLogState::new(None),
+                &mut StreamState::new(),
+                &presentation,
+                true,
+                false,
+                &mut WriterStdout(&mut stdout),
+                None,
+                Some(&summary),
+            )
+            .exit_code(),
+            0
+        );
+        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_eq!(
+            document["observation"]["identity"]["fallback"],
+            "fd_headroom: target_run_limit"
+        );
+    }
+
     /// C5.11: a native document discloses the attach mechanism, the
     /// operator's selection and any `auto` fallback reason; the start and
     /// stop lines name the mechanism too.
@@ -4903,6 +5139,7 @@ mod tests {
                     false,
                     &mut WriterStdout(&mut stdout),
                     Some(&summary),
+                    None,
                 )
                 .exit_code(),
                 0
@@ -4956,6 +5193,7 @@ mod tests {
                     false,
                     &mut WriterStdout(&mut stdout),
                     Some(&summary),
+                    None,
                 )
                 .exit_code(),
                 0
@@ -4988,6 +5226,7 @@ mod tests {
                 true,
                 false,
                 &mut WriterStdout(&mut stdout),
+                None,
                 None,
             )
             .exit_code(),
@@ -5252,6 +5491,7 @@ mod tests {
                 false,
                 true,
                 &mut WriterStdout(&mut Vec::new()),
+                None,
                 None
             )
             .exit_code(),
@@ -5503,6 +5743,7 @@ mod tests {
             true,
             &mut WriterStdout(&mut Vec::new()),
             None,
+            None,
         );
         assert_eq!(outcome.exit_code(), 0);
         let records = stream_sink_records(&mut reader);
@@ -5555,6 +5796,7 @@ mod tests {
                 false,
                 true,
                 &mut WriterStdout(&mut Vec::new()),
+                None,
                 None
             )
             .exit_code(),
@@ -5614,6 +5856,7 @@ mod tests {
                 false,
                 true,
                 &mut WriterStdout(&mut Vec::new()),
+                None,
                 None
             )
             .exit_code(),
@@ -5789,6 +6032,7 @@ mod tests {
                 false,
                 true,
                 &mut WriterStdout(&mut sink),
+                None,
                 None,
             )
             .exit_code(),
@@ -6013,6 +6257,7 @@ mod tests {
                     false,
                     true,
                     &mut WriterStdout(&mut sink),
+                    None,
                     None,
                 )
                 .exit_code(),

@@ -106,6 +106,8 @@ fn run() -> Result<i32> {
                 a.attach_backend,
                 a.diagnostics.as_deref(),
                 a.diagnostics_pid,
+                a.identity_backend,
+                a.identity_backend_explicit,
             )
             .map_err(|error| {
                 if error.is::<pidns::NumberingMismatch>() {

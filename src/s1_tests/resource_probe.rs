@@ -602,3 +602,449 @@ fn native_semantic_resource_registry_probe() {
         println!("S1_RESOURCE_RESULT {row}");
     }
 }
+
+#[test]
+fn native_semantic_resource_final_types_pinned() {
+    // Final H3 Task5 types, pinned like Edge360/Pending144. Compiler and
+    // target ABI are guarded by resources.rs; these pins catch layout drift
+    // before SYSTEM activation. Measured on Rust 1.98.1 x86-64 Linux.
+    assert_eq!(size_of::<crate::inventory_semantics::SemanticBatch>(), 88);
+    assert_eq!(size_of::<crate::inventory_semantics::LaneNegative>(), 16);
+    assert_eq!(
+        size_of::<crate::inventory_semantics::LaneCollectionRefusal>(),
+        1
+    );
+    assert_eq!(size_of::<crate::inventory_semantics::LaneCoverage>(), 64);
+    assert_eq!(
+        size_of::<crate::inventory_semantics::TerminalBatchStage>(),
+        40
+    );
+    assert_eq!(size_of::<crate::semantic_capture::TickOutcome>(), 432);
+    assert_eq!(size_of::<crate::semantic_capture::TickReport>(), 112);
+    assert_eq!(size_of::<crate::semantic_capture::RoutedCall>(), 432);
+    assert_eq!(
+        size_of::<crate::semantic_capture::CurrentPartitionReceipt>(),
+        392
+    );
+    assert_eq!(size_of::<crate::semantic_capture::Invalidation>(), 72);
+    assert_eq!(size_of::<crate::semantic_capture::InvalidationScope>(), 48);
+    assert_eq!(size_of::<crate::semantic_capture::OtherRecord>(), 392);
+    assert_eq!(size_of::<crate::semantic_capture::Endpoint>(), 16);
+    assert_eq!(size_of::<crate::inventory_events::InstanceEmitter>(), 184);
+    assert_eq!(size_of::<crate::inventory_events::InstanceEmission>(), 32);
+    assert_eq!(size_of::<crate::inventory_events::InstanceSweep>(), 16);
+    assert_eq!(size_of::<crate::inventory_present::InstanceView>(), 48);
+    assert_eq!(
+        size_of::<crate::inventory_present::InstanceSemanticView>(),
+        272
+    );
+    assert_eq!(size_of::<crate::inventory_present::Presentation>(), 824);
+    // Supporting payload: RoutedCall carries one EventRecord.
+    assert_eq!(size_of::<p11scope_ebpf_common::EventRecord>(), 368);
+    // Existing bounds the N/N+1 populations use.
+    assert_eq!(crate::discovery::instances::MAX_INSTANCES, 4_096);
+    assert_eq!(crate::inventory_semantics::MAX_LANE_NEGATIVES, 64);
+    assert_eq!(crate::inventory_semantics::TERMINAL_STAGED_BATCH_CAP, 33);
+    assert_eq!(crate::inventory_events::INSTANCE_EVENTS_PER_PASS, 4_096);
+    assert_eq!(
+        crate::discovery::caller_registry::instance_input::MAX_REGISTRY_INSTANCES,
+        4_096
+    );
+}
+
+#[test]
+fn native_semantic_resource_batch_n_and_n_plus_one() {
+    use crate::inventory_semantics::{
+        LaneCollectionRefusal, LaneNegative, MAX_LANE_NEGATIVES, SemanticBatch,
+        TERMINAL_STAGED_BATCH_CAP, TerminalBatchStage,
+    };
+    use crate::semantic_capture::TickReport;
+
+    // Sparse: one empty batch. No heap for empty vectors.
+    let domain = NativeDomainId::mint();
+    let (sparse, sparse_peak) = crate::test_alloc::requested_peak_during(|| {
+        SemanticBatch::scripted(domain, Vec::new(), 100)
+    });
+    assert!(!sparse_peak.incomplete);
+    assert_eq!(sparse.into_parts().2.len(), 0);
+    // Saturated negatives N=64: mixed variants, both fit the same 16-byte slot.
+    // The vector is built inside the armed closure so its heap counts.
+    let (saturated, saturated_peak) = crate::test_alloc::requested_peak_during(|| {
+        let negatives: Vec<LaneNegative> = (0..MAX_LANE_NEGATIVES as u64)
+            .map(|ordinal| {
+                if ordinal % 2 == 0 {
+                    LaneNegative::CutBarrier { ordinal }
+                } else {
+                    LaneNegative::CollectionRefused {
+                        reason: if ordinal % 4 == 1 {
+                            LaneCollectionRefusal::Backpressure
+                        } else {
+                            LaneCollectionRefusal::CollectionFailed
+                        },
+                    }
+                }
+            })
+            .collect();
+        assert_eq!(negatives.len(), 64);
+        SemanticBatch::scripted(domain, negatives, 200)
+    });
+    assert!(!saturated_peak.incomplete);
+    assert_eq!(saturated.into_parts().2.len(), MAX_LANE_NEGATIVES);
+    // N+1=65 negatives refuses; the batch is never constructed.
+    let over: Vec<LaneNegative> = (0..65)
+        .map(|ordinal| LaneNegative::CutBarrier { ordinal })
+        .collect();
+    assert!(
+        matches!(
+            SemanticBatch::from_tick_report(domain, TickReport::default(), over, 300),
+            Err(crate::inventory_semantics::SemanticRefusal::Unavailable)
+        ),
+        "65 negatives must refuse"
+    );
+    // Terminal staging N=33 batches, then N+1 sheds exactly one.
+    let (mut stage, stage_peak) = crate::test_alloc::requested_peak_during(|| {
+        let mut stage = TerminalBatchStage::new();
+        for marker in 0..TERMINAL_STAGED_BATCH_CAP as u64 {
+            stage.push(SemanticBatch::scripted(domain, Vec::new(), marker));
+        }
+        stage
+    });
+    assert!(!stage_peak.incomplete);
+    assert_eq!(stage.len(), TERMINAL_STAGED_BATCH_CAP);
+    assert_eq!(stage.shed(), 0);
+    stage.push(SemanticBatch::scripted(domain, Vec::new(), 1_000));
+    assert_eq!(stage.len(), TERMINAL_STAGED_BATCH_CAP);
+    assert_eq!(stage.shed(), 1);
+    // Churn: 100 batches through the bounded stage; length stays capped.
+    let (churned, churn_peak) = crate::test_alloc::requested_peak_during(|| {
+        let mut stage = TerminalBatchStage::new();
+        for marker in 0..100 {
+            stage.push(SemanticBatch::scripted(domain, Vec::new(), marker));
+        }
+        stage
+    });
+    assert!(!churn_peak.incomplete);
+    assert_eq!(churned.len(), TERMINAL_STAGED_BATCH_CAP);
+    assert_eq!(churned.shed(), 100 - TERMINAL_STAGED_BATCH_CAP);
+    // Saturated terminal: 33 batches each carrying 64 negatives.
+    let (full_stage, full_peak) = crate::test_alloc::requested_peak_during(|| {
+        let mut stage = TerminalBatchStage::new();
+        for batch in 0..TERMINAL_STAGED_BATCH_CAP as u64 {
+            let negatives: Vec<LaneNegative> = (0..MAX_LANE_NEGATIVES as u64)
+                .map(|ordinal| LaneNegative::CutBarrier {
+                    ordinal: batch * 1_000 + ordinal,
+                })
+                .collect();
+            stage.push(SemanticBatch::scripted(domain, negatives, batch));
+        }
+        stage
+    });
+    assert!(!full_peak.incomplete);
+    assert_eq!(full_stage.len(), TERMINAL_STAGED_BATCH_CAP);
+    // Computed (not heap-measured) worst cases from pinned sizes: outcomes
+    // and receipts have no test-usable constructor, so saturated vectors are
+    // arithmetic, not allocations. Defensive bound 4096 each; reachable per
+    // tick is at most 1024 records and 4 scans via TickLimits.
+    let defensive_batch_heap = 4_096 * size_of::<crate::semantic_capture::TickOutcome>()
+        + 4_096 * size_of::<crate::semantic_capture::CurrentPartitionReceipt>()
+        + MAX_LANE_NEGATIVES * size_of::<LaneNegative>();
+    let reachable_batch_heap = 1_024 * size_of::<crate::semantic_capture::TickOutcome>()
+        + 4 * size_of::<crate::semantic_capture::CurrentPartitionReceipt>()
+        + MAX_LANE_NEGATIVES * size_of::<LaneNegative>();
+    let row = serde_json::json!({
+        "test": "batch_n_and_n_plus_one",
+        "populations": {"negatives_n": 64, "negatives_n_plus_one": 65,
+            "terminal_n": TERMINAL_STAGED_BATCH_CAP, "terminal_n_plus_one": TERMINAL_STAGED_BATCH_CAP + 1,
+            "churn_batches": 100},
+        "measured_peaks": {
+            "sparse_batch": {"live_bytes": sparse_peak.live_bytes, "peak_bytes": sparse_peak.peak_bytes},
+            "saturated_64_negatives": {"live_bytes": saturated_peak.live_bytes, "peak_bytes": saturated_peak.peak_bytes},
+            "terminal_33_empty": {"live_bytes": stage_peak.live_bytes, "peak_bytes": stage_peak.peak_bytes},
+            "terminal_churn_100": {"live_bytes": churn_peak.live_bytes, "peak_bytes": churn_peak.peak_bytes},
+            "terminal_33_saturated": {"live_bytes": full_peak.live_bytes, "peak_bytes": full_peak.peak_bytes},
+        },
+        "computed_heap": {"defensive_4096_batch_bytes": defensive_batch_heap,
+            "reachable_tick_batch_bytes": reachable_batch_heap,
+            "defensive_terminal_33_bytes": defensive_batch_heap * TERMINAL_STAGED_BATCH_CAP,
+            "reachable_terminal_33_bytes": reachable_batch_heap * TERMINAL_STAGED_BATCH_CAP},
+    });
+    println!("S1_RESOURCE_ROW {row}");
+    std::hint::black_box((full_stage, churned));
+}
+
+#[test]
+fn native_semantic_resource_final_probe_child() {
+    let Ok(profile) = std::env::var("P11SCOPE_S1_RESOURCE_PROFILE") else {
+        return;
+    };
+    let (kind, population) = profile.rsplit_once(':').unwrap();
+    let population = population.parse::<usize>().unwrap();
+    assert!(population > 0 && population <= MAX_REGISTRY_INSTANCES);
+    assert!(matches!(kind, "emitter" | "churn" | "combined"));
+    // Build the saturated instance population like the registry probe:
+    // one caller, one module, N registered instances each with a sparse
+    // completed reducer (Init + Op), committed in 1024-call quanta.
+    let (mut h, caller, _) = single_edge();
+    let mut info = crate::discovery::inventory_workload::scale_module_info(1, 1);
+    info.key = ModuleKey::physical(8, 1, 100_001, Some("a".repeat(64)), &info.path);
+    let module = info.key.clone();
+    h.coordinator_mut()
+        .registry_mut()
+        .note_mapping(caller, 9000, info, 1);
+    let domain = NativeDomainId::mint();
+    let router = instance_router_ids(domain, 1)[0];
+    h.coordinator_mut()
+        .registry_mut()
+        .observe_entries(caller, &module, 17, 1);
+    h.commit();
+    let keys: Vec<_> = (0..population)
+        .map(|index| {
+            instance::key(
+                domain,
+                ImageIdentity {
+                    task_cookie: 1000 + index as u64,
+                    exec_id: 0,
+                },
+                router,
+                module.clone(),
+            )
+        })
+        .collect();
+    for key in &keys {
+        instance_register(&mut h, key, caller, 100);
+    }
+    h.commit();
+    assert_eq!(h.coordinator().registry().instances().count(), population);
+    for quantum in keys.chunks(512) {
+        for key in quantum {
+            instance_feed(
+                &mut h,
+                key,
+                caller,
+                domain,
+                1,
+                init("C_SignInit", 1, RSA_PSS, 101),
+            );
+            instance_feed(&mut h, key, caller, domain, 2, op("C_Sign", 1, 102));
+        }
+        h.commit();
+    }
+    assert_eq!(
+        h.coordinator().registry().instance_semantic_occupied(),
+        population
+    );
+    let charged = h.coordinator().registry().semantic_resource_snapshot();
+    // Large stages use the unbounded `measure` pattern (requested sums plus
+    // heap deltas), not the 8192-block peak tracker which overflows on the
+    // 4096-instance JSON tree. Small terminal staging keeps exact live/peak.
+    let (presentation, presentation_stage) = measure("immutable_presentation", || {
+        Presentation::capture(h.coordinator(), "final-probe", 0, 105, 1)
+    });
+    assert_eq!(presentation.instances.len(), population);
+    assert_eq!(presentation.semantic_edges.len(), population);
+    let limit = presentation.budgets.instances_limit;
+    assert_eq!(limit, MAX_REGISTRY_INSTANCES);
+    // Emitter: one pass under the shared 4096-row quota.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let path = dir.path().join("final-emitter.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 30, 5).unwrap();
+    let mut emitter = crate::inventory_events::InstanceEmitter::new();
+    let (emission, emit_stage) = measure("emitter_first_pass", || {
+        emitter
+            .emit(
+                &mut writer,
+                &presentation.instances,
+                &presentation.semantic_edges,
+                limit,
+                105,
+            )
+            .unwrap()
+    });
+    assert_eq!(emitter.tracked(), population);
+    let total_rows = population * 2;
+    let emitted = emission.instance_emitted + emission.edge_emitted;
+    let deferred = emission.instance_deferred + emission.edge_deferred;
+    assert_eq!(emitted + deferred, total_rows);
+    if total_rows <= crate::inventory_events::INSTANCE_EVENTS_PER_PASS {
+        assert_eq!(deferred, 0, "sparse fits the quota");
+        assert_eq!(emitted, total_rows);
+    } else {
+        // Saturated N/N+1: quota 4096 serves the first 4096 rows (all
+        // instances), the 4097th row (first edge) waits.
+        assert_eq!(emitted, crate::inventory_events::INSTANCE_EVENTS_PER_PASS);
+        assert_eq!(emission.instance_emitted, population);
+        assert_eq!(emission.edge_emitted, 0);
+        assert_eq!(deferred, total_rows - emitted);
+    }
+    let mut emit_stage = emit_stage;
+    emit_stage["emitted"] = serde_json::json!(emitted);
+    emit_stage["deferred"] = serde_json::json!(deferred);
+    emit_stage["tracked"] = serde_json::json!(emitter.tracked());
+    let mut stages = vec![presentation_stage, emit_stage];
+    // Churn: two more passes with fresh calls; tracking stays bounded.
+    if kind == "churn" || kind == "combined" {
+        for round in 0..2 {
+            for quantum in keys.chunks(512) {
+                for key in quantum {
+                    instance_feed(
+                        &mut h,
+                        key,
+                        caller,
+                        domain,
+                        3 + round * 2,
+                        init("C_EncryptInit", 2, AES_GCM, 110 + round * 10),
+                    );
+                    instance_feed(
+                        &mut h,
+                        key,
+                        caller,
+                        domain,
+                        4 + round * 2,
+                        op("C_Encrypt", 2, 111 + round * 10),
+                    );
+                }
+                h.commit();
+            }
+            let presentation = Presentation::capture(
+                h.coordinator(),
+                "final-probe",
+                0,
+                120 + round * 10,
+                2 + round,
+            );
+            let (_, mut pass_stage) = measure(&format!("emitter_churn_pass_{round}"), || {
+                emitter
+                    .emit(
+                        &mut writer,
+                        &presentation.instances,
+                        &presentation.semantic_edges,
+                        limit,
+                        120 + round * 10,
+                    )
+                    .unwrap()
+            });
+            assert_eq!(emitter.tracked(), population);
+            pass_stage["tracked"] = serde_json::json!(emitter.tracked());
+            stages.push(pass_stage);
+            std::hint::black_box(presentation);
+        }
+    }
+    // Combined: presentation + JSON value + serialized buffer over the
+    // saturated population, plus the terminal batch envelope.
+    let mut combined_peaks = serde_json::json!({});
+    if kind == "combined" {
+        let (document, document_stage) = measure("json_value_from_same_presentation", || {
+            crate::inventory::render_json_from_presentation(&presentation)
+        });
+        assert_eq!(document["instances"].as_array().unwrap().len(), population);
+        let (serialized, serialize_stage) = measure("serialized_json_buffer", || {
+            serde_json::to_vec(&document).unwrap()
+        });
+        let (terminal, terminal_peak) = crate::test_alloc::requested_peak_during(|| {
+            use crate::inventory_semantics::{
+                LaneNegative, SemanticBatch, TERMINAL_STAGED_BATCH_CAP, TerminalBatchStage,
+            };
+            let mut stage = TerminalBatchStage::new();
+            for batch in 0..TERMINAL_STAGED_BATCH_CAP as u64 {
+                let negatives: Vec<LaneNegative> = (0..64)
+                    .map(|ordinal| LaneNegative::CutBarrier {
+                        ordinal: batch * 1_000 + ordinal,
+                    })
+                    .collect();
+                stage.push(SemanticBatch::scripted(domain, negatives, batch));
+            }
+            stage
+        });
+        assert!(!terminal_peak.incomplete);
+        assert_eq!(
+            terminal.len(),
+            crate::inventory_semantics::TERMINAL_STAGED_BATCH_CAP
+        );
+        // Final reducer charges after churn (new mechanisms), for the verdict.
+        let final_charged = h.coordinator().registry().semantic_resource_snapshot();
+        combined_peaks = serde_json::json!({
+            "json_requested_bytes": document_stage["requested_allocation_bytes"],
+            "json_heap_delta_bytes": document_stage["delta"]["glibc_heap_used_delta_bytes"],
+            "serialized_requested_bytes": serialize_stage["requested_allocation_bytes"],
+            "serialized_heap_delta_bytes": serialize_stage["delta"]["glibc_heap_used_delta_bytes"],
+            "serialized_bytes": serialized.len(),
+            "terminal_live_bytes": terminal_peak.live_bytes,
+            "terminal_peak_bytes": terminal_peak.peak_bytes,
+            "final_reducer_charged_bytes": final_charged.charged_bytes,
+        });
+        stages.push(document_stage);
+        stages.push(serialize_stage);
+        stages.push(serde_json::json!({"stage": "terminal_33_saturated",
+            "live_bytes": terminal_peak.live_bytes, "peak_bytes": terminal_peak.peak_bytes}));
+        // Pool-cover verdict: sparse-saturated reducer charges plus measured
+        // heap deltas (retained) and requested sums (conservative) vs 64 MiB.
+        // JSON/presentation/emit are all over the sparse population (one
+        // mechanism per reducer); churn only proves emitter boundedness and
+        // its final charges are recorded separately. The verdict is recorded,
+        // not asserted; the numeric decision stays with root.
+        let pool = crate::semantics_edge::resources::SEMANTIC_RESOURCE_LIMIT;
+        let heap_delta = |stage: &serde_json::Value| -> usize {
+            stage["delta"]["glibc_heap_used_delta_bytes"]
+                .as_i64()
+                .unwrap()
+                .max(0) as usize
+        };
+        let retained_sum = charged.charged_bytes
+            + heap_delta(&stages[0])
+            + heap_delta(&stages[1])
+            + heap_delta(&stages[4])
+            + heap_delta(&stages[5])
+            + terminal_peak.live_bytes;
+        let requested_sum = charged.charged_bytes
+            + stages[0]["requested_allocation_bytes"].as_u64().unwrap() as usize
+            + stages[1]["requested_allocation_bytes"].as_u64().unwrap() as usize
+            + stages[4]["requested_allocation_bytes"].as_u64().unwrap() as usize
+            + stages[5]["requested_allocation_bytes"].as_u64().unwrap() as usize
+            + terminal_peak.peak_bytes;
+        combined_peaks["pool_cover"] = serde_json::json!({
+            "pool_bytes": pool, "sparse_reducer_charged_bytes": charged.charged_bytes,
+            "retained_sum_bytes": retained_sum,
+            "retained_covers": retained_sum <= pool,
+            "requested_sum_bytes": requested_sum, "requested_covers": requested_sum <= pool,
+        });
+        std::hint::black_box((document, serialized, terminal));
+    }
+    let memory = Memory::read();
+    let row = serde_json::json!({
+        "profile": profile, "instances": population,
+        "reducer_charged_bytes": charged.charged_bytes,
+        "reducer_limit_bytes": charged.limit_bytes,
+        "stages": stages, "combined": combined_peaks,
+        "after_measurement": memory.json(),
+        "actual_type_sizes": {
+            "SemanticBatch": size_of::<crate::inventory_semantics::SemanticBatch>(),
+            "TickOutcome": size_of::<crate::semantic_capture::TickOutcome>(),
+            "CurrentPartitionReceipt": size_of::<crate::semantic_capture::CurrentPartitionReceipt>(),
+            "LaneNegative": size_of::<crate::inventory_semantics::LaneNegative>(),
+            "TerminalBatchStage": size_of::<crate::inventory_semantics::TerminalBatchStage>(),
+            "InstanceEmitter": size_of::<crate::inventory_events::InstanceEmitter>(),
+            "InstanceView": size_of::<crate::inventory_present::InstanceView>(),
+            "InstanceSemanticView": size_of::<crate::inventory_present::InstanceSemanticView>(),
+            "Presentation": size_of::<crate::inventory_present::Presentation>(),
+        },
+    });
+    println!("\nS1_RESOURCE_ROW {row}");
+    std::hint::black_box((h, keys, presentation, emitter));
+}
+
+#[test]
+#[ignore = "explicit controller-granted host measurement; spawns bounded children"]
+fn native_semantic_resource_final_probe() {
+    for profile in ["emitter:1", "emitter:4096", "churn:4096", "combined:4096"] {
+        let row = run_child(
+            "s1_tests::resource_probe::native_semantic_resource_final_probe_child",
+            profile,
+        );
+        println!("S1_RESOURCE_RESULT {row}");
+    }
+}

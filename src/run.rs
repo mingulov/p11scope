@@ -4100,6 +4100,44 @@ fn split_staged_discovery(
     (records, malformed)
 }
 
+/// One tick's discovery staging allowance (H5): the drain quantum, bounded
+/// by the shared discovery allowance minus what the session already staged
+/// and what the Engine still holds. Staging stops instead of over-admitting;
+/// excess records stay in the kernel ring with producer-side overflow.
+fn discovery_stage_quantum(staged_len: usize, engine_held: usize) -> usize {
+    crate::discovery::engine::DISCOVERY_HELD_CAP
+        .saturating_sub(staged_len)
+        .saturating_sub(engine_held)
+        .min(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM)
+}
+
+/// Stages one quiescence poll's discovery items up to the shared allowance.
+/// Stops at the cap with `overflow` set instead of growing past it; the
+/// first unstaged record stays unread in the ring, and the caller stops
+/// draining discovery on later polls once `overflow` is set. Malformed items
+/// count as transport evidence, never as held records.
+fn stage_quiesced_discovery_items(
+    mut next: impl FnMut() -> Option<crate::events::DiscoveryItem>,
+    staged_records: &mut Vec<p11scope_ebpf_common::DiscoveryRecord>,
+    staged_malformed: &mut u64,
+    cap: usize,
+    overflow: &mut bool,
+) {
+    for _ in 0..crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM {
+        if staged_records.len() >= cap {
+            *overflow = true;
+            return;
+        }
+        match next() {
+            Some(crate::events::DiscoveryItem::Record(record)) => staged_records.push(record),
+            Some(crate::events::DiscoveryItem::Malformed) => {
+                *staged_malformed = staged_malformed.saturating_add(1);
+            }
+            None => break,
+        }
+    }
+}
+
 /// The control-latency signal printed on stderr the moment a signalled
 /// loop exits, before detach work: the harness timestamps its arrival.
 fn cancel_marker(signal: Option<libc::c_int>, ticks: u64) -> String {
@@ -4769,10 +4807,14 @@ fn capture_profile(
         scheduling.maybe_sample_resource_periodic();
         // Stage the discovery ring on every tick: discovery is applied once
         // per drain interval, and a busy host overflows the ring in between
-        // (RB-2). Staging applies nothing.
-        session.stage_discovery(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM)?;
+        // (RB-2). Staging applies nothing. The quantum and the readiness
+        // poll share one allowance with what the Engine still holds (H5).
+        session.stage_discovery(discovery_stage_quantum(
+            session.staged_discovery_len(),
+            engine.discovery_held_len(),
+        ))?;
         wait_until_ready(
-            &session.readiness_fds(),
+            &session.readiness_fds_with_held(engine.discovery_held_len()),
             ready_sleep_duration(
                 paused,
                 scheduling.last_drain_had_backlog(),
@@ -4829,6 +4871,12 @@ fn capture_profile(
         // Items the ticks staged left the ring first: they lead the batch.
         let (mut staged_records, mut staged_malformed) =
             split_staged_discovery(session.take_staged_discovery());
+        // Quiescence staging shares one allowance with what the Engine still
+        // holds (H5); the first record past the cap stays unread and later
+        // polls stop draining discovery.
+        let quiesce_cap = crate::discovery::engine::DISCOVERY_HELD_CAP
+            .saturating_sub(engine.discovery_held_len());
+        let mut quiesce_overflow = false;
         let stop_state = session.quiesce_terminal(
             STOP_QUIESCE_BUDGET,
             if profile {
@@ -4855,17 +4903,16 @@ fn capture_profile(
                 None
             },
             |discovery_drain: &mut crate::events::OwnedDiscoveryDrain| {
-                for _ in 0..crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM {
-                    match discovery_drain.dequeue() {
-                        Some(crate::events::DiscoveryItem::Record(record)) => {
-                            staged_records.push(record);
-                        }
-                        Some(crate::events::DiscoveryItem::Malformed) => {
-                            staged_malformed = staged_malformed.saturating_add(1);
-                        }
-                        None => break,
-                    }
+                if quiesce_overflow {
+                    return;
                 }
+                stage_quiesced_discovery_items(
+                    || discovery_drain.dequeue(),
+                    &mut staged_records,
+                    &mut staged_malformed,
+                    quiesce_cap,
+                    &mut quiesce_overflow,
+                );
             },
             Instant::now,
         )?;
@@ -4888,6 +4935,9 @@ fn capture_profile(
             StopState::Running | StopState::StopRequested => None,
         };
         let stop_quiescence = stop_quiescence_for(stop_state);
+        if quiesce_overflow {
+            engine.note_quiesced_discovery_overflow();
+        }
         if engine.apply_quiesced_discovery(session, staged_records, staged_malformed)? {
             let plan = engine.plan();
             state.sync_plan(plan);
@@ -5453,10 +5503,14 @@ fn capture_trace(
         scheduling.maybe_sample_resource_periodic();
         // Stage the discovery ring on every tick: discovery is applied once
         // per drain interval, and a busy host overflows the ring in between
-        // (RB-2). Staging applies nothing.
-        session.stage_discovery(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM)?;
+        // (RB-2). Staging applies nothing. The quantum and the readiness
+        // poll share one allowance with what the Engine still holds (H5).
+        session.stage_discovery(discovery_stage_quantum(
+            session.staged_discovery_len(),
+            engine.discovery_held_len(),
+        ))?;
         wait_until_ready(
-            &session.readiness_fds(),
+            &session.readiness_fds_with_held(engine.discovery_held_len()),
             ready_sleep_duration(
                 paused,
                 scheduling.last_drain_had_backlog(),
@@ -5517,6 +5571,12 @@ fn capture_trace(
         // Items the ticks staged left the ring first: they lead the batch.
         let (mut staged_records, mut staged_malformed) =
             split_staged_discovery(session.take_staged_discovery());
+        // Quiescence staging shares one allowance with what the Engine still
+        // holds (H5); the first record past the cap stays unread and later
+        // polls stop draining discovery.
+        let quiesce_cap = crate::discovery::engine::DISCOVERY_HELD_CAP
+            .saturating_sub(engine.discovery_held_len());
+        let mut quiesce_overflow = false;
         let stop_state = session.quiesce_terminal(
             STOP_QUIESCE_BUDGET,
             Some(|events_drain: &mut crate::events::OwnedDrain| {
@@ -5547,17 +5607,16 @@ fn capture_trace(
                 collect_sink_drops(stdout, &mut scheduling, &mut None, Instant::now());
             }),
             |discovery_drain: &mut crate::events::OwnedDiscoveryDrain| {
-                for _ in 0..crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM {
-                    match discovery_drain.dequeue() {
-                        Some(crate::events::DiscoveryItem::Record(record)) => {
-                            staged_records.push(record);
-                        }
-                        Some(crate::events::DiscoveryItem::Malformed) => {
-                            staged_malformed = staged_malformed.saturating_add(1);
-                        }
-                        None => break,
-                    }
+                if quiesce_overflow {
+                    return;
                 }
+                stage_quiesced_discovery_items(
+                    || discovery_drain.dequeue(),
+                    &mut staged_records,
+                    &mut staged_malformed,
+                    quiesce_cap,
+                    &mut quiesce_overflow,
+                );
             },
             Instant::now,
         )?;
@@ -5576,6 +5635,9 @@ fn capture_trace(
             StopState::Running | StopState::StopRequested => None,
         };
         let stop_quiescence = stop_quiescence_for(stop_state);
+        if quiesce_overflow {
+            engine.note_quiesced_discovery_overflow();
+        }
         if engine.apply_quiesced_discovery(session, staged_records, staged_malformed)? {
             let plan = engine.plan();
             state.sync_plan(plan);
@@ -16029,6 +16091,113 @@ mod tests {
         };
         let mut open = true;
         assert!(flush_stdout(&mut flush, &mut open).is_err());
+    }
+
+    #[test]
+    fn discovery_stage_quantum_bounds_ticks_by_shared_allowance() {
+        use crate::discovery::engine::{DISCOVERY_HELD_CAP, LIVE_DISCOVERY_DRAIN_QUANTUM};
+        assert_eq!(discovery_stage_quantum(0, 0), LIVE_DISCOVERY_DRAIN_QUANTUM);
+        assert_eq!(
+            discovery_stage_quantum(100, 100),
+            LIVE_DISCOVERY_DRAIN_QUANTUM
+        );
+        assert_eq!(
+            discovery_stage_quantum(DISCOVERY_HELD_CAP - 96, 0),
+            96,
+            "the last room stages a partial quantum"
+        );
+        assert_eq!(
+            discovery_stage_quantum(0, DISCOVERY_HELD_CAP - 96),
+            96,
+            "Engine-held records count against the same allowance"
+        );
+        assert_eq!(discovery_stage_quantum(DISCOVERY_HELD_CAP, 0), 0);
+        assert_eq!(discovery_stage_quantum(0, DISCOVERY_HELD_CAP), 0);
+        assert_eq!(
+            discovery_stage_quantum(DISCOVERY_HELD_CAP, DISCOVERY_HELD_CAP),
+            0,
+            "saturation never underflows"
+        );
+        assert_eq!(
+            discovery_stage_quantum(DISCOVERY_HELD_CAP + 1, 0),
+            0,
+            "over full still stages nothing"
+        );
+    }
+
+    #[test]
+    fn stage_quiesced_discovery_items_stops_at_cap_with_overflow() {
+        fn record(pid: u32) -> p11scope_ebpf_common::DiscoveryRecord {
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.pid_tgid = (u64::from(pid)) << 32;
+            record
+        }
+        use crate::events::DiscoveryItem;
+        // Under the cap everything stages in order, malformed items count
+        // without consuming room, and an empty read ends the poll.
+        let script = vec![
+            Some(DiscoveryItem::Record(record(1))),
+            Some(DiscoveryItem::Malformed),
+            Some(DiscoveryItem::Record(record(2))),
+            None,
+            Some(DiscoveryItem::Record(record(3))),
+        ];
+        let mut script = script.into_iter();
+        let mut staged = Vec::new();
+        let mut malformed = 0u64;
+        let mut overflow = false;
+        stage_quiesced_discovery_items(
+            || script.next().unwrap(),
+            &mut staged,
+            &mut malformed,
+            4096,
+            &mut overflow,
+        );
+        assert_eq!(
+            staged
+                .iter()
+                .map(|record| record.pid_tgid)
+                .collect::<Vec<_>>(),
+            vec![1u64 << 32, 2u64 << 32]
+        );
+        assert_eq!(malformed, 1);
+        assert!(!overflow);
+        // At the cap the poll stops before dequeuing anything further: the
+        // next record stays unread and the overflow flag trips exactly once.
+        let script = vec![
+            Some(DiscoveryItem::Record(record(10))),
+            Some(DiscoveryItem::Record(record(11))),
+        ];
+        let mut script = script.into_iter();
+        let mut staged = vec![record(9)];
+        let mut malformed = 0u64;
+        let mut overflow = false;
+        stage_quiesced_discovery_items(
+            || script.next().unwrap(),
+            &mut staged,
+            &mut malformed,
+            1,
+            &mut overflow,
+        );
+        assert_eq!(staged.len(), 1, "nothing past the cap is staged");
+        assert_eq!(malformed, 0);
+        assert!(overflow);
+        assert_eq!(script.len(), 2, "the next record stays unread in the ring");
+        // A zero cap overflows immediately without consuming anything.
+        let script = vec![Some(DiscoveryItem::Record(record(20)))];
+        let mut script = script.into_iter();
+        let mut staged = Vec::new();
+        let mut malformed = 0u64;
+        let mut overflow = false;
+        stage_quiesced_discovery_items(
+            || script.next().unwrap(),
+            &mut staged,
+            &mut malformed,
+            0,
+            &mut overflow,
+        );
+        assert!(staged.is_empty() && malformed == 0 && overflow);
+        assert_eq!(script.len(), 1);
     }
 }
 

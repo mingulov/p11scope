@@ -378,6 +378,9 @@ pub struct Engine {
     /// name). Meaningful only while `pressure_service_active` is set: those
     /// views are neither refreshed nor retired until their records dispatch.
     pressure_protected_pids: BTreeSet<u32>,
+    /// Diagnostic high-water mark of held ordinary discovery records
+    /// (pending plus terminal plus in-flight batch records). Never evidence.
+    discovery_held_high_water: usize,
     /// The records the running pause-owned batch was handed.
     held_records: BTreeSet<(u64, u64, u8)>,
     /// Views with at least one loader hit held by a pause stop, and views
@@ -3162,6 +3165,10 @@ impl TerminalBatch {
         }
     }
 
+    pub(crate) fn len(&self) -> usize {
+        self.records.len()
+    }
+
     pub(crate) fn extend(&mut self, records: impl IntoIterator<Item = DiscoveryRecord>) {
         let start = self.records.len();
         self.records
@@ -5275,11 +5282,12 @@ pub(crate) const LIVE_DISCOVERY_FRAME_QUANTA: usize = 16;
 
 /// Shared userspace allowance for ordinary discovery records (H5): pending
 /// Engine records plus session-staged records plus the fresh records one
-/// frame pulls. Terminal-authority batches stay outside this in-Engine
-/// bound so terminal completion can never deadlock behind it; the full
-/// cross-owner credit audit (including pause-held records) needs the
-/// coordinator-owned credit module outside this slice's lease.
-pub(crate) const DISCOVERY_HELD_CAP: usize = 4096;
+/// frame pulls — one allowance, so the staging FIFO capacity is its single
+/// source. Terminal-authority batches stay outside this in-Engine bound so
+/// terminal completion can never deadlock behind it; the full cross-owner
+/// credit audit (including pause-held records) needs the coordinator-owned
+/// credit module outside this slice's lease.
+pub(crate) const DISCOVERY_HELD_CAP: usize = crate::attach::DiscoveryStage::CAPACITY;
 
 /// How long one live discovery frame may work before it defers the rest of
 /// its records, deferred loader scans, loader arming and export attach to
@@ -7901,6 +7909,7 @@ impl Engine {
             pressure_service_active: false,
             in_refresh_tick: false,
             pressure_protected_pids: BTreeSet::new(),
+            discovery_held_high_water: 0,
             held_records: BTreeSet::new(),
             paused_loader_views: BTreeSet::new(),
             unpaused_loader_views: BTreeSet::new(),
@@ -9746,6 +9755,32 @@ impl Engine {
             }
         }
         Err(IncompleteTerminalDrain::backlog(records, malformed).into())
+    }
+
+    /// Pulls up to `limit` items for a capacity-bounded frame quantum. Unlike
+    /// the backlog-signalling collector above, reaching the limit is an
+    /// ordinary stop, reported through `observed_empty`: only an observed
+    /// empty read proves the queue drained. A real dequeue failure still
+    /// carries its retained prefix with it.
+    fn collect_discovery_records_bounded(
+        session: &mut dyn EngineSession,
+        limit: usize,
+    ) -> Result<(Vec<DiscoveryRecord>, u64, bool)> {
+        let mut records = Vec::new();
+        let mut malformed = 0u64;
+        for _ in 0..limit {
+            match session.discovery_dequeue() {
+                Ok(Some(crate::events::DiscoveryItem::Record(record))) => records.push(record),
+                Ok(Some(crate::events::DiscoveryItem::Malformed)) => {
+                    malformed = malformed.saturating_add(1);
+                }
+                Ok(None) => return Ok((records, malformed, true)),
+                Err(error) => {
+                    return Err(IncompleteTerminalDrain::new(records, malformed, 0, error).into());
+                }
+            }
+        }
+        Ok((records, malformed, false))
     }
 
     /// Every dequeue is capture-wide work, charged where the records enter the
@@ -15988,6 +16023,7 @@ impl Engine {
         collect: &mut DiscoveryCollector<'_>,
         closure: &mut PauseClosure,
     ) -> Result<bool> {
+        self.note_discovery_held_high_water(records.len());
         let mut changed = false;
         let mut named_generation_lost = false;
         let mut conservative_replay_attempted = false;
@@ -16066,12 +16102,14 @@ impl Engine {
                                 // A fatal service failure keeps every
                                 // undispatched record queued in ring order.
                                 self.pending_discovery_records.extend(parked);
-                                self.pending_discovery_records
-                                    .extend(diverted_fresh.drain(..));
+                                self.pending_discovery_records.append(&mut diverted_fresh);
                                 return Err(error);
                             }
                         }
                     }
+                    self.note_discovery_held_high_water(
+                        parked.len().saturating_add(diverted_fresh.len()),
+                    );
                     // A service pass may have spent the frame: defer the
                     // parked prefix untouched rather than refusing work the
                     // next frame can still service.
@@ -16119,8 +16157,7 @@ impl Engine {
             }
             // Diverted fresh records join the pending queue behind anything
             // the frame deferred: they are newer than every parked record.
-            self.pending_discovery_records
-                .extend(diverted_fresh.drain(..));
+            self.pending_discovery_records.append(&mut diverted_fresh);
             self.settle_deferred_loader_mismatches(deferred_mismatches, &exec_refresh_views);
             self.promote_stale_execs(pending_views);
             if pending_views.is_empty() {
@@ -17869,7 +17906,7 @@ impl Engine {
         session: &mut dyn EngineSession,
         force_full: bool,
     ) -> Result<bool> {
-        let (records, malformed) = self.collect_frame_discovery(session)?;
+        let (records, malformed, _fresh_blocked) = self.collect_frame_discovery(session)?;
         if force_full || !records.is_empty() || malformed != 0 || !self.discovery_shallow_idle() {
             return self.with_live_frame(|engine| {
                 engine.apply_discovery_batch(session, records, malformed)
@@ -18090,29 +18127,49 @@ impl Engine {
     /// duration/signal checks precede. Overflow in between is the producer's
     /// `ring_loss`, read with every batch.
     pub(crate) fn drain_discovery_from(&mut self, session: &mut dyn EngineSession) -> Result<bool> {
-        let (records, malformed) = self.collect_frame_discovery(session)?;
+        let (records, malformed, _fresh_blocked) = self.collect_frame_discovery(session)?;
         self.with_live_frame(|engine| engine.apply_discovery_batch(session, records, malformed))
     }
 
-    /// One live frame's records: up to `LIVE_DISCOVERY_FRAME_QUANTA` collector
-    /// quanta, stopping at the first that empties the queue. A quantum stop
-    /// is backlog, never failure; a real dequeue failure aborts the route as
-    /// before.
+    /// One live frame's records: fresh pulls up to the shared held allowance
+    /// minus what this Engine already holds (pending plus terminal), in
+    /// collector quanta of at most `LIVE_DISCOVERY_DRAIN_QUANTUM`, stopping
+    /// at the first that empties the queue or at the allowance. A quantum
+    /// stop is backlog, never failure; excess records stay unread in ring
+    /// order for the next frame, and any overflow they cause is the
+    /// producer's `ring_loss`. A real dequeue failure aborts the route as
+    /// before. `fresh_blocked` reports stopping for capacity without
+    /// observing an empty queue: capacity-blocked, never empty.
     fn collect_frame_discovery(
         &mut self,
         session: &mut dyn EngineSession,
-    ) -> Result<(Vec<DiscoveryRecord>, u64)> {
+    ) -> Result<(Vec<DiscoveryRecord>, u64, bool)> {
+        let held = self
+            .pending_discovery_records
+            .len()
+            .saturating_add(self.terminal_batch.as_ref().map_or(0, TerminalBatch::len));
+        let mut remaining = DISCOVERY_HELD_CAP.saturating_sub(held);
         let mut records = Vec::new();
         let mut malformed = 0u64;
+        let mut observed_empty = false;
         for _ in 0..LIVE_DISCOVERY_FRAME_QUANTA {
-            match Self::collect_discovery_records(session) {
-                Ok((drained, drained_malformed)) => {
+            if remaining == 0 {
+                break;
+            }
+            let quantum = remaining.min(LIVE_DISCOVERY_DRAIN_QUANTUM);
+            match Self::collect_discovery_records_bounded(session, quantum) {
+                Ok((drained, drained_malformed, empty)) => {
+                    remaining = remaining.saturating_sub(drained.len());
                     records.extend(drained);
                     malformed = malformed.saturating_add(drained_malformed);
-                    break;
+                    if empty {
+                        observed_empty = true;
+                        break;
+                    }
                 }
                 Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
                     Ok(incomplete) if incomplete.backlog => {
+                        remaining = remaining.saturating_sub(incomplete.records.len());
                         records.extend(incomplete.records);
                         malformed = malformed.saturating_add(incomplete.malformed);
                     }
@@ -18121,7 +18178,7 @@ impl Engine {
                 },
             }
         }
-        Ok((records, malformed))
+        Ok((records, malformed, !observed_empty))
     }
 
     /// `drain_discovery_tick` (src/run.rs) aborts the run with `?` on this
@@ -18133,6 +18190,41 @@ impl Engine {
             Ok(incomplete) => anyhow::Error::msg(incomplete.cause),
             Err(error) => error,
         }
+    }
+
+    /// Ordinary discovery records this Engine currently holds in userspace:
+    /// pending records plus the terminal batch. Measured at tick boundaries
+    /// (no batch locals outstanding) it is exact; the run loop uses it to
+    /// size staging quanta and readiness against the shared allowance.
+    pub(crate) fn discovery_held_len(&self) -> usize {
+        self.pending_discovery_records
+            .len()
+            .saturating_add(self.terminal_batch.as_ref().map_or(0, TerminalBatch::len))
+    }
+
+    /// Records quiescence staging hitting the shared discovery allowance
+    /// with records still unread in the ring: at least one unit of terminal
+    /// work is unfinished. The count is an explicit lower bound — the
+    /// remainder stays unread, so it cannot be inventoried — and the strict
+    /// lossless verdict must fail on it.
+    pub(crate) fn note_quiesced_discovery_overflow(&mut self) {
+        self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+        self.mark_live_loss(
+            "terminal discovery quiescence",
+            "quiescence staging reached the shared discovery allowance with at least one record still unread; terminal work is unfinished",
+        );
+    }
+
+    /// Notes the current held occupancy (pending plus terminal plus the
+    /// batch's in-flight records) into the diagnostic high-water mark.
+    fn note_discovery_held_high_water(&mut self, in_flight: usize) {
+        let held = self.discovery_held_len().saturating_add(in_flight);
+        self.discovery_held_high_water = self.discovery_held_high_water.max(held);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn discovery_held_high_water_for_test(&self) -> usize {
+        self.discovery_held_high_water
     }
 
     pub(crate) fn apply_discovery_batch(

@@ -225,6 +225,8 @@ discovery::sweep_attribution::tests::privileged_a_file_swapped_behind_an_identic
 first_use_probe::native::system_capture_observer_facts
 process::tests::pidfd_denial::pidfd_denial_helper
 run::root_fence_runtime::actual_original_exit_delayed_first_admission_retires_pending
+inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64
+inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64
 )
 SKIP_REASONS=(
 "needs punch-hole support under TMPDIR (btrfs/ext4/xfs; tmpfs refuses); no BPF-independent probe: run by hand as root: TMPDIR=<hole-capable dir> <binary> --exact <path> --ignored"
@@ -240,6 +242,8 @@ SKIP_REASONS=(
 "needs a frozen supervisor config via P11SCOPE_FIRST_USE_PROBE_CONFIG plus an exclusive BPF lane; its verdict requires an external owned oracle"
 "private seccomp helper re-executed by real_pidfd_denial_preserves_proc_identity_without_signal_authority with P11SCOPE_TEST_PIDFD_DENIAL_*; that unprivileged test is its only passing form"
 "needs a separately reviewed native stage via P11SCOPE_ROOT_RUNTIME_STAGE (provider.so, driver, provider.json); the test documents no runtime skip"
+"needs TMPDIR on btrfs (it asserts the statfs magic) plus a kernel-identity-capable host (BTF, task_iter pidfd); run by hand as root: TMPDIR=<btrfs dir> <binary> --exact <path> --ignored"
+"needs TMPDIR on btrfs (it asserts the statfs magic) plus a kernel-identity-capable host (BTF, task_iter pidfd); run by hand as root: TMPDIR=<btrfs dir> <binary> --exact <path> --ignored"
 )
 
 usage() {

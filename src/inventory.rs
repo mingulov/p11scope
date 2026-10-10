@@ -1305,6 +1305,55 @@ fn start_semantic_lane(
     }
 }
 
+/// Resolve one refresh candidate's bind target: the first required
+/// provider, in subset order, whose registry module the candidate
+/// currently maps. The slot→object→attach-path→registry-module chain is
+/// the same proof the single-provider refresh used, applied per
+/// candidate rather than once: one refresh slot still suffices for the
+/// image hint because the image is process-level, shared by every slot
+/// of the provider. A candidate no provider's module maps stays
+/// unresolvable: no positive without proof.
+pub(crate) fn refresh_target_for_candidate(
+    coordinator: &InventoryCoordinator<OsProcessSource>,
+    lane: &crate::inventory_semantics::AttestedSemanticLane,
+    caller: CallerId,
+) -> Option<(u32, ModuleKey)> {
+    let subset = lane.subset();
+    for slots in subset.required().values() {
+        let Some(slot) = slots.first().copied() else {
+            continue;
+        };
+        // The refreshed slot's object names the provider; the registry
+        // module carrying that path is the bind target.
+        let module = subset
+            .plan()
+            .slots
+            .iter()
+            .find(|slot_info| slot_info.index == slot)
+            .and_then(|slot_info| subset.pins().attach_path_for(slot_info.object).ok())
+            .and_then(|path| {
+                let path = path.to_string_lossy().into_owned();
+                coordinator
+                    .registry()
+                    .modules()
+                    .find(|module| module.paths.contains(&path))
+                    .map(|module| module.key.clone())
+            });
+        let Some(module) = module else {
+            continue;
+        };
+        let mapped = coordinator
+            .registry()
+            .module_id_for(&module)
+            .and_then(|id| coordinator.registry().edge(caller, id))
+            .is_some_and(|edge| edge.mapping == MappingState::Mapped);
+        if mapped {
+            return Some((slot, module));
+        }
+    }
+    None
+}
+
 /// Bind lane callers after the pass applied: re-prove accepted
 /// bindings and refresh a bounded, rotating set of unbound candidates.
 /// Every bind re-proves through live native state; refusals stay
@@ -1355,40 +1404,14 @@ fn bind_semantic_callers(
     let passes = coordinator.passes() as usize;
     let candidates_len = candidates.len();
     candidates.rotate_left(passes % candidates_len);
-    // One refresh slot suffices for the image hint: the image is
-    // process-level, shared by every slot of the provider. The hint is
-    // a claim only; the bind proof re-verifies everything.
-    let slot = lane
-        .subset()
-        .required()
-        .values()
-        .flat_map(|slots| slots.iter().copied())
-        .next();
-    let Some(slot) = slot else {
-        return;
-    };
-    // The refreshed slot's object names the provider; the registry
-    // module carrying that path is the bind target. Unresolvable
-    // stays unbound: no positive without proof.
-    let module = lane
-        .subset()
-        .plan()
-        .slots
-        .iter()
-        .find(|slot_info| slot_info.index == slot)
-        .and_then(|slot_info| lane.subset().pins().attach_path_for(slot_info.object).ok())
-        .and_then(|path| {
-            let path = path.to_string_lossy().into_owned();
-            coordinator
-                .registry()
-                .modules()
-                .find(|module| module.paths.contains(&path))
-                .map(|module| module.key.clone())
-        });
-    let Some(module) = module else {
-        return;
-    };
     for (caller, pid) in candidates.into_iter().take(4) {
+        // Each candidate binds against ITS provider's module: a
+        // candidate no provider's module maps stays unbound, honestly
+        // without positives. The image hint is a claim only; the bind
+        // proof re-verifies everything.
+        let Some((slot, module)) = refresh_target_for_candidate(coordinator, lane, caller) else {
+            continue;
+        };
         let Some(pin) = coordinator
             .adapter()
             .live_pin(pid)

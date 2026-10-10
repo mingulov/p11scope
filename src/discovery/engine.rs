@@ -365,6 +365,19 @@ pub struct Engine {
     pending_discovery_records: Vec<QueuedDiscoveryRecord>,
     /// Set while a pause cycle applies its batch (the owned child stopped).
     pause_owned_batch: bool,
+    /// Set while a pressure service pass runs inside record dispatch. Nested
+    /// record passes observe it and dispatch normally instead of starting a
+    /// second service pass, and retirement paths shield the protected pids.
+    pressure_service_active: bool,
+    /// Set while an inventory tick runs. A tick's own leftover-record passes
+    /// dispatch normally; only live-batch dispatch parks a pressure head, so
+    /// a service pass can never nest inside the tick it is servicing.
+    in_refresh_tick: bool,
+    /// Pids named by undispatched parked records (plus the owner views of
+    /// loader contexts, terminal owners and selection bindings those records
+    /// name). Meaningful only while `pressure_service_active` is set: those
+    /// views are neither refreshed nor retired until their records dispatch.
+    pressure_protected_pids: BTreeSet<u32>,
     /// The records the running pause-owned batch was handed.
     held_records: BTreeSet<(u64, u64, u8)>,
     /// Views with at least one loader hit held by a pause stop, and views
@@ -2771,6 +2784,24 @@ impl std::fmt::Display for DeferredDiscoveryItem {
 }
 
 impl std::error::Error for DeferredDiscoveryItem {}
+
+/// A nested collector pulled fresh session records while a pressure service
+/// pass owned the dispatch order. The pulled prefix is stashed behind the
+/// parked records by the service pass itself; this error only tells the
+/// nested caller its operation cannot complete in this episode. It is never
+/// empty, complete, backlog or failure evidence.
+#[derive(Debug)]
+struct PressureOrderingBlocked;
+
+impl std::fmt::Display for PressureOrderingBlocked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "a nested collection would dispatch fresh records ahead of parked discovery records",
+        )
+    }
+}
+
+impl std::error::Error for PressureOrderingBlocked {}
 
 struct ManifestInput {
     path: PathBuf,
@@ -5241,6 +5272,14 @@ pub(crate) const LIVE_DISCOVERY_DRAIN_QUANTUM: usize = 256;
 /// Sixteen quanta, 4,096 items — the staging capacity — per frame; anything
 /// left stays queued in ring order for the next frame.
 pub(crate) const LIVE_DISCOVERY_FRAME_QUANTA: usize = 16;
+
+/// Shared userspace allowance for ordinary discovery records (H5): pending
+/// Engine records plus session-staged records plus the fresh records one
+/// frame pulls. Terminal-authority batches stay outside this in-Engine
+/// bound so terminal completion can never deadlock behind it; the full
+/// cross-owner credit audit (including pause-held records) needs the
+/// coordinator-owned credit module outside this slice's lease.
+pub(crate) const DISCOVERY_HELD_CAP: usize = 4096;
 
 /// How long one live discovery frame may work before it defers the rest of
 /// its records, deferred loader scans, loader arming and export attach to
@@ -7859,6 +7898,9 @@ impl Engine {
             terminal_journal: None,
             pending_discovery_records: Vec::new(),
             pause_owned_batch: false,
+            pressure_service_active: false,
+            in_refresh_tick: false,
+            pressure_protected_pids: BTreeSet::new(),
             held_records: BTreeSet::new(),
             paused_loader_views: BTreeSet::new(),
             unpaused_loader_views: BTreeSet::new(),
@@ -14544,6 +14586,10 @@ impl Engine {
                 self.retain_terminal_batch(records, true, malformed)?;
                 Ok(Ok(()))
             }
+            // H5 pressure: the collector diverted fresh records behind the
+            // parked prefix; the nested operation stays incomplete for this
+            // episode. Never loss, never complete.
+            Err(error) if error.is::<PressureOrderingBlocked>() => Ok(Err(error)),
             Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
                 Ok(incomplete) => {
                     self.account_unvalidated_discovery(incomplete.unvalidated_records);
@@ -14866,6 +14912,12 @@ impl Engine {
                     self.mark_live_loss(TERMINAL_DRAIN_SUBJECT, TERMINAL_DRAIN_RETRY_REASON);
                     return Ok((changed, false));
                 }
+                // H5 pressure: the journal survives the episode untouched;
+                // its continuation retries after the parked prefix dispatch.
+                Err(error) if error.is::<PressureOrderingBlocked>() => {
+                    closure.fail();
+                    return Ok((changed, false));
+                }
                 Err(error) => return Err(error),
             }
             if self.terminal_journal.is_some() {
@@ -14935,6 +14987,12 @@ impl Engine {
                         let mut deferred = error.downcast::<DeferredDiscoveryItem>()?;
                         deferred.terminal_batch = Some(self.take_terminal_batch_for_deferred()?);
                         return Err(deferred.into());
+                    }
+                    // H5 pressure: the tombstoned context keeps its pending
+                    // journal; no loss is marked for an episode block.
+                    Ok(Err(error)) if error.is::<PressureOrderingBlocked>() => {
+                        closure.fail();
+                        return Ok((changed, false));
                     }
                     Ok(Err(error)) => {
                         if let Ok(incomplete) = error.downcast::<IncompleteTerminalDrain>() {
@@ -15277,6 +15335,164 @@ impl Engine {
         outcome
     }
 
+    /// Whether dispatching a matched EXEC for `view` would consume the owned
+    /// initial prearm as an acknowledgment instead of queueing a refresh.
+    /// Read-only preview of `acknowledge_owned_initial_exec` for the pressure
+    /// lookahead: the same checks without consuming the one-shot prearm.
+    fn owned_initial_exec_would_acknowledge(&self, view: ProcessViewId) -> bool {
+        let Some(initial) = self
+            .owned_initial_exec
+            .filter(|initial| initial.view == view)
+        else {
+            return false;
+        };
+        initial.revalidated
+            && self.counter_snapshot.ring_loss == 0
+            && self.malformed_discovery == 0
+            && self.discovery_truncated == 0
+            && self
+                .views
+                .iter()
+                .any(|retained| retained.id() == view && retained.still_the_same())
+            && self
+                .loader_registry
+                .context(initial.context)
+                .is_some_and(|context| {
+                    context.spec.view == view
+                        && context.spec.mapping.is_none()
+                        && context.was_attached
+                        && !self.loader_registry.is_tombstoned(initial.context)
+                })
+            && self.pinned.check_unchanged().unwrap_or(false)
+    }
+
+    /// Whether dispatching this queued record would consume a refresh-request
+    /// map entry for a pid that has none. Renewing an already-pending pid is
+    /// free. Every arm mirrors the exact dispatch condition that calls
+    /// `request_refresh_consumed`, without charging loader acceptance,
+    /// emitting rejection evidence or reading provider memory. The selection
+    /// arm is conservative: it predicts that lowering will need the entry
+    /// whenever the record is lowerable and its generation is gone, even
+    /// though attribution itself may still reject the record first.
+    fn record_needs_new_request(&self, queued: &QueuedDiscoveryRecord) -> bool {
+        if self.refresh_requested.len() < MAX_PENDING_REFRESH {
+            return false;
+        }
+        let record = &queued.record;
+        let pid = (record.pid_tgid >> 32) as u32;
+        if self.refresh_requested.contains_key(&pid) {
+            return false;
+        }
+        match record.kind {
+            DISCOVERY_KIND_EXEC => {
+                if let Some((view, cause)) = self.admitted_lifecycle_match(record) {
+                    cause == RetirementCause::ExecRefresh
+                        && !self.owned_initial_exec_would_acknowledge(view)
+                } else {
+                    unmatched_exec_requests_refresh(&self.views, pid)
+                }
+            }
+            DISCOVERY_KIND_FUNCTION_LIST_RETURN | DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN => {
+                !self.views.iter().any(|view| view.pid() == pid)
+            }
+            DISCOVERY_KIND_LOADER => {
+                self.loader_records_accepted < self.counter_snapshot.loader_hits
+                    && !self.views.iter().any(|view| view.pid() == pid)
+            }
+            DISCOVERY_KIND_INTERFACE_RETURN => {
+                queued.terminal_owner.is_none()
+                    && record.return_rv == 0
+                    && record.table_ptr != 0
+                    && self
+                        .selection_bindings
+                        .get(&record.binding_id)
+                        .is_some_and(|binding| {
+                            !self.views.iter().any(|view| {
+                                view.id() == binding.view
+                                    && view.pid() == pid
+                                    && view.still_the_same()
+                            })
+                        })
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether this record is a pressure head: the request map is full, the
+    /// record would need a new entry, and this pass is allowed to service
+    /// pressure. Pause-owned batches keep their bounded timing, and a tick's
+    /// own leftover passes dispatch normally, so a service pass can never
+    /// nest inside the tick it is servicing.
+    fn pressure_head_pending(&self, queued: &QueuedDiscoveryRecord) -> bool {
+        if self.pause_owned_batch || self.in_refresh_tick {
+            return false;
+        }
+        self.record_needs_new_request(queued)
+    }
+
+    /// Every pid a pressure service pass must leave untouched: the pids the
+    /// parked records name, plus the owner views of loader contexts,
+    /// terminal owners and selection bindings those records name. A loader
+    /// record whose context no longer resolves protects its pid only; an
+    /// unresolvable case id matches no retained context to shield.
+    fn pressure_protection_for(&self, parked: &[QueuedDiscoveryRecord]) -> BTreeSet<u32> {
+        let mut protected = BTreeSet::new();
+        for queued in parked {
+            let record = &queued.record;
+            let pid = (record.pid_tgid >> 32) as u32;
+            protected.insert(pid);
+            if record.kind == DISCOVERY_KIND_LOADER {
+                let context_id = LoaderContextId::from_case_id(record.case_id);
+                if let Some(context) = self.loader_registry.context(context_id)
+                    && let Some(owner) = self
+                        .views
+                        .iter()
+                        .find(|view| view.id() == context.spec.view)
+                {
+                    protected.insert(owner.pid());
+                }
+            }
+            if let Some(owner) = queued.terminal_owner
+                && let Some(context) = self.loader_registry.context(owner)
+                && let Some(view) = self
+                    .views
+                    .iter()
+                    .find(|view| view.id() == context.spec.view)
+            {
+                protected.insert(view.pid());
+            }
+            if record.kind == DISCOVERY_KIND_INTERFACE_RETURN
+                && let Some(binding) = self.selection_bindings.get(&record.binding_id)
+                && let Some(view) = self.views.iter().find(|view| view.id() == binding.view)
+            {
+                protected.insert(view.pid());
+            }
+        }
+        protected
+    }
+
+    /// Whether any queued request is eligible for pressure service: its pid
+    /// and its owner's view are both outside the protected set.
+    fn pressure_has_eligible_request(&self, protected: &BTreeSet<u32>) -> bool {
+        self.refresh_requested.iter().any(|(pid, request)| {
+            if protected.contains(pid) {
+                return false;
+            }
+            match request
+                .owner
+                .and_then(|owner| self.views.iter().find(|view| view.id() == owner))
+            {
+                Some(view) => !protected.contains(&view.pid()),
+                None => true,
+            }
+        })
+    }
+
+    /// Whether a pressure service pass must leave this pid's views alone.
+    fn pressure_view_shielded(&self, pid: u32) -> bool {
+        self.pressure_service_active && self.pressure_protected_pids.contains(&pid)
+    }
+
     fn acknowledge_owned_initial_exec(&mut self, view: ProcessViewId) -> bool {
         let Some(initial) = self
             .owned_initial_exec
@@ -15307,38 +15523,46 @@ impl Engine {
             && self.pinned.check_unchanged().unwrap_or(false)
     }
 
+    /// The lifecycle generation a record resolves against, after the scope
+    /// admission check. Only cgroup scope filters through the admission
+    /// ledger: system scope admits every pid without a membership check
+    /// (the whole machine is in scope), while the ledger still counts
+    /// unmatched exits as descendant gaps below. Shared by dispatch and by
+    /// the pressure lookahead so both resolve the same owner.
+    fn admitted_lifecycle_match(
+        &self,
+        record: &DiscoveryRecord,
+    ) -> Option<(ProcessViewId, RetirementCause)> {
+        let pid = (record.pid_tgid >> 32) as u32;
+        lifecycle_retirement(&self.views, pid, record.hook_ts_ns, record.kind).filter(
+            |(view, _)| {
+                !matches!(self.scope, Scope::Cgroup { .. })
+                    || self
+                        .admitted_cgroup_views
+                        .get(view)
+                        .is_some_and(|admission| {
+                            if record.kind == DISCOVERY_KIND_LEADER_EXIT {
+                                admission.covers(record.hook_ts_ns, pid)
+                            } else {
+                                admission.pid == pid
+                                    && self
+                                        .views
+                                        .iter()
+                                        .find(|candidate| candidate.id() == *view)
+                                        .is_some_and(ProcessView::still_the_same)
+                            }
+                        })
+            },
+        )
+    }
+
     fn dispatch_lifecycle_record(
         &mut self,
         record: &DiscoveryRecord,
         pending_views: &mut PendingViewRetirements,
     ) -> Option<ProcessViewId> {
         let pid = (record.pid_tgid >> 32) as u32;
-        // Only cgroup scope filters lifecycle records through the admission
-        // ledger: system scope admits every pid without a membership check
-        // (the whole machine is in scope), while the ledger still counts
-        // unmatched exits as descendant gaps below.
-        if let Some((view, cause)) =
-            lifecycle_retirement(&self.views, pid, record.hook_ts_ns, record.kind).filter(
-                |(view, _)| {
-                    !matches!(self.scope, Scope::Cgroup { .. })
-                        || self
-                            .admitted_cgroup_views
-                            .get(view)
-                            .is_some_and(|admission| {
-                                if record.kind == DISCOVERY_KIND_LEADER_EXIT {
-                                    admission.covers(record.hook_ts_ns, pid)
-                                } else {
-                                    admission.pid == pid
-                                        && self
-                                            .views
-                                            .iter()
-                                            .find(|candidate| candidate.id() == *view)
-                                            .is_some_and(ProcessView::still_the_same)
-                                }
-                            })
-                },
-            )
-        {
+        if let Some((view, cause)) = self.admitted_lifecycle_match(record) {
             if record.kind == DISCOVERY_KIND_EXEC && self.acknowledge_owned_initial_exec(view) {
                 // The validated prearm now also serves ordinary live loader
                 // discovery. Keep the existing per-load-kind classification;
@@ -15587,6 +15811,174 @@ impl Engine {
         }
     }
 
+    /// Dispatches one queued record with the batch's exact outcome
+    /// accounting. Shared by the ordinary loop and by the pressure path's
+    /// explicit head refusal, so a refused head keeps the honest accounting
+    /// ordinary dispatch would have recorded for it.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_one_queued_record(
+        &mut self,
+        queued: QueuedDiscoveryRecord,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+        exec_refresh_views: &mut BTreeSet<ProcessViewId>,
+        deferred_mismatches: &mut Vec<ProcessViewId>,
+        terminal_selection_handoffs: &mut TerminalSelectionHandoffs,
+        closure: &mut PauseClosure,
+        changed: &mut bool,
+    ) {
+        self.note_record_protection(&queued.record);
+        let record = queued.record;
+        let origin = (queued.record.pid_tgid >> 32) as u32;
+        match self.dispatch_discovery_record(
+            queued,
+            session,
+            additions_allowed,
+            pending_views,
+            exec_refresh_views,
+            deferred_mismatches,
+        ) {
+            Ok(DiscoveryRecordOutcome::TerminalSelectionHandoff { view, owner }) => {
+                terminal_selection_handoffs
+                    .entry(owner.get())
+                    .or_default()
+                    .push(record);
+                self.queue_retirement(view, RetirementCause::GenerationLost, pending_views);
+            }
+            Ok(outcome) => {
+                *changed |= outcome.changed();
+                if !outcome.required_complete() {
+                    closure.fail();
+                }
+            }
+            Err(_) => {
+                closure.fail();
+                if self.record_generation_ended(origin) {
+                    if record_could_publish_callable_code(&record) {
+                        self.invalidate_causal_timing();
+                    }
+                } else {
+                    self.mark_live_loss(
+                        "live discovery record",
+                        "a structurally valid private record failed exact live resolution",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Runs one accepted-refresh inventory tick with the parked prefix
+    /// withheld, to free a request-map slot for a pressure head. Protected
+    /// views are neither refreshed nor retired; protected requests keep
+    /// their serials and ages. The tick's collector diverts any fresh
+    /// session records into `diverted` (oldest first) instead of dispatching
+    /// them ahead of the parked prefix, and reports the nested operation
+    /// blocked for this episode. Diverted records are charged and counted
+    /// exactly once, at their first Engine accounting boundary.
+    #[allow(clippy::too_many_arguments)]
+    fn pressure_service_pass(
+        &mut self,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+        collect: &mut DiscoveryCollector<'_>,
+        closure: &mut PauseClosure,
+        protected: &BTreeSet<u32>,
+        parked_len: usize,
+        diverted: &mut Vec<QueuedDiscoveryRecord>,
+    ) -> Result<bool> {
+        let held = self
+            .pending_discovery_records
+            .len()
+            .saturating_add(parked_len)
+            .saturating_add(diverted.len());
+        let allowance = DISCOVERY_HELD_CAP
+            .saturating_sub(held)
+            .saturating_sub(LIVE_DISCOVERY_DRAIN_QUANTUM);
+        let diverted_base = diverted.len();
+        let mut diverted_malformed = 0u64;
+        self.pressure_service_active = true;
+        self.pressure_protected_pids.clone_from(protected);
+        let collect_inner = &mut *collect;
+        let mut service_collect =
+            |session: &mut dyn EngineSession| -> Result<(Vec<DiscoveryRecord>, u64)> {
+                let diverted_now =
+                    diverted.len().saturating_sub(diverted_base) as u64 + diverted_malformed;
+                // Once this episode has diverted anything, later nested collects
+                // block without pulling: the pending journal must see its whole
+                // drain, and its completion waits for the post-service
+                // continuation that observes the ring directly. At capacity the
+                // pass likewise blocks without pulling: claiming empty would be
+                // fabricated, and pulling past the shared allowance would
+                // over-admit. Every nested operation retries after the parked
+                // prefix is dispatched.
+                if diverted_now > 0 || diverted_now >= allowance as u64 {
+                    return Err(PressureOrderingBlocked.into());
+                }
+                match collect_inner(session) {
+                    Ok((records, malformed)) if records.is_empty() && malformed == 0 => {
+                        Ok((records, malformed))
+                    }
+                    Ok((records, malformed)) => {
+                        diverted.extend(records.into_iter().map(|record| QueuedDiscoveryRecord {
+                            record,
+                            terminal_owner: None,
+                            terminal_exports: Vec::new(),
+                        }));
+                        diverted_malformed = diverted_malformed.saturating_add(malformed);
+                        Err(PressureOrderingBlocked.into())
+                    }
+                    Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
+                        Ok(incomplete) if incomplete.backlog => {
+                            // A genuine quantum stop: the pulled prefix is
+                            // consumed, so it joins the diverted stash and the
+                            // nested operation stays incomplete for this episode.
+                            diverted.extend(incomplete.records.into_iter().map(|record| {
+                                QueuedDiscoveryRecord {
+                                    record,
+                                    terminal_owner: None,
+                                    terminal_exports: Vec::new(),
+                                }
+                            }));
+                            diverted_malformed =
+                                diverted_malformed.saturating_add(incomplete.malformed);
+                            Err(PressureOrderingBlocked.into())
+                        }
+                        Ok(incomplete) => Err(incomplete.into()),
+                        Err(error) => Err(error),
+                    },
+                }
+            };
+        let mut empty_records = Vec::new();
+        let mut tick_now = crate::attach::monotonic_ns;
+        let outcome = self.refresh_inventory(
+            session,
+            additions_allowed,
+            &mut empty_records,
+            pending_views,
+            &mut service_collect,
+            closure,
+            &mut tick_now,
+        );
+        self.pressure_service_active = false;
+        self.pressure_protected_pids.clear();
+        // Every nested pull during the pass belonged to a terminal drain, so
+        // the diverted slice keeps its terminal validation: records matching
+        // the pending authority dispatch as terminal hits after the parked
+        // prefix instead of rejecting as ordinary records.
+        if let Some(batch) = self.terminal_batch.as_ref() {
+            batch.authority.tag_matching(&mut diverted[diverted_base..]);
+        }
+        let fresh = diverted.len().saturating_sub(diverted_base);
+        self.charge_discovery_drain(fresh, diverted_malformed);
+        self.record_malformed_discovery(diverted_malformed);
+        if diverted_malformed != 0 {
+            closure.fail();
+        }
+        outcome
+    }
+
     fn process_discovery_records(
         &mut self,
         session: &mut dyn EngineSession,
@@ -15600,6 +15992,13 @@ impl Engine {
         let mut named_generation_lost = false;
         let mut conservative_replay_attempted = false;
         let mut terminal_selection_handoffs = TerminalSelectionHandoffs::new();
+        // Set once a service pass concludes without freeing a request slot:
+        // later heads in this pass dispatch normally instead of repeating a
+        // service attempt the same state just proved fruitless.
+        let mut pressure_quiet = false;
+        // Fresh session records diverted by service passes, oldest first.
+        // They rejoin the pending queue behind every parked record.
+        let mut diverted_fresh: Vec<QueuedDiscoveryRecord> = Vec::new();
         for (view, cause) in self.retirement_intents.clone() {
             pending_views
                 .entry(view)
@@ -15629,45 +16028,99 @@ impl Engine {
                         .extend(std::iter::once(queued).chain(batch));
                     break;
                 }
-                self.note_record_protection(&queued.record);
-                let record = queued.record;
-                let origin = (queued.record.pid_tgid >> 32) as u32;
-                match self.dispatch_discovery_record(
+                // H5 pressure: at a full request map, a head that would need
+                // a new entry parks with its whole suffix in original order
+                // while one accepted-refresh service pass runs. The service
+                // shields every view the parked records name; if it frees a
+                // slot the parked prefix resumes in order, otherwise the
+                // head is refused exactly once through ordinary dispatch and
+                // the suffix advances. Never a frame deferral: deferral
+                // would suppress the inventory work that frees capacity.
+                if !pressure_quiet && self.pressure_head_pending(&queued) {
+                    if self.frame_work_exhausted() {
+                        self.note_frame_deferral();
+                        self.pending_discovery_records
+                            .extend(std::iter::once(queued).chain(batch));
+                        break;
+                    }
+                    let parked: Vec<QueuedDiscoveryRecord> =
+                        std::iter::once(queued).chain(batch).collect();
+                    let protected = self.pressure_protection_for(&parked);
+                    let mut serviced = false;
+                    if self.pressure_has_eligible_request(&protected) {
+                        match self.pressure_service_pass(
+                            session,
+                            additions_allowed,
+                            pending_views,
+                            collect,
+                            closure,
+                            &protected,
+                            parked.len(),
+                            &mut diverted_fresh,
+                        ) {
+                            Ok(service_changed) => {
+                                changed |= service_changed;
+                                serviced = true;
+                            }
+                            Err(error) => {
+                                // A fatal service failure keeps every
+                                // undispatched record queued in ring order.
+                                self.pending_discovery_records.extend(parked);
+                                self.pending_discovery_records
+                                    .extend(diverted_fresh.drain(..));
+                                return Err(error);
+                            }
+                        }
+                    }
+                    // A service pass may have spent the frame: defer the
+                    // parked prefix untouched rather than refusing work the
+                    // next frame can still service.
+                    if self.frame_work_exhausted() {
+                        self.note_frame_deferral();
+                        self.pending_discovery_records.extend(parked);
+                        break;
+                    }
+                    if serviced && self.refresh_requested.len() >= MAX_PENDING_REFRESH {
+                        pressure_quiet = true;
+                    }
+                    if self.refresh_requested.len() < MAX_PENDING_REFRESH {
+                        batch = parked.into_iter();
+                        continue;
+                    }
+                    let mut parked = parked.into_iter();
+                    let head = parked
+                        .next()
+                        .expect("a parked prefix always holds its head");
+                    batch = parked;
+                    self.dispatch_one_queued_record(
+                        head,
+                        session,
+                        additions_allowed,
+                        pending_views,
+                        &mut exec_refresh_views,
+                        &mut deferred_mismatches,
+                        &mut terminal_selection_handoffs,
+                        closure,
+                        &mut changed,
+                    );
+                    continue;
+                }
+                self.dispatch_one_queued_record(
                     queued,
                     session,
                     additions_allowed,
                     pending_views,
                     &mut exec_refresh_views,
                     &mut deferred_mismatches,
-                ) {
-                    Ok(DiscoveryRecordOutcome::TerminalSelectionHandoff { view, owner }) => {
-                        terminal_selection_handoffs
-                            .entry(owner.get())
-                            .or_default()
-                            .push(record);
-                        self.queue_retirement(view, RetirementCause::GenerationLost, pending_views);
-                    }
-                    Ok(outcome) => {
-                        changed |= outcome.changed();
-                        if !outcome.required_complete() {
-                            closure.fail();
-                        }
-                    }
-                    Err(_) => {
-                        closure.fail();
-                        if self.record_generation_ended(origin) {
-                            if record_could_publish_callable_code(&record) {
-                                self.invalidate_causal_timing();
-                            }
-                        } else {
-                            self.mark_live_loss(
-                                "live discovery record",
-                                "a structurally valid private record failed exact live resolution",
-                            );
-                        }
-                    }
-                }
+                    &mut terminal_selection_handoffs,
+                    closure,
+                    &mut changed,
+                );
             }
+            // Diverted fresh records join the pending queue behind anything
+            // the frame deferred: they are newer than every parked record.
+            self.pending_discovery_records
+                .extend(diverted_fresh.drain(..));
             self.settle_deferred_loader_mismatches(deferred_mismatches, &exec_refresh_views);
             self.promote_stale_execs(pending_views);
             if pending_views.is_empty() {
@@ -15719,6 +16172,13 @@ impl Engine {
                     continue;
                 };
                 let retained_pid = retained.pid();
+                // H5 pressure: a service pass never refreshes or retires a
+                // view whose old contexts an undispatched parked record may
+                // still need. The persistent intent survives this deferral
+                // and retries after the parked prefix is dispatched.
+                if self.pressure_view_shielded(retained_pid) {
+                    continue;
+                }
                 // A frame-budget deferral must not let EXEC refresh retire
                 // a context still needed by this view's collected records.
                 // The persistent intent is retried after their dispatch.
@@ -16130,6 +16590,12 @@ impl Engine {
     /// nothing), never flap owned modules — owned views rely on
     /// event-driven refresh instead. `pids` must be sorted ascending.
     fn queue_polling_rescans(&mut self, pids: &[u32]) {
+        // H5 pressure: a service pass services already-accepted requests; it
+        // never queues optional polls, which would only consume the capacity
+        // it is trying to free (and set a frame deferral at a full map).
+        if self.pressure_service_active {
+            return;
+        }
         let mut polling = 0;
         let mut last_queued = None;
         for pid in self.scheduler.poll_order(pids) {
@@ -16603,6 +17069,7 @@ impl Engine {
         tick_now: &mut TickClock<'_>,
     ) -> Result<bool> {
         let mut new_views = Vec::new();
+        self.in_refresh_tick = true;
         let result = self.refresh_inventory_inner(
             session,
             additions_allowed,
@@ -16613,6 +17080,7 @@ impl Engine {
             &mut new_views,
             tick_now,
         );
+        self.in_refresh_tick = false;
         self.release_unadmitted_views(new_views);
         result
     }
@@ -16760,10 +17228,27 @@ impl Engine {
         // neither scope claims authority.
         let membership_authoritative = membership_complete && self.admits_generations();
         let serviced_requests = self.refresh_request_snapshot();
+        // H5 pressure: protected requests are seeded into the failed set so
+        // the service pass retains them with their serials and ages on every
+        // exit path, including the empty-tick early return below.
+        let mut failed_refresh_pids: BTreeSet<u32> = BTreeSet::new();
+        if self.pressure_service_active {
+            failed_refresh_pids.extend(
+                self.refresh_requested
+                    .keys()
+                    .filter(|pid| self.pressure_protected_pids.contains(pid))
+                    .copied(),
+            );
+        }
         let retirement_causes: BTreeMap<_, _> = self
             .views
             .iter()
             .filter_map(|view| {
+                // H5 pressure: a view the parked records name gets no cause
+                // in a service pass — neither refreshed nor retired.
+                if self.pressure_view_shielded(view.pid()) {
+                    return None;
+                }
                 inventory_retirement_cause(
                     view.still_the_same(),
                     membership_authoritative,
@@ -16806,7 +17291,7 @@ impl Engine {
             crate::attach::monotonic_ns(),
         );
         if removed.is_empty() && refreshed.is_empty() && new_pids.is_empty() {
-            self.complete_refresh_requests(&serviced_requests, &BTreeSet::new());
+            self.complete_refresh_requests(&serviced_requests, &failed_refresh_pids);
             // No tick queued anything (a queued poll would have made a
             // retirement cause), so any pending poll is stale: forget it
             // with the requests rather than leaking it into a later tick.
@@ -16835,7 +17320,7 @@ impl Engine {
         for pid in admitted.iter().chain(deferred.iter()) {
             self.mark_newcomer_arrival(*pid, arrival_now);
         }
-        let mut failed_refresh_pids: BTreeSet<u32> = deferred.iter().copied().collect();
+        failed_refresh_pids.extend(deferred.iter().copied());
         if !deferred.is_empty() {
             let pending = admitted.len() + deferred.len();
             let noun = if pending == 1 { "process" } else { "processes" };
@@ -16979,6 +17464,21 @@ impl Engine {
         let retirement_views: BTreeSet<_> = removed.union(&refreshed_ok).copied().collect();
         self.queue_inventory_retirements(&retirement_views, &stale, &departed, pending_views);
         for view in &retirement_views {
+            // H5 pressure: a view the parked records name is never retired
+            // by the direct path either; its request is retained for retry
+            // after the parked prefix is dispatched.
+            if let Some(pid) = self
+                .views
+                .iter()
+                .find(|candidate| candidate.id() == *view)
+                .map(ProcessView::pid)
+                .filter(|pid| self.pressure_view_shielded(*pid))
+            {
+                failed_retirements.insert(*view);
+                failed_refresh_pids.insert(pid);
+                self.request_refresh(pid, crate::attach::monotonic_ns());
+                continue;
+            }
             if !self.loader_registry.ids_for_view(*view).is_empty() {
                 mutation_started = true;
                 context_retirements.insert(*view);

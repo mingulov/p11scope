@@ -386,6 +386,11 @@ impl DiscoveryScheduler {
     }
 
     #[cfg(test)]
+    pub(crate) fn under_cap_ticks_for_test(&self) -> u64 {
+        self.under_cap_ticks
+    }
+
+    #[cfg(test)]
     pub(crate) fn cooling_for_test(&self) -> Vec<u32> {
         let sweeps = self.reconcile_sweeps;
         let cooldown = self.cooldown_sweeps;

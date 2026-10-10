@@ -32430,7 +32430,7 @@ fn pressure_ordering_direct_pass_keeps_loader_and_terminal_context() {
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     // Only the retained pid is protected here (the parked loader names it);
     // the fake requests are unprotected stale entries the service completes.
-    let real_before = engine.refresh_requested[&pid].clone();
+    let real_before = engine.refresh_requested[&pid];
     // A drain would snapshot the session's loader-hit counter; the direct
     // pass sets the same authority explicitly.
     engine.counter_snapshot.loader_hits = 1;
@@ -32525,7 +32525,7 @@ fn pressure_service_diverts_nested_terminal_pulls_behind_parked() {
     }
     assert!(engine.request_refresh_consumed(5_000_000, Some(3_000)));
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
-    let real_before = engine.refresh_requested[&pid].clone();
+    let real_before = engine.refresh_requested[&pid];
     let terminal_loader = loader_record_for(armed, pid);
     session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(
         terminal_loader,
@@ -32716,7 +32716,7 @@ fn pressure_zero_quantum_service_defers_and_refuses_once() {
         );
     }
     assert_eq!(fixture.engine.refresh_requested.len(), MAX_PENDING_REFRESH);
-    let real_before = fixture.engine.refresh_requested[&retained_pid].clone();
+    let real_before = fixture.engine.refresh_requested[&retained_pid];
     let scans_before = fixture.engine.deep_scans;
     let ticks_before = fixture.engine.scheduler.under_cap_ticks_for_test();
     let head_pid = 6_000_000u32;
@@ -33074,5 +33074,251 @@ fn pressure_preserves_loader_exec_and_terminal_order() {
         normalized(&pressured.counters.object_skips),
         normalized(&oracle.counters.object_skips),
         "every rejection is identical on both sides"
+    );
+}
+
+/// H5 storage, retained prefix first: one 4,096-record allowance holds the
+/// retained prefix plus the fresh suffix; the prefix dispatches first and
+/// the last serviced block proves it.
+#[test]
+fn discovery_retained_prefix_dispatches_before_fresh_within_one_allowance() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    engine.frame_work_budget_ns = u64::MAX;
+    let mut records: Vec<QueuedDiscoveryRecord> = (0..4000u32)
+        .map(|offset| {
+            let mut head = exec_record_for(1_000_000 + offset);
+            head.hook_ts_ns = u64::MAX;
+            QueuedDiscoveryRecord {
+                record: head,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            }
+        })
+        .chain((0..96u32).map(|offset| {
+            let mut head = exec_record_for(2_000_000 + offset);
+            head.hook_ts_ns = u64::MAX;
+            QueuedDiscoveryRecord {
+                record: head,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            }
+        }))
+        .collect();
+    let mut session = ScriptedSession::with_records([], 0);
+    let mut collect = Engine::collect_discovery_records;
+    engine
+        .process_discovery_records(
+            &mut session,
+            &mut records,
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("a full allowance still advances");
+    assert!(records.is_empty());
+    assert_eq!(engine.discovery_truncated, 0);
+    assert_eq!(
+        engine.scheduler.under_cap_ticks_for_test(),
+        15,
+        "fifteen block boundaries take fifteen bounded service passes"
+    );
+    assert_eq!(
+        engine.discovery_held_high_water_for_test(),
+        4096,
+        "one full allowance is the most the Engine ever holds"
+    );
+    let remaining: BTreeSet<u32> = engine.refresh_requested.keys().copied().collect();
+    let expected: BTreeSet<u32> = (3840..4000u32)
+        .map(|offset| 1_000_000 + offset)
+        .chain((0..96u32).map(|offset| 2_000_000 + offset))
+        .collect();
+    assert_eq!(
+        remaining, expected,
+        "the retained prefix dispatched before the fresh suffix"
+    );
+}
+
+/// H5 storage, shared allowance: a frame whose Engine already holds 4,000
+/// retained records pulls only 96 fresh ones; the excess stays unread in
+/// ring order and the whole allowance advances without loss.
+#[test]
+fn discovery_frame_collects_fresh_only_within_shared_allowance() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    engine.frame_work_budget_ns = u64::MAX;
+    engine
+        .pending_discovery_records
+        .extend((0..4000u32).map(|offset| {
+            let mut head = exec_record_for(1_000_000 + offset);
+            head.hook_ts_ns = u64::MAX;
+            QueuedDiscoveryRecord {
+                record: head,
+                terminal_owner: None,
+                terminal_exports: Vec::new(),
+            }
+        }));
+    let mut session = ScriptedSession::with_records(
+        (0..4096u32)
+            .map(|offset| exec_record_for(2_000_000 + offset))
+            .collect::<Vec<_>>(),
+        0,
+    );
+    let dequeues_before = session.dequeues.len();
+    assert_eq!(dequeues_before, 4096);
+    engine
+        .drain_discovery_from(&mut session)
+        .expect("a capped frame still advances");
+    assert_eq!(
+        session.dequeues.len(),
+        dequeues_before - 96,
+        "excess stays unread past the shared allowance"
+    );
+    assert!(
+        engine.pending_discovery_records.is_empty(),
+        "the whole allowance dispatched"
+    );
+    assert_eq!(engine.discovery_truncated, 0);
+    assert!(
+        engine.refresh_requested.is_empty(),
+        "service plus the ordinary tick drains every request"
+    );
+    assert_eq!(
+        engine.scheduler.under_cap_ticks_for_test(),
+        16,
+        "fifteen service passes plus the ordinary tick"
+    );
+    assert_eq!(
+        engine.discovery_held_high_water_for_test(),
+        4096,
+        "one full allowance is the most the Engine ever holds"
+    );
+}
+
+/// H5 storage, blocked is not empty: a frame stopped by the shared allowance
+/// reports capacity-blocked even with records or malformed items still
+/// queued, and reports unblocked only after an observed empty read.
+#[test]
+fn discovery_frame_reports_capacity_blocked_not_empty() {
+    // Full Engine, ten fresh records waiting: nothing is pulled and the
+    // frame reports blocked, never empty.
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    engine
+        .pending_discovery_records
+        .extend((0..4096u32).map(|offset| QueuedDiscoveryRecord {
+            record: exec_record_for(1_000_000 + offset),
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        }));
+    let mut session =
+        ScriptedSession::with_records((0..10u32).map(exec_record_for).collect::<Vec<_>>(), 0);
+    let (records, malformed, blocked) = engine.collect_frame_discovery(&mut session).unwrap();
+    assert!(records.is_empty() && malformed == 0 && blocked);
+    assert_eq!(session.dequeues.len(), 10, "a blocked frame pulls nothing");
+    // Empty Engine, empty session: the observed empty read is genuine.
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    let mut session = ScriptedSession::with_records([], 0);
+    let (records, malformed, blocked) = engine.collect_frame_discovery(&mut session).unwrap();
+    assert!(records.is_empty() && malformed == 0 && !blocked);
+    // Ninety-six missing to a full allowance with exactly ninety-six
+    // waiting: the frame pulls them all but cannot claim empty, because it
+    // stopped at the allowance without observing the empty read.
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    engine
+        .pending_discovery_records
+        .extend((0..4000u32).map(|offset| QueuedDiscoveryRecord {
+            record: exec_record_for(1_000_000 + offset),
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        }));
+    let mut session =
+        ScriptedSession::with_records((0..96u32).map(exec_record_for).collect::<Vec<_>>(), 0);
+    let (records, malformed, blocked) = engine.collect_frame_discovery(&mut session).unwrap();
+    assert_eq!(records.len(), 96);
+    assert_eq!(malformed, 0);
+    assert!(
+        blocked,
+        "stopping at the allowance proves nothing about empty"
+    );
+    assert!(session.dequeues.is_empty());
+    // Room to spare with one hundred waiting: the frame drains the queue
+    // and the observed empty read clears the flag.
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    let mut session =
+        ScriptedSession::with_records((0..100u32).map(exec_record_for).collect::<Vec<_>>(), 0);
+    let (records, malformed, blocked) = engine.collect_frame_discovery(&mut session).unwrap();
+    assert_eq!(records.len(), 100);
+    assert_eq!(malformed, 0);
+    assert!(!blocked);
+    assert!(session.dequeues.is_empty());
+    // Malformed items count as transport evidence, never as held records.
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    let mut session = ScriptedSession::default();
+    session.dequeues.extend([
+        Ok(Some(crate::events::DiscoveryItem::Malformed)),
+        Ok(Some(crate::events::DiscoveryItem::Malformed)),
+        Ok(Some(crate::events::DiscoveryItem::Malformed)),
+        Ok(None),
+    ]);
+    let (records, malformed, blocked) = engine.collect_frame_discovery(&mut session).unwrap();
+    assert!(records.is_empty() && !blocked);
+    assert_eq!(malformed, 3);
+}
+
+/// H5 storage, terminal liveness: a bounded frame never strands terminal
+/// completion. A pending journal with its persisted retirement intent is not
+/// idle, so the shallow frame still runs the full pass and the continuation
+/// observes the empty ring directly.
+#[test]
+fn discovery_terminal_progress_survives_bounded_frames() {
+    let (_fixture, mut engine, armed, _record, mut session) = armed_seed_route(1);
+    engine.frame_work_budget_ns = u64::MAX;
+    let view = engine.views[0].id();
+    engine
+        .begin_terminal_drain(armed, Vec::new(), || {
+            Err::<(), _>(anyhow::anyhow!("deferred"))
+        })
+        .unwrap()
+        .unwrap_err();
+    engine.queue_retirement(
+        view,
+        RetirementCause::ExecRefresh,
+        &mut PendingViewRetirements::new(),
+    );
+    assert!(
+        !engine.discovery_shallow_idle(),
+        "a pending journal with its intent is not idle"
+    );
+    session.dequeues = [].into();
+    engine
+        .drain_discovery_shallow_from(&mut session, false)
+        .expect("the shallow frame still runs the full pass");
+    assert!(
+        engine.terminal_journal.is_none(),
+        "the continuation observes the empty ring and resolves"
+    );
+    assert!(engine.terminal_batch_for_test().is_none());
+}
+
+/// H5 storage, terminal N+1: quiescence staging that hits the shared
+/// allowance with records still unread publishes explicit unfinished work
+/// and fails the strict lossless verdict.
+#[test]
+fn quiesced_discovery_overflow_publishes_unfinished_terminal_work() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    assert_eq!(engine.discovery_truncated, 0);
+    engine.note_quiesced_discovery_overflow();
+    assert_eq!(
+        engine.discovery_truncated, 1,
+        "unfinished terminal work fails strict lossless"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "terminal discovery quiescence"
+                && skip.reason.contains("at least one record still unread")),
+        "the overflow publishes explicit unfinished evidence: {:?}",
+        engine.counters.object_skips
     );
 }

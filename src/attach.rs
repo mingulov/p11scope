@@ -4348,13 +4348,19 @@ impl Session {
         self.discovery_domain.as_fd()
     }
 
-    /// The descriptors the idle wait polls: EVENTS always, and DISCOVERY
-    /// while the staging FIFO has room. A full FIFO leaves the discovery
-    /// ring readable until the next frame applies it; polling it then would
-    /// spin the loop.
-    pub(crate) fn readiness_fds(&self) -> Vec<BorrowedFd<'_>> {
+    /// Staged DISCOVERY items currently held in the session FIFO.
+    pub(crate) fn staged_discovery_len(&self) -> usize {
+        self.discovery_staged.len()
+    }
+
+    /// The idle-wait descriptors against the shared discovery allowance:
+    /// EVENTS always, and DISCOVERY while the staged FIFO plus what the
+    /// Engine still holds leaves room. Stopping the poll while the Engine
+    /// drains its backlog keeps the loop from spin-waking on a ring whose
+    /// records cannot be staged yet.
+    pub(crate) fn readiness_fds_with_held(&self, engine_held: usize) -> Vec<BorrowedFd<'_>> {
         let mut fds = vec![self.events_readiness_fd()];
-        if self.discovery_staged.len() < DiscoveryStage::CAPACITY {
+        if self.discovery_staged.len().saturating_add(engine_held) < DiscoveryStage::CAPACITY {
             fds.push(self.discovery_readiness_fd());
         }
         fds

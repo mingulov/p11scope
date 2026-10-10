@@ -243,6 +243,12 @@ enum SuccessorAdmission {
     ScopedDenied,
 }
 
+/// Lifecycle reason for a natively proven exec retirement: the later image
+/// of the same task was witnessed (its exec sequence advanced under its
+/// task cookie, or its leader task changed under the held pidfd).
+const NATIVE_EXEC_REASON: &str = "a later image of the same task was witnessed natively (its exec \
+     sequence advanced under its task cookie, or its leader task changed under the held pidfd)";
+
 struct TrackedCaller<Pin> {
     record: CallerRecord,
     pin: Option<Pin>,
@@ -651,18 +657,26 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         else {
             return Vec::new();
         };
-        self.retire(
-            id,
-            CallerLifecycle::ExecRetired,
-            "a later image of the same task was witnessed natively (its exec sequence advanced \
-             under its task cookie, or its leader task changed under the held pidfd)"
-                .into(),
-            now_ns,
-        );
         if matches!(admission, SuccessorAdmission::ScopedDenied) {
+            self.retire(
+                id,
+                CallerLifecycle::ExecRetired,
+                NATIVE_EXEC_REASON.into(),
+                now_ns,
+            );
             return vec![self.retired_event(id)];
         }
-        vec![match self.try_admit(pid, authority_for(pid), now_ns) {
+        // H6 slice 2: the original held pin moves to the successor first,
+        // then the old incarnation retires. The successor is never reopened
+        // by scalar PID. This rides the same two primitives as the
+        // coordinator's pending handoff.
+        let authority = authority_for(pid);
+        let handoff = self.retire_for_exec_handoff(id, now_ns);
+        let commit = match handoff {
+            Some((pid, pin)) => self.admit_retained_successor(pid, pin, authority, now_ns),
+            None => self.commit_retained_successor(pid, None, authority, now_ns),
+        };
+        vec![match commit {
             Ok(new) => CallerEvent::ExecRetired { old: id, new },
             Err(failure) => CallerEvent::AdmitFailed {
                 pid,
@@ -670,6 +684,137 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                 budget: failure.budget,
             },
         }]
+    }
+
+    /// Retire `id` for a coordinator exec handoff (H6 slice 2): the
+    /// original held pin moves to the caller first, then the old
+    /// incarnation retires exec-retired. `None` unless `id` is live with
+    /// its pin. The coordinator mints the pending successor from this
+    /// custody; the pin is never dropped here and never reopened by PID.
+    pub(crate) fn retire_for_exec_handoff(
+        &mut self,
+        id: CallerId,
+        now_ns: u64,
+    ) -> Option<(u32, Source::Pin)> {
+        let pid = self
+            .callers
+            .get(&id)
+            .filter(|tracked| !tracked.record.retired)
+            .map(|tracked| tracked.record.pid)?;
+        let pin = self.callers.get_mut(&id)?.pin.take()?;
+        self.retire(
+            id,
+            CallerLifecycle::ExecRetired,
+            NATIVE_EXEC_REASON.into(),
+            now_ns,
+        );
+        Some((pid, pin))
+    }
+
+    /// Admit one exec successor on retained custody (H6 slice 2): the moved
+    /// original pin proves the same process. A dead pin, a live pid
+    /// collision, a full caller budget, or a zombie refuses; nothing here
+    /// reopens the successor by scalar PID.
+    pub(crate) fn admit_retained_successor(
+        &mut self,
+        pid: u32,
+        pin: Source::Pin,
+        authority: ImageAuthority,
+        now_ns: u64,
+    ) -> Result<CallerId, AdmitFailure> {
+        self.commit_retained_successor(pid, Some(pin), authority, now_ns)
+    }
+
+    /// The one retained-custody commit behind every exec handoff: the native
+    /// transition path, the scan-proven path, and the coordinator's pending
+    /// successor commit share these checks, in this order.
+    fn commit_retained_successor(
+        &mut self,
+        pid: u32,
+        pin: Option<Source::Pin>,
+        authority: ImageAuthority,
+        now_ns: u64,
+    ) -> Result<CallerId, AdmitFailure> {
+        let Some(pin) = pin else {
+            return Err(AdmitFailure {
+                reason: "no retained process custody for the exec successor \
+                     (the successor is never reopened by scalar PID)"
+                    .into(),
+                budget: None,
+            });
+        };
+        if !self.source.still_the_same(&pin) {
+            return Err(AdmitFailure {
+                reason: "original process custody lost: the process exited or the pid was reused"
+                    .into(),
+                budget: None,
+            });
+        }
+        if self.live_by_pid.contains_key(&pid) {
+            return Err(AdmitFailure {
+                reason: format!(
+                    "pid {pid} already has live caller {}",
+                    self.live_by_pid[&pid].label()
+                ),
+                budget: None,
+            });
+        }
+        if self.callers.len() >= self.max_callers {
+            self.admit_refused = self.admit_refused.saturating_add(1);
+            let refusal = BudgetRefusal {
+                resource: "callers",
+                limit: self.max_callers,
+                requested: self.callers.len() + 1,
+            };
+            return Err(AdmitFailure {
+                reason: format!(
+                    "caller budget exhausted: the registry retains at most {} callers (requested caller {}); the admission was refused",
+                    refusal.limit, refusal.requested,
+                ),
+                budget: Some(refusal),
+            });
+        }
+        // A zombie pins successfully but admits nothing: same refusal as a
+        // fresh open, so a dead-but-unreaped target never mints a spurious
+        // successor incarnation.
+        if self.source.gone(pid) {
+            return Err(AdmitFailure {
+                reason: format!(
+                    "cannot pin caller pid {pid}: no live process with that pid (it exited)"
+                ),
+                budget: None,
+            });
+        }
+        let start_time = self.source.start_time(pid);
+        let exe = self.source.exe_identity(pid);
+        let id = self.mint().map_err(|error| AdmitFailure {
+            reason: format!("{error:#}"),
+            budget: None,
+        })?;
+        let incarnation = self.incarnations.get(&pid).copied().unwrap_or(0);
+        self.incarnations.insert(pid, incarnation.saturating_add(1));
+        self.callers.insert(
+            id,
+            TrackedCaller {
+                record: CallerRecord {
+                    id,
+                    pid,
+                    start_time,
+                    incarnation,
+                    exec_observed: exe.is_some(),
+                    exe,
+                    authority,
+                    lifecycle: CallerLifecycle::Mapped,
+                    lifecycle_reason: None,
+                    first_seen_ns: now_ns,
+                    last_seen_ns: now_ns,
+                    retired: false,
+                },
+                pin: Some(pin),
+            },
+        );
+        self.live_by_pid.insert(pid, id);
+        Ok(id)
     }
 
     /// Reconcile tracked callers against one scan pass's observed pids:
@@ -780,17 +925,31 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     // Same generation, new image: an exec (leader or
                     // nonleader). Retire the old incarnation with its
                     // evidence, admit the new one.
+                    if matches!(admission, SuccessorAdmission::ScopedDenied) {
+                        self.retire(
+                            id,
+                            CallerLifecycle::ExecRetired,
+                            "executable image changed while the generation pin held (exec)".into(),
+                            now_ns,
+                        );
+                        events.push(self.retired_event(id));
+                        continue;
+                    }
+                    // H6 slice 2: the original held pin moves to the
+                    // successor first, then the old incarnation retires.
+                    // The successor is never reopened by scalar PID.
+                    let authority = authority_for(pid);
+                    let pin = self
+                        .callers
+                        .get_mut(&id)
+                        .and_then(|tracked| tracked.pin.take());
                     self.retire(
                         id,
                         CallerLifecycle::ExecRetired,
                         "executable image changed while the generation pin held (exec)".into(),
                         now_ns,
                     );
-                    if matches!(admission, SuccessorAdmission::ScopedDenied) {
-                        events.push(self.retired_event(id));
-                        continue;
-                    }
-                    match self.try_admit(pid, authority_for(pid), now_ns) {
+                    match self.commit_retained_successor(pid, pin, authority, now_ns) {
                         Ok(new) => events.push(CallerEvent::ExecRetired { old: id, new }),
                         Err(failure) => events.push(CallerEvent::AdmitFailed {
                             pid,
@@ -4213,6 +4372,12 @@ pub(crate) mod tests {
     #[derive(Debug, Clone, Default)]
     struct ScriptedState {
         processes: HashMap<u32, ScriptedProcess>,
+        /// H6 slice 2: when set, `open` fails for every pid while pins
+        /// already held keep proving their process — the fd-exhaustion /
+        /// permission shape where numeric-PID reopen is unavailable but
+        /// retained custody works.
+        reopen_poisoned: bool,
+        reopen_attempts: usize,
     }
 
     /// Scripted source: the pid/exit/reuse/exec sequence is programmed,
@@ -4287,13 +4452,27 @@ pub(crate) mod tests {
                 });
             }
         }
+
+        /// Poison every future numeric-PID reopen; held pins are unaffected.
+        pub(crate) fn poison_reopen(&self) {
+            self.state.borrow_mut().reopen_poisoned = true;
+        }
+
+        /// Numeric-PID reopen attempts so far, poisoned or not.
+        pub(crate) fn reopen_attempts(&self) -> usize {
+            self.state.borrow().reopen_attempts
+        }
     }
 
     impl ProcessSource for ScriptedSource {
         type Pin = (u32, u64);
 
         fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
-            let state = self.state.borrow();
+            let mut state = self.state.borrow_mut();
+            state.reopen_attempts = state.reopen_attempts.saturating_add(1);
+            if state.reopen_poisoned {
+                return Err(format!("poisoned numeric-PID reopen of {pid}"));
+            }
             let process = state
                 .processes
                 .get(&pid)

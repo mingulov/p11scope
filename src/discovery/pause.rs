@@ -2147,18 +2147,28 @@ impl PauseIo for SessionPauseIo<'_> {
             )
         };
         let terminal_dispatch = terminal_batch.is_some();
-        if let Some(batch) = terminal_batch.take()
-            && let Err(error) = self
-                .engine
-                .install_terminal_batch(batch.clone(), records.clone())
-        {
-            *terminal_batch = Some(batch);
-            return Err(PauseBatchError::new(
-                format!("terminal discovery batch restore failed: {error:#}"),
-                None,
-            ));
-        }
-        let records = terminal_dispatch.then(Vec::new).unwrap_or(records);
+        // Move-only: the batch and its records move into the engine. The
+        // install is prechecked before the move, so a refusal restores the
+        // batch without needing a second owned copy.
+        let records = match terminal_batch.take() {
+            Some(batch) => {
+                if let Err(error) = self.engine.terminal_batch_installable(&batch) {
+                    *terminal_batch = Some(batch);
+                    return Err(PauseBatchError::new(
+                        format!("terminal discovery batch restore failed: {error:#}"),
+                        None,
+                    ));
+                }
+                if let Err(error) = self.engine.install_terminal_batch(batch, records) {
+                    return Err(PauseBatchError::new(
+                        format!("terminal discovery batch restore failed: {error:#}"),
+                        None,
+                    ));
+                }
+                Vec::new()
+            }
+            None => records,
+        };
         let before_ns = attach::monotonic_ns();
         self.engine.set_pause_owned_batch(pause_owned);
         let applied = self.engine.apply_discovery_batch_with(

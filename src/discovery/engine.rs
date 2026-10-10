@@ -2705,7 +2705,10 @@ impl EngineSession for Session {
     }
 }
 
-#[derive(Clone)]
+/// An incomplete terminal pull owns its exact off-ring prefix: move-only, so
+/// the prefix has exactly one owner (this error or the batch it moves
+/// into). A work-quantum stop, a shared-storage stop and a transport
+/// failure are three distinct meanings; none is ever an empty observation.
 pub(crate) struct IncompleteTerminalDrain {
     pub(crate) records: Vec<DiscoveryRecord>,
     pub(crate) malformed: u64,
@@ -2713,6 +2716,14 @@ pub(crate) struct IncompleteTerminalDrain {
     /// The drain stopped at its work quantum, not on a failure: the prefix is
     /// exact and the rest is still queued on the ring for the next drain.
     pub(crate) backlog: bool,
+    /// The drain stopped at the shared 4,096-item allowance with the queue
+    /// not observed empty: the prefix is exact, the rest stays unread, and
+    /// the operation retries only after owned items settle. Never complete.
+    pub(crate) capacity_blocked: bool,
+    /// Prefix records already moved into the terminal batch when this signal
+    /// was rebuilt after the move. `records` is empty then; the count keeps
+    /// the retry diagnostic exact without a second owned copy.
+    moved_to_batch: usize,
     cause: String,
 }
 
@@ -2728,6 +2739,8 @@ impl IncompleteTerminalDrain {
             malformed,
             unvalidated_records,
             backlog: false,
+            capacity_blocked: false,
+            moved_to_batch: 0,
             cause: cause.to_string(),
         }
     }
@@ -2738,7 +2751,25 @@ impl IncompleteTerminalDrain {
             malformed,
             unvalidated_records: 0,
             backlog: true,
+            capacity_blocked: false,
+            moved_to_batch: 0,
             cause: DISCOVERY_DRAIN_BACKLOG_REASON.into(),
+        }
+    }
+
+    fn capacity_blocked(
+        records: Vec<DiscoveryRecord>,
+        malformed: u64,
+        unvalidated_records: u64,
+    ) -> Self {
+        Self {
+            records,
+            malformed,
+            unvalidated_records,
+            backlog: false,
+            capacity_blocked: true,
+            moved_to_batch: 0,
+            cause: DISCOVERY_CAPACITY_BLOCKED_REASON.into(),
         }
     }
 }
@@ -2751,6 +2782,8 @@ impl std::fmt::Debug for IncompleteTerminalDrain {
             .field("malformed", &self.malformed)
             .field("unvalidated_records", &self.unvalidated_records)
             .field("backlog", &self.backlog)
+            .field("capacity_blocked", &self.capacity_blocked)
+            .field("moved_to_batch", &self.moved_to_batch)
             .field("cause", &self.cause)
             .finish()
     }
@@ -2758,12 +2791,13 @@ impl std::fmt::Debug for IncompleteTerminalDrain {
 
 impl std::fmt::Display for IncompleteTerminalDrain {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let retained = self.records.len().saturating_add(self.moved_to_batch);
         write!(
             formatter,
             "{}; {} terminal record{} retained for retry",
             self.cause,
-            self.records.len(),
-            if self.records.len() == 1 { "" } else { "s" },
+            retained,
+            if retained == 1 { "" } else { "s" },
         )
     }
 }
@@ -3212,7 +3246,12 @@ struct CollectedExportWork {
     required_seed_complete: bool,
 }
 
-#[derive(Clone)]
+/// One queued record envelope: move-only, so each record crosses dispatch
+/// through exactly one owned envelope. The payload (`DiscoveryRecord`, a
+/// frozen `Copy` ABI type) is still read by value for field checks, but a
+/// by-value read never creates a second dispatchable owner: only this
+/// envelope (or the terminal batch/error prefix it moves into) carries the
+/// record to dispatch or retention.
 struct QueuedDiscoveryRecord {
     record: DiscoveryRecord,
     terminal_owner: Option<LoaderContextId>,
@@ -3227,8 +3266,10 @@ pub(crate) struct TerminalAuthority {
 
 /// The only transfer that may carry a tombstoned loader's final exports.  It
 /// stays separate from ordinary pending records so a later generic drain
-/// cannot accidentally consume it.
-#[derive(Clone)]
+/// cannot accidentally consume it. Move-only: the batch owns its records,
+/// and journal/pause handoffs transfer that ownership instead of copying
+/// it. (`TerminalAuthority` keeps its `Clone`: it carries only the owner
+/// id and export identities, never records.)
 pub(crate) struct TerminalBatch {
     pub(crate) authority: TerminalAuthority,
     records: Vec<QueuedDiscoveryRecord>,
@@ -5390,6 +5431,8 @@ pub(crate) const UNFINISHED_DEFERRAL_LOSS: &str =
     "discovery work deferred by a frame budget was never completed before the capture ended";
 const DISCOVERY_DRAIN_BACKLOG_REASON: &str =
     "the live discovery drain stopped at its work quantum with records still queued";
+const DISCOVERY_CAPACITY_BLOCKED_REASON: &str =
+    "the live discovery drain stopped at the shared storage allowance with records still unread";
 const TERMINAL_DRAIN_RETRY_REASON: &str = "the post-detach private discovery drain failed; the exact terminal batch remains \
      tombstoned for retry";
 
@@ -14712,11 +14755,14 @@ impl Engine {
             Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
                 Ok(incomplete) => {
                     self.account_unvalidated_discovery(incomplete.unvalidated_records);
-                    self.retain_terminal_batch(
-                        incomplete.records.clone(),
-                        false,
-                        incomplete.malformed,
-                    )?;
+                    // Move-only: the batch takes the prefix, and the signal
+                    // back up keeps the retained count for its diagnostic
+                    // without a second owned copy.
+                    let mut incomplete = incomplete;
+                    let prefix = std::mem::take(&mut incomplete.records);
+                    incomplete.moved_to_batch = prefix.len();
+                    let malformed = incomplete.malformed;
+                    self.retain_terminal_batch(prefix, false, malformed)?;
                     Ok(Err(incomplete.into()))
                 }
                 Err(error) => Ok(Err(error)),
@@ -14756,6 +14802,23 @@ impl Engine {
             "live discovery counters",
             "the terminal batch exhausted its one predispatch retry and was cleaned without replay",
         );
+    }
+
+    /// Whether `install_terminal_batch` would accept this batch: the
+    /// journal exists and names its owner, dispatch has not started, and the
+    /// engine holds no competing batch. Move-only callers precheck before
+    /// moving ownership, so a refusal never needs the batch back.
+    pub(crate) fn terminal_batch_installable(&self, batch: &TerminalBatch) -> Result<()> {
+        let Some(journal) = self.terminal_journal else {
+            bail!("terminal loader drain journal is missing");
+        };
+        if journal.owner != batch.authority.owner
+            || journal.dispatch_started
+            || self.terminal_batch.is_some()
+        {
+            bail!("terminal loader drain batch cannot be restored");
+        }
+        Ok(())
     }
 
     pub(crate) fn install_terminal_batch(
@@ -15080,11 +15143,24 @@ impl Engine {
                     self.begin_terminal_drain(context_id, terminal_exports, || collect(session));
                 if terminal_drain.is_ok()
                     && let Some(records) = terminal_selection_handoffs.remove(&context_id.get())
-                    && let Err(error) =
-                        self.handoff_precharged_terminal_records(context_id, records.clone())
+                    && !records.is_empty()
                 {
-                    self.reject_terminal_selection_handoffs(records, closure);
-                    return Err(error);
+                    // Move-only: the handoff moves the records, so ownership
+                    // is checked before the move; only a failed check keeps
+                    // the originals for rejection.
+                    let owner_ok = self.terminal_batch.as_ref().is_some_and(|batch| {
+                        batch.authority.owner == context_id
+                    });
+                    if !owner_ok {
+                        let error = if self.terminal_batch.is_none() {
+                            anyhow!("terminal loader drain batch is missing")
+                        } else {
+                            anyhow!("terminal selection handoff named the wrong loader owner")
+                        };
+                        self.reject_terminal_selection_handoffs(records, closure);
+                        return Err(error);
+                    }
+                    self.handoff_precharged_terminal_records(context_id, records)?;
                 }
                 match terminal_drain {
                     Ok(Ok((owned, malformed))) => {
@@ -18677,15 +18753,13 @@ impl Engine {
         let retained_pids: BTreeSet<_> = self.views.iter().map(ProcessView::pid).collect();
         let mut deferred_exits = Vec::new();
         if self.admits_generations() {
-            records.retain(|queued| {
+            // Move-only: the deferred exits move out in encounter order;
+            // both sides keep their original relative order.
+            deferred_exits.extend(records.extract_if(.., |queued| {
                 let record = &queued.record;
-                let defer = record.kind == DISCOVERY_KIND_LEADER_EXIT
-                    && !retained_pids.contains(&((record.pid_tgid >> 32) as u32));
-                if defer {
-                    deferred_exits.push(queued.clone());
-                }
-                !defer
-            });
+                record.kind == DISCOVERY_KIND_LEADER_EXIT
+                    && !retained_pids.contains(&((record.pid_tgid >> 32) as u32))
+            }));
         }
 
         let mut additions_allowed = additions_allowed;

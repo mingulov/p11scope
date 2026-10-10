@@ -81,6 +81,26 @@ enum InventoryScanClass {
     Newcomer,
 }
 
+/// The H1 fairness-accounting cursors a pressure service pass must leave
+/// untouched: pass counts, rotation cursors, the scan-class alternation and
+/// the tick deadline. Restored verbatim after each selected transaction, so
+/// pressure service never consumes an ordinary tick's polling round,
+/// reconcile turn or alternation share. Cooling entries are real admission
+/// facts, not accounting, and are never restored.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FairnessCheckpoint {
+    over_cap_passes: u64,
+    cursor: Option<u32>,
+    reconcile_sweeps: u64,
+    new_view_cursor: Option<u32>,
+    retained_view_cursor: Option<u32>,
+    first_scan_class: InventoryScanClass,
+    tick_scan_started: bool,
+    tick_deadline_ns: Option<u64>,
+    under_cap_ticks: u64,
+    poll_cursor: Option<u32>,
+}
+
 /// The per-capture discovery schedule. Reconciliation, polling and new-view
 /// admission have independent cursors so failed candidates cannot monopolize
 /// a bounded tick, including when the whole scope fits under the view cap.
@@ -337,6 +357,41 @@ impl DiscoveryScheduler {
         self.cursor = Some(last_read);
     }
 
+    /// Snapshots the H1 fairness-accounting cursors before a pressure
+    /// service pass. The pass runs its selected transaction, then
+    /// `restore_fairness` puts every cursor back: the selected attempt is
+    /// recorded in the pressure episode's own counters, never in H1 shares.
+    pub(crate) fn fairness_checkpoint(&self) -> FairnessCheckpoint {
+        FairnessCheckpoint {
+            over_cap_passes: self.over_cap_passes,
+            cursor: self.cursor,
+            reconcile_sweeps: self.reconcile_sweeps,
+            new_view_cursor: self.new_view_cursor,
+            retained_view_cursor: self.retained_view_cursor,
+            first_scan_class: self.first_scan_class,
+            tick_scan_started: self.tick_scan_started,
+            tick_deadline_ns: self.tick_deadline_ns,
+            under_cap_ticks: self.under_cap_ticks,
+            poll_cursor: self.poll_cursor,
+        }
+    }
+
+    /// Restores H1 fairness accounting after a pressure service pass. Cooling
+    /// entries stay as the transaction left them: an admission or departure
+    /// it observed is a real fact, not a consumed share.
+    pub(crate) fn restore_fairness(&mut self, checkpoint: FairnessCheckpoint) {
+        self.over_cap_passes = checkpoint.over_cap_passes;
+        self.cursor = checkpoint.cursor;
+        self.reconcile_sweeps = checkpoint.reconcile_sweeps;
+        self.new_view_cursor = checkpoint.new_view_cursor;
+        self.retained_view_cursor = checkpoint.retained_view_cursor;
+        self.first_scan_class = checkpoint.first_scan_class;
+        self.tick_scan_started = checkpoint.tick_scan_started;
+        self.tick_deadline_ns = checkpoint.tick_deadline_ns;
+        self.under_cap_ticks = checkpoint.under_cap_ticks;
+        self.poll_cursor = checkpoint.poll_cursor;
+    }
+
     pub(crate) fn quantum_ns(&self) -> u64 {
         self.quantum_ns
     }
@@ -496,6 +551,50 @@ mod tests {
         let pids = [1, 2, 3];
         let exclude = BTreeSet::new();
         assert!(DiscoveryScheduler::rotation_window(&pids, &exclude, 0).is_empty());
+    }
+
+    /// A fairness checkpoint covers every H1 accounting cursor: after
+    /// polling rounds, reconcile passes, scan attempts and a deep-scan
+    /// tick, restoring returns each observable cursor and the alternation
+    /// to its checkpoint, while a real admission fact (cooling cleared)
+    /// survives the restore.
+    #[test]
+    fn fairness_checkpoint_restores_h1_accounting_but_keeps_admission_facts() {
+        let mut scheduler = DiscoveryScheduler::new();
+        scheduler.note_new_view_attempt(7);
+        scheduler.note_retained_view_attempt(3);
+        scheduler.advance_poll_cursor(11);
+        scheduler.advance_cursor(13);
+        for _ in 0..3 {
+            scheduler.begin_under_cap_tick();
+        }
+        scheduler.begin_over_cap_pass();
+        let checkpoint = scheduler.fairness_checkpoint();
+        let order_before = scheduler.new_view_order(&[5, 7, 9]);
+        let retained_before = scheduler.retained_view_order(&[1, 3, 5]);
+        let alternation_before = scheduler.newcomers_first(true, true);
+        scheduler.begin_under_cap_tick();
+        scheduler.begin_over_cap_pass();
+        scheduler.begin_deep_scan_tick(Some(1_000));
+        scheduler.note_new_view_attempt(9);
+        scheduler.note_retained_view_attempt(5);
+        scheduler.advance_poll_cursor(17);
+        scheduler.advance_cursor(19);
+        scheduler.note_evicted(21);
+        assert_ne!(scheduler.new_view_order(&[5, 7, 9]), order_before);
+        scheduler.note_admitted(21);
+        scheduler.note_evicted(23);
+        scheduler.restore_fairness(checkpoint);
+        assert_eq!(scheduler.new_view_order(&[5, 7, 9]), order_before);
+        assert_eq!(scheduler.retained_view_order(&[1, 3, 5]), retained_before);
+        assert_eq!(scheduler.newcomers_first(true, true), alternation_before);
+        assert_eq!(scheduler.under_cap_ticks_for_test(), 3);
+        assert_eq!(scheduler.over_cap_passes(), 1);
+        assert_eq!(scheduler.cursor_for_test(), Some(13));
+        assert!(!scheduler.cooling_down(21));
+        assert!(!scheduler.is_stale(21));
+        assert!(scheduler.cooling_down(23));
+        assert!(scheduler.is_stale(23));
     }
 
     /// The reconcile slice starts after the cursor and wraps past the end,

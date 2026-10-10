@@ -60,9 +60,10 @@ use crate::inventory_diagnostics::{
     DiagnosticReason, DiagnosticRecord, Eligibility, FinishedDiagnostics, InitError, NativePairKey,
     ReadOrigin, Recorder,
 };
+use crate::inventory_semantics::{AttestedSemanticLane, SemanticBatch};
 use crate::scope::inventory_cgroup::{CgroupWalkLimits, CgroupWalkState, CollectionControl};
 use p11scope_ebpf_common::inventory_callers::CallerEvidence;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -201,6 +202,29 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// The native witness binder (Task 6 C4): every native row enters
     /// through `stage_native`.
     binder: NativeBinder,
+    /// Accepted semantic caller bindings (H3 Task 3): one stable custody
+    /// Arc per accepted caller, owned by the coordinator semantic child.
+    semantic_bindings: semantics::SemanticBindingSet,
+    /// At most one ordinary semantic collection quantum, finalized after
+    /// the commit tail and before registry publication.
+    pending_semantic: Option<SemanticBatch>,
+    /// Detailed domains whose semantic authority ended permanently
+    /// (cut/writeback/counter failure): new batches refuse, broad
+    /// Inventory continues.
+    refused_semantic_domains: HashSet<NativeDomainId>,
+    /// Pending physical adjudication (H3 Task 3): one marker per live
+    /// caller whose unscanned placeholder waits for the commit tail.
+    /// Bounded by the caller budget; drained every commit.
+    pending_adjudication: BTreeMap<CallerId, u32>,
+    /// Callers with genuine physical uncertainty this publication
+    /// (unscanned members, incomplete absences): the tail-gap source.
+    tail_uncertain: BTreeSet<CallerId>,
+    /// Callers with complete same-custody caller/provider/full-image
+    /// proof this publication: the suppression source.
+    complete_scanned: BTreeSet<CallerId>,
+    /// Latest observed exec per Detailed ticket: H0-association proof
+    /// for gap minting, keyed conservatively for refusal.
+    proven_images: HashMap<(NativeDomainId, u64), u64>,
     /// The latest known count per witnessed pair (C7 C4): first-sight
     /// and refresh counts merge here (the maximum wins, with its
     /// observing read) and stage to the edge once the pair binds. One
@@ -300,6 +324,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pending_targets: TargetDelta::default(),
             capture: None,
             binder: NativeBinder::new(BinderLimits::default()),
+            semantic_bindings: semantics::SemanticBindingSet::new(),
+            pending_semantic: None,
+            refused_semantic_domains: HashSet::new(),
+            pending_adjudication: BTreeMap::new(),
+            tail_uncertain: BTreeSet::new(),
+            complete_scanned: BTreeSet::new(),
+            proven_images: HashMap::new(),
             pair_counts: HashMap::new(),
             pair_targets: HashMap::new(),
             pending_ids: HashMap::new(),
@@ -887,6 +918,32 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     #[cfg(test)]
     pub(crate) fn registry_mut(&mut self) -> &mut CallerRegistry {
         &mut self.registry
+    }
+
+    /// Accepted semantic bindings (H3 Task 3): the tick window borrows
+    /// from here; tests observe stable custody through it.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task5 lane loop consumes the tick window")
+    )]
+    pub(crate) fn semantic_bindings(&self) -> &semantics::SemanticBindingSet {
+        &self.semantic_bindings
+    }
+
+    /// Mutable binding-set access for the tick window and tests.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task5 lane loop consumes the tick window")
+    )]
+    pub(crate) fn semantic_bindings_mut(&mut self) -> &mut semantics::SemanticBindingSet {
+        &mut self.semantic_bindings
+    }
+
+    /// Test seam: script the binder's current-binding clock so scripted
+    /// horizons can cover scripted sightings.
+    #[cfg(test)]
+    pub(crate) fn set_semantic_binding_clock(&mut self, clock: fn() -> Option<u64>) {
+        self.binder.set_current_binding_clock(clock);
     }
 
     /// The run's attach set (read side): presentation reports its
@@ -1707,13 +1764,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .reconcile_scoped(now_ns, &mut || work.charge(5));
         self.apply_reconcile_events(&events, now_ns);
         // Any history absent from this bounded pass stays live and uncertain;
-        // a partial census is never an exit or physical-unmap proof.
+        // a partial census is never an exit or physical-unmap proof. The
+        // marker is provisional, not an early placeholder: the commit tail
+        // proves continued authority or stages the genuine uncertainty,
+        // never before the catalog is known. The loop charges nothing:
+        // records are admission-bounded (one marker per live caller), and
+        // failed walks exhaust the collection work that a charge would
+        // draw on — those passes need their markers most.
         for record in self.adapter.records() {
-            if !work.charge(1) {
-                break;
-            }
             if !record.retired {
-                self.registry.note_member_unscanned(record.id);
+                self.pending_adjudication.insert(record.id, record.pid);
             }
         }
         let scanned = collection.member_pids().count();
@@ -1947,6 +2007,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .collect();
         for caller in &live {
             self.registry.note_member_unscanned(*caller);
+            self.tail_uncertain.insert(*caller);
         }
         self.registry.record_gap(RegistryGap {
             caller: None,
@@ -2263,6 +2324,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             if !shown {
                 self.registry
                     .note_module_absent(caller, edge.0, commit.complete, now_ns);
+                if !commit.complete {
+                    self.tail_uncertain.insert(caller);
+                }
                 absent = commit.complete && edge.1 == MappingState::Mapped;
             }
         }
@@ -2349,6 +2413,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             };
             if !process.status.attributable() {
                 self.registry.note_member_unscanned(caller);
+                self.tail_uncertain.insert(caller);
                 self.count_ownership
                     .queue_observation(caller, Vec::new(), None);
                 continue;
@@ -2358,11 +2423,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // The collected mappings belong to another generation or
                 // image: they neither confirm nor refute this caller's.
                 self.registry.note_member_unscanned(caller);
+                self.tail_uncertain.insert(caller);
                 self.count_ownership
                     .queue_observation(caller, Vec::new(), None);
                 continue;
             }
             let mut retirement_admission_known = true;
+            let mut deep_scanned = false;
             // One mapping note per observation (not per object path):
             // aliased objects are observed under several paths and the
             // registry accumulates every spelling.
@@ -2385,6 +2452,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     ObservationEvidence::DeepScan => {
                         self.registry
                             .note_mapping(caller, process.pid, info, now_ns);
+                        deep_scanned = true;
                     }
                     ObservationEvidence::MapsMatch => {
                         self.registry
@@ -2402,6 +2470,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // Only a complete deep scan makes absence authoritative: a
             // maps match decoded nothing, so its absences read uncertain.
             let complete = matches!(process.status, MemberStatus::Scanned);
+            if complete && deep_scanned {
+                // Complete same-custody caller/provider/full-image proof:
+                // the generation join held above, the member image
+                // scanned completely, and provider mappings re-observed.
+                self.complete_scanned.insert(caller);
+            }
             let shown: BTreeSet<ModuleKey> = process
                 .objects
                 .iter()
@@ -2425,6 +2499,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 if !shown {
                     self.registry
                         .note_module_absent(caller, module, complete, now_ns);
+                    if !complete {
+                        self.tail_uncertain.insert(caller);
+                    }
                     absent = complete && mapping == MappingState::Mapped;
                 }
             }
@@ -2559,6 +2636,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 self.binder.absorb_lifecycle(&batch)
             }
             NativeBatch::Finish { domain } => self.binder.finish(domain),
+            NativeBatch::Semantic(batch) => self.stage_semantic_batch(batch),
         }
         let receipt = self.stage_binder_output(identity, now_ns);
         self.reconcile_count_eligibility(identity, &mut RecoveryWorkBudget::new());
@@ -4532,13 +4610,41 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// invisible before this returns and visible after — the ordering
     /// the Phase 2 test pins, extended to caller/edge facts.
     pub(crate) fn commit_batch(&mut self, engine_changed: bool) -> Result<BatchReceipt> {
+        self.commit_batch_inner(engine_changed, None)
+    }
+
+    /// The commit with an attested Detailed lane: pending semantic batches
+    /// finalize after all reconciliation/catalog work and immediately
+    /// before registry publication. `commit_batch` delegates with `None`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "Task5 loop commits with the lane")
+    )]
+    pub(crate) fn commit_batch_with_semantics(
+        &mut self,
+        engine_changed: bool,
+        lane: Option<&mut AttestedSemanticLane>,
+    ) -> Result<BatchReceipt> {
+        self.commit_batch_inner(engine_changed, lane)
+    }
+
+    fn commit_batch_inner(
+        &mut self,
+        engine_changed: bool,
+        lane: Option<&mut AttestedSemanticLane>,
+    ) -> Result<BatchReceipt> {
         // Original cgroup custody is still in self during the fallible engine
         // tail. Scoped preparation/staging then has no later fallible tail.
         self.engine.publish_batch_tail(engine_changed)?;
+        // Fresh per-publication proof tracking for the tail adjudication.
+        // Tail bits are NOT cleared here: they join this publication's
+        // cut directly, and drain in the finalizer either way.
+        self.complete_scanned.clear();
         let mut publishing_cgroup = self.pending_cgroup.take();
         let mut scoped_events = Vec::new();
         let mut scoped_admitted = 0;
         let mut scoped_scan_callers = 0;
+        let mut cgroup_proof_complete = false;
         if let Some((collection, now_ns)) = &mut publishing_cgroup {
             let work = collection.work();
             let pids: Vec<u32> = if work.charge(
@@ -4669,8 +4775,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     reason: outcome.reason().into(),
                     budget: None,
                 });
+            } else {
+                cgroup_proof_complete = true;
             }
         }
+        // Provisional adjudication runs at the end of the commit's catalog
+        // work, before any semantic input stages: suppression needs a
+        // complete publication's proof, never less.
+        self.adjudicate_provisional_unscanned(cgroup_proof_complete);
+        // Semantic finalization runs after all reconciliation/catalog work
+        // and immediately before registry publication: negatives first,
+        // validated registrations second, eligible calls in position
+        // order. No semantic positive sits ahead of a physical decision.
+        self.finalize_semantic_batches(lane);
         // Pure projection performs no additional generation/admission reads.
         // Keep the original handles through this actual publication call.
         let registry_applied = if let Some(recorder) = &mut self.diagnostics {
@@ -4730,6 +4847,9 @@ pub(crate) enum NativeBatch {
     /// capture retired): every row of that domain still waiting is decided
     /// unbound. Pass the retired facade's `domain()`.
     Finish { domain: NativeDomainId },
+    /// One owned lane batch (H0 outcomes, current-partition receipts and
+    /// lane negatives) queued for finalization after the commit tail.
+    Semantic(SemanticBatch),
 }
 
 /// What one `stage_native` call did.

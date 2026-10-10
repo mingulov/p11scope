@@ -738,6 +738,7 @@ impl LaneHost<Pin> for Scene {
             NativeBatch::Witness(_) => "stage:witness",
             NativeBatch::Lifecycle(_) => "stage:lifecycle",
             NativeBatch::Finish { .. } => "stage:finish",
+            NativeBatch::Semantic(_) => "stage:semantic",
         });
         if let NativeBatch::Lifecycle(lifecycle) = &batch {
             self.staged_lifecycle.push(lifecycle.started_ns);

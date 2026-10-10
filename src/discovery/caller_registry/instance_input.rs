@@ -8,9 +8,12 @@ use super::{
     RegistryGap,
 };
 use crate::attach::capture::NativeDomainId;
-use crate::discovery::instances::InstanceId;
+use crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding;
+use crate::discovery::instances::{InstanceId, Route};
+use crate::inventory_semantics::{AttestedSubset, LaneCoverage, LaneNegative};
+use crate::semantic_capture::{Endpoint, InvalidationScope, RoutedCall};
 use crate::semantics_edge::{EdgeSemantics, SemanticCall};
-use p11scope_ebpf_common::ImageIdentity;
+use p11scope_ebpf_common::{Event, ImageIdentity, SlotSemantics};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -1063,6 +1066,438 @@ impl CallerRegistry {
     #[cfg(test)]
     pub(crate) fn reference_instance_limit(&mut self, limit: usize) {
         self.instance_state.limit = limit.min(MAX_REGISTRY_INSTANCES);
+    }
+}
+
+// ---- H3 Task 3 production conversion (evidence adapter) ----
+//
+// The sole positive factory consumes one unique opaque `RoutedCall` into
+// one move-only envelope, without cloning it or re-minting from a
+// borrowed record. The thin by-value move lands in `CallEvidence`; every
+// authority decision below combines the coordinator's caller binding, the
+// attested subset's descriptor proof and the lane's validated coverage.
+// Ordinals are H0-timeline evidence, never caller-selected authority.
+
+/// Owned decomposed call evidence: the thin by-value move out of a unique
+/// `RoutedCall`. Production builds it only by consuming the call
+/// (exactly-once); tests script equivalent evidence directly.
+pub(crate) struct CallEvidence {
+    domain: NativeDomainId,
+    image: ImageIdentity,
+    token: u64,
+    router: InstanceId,
+    endpoint: Option<Endpoint>,
+    event: Event,
+}
+
+impl std::fmt::Debug for CallEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CallEvidence(<private>)")
+    }
+}
+
+impl CallEvidence {
+    /// Consume the unique call. `None` unless the call joined an instance
+    /// with a timeline token; pending and unknown routes convert nothing.
+    pub(crate) fn from_routed(call: RoutedCall) -> Option<Self> {
+        let Route::Joined(router) = call.route() else {
+            return None;
+        };
+        let token = call.token()?;
+        Some(Self {
+            domain: call.domain(),
+            image: call.image(),
+            token,
+            router,
+            endpoint: call.endpoint(),
+            event: call.record().event,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted(
+        domain: NativeDomainId,
+        image: ImageIdentity,
+        token: u64,
+        router: InstanceId,
+        endpoint: Option<Endpoint>,
+        event: Event,
+    ) -> Self {
+        Self {
+            domain,
+            image,
+            token,
+            router,
+            endpoint,
+            event,
+        }
+    }
+
+    /// Binding lookup and position ordering read these; conversion still
+    /// consumes the whole owned evidence.
+    pub(crate) fn domain(&self) -> NativeDomainId {
+        self.domain
+    }
+
+    pub(crate) fn image(&self) -> ImageIdentity {
+        self.image
+    }
+
+    pub(crate) fn token(&self) -> u64 {
+        self.token
+    }
+
+    pub(crate) fn router(&self) -> InstanceId {
+        self.router
+    }
+}
+
+/// Reduction standing for one call: a validated current-partition proof
+/// or a finite historical-only reason.
+pub(crate) enum CallStanding<'a> {
+    Current(&'a LaneCoverage),
+    Historical(InstanceReason),
+}
+
+/// Finite conversion refusal: the finalizer records it through the
+/// audited path and stages no envelope for the input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConversionRefusal {
+    Domain,
+    Custody,
+    Slot,
+    Coverage,
+    Position,
+    Module,
+}
+
+impl ConversionRefusal {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::Domain => "domain",
+            Self::Custody => "custody",
+            Self::Slot => "slot",
+            Self::Coverage => "coverage",
+            Self::Position => "position",
+            Self::Module => "module",
+        }
+    }
+}
+
+/// Convert one owned call: assemble the full key from proofs, decode the
+/// verbatim record facts, and decide current versus historical-only
+/// reduction. `barrier` is the narrowest staged loss ordinal covering
+/// this scope in the same publication, if any: a call at or before it is
+/// historical even with a validated current proof. No legacy physical
+/// reduction happens here; the legacy reducer is never touched.
+pub(crate) fn admit_call_from_evidence(
+    evidence: CallEvidence,
+    binding: &SemanticCallerBinding,
+    subset: &AttestedSubset,
+    standing: CallStanding<'_>,
+    barrier: Option<u64>,
+) -> Result<AdmittedInstanceCall, ConversionRefusal> {
+    if evidence.domain != binding.domain() {
+        return Err(ConversionRefusal::Domain);
+    }
+    if evidence.image != binding.image() {
+        return Err(ConversionRefusal::Custody);
+    }
+    if evidence.token == 0 {
+        return Err(ConversionRefusal::Position);
+    }
+    let module = binding.module();
+    if matches!(module, ModuleKey::Unidentified { .. }) {
+        return Err(ConversionRefusal::Module);
+    }
+    let endpoint = evidence.endpoint.ok_or(ConversionRefusal::Slot)?;
+    let plan = subset.plan();
+    let slot = plan
+        .slots
+        .iter()
+        .find(|slot| slot.index == evidence.event.slot)
+        .ok_or(ConversionRefusal::Slot)?;
+    if slot.object != endpoint.object || slot.file_offset != endpoint.offset {
+        return Err(ConversionRefusal::Slot);
+    }
+    // Descriptor authority comes only from the attested plan: one
+    // canonical operator-attested name, unambiguous, never count-only.
+    // The flags below are derived from these checks, never selected.
+    if !slot.semantic_authorized
+        || slot.aliased
+        || slot.semantic_ambiguous
+        || slot.names.len() != 1
+        || plan.effective_semantics(slot) == SlotSemantics::COUNT_ONLY
+    {
+        return Err(ConversionRefusal::Slot);
+    }
+    let permission = match standing {
+        CallStanding::Historical(reason) => ReductionPermission::HistoricalOnly(reason),
+        CallStanding::Current(coverage) => {
+            // Partition granularity: the coverage proves the watched file
+            // (slot and object) and the instance set current; functions
+            // on other endpoints of the same file share it, while their
+            // own descriptor authority comes from the slot proof above.
+            let covered = coverage.endpoint();
+            if coverage.domain() != evidence.domain
+                || coverage.image() != evidence.image
+                || covered.file_slot != endpoint.file_slot
+                || covered.object != endpoint.object
+                || !coverage.instances().contains(&evidence.router)
+            {
+                return Err(ConversionRefusal::Coverage);
+            }
+            if barrier.is_some_and(|at| evidence.token <= at) {
+                ReductionPermission::HistoricalOnly(InstanceReason::BeforeSemanticBoundary)
+            } else {
+                ReductionPermission::CurrentContinuity
+            }
+        }
+    };
+    Ok(AdmittedInstanceCall {
+        key: InstanceKey {
+            domain: evidence.domain,
+            image: evidence.image,
+            router: evidence.router,
+            module: module.clone(),
+        },
+        caller: binding.caller(),
+        position: SemanticPosition {
+            domain: evidence.domain,
+            ordinal: evidence.token,
+        },
+        facts: SemanticCall {
+            function: slot.names[0].clone(),
+            rv: evidence.event.rv,
+            session: evidence.event.session,
+            mechanism: evidence.event.mechanism,
+            capture: evidence.event.capture,
+            slot_id: evidence.event.slot_id,
+            target_function: evidence.event.target_function,
+            async_value: evidence.event.async_value,
+            flags: evidence.event.flags,
+            user_type: evidence.event.user_type,
+            authorized: true,
+            unambiguous: true,
+            count_only: false,
+            attributable: true,
+            ts_ns: evidence.event.ts_ns,
+        },
+        permission,
+    })
+}
+
+/// Register one exact instance from validated coverage: `router` names one
+/// id carried by the coverage itself (re-checked here, never free-chosen).
+/// `boundary` inherits the staged barrier ordinal for this scope, if any;
+/// `observed_ns` is the batch stamp, non-authority metadata.
+pub(crate) fn admit_registration_from_coverage(
+    coverage: &LaneCoverage,
+    binding: &SemanticCallerBinding,
+    router: InstanceId,
+    observed_ns: u64,
+    boundary: Option<u64>,
+) -> Result<AdmittedInstance, ConversionRefusal> {
+    if coverage.domain() != binding.domain() {
+        return Err(ConversionRefusal::Domain);
+    }
+    if coverage.image() != binding.image() {
+        return Err(ConversionRefusal::Custody);
+    }
+    if !coverage.instances().contains(&router) {
+        return Err(ConversionRefusal::Coverage);
+    }
+    let module = binding.module();
+    if matches!(module, ModuleKey::Unidentified { .. }) {
+        return Err(ConversionRefusal::Module);
+    }
+    let boundary = match boundary {
+        None => None,
+        Some(0) => return Err(ConversionRefusal::Position),
+        Some(ordinal) => Some(SemanticPosition {
+            domain: coverage.domain(),
+            ordinal,
+        }),
+    };
+    Ok(AdmittedInstance {
+        key: InstanceKey {
+            domain: coverage.domain(),
+            image: coverage.image(),
+            router,
+            module: module.clone(),
+        },
+        caller: binding.caller(),
+        observed_ns,
+        boundary,
+    })
+}
+
+/// Convert one lane negative into the domain loss it proves, if it proves
+/// one: a cut barrier becomes the domain loss at its ordinal, while a
+/// refused collection is `None` (the finalizer records it through the
+/// audited path instead of staging H2 loss).
+pub(crate) fn tail_loss_from_negative(
+    domain: NativeDomainId,
+    negative: &LaneNegative,
+) -> Option<Result<InstanceSemanticLoss, ConversionRefusal>> {
+    match *negative {
+        LaneNegative::CollectionRefused { .. } => None,
+        LaneNegative::CutBarrier { ordinal } => {
+            if ordinal == 0 {
+                return Some(Err(ConversionRefusal::Position));
+            }
+            Some(Ok(InstanceSemanticLoss {
+                scope: InstanceScope::Domain(domain),
+                position: Some(SemanticPosition { domain, ordinal }),
+                reason: InstanceReason::SemanticLoss,
+            }))
+        }
+    }
+}
+
+/// Convert one H0 invalidation into staged losses and exact retirements.
+/// Scopes stay as narrow as the proofs allow and widen only within the
+/// domain. A superseded partition retires its exact prior ids only when a
+/// validated same-batch coverage proves the fresh disjoint partition;
+/// otherwise the invalidation is loss, never a silent revival. A missing
+/// position (exhaustion) dominates every scope: the domain loss carries no
+/// ordinal and persists permanent domain authority refusal.
+pub(crate) fn finalize_invalidation(
+    scope: &InvalidationScope,
+    position: Option<u64>,
+    domain: NativeDomainId,
+    binding: Option<&SemanticCallerBinding>,
+    fresh: &[LaneCoverage],
+) -> Result<(Vec<InstanceSemanticLoss>, Vec<InstanceRetirement>), ConversionRefusal> {
+    let Some(ordinal) = position else {
+        return Ok((
+            vec![InstanceSemanticLoss {
+                scope: InstanceScope::Domain(domain),
+                position: None,
+                reason: InstanceReason::AuthorityExhausted,
+            }],
+            Vec::new(),
+        ));
+    };
+    if ordinal == 0 {
+        return Err(ConversionRefusal::Position);
+    }
+    let at = SemanticPosition { domain, ordinal };
+    let loss = |scope: InstanceScope, reason: InstanceReason| InstanceSemanticLoss {
+        scope,
+        position: Some(at),
+        reason,
+    };
+    let bound_image = binding
+        .filter(|proof| proof.domain() == domain)
+        .map(|proof| (proof.image(), proof.module().clone()));
+    match scope {
+        InvalidationScope::CoverageFailed => Ok((
+            vec![loss(
+                InstanceScope::Domain(domain),
+                InstanceReason::SemanticLoss,
+            )],
+            Vec::new(),
+        )),
+        InvalidationScope::AuthorityExhausted => Ok((
+            vec![loss(
+                InstanceScope::Domain(domain),
+                InstanceReason::AuthorityExhausted,
+            )],
+            Vec::new(),
+        )),
+        InvalidationScope::FaultEra => Ok((
+            vec![loss(
+                InstanceScope::Domain(domain),
+                InstanceReason::SemanticLoss,
+            )],
+            Vec::new(),
+        )),
+        InvalidationScope::Stopped => Ok((
+            vec![loss(
+                InstanceScope::Domain(domain),
+                InstanceReason::CaptureStopped,
+            )],
+            Vec::new(),
+        )),
+        InvalidationScope::TaskRetired(_) => Ok((
+            vec![loss(
+                InstanceScope::Domain(domain),
+                InstanceReason::TaskRetired,
+            )],
+            Vec::new(),
+        )),
+        InvalidationScope::ImageRetired(image) => Ok((
+            vec![loss(
+                InstanceScope::Image(domain, *image),
+                InstanceReason::ImageRetired,
+            )],
+            Vec::new(),
+        )),
+        InvalidationScope::File { image, .. } => {
+            let scope = match &bound_image {
+                Some((bound, module)) if *bound == *image => {
+                    InstanceScope::Module(domain, *image, module.clone())
+                }
+                _ => InstanceScope::Image(domain, *image),
+            };
+            Ok((vec![loss(scope, InstanceReason::SemanticLoss)], Vec::new()))
+        }
+        InvalidationScope::InstancesRetired {
+            image,
+            file_slot,
+            ids,
+        } => {
+            let fresh_partition = fresh.iter().any(|coverage| {
+                coverage.domain() == domain
+                    && coverage.image() == *image
+                    && coverage.endpoint().file_slot == *file_slot
+                    && !coverage.instances().is_empty()
+                    && coverage.instances().iter().all(|id| !ids.contains(id))
+            });
+            match (&bound_image, fresh_partition) {
+                (Some((bound, module)), true) if *bound == *image => {
+                    let retirements = ids
+                        .iter()
+                        .map(|id| InstanceRetirement {
+                            scope: RetirementScope::Exact(InstanceKey {
+                                domain,
+                                image: *image,
+                                router: *id,
+                                module: module.clone(),
+                            }),
+                            position: at,
+                            reason: InstanceReason::InstanceRetired,
+                        })
+                        .collect();
+                    Ok((Vec::new(), retirements))
+                }
+                (Some((bound, module)), _) if *bound == *image => {
+                    let losses = ids
+                        .iter()
+                        .map(|id| {
+                            loss(
+                                InstanceScope::Exact(InstanceKey {
+                                    domain,
+                                    image: *image,
+                                    router: *id,
+                                    module: module.clone(),
+                                }),
+                                InstanceReason::SemanticLoss,
+                            )
+                        })
+                        .collect();
+                    Ok((losses, Vec::new()))
+                }
+                _ => Ok((
+                    vec![loss(
+                        InstanceScope::Image(domain, *image),
+                        InstanceReason::SemanticLoss,
+                    )],
+                    Vec::new(),
+                )),
+            }
+        }
     }
 }
 

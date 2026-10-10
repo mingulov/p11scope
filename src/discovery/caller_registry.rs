@@ -854,7 +854,10 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         )
     }
 
-    fn retired_event(&self, id: CallerId) -> CallerEvent {
+    /// The retirement event for an already-retired caller (H6 slice 2): the
+    /// coordinator mints its pending handoff from the retired record and
+    /// reports the retirement now while the successor commits later.
+    pub(crate) fn retired_event(&self, id: CallerId) -> CallerEvent {
         CallerEvent::Retired {
             id,
             reason: self

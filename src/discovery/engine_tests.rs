@@ -9866,6 +9866,134 @@ fn automatic_exec_cold_nonleader_bootstraps_before_image_receipt() {
     );
 }
 
+/// H6 slice 1 abort twin: a forcing tick that aborts after lowering — here the
+/// post-retirement target preflight refuses — retains both the refresh request
+/// and the exec marker, so the retry still runs the unchanged PID-bound links
+/// through detach/replace instead of completing with dead links attached.
+#[test]
+fn automatic_exec_aborted_tick_retry_still_rearms_pid_targets() {
+    let (_fixture, mut engine, mut session) = exec_rearm_pid_route();
+    let pid = engine.views[0].pid();
+    let view_id = engine.views[0].id();
+    let old_context = engine.loader_registry.ids_for_view(view_id)[0];
+    let accepted: Vec<(u32, PinnedObjectId, u64)> = engine
+        .plan
+        .slots
+        .iter()
+        .map(|slot| (slot.index, slot.object, slot.file_offset))
+        .collect();
+    let active_before = engine.plan.active_slot_count();
+    let modules_before = engine.capture_facts.history.modules.clone();
+    let preflights_before = session.preflight_targets.borrow().len();
+
+    // The first admission preflight passes; the post-retirement one — after
+    // lowering — refuses, aborting the forcing tick without mutating links.
+    session.refuse_preflights([false, true]);
+    let aborted = apply_ordinary_batch(&mut engine, &mut session, vec![exec_record_for(pid)])
+        .expect("the aborted exec batch still applies");
+    assert_eq!(
+        session.preflight_targets.borrow().len(),
+        preflights_before + 2,
+        "the aborted tick returned at its second (post-retirement) preflight"
+    );
+    assert!(
+        session
+            .detached_slot_indices
+            .iter()
+            .all(|call| call.is_empty()),
+        "the aborted tick detaches nothing: {:?}",
+        session.detached_slot_indices
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&pid),
+        "the aborted tick retains the refresh request for retry"
+    );
+    assert!(
+        engine.exec_rearm_views.contains(&view_id),
+        "the aborted tick retains the exec marker for the retry"
+    );
+    assert!(
+        aborted.required_complete,
+        "the aborted tick reports its batch outcome; the retained request plus the published gap below drive the honest retry"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live inventory transaction"
+                && skip.reason
+                    == "post-retirement candidate preflight failed; conservative retirements were committed and additions were blocked"
+        }),
+        "the post-retirement refusal stays visible: {:?}",
+        engine.counters.object_skips
+    );
+
+    // The retry — no fresh EXEC — still forces the unchanged links through
+    // detach/replace and completes with everything re-linked.
+    let outcome = apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+        .expect("the retry batch applies");
+    assert!(outcome.required_complete);
+    let rearmed: Vec<(u32, PinnedObjectId, u64)> = engine
+        .plan
+        .slots
+        .iter()
+        .map(|slot| (slot.index, slot.object, slot.file_offset))
+        .collect();
+    assert_eq!(
+        rearmed, accepted,
+        "the retry keeps its object/offset/slot identities"
+    );
+    assert!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .all(|slot| engine.plan.is_active(slot.index)),
+        "every retried slot is re-linked, never active-without-link"
+    );
+    assert_eq!(engine.plan.active_slot_count(), active_before);
+    let detached: BTreeSet<u32> = session
+        .detached_slot_indices
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    let replaced: BTreeSet<u32> = session
+        .replaced_slot_indices
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    for (index, _, _) in &accepted {
+        assert!(
+            detached.contains(index),
+            "retry slot {index} detaches; detach calls: {:?}",
+            session.detached_slot_indices
+        );
+        assert!(
+            replaced.contains(index),
+            "retry slot {index} replaces; replace calls: {:?}",
+            session.replaced_slot_indices
+        );
+    }
+    let contexts = engine.loader_registry.ids_for_view(view_id);
+    assert_eq!(contexts.len(), 1);
+    assert_ne!(contexts[0], old_context, "the loader rearms on the retry");
+    assert_eq!(
+        engine.capture_facts.history.modules, modules_before,
+        "retry totals persist once: nothing zeroed, nothing duplicated"
+    );
+    assert!(
+        engine
+            .views
+            .iter()
+            .any(|view| view.id() == view_id && view.still_the_same()),
+        "original process custody is retained, never reopened by PID"
+    );
+    assert!(
+        !engine.exec_rearm_views.contains(&view_id),
+        "the completed rearm clears the marker"
+    );
+}
+
 #[test]
 fn selection_bindings_reuse_existing_physical_attachments() {
     let (_fixture, mut engine, mut session) = initial_export_route();

@@ -11558,20 +11558,25 @@ impl Engine {
     /// carrying a matched-EXEC marker, a matched owner at the tick's checked
     /// serial, and live original custody mint a rearm, and only their own
     /// unchanged active targets are lowered — unrelated views' links are
-    /// never touched. A completed rearm, or an ordinary delta that already
-    /// churned every attributable target, clears the marker; anything else
-    /// keeps it for the retry the renewal owns.
+    /// never touched. Lowering reports the consumed views but clears nothing:
+    /// the caller clears them only after the apply mutates (a completed
+    /// rearm, or an ordinary delta that already churned every attributable
+    /// target). A tick that aborts after lowering — stale views, a refused
+    /// preflight, a refused apply — keeps every marker, so the retry the
+    /// retained request owns re-forces the same unchanged links instead of
+    /// completing with them silently dead.
     fn lower_exec_rearms(
         &mut self,
         candidate: &mut LiveCandidate,
         refreshed: &BTreeSet<ProcessViewId>,
         serviced: &BTreeMap<u32, u64>,
-    ) {
+    ) -> Vec<ProcessViewId> {
         let marked: Vec<ProcessViewId> = refreshed
             .iter()
             .copied()
             .filter(|view| self.exec_rearm_views.contains(view))
             .collect();
+        let mut lowered = Vec::new();
         for view in marked {
             let serial = self
                 .views
@@ -11585,13 +11590,14 @@ impl Engine {
             if let Some(prepared) = self.prepare_exec_rearm(view, serial, candidate)
                 && self.consume_exec_rearm(candidate, prepared)
             {
-                self.exec_rearm_views.remove(&view);
+                lowered.push(view);
                 continue;
             }
             if Self::exec_rearm_moot(view, candidate) {
-                self.exec_rearm_views.remove(&view);
+                lowered.push(view);
             }
         }
+        lowered
     }
 
     /// Whether an exec marker's work is already done: none of the view's
@@ -18289,7 +18295,8 @@ impl Engine {
         // targets force them through detach/replace: PID-bound links may be
         // dead while still recorded as attached. Lowered before admission so
         // the forced targets are preflighted like any other replacement.
-        self.lower_exec_rearms(&mut candidate, &refreshed_ok, &serviced_requests);
+        let lowered_exec_rearms =
+            self.lower_exec_rearms(&mut candidate, &refreshed_ok, &serviced_requests);
         let admission_start = crate::attach::monotonic_ns();
         let admission =
             self.inventory_candidate_admission(session, &candidate, &removed, new_views);
@@ -18379,6 +18386,16 @@ impl Engine {
         let outcome =
             self.apply_candidate(session, candidate, additions_allowed, true, &extra_views)?;
         self.record_apply_timing(&outcome);
+        if !outcome.refused() {
+            // The apply mutated: forced slots detached/replaced, or were
+            // deactivated for a `delta.new` retry, so their markers are
+            // consumed. A refusal mutated nothing — like the stale-view and
+            // preflight exits above — and keeps every marker for the retry
+            // the retained request owns.
+            for view in lowered_exec_rearms {
+                self.exec_rearm_views.remove(&view);
+            }
+        }
         // Only a published newcomer is retained and armed. An unpublished one
         // committed nothing, so it stays in `new_views` for release and is
         // requested again, like a newcomer lost to a stale preflight (U-07).

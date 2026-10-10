@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Observer launch construction and custody checks for system-scope-measure.sh."""
 
+import importlib.util
 import json
 import os
+from contextlib import contextmanager
 from pathlib import Path
 import shlex
 import stat
@@ -14,6 +16,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 MEASURE = ROOT / "scripts" / "system-scope-measure.sh"
+LANE_A = ROOT / "scripts" / "task-1.6-lane-a.py"
 TEST_TMP = Path("/var/tmp/p11scope-ws-tmp")
 
 
@@ -52,6 +55,38 @@ def require_root_observer_launch(privilege):
             f"observer must use owned_launch root, got {privilege!r}")
 
 
+def load_lane_a():
+    spec = importlib.util.spec_from_file_location("task_1_6_lane_a", LANE_A)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class FakeObserverProc:
+    """Minimal stand-in for the Popen object wait_attach polls."""
+
+    def __init__(self, returncode=None):
+        self._returncode = returncode
+
+    def poll(self):
+        return self._returncode
+
+    @property
+    def returncode(self):
+        return self._returncode
+
+
+@contextmanager
+def live_sleep():
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        yield proc, process_starttime(proc.pid)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+
 class SystemScopeMeasureLaunchTests(unittest.TestCase):
     maxDiff = None
 
@@ -72,7 +107,8 @@ class SystemScopeMeasureLaunchTests(unittest.TestCase):
             condition = base / "condition"
             condition.mkdir()
             (condition / "stderr.txt").write_text(
-                "p11scope: discovery:\n", encoding="utf-8")
+                "p11scope: discovery:\n"
+                "p11scope: attached 136 probes\n", encoding="utf-8")
             (condition / "observer.stdout").write_text(
                 "probes attached\n", encoding="utf-8")
             live = subprocess.Popen(["sleep", "30"])
@@ -375,6 +411,166 @@ class SystemScopeMeasureLaunchTests(unittest.TestCase):
                                 command[command.index("--mode") + 1], mode)
                         self.assertIn(
                             "--pid" if scope == "pid" else "--system", command)
+
+
+class PrivilegedAttachGateTests(unittest.TestCase):
+    """Both wait_attach copies gate on the stderr attach-complete line.
+
+    Since M-10 (7eb86f0d) live frames render only on a terminal while the
+    harness captures observer stdout to a file, the old stdout "probes
+    attached" frame signal can never fire. The gate is the discovery
+    marker AND the product's stderr attach-complete line (0801e79c).
+    """
+
+    maxDiff = None
+
+    # Exact spellings pinned by the product test
+    # attach_complete_line_names_the_probe_count (src/run.rs).
+    ATTACH_SPELLINGS = (
+        "p11scope: attached 0 probes",
+        "p11scope: attached 1 probe",
+        "p11scope: attached 136 probes",
+    )
+    DISCOVERY = ("p11scope: discovery: 1 module(s), 68 attach slot(s), "
+                 "scan 8ms, conflicts 0, uncorroborated 0")
+    OBSOLETE_FRAME = "68/136 probes attached"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.lane_a = load_lane_a()
+
+    def write_condition(self, base, stderr_text, stdout_text):
+        condition = base / "condition"
+        condition.mkdir(parents=True)
+        (condition / "stderr.txt").write_text(
+            stderr_text, encoding="utf-8")
+        (condition / "observer.stdout").write_text(
+            stdout_text, encoding="utf-8")
+        return condition
+
+    def run_shell_gate(self, condition, pid, birth, timeout):
+        shell = textwrap.dedent(
+            f"""
+            set -u
+            P11SCOPE_RECEIPT_HELPER={shlex.quote(str(ROOT / 'scripts/system-scope-receipt.py'))}
+            export P11SCOPE_RECEIPT_HELPER
+            . scripts/system-scope-owned.sh
+            {wait_attach_source()}
+            wait_attach {shlex.quote(str(condition))} {pid} {birth} {timeout}
+            printf 'rc=%s\\n' "$?"
+            """
+        )
+        result = subprocess.run(
+            ["sh", "-c", shell], cwd=ROOT, text=True,
+            capture_output=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        [line] = [entry for entry in result.stdout.splitlines()
+                  if entry.startswith("rc=")]
+        return int(line.removeprefix("rc="))
+
+    def test_shell_gate_fires_on_stderr_signals_with_empty_stdout(self):
+        ensure_test_tmp()
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as raw:
+            condition = self.write_condition(
+                Path(raw),
+                f"{self.DISCOVERY}\n{self.ATTACH_SPELLINGS[2]}\n", "")
+            with live_sleep() as (proc, birth):
+                self.assertEqual(
+                    self.run_shell_gate(condition, proc.pid, birth, 5), 0)
+
+    def test_shell_gate_ignores_the_obsolete_stdout_frame(self):
+        ensure_test_tmp()
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as raw:
+            condition = self.write_condition(
+                Path(raw), f"{self.DISCOVERY}\n",
+                f"{self.OBSOLETE_FRAME}\n")
+            with live_sleep() as (proc, birth):
+                self.assertEqual(
+                    self.run_shell_gate(condition, proc.pid, birth, 1), 1)
+
+    def test_shell_gate_still_requires_discovery(self):
+        ensure_test_tmp()
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as raw:
+            condition = self.write_condition(
+                Path(raw), f"{self.ATTACH_SPELLINGS[2]}\n", "")
+            with live_sleep() as (proc, birth):
+                self.assertEqual(
+                    self.run_shell_gate(condition, proc.pid, birth, 1), 1)
+
+    def test_shell_gate_accepts_all_product_attach_spellings(self):
+        ensure_test_tmp()
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as raw:
+            base = Path(raw)
+            with live_sleep() as (proc, birth):
+                for spelling in self.ATTACH_SPELLINGS:
+                    with self.subTest(spelling=spelling):
+                        condition = self.write_condition(
+                            base / spelling.replace(" ", "_").replace(
+                                "/", "_"),
+                            f"{self.DISCOVERY}\n{spelling}\n", "")
+                        self.assertEqual(
+                            self.run_shell_gate(
+                                condition, proc.pid, birth, 5), 0)
+
+    def test_python_gate_fires_on_stderr_signals_with_empty_stdout(self):
+        ensure_test_tmp()
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as raw:
+            condition = self.write_condition(
+                Path(raw),
+                f"{self.DISCOVERY}\n{self.ATTACH_SPELLINGS[2]}\n", "")
+            fired = self.lane_a.wait_attach(
+                condition, FakeObserverProc(), timeout_s=5)
+            self.assertIsInstance(fired, int)
+
+    def test_python_gate_times_out_without_the_attach_complete_line(self):
+        ensure_test_tmp()
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as raw:
+            condition = self.write_condition(
+                Path(raw), f"{self.DISCOVERY}\n",
+                f"{self.OBSOLETE_FRAME}\n")
+            with self.assertRaisesRegex(
+                    SystemExit, "attach never settled"):
+                self.lane_a.wait_attach(
+                    condition, FakeObserverProc(), timeout_s=0.2)
+
+    def test_python_gate_still_requires_discovery(self):
+        ensure_test_tmp()
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as raw:
+            condition = self.write_condition(
+                Path(raw), f"{self.ATTACH_SPELLINGS[2]}\n", "")
+            with self.assertRaisesRegex(
+                    SystemExit, "attach never settled"):
+                self.lane_a.wait_attach(
+                    condition, FakeObserverProc(), timeout_s=0.2)
+
+    def test_python_gate_accepts_all_product_attach_spellings(self):
+        ensure_test_tmp()
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as raw:
+            base = Path(raw)
+            for spelling in self.ATTACH_SPELLINGS:
+                with self.subTest(spelling=spelling):
+                    self.assertTrue(
+                        self.lane_a.has_attach_complete_line(spelling))
+                    condition = self.write_condition(
+                        base / spelling.replace(" ", "_").replace("/", "_"),
+                        f"{self.DISCOVERY}\n{spelling}\n", "")
+                    fired = self.lane_a.wait_attach(
+                        condition, FakeObserverProc(), timeout_s=5)
+                    self.assertIsInstance(fired, int)
+
+    def test_python_gate_reports_observer_death(self):
+        ensure_test_tmp()
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as raw:
+            condition = self.write_condition(
+                Path(raw),
+                f"{self.DISCOVERY}\n{self.ATTACH_SPELLINGS[2]}\n", "")
+            with self.assertRaisesRegex(
+                    SystemExit,
+                    r"observer died during attach \(rc=3\)"):
+                self.lane_a.wait_attach(
+                    condition, FakeObserverProc(returncode=3),
+                    timeout_s=5)
 
 
 if __name__ == "__main__":

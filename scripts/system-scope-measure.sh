@@ -8,9 +8,9 @@
 #
 # Method: the gated two-phase workload (system-scope-workload.c) maps the
 # provider and opens a session, waits for attach (the harness holds the go
-# file until the discovery marker lands on stderr AND the observer's first
-# live frame lands on stdout — the in-observer attach-end signal), then
-# fires exactly N C_GenerateRandom calls. A /proc sampler
+# file until the discovery marker AND the attach-complete line land on
+# stderr — the in-observer attach-end signal), then fires exactly N
+# C_GenerateRandom calls. A /proc sampler
 # (system-scope-sample.py, under sudo) records CPU/RSS/fds at 20 Hz; a
 # timestamp pipe (system-scope-ts.py) dates stderr markers;
 # system-scope-measure.py joins the observer report + traces + workload
@@ -23,11 +23,11 @@
 #   [--work DIR] [--profile release|debug] [--binary PATH] [--no-build]
 #
 # both = metrics+profile (Task 1.4 shape); all adds trace. The sink selects
-# the observer's stdout destination: file (default, kept for the attach
-# gate), discard (/dev/null: no sink backpressure), slow-pipe (a throttled
-# FIFO reader: explicit downstream backpressure). Non-file sinks and trace
-# mode use the weaker marker+settle attach gate (no first-frame signal);
-# the gate used is recorded per condition and validated post-hoc.
+# the observer's stdout destination: file (default), discard (/dev/null: no
+# sink backpressure), slow-pipe (a throttled FIFO reader: explicit
+# downstream backpressure). Non-file sinks and trace mode use the weaker
+# marker+settle attach gate (no attach-complete signal); the gate used is
+# recorded per condition and validated post-hoc.
 set -eu
 cd "$(dirname "$0")/.."
 . scripts/lib.sh
@@ -289,14 +289,17 @@ collect_receipt() {
 
 # wait_attach <cond_dir> <observer_pid> <observer_birth> <timeout_s> — hold the go file
 # until discovery is done (marker on the timestamped stderr passthrough)
-# AND the capture loop is live: the observer renders its first live frame
-# to stdout on tick one (last_frame starts a full drain interval in the
-# past), strictly after the attach session completes, so the frame's
-# "probes attached" line is an in-observer attach-end signal. An fd
-# plateau is NOT the gate — under load attach stalls for seconds mid-ramp
-# and a plateau detector fires early, releasing the workload burst into a
-# half-attached observer (observed once: 1/20000 calls). Returns 2 if the
-# observer is terminal and 3 if its exact identity cannot be inspected.
+# AND the attach session is complete: the observer prints
+# "p11scope: attached N probe(s)" on stderr once the attach session
+# completes, strictly before the capture loop (0801e79c), so that line is
+# the in-observer attach-end signal. The old first-live-frame stdout
+# signal died with M-10 (7eb86f0d made live frames terminal-only) while
+# the harness captures observer stdout to a file, so a frame gate could
+# never fire. An fd plateau is NOT the gate — under load attach stalls
+# for seconds mid-ramp and a plateau detector fires early, releasing the
+# workload burst into a half-attached observer (observed once: 1/20000
+# calls). Returns 2 if the observer is terminal and 3 if its exact
+# identity cannot be inspected.
 wait_attach() {
     end=$(( $(date +%s) + $4 ))
     while :; do
@@ -305,7 +308,7 @@ wait_attach() {
         case "$owned_live_status" in 0) ;; 1) return 2 ;; *) return 3 ;; esac
         [ "$(date +%s)" -lt "$end" ] || return 1
         if grep -q "p11scope: discovery:" "$1/stderr.txt" 2>/dev/null \
-            && grep -q "probes attached" "$1/observer.stdout" 2>/dev/null; then
+            && grep -q -E "p11scope: attached [0-9]+ probes?" "$1/stderr.txt" 2>/dev/null; then
             return 0
         fi
         sleep 0.2
@@ -314,9 +317,9 @@ wait_attach() {
 
 # wait_marker <cond_dir> <observer_pid> <observer_birth> <timeout_s> — hold until the
 # discovery marker lands on stderr. Weaker than wait_attach (no
-# in-observer attach-end signal): used only where no first live frame
-# exists (trace mode) or the frame is not kept (discard/slow-pipe sinks).
-# Settles after the marker; post-hoc counts prove the window.
+# in-observer attach-end signal): used only for trace mode and the
+# discard sink. Settles after the marker; post-hoc counts prove the
+# window.
 wait_marker() {
     end=$(( $(date +%s) + $4 ))
     while :; do
@@ -535,10 +538,10 @@ out.close()
     SMPID_RECEIPT=$OWNED_RECEIPT
     owned_verify_launch "$SMPID" "$SMPID_STARTTIME" "$SMPID_RECEIPT" || exit 1
 
-    # Attach gate: the first live frame (profile/metrics to a kept sink)
-    # is an in-observer attach-end signal; everywhere else (trace has no
-    # frames; discard keeps nothing) fall back to marker+settle and let
-    # post-hoc counts prove the window. The gate used is recorded.
+    # Attach gate: the stderr attach-complete line (profile/metrics to a
+    # kept sink) is the in-observer attach-end signal; everywhere else
+    # fall back to marker+settle and let post-hoc counts prove the
+    # window. The gate used is recorded.
     GATE=frame
     if [ "$mode" != trace ] && [ "$SINK" != discard ]; then
         if wait_attach "$dir" "$STARGET_PID" "$STARGET_STARTTIME" 600; then

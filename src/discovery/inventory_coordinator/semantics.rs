@@ -363,7 +363,7 @@ impl SemanticBindingRefusal {
         not(test),
         expect(
             dead_code,
-            reason = "Task5 lane loop surfaces bind refusals through the audited path"
+            reason = "bind/refresh refusals are currently silent; code() awaits Task6 refusal-visibility wiring"
         )
     )]
     pub(crate) const fn code(self) -> &'static str {

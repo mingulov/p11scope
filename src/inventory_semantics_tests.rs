@@ -4299,6 +4299,49 @@ fn native_semantic_stop_orders_gate_drain_finish_output() {
     assert_eq!(io.finish_calls, 1);
     assert!(summary.final_drain);
 
+    // Pending-expiry below the scripted refusals: the refusals above
+    // count H0 quanta that will not route, but join expiry is a router
+    // transition, not a count. Drive the production router directly:
+    // unobserved calls pend real joins, and `expire_image` — the exact
+    // call `SemanticCapture::stop` makes per awaiting image — resolves
+    // that image's joins as unknown while other images stay pending.
+    use crate::discovery::instances::UnknownReason;
+    let mut router = InstanceRouter::new(domain, RouterLimits::default());
+    let stamp = InstanceStamp {
+        epoch: 1,
+        global: 0,
+        fault: 0,
+        file_slot_plus1: 1,
+        flags: STAMP_VALID,
+    };
+    let facts = |token: u64, cookie: u64| CallFacts {
+        token,
+        domain,
+        image: ImageIdentity {
+            task_cookie: cookie,
+            exec_id: 0,
+        },
+        entry: stamp,
+        ret: stamp,
+        ip: EntryIp::new(0x7000_1000),
+        attached_offset: Some(0x1000),
+    };
+    assert_eq!(router.route(facts(11, 71)), Route::Pending);
+    assert_eq!(router.route(facts(12, 72)), Route::Pending);
+    assert_eq!(router.pending_len(), 2, "unobserved calls pend joins");
+    let resolved = router.expire_image(ImageIdentity {
+        task_cookie: 71,
+        exec_id: 0,
+    });
+    assert_eq!(
+        resolved,
+        vec![(11, Route::Unknown(UnknownReason::Unobserved))]
+    );
+    assert_eq!(router.pending_len(), 1, "expiry is image-scoped");
+    // TASK6-LIVE: live H0 `SemanticCapture::stop()` expiring a real
+    // awaiting join, with the expiry resolution observed in the Finish
+    // batch of an installed loss-recovery cell.
+
     // Quiescence timeout: the 5 s budget ends the wait unproven, only
     // one bounded poll drains each cursor under the terminal bound, and
     // semantic loss is declared with positive history preserved.
@@ -4501,6 +4544,47 @@ fn native_semantic_stop_orders_gate_drain_finish_output() {
         "the semantic Finish mutates no reducer and settles nothing else"
     );
 
+    // The reverse direction: Inventory-side terminal work never
+    // certifies the semantic lane. Pure-Inventory commits and a
+    // retirement disclosure leave the lane's stop accounting
+    // untouched, and the Inventory-side gap discloses verbatim beside
+    // semantic rows through the shared audited path.
+    let lane_before = conv.lane.semantic_summary();
+    assert_eq!(lane_before.status, SemanticCaptureStatus::Disabled);
+    conv.commit();
+    conv.scene.coordinator.note_scope_gap(
+        "native capture retirement unsettled".into(),
+        "budget passed".into(),
+    );
+    conv.commit();
+    let lane_after = conv.lane.semantic_summary();
+    assert_eq!(lane_after.status, SemanticCaptureStatus::Disabled);
+    assert_eq!(
+        lane_after.stop_quiescence,
+        SemanticStopQuiescence::NotRequested,
+        "Inventory commits never certify semantic quiescence"
+    );
+    assert_eq!(lane_after.final_drain, None);
+    assert!(
+        conv.gap_pairs().contains(&(
+            "native capture retirement unsettled".to_string(),
+            "budget passed".to_string()
+        )),
+        "the Inventory-side disclosure survives, got {:?}",
+        conv.gap_pairs()
+    );
+    let gaps_after_inventory = conv.gap_pairs();
+    conv.commit();
+    assert_eq!(
+        conv.gap_pairs(),
+        gaps_after_inventory,
+        "a repeat Inventory commit stays quiet"
+    );
+    // TASK6-LIVE: one live loop with a quiesced H0 lane and an
+    // unsettled native retirement, asserting the observation shows
+    // semantic_capture.stop_quiescence=quiesced beside
+    // settlement=unsettled.
+
     // Output legs: a slow, broken or signal-cancelled stdout records
     // its failure while the event stream still completes with the
     // semantic summary; a broken event sink likewise never suppresses
@@ -4623,6 +4707,81 @@ fn native_semantic_stop_orders_gate_drain_finish_output() {
         "disabled"
     );
     assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+}
+
+#[test]
+fn native_semantic_stop_bounds_noisy_terminal_staging() {
+    use crate::inventory_semantics::{
+        TERMINAL_STAGED_BATCH_CAP, TerminalBatchStage, run_semantic_stop,
+    };
+    use std::time::{Duration, Instant};
+    let domain = crate::attach::capture::NativeDomainId::mint();
+    // A noisy producer: several caps of quiesce-wait batches before Q.
+    // Phase 1 proves the bound matters; phase 2 proves it holds.
+    const NOISE: usize = 4 * TERMINAL_STAGED_BATCH_CAP;
+    let scripted = || {
+        let mut io = ScriptedStopIo::new(domain);
+        io.quiesce_after = NOISE;
+        io.positions = [(0, 0), (0, 0)];
+        io.drain_markers = (1..=(NOISE as u64)).collect();
+        io
+    };
+    let clock = || {
+        let start = Instant::now();
+        let mut at = 0;
+        move || {
+            at += 1;
+            start + Duration::from_millis(at)
+        }
+    };
+
+    // Phase 1 (noise control): unbounded staging would hold every
+    // quiesce-wait batch plus Finish — far beyond the cap. If the fake
+    // ever goes quiet this fails instead of a vacuous GREEN.
+    let mut io = scripted();
+    let mut unbounded = Vec::new();
+    let summary = run_semantic_stop(
+        &mut io,
+        Duration::from_secs(5),
+        16,
+        1024,
+        clock(),
+        |batch| unbounded.push(batch.observed_ns()),
+    );
+    assert!(summary.quiesced);
+    assert_eq!(summary.drain_batches, NOISE);
+    assert_eq!(unbounded.len(), NOISE + 1);
+    assert!(
+        unbounded.len() > TERMINAL_STAGED_BATCH_CAP,
+        "the producer must be noisy enough to overflow the cap"
+    );
+
+    // Phase 2 (bound): the stage sheds oldest-first, discloses the
+    // shed count, and preserves delivery order with Finish last.
+    let mut io = scripted();
+    let mut stage = TerminalBatchStage::new();
+    let summary = run_semantic_stop(
+        &mut io,
+        Duration::from_secs(5),
+        16,
+        1024,
+        clock(),
+        |batch| stage.push(batch),
+    );
+    assert!(summary.quiesced);
+    assert!(summary.final_drain);
+    assert_eq!(summary.drain_batches, NOISE);
+    assert_eq!(stage.len(), TERMINAL_STAGED_BATCH_CAP);
+    assert!(!stage.is_empty());
+    let shed = NOISE + 1 - TERMINAL_STAGED_BATCH_CAP;
+    assert_eq!(stage.shed(), shed, "every over-cap batch discloses");
+    let markers: Vec<u64> = stage
+        .into_batches()
+        .map(|batch| batch.observed_ns())
+        .collect();
+    let mut expected: Vec<u64> = ((shed as u64 + 1)..=(NOISE as u64)).collect();
+    expected.push(u64::MAX);
+    assert_eq!(markers, expected, "oldest shed, order kept, Finish last");
 }
 
 #[test]

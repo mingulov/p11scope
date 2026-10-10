@@ -13235,6 +13235,339 @@ pub(crate) mod tests {
         let _ = proof_owner;
     }
 
+    /// H6 slice 2: poison the numeric-PID reopen path; the successful
+    /// same-process successor still admits using original custody. Changed
+    /// process, wrong original Arc/domain, stale owner/revision and
+    /// mismatched current receipt refuse. Inventory and Detailed colliding
+    /// numeric cookies do not join. Replayed/delayed second-domain
+    /// transition creates no second successor.
+    #[test]
+    fn automatic_exec_successor_keeps_original_custody() {
+        use crate::discovery::native_binding::CallerLookup;
+
+        // Native proof with reopen poisoned: the successor admits on the
+        // original held pin, with no numeric reopen attempted.
+        let (mut native, caller) = NativeScene::new();
+        native.scene.source.exec(7, 200, "/bin/other");
+        native.scene.source.poison_reopen();
+        let opens_before = native.scene.source.reopen_attempts();
+        native.answer(7, 500, 41);
+        let first = native.row(41, 1, 7, 100, 0);
+        native.witness(vec![first]);
+        let later = native.row(41, 2, 7, 1_100, 1);
+        let events = native.witness(vec![later]);
+        let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+            panic!("poisoned reopen must still admit the successor: {events:?}");
+        };
+        assert_eq!(*old, caller);
+        let adapter = &native.scene.coordinator.adapter;
+        assert!(adapter.record(caller).unwrap().retired);
+        assert_eq!(adapter.live_id(7), Some(*new));
+        let successor = adapter.record(*new).unwrap();
+        assert_eq!(successor.start_time, Some(500), "same process");
+        assert_eq!(successor.incarnation, 1);
+        assert_eq!(
+            successor.exe.as_ref().unwrap().path.as_deref(),
+            Some("/bin/other"),
+            "the successor carries the current image"
+        );
+        let (_, pin) = adapter.live_pin(7).unwrap();
+        assert_eq!(*pin, (7, 500), "the original held pin moves over");
+        assert_eq!(
+            native.scene.source.reopen_attempts(),
+            opens_before,
+            "no numeric-PID reopen during the handoff"
+        );
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Counted {
+                since_ns: 100,
+                lossy: false
+            },
+            "the old image keeps its count"
+        );
+
+        // Scan-proven exec with reopen poisoned: same retained custody.
+        let (mut scan, caller) = NativeScene::new();
+        scan.scene.source.exec(7, 200, "/bin/other");
+        scan.scene.source.poison_reopen();
+        let opens_before = scan.scene.source.reopen_attempts();
+        let observed: BTreeSet<u32> = [7].into_iter().collect();
+        let events = scan.scene.coordinator.adapter.reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            1_200,
+        );
+        let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+            panic!("poisoned scan handoff must still admit: {events:?}");
+        };
+        assert_eq!(*old, caller);
+        let adapter = &scan.scene.coordinator.adapter;
+        assert_eq!(adapter.live_id(7), Some(*new));
+        assert_eq!(adapter.live_pin(7).unwrap().1, &(7, 500));
+        assert_eq!(
+            scan.scene.source.reopen_attempts(),
+            opens_before,
+            "scan handoff never reopens by PID"
+        );
+
+        // Same-file reexec: the scan lane sees no change and splits
+        // nothing; actual native evidence still establishes the transition.
+        let (mut same, caller) = NativeScene::new();
+        same.scene.source.poison_reopen();
+        let observed: BTreeSet<u32> = [7].into_iter().collect();
+        let events = same.scene.coordinator.adapter.reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            1_200,
+        );
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(same.scene.coordinator.adapter.live_id(7), Some(caller));
+        same.answer(7, 500, 41);
+        same.witness(vec![same.row(41, 1, 7, 100, 0)]);
+        let events = same.witness(vec![same.row(41, 2, 7, 1_100, 1)]);
+        assert!(
+            matches!(events.as_slice(), [CallerEvent::ExecRetired { old, .. }] if *old == caller),
+            "{events:?}"
+        );
+        let adapter = &same.scene.coordinator.adapter;
+        let successor = adapter.record(adapter.live_id(7).unwrap()).unwrap();
+        assert_eq!(
+            successor.exe,
+            adapter.record(caller).unwrap().exe,
+            "same-file successor keeps the shared exe identity"
+        );
+
+        // Changed process refuses: a dead pin ends the old incarnation but
+        // mints no successor, attempts no reopen, and the reused pid later
+        // admits fresh with no inherited history.
+        let (mut dead, caller) = NativeScene::new();
+        dead.scene.source.poison_reopen();
+        dead.scene.source.kill(7);
+        let opens_before = dead.scene.source.reopen_attempts();
+        let events = dead.scene.coordinator.adapter.exec_transition(
+            caller,
+            &mut |_| ImageAuthority::ScanPinned,
+            2_000,
+        );
+        let [
+            CallerEvent::AdmitFailed {
+                pid,
+                reason,
+                budget,
+            },
+        ] = events.as_slice()
+        else {
+            panic!("a dead pin must refuse the successor: {events:?}");
+        };
+        assert_eq!(*pid, 7);
+        assert!(
+            reason.contains("custody lost"),
+            "the refusal names custody, not a pin failure: {reason}"
+        );
+        assert_eq!(*budget, None);
+        assert_eq!(
+            dead.scene.source.reopen_attempts(),
+            opens_before,
+            "no reopen is attempted without custody"
+        );
+        let adapter = &dead.scene.coordinator.adapter;
+        assert!(adapter.record(caller).unwrap().retired);
+        assert_eq!(adapter.live_id(7), None);
+        assert_eq!(adapter.len(), 1, "no successor incarnation was minted");
+
+        // Caller budget N/N+1 at the shared reservation: N works, N+1
+        // refuses with the exact requested occupancy.
+        let (mut full, caller) = NativeScene::new();
+        full.scene.coordinator.adapter.set_max_callers(2);
+        full.scene.source.spawn(8, 600);
+        full.scene
+            .coordinator
+            .adapter
+            .admit(8, ImageAuthority::ScanPinned, 60)
+            .unwrap();
+        let events = full.scene.coordinator.adapter.exec_transition(
+            caller,
+            &mut |_| ImageAuthority::ScanPinned,
+            2_000,
+        );
+        let [CallerEvent::AdmitFailed { budget, .. }] = events.as_slice() else {
+            panic!("a full budget must refuse the successor: {events:?}");
+        };
+        assert_eq!(
+            budget.unwrap(),
+            BudgetRefusal {
+                resource: "callers",
+                limit: 2,
+                requested: 3,
+            }
+        );
+        assert_eq!(
+            full.scene.coordinator.adapter.admit_refused(),
+            1,
+            "the refusal counts exactly once"
+        );
+        let (mut roomy, caller) = NativeScene::new();
+        roomy.scene.coordinator.adapter.set_max_callers(3);
+        roomy.scene.source.spawn(8, 600);
+        roomy
+            .scene
+            .coordinator
+            .adapter
+            .admit(8, ImageAuthority::ScanPinned, 60)
+            .unwrap();
+        let events = roomy.scene.coordinator.adapter.exec_transition(
+            caller,
+            &mut |_| ImageAuthority::ScanPinned,
+            2_000,
+        );
+        assert!(
+            matches!(events.as_slice(), [CallerEvent::ExecRetired { .. }]),
+            "{events:?}"
+        );
+        assert_eq!(roomy.scene.coordinator.adapter.len(), 3);
+
+        // Mismatched current-image queries refuse: wrong exec, wrong pid,
+        // foreign domain, and a post-admission exec record.
+        let (mut current, caller) = NativeScene::new();
+        current.answer(7, 500, 41);
+        current.witness(vec![current.row(41, 1, 7, 100, 0)]);
+        let image = DomainCookie::scripted(current.domain, 41);
+        let request = |exec_id: u64, pid: u32| CurrentBindingRequest {
+            caller,
+            pid,
+            image,
+            exec_id,
+        };
+        let sight = |scene: &mut NativeScene, req: CurrentBindingRequest| {
+            let coordinator = &scene.scene.coordinator;
+            let lookup = &coordinator.adapter as &dyn CallerLookup<(u32, u64)>;
+            coordinator
+                .binder
+                .sight_current_binding(req, lookup, &mut scene.cookies)
+        };
+        // CurrentBindingSighting carries no Debug by design; match instead.
+        let refused = |scene: &mut NativeScene, req: CurrentBindingRequest| match sight(scene, req)
+        {
+            Err(reason) => reason,
+            Ok(_) => panic!("a mismatched current image must refuse"),
+        };
+        assert_eq!(
+            refused(&mut current, request(2, 7)),
+            UnboundReason::ExecAmbiguous,
+            "a mismatched exec refuses"
+        );
+        assert_eq!(
+            refused(&mut current, request(1, 999)),
+            UnboundReason::NoLiveCaller,
+            "a mismatched pid refuses"
+        );
+        let foreign = DomainCookie::scripted(NativeDomainId::mint(), 41);
+        assert_eq!(
+            refused(
+                &mut current,
+                CurrentBindingRequest {
+                    caller,
+                    pid: 7,
+                    image: foreign,
+                    exec_id: 1
+                }
+            ),
+            UnboundReason::EvidenceIncomplete,
+            "a foreign domain proves nothing here"
+        );
+        current
+            .scene
+            .coordinator
+            .binder
+            .set_current_binding_clock(|| Some(1_005));
+        let sighted = match sight(&mut current, request(1, 7)) {
+            Ok(sighted) => sighted,
+            Err(reason) => panic!("the matched current image must sight: {reason:?}"),
+        };
+        assert!(
+            matches!(
+                current
+                    .scene
+                    .coordinator
+                    .binder
+                    .check_current_binding(&sighted),
+                CurrentBindingCheck::Proven
+            ),
+            "the matched current image proves"
+        );
+        // SAFETY: DiscoveryRecord contains only integer fields.
+        let mut exec_record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        exec_record.hook_ts_ns = 60;
+        exec_record.pid_tgid = (u64::from(7u32) << 32) | u64::from(7u32);
+        exec_record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        let at = current.stamps.tick();
+        current.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            current.domain,
+            vec![exec_record],
+            at,
+        )));
+        assert_eq!(
+            refused(&mut current, request(1, 7)),
+            UnboundReason::ExecAfterAdmission,
+            "an exec record after admission refuses the old proof"
+        );
+
+        // Colliding numeric cookies across domains never join: a Detailed
+        // transition for pid 7 leaves the Inventory-bound pid 8 alone, and
+        // pid 8 keeps binding its own ticket afterwards.
+        let (mut split, caller) = NativeScene::new();
+        let detailed = split.domain;
+        split.scene.source.spawn(8, 600);
+        let caller8 = split
+            .scene
+            .coordinator
+            .adapter
+            .admit(8, ImageAuthority::ScanPinned, 150)
+            .unwrap();
+        let inventory = NativeDomainId::mint();
+        split
+            .scene
+            .coordinator
+            .binder
+            .note_exec_coverage(ExecCoverage::scripted(inventory, 0));
+        split.cookies.answers.insert(
+            ((8, 600), inventory),
+            CookieQuery::Cookie(DomainCookie::scripted(inventory, 41)),
+        );
+        let endpoint = split.scene.delta.endpoints[0];
+        let bind8 = WitnessRow::scripted(inventory, 41, 1, endpoint.object, endpoint.id, 8, 200);
+        split.stage(split.stamps.read(inventory, vec![bind8]));
+        split.stage(split.stamps.drain(inventory));
+        split.stage(split.stamps.read(inventory, Vec::new()));
+        split.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            split.scene.coordinator.binder.census().bound,
+            1,
+            "pid 8 binds ticket 41 in the Inventory domain"
+        );
+        split.answer(7, 500, 41);
+        split.witness(vec![split.row(41, 1, 7, 100, 0)]);
+        let events = split.witness(vec![split.row(41, 2, 7, 1_100, 1)]);
+        assert!(
+            matches!(events.as_slice(), [CallerEvent::ExecRetired { old, .. }] if *old == caller),
+            "{events:?}"
+        );
+        assert_eq!(
+            split.scene.coordinator.adapter.live_id(8),
+            Some(caller8),
+            "the Detailed transition touches no Inventory caller"
+        );
+        assert_eq!(
+            split.scene.coordinator.adapter.live_id(7).unwrap(),
+            match events.as_slice() {
+                [CallerEvent::ExecRetired { new, .. }] => *new,
+                _ => unreachable!(),
+            }
+        );
+        let _ = detailed;
+    }
+
     #[test]
     fn a_row_naming_another_object_for_its_endpoint_never_stages() {
         let (mut native, caller) = NativeScene::new();

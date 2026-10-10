@@ -12583,6 +12583,10 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
     // router; every other consumer gets the bare `Event` from `decode`.
     let events = read("src/events.rs");
     assert!(events.contains("decode_record(bytes).map(|record| record.event)"));
+    assert!(
+        events.contains("fn poll_records_to_position"),
+        "the sanctioned same-consumer drain spelling must stay deliberate"
+    );
     let mut stack = vec![std::path::PathBuf::from("src")];
     let mut users = Vec::new();
     while let Some(dir) = stack.pop() {
@@ -12596,6 +12600,14 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
                 continue;
             }
             let source = fs::read_to_string(&path).expect("read source");
+            // Strip the two sanctioned lane identifiers before scanning:
+            // `continuity_cuts` is a counts-only summary field (Task5 item 7)
+            // and `poll_records_to_position` is the sanctioned same-consumer
+            // drain defined in allowlisted src/events.rs (Task5 item 2). Any
+            // raw use of the six tokens below anywhere still fails.
+            let scan = source
+                .replace("continuity_cuts", "")
+                .replace("poll_records_to_position", "");
             if [
                 "entry_ip",
                 "entry_stamp",
@@ -12605,7 +12617,7 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
                 "decode_record",
             ]
             .iter()
-            .any(|field| source.contains(field))
+            .any(|field| scan.contains(field))
             {
                 users.push(path.to_string_lossy().into_owned());
             }

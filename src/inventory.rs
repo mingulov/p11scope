@@ -15,8 +15,8 @@ use crate::attach::Scope;
 use crate::capacity::{InventoryBudget, inventory_endpoint_budget};
 use crate::cli::{CaptureMode, InspectScope};
 use crate::discovery::caller_registry::{
-    CallerEvent, ImageAuthority, ModuleId, OsProcessSource, ProcessSource, RegistryLimits,
-    UseCoverage, now_ns,
+    CallerEvent, CallerId, ImageAuthority, MappingState, ModuleId, ModuleKey, OsProcessSource,
+    ProcessSource, RegistryLimits, UseCoverage, now_ns,
 };
 use crate::discovery::engine::inventory::UnavailableImageGuard;
 use crate::discovery::engine::inventory_coordinator::{
@@ -41,8 +41,8 @@ use crate::inventory_diagnostics::{
 use crate::inventory_diagnostics_output::{DiagnosticsDestination, PrepareError};
 use crate::inventory_event_identity::IdentityIndex;
 use crate::inventory_events::{
-    EdgeEmitter, EventWriter, GapEmitter, caller_event_payload, ended_payload, pass_payload,
-    started_payload,
+    EdgeEmitter, EventWriter, GapEmitter, InstanceEmitter, caller_event_payload,
+    combined_dump_fits, ended_payload, pass_payload, settle_ended_combined, started_payload,
 };
 #[cfg(test)]
 use crate::inventory_output::WriterStdout;
@@ -51,6 +51,7 @@ use crate::inventory_present::{DASHBOARD_ACTIVITY_WINDOW_NS, Presentation, rende
 use crate::output::AtomicFile;
 use crate::process::PidPin;
 use anyhow::{Context as _, Result};
+use p11scope_ebpf_common::ImageIdentity;
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -358,6 +359,18 @@ impl FinalOutputOutcome {
                 ..
             }))
         )
+    }
+
+    /// Recorded failures (tests assert sink-failure disclosure).
+    #[cfg(test)]
+    pub(crate) fn failures(&self) -> &[String] {
+        &self.failures
+    }
+
+    /// Whether the event stream confirmed completion (tests).
+    #[cfg(test)]
+    pub(crate) fn event_log_confirmed(&self) -> Option<bool> {
+        self.event_log_confirmed
     }
 
     fn notices(&self, previously_reported: Option<&str>, notice: &mut dyn FnMut(&str)) {
@@ -821,6 +834,14 @@ fn run_with_terminal_budget(
         coordinator.note_diagnostics_native_unavailable();
     }
     let native_available = lane.is_some();
+    // The optional Detailed lane starts beside the native lane. No
+    // manifests means no Session and no semantic gap at all; a refused
+    // startup keeps broad Inventory running with an honest gap.
+    let semantic = if manifests.is_empty() {
+        None
+    } else {
+        start_semantic_lane(&mut coordinator, &engine_scope, attach_backend)
+    };
     // Interactive dashboard takes over stdout's terminal; a pipe
     // degrades honestly to snapshots/JSON below (never ANSI).
     let mut degraded = dashboard.then(|| "needs a terminal on stdout".to_string());
@@ -850,6 +871,7 @@ fn run_with_terminal_budget(
                     diagnostics,
                     request.second_signal,
                     native_available,
+                    semantic,
                 );
             }
             // A terminal the run cannot open privately (another user's
@@ -890,6 +912,8 @@ fn run_with_terminal_budget(
         guard: UnavailableImageGuard,
         deadline,
         display: None,
+        semantic,
+        semantic_staged: false,
     };
     let clock = LoopClock {
         deadline,
@@ -911,8 +935,9 @@ fn run_with_terminal_budget(
                         inventory_diagnostic(&line);
                     }
                     if let Some(error) = stream.attempt("pass publication", |writer| {
-                        let presentation =
+                        let mut presentation =
                             stream_presentation(coordinator, &scope_label, started_ns, now_ns);
+                        presentation.semantic_capture = driver.semantic_summary();
                         emit_pass_events(writer, &mut stream_state, report, &presentation, now_ns)
                     }) {
                         let _ =
@@ -932,8 +957,9 @@ fn run_with_terminal_budget(
                 }),
                 Publish::Stop { events, now_ns } => {
                     if let Some(error) = stream.attempt("stop publication", |writer| {
-                        let presentation =
+                        let mut presentation =
                             stream_presentation(coordinator, &scope_label, started_ns, now_ns);
+                        presentation.semantic_capture = driver.semantic_summary();
                         emit_stop_events(
                             writer,
                             &mut stream_state,
@@ -953,6 +979,11 @@ fn run_with_terminal_budget(
     );
     let stopped = running.stopped;
     let capture_error = running.error;
+    let semantic_summary = driver.semantic_summary();
+    // Both owners stay alive through the final commit, the immutable
+    // presentation and every sink attempt; the lane releases after
+    // output, beside the native capture it never certified.
+    let semantic_lane = driver.semantic.take();
     drop(driver);
     begin_scan_stdout(stdout, stopped.is_some());
     if let Some(stopped) = &stopped {
@@ -960,8 +991,9 @@ fn run_with_terminal_budget(
     }
     let ended_ns = now_ns();
     let passes = coordinator.passes();
-    let presentation =
+    let mut presentation =
         Presentation::capture(&coordinator, &scope_label, started_ns, ended_ns, passes);
+    presentation.semantic_capture = semantic_summary;
     // Output attempts first; only then may an unsettled retirement's drop
     // block (invariant 5), and a further signal then exits at once
     // (R-C51-4).
@@ -998,6 +1030,7 @@ fn run_with_terminal_budget(
     outcome.notices(previously_reported.as_deref(), &mut |line| {
         let _ = crate::sink::try_stderr_line(line);
     });
+    drop(semantic_lane);
     if let Some(error) = capture_error {
         return Err(error);
     }
@@ -1189,6 +1222,14 @@ struct ClassicDriver<'a> {
     /// The interactive dashboard's display (C5.3): it draws on the loop's
     /// service ticks and takes the pass warnings into its log tail.
     display: Option<Display>,
+    /// The optional attested Detailed lane: present when `--manifest`
+    /// attested a subset. Ticks drive H0; commits finalize beside the
+    /// physical evidence; the stop path owns its terminal sequence.
+    semantic: Option<crate::inventory_semantics::AttestedSemanticLane>,
+    /// A lane batch is already staged ahead of the next commit: at most
+    /// one ordinary collection quantum is owned at a time, so later
+    /// ticks in the same pass stay quiet instead of backpressuring.
+    semantic_staged: bool,
 }
 
 impl ClassicDriver<'_> {
@@ -1199,6 +1240,170 @@ impl ClassicDriver<'_> {
         match self.display.as_mut() {
             Some(display) => display.warn(warning),
             None => inventory_diagnostic(warning),
+        }
+    }
+
+    /// The lane's sanitized summary for this pass's presentation:
+    /// disabled without manifests, never permission-bearing.
+    fn semantic_summary(&self) -> crate::inventory_semantics::SemanticCaptureSummary {
+        self.semantic.as_ref().map_or(
+            crate::inventory_semantics::SemanticCaptureSummary::default(),
+            |lane| lane.semantic_summary(),
+        )
+    }
+}
+
+/// Optional lane startup: no manifests means no Detailed Session, maps,
+/// links or cursor. A refused live startup keeps the shell lane for
+/// its honest `unavailable` summary; broad Inventory runs either way.
+fn start_semantic_lane(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    scope: &Scope,
+    backend: crate::attach::BackendSelection,
+) -> Option<crate::inventory_semantics::AttestedSemanticLane> {
+    use crate::inventory_semantics::AttestedSemanticLane;
+    let preparation = coordinator.prepare_semantic_subset();
+    for refusal in &preparation.refusals {
+        coordinator.note_scope_gap(
+            "semantic subset refused".into(),
+            format!("{refusal}; broad inventory continues without instance semantics"),
+        );
+    }
+    let attach_subset = preparation.subset?;
+    // The second mint over the same retained sources stays the lane's
+    // conversion envelope; it fails only when the retained inputs
+    // moved under the startup.
+    let second = coordinator.prepare_semantic_subset();
+    let convert_subset = match second.subset {
+        Some(subset) => subset,
+        None => {
+            for refusal in &second.refusals {
+                coordinator.note_scope_gap(
+                    "semantic subset refused".into(),
+                    format!("{refusal}; broad inventory continues without instance semantics"),
+                );
+            }
+            return None;
+        }
+    };
+    match AttestedSemanticLane::start_live(attach_subset, convert_subset, scope, backend) {
+        Ok(lane) => Some(lane),
+        Err(refusal) => {
+            coordinator.note_scope_gap(
+                "semantic lane unavailable".into(),
+                format!("{refusal}; broad inventory continues without instance semantics"),
+            );
+            coordinator
+                .prepare_semantic_subset()
+                .subset
+                .and_then(|subset| AttestedSemanticLane::start(subset, scope, backend).ok())
+                .map(|mut shell| {
+                    shell.mark_startup_failed();
+                    shell
+                })
+        }
+    }
+}
+
+/// Bind lane callers after the pass applied: re-prove accepted
+/// bindings and refresh a bounded, rotating set of unbound candidates.
+/// Every bind re-proves through live native state; refusals stay
+/// unbound, honestly without positives.
+fn bind_semantic_callers(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    lane: &mut crate::inventory_semantics::AttestedSemanticLane,
+    identity: &mut dyn NativeIdentity<PidPin>,
+) {
+    if !lane.is_live() || lane.is_finished() {
+        return;
+    }
+    // Accepted bindings re-prove in place through the same custody.
+    // The full window is rotation-neutral (cursor advances by exactly
+    // the length), so re-proof never steals the tick window's turn.
+    let rebind: Vec<(CallerId, ModuleKey, ImageIdentity)> = {
+        let len = coordinator.semantic_bindings().len();
+        coordinator
+            .semantic_bindings_mut()
+            .windowed(len)
+            .iter()
+            .map(|binding| (binding.caller(), binding.module().clone(), binding.image()))
+            .collect()
+    };
+    let domain = lane.domain();
+    for (caller, module, image) in rebind {
+        let _ = coordinator.bind_semantic_caller(caller, module, domain, image, identity);
+    }
+    // Unbound live callers with a mapped edge are refresh candidates,
+    // rotated by pass so no fixed prefix starves.
+    let mut candidates: Vec<(CallerId, u32)> = coordinator
+        .adapter()
+        .records()
+        .filter(|record| {
+            !record.retired
+                && coordinator.adapter().live_id(record.pid) == Some(record.id)
+                && coordinator.semantic_bindings().get(record.id).is_none()
+                && coordinator
+                    .registry()
+                    .edges_of(record.id)
+                    .any(|edge| edge.mapping == MappingState::Mapped)
+        })
+        .map(|record| (record.id, record.pid))
+        .collect();
+    if candidates.is_empty() {
+        return;
+    }
+    let passes = coordinator.passes() as usize;
+    let candidates_len = candidates.len();
+    candidates.rotate_left(passes % candidates_len);
+    // One refresh slot suffices for the image hint: the image is
+    // process-level, shared by every slot of the provider. The hint is
+    // a claim only; the bind proof re-verifies everything.
+    let slot = lane
+        .subset()
+        .required()
+        .values()
+        .flat_map(|slots| slots.iter().copied())
+        .next();
+    let Some(slot) = slot else {
+        return;
+    };
+    // The refreshed slot's object names the provider; the registry
+    // module carrying that path is the bind target. Unresolvable
+    // stays unbound: no positive without proof.
+    let module = lane
+        .subset()
+        .plan()
+        .slots
+        .iter()
+        .find(|slot_info| slot_info.index == slot)
+        .and_then(|slot_info| lane.subset().pins().attach_path_for(slot_info.object).ok())
+        .and_then(|path| {
+            let path = path.to_string_lossy().into_owned();
+            coordinator
+                .registry()
+                .modules()
+                .find(|module| module.paths.contains(&path))
+                .map(|module| module.key.clone())
+        });
+    let Some(module) = module else {
+        return;
+    };
+    for (caller, pid) in candidates.into_iter().take(4) {
+        let Some(pin) = coordinator
+            .adapter()
+            .live_pin(pid)
+            .and_then(|(_, pin)| pin.try_clone().ok())
+            .map(std::sync::Arc::new)
+        else {
+            continue;
+        };
+        let images = match lane.refresh_candidate(pin, slot) {
+            Ok(images) => images,
+            Err(_) => continue,
+        };
+        for image in images {
+            let _ =
+                coordinator.bind_semantic_caller(caller, module.clone(), domain, image, identity);
         }
     }
 }
@@ -1285,11 +1490,23 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         if let Some(warning) = warning {
             self.warn(&warning);
         }
+        if let Some(lane) = self.semantic.as_mut() {
+            bind_semantic_callers(self.coordinator, lane, identity);
+        }
         Ok(report)
     }
 
     fn commit(&mut self, engine_changed: bool) -> Result<()> {
-        self.coordinator.commit_batch(engine_changed).map(|_| ())
+        let receipt = match self.semantic.as_mut() {
+            Some(lane) => self
+                .coordinator
+                .commit_batch_with_semantics(engine_changed, Some(lane)),
+            None => self.coordinator.commit_batch(engine_changed),
+        };
+        receipt.map(|_| {
+            // The staged quantum published: the next tick may stage again.
+            self.semantic_staged = false;
+        })
     }
 
     fn finish_pass(&mut self, report: &mut PassReport) -> Result<()> {
@@ -1316,6 +1533,91 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         if let Some(display) = self.display.as_mut() {
             display.tick();
         }
+        // Regular and collection-time lane ticks share this hook: the
+        // loop calls it between passes and while the pass's collection
+        // runs. At most one quantum stages ahead of the next commit.
+        if self.semantic_staged {
+            return;
+        }
+        let Some(lane) = self.semantic.as_mut() else {
+            return;
+        };
+        if !lane.is_live() || lane.is_finished() {
+            return;
+        }
+        let pins = self.coordinator.semantic_bindings_mut().bindings_for_tick();
+        // The borrow ends with the tick: the batch owns its outcomes.
+        let staged = match lane.tick(pins) {
+            Ok(batch) => {
+                self.coordinator.stage_semantic_batch(batch);
+                true
+            }
+            Err(_) => false,
+        };
+        self.semantic_staged = staged;
+    }
+
+    fn on_stop_requested(&mut self) {
+        // Gate Detailed immediately, before the (possibly slow) native
+        // retirement: one producer's stop never certifies the other.
+        if let Some(lane) = self.semantic.as_mut() {
+            lane.request_semantic_stop();
+        }
+    }
+
+    fn on_lane_stopped(&mut self) {
+        // The lane's independent terminal sequence: drain owned cursors
+        // to Q, then stop H0 once. Every drained batch commits beside
+        // the lane's stop before the Finish batch; a terminal failure
+        // records a gap instead of losing Inventory's stop.
+        if !self
+            .semantic
+            .as_ref()
+            .is_some_and(|lane| lane.is_live() && !lane.is_finished())
+        {
+            return;
+        }
+        // Publish any pass-staged quantum first: the terminal drain
+        // must never backpressure behind it.
+        if self.semantic_staged
+            && let Err(error) = self.commit(false)
+        {
+            self.coordinator.note_scope_gap(
+                "semantic terminal commit failed".into(),
+                format!("{error:#}"),
+            );
+        }
+        let pins: Vec<std::sync::Arc<PidPin>> = self
+            .coordinator
+            .semantic_bindings_mut()
+            .bindings_for_tick()
+            .iter()
+            .map(|binding| binding.pin())
+            .collect();
+        let Some(lane) = self.semantic.as_mut() else {
+            return;
+        };
+        let mut terminal = Vec::new();
+        lane.run_semantic_stop(&pins, std::time::Instant::now, |batch| {
+            terminal.push(batch);
+        });
+        for batch in terminal {
+            self.coordinator.stage_semantic_batch(batch);
+            let lane = match self.semantic.as_mut() {
+                Some(lane) => lane,
+                None => break,
+            };
+            if let Err(error) = self
+                .coordinator
+                .commit_batch_with_semantics(false, Some(lane))
+            {
+                self.coordinator.note_scope_gap(
+                    "semantic terminal commit failed".into(),
+                    format!("{error:#}"),
+                );
+            }
+        }
+        self.semantic_staged = false;
     }
 }
 
@@ -1545,8 +1847,13 @@ pub(crate) fn finish_output(
     }
     let event_requested = stream.writer.is_some() || stream.first_error().is_some();
     stream.attempt("completion", |writer| {
-        // Exact repeat counts, then the final edge sweep, then ended:
-        // preserve healthy ordering and the sweep's retention reservation.
+        // Exact repeat counts, then the final combined sweep of physical
+        // edges plus both instance kinds, then ended: preserve healthy
+        // ordering and the sweep's retention reservation. The instance
+        // rows join before retention settles, so appending semantic rows
+        // can never silently evict a retained physical final row: an
+        // eviction is either repaired by the combined dump or disclosed
+        // in the exact unretained counts.
         stream_state
             .gaps
             .emit(writer, &presentation.gaps, true, presentation.ended_ns)?;
@@ -1560,15 +1867,53 @@ pub(crate) fn finish_output(
             presentation.ended_ns,
             tail,
         )?;
-        let (_, payload) = stream_state.edges.settle_ended(
+        let swept_instances = stream_state.instances.sweep_exact(
             writer,
-            &presentation.edges,
-            swept.unretained,
+            &presentation.instances,
+            &presentation.semantic_edges,
+            presentation.budgets.instances_limit,
             presentation.ended_ns,
-            |unretained| {
+        )?;
+        writer.reserve(tail)?;
+        let mut estimate = combined_unretained_after(stream_state, writer, presentation, tail);
+        if estimate.0 + estimate.1 + estimate.2 > 0
+            && combined_dump_fits(&stream_state.edges, &stream_state.instances, writer, tail)
+        {
+            stream_state.edges.dump_all(
+                writer,
+                &presentation.edges,
+                &identities,
+                presentation.budgets.edges_limit,
+                presentation.ended_ns,
+            )?;
+            stream_state.instances.dump_all(
+                writer,
+                &presentation.instances,
+                &presentation.semantic_edges,
+                presentation.budgets.instances_limit,
+                presentation.ended_ns,
+            )?;
+            // No second reserve: the fit bound already holds the tail.
+            estimate = combined_unretained_after(stream_state, writer, presentation, tail);
+        }
+        let edge_events = swept.emitted;
+        let instance_events = swept_instances.instance_emitted;
+        let semantic_edge_events = swept_instances.edge_emitted;
+        let (_, payload) = settle_ended_combined(
+            &stream_state.edges,
+            &stream_state.instances,
+            writer,
+            presentation,
+            estimate,
+            presentation.ended_ns,
+            |(edges_unretained, instances_unretained, semantic_unretained)| {
                 let mut payload = ended_payload(presentation, presentation.ended_ns, writer);
-                payload["edge_events"] = swept.emitted.into();
-                payload["edges_unretained"] = unretained.into();
+                payload["edge_events"] = edge_events.into();
+                payload["edges_unretained"] = edges_unretained.into();
+                payload["instance_events"] = instance_events.into();
+                payload["instances_unretained"] = instances_unretained.into();
+                payload["semantic_edge_events"] = semantic_edge_events.into();
+                payload["semantic_edges_unretained"] = semantic_unretained.into();
                 payload
             },
         );
@@ -1661,12 +2006,37 @@ fn finish_runtime_output<Source: ProcessSource>(
     outcome
 }
 
+/// All three kinds' rows whose last record will not be retained
+/// once the `tail` bytes still to come are written: `(physical edges,
+/// instances, semantic edges)`.
+fn combined_unretained_after(
+    stream_state: &StreamState,
+    writer: &EventWriter,
+    presentation: &Presentation,
+    tail: u64,
+) -> (usize, usize, usize) {
+    let edges_unretained = stream_state
+        .edges
+        .unretained_after(writer, &presentation.edges, tail);
+    let (instances_unretained, semantic_unretained) = stream_state.instances.unretained_after(
+        writer,
+        &presentation.instances,
+        &presentation.semantic_edges,
+        tail,
+    );
+    (edges_unretained, instances_unretained, semantic_unretained)
+}
+
 /// Bytes the `ended` line may take: its payload as measured now plus
 /// [`ENDED_TAIL_SLACK`] (the envelope and counters that may still grow).
 fn ended_tail(presentation: &Presentation, writer: &EventWriter) -> u64 {
     let mut payload = ended_payload(presentation, presentation.ended_ns, writer);
     payload["edge_events"] = u64::MAX.into();
     payload["edges_unretained"] = u64::MAX.into();
+    payload["instance_events"] = u64::MAX.into();
+    payload["instances_unretained"] = u64::MAX.into();
+    payload["semantic_edge_events"] = u64::MAX.into();
+    payload["semantic_edges_unretained"] = u64::MAX.into();
     (payload.to_string().len() as u64).saturating_add(crate::inventory_events::ENDED_TAIL_SLACK)
 }
 
@@ -1717,10 +2087,13 @@ fn apply_one_pass(
 /// Incremental stream position: gaps are push-only until the bound,
 /// so an index plus the suppressed counter replays exactly the new
 /// loss on every pass; edges keep one digest each (bounded by the edge
-/// limit) so only changes are streamed (DR-C5-EDGE).
+/// limit) so only changes are streamed (DR-C5-EDGE); instances keep one
+/// tracked record each with separate dirty flags for the two instance
+/// kinds under one shared per-pass quota.
 pub(crate) struct StreamState {
     gaps: GapEmitter,
     edges: EdgeEmitter,
+    instances: InstanceEmitter,
     emitted_suppressed: u64,
     /// Unbound witness rows per (module, reason) already counted on a
     /// pass marker.
@@ -1732,6 +2105,7 @@ impl StreamState {
         Self {
             gaps: GapEmitter::new(),
             edges: EdgeEmitter::new(),
+            instances: InstanceEmitter::new(),
             emitted_suppressed: 0,
             emitted_unbound: BTreeMap::new(),
         }
@@ -1839,6 +2213,13 @@ fn emit_commit(
         presentation.budgets.edges_limit,
         now_ns,
     )?;
+    let instances = state.instances.emit(
+        writer,
+        &presentation.instances,
+        &presentation.semantic_edges,
+        presentation.budgets.instances_limit,
+        now_ns,
+    )?;
     let suppressed_delta = presentation
         .gaps_suppressed
         .saturating_sub(state.emitted_suppressed);
@@ -1846,6 +2227,10 @@ fn emit_commit(
     let mut payload = pass_payload(report, presentation, fresh, suppressed_delta);
     payload["edge_events"] = edges.emitted.into();
     payload["edge_events_deferred"] = edges.deferred.into();
+    payload["instance_events"] = instances.instance_emitted.into();
+    payload["instance_events_deferred"] = instances.instance_deferred.into();
+    payload["semantic_edge_events"] = instances.edge_emitted.into();
+    payload["semantic_edge_events_deferred"] = instances.edge_deferred.into();
     add_unbound_rows(&mut payload, state, presentation);
     if stop {
         payload["final"] = serde_json::Value::Bool(true);
@@ -1946,8 +2331,9 @@ fn dashboard_pass_views<S: ProcessSource>(
     scope_label: &str,
     started_ns: u64,
     now_ns: u64,
+    semantic: crate::inventory_semantics::SemanticCaptureSummary,
 ) -> (Presentation, Presentation) {
-    let display = Presentation::capture_dashboard(
+    let mut display = Presentation::capture_dashboard(
         coordinator,
         scope_label,
         started_ns,
@@ -1956,10 +2342,10 @@ fn dashboard_pass_views<S: ProcessSource>(
         now_ns,
         DASHBOARD_ACTIVITY_WINDOW_NS,
     );
-    (
-        stream_presentation(coordinator, scope_label, started_ns, now_ns),
-        display,
-    )
+    display.semantic_capture = semantic;
+    let mut stream_view = stream_presentation(coordinator, scope_label, started_ns, now_ns);
+    stream_view.semantic_capture = semantic;
+    (stream_view, display)
 }
 
 /// One dashboard pass on the stream side: the pass's events go out from the
@@ -1975,9 +2361,10 @@ fn dashboard_stream_pass<S: ProcessSource>(
     scope_label: &str,
     started_ns: u64,
     now_ns: u64,
+    semantic: crate::inventory_semantics::SemanticCaptureSummary,
 ) -> (Presentation, Option<String>) {
     let (stream_view, display_view) =
-        dashboard_pass_views(coordinator, scope_label, started_ns, now_ns);
+        dashboard_pass_views(coordinator, scope_label, started_ns, now_ns, semantic);
     let error = stream.attempt("pass publication", |writer| {
         emit_pass_events(writer, state, report, &stream_view, now_ns)
     });
@@ -2033,6 +2420,7 @@ fn run_dashboard(
     diagnostics: Option<DiagnosticsState>,
     second_signal: &dyn Fn() -> bool,
     native_available: bool,
+    semantic: Option<crate::inventory_semantics::AttestedSemanticLane>,
 ) -> Result<i32> {
     let DashboardRun {
         scope,
@@ -2063,6 +2451,8 @@ fn run_dashboard(
         guard: UnavailableImageGuard,
         deadline,
         display: Some(display),
+        semantic,
+        semantic_staged: false,
     };
     let ending = || stop() || quit.get();
     let clock = LoopClock {
@@ -2089,6 +2479,7 @@ fn run_dashboard(
                         &scope_label,
                         started_ns,
                         now_ns,
+                        driver.semantic_summary(),
                     );
                     if let Some(display) = driver.display.as_mut() {
                         if let Some(error) = event_error {
@@ -2127,8 +2518,9 @@ fn run_dashboard(
                 Publish::Stop { events, now_ns } => {
                     let coordinator = &*driver.coordinator;
                     if let Some(error) = stream.attempt("stop publication", |writer| {
-                        let presentation =
+                        let mut presentation =
                             stream_presentation(coordinator, &scope_label, started_ns, now_ns);
+                        presentation.semantic_capture = driver.semantic_summary();
                         emit_stop_events(
                             writer,
                             &mut stream_state,
@@ -2153,6 +2545,8 @@ fn run_dashboard(
         .display
         .take()
         .expect("the dashboard driver keeps its display");
+    let semantic_summary = driver.semantic_summary();
+    let semantic_lane = driver.semantic.take();
     drop(driver);
     display.restore();
     let failure = display.take_failure();
@@ -2161,8 +2555,9 @@ fn run_dashboard(
     }
     let passes = coordinator.passes();
     let ended_ns = now_ns();
-    let presentation =
+    let mut presentation =
         Presentation::capture(&coordinator, &scope_label, started_ns, ended_ns, passes);
+    presentation.semantic_capture = semantic_summary;
     // Output attempts first (R-C51-4), silent text: the live view showed it.
     let previously_reported = stream.first_error().map(str::to_string);
     let diagnostic_outcome = diagnostic_outcome(
@@ -2193,6 +2588,7 @@ fn run_dashboard(
         outputs_attempted,
         &mut |line| display_notices.borrow_mut().notice(&line),
     );
+    drop(semantic_lane);
     // A restore the terminal shed (Ctrl-S then `q`) leaves the shell in
     // the alternate screen: after output attempts, it can wait longer.
     display.retry_restore(if outcome.stdout_cancelled() {
@@ -2743,6 +3139,7 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
                 &presentation.native_witnesses,
                 presentation.witness_placement,
             ),
+            "semantic_capture": presentation.semantic_capture.json(),
         },
         "budgets": budgets_json(&presentation.budgets),
         "callers": presentation.callers.iter().map(caller_json).collect::<Vec<_>>(),
@@ -5533,8 +5930,13 @@ mod tests {
         let now = harness.now_ns();
         let coordinator = harness.coordinator();
         let classic = stream_presentation(coordinator, "pid:83000", started, now);
-        let (stream_view, display_view) =
-            dashboard_pass_views(coordinator, "pid:83000", started, now);
+        let (stream_view, display_view) = dashboard_pass_views(
+            coordinator,
+            "pid:83000",
+            started,
+            now,
+            crate::inventory_semantics::SemanticCaptureSummary::default(),
+        );
         let activity = |view: &Presentation| {
             view.edges
                 .iter()

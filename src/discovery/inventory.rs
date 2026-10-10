@@ -121,6 +121,11 @@ pub(crate) enum RefreshCause {
     ValidatedExec(ExecProof),
 }
 
+/// Dirty-cause bit for a natively proven exec invalidation (H6 slice 2).
+/// LoaderHint/Periodic/TransportRecovery/ScopeRecheck hold bits 1/2/4/8; an
+/// ended owner never services again, so this bit stays set as the marker.
+const EXEC_INVALIDATED_DIRTY: u8 = 16;
+
 #[derive(Debug)]
 struct Owner {
     image: ImageIdentity,
@@ -338,6 +343,13 @@ impl Engine {
     pub(crate) fn acquire_inventory_scan(&mut self, owner: ProcessViewId) -> Result<ScanLease> {
         let state = self.inventory_state()?;
         state.require_reserved_or_retained(owner)?;
+        if state
+            .owners
+            .get(&owner)
+            .is_some_and(|record| record.image_state == ImageCheck::Changed)
+        {
+            bail!("inventory owner image ended; the owner retains its history but scans nothing new");
+        }
         if state.leases.contains_key(&owner)
             || state.leases.len() >= state.config.owners.scan_leases
         {
@@ -383,10 +395,11 @@ impl Engine {
         cause: RefreshCause,
     ) -> Result<()> {
         self.inventory_state()?;
-        // The native proof/terminal retirement adapter is deliberately not
-        // implemented here. Generic hints never set legacy retirement intents.
-        if matches!(cause, RefreshCause::ValidatedExec(_)) {
-            bail!("validated exec retirement requires the native lifecycle adapter");
+        // A natively proven image transition invalidates the proved old
+        // owner through the adapter below. Generic hints never set legacy
+        // retirement intents.
+        if let RefreshCause::ValidatedExec(proof) = cause {
+            return self.invalidate_owner_for_exec(owner, proof);
         }
         let owner = self
             .inventory
@@ -411,6 +424,41 @@ impl Engine {
         };
         owner.requested_epoch = epoch;
         owner.dirty |= bit;
+        Ok(())
+    }
+
+    /// The native lifecycle adapter for a proved old incarnation: its scan
+    /// lease, checked revision and current image end here, before
+    /// publication, while every committed claim stays retained. This assigns
+    /// no Detailed cookie and grants no new exact result — the successor's
+    /// exact authority comes only from its own validated admission. Proving
+    /// an already ended owner is idempotent; a proof naming another owner
+    /// is refused and changes nothing.
+    fn invalidate_owner_for_exec(&mut self, owner: ProcessViewId, proof: ExecProof) -> Result<()> {
+        if proof.owner != owner {
+            bail!("validated exec proof names another inventory owner; nothing was invalidated");
+        }
+        let state = self
+            .inventory
+            .as_mut()
+            .expect("checked Inventory state");
+        let record = state
+            .owners
+            .get_mut(&owner)
+            .ok_or_else(|| anyhow!("inventory refresh owner is not retained"))?;
+        if record.image_state == ImageCheck::Changed {
+            return Ok(());
+        }
+        state.leases.remove(&owner);
+        record.revision = record
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("inventory owner revision exhausted; existing claims retained"))?;
+        record.image_state = ImageCheck::Changed;
+        record.requested_epoch = record.requested_epoch.checked_add(1).ok_or_else(|| {
+            anyhow!("inventory refresh epoch exhausted; existing claims retained")
+        })?;
+        record.dirty |= EXEC_INVALIDATED_DIRTY;
         Ok(())
     }
 

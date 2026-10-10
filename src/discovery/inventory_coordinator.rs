@@ -12854,17 +12854,390 @@ pub(crate) mod tests {
             "{events:?}"
         );
         coordinator.commit_batch(false).unwrap();
-        let proof_gap = coordinator
-            .registry()
-            .gaps()
-            .iter()
-            .find(|gap| gap.subject == "native exec proof not applied")
-            .expect("the owner lane refuses the proof until its adapter exists");
         assert!(
-            proof_gap.reason.contains("native lifecycle adapter"),
-            "{proof_gap:?}"
+            !coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "native exec proof not applied"),
+            "the lifecycle adapter applies the proof: {:?}",
+            coordinator.registry().gaps()
+        );
+        let owner = coordinator.owner_of(caller).unwrap();
+        assert_eq!(
+            coordinator
+                .engine
+                .inventory_owner_epochs(owner)
+                .unwrap()
+                .image_state,
+            ImageCheck::Changed,
+            "the proved old owner is invalidated"
         );
         assert!(coordinator.adapter().record(caller).unwrap().retired);
+    }
+
+    /// H6 slice 2: a proved old incarnation invalidates all prepared old
+    /// leases/receipts before publication, with retained history. A generic
+    /// EXEC hint does not grant exact image state. Fresh correctly scoped
+    /// successor scan/physical names remain useful without a manifest or H0.
+    #[test]
+    fn automatic_exec_invalidates_old_inventory_leases() {
+        // Real provider child under PID scope: its mapped provider gives the
+        // owner committed module history to retain.
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let provider = gcc(
+            dir.path(),
+            "scoped-provider.so",
+            &manifest.join("crates/discover/tests/fixture/version_matrix.c"),
+            &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+            &[],
+        );
+        gcc(
+            dir.path(),
+            "scoped-driver",
+            &manifest.join("tests/fixtures/catalog-driver.c"),
+            &["-O2", "-Wall", "-Wextra", "-Werror"],
+            &["-ldl"],
+        );
+        let child = spawn_cgroup_provider_child(dir.path(), &provider, "ready");
+        let pid = child.id();
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::Pid(pid),
+            HookRegistry::builtin(),
+            Vec::new(),
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let now = crate::discovery::caller_registry::now_ns();
+        // Committed history first: a full native pass over the child.
+        let report = coordinator
+            .scan_pass(
+                &InventoryScope::Pid(pid),
+                None,
+                &mut FixtureImages,
+                &mut OwnerImages(fixture_image),
+                u64::MAX,
+                now,
+            )
+            .unwrap();
+        assert_eq!(report.native_callers, 1);
+        coordinator.commit_batch(true).unwrap();
+        let caller = coordinator.adapter().live_id(pid).unwrap();
+        let owner = coordinator.owner_of(caller).unwrap();
+        let modules_before = coordinator.engine.modules.len();
+        assert!(modules_before > 0, "the owner committed real history");
+        let complete_before = coordinator.engine.inventory_last_complete(owner).unwrap();
+        assert!(
+            complete_before.is_some(),
+            "the owner committed a complete receipt"
+        );
+        // A prepared old lease and a prepared old receipt, held across the
+        // proof: both must die with the proved old image.
+        let lease = coordinator.engine.acquire_inventory_scan(owner).unwrap();
+        let receipt = coordinator
+            .engine
+            .scan_inventory_owner(&lease, &mut FixtureImages)
+            .unwrap();
+        let prepared = coordinator
+            .engine
+            .prepare_inventory_reconciliation(receipt, &mut FixtureImages)
+            .unwrap();
+        // Natively proven transition: image (41,1) binds, then (41,2).
+        let domain = NativeDomainId::mint();
+        let mut identity = OneTicket { domain, ticket: 41 };
+        let object = crate::discovery::inventory_attach_set::AttachObjectId::scripted(0);
+        let stamps = Stamps::from(now);
+        coordinator
+            .binder
+            .note_exec_coverage(ExecCoverage::scripted(domain, 0));
+        let mut stage = |coordinator: &mut InventoryCoordinator<OsProcessSource>,
+                         rows: Vec<WitnessRow>| {
+            let mut events = Vec::new();
+            for batch in [
+                stamps.read(domain, rows),
+                stamps.drain(domain),
+                stamps.read(domain, Vec::new()),
+            ] {
+                events.extend(
+                    coordinator
+                        .stage_native(batch, &mut identity, now + 10)
+                        .events,
+                );
+            }
+            events
+        };
+        let bound = WitnessRow::scripted(domain, 41, 1, object, EndpointId(0), pid, now + 1);
+        assert!(stage(&mut coordinator, vec![bound]).is_empty());
+        let later = WitnessRow::scripted(domain, 41, 2, object, EndpointId(1), pid, now + 2);
+        let events = stage(&mut coordinator, vec![later]);
+        assert!(
+            matches!(events.as_slice(), [CallerEvent::ExecRetired { old, .. }] if *old == caller),
+            "{events:?}"
+        );
+        coordinator.commit_batch(false).unwrap();
+        // Decisive: the proof applies (no refusal gap) and the old owner is
+        // invalidated before publication.
+        assert!(
+            !coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "native exec proof not applied"),
+            "the proof must apply, not refuse: {:?}",
+            coordinator.registry().gaps()
+        );
+        let epochs = coordinator.engine.inventory_owner_epochs(owner).unwrap();
+        assert_eq!(
+            epochs.image_state,
+            ImageCheck::Changed,
+            "the proved old image is invalidated"
+        );
+        assert!(
+            coordinator.engine.release_inventory_scan(&lease).is_err(),
+            "the prepared old scan lease dies with the image"
+        );
+        assert!(
+            coordinator
+                .engine
+                .commit_inventory_reconciliation(prepared, &mut FixtureImages)
+                .is_err(),
+            "the prepared old receipt dies with the image"
+        );
+        // History is retained, not rewritten.
+        assert_eq!(coordinator.engine.modules.len(), modules_before);
+        assert_eq!(
+            coordinator.engine.inventory_last_complete(owner).unwrap(),
+            complete_before
+        );
+        assert!(
+            coordinator.adapter().record(caller).unwrap().retired,
+            "the proved old caller retires"
+        );
+        let successor = coordinator.adapter().live_id(pid).unwrap();
+        assert_ne!(successor, caller);
+
+        // A generic EXEC hint grants nothing exact: an EXEC lifecycle
+        // record alone proves no transition and touches no owner.
+        let mut hinted = DiscoveryBatch::scripted(domain, Vec::new(), now + 20);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut hint_record: p11scope_ebpf_common::DiscoveryRecord =
+            unsafe { std::mem::zeroed() };
+        hint_record.hook_ts_ns = now + 20;
+        hint_record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+        hint_record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        hinted.records.push(hint_record);
+        let receipt = coordinator.stage_native(
+            NativeBatch::Lifecycle(hinted),
+            &mut OneTicket { domain, ticket: 41 },
+            now + 21,
+        );
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        assert!(
+            coordinator.binder.take_transitions().is_empty(),
+            "a hint alone is not an ended-incarnation proof"
+        );
+
+        // Fresh successor authority comes from its own validated admission:
+        // LoaderHint/Periodic touch neither image state nor the revision, and
+        // the successor scans usefully with no manifest and no H0 receipt.
+        let image2 = ImageIdentity {
+            task_cookie: u64::from(pid) + 1,
+            exec_id: 9,
+        };
+        let owner2 = coordinator
+            .engine
+            .open_inventory_owner(pid, image2, &mut FixtureImages)
+            .unwrap();
+        coordinator.owners.insert(successor, owner2);
+        for cause in [RefreshCause::LoaderHint, RefreshCause::Periodic] {
+            coordinator
+                .engine
+                .request_inventory_refresh(owner2, cause)
+                .unwrap();
+        }
+        assert_eq!(
+            coordinator
+                .engine
+                .inventory_owner_epochs(owner2)
+                .unwrap()
+                .image_state,
+            ImageCheck::Exact,
+            "generic hints grant nothing exact and change nothing proven"
+        );
+        let commit2 = coordinator
+            .scan_owner(owner2, &mut FixtureImages, u64::MAX, now + 100)
+            .unwrap();
+        assert!(commit2.complete, "the successor scan commits");
+        assert!(
+            coordinator.engine.manifests.is_empty(),
+            "physical recovery needs no manifest"
+        );
+        assert_eq!(
+            coordinator.semantic_bindings().len(),
+            0,
+            "physical recovery needs no H0 receipt"
+        );
+        assert!(
+            coordinator
+                .engine
+                .modules
+                .iter()
+                .any(|module| module.scanned.view == owner2 && !module.scanned.path.is_empty()),
+            "the successor scan names its modules"
+        );
+        assert!(
+            coordinator
+                .engine
+                .modules
+                .iter()
+                .any(|module| module.scanned.view == owner),
+            "the old owner's module history stays retained alongside"
+        );
+
+        // A proof naming another owner is refused and changes nothing; the
+        // guard is never consulted and no Detailed cookie is assigned.
+        let self_pid = std::process::id();
+        let mut prover = InventoryCoordinator::new(
+            Scope::Pid(self_pid),
+            HookRegistry::builtin(),
+            Vec::new(),
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let proof_owner = prover
+            .test_open_native_owner(
+                self_pid,
+                fixture_image(self_pid).unwrap(),
+                &mut FixtureImages,
+                now,
+            )
+            .unwrap();
+        let proof_domain = NativeDomainId::mint();
+        let mut proof_identity = OneTicket {
+            domain: proof_domain,
+            ticket: 41,
+        };
+        prover
+            .binder
+            .note_exec_coverage(ExecCoverage::scripted(proof_domain, 0));
+        let proof_stamps = Stamps::from(now);
+        let mut proof_stage =
+            |prover: &mut InventoryCoordinator<OsProcessSource>, rows: Vec<WitnessRow>| {
+                for batch in [
+                    proof_stamps.read(proof_domain, rows),
+                    proof_stamps.drain(proof_domain),
+                    proof_stamps.read(proof_domain, Vec::new()),
+                ] {
+                    prover.stage_native(batch, &mut proof_identity, now + 10);
+                }
+            };
+        let proof_object =
+            crate::discovery::inventory_attach_set::AttachObjectId::scripted(0);
+        proof_stage(
+            &mut prover,
+            vec![WitnessRow::scripted(
+                proof_domain,
+                41,
+                1,
+                proof_object,
+                EndpointId(0),
+                self_pid,
+                now + 1,
+            )],
+        );
+        // The proving row goes through the binder only, so the transition
+        // can be captured for proof-construction without being applied.
+        let proving = WitnessRow::scripted(
+            proof_domain,
+            41,
+            2,
+            proof_object,
+            EndpointId(1),
+            self_pid,
+            now + 2,
+        );
+        for batch in [
+            proof_stamps.read(proof_domain, vec![proving]),
+            proof_stamps.drain(proof_domain),
+            proof_stamps.read(proof_domain, Vec::new()),
+        ] {
+            match batch {
+                NativeBatch::Witness(read) => {
+                    prover
+                        .binder
+                        .absorb_witnesses(&read, &prover.adapter, &mut proof_identity);
+                }
+                NativeBatch::Lifecycle(drain) => prover.binder.absorb_lifecycle(&drain),
+                _ => unreachable!("scripted read/drain only"),
+            }
+        }
+        let transitions = prover.binder.take_transitions();
+        assert_eq!(transitions.len(), 1, "one proven transition captured");
+        let stale_owner = ProcessViewId(999_999);
+        let before = coordinator
+            .engine
+            .inventory_owner_epochs(owner2)
+            .unwrap();
+        assert!(
+            coordinator
+                .engine
+                .request_inventory_refresh(
+                    owner2,
+                    RefreshCause::ValidatedExec(ExecProof::from_transition(
+                        stale_owner,
+                        transitions[0]
+                    )),
+                )
+                .is_err(),
+            "a proof naming another owner is refused"
+        );
+        assert_eq!(
+            coordinator.engine.inventory_owner_epochs(owner2).unwrap(),
+            before,
+            "a refused proof changes nothing"
+        );
+        // Re-proving the ended owner is idempotent: history stays intact and
+        // no new exact authority is granted.
+        let epochs_before = coordinator.engine.inventory_owner_epochs(owner).unwrap();
+        coordinator
+            .engine
+            .request_inventory_refresh(
+                owner,
+                RefreshCause::ValidatedExec(ExecProof::from_transition(owner, transitions[0])),
+            )
+            .unwrap();
+        assert_eq!(
+            coordinator.engine.inventory_owner_epochs(owner).unwrap(),
+            epochs_before,
+            "re-proving an ended owner changes nothing"
+        );
+        // No guard can resurrect the ended owner: acquisition refuses before
+        // any guard check, so invalidation grants no new exact result and
+        // assigns no Detailed cookie.
+        struct CountingGuard(std::cell::Cell<usize>);
+        impl ImageGuard for CountingGuard {
+            fn check(&mut self, _: &ProcessView, _: ImageIdentity) -> ImageCheck {
+                self.0.set(self.0.get() + 1);
+                ImageCheck::Exact
+            }
+        }
+        let mut counting = CountingGuard(std::cell::Cell::new(0));
+        assert!(
+            coordinator
+                .scan_owner(owner, &mut counting, u64::MAX, now + 200)
+                .is_err(),
+            "an ended owner scans nothing new"
+        );
+        assert_eq!(
+            counting.0.get(),
+            0,
+            "the ended owner refuses before any guard check"
+        );
+        let _ = proof_owner;
     }
 
     #[test]

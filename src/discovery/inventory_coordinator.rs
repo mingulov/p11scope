@@ -35,10 +35,10 @@ use crate::attach::capture::{
 };
 use crate::capacity::InventoryBudget;
 use crate::discovery::caller_registry::{
-    AdmissionState, BudgetRefusal, CallerAdapter, CallerEvent, CallerId, CallerRegistry,
-    CountPublication, CoverageNote, EdgeRecord, ImageAuthority, MappingState, ModuleId, ModuleInfo,
-    ModuleKey, PendingCountOutcome, PendingRejection, ProcessSource, RegistryGap, RegistryLimits,
-    UnknownReason, UseCoverage,
+    AdmissionState, AdmitFailure, BudgetRefusal, CallerAdapter, CallerEvent, CallerId,
+    CallerRegistry, CountPublication, CoverageNote, EdgeRecord, ExeIdentity, ImageAuthority,
+    MappingState, ModuleId, ModuleInfo, ModuleKey, PendingCountOutcome, PendingRejection,
+    ProcessSource, RegistryGap, RegistryLimits, UnknownReason, UseCoverage,
 };
 use crate::discovery::inventory_attach_set::{
     AbsorbOutcome, AttachModuleKey, AttachObjectId, AttachVerdict, ENDPOINT_RESOURCE, EndpointId,
@@ -62,6 +62,7 @@ use crate::inventory_diagnostics::{
 };
 use crate::inventory_semantics::{AttestedSemanticLane, SemanticBatch};
 use crate::scope::inventory_cgroup::{CgroupWalkLimits, CgroupWalkState, CollectionControl};
+use p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
 use p11scope_ebpf_common::inventory_callers::CallerEvidence;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
@@ -182,6 +183,27 @@ impl<Pin> AuthorityResolver<'_, Pin> {
     }
 }
 
+/// One held exec handoff (H6 slice 2): the ended incarnation's identity
+/// and revision, its original held custody, and the native transition
+/// evidence. Minted only by the coordinator's ended-incarnation path
+/// (`apply_exec_transition` via `mint_pending_successor`); committed by
+/// `commit_pending_successor` (or the scoped collection commit) or released
+/// on refusal/stop. Holds no borrowed cgroup permit across async work:
+/// scope proof is borrowed fresh at commit. Move-only: private fields, no
+/// public scalar constructor, `Clone`, `Default`, serialization, or
+/// authority booleans.
+struct PendingExecSuccessor<Pin> {
+    old: CallerId,
+    old_incarnation: u32,
+    pid: u32,
+    custody: Pin,
+    /// Current generation/image reads at mint: commit refuses when they
+    /// moved (a newer image or generation arrived before commit).
+    mint_start: Option<u64>,
+    mint_exe: Option<ExeIdentity>,
+    transition: ExecTransition,
+}
+
 /// The coordinator: an Inventory-policy engine, the caller adapter, and
 /// the caller registry behind one batch boundary, plus the attach set the
 /// catalog's Inventory lowering feeds every pass.
@@ -248,6 +270,18 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     next_pending_id: u64,
     owners: BTreeMap<CallerId, ProcessViewId>,
     pending_owners: BTreeMap<u32, ProcessViewId>,
+    /// Held exec handoffs (H6 slice 2): at most one per ended caller, keyed
+    /// by it — no new unbounded table, one entry per retired caller
+    /// reservation at most. Unscoped handoffs commit immediately; scoped
+    /// ones wait for a fresh collection transaction.
+    pending_successors: BTreeMap<CallerId, PendingExecSuccessor<Source::Pin>>,
+    /// Leader exits already recorded as link loss (H6 slice 2): one entry
+    /// per incarnation at most, never cleared (IDs never reuse).
+    leader_link_loss_noted: BTreeSet<CallerId>,
+    /// Coordinator stop (H6 slice 2): set once, never cleared. No new scan,
+    /// attach, successor/name admission, or retry starts afterwards; staged
+    /// facts still drain through `commit_batch`.
+    stopped: bool,
     cgroup_fence: CgroupFence,
     pending_cgroup: Option<(CgroupCollection, u64)>,
     completed_cgroup: Option<CgroupCompletion>,
@@ -342,6 +376,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             next_pending_id: 0,
             owners: BTreeMap::new(),
             pending_owners: BTreeMap::new(),
+            pending_successors: BTreeMap::new(),
+            leader_link_loss_noted: BTreeSet::new(),
+            stopped: false,
             cgroup_fence: CgroupFence::default(),
             pending_cgroup: None,
             completed_cgroup: None,
@@ -1649,6 +1686,33 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.passes
     }
 
+    /// Refuse one scan pass after `stop` (H6 slice 2): no pass number is
+    /// consumed and nothing is scanned, reconciled, or projected.
+    fn stopped_pass_report(&mut self, what: &str) -> PassReport {
+        self.registry.record_gap(RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "scan refused after stop".into(),
+            reason: format!(
+                "the coordinator stopped; {what} starts no new scan, attach, \
+                 successor admission, or retry"
+            ),
+            budget: None,
+        });
+        PassReport {
+            pass: self.passes,
+            scanned: 0,
+            maps_matched: 0,
+            native_callers: 0,
+            scan_callers: 0,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events: Vec::new(),
+            timings: crate::timing::StageTimings::new(),
+        }
+    }
+
     /// One scan pass: collect the scope, reconcile caller incarnations
     /// (attempting a native owner per newly admitted pid), scan every
     /// native owner through the core, and project scan-lane mappings.
@@ -1779,6 +1843,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         collection: CgroupCollection,
         now_ns: u64,
     ) -> Result<PassReport> {
+        if self.stopped {
+            bail!(
+                "the coordinator stopped; the collection starts no new scan, attach, \
+                 successor admission, or retry"
+            );
+        }
         let Scope::Cgroup { dir, .. } = &self.engine.scope else {
             bail!("scoped cgroup collection cannot apply to a PID/System coordinator");
         };
@@ -1846,6 +1916,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         deadline_ns: u64,
         now_ns: u64,
     ) -> PassReport {
+        if self.stopped {
+            return self.stopped_pass_report("a catalog pass");
+        }
         if matches!(self.engine.scope, Scope::Cgroup { .. }) {
             return self.observe_empty_pass(
                 guard,
@@ -2015,6 +2088,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         reason: &str,
         now_ns: u64,
     ) -> PassReport {
+        if self.stopped {
+            return self.stopped_pass_report("an empty pass");
+        }
         self.count_ownership.begin_catalog_pass();
         let mut resolver = AuthorityResolver {
             engine: &mut self.engine,
@@ -2668,7 +2744,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 self.lifecycle_high_water_bytes = self
                     .lifecycle_high_water_bytes
                     .max(batch.drain_high_water_bytes);
-                self.binder.absorb_lifecycle(&batch)
+                self.binder.absorb_lifecycle(&batch);
+                self.note_leader_exits(&batch);
             }
             NativeBatch::Finish { domain } => self.binder.finish(domain),
             NativeBatch::Semantic(batch) => self.stage_semantic_batch(batch),
@@ -2676,6 +2753,47 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let receipt = self.stage_binder_output(identity, now_ns);
         self.reconcile_count_eligibility(identity, &mut RecoveryWorkBudget::new());
         receipt
+    }
+
+    /// `LEADER_EXIT` records (H6 slice 2): a leader exit whose generation
+    /// pin still holds is link loss, not death — record it once, keep the
+    /// original custody, and make no permanent dead tombstone. A later EXEC
+    /// still renews recovery, in the same or a later batch. Whole-group
+    /// death (a dead pin or no live caller) is reconcile's business, never
+    /// this record's.
+    fn note_leader_exits(&mut self, batch: &DiscoveryBatch) {
+        for record in &batch.records {
+            if record.kind != DISCOVERY_KIND_LEADER_EXIT {
+                continue;
+            }
+            let pid = (record.pid_tgid >> 32) as u32;
+            let Some(caller) = self.adapter.live_id(pid) else {
+                continue;
+            };
+            let holds = self
+                .adapter
+                .live_pin(pid)
+                .is_some_and(|(_, pin)| self.adapter.source().still_the_same(pin));
+            if !holds || !self.leader_link_loss_noted.insert(caller) {
+                continue;
+            }
+            self.registry.record_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: Some(pid),
+                subject: "leader task link loss".into(),
+                reason: "the leader task exited while the generation pin holds (live \
+                     threads); original custody is retained with no tombstone, and a \
+                     later EXEC may renew recovery"
+                    .into(),
+                budget: None,
+            });
+            // Bound callers carry the loss into the commit tail, where H3's
+            // once-per-gap cut fences unpublished semantic positives.
+            if self.semantic_bindings.get(caller).is_some() {
+                self.tail_uncertain.insert(caller);
+            }
+        }
     }
 
     /// The exec-coverage revalidation (C1 ruling): for every domain whose
@@ -4579,10 +4697,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         Ok(modules.into_iter().collect())
     }
 
-    /// A proven exec transition: the incarnation's image ended. A still
-    /// live incarnation retires (exec-retired) and its successor is
-    /// admitted; one the scan lane already retired needs nothing. A native
-    /// owner gets the `ExecProof` the transition carries.
+    /// A proven exec transition: the incarnation's image ended. The
+    /// coordinator's ended-incarnation path mints one held handoff
+    /// (`mint_pending_successor`) and commits it: immediately outside scope
+    /// transactions, at the next fresh collection inside them. One the scan
+    /// lane already retired needs nothing. A native owner gets the
+    /// `ExecProof` the transition carries; a stale owner refuses the whole
+    /// handoff while the old incarnation still retires.
     fn apply_exec_transition(
         &mut self,
         transition: ExecTransition,
@@ -4590,11 +4711,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         now_ns: u64,
     ) -> Vec<CallerEvent> {
         let caller = transition.caller();
+        let transition_pid = transition.pid();
         if matches!(self.engine.scope, Scope::Cgroup { .. }) {
             self.cgroup_fence.invalidate();
         }
         if let Some((collection, _)) = &mut self.pending_cgroup {
-            collection.invalidate(transition.pid());
+            collection.invalidate(transition_pid);
         }
         // The binder emits a transition only for the live incarnation that
         // held the row's tgid, so the pid matches by construction; whether
@@ -4615,11 +4737,41 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             self.registry.record_gap(RegistryGap {
                 caller: Some(caller),
                 module: None,
-                pid: Some(transition.pid()),
+                pid: Some(transition_pid),
                 subject: "native exec proof not applied".into(),
                 reason: format!("{error:#}; the caller incarnation still retires"),
                 budget: None,
             });
+            // A stale owner refuses the handoff: the image end is fact (the
+            // old incarnation retires) but no successor is minted for it.
+            return self.adapter.exec_transition_scoped(caller, now_ns);
+        }
+        if self.stopped {
+            // Stop wins before successor admission: the old incarnation
+            // still retires on the proven image end, but no handoff is
+            // minted and no retry is scheduled.
+            self.registry.record_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: Some(transition_pid),
+                subject: "successor admission refused while stopped".into(),
+                reason: "the coordinator stopped; the proved old incarnation retires \
+                     without a successor and no retry is scheduled"
+                    .into(),
+                budget: None,
+            });
+            return self.adapter.exec_transition_scoped(caller, now_ns);
+        }
+        if self.mint_pending_successor(transition, now_ns).is_none() {
+            // Defensive only: live callers never hold a handoff and never
+            // lack their pin. Refuse rather than double-mint.
+            return self.adapter.exec_transition_scoped(caller, now_ns);
+        }
+        if matches!(self.engine.scope, Scope::Cgroup { .. }) {
+            // An out-of-scope exec ends the old image but cannot admit its
+            // successor: re-entry needs a new current-scope transaction,
+            // which commits the held handoff.
+            return vec![self.adapter.retired_event(caller)];
         }
         let mut resolver = AuthorityResolver {
             engine: &mut self.engine,
@@ -4629,15 +4781,194 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             native_failures: Vec::new(),
             scan_pinned: 0,
         };
-        let events = if matches!(resolver.engine.scope, Scope::Cgroup { .. }) {
-            self.adapter.exec_transition_scoped(caller, now_ns)
-        } else {
-            self.adapter
-                .exec_transition(caller, &mut |pid| resolver.resolve(pid), now_ns)
-        };
+        let authority = resolver.resolve(transition_pid);
         let (native_failures, scan_pinned) = resolver.finish();
         self.record_authority_gaps(native_failures, scan_pinned);
-        events
+        self.commit_pending_successor(caller, authority, now_ns)
+    }
+
+    /// Mint one held exec handoff for a proven transition (H6 slice 2).
+    /// The sole minter: `apply_exec_transition` is the only caller. The
+    /// original held pin moves into the handoff first, then the old
+    /// incarnation retires; at most one handoff per ended caller. `None`
+    /// when one is already held or custody is gone (both defensive: live
+    /// callers hold neither state).
+    fn mint_pending_successor(&mut self, transition: ExecTransition, now_ns: u64) -> Option<()> {
+        let caller = transition.caller();
+        if self.pending_successors.contains_key(&caller) {
+            self.registry.record_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: Some(transition.pid()),
+                subject: "duplicate exec handoff refused".into(),
+                reason: "an exec handoff is already held for this caller; \
+                     at most one successor commits per ended caller"
+                    .into(),
+                budget: None,
+            });
+            return None;
+        }
+        let Some((pid, pin)) = self.adapter.retire_for_exec_handoff(caller, now_ns) else {
+            self.registry.record_gap(RegistryGap {
+                caller: Some(caller),
+                module: None,
+                pid: Some(transition.pid()),
+                subject: "exec handoff without custody refused".into(),
+                reason: "the live incarnation holds no pin to hand over; \
+                     the successor is never reopened by scalar PID"
+                    .into(),
+                budget: None,
+            });
+            return None;
+        };
+        let old_incarnation = self
+            .adapter
+            .record(caller)
+            .expect("the retired caller retains its record")
+            .incarnation;
+        self.pending_successors.insert(
+            caller,
+            PendingExecSuccessor {
+                old: caller,
+                old_incarnation,
+                pid,
+                custody: pin,
+                mint_start: self.adapter.source().start_time(pid),
+                mint_exe: self.adapter.source().exe_identity(pid),
+                transition,
+            },
+        );
+        Some(())
+    }
+
+    /// Commit one held exec handoff: the fresh admission transaction (H6
+    /// slice 2). Unscoped commits run here; the scoped collection commit
+    /// verifies through `verify_pending_successor` under its own permit.
+    /// The handoff is consumed either way; every refusal is an honest
+    /// event, never silent.
+    fn commit_pending_successor(
+        &mut self,
+        old: CallerId,
+        authority: ImageAuthority,
+        now_ns: u64,
+    ) -> Vec<CallerEvent> {
+        let Some(pending) = self.pending_successors.remove(&old) else {
+            return Vec::new();
+        };
+        let pid = pending.pid;
+        match self.verify_pending_successor(&pending) {
+            Ok(Some(_)) => {
+                // An already-admitted same-incarnation candidate stands on
+                // its own admission; the handoff links to it by retirement
+                // order (same pid, next incarnation) without minting again.
+                Vec::new()
+            }
+            Ok(None) => {
+                match self
+                    .adapter
+                    .admit_retained_successor(pid, pending.custody, authority, now_ns)
+                {
+                    Ok(new) => vec![CallerEvent::ExecRetired { old, new }],
+                    Err(failure) => vec![CallerEvent::AdmitFailed {
+                        pid,
+                        reason: format!("post-exec re-admission failed: {}", failure.reason),
+                        budget: failure.budget,
+                    }],
+                }
+            }
+            Err(failure) => vec![CallerEvent::AdmitFailed {
+                pid,
+                reason: failure.reason,
+                budget: failure.budget,
+            }],
+        }
+    }
+
+    /// Verify one held handoff against current truth (H6 slice 2): the
+    /// ended incarnation is unchanged since mint, original custody still
+    /// holds the same process, and no newer image or generation arrived
+    /// before commit. Returns the adoptable live candidate when one
+    /// already holds this pid's current incarnation — pid equality alone
+    /// never selects it.
+    fn verify_pending_successor(
+        &self,
+        pending: &PendingExecSuccessor<Source::Pin>,
+    ) -> Result<Option<CallerId>, AdmitFailure> {
+        let failed = |reason: &str| AdmitFailure {
+            reason: reason.into(),
+            budget: None,
+        };
+        // The held evidence names this handoff's ended incarnation (the
+        // binder's domain-carrying proof; never rendered, only matched).
+        if pending.transition.caller() != pending.old || pending.transition.pid() != pending.pid {
+            return Err(failed(
+                "stale exec handoff: the held transition names another incarnation",
+            ));
+        }
+        let unchanged = self.adapter.record(pending.old).is_some_and(|record| {
+            record.retired
+                && record.pid == pending.pid
+                && record.incarnation == pending.old_incarnation
+        });
+        if !unchanged {
+            return Err(failed(
+                "stale exec handoff: the ended incarnation changed since the handoff was minted",
+            ));
+        }
+        if !self.adapter.source().still_the_same(&pending.custody) {
+            return Err(failed(
+                "original process custody lost: the process exited or the pid was reused",
+            ));
+        }
+        if self.adapter.source().start_time(pending.pid) != pending.mint_start
+            || self.adapter.source().exe_identity(pending.pid) != pending.mint_exe
+        {
+            return Err(failed(
+                "stale exec handoff: a newer image or generation arrived before commit; \
+                 the stale candidate is rejected and the renewed request services separately",
+            ));
+        }
+        if let Some(live) = self.adapter.live_id(pending.pid) {
+            let adoptable = self.adapter.record(live).is_some_and(|record| {
+                !record.retired
+                    && record.start_time == pending.mint_start
+                    && record.exe == pending.mint_exe
+            });
+            if !adoptable {
+                return Err(failed(
+                    "the pid's live caller is not this handoff's current incarnation; \
+                     pid equality alone never adopts it",
+                ));
+            }
+            return Ok(Some(live));
+        }
+        Ok(None)
+    }
+
+    /// Stop the coordinator (H6 slice 2): no new scan, attach,
+    /// successor/name admission, or retry starts afterwards. Held exec
+    /// handoffs release their custody now; staged facts still drain
+    /// through `commit_batch`.
+    pub(crate) fn stop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+        let held = self.pending_successors.len();
+        self.pending_successors.clear();
+        if held > 0 {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "held exec handoffs released at stop".into(),
+                reason: format!(
+                    "{held} held exec handoff(s) released their custody at stop; \
+                     no successor commits and no retry is scheduled"
+                ),
+                budget: None,
+            });
+        }
     }
 
     /// The I4b batch: the engine tail and the registry publish as one
@@ -5635,6 +5966,21 @@ pub(crate) mod tests {
             RegistryLimits::default_limits(),
         )
         .unwrap()
+    }
+
+    /// Heap-built PID-scope coordinator (H6 slice 2 oracles): see
+    /// `NativeScene::boxed` for why multi-scene oracles box.
+    fn boxed_os_coordinator(pid: u32) -> Box<InventoryCoordinator<OsProcessSource>> {
+        Box::new(
+            InventoryCoordinator::new(
+                Scope::Pid(pid),
+                HookRegistry::builtin(),
+                Vec::new(),
+                OsProcessSource,
+                RegistryLimits::default_limits(),
+            )
+            .unwrap(),
+        )
     }
 
     #[test]
@@ -9427,6 +9773,44 @@ pub(crate) mod tests {
             events.extend(self.read(Vec::new()).events);
             self.scene.coordinator.commit_batch(false).unwrap();
             events
+        }
+
+        /// Heap-built scene (H6 slice 2 oracles): the ~54 KiB scene
+        /// value is constructed and boxed inside this call, so only the
+        /// box lives in the oracle's frame and multi-scene oracles fit
+        /// the default test stack (debug builds retain every local's
+        /// slot, so inline scenes would overflow it).
+        pub(super) fn boxed() -> (Box<NativeScene>, CallerId) {
+            let (scene, caller) = NativeScene::new();
+            (Box::new(scene), caller)
+        }
+
+        /// Drive `rows` through the binder only (H6 slice 2): no
+        /// coordinator staging runs, so the caller captures proven
+        /// transitions for manual application. Returns what the binder
+        /// proved, in emission order.
+        pub(super) fn binder_only(&mut self, rows: Vec<WitnessRow>) -> Vec<ExecTransition> {
+            for batch in [
+                self.stamps.read(self.domain, rows),
+                self.stamps.drain(self.domain),
+                self.stamps.read(self.domain, Vec::new()),
+            ] {
+                match batch {
+                    NativeBatch::Witness(read) => {
+                        let coordinator = &mut self.scene.coordinator;
+                        coordinator.binder.absorb_witnesses(
+                            &read,
+                            &coordinator.adapter,
+                            &mut self.cookies,
+                        );
+                    }
+                    NativeBatch::Lifecycle(drain) => {
+                        self.scene.coordinator.binder.absorb_lifecycle(&drain);
+                    }
+                    _ => unreachable!("scripted read/drain only"),
+                }
+            }
+            self.scene.coordinator.binder.take_transitions()
         }
 
         pub(super) fn module_unbound(&self) -> Option<UnboundUse> {
@@ -13243,43 +13627,864 @@ pub(crate) mod tests {
     /// transition creates no second successor.
     #[test]
     fn automatic_exec_successor_keeps_original_custody() {
+        // Scenes are boxed below: each coordinator value is ~54 KiB and
+        // debug builds retain every local's stack slot, so the oracle's
+        // scenes live on the heap to fit the default test stack.
         use crate::discovery::native_binding::CallerLookup;
+        let pid = std::process::id();
+        let now = crate::discovery::caller_registry::now_ns();
 
         // Native proof with reopen poisoned: the successor admits on the
         // original held pin, with no numeric reopen attempted.
-        let (mut native, caller) = NativeScene::new();
-        native.scene.source.exec(7, 200, "/bin/other");
-        native.scene.source.poison_reopen();
-        let opens_before = native.scene.source.reopen_attempts();
+        {
+            let (mut native, caller) = NativeScene::boxed();
+            native.scene.source.exec(7, 200, "/bin/other");
+            native.scene.source.poison_reopen();
+            let opens_before = native.scene.source.reopen_attempts();
+            native.answer(7, 500, 41);
+            let first = native.row(41, 1, 7, 100, 0);
+            native.witness(vec![first]);
+            let later = native.row(41, 2, 7, 1_100, 1);
+            let events = native.witness(vec![later]);
+            let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+                panic!("poisoned reopen must still admit the successor: {events:?}");
+            };
+            assert_eq!(*old, caller);
+            let adapter = &native.scene.coordinator.adapter;
+            assert!(adapter.record(caller).unwrap().retired);
+            assert_eq!(adapter.live_id(7), Some(*new));
+            let successor = adapter.record(*new).unwrap();
+            assert_eq!(successor.start_time, Some(500), "same process");
+            assert_eq!(successor.incarnation, 1);
+            assert_eq!(
+                successor.exe.as_ref().unwrap().path.as_deref(),
+                Some("/bin/other"),
+                "the successor carries the current image"
+            );
+            let (_, pin) = adapter.live_pin(7).unwrap();
+            assert_eq!(*pin, (7, 500), "the original held pin moves over");
+            assert_eq!(
+                native.scene.source.reopen_attempts(),
+                opens_before,
+                "no numeric-PID reopen during the handoff"
+            );
+            assert_eq!(
+                native.scene.coverage(caller),
+                UseCoverage::Counted {
+                    since_ns: 100,
+                    lossy: false
+                },
+                "the old image keeps its count"
+            );
+        }
+
+        // Scan-proven exec with reopen poisoned: same retained custody.
+        {
+            let (mut scan, caller) = NativeScene::boxed();
+            scan.scene.source.exec(7, 200, "/bin/other");
+            scan.scene.source.poison_reopen();
+            let opens_before = scan.scene.source.reopen_attempts();
+            let observed: BTreeSet<u32> = [7].into_iter().collect();
+            let events = scan.scene.coordinator.adapter.reconcile(
+                &observed,
+                &mut |_| ImageAuthority::ScanPinned,
+                1_200,
+            );
+            let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+                panic!("poisoned scan handoff must still admit: {events:?}");
+            };
+            assert_eq!(*old, caller);
+            let adapter = &scan.scene.coordinator.adapter;
+            assert_eq!(adapter.live_id(7), Some(*new));
+            assert_eq!(adapter.live_pin(7).unwrap().1, &(7, 500));
+            assert_eq!(
+                scan.scene.source.reopen_attempts(),
+                opens_before,
+                "scan handoff never reopens by PID"
+            );
+        }
+
+        // Same-file reexec: the scan lane sees no change and splits
+        // nothing; actual native evidence still establishes the transition.
+        {
+            let (mut same, caller) = NativeScene::boxed();
+            same.scene.source.poison_reopen();
+            let observed: BTreeSet<u32> = [7].into_iter().collect();
+            let events = same.scene.coordinator.adapter.reconcile(
+                &observed,
+                &mut |_| ImageAuthority::ScanPinned,
+                1_200,
+            );
+            assert!(events.is_empty(), "{events:?}");
+            assert_eq!(same.scene.coordinator.adapter.live_id(7), Some(caller));
+            same.answer(7, 500, 41);
+            same.witness(vec![same.row(41, 1, 7, 100, 0)]);
+            let events = same.witness(vec![same.row(41, 2, 7, 1_100, 1)]);
+            assert!(
+                matches!(events.as_slice(), [CallerEvent::ExecRetired { old, .. }] if *old == caller),
+                "{events:?}"
+            );
+            let adapter = &same.scene.coordinator.adapter;
+            let successor = adapter.record(adapter.live_id(7).unwrap()).unwrap();
+            assert_eq!(
+                successor.exe,
+                adapter.record(caller).unwrap().exe,
+                "same-file successor keeps the shared exe identity"
+            );
+        }
+
+        // Changed process refuses: a dead pin ends the old incarnation but
+        // mints no successor, attempts no reopen, and the reused pid later
+        // admits fresh with no inherited history.
+        {
+            let (mut dead, caller) = NativeScene::boxed();
+            dead.scene.source.poison_reopen();
+            dead.scene.source.kill(7);
+            let opens_before = dead.scene.source.reopen_attempts();
+            let events = dead.scene.coordinator.adapter.exec_transition(
+                caller,
+                &mut |_| ImageAuthority::ScanPinned,
+                2_000,
+            );
+            let [
+                CallerEvent::AdmitFailed {
+                    pid,
+                    reason,
+                    budget,
+                },
+            ] = events.as_slice()
+            else {
+                panic!("a dead pin must refuse the successor: {events:?}");
+            };
+            assert_eq!(*pid, 7);
+            assert!(
+                reason.contains("custody lost"),
+                "the refusal names custody, not a pin failure: {reason}"
+            );
+            assert_eq!(*budget, None);
+            assert_eq!(
+                dead.scene.source.reopen_attempts(),
+                opens_before,
+                "no reopen is attempted without custody"
+            );
+            let adapter = &dead.scene.coordinator.adapter;
+            assert!(adapter.record(caller).unwrap().retired);
+            assert_eq!(adapter.live_id(7), None);
+            assert_eq!(adapter.len(), 1, "no successor incarnation was minted");
+        }
+
+        // Caller budget N/N+1 at the shared reservation: N works, N+1
+        // refuses with the exact requested occupancy.
+        {
+            let (mut full, caller) = NativeScene::boxed();
+            full.scene.coordinator.adapter.set_max_callers(2);
+            full.scene.source.spawn(8, 600);
+            full.scene
+                .coordinator
+                .adapter
+                .admit(8, ImageAuthority::ScanPinned, 60)
+                .unwrap();
+            let events = full.scene.coordinator.adapter.exec_transition(
+                caller,
+                &mut |_| ImageAuthority::ScanPinned,
+                2_000,
+            );
+            let [CallerEvent::AdmitFailed { budget, .. }] = events.as_slice() else {
+                panic!("a full budget must refuse the successor: {events:?}");
+            };
+            assert_eq!(
+                budget.unwrap(),
+                BudgetRefusal {
+                    resource: "callers",
+                    limit: 2,
+                    requested: 3,
+                }
+            );
+            assert_eq!(
+                full.scene.coordinator.adapter.admit_refused(),
+                1,
+                "the refusal counts exactly once"
+            );
+            let (mut roomy, caller) = NativeScene::boxed();
+            roomy.scene.coordinator.adapter.set_max_callers(3);
+            roomy.scene.source.spawn(8, 600);
+            roomy
+                .scene
+                .coordinator
+                .adapter
+                .admit(8, ImageAuthority::ScanPinned, 60)
+                .unwrap();
+            let events = roomy.scene.coordinator.adapter.exec_transition(
+                caller,
+                &mut |_| ImageAuthority::ScanPinned,
+                2_000,
+            );
+            assert!(
+                matches!(events.as_slice(), [CallerEvent::ExecRetired { .. }]),
+                "{events:?}"
+            );
+            assert_eq!(roomy.scene.coordinator.adapter.len(), 3);
+        }
+
+        // Mismatched current-image queries refuse: wrong exec, wrong pid,
+        // foreign domain, and a post-admission exec record.
+        {
+            let (mut current, caller) = NativeScene::boxed();
+            current.answer(7, 500, 41);
+            current.witness(vec![current.row(41, 1, 7, 100, 0)]);
+            let image = DomainCookie::scripted(current.domain, 41);
+            let request = |exec_id: u64, pid: u32| CurrentBindingRequest {
+                caller,
+                pid,
+                image,
+                exec_id,
+            };
+            let sight = |scene: &mut NativeScene, req: CurrentBindingRequest| {
+                let coordinator = &scene.scene.coordinator;
+                let lookup = &coordinator.adapter as &dyn CallerLookup<(u32, u64)>;
+                coordinator
+                    .binder
+                    .sight_current_binding(req, lookup, &mut scene.cookies)
+            };
+            // CurrentBindingSighting carries no Debug by design; match instead.
+            let refused =
+                |scene: &mut NativeScene, req: CurrentBindingRequest| match sight(scene, req) {
+                    Err(reason) => reason,
+                    Ok(_) => panic!("a mismatched current image must refuse"),
+                };
+            assert_eq!(
+                refused(&mut current, request(2, 7)),
+                UnboundReason::ExecAmbiguous,
+                "a mismatched exec refuses"
+            );
+            assert_eq!(
+                refused(&mut current, request(1, 999)),
+                UnboundReason::NoLiveCaller,
+                "a mismatched pid refuses"
+            );
+            let foreign = DomainCookie::scripted(NativeDomainId::mint(), 41);
+            assert_eq!(
+                refused(
+                    &mut current,
+                    CurrentBindingRequest {
+                        caller,
+                        pid: 7,
+                        image: foreign,
+                        exec_id: 1
+                    }
+                ),
+                UnboundReason::EvidenceIncomplete,
+                "a foreign domain proves nothing here"
+            );
+            current
+                .scene
+                .coordinator
+                .binder
+                .set_current_binding_clock(|| Some(1_005));
+            let sighted = match sight(&mut current, request(1, 7)) {
+                Ok(sighted) => sighted,
+                Err(reason) => panic!("the matched current image must sight: {reason:?}"),
+            };
+            assert!(
+                matches!(
+                    current
+                        .scene
+                        .coordinator
+                        .binder
+                        .check_current_binding(&sighted),
+                    CurrentBindingCheck::Proven
+                ),
+                "the matched current image proves"
+            );
+            // SAFETY: DiscoveryRecord contains only integer fields.
+            let mut exec_record: p11scope_ebpf_common::DiscoveryRecord =
+                unsafe { std::mem::zeroed() };
+            exec_record.hook_ts_ns = 60;
+            exec_record.pid_tgid = (u64::from(7u32) << 32) | u64::from(7u32);
+            exec_record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+            let at = current.stamps.tick();
+            current.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+                current.domain,
+                vec![exec_record],
+                at,
+            )));
+            assert_eq!(
+                refused(&mut current, request(1, 7)),
+                UnboundReason::ExecAfterAdmission,
+                "an exec record after admission refuses the old proof"
+            );
+        }
+
+        // Colliding numeric cookies across domains never join: a Detailed
+        // transition for pid 7 leaves the Inventory-bound pid 8 alone, and
+        // pid 8 keeps binding its own ticket afterwards.
+        {
+            let (mut split, caller) = NativeScene::boxed();
+            let detailed = split.domain;
+            split.scene.source.spawn(8, 600);
+            let caller8 = split
+                .scene
+                .coordinator
+                .adapter
+                .admit(8, ImageAuthority::ScanPinned, 150)
+                .unwrap();
+            let inventory = NativeDomainId::mint();
+            split
+                .scene
+                .coordinator
+                .binder
+                .note_exec_coverage(ExecCoverage::scripted(inventory, 0));
+            split.cookies.answers.insert(
+                ((8, 600), inventory),
+                CookieQuery::Cookie(DomainCookie::scripted(inventory, 41)),
+            );
+            let endpoint = split.scene.delta.endpoints[0];
+            let bind8 =
+                WitnessRow::scripted(inventory, 41, 1, endpoint.object, endpoint.id, 8, 200);
+            split.stage(split.stamps.read(inventory, vec![bind8]));
+            split.stage(split.stamps.drain(inventory));
+            split.stage(split.stamps.read(inventory, Vec::new()));
+            split.scene.coordinator.commit_batch(false).unwrap();
+            assert_eq!(
+                split.scene.coordinator.binder.census().bound,
+                1,
+                "pid 8 binds ticket 41 in the Inventory domain"
+            );
+            split.answer(7, 500, 41);
+            split.witness(vec![split.row(41, 1, 7, 100, 0)]);
+            let events = split.witness(vec![split.row(41, 2, 7, 1_100, 1)]);
+            assert!(
+                matches!(events.as_slice(), [CallerEvent::ExecRetired { old, .. }] if *old == caller),
+                "{events:?}"
+            );
+            assert_eq!(
+                split.scene.coordinator.adapter.live_id(8),
+                Some(caller8),
+                "the Detailed transition touches no Inventory caller"
+            );
+            assert_eq!(
+                split.scene.coordinator.adapter.live_id(7).unwrap(),
+                match events.as_slice() {
+                    [CallerEvent::ExecRetired { new, .. }] => *new,
+                    _ => unreachable!(),
+                }
+            );
+            let _ = detailed;
+        }
+
+        // Held handoff, changed process: the generation turns over while
+        // the handoff is held, so commit refuses with custody lost and the
+        // handoff is consumed without minting.
+        {
+            let (mut held, caller) = NativeScene::boxed();
+            held.answer(7, 500, 41);
+            held.witness(vec![held.row(41, 1, 7, 100, 0)]);
+            let captured = held.binder_only(vec![held.row(41, 2, 7, 1_100, 1)]);
+            assert_eq!(captured.len(), 1);
+            assert!(
+                held.scene
+                    .coordinator
+                    .mint_pending_successor(captured[0], 1_200)
+                    .is_some()
+            );
+            assert!(
+                held.scene
+                    .coordinator
+                    .pending_successors
+                    .contains_key(&caller),
+                "the handoff is held, not committed"
+            );
+            held.scene.source.kill(7);
+            held.scene.source.spawn(7, 900);
+            let events = held.scene.coordinator.commit_pending_successor(
+                caller,
+                ImageAuthority::ScanPinned,
+                1_300,
+            );
+            let [CallerEvent::AdmitFailed { reason, .. }] = events.as_slice() else {
+                panic!("a turned-over generation must refuse: {events:?}");
+            };
+            assert!(reason.contains("custody lost"), "{reason}");
+            assert!(
+                held.scene.coordinator.pending_successors.is_empty(),
+                "a refused handoff is consumed"
+            );
+            assert_eq!(held.scene.coordinator.adapter.live_id(7), None);
+            assert_eq!(held.scene.coordinator.adapter.len(), 1);
+        }
+
+        // Held handoff, newer image: a second exec before commit rejects
+        // the stale candidate; the renewed request services separately.
+        {
+            let (mut stale, caller) = NativeScene::boxed();
+            stale.answer(7, 500, 41);
+            stale.witness(vec![stale.row(41, 1, 7, 100, 0)]);
+            let captured = stale.binder_only(vec![stale.row(41, 2, 7, 1_100, 1)]);
+            stale
+                .scene
+                .coordinator
+                .mint_pending_successor(captured[0], 1_200)
+                .unwrap();
+            stale.scene.source.exec(7, 300, "/bin/newer");
+            let events = stale.scene.coordinator.commit_pending_successor(
+                caller,
+                ImageAuthority::ScanPinned,
+                1_300,
+            );
+            let [CallerEvent::AdmitFailed { reason, .. }] = events.as_slice() else {
+                panic!("a newer image before commit must refuse: {events:?}");
+            };
+            assert!(reason.contains("newer image"), "{reason}");
+        }
+
+        // Held handoff, clean commit: the manually held handoff commits to
+        // exactly one successor on original custody.
+        {
+            let (mut manual, caller) = NativeScene::boxed();
+            manual.answer(7, 500, 41);
+            manual.witness(vec![manual.row(41, 1, 7, 100, 0)]);
+            let captured = manual.binder_only(vec![manual.row(41, 2, 7, 1_100, 1)]);
+            manual
+                .scene
+                .coordinator
+                .mint_pending_successor(captured[0], 1_200)
+                .unwrap();
+            let events = manual.scene.coordinator.commit_pending_successor(
+                caller,
+                ImageAuthority::ScanPinned,
+                1_300,
+            );
+            let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+                panic!("a clean held handoff must commit: {events:?}");
+            };
+            assert_eq!(*old, caller);
+            assert_eq!(manual.scene.coordinator.adapter.live_id(7), Some(*new));
+            assert!(manual.scene.coordinator.pending_successors.is_empty());
+            assert!(
+                manual
+                    .scene
+                    .coordinator
+                    .mint_pending_successor(captured[0], 1_400)
+                    .is_none(),
+                "no second handoff for an ended caller"
+            );
+        }
+
+        // Delayed proof from a second domain allocates no second
+        // successor: both transitions name the old incarnation, the first
+        // commits, and the replayed/delayed remainder changes nothing.
+        {
+            let (mut two, caller) = NativeScene::boxed();
+            let second = NativeDomainId::mint();
+            two.scene
+                .coordinator
+                .binder
+                .note_exec_coverage(ExecCoverage::scripted(second, 0));
+            two.cookies.answers.insert(
+                ((7, 500), second),
+                CookieQuery::Cookie(DomainCookie::scripted(second, 41)),
+            );
+            two.answer(7, 500, 41);
+            two.witness(vec![two.row(41, 1, 7, 100, 0)]);
+            let endpoint = two.scene.delta.endpoints[0];
+            let other = WitnessRow::scripted(second, 41, 1, endpoint.object, endpoint.id, 7, 100);
+            two.stage(two.stamps.read(second, vec![other]));
+            two.stage(two.stamps.drain(second));
+            two.stage(two.stamps.read(second, Vec::new()));
+            two.scene.coordinator.commit_batch(false).unwrap();
+            let first = two.binder_only(vec![two.row(41, 2, 7, 1_100, 1)]);
+            assert_eq!(first.len(), 1);
+            let proving =
+                WitnessRow::scripted(second, 41, 2, endpoint.object, endpoint.id, 7, 1_100);
+            let batches = [
+                two.stamps.read(second, vec![proving]),
+                two.stamps.drain(second),
+                two.stamps.read(second, Vec::new()),
+            ];
+            for batch in batches {
+                match batch {
+                    NativeBatch::Witness(read) => {
+                        let coordinator = &mut two.scene.coordinator;
+                        coordinator.binder.absorb_witnesses(
+                            &read,
+                            &coordinator.adapter,
+                            &mut two.cookies,
+                        );
+                    }
+                    NativeBatch::Lifecycle(drain) => {
+                        two.scene.coordinator.binder.absorb_lifecycle(&drain);
+                    }
+                    _ => unreachable!("scripted read/drain only"),
+                }
+            }
+            let delayed = two.scene.coordinator.binder.take_transitions();
+            assert_eq!(delayed.len(), 1, "the second domain proves independently");
+            assert_eq!(delayed[0].caller(), caller);
+            let events =
+                two.scene
+                    .coordinator
+                    .apply_exec_transition(first[0], &mut two.cookies, 1_200);
+            assert!(
+                matches!(events.as_slice(), [CallerEvent::ExecRetired { old, .. }] if *old == caller),
+                "{events:?}"
+            );
+            let events =
+                two.scene
+                    .coordinator
+                    .apply_exec_transition(delayed[0], &mut two.cookies, 1_300);
+            assert!(events.is_empty(), "delayed proof mints nothing: {events:?}");
+            let events =
+                two.scene
+                    .coordinator
+                    .apply_exec_transition(first[0], &mut two.cookies, 1_400);
+            assert!(
+                events.is_empty(),
+                "replayed proof mints nothing: {events:?}"
+            );
+            assert_eq!(two.scene.coordinator.adapter.len(), 2);
+        }
+
+        // Stale owner refuses the handoff: a desynced owner mapping ends
+        // the old incarnation without minting, and the real owner is
+        // untouched.
+        {
+            let mut stale_owner = boxed_os_coordinator(pid);
+            let caller = stale_owner
+                .test_open_native_owner(pid, fixture_image(pid).unwrap(), &mut FixtureImages, now)
+                .unwrap();
+            let owner = stale_owner.owner_of(caller).unwrap();
+            stale_owner.owners.insert(caller, ProcessViewId(999_999));
+            let domain = NativeDomainId::mint();
+            let mut identity = OneTicket { domain, ticket: 41 };
+            let object = crate::discovery::inventory_attach_set::AttachObjectId::scripted(0);
+            let stamps = Stamps::from(now);
+            stale_owner
+                .binder
+                .note_exec_coverage(ExecCoverage::scripted(domain, 0));
+            let mut stage = |coordinator: &mut InventoryCoordinator<OsProcessSource>,
+                             rows: Vec<WitnessRow>| {
+                let mut events = Vec::new();
+                for batch in [
+                    stamps.read(domain, rows),
+                    stamps.drain(domain),
+                    stamps.read(domain, Vec::new()),
+                ] {
+                    events.extend(
+                        coordinator
+                            .stage_native(batch, &mut identity, now + 10)
+                            .events,
+                    );
+                }
+                events
+            };
+            assert!(
+                stage(
+                    &mut stale_owner,
+                    vec![WitnessRow::scripted(
+                        domain,
+                        41,
+                        1,
+                        object,
+                        EndpointId(0),
+                        pid,
+                        now + 1
+                    )]
+                )
+                .is_empty()
+            );
+            let events = stage(
+                &mut stale_owner,
+                vec![WitnessRow::scripted(
+                    domain,
+                    41,
+                    2,
+                    object,
+                    EndpointId(1),
+                    pid,
+                    now + 2,
+                )],
+            );
+            assert!(
+                matches!(events.as_slice(), [CallerEvent::Retired { id, .. }] if *id == caller),
+                "a stale owner retires without a successor: {events:?}"
+            );
+            stale_owner.commit_batch(false).unwrap();
+            assert!(
+                stale_owner
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .any(|gap| gap.subject == "native exec proof not applied"),
+                "the stale handoff records its refusal"
+            );
+            assert_eq!(stale_owner.adapter.live_id(pid), None);
+            assert_eq!(stale_owner.adapter.len(), 1);
+            assert_eq!(
+                stale_owner
+                    .engine
+                    .inventory_owner_epochs(owner)
+                    .unwrap()
+                    .image_state,
+                ImageCheck::Exact,
+                "the real owner is untouched by the desync"
+            );
+        }
+
+        // Exhausted owner revision refuses permanently with history
+        // intact: the old incarnation retires, nothing is minted, and the
+        // owner stays readable.
+        {
+            let mut exhausted = boxed_os_coordinator(pid);
+            let object = crate::discovery::inventory_attach_set::AttachObjectId::scripted(0);
+            let stamps = Stamps::from(now);
+            let caller = exhausted
+                .test_open_native_owner(pid, fixture_image(pid).unwrap(), &mut FixtureImages, now)
+                .unwrap();
+            let owner = exhausted.owner_of(caller).unwrap();
+            exhausted.engine.test_exhaust_owner_revision(owner).unwrap();
+            let domain = NativeDomainId::mint();
+            let mut identity = OneTicket { domain, ticket: 41 };
+            exhausted
+                .binder
+                .note_exec_coverage(ExecCoverage::scripted(domain, 0));
+            let mut stage = |coordinator: &mut InventoryCoordinator<OsProcessSource>,
+                             rows: Vec<WitnessRow>| {
+                let mut events = Vec::new();
+                for batch in [
+                    stamps.read(domain, rows),
+                    stamps.drain(domain),
+                    stamps.read(domain, Vec::new()),
+                ] {
+                    events.extend(
+                        coordinator
+                            .stage_native(batch, &mut identity, now + 10)
+                            .events,
+                    );
+                }
+                events
+            };
+            assert!(
+                stage(
+                    &mut exhausted,
+                    vec![WitnessRow::scripted(
+                        domain,
+                        41,
+                        1,
+                        object,
+                        EndpointId(0),
+                        pid,
+                        now + 1
+                    )]
+                )
+                .is_empty()
+            );
+            let events = stage(
+                &mut exhausted,
+                vec![WitnessRow::scripted(
+                    domain,
+                    41,
+                    2,
+                    object,
+                    EndpointId(1),
+                    pid,
+                    now + 2,
+                )],
+            );
+            assert!(
+                matches!(events.as_slice(), [CallerEvent::Retired { id, .. }] if *id == caller),
+                "an exhausted revision retires without a successor: {events:?}"
+            );
+            exhausted.commit_batch(false).unwrap();
+            assert!(
+                exhausted
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .any(|gap| gap.subject == "native exec proof not applied"),
+                "the exhausted handoff records its refusal"
+            );
+            assert!(exhausted.engine.inventory_owner_epochs(owner).is_ok());
+        }
+
+        // Stop wins before successor admission: a held handoff releases
+        // its custody at stop and no commit follows.
+        {
+            let (mut held_stop, caller) = NativeScene::boxed();
+            held_stop.answer(7, 500, 41);
+            held_stop.witness(vec![held_stop.row(41, 1, 7, 100, 0)]);
+            let captured = held_stop.binder_only(vec![held_stop.row(41, 2, 7, 1_100, 1)]);
+            held_stop
+                .scene
+                .coordinator
+                .mint_pending_successor(captured[0], 1_200)
+                .unwrap();
+            held_stop.scene.coordinator.stop();
+            assert!(
+                held_stop.scene.coordinator.pending_successors.is_empty(),
+                "stop releases held handoffs"
+            );
+            assert!(
+                held_stop
+                    .scene
+                    .coordinator
+                    .commit_pending_successor(caller, ImageAuthority::ScanPinned, 1_300)
+                    .is_empty(),
+                "no commit after the release"
+            );
+            held_stop.scene.coordinator.commit_batch(false).unwrap();
+            assert!(
+                held_stop
+                    .gap_subjects()
+                    .iter()
+                    .any(|subject| subject == "held exec handoffs released at stop"),
+                "the release is recorded"
+            );
+        }
+
+        // Stop wins before successor admission and new scans: the proved
+        // old incarnation still retires, no successor is minted, new
+        // passes refuse without consuming a pass number, and staged facts
+        // still drain.
+        {
+            let (mut stopped, caller) = NativeScene::boxed();
+            stopped.answer(7, 500, 41);
+            stopped.witness(vec![stopped.row(41, 1, 7, 100, 0)]);
+            stopped.scene.coordinator.stop();
+            stopped.scene.coordinator.stop();
+            let events = stopped.witness(vec![stopped.row(41, 2, 7, 1_100, 1)]);
+            assert!(
+                matches!(events.as_slice(), [CallerEvent::Retired { id, .. }] if *id == caller),
+                "stop retires the proved caller without a successor: {events:?}"
+            );
+            assert_eq!(stopped.scene.coordinator.adapter.live_id(7), None);
+            assert_eq!(stopped.scene.coordinator.adapter.len(), 1);
+            let passes_before = stopped.scene.coordinator.passes();
+            let report = stopped.scene.coordinator.observe_empty_pass(
+                &mut super::inventory::UnavailableImageGuard,
+                &mut stopped.cookies,
+                "post-stop pass",
+                1_500,
+            );
+            assert_eq!(report.scanned, 0);
+            assert!(report.events.is_empty());
+            assert_eq!(report.pass, passes_before);
+            assert_eq!(
+                stopped.scene.coordinator.passes(),
+                passes_before,
+                "a refused pass consumes no pass number"
+            );
+            stopped.scene.coordinator.commit_batch(false).unwrap();
+            let subjects = stopped.gap_subjects();
+            for want in [
+                "successor admission refused while stopped",
+                "scan refused after stop",
+            ] {
+                assert!(
+                    subjects.iter().any(|subject| subject == want),
+                    "the refusal is recorded: {subjects:?}"
+                );
+            }
+        }
+    }
+
+    /// H6 slice 2: leader exit with live sibling keeps original custody and
+    /// explicit link loss; later EXEC in the same and a later batch restores
+    /// useful endpoints. Whole-group death and delayed pre-admission EXEC
+    /// for reused PID cannot attach. Owned-initial-exec acknowledgement
+    /// happens exactly once.
+    #[test]
+    fn automatic_exec_live_group_exit_then_exec_recovers() {
+        // Leader exit with a live sibling: explicit link loss once, custody
+        // kept, no tombstone, sibling untouched.
+        let (mut native, leader) = NativeScene::new();
+        native.scene.source.spawn(8, 600);
+        let sibling = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(8, ImageAuthority::ScanPinned, 150)
+            .unwrap();
         native.answer(7, 500, 41);
-        let first = native.row(41, 1, 7, 100, 0);
-        native.witness(vec![first]);
-        let later = native.row(41, 2, 7, 1_100, 1);
-        let events = native.witness(vec![later]);
-        let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
-            panic!("poisoned reopen must still admit the successor: {events:?}");
-        };
-        assert_eq!(*old, caller);
+        native.answer(8, 600, 42);
+        native.witness(vec![native.row(41, 1, 7, 100, 0)]);
+        native.witness(vec![native.row(42, 1, 8, 200, 0)]);
+        // SAFETY: DiscoveryRecord contains only integer fields.
+        let mut exit_record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        exit_record.hook_ts_ns = 1_500;
+        exit_record.pid_tgid = (u64::from(7u32) << 32) | u64::from(7u32);
+        exit_record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+        let receipt = native.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            native.domain,
+            vec![exit_record],
+            native.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+        native.scene.coordinator.commit_batch(false).unwrap();
         let adapter = &native.scene.coordinator.adapter;
-        assert!(adapter.record(caller).unwrap().retired);
-        assert_eq!(adapter.live_id(7), Some(*new));
-        let successor = adapter.record(*new).unwrap();
-        assert_eq!(successor.start_time, Some(500), "same process");
-        assert_eq!(successor.incarnation, 1);
+        assert_eq!(adapter.live_id(7), Some(leader), "custody kept");
+        assert_eq!(adapter.live_pin(7).unwrap().1, &(7, 500));
+        assert!(!adapter.record(leader).unwrap().retired, "no tombstone");
         assert_eq!(
-            successor.exe.as_ref().unwrap().path.as_deref(),
-            Some("/bin/other"),
-            "the successor carries the current image"
+            adapter.live_id(8),
+            Some(sibling),
+            "the live sibling is untouched"
         );
-        let (_, pin) = adapter.live_pin(7).unwrap();
-        assert_eq!(*pin, (7, 500), "the original held pin moves over");
+        let losses = native
+            .gap_subjects()
+            .iter()
+            .filter(|subject| subject.as_str() == "leader task link loss")
+            .count();
+        assert_eq!(losses, 1, "explicit link loss, recorded once");
+        // A replayed exit, an unknown pid, and a truly dead caller add no
+        // further link-loss record.
+        let receipt = native.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            native.domain,
+            vec![exit_record],
+            native.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        native.scene.coordinator.commit_batch(false).unwrap();
         assert_eq!(
-            native.scene.source.reopen_attempts(),
-            opens_before,
-            "no numeric-PID reopen during the handoff"
+            native
+                .gap_subjects()
+                .iter()
+                .filter(|subject| subject.as_str() == "leader task link loss")
+                .count(),
+            1,
+            "link loss is recorded once per incarnation"
+        );
+
+        // Later EXEC in the next cycle restores useful endpoints.
+        native.scene.source.exec(7, 200, "/bin/other");
+        let events = native.witness(vec![native.row(41, 2, 7, 1_600, 1)]);
+        let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+            panic!("EXEC after link loss must recover: {events:?}");
+        };
+        assert_eq!(*old, leader);
+        let successor = *new;
+        assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(successor));
+        native.scene.project(7, 1_700);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(7, 500, 41);
+        native.witness(vec![native.row(41, 2, 7, 1_800, 0)]);
+        // The recovery row binds the successor (useful endpoints). Its pair
+        // stays count-dropped by the proving row's unbound decision — the
+        // pre-existing C7 dropped-pair rule, unchanged by this slice — so
+        // the edge reads witnessed, not counted.
+        assert_eq!(
+            native.scene.coverage(successor),
+            UseCoverage::Witnessed { first_ns: 1_800 },
+            "the successor serves useful endpoints"
+        );
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(census.bound, 3, "leader, sibling, and successor rows bind");
+        assert_eq!(
+            census.unbound.get(&UnboundReason::ExecTransition),
+            Some(&1),
+            "only the proving row stays unbound"
         );
         assert_eq!(
-            native.scene.coverage(caller),
+            native.scene.coverage(leader),
             UseCoverage::Counted {
                 since_ns: 100,
                 lossy: false
@@ -13287,285 +14492,142 @@ pub(crate) mod tests {
             "the old image keeps its count"
         );
 
-        // Scan-proven exec with reopen poisoned: same retained custody.
-        let (mut scan, caller) = NativeScene::new();
-        scan.scene.source.exec(7, 200, "/bin/other");
-        scan.scene.source.poison_reopen();
-        let opens_before = scan.scene.source.reopen_attempts();
-        let observed: BTreeSet<u32> = [7].into_iter().collect();
-        let events = scan.scene.coordinator.adapter.reconcile(
-            &observed,
-            &mut |_| ImageAuthority::ScanPinned,
-            1_200,
-        );
-        let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
-            panic!("poisoned scan handoff must still admit: {events:?}");
-        };
-        assert_eq!(*old, caller);
-        let adapter = &scan.scene.coordinator.adapter;
-        assert_eq!(adapter.live_id(7), Some(*new));
-        assert_eq!(adapter.live_pin(7).unwrap().1, &(7, 500));
-        assert_eq!(
-            scan.scene.source.reopen_attempts(),
-            opens_before,
-            "scan handoff never reopens by PID"
-        );
-
-        // Same-file reexec: the scan lane sees no change and splits
-        // nothing; actual native evidence still establishes the transition.
-        let (mut same, caller) = NativeScene::new();
-        same.scene.source.poison_reopen();
-        let observed: BTreeSet<u32> = [7].into_iter().collect();
-        let events = same.scene.coordinator.adapter.reconcile(
-            &observed,
-            &mut |_| ImageAuthority::ScanPinned,
-            1_200,
-        );
-        assert!(events.is_empty(), "{events:?}");
-        assert_eq!(same.scene.coordinator.adapter.live_id(7), Some(caller));
-        same.answer(7, 500, 41);
-        same.witness(vec![same.row(41, 1, 7, 100, 0)]);
-        let events = same.witness(vec![same.row(41, 2, 7, 1_100, 1)]);
-        assert!(
-            matches!(events.as_slice(), [CallerEvent::ExecRetired { old, .. }] if *old == caller),
-            "{events:?}"
-        );
-        let adapter = &same.scene.coordinator.adapter;
-        let successor = adapter.record(adapter.live_id(7).unwrap()).unwrap();
-        assert_eq!(
-            successor.exe,
-            adapter.record(caller).unwrap().exe,
-            "same-file successor keeps the shared exe identity"
-        );
-
-        // Changed process refuses: a dead pin ends the old incarnation but
-        // mints no successor, attempts no reopen, and the reused pid later
-        // admits fresh with no inherited history.
-        let (mut dead, caller) = NativeScene::new();
-        dead.scene.source.poison_reopen();
-        dead.scene.source.kill(7);
-        let opens_before = dead.scene.source.reopen_attempts();
-        let events = dead.scene.coordinator.adapter.exec_transition(
-            caller,
-            &mut |_| ImageAuthority::ScanPinned,
-            2_000,
-        );
-        let [
-            CallerEvent::AdmitFailed {
-                pid,
-                reason,
-                budget,
-            },
-        ] = events.as_slice()
-        else {
-            panic!("a dead pin must refuse the successor: {events:?}");
-        };
-        assert_eq!(*pid, 7);
-        assert!(
-            reason.contains("custody lost"),
-            "the refusal names custody, not a pin failure: {reason}"
-        );
-        assert_eq!(*budget, None);
-        assert_eq!(
-            dead.scene.source.reopen_attempts(),
-            opens_before,
-            "no reopen is attempted without custody"
-        );
-        let adapter = &dead.scene.coordinator.adapter;
-        assert!(adapter.record(caller).unwrap().retired);
-        assert_eq!(adapter.live_id(7), None);
-        assert_eq!(adapter.len(), 1, "no successor incarnation was minted");
-
-        // Caller budget N/N+1 at the shared reservation: N works, N+1
-        // refuses with the exact requested occupancy.
-        let (mut full, caller) = NativeScene::new();
-        full.scene.coordinator.adapter.set_max_callers(2);
-        full.scene.source.spawn(8, 600);
-        full.scene
-            .coordinator
-            .adapter
-            .admit(8, ImageAuthority::ScanPinned, 60)
-            .unwrap();
-        let events = full.scene.coordinator.adapter.exec_transition(
-            caller,
-            &mut |_| ImageAuthority::ScanPinned,
-            2_000,
-        );
-        let [CallerEvent::AdmitFailed { budget, .. }] = events.as_slice() else {
-            panic!("a full budget must refuse the successor: {events:?}");
-        };
-        assert_eq!(
-            budget.unwrap(),
-            BudgetRefusal {
-                resource: "callers",
-                limit: 2,
-                requested: 3,
-            }
-        );
-        assert_eq!(
-            full.scene.coordinator.adapter.admit_refused(),
-            1,
-            "the refusal counts exactly once"
-        );
-        let (mut roomy, caller) = NativeScene::new();
-        roomy.scene.coordinator.adapter.set_max_callers(3);
-        roomy.scene.source.spawn(8, 600);
-        roomy
-            .scene
-            .coordinator
-            .adapter
-            .admit(8, ImageAuthority::ScanPinned, 60)
-            .unwrap();
-        let events = roomy.scene.coordinator.adapter.exec_transition(
-            caller,
-            &mut |_| ImageAuthority::ScanPinned,
-            2_000,
-        );
-        assert!(
-            matches!(events.as_slice(), [CallerEvent::ExecRetired { .. }]),
-            "{events:?}"
-        );
-        assert_eq!(roomy.scene.coordinator.adapter.len(), 3);
-
-        // Mismatched current-image queries refuse: wrong exec, wrong pid,
-        // foreign domain, and a post-admission exec record.
-        let (mut current, caller) = NativeScene::new();
-        current.answer(7, 500, 41);
-        current.witness(vec![current.row(41, 1, 7, 100, 0)]);
-        let image = DomainCookie::scripted(current.domain, 41);
-        let request = |exec_id: u64, pid: u32| CurrentBindingRequest {
-            caller,
-            pid,
-            image,
-            exec_id,
-        };
-        let sight = |scene: &mut NativeScene, req: CurrentBindingRequest| {
-            let coordinator = &scene.scene.coordinator;
-            let lookup = &coordinator.adapter as &dyn CallerLookup<(u32, u64)>;
-            coordinator
-                .binder
-                .sight_current_binding(req, lookup, &mut scene.cookies)
-        };
-        // CurrentBindingSighting carries no Debug by design; match instead.
-        let refused = |scene: &mut NativeScene, req: CurrentBindingRequest| match sight(scene, req)
-        {
-            Err(reason) => reason,
-            Ok(_) => panic!("a mismatched current image must refuse"),
-        };
-        assert_eq!(
-            refused(&mut current, request(2, 7)),
-            UnboundReason::ExecAmbiguous,
-            "a mismatched exec refuses"
-        );
-        assert_eq!(
-            refused(&mut current, request(1, 999)),
-            UnboundReason::NoLiveCaller,
-            "a mismatched pid refuses"
-        );
-        let foreign = DomainCookie::scripted(NativeDomainId::mint(), 41);
-        assert_eq!(
-            refused(
-                &mut current,
-                CurrentBindingRequest {
-                    caller,
-                    pid: 7,
-                    image: foreign,
-                    exec_id: 1
-                }
-            ),
-            UnboundReason::EvidenceIncomplete,
-            "a foreign domain proves nothing here"
-        );
-        current
-            .scene
-            .coordinator
-            .binder
-            .set_current_binding_clock(|| Some(1_005));
-        let sighted = match sight(&mut current, request(1, 7)) {
-            Ok(sighted) => sighted,
-            Err(reason) => panic!("the matched current image must sight: {reason:?}"),
-        };
-        assert!(
-            matches!(
-                current
-                    .scene
-                    .coordinator
-                    .binder
-                    .check_current_binding(&sighted),
-                CurrentBindingCheck::Proven
-            ),
-            "the matched current image proves"
-        );
-        // SAFETY: DiscoveryRecord contains only integer fields.
-        let mut exec_record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
-        exec_record.hook_ts_ns = 60;
-        exec_record.pid_tgid = (u64::from(7u32) << 32) | u64::from(7u32);
-        exec_record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
-        let at = current.stamps.tick();
-        current.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
-            current.domain,
-            vec![exec_record],
-            at,
-        )));
-        assert_eq!(
-            refused(&mut current, request(1, 7)),
-            UnboundReason::ExecAfterAdmission,
-            "an exec record after admission refuses the old proof"
-        );
-
-        // Colliding numeric cookies across domains never join: a Detailed
-        // transition for pid 7 leaves the Inventory-bound pid 8 alone, and
-        // pid 8 keeps binding its own ticket afterwards.
-        let (mut split, caller) = NativeScene::new();
-        let detailed = split.domain;
-        split.scene.source.spawn(8, 600);
-        let caller8 = split
+        // Later EXEC in a later batch (after unrelated work) recovers too.
+        let (mut later, leader) = NativeScene::new();
+        later.scene.source.spawn(8, 600);
+        later
             .scene
             .coordinator
             .adapter
             .admit(8, ImageAuthority::ScanPinned, 150)
             .unwrap();
-        let inventory = NativeDomainId::mint();
-        split
-            .scene
-            .coordinator
-            .binder
-            .note_exec_coverage(ExecCoverage::scripted(inventory, 0));
-        split.cookies.answers.insert(
-            ((8, 600), inventory),
-            CookieQuery::Cookie(DomainCookie::scripted(inventory, 41)),
-        );
-        let endpoint = split.scene.delta.endpoints[0];
-        let bind8 = WitnessRow::scripted(inventory, 41, 1, endpoint.object, endpoint.id, 8, 200);
-        split.stage(split.stamps.read(inventory, vec![bind8]));
-        split.stage(split.stamps.drain(inventory));
-        split.stage(split.stamps.read(inventory, Vec::new()));
-        split.scene.coordinator.commit_batch(false).unwrap();
-        assert_eq!(
-            split.scene.coordinator.binder.census().bound,
-            1,
-            "pid 8 binds ticket 41 in the Inventory domain"
-        );
-        split.answer(7, 500, 41);
-        split.witness(vec![split.row(41, 1, 7, 100, 0)]);
-        let events = split.witness(vec![split.row(41, 2, 7, 1_100, 1)]);
+        later.answer(7, 500, 41);
+        later.answer(8, 600, 42);
+        later.witness(vec![later.row(41, 1, 7, 100, 0)]);
+        let mut exit_record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        exit_record.pid_tgid = (u64::from(7u32) << 32) | u64::from(7u32);
+        exit_record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+        later.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            later.domain,
+            vec![exit_record],
+            later.stamps.tick(),
+        )));
+        later.scene.coordinator.commit_batch(false).unwrap();
+        later.witness(vec![later.row(42, 1, 8, 1_550, 0)]);
+        later.scene.source.exec(7, 200, "/bin/other");
+        let events = later.witness(vec![later.row(41, 2, 7, 1_600, 1)]);
         assert!(
-            matches!(events.as_slice(), [CallerEvent::ExecRetired { old, .. }] if *old == caller),
+            matches!(events.as_slice(), [CallerEvent::ExecRetired { old, .. }] if *old == leader),
+            "EXEC in a later batch must recover: {events:?}"
+        );
+
+        // Whole-group death twin: both incarnations exit, the pid is reused
+        // by a fresh generation, and a delayed pre-admission EXEC for the
+        // old incarnation cannot attach to anything.
+        let (mut dead, leader) = NativeScene::new();
+        dead.scene.source.spawn(8, 600);
+        dead.scene
+            .coordinator
+            .adapter
+            .admit(8, ImageAuthority::ScanPinned, 150)
+            .unwrap();
+        dead.answer(7, 500, 41);
+        dead.witness(vec![dead.row(41, 1, 7, 100, 0)]);
+        let proving = dead.row(41, 2, 7, 1_600, 1);
+        let delayed = dead.binder_only(vec![proving]);
+        assert_eq!(delayed.len(), 1, "one transition captured pre-death");
+        dead.scene.source.kill(7);
+        dead.scene.source.kill(8);
+        let events = dead.scene.coordinator.adapter.reconcile(
+            &BTreeSet::new(),
+            &mut |_| ImageAuthority::ScanPinned,
+            2_000,
+        );
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(
+            events
+                .iter()
+                .all(|event| matches!(event, CallerEvent::Exited { .. })),
+            "whole-group death exits every incarnation: {events:?}"
+        );
+        dead.scene
+            .coordinator
+            .apply_reconcile_events(&events, 2_000);
+        dead.scene.coordinator.commit_batch(false).unwrap();
+        dead.scene.source.spawn(7, 900);
+        let observed: BTreeSet<u32> = [7].into_iter().collect();
+        let events = dead.scene.coordinator.adapter.reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            2_100,
+        );
+        let [CallerEvent::Admitted { id }] = events.as_slice() else {
+            panic!("the reused pid admits fresh: {events:?}");
+        };
+        let fresh = *id;
+        assert_ne!(fresh, leader);
+        let adapter = &dead.scene.coordinator.adapter;
+        let record = adapter.record(fresh).unwrap();
+        assert_eq!(record.start_time, Some(900));
+        assert_eq!(record.incarnation, 1);
+        dead.scene
+            .coordinator
+            .apply_reconcile_events(&events, 2_100);
+        dead.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            dead.scene
+                .coordinator
+                .registry
+                .edges()
+                .all(|edge| edge.caller != fresh),
+            "the fresh incarnation inherits no history"
+        );
+        let stale =
+            dead.scene
+                .coordinator
+                .apply_exec_transition(delayed[0], &mut dead.cookies, 2_200);
+        assert!(
+            stale.is_empty(),
+            "a delayed transition for a dead caller attaches nothing: {stale:?}"
+        );
+        assert_eq!(dead.scene.coordinator.adapter.live_id(7), Some(fresh));
+        assert_eq!(dead.scene.coordinator.adapter.len(), 3);
+
+        // Owned-initial-exec acknowledgement happens exactly once: the
+        // initial image binds without emitting, the real exec emits one
+        // transition, and a replay emits nothing further.
+        let (mut once, leader) = NativeScene::new();
+        once.answer(7, 500, 41);
+        assert!(
+            once.binder_only(vec![once.row(41, 1, 7, 100, 0)])
+                .is_empty(),
+            "the initial image binds; it never transitions"
+        );
+        let emitted = once.binder_only(vec![once.row(41, 2, 7, 1_100, 1)]);
+        assert_eq!(emitted.len(), 1, "the real exec emits one transition");
+        assert_eq!(emitted[0].caller(), leader);
+        assert!(
+            once.binder_only(vec![once.row(41, 2, 7, 1_100, 1)])
+                .is_empty(),
+            "a replayed proof emits no second transition"
+        );
+        let events =
+            once.scene
+                .coordinator
+                .apply_exec_transition(emitted[0], &mut once.cookies, 1_200);
+        assert!(
+            matches!(events.as_slice(), [CallerEvent::ExecRetired { old, .. }] if *old == leader),
             "{events:?}"
         );
-        assert_eq!(
-            split.scene.coordinator.adapter.live_id(8),
-            Some(caller8),
-            "the Detailed transition touches no Inventory caller"
+        let again =
+            once.scene
+                .coordinator
+                .apply_exec_transition(emitted[0], &mut once.cookies, 1_300);
+        assert!(
+            again.is_empty(),
+            "one successor per ended caller: {again:?}"
         );
-        assert_eq!(
-            split.scene.coordinator.adapter.live_id(7).unwrap(),
-            match events.as_slice() {
-                [CallerEvent::ExecRetired { new, .. }] => *new,
-                _ => unreachable!(),
-            }
-        );
-        let _ = detailed;
+        assert_eq!(once.scene.coordinator.adapter.len(), 2);
     }
 
     #[test]

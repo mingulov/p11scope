@@ -5324,3 +5324,285 @@ fn native_semantic_live_stream_retention_matches_snapshot() {
     assert_eq!(ended["event"]["instances_unretained"], 3);
     assert_eq!(ended["event"]["semantic_edges_unretained"], 3);
 }
+
+// ---- H3 Task 5 I2: per-candidate refresh binding across providers ----
+
+impl BindingScene {
+    /// Map one caller to an explicit registry module: the refresh-target
+    /// tests name each provider's attach path per caller instead of the
+    /// shared single-provider fixture module.
+    fn map_module(&mut self, caller: CallerId, pid: u32, key: &ModuleKey, path: &str, at_ns: u64) {
+        let info = ModuleInfo {
+            path: path.into(),
+            key: key.clone(),
+            double_loaded: false,
+            build_id: None,
+            identity_source: Some("task3".into()),
+            admission: AdmissionState::Admitted,
+            admission_class: Some("exact".into()),
+            admission_endpoints: Some(1),
+            admission_reasons: Vec::new(),
+        };
+        self.coordinator
+            .registry_mut()
+            .note_mapping(caller, pid, info, at_ns);
+        self.coordinator.commit_batch(false).unwrap();
+    }
+}
+
+/// Two independent attested providers in one subset: two manifests over
+/// two provider files, pinned and prepared together. The subset carries
+/// one required slot set per provider.
+fn dual_provider_subset() -> (ProviderFixture, ProviderFixture, AttestedSubset) {
+    let first = ProviderFixture::new();
+    let second = ProviderFixture::new();
+    let mut pins = first.pins.clone();
+    assert!(
+        pins.absorb(second.pins.clone()).is_empty(),
+        "distinct provider files pin without collisions"
+    );
+    let engine = engine_for_test(Vec::new(), Vec::new(), pins);
+    let prepared =
+        prepare_attested_subset(&engine, &[first.write_manifest(), second.write_manifest()]);
+    let subset = prepared
+        .subset
+        .expect("two complete providers attest together");
+    assert_eq!(
+        subset.required().len(),
+        2,
+        "one required slot set per provider"
+    );
+    assert_eq!(
+        subset.plan().slots.len(),
+        4,
+        "two attested endpoints per provider"
+    );
+    (first, second, subset)
+}
+
+#[test]
+fn native_semantic_multiprovider_candidates_bind_per_provider() {
+    set_sight(1_005);
+    let (_first, _second, subset) = dual_provider_subset();
+    let mut scene = BindingScene::new();
+    let pid_a = std::process::id();
+    let child_b = OwnedStoppedChild::new();
+    let child_c = OwnedStoppedChild::new();
+    let lane = AttestedSemanticLane::start(subset, &Scope::Pid(pid_a), BackendSelection::Auto)
+        .expect("shell lane starts over two providers");
+    let detailed = lane.domain();
+    scene.coordinator.note_extend_receipt(&ExtendReceipt {
+        activated_roots: true,
+        exec_coverage: Some(ExecCoverage::scripted(detailed, 0)),
+        ..ExtendReceipt::default()
+    });
+    // One registry module per provider attach path, plus a foreign
+    // module no provider claims.
+    let providers: Vec<(PinnedObjectId, String)> = lane
+        .subset()
+        .required()
+        .keys()
+        .map(|object| {
+            let path = lane
+                .subset()
+                .pins()
+                .attach_path_for(*object)
+                .expect("required provider stays pinned")
+                .to_string_lossy()
+                .into_owned();
+            (*object, path)
+        })
+        .collect();
+    assert_eq!(providers.len(), 2);
+    let module_a = ModuleKey::physical(7, 7, 771, None, &providers[0].1);
+    let module_b = ModuleKey::physical(7, 7, 772, None, &providers[1].1);
+    let foreign = ModuleKey::physical(7, 7, 773, None, "/task3/foreign.so");
+    let caller_a = scene.admit(pid_a, 7_000);
+    let caller_b = scene.admit(child_b.id(), 7_001);
+    let caller_c = scene.admit(child_c.id(), 7_002);
+    scene.map_module(caller_a, pid_a, &module_a, &providers[0].1, 7_100);
+    scene.map_module(caller_b, child_b.id(), &module_b, &providers[1].1, 7_101);
+    scene.map_module(caller_c, child_c.id(), &foreign, "/task3/foreign.so", 7_102);
+    scene.answer(pid_a, detailed, 100);
+    scene.answer(child_b.id(), detailed, 101);
+    scene.answer(child_c.id(), detailed, 102);
+    scene.bind_image(
+        detailed,
+        vec![
+            (100, 1, pid_a, 7_200),
+            (101, 1, child_b.id(), 7_201),
+            (102, 1, child_c.id(), 7_202),
+        ],
+        7_300,
+    );
+    set_sight(7_100);
+    let image_a = ImageIdentity {
+        task_cookie: 100,
+        exec_id: 1,
+    };
+    let image_b = ImageIdentity {
+        task_cookie: 101,
+        exec_id: 1,
+    };
+    // Each candidate resolves ITS provider's slot and registry module.
+    let target_a =
+        crate::inventory::refresh_target_for_candidate(&scene.coordinator, &lane, caller_a);
+    let target_b =
+        crate::inventory::refresh_target_for_candidate(&scene.coordinator, &lane, caller_b);
+    let target_c =
+        crate::inventory::refresh_target_for_candidate(&scene.coordinator, &lane, caller_c);
+    let (slot_a, resolved_a) = target_a.expect("caller A resolves provider 1");
+    let (slot_b, resolved_b) = target_b.expect("caller B resolves provider 2");
+    assert_eq!(resolved_a, module_a, "caller A binds provider 1");
+    assert_eq!(resolved_b, module_b, "caller B binds provider 2");
+    assert_ne!(
+        slot_a, slot_b,
+        "each provider refreshes through its own slot"
+    );
+    assert!(
+        lane.subset().required()[&providers[0].0].contains(&slot_a),
+        "caller A's slot is provider 1's required slot"
+    );
+    assert!(
+        lane.subset().required()[&providers[1].0].contains(&slot_b),
+        "caller B's slot is provider 2's required slot"
+    );
+    assert_eq!(
+        target_c, None,
+        "a caller no provider claims stays unresolvable"
+    );
+    // The bug mode refuses: caller B against provider 1's module has no
+    // mapping proof, so the old single-module refresh left it silently
+    // unbound.
+    assert_eq!(
+        scene.bind(caller_b, &module_a, detailed, image_b),
+        Err(SemanticBindingRefusal::MappingIncomplete),
+        "the wrong-provider module proves nothing for caller B"
+    );
+    // Both candidates bind through the real proof against their own
+    // provider; the unresolvable caller stays unbound with no positive.
+    assert_eq!(scene.bind(caller_a, &resolved_a, detailed, image_a), Ok(()));
+    assert_eq!(scene.bind(caller_b, &resolved_b, detailed, image_b), Ok(()));
+    assert_eq!(scene.coordinator.semantic_bindings().len(), 2);
+    assert_eq!(
+        scene
+            .coordinator
+            .semantic_bindings()
+            .get(caller_a)
+            .unwrap()
+            .module(),
+        &module_a
+    );
+    assert_eq!(
+        scene
+            .coordinator
+            .semantic_bindings()
+            .get(caller_b)
+            .unwrap()
+            .module(),
+        &module_b
+    );
+    assert!(
+        scene
+            .coordinator
+            .semantic_bindings()
+            .get(caller_c)
+            .is_none(),
+        "no positive without proof"
+    );
+}
+
+#[test]
+fn native_semantic_single_provider_refresh_target_preserved() {
+    set_sight(1_005);
+    let fixture = ProviderFixture::new();
+    let mut scene = BindingScene::new();
+    let pid = std::process::id();
+    let child = OwnedStoppedChild::new();
+    let lane =
+        AttestedSemanticLane::start(fixture.subset(), &Scope::Pid(pid), BackendSelection::Auto)
+            .expect("shell lane starts over one provider");
+    let detailed = lane.domain();
+    scene.coordinator.note_extend_receipt(&ExtendReceipt {
+        activated_roots: true,
+        exec_coverage: Some(ExecCoverage::scripted(detailed, 0)),
+        ..ExtendReceipt::default()
+    });
+    // The previous inline chain: the first required slot, its object's
+    // attach path, the first registry module carrying that path.
+    let subset = lane.subset();
+    let slot = subset
+        .required()
+        .values()
+        .flat_map(|slots| slots.iter().copied())
+        .next()
+        .expect("one provider has required slots");
+    let object = subset
+        .plan()
+        .slots
+        .iter()
+        .find(|slot_info| slot_info.index == slot)
+        .expect("required slot is planned")
+        .object;
+    let attach = subset
+        .pins()
+        .attach_path_for(object)
+        .expect("required provider stays pinned")
+        .to_string_lossy()
+        .into_owned();
+    let module = ModuleKey::physical(7, 7, 777, None, &attach);
+    let foreign = ModuleKey::physical(7, 7, 778, None, "/task3/foreign.so");
+    let caller = scene.admit(pid, 7_000);
+    let stranger = scene.admit(child.id(), 7_001);
+    scene.map_module(caller, pid, &module, &attach, 7_100);
+    scene.map_module(stranger, child.id(), &foreign, "/task3/foreign.so", 7_101);
+    scene.answer(pid, detailed, 100);
+    scene.answer(child.id(), detailed, 101);
+    scene.bind_image(
+        detailed,
+        vec![(100, 1, pid, 7_200), (101, 1, child.id(), 7_201)],
+        7_300,
+    );
+    set_sight(7_100);
+    // Per-candidate resolution reduces to the previous chain for one
+    // provider: the mapped caller resolves it, a caller without the
+    // provider mapping stays unresolvable.
+    let expected = scene
+        .coordinator
+        .registry()
+        .modules()
+        .find(|record| record.paths.contains(&attach))
+        .map(|record| record.key.clone())
+        .expect("provider module registered");
+    assert_eq!(
+        crate::inventory::refresh_target_for_candidate(&scene.coordinator, &lane, caller),
+        Some((slot, expected.clone())),
+        "single-provider resolution matches the previous inline chain"
+    );
+    assert_eq!(
+        crate::inventory::refresh_target_for_candidate(&scene.coordinator, &lane, stranger),
+        None,
+        "a caller without the provider mapping stays unresolvable"
+    );
+    // The binds are unchanged: the mapped caller binds, and the
+    // stranger's attempt refuses exactly as the old refresh attempt did.
+    let image = ImageIdentity {
+        task_cookie: 100,
+        exec_id: 1,
+    };
+    assert_eq!(scene.bind(caller, &expected, detailed, image), Ok(()));
+    assert_eq!(
+        scene.bind(
+            stranger,
+            &expected,
+            detailed,
+            ImageIdentity {
+                task_cookie: 101,
+                exec_id: 1
+            }
+        ),
+        Err(SemanticBindingRefusal::MappingIncomplete),
+        "the stranger's bind attempt refuses exactly as before"
+    );
+    assert_eq!(scene.coordinator.semantic_bindings().len(), 1);
+}

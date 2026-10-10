@@ -348,7 +348,9 @@ impl Engine {
             .get(&owner)
             .is_some_and(|record| record.image_state == ImageCheck::Changed)
         {
-            bail!("inventory owner image ended; the owner retains its history but scans nothing new");
+            bail!(
+                "inventory owner image ended; the owner retains its history but scans nothing new"
+            );
         }
         if state.leases.contains_key(&owner)
             || state.leases.len() >= state.config.owners.scan_leases
@@ -438,10 +440,7 @@ impl Engine {
         if proof.owner != owner {
             bail!("validated exec proof names another inventory owner; nothing was invalidated");
         }
-        let state = self
-            .inventory
-            .as_mut()
-            .expect("checked Inventory state");
+        let state = self.inventory.as_mut().expect("checked Inventory state");
         let record = state
             .owners
             .get_mut(&owner)
@@ -450,10 +449,9 @@ impl Engine {
             return Ok(());
         }
         state.leases.remove(&owner);
-        record.revision = record
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| anyhow!("inventory owner revision exhausted; existing claims retained"))?;
+        record.revision = record.revision.checked_add(1).ok_or_else(|| {
+            anyhow!("inventory owner revision exhausted; existing claims retained")
+        })?;
         record.image_state = ImageCheck::Changed;
         record.requested_epoch = record.requested_epoch.checked_add(1).ok_or_else(|| {
             anyhow!("inventory refresh epoch exhausted; existing claims retained")

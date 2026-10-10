@@ -32397,10 +32397,160 @@ fn pressure_services_unprotected_request_before_original_head() {
     );
 }
 
-/// H5 ordering, direct pass: a parked head waits while an unprotected stale
-/// request is serviced; the retained view's armed loader context, the
-/// pending terminal journal and every protected serial survive the service
-/// pass untouched, and the parked loader record still validates afterwards.
+/// H5 isolation: a positive service pass — real rescan, rearm and
+/// publication — leaves every H1 fairness cursor untouched: no under-cap
+/// tick, no over-cap pass, no rotation-cursor or poll-cursor move, and no
+/// scan-class alternation consumed. The flanking ordinary ticks prove H1
+/// cadence proceeds exactly as if the service never ran.
+#[test]
+fn pressure_service_pass_leaves_h1_fairness_accounting_untouched() {
+    let mut fixture = RefreshFairnessFixture::new();
+    let retained_pid = fixture.engine.views[0].pid();
+    fixture.engine.frame_work_budget_ns = u64::MAX;
+    // Fresh H1 baseline: no ordinary tick has run, so every cursor starts
+    // absent and the alternation starts at its default.
+    assert_eq!(fixture.engine.scheduler.cursor_for_test(), None);
+    assert!(!fixture.engine.scheduler.newcomers_first(true, true));
+    assert!(
+        fixture
+            .engine
+            .request_refresh_consumed(retained_pid, Some(2_000))
+    );
+    for offset in 0..255u32 {
+        assert!(
+            fixture
+                .engine
+                .request_refresh_consumed(4_000_000 + offset, Some(3_000 + u64::from(offset)))
+        );
+    }
+    assert_eq!(fixture.engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    let under_cap_before = fixture.engine.scheduler.under_cap_ticks_for_test();
+    let over_cap_before = fixture.engine.scheduler.over_cap_passes();
+    let cursor_before = fixture.engine.scheduler.cursor_for_test();
+    let new_order_before = fixture.engine.scheduler.new_view_order(&[3, 5, 7]);
+    let retained_order_before = fixture.engine.scheduler.retained_view_order(&[3, 5, 7]);
+    let poll_order_before = fixture.engine.scheduler.poll_order(&[3, 5, 7]);
+    let alternation_before = fixture.engine.scheduler.newcomers_first(true, true);
+    let scans_before = fixture.engine.deep_scans;
+    let arms_before = fixture.engine.loader_arms();
+    let head_pid = 6_000_000u32;
+    let mut records: Vec<QueuedDiscoveryRecord> = std::iter::once(exec_record_for(head_pid))
+        .chain((0..255u32).map(|offset| exec_record_for(4_000_000 + offset)))
+        .map(|record| QueuedDiscoveryRecord {
+            record,
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        })
+        .collect();
+    // Direct record pass, not a drain: no ordinary tick runs behind the
+    // service, so any cursor move is the service pass's own.
+    let mut session = ScriptedSession::with_records([], 0);
+    let mut collect = Engine::collect_discovery_records;
+    fixture
+        .engine
+        .process_discovery_records(
+            &mut session,
+            &mut records,
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("pressure service keeps the batch alive");
+    assert!(records.is_empty(), "the serviced prefix fully dispatched");
+    let engine = &fixture.engine;
+    assert_eq!(
+        engine.pressure_service_passes, 1,
+        "the episode ran its positive service pass"
+    );
+    assert_eq!(engine.pressure_attempts, 1);
+    assert!(
+        engine.deep_scans > scans_before,
+        "the service pass rescanned the live provider view"
+    );
+    assert!(
+        engine.loader_arms() > arms_before,
+        "the service pass rearmed the live provider view"
+    );
+    assert_eq!(
+        engine.discovery_truncated, 0,
+        "the parked head was serviced, not dropped"
+    );
+    assert_eq!(
+        engine.scheduler.under_cap_ticks_for_test(),
+        under_cap_before,
+        "service consumes no under-cap tick"
+    );
+    assert_eq!(
+        engine.scheduler.over_cap_passes(),
+        over_cap_before,
+        "service consumes no over-cap pass"
+    );
+    assert_eq!(
+        engine.scheduler.cursor_for_test(),
+        cursor_before,
+        "service moves no reconcile cursor"
+    );
+    assert_eq!(
+        engine.scheduler.new_view_order(&[3, 5, 7]),
+        new_order_before,
+        "service moves no newcomer cursor"
+    );
+    assert_eq!(
+        engine.scheduler.retained_view_order(&[3, 5, 7]),
+        retained_order_before,
+        "service moves no retained cursor"
+    );
+    assert_eq!(
+        engine.scheduler.poll_order(&[3, 5, 7]),
+        poll_order_before,
+        "service moves no poll cursor"
+    );
+    assert_eq!(
+        engine.scheduler.newcomers_first(true, true),
+        alternation_before,
+        "service consumes no alternation share"
+    );
+    // H1 cadence proceeds after the episode exactly as without it: a
+    // settling tick drains the stale map, then live work on ordinary
+    // ticks alternates the scan classes and advances the under-cap count
+    // the service never touched.
+    refresh_inventory_once(&mut fixture.engine);
+    assert!(
+        fixture.engine.refresh_requested.is_empty(),
+        "the settling tick drains the stale map"
+    );
+    assert!(
+        !fixture.engine.scheduler.newcomers_first(true, true),
+        "a workless tick consumes no alternation share"
+    );
+    assert!(fixture.engine.request_refresh(retained_pid, Some(4_000)));
+    refresh_inventory_once(&mut fixture.engine);
+    assert!(
+        fixture.engine.scheduler.newcomers_first(true, true),
+        "the first live tick after service alternates"
+    );
+    fixture.include_newcomer();
+    refresh_inventory_once(&mut fixture.engine);
+    assert_eq!(
+        fixture.engine.scheduler.newcomers_first(true, true),
+        alternation_before,
+        "the newcomer tick alternates back"
+    );
+    assert_eq!(
+        fixture.engine.scheduler.under_cap_ticks_for_test(),
+        under_cap_before + 3,
+        "only ordinary ticks advance the under-cap count"
+    );
+}
+
+/// H5 ordering, direct pass: a parked head waits while the selected
+/// unprotected stale request — and only it — is serviced; the retained
+/// view's armed loader context, the pending terminal journal and every
+/// protected serial survive the service pass untouched, and the parked
+/// loader record still validates afterwards. The synthetic terminal batch
+/// record (unresolvable binding) widens protection to block-all, so only
+/// provably context-free stale requests stay eligible.
 #[test]
 fn pressure_ordering_direct_pass_keeps_loader_and_terminal_context() {
     let (_fixture, mut engine, armed, loader_record, mut session) = armed_seed_route(1);
@@ -32429,8 +32579,10 @@ fn pressure_ordering_direct_pass_keeps_loader_and_terminal_context() {
     assert!(engine.request_refresh_consumed(5_000_000, Some(3_000)));
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     // Only the retained pid is protected here (the parked loader names it);
-    // the fake requests are unprotected stale entries the service completes.
+    // the fake requests are unprotected stale entries, of which the service
+    // completes exactly its lowest selection.
     let real_before = engine.refresh_requested[&pid];
+    let scans_before = engine.deep_scans;
     // A drain would snapshot the session's loader-hit counter; the direct
     // pass sets the same authority explicitly.
     engine.counter_snapshot.loader_hits = 1;
@@ -32470,15 +32622,36 @@ fn pressure_ordering_direct_pass_keeps_loader_and_terminal_context() {
         "the original head dispatched into the freed slot"
     );
     assert!(
-        !engine.refresh_requested.contains_key(&5_000_000),
-        "the unprotected request was serviced"
+        !engine.refresh_requested.contains_key(&4_000_000),
+        "the selected stale request was serviced"
     );
-    for offset in 0..254u32 {
-        assert!(
-            !engine.refresh_requested.contains_key(&(4_000_000 + offset)),
-            "unprotected stale requests are serviced, not retained"
+    // The selected transaction completes only its selection: every other
+    // unprotected request is retained with its serial and age.
+    for offset in 1..254u32 {
+        let request = engine.refresh_requested.get(&(4_000_000 + offset));
+        assert_eq!(
+            request.map(|request| request.first_seen_ns),
+            Some(Some(2_000 + u64::from(offset))),
+            "unselected stale requests keep their original ages"
         );
     }
+    assert!(
+        engine.refresh_requested.contains_key(&5_000_000),
+        "the unselected unprotected request is retained, not cleared"
+    );
+    assert_eq!(
+        engine.pressure_service_passes, 1,
+        "one head episode runs exactly one service pass"
+    );
+    assert_eq!(
+        engine.pressure_attempts, 1,
+        "the stale completion is the episode's one real attempt"
+    );
+    assert_eq!(
+        engine.deep_scans,
+        scans_before + 1,
+        "the only scan is the parked loader's validation dispatch, not service"
+    );
     assert_eq!(
         engine.refresh_requested.get(&pid),
         Some(&real_before),
@@ -32507,25 +32680,44 @@ fn pressure_ordering_direct_pass_keeps_loader_and_terminal_context() {
     );
 }
 
-/// H5 divert: a service pass whose nested terminal drain pulls fresh session
-/// records stashes them behind the parked prefix instead of dispatching them
-/// first. The diverted loader keeps its terminal validation and still
-/// applies after the parked prefix; the head is serviced from the slot the
-/// pass frees elsewhere.
+/// H5 divert: a selected transaction whose retirement advances a pending
+/// foreign terminal journal pulls fresh session records and stashes them
+/// behind the parked prefix instead of dispatching them first. The
+/// diverting selection cannot complete — its retirement stays incomplete
+/// for the episode — so the episode rotates: a later opportunity frees
+/// the slot from a stale entry while the diverted loader keeps its
+/// terminal validation and still applies after the parked prefix.
 #[test]
 fn pressure_service_diverts_nested_terminal_pulls_behind_parked() {
-    let (_fixture, mut engine, armed, _record, mut session) = armed_seed_route(1);
+    let (mut fixture, mut engine, armed, _record, mut session) = armed_seed_route(1);
     engine.frame_work_budget_ns = u64::MAX;
     let pid = engine.views[0].pid();
+    // A second live provider view with no loader contexts: the episode's
+    // first selection. Its retirement advances the foreign journal below.
+    let pid2 = fixture.spawn_peer();
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), pid2).unwrap());
+    engine.next_view_id = 2;
+    // The foreign journal pends with an incomplete batch before the head
+    // parks; the nested pull it triggers must divert, never dispatch.
+    engine
+        .begin_terminal_drain(armed, Vec::new(), || {
+            Err::<(), _>(anyhow::anyhow!("deferred"))
+        })
+        .unwrap()
+        .unwrap_err();
     assert!(engine.request_refresh_consumed(pid, Some(1_000)));
-    for offset in 0..254u32 {
+    assert!(engine.request_refresh_consumed(pid2, Some(1_500)));
+    for offset in 0..253u32 {
         assert!(
             engine.request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
         );
     }
     assert!(engine.request_refresh_consumed(5_000_000, Some(3_000)));
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
-    let real_before = engine.refresh_requested[&pid];
+    let pid_before = engine.refresh_requested[&pid];
+    let pid2_before = engine.refresh_requested[&pid2];
     let terminal_loader = loader_record_for(armed, pid);
     session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(
         terminal_loader,
@@ -32533,10 +32725,13 @@ fn pressure_service_diverts_nested_terminal_pulls_behind_parked() {
     .into();
     let head_pid = 6_000_000u32;
     let mut records: Vec<QueuedDiscoveryRecord> = std::iter::once(head_pid)
-        .chain((0..254u32).map(|offset| 4_000_000 + offset))
+        .chain((0..253u32).map(|offset| 4_000_000 + offset))
         .map(refresh_exec)
         .collect();
+    let parked_len = records.len();
     let mut collect = Engine::collect_discovery_records;
+    // First opportunity: the live selection diverts the nested pull, stays
+    // incomplete, and the episode re-parks for rotation.
     engine
         .process_discovery_records(
             &mut session,
@@ -32547,35 +32742,46 @@ fn pressure_service_diverts_nested_terminal_pulls_behind_parked() {
             &mut PauseClosure::new(true),
         )
         .expect("pressure service keeps the batch alive");
-    assert!(records.is_empty(), "the parked prefix both dispatched");
+    assert!(records.is_empty(), "the first opportunity parks everything");
+    assert_eq!(
+        engine.pressure_service_passes, 1,
+        "the first opportunity runs one selected transaction"
+    );
+    assert_eq!(
+        engine.pressure_attempts, 1,
+        "the live selection rescans: a real attempt"
+    );
     assert_eq!(
         engine.discovery_truncated, 0,
-        "the parked head was serviced, not dropped"
+        "rotation refuses nothing"
     );
     assert!(
-        engine.refresh_requested.contains_key(&head_pid),
-        "the original head dispatched into the freed slot"
-    );
-    assert!(
-        !engine.refresh_requested.contains_key(&5_000_000),
-        "the unprotected request was serviced"
+        !engine.refresh_requested.contains_key(&head_pid),
+        "the head waits parked while rotation continues"
     );
     assert_eq!(
-        engine.refresh_requested.get(&pid),
-        Some(&real_before),
-        "the blocked retirement keeps its serial and age"
+        engine.refresh_requested.get(&pid2),
+        Some(&pid2_before),
+        "the diverted selection keeps its serial and age"
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&5_000_000),
+        "the stale entry waits for the next opportunity"
     );
     assert_eq!(
         engine.pending_discovery_records.len(),
-        1,
-        "the nested pull waits behind the parked prefix"
+        parked_len + 1,
+        "the parked prefix waits with the nested pull behind it"
     );
     assert_eq!(
-        engine.pending_discovery_records[0].record.case_id,
-        terminal_loader.case_id
+        engine.pending_discovery_records[0].record.pid_tgid >> 32,
+        head_pid as u64,
+        "the head still leads the parked prefix"
     );
+    let diverted = engine.pending_discovery_records.last().unwrap();
+    assert_eq!(diverted.record.case_id, terminal_loader.case_id);
     assert_eq!(
-        engine.pending_discovery_records[0].terminal_owner,
+        diverted.terminal_owner,
         Some(armed),
         "the diverted loader keeps its terminal validation"
     );
@@ -32587,17 +32793,64 @@ fn pressure_service_diverts_nested_terminal_pulls_behind_parked() {
         engine.loader_registry.is_tombstoned(armed),
         "the retiring context stays tombstoned, not removed"
     );
+    // Second opportunity: the stale selection frees the slot and the whole
+    // prefix — parked head first, diverted pull last — dispatches in order.
+    // The test drives the re-parked prefix the way the batch route does. A
+    // drain would snapshot the session's loader-hit counter; the direct
+    // pass sets the same authority explicitly.
+    engine.counter_snapshot.loader_hits = 1;
+    let mut records = std::mem::take(&mut engine.pending_discovery_records);
     engine
-        .drain_discovery_from(&mut session)
-        .expect("the next frame dispatches the diverted pull");
+        .process_discovery_records(
+            &mut session,
+            &mut records,
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("the next opportunity continues the rotation");
+    assert_eq!(
+        engine.pressure_service_passes, 2,
+        "rotation runs one transaction per opportunity"
+    );
+    assert_eq!(
+        engine.pressure_attempts, 2,
+        "the stale completion is the second real attempt"
+    );
+    assert_eq!(
+        engine.discovery_truncated, 0,
+        "the parked head was serviced, not dropped"
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&head_pid),
+        "the original head dispatched into the freed slot"
+    );
+    assert!(
+        !engine.refresh_requested.contains_key(&5_000_000),
+        "the stale selection freed the slot"
+    );
+    assert_eq!(
+        engine.refresh_requested.get(&pid),
+        Some(&pid_before),
+        "the armed request was never selected"
+    );
+    assert_eq!(
+        engine.refresh_requested.get(&pid2),
+        Some(&pid2_before),
+        "the diverted selection keeps its serial and age"
+    );
     assert!(
         engine.pending_discovery_records.is_empty(),
-        "the diverted pull dispatched after the parked prefix"
+        "the prefix and the diverted pull both dispatched"
     );
     assert_eq!(
         engine.loader_records_accepted, 1,
         "the diverted terminal loader still applied"
     );
+    engine
+        .drain_discovery_from(&mut session)
+        .expect("the next frame resolves the continued journal");
     assert!(
         engine.terminal_journal.is_none(),
         "the continued journal genuinely resolves"
@@ -32612,28 +32865,87 @@ fn pressure_service_diverts_nested_terminal_pulls_behind_parked() {
     );
 }
 
-/// H5 finiteness: one service pass per episode, no more; protected serials
-/// and ages survive; an all-blocked pair of fresh heads is refused honestly
-/// with zero service passes.
+/// H5 rotation: one bounded snapshot rotation per held head. Two low-ID
+/// live selections fail honestly (real rescan attempts, retained with
+/// serials and ages), an absent snapshot entry is skipped without an
+/// attempt, and a higher real provider then completes with a genuine
+/// rescan, rearm and publication. Every real attempt advances once; the
+/// absent scheduler cursor stays absent and H1 fairness accounting is
+/// untouched throughout. A consumed renewal after the older completion
+/// keeps its newer serial while retries renew nothing.
 #[test]
 fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
-    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    let (mut fixture, mut engine, _armed, _record, mut session) = armed_seed_route(1);
     engine.frame_work_budget_ns = u64::MAX;
-    for offset in 0..255u32 {
+    let pid = engine.views[0].pid();
+    // Four live provider views with no loader contexts. Roles follow sorted
+    // pid order, so the test never assumes how the host allocates pids.
+    let mut peers: Vec<u32> = (0..4).map(|_| fixture.spawn_peer()).collect();
+    peers.sort_unstable();
+    let (fail_a, fail_b, absent, success) = (peers[0], peers[1], peers[2], peers[3]);
+    for (index, peer) in peers.iter().enumerate() {
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(1 + index as u32), *peer).unwrap());
+    }
+    engine.next_view_id = 5;
+    assert!(engine.request_refresh_consumed(pid, Some(1_000)));
+    assert!(engine.request_refresh_consumed(fail_a, Some(1_100)));
+    assert!(engine.request_refresh_consumed(fail_b, Some(1_200)));
+    assert!(engine.request_refresh_consumed(absent, Some(1_300)));
+    assert!(engine.request_refresh_consumed(success, Some(1_400)));
+    for offset in 0..251u32 {
         assert!(
-            engine.request_refresh_consumed(4_000_000 + offset, Some(1_000 + u64::from(offset)))
+            engine.request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
         );
     }
-    assert!(engine.request_refresh_consumed(5_000_000, Some(2_000)));
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
-    let ticks_before = engine.scheduler.under_cap_ticks_for_test();
+    let fail_a_before = engine.refresh_requested[&fail_a];
+    let fail_b_before = engine.refresh_requested[&fail_b];
+    let pid_before = engine.refresh_requested[&pid];
+    let success_serial_before = engine.refresh_requested[&success].serial;
+    // Absent cursor: no ordinary tick ever ran, so H1 fairness starts
+    // untouched; the episode must neither need nor move it.
+    assert_eq!(engine.scheduler.cursor_for_test(), None);
+    let under_cap_before = engine.scheduler.under_cap_ticks_for_test();
+    let over_cap_before = engine.scheduler.over_cap_passes();
+    let new_order_before = engine.scheduler.new_view_order(&[3, 5, 7]);
+    let retained_order_before = engine.scheduler.retained_view_order(&[3, 5, 7]);
+    let alternation_before = engine.scheduler.newcomers_first(true, true);
+    let scans_before = engine.deep_scans;
+    let arms_before = engine.loader_arms();
     let head_pid = 6_000_000u32;
     let mut records: Vec<QueuedDiscoveryRecord> = std::iter::once(head_pid)
-        .chain((0..255u32).map(|offset| 4_000_000 + offset))
+        .chain((0..251u32).map(|offset| 4_000_000 + offset))
         .map(refresh_exec)
         .collect();
-    let mut session = ScriptedSession::with_records([], 0);
     let mut collect = Engine::collect_discovery_records;
+    let fairness_untouched = |engine: &Engine| {
+        assert_eq!(engine.scheduler.cursor_for_test(), None);
+        assert_eq!(
+            engine.scheduler.under_cap_ticks_for_test(),
+            under_cap_before,
+            "rotation consumes no under-cap tick"
+        );
+        assert_eq!(
+            engine.scheduler.over_cap_passes(),
+            over_cap_before,
+            "rotation consumes no over-cap pass"
+        );
+        assert_eq!(engine.scheduler.new_view_order(&[3, 5, 7]), new_order_before);
+        assert_eq!(
+            engine.scheduler.retained_view_order(&[3, 5, 7]),
+            retained_order_before
+        );
+        assert_eq!(
+            engine.scheduler.newcomers_first(true, true),
+            alternation_before,
+            "rotation preserves the H1 scan-class alternation"
+        );
+    };
+    // First opportunity: the lowest live selection rescans honestly, then
+    // its candidate preflight refuses and the request is retained.
+    session.refuse_preflights([true]);
     engine
         .process_discovery_records(
             &mut session,
@@ -32644,20 +32956,216 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
             &mut PauseClosure::new(true),
         )
         .expect("pressure service keeps the batch alive");
+    assert!(records.is_empty(), "the first opportunity parks everything");
+    assert_eq!(engine.pressure_service_passes, 1);
     assert_eq!(
-        engine.scheduler.under_cap_ticks_for_test() - ticks_before,
-        1,
-        "one head episode runs exactly one service pass"
+        engine.pressure_attempts, 1,
+        "the failed low-ID rescan is a real attempt"
     );
-    assert_eq!(engine.discovery_truncated, 0);
-    assert!(engine.refresh_requested.contains_key(&head_pid));
-    for offset in 0..255u32 {
+    assert_eq!(
+        engine.deep_scans,
+        scans_before + 1,
+        "exactly the selected rescan ran"
+    );
+    assert_eq!(engine.discovery_truncated, 0, "rotation refuses nothing");
+    assert!(
+        !engine.refresh_requested.contains_key(&head_pid),
+        "the head waits parked while rotation continues"
+    );
+    assert_eq!(
+        engine.refresh_requested.get(&fail_a),
+        Some(&fail_a_before),
+        "the failed selection keeps its serial and age"
+    );
+    assert_eq!(
+        engine
+            .pressure_episode
+            .as_ref()
+            .map(|episode| episode.ruled_out.clone()),
+        Some(BTreeSet::from([fail_a])),
+        "one rotation rules out exactly the failed entry"
+    );
+    fairness_untouched(&engine);
+    // Between opportunities the absent entry's request settles elsewhere
+    // (a pause-owned batch, which never runs service passes) while a
+    // concurrent arrival refills the map: the episode must skip the absent
+    // snapshot entry without an attempt and must never select the arrival,
+    // which is not in its snapshot.
+    engine.refresh_requested.remove(&absent);
+    let newcomer = 7_000_000u32;
+    assert!(engine.request_refresh_consumed(newcomer, Some(5_000)));
+    let newcomer_before = engine.refresh_requested[&newcomer];
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    // Second opportunity: the absent entry is skipped and the next low-ID
+    // selection fails the same honest way. No indefinite retry of the
+    // first failure: it is never reselected.
+    let mut records = std::mem::take(&mut engine.pending_discovery_records);
+    session.refuse_preflights([true]);
+    engine
+        .process_discovery_records(
+            &mut session,
+            &mut records,
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("the next opportunity continues the rotation");
+    assert_eq!(engine.pressure_service_passes, 2);
+    assert_eq!(
+        engine.pressure_attempts, 2,
+        "the absent entry advances no attempt"
+    );
+    assert_eq!(
+        engine.deep_scans,
+        scans_before + 2,
+        "exactly one rescan per opportunity"
+    );
+    assert_eq!(
+        engine
+            .pressure_episode
+            .as_ref()
+            .map(|episode| episode.ruled_out.clone()),
+        Some(BTreeSet::from([fail_a, fail_b])),
+        "rotation never reselects a ruled-out entry"
+    );
+    assert_eq!(
+        engine.refresh_requested.get(&fail_b),
+        Some(&fail_b_before),
+        "the second failure keeps its serial and age"
+    );
+    assert!(
+        !engine.refresh_requested.contains_key(&head_pid),
+        "the head still waits for the successful provider"
+    );
+    fairness_untouched(&engine);
+    // Third opportunity: the higher real provider completes with a genuine
+    // rescan, rearm and publication, and the head resumes into the slot.
+    let mut records = std::mem::take(&mut engine.pending_discovery_records);
+    session.refuse_preflights([false, false]);
+    engine
+        .process_discovery_records(
+            &mut session,
+            &mut records,
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("the successful provider frees the head");
+    assert_eq!(engine.pressure_service_passes, 3);
+    assert_eq!(
+        engine.pressure_attempts, 3,
+        "the successful completion is a real attempt"
+    );
+    assert_eq!(engine.discovery_truncated, 0, "rotation loses nothing");
+    assert!(
+        engine.refresh_requested.contains_key(&head_pid),
+        "the original head dispatched into the freed slot"
+    );
+    assert!(
+        !engine.refresh_requested.contains_key(&success),
+        "the successful provider completed"
+    );
+    assert!(
+        !engine
+            .loader_registry
+            .ids_for_view(ProcessViewId(4))
+            .is_empty(),
+        "the successful provider really rearmed"
+    );
+    assert!(
+        !session.attached_slots.is_empty(),
+        "the successful provider really published"
+    );
+    assert!(
+        engine.loader_arms() > arms_before,
+        "the successful completion armed its loader"
+    );
+    assert_eq!(
+        engine.refresh_requested.get(&fail_a),
+        Some(&fail_a_before),
+        "the first failure still keeps its serial and age"
+    );
+    assert_eq!(
+        engine.refresh_requested.get(&fail_b),
+        Some(&fail_b_before),
+        "the second failure still keeps its serial and age"
+    );
+    assert_eq!(
+        engine.refresh_requested.get(&pid),
+        Some(&pid_before),
+        "the armed request was never selected"
+    );
+    assert_eq!(
+        engine.refresh_requested.get(&newcomer),
+        Some(&newcomer_before),
+        "the arrival is not in the snapshot and is never selected"
+    );
+    assert!(
+        engine.pending_discovery_records.is_empty(),
+        "the parked prefix fully dispatched"
+    );
+    assert!(
+        engine.pressure_episode.is_none(),
+        "the settled head discards its episode"
+    );
+    assert!(
+        !engine.pressure_rotation_pending,
+        "no rotation outlives its head"
+    );
+    let mut previous = 0u64;
+    for offset in 0..251u32 {
+        let request = &engine.refresh_requested[&(4_000_000 + offset)];
         assert_eq!(
-            engine.refresh_requested[&(4_000_000 + offset)].first_seen_ns,
-            Some(1_000 + u64::from(offset)),
-            "protected suffix keeps its original age"
+            request.first_seen_ns,
+            Some(2_000 + u64::from(offset)),
+            "suffix renewals keep their original ages"
         );
+        assert!(
+            request.serial > previous,
+            "suffix renewal serials advance in exact order"
+        );
+        previous = request.serial;
     }
+    fairness_untouched(&engine);
+    // Renewal survival: after the episode a later ordinary tick settles
+    // stale entries, and then internal retries cannot renew the completed
+    // request, while a genuine newer consumed record keeps its newer
+    // serial and original age.
+    refresh_inventory_once(&mut engine);
+    assert_eq!(
+        engine.discovery_truncated, 0,
+        "the settling tick refuses nothing"
+    );
+    assert!(engine.request_refresh(success, Some(9_000)));
+    let retry_serial = engine.refresh_requested[&success].serial;
+    assert!(engine.request_refresh(success, Some(9_001)));
+    assert_eq!(
+        engine.refresh_requested[&success].serial, retry_serial,
+        "a retry of the live request renews nothing"
+    );
+    let mut renewal = vec![refresh_exec(success)];
+    engine
+        .process_discovery_records(
+            &mut session,
+            &mut renewal,
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("the renewal dispatch keeps the batch alive");
+    let renewed = engine.refresh_requested[&success];
+    assert!(
+        renewed.serial > retry_serial && renewed.serial > success_serial_before,
+        "the consumed renewal keeps a newer serial than every older entry"
+    );
+    assert_eq!(
+        renewed.first_seen_ns,
+        Some(9_000),
+        "the renewal keeps its original age"
+    );
     let (mut blocked, _dir) = engine_over_cgroup_naming(&[]);
     blocked.frame_work_budget_ns = u64::MAX;
     for offset in 0..MAX_PENDING_REFRESH as u32 {
@@ -32665,7 +33173,6 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
             blocked.request_refresh_consumed(4_000_000 + offset, Some(1_000 + u64::from(offset)))
         );
     }
-    let ticks_before = blocked.scheduler.under_cap_ticks_for_test();
     let mut records: Vec<QueuedDiscoveryRecord> = [6_000_000u32, 6_000_001u32]
         .into_iter()
         .chain((0..MAX_PENDING_REFRESH as u32).map(|offset| 4_000_000 + offset))
@@ -32684,9 +33191,12 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
         )
         .expect("the all-blocked batch still advances");
     assert_eq!(
-        blocked.scheduler.under_cap_ticks_for_test() - ticks_before,
-        0,
+        blocked.pressure_service_passes, 0,
         "all-blocked heads run zero service passes"
+    );
+    assert_eq!(
+        blocked.pressure_attempts, 0,
+        "all-blocked heads attempt nothing"
     );
     assert_eq!(
         blocked.discovery_truncated, 2,
@@ -32738,9 +33248,17 @@ fn pressure_zero_quantum_service_defers_and_refuses_once() {
         )
         .expect("a deferred service pass keeps the batch alive");
     assert_eq!(
-        fixture.engine.scheduler.under_cap_ticks_for_test() - ticks_before,
-        1,
+        fixture.engine.pressure_service_passes, 1,
         "one head episode runs exactly one service pass"
+    );
+    assert_eq!(
+        fixture.engine.pressure_attempts, 0,
+        "a zero quantum advances no attempt"
+    );
+    assert_eq!(
+        fixture.engine.scheduler.under_cap_ticks_for_test(),
+        ticks_before,
+        "the service pass leaves H1 fairness accounting untouched"
     );
     assert_eq!(
         fixture.engine.deep_scans, scans_before,
@@ -33119,9 +33637,14 @@ fn discovery_retained_prefix_dispatches_before_fresh_within_one_allowance() {
     assert!(records.is_empty());
     assert_eq!(engine.discovery_truncated, 0);
     assert_eq!(
+        engine.pressure_service_passes,
+        4096 - 256,
+        "every head past the first block frees exactly one selected slot"
+    );
+    assert_eq!(
         engine.scheduler.under_cap_ticks_for_test(),
-        15,
-        "fifteen block boundaries take fifteen bounded service passes"
+        0,
+        "service passes never consume H1 under-cap ticks"
     );
     assert_eq!(
         engine.discovery_held_high_water_for_test(),
@@ -33183,9 +33706,14 @@ fn discovery_frame_collects_fresh_only_within_shared_allowance() {
         "service plus the ordinary tick drains every request"
     );
     assert_eq!(
+        engine.pressure_service_passes,
+        4096 - 256,
+        "every head past the first block frees exactly one selected slot"
+    );
+    assert_eq!(
         engine.scheduler.under_cap_ticks_for_test(),
-        16,
-        "fifteen service passes plus the ordinary tick"
+        1,
+        "only the ordinary tick consumes an H1 under-cap tick"
     );
     assert_eq!(
         engine.discovery_held_high_water_for_test(),

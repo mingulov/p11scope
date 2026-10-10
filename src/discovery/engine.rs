@@ -373,11 +373,36 @@ pub struct Engine {
     /// dispatch normally; only live-batch dispatch parks a pressure head, so
     /// a service pass can never nest inside the tick it is servicing.
     in_refresh_tick: bool,
-    /// Pids named by undispatched parked records (plus the owner views of
-    /// loader contexts, terminal owners and selection bindings those records
-    /// name). Meaningful only while `pressure_service_active` is set: those
-    /// views are neither refreshed nor retired until their records dispatch.
-    pressure_protected_pids: BTreeSet<u32>,
+    /// The single queued request a pressure service pass may complete. Set
+    /// only while `pressure_service_active` holds; the tick scopes every
+    /// retirement, rescan, admission and completion set to this pid and
+    /// retains every other request with its serial and age.
+    pressure_selected: Option<PressureSelection>,
+    /// What a pressure service pass must leave untouched: pids named by
+    /// undispatched owned records (parked, pending, diverted, terminal and
+    /// pause-held), plus the owner views of loader contexts, terminal
+    /// owners and selection bindings those records name. Meaningful while
+    /// `pressure_service_active` or `pressure_rotation_pending` holds. When
+    /// an owned record's ownership cannot be narrowed, `block_all` shields
+    /// every retained context instead of guessing an owner from PID alone.
+    pressure_protection: PressureProtection,
+    /// The held head's service episode: its request snapshot and the
+    /// entries one bounded rotation already ruled out. Discarded when the
+    /// head settles (dispatch or refusal); a new head starts a new episode.
+    pressure_episode: Option<PressureEpisode>,
+    /// Set when a head episode re-parks its prefix for another rotation
+    /// opportunity: the ordinary tick behind it is suppressed, and
+    /// retirement stays shielded until the head settles. Cleared at every
+    /// record-pass entry and whenever the head settles.
+    pressure_rotation_pending: bool,
+    /// Selected-request service passes run (including deferrals): the
+    /// rotation instrument. H1 fairness cursors are checkpointed around
+    /// each pass, so this — not an H1 counter — measures service.
+    pressure_service_passes: u64,
+    /// Service passes that ran a real attempt: a scan, an arm, an admission
+    /// or a completion with a working clock. Quantum/clock deferrals and
+    /// absent candidates advance no attempt.
+    pressure_attempts: u64,
     /// Diagnostic high-water mark of held ordinary discovery records
     /// (pending plus terminal plus in-flight batch records). Never evidence.
     discovery_held_high_water: usize,
@@ -2805,6 +2830,60 @@ impl std::fmt::Display for PressureOrderingBlocked {
 }
 
 impl std::error::Error for PressureOrderingBlocked {}
+
+/// The single queued request a pressure service pass may complete: its pid
+/// and the snapshot serial the pass revalidates before completing. A
+/// renewed serial keeps its newer work; the pass never completes a serial
+/// it did not select.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PressureSelection {
+    pid: u32,
+    serial: u64,
+}
+
+/// Identifies a parked pressure head across service opportunities, so one
+/// bounded rotation belongs to exactly one held head. A new head starts a
+/// new episode; the episode is discarded when the head settles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PressureHeadKey {
+    pid_tgid: u64,
+    kind: u8,
+    case_id: u8,
+    hook_ts_ns: u64,
+}
+
+/// One held head's service episode: the request snapshot taken when the
+/// head parked (at most 256 entries, pid order) and the entries one
+/// bounded rotation already ruled out. Entries are ruled out when their
+/// selected transaction frees no slot — failed, deferred or absent — so
+/// no entry is retried within the episode and rotation ends after at most
+/// one pass over the snapshot with an honest head refusal.
+#[derive(Debug, Clone)]
+struct PressureEpisode {
+    head: PressureHeadKey,
+    snapshot: BTreeMap<u32, (u64, Option<ProcessViewId>)>,
+    ruled_out: BTreeSet<u32>,
+}
+
+/// What a pressure service pass must leave untouched. `pids` names every
+/// pid an undispatched owned record requires; `block_all` shields every
+/// retained context when some owned record's ownership cannot be narrowed
+/// to a pid at all.
+#[derive(Debug, Clone, Default)]
+struct PressureProtection {
+    pids: BTreeSet<u32>,
+    block_all: bool,
+}
+
+/// What one selected-request service transaction did: whether anything
+/// changed, and whether it ran a real attempt (a scan, an arm, an
+/// admission or a completion with a working clock). A quantum/clock
+/// deferral changes nothing and attempts nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PressureServiceOutcome {
+    changed: bool,
+    attempted: bool,
+}
 
 struct ManifestInput {
     path: PathBuf,
@@ -7908,7 +7987,12 @@ impl Engine {
             pause_owned_batch: false,
             pressure_service_active: false,
             in_refresh_tick: false,
-            pressure_protected_pids: BTreeSet::new(),
+            pressure_selected: None,
+            pressure_protection: PressureProtection::default(),
+            pressure_episode: None,
+            pressure_rotation_pending: false,
+            pressure_service_passes: 0,
+            pressure_attempts: 0,
             discovery_held_high_water: 0,
             held_records: BTreeSet::new(),
             paused_loader_views: BTreeSet::new(),
@@ -15465,67 +15549,249 @@ impl Engine {
         self.record_needs_new_request(queued)
     }
 
-    /// Every pid a pressure service pass must leave untouched: the pids the
-    /// parked records name, plus the owner views of loader contexts,
-    /// terminal owners and selection bindings those records name. A loader
-    /// record whose context no longer resolves protects its pid only; an
-    /// unresolvable case id matches no retained context to shield.
-    fn pressure_protection_for(&self, parked: &[QueuedDiscoveryRecord]) -> BTreeSet<u32> {
-        let mut protected = BTreeSet::new();
-        for queued in parked {
-            let record = &queued.record;
-            let pid = (record.pid_tgid >> 32) as u32;
-            protected.insert(pid);
-            if record.kind == DISCOVERY_KIND_LOADER {
-                let context_id = LoaderContextId::from_case_id(record.case_id);
-                if let Some(context) = self.loader_registry.context(context_id)
-                    && let Some(owner) = self
-                        .views
-                        .iter()
-                        .find(|view| view.id() == context.spec.view)
-                {
-                    protected.insert(owner.pid());
-                }
+    /// What a pressure service pass must leave untouched, built from every
+    /// already-owned undispatched record: the parked prefix, the pending
+    /// queue, the fresh records diverted behind the prefix this episode,
+    /// the terminal batch and journal authority, and pause-held records.
+    /// Each record protects its pid plus the owner views of the loader
+    /// context, terminal owner and selection binding it names. Ownership
+    /// that cannot be narrowed — an unresolvable loader context, terminal
+    /// owner, journal authority or selection binding — blocks every
+    /// retained context instead of guessing an owner from PID alone.
+    fn pressure_protection_for(
+        &self,
+        parked: &[QueuedDiscoveryRecord],
+        diverted: &[QueuedDiscoveryRecord],
+    ) -> PressureProtection {
+        let mut protection = PressureProtection::default();
+        for queued in parked
+            .iter()
+            .chain(self.pending_discovery_records.iter())
+            .chain(diverted.iter())
+        {
+            self.protect_queued_record(queued, &mut protection);
+        }
+        if let Some(batch) = self.terminal_batch.as_ref() {
+            for queued in batch.records.iter() {
+                self.protect_queued_record(queued, &mut protection);
             }
-            if let Some(owner) = queued.terminal_owner
-                && let Some(context) = self.loader_registry.context(owner)
-                && let Some(view) = self
-                    .views
-                    .iter()
-                    .find(|view| view.id() == context.spec.view)
-            {
-                protected.insert(view.pid());
-            }
-            if record.kind == DISCOVERY_KIND_INTERFACE_RETURN
-                && let Some(binding) = self.selection_bindings.get(&record.binding_id)
-                && let Some(view) = self.views.iter().find(|view| view.id() == binding.view)
-            {
-                protected.insert(view.pid());
+            if !self.protect_loader_owner(batch.authority.owner, &mut protection.pids) {
+                protection.block_all = true;
             }
         }
-        protected
+        if let Some(journal) = self.terminal_journal
+            && !self.protect_loader_owner(journal.owner, &mut protection.pids)
+        {
+            protection.block_all = true;
+        }
+        for (pid_tgid, _, _) in self.held_records.iter() {
+            protection.pids.insert((pid_tgid >> 32) as u32);
+        }
+        protection
     }
 
-    /// Whether any queued request is eligible for pressure service: its pid
-    /// and its owner's view are both outside the protected set.
-    fn pressure_has_eligible_request(&self, protected: &BTreeSet<u32>) -> bool {
-        self.refresh_requested.iter().any(|(pid, request)| {
-            if protected.contains(pid) {
+    /// Folds one owned record's requirements into the protection: its pid,
+    /// plus the owner view of any loader context, terminal owner or
+    /// selection binding it names. Unresolvable ownership sets `block_all`.
+    fn protect_queued_record(
+        &self,
+        queued: &QueuedDiscoveryRecord,
+        protection: &mut PressureProtection,
+    ) {
+        let record = &queued.record;
+        protection.pids.insert((record.pid_tgid >> 32) as u32);
+        if record.kind == DISCOVERY_KIND_LOADER
+            && !self.protect_loader_owner(
+                LoaderContextId::from_case_id(record.case_id),
+                &mut protection.pids,
+            )
+        {
+            protection.block_all = true;
+        }
+        if let Some(owner) = queued.terminal_owner
+            && !self.protect_loader_owner(owner, &mut protection.pids)
+        {
+            protection.block_all = true;
+        }
+        if record.kind == DISCOVERY_KIND_INTERFACE_RETURN {
+            let narrowed = self
+                .selection_bindings
+                .get(&record.binding_id)
+                .and_then(|binding| {
+                    self.views
+                        .iter()
+                        .find(|view| view.id() == binding.view)
+                })
+                .is_some_and(|view| {
+                    protection.pids.insert(view.pid());
+                    true
+                });
+            if !narrowed {
+                protection.block_all = true;
+            }
+        }
+    }
+
+    /// Protects the retained view owning a loader context. Reports whether
+    /// the ownership narrowed to a retained view at all.
+    fn protect_loader_owner(
+        &self,
+        context: LoaderContextId,
+        pids: &mut BTreeSet<u32>,
+    ) -> bool {
+        self.loader_registry
+            .context(context)
+            .and_then(|context| {
+                self.views
+                    .iter()
+                    .find(|view| view.id() == context.spec.view)
+            })
+            .is_some_and(|view| {
+                pids.insert(view.pid());
+                true
+            })
+    }
+
+    /// Begins (or continues) the held head's service episode. A newly seen
+    /// head snapshots at most 256 `(pid, serial, owner)` request candidates
+    /// in pid order; the same head keeps its snapshot and ruled-out set so
+    /// one bounded rotation spans its service opportunities.
+    fn pressure_episode_begin(&mut self, head: &QueuedDiscoveryRecord) {
+        let record = &head.record;
+        let key = PressureHeadKey {
+            pid_tgid: record.pid_tgid,
+            kind: record.kind,
+            case_id: record.case_id,
+            hook_ts_ns: record.hook_ts_ns,
+        };
+        if self
+            .pressure_episode
+            .as_ref()
+            .is_some_and(|episode| episode.head == key)
+        {
+            return;
+        }
+        self.pressure_episode = Some(PressureEpisode {
+            head: key,
+            snapshot: self
+                .refresh_requested
+                .iter()
+                .map(|(pid, request)| (*pid, (request.serial, request.owner)))
+                .collect(),
+            ruled_out: BTreeSet::new(),
+        });
+    }
+
+    /// Discards the held head's episode when the head settles (dispatch or
+    /// refusal): its rotation, protection and re-park state end with it.
+    fn pressure_episode_clear(&mut self) {
+        self.pressure_episode = None;
+        self.pressure_protection = PressureProtection::default();
+        self.pressure_rotation_pending = false;
+    }
+
+    /// The next request this episode may attempt: the lowest snapshot pid
+    /// not yet ruled out whose live request still carries the snapshot
+    /// serial and passes the safe-service subset. Absent or renewed
+    /// candidates are skipped without an attempt and never selected.
+    fn pressure_select_next(
+        &self,
+        protection: &PressureProtection,
+    ) -> Option<PressureSelection> {
+        let episode = self.pressure_episode.as_ref()?;
+        episode
+            .snapshot
+            .iter()
+            .filter(|(pid, _)| !episode.ruled_out.contains(pid))
+            .filter(|(pid, (serial, _))| {
+                self.refresh_requested
+                    .get(pid)
+                    .is_some_and(|live| live.serial == *serial)
+            })
+            .filter(|(pid, _)| {
+                self.refresh_requested
+                    .get(pid)
+                    .is_some_and(|live| self.pressure_request_eligible(**pid, live, protection))
+            })
+            .map(|(pid, (serial, _))| PressureSelection {
+                pid: *pid,
+                serial: *serial,
+            })
+            .next()
+    }
+
+    /// Whether a queued request is safe to service while the head is held:
+    /// its pid and its owner's view are outside the protected set, and it
+    /// falls in the conservative service subset — provably stale with no
+    /// live context obligation, or a retained owner whose old contexts are
+    /// already fully retired so setup finishes without dispatching later
+    /// records. A live old context, selection handoff or incomplete
+    /// terminal journal blocks the request for this pressure episode. Under
+    /// block-all protection only provably context-free stale requests —
+    /// no views at all — stay eligible.
+    fn pressure_request_eligible(
+        &self,
+        pid: u32,
+        request: &RefreshRequest,
+        protection: &PressureProtection,
+    ) -> bool {
+        if protection.pids.contains(&pid) {
+            return false;
+        }
+        if let Some(view) = request
+            .owner
+            .and_then(|owner| self.views.iter().find(|view| view.id() == owner))
+            && protection.pids.contains(&view.pid())
+        {
+            return false;
+        }
+        if protection.block_all {
+            return !self.views.iter().any(|view| view.pid() == pid)
+                && request.owner.is_none_or(|owner| {
+                    !self.views.iter().any(|view| view.id() == owner)
+                });
+        }
+        let mut views: Vec<ProcessViewId> = self
+            .views
+            .iter()
+            .filter(|view| view.pid() == pid)
+            .map(ProcessView::id)
+            .collect();
+        if let Some(owner) = request.owner
+            && !views.contains(&owner)
+            && self.views.iter().any(|view| view.id() == owner)
+        {
+            views.push(owner);
+        }
+        for view in views {
+            if !self.loader_registry.ids_for_view(view).is_empty() {
                 return false;
             }
-            match request
-                .owner
-                .and_then(|owner| self.views.iter().find(|view| view.id() == owner))
+            if self
+                .selection_bindings
+                .values()
+                .any(|binding| binding.view == view)
             {
-                Some(view) => !protected.contains(&view.pid()),
-                None => true,
+                return false;
             }
-        })
+            if self.terminal_journal.is_some_and(|journal| {
+                self.loader_registry
+                    .context(journal.owner)
+                    .is_some_and(|context| context.spec.view == view)
+            }) {
+                return false;
+            }
+        }
+        true
     }
 
-    /// Whether a pressure service pass must leave this pid's views alone.
+    /// Whether a pressure service pass must leave this pid's views alone:
+    /// while the pass runs, and while its head episode still holds the
+    /// parked prefix for another rotation opportunity.
     fn pressure_view_shielded(&self, pid: u32) -> bool {
-        self.pressure_service_active && self.pressure_protected_pids.contains(&pid)
+        (self.pressure_service_active || self.pressure_rotation_pending)
+            && (self.pressure_protection.block_all
+                || self.pressure_protection.pids.contains(&pid))
     }
 
     fn acknowledge_owned_initial_exec(&mut self, view: ProcessViewId) -> bool {
@@ -15903,14 +16169,18 @@ impl Engine {
         }
     }
 
-    /// Runs one accepted-refresh inventory tick with the parked prefix
-    /// withheld, to free a request-map slot for a pressure head. Protected
-    /// views are neither refreshed nor retired; protected requests keep
-    /// their serials and ages. The tick's collector diverts any fresh
+    /// Runs one selected-request service transaction with the parked
+    /// prefix withheld, to free a request-map slot for a pressure head. The
+    /// transaction serves only `selection`: every other request is retained
+    /// with its serial and age on every exit path. Protected views are
+    /// neither refreshed nor retired. The tick's collector diverts any fresh
     /// session records into `diverted` (oldest first) instead of dispatching
     /// them ahead of the parked prefix, and reports the nested operation
     /// blocked for this episode. Diverted records are charged and counted
-    /// exactly once, at their first Engine accounting boundary.
+    /// exactly once, at their first Engine accounting boundary. H1 fairness
+    /// cursors are checkpointed around the transaction and restored on every
+    /// exit path, fatal or not: the selected attempt is recorded in the
+    /// pressure episode's own counters, never in H1 shares.
     #[allow(clippy::too_many_arguments)]
     fn pressure_service_pass(
         &mut self,
@@ -15919,10 +16189,11 @@ impl Engine {
         pending_views: &mut PendingViewRetirements,
         collect: &mut DiscoveryCollector<'_>,
         closure: &mut PauseClosure,
-        protected: &BTreeSet<u32>,
+        protection: &PressureProtection,
+        selection: PressureSelection,
         parked_len: usize,
         diverted: &mut Vec<QueuedDiscoveryRecord>,
-    ) -> Result<bool> {
+    ) -> Result<PressureServiceOutcome> {
         let held = self
             .pending_discovery_records
             .len()
@@ -15933,8 +16204,13 @@ impl Engine {
             .saturating_sub(LIVE_DISCOVERY_DRAIN_QUANTUM);
         let diverted_base = diverted.len();
         let mut diverted_malformed = 0u64;
+        let fairness = self.scheduler.fairness_checkpoint();
+        let scans_before = self.deep_scans;
+        let arms_before = self.loader_arms;
         self.pressure_service_active = true;
-        self.pressure_protected_pids.clone_from(protected);
+        self.pressure_protection.clone_from(protection);
+        self.pressure_selected = Some(selection);
+        self.pressure_service_passes = self.pressure_service_passes.saturating_add(1);
         let collect_inner = &mut *collect;
         let mut service_collect =
             |session: &mut dyn EngineSession| -> Result<(Vec<DiscoveryRecord>, u64)> {
@@ -15965,10 +16241,11 @@ impl Engine {
                         Err(PressureOrderingBlocked.into())
                     }
                     Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
-                        Ok(incomplete) if incomplete.backlog => {
-                            // A genuine quantum stop: the pulled prefix is
-                            // consumed, so it joins the diverted stash and the
-                            // nested operation stays incomplete for this episode.
+                        Ok(incomplete) if incomplete.backlog || incomplete.capacity_blocked => {
+                            // A genuine quantum or storage stop: the pulled
+                            // prefix is consumed, so it joins the diverted
+                            // stash and the nested operation stays incomplete
+                            // for this episode.
                             diverted.extend(incomplete.records.into_iter().map(|record| {
                                 QueuedDiscoveryRecord {
                                     record,
@@ -15997,7 +16274,8 @@ impl Engine {
             &mut tick_now,
         );
         self.pressure_service_active = false;
-        self.pressure_protected_pids.clear();
+        self.pressure_selected = None;
+        self.scheduler.restore_fairness(fairness);
         // Every nested pull during the pass belonged to a terminal drain, so
         // the diverted slice keeps its terminal validation: records matching
         // the pending authority dispatch as terminal hits after the parked
@@ -16011,7 +16289,19 @@ impl Engine {
         if diverted_malformed != 0 {
             closure.fail();
         }
-        outcome
+        let changed = outcome?;
+        // A real attempt ran a scan, an arm or an admission, or it settled
+        // the selected request (completed, or completed-then-renewed with a
+        // newer serial). A quantum deferral settles nothing and scans
+        // nothing; the episode rules the entry out without an attempt.
+        let completed = self
+            .refresh_requested
+            .get(&selection.pid)
+            .is_none_or(|live| live.serial != selection.serial);
+        let attempted = completed
+            || self.deep_scans != scans_before
+            || self.loader_arms != arms_before;
+        Ok(PressureServiceOutcome { changed, attempted })
     }
 
     fn process_discovery_records(
@@ -16024,6 +16314,9 @@ impl Engine {
         closure: &mut PauseClosure,
     ) -> Result<bool> {
         self.note_discovery_held_high_water(records.len());
+        // A re-parked rotation never leaks across record passes: this pass
+        // sets it again only if it re-parks a head itself.
+        self.pressure_rotation_pending = false;
         let mut changed = false;
         let mut named_generation_lost = false;
         let mut conservative_replay_attempted = false;
@@ -16066,12 +16359,16 @@ impl Engine {
                 }
                 // H5 pressure: at a full request map, a head that would need
                 // a new entry parks with its whole suffix in original order
-                // while one accepted-refresh service pass runs. The service
-                // shields every view the parked records name; if it frees a
-                // slot the parked prefix resumes in order, otherwise the
-                // head is refused exactly once through ordinary dispatch and
-                // the suffix advances. Never a frame deferral: deferral
-                // would suppress the inventory work that frees capacity.
+                // while its episode runs one selected-request service
+                // transaction per opportunity. The transaction shields every
+                // view the owned records name and serves only its selected
+                // request; if it frees a slot the parked prefix resumes in
+                // order, otherwise the episode rotates to its next eligible
+                // snapshot entry on a later opportunity. When one bounded
+                // rotation rules every entry out, the head is refused exactly
+                // once through ordinary dispatch and the suffix advances.
+                // Never a frame deferral: deferral would suppress the
+                // inventory work that frees capacity.
                 if !pressure_quiet && self.pressure_head_pending(&queued) {
                     if self.frame_work_exhausted() {
                         self.note_frame_deferral();
@@ -16081,26 +16378,45 @@ impl Engine {
                     }
                     let parked: Vec<QueuedDiscoveryRecord> =
                         std::iter::once(queued).chain(batch).collect();
-                    let protected = self.pressure_protection_for(&parked);
-                    let mut serviced = false;
-                    if self.pressure_has_eligible_request(&protected) {
+                    self.pressure_episode_begin(&parked[0]);
+                    let protection = self.pressure_protection_for(&parked, &diverted_fresh);
+                    // A failed clock is a deferral condition, never a
+                    // refusal: the episode waits untouched for the next
+                    // opportunity instead of manufacturing queue overflow.
+                    let clock_ok = crate::attach::monotonic_ns().is_some();
+                    if clock_ok
+                        && let Some(selection) = self.pressure_select_next(&protection)
+                    {
                         match self.pressure_service_pass(
                             session,
                             additions_allowed,
                             pending_views,
                             collect,
                             closure,
-                            &protected,
+                            &protection,
+                            selection,
                             parked.len(),
                             &mut diverted_fresh,
                         ) {
-                            Ok(service_changed) => {
-                                changed |= service_changed;
-                                serviced = true;
+                            Ok(outcome) => {
+                                changed |= outcome.changed;
+                                if let Some(episode) = self.pressure_episode.as_mut() {
+                                    episode.ruled_out.insert(selection.pid);
+                                }
+                                if outcome.attempted {
+                                    self.pressure_attempts =
+                                        self.pressure_attempts.saturating_add(1);
+                                }
                             }
                             Err(error) => {
                                 // A fatal service failure keeps every
                                 // undispatched record queued in ring order.
+                                // The fatal entry is ruled out so a later
+                                // retry never reselects it; the episode
+                                // otherwise survives for that retry.
+                                if let Some(episode) = self.pressure_episode.as_mut() {
+                                    episode.ruled_out.insert(selection.pid);
+                                }
                                 self.pending_discovery_records.extend(parked);
                                 self.pending_discovery_records.append(&mut diverted_fresh);
                                 return Err(error);
@@ -16118,13 +16434,27 @@ impl Engine {
                         self.pending_discovery_records.extend(parked);
                         break;
                     }
-                    if serviced && self.refresh_requested.len() >= MAX_PENDING_REFRESH {
-                        pressure_quiet = true;
-                    }
                     if self.refresh_requested.len() < MAX_PENDING_REFRESH {
                         batch = parked.into_iter();
+                        self.pressure_episode_clear();
                         continue;
                     }
+                    // Rotation continues while the snapshot holds another
+                    // selectable entry: the parked prefix waits in ring order
+                    // for the next opportunity, with no ordinary tick behind
+                    // it and retirement still shielded. A failed clock
+                    // always re-parks, even with nothing selectable.
+                    let protection = self.pressure_protection_for(&parked, &diverted_fresh);
+                    if !clock_ok || self.pressure_select_next(&protection).is_some() {
+                        self.pending_discovery_records.extend(parked);
+                        self.pressure_rotation_pending = true;
+                        break;
+                    }
+                    // One bounded rotation ruled every entry out: refuse the
+                    // head exactly once. Later heads in this pass dispatch
+                    // normally instead of repeating service the same state
+                    // just proved fruitless.
+                    pressure_quiet = true;
                     let mut parked = parked.into_iter();
                     let head = parked
                         .next()
@@ -16141,6 +16471,7 @@ impl Engine {
                         closure,
                         &mut changed,
                     );
+                    self.pressure_episode_clear();
                     continue;
                 }
                 self.dispatch_one_queued_record(
@@ -16214,6 +16545,16 @@ impl Engine {
                 // still need. The persistent intent survives this deferral
                 // and retries after the parked prefix is dispatched.
                 if self.pressure_view_shielded(retained_pid) {
+                    continue;
+                }
+                // H5 pressure: a selected transaction retires only the
+                // selected pid's views. Unrelated persistent intents are
+                // not whole-scope work for this pass; they retry after
+                // the parked prefix is dispatched.
+                if self
+                    .pressure_selected
+                    .is_some_and(|selected| retained_pid != selected.pid)
+                {
                     continue;
                 }
                 // A frame-budget deferral must not let EXEC refresh retire
@@ -17233,7 +17574,17 @@ impl Engine {
         // `desired` only narrows which new pids get deep-scanned. A zero cap
         // short-circuits to empty: selection could only ever take nothing,
         // so the sweep reads are skipped outright.
-        let desired: BTreeSet<_> = if max_scan_pids == 0 {
+        let desired: BTreeSet<_> = if let Some(selected) = self.pressure_selected {
+            // Selected transaction: serve only the selected pid. No polling
+            // round, no over-cap reconcile turn, no sweep: the pass neither
+            // reads maps beyond this enumeration nor advances any scheduler
+            // cursor of its own (H1 accounting is checkpointed around it).
+            if pids.contains(&selected.pid) {
+                BTreeSet::from([selected.pid])
+            } else {
+                BTreeSet::new()
+            }
+        } else if max_scan_pids == 0 {
             BTreeSet::new()
         } else if pids.len() > max_scan_pids {
             self.select_over_cap_desired(&pids)
@@ -17265,15 +17616,17 @@ impl Engine {
         // neither scope claims authority.
         let membership_authoritative = membership_complete && self.admits_generations();
         let serviced_requests = self.refresh_request_snapshot();
-        // H5 pressure: protected requests are seeded into the failed set so
-        // the service pass retains them with their serials and ages on every
-        // exit path, including the empty-tick early return below.
+        // H5 pressure: a service pass retains every request except its
+        // selected one with serials and ages on every exit path, including
+        // the empty-tick early return below. Only the selected request may
+        // complete; unrelated requests are never cleared.
         let mut failed_refresh_pids: BTreeSet<u32> = BTreeSet::new();
         if self.pressure_service_active {
+            let selected = self.pressure_selected.map(|selection| selection.pid);
             failed_refresh_pids.extend(
                 self.refresh_requested
                     .keys()
-                    .filter(|pid| self.pressure_protected_pids.contains(pid))
+                    .filter(|pid| Some(**pid) != selected)
                     .copied(),
             );
         }
@@ -17281,9 +17634,16 @@ impl Engine {
             .views
             .iter()
             .filter_map(|view| {
-                // H5 pressure: a view the parked records name gets no cause
-                // in a service pass — neither refreshed nor retired.
+                // H5 pressure: a view the owned records name gets no cause
+                // in a service pass — neither refreshed nor retired — and a
+                // selected transaction scopes causes to the selected pid.
                 if self.pressure_view_shielded(view.pid()) {
+                    return None;
+                }
+                if self
+                    .pressure_selected
+                    .is_some_and(|selected| view.pid() != selected.pid)
+                {
                     return None;
                 }
                 inventory_retirement_cause(
@@ -17332,7 +17692,11 @@ impl Engine {
             // No tick queued anything (a queued poll would have made a
             // retirement cause), so any pending poll is stale: forget it
             // with the requests rather than leaking it into a later tick.
-            self.polled_pids.clear();
+            // A selected transaction never touches ordinary polls: it
+            // queued none and settles none.
+            if self.pressure_selected.is_none() {
+                self.polled_pids.clear();
+            }
             for skip in skipped {
                 self.mark_partial(&skip.subject, &skip.reason);
             }
@@ -18375,10 +18739,14 @@ impl Engine {
             )?;
         }
         // A frame that deferred records runs no inventory pass: the next
-        // frame dispatches them first, then refreshes (H-1).
+        // frame dispatches them first, then refreshes (H-1). A head
+        // episode awaiting another rotation opportunity likewise runs no
+        // ordinary whole-scope tick behind its parked prefix: the next
+        // opportunity services the next snapshot entry first.
         if self.pending_retirements.is_empty()
             && self.pending_rejected_keys.is_empty()
             && !self.frame_deferred
+            && !self.pressure_rotation_pending
         {
             let mut tick_now = crate::attach::monotonic_ns;
             changed |= self.refresh_inventory(

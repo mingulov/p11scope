@@ -106,6 +106,26 @@ impl fmt::Debug for PhysicalSemanticGap {
     }
 }
 impl PhysicalSemanticGap {
+    /// Sole production factory: the coordinator's final physical
+    /// adjudication mints one gap per proven genuine-loss episode from
+    /// the binding's domain, image and stable custody Arc. Fields stay
+    /// private, Debug stays redacted, and the episode starts unapplied;
+    /// H0 re-checks custody, image and association at the cut. The finite
+    /// loss cause travels with the finalizer's loss mapping, not here.
+    pub(crate) fn adjudicated(
+        domain: NativeDomainId,
+        image: ImageIdentity,
+        pin: Arc<PidPin>,
+    ) -> Self {
+        Self {
+            episode: Arc::new(PhysicalGapEpisode {
+                domain,
+                image,
+                pin,
+                applied: AtomicBool::new(false),
+            }),
+        }
+    }
     #[cfg(test)]
     fn test_episode(domain: NativeDomainId, image: ImageIdentity, pin: Arc<PidPin>) -> Self {
         Self {

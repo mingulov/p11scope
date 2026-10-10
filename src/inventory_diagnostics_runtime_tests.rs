@@ -150,6 +150,86 @@ fn primary_stdout_failure_still_delivers_diagnostics_after_report() {
     );
 }
 
+// A failed primary stdout still delivers the identity disclosure in
+// the committed report, with diagnostics afterwards.
+#[test]
+fn primary_stdout_failure_still_delivers_identity_and_diagnostics() {
+    struct FailedStdout<'a> {
+        report: &'a Path,
+        diagnostics: &'a Path,
+    }
+    impl FinalStdout for FailedStdout<'_> {
+        fn begin_finalization(&mut self) {}
+        fn write_document(&mut self, bytes: &[u8]) -> StdoutResult {
+            assert!(
+                self.report.exists(),
+                "primary report must be attempted first"
+            );
+            assert!(
+                !self.diagnostics.exists(),
+                "diagnostics follow primary output"
+            );
+            Err(crate::inventory_output::StdoutFailure {
+                accepted: 0,
+                total: bytes.len(),
+                reason: StdoutFailureReason::Io(std::io::Error::other("stdout refused")),
+            })
+        }
+    }
+    let dir = private_tempdir();
+    let report = dir.path().join("report.json");
+    let diagnostics = fixture_diagnostic_path(dir.path());
+    let mut coordinator = coordinator();
+    let mut diagnostic = fixture_diagnostics(&diagnostics, Some(&report), None);
+    diagnostic.enable(
+        &mut coordinator,
+        CaptureMode::Native,
+        InspectScope::System,
+        None,
+    );
+    let presentation = Presentation::capture(&coordinator, "system", 1, 2, 0);
+    let identity = crate::inspect_system::IdentitySummary {
+        backend: crate::inspect_system::IdentityBackend::Kernel,
+        fallback: Some("deadline".to_string()),
+    };
+    let mut notices = Vec::new();
+    let result = finish_runtime_output(
+        Some(crate::output::atomic_file_test_fixture(&report)),
+        &mut EventLogState::new(None),
+        &mut StreamState::new(),
+        &presentation,
+        true,
+        false,
+        &mut FailedStdout {
+            report: &report,
+            diagnostics: &diagnostics,
+        },
+        None,
+        Some(&identity),
+        &mut coordinator,
+        Some(diagnostic),
+        completed(),
+        &|| false,
+        &mut |line| notices.push(line.to_string()),
+    );
+    assert_eq!(result.exit_code(), 1);
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).unwrap()).unwrap();
+    assert_eq!(document["observation"]["identity"]["backend"], "kernel");
+    assert_eq!(document["observation"]["identity"]["fallback"], "deadline");
+    assert_eq!(
+        records(&diagnostics).last().unwrap()["capture_outcome"],
+        "completed"
+    );
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|line| line.starts_with("Diagnostics:"))
+            .count(),
+        1
+    );
+}
+
 #[test]
 fn primary_report_commit_failure_still_delivers_diagnostics_and_stdout() {
     let dir = private_tempdir();
@@ -379,6 +459,7 @@ fn diagnostic_alias_is_refused_before_event_log_truncation() {
                 None,
                 CaptureMode::Native,
                 crate::attach::BackendSelection::Auto,
+                None,
                 &|| false,
                 &|| {},
                 false,
@@ -422,6 +503,7 @@ fn native_startup_error_exports_failed_footer_and_keeps_primary_error() {
                 None,
                 CaptureMode::Native,
                 crate::attach::BackendSelection::Auto,
+                None,
                 &|| false,
                 &|| finalized.set(true),
                 false,
@@ -513,6 +595,7 @@ fn failed_started_record_retires_event_log_before_classic_or_dashboard_finalizat
                     None,
                     CaptureMode::Auto,
                     crate::attach::BackendSelection::Auto,
+                    None,
                     &|| false,
                     &|| finalized.set(true),
                     dashboard,

@@ -641,6 +641,7 @@ fn run_with_terminal_inner(
         event_max_files,
         capture,
         attach_backend,
+        None,
         stop,
         outputs_attempted,
         stdout_tty,
@@ -668,6 +669,7 @@ fn run_with_terminal_diagnostics(
     event_max_files: Option<usize>,
     capture: CaptureMode,
     attach_backend: crate::attach::BackendSelection,
+    identity: Option<crate::cli::IdentityBackendSelection>,
     stop: &dyn Fn() -> bool,
     outputs_attempted: &dyn Fn(),
     stdout_tty: bool,
@@ -693,7 +695,7 @@ fn run_with_terminal_diagnostics(
         event_max_files,
         capture,
         attach_backend,
-        None,
+        identity,
         stop,
         outputs_attempted,
         stdout_tty,
@@ -770,14 +772,24 @@ fn run_with_terminal_budget(
             #[cfg(not(test))]
             let checks: Box<dyn crate::inspect_system::IdentityChecks> =
                 Box::new(crate::inspect_system::LiveIdentityChecks);
-            if selection == crate::cli::IdentityBackendSelection::Kernel
-                && let Err(reason) = crate::inspect_system::preflight_forced_kernel(checks.as_ref())
-            {
-                anyhow::bail!("{}", crate::inspect_system::forced_kernel_refusal(reason));
+            if selection == crate::cli::IdentityBackendSelection::Kernel {
+                // The preflight session becomes the capture-owned session:
+                // the eligibility probe ran once, before sinks existed.
+                match crate::inspect_system::preflight_forced_kernel(checks.as_ref()) {
+                    Ok(session) => Some(std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::inspect_system::IdentityRunShared::new_with_session(
+                            selection, checks, session,
+                        ),
+                    ))),
+                    Err(reason) => {
+                        anyhow::bail!("{}", crate::inspect_system::forced_kernel_refusal(reason));
+                    }
+                }
+            } else {
+                Some(std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::inspect_system::IdentityRunShared::new(selection, checks),
+                )))
             }
-            Some(std::sync::Arc::new(std::sync::Mutex::new(
-                crate::inspect_system::IdentityRunShared::new(selection, checks),
-            )))
         }
         _ => None,
     };

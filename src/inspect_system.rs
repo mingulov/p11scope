@@ -2816,11 +2816,12 @@ fn live_create_session()
 }
 
 /// Forced-kernel preflight (D3d): numbering, BTF, strict load and
-/// functional probe, before capture or any sink exists. `Ok` drops its
-/// validation session; the capture loads fresh per-pass sessions.
+/// functional probe, before capture or any sink exists. `Ok` returns the
+/// fresh production session; the capture owns it and installs every proof
+/// pass on it, so the eligibility probe runs once per capture.
 pub(crate) fn preflight_forced_kernel(
     checks: &dyn IdentityChecks,
-) -> Result<(), IdentityUnavailable> {
+) -> Result<crate::discovery::kernel_identity::IdentitySession, IdentityUnavailable> {
     match checks.numbering() {
         IdentityNumbering::Agree => {}
         IdentityNumbering::Mismatch => return Err(IdentityUnavailable::NumberingMismatch),
@@ -2832,7 +2833,7 @@ pub(crate) fn preflight_forced_kernel(
         IdentityBtf::NoTaskIterPidfd => return Err(IdentityUnavailable::NoTaskIterPidfd),
         IdentityBtf::NoBtf => return Err(IdentityUnavailable::NoBtf),
     }
-    checks.create_session().map(|_| ())
+    checks.create_session()
 }
 
 /// The forced-kernel refusal line: `--identity-backend kernel: kernel
@@ -2844,11 +2845,15 @@ pub(crate) fn forced_kernel_refusal(reason: IdentityUnavailable) -> String {
     )
 }
 
-/// Capture-owned identity state (D3d): selection, resolved backend,
-/// first finite fallback, cost threshold, and the injected checks. All
-/// fields are `Send`; per-pass BPF sessions live only inside their
-/// collection job and never cross threads. No cross-pass identity
-/// cache: each proof pass loads fresh.
+/// Capture-owned identity state (D3d): selection, resolved backend, first
+/// finite fallback, cost threshold, the injected checks, and the one
+/// capture-owned kernel session. All fields are `Send`: each collection job
+/// takes the session for its pass and returns it afterwards, so session
+/// lifetime (loaded capability, generation, sticky status and counters)
+/// survives across passes while pass lifetime (held files, arenas, scope,
+/// pins, records) stays per-pass. No cross-pass identity cache beyond the
+/// session itself: every pass installs fresh anchors under a fresh
+/// generation.
 pub(crate) struct IdentityRunShared {
     selection: crate::cli::IdentityBackendSelection,
     backend: IdentityBackend,
@@ -2856,10 +2861,20 @@ pub(crate) struct IdentityRunShared {
     threshold: Option<usize>,
     auto_ineligible: bool,
     loaded: bool,
+    session_failed: bool,
+    next_generation: u64,
+    session: Option<crate::discovery::kernel_identity::IdentitySession>,
     checks: Box<dyn IdentityChecks>,
 }
 
 pub(crate) type IdentityShared = std::sync::Arc<std::sync::Mutex<IdentityRunShared>>;
+
+// The capture-owned session crosses to the collection worker inside the
+// shared handle: the whole state (including the loaded BPF object) is Send.
+fn _identity_shared_is_send() {
+    fn assert_send<T: Send>() {}
+    assert_send::<IdentityShared>();
+}
 
 impl IdentityRunShared {
     /// New capture state. Forced kernel must have passed
@@ -2884,8 +2899,24 @@ impl IdentityRunShared {
             threshold,
             auto_ineligible: false,
             loaded: false,
+            session_failed: false,
+            next_generation: 1,
+            session: None,
             checks,
         }
+    }
+
+    /// New capture state preloaded with the forced-kernel preflight session:
+    /// the one eligibility probe already ran before sinks existed, so proof
+    /// passes install on it without a second load.
+    pub(crate) fn new_with_session(
+        selection: crate::cli::IdentityBackendSelection,
+        checks: Box<dyn IdentityChecks>,
+        session: crate::discovery::kernel_identity::IdentitySession,
+    ) -> Self {
+        let mut shared = Self::new(selection, checks);
+        shared.session = Some(session);
+        shared
     }
 
     #[cfg(test)]
@@ -3226,12 +3257,94 @@ fn decide_pass_attempt(shared: &IdentityShared, has_proof: bool) -> PassAttempt 
     }
 }
 
-/// Run this pass's sweep attribution with a fresh per-pass kernel
-/// session, falling back to userspace within the same pins on any
-/// setup failure. The session never leaves this job: no cross-pass
-/// cache, no shared BPF state. Forced kernel bypasses the cost
-/// threshold only (`threshold: None`); resource and run caps still
-/// apply inside the proof.
+/// One pass's exclusive session takeout: the capture-owned session plus
+/// the generation this pass installs under. The pass returns the session
+/// to the shared state when it ends; the generation is spent whether the
+/// install succeeds or not.
+struct SessionTakeout {
+    session: crate::discovery::kernel_identity::IdentitySession,
+    generation: u64,
+}
+
+/// Take this pass's kernel session from the capture-owned state: reuse
+/// the live session when one is held, otherwise attempt the single
+/// capture-level session creation. A failed creation is sticky with its
+/// first finite reason (no per-pass re-probe); the caller installs exactly
+/// one anchor pass under the takeout generation and returns the session
+/// afterwards, so sticky status and counters survive across passes. The
+/// generation is spent whether the install succeeds or not; before
+/// generation exhaustion the object is retired and reloaded once rather
+/// than wrapping into a parser-accepted old generation.
+fn take_session_for_pass(shared: &IdentityShared) -> Option<SessionTakeout> {
+    let mut shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+    if shared.next_generation >= u64::from(u32::MAX) {
+        // Practically unreachable (one generation per pass): retire the
+        // object before exhaustion; the creation below reloads it and the
+        // counter restarts at 1.
+        shared.session = None;
+        shared.next_generation = 1;
+    }
+    let session = match shared.session.take() {
+        Some(session) => session,
+        None if shared.session_failed => return None,
+        None => {
+            // The trait object cannot be cloned; create the session while
+            // holding the lock (jobs run sequentially, the service tick
+            // never takes it). Mark the load attempt first.
+            shared.loaded = true;
+            match shared.checks.create_session() {
+                Ok(session) => session,
+                Err(reason) => {
+                    shared.session_failed = true;
+                    let selection = shared.selection;
+                    match selection {
+                        // Auto's first load failure is failed selection:
+                        // userspace with a finite reason, sticky.
+                        crate::cli::IdentityBackendSelection::Auto
+                            if shared.backend == IdentityBackend::Userspace =>
+                        {
+                            shared.auto_ineligible = true;
+                            shared.note_selection_fallback(reason);
+                        }
+                        // A later failure keeps `kernel`: runtime fallback.
+                        _ => shared.note_selection_fallback(reason),
+                    }
+                    return None;
+                }
+            }
+        }
+    };
+    let generation = shared.next_generation;
+    shared.next_generation = shared.next_generation.saturating_add(1);
+    Some(SessionTakeout {
+        session,
+        generation,
+    })
+}
+
+/// Apply this pass's kernel fallback to the capture disclosure: the
+/// session ledger's first reason (chronologically first across batch and
+/// within-batch fallbacks) wins, then the batch wrapper's first
+/// batch-level reason; an existing capture reason still wins over both.
+fn apply_kernel_fallback(
+    shared: &mut IdentityRunShared,
+    observed: Option<crate::discovery::kernel_identity::KernelFallbackReason>,
+    ledger_first: Option<crate::discovery::kernel_identity::KernelFallbackReason>,
+) {
+    if let Some(reason) = ledger_first {
+        shared.note_fallback(&runtime_fallback_label(reason));
+    }
+    if let Some(reason) = observed {
+        shared.note_fallback(&runtime_fallback_label(reason));
+    }
+}
+
+/// Run this pass's sweep attribution on the capture-owned kernel session,
+/// falling back to userspace within the same pins on any setup failure.
+/// The pass installs fresh anchors under its takeout generation and always
+/// returns the session, so sticky status and counters survive across
+/// passes. Forced kernel bypasses the cost threshold only (`threshold:
+/// None`); resource and run caps still apply inside the proof.
 #[allow(clippy::too_many_arguments)]
 fn attribute_pass_with_kernel(
     shared: &IdentityShared,
@@ -3244,35 +3357,8 @@ fn attribute_pass_with_kernel(
     pools: ProofPools<'_>,
     threshold: Option<usize>,
 ) -> Option<Attributed> {
-    // One session attempt for this pass, outside the capture lock.
-    let session = {
-        let checks_locked = shared.lock().unwrap_or_else(|poison| poison.into_inner());
-        // The trait object cannot be cloned; create the session while
-        // holding the lock (jobs run sequentially, the service tick
-        // never takes it). Mark the load attempt first.
-        let mut shared = checks_locked;
-        shared.loaded = true;
-        match shared.checks.create_session() {
-            Ok(session) => Some(session),
-            Err(reason) => {
-                let selection = shared.selection;
-                match selection {
-                    // Auto's first load failure is failed selection:
-                    // userspace with a finite reason, sticky.
-                    crate::cli::IdentityBackendSelection::Auto
-                        if shared.backend == IdentityBackend::Userspace =>
-                    {
-                        shared.auto_ineligible = true;
-                        shared.note_selection_fallback(reason);
-                    }
-                    // A later failure keeps `kernel`: runtime fallback.
-                    _ => shared.note_selection_fallback(reason),
-                }
-                None
-            }
-        }
-    };
-    let Some(mut session) = session else {
+    let takeout = take_session_for_pass(shared);
+    let Some(takeout) = takeout else {
         return attribute_sweep_with(
             collection,
             bound,
@@ -3292,6 +3378,8 @@ fn attribute_pass_with_kernel(
             },
         );
     };
+    let mut session = takeout.session;
+    let generation = takeout.generation;
     // Admitted anchors: the aggregate's proven sweep keys; examined
     // anchors ride in custody. Held files only, never a pathname.
     let admitted: Vec<(ObjectKey, PinnedObjectId)> =
@@ -3299,80 +3387,99 @@ fn attribute_pass_with_kernel(
     let pass =
         crate::discovery::kernel_identity::AnchorPass::prepare(&bound.aggregate, admitted, custody);
     let install_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-    let mut installed = match session.install_anchors(pass, 1, install_deadline) {
-        Ok(installed) => installed,
-        Err(_) => {
-            let mut shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
-            if shared.selection == crate::cli::IdentityBackendSelection::Auto
-                && shared.backend == IdentityBackend::Userspace
-            {
-                shared.auto_ineligible = true;
+    // The install borrows the session exclusively; its scope ends before
+    // the common tail below touches the session again. `Some` carries the
+    // proof outcome out (dropping the install rolls this pass's ledger —
+    // batch and within-batch fallbacks — into the session totals);
+    // `None` is a failed install, whose spent generation is never reused.
+    let proved = {
+        let installed = session
+            .install_anchors(pass, generation, install_deadline)
+            .ok();
+        if let Some(mut installed) = installed {
+            let probe_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut probe = crate::discovery::kernel_identity::KernelMemberProbe::new(
+                &mut installed,
+                OsConfirmIo::with_pools(pools),
+                probe_deadline,
+            );
+            if let Some(threshold) = threshold {
+                probe = probe.with_auto_threshold(threshold);
             }
-            shared.note_fallback("anchor_not_installed");
-            drop(shared);
-            return attribute_sweep_with(
+            let (attributed, observed) = attribute_sweep_with_kernel(
                 collection,
                 bound,
-                &bound.aggregate,
-                |sweep, unavailable, selected, index, budget| {
-                    crate::discovery::confirm_shards::attribute_unselected_with_policy(
-                        sweep,
-                        unavailable,
-                        selected,
-                        index,
-                        budget,
-                        segment_policy,
-                        reservations,
-                        shards,
-                        &|| OsConfirmIo::with_pools(pools),
-                    )
-                },
+                segment_policy,
+                reservations,
+                shards,
+                &|| OsConfirmIo::with_pools(pools),
+                &mut probe,
             );
+            drop(probe);
+            drop(installed);
+            Some((attributed, observed))
+        } else {
+            None
         }
     };
-    let probe_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let mut probe = crate::discovery::kernel_identity::KernelMemberProbe::new(
-        &mut installed,
-        OsConfirmIo::with_pools(pools),
-        probe_deadline,
-    );
-    if let Some(threshold) = threshold {
-        probe = probe.with_auto_threshold(threshold);
-    }
-    let (attributed, observed) = attribute_sweep_with_kernel(
-        collection,
-        bound,
-        segment_policy,
-        reservations,
-        shards,
-        &|| OsConfirmIo::with_pools(pools),
-        &mut probe,
-    );
-    // The wrapper's first batch fallback, if any, becomes the
-    // capture's first finite reason. A fully proved pass adds zero.
-    let fallback = observed.map(runtime_fallback_label);
-    drop(probe);
-    drop(installed);
-    drop(session);
-    {
-        let mut shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
-        if shared.backend == IdentityBackend::Userspace
-            && shared.selection == crate::cli::IdentityBackendSelection::Auto
-        {
-            shared.backend = IdentityBackend::Kernel;
-        }
-        if let Some(reason) = fallback {
-            shared.note_fallback(&reason);
-        }
-    }
-    match attributed {
-        Some(attributed) => Some(attributed),
-        None => {
-            // Kernel expectations failed to install: same-pin
-            // userspace fallback with a finite reason.
+    match proved {
+        Some((attributed, observed)) => {
+            // A fully proved pass adds zero to the totals.
+            let ledger_first = session.fallback_totals().first_reason;
             {
                 let mut shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+                if shared.backend == IdentityBackend::Userspace
+                    && shared.selection == crate::cli::IdentityBackendSelection::Auto
+                {
+                    shared.backend = IdentityBackend::Kernel;
+                }
+                apply_kernel_fallback(&mut shared, observed, ledger_first);
+                // Always return the session: later passes install on it and
+                // its sticky status and counters persist across the capture.
+                shared.session = Some(session);
+            }
+            match attributed {
+                Some(attributed) => Some(attributed),
+                None => {
+                    // Kernel expectations failed to install: same-pin
+                    // userspace fallback with a finite reason.
+                    {
+                        let mut shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+                        shared.note_fallback("anchor_not_installed");
+                    }
+                    attribute_sweep_with(
+                        collection,
+                        bound,
+                        &bound.aggregate,
+                        |sweep, unavailable, selected, index, budget| {
+                            crate::discovery::confirm_shards::attribute_unselected_with_policy(
+                                sweep,
+                                unavailable,
+                                selected,
+                                index,
+                                budget,
+                                segment_policy,
+                                reservations,
+                                shards,
+                                &|| OsConfirmIo::with_pools(pools),
+                            )
+                        },
+                    )
+                }
+            }
+        }
+        None => {
+            // The install failed but the session stays valid: return it
+            // for later passes with the finite reason recorded.
+            {
+                let mut shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+                if shared.selection == crate::cli::IdentityBackendSelection::Auto
+                    && shared.backend == IdentityBackend::Userspace
+                {
+                    shared.auto_ineligible = true;
+                }
                 shared.note_fallback("anchor_not_installed");
+                shared.session = Some(session);
             }
             attribute_sweep_with(
                 collection,
@@ -3498,8 +3605,9 @@ where
 mod tests {
     use super::{
         IdentityNumbering, IdentityRunShared, IdentityShared, IdentityUnavailable,
-        LiveIdentityChecks, ScriptedIdentityChecks, decide_pass_attempt, forced_kernel_refusal,
-        preflight_forced_kernel, runtime_fallback_label,
+        LiveIdentityChecks, ScriptedIdentityChecks, apply_kernel_fallback, decide_pass_attempt,
+        forced_kernel_refusal, preflight_forced_kernel, runtime_fallback_label,
+        take_session_for_pass,
     };
     use crate::cli::IdentityBackendSelection;
     use std::sync::atomic::Ordering;
@@ -3533,8 +3641,10 @@ mod tests {
             IdentityUnavailable::ProbeFailed,
         ] {
             let checks = ScriptedIdentityChecks::refuse(reason);
-            let result = preflight_forced_kernel(&checks);
-            assert_eq!(result, Err(reason), "arm {}", reason.label());
+            match preflight_forced_kernel(&checks) {
+                Err(got) => assert_eq!(got, reason, "arm {}", reason.label()),
+                Ok(_) => panic!("arm {} must refuse", reason.label()),
+            }
             assert_eq!(
                 forced_kernel_refusal(reason),
                 format!(
@@ -3809,6 +3919,126 @@ mod tests {
                 super::PassAttempt::Userspace => panic!("cheap pass must attempt kernel"),
             }
         }
+    }
+
+    /// D3d fix (I2/I3): the eligibility probe (BTF+load+probe) runs once
+    /// per capture, never once per pass: three production takes attempt a
+    /// single session creation for both auto and forced kernel, so the one
+    /// capture-owned session (with its sticky status and counters) serves
+    /// every pass.
+    #[test]
+    fn d3d_capture_session_created_once_per_capture() {
+        for selection in [
+            IdentityBackendSelection::Auto,
+            IdentityBackendSelection::Kernel,
+        ] {
+            let (shared, ptr) = shared_with(
+                selection,
+                ScriptedIdentityChecks::session_fails(IdentityUnavailable::ProbeFailed),
+            );
+            for take in 0..3 {
+                assert!(
+                    take_session_for_pass(&shared).is_none(),
+                    "{selection:?} take {take} fails its session creation"
+                );
+            }
+            let checks = unsafe { &*ptr };
+            assert_eq!(
+                checks.session_calls.load(Ordering::SeqCst),
+                1,
+                "{selection:?} probes once per capture, not once per pass"
+            );
+        }
+    }
+
+    /// D3d fix (I2/I3): a failed session creation is sticky with its first
+    /// finite reason: later passes attempt nothing further, the load is
+    /// recorded, and auto never consults cheap checks again.
+    #[test]
+    fn d3d_session_creation_failure_is_sticky_with_first_reason() {
+        for selection in [
+            IdentityBackendSelection::Auto,
+            IdentityBackendSelection::Kernel,
+        ] {
+            let (shared, ptr) = shared_with(
+                selection,
+                ScriptedIdentityChecks::session_fails(IdentityUnavailable::LoadFailed),
+            );
+            assert!(take_session_for_pass(&shared).is_none());
+            assert!(take_session_for_pass(&shared).is_none());
+            let checks = unsafe { &*ptr };
+            assert_eq!(checks.session_calls.load(Ordering::SeqCst), 1);
+            {
+                let shared = shared.lock().unwrap();
+                assert_eq!(shared.summary().fallback.as_deref(), Some("load_failed"));
+                assert!(shared.loaded());
+            }
+            if selection == IdentityBackendSelection::Auto {
+                let numbering = checks.numbering_calls.load(Ordering::SeqCst);
+                let btf = checks.btf_calls.load(Ordering::SeqCst);
+                assert!(matches!(
+                    decide_pass_attempt(&shared, true),
+                    super::PassAttempt::Userspace
+                ));
+                assert_eq!(checks.numbering_calls.load(Ordering::SeqCst), numbering);
+                assert_eq!(checks.btf_calls.load(Ordering::SeqCst), btf);
+            }
+        }
+    }
+
+    /// D3d fix (I1): a within-batch fallback recorded in the session ledger
+    /// (unvisited, anchor-not-installed, conflicting-duplicate) is disclosed
+    /// in the capture fallback slot with the kernel backend kept, even when
+    /// no batch fell back.
+    #[test]
+    fn d3d_within_batch_fallback_disclosed_with_kernel_backend() {
+        use crate::discovery::kernel_identity::KernelFallbackReason;
+        let (shared, _) = shared_with(
+            IdentityBackendSelection::Auto,
+            ScriptedIdentityChecks::must_not_load(),
+        );
+        for reason in [
+            KernelFallbackReason::Unvisited,
+            KernelFallbackReason::AnchorNotInstalled,
+            KernelFallbackReason::ConflictingDuplicate,
+        ] {
+            let mut shared = shared.lock().unwrap();
+            shared.backend = super::IdentityBackend::Kernel;
+            shared.fallback = None;
+            apply_kernel_fallback(&mut shared, None, Some(reason));
+            assert_eq!(shared.summary().backend, super::IdentityBackend::Kernel);
+            assert_eq!(
+                shared.summary().fallback.as_deref(),
+                Some(reason.label()),
+                "ledger {reason:?} reaches the disclosure slot"
+            );
+        }
+    }
+
+    /// D3d fix (I1): the ledger's first reason is chronologically first, so
+    /// it wins over a later batch-level reason; an existing capture reason
+    /// still wins over both.
+    #[test]
+    fn d3d_ledger_first_reason_wins_over_later_batch_reason() {
+        use crate::discovery::kernel_identity::KernelFallbackReason;
+        let (shared, _) = shared_with(
+            IdentityBackendSelection::Auto,
+            ScriptedIdentityChecks::must_not_load(),
+        );
+        let mut shared = shared.lock().unwrap();
+        shared.backend = super::IdentityBackend::Kernel;
+        apply_kernel_fallback(
+            &mut shared,
+            Some(KernelFallbackReason::Deadline),
+            Some(KernelFallbackReason::Unvisited),
+        );
+        assert_eq!(shared.summary().fallback.as_deref(), Some("unvisited"));
+        apply_kernel_fallback(
+            &mut shared,
+            Some(KernelFallbackReason::StreamInvalid),
+            Some(KernelFallbackReason::ConflictingDuplicate),
+        );
+        assert_eq!(shared.summary().fallback.as_deref(), Some("unvisited"));
     }
 
     #[test]

@@ -1705,9 +1705,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// The D3d System pass with capture-owned identity state: the job
-    /// shares only the `Send` disclosure state; per-pass BPF sessions
-    /// live inside the worker. PID scope ignores the handle and stays
-    /// userspace without identity output.
+    /// shares the `Send` disclosure state plus the one capture-owned
+    /// session, taken for this pass and returned afterwards. PID scope
+    /// ignores the handle and stays userspace without identity output.
     pub(crate) fn collector_with_identity(
         &self,
         scope: InventoryScope,

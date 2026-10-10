@@ -61,21 +61,7 @@ impl AttestedSubset {
 }
 
 pub(crate) struct SubsetPreparation {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "H3 runtime wiring follows the attested subset gate"
-        )
-    )]
     pub(crate) subset: Option<AttestedSubset>,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "H3 runtime wiring follows the attested subset gate"
-        )
-    )]
     pub(crate) refusals: Vec<SemanticRefusal>,
 }
 
@@ -400,7 +386,6 @@ pub(crate) struct SemanticBindingSet {
     bindings: Vec<SemanticCallerBinding>,
     index: HashMap<CallerId, usize>,
     cursor: usize,
-    #[cfg_attr(not(test), expect(dead_code, reason = "Task5 lane loop binds callers"))]
     limit: usize,
 }
 
@@ -414,13 +399,6 @@ impl SemanticBindingSet {
         }
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Task5 lane ticks and finalizer admission read binding occupancy"
-        )
-    )]
     pub(crate) fn len(&self) -> usize {
         self.bindings.len()
     }
@@ -454,7 +432,6 @@ impl SemanticBindingSet {
         self.limit = limit.min(MAX_INSTANCES);
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "Task5 lane loop binds callers"))]
     fn insert(&mut self, binding: SemanticCallerBinding) -> Result<(), SemanticBindingRefusal> {
         debug_assert!(!self.index.contains_key(&binding.caller));
         if self.bindings.len() >= self.limit {
@@ -467,10 +444,6 @@ impl SemanticBindingSet {
 
     /// Up to MAX_PENDING bindings for one tick, from the persistent fair
     /// cursor. Every accepted binding is served in rotation.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task5 lane loop consumes the tick window")
-    )]
     pub(crate) fn bindings_for_tick(&mut self) -> &[SemanticCallerBinding] {
         self.windowed(MAX_PENDING)
     }
@@ -478,10 +451,6 @@ impl SemanticBindingSet {
     /// The bounded-selection primitive behind `bindings_for_tick`: up to
     /// `limit` bindings from the persistent fair cursor. Tests pin rotation
     /// with small limits; production always passes MAX_PENDING.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task5 lane loop consumes the tick window")
-    )]
     pub(crate) fn windowed(&mut self, limit: usize) -> &[SemanticCallerBinding] {
         let len = self.bindings.len();
         if len == 0 || limit == 0 {
@@ -506,7 +475,6 @@ impl InventoryCoordinator<OsProcessSource> {
     /// completely established, bracketed by fresh same-custody queries.
     /// The original pidfd is duplicated once; re-proving the same binding
     /// reuses the stored Arc without another duplication.
-    #[cfg_attr(not(test), expect(dead_code, reason = "Task5 lane loop binds callers"))]
     pub(crate) fn bind_semantic_caller(
         &mut self,
         caller: CallerId,
@@ -569,7 +537,6 @@ impl InventoryCoordinator<OsProcessSource> {
     /// Every ticket comparison carries its domain, so equal numeric
     /// cookies from Inventory, foreign or other Detailed producers never
     /// satisfy this proof.
-    #[cfg_attr(not(test), expect(dead_code, reason = "Task5 lane loop binds callers"))]
     fn prove_binding(
         &self,
         caller: CallerId,

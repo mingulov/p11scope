@@ -368,10 +368,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.semantic_inputs = semantics::SemanticInputs::new(manifests);
     }
 
-    #[expect(
-        dead_code,
-        reason = "H3 runtime wiring follows the attested subset gate"
-    )]
     pub(crate) fn prepare_semantic_subset(&mut self) -> semantics::SubsetPreparation {
         self.semantic_inputs.prepare(&self.engine)
     }
@@ -922,19 +918,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     /// Accepted semantic bindings (H3 Task 3): the tick window borrows
     /// from here; tests observe stable custody through it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task5 lane loop consumes the tick window")
-    )]
     pub(crate) fn semantic_bindings(&self) -> &semantics::SemanticBindingSet {
         &self.semantic_bindings
     }
 
     /// Mutable binding-set access for the tick window and tests.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task5 lane loop consumes the tick window")
-    )]
     pub(crate) fn semantic_bindings_mut(&mut self) -> &mut semantics::SemanticBindingSet {
         &mut self.semantic_bindings
     }
@@ -4630,10 +4618,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// The commit with an attested Detailed lane: pending semantic batches
     /// finalize after all reconciliation/catalog work and immediately
     /// before registry publication. `commit_batch` delegates with `None`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "Task5 loop commits with the lane")
-    )]
     pub(crate) fn commit_batch_with_semantics(
         &mut self,
         engine_changed: bool,

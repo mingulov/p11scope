@@ -3137,10 +3137,6 @@ impl Session {
 
     /// The receipt is minted from this new Session's maps and retained links;
     /// the caller supplies only the coordinator's move-only accepted subset.
-    #[expect(
-        dead_code,
-        reason = "H3 runtime wiring follows the attested subset gate"
-    )]
     pub(crate) fn start_attested(
         subset: crate::inventory_semantics::AttestedSubset,
         scope: &Scope,
@@ -3201,10 +3197,6 @@ impl Session {
             .collect()
     }
 
-    #[expect(
-        dead_code,
-        reason = "H3 runtime wiring follows the attested subset gate"
-    )]
     pub(crate) fn validate_semantic_set(&self, attached: &AttachedSemanticSet) -> Result<()> {
         let domain = self
             .native_domain()

@@ -1270,6 +1270,7 @@ fn privileged_native_lane_pid_provider_retirement_diagnostics_lp64() -> Result<(
         None,
         CaptureMode::Native,
         crate::attach::BackendSelection::Auto,
+        None,
         &stop,
         &|| {},
         false,

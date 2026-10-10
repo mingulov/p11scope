@@ -1539,6 +1539,13 @@ impl IdentitySession {
         }
     }
 
+    /// D3d capture disclosure input: the session-owned fallback totals
+    /// (affected passes/PIDs/keys with the first finite reason). Read-only:
+    /// the ledger, sticky status and counters stay session-owned.
+    pub(crate) fn fallback_totals(&self) -> KernelFallbackTotals {
+        self.fallback.totals()
+    }
+
     /// Install only this pass's observer anchors. Target-range proof belongs
     /// to D3c. A generation is spent before I/O so a failed pass cannot reuse it.
     pub(crate) fn install_anchors<'s, 'p>(

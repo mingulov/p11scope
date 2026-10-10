@@ -9268,6 +9268,604 @@ fn overflowing_retained_exec_refresh_rearms_after_queue_capacity_returns() {
     assert_eq!(engine.newcomer_ages.dropped_unknown, 1);
 }
 
+/// H6 slice 1 fixture: a live child mapping a provider that publishes a real
+/// static 2.40 function table in its data mappings, so the real scan decodes
+/// identical tables — hence an identical static plan — on every pass. Only
+/// the EXEC hint and the scripted link failures are synthetic.
+struct TabledSeedProvider {
+    child: std::process::Child,
+    peers: Vec<std::process::Child>,
+    dir: tempfile::TempDir,
+}
+
+impl Drop for TabledSeedProvider {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        for peer in &mut self.peers {
+            let _ = peer.kill();
+            let _ = peer.wait();
+        }
+    }
+}
+
+const TABLED_PROVIDER_C: &str = r#"
+#include <stddef.h>
+__attribute__((visibility("default")))
+int P11S_fn_a(void) { return 11; }
+__attribute__((visibility("default")))
+int P11S_fn_b(void) { return 22; }
+__attribute__((visibility("default")))
+int P11S_fn_c(void) { return 33; }
+struct p11s_function_list {
+    unsigned char major;
+    unsigned char minor;
+    unsigned char reserved[6];
+    void *slots[68];
+};
+__attribute__((visibility("default"))) struct p11s_function_list P11S_function_list = {
+    2, 40, {0}, { P11S_fn_a, P11S_fn_b, P11S_fn_c }
+};
+__attribute__((visibility("default"), noinline))
+int C_GetFunctionList(void **out) {
+    if (out != NULL) *out = &P11S_function_list;
+    return 0;
+}
+__attribute__((visibility("default"), noinline))
+int C_GetInterfaceList(void *out, unsigned long *count) {
+    if (out != NULL) *(void **)out = NULL;
+    if (count != NULL) *count = 0;
+    return 0;
+}
+__attribute__((visibility("default"), noinline))
+int C_GetInterface(const char *name, void *version, void **out, unsigned long flags) {
+    (void)name; (void)version; (void)flags;
+    if (out != NULL) *out = NULL;
+    return 0;
+}
+"#;
+
+const TABLED_RUNNER_C: &str = r#"
+#include <dlfcn.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    if (argc != 2) return 2;
+    void *handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    if (handle == NULL) return 3;
+    sleep(30);
+    dlclose(handle);
+    return 0;
+}
+"#;
+
+fn compile_tabled_provider(dir: &std::path::Path, stem: &str) -> PathBuf {
+    let source = dir.join(format!("{stem}.c"));
+    let library = dir.join(format!("{stem}.so"));
+    std::fs::write(&source, TABLED_PROVIDER_C).unwrap();
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&library)
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success()
+    );
+    library
+}
+
+fn wait_tabled_mapping(pid: u32, library: &std::path::Path) {
+    for _ in 0..200 {
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+        if maps.contains(library.to_str().unwrap()) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!(
+        "the tabled provider {} never mapped in {pid}",
+        library.display()
+    );
+}
+
+impl TabledSeedProvider {
+    fn spawn_peer(&mut self, stem: &str) -> (u32, PathBuf) {
+        let library = compile_tabled_provider(self.dir.path(), stem);
+        let child = std::process::Command::new(self.dir.path().join("tabled-runner"))
+            .arg(&library)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        self.peers.push(child);
+        wait_tabled_mapping(pid, &library);
+        (pid, library)
+    }
+}
+
+fn loaded_tabled_provider() -> (TabledSeedProvider, ProcessView, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let library = compile_tabled_provider(dir.path(), "tabled-provider");
+    let runner_source = dir.path().join("tabled-runner.c");
+    let runner = dir.path().join("tabled-runner");
+    std::fs::write(&runner_source, TABLED_RUNNER_C).unwrap();
+    assert!(
+        std::process::Command::new("gcc")
+            .args(["-o"])
+            .arg(&runner)
+            .arg(&runner_source)
+            .arg("-ldl")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let child = std::process::Command::new(&runner)
+        .arg(&library)
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    wait_tabled_mapping(pid, &library);
+    let fixture = TabledSeedProvider {
+        child,
+        peers: Vec::new(),
+        dir,
+    };
+    let view = ProcessView::open(ProcessViewId(0), pid).unwrap();
+    let library = fixture.dir.path().join("tabled-provider.so");
+    (fixture, view, library)
+}
+
+/// H6 slice 1 route: a PID capture whose static plan, loader and exports all
+/// come from the real inventory tick over a live tabled-provider child — no
+/// hand-built modules, so the post-exec rescan re-accepts the same facts.
+fn exec_rearm_pid_route() -> (TabledSeedProvider, Engine, ScriptedSession) {
+    let (fixture, view, library) = loaded_tabled_provider();
+    let pid = view.pid();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Pid(pid);
+    engine.next_view_id = 1;
+    engine.module_hints = vec![library];
+    engine.views.push(view);
+    let mut session = ScriptedSession::default();
+    session.dynamic_attach_reports_added = true;
+    assert!(engine.request_refresh(pid, crate::attach::monotonic_ns()));
+    let outcome = apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+        .expect("the initial inventory tick applies");
+    assert!(
+        outcome.required_complete,
+        "the initial tick must complete: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        !engine.plan.slots.is_empty(),
+        "the real scan must attach static targets to rearm"
+    );
+    assert_eq!(
+        engine.loader_registry.ids_for_view(ProcessViewId(0)).len(),
+        1,
+        "the initial tick arms the provider loader"
+    );
+    (fixture, engine, session)
+}
+
+/// H6 slice 1 twin route: two live provider children under one cgroup scope,
+/// each mapping a distinct provider file so their static slots are disjoint.
+fn exec_rearm_cgroup_twin_route() -> (
+    TabledSeedProvider,
+    Engine,
+    ScriptedSession,
+    tempfile::TempDir,
+) {
+    let (mut fixture, view, library0) = loaded_tabled_provider();
+    let pid0 = view.pid();
+    let (pid1, library1) = fixture.spawn_peer("tabled-sibling");
+    let peer_view = ProcessView::open(ProcessViewId(1), pid1).unwrap();
+    let (cgroup_engine, scope_dir) = engine_over_cgroup_naming(&[pid0, pid1]);
+    let mut engine = Engine::empty();
+    engine.scope = cgroup_engine.scope;
+    engine.next_view_id = 2;
+    engine.module_hints = vec![library0, library1];
+    engine.views.push(view);
+    engine.views.push(peer_view);
+    engine.seed_initial_cgroup_views();
+    let mut session = ScriptedSession::default();
+    session.dynamic_attach_reports_added = true;
+    assert!(engine.request_refresh(pid0, crate::attach::monotonic_ns()));
+    assert!(engine.request_refresh(pid1, crate::attach::monotonic_ns()));
+    let outcome = apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+        .expect("the initial cgroup tick applies");
+    assert!(
+        outcome.required_complete,
+        "the initial cgroup tick must complete: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        !engine.plan.slots.is_empty(),
+        "the real scan must attach static targets to rearm"
+    );
+    assert_eq!(
+        engine.loader_registry.ids_for_view(ProcessViewId(0)).len(),
+        1,
+        "the initial tick arms the first provider loader"
+    );
+    assert_eq!(
+        engine.loader_registry.ids_for_view(ProcessViewId(1)).len(),
+        1,
+        "the initial tick arms the sibling provider loader"
+    );
+    (fixture, engine, session, scope_dir)
+}
+
+/// H6 slice 1: an EXEC whose rescan re-accepts the same static targets must
+/// still run those PID-bound links through detach/replace and rearm
+/// loader/exports — never retain them as silently dead. Real held provider
+/// files plus the original live processes throughout; only the EXEC hint and
+/// the scripted link failures are synthetic. The cgroup twin proves the
+/// sibling's unrelated links stay installed, and the failure twins prove no
+/// active-without-link publication and no duplicate counts.
+#[test]
+fn automatic_exec_unchanged_plan_rearms_pid_targets() {
+    // --- PID scene: the unchanged plan rearms through detach/replace. ---
+    let (_fixture, mut engine, mut session) = exec_rearm_pid_route();
+    let pid = engine.views[0].pid();
+    let view_id = engine.views[0].id();
+    let old_context = engine.loader_registry.ids_for_view(view_id)[0];
+    let accepted: Vec<(u32, PinnedObjectId, u64)> = engine
+        .plan
+        .slots
+        .iter()
+        .map(|slot| (slot.index, slot.object, slot.file_offset))
+        .collect();
+    let active_before = engine.plan.active_slot_count();
+    let modules_before = engine.capture_facts.history.modules.clone();
+    let decoded_before = engine.capture_facts.history.decoded.clone();
+    let dynamic_before = session.dynamic_attach_calls.len();
+    assert!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .all(|slot| engine.plan.is_active(slot.index)),
+        "precondition: every accepted slot starts active"
+    );
+
+    let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![exec_record_for(pid)])
+        .expect("the exec refresh batch applies");
+    assert!(outcome.required_complete);
+
+    let rearmed: Vec<(u32, PinnedObjectId, u64)> = engine
+        .plan
+        .slots
+        .iter()
+        .map(|slot| (slot.index, slot.object, slot.file_offset))
+        .collect();
+    assert_eq!(
+        rearmed, accepted,
+        "the unchanged plan keeps its object/offset/slot identities"
+    );
+    assert!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .all(|slot| engine.plan.is_active(slot.index)),
+        "every rearmed slot is re-linked, never active-without-link"
+    );
+    assert_eq!(engine.plan.active_slot_count(), active_before);
+    let detached: BTreeSet<u32> = session
+        .detached_slot_indices
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    let replaced: BTreeSet<u32> = session
+        .replaced_slot_indices
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    for (index, _, _) in &accepted {
+        assert!(
+            detached.contains(index),
+            "slot {index} detaches; detach calls: {:?}",
+            session.detached_slot_indices
+        );
+        assert!(
+            replaced.contains(index),
+            "slot {index} replaces; replace calls: {:?}",
+            session.replaced_slot_indices
+        );
+    }
+    let contexts = engine.loader_registry.ids_for_view(view_id);
+    assert_eq!(contexts.len(), 1);
+    assert_ne!(contexts[0], old_context, "the loader context rearms");
+    assert!(
+        session.dynamic_attach_calls.len() > dynamic_before,
+        "exports rearm through the refreshed context"
+    );
+    assert_eq!(
+        engine.capture_facts.history.modules, modules_before,
+        "old totals persist once: nothing zeroed"
+    );
+    assert_eq!(
+        engine.capture_facts.history.decoded, decoded_before,
+        "no duplicate decoded facts from the rearm"
+    );
+    assert!(
+        engine
+            .views
+            .iter()
+            .any(|view| view.id() == view_id && view.still_the_same()),
+        "original process custody is retained, never reopened by PID"
+    );
+
+    // --- Cgroup twin: the sibling's unrelated links stay installed. ---
+    let (_twin, mut engine, mut session, _scope_dir) = exec_rearm_cgroup_twin_route();
+    let pid0 = engine.views[0].pid();
+    let sibling_context = engine.loader_registry.ids_for_view(ProcessViewId(1))[0];
+    let slot_view = |engine: &Engine, object: PinnedObjectId| {
+        engine
+            .modules
+            .iter()
+            .find(|module| module.object == object)
+            .unwrap_or_else(|| panic!("slot object {object:?} names no retained module"))
+            .scanned
+            .view
+    };
+    let first_slots: BTreeSet<u32> = engine
+        .plan
+        .slots
+        .iter()
+        .filter(|slot| slot_view(&engine, slot.object) == ProcessViewId(0))
+        .map(|slot| slot.index)
+        .collect();
+    let sibling_slots: BTreeSet<u32> = engine
+        .plan
+        .slots
+        .iter()
+        .filter(|slot| slot_view(&engine, slot.object) == ProcessViewId(1))
+        .map(|slot| slot.index)
+        .collect();
+    assert!(
+        !first_slots.is_empty() && !sibling_slots.is_empty(),
+        "both views must own disjoint static slots"
+    );
+    assert!(
+        first_slots.is_disjoint(&sibling_slots),
+        "distinct provider files must not share slots"
+    );
+    let twin_modules = engine.capture_facts.history.modules.clone();
+
+    let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![exec_record_for(pid0)])
+        .expect("the twin exec batch applies");
+    assert!(outcome.required_complete);
+    let detached: BTreeSet<u32> = session
+        .detached_slot_indices
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    let replaced: BTreeSet<u32> = session
+        .replaced_slot_indices
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    assert_eq!(
+        detached, first_slots,
+        "only the exec'd view detaches; sibling links stay installed"
+    );
+    assert_eq!(
+        replaced, first_slots,
+        "only the exec'd view replaces; sibling links stay installed"
+    );
+    assert_eq!(
+        engine.loader_registry.ids_for_view(ProcessViewId(1)),
+        [sibling_context],
+        "the sibling caller stays live on its original context"
+    );
+    assert!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .all(|slot| engine.plan.is_active(slot.index)),
+        "every slot stays linked after the scoped rearm"
+    );
+    assert_eq!(
+        engine.capture_facts.history.modules, twin_modules,
+        "twin totals persist once"
+    );
+
+    // --- Single failure: a failed detach deactivates, never publishes. ---
+    let (_failed, mut engine, mut session) = exec_rearm_pid_route();
+    let pid = engine.views[0].pid();
+    let accepted: Vec<u32> = engine.plan.slots.iter().map(|slot| slot.index).collect();
+    let modules_before = engine.capture_facts.history.modules.clone();
+    session.fail_slot_detaches([true]);
+    let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![exec_record_for(pid)])
+        .expect("the failed-detach batch still applies");
+    for index in &accepted {
+        assert!(
+            !engine.plan.is_active(*index),
+            "slot {index}: a failed detach must deactivate, never publish active-without-link"
+        );
+    }
+    assert_eq!(
+        engine.capture_facts.history.modules, modules_before,
+        "no duplicate counts from the failed rearm"
+    );
+    assert!(
+        !outcome.required_complete,
+        "the failed rearm stays honestly incomplete"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live discovery detach" || skip.subject == "live discovery transaction"
+        }),
+        "the detach failure stays visible: {:?}",
+        engine.counters.object_skips
+    );
+
+    // --- Multi failure: a partial group rebuild deactivates only losers. ---
+    let (_multi, mut engine, mut session) = exec_rearm_pid_route();
+    let pid = engine.views[0].pid();
+    let accepted: Vec<u32> = engine.plan.slots.iter().map(|slot| slot.index).collect();
+    let modules_before = engine.capture_facts.history.modules.clone();
+    let failed_slot = accepted[0];
+    let survivors: Vec<(u32, Option<u64>)> = accepted[1..]
+        .iter()
+        .map(|index| (*index, Some(7)))
+        .collect();
+    session.report_slot_rebuilds([DetachOutcome {
+        recompleted: survivors,
+        rebuild_failures: vec![(failed_slot, "scripted multi survivor lost".into())],
+        rebuilt_groups: 1,
+    }]);
+    apply_ordinary_batch(&mut engine, &mut session, vec![exec_record_for(pid)])
+        .expect("the multi-rebuild batch still applies");
+    assert!(
+        !engine.plan.is_active(failed_slot),
+        "the lost rebuild survivor deactivates, never active-without-link"
+    );
+    for index in &accepted[1..] {
+        assert!(
+            engine.plan.is_active(*index),
+            "recompleted survivor slot {index} stays linked"
+        );
+    }
+    assert_eq!(
+        engine.capture_facts.history.modules, modules_before,
+        "no duplicate counts from the partial rebuild"
+    );
+    assert_eq!(
+        engine.multi_rebuild_gaps, 1,
+        "the rebuilt group counts exactly one published gap window"
+    );
+}
+
+/// H6 slice 1: a cold nonleader successor holds no identity receipt when its
+/// first calls arrive — physical rearm runs before the first real successor
+/// call can be served, the early unknown stays visible, and only actual
+/// successor evidence admits nonempty current calls. Everything flows through
+/// the ordinary batch path: no manual Session rebind, no map insertion, no
+/// fake receipt, no constructor bypass.
+#[test]
+fn automatic_exec_cold_nonleader_bootstraps_before_image_receipt() {
+    let (_fixture, mut engine, mut session) = exec_rearm_pid_route();
+    let pid = engine.views[0].pid();
+    let view_id = engine.views[0].id();
+    let old_context = engine.loader_registry.ids_for_view(view_id)[0];
+    let accepted: Vec<(u32, PinnedObjectId, u64)> = engine
+        .plan
+        .slots
+        .iter()
+        .map(|slot| (slot.index, slot.object, slot.file_offset))
+        .collect();
+
+    // Cold: no successor evidence of any kind exists yet.
+    assert_eq!(
+        engine.loader_records_accepted, 0,
+        "no loader receipt before the successor acts"
+    );
+    assert!(
+        engine.capture_facts.history.selections.is_empty(),
+        "no current calls before the successor acts"
+    );
+    assert!(
+        engine.selection_claims.is_empty(),
+        "no continuity claim before the successor acts"
+    );
+
+    // The EXEC plus an early successor call that no receipt could serve: its
+    // binding is unknown because the successor was never admitted.
+    let mut early = successful_selection_record(pid, u64::MAX, 0);
+    early.hook_ts_ns = crate::attach::monotonic_ns().unwrap();
+    let outcome =
+        apply_ordinary_batch(&mut engine, &mut session, vec![exec_record_for(pid), early])
+            .expect("the exec plus early-call batch applies");
+    assert!(
+        !outcome.required_complete,
+        "the refused early call keeps the batch honestly incomplete"
+    );
+
+    // Physical rearm ran inside that batch, before any successor call served.
+    let contexts = engine.loader_registry.ids_for_view(view_id);
+    assert_eq!(contexts.len(), 1);
+    let rearmed = contexts[0];
+    assert_ne!(rearmed, old_context, "the loader rearms for the successor");
+    let detached: BTreeSet<u32> = session
+        .detached_slot_indices
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    let replaced: BTreeSet<u32> = session
+        .replaced_slot_indices
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    for (index, _, _) in &accepted {
+        assert!(
+            detached.contains(index),
+            "slot {index} detaches before the first served successor call"
+        );
+        assert!(
+            replaced.contains(index),
+            "slot {index} replaces before the first served successor call"
+        );
+    }
+
+    // Early unknown stays visible: rejected, counted, never retro-named.
+    assert!(
+        engine.capture_facts.history.selections.is_empty(),
+        "the early call attributes to nothing"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live interface selection"
+                && skip.reason == "a selection record named an unknown capture-local binding"
+        }),
+        "the early unknown stays visible: {:?}",
+        engine.counters.object_skips
+    );
+
+    // Actual successor evidence through the rearmed endpoints: a live call
+    // against the freshly admitted successor binding is served.
+    let successor = engine
+        .selection_bindings
+        .values()
+        .find(|binding| binding.context == rearmed && binding.attached && !binding.retired)
+        .copied()
+        .expect("the rearm admits a successor binding from real evidence");
+    let mut call = successful_selection_record(pid, successor.id, 0);
+    call.hook_ts_ns = crate::attach::monotonic_ns().unwrap();
+    apply_ordinary_batch(&mut engine, &mut session, vec![call])
+        .expect("the successor call batch applies");
+    assert!(
+        !engine.capture_facts.history.selections.is_empty(),
+        "the actual receipt supports nonempty current calls"
+    );
+    assert!(
+        engine.selection_bindings[&successor.id].observed,
+        "the successor call is observed on its own binding"
+    );
+    assert!(
+        engine
+            .views
+            .iter()
+            .any(|view| view.id() == view_id && view.still_the_same()),
+        "original custody bootstraps the successor; no rebind by scalar PID"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live interface selection"
+                && skip.reason == "a selection record named an unknown capture-local binding"
+        }),
+        "recovery never erases the early unknown"
+    );
+}
+
 #[test]
 fn selection_bindings_reuse_existing_physical_attachments() {
     let (_fixture, mut engine, mut session) = initial_export_route();

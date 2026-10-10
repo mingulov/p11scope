@@ -494,6 +494,11 @@ pub struct Engine {
     expected_target_exit: bool,
     pending_leader_exit_views: BTreeSet<ProcessViewId>,
     counted_leader_exit_views: BTreeSet<ProcessViewId>,
+    /// Views with a matched EXEC whose PID-bound static links may be dead
+    /// while still recorded as attached. At most one marker per retained
+    /// view: the next refresh rearms even an unchanged plan, ordinary-delta
+    /// churn or a completed rearm clears it, and view removal prunes it.
+    exec_rearm_views: BTreeSet<ProcessViewId>,
     pid_descendant_gaps: u64,
     /// Multi-group rebuild windows this capture published: one per rebuilt
     /// group per rebuild transaction. Ungated by scope — a rebuild blinds
@@ -2988,6 +2993,19 @@ struct LoaderPlanCache {
     revision: u64,
     broad_admit: bool,
     plan: plan::AttachPlan,
+}
+
+/// One Engine-minted exec rearm: a single refresh request's matched owner
+/// whose rescan re-accepted the same static targets, lowered into the
+/// existing detach/replace transaction because PID-bound links may be dead
+/// while still recorded as attached. Minted only inside `Engine` from one
+/// selected request plus actual custody/scope/target preparation; consumed
+/// by the candidate path. No public scalar constructor, `Clone`, `Default`,
+/// serialized form, or authority booleans.
+struct PreparedExecRearm {
+    view: ProcessViewId,
+    serial: u64,
+    slots: Vec<plan::Slot>,
 }
 
 /// Transient baseline for one loader transaction, never a second retained
@@ -8156,6 +8174,7 @@ impl Engine {
             expected_target_exit: false,
             pending_leader_exit_views: BTreeSet::new(),
             counted_leader_exit_views: BTreeSet::new(),
+            exec_rearm_views: BTreeSet::new(),
             pid_descendant_gaps: 0,
             multi_rebuild_gaps: 0,
             admitted_cgroup_views: BTreeMap::new(),
@@ -9400,6 +9419,7 @@ impl Engine {
     }
 
     fn release_view_id(&mut self, id: ProcessViewId) {
+        self.exec_rearm_views.remove(&id);
         if let Some(seed) = self.trace_by_view.get(&id).copied() {
             if let Some(proof) = &self.trace_owner
                 && let Some(candidate) = self.trace_seeds.get(&seed)
@@ -11437,6 +11457,148 @@ impl Engine {
         for pid in pids {
             self.request_refresh(pid, crate::attach::monotonic_ns());
         }
+    }
+
+    /// The view's accepted static targets that survived the rescan unchanged:
+    /// active, attributable to the view's reconciled modules, and absent
+    /// from every delta list. Anything the ordinary delta already churns is
+    /// excluded, so forcing never double-covers a target.
+    fn unchanged_exec_targets(view: ProcessViewId, candidate: &LiveCandidate) -> Vec<plan::Slot> {
+        let owned: BTreeSet<PinnedObjectId> = candidate
+            .modules
+            .iter()
+            .filter(|module| module.scanned.view == view)
+            .map(|module| module.object)
+            .collect();
+        let covered: BTreeSet<u32> = candidate
+            .delta
+            .new
+            .iter()
+            .chain(&candidate.delta.replace)
+            .chain(&candidate.delta.retire)
+            .map(|slot| slot.index)
+            .collect();
+        candidate
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| {
+                candidate.plan.is_active(slot.index)
+                    && !covered.contains(&slot.index)
+                    && slot.module_ids.iter().any(|id| {
+                        candidate
+                            .plan
+                            .modules
+                            .iter()
+                            .any(|module| module.id == *id && owned.contains(&module.object))
+                    })
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Mints one exec rearm for an exec-refreshed view: the refresh request
+    /// still names this exact matched owner at the tick's checked serial,
+    /// original custody is live, and the rescan re-accepted the same static
+    /// targets. Anything else mints nothing: a renewed serial, a lost
+    /// generation, or a changed plan stays owned by the ordinary delta or a
+    /// later attempt.
+    fn prepare_exec_rearm(
+        &self,
+        view: ProcessViewId,
+        serial: u64,
+        candidate: &LiveCandidate,
+    ) -> Option<PreparedExecRearm> {
+        let retained = self.views.iter().find(|old| old.id() == view)?;
+        if !retained.still_the_same() {
+            return None;
+        }
+        let request = self.refresh_requested.get(&retained.pid())?;
+        if request.owner != Some(view) || request.serial != serial {
+            return None;
+        }
+        let slots = Self::unchanged_exec_targets(view, candidate);
+        if slots.is_empty() {
+            return None;
+        }
+        Some(PreparedExecRearm {
+            view,
+            serial,
+            slots,
+        })
+    }
+
+    /// Lowers one minted rearm into the existing replacement transaction: the
+    /// unchanged accepted targets detach and reattach at their same
+    /// object/offset/slot through `detach_slots`/`replace_targets`. The
+    /// request binding is rechecked first: a renewal since minting owns the
+    /// retry, and this attempt retires without touching the delta.
+    fn consume_exec_rearm(
+        &self,
+        candidate: &mut LiveCandidate,
+        prepared: PreparedExecRearm,
+    ) -> bool {
+        let current = self
+            .views
+            .iter()
+            .find(|view| view.id() == prepared.view)
+            .and_then(|view| self.refresh_requested.get(&view.pid()));
+        let renewed = current.is_none_or(|request| {
+            request.owner != Some(prepared.view) || request.serial != prepared.serial
+        });
+        if renewed {
+            return false;
+        }
+        candidate.delta.replace.extend(prepared.slots);
+        true
+    }
+
+    /// Forces exec-refreshed views whose rescan re-accepted the same static
+    /// targets through the existing detach/replace transaction. Only views
+    /// carrying a matched-EXEC marker, a matched owner at the tick's checked
+    /// serial, and live original custody mint a rearm, and only their own
+    /// unchanged active targets are lowered — unrelated views' links are
+    /// never touched. A completed rearm, or an ordinary delta that already
+    /// churned every attributable target, clears the marker; anything else
+    /// keeps it for the retry the renewal owns.
+    fn lower_exec_rearms(
+        &mut self,
+        candidate: &mut LiveCandidate,
+        refreshed: &BTreeSet<ProcessViewId>,
+        serviced: &BTreeMap<u32, u64>,
+    ) {
+        let marked: Vec<ProcessViewId> = refreshed
+            .iter()
+            .copied()
+            .filter(|view| self.exec_rearm_views.contains(view))
+            .collect();
+        for view in marked {
+            let serial = self
+                .views
+                .iter()
+                .find(|old| old.id() == view)
+                .map(ProcessView::pid)
+                .and_then(|pid| serviced.get(&pid).copied());
+            let Some(serial) = serial else {
+                continue;
+            };
+            if let Some(prepared) = self.prepare_exec_rearm(view, serial, candidate)
+                && self.consume_exec_rearm(candidate, prepared)
+            {
+                self.exec_rearm_views.remove(&view);
+                continue;
+            }
+            if Self::exec_rearm_moot(view, candidate) {
+                self.exec_rearm_views.remove(&view);
+            }
+        }
+    }
+
+    /// Whether an exec marker's work is already done: none of the view's
+    /// attributable targets is both active and absent from the delta, so the
+    /// ordinary transaction retired, replaced, or never owned every one.
+    fn exec_rearm_moot(view: ProcessViewId, candidate: &LiveCandidate) -> bool {
+        Self::unchanged_exec_targets(view, candidate).is_empty()
     }
 
     /// Everything a candidate can fail at, proven before its first link
@@ -16054,6 +16216,12 @@ impl Engine {
                 self.request_refresh_consumed_for_view(pid, crate::attach::monotonic_ns(), view);
                 self.queue_retirement(view, cause, pending_views);
             }
+            if record.kind == DISCOVERY_KIND_EXEC && cause == RetirementCause::ExecRefresh {
+                // A matched EXEC may have killed this view's PID-bound static
+                // links. The refresh rearms them even when the rescan
+                // re-accepts the same targets; removal prunes the marker.
+                self.exec_rearm_views.insert(view);
+            }
             (cause == RetirementCause::ExecRefresh).then_some(view)
         } else if record.kind == DISCOVERY_KIND_EXEC
             && unmatched_exec_requests_refresh(&self.views, pid)
@@ -18115,7 +18283,13 @@ impl Engine {
         refreshed_ok = refreshed_scans.iter().map(|(view, _, _)| *view).collect();
         refreshed_ok.retain(|view| !failed_retirements.contains(view));
         refreshed_scans.retain(|(view, _, _)| refreshed_ok.contains(view));
-        let candidate = self.inventory_candidate(&removed, &refreshed_scans, new_views, skipped)?;
+        let mut candidate =
+            self.inventory_candidate(&removed, &refreshed_scans, new_views, skipped)?;
+        // Exec-refreshed views whose rescan re-accepted the same static
+        // targets force them through detach/replace: PID-bound links may be
+        // dead while still recorded as attached. Lowered before admission so
+        // the forced targets are preflighted like any other replacement.
+        self.lower_exec_rearms(&mut candidate, &refreshed_ok, &serviced_requests);
         let admission_start = crate::attach::monotonic_ns();
         let admission =
             self.inventory_candidate_admission(session, &candidate, &removed, new_views);
@@ -19675,6 +19849,8 @@ pub(crate) mod session_fixture {
         pub(crate) detached_slots: Vec<usize>,
         /// Exact slot identities of every `detach_slots` call, in order.
         pub(crate) detached_slot_indices: Vec<Vec<u32>>,
+        /// Exact slot identities of every `replace_targets` call, in order.
+        pub(crate) replaced_slot_indices: Vec<Vec<u32>>,
         /// One entry per upcoming `detach_slots` call; `true` fails it.
         detach_slot_script: VecDeque<bool>,
         /// One entry per upcoming `detach_slots` call; `true` fails it
@@ -19998,6 +20174,8 @@ pub(crate) mod session_fixture {
             slots: &[plan::Slot],
             _: &PinnedObjects,
         ) -> Result<ReplacementOutcome> {
+            self.replaced_slot_indices
+                .push(slots.iter().map(|slot| slot.index).collect());
             attachment_admission(&self.detach_failures, !slots.is_empty())?;
             Ok(ReplacementOutcome::default())
         }

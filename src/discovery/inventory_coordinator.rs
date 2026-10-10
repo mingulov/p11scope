@@ -278,6 +278,11 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Leader exits already recorded as link loss (H6 slice 2): one entry
     /// per incarnation at most, never cleared (IDs never reuse).
     leader_link_loss_noted: BTreeSet<CallerId>,
+    /// Retirements already staged in the registry (H6 slice 2): held
+    /// handoffs report the old incarnation at mint and again at commit;
+    /// the second report binds owners without restaging the retirement.
+    /// One entry per retired caller at most, never cleared.
+    staged_retirements: BTreeSet<CallerId>,
     /// Coordinator stop (H6 slice 2): set once, never cleared. No new scan,
     /// attach, successor/name admission, or retry starts afterwards; staged
     /// facts still drain through `commit_batch`.
@@ -378,6 +383,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pending_owners: BTreeMap::new(),
             pending_successors: BTreeMap::new(),
             leader_link_loss_noted: BTreeSet::new(),
+            staged_retirements: BTreeSet::new(),
             stopped: false,
             cgroup_fence: CgroupFence::default(),
             pending_cgroup: None,
@@ -2253,6 +2259,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     fn retire_caller_in_registry(&mut self, id: CallerId, now_ns: u64) {
+        // Each retirement stages once: held handoffs report the old
+        // incarnation at mint and again at commit, and the second report
+        // is a no-op here (owner binding rides the normal event path).
+        if !self.staged_retirements.insert(id) {
+            return;
+        }
         self.count_ownership.forget_live(id);
         let reason = self
             .adapter
@@ -4945,10 +4957,38 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         Ok(None)
     }
 
+    /// Release held exec handoffs whose original custody died (H6 slice
+    /// 2): a dead pin can never commit, so the handoff drops now instead
+    /// of holding its FD for a re-entry that cannot come. Live-but-absent
+    /// handoffs stay held: the member may re-enter.
+    fn release_dead_handoffs(&mut self) {
+        let dead: Vec<CallerId> = self
+            .pending_successors
+            .iter()
+            .filter(|(_, pending)| !self.adapter.source().still_the_same(&pending.custody))
+            .map(|(old, _)| *old)
+            .collect();
+        for old in dead {
+            if let Some(pending) = self.pending_successors.remove(&old) {
+                self.registry.record_gap(RegistryGap {
+                    caller: Some(old),
+                    module: None,
+                    pid: Some(pending.pid),
+                    subject: "held exec handoff released".into(),
+                    reason: "original process custody died while the handoff was held; \
+                         no successor commits and the pin is released"
+                        .into(),
+                    budget: None,
+                });
+            }
+        }
+    }
+
     /// Stop the coordinator (H6 slice 2): no new scan, attach,
     /// successor/name admission, or retry starts afterwards. Held exec
     /// handoffs release their custody now; staged facts still drain
     /// through `commit_batch`.
+    #[cfg_attr(not(test), allow(dead_code))] // Production stop wiring lands with the runtime consumer.
     pub(crate) fn stop(&mut self) {
         if self.stopped {
             return;
@@ -5008,6 +5048,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut scoped_scan_callers = 0;
         let mut cgroup_proof_complete = false;
         if let Some((collection, now_ns)) = &mut publishing_cgroup {
+            // Dead custody can never re-enter: release those handoffs
+            // before the transaction prepares anything.
+            self.release_dead_handoffs();
+            // At most one held handoff commits per pid in a transaction.
+            let mut handoff_pids = BTreeMap::new();
+            for (old, pending) in &self.pending_successors {
+                let previous = handoff_pids.insert(pending.pid, *old);
+                debug_assert!(previous.is_none(), "at most one held handoff per pid");
+            }
             let work = collection.work();
             let pids: Vec<u32> = if work.charge(
                 collection
@@ -5021,9 +5070,41 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 Vec::new()
             };
             let mut prepared = BTreeMap::new();
+            let mut prepared_handoffs = BTreeMap::new();
             for pid in pids {
                 if !work.charge(6) {
                     break;
+                }
+                if let Some(&old) = handoff_pids.get(&pid) {
+                    // Handoff members never take the ordinary fresh-open
+                    // path: verify the held handoff against current truth
+                    // and require the walk to show its current image.
+                    // Anything unproven here stays held silently for a
+                    // fresher walk; only terminal refusals consume.
+                    let Some(pending) = self.pending_successors.get(&old) else {
+                        continue;
+                    };
+                    let verified = self.verify_pending_successor(pending);
+                    let (mint_start, mint_exe) = (pending.mint_start, pending.mint_exe.clone());
+                    if let Err(failure) = verified {
+                        self.pending_successors.remove(&old);
+                        collection.preparation_failed();
+                        scoped_events.push(CallerEvent::AdmitFailed {
+                            pid,
+                            reason: failure.reason,
+                            budget: failure.budget,
+                        });
+                        continue;
+                    }
+                    let Some(preparation) = collection.preparation(pid) else {
+                        continue;
+                    };
+                    if preparation.generation().start_time == mint_start
+                        && preparation.generation().exe == mint_exe
+                    {
+                        prepared_handoffs.insert(pid, old);
+                    }
+                    continue;
                 }
                 let Some(preparation) = collection.preparation(pid) else {
                     continue;
@@ -5067,9 +5148,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 None
             };
             let requested = if provider.is_some()
-                && work.charge(prepared.len().saturating_mul(8).saturating_add(1))
-            {
-                prepared.keys().copied().collect()
+                && work.charge(
+                    prepared
+                        .len()
+                        .saturating_add(prepared_handoffs.len())
+                        .saturating_mul(8)
+                        .saturating_add(1),
+                ) {
+                prepared
+                    .keys()
+                    .copied()
+                    .chain(prepared_handoffs.keys().copied())
+                    .collect()
             } else {
                 BTreeSet::new()
             };
@@ -5085,6 +5175,35 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         if admitted {
                             scoped_admitted += 1;
                             scoped_events.push(CallerEvent::Admitted { id });
+                        }
+                    }
+                    Err(failure) => scoped_events.push(CallerEvent::AdmitFailed {
+                        pid,
+                        reason: failure.reason,
+                        budget: failure.budget,
+                    }),
+                }
+            }
+            // Held handoffs commit under their own exact member permits:
+            // borrow the permit, commit the moved custody, finish. No
+            // permit this transaction holds the handoff for a fresher one.
+            for (pid, old) in prepared_handoffs {
+                let Some(pending) = self.pending_successors.remove(&old) else {
+                    continue;
+                };
+                let Some(permit) = collection.permit(pid) else {
+                    self.pending_successors.insert(old, pending);
+                    continue;
+                };
+                match self
+                    .adapter
+                    .commit_handoff_caller(pid, pending.custody, permit, *now_ns)
+                {
+                    Ok((new, admitted)) => {
+                        allowed.insert(pid);
+                        if admitted {
+                            scoped_admitted += 1;
+                            scoped_events.push(CallerEvent::ExecRetired { old, new });
                         }
                     }
                     Err(failure) => scoped_events.push(CallerEvent::AdmitFailed {

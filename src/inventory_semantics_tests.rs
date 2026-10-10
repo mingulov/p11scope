@@ -5610,3 +5610,1922 @@ fn native_semantic_single_provider_refresh_target_preserved() {
     );
     assert_eq!(scene.coordinator.semantic_bindings().len(), 1);
 }
+
+// ---- H6 slice 3: runtime recovery and names ----
+
+use crate::discovery::caller_registry::{BudgetRefusal, CallerEvent};
+
+/// H6 slice 3: one witness wave (read, drain, read) with published events.
+/// Mirrors `bind_image` but returns every native event (proven EXEC
+/// transitions retire here) instead of discarding the receipts.
+fn h6_witness_batch(domain: NativeDomainId, rows: Vec<WitnessRow>, at_ns: u64) -> WitnessBatch {
+    WitnessBatch {
+        domain,
+        phase: CapturePhase::Active,
+        rows,
+        integrity: Vec::new(),
+        integrity_total: 0,
+        visited: 0,
+        sweep_completed: true,
+        sweeps_completed: 1,
+        row_bound_reached: false,
+        deadline_reached: false,
+        read_failures: Vec::new(),
+        unrecorded_rows: 0,
+        sweep_gaps: false,
+        counts: Vec::new(),
+        refresh_sweep_completed: true,
+        refresh_sweep_gaps: false,
+        refresh_deadline_reached: false,
+        refresh_sweeps_completed: 1,
+        seen_rows: 0,
+        pair_limit: 65_536,
+        health: CaptureHealth {
+            discovery_counters: Some([0; 5]),
+            ..CaptureHealth::default()
+        },
+        health_regression: None,
+        health_unproven: None,
+        health_baseline_ns: 0,
+        health_read_ns: at_ns,
+        rows_anchor_ns: at_ns + 1,
+        rows_read_ns: at_ns + 1,
+        counts_read_ns: at_ns + 1,
+        changed_objects: Vec::new(),
+        custody: ScopeCustody::System,
+        custody_proven_ns: None,
+        lifecycle_proven_ns: u64::MAX,
+        lifecycle_loss: None,
+        unsettled: false,
+    }
+}
+
+/// H6 slice 3: one witness wave over an explicit coordinator and
+/// identity, returning every native event.
+fn h6_native_wave(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    identity: &mut ScriptedPidIdentity,
+    domain: NativeDomainId,
+    rows: Vec<(u64, u64, u32, u64)>,
+    at_ns: u64,
+) -> Vec<CallerEvent> {
+    let rows = rows
+        .into_iter()
+        .map(|(ticket, exec, tgid, t0)| {
+            WitnessRow::scripted(
+                domain,
+                ticket,
+                exec,
+                AttachObjectId::scripted(0),
+                EndpointId(0),
+                tgid,
+                t0,
+            )
+        })
+        .collect();
+    let mut events = Vec::new();
+    let receipt = coordinator.stage_native(
+        NativeBatch::Witness(Box::new(h6_witness_batch(domain, rows, at_ns))),
+        identity,
+        at_ns + 2,
+    );
+    events.extend(receipt.events);
+    let batch = DiscoveryBatch::scripted(domain, Vec::new(), at_ns + 10);
+    let receipt = coordinator.stage_native(NativeBatch::Lifecycle(batch), identity, at_ns + 11);
+    events.extend(receipt.events);
+    let receipt = coordinator.stage_native(
+        NativeBatch::Witness(Box::new(h6_witness_batch(domain, Vec::new(), at_ns + 20))),
+        identity,
+        at_ns + 22,
+    );
+    events.extend(receipt.events);
+    coordinator.commit_batch(false).unwrap();
+    events
+}
+
+fn h6_wave(
+    conv: &mut ConversionScene,
+    domain: NativeDomainId,
+    rows: Vec<(u64, u64, u32, u64)>,
+    at_ns: u64,
+) -> Vec<CallerEvent> {
+    let scene = &mut conv.scene;
+    h6_native_wave(
+        &mut scene.coordinator,
+        &mut scene.identity,
+        domain,
+        rows,
+        at_ns,
+    )
+}
+
+/// H6 slice 3: map one more caller onto the scene's provider module, the
+/// way `BindingScene::map` maps the first caller.
+fn h6_map(conv: &mut ConversionScene, caller: CallerId, pid: u32, at_ns: u64) {
+    let module = conv.scene.module.clone();
+    let info = ModuleInfo {
+        path: "/task3/provider.so".into(),
+        key: module,
+        double_loaded: false,
+        build_id: None,
+        identity_source: Some("task3".into()),
+        admission: AdmissionState::Admitted,
+        admission_class: Some("exact".into()),
+        admission_endpoints: Some(1),
+        admission_reasons: Vec::new(),
+    };
+    conv.scene
+        .coordinator
+        .registry_mut()
+        .note_mapping(caller, pid, info, at_ns);
+    conv.scene.coordinator.commit_batch(false).unwrap();
+}
+
+/// H6 slice 3: register one exact instance under an explicit caller
+/// binding (the scene helper always uses the original caller).
+fn h6_register(
+    conv: &mut ConversionScene,
+    caller: CallerId,
+    coverage: &LaneCoverage,
+    router: InstanceId,
+    observed_ns: u64,
+    boundary: Option<u64>,
+) {
+    let input = {
+        let binding = conv
+            .scene
+            .coordinator
+            .semantic_bindings()
+            .get(caller)
+            .unwrap();
+        admit_registration_from_coverage(coverage, binding, router, observed_ns, boundary)
+            .expect("scripted coverage registers")
+    };
+    conv.scene.coordinator.registry_mut().note_instance(input);
+}
+
+/// H6 slice 3: feed one converted call under an explicit caller binding.
+fn h6_feed(
+    conv: &mut ConversionScene,
+    caller: CallerId,
+    evidence: CallEvidence,
+    standing: CallStanding<'_>,
+    barrier: Option<u64>,
+) {
+    let input = {
+        let binding = conv
+            .scene
+            .coordinator
+            .semantic_bindings()
+            .get(caller)
+            .unwrap();
+        admit_call_from_evidence(evidence, binding, conv.lane.subset(), standing, barrier)
+            .expect("scripted evidence converts")
+    };
+    conv.scene
+        .coordinator
+        .registry_mut()
+        .observe_instance_semantic(input);
+}
+
+fn h6_successor_image(exec_id: u64) -> ImageIdentity {
+    ImageIdentity {
+        task_cookie: 7,
+        exec_id,
+    }
+}
+
+/// H6 slice 3 H3 control (slice-2 review minor 8): a failed exec mints no
+/// S1 physical-gap cut. Failed execs emit no coordinator signal (the
+/// producer hooks `sched_process_exec`, success-only), so the lane records
+/// no gap, carries no barrier, and the in-flight operation still matches
+/// its return. The successful twin proves this test can see a cut.
+#[test]
+fn automatic_exec_failed_exec_mints_no_h3_cut() {
+    let mut conv = ConversionScene::new();
+    let r0 = conv.ids[0];
+
+    // An in-flight Init stages before the failed exec attempt.
+    let coverage = conv.coverage(vec![r0]);
+    conv.register(&coverage, r0, 100, None);
+    conv.feed(
+        conv.evidence(1, r0, conv.init_slot, conv.init_event(110)),
+        CallStanding::Current(&coverage),
+        None,
+    );
+
+    // The failed exec: no transition, no lifecycle signal, only ordinary
+    // service around it. A failed leader/nonleader exec produces no
+    // successor, no cut and no rearm.
+    conv.scene.drain(conv.detailed(), 1_100);
+    conv.commit_with_lane();
+    assert!(
+        conv.lane.take_recorded_gaps().is_empty(),
+        "a failed exec mints no physical-gap cut"
+    );
+    assert_eq!(
+        conv.lane.take_last_conversion_barrier(),
+        None,
+        "a failed exec carries no timeline boundary"
+    );
+
+    // The original in-flight return still matches and the pair completes
+    // cleanly, with no loss disclosed.
+    conv.feed(
+        conv.evidence(2, r0, conv.sign_slot, conv.sign_event(120)),
+        CallStanding::Current(&coverage),
+        None,
+    );
+    conv.commit_with_lane();
+    assert_eq!(conv.edge_rows(), vec![(Some(2), 0, false, 1, 1)]);
+    assert!(conv.lane.take_recorded_gaps().is_empty());
+
+    // Successful twin: genuine uncertainty mints exactly one cut, and the
+    // boundary fences a late call. This leg proves the control above is
+    // not vacuous: the same scene mints and fences when proof requires it.
+    conv.prove_and_mark_tail();
+    conv.lane.script_cut_barrier(9);
+    conv.commit_with_lane();
+    assert_eq!(
+        conv.lane.take_recorded_gaps().len(),
+        1,
+        "genuine uncertainty mints exactly one cut"
+    );
+    assert_eq!(
+        conv.lane.take_last_conversion_barrier(),
+        Some(9),
+        "the cut carries its timeline boundary"
+    );
+    conv.feed(
+        conv.evidence(1, r0, conv.init_slot, conv.init_event(610)),
+        CallStanding::Current(&coverage),
+        None,
+    );
+    conv.commit_with_lane();
+    assert_eq!(
+        conv.edge_rows()[0],
+        (Some(3), 1, true, 1, 1),
+        "the cut fence keeps the late call historical-only"
+    );
+    // No standing cut repeats: an empty commit mints nothing.
+    conv.commit_with_lane();
+    assert!(conv.lane.take_recorded_gaps().is_empty());
+}
+
+/// H6 slice 3 oracle 1: "Queue old loader/selection work and old
+/// pending/Joined CALLs around EXEC and physical cut. Original contexts
+/// survive until required dispatch; old facts are historical or unknown,
+/// never successor registration/live S1 or wrong trace name. Fresh
+/// successor Init/Sign completes; a healthy no-gap long operation survives
+/// ordinary refresh."
+///
+/// Engine loader dispatch around EXEC is pinned where it lives (the
+/// preserved `frame_deferred_loader_records_*` selectors and the slice-1
+/// oracles); this integrated oracle pins the coordinator-observable half:
+/// staged old facts publish with old attribution, fence under the cut,
+/// and never register or complete as the successor.
+#[test]
+fn automatic_exec_late_old_records_keep_only_old_authority() {
+    use crate::discovery::engine::tests::detailed_proof_driver as trace_driver;
+
+    let mut conv = Box::new(ConversionScene::new());
+    let pid = std::process::id();
+    let detailed = conv.detailed();
+    let old = conv.caller;
+    let old_image = conv.image;
+    let (r0, r1) = (conv.ids[0], conv.ids[1]);
+
+    // Old pending CALLs queue before EXEC: registered and staged, but
+    // unpublished (publication ordering: invisible until commit).
+    let coverage0 = conv.coverage(vec![r0]);
+    conv.register(&coverage0, r0, 1_100, None);
+    conv.feed(
+        conv.evidence(1, r0, conv.init_slot, conv.init_event(1_110)),
+        CallStanding::Current(&coverage0),
+        None,
+    );
+    assert_eq!(
+        conv.scene.coordinator.registry().instances().count(),
+        0,
+        "staged old facts stay invisible until publication"
+    );
+
+    // The proven EXEC wave: the old incarnation retires, the successor
+    // admits on original custody, and the staged old Init publishes with
+    // old attribution in the same window.
+    let events = h6_wave(&mut conv, detailed, vec![(7, 2, pid, 1_500)], 2_000);
+    let [CallerEvent::ExecRetired { old: retired, new }] = events.as_slice() else {
+        panic!("the proven EXEC must retire exactly once: {events:?}");
+    };
+    assert_eq!(*retired, old);
+    let successor = *new;
+    assert_ne!(successor, old, "no caller ID is reused");
+    let adapter = conv.scene.coordinator.adapter();
+    assert!(adapter.record(old).unwrap().retired);
+    assert_eq!(adapter.live_id(pid), Some(successor));
+    assert_eq!(
+        adapter.record(successor).unwrap().start_time,
+        adapter.record(old).unwrap().start_time,
+        "original process custody survives the handoff"
+    );
+    assert_eq!(
+        conv.scene.coordinator.registry().instances().count(),
+        1,
+        "the original context survives until its required dispatch"
+    );
+    assert_eq!(
+        conv.edge_rows(),
+        vec![(Some(1), 0, true, 1, 0)],
+        "the lone old Init publishes with old attribution, retired with its image"
+    );
+    assert_eq!(
+        conv.edge_reasons(0),
+        vec![InstanceReason::InstanceRetired],
+        "the ended image retires its live operation honestly"
+    );
+
+    // The genuine cut for the ended authority: exactly one gap, one
+    // boundary, and the old record fenced with its flesh intact.
+    conv.prove_and_mark_tail();
+    conv.lane.script_cut_barrier(5);
+    conv.commit_with_lane();
+    assert_eq!(
+        conv.lane.take_recorded_gaps().len(),
+        1,
+        "one proven bound caller mints exactly one gap"
+    );
+    assert_eq!(
+        conv.lane.take_last_conversion_barrier(),
+        Some(5),
+        "the cut carries its timeline boundary"
+    );
+    assert_eq!(conv.edge_rows(), vec![(Some(1), 0, true, 1, 0)]);
+    assert_eq!(
+        conv.edge_reasons(0),
+        vec![
+            InstanceReason::SemanticLoss,
+            InstanceReason::InstanceRetired
+        ],
+        "negatives stage before the retirement they fence"
+    );
+    // An empty commit mints no standing cut: never cut every frame.
+    conv.commit_with_lane();
+    assert!(conv.lane.take_recorded_gaps().is_empty());
+
+    // The old Sign under the cut boundary: historical-only, never a live
+    // completion of a new operation.
+    conv.feed(
+        conv.evidence(2, r0, conv.sign_slot, conv.sign_event(1_120)),
+        CallStanding::Current(&coverage0),
+        Some(5),
+    );
+    conv.commit_with_lane();
+    assert_eq!(
+        conv.edge_rows()[0],
+        (Some(2), 1, true, 1, 0),
+        "old facts under the cut stay historical-only"
+    );
+
+    // The successor binds fresh through ordinary pass work.
+    h6_map(&mut conv, successor, pid, 2_100);
+    set_sight(3_005);
+    conv.scene
+        .bind_image(detailed, vec![(7, 2, pid, 2_500)], 3_000);
+    let module = conv.scene.module.clone();
+    let new_image = h6_successor_image(2);
+    assert_eq!(
+        conv.scene.bind(successor, &module, detailed, new_image),
+        Ok(())
+    );
+
+    // Old coverage can never register the successor; only the successor's
+    // own fresh coverage registers under its binding.
+    let succ_binding_image = conv
+        .scene
+        .coordinator
+        .semantic_bindings()
+        .get(successor)
+        .unwrap()
+        .image();
+    assert_eq!(succ_binding_image, new_image);
+    let new_coverage =
+        LaneCoverage::scripted(detailed, new_image, conv.endpoint(conv.init_slot), vec![r1]);
+    {
+        let binding = conv
+            .scene
+            .coordinator
+            .semantic_bindings()
+            .get(successor)
+            .unwrap();
+        assert_eq!(
+            refusal(admit_registration_from_coverage(
+                &coverage0, binding, r0, 3_100, None
+            )),
+            Err(ConversionRefusal::Custody),
+            "old coverage never registers the successor"
+        );
+    }
+    h6_register(&mut conv, successor, &new_coverage, r1, 3_100, None);
+
+    // Old evidence can never convert as the successor's live call.
+    let old_sign = CallEvidence::scripted(
+        detailed,
+        old_image,
+        3,
+        r0,
+        Some(conv.endpoint(conv.sign_slot)),
+        conv.sign_event(3_110),
+    );
+    {
+        let binding = conv
+            .scene
+            .coordinator
+            .semantic_bindings()
+            .get(successor)
+            .unwrap();
+        assert_eq!(
+            refusal(admit_call_from_evidence(
+                old_sign,
+                binding,
+                conv.lane.subset(),
+                CallStanding::Current(&new_coverage),
+                None,
+            )),
+            Err(ConversionRefusal::Custody),
+            "old evidence never converts as the successor's live call"
+        );
+    }
+
+    // Fresh successor Init/Sign completes above the boundary: it reduces
+    // through the fence while the inherited cut stays disclosed.
+    let succ_init = CallEvidence::scripted(
+        detailed,
+        new_image,
+        6,
+        r1,
+        Some(conv.endpoint(conv.init_slot)),
+        conv.init_event(3_120),
+    );
+    h6_feed(
+        &mut conv,
+        successor,
+        succ_init,
+        CallStanding::Current(&new_coverage),
+        None,
+    );
+    let succ_sign = CallEvidence::scripted(
+        detailed,
+        new_image,
+        7,
+        r1,
+        Some(conv.endpoint(conv.sign_slot)),
+        conv.sign_event(3_130),
+    );
+    h6_feed(
+        &mut conv,
+        successor,
+        succ_sign,
+        CallStanding::Current(&new_coverage),
+        None,
+    );
+    conv.commit_with_lane();
+    assert!(conv.lane.take_recorded_gaps().is_empty());
+    assert_eq!(
+        conv.edge_rows()[1],
+        (Some(2), 0, true, 1, 1),
+        "fresh successor calls reduce; the inherited cut stays disclosed"
+    );
+    assert_eq!(
+        conv.instance_states()[1],
+        InstanceLifecycle::Observed,
+        "reducing flesh revives the successor record"
+    );
+
+    // A late old Init after the successor completed counts but never
+    // restarts: the old operation stays fenced.
+    conv.feed(
+        conv.evidence(1, r0, conv.init_slot, conv.init_event(3_210)),
+        CallStanding::Current(&coverage0),
+        None,
+    );
+    conv.commit_with_lane();
+    assert_eq!(
+        conv.edge_rows()[0],
+        (Some(3), 2, true, 1, 0),
+        "late old calls count but never restart"
+    );
+
+    // Publication ordering holds end to end: one more empty commit
+    // publishes nothing twice.
+    let rows_before = conv.edge_rows();
+    conv.commit_with_lane();
+    assert_eq!(conv.edge_rows(), rows_before);
+    assert!(conv.lane.take_recorded_gaps().is_empty());
+
+    // Trace names: H0/S1 evidence never mints a name. The successor
+    // completed S1 above, yet its trace key is still unknown: only a
+    // fresh verified seed names it, and the old key keeps the old name.
+    let (mut engine, mut io) = trace_driver::fixture();
+    trace_driver::seed(&mut engine, &mut io);
+    assert_eq!(trace_driver::calls(&io, 20, 11, 0), 1);
+    io.cookie.set(Some(11));
+    assert!(trace_driver::service(&mut engine, &mut io).is_empty());
+    trace_driver::empty(&io);
+    let mut first = trace_driver::service(&mut engine, &mut io);
+    assert_eq!(first.len(), 1);
+    let receipt0 = first.pop().unwrap();
+    let key0 = receipt0.key();
+    assert_eq!(receipt0.path(), "/owned/fixture");
+    let mut store = crate::trace_identity::TraceIdentityStore::new(io.proof.clone());
+    store.admit(receipt0).unwrap();
+    let key1 = crate::semantics::ProcessKey { exec_id: 1, ..key0 };
+    assert_eq!(
+        store.lookup(key1, 30).path(),
+        None,
+        "the successor key stays unknown until its own seed verifies"
+    );
+    // The successor seed verifies on later evidence; both names then hold.
+    assert_eq!(trace_driver::calls(&io, 60, 11, 1), 1);
+    assert!(trace_driver::service(&mut engine, &mut io).is_empty());
+    trace_driver::empty(&io);
+    let mut second = trace_driver::service(&mut engine, &mut io);
+    assert_eq!(
+        second.len(),
+        1,
+        "the successor seed verifies on fresh proof"
+    );
+    let boundary1 = second[0].eligible_after_ns();
+    let receipt1 = second.pop().unwrap();
+    assert_eq!(receipt1.key(), key1);
+    store.admit(receipt1).unwrap();
+    assert_eq!(
+        store.lookup(key1, boundary1 + 1).path(),
+        Some("/owned/fixture")
+    );
+    assert_eq!(
+        store.lookup(key0, 20).path(),
+        Some("/owned/fixture"),
+        "the old key keeps the old name after the successor verifies"
+    );
+
+    // A healthy no-gap long operation survives ordinary refresh: Init,
+    // ordinary witness/lifecycle service with no gap, then Sign completes
+    // cleanly with no cut and no boundary.
+    let mut healthy = Box::new(ConversionScene::new());
+    let hr = healthy.ids[4];
+    let hcoverage = healthy.coverage(vec![hr]);
+    healthy.register(&hcoverage, hr, 1_100, None);
+    healthy.feed(
+        healthy.evidence(11, hr, healthy.init_slot, healthy.init_event(1_110)),
+        CallStanding::Current(&hcoverage),
+        None,
+    );
+    let hpid = std::process::id();
+    let hdetailed = healthy.detailed();
+    let hevents = h6_wave(&mut healthy, hdetailed, vec![(7, 1, hpid, 1_500)], 2_000);
+    assert!(
+        hevents.is_empty(),
+        "ordinary refresh proves no transition: {hevents:?}"
+    );
+    healthy.commit_with_lane();
+    assert!(healthy.lane.take_recorded_gaps().is_empty());
+    assert_eq!(healthy.lane.take_last_conversion_barrier(), None);
+    healthy.feed(
+        healthy.evidence(12, hr, healthy.sign_slot, healthy.sign_event(2_110)),
+        CallStanding::Current(&hcoverage),
+        None,
+    );
+    healthy.commit_with_lane();
+    assert_eq!(
+        healthy.edge_rows(),
+        vec![(Some(2), 0, false, 1, 1)],
+        "the healthy long operation completes with no loss"
+    );
+    assert!(healthy.lane.take_recorded_gaps().is_empty());
+}
+
+/// H6 slice 3 oracle 2: "Three actual/proven image transitions reuse
+/// physical addresses/session values. A renewal during apply survives
+/// older serial completion, stale candidates refuse, skipped intervals
+/// are visible and final stable image recovers. No duplicate API returns,
+/// caller IDs or recycled instance IDs."
+///
+/// Every transition here is binder-proven (a later sequence of the same
+/// held ticket, never a bare hint); the ticket, session values and
+/// endpoint slots repeat on every image, so any cross-image confusion
+/// would mistarget a live operation.
+#[test]
+fn automatic_exec_rapid_chain_preserves_newer_request() {
+    let mut conv = Box::new(ConversionScene::new());
+    let pid = std::process::id();
+    let detailed = conv.detailed();
+    let c1 = conv.caller;
+    let (r0, r1, r3) = (conv.ids[0], conv.ids[1], conv.ids[3]);
+
+    // Image 1 completes a proven pair before the chain: proven returns
+    // keep their old attribution through everything below.
+    let coverage1 = conv.coverage(vec![r0]);
+    conv.register(&coverage1, r0, 1_100, None);
+    conv.feed(
+        conv.evidence(1, r0, conv.init_slot, conv.init_event(1_110)),
+        CallStanding::Current(&coverage1),
+        None,
+    );
+    conv.feed(
+        conv.evidence(2, r0, conv.sign_slot, conv.sign_event(1_120)),
+        CallStanding::Current(&coverage1),
+        None,
+    );
+    conv.commit();
+    assert_eq!(conv.edge_rows(), vec![(Some(2), 0, false, 1, 1)]);
+
+    // T1 (exec 1 -> 2): the successor binds fresh and stages an Init that
+    // is still in flight when the renewal arrives.
+    let events = h6_wave(&mut conv, detailed, vec![(7, 2, pid, 1_500)], 2_000);
+    let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+        panic!("T1 must retire exactly once: {events:?}");
+    };
+    assert_eq!(
+        (*old, *new),
+        (c1, conv.scene.coordinator.adapter().live_id(pid).unwrap())
+    );
+    let c2 = *new;
+    h6_map(&mut conv, c2, pid, 2_100);
+    set_sight(3_005);
+    conv.scene
+        .bind_image(detailed, vec![(7, 2, pid, 2_500)], 3_000);
+    let module = conv.scene.module.clone();
+    let image2 = h6_successor_image(2);
+    assert_eq!(conv.scene.bind(c2, &module, detailed, image2), Ok(()));
+    let coverage2 =
+        LaneCoverage::scripted(detailed, image2, conv.endpoint(conv.init_slot), vec![r1]);
+    h6_register(&mut conv, c2, &coverage2, r1, 3_100, None);
+    let c2_init = CallEvidence::scripted(
+        detailed,
+        image2,
+        6,
+        r1,
+        Some(conv.endpoint(conv.init_slot)),
+        conv.init_event(3_120),
+    );
+    h6_feed(
+        &mut conv,
+        c2,
+        c2_init,
+        CallStanding::Current(&coverage2),
+        None,
+    );
+
+    // T2 renewal during apply (exec 2 -> 3): the newer request is
+    // serviced while the older image's in-flight work settles. The older
+    // serial's completion disturbs nothing newer.
+    let events = h6_wave(&mut conv, detailed, vec![(7, 3, pid, 3_500)], 4_000);
+    let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+        panic!("T2 must retire exactly once: {events:?}");
+    };
+    assert_eq!(*old, c2, "the renewal retires the current incarnation");
+    let c3 = *new;
+    {
+        let adapter = conv.scene.coordinator.adapter();
+        assert!(adapter.record(c1).unwrap().retired);
+        assert!(adapter.record(c2).unwrap().retired);
+        assert_eq!(adapter.live_id(pid), Some(c3));
+    }
+    assert_eq!(
+        conv.edge_rows()[1],
+        (Some(1), 0, true, 1, 0),
+        "the renewed image retires its in-flight work honestly"
+    );
+    assert_eq!(conv.edge_reasons(1), vec![InstanceReason::InstanceRetired]);
+
+    // C3 binds its own image before the next renewal: the chain holds
+    // (7,3), so the following jump transitions from a proven image.
+    let bind3 = h6_wave(&mut conv, detailed, vec![(7, 3, pid, 4_050)], 4_100);
+    assert!(
+        bind3.is_empty(),
+        "first sight binds, never transitions: {bind3:?}"
+    );
+
+    // Stale candidates refuse: the retired caller binds no newer image,
+    // and replayed exec-2 rows prove no second successor.
+    let image3 = h6_successor_image(3);
+    assert_eq!(
+        conv.scene.bind(c2, &module, detailed, image3),
+        Err(SemanticBindingRefusal::NoLiveCaller),
+        "a retired caller binds no newer image"
+    );
+    let gaps_before = conv.gap_pairs().len();
+    let stale = h6_wave(&mut conv, detailed, vec![(7, 2, pid, 4_500)], 5_000);
+    assert!(
+        stale.is_empty(),
+        "delayed proof creates no second successor: {stale:?}"
+    );
+    assert_eq!(
+        conv.scene.coordinator.adapter().live_id(pid),
+        Some(c3),
+        "the live incarnation is undisturbed by stale rows"
+    );
+    assert_eq!(
+        conv.scene.coordinator.adapter().len(),
+        3,
+        "no phantom incarnation was minted"
+    );
+    assert_eq!(
+        conv.gap_pairs().len(),
+        gaps_before,
+        "stale rows refuse silently without new disclosure"
+    );
+
+    // T3 with a skip (exec 3 -> 5): exec 4 is never observed.
+    let events = h6_wave(&mut conv, detailed, vec![(7, 5, pid, 5_500)], 6_000);
+    let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+        panic!("T3 must retire exactly once: {events:?}");
+    };
+    assert_eq!(*old, c3);
+    let c4 = *new;
+    // The skipped interval stays visible as an interval, never as a
+    // phantom: exactly the four proven incarnations exist, with no
+    // caller, instance record or edge claiming the unobserved exec, and
+    // the retirement linkage still chains through the jump.
+    {
+        let adapter = conv.scene.coordinator.adapter();
+        assert_eq!(adapter.len(), 4, "no phantom incarnation for exec 4");
+        let incarnations: Vec<u32> = [c1, c2, c3, c4]
+            .iter()
+            .map(|caller| adapter.record(*caller).unwrap().incarnation)
+            .collect();
+        assert_eq!(incarnations, vec![0, 1, 2, 3]);
+        assert_eq!(adapter.live_id(pid), Some(c4));
+    }
+    assert_eq!(
+        conv.scene.coordinator.registry().instances().count(),
+        2,
+        "no instance record claims the skipped image"
+    );
+
+    // The final stable image recovers: it binds, and its Init/Sign pair
+    // (reused session values and slots, fresh tokens) completes.
+    h6_map(&mut conv, c4, pid, 6_100);
+    set_sight(7_005);
+    conv.scene
+        .bind_image(detailed, vec![(7, 5, pid, 6_500)], 7_000);
+    let image5 = h6_successor_image(5);
+    assert_eq!(conv.scene.bind(c4, &module, detailed, image5), Ok(()));
+    let coverage5 =
+        LaneCoverage::scripted(detailed, image5, conv.endpoint(conv.init_slot), vec![r3]);
+    h6_register(&mut conv, c4, &coverage5, r3, 7_100, None);
+    let c4_init = CallEvidence::scripted(
+        detailed,
+        image5,
+        16,
+        r3,
+        Some(conv.endpoint(conv.init_slot)),
+        conv.init_event(7_120),
+    );
+    h6_feed(
+        &mut conv,
+        c4,
+        c4_init,
+        CallStanding::Current(&coverage5),
+        None,
+    );
+    let c4_sign = CallEvidence::scripted(
+        detailed,
+        image5,
+        17,
+        r3,
+        Some(conv.endpoint(conv.sign_slot)),
+        conv.sign_event(7_130),
+    );
+    h6_feed(
+        &mut conv,
+        c4,
+        c4_sign,
+        CallStanding::Current(&coverage5),
+        None,
+    );
+    conv.commit();
+    assert_eq!(
+        conv.edge_rows()[2],
+        (Some(2), 0, false, 1, 1),
+        "the stable image recovers cleanly with no cut in this chain"
+    );
+
+    // No duplicate API returns, caller IDs or recycled instance IDs.
+    let records: Vec<_> = conv.scene.coordinator.registry().instances().collect();
+    assert_eq!(records.len(), 3, "one record per proven image, no phantoms");
+    let mut ids: Vec<_> = records.iter().map(|record| record.id).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 3, "no instance ID is recycled");
+    let mut owners: Vec<_> = records.iter().map(|record| record.caller).collect();
+    owners.sort();
+    let mut expected = [c1, c2, c4];
+    expected.sort();
+    assert_eq!(
+        owners, expected,
+        "each record keeps its own image's caller, never reattributed"
+    );
+    let callers = [c1, c2, c3, c4];
+    assert_eq!(
+        conv.scene.coordinator.adapter().len(),
+        4,
+        "exactly the four proven incarnations exist"
+    );
+    for (index, caller) in callers.iter().enumerate() {
+        assert_eq!(
+            conv.scene
+                .coordinator
+                .adapter()
+                .record(*caller)
+                .unwrap()
+                .incarnation,
+            index as u32,
+            "incarnations advance exactly once per proven transition"
+        );
+    }
+    let api_total: u64 = conv
+        .edge_rows()
+        .iter()
+        .map(|(returns, _, _, _, _)| returns.unwrap_or(0))
+        .sum();
+    assert_eq!(
+        api_total, 5,
+        "every fed call returns exactly once: no duplicates, no drops"
+    );
+}
+
+/// H6 slice 3: a reaped `/bin/sleep` child for caller-budget legs.
+struct H6Child(std::process::Child);
+
+impl H6Child {
+    fn spawn() -> Self {
+        Self(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for H6Child {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// H6 slice 3 oracle 3: "N requests/credits/owner reservations work; N+1
+/// refuses with one finite gap and no eviction of protected owners.
+/// Exercise failed pin duplication, scan, detach/attach, postcheck,
+/// receipt, clock/serial exhaustion and stop at every stage. Retry and
+/// stop release owned resources exactly once; healthy recovery still
+/// progresses under backlog."
+///
+/// Every N/N+1 leg below asserts at the actual shared reservation (the
+/// admission API and its exact occupancy accounting), never at a
+/// container length alone.
+#[test]
+fn automatic_exec_recovery_budget_failure_and_stop_are_finite() {
+    use crate::discovery::engine::tests::detailed_proof_driver as trace_driver;
+
+    // Caller budget N/N+1 at the shared reservation: 2 works, the
+    // 3rd (the exec successor) refuses with the exact occupancy.
+    {
+        let mut conv = Box::new(ConversionScene::new());
+        let pid = std::process::id();
+        let detailed = conv.detailed();
+        let c1 = conv.caller;
+        let child = H6Child::spawn();
+        let sibling = conv
+            .scene
+            .coordinator
+            .adapter_mut()
+            .admit(child.pid(), ImageAuthority::ScanPinned, 60)
+            .unwrap();
+        conv.scene.coordinator.adapter_mut().set_max_callers(2);
+        let events = h6_wave(&mut conv, detailed, vec![(7, 2, pid, 1_500)], 2_000);
+        let [
+            CallerEvent::AdmitFailed {
+                pid: failed,
+                reason,
+                budget,
+            },
+        ] = events.as_slice()
+        else {
+            panic!("a full budget must refuse the successor: {events:?}");
+        };
+        assert_eq!(*failed, pid);
+        assert!(
+            reason.contains("post-exec re-admission failed"),
+            "the refusal names the recovery stage: {reason}"
+        );
+        assert_eq!(
+            budget.unwrap(),
+            BudgetRefusal {
+                resource: "callers",
+                limit: 2,
+                requested: 3,
+            },
+            "N+1 refuses with the exact requested occupancy"
+        );
+        assert_eq!(
+            conv.scene.coordinator.adapter().admit_refused(),
+            1,
+            "the refusal counts exactly once"
+        );
+        // The image end is fact (the old retires) but no successor is
+        // minted, and the protected live sibling is untouched: no
+        // eviction, no disturbance.
+        {
+            let adapter = conv.scene.coordinator.adapter();
+            assert!(adapter.record(c1).unwrap().retired);
+            assert_eq!(adapter.live_id(pid), None);
+            assert!(!adapter.record(sibling).unwrap().retired);
+            assert_eq!(adapter.live_id(child.pid()), Some(sibling));
+            assert_eq!(adapter.len(), 2);
+        }
+        // Retry after room frees: the pid re-admits fresh through the
+        // ordinary scan path, binds its image, and completes S1. The
+        // refused handoff held nothing: a stop now records no held
+        // release.
+        conv.scene.coordinator.adapter_mut().set_max_callers(3);
+        let observed: std::collections::BTreeSet<u32> = [pid, child.pid()].into_iter().collect();
+        let readmitted = {
+            let scene = &mut conv.scene;
+            scene.coordinator.adapter_mut().reconcile(
+                &observed,
+                &mut |_| ImageAuthority::ScanPinned,
+                2_500,
+            )
+        };
+        assert!(
+            matches!(readmitted.as_slice(), [CallerEvent::Admitted { .. }]),
+            "the live pid re-admits fresh: {readmitted:?}"
+        );
+        let fresh = conv.scene.coordinator.adapter().live_id(pid).unwrap();
+        assert_ne!(fresh, c1, "the fresh admission mints a new caller");
+        h6_map(&mut conv, fresh, pid, 2_600);
+        set_sight(3_005);
+        conv.scene
+            .bind_image(detailed, vec![(7, 3, pid, 2_700)], 3_000);
+        let module = conv.scene.module.clone();
+        let image3 = h6_successor_image(3);
+        assert_eq!(conv.scene.bind(fresh, &module, detailed, image3), Ok(()));
+        let coverage = LaneCoverage::scripted(
+            detailed,
+            image3,
+            conv.endpoint(conv.init_slot),
+            vec![conv.ids[2]],
+        );
+        let router = conv.ids[2];
+        h6_register(&mut conv, fresh, &coverage, router, 3_100, None);
+        let init = CallEvidence::scripted(
+            detailed,
+            image3,
+            21,
+            router,
+            Some(conv.endpoint(conv.init_slot)),
+            conv.init_event(3_120),
+        );
+        h6_feed(
+            &mut conv,
+            fresh,
+            init,
+            CallStanding::Current(&coverage),
+            None,
+        );
+        let sign = CallEvidence::scripted(
+            detailed,
+            image3,
+            22,
+            router,
+            Some(conv.endpoint(conv.sign_slot)),
+            conv.sign_event(3_130),
+        );
+        h6_feed(
+            &mut conv,
+            fresh,
+            sign,
+            CallStanding::Current(&coverage),
+            None,
+        );
+        conv.commit();
+        assert_eq!(
+            conv.edge_rows()[0],
+            (Some(2), 0, false, 1, 1),
+            "the retried image recovers cleanly"
+        );
+        let gaps_before = conv.gap_pairs().len();
+        conv.scene.coordinator.stop();
+        assert_eq!(
+            conv.gap_pairs().len(),
+            gaps_before,
+            "the refused handoff held nothing to release"
+        );
+    }
+
+    // Semantic binding cap N/N+1: the first binding holds, the second
+    // refuses Capacity, the protected binding is never evicted, and room
+    // lets the retry through.
+    {
+        let mut conv = Box::new(ConversionScene::new());
+        let detailed = conv.detailed();
+        let child = H6Child::spawn();
+        let candidate = conv
+            .scene
+            .coordinator
+            .adapter_mut()
+            .admit(child.pid(), ImageAuthority::ScanPinned, 60)
+            .unwrap();
+        h6_map(&mut conv, candidate, child.pid(), 70);
+        conv.scene.answer(child.pid(), detailed, 9);
+        set_sight(1_005);
+        conv.scene
+            .bind_image(detailed, vec![(9, 1, child.pid(), 100)], 1_000);
+        conv.scene
+            .coordinator
+            .semantic_bindings_mut()
+            .reference_limit(1);
+        let module = conv.scene.module.clone();
+        let image = ImageIdentity {
+            task_cookie: 9,
+            exec_id: 1,
+        };
+        assert_eq!(
+            conv.scene.bind(candidate, &module, detailed, image),
+            Err(SemanticBindingRefusal::Capacity),
+            "N+1 refuses at the shared binding reservation"
+        );
+        assert_eq!(
+            conv.scene.coordinator.semantic_bindings().len(),
+            1,
+            "the refusal mints no binding"
+        );
+        assert!(
+            conv.scene
+                .coordinator
+                .semantic_bindings()
+                .get(conv.caller)
+                .is_some(),
+            "the protected binding is never evicted"
+        );
+        conv.scene
+            .coordinator
+            .semantic_bindings_mut()
+            .reference_limit(2);
+        assert_eq!(conv.scene.bind(candidate, &module, detailed, image), Ok(()));
+        assert_eq!(conv.scene.coordinator.semantic_bindings().len(), 2);
+    }
+
+    // Semantic queue N/N+1: one ordinary quantum stages; the second
+    // refuses with exactly one finite backpressure gap, and the first
+    // still finalizes on commit.
+    {
+        let mut conv = Box::new(ConversionScene::new());
+        let detailed = conv.detailed();
+        conv.scene
+            .coordinator
+            .stage_semantic_batch(SemanticBatch::scripted(detailed, Vec::new(), 100));
+        conv.scene
+            .coordinator
+            .stage_semantic_batch(SemanticBatch::scripted(detailed, Vec::new(), 110));
+        conv.commit_with_lane();
+        let backpressure = conv
+            .gap_pairs()
+            .iter()
+            .filter(|(subject, _)| subject == "semantic collection backpressure")
+            .count();
+        assert_eq!(
+            backpressure,
+            1,
+            "N+1 refuses with one finite gap: {:?}",
+            conv.gap_pairs()
+        );
+        assert!(conv.lane.take_recorded_gaps().is_empty());
+        conv.scene
+            .coordinator
+            .stage_semantic_batch(SemanticBatch::scripted(detailed, Vec::new(), 120));
+        conv.commit_with_lane();
+        let backpressure = conv
+            .gap_pairs()
+            .iter()
+            .filter(|(subject, _)| subject == "semantic collection backpressure")
+            .count();
+        assert_eq!(backpressure, 1, "the published quantum clears the queue");
+    }
+
+    // Lane negatives N/N+1 at the actual reservation: 64 stage, the
+    // 65th refuses the whole batch.
+    {
+        let conv = ConversionScene::new();
+        let domain = conv.detailed();
+        let sixty_four = vec![LaneNegative::CutBarrier { ordinal: 1 }; 64];
+        assert!(
+            SemanticBatch::from_tick_report(
+                domain,
+                crate::semantic_capture::TickReport::default(),
+                sixty_four,
+                100,
+            )
+            .is_ok(),
+            "N lane negatives stage"
+        );
+        let sixty_five = vec![LaneNegative::CutBarrier { ordinal: 1 }; 65];
+        assert_eq!(
+            SemanticBatch::from_tick_report(
+                domain,
+                crate::semantic_capture::TickReport::default(),
+                sixty_five,
+                100,
+            )
+            .map(|_| ()),
+            Err(SemanticRefusal::Unavailable),
+            "N+1 refuses the whole batch"
+        );
+    }
+
+    // Trace pool N/N+1 at the shared reservation: the pool fills to
+    // its exact cap; in-flight work still completes (it holds its own
+    // reservation), new seeding defers while full (never drops), and
+    // releasing the filler lets recovery proceed with exact accounting.
+    {
+        let (mut engine, mut io) = trace_driver::fixture();
+        trace_driver::seed(&mut engine, &mut io);
+        assert_eq!(trace_driver::calls(&io, 20, 11, 0), 1);
+        io.cookie.set(Some(11));
+        assert!(trace_driver::service(&mut engine, &mut io).is_empty());
+        trace_driver::empty(&io);
+        let mut first = trace_driver::service(&mut engine, &mut io);
+        assert_eq!(first.len(), 1);
+        let mut store = crate::trace_identity::TraceIdentityStore::new(io.proof.clone());
+        store.admit(first.pop().unwrap()).unwrap();
+        assert_eq!(
+            io.proof.usage(),
+            (2, 28),
+            "the store receipt plus the engine's pending re-seed"
+        );
+        let filler: Vec<_> = (0..16_382).map(|_| io.proof.reserve(0).unwrap()).collect();
+        assert_eq!(io.proof.usage(), (16_384, 28));
+        assert!(matches!(
+            io.proof.reserve(0),
+            Err(crate::attach::detailed_identity::TraceProofUnknown::Budget)
+        ));
+        // The in-flight re-seed completes under the full pool on fresh
+        // successor evidence: the cap gates new reservations, never
+        // reserved work.
+        let mut second = Vec::new();
+        for _ in 0..6 {
+            assert_eq!(trace_driver::calls(&io, io.proof.test_time() + 1, 11, 1), 1);
+            trace_driver::empty(&io);
+            second.extend(trace_driver::service(&mut engine, &mut io));
+            if !second.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(second.len(), 1, "reserved work completes at capacity");
+        // No new seed starts while the pool is full: service defers.
+        assert_eq!(io.proof.usage(), (16_384, 28));
+        for _ in 0..3 {
+            assert!(
+                trace_driver::service(&mut engine, &mut io).is_empty(),
+                "new seeding defers at capacity, never drops"
+            );
+        }
+        assert_eq!(io.proof.usage(), (16_384, 28));
+        drop(filler);
+        assert_eq!(
+            io.proof.usage(),
+            (2, 28),
+            "the filler releases exactly once"
+        );
+        trace_driver::service(&mut engine, &mut io);
+        assert_eq!(io.proof.usage(), (3, 42), "recovery re-seeds after release");
+        store.admit(second.pop().unwrap()).unwrap();
+        drop(store);
+        drop(engine);
+        assert_eq!(io.proof.usage(), (0, 0));
+    }
+
+    // Failed attach, pin duplication and scan, each finite with history
+    // intact; the retry reuses the one stored pin and succeeds.
+    {
+        use crate::discovery::native_binding::UnboundReason;
+
+        let mut conv = Box::new(ConversionScene::new());
+        let detailed = conv.detailed();
+        let child = H6Child::spawn();
+        let candidate = conv
+            .scene
+            .coordinator
+            .adapter_mut()
+            .admit(child.pid(), ImageAuthority::ScanPinned, 60)
+            .unwrap();
+        conv.scene.answer(child.pid(), detailed, 9);
+        set_sight(1_005);
+        conv.scene
+            .bind_image(detailed, vec![(9, 1, child.pid(), 100)], 1_000);
+        let module = conv.scene.module.clone();
+        let image = ImageIdentity {
+            task_cookie: 9,
+            exec_id: 1,
+        };
+        // Attach: the mapping is not established yet.
+        assert_eq!(
+            conv.scene.bind(candidate, &module, detailed, image),
+            Err(SemanticBindingRefusal::MappingIncomplete),
+            "unmapped candidates refuse before any pin work"
+        );
+        assert_eq!(conv.scene.coordinator.semantic_bindings().len(), 1);
+        h6_map(&mut conv, candidate, child.pid(), 1_100);
+        // Pin duplication: the identity reports the process exited.
+        conv.scene
+            .identity
+            .answers
+            .insert((child.pid(), detailed), CookieQuery::Exited);
+        assert_eq!(
+            conv.scene.bind(candidate, &module, detailed, image),
+            Err(SemanticBindingRefusal::ImageUnproven(
+                UnboundReason::CallerExited
+            )),
+            "a dead process fails pin duplication honestly"
+        );
+        assert_eq!(conv.scene.coordinator.semantic_bindings().len(), 1);
+        // Scan: the identity is temporarily unavailable.
+        conv.scene.identity.answers.insert(
+            (child.pid(), detailed),
+            CookieQuery::Unavailable("scripted scan outage".into()),
+        );
+        assert_eq!(
+            conv.scene.bind(candidate, &module, detailed, image),
+            Err(SemanticBindingRefusal::ImageUnproven(
+                UnboundReason::CookieUnavailable
+            )),
+            "an unavailable scan fails without minting"
+        );
+        assert_eq!(conv.scene.coordinator.semantic_bindings().len(), 1);
+        // Retry with proof present succeeds on the one stored pin, and
+        // re-proof reuses that same Arc: retries never re-duplicate.
+        conv.scene.identity.answers.insert(
+            (child.pid(), detailed),
+            CookieQuery::Cookie(DomainCookie::scripted(detailed, 9)),
+        );
+        assert_eq!(conv.scene.bind(candidate, &module, detailed, image), Ok(()));
+        assert_eq!(conv.scene.coordinator.semantic_bindings().len(), 2);
+        let first_pin = conv
+            .scene
+            .coordinator
+            .semantic_bindings()
+            .get(candidate)
+            .unwrap()
+            .pin();
+        assert_eq!(conv.scene.bind(candidate, &module, detailed, image), Ok(()));
+        let second_pin = conv
+            .scene
+            .coordinator
+            .semantic_bindings()
+            .get(candidate)
+            .unwrap()
+            .pin();
+        assert!(
+            std::sync::Arc::ptr_eq(&first_pin, &second_pin),
+            "re-proof shares the stored pin, never duplicates it"
+        );
+    }
+
+    // Failed postcheck in the exec context: the cut fails, semantic
+    // authority ends permanently for the domain, and broad Inventory
+    // continues.
+    {
+        let mut conv = Box::new(ConversionScene::new());
+        let pid = std::process::id();
+        let detailed = conv.detailed();
+        let events = h6_wave(&mut conv, detailed, vec![(7, 2, pid, 1_500)], 2_000);
+        let [CallerEvent::ExecRetired { new, .. }] = events.as_slice() else {
+            panic!("the proven EXEC must retire: {events:?}");
+        };
+        let successor = *new;
+        h6_map(&mut conv, successor, pid, 2_100);
+        set_sight(3_005);
+        conv.scene
+            .bind_image(detailed, vec![(7, 2, pid, 2_500)], 3_000);
+        let module = conv.scene.module.clone();
+        assert_eq!(
+            conv.scene
+                .bind(successor, &module, detailed, h6_successor_image(2)),
+            Ok(())
+        );
+        conv.prove_and_mark_tail();
+        conv.lane.fail_cut_once();
+        conv.lane.script_cut_barrier(9);
+        conv.commit_with_lane();
+        let ended = conv
+            .gap_pairs()
+            .iter()
+            .filter(|(subject, _)| subject == "semantic authority ended for domain")
+            .count();
+        assert_eq!(
+            ended,
+            1,
+            "the failed cut ends authority once: {:?}",
+            conv.gap_pairs()
+        );
+        // New semantic authority refuses permanently afterwards.
+        conv.scene
+            .coordinator
+            .stage_semantic_batch(SemanticBatch::scripted(detailed, Vec::new(), 3_200));
+        conv.commit_with_lane();
+        let refused = conv
+            .gap_pairs()
+            .iter()
+            .filter(|(subject, _)| subject == "semantic batch refused for an ended domain")
+            .count();
+        assert_eq!(
+            refused,
+            1,
+            "ended domains refuse new batches: {:?}",
+            conv.gap_pairs()
+        );
+        // Broad Inventory continues: the retired old edge keeps its
+        // retained history while the successor edge stays mapped.
+        let mid = conv
+            .scene
+            .coordinator
+            .registry()
+            .module_id_for(&conv.scene.module.clone())
+            .unwrap();
+        assert_eq!(
+            conv.scene
+                .coordinator
+                .registry()
+                .edge(conv.caller, mid)
+                .unwrap()
+                .mapping,
+            MappingState::Ended,
+            "the retired old edge keeps its ended history"
+        );
+        assert_eq!(
+            conv.scene
+                .coordinator
+                .registry()
+                .edge(successor, mid)
+                .unwrap()
+                .mapping,
+            MappingState::Mapped,
+            "the successor edge stays mapped through the semantic failure"
+        );
+    }
+
+    // Clock/serial exhaustion: a sentinel loss observation exhausts the
+    // proof ledger permanently. New reservations and seeds refuse with
+    // LifecycleLoss while every proven fact stands.
+    {
+        let (mut engine, mut io) = trace_driver::fixture();
+        trace_driver::seed(&mut engine, &mut io);
+        assert_eq!(trace_driver::calls(&io, 20, 11, 0), 1);
+        io.cookie.set(Some(11));
+        assert!(trace_driver::service(&mut engine, &mut io).is_empty());
+        trace_driver::empty(&io);
+        let mut first = trace_driver::service(&mut engine, &mut io);
+        assert_eq!(first.len(), 1);
+        let mut store = crate::trace_identity::TraceIdentityStore::new(io.proof.clone());
+        let receipt0 = first.pop().unwrap();
+        let key0 = receipt0.key();
+        store.admit(receipt0).unwrap();
+        assert_eq!(store.lookup(key0, 20).path(), Some("/owned/fixture"));
+        let usage_before = io.proof.usage();
+        let exhausted = engine
+            .with_trace_frame(&mut io, |_, io, work| {
+                Ok(io.proof.test_refresh_read(work, Ok(u64::MAX)).is_err())
+            })
+            .unwrap();
+        assert!(exhausted, "the sentinel loss observation fails the read");
+        assert!(matches!(
+            io.proof.reserve(0),
+            Err(crate::attach::detailed_identity::TraceProofUnknown::LifecycleLoss)
+        ));
+        let view =
+            crate::process::ProcessView::open(crate::process::ProcessViewId(0), std::process::id())
+                .unwrap();
+        assert!(matches!(
+            io.proof.can_seed(&view),
+            Err(crate::attach::detailed_identity::TraceProofUnknown::LifecycleLoss)
+        ));
+        assert_eq!(
+            io.proof.usage(),
+            usage_before,
+            "accounting freezes at exhaustion"
+        );
+        assert_eq!(
+            store.lookup(key0, 20).path(),
+            Some("/owned/fixture"),
+            "proven facts stand through exhaustion"
+        );
+    }
+
+    // Stop is finite and exact: new scans, exec admissions and retries
+    // refuse; staged lifecycle/semantic facts still drain; stop releases
+    // exactly once.
+    {
+        let mut conv = Box::new(ConversionScene::new());
+        let pid = std::process::id();
+        let detailed = conv.detailed();
+        let c1 = conv.caller;
+        let child = H6Child::spawn();
+        let sibling = conv
+            .scene
+            .coordinator
+            .adapter_mut()
+            .admit(child.pid(), ImageAuthority::ScanPinned, 60)
+            .unwrap();
+        h6_map(&mut conv, sibling, child.pid(), 70);
+        conv.scene.answer(child.pid(), detailed, 9);
+        set_sight(1_005);
+        conv.scene
+            .bind_image(detailed, vec![(9, 1, child.pid(), 100)], 1_000);
+        let module = conv.scene.module.clone();
+        let image9 = ImageIdentity {
+            task_cookie: 9,
+            exec_id: 1,
+        };
+        assert_eq!(conv.scene.bind(sibling, &module, detailed, image9), Ok(()));
+
+        let gaps_before = conv.gap_pairs().len();
+        let passes_before = conv.scene.coordinator.passes();
+        conv.scene.coordinator.stop();
+        assert_eq!(
+            conv.gap_pairs().len(),
+            gaps_before,
+            "an unheld stop records no release"
+        );
+        // New scans refuse after stop.
+        let mut guard = crate::discovery::engine::inventory::UnavailableImageGuard;
+        let report = {
+            let scene = &mut conv.scene;
+            scene
+                .coordinator
+                .scan_pass(
+                    &crate::discovery::engine::inventory_coordinator::InventoryScope::Pid(pid),
+                    None,
+                    &mut guard,
+                    &mut scene.identity,
+                    6_000,
+                    5_000,
+                )
+                .unwrap()
+        };
+        assert_eq!(report.scanned, 0, "refused scans scan nothing");
+        assert!(!report.engine_changed);
+        assert!(report.events.is_empty());
+        assert_eq!(
+            conv.scene.coordinator.passes(),
+            passes_before,
+            "refused scans consume no pass number"
+        );
+        conv.commit_with_lane();
+        let refused_scans = conv
+            .gap_pairs()
+            .iter()
+            .filter(|(subject, _)| subject == "scan refused after stop")
+            .count();
+        assert_eq!(
+            refused_scans,
+            1,
+            "one finite scan refusal: {:?}",
+            conv.gap_pairs()
+        );
+        // Staged lifecycle facts still drain: the live sibling's leader
+        // exit records honest link loss after stop (drain, not gate).
+        // SAFETY: DiscoveryRecord contains only integer fields.
+        let mut exit_record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        exit_record.hook_ts_ns = 5_500;
+        exit_record.pid_tgid = (u64::from(child.pid()) << 32) | u64::from(child.pid());
+        exit_record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+        {
+            let scene = &mut conv.scene;
+            let batch = DiscoveryBatch::scripted(detailed, vec![exit_record], 5_600);
+            let receipt = scene.coordinator.stage_native(
+                NativeBatch::Lifecycle(batch),
+                &mut scene.identity,
+                5_601,
+            );
+            assert!(receipt.events.is_empty());
+            scene.coordinator.commit_batch(false).unwrap();
+        }
+        let link_loss = conv
+            .gap_pairs()
+            .iter()
+            .filter(|(subject, _)| subject == "leader task link loss")
+            .count();
+        assert_eq!(link_loss, 1, "link-loss evidence drains after stop");
+        // Exec admissions refuse after stop: the old retires, no
+        // successor is minted, no retry is scheduled.
+        let events = h6_wave(&mut conv, detailed, vec![(7, 2, pid, 5_700)], 5_800);
+        let [CallerEvent::Retired { id, .. }] = events.as_slice() else {
+            panic!("a stopped EXEC retires without a successor: {events:?}");
+        };
+        assert_eq!(*id, c1);
+        {
+            let adapter = conv.scene.coordinator.adapter();
+            assert_eq!(adapter.live_id(pid), None);
+            assert_eq!(adapter.len(), 2, "no successor incarnation was minted");
+        }
+        let refused_admission = conv
+            .gap_pairs()
+            .iter()
+            .filter(|(subject, _)| subject == "successor admission refused while stopped")
+            .count();
+        assert_eq!(refused_admission, 1);
+        // Semantic absorption still drains: a staged quantum finalizes
+        // and clears after stop.
+        conv.scene
+            .coordinator
+            .stage_semantic_batch(SemanticBatch::scripted(detailed, Vec::new(), 5_900));
+        conv.commit_with_lane();
+        conv.scene
+            .coordinator
+            .stage_semantic_batch(SemanticBatch::scripted(detailed, Vec::new(), 5_910));
+        conv.commit_with_lane();
+        let backpressure = conv
+            .gap_pairs()
+            .iter()
+            .filter(|(subject, _)| subject == "semantic collection backpressure")
+            .count();
+        assert_eq!(backpressure, 0, "staged quanta keep finalizing after stop");
+        // Stop releases exactly once: a second stop adds nothing.
+        let gaps_mid = conv.gap_pairs().len();
+        conv.scene.coordinator.stop();
+        assert_eq!(conv.gap_pairs().len(), gaps_mid);
+    }
+
+    // Held handoffs release exactly once at stop: the cgroup control
+    // holds-then-commits, while the stopped handoff releases without
+    // ever minting its successor.
+    {
+        let mut scene = Box::new(CgroupScene::new());
+        let pid = scene.child.id();
+        let detailed = scene.lane.domain();
+        let mut identity = ScriptedPidIdentity::default();
+        identity.answers.insert(
+            (pid, detailed),
+            CookieQuery::Cookie(DomainCookie::scripted(detailed, 7)),
+        );
+        let c1 = scene.caller;
+        // T1 holds silently: the old retires with no successor yet.
+        let events = h6_native_wave(
+            &mut scene.coordinator,
+            &mut identity,
+            detailed,
+            vec![(7, 2, pid, 2_500)],
+            3_000,
+        );
+        let [CallerEvent::Retired { id, .. }] = events.as_slice() else {
+            panic!("a held handoff retires silently: {events:?}");
+        };
+        assert_eq!(*id, c1);
+        assert_eq!(scene.coordinator.adapter().live_id(pid), None);
+        assert_eq!(scene.coordinator.adapter().len(), 1);
+        // Control: the next transaction commits the held successor.
+        let outcome = scene.pass(CgroupWalkLimits::default(), 4_000);
+        assert_eq!(outcome, ScopedCollectionOutcome::Complete);
+        let c2 = scene.coordinator.adapter().live_id(pid).unwrap();
+        assert_ne!(c2, c1, "the held handoff commits its successor");
+        // T2 binds, then holds again.
+        let bound = h6_native_wave(
+            &mut scene.coordinator,
+            &mut identity,
+            detailed,
+            vec![(7, 2, pid, 4_500)],
+            5_000,
+        );
+        assert!(bound.is_empty(), "first sight binds: {bound:?}");
+        let events = h6_native_wave(
+            &mut scene.coordinator,
+            &mut identity,
+            detailed,
+            vec![(7, 3, pid, 5_500)],
+            6_000,
+        );
+        assert!(
+            matches!(events.as_slice(), [CallerEvent::Retired { .. }]),
+            "the second handoff holds: {events:?}"
+        );
+        assert_eq!(scene.coordinator.adapter().live_id(pid), None);
+        // Stop releases the held handoff exactly once.
+        let gaps_before = scene.gap_pairs().len();
+        scene.coordinator.stop();
+        scene.coordinator.commit_batch(false).unwrap();
+        let released = scene.gap_pairs()[gaps_before..]
+            .iter()
+            .filter(|(subject, _)| subject == "held exec handoffs released at stop")
+            .count();
+        assert_eq!(
+            released,
+            1,
+            "one finite held release: {:?}",
+            scene.gap_pairs()
+        );
+        // No collection applies afterwards: the gate holds, and no
+        // successor was ever minted for the released handoff.
+        let collection = scene
+            .coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        let refused = scene.coordinator.apply_cgroup_collection(collection, 7_000);
+        assert!(
+            refused.is_err_and(|error| format!("{error:#}").contains("coordinator stopped")),
+            "post-stop collections refuse at the gate"
+        );
+        assert_eq!(scene.coordinator.adapter().live_id(pid), None);
+        assert_eq!(
+            scene.coordinator.adapter().len(),
+            2,
+            "no successor was ever minted for the released handoff"
+        );
+        let gaps_mid = scene.gap_pairs().len();
+        scene.coordinator.stop();
+        scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            scene.gap_pairs().len(),
+            gaps_mid,
+            "the second stop releases nothing twice"
+        );
+    }
+
+    // Healthy recovery progresses under backlog: the semantic queue is
+    // saturated when the EXEC lands, yet the successor still commits,
+    // binds and completes S1.
+    {
+        let mut conv = Box::new(ConversionScene::new());
+        let pid = std::process::id();
+        let detailed = conv.detailed();
+        let c1 = conv.caller;
+        let events = h6_wave(&mut conv, detailed, vec![(7, 2, pid, 1_500)], 2_000);
+        let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+            panic!("the proven EXEC must retire: {events:?}");
+        };
+        assert_eq!(
+            (*old, *new),
+            (c1, conv.scene.coordinator.adapter().live_id(pid).unwrap())
+        );
+        let successor = *new;
+        // Saturate the semantic queue before recovery runs.
+        conv.scene
+            .coordinator
+            .stage_semantic_batch(SemanticBatch::scripted(detailed, Vec::new(), 2_100));
+        conv.scene
+            .coordinator
+            .stage_semantic_batch(SemanticBatch::scripted(detailed, Vec::new(), 2_110));
+        // Recovery proceeds through ordinary work anyway.
+        h6_map(&mut conv, successor, pid, 2_200);
+        set_sight(3_005);
+        conv.scene
+            .bind_image(detailed, vec![(7, 2, pid, 2_500)], 3_000);
+        let module = conv.scene.module.clone();
+        let image2 = h6_successor_image(2);
+        assert_eq!(
+            conv.scene.bind(successor, &module, detailed, image2),
+            Ok(())
+        );
+        let coverage = LaneCoverage::scripted(
+            detailed,
+            image2,
+            conv.endpoint(conv.init_slot),
+            vec![conv.ids[0]],
+        );
+        let router = conv.ids[0];
+        h6_register(&mut conv, successor, &coverage, router, 3_100, None);
+        let init = CallEvidence::scripted(
+            detailed,
+            image2,
+            31,
+            router,
+            Some(conv.endpoint(conv.init_slot)),
+            conv.init_event(3_120),
+        );
+        h6_feed(
+            &mut conv,
+            successor,
+            init,
+            CallStanding::Current(&coverage),
+            None,
+        );
+        let sign = CallEvidence::scripted(
+            detailed,
+            image2,
+            32,
+            router,
+            Some(conv.endpoint(conv.sign_slot)),
+            conv.sign_event(3_130),
+        );
+        h6_feed(
+            &mut conv,
+            successor,
+            sign,
+            CallStanding::Current(&coverage),
+            None,
+        );
+        conv.commit_with_lane();
+        assert_eq!(
+            conv.edge_rows(),
+            vec![(Some(2), 0, false, 1, 1)],
+            "recovery completes S1 under backlog"
+        );
+        let backpressure = conv
+            .gap_pairs()
+            .iter()
+            .filter(|(subject, _)| subject == "semantic collection backpressure")
+            .count();
+        assert_eq!(
+            backpressure, 1,
+            "the backlog refusal stands disclosed exactly once"
+        );
+        assert!(conv.lane.take_recorded_gaps().is_empty());
+    }
+
+    // Runtime wiring: the classic loop stops its host exactly once when
+    // the pass loop ends, before any retirement runs.
+    {
+        use crate::inventory_capture::{
+            CollectJob, LaneHost, LoopClock, NativeLane, PassDriver, Publish,
+            run_classic_finalizing,
+        };
+
+        struct H6Pin;
+        struct H6Targets;
+        impl crate::attach::inventory::capture::CaptureTargets for H6Targets {
+            fn target(
+                &self,
+                _object: AttachObjectId,
+            ) -> Option<&crate::discovery::identity::RetainedInventoryTarget> {
+                None
+            }
+        }
+        struct H6Host {
+            stops: usize,
+            targets: H6Targets,
+        }
+        impl LaneHost<H6Pin> for H6Host {
+            fn begin_capture_coverage(
+                &mut self,
+                _scope: crate::attach::inventory::capture::CaptureScopeCoverage,
+            ) {
+            }
+            fn abandon_capture_coverage(&mut self) {}
+            fn note_extend_receipt(
+                &mut self,
+                _receipt: &crate::attach::inventory::capture::ExtendReceipt,
+            ) {
+            }
+            fn note_capture_custody(
+                &mut self,
+                _custody: &crate::attach::inventory::capture::ScopeCustody,
+            ) {
+            }
+            fn take_target_delta(&mut self) -> crate::discovery::inventory_attach_set::TargetDelta {
+                crate::discovery::inventory_attach_set::TargetDelta::default()
+            }
+            fn capture_targets(&self) -> &dyn crate::attach::inventory::capture::CaptureTargets {
+                &self.targets
+            }
+            fn stage_native(
+                &mut self,
+                _batch: NativeBatch,
+                _identity: &mut dyn NativeIdentity<H6Pin>,
+                _now_ns: u64,
+            ) -> crate::discovery::engine::inventory_coordinator::NativeReceipt {
+                crate::discovery::engine::inventory_coordinator::NativeReceipt::default()
+            }
+            fn end_capture_coverage(&mut self, _at_ns: u64) {}
+            fn note_native_lane(&mut self) {}
+            fn note_scope_gap(&mut self, _subject: String, _reason: String) {}
+            fn note_refresh_loss(&mut self, _reason: String) {}
+            fn stop_coordinator(&mut self) {
+                self.stops += 1;
+            }
+        }
+        struct H6NoLane;
+        impl NativeIdentity<H6Pin> for H6NoLane {
+            fn owner_image(&mut self, _pid: u32) -> Option<ImageIdentity> {
+                unreachable!("the wiring probe runs without a lane")
+            }
+            fn query_cookie(&mut self, _domain: NativeDomainId, _pin: &H6Pin) -> CookieQuery {
+                unreachable!("the wiring probe runs without a lane")
+            }
+        }
+        impl crate::inventory_capture::CaptureLane<H6Pin> for H6NoLane {
+            fn domain(&self) -> NativeDomainId {
+                unreachable!("the wiring probe runs without a lane")
+            }
+            fn scope_coverage(&self) -> crate::attach::inventory::capture::CaptureScopeCoverage {
+                unreachable!("the wiring probe runs without a lane")
+            }
+            fn extend(
+                &mut self,
+                _delta: crate::discovery::inventory_attach_set::TargetDelta,
+                _targets: &dyn crate::attach::inventory::capture::CaptureTargets,
+                _window: crate::attach::inventory::capture::ExtendWindow,
+            ) -> crate::attach::inventory::capture::ExtendReceipt {
+                unreachable!("the wiring probe runs without a lane")
+            }
+            fn service_discovery(
+                &mut self,
+                _window: crate::attach::inventory::capture::ReadWindow,
+            ) -> DiscoveryBatch {
+                unreachable!("the wiring probe runs without a lane")
+            }
+            fn read_witnesses(
+                &mut self,
+                _window: crate::attach::inventory::capture::ReadWindow,
+            ) -> WitnessBatch {
+                unreachable!("the wiring probe runs without a lane")
+            }
+            fn begin_stop(&mut self) {
+                unreachable!("the wiring probe runs without a lane")
+            }
+            fn poll_retirement(&mut self, _deadline: std::time::Instant) -> anyhow::Result<bool> {
+                unreachable!("the wiring probe runs without a lane")
+            }
+            fn cleanup(&self) -> Option<crate::attach::inventory::capture::CleanupSummary> {
+                unreachable!("the wiring probe runs without a lane")
+            }
+        }
+        struct H6Driver {
+            host: H6Host,
+            passes: usize,
+        }
+        impl PassDriver<H6Pin> for H6Driver {
+            type Host = H6Host;
+            fn host(&mut self) -> &mut H6Host {
+                &mut self.host
+            }
+            fn collector(&mut self) -> CollectJob {
+                CollectJob::Legacy(Box::new(|| {
+                    Err(anyhow::anyhow!("no collection in the wiring probe"))
+                }))
+            }
+            fn apply(
+                &mut self,
+                _collected: crate::inventory_capture::CollectedPass,
+                _identity: &mut dyn NativeIdentity<H6Pin>,
+                _now_ns: u64,
+            ) -> anyhow::Result<crate::discovery::engine::inventory_coordinator::PassReport>
+            {
+                self.passes += 1;
+                Ok(
+                    crate::discovery::engine::inventory_coordinator::PassReport {
+                        pass: self.passes as u64,
+                        scanned: 0,
+                        maps_matched: 0,
+                        native_callers: 0,
+                        scan_callers: 0,
+                        engine_changed: false,
+                        pending_refresh: Vec::new(),
+                        events: Vec::new(),
+                        timings: crate::timing::StageTimings::new(),
+                    },
+                )
+            }
+            fn commit(&mut self, _engine_changed: bool) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut driver = H6Driver {
+            host: H6Host {
+                stops: 0,
+                targets: H6Targets,
+            },
+            passes: 0,
+        };
+        let stop = || true;
+        let clock = LoopClock {
+            deadline: None,
+            stop: &stop,
+            interval: std::time::Duration::from_secs(60),
+            tick: std::time::Duration::from_millis(10),
+            collection_tick: std::time::Duration::from_millis(10),
+        };
+        let outcome = run_classic_finalizing(
+            &mut driver,
+            None::<NativeLane<H6NoLane>>,
+            &clock,
+            None,
+            &mut |_, _: Publish<'_>| Ok(()),
+        );
+        assert!(outcome.error.is_none());
+        assert!(outcome.stopped.is_none());
+        assert_eq!(driver.passes, 1, "the probe runs its single pass");
+        assert_eq!(driver.host.stops, 1, "the loop stops its host exactly once");
+    }
+}

@@ -11,7 +11,7 @@ coverage, phase timings, observer/target CPU, map memory, map-read
 cost, and every loss counter.
 
 Method mirrors scripts/system-scope-measure.sh (attach gate = discovery
-marker on stderr AND the observer's first live frame on stdout; /proc
+marker AND attach-complete line, both on stderr; /proc
 sampling via system-scope-sample.py; stderr dating via
 system-scope-ts.py) but the workload is fixture stage children with a
 gated call plan, and the analysis (oracle diff, bpftool memory,
@@ -41,6 +41,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -399,17 +400,30 @@ def bpftool_dump_timed(map_id, reps=3):
 # Observer run + attach gate.
 # --------------------------------------------------------------------------
 
-def wait_attach(cell_dir, observer_proc, timeout_s=600):
-    """Gate: discovery marker on stderr AND first live frame on stdout.
+# Attach-complete signal: the observer prints one stderr line once the
+# attach session completes (src/run.rs format_attach_complete, 0801e79c),
+# strictly before the capture loop — 'p11scope: attached N probe' for one
+# probe, 'p11scope: attached N probes' otherwise. Both spellings match.
+_ATTACH_COMPLETE_RE = re.compile(r"p11scope: attached [0-9]+ probes?")
 
-    Same contract as system-scope-measure.sh's wait_attach: the frame's
-    "probes attached" line is the in-observer attach-end signal. An fd
-    plateau is deliberately NOT the gate (fires early under load).
-    Returns the gate monotonic timestamp. Raises on observer death or
-    timeout.
+
+def has_attach_complete_line(stderr_text):
+    """True when the stderr transcript holds the attach-complete line."""
+    return _ATTACH_COMPLETE_RE.search(stderr_text) is not None
+
+
+def wait_attach(cell_dir, observer_proc, timeout_s=600):
+    """Gate: discovery marker AND attach-complete line, both on stderr.
+
+    Same contract as system-scope-measure.sh's wait_attach: the
+    attach-complete line is the in-observer attach-end signal. The old
+    stdout first-live-frame signal died with M-10 (7eb86f0d made live
+    frames terminal-only) while the harness captures observer stdout to
+    a file, so a frame gate could never fire. An fd plateau is
+    deliberately NOT the gate (fires early under load). Returns the gate
+    monotonic timestamp. Raises on observer death or timeout.
     """
     stderr_path = cell_dir / "stderr.txt"
-    stdout_path = cell_dir / "observer.stdout"
     deadline = time.monotonic() + timeout_s
     while True:
         if observer_proc.poll() is not None:
@@ -423,13 +437,8 @@ def wait_attach(cell_dir, observer_proc, timeout_s=600):
                                                 errors="replace")
         except OSError:
             stderr_text = ""
-        try:
-            stdout_text = stdout_path.read_text(encoding="utf-8",
-                                                errors="replace")
-        except OSError:
-            stdout_text = ""
         if "p11scope: discovery:" in stderr_text \
-                and "probes attached" in stdout_text:
+                and has_attach_complete_line(stderr_text):
             return time.monotonic_ns()
         time.sleep(0.2)
 

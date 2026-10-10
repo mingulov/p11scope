@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Native Linux x86-64 LP64 caller. Real SoftHSM calls; no simulated provider.
- * Every provider call, including setup/teardown, has an independent ledger.
+ * Every provider call, including setup/teardown, has an independent ledger
+ * (call rows carry the session handle, or 0 where no session exists; target
+ * rows carry the observed vaddr alongside the file offset).
  * Interactive: calls|spaced FUNCTION COUNT DELAY_MS PHASE SCOPE;
  * exec|thread-exec PATH; stop. Auto: --start-gate PATH --auto-gate PATH
  * [--auto-count N --auto-delay-ms N --canary PRIVATE_VALUE]. */
@@ -52,12 +54,12 @@ static void ack(const char *phase) {
   header("ack"); printf(",\"phase\":"); quoted(phase);
   printf(",\"t\":%llu}\n", now_ns()); fflush(stdout);
 }
-static void call(const char *fn, CK_RV rv, const char *phase, unsigned long long start) {
+static void call(const char *fn, CK_RV rv, const char *phase, unsigned long long start, unsigned long sess) {
   unsigned long long finish = now_ns();
   header("call"); printf(",\"pid\":%d,\"tid\":%ld,\"fn\":", getpid(), syscall(SYS_gettid));
   quoted(fn); printf(",\"rv\":%lu,\"phase\":", rv); quoted(phase);
   printf(",\"scope\":"); quoted(scope);
-  printf(",\"t0\":%llu,\"t1\":%llu}\n", start, finish); fflush(stdout);
+  printf(",\"sess\":%lu,\"t0\":%llu,\"t1\":%llu}\n", sess, start, finish); fflush(stdout);
   if (rv) { fprintf(stderr, "provider call failed: %s rv=%lu\n", fn, rv); exit(1); }
 }
 static int target(const char *fn, void *address) {
@@ -69,8 +71,8 @@ static int target(const char *fn, void *address) {
     if (sscanf(line, "%lx-%lx %4s %lx %x:%x %lu", &lo, &hi, perms, &off, &major, &minor, &ino) == 7 &&
         ptr >= lo && ptr < hi && perms[2] == 'x' && ino) {
       header("target"); printf(",\"fn\":"); quoted(fn);
-      printf(",\"dev\":[%u,%u],\"ino\":%lu,\"file_offset\":%lu}\n",
-             major, minor, ino, (unsigned long)(ptr - lo) + off);
+      printf(",\"dev\":[%u,%u],\"ino\":%lu,\"file_offset\":%lu,\"vaddr\":%lu}\n",
+             major, minor, ino, (unsigned long)(ptr - lo) + off, (unsigned long)ptr);
       fclose(maps); fflush(stdout); return 0;
     }
   }
@@ -108,7 +110,7 @@ static void setup(void) {
   if (!symbol || target("C_GetFunctionList", symbol)) exit(1);
   unsigned long long t = now_ns();
   CK_RV rv = ((CK_RV (*)(void **))symbol)(&list);
-  call("C_GetFunctionList", rv, "setup", t);
+  call("C_GetFunctionList", rv, "setup", t, 0);
   if (!list) exit(1);
   fns = (void **)((char *)list + 8); /* CK_VERSION plus LP64 alignment. */
   const char *names[] = {"C_Initialize", "C_Finalize", "C_GetInfo", "C_GetSlotList", "C_OpenSession",
@@ -116,18 +118,18 @@ static void setup(void) {
   const int indexes[] = {0, 1, 2, 4, 12, 13, 15, 64};
   for (unsigned int i = 0; i < sizeof indexes / sizeof indexes[0]; i++)
     if (!fns[indexes[i]] || target(names[i], fns[indexes[i]])) exit(1);
-  t = now_ns(); rv = F(0, CK_RV (*)(void *))(NULL); call("C_Initialize", rv, "setup", t);
+  t = now_ns(); rv = F(0, CK_RV (*)(void *))(NULL); call("C_Initialize", rv, "setup", t, 0);
   CK_SLOT_ID slots[16]; CK_ULONG n = 16;
   t = now_ns(); rv = F(4, CK_RV (*)(unsigned char, CK_SLOT_ID *, CK_ULONG *))(1, slots, &n);
-  call("C_GetSlotList", rv, "setup", t); if (!n || n > 16) exit(1);
+  call("C_GetSlotList", rv, "setup", t, 0); if (!n || n > 16) exit(1);
   t = now_ns(); rv = F(12, CK_RV (*)(CK_SLOT_ID, CK_ULONG, void *, void *, CK_SESSION_HANDLE *))
-    (slots[0], 6, NULL, NULL, &session); call("C_OpenSession", rv, "setup", t);
+    (slots[0], 6, NULL, NULL, &session); call("C_OpenSession", rv, "setup", t, session);
   header("ready"); printf(",\"t\":%llu}\n", now_ns()); fflush(stdout);
 }
 static void teardown(void) {
   unsigned long long t = now_ns(); CK_RV rv = F(13, CK_RV (*)(CK_SESSION_HANDLE))(session);
-  call("C_CloseSession", rv, "teardown", t);
-  t = now_ns(); rv = F(1, CK_RV (*)(void *))(NULL); call("C_Finalize", rv, "teardown", t);
+  call("C_CloseSession", rv, "teardown", t, session);
+  t = now_ns(); rv = F(1, CK_RV (*)(void *))(NULL); call("C_Finalize", rv, "teardown", t, 0);
 }
 static void calls(const char *fn, unsigned long n, unsigned long ms, const char *phase, int spaced) {
   if (n > 10000 || ms > (spaced ? 61000UL : 10000UL) ||
@@ -145,7 +147,7 @@ static void calls(const char *fn, unsigned long n, unsigned long ms, const char 
     } else {
       CK_ULONG info[32]; rv = F(2, CK_RV (*)(void *))(info);
     }
-    call(fn, rv, phase, t);
+    call(fn, rv, phase, t, strcmp(fn, "C_GetInfo") ? session : 0);
     if (!spaced && ms) delay_ms(ms);
   }
   ack(phase);

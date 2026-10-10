@@ -41,6 +41,23 @@ impl AttestedSubset {
     pub(crate) fn required(&self) -> &BTreeMap<PinnedObjectId, BTreeSet<u32>> {
         &self.required
     }
+
+    /// Tests-only envelope: conversion tests script descriptor shapes
+    /// (unauthorized, ambiguous, count-only) that `prepare` never admits,
+    /// to pin the defense-in-depth refusals above the proven Slot paths.
+    /// Production construction stays move-only.
+    #[cfg(test)]
+    pub(crate) fn scripted(
+        plan: plan::AttachPlan,
+        pins: PinnedObjects,
+        required: BTreeMap<PinnedObjectId, BTreeSet<u32>>,
+    ) -> Self {
+        Self {
+            plan,
+            pins,
+            required,
+        }
+    }
 }
 
 pub(crate) struct SubsetPreparation {
@@ -321,6 +338,26 @@ impl SemanticCallerBinding {
     pub(crate) fn pin(&self) -> Arc<PidPin> {
         self.pin.clone()
     }
+
+    /// Tests-only binding: conversion tests script modules (including
+    /// unidentified ones production proof refuses) that binding proof
+    /// never accepts, to pin the conversion refusals above it.
+    #[cfg(test)]
+    pub(crate) fn scripted(
+        caller: CallerId,
+        module: ModuleKey,
+        domain: NativeDomainId,
+        image: ImageIdentity,
+        pin: Arc<PidPin>,
+    ) -> Self {
+        Self {
+            caller,
+            module,
+            domain,
+            image,
+            pin,
+        }
+    }
 }
 
 /// Finite semantic-binding refusal.
@@ -402,6 +439,14 @@ impl SemanticBindingSet {
         self.bindings
             .iter()
             .find(|binding| binding.domain() == domain && binding.image() == image)
+    }
+
+    /// Whether a bound caller holds this Detailed ticket: proven-image
+    /// retention keys on it, so the map never outgrows the binding cap.
+    fn has_ticket(&self, domain: NativeDomainId, ticket: u64) -> bool {
+        self.bindings
+            .iter()
+            .any(|binding| binding.domain() == domain && binding.image().task_cookie == ticket)
     }
 
     #[cfg(test)]
@@ -713,8 +758,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     /// Record H0 association: a receipt's presence proves its scan was
     /// accepted, whether or not the receipt still validates fresh. The
-    /// latest observed exec per ticket decides gap minting.
+    /// latest observed exec per ticket decides gap minting. Retention keys
+    /// on live bindings (`assemble_tail_gaps` consults the binding first,
+    /// so entries for unbound tickets are never read): the map stays
+    /// bounded by the binding cap instead of growing per distinct scan.
     fn observe_proven_image(&mut self, receipt: &crate::semantic_capture::CurrentPartitionReceipt) {
+        if !self
+            .semantic_bindings
+            .has_ticket(receipt.domain(), receipt.image().task_cookie)
+        {
+            return;
+        }
         self.proven_images
             .entry((receipt.domain(), receipt.image().task_cookie))
             .and_modify(|exec| *exec = (*exec).max(receipt.image().exec_id))
@@ -722,9 +776,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Test seam: record an accepted H0 scan the shell lane cannot run,
-    /// so the adjudication and cut legs exercise downstream of it.
+    /// so the adjudication and cut legs exercise downstream of it. It
+    /// mirrors production retention exactly: only bound tickets persist.
     #[cfg(test)]
     pub(crate) fn reference_prove_image(&mut self, domain: NativeDomainId, image: ImageIdentity) {
+        if !self.semantic_bindings.has_ticket(domain, image.task_cookie) {
+            return;
+        }
         self.proven_images
             .entry((domain, image.task_cookie))
             .and_modify(|exec| *exec = (*exec).max(image.exec_id))

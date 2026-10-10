@@ -939,6 +939,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &mut self.semantic_bindings
     }
 
+    /// Test seam: stage one provisional marker the way cgroup collection
+    /// does, so the tail adjudicator's genuine arm fires without a full
+    /// scoped pass.
+    #[cfg(test)]
+    pub(crate) fn reference_stage_adjudication(&mut self, caller: CallerId, pid: u32) {
+        self.pending_adjudication.insert(caller, pid);
+    }
+
+    /// Test seam: retained proven-image count, bounded by live bindings.
+    #[cfg(test)]
+    pub(crate) fn proven_image_count(&self) -> usize {
+        self.proven_images.len()
+    }
+
     /// Test seam: script the binder's current-binding clock so scripted
     /// horizons can cover scripted sightings.
     #[cfg(test)]

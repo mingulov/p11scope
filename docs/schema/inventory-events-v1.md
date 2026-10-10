@@ -36,10 +36,22 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   units; child `entries.count` is null and never copies a physical count.
   No-call rows retain unknown labels and null details. Loss reasons and private
   identity exclusions are defined in [inventory v1](inventory-v1.md#semantic-instances-additive-within-v1).
-  H2 provides shared serializers and the snapshot replay helper. H3 still must
-  connect bounded incremental emission and a retention-aware final sweep before
-  `ended`, with separate deferred/unretained counts. Snapshot replay equivalence
-  does not claim that the production live stream emits these new kinds yet.
+  Both instance kinds stream change-driven, like `edge_observed`: one
+  tracked record per instance with a separate dirty flag per kind; a
+  commit writes a record for a row that is new or whose payload differs
+  from its last record (a row that changes again while it waits keeps
+  its single queue place and emits its current payload). At most 4,096
+  records of both kinds together per commit, first in first out; the
+  rest wait, counted in that commit's `instance_events_deferred` and
+  `semantic_edge_events_deferred` (with `instance_events` and
+  `semantic_edge_events` counting the records the commit wrote). The
+  exact sweep before `ended` writes every due or evicted row of both
+  kinds, then settles all three kinds together: `ended.instance_events`
+  and `ended.semantic_edge_events` count the sweep's records,
+  `ended.instances_unretained` and `ended.semantic_edges_unretained`
+  the rows whose last record retention deleted (0 unless the retention
+  cannot hold them; when all three unretained counts are 0, every last
+  retained record equals its snapshot row).
 
 - `started`: `{scope, clock: {basis, unit}, started_ns, limits:
   {callers, modules, edges, endpoints, inventory_endpoints,
@@ -104,7 +116,10 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   Every `pass_committed` also carries `edge_events` (the `edge_observed`
   records the commit wrote just before it) and `edge_events_deferred`
   (changed edges still waiting past the per-pass cap; see
-  `edge_observed`).
+  `edge_observed`), plus `instance_events`, `instance_events_deferred`,
+  `semantic_edge_events` and `semantic_edge_events_deferred` — the
+  same accounting for the two instance kinds under their one shared
+  4,096-row per-commit quota.
 - `edge_observed`: one edge as the snapshot `edges[]` entry verbatim,
   plus the three derived presentation states `presence`, `capture`,
   `activity` and additive `identity_context` — computed from the same model the dashboard renders,
@@ -286,11 +301,14 @@ never sum successive cumulative records for an edge.
   accounted (direct + covered) always equal emitted.
 - `ended`: `{ended_ns, passes, budgets, gaps_suppressed, stream:
   {rotations, evicted_events, evicted_bytes}, edge_events,
-  edges_unretained}` — terminal marker with final budgets plus stream
-  accounting; `edge_events` counts the final edge sweep's records and
-  `edges_unretained` the edges whose last record retention deleted (0
-  unless the retention cannot hold one record per edge; see
-  `edge_observed`).
+  edges_unretained, instance_events, instances_unretained,
+  semantic_edge_events, semantic_edges_unretained}` — terminal marker
+  with final budgets plus stream accounting; `edge_events` counts the
+  final edge sweep's records and `edges_unretained` the edges whose
+  last record retention deleted (0 unless the retention cannot hold
+  one record per edge; see `edge_observed`). The instance pairs carry
+  the same accounting for the two instance kinds, settled together
+  with the physical edges over the one reserved `ended` line.
   The semantic resource budget uses this terminal presentation's current
   charges, peak charges, refusals and occupancy; it never recomputes live
   registry state while serializing the event.

@@ -44,6 +44,8 @@ impl<'a> ObservedDriver<'a> {
                 guard: UnavailableImageGuard,
                 deadline: None,
                 display: None,
+                semantic: None,
+                semantic_staged: false,
             },
             wrapper: None,
             tick: None,
@@ -667,6 +669,37 @@ fn retained(scope: Scope) -> InventorySelection {
         scope,
         numbering: crate::pidns::PidNumbering::agreeing(),
     }
+}
+
+#[test]
+fn native_semantic_no_manifests_means_no_lane_and_no_gap() {
+    // H3 Task5: without --manifest the run starts no Detailed lane and
+    // records no semantic gap at all; the summary reports disabled.
+    let mut stdout = Vec::new();
+    let result = run_public_selection(
+        crate::cli::ScopeArg::Pid(std::process::id()),
+        &[],
+        None,
+        None,
+        None,
+        &mut stdout,
+    );
+    assert_eq!(result.unwrap(), 0);
+    let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    assert_eq!(
+        document["observation"]["semantic_capture"]["status"],
+        "disabled"
+    );
+    let gaps = document["gaps"].as_array().unwrap();
+    assert!(
+        gaps.iter().all(|gap| {
+            !gap["subject"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("semantic")
+        }),
+        "a manifest-less run carries no semantic gaps, got {gaps:?}"
+    );
 }
 
 #[test]

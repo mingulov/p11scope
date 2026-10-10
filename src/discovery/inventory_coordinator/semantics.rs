@@ -878,6 +878,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             });
             return;
         }
+        if domain != lane.domain() {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "semantic batch refused for a foreign domain".into(),
+                reason: "the batch names another lane domain; it was dropped \
+                     through the audited path without staging"
+                    .into(),
+                budget: None,
+            });
+            return;
+        }
         let observed_ns = batch.observed_ns();
         let (outcomes, current, negatives) = batch.into_parts();
         // Receipts: presence proves H0 association either way; only the
@@ -1021,6 +1034,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
         }
         // Eligible calls last, in original position order.
+        #[cfg(test)]
+        lane.note_conversion_barrier(barrier);
         calls.sort_by_key(CallEvidence::token);
         let subset = lane.subset();
         let staged: Vec<(

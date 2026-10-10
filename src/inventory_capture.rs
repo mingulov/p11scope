@@ -1227,6 +1227,15 @@ pub(crate) trait PassDriver<Pin> {
     /// interactive dashboard draws here). It must return within a small
     /// bound: it shares the tick.
     fn on_tick(&mut self) {}
+    /// The pass loop ended (stop, deadline, cancellation or error) and
+    /// the lane is about to retire: gate promptly anything the stop
+    /// must fence before the (possibly slow) retirement runs. Called
+    /// exactly once per run, before `Publish::Retiring`.
+    fn on_stop_requested(&mut self) {}
+    /// The lane retired and staged its stop; the final commit runs
+    /// next. A driver with its own terminal evidence finalizes it
+    /// here, before that commit publishes.
+    fn on_lane_stopped(&mut self) {}
 }
 
 /// Runs `job` on a scoped worker thread and calls `service` every `tick`
@@ -1549,6 +1558,10 @@ where
             .host()
             .note_scope_gap("inventory capture failed".into(), format!("{error:#}"));
     }
+    // The loop ended: gate promptly, before any (possibly slow)
+    // retirement. A scan run gates too: a refused native lane never
+    // implies a refused semantic lane elsewhere.
+    driver.on_stop_requested();
     let Some(lane) = lane else {
         // Publish the failure gap without repeating the failed scan/pass.
         if error.is_some() {
@@ -1584,6 +1597,9 @@ where
     } else {
         lane.stop(driver.host())
     };
+    // The driver's own terminal evidence finalizes before the commit
+    // below publishes it beside the lane's stop.
+    driver.on_lane_stopped();
     if let Err(next) = driver.commit(false) {
         error.get_or_insert(next);
     }

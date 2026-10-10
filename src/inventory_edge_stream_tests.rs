@@ -1009,6 +1009,7 @@ fn a_dashboard_pass_streams_the_classic_view_when_the_display_window_expires() {
             "pid",
             started,
             now,
+            crate::inventory_semantics::SemanticCaptureSummary::default(),
         );
         assert!(error.is_none());
         display_activity.push(display.edges[0].activity.label());

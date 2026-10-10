@@ -751,6 +751,78 @@ pub(crate) fn poll_events_to_position<S: BoundedRecordSource>(
     }
 }
 
+/// The full-`EventRecord` counterpart of [`poll_events_to_position`]:
+/// the same proven-Q bounded drain over the same owned consumer, but
+/// delivering whole records with the private continuity tail intact
+/// instead of decoding it away to `Event`. The Detailed lane's
+/// terminal drain consumes its own cursor through here, in bounded
+/// quanta, never creating another consumer. Same contract:
+/// `(post_q_record, backlog)`, same `UngatedWriterBeforeQ` failure,
+/// same malformed accounting.
+pub(crate) fn poll_records_to_position<S: BoundedRecordSource>(
+    drain: &mut EventDrain<S>,
+    stop: usize,
+    quantum: Option<usize>,
+    mut f: impl FnMut(EventRecord) -> ControlFlow<()>,
+) -> Result<(bool, bool)> {
+    let mut left = quantum;
+    loop {
+        if left == Some(0) {
+            return Ok((false, true));
+        }
+        // Decode to an owned record first: matching the borrowed item
+        // directly keeps the source borrow alive across the match,
+        // blocking the post-Reached positions read below.
+        let record: BoundedRecord<Option<EventRecord>> = match drain.source.bounded_record(stop) {
+            Ok(bounded) => match bounded {
+                BoundedRecord::Item(item) => BoundedRecord::Item(decode_record(&item)),
+                BoundedRecord::Reached => BoundedRecord::Reached,
+                BoundedRecord::Pending => BoundedRecord::Pending,
+            },
+            Err(error) => {
+                if let Some(tap) = &drain.trace_tap {
+                    tap.observe_failure();
+                }
+                return Ok((map_bounded_error(error)?, false));
+            }
+        };
+        match record {
+            BoundedRecord::Item(record) => {
+                if let Some(left) = left.as_mut() {
+                    *left -= 1;
+                }
+                match record {
+                    Some(record) => {
+                        if let Some(tap) = &drain.trace_tap {
+                            tap.observe_call(&record.event);
+                        }
+                        if f(record).is_break() {
+                            return Ok((false, true));
+                        }
+                    }
+                    None => {
+                        drain.malformed = drain.malformed.saturating_add(1);
+                        if let Some(tap) = &drain.trace_tap {
+                            tap.observe_failure();
+                        }
+                    }
+                }
+            }
+            BoundedRecord::Reached => {
+                let post_q_record = drain.source.positions().producer != stop;
+                return Ok((post_q_record, false));
+            }
+            BoundedRecord::Pending => {
+                let consumer = drain.source.consumer();
+                if consumer != stop {
+                    return Err(BoundedDrainError::UngatedWriterBeforeQ { consumer, stop }.into());
+                }
+                return Ok((false, false));
+            }
+        }
+    }
+}
+
 /// A ring standing in for the live one: it hands out the scripted records
 /// and fails the test outright once a poll takes one more than `bound`, so a
 /// missing quantum is a panic on a finite script, never a hang.
@@ -1083,6 +1155,67 @@ mod runtime_tests;
 mod tests {
     use super::*;
     use p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+
+    #[test]
+    fn poll_records_to_position_delivers_whole_records_to_q() {
+        use p11scope_ebpf_common::{InstanceContinuity, InstanceStamp};
+        let record = |slot: u32, entry_ip: u64| EventRecord {
+            event: Event {
+                slot,
+                ..Default::default()
+            },
+            continuity: InstanceContinuity {
+                entry_ip,
+                entry_stamp: InstanceStamp {
+                    epoch: 9,
+                    ..Default::default()
+                },
+                return_stamp: InstanceStamp::default(),
+            },
+        };
+        let bytes = [record(3, 0x1111), record(4, 0x2222)]
+            .into_iter()
+            .map(|record| record_bytes(&record));
+        let mut drain = EventDrain::over_test_domain(ScriptedRecords::records(bytes, 8), 7);
+        // The Q stop stands after both records (8 bytes each in the
+        // scripted positions); a quantum of one drains in two calls.
+        let mut seen = Vec::new();
+        let (post_q, backlog) = poll_records_to_position(&mut drain, 16, Some(1), |record| {
+            seen.push((record.event.slot, record.continuity.entry_ip));
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!((post_q, backlog), (false, true));
+        let (post_q, backlog) = poll_records_to_position(&mut drain, 16, Some(8), |record| {
+            seen.push((record.event.slot, record.continuity.entry_ip));
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!((post_q, backlog), (false, false));
+        assert_eq!(seen, vec![(3, 0x1111), (4, 0x2222)]);
+        // A third record past Q is the post-Q signature at Reached:
+        // reported, never silently consumed.
+        let bytes = [record(3, 0x1111), record(4, 0x2222), record(5, 0x3333)]
+            .into_iter()
+            .map(|record| record_bytes(&record));
+        let mut drain = EventDrain::over_test_domain(ScriptedRecords::records(bytes, 8), 7);
+        let mut seen = 0;
+        let (post_q, backlog) = poll_records_to_position(&mut drain, 16, Some(8), |_| {
+            seen += 1;
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!((post_q, backlog), (true, false));
+        assert_eq!(seen, 2);
+        // Malformed bytes count without yielding a record.
+        let mut drain =
+            EventDrain::over_test_domain(ScriptedRecords::records([vec![7u8; 3]], 8), 7);
+        let (post_q, backlog) =
+            poll_records_to_position(&mut drain, 8, Some(8), |_| ControlFlow::Continue(()))
+                .unwrap();
+        assert_eq!((post_q, backlog), (false, false));
+        assert_eq!(drain.malformed(), 1);
+    }
 
     #[test]
     fn pending_bytes_is_producer_minus_consumer() {

@@ -523,6 +523,11 @@ pub(crate) struct Presentation {
     pub gaps: Vec<GapView>,
     pub gaps_suppressed: u64,
     pub budgets: BudgetView,
+    /// The sanitized Detailed-lane summary (`observation.
+    /// semantic_capture`): counts only, set by the run loop from the
+    /// lane after capture; `disabled` without a lane. The summary
+    /// grants no semantic permission.
+    pub semantic_capture: crate::inventory_semantics::SemanticCaptureSummary,
 }
 
 /// What an edge's activity label answers (Choice 3).
@@ -786,6 +791,7 @@ impl Presentation {
             semantic_edges,
             gaps,
             gaps_suppressed: registry.gaps_suppressed(),
+            semantic_capture: crate::inventory_semantics::SemanticCaptureSummary::default(),
             budgets: BudgetView {
                 callers_limit: limits.max_callers,
                 callers_occupied: coordinator.adapter().len(),

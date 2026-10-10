@@ -17,12 +17,15 @@
 //! a retained event. Edge records are change-driven and capped per
 //! pass ([`EdgeEmitter`]); deferred ones are counted, never dropped.
 
+use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
 use crate::discovery::caller_registry::{CallerEvent, CallerId, ModuleId, UseCoverage};
 use crate::discovery::engine::inventory_coordinator::PassReport;
 use crate::inventory::{edge_json, render_json_from_presentation};
 use crate::inventory_event_identity::{IdentityIndex, bounded_context, context_budget_caller};
 use crate::inventory_present::GapView;
-use crate::inventory_present::{Activity, Capture, EdgeView, Presence, Presentation};
+use crate::inventory_present::{
+    Activity, Capture, EdgeView, InstanceSemanticView, InstanceView, Presence, Presentation,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::hash::BuildHasher as _;
@@ -1017,7 +1020,41 @@ impl EdgeEmitter {
     /// Edges holding a digest (at most the edge limit).
     #[cfg(test)]
     pub(crate) fn tracked(&self) -> usize {
+        self.tracked_len()
+    }
+
+    /// Tracked edges (the combined retention dump's slack bound).
+    pub(crate) fn tracked_len(&self) -> usize {
         self.digests.len()
+    }
+
+    /// One copy of every tracked edge's last record, in bytes (the
+    /// combined retention dump's size bound).
+    pub(crate) fn carried_bytes(&self) -> u64 {
+        self.carried_bytes
+    }
+
+    /// The largest edge record line written so far.
+    pub(crate) fn largest_line(&self) -> u64 {
+        self.largest_line
+    }
+
+    /// One contiguous copy of every edge, in `edges` order. The final
+    /// retention dump's edge half; the caller already proved it fits.
+    pub(crate) fn dump_all(
+        &mut self,
+        writer: &mut EventWriter,
+        edges: &[EdgeView],
+        identities: &IdentityIndex<'_>,
+        limit: usize,
+        at_ns: u64,
+    ) -> Result<usize, String> {
+        let mut emitted = 0;
+        for edge in edges {
+            self.write(writer, edge, edge_payload(edge, identities), limit, at_ns)?;
+            emitted += 1;
+        }
+        Ok(emitted)
     }
 
     fn digest(&self, payload: &serde_json::Value) -> (u64, u64) {
@@ -1202,10 +1239,7 @@ impl EdgeEmitter {
         let dumped =
             self.unretained_after(writer, edges, tail) > 0 && self.fits_with_tail(writer, tail);
         if dumped {
-            for edge in edges {
-                self.write(writer, edge, edge_payload(edge, identities), limit, at_ns)?;
-                emitted += 1;
-            }
+            emitted += self.dump_all(writer, edges, identities, limit, at_ns)?;
             // No second reserve: the fit bound already holds the tail.
         }
         Ok(EdgeSweep {
@@ -1236,7 +1270,10 @@ impl EdgeEmitter {
     /// Starting from the sweep's `estimate` (taken for the reserved tail,
     /// at least as long as any real `ended` line) the count can only fall,
     /// and a longer count never shortens the line, so this converges to a
-    /// count that is exact for the line actually written.
+    /// count that is exact for the line actually written. Production
+    /// settles through [`settle_ended_combined`]; the edge-only form
+    /// stays for the margin tests.
+    #[cfg(test)]
     pub(crate) fn settle_ended(
         &self,
         writer: &EventWriter,
@@ -1257,6 +1294,592 @@ impl EdgeEmitter {
         }
         unreachable!("the unretained count converges within edges + 1 steps")
     }
+}
+
+/// The most `instance_observed` plus `semantic_edge_observed` records
+/// one pass (or the native stop's commit) writes under the single
+/// shared per-publication quota; the rest wait, counted in
+/// `instance_events_deferred` and `semantic_edge_events_deferred`.
+pub(crate) const INSTANCE_EVENTS_PER_PASS: usize = 4096;
+
+/// One pass's instance output: records written and records still
+/// waiting, per kind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct InstanceEmission {
+    pub instance_emitted: usize,
+    pub instance_deferred: usize,
+    pub edge_emitted: usize,
+    pub edge_deferred: usize,
+}
+
+/// The final sweep's instance output: records written per kind. The
+/// caller settles retention for all three kinds together.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct InstanceSweep {
+    pub instance_emitted: usize,
+    pub edge_emitted: usize,
+}
+
+/// Which of one instance's two rows a queue entry serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum InstanceKind {
+    Instance,
+    Edge,
+}
+
+/// What the stream last carried for one row: a 128-bit keyed digest
+/// of the exact payload (the sweep's comparison) plus where and how
+/// large that record is (the retention checks).
+#[derive(Debug, Clone, Copy)]
+struct CarriedRow {
+    exact: (u64, u64),
+    generation: u64,
+    bytes: u64,
+}
+
+/// What the stream last carried for one instance: each kind's last
+/// record plus its separate dirty flag. A set flag means the row
+/// differs from its last carried record (or was never carried); a
+/// row that changes again while it waits keeps its single queue
+/// place and emits its current payload when served.
+#[derive(Debug, Default)]
+struct InstanceDigest {
+    instance: Option<CarriedRow>,
+    edge: Option<CarriedRow>,
+    instance_dirty: bool,
+    edge_dirty: bool,
+}
+
+/// The single place `instance_observed` and `semantic_edge_observed`
+/// records are written. **Every emitter that appends instance records
+/// must call [`InstanceEmitter`]; never append either kind directly**,
+/// or the replayed stream diverges from the snapshot.
+///
+/// One bounded tracked record per H2 instance with separate dirty
+/// flags for the two kinds; FIFO service under the one shared
+/// [`INSTANCE_EVENTS_PER_PASS`] quota. Rows serialize through H2's
+/// snapshot serializers verbatim. A row that changes again while it
+/// waits keeps its single queue place and emits its current payload
+/// when served, so deferred updates are never lost. Retention reuses
+/// the [`EventWriter`] generations every other emitter uses.
+///
+/// Memory: one digest per instance, bounded by the registry's
+/// instance limit (4,096). A row past that bound (unreachable while
+/// the registry enforces the same limit) keeps no digest and is
+/// treated as always changed: it over-emits, never under-emits.
+#[derive(Debug)]
+pub(crate) struct InstanceEmitter {
+    digests: HashMap<RegistryInstanceId, InstanceDigest>,
+    queue: VecDeque<(RegistryInstanceId, InstanceKind)>,
+    queued: HashSet<(RegistryInstanceId, InstanceKind)>,
+    per_pass: usize,
+    /// Sum of `bytes` over every carried row of both kinds.
+    carried_bytes: u64,
+    /// The largest instance record line written so far.
+    largest_line: u64,
+    keys: (std::hash::RandomState, std::hash::RandomState),
+}
+
+impl Default for InstanceEmitter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InstanceEmitter {
+    pub(crate) fn new() -> Self {
+        Self::with_cap(INSTANCE_EVENTS_PER_PASS)
+    }
+
+    /// An emitter with its own shared per-pass record cap (tests).
+    pub(crate) fn with_cap(per_pass: usize) -> Self {
+        Self {
+            digests: HashMap::new(),
+            queue: VecDeque::new(),
+            queued: HashSet::new(),
+            per_pass,
+            carried_bytes: 0,
+            largest_line: 0,
+            keys: (std::hash::RandomState::new(), std::hash::RandomState::new()),
+        }
+    }
+
+    /// Instances holding a digest (at most the instance limit).
+    #[cfg(test)]
+    pub(crate) fn tracked(&self) -> usize {
+        self.tracked_len()
+    }
+
+    /// Tracked instances (the combined retention dump's slack bound).
+    pub(crate) fn tracked_len(&self) -> usize {
+        self.digests.len()
+    }
+
+    fn digest(&self, payload: &serde_json::Value) -> (u64, u64) {
+        let bytes = payload.to_string();
+        (
+            self.keys.0.hash_one(bytes.as_bytes()),
+            self.keys.1.hash_one(bytes.as_bytes()),
+        )
+    }
+
+    /// Whether one contiguous copy of every tracked instance row, plus
+    /// a tail of at most [`DUMP_TAIL_RESERVE`] bytes, is guaranteed to
+    /// survive retention (the mid-run refresh condition).
+    fn fits(&self, writer: &EventWriter) -> bool {
+        let slack = DUMP_LINE_SLACK.saturating_mul(self.digests.len() as u64);
+        let dump = self
+            .carried_bytes
+            .saturating_add(slack)
+            .saturating_add(DUMP_TAIL_RESERVE);
+        dump <= writer.contiguous_capacity(self.largest_line.saturating_add(DUMP_LINE_SLACK))
+    }
+
+    /// Mark one row dirty and queue it unless it already waits. A row
+    /// that changes again while queued keeps its single place; its
+    /// flag stays set until the current payload is written. Rows past
+    /// the digest bound queue without a digest (the always-changed
+    /// path); the queue stays input-bounded, as the registry bounds
+    /// the presentation.
+    fn mark(
+        &mut self,
+        id: RegistryInstanceId,
+        kind: InstanceKind,
+        dirty: bool,
+        limit: usize,
+    ) -> bool {
+        if let Some(digest) = self.digests.get_mut(&id) {
+            let flag = match kind {
+                InstanceKind::Instance => &mut digest.instance_dirty,
+                InstanceKind::Edge => &mut digest.edge_dirty,
+            };
+            *flag = dirty;
+        } else if dirty && self.digests.len() < limit {
+            let mut digest = InstanceDigest::default();
+            let flag = match kind {
+                InstanceKind::Instance => &mut digest.instance_dirty,
+                InstanceKind::Edge => &mut digest.edge_dirty,
+            };
+            *flag = dirty;
+            self.digests.insert(id, digest);
+        }
+        if dirty && self.queued.insert((id, kind)) {
+            self.queue.push_back((id, kind));
+            return true;
+        }
+        false
+    }
+
+    /// Write one record and remember it, within `limit`.
+    fn write(
+        &mut self,
+        writer: &mut EventWriter,
+        id: RegistryInstanceId,
+        kind: InstanceKind,
+        payload: serde_json::Value,
+        limit: usize,
+        at_ns: u64,
+    ) -> Result<(), String> {
+        let exact = self.digest(&payload);
+        let name = match kind {
+            InstanceKind::Instance => "instance_observed",
+            InstanceKind::Edge => "semantic_edge_observed",
+        };
+        let bytes = writer.append_sized(name, payload, at_ns)?;
+        self.largest_line = self.largest_line.max(bytes);
+        if !self.digests.contains_key(&id) && self.digests.len() >= limit {
+            return Ok(());
+        }
+        let carried = CarriedRow {
+            exact,
+            generation: writer.generation(),
+            bytes,
+        };
+        self.carried_bytes = self.carried_bytes.saturating_add(bytes);
+        let digest = self.digests.entry(id).or_default();
+        let slot = match kind {
+            InstanceKind::Instance => &mut digest.instance,
+            InstanceKind::Edge => &mut digest.edge,
+        };
+        if let Some(old) = slot.replace(carried) {
+            self.carried_bytes = self.carried_bytes.saturating_sub(old.bytes);
+        }
+        match kind {
+            InstanceKind::Instance => digest.instance_dirty = false,
+            InstanceKind::Edge => digest.edge_dirty = false,
+        }
+        Ok(())
+    }
+
+    /// Whether one row is due: new, changed, or (while the records fit
+    /// the retention) evicted. Marks its dirty flag either way.
+    fn due(
+        &mut self,
+        writer: &EventWriter,
+        id: RegistryInstanceId,
+        kind: InstanceKind,
+        payload: &serde_json::Value,
+        refresh: bool,
+        limit: usize,
+    ) -> bool {
+        let exact = self.digest(payload);
+        let due = match self.digests.get(&id) {
+            None => true,
+            Some(digest) => {
+                let carried = match kind {
+                    InstanceKind::Instance => &digest.instance,
+                    InstanceKind::Edge => &digest.edge,
+                };
+                match carried {
+                    None => true,
+                    Some(carried) => {
+                        carried.exact != exact
+                            || (refresh && carried.generation < writer.oldest_generation())
+                    }
+                }
+            }
+        };
+        self.mark(id, kind, due, limit);
+        due
+    }
+
+    /// One pass: queue every new, changed or (while the records fit
+    /// the retention) evicted row of either kind — instances first,
+    /// then semantic edges, each in presentation order — then write up
+    /// to the shared per-pass cap from the queue's head, FIFO, each
+    /// with the row's current payload.
+    pub(crate) fn emit(
+        &mut self,
+        writer: &mut EventWriter,
+        instances: &[InstanceView],
+        edges: &[InstanceSemanticView],
+        limit: usize,
+        at_ns: u64,
+    ) -> Result<InstanceEmission, String> {
+        let refresh = self.fits(writer);
+        for row in instances {
+            if self.queued.contains(&(row.id, InstanceKind::Instance)) {
+                // Still waiting: refresh its dirty flag against the
+                // current payload so a change is never lost, but keep
+                // its single queue place.
+                let payload = crate::inventory::instance_json(row);
+                self.due(
+                    writer,
+                    row.id,
+                    InstanceKind::Instance,
+                    &payload,
+                    refresh,
+                    limit,
+                );
+                continue;
+            }
+            let payload = crate::inventory::instance_json(row);
+            self.due(
+                writer,
+                row.id,
+                InstanceKind::Instance,
+                &payload,
+                refresh,
+                limit,
+            );
+        }
+        for row in edges {
+            if self.queued.contains(&(row.instance, InstanceKind::Edge)) {
+                let payload = crate::inventory::instance_semantic_json(row);
+                self.due(
+                    writer,
+                    row.instance,
+                    InstanceKind::Edge,
+                    &payload,
+                    refresh,
+                    limit,
+                );
+                continue;
+            }
+            let payload = crate::inventory::instance_semantic_json(row);
+            self.due(
+                writer,
+                row.instance,
+                InstanceKind::Edge,
+                &payload,
+                refresh,
+                limit,
+            );
+        }
+        let mut emission = InstanceEmission::default();
+        while emission.instance_emitted + emission.edge_emitted < self.per_pass {
+            let Some((id, kind)) = self.queue.pop_front() else {
+                break;
+            };
+            self.queued.remove(&(id, kind));
+            // A change that reverted while it waited is already carried,
+            // unless its record has since been evicted.
+            let current = match kind {
+                InstanceKind::Instance => instances
+                    .binary_search_by_key(&id, |row| row.id)
+                    .ok()
+                    .map(|at| crate::inventory::instance_json(&instances[at])),
+                InstanceKind::Edge => edges
+                    .binary_search_by_key(&id, |row| row.instance)
+                    .ok()
+                    .map(|at| crate::inventory::instance_semantic_json(&edges[at])),
+            };
+            let Some(payload) = current else {
+                continue;
+            };
+            let exact = self.digest(&payload);
+            if self.digests.get(&id).is_some_and(|digest| {
+                let carried = match kind {
+                    InstanceKind::Instance => &digest.instance,
+                    InstanceKind::Edge => &digest.edge,
+                };
+                carried.is_some_and(|carried| {
+                    carried.exact == exact && carried.generation >= writer.oldest_generation()
+                })
+            }) {
+                self.mark(id, kind, false, limit);
+                continue;
+            }
+            self.write(writer, id, kind, payload, limit, at_ns)?;
+            match kind {
+                InstanceKind::Instance => emission.instance_emitted += 1,
+                InstanceKind::Edge => emission.edge_emitted += 1,
+            }
+        }
+        for (_, kind) in &self.queue {
+            match kind {
+                InstanceKind::Instance => emission.instance_deferred += 1,
+                InstanceKind::Edge => emission.edge_deferred += 1,
+            }
+        }
+        Ok(emission)
+    }
+
+    /// The exact sweep before `ended`: every row whose payload differs
+    /// from its last record, or whose last record was evicted (or that
+    /// was never carried), in presentation order, uncapped. Clears the
+    /// deferred queue. The caller reserves the tail and settles all
+    /// three kinds together.
+    pub(crate) fn sweep_exact(
+        &mut self,
+        writer: &mut EventWriter,
+        instances: &[InstanceView],
+        edges: &[InstanceSemanticView],
+        limit: usize,
+        at_ns: u64,
+    ) -> Result<InstanceSweep, String> {
+        self.queue.clear();
+        self.queued.clear();
+        let mut swept = InstanceSweep::default();
+        for row in instances {
+            let payload = crate::inventory::instance_json(row);
+            let carried = self.digests.get(&row.id).is_some_and(|digest| {
+                digest.instance.is_some_and(|carried| {
+                    carried.exact == self.digest(&payload)
+                        && carried.generation >= writer.oldest_generation()
+                })
+            });
+            if carried {
+                continue;
+            }
+            self.write(
+                writer,
+                row.id,
+                InstanceKind::Instance,
+                payload,
+                limit,
+                at_ns,
+            )?;
+            swept.instance_emitted += 1;
+        }
+        for row in edges {
+            let payload = crate::inventory::instance_semantic_json(row);
+            let carried = self.digests.get(&row.instance).is_some_and(|digest| {
+                digest.edge.is_some_and(|carried| {
+                    carried.exact == self.digest(&payload)
+                        && carried.generation >= writer.oldest_generation()
+                })
+            });
+            if carried {
+                continue;
+            }
+            self.write(
+                writer,
+                row.instance,
+                InstanceKind::Edge,
+                payload,
+                limit,
+                at_ns,
+            )?;
+            swept.edge_emitted += 1;
+        }
+        Ok(swept)
+    }
+
+    /// One contiguous copy of every instance and semantic-edge row, in
+    /// presentation order. The final retention dump's instance half;
+    /// the caller already proved it fits.
+    pub(crate) fn dump_all(
+        &mut self,
+        writer: &mut EventWriter,
+        instances: &[InstanceView],
+        edges: &[InstanceSemanticView],
+        limit: usize,
+        at_ns: u64,
+    ) -> Result<(usize, usize), String> {
+        let mut emitted = (0, 0);
+        for row in instances {
+            let payload = crate::inventory::instance_json(row);
+            self.write(
+                writer,
+                row.id,
+                InstanceKind::Instance,
+                payload,
+                limit,
+                at_ns,
+            )?;
+            emitted.0 += 1;
+        }
+        for row in edges {
+            let payload = crate::inventory::instance_semantic_json(row);
+            self.write(
+                writer,
+                row.instance,
+                InstanceKind::Edge,
+                payload,
+                limit,
+                at_ns,
+            )?;
+            emitted.1 += 1;
+        }
+        Ok(emitted)
+    }
+
+    /// Rows whose last record will not be retained once one more line
+    /// of `incoming` bytes is appended: `(instances, semantic_edges)`.
+    /// A kind never carried counts unretained; a row past the digest
+    /// bound (no digest at all) is never counted here — it over-emits
+    /// instead — exactly like an over-limit physical edge.
+    pub(crate) fn unretained_after(
+        &self,
+        writer: &EventWriter,
+        instances: &[InstanceView],
+        edges: &[InstanceSemanticView],
+        incoming: u64,
+    ) -> (usize, usize) {
+        let oldest = writer.oldest_generation_after(incoming);
+        let unretained = |id: RegistryInstanceId, kind: InstanceKind| {
+            self.digests.get(&id).is_some_and(|digest| {
+                let carried = match kind {
+                    InstanceKind::Instance => &digest.instance,
+                    InstanceKind::Edge => &digest.edge,
+                };
+                carried.is_none_or(|carried| carried.generation < oldest)
+            })
+        };
+        (
+            instances
+                .iter()
+                .filter(|row| unretained(row.id, InstanceKind::Instance))
+                .count(),
+            edges
+                .iter()
+                .filter(|row| unretained(row.instance, InstanceKind::Edge))
+                .count(),
+        )
+    }
+
+    /// One copy of every tracked row's last record, in bytes (the
+    /// combined retention dump's size bound).
+    pub(crate) fn carried_bytes(&self) -> u64 {
+        self.carried_bytes
+    }
+
+    /// The largest instance record line written so far.
+    pub(crate) fn largest_line(&self) -> u64 {
+        self.largest_line
+    }
+}
+
+/// Whether one contiguous copy of every tracked row of all three
+/// kinds, plus a tail of `tail` bytes, is guaranteed to survive
+/// retention: the combined dump's fit bound. Rows past the digest
+/// bound (unreachable while the registry enforces the same limit)
+/// only undercount here; the exact unretained count after the dump is
+/// the backstop, so a misjudged dump is disclosed, never silent.
+pub(crate) fn combined_dump_fits(
+    edges: &EdgeEmitter,
+    instances: &InstanceEmitter,
+    writer: &EventWriter,
+    tail: u64,
+) -> bool {
+    let slack = DUMP_LINE_SLACK
+        .saturating_mul(edges.tracked_len().saturating_add(instances.tracked_len()) as u64);
+    let dump = edges
+        .carried_bytes()
+        .saturating_add(instances.carried_bytes())
+        .saturating_add(slack)
+        .saturating_add(tail);
+    dump <= writer.contiguous_capacity(
+        edges
+            .largest_line()
+            .max(instances.largest_line())
+            .saturating_add(DUMP_LINE_SLACK),
+    )
+}
+
+/// The exact `ended` payload and its three unretained counts: physical
+/// edges, instances and semantic edges settle together. `ended(counts)`
+/// builds the payload carrying `counts`; the counts are recomputed for
+/// that payload's exact line length until stable. Starting from the
+/// sweep's `estimate` (taken for the reserved tail, at least as long as
+/// any real `ended` line) the counts can only fall, and longer counts
+/// never shorten the line, so this converges to counts that are exact
+/// for the line actually written.
+pub(crate) fn settle_ended_combined(
+    edges: &EdgeEmitter,
+    instances: &InstanceEmitter,
+    writer: &EventWriter,
+    presentation: &Presentation,
+    estimate: (usize, usize, usize),
+    at_ns: u64,
+    ended: impl Fn((usize, usize, usize)) -> serde_json::Value,
+) -> ((usize, usize, usize), serde_json::Value) {
+    let mut counts = estimate;
+    let bound = presentation
+        .edges
+        .len()
+        .saturating_add(presentation.instances.len())
+        .saturating_add(presentation.semantic_edges.len())
+        .saturating_add(1);
+    for _ in 0..=bound {
+        let payload = ended(counts);
+        let incoming = writer.line_len("ended", &payload, at_ns);
+        let exact = (
+            edges.unretained_after(writer, &presentation.edges, incoming),
+            instances
+                .unretained_after(
+                    writer,
+                    &presentation.instances,
+                    &presentation.semantic_edges,
+                    incoming,
+                )
+                .0,
+            instances
+                .unretained_after(
+                    writer,
+                    &presentation.instances,
+                    &presentation.semantic_edges,
+                    incoming,
+                )
+                .1,
+        );
+        if exact == counts {
+            return (counts, payload);
+        }
+        counts = exact;
+    }
+    unreachable!("the unretained counts converge within rows + 1 steps")
 }
 
 /// One gap as a `gap_recorded` payload: the IDENTICAL caller/module/

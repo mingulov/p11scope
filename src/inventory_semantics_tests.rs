@@ -7,7 +7,10 @@ use crate::discovery::engine::inventory_coordinator::semantics::{
 };
 use crate::discovery::identity::{PinnedObjectId, PinnedObjects, ReconciledModule};
 use crate::discovery::scan::{ScannedEntry, ScannedModule, ScannedTable};
-use crate::inventory_semantics::{AttestedSubset, SemanticRefusal};
+use crate::inventory_semantics::{
+    AttestedSubset, LaneDrainOutcome, SemanticCaptureStatus, SemanticCaptureSummary,
+    SemanticRefusal, SemanticStopIo, SemanticStopQuiescence,
+};
 use p11scope_manifest::identity::{inspect_file, mapping_file_key, open_object};
 use p11scope_manifest::manifest::*;
 
@@ -4079,4 +4082,1086 @@ fn native_semantic_binding_refuses_domain_conflict() {
         "the refused rebind keeps the original domain"
     );
     assert_eq!(scene.bind(caller, &module, detailed, image), Ok(()));
+}
+
+/// A scripted [`SemanticStopIo`]: the same orchestration the live lane
+/// runs, driven without a Session. Drain batches carry ascending
+/// `observed_ns` markers; the Finish batch carries `u64::MAX`, so batch
+/// order is observable without forging H0 outcomes.
+struct ScriptedStopIo {
+    domain: crate::attach::capture::NativeDomainId,
+    gated: std::cell::Cell<bool>,
+    quiesce_after: usize,
+    services: usize,
+    quiesce_failures: usize,
+    positions: [(usize, usize); 2],
+    advance_per_service: [(usize, usize); 2],
+    fail_positions: bool,
+    position_reads: usize,
+    drain_markers: Vec<u64>,
+    events_drain: LaneDrainOutcome,
+    discovery_drain: LaneDrainOutcome,
+    events_stops: Vec<usize>,
+    discovery_stops: Vec<usize>,
+    finish_calls: usize,
+    cuts: u64,
+    next_marker: u64,
+}
+
+impl ScriptedStopIo {
+    fn new(domain: crate::attach::capture::NativeDomainId) -> Self {
+        Self {
+            domain,
+            gated: std::cell::Cell::new(false),
+            quiesce_after: 0,
+            services: 0,
+            quiesce_failures: 0,
+            positions: [(0, 0), (0, 0)],
+            advance_per_service: [(0, 0), (0, 0)],
+            fail_positions: false,
+            position_reads: 0,
+            drain_markers: Vec::new(),
+            events_drain: LaneDrainOutcome::default(),
+            discovery_drain: LaneDrainOutcome::default(),
+            events_stops: Vec::new(),
+            discovery_stops: Vec::new(),
+            finish_calls: 0,
+            cuts: 0,
+            next_marker: 1,
+        }
+    }
+
+    fn batch(&mut self, marker: u64) -> crate::inventory_semantics::SemanticBatch {
+        crate::inventory_semantics::SemanticBatch::scripted(self.domain, Vec::new(), marker)
+    }
+}
+
+impl SemanticStopIo for ScriptedStopIo {
+    fn request_stop(&self) {
+        self.gated.set(true);
+    }
+
+    fn quiescent(&self) -> bool {
+        self.services >= self.quiesce_after
+    }
+
+    fn service_quantum(
+        &mut self,
+    ) -> Result<Option<crate::inventory_semantics::SemanticBatch>, SemanticRefusal> {
+        self.services += 1;
+        self.positions[0].0 = self.positions[0]
+            .0
+            .saturating_add(self.advance_per_service[0].0)
+            .min(self.positions[0].1 + self.advance_per_service[0].1);
+        self.positions[1].0 = self.positions[1]
+            .0
+            .saturating_add(self.advance_per_service[1].0)
+            .min(self.positions[1].1 + self.advance_per_service[1].1);
+        if self.services <= self.quiesce_failures {
+            return Err(SemanticRefusal::Unavailable);
+        }
+        if self.drain_markers.is_empty() {
+            return Ok(None);
+        }
+        let marker = self.drain_markers.remove(0);
+        self.next_marker = self.next_marker.max(marker + 1);
+        Ok(Some(self.batch(marker)))
+    }
+
+    fn positions(&mut self) -> Option<[(usize, usize); 2]> {
+        self.position_reads += 1;
+        if self.fail_positions {
+            return None;
+        }
+        Some(self.positions)
+    }
+
+    fn drain_events_to(&mut self, stop: usize, _quantum: usize) -> LaneDrainOutcome {
+        self.events_stops.push(stop);
+        self.events_drain
+    }
+
+    fn drain_discovery_to(&mut self, stop: usize, _quantum: usize) -> LaneDrainOutcome {
+        self.discovery_stops.push(stop);
+        self.discovery_drain
+    }
+
+    fn finish_h0(&mut self) -> crate::inventory_semantics::SemanticBatch {
+        self.finish_calls += 1;
+        self.batch(u64::MAX)
+    }
+
+    fn continuity_cuts(&self) -> u64 {
+        self.cuts
+    }
+}
+
+#[test]
+fn native_semantic_stop_orders_gate_drain_finish_output() {
+    use crate::inventory_semantics::run_semantic_stop;
+    use std::time::{Duration, Instant};
+    let domain = crate::attach::capture::NativeDomainId::mint();
+    let clock = |ticks: Vec<Duration>| {
+        let start = Instant::now();
+        let mut at = 0;
+        move || {
+            let step = ticks
+                .get(at)
+                .copied()
+                .unwrap_or(Duration::from_secs(3600 * 24 * 365));
+            at += 1;
+            start + step
+        }
+    };
+
+    // Clean quiesced drain: the gate is requested immediately, bounded
+    // audited quanta run while waiting, both producer positions are
+    // captured at Q, the same owned cursors drain exactly to Q, and H0
+    // stops once after every drained batch.
+    let mut io = ScriptedStopIo::new(domain);
+    io.quiesce_after = 2;
+    io.positions = [(0, 16), (0, 8)];
+    io.advance_per_service = [(8, 0), (4, 0)];
+    io.drain_markers = vec![1, 2];
+    io.cuts = 3;
+    let mut markers = Vec::new();
+    let summary = run_semantic_stop(
+        &mut io,
+        Duration::from_secs(5),
+        16,
+        1024,
+        clock(vec![
+            Duration::ZERO,
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+        ]),
+        |batch| markers.push(batch.observed_ns()),
+    );
+    assert!(io.gated.get(), "the stop request gates immediately");
+    assert!(summary.quiesced);
+    assert_eq!(
+        summary.q,
+        Some(crate::run::TerminalQuiescence {
+            events_q: 16,
+            discovery_q: 8,
+        }),
+        "Q captures both producer positions"
+    );
+    assert_eq!(
+        markers,
+        vec![1, 2, u64::MAX],
+        "drained batches finalize before Finish"
+    );
+    assert_eq!(io.finish_calls, 1, "H0 stops exactly once");
+    assert_eq!(summary.drain_batches, 2);
+    assert_eq!(summary.continuity_cuts, 3);
+    assert!(!summary.semantic_loss);
+    assert!(summary.final_drain);
+    assert_eq!(io.events_stops, vec![16]);
+    assert_eq!(io.discovery_stops, vec![8]);
+
+    // A delayed last return drained after Q still finalizes before the
+    // Finish batch: the stop request is not Finish.
+    let mut io = ScriptedStopIo::new(domain);
+    io.quiesce_after = 0;
+    io.positions = [(0, 16), (0, 0)];
+    io.advance_per_service = [(16, 0), (0, 0)];
+    io.drain_markers = vec![7];
+    let mut markers = Vec::new();
+    let summary = run_semantic_stop(
+        &mut io,
+        Duration::from_secs(5),
+        16,
+        1024,
+        clock(vec![Duration::ZERO]),
+        |batch| markers.push(batch.observed_ns()),
+    );
+    assert_eq!(markers, vec![7, u64::MAX]);
+    assert!(summary.final_drain);
+
+    // Quiesce refusals (pending H0 work that will not route) never stall
+    // the wait: they count, and the Finish batch still expires joins.
+    let mut io = ScriptedStopIo::new(domain);
+    io.quiesce_after = 3;
+    io.quiesce_failures = 2;
+    io.positions = [(0, 0), (0, 0)];
+    let mut markers = Vec::new();
+    let summary = run_semantic_stop(
+        &mut io,
+        Duration::from_secs(5),
+        16,
+        1024,
+        clock(vec![Duration::ZERO; 8]),
+        |batch| markers.push(batch.observed_ns()),
+    );
+    assert_eq!(summary.quiesce_refusals, 2);
+    assert_eq!(markers, vec![u64::MAX]);
+    assert_eq!(io.finish_calls, 1);
+    assert!(summary.final_drain);
+
+    // Quiescence timeout: the 5 s budget ends the wait unproven, only
+    // one bounded poll drains each cursor under the terminal bound, and
+    // semantic loss is declared with positive history preserved.
+    let mut io = ScriptedStopIo::new(domain);
+    io.quiesce_after = usize::MAX;
+    io.positions = [(4, 40), (2, 20)];
+    io.events_drain = LaneDrainOutcome {
+        records: 3,
+        post_q: false,
+        backlog: true,
+        failed: false,
+    };
+    let mut markers = Vec::new();
+    let summary = run_semantic_stop(
+        &mut io,
+        Duration::from_secs(5),
+        16,
+        1024,
+        clock(vec![
+            Duration::ZERO,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+            Duration::from_secs(4),
+            Duration::from_secs(5),
+            Duration::from_secs(6),
+        ]),
+        |batch| markers.push(batch.observed_ns()),
+    );
+    assert!(!summary.quiesced);
+    assert_eq!(summary.q, None);
+    assert!(summary.semantic_loss);
+    assert!(!summary.final_drain);
+    assert_eq!(io.services, 4, "bounded audited work while waiting");
+    assert_eq!(io.events_stops, vec![40], "one terminal-bound poll");
+    assert_eq!(io.discovery_stops, vec![20]);
+    assert_eq!(summary.unrouted_returns, 3);
+    assert_eq!(markers, vec![u64::MAX], "the Finish batch still finalizes");
+
+    // An unreadable ring at Q capture declares loss without hanging or
+    // certifying a drain; the Finish batch still runs once.
+    let mut io = ScriptedStopIo::new(domain);
+    io.quiesce_after = 0;
+    io.fail_positions = true;
+    let mut markers = Vec::new();
+    let summary = run_semantic_stop(
+        &mut io,
+        Duration::from_secs(5),
+        16,
+        1024,
+        clock(vec![Duration::ZERO]),
+        |batch| markers.push(batch.observed_ns()),
+    );
+    assert!(summary.quiesced);
+    assert!(summary.semantic_loss);
+    assert!(!summary.final_drain);
+    assert!(io.events_stops.is_empty());
+    assert_eq!(markers, vec![u64::MAX]);
+    assert_eq!(io.finish_calls, 1);
+
+    // A post-Q writer is detected and reported, and the drain is not
+    // certified; the violation is disclosure, not silent loss.
+    let mut io = ScriptedStopIo::new(domain);
+    io.quiesce_after = 0;
+    io.positions = [(16, 16), (8, 8)];
+    io.events_drain = LaneDrainOutcome {
+        records: 0,
+        post_q: true,
+        backlog: false,
+        failed: false,
+    };
+    let summary = run_semantic_stop(
+        &mut io,
+        Duration::from_secs(5),
+        16,
+        1024,
+        clock(vec![Duration::ZERO]),
+        |_| {},
+    );
+    assert!(summary.post_q_events);
+    assert!(!summary.post_q_discovery);
+    assert!(!summary.final_drain);
+    assert!(!summary.semantic_loss);
+
+    // A failed drain read declares loss and refuses certification.
+    let mut io = ScriptedStopIo::new(domain);
+    io.quiesce_after = 0;
+    io.positions = [(16, 16), (8, 8)];
+    io.discovery_drain = LaneDrainOutcome {
+        records: 0,
+        post_q: false,
+        backlog: true,
+        failed: true,
+    };
+    let summary = run_semantic_stop(
+        &mut io,
+        Duration::from_secs(5),
+        16,
+        1024,
+        clock(vec![Duration::ZERO]),
+        |_| {},
+    );
+    assert!(summary.semantic_loss);
+    assert!(!summary.final_drain);
+
+    // Failed startup finishes nothing: no gate, no drain, no Finish
+    // batch, and no disturbance to positive history elsewhere.
+    let mut conv = ConversionScene::new();
+    conv.lane.mark_startup_failed();
+    assert!(!conv.lane.is_live());
+    let mut batches = 0;
+    let summary = conv
+        .lane
+        .run_semantic_stop(&[], clock(vec![Duration::ZERO]), |_| {
+            batches += 1;
+        });
+    assert_eq!(batches, 0);
+    assert!(!summary.quiesced);
+    assert!(!summary.final_drain);
+    assert_eq!(
+        conv.lane.semantic_summary().status,
+        SemanticCaptureStatus::Unavailable
+    );
+    // A shell lane without any startup attempt reports disabled with a
+    // null final drain: no manifests, no Detailed anything.
+    let quiet = ConversionScene::new();
+    let summary = quiet.lane.semantic_summary();
+    assert_eq!(summary.status, SemanticCaptureStatus::Disabled);
+    assert_eq!(
+        summary.stop_quiescence,
+        SemanticStopQuiescence::NotRequested
+    );
+    assert_eq!(summary.final_drain, None);
+    assert_eq!(
+        summary.json(),
+        serde_json::json!({
+            "status": "disabled",
+            "admitted_endpoints": 0,
+            "refused_endpoints": 0,
+            "continuity_cuts": 0,
+            "unrouted_returns": 0,
+            "stop_quiescence": "not_requested",
+            "final_drain": null,
+        })
+    );
+    let stopped = SemanticCaptureSummary {
+        status: SemanticCaptureStatus::Stopped,
+        admitted_endpoints: 4,
+        refused_endpoints: 1,
+        continuity_cuts: 2,
+        unrouted_returns: 3,
+        stop_quiescence: SemanticStopQuiescence::Quiesced,
+        final_drain: Some(true),
+    };
+    assert_eq!(stopped.json()["status"], "stopped");
+    assert_eq!(stopped.json()["stop_quiescence"], "quiesced");
+    assert_eq!(stopped.json()["final_drain"], true);
+
+    // Finish certifies nothing about Inventory: the terminal batches
+    // commit beside the registry without mutating it, and a repeat
+    // commit stays quiet. One producer's stop never settles the other.
+    let mut conv = ConversionScene::new();
+    let r0 = conv.ids[0];
+    let coverage = conv.coverage(vec![r0]);
+    conv.register(&coverage, r0, 100, None);
+    conv.feed(
+        conv.evidence(1, r0, conv.init_slot, conv.init_event(110)),
+        CallStanding::Current(&coverage),
+        None,
+    );
+    conv.feed(
+        conv.evidence(2, r0, conv.sign_slot, conv.sign_event(120)),
+        CallStanding::Current(&coverage),
+        None,
+    );
+    conv.commit_with_lane();
+    let before = (conv.edge_rows(), conv.instance_states(), conv.gap_pairs());
+    let lane_domain = conv.lane.domain();
+    let mut io = ScriptedStopIo::new(lane_domain);
+    io.quiesce_after = 0;
+    io.positions = [(0, 0), (0, 0)];
+    let mut terminal = Vec::new();
+    let summary = run_semantic_stop(
+        &mut io,
+        Duration::from_secs(5),
+        16,
+        1024,
+        clock(vec![Duration::ZERO]),
+        |batch| terminal.push(batch),
+    );
+    assert!(summary.final_drain);
+    for batch in terminal {
+        conv.scene.coordinator.stage_semantic_batch(batch);
+        conv.commit_with_lane();
+    }
+    conv.commit_with_lane();
+    assert_eq!(
+        (conv.edge_rows(), conv.instance_states(), conv.gap_pairs()),
+        before,
+        "the semantic Finish mutates no reducer and settles nothing else"
+    );
+
+    // Output legs: a slow, broken or signal-cancelled stdout records
+    // its failure while the event stream still completes with the
+    // semantic summary; a broken event sink likewise never suppresses
+    // the document. Both owners stay preserved through every attempt.
+    use crate::inventory::{EventLogState, StreamState, finish_output};
+    use crate::inventory_events::EventWriter;
+    use crate::inventory_output::{FinalStdout, StdoutFailure, StdoutFailureReason, StdoutResult};
+    struct FailingStdout {
+        reason: Option<StdoutFailureReason>,
+        pub written: Vec<u8>,
+    }
+    impl FinalStdout for FailingStdout {
+        fn begin_finalization(&mut self) {}
+        fn write_document(&mut self, bytes: &[u8]) -> StdoutResult {
+            self.written.extend_from_slice(bytes);
+            match self.reason.take() {
+                None => Ok(bytes.len()),
+                Some(StdoutFailureReason::Io(error)) => Err(StdoutFailure {
+                    accepted: 0,
+                    total: bytes.len(),
+                    reason: StdoutFailureReason::Io(error),
+                }),
+                Some(reason) => Err(StdoutFailure {
+                    accepted: 0,
+                    total: bytes.len(),
+                    reason,
+                }),
+            }
+        }
+    }
+    let output_dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        output_dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    for (name, reason, expect) in [
+        (
+            "broken",
+            StdoutFailureReason::Io(std::io::Error::other("EPIPE")),
+            "I/O error: EPIPE",
+        ),
+        (
+            "slow",
+            StdoutFailureReason::NoProgress,
+            "no progress for 5 seconds",
+        ),
+        (
+            "second-signal",
+            StdoutFailureReason::Cancelled,
+            "cancelled by a later signal",
+        ),
+    ] {
+        let path = output_dir.path().join(format!("{name}.jsonl"));
+        let writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+        let mut stdout = FailingStdout {
+            reason: Some(reason),
+            written: Vec::new(),
+        };
+        let mut presentation = crate::inventory_present::Presentation::capture(
+            &conv.scene.coordinator,
+            "test",
+            0,
+            500,
+            6,
+        );
+        presentation.semantic_capture = conv.lane.semantic_summary();
+        let outcome = finish_output(
+            None,
+            &mut EventLogState::new(Some(writer)),
+            &mut StreamState::new(),
+            &presentation,
+            true,
+            false,
+            &mut stdout,
+            None,
+        );
+        assert_eq!(outcome.exit_code(), 1, "{name} stdout fails the run");
+        assert_eq!(outcome.event_log_confirmed(), Some(true));
+        assert!(
+            outcome.failures().iter().any(|line| line.contains(expect)),
+            "{name} stdout discloses its reason, got {:?}",
+            outcome.failures()
+        );
+        if name == "second-signal" {
+            assert!(outcome.stdout_cancelled());
+        }
+        let document: serde_json::Value = serde_json::from_slice(&stdout.written).unwrap();
+        assert_eq!(
+            document["observation"]["semantic_capture"]["status"], "disabled",
+            "{name} stdout still attempted the full document"
+        );
+    }
+    // A broken event sink (a planted rotation link) fails the stream
+    // while the document still completes with its semantic summary.
+    let events = output_dir.path().join("broken.jsonl");
+    let writer = EventWriter::create(&events, 64, 2).unwrap();
+    let victim = output_dir.path().join("victim.txt");
+    std::fs::write(&victim, b"do not touch").unwrap();
+    std::os::unix::fs::symlink(&victim, output_dir.path().join("broken.jsonl.1")).unwrap();
+    let mut document_bytes = Vec::new();
+    let presentation =
+        crate::inventory_present::Presentation::capture(&conv.scene.coordinator, "test", 0, 500, 6);
+    let outcome = finish_output(
+        None,
+        &mut EventLogState::new(Some(writer)),
+        &mut StreamState::new(),
+        &presentation,
+        true,
+        false,
+        &mut crate::inventory_output::WriterStdout(&mut document_bytes),
+        None,
+    );
+    assert_eq!(outcome.exit_code(), 1);
+    assert_eq!(outcome.event_log_confirmed(), Some(false));
+    assert!(!document_bytes.is_empty());
+    let document: serde_json::Value = serde_json::from_slice(&document_bytes).unwrap();
+    assert_eq!(
+        document["observation"]["semantic_capture"]["status"],
+        "disabled"
+    );
+    assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+}
+
+#[test]
+fn native_semantic_one_cursor_and_independent_producers() {
+    // No manifests means no Detailed anything: subset preparation
+    // refuses, no lane starts, and broad Inventory is untouched.
+    set_sight(1_005);
+    let mut scene = BindingScene::new();
+    let pid = std::process::id();
+    let caller = scene.admit(pid, 50);
+    scene.map(caller, pid, 60);
+    let engine = engine_for_test(
+        Vec::new(),
+        Vec::new(),
+        crate::discovery::identity::PinnedObjects::empty(),
+    );
+    let preparation = prepare_attested_subset(&engine, &[]);
+    assert!(preparation.subset.is_none());
+    assert!(
+        preparation.refusals.contains(&SemanticRefusal::Unattested),
+        "no manifests refuses without attesting, got {:?}",
+        preparation.refusals
+    );
+
+    // A shell lane drives no H0 work: ticks and refreshes refuse
+    // instead of inventing calls, and nothing stages behind them.
+    let mut conv = ConversionScene::new();
+    assert!(!conv.lane.is_live());
+    let bindings: Vec<SemanticCallerBinding> = Vec::new();
+    assert!(
+        matches!(conv.lane.tick(&bindings), Err(SemanticRefusal::Unavailable)),
+        "a shell lane refuses ticks instead of inventing calls"
+    );
+    let pin = conv.binding().pin();
+    assert_eq!(
+        conv.lane.refresh_candidate(pin, conv.init_slot),
+        Err(SemanticRefusal::Unavailable)
+    );
+
+    // Interleaved counts and calls commit together: a staged semantic
+    // quantum publishes beside physical staging with exact totals.
+    let (r0, r1) = (conv.ids[0], conv.ids[1]);
+    let coverage = conv.coverage(vec![r0]);
+    conv.register(&coverage, r0, 100, None);
+    conv.feed(
+        conv.evidence(1, r0, conv.init_slot, conv.init_event(110)),
+        CallStanding::Current(&coverage),
+        None,
+    );
+    conv.feed(
+        conv.evidence(2, r0, conv.sign_slot, conv.sign_event(120)),
+        CallStanding::Current(&coverage),
+        None,
+    );
+    conv.scene
+        .coordinator
+        .stage_semantic_batch(SemanticBatch::scripted(conv.detailed(), Vec::new(), 130));
+    conv.commit_with_lane();
+    assert_eq!(conv.edge_rows(), vec![(Some(2), 0, false, 1, 1)]);
+    let mid = conv
+        .scene
+        .coordinator
+        .registry()
+        .module_id_for(&conv.scene.module.clone())
+        .unwrap();
+    let edge = conv
+        .scene
+        .coordinator
+        .registry()
+        .edge(conv.caller, mid)
+        .unwrap();
+    assert_eq!(edge.mapping, MappingState::Mapped);
+    assert!(
+        edge.semantics.is_none(),
+        "instance calls never feed the legacy physical reducer"
+    );
+
+    // A foreign batch refuses loudly through the audited path: no
+    // positives, no disturbance, broad counts intact.
+    let foreign = crate::attach::capture::NativeDomainId::mint();
+    conv.scene
+        .coordinator
+        .stage_semantic_batch(SemanticBatch::scripted(foreign, Vec::new(), 140));
+    conv.commit_with_lane();
+    assert!(
+        conv.gap_pairs().contains(&(
+            "semantic batch refused for a foreign domain".into(),
+            "the batch names another lane domain; it was dropped through the audited path \
+             without staging"
+                .into()
+        )),
+        "foreign batches refuse loudly, got {:?}",
+        conv.gap_pairs()
+    );
+    assert_eq!(
+        conv.scene.coordinator.registry().instances().count(),
+        1,
+        "a foreign batch stages no records"
+    );
+    assert_eq!(conv.edge_rows(), vec![(Some(2), 0, false, 1, 1)]);
+
+    // Subset failure preserves broad counts: a manifest whose
+    // provider the retained pins never saw cannot attest a lane.
+    let fixture = ProviderFixture::new();
+    let mut bad = fixture.manifest.clone();
+    bad.module_path = "/nonexistent/provider.so".to_string();
+    let bad_path = fixture.dir.path().join("bad-input.json");
+    std::fs::write(&bad_path, serde_json::to_vec(&bad).unwrap()).unwrap();
+    let engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+    let preparation = prepare_attested_subset(&engine, &[bad_path]);
+    assert!(preparation.subset.is_none());
+    assert!(
+        preparation
+            .refusals
+            .contains(&SemanticRefusal::ManifestInput),
+        "unresolvable manifests refuse at the input, got {:?}",
+        preparation.refusals
+    );
+
+    // A no-call registration rows unknown: null returns, no operation
+    // claims, never observed zeros.
+    let coverage1 = conv.coverage(vec![r1]);
+    conv.register(&coverage1, r1, 200, None);
+    conv.commit_with_lane();
+    assert_eq!(
+        conv.edge_rows()[1],
+        (None, 0, false, 0, 0),
+        "no-call rows stay unknown"
+    );
+
+    // Per-edge refusal and unknown stay independent of the global
+    // usage feed: semantic gaps never flip physical coverage.
+    let presentation =
+        crate::inventory_present::Presentation::capture(&conv.scene.coordinator, "test", 0, 300, 3);
+    assert!(
+        !presentation.usage_feed,
+        "semantic-only activity never feeds the physical usage signal"
+    );
+    assert_eq!(presentation.semantic_edges.len(), 2);
+    assert!(presentation.edges.iter().all(|edge| edge.entry_count == 0));
+}
+
+#[test]
+fn native_semantic_finalizer_orchestrates_cut_and_queued_batch_through_commit() {
+    use crate::discovery::caller_registry::instance_input::{
+        self as instance, Retirement as RefRetirement,
+    };
+    // TASK3 CARRYOVER (a): end-to-end finalizer orchestration through
+    // commit_with_lane with H0-timeline batch inputs. A published pair
+    // reduces cleanly before any physical cut.
+    let mut conv = ConversionScene::new();
+    let (r0, r1) = (conv.ids[0], conv.ids[1]);
+    let coverage = conv.coverage(vec![r0]);
+    conv.register(&coverage, r0, 100, None);
+    conv.feed(
+        conv.evidence(1, r0, conv.init_slot, conv.init_event(110)),
+        CallStanding::Current(&coverage),
+        None,
+    );
+    conv.feed(
+        conv.evidence(2, r0, conv.sign_slot, conv.sign_event(120)),
+        CallStanding::Current(&coverage),
+        None,
+    );
+    conv.commit_with_lane();
+    assert_eq!(conv.edge_rows(), vec![(Some(2), 0, false, 1, 1)]);
+    assert_eq!(conv.lane.take_last_conversion_barrier(), None);
+
+    // A retired sibling stays exactly retired: the finalizer invents
+    // no retirements and revives none.
+    let coverage1 = conv.coverage(vec![r1]);
+    conv.register(&coverage1, r1, 150, None);
+    conv.commit_with_lane();
+    let module = conv.scene.module.clone();
+    let detailed = conv.detailed();
+    let key = instance::key(detailed, conv.image, r1, module);
+    let position = instance::position(detailed, 3);
+    conv.scene
+        .coordinator
+        .registry_mut()
+        .retire_instance(instance::retirement(
+            RefRetirement::Exact(key),
+            position,
+            InstanceReason::InstanceRetired,
+        ));
+    conv.commit_with_lane();
+    assert_eq!(
+        conv.instance_states(),
+        vec![InstanceLifecycle::Observed, InstanceLifecycle::Retired]
+    );
+
+    // A staged ordinary quantum plus a tail cut co-finalize in one
+    // publication: the cut joins first and its floor fences the queued
+    // quantum's conversion barrier.
+    conv.scene
+        .coordinator
+        .stage_semantic_batch(SemanticBatch::scripted(conv.detailed(), Vec::new(), 200));
+    conv.prove_and_mark_tail();
+    conv.lane.script_cut_barrier(5);
+    conv.commit_with_lane();
+    assert_eq!(conv.lane.take_recorded_gaps().len(), 1);
+    assert_eq!(
+        conv.lane.take_last_conversion_barrier(),
+        Some(5),
+        "the cut floor fences the queued quantum"
+    );
+    assert_eq!(
+        conv.instance_states(),
+        vec![InstanceLifecycle::Uncertain, InstanceLifecycle::Retired],
+        "the cut invalidates live flesh; the retired sibling is untouched"
+    );
+    assert_eq!(conv.edge_rows()[0], (Some(2), 0, true, 1, 1));
+
+    // A pending batch's own barrier fences its own calls without any
+    // tail cut: the conversion barrier is the batch's own negative.
+    conv.scene
+        .coordinator
+        .stage_semantic_batch(SemanticBatch::scripted(
+            conv.detailed(),
+            vec![crate::inventory_semantics::LaneNegative::CutBarrier { ordinal: 7 }],
+            300,
+        ));
+    conv.commit_with_lane();
+    assert_eq!(conv.lane.take_last_conversion_barrier(), Some(7));
+    assert!(conv.lane.take_recorded_gaps().is_empty());
+
+    // Both batches were consumed exactly once: a second commit stages
+    // nothing, records nothing, and disturbs nothing.
+    let gaps_before = conv.gap_pairs().len();
+    conv.commit_with_lane();
+    assert_eq!(conv.lane.take_last_conversion_barrier(), None);
+    assert_eq!(conv.gap_pairs().len(), gaps_before);
+    assert_eq!(
+        conv.instance_states(),
+        vec![InstanceLifecycle::Uncertain, InstanceLifecycle::Retired]
+    );
+}
+
+#[test]
+fn native_semantic_preminted_call_fenced_by_carried_floor() {
+    // TASK3 CARRYOVER (b): a call minted before the cut meets the cut's
+    // floor through the finalizer. Conversion admits the call pre-cut
+    // (admission evidence only); the converted input drops unstaged.
+    let mut conv = ConversionScene::new();
+    let r0 = conv.ids[0];
+    let coverage = conv.coverage(vec![r0]);
+    conv.register(&coverage, r0, 100, None);
+    let preminted = conv.evidence(3, r0, conv.init_slot, conv.init_event(130));
+    let admitted = conv.convert(preminted, CallStanding::Current(&coverage), None);
+    drop(admitted);
+    conv.commit_with_lane();
+    assert_eq!(conv.edge_rows(), vec![(None, 0, false, 0, 0)]);
+
+    // The tail cut commits through the lane: the finalizer carries the
+    // H0-timeline barrier into the publication.
+    conv.prove_and_mark_tail();
+    conv.lane.script_cut_barrier(5);
+    conv.commit_with_lane();
+    assert_eq!(conv.lane.take_recorded_gaps().len(), 1);
+    let floor = conv.lane.take_last_conversion_barrier();
+    assert_eq!(floor, Some(5));
+
+    // The preminted call fenced by the carried floor counts as history
+    // only: no machine starts behind the cut.
+    conv.feed(
+        conv.evidence(3, r0, conv.init_slot, conv.init_event(130)),
+        CallStanding::Current(&coverage),
+        floor,
+    );
+    conv.commit_with_lane();
+    assert_eq!(
+        conv.edge_rows(),
+        vec![(Some(1), 1, true, 0, 0)],
+        "a preminted call below the carried floor is history-only"
+    );
+
+    // A fresh pair above the floor still reduces: fencing is precise,
+    // not a blanket refusal.
+    conv.feed(
+        conv.evidence(6, r0, conv.init_slot, conv.init_event(610)),
+        CallStanding::Current(&coverage),
+        None,
+    );
+    conv.feed(
+        conv.evidence(7, r0, conv.sign_slot, conv.sign_event(620)),
+        CallStanding::Current(&coverage),
+        None,
+    );
+    conv.commit_with_lane();
+    assert_eq!(
+        conv.edge_rows(),
+        vec![(Some(3), 1, true, 1, 1)],
+        "fresh calls above the floor reduce with loss disclosed"
+    );
+}
+
+#[test]
+fn native_semantic_live_stream_retention_matches_snapshot() {
+    use crate::discovery::caller_registry::instance_input::{self as instance};
+    use crate::inventory::{EventLogState, StreamState, finish_output};
+    use crate::inventory_events::{EventWriter, InstanceEmitter};
+    use crate::inventory_output::WriterStdout;
+    fn event_records(path: &std::path::Path) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+    fn last_by_kind<'a>(
+        records: &'a [serde_json::Value],
+        kind: &str,
+    ) -> Vec<&'a serde_json::Value> {
+        records
+            .iter()
+            .filter(|record| record["kind"] == kind)
+            .map(|record| &record["event"])
+            .collect()
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+
+    // Three instances: a completed pair, a no-call row, and a retired
+    // sibling, beside one physical edge and a repeated refusal gap.
+    let mut conv = ConversionScene::new();
+    let (r0, r1, r2) = (conv.ids[0], conv.ids[1], conv.ids[2]);
+    let coverage = conv.coverage(vec![r0]);
+    conv.register(&coverage, r0, 100, None);
+    conv.feed(
+        conv.evidence(1, r0, conv.init_slot, conv.init_event(110)),
+        CallStanding::Current(&coverage),
+        None,
+    );
+    conv.feed(
+        conv.evidence(2, r0, conv.sign_slot, conv.sign_event(120)),
+        CallStanding::Current(&coverage),
+        None,
+    );
+    let coverage1 = conv.coverage(vec![r1]);
+    conv.register(&coverage1, r1, 140, None);
+    conv.commit_with_lane();
+    let coverage2 = conv.coverage(vec![r2]);
+    conv.register(&coverage2, r2, 150, None);
+    conv.commit_with_lane();
+    let module = conv.scene.module.clone();
+    let detailed = conv.detailed();
+    conv.scene
+        .coordinator
+        .registry_mut()
+        .retire_instance(instance::retirement(
+            instance::Retirement::Exact(instance::key(detailed, conv.image, r2, module)),
+            instance::position(detailed, 3),
+            InstanceReason::InstanceRetired,
+        ));
+    // One refusal recorded twice: the stream must carry the exact
+    // repeat count, and the sweep must not disturb it.
+    let foreign = crate::attach::capture::NativeDomainId::mint();
+    conv.scene
+        .coordinator
+        .stage_semantic_batch(SemanticBatch::scripted(foreign, Vec::new(), 160));
+    conv.commit_with_lane();
+    conv.scene
+        .coordinator
+        .stage_semantic_batch(SemanticBatch::scripted(foreign, Vec::new(), 170));
+    conv.commit_with_lane();
+    let presentation =
+        crate::inventory_present::Presentation::capture(&conv.scene.coordinator, "test", 0, 200, 4);
+    assert_eq!(presentation.instances.len(), 3);
+    assert_eq!(presentation.semantic_edges.len(), 3);
+    assert_eq!(presentation.edges.len(), 1);
+
+    // Tiny per-pass quota: four rows wait behind two served, FIFO, with
+    // exact per-kind deferred counts.
+    let path = dir.path().join("live.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+    let mut emitter = InstanceEmitter::with_cap(2);
+    let first = emitter
+        .emit(
+            &mut writer,
+            &presentation.instances,
+            &presentation.semantic_edges,
+            presentation.budgets.instances_limit,
+            200,
+        )
+        .unwrap();
+    assert_eq!(first.instance_emitted, 2);
+    assert_eq!(first.instance_deferred, 1);
+    assert_eq!(first.edge_emitted, 0);
+    assert_eq!(first.edge_deferred, 3);
+    assert_eq!(emitter.tracked(), 3, "one tracked record per instance");
+    let records = event_records(&path);
+    assert_eq!(last_by_kind(&records, "instance_observed").len(), 2);
+    assert_eq!(
+        last_by_kind(&records, "instance_observed")[0],
+        &crate::inventory::instance_json(&presentation.instances[0]),
+        "instance rows serialize verbatim"
+    );
+
+    // A deferred row that changes again keeps its single queue place
+    // and emits its current payload: no lost updates, no duplicates.
+    conv.feed(
+        conv.evidence(4, r0, conv.init_slot, conv.init_event(210)),
+        CallStanding::Current(&coverage),
+        None,
+    );
+    conv.feed(
+        conv.evidence(5, r0, conv.sign_slot, conv.sign_event(220)),
+        CallStanding::Current(&coverage),
+        None,
+    );
+    conv.commit_with_lane();
+    let presentation =
+        crate::inventory_present::Presentation::capture(&conv.scene.coordinator, "test", 0, 300, 5);
+    let second = emitter
+        .emit(
+            &mut writer,
+            &presentation.instances,
+            &presentation.semantic_edges,
+            presentation.budgets.instances_limit,
+            300,
+        )
+        .unwrap();
+    assert_eq!(second.instance_emitted + second.edge_emitted, 2);
+    assert_eq!(second.instance_emitted, 1);
+    assert_eq!(second.edge_emitted, 1);
+    assert_eq!(
+        second.instance_deferred + second.edge_deferred,
+        3,
+        "a row that changes while queued rejoins nothing twice; the \
+         call-advanced instance row re-dirties exactly once"
+    );
+    drop(writer);
+    let live_records = event_records(&path);
+    let edges = last_by_kind(&live_records, "semantic_edge_observed");
+    assert_eq!(
+        edges.len(),
+        1,
+        "the shared quota serves FIFO across both kinds"
+    );
+    assert_eq!(edges[0]["instance"], "i0");
+    assert_eq!(
+        edges[0]["api_returns"]["count"], 4,
+        "a deferred row emits its current payload, exactly once"
+    );
+
+    // The exact sweep before ended settles all three kinds together:
+    // every last retained record equals its snapshot row verbatim.
+    let path = dir.path().join("swept.jsonl");
+    let writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+    let mut stream = EventLogState::new(Some(writer));
+    let mut state = StreamState::new();
+    assert_eq!(
+        finish_output(
+            None,
+            &mut stream,
+            &mut state,
+            &presentation,
+            false,
+            true,
+            &mut WriterStdout(&mut Vec::new()),
+            None,
+        )
+        .exit_code(),
+        0
+    );
+    let records = event_records(&path);
+    let instances = last_by_kind(&records, "instance_observed");
+    let edges = last_by_kind(&records, "semantic_edge_observed");
+    assert_eq!(instances.len(), 3);
+    assert_eq!(edges.len(), 3);
+    for (row, carried) in presentation.instances.iter().zip(instances.iter().copied()) {
+        assert_eq!(
+            carried,
+            &crate::inventory::instance_json(row),
+            "the live instance row equals its snapshot row"
+        );
+    }
+    for (row, carried) in presentation
+        .semantic_edges
+        .iter()
+        .zip(edges.iter().copied())
+    {
+        assert_eq!(
+            carried,
+            &crate::inventory::instance_semantic_json(row),
+            "the live semantic row equals its snapshot row"
+        );
+    }
+    // The no-call row carries nulls, never zeros; the retired row
+    // carries its retirement; the completed row carries both pairs.
+    assert_eq!(instances[1]["state"], "observed");
+    assert_eq!(edges[1]["api_returns"]["count"], serde_json::Value::Null);
+    assert_eq!(instances[2]["state"], "retired");
+    assert_eq!(edges[0]["api_returns"]["count"], 4);
+    let physical = last_by_kind(&records, "edge_observed");
+    assert_eq!(physical.len(), 1);
+    let ended = records.last().unwrap();
+    assert_eq!(ended["kind"], "ended");
+    assert_eq!(ended["event"]["edges_unretained"], 0);
+    assert_eq!(ended["event"]["instances_unretained"], 0);
+    assert_eq!(ended["event"]["semantic_edges_unretained"], 0);
+    assert_eq!(ended["event"]["instance_events"], 3);
+    assert_eq!(ended["event"]["semantic_edge_events"], 3);
+    let repeats: Vec<u64> = records
+        .iter()
+        .filter(|record| record["kind"] == "gap_repeated")
+        .map(|record| record["event"]["repeats"].as_u64().unwrap())
+        .collect();
+    assert_eq!(repeats.last(), Some(&2), "exact repeat counts survive");
+
+    // Tiny rotation budgets disclose unavoidable loss exactly per kind:
+    // nothing retained reads as zero, and no physical final row is
+    // silently evicted by appended semantic rows.
+    let path = dir.path().join("tiny.jsonl");
+    let writer = EventWriter::create(&path, 1, 1).unwrap();
+    let mut stream = EventLogState::new(Some(writer));
+    let mut state = StreamState::new();
+    assert_eq!(
+        finish_output(
+            None,
+            &mut stream,
+            &mut state,
+            &presentation,
+            false,
+            true,
+            &mut WriterStdout(&mut Vec::new()),
+            None,
+        )
+        .exit_code(),
+        0
+    );
+    let records = event_records(&path);
+    let ended = records.last().unwrap();
+    assert_eq!(ended["kind"], "ended");
+    assert_eq!(ended["event"]["edges_unretained"], 1);
+    assert_eq!(ended["event"]["instances_unretained"], 3);
+    assert_eq!(ended["event"]["semantic_edges_unretained"], 3);
 }

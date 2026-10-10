@@ -1704,6 +1704,39 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// The D3d System pass with capture-owned identity state: the job
+    /// shares only the `Send` disclosure state; per-pass BPF sessions
+    /// live inside the worker. PID scope ignores the handle and stays
+    /// userspace without identity output.
+    pub(crate) fn collector_with_identity(
+        &self,
+        scope: InventoryScope,
+        max_scan_pids: Option<usize>,
+        shared: crate::inspect_system::IdentityShared,
+    ) -> impl FnOnce() -> Result<crate::inspect_system::Catalog> + Send + 'static {
+        let cgroup_requires_transaction = matches!(self.engine.scope, Scope::Cgroup { .. });
+        let policy = crate::plan::AdmissionPolicy::Inventory(self.attach_set.budget());
+        let hints = self.engine.module_hints.clone();
+        let hooks = self.engine.hooks.clone();
+        move || {
+            if cgroup_requires_transaction {
+                bail!("cgroup inventory requires the bounded scoped collection job");
+            }
+            match scope {
+                InventoryScope::Pid(pid) => {
+                    crate::inspect_system::collect_pid(pid, &hints, &hooks, policy)
+                }
+                InventoryScope::System => crate::inspect_system::collect_system_with_identity(
+                    &hints,
+                    &hooks,
+                    max_scan_pids,
+                    policy,
+                    shared,
+                ),
+            }
+        }
+    }
+
     /// Prepare one bounded cgroup job over exactly the root retained by the
     /// engine. A legacy System/PID job can never stand in for this request.
     #[cfg_attr(not(test), allow(dead_code))] // Cg4 supplies the runtime owner.

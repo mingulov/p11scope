@@ -44,9 +44,9 @@ use crate::discovery::scan::{
     scan_process_view_examined, scan_skip_truncates,
 };
 use crate::discovery::sweep_attribution::{
-    AttributionLoss, KnownKeyIndex, MatchedObject, ObjectChecks, OsConfirmIo, ProofPools,
-    RefusedObject, ReservationOwner, SegmentPolicy, SweepAttribution, SweptMember, is_caller_range,
-    retain_unchanged,
+    AttributionLoss, IoResources, KnownKeyIndex, MatchedObject, ObjectChecks, OsConfirmIo,
+    ProofPools, RefusedObject, ReservationOwner, SegmentPolicy, SweepAttribution, SweptMember,
+    is_caller_range, retain_unchanged,
 };
 use crate::discovery::sweep_attribution::{MemberProbe, OsMemberProbe, attribute_unselected};
 use crate::discovery::sweep_shards::{shard_count, shard_threads};
@@ -2589,8 +2589,1228 @@ fn render_gaps(out: &mut String, title: &str, gaps: &[PidGap]) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// D3d: system sweep identity backend selection, sessions and disclosure.
+// ---------------------------------------------------------------------------
+
+/// Resolved system sweep identity backend (D3d): the approved
+/// `observation.identity.backend` vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdentityBackend {
+    Userspace,
+    Kernel,
+}
+
+impl IdentityBackend {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Userspace => "userspace",
+            Self::Kernel => "kernel",
+        }
+    }
+}
+
+/// Capture-level identity disclosure: the approved `{backend, fallback}`
+/// shape. No coverage counters, no PIDs, paths or raw errors: `fallback`
+/// is a finite label (or `label: detail` for the fixed target-run-limit
+/// detail) or null.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IdentitySummary {
+    pub backend: IdentityBackend,
+    pub fallback: Option<String>,
+}
+
+impl IdentitySummary {
+    pub(crate) fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "backend": self.backend.label(),
+            "fallback": self.fallback,
+        })
+    }
+}
+
+/// Finite kernel-selection failure cause (D3d): sanitized, no paths,
+/// PIDs, verifier text or probe detail. Verifier rejection stays
+/// `load_failed` even when its errno is EACCES; it is never a
+/// capability skip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdentityUnavailable {
+    NoBtf,
+    KernelFixMissing,
+    NoTaskIterPidfd,
+    NumberingMismatch,
+    NumberingUnknown,
+    PermissionDenied,
+    LoadFailed,
+    ProbeFailed,
+}
+
+impl IdentityUnavailable {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::NoBtf => "no_btf",
+            Self::KernelFixMissing => "kernel_fix_missing",
+            Self::NoTaskIterPidfd => "no_task_iter_pidfd",
+            Self::NumberingMismatch => "numbering_mismatch",
+            Self::NumberingUnknown => "numbering_unknown",
+            Self::PermissionDenied => "permission_denied",
+            Self::LoadFailed => "load_failed",
+            Self::ProbeFailed => "probe_failed",
+        }
+    }
+
+    /// The sanitized deny: the label only, never the raw detail.
+    pub(crate) fn from_kernel_deny(deny: crate::attach::identity_iter::KernelDeny) -> Self {
+        match deny {
+            crate::attach::identity_iter::KernelDeny::FixMissing => Self::KernelFixMissing,
+            crate::attach::identity_iter::KernelDeny::NoTaskIterPidfd => Self::NoTaskIterPidfd,
+            crate::attach::identity_iter::KernelDeny::NoBtf(_) => Self::NoBtf,
+        }
+    }
+}
+
+/// Typed PID-numbering outcome for identity eligibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdentityNumbering {
+    Agree,
+    Mismatch,
+    Unknown,
+}
+
+/// Typed BTF eligibility outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdentityBtf {
+    Ok,
+    FixMissing,
+    NoTaskIterPidfd,
+    NoBtf,
+}
+
+/// Typed injected capability/probe source (D3d): every selection input
+/// is a finite enum, never a raw string. Production reads the live host
+/// (numbering, BTF, strict load, functional probe); tests inject each
+/// arm deterministically without BPF.
+pub(crate) trait IdentityChecks: Send {
+    fn numbering(&self) -> IdentityNumbering;
+    fn btf(&self) -> IdentityBtf;
+    /// Full strict-load plus functional-probe validation, returning a
+    /// fresh loaded session on success. Production loads BPF; the
+    /// injected test source answers from its canned outcome.
+    fn create_session(
+        &self,
+    ) -> Result<crate::discovery::kernel_identity::IdentitySession, IdentityUnavailable>;
+}
+
+/// The production capability source: live numbering, live BTF, real
+/// strict loads and the real functional probe.
+pub(crate) struct LiveIdentityChecks;
+
+impl IdentityChecks for LiveIdentityChecks {
+    fn numbering(&self) -> IdentityNumbering {
+        let numbering = crate::pidns::numbering();
+        if numbering.agrees() {
+            return IdentityNumbering::Agree;
+        }
+        match (&numbering.observer, &numbering.proc_view) {
+            (crate::pidns::ObserverPidNs::Unknown(_), _)
+            | (_, crate::pidns::ProcView::Unserved(_)) => IdentityNumbering::Unknown,
+            _ => IdentityNumbering::Mismatch,
+        }
+    }
+
+    fn btf(&self) -> IdentityBtf {
+        match crate::attach::identity_iter::ensure_kernel_identity_btf() {
+            Ok(_) => IdentityBtf::Ok,
+            Err(crate::attach::identity_iter::KernelDeny::FixMissing) => IdentityBtf::FixMissing,
+            Err(crate::attach::identity_iter::KernelDeny::NoTaskIterPidfd) => {
+                IdentityBtf::NoTaskIterPidfd
+            }
+            Err(crate::attach::identity_iter::KernelDeny::NoBtf(_)) => IdentityBtf::NoBtf,
+        }
+    }
+
+    fn create_session(
+        &self,
+    ) -> Result<crate::discovery::kernel_identity::IdentitySession, IdentityUnavailable> {
+        live_create_session()
+    }
+}
+
+/// Whether a strict-load failure without a verifier log is a permission
+/// refusal (EPERM/EACCES on the BPF syscalls) rather than a verifier or
+/// object failure. Any non-empty verifier log means verifier rejection
+/// (`load_failed`), even when its errno is EACCES.
+fn load_error_is_permission(error: &crate::attach::identity_iter::LoadError) -> bool {
+    use std::error::Error as _;
+    if crate::attach::identity_iter::verifier_log_of(error).is_some_and(|log| !log.is_empty()) {
+        return false;
+    }
+    let mut source: Option<&(dyn std::error::Error + 'static)> = error.source();
+    while let Some(error) = source {
+        if let Some(io) = error.downcast_ref::<std::io::Error>()
+            && matches!(io.raw_os_error(), Some(libc::EPERM) | Some(libc::EACCES))
+        {
+            return true;
+        }
+        source = error.source();
+    }
+    false
+}
+
+fn map_live_load_error(error: crate::attach::identity_iter::LoadError) -> IdentityUnavailable {
+    if load_error_is_permission(&error) {
+        IdentityUnavailable::PermissionDenied
+    } else {
+        IdentityUnavailable::LoadFailed
+    }
+}
+
+/// Production session creation: BTF parse, full probe-and-load, with a
+/// follow-up strict load only to distinguish a permission refusal from
+/// a verifier/object failure when the session load fails.
+/// A minimal RAII probe directory (std only: `tempfile` is a
+/// dev-dependency): unique per call, removed on drop.
+struct ProbeDir {
+    path: std::path::PathBuf,
+}
+
+impl ProbeDir {
+    fn create() -> Result<Self, IdentityUnavailable> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "p11scope-identity-probe-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path).map_err(|_| IdentityUnavailable::ProbeFailed)?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for ProbeDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn live_create_session()
+-> Result<crate::discovery::kernel_identity::IdentitySession, IdentityUnavailable> {
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .map_err(IdentityUnavailable::from_kernel_deny)?;
+    let parsed = aya::Btf::from_sys_fs().map_err(|_| IdentityUnavailable::NoBtf)?;
+    let dir = ProbeDir::create()?;
+    match crate::discovery::kernel_identity::IdentitySession::probe_and_load(&parsed, &dir.path) {
+        Ok(session) => Ok(session),
+        Err("identity functional probe failed") => Err(IdentityUnavailable::ProbeFailed),
+        Err(_) => {
+            // The session load failed: distinguish permission from
+            // verifier/object with one follow-up strict load carrying
+            // the full error. A now-successful load means the session
+            // failure was transient, still `load_failed`.
+            match crate::attach::identity_iter::load_identity_object_strict(&parsed) {
+                Ok(_) => Err(IdentityUnavailable::LoadFailed),
+                Err(error) => Err(map_live_load_error(error)),
+            }
+        }
+    }
+}
+
+/// Forced-kernel preflight (D3d): numbering, BTF, strict load and
+/// functional probe, before capture or any sink exists. `Ok` drops its
+/// validation session; the capture loads fresh per-pass sessions.
+pub(crate) fn preflight_forced_kernel(
+    checks: &dyn IdentityChecks,
+) -> Result<(), IdentityUnavailable> {
+    match checks.numbering() {
+        IdentityNumbering::Agree => {}
+        IdentityNumbering::Mismatch => return Err(IdentityUnavailable::NumberingMismatch),
+        IdentityNumbering::Unknown => return Err(IdentityUnavailable::NumberingUnknown),
+    }
+    match checks.btf() {
+        IdentityBtf::Ok => {}
+        IdentityBtf::FixMissing => return Err(IdentityUnavailable::KernelFixMissing),
+        IdentityBtf::NoTaskIterPidfd => return Err(IdentityUnavailable::NoTaskIterPidfd),
+        IdentityBtf::NoBtf => return Err(IdentityUnavailable::NoBtf),
+    }
+    checks.create_session().map(|_| ())
+}
+
+/// The forced-kernel refusal line: `--identity-backend kernel: kernel
+/// identity is unavailable: <reason>`.
+pub(crate) fn forced_kernel_refusal(reason: IdentityUnavailable) -> String {
+    format!(
+        "--identity-backend kernel: kernel identity is unavailable: {}",
+        reason.label()
+    )
+}
+
+/// Capture-owned identity state (D3d): selection, resolved backend,
+/// first finite fallback, cost threshold, and the injected checks. All
+/// fields are `Send`; per-pass BPF sessions live only inside their
+/// collection job and never cross threads. No cross-pass identity
+/// cache: each proof pass loads fresh.
+pub(crate) struct IdentityRunShared {
+    selection: crate::cli::IdentityBackendSelection,
+    backend: IdentityBackend,
+    fallback: Option<String>,
+    threshold: Option<usize>,
+    auto_ineligible: bool,
+    loaded: bool,
+    checks: Box<dyn IdentityChecks>,
+}
+
+pub(crate) type IdentityShared = std::sync::Arc<std::sync::Mutex<IdentityRunShared>>;
+
+impl IdentityRunShared {
+    /// New capture state. Forced kernel must have passed
+    /// [`preflight_forced_kernel`] before sinks exist; auto starts
+    /// unresolved (userspace until its first proof selects kernel).
+    pub(crate) fn new(
+        selection: crate::cli::IdentityBackendSelection,
+        checks: Box<dyn IdentityChecks>,
+    ) -> Self {
+        let (backend, threshold) = match selection {
+            crate::cli::IdentityBackendSelection::Userspace => (IdentityBackend::Userspace, None),
+            crate::cli::IdentityBackendSelection::Kernel => (IdentityBackend::Kernel, None),
+            crate::cli::IdentityBackendSelection::Auto => (
+                IdentityBackend::Userspace,
+                Some(crate::discovery::kernel_identity::AUTO_KERNEL_PROOF_PID_THRESHOLD),
+            ),
+        };
+        Self {
+            selection,
+            backend,
+            fallback: None,
+            threshold,
+            auto_ineligible: false,
+            loaded: false,
+            checks,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_threshold(
+        selection: crate::cli::IdentityBackendSelection,
+        threshold: Option<usize>,
+        checks: Box<dyn IdentityChecks>,
+    ) -> Self {
+        let mut shared = Self::new(selection, checks);
+        shared.threshold = threshold;
+        shared
+    }
+
+    pub(crate) fn summary(&self) -> IdentitySummary {
+        IdentitySummary {
+            backend: self.backend,
+            fallback: self.fallback.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn loaded(&self) -> bool {
+        self.loaded
+    }
+
+    fn note_fallback(&mut self, reason: &str) {
+        if self.fallback.is_none() {
+            self.fallback = Some(reason.to_string());
+        }
+    }
+
+    fn note_selection_fallback(&mut self, reason: IdentityUnavailable) {
+        self.note_fallback(reason.label());
+    }
+}
+
+/// The finite runtime-fallback rendering: `label` alone, or
+/// `label: detail` for the fixed target-run-limit detail.
+fn runtime_fallback_label(
+    reason: crate::discovery::kernel_identity::KernelFallbackReason,
+) -> String {
+    match reason.detail() {
+        Some(detail) => format!("{}: {detail}", reason.label()),
+        None => reason.label().to_string(),
+    }
+}
+
+/// Scripted capability source for tests: canned outcomes plus call
+/// counts proving load/probe ordering (userspace and auto-no-proof
+/// never load; cheap failures never reach the session attempt).
+#[cfg(test)]
+pub(crate) struct ScriptedIdentityChecks {
+    pub numbering: IdentityNumbering,
+    pub btf: IdentityBtf,
+    /// `create_session` outcome: always `Err` in unit tests (a real
+    /// session needs BPF; success is covered by privileged cells).
+    /// `None` panics if called, proving no-load paths.
+    pub session: Option<IdentityUnavailable>,
+    pub numbering_calls: std::sync::atomic::AtomicUsize,
+    pub btf_calls: std::sync::atomic::AtomicUsize,
+    pub session_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl ScriptedIdentityChecks {
+    pub(crate) fn refuse(reason: IdentityUnavailable) -> Self {
+        let (numbering, btf, session) = match reason {
+            IdentityUnavailable::NumberingMismatch => {
+                (IdentityNumbering::Mismatch, IdentityBtf::Ok, None)
+            }
+            IdentityUnavailable::NumberingUnknown => {
+                (IdentityNumbering::Unknown, IdentityBtf::Ok, None)
+            }
+            IdentityUnavailable::KernelFixMissing => {
+                (IdentityNumbering::Agree, IdentityBtf::FixMissing, None)
+            }
+            IdentityUnavailable::NoTaskIterPidfd => {
+                (IdentityNumbering::Agree, IdentityBtf::NoTaskIterPidfd, None)
+            }
+            IdentityUnavailable::NoBtf => (IdentityNumbering::Agree, IdentityBtf::NoBtf, None),
+            IdentityUnavailable::PermissionDenied
+            | IdentityUnavailable::LoadFailed
+            | IdentityUnavailable::ProbeFailed => {
+                (IdentityNumbering::Agree, IdentityBtf::Ok, Some(reason))
+            }
+        };
+        Self {
+            numbering,
+            btf,
+            session,
+            numbering_calls: std::sync::atomic::AtomicUsize::new(0),
+            btf_calls: std::sync::atomic::AtomicUsize::new(0),
+            session_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Cheap checks pass; any session attempt answers `reason`.
+    pub(crate) fn session_fails(reason: IdentityUnavailable) -> Self {
+        Self {
+            numbering: IdentityNumbering::Agree,
+            btf: IdentityBtf::Ok,
+            session: Some(reason),
+            numbering_calls: std::sync::atomic::AtomicUsize::new(0),
+            btf_calls: std::sync::atomic::AtomicUsize::new(0),
+            session_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Nothing may be consulted: any call panics (no-load proofs).
+    pub(crate) fn must_not_load() -> Self {
+        Self {
+            numbering: IdentityNumbering::Agree,
+            btf: IdentityBtf::Ok,
+            session: None,
+            numbering_calls: std::sync::atomic::AtomicUsize::new(0),
+            btf_calls: std::sync::atomic::AtomicUsize::new(0),
+            session_calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+impl IdentityChecks for ScriptedIdentityChecks {
+    fn numbering(&self) -> IdentityNumbering {
+        self.numbering_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.numbering
+    }
+
+    fn btf(&self) -> IdentityBtf {
+        self.btf_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.btf
+    }
+
+    fn create_session(
+        &self,
+    ) -> Result<crate::discovery::kernel_identity::IdentitySession, IdentityUnavailable> {
+        self.session_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(self
+            .session
+            .expect("scripted checks: no session load on this path"))
+    }
+}
+
+/// Observes batch-level userspace fallback inside kernel attribution:
+/// delegates every batch to the kernel proof and records the first
+/// finite fallback reason. Per-request `None` answers inside an
+/// otherwise-kernel batch (unvisited/demoted/ineligible) stay in the
+/// session ledger; this wrapper sees batch decisions only.
+struct FallbackObservingProof<'a, P> {
+    inner: &'a mut P,
+    first_fallback:
+        std::cell::Cell<Option<crate::discovery::kernel_identity::KernelFallbackReason>>,
+}
+
+impl<P> FallbackObservingProof<'_, P> {
+    fn observed(&self) -> Option<crate::discovery::kernel_identity::KernelFallbackReason> {
+        self.first_fallback.get()
+    }
+}
+
+impl<P: crate::discovery::confirm_shards::SegmentProof>
+    crate::discovery::confirm_shards::SegmentProof for FallbackObservingProof<'_, P>
+{
+    fn prove<'r>(
+        &'r mut self,
+        batch: &crate::discovery::confirm_shards::AcceptedBatch<'_>,
+        budget: &mut CaptureWorkBudget,
+        resources: &IoResources,
+    ) -> crate::discovery::kernel_identity::ProofDecision<'r> {
+        let decision = self.inner.prove(batch, budget, resources);
+        if let crate::discovery::kernel_identity::ProofDecision::Userspace(reason) = &decision
+            && self.first_fallback.get().is_none()
+        {
+            self.first_fallback.set(Some((*reason).into()));
+        }
+        decision
+    }
+}
+
+/// Collect `--system` for inventory with D3d identity selection: custody
+/// plus userspace or kernel sweep proof per the capture-owned shared
+/// state, assembled under the Inventory policy. `inspect --system`
+/// keeps using [`collect`] (userspace-only, frozen output).
+pub(crate) fn collect_system_with_identity(
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
+    max_scan_pids: Option<usize>,
+    policy: AdmissionPolicy,
+    shared: IdentityShared,
+) -> Result<Catalog> {
+    if !matches!(policy, AdmissionPolicy::Inventory(_)) {
+        return Err(anyhow::anyhow!(
+            "physical identity collection requires inventory policy"
+        ));
+    }
+    let mut timings = StageTimings::new();
+    let (mut collection, mut custody) =
+        collect_members_identity(hints, hooks, max_scan_pids, &mut timings, true);
+    let stats = OutcomeStats {
+        enumerated: collection.enumerated.len(),
+        scanned: collection.scanned(),
+        unreadable: collection.unreadable(),
+        proc_list_failed: collection.proc_list_failed,
+    };
+    if decide_system_outcome(stats) == SystemOutcome::HardError {
+        return Err(unreadable_system_error(&collection));
+    }
+    progress!("p11scope: lowering scan-only admission and rendering...");
+    let bind_start = monotonic_ns();
+    let bound = bind_collection(&mut collection);
+    timings.span(StageKind::Bind, "assemble", bind_start, monotonic_ns());
+    let confirm_start = monotonic_ns();
+    let shards = shard_count(collection.sweep.len(), shard_threads());
+    let held = custody.as_mut().expect("identity scan owns custody");
+    let ready = !held.failed()
+        && collection.budget.check_deadline_now().is_none()
+        && collection.budget.poll_collection(0);
+    let census = if ready {
+        let census = SegmentPolicy::try_snapshot(shard_threads(), collection.sweep.len());
+        if collection.budget.check_deadline_now().is_some() || !collection.budget.poll_collection(0)
+        {
+            Err(crate::discovery::sweep_attribution::FD_CENSUS_REASON.into())
+        } else {
+            census
+        }
+    } else {
+        Err(crate::discovery::sweep_attribution::FD_CENSUS_REASON.into())
+    };
+    let segment_policy = identity_confirmation_policy(held, census).map_err(anyhow::Error::msg)?;
+    let reservations = held.owner.clone();
+    // Per-pass kernel decision under the capture lock: userspace never
+    // loads; auto without proof never loads; otherwise cheap checks
+    // first, then at most one session attempt for this pass.
+    let has_proof = collection.cap_hit && !collection.sweep.is_empty();
+    let attempt = decide_pass_attempt(&shared, has_proof);
+    let attributed = with_confirmation_pools(
+        shards,
+        segment_policy,
+        proof_stat_threads(),
+        |pools| match attempt {
+            PassAttempt::Userspace => attribute_sweep_with(
+                &mut collection,
+                &bound,
+                &bound.aggregate,
+                |sweep, unavailable, selected, index, budget| {
+                    crate::discovery::confirm_shards::attribute_unselected_with_policy(
+                        sweep,
+                        unavailable,
+                        selected,
+                        index,
+                        budget,
+                        segment_policy,
+                        &reservations,
+                        shards,
+                        &|| OsConfirmIo::with_pools(pools),
+                    )
+                },
+            ),
+            PassAttempt::Kernel { threshold } => attribute_pass_with_kernel(
+                &shared,
+                &mut collection,
+                &bound,
+                custody.take().expect("identity scan owns custody"),
+                segment_policy,
+                &reservations,
+                shards,
+                pools,
+                threshold,
+            ),
+        },
+    );
+    timings.span(StageKind::Scan, "confirm", confirm_start, monotonic_ns());
+    let assemble_start = monotonic_ns();
+    let mut catalog = assemble(collection, bound, attributed, policy);
+    timings.span(StageKind::Plan, "assemble", assemble_start, monotonic_ns());
+    catalog.stage_timings = timings;
+    Ok(catalog)
+}
+
+/// What this pass's attribution may attempt.
+enum PassAttempt {
+    Userspace,
+    Kernel { threshold: Option<usize> },
+}
+
+/// Decide under the capture lock whether this pass attempts kernel
+/// proof. Cheap checks (numbering/BTF) run here for auto's first
+/// proof; session loads happen after the lock is dropped. No-request
+/// passes add zero: they neither load nor record fallback.
+fn decide_pass_attempt(shared: &IdentityShared, has_proof: bool) -> PassAttempt {
+    let mut shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+    match shared.selection {
+        crate::cli::IdentityBackendSelection::Userspace => PassAttempt::Userspace,
+        crate::cli::IdentityBackendSelection::Kernel if !has_proof => PassAttempt::Userspace,
+        crate::cli::IdentityBackendSelection::Kernel => PassAttempt::Kernel { threshold: None },
+        crate::cli::IdentityBackendSelection::Auto if !has_proof => PassAttempt::Userspace,
+        crate::cli::IdentityBackendSelection::Auto if shared.auto_ineligible => {
+            PassAttempt::Userspace
+        }
+        crate::cli::IdentityBackendSelection::Auto => {
+            match shared.checks.numbering() {
+                IdentityNumbering::Agree => {}
+                IdentityNumbering::Mismatch => {
+                    shared.auto_ineligible = true;
+                    shared.note_selection_fallback(IdentityUnavailable::NumberingMismatch);
+                    return PassAttempt::Userspace;
+                }
+                IdentityNumbering::Unknown => {
+                    shared.auto_ineligible = true;
+                    shared.note_selection_fallback(IdentityUnavailable::NumberingUnknown);
+                    return PassAttempt::Userspace;
+                }
+            }
+            match shared.checks.btf() {
+                IdentityBtf::Ok => {}
+                IdentityBtf::FixMissing => {
+                    shared.auto_ineligible = true;
+                    shared.note_selection_fallback(IdentityUnavailable::KernelFixMissing);
+                    return PassAttempt::Userspace;
+                }
+                IdentityBtf::NoTaskIterPidfd => {
+                    shared.auto_ineligible = true;
+                    shared.note_selection_fallback(IdentityUnavailable::NoTaskIterPidfd);
+                    return PassAttempt::Userspace;
+                }
+                IdentityBtf::NoBtf => {
+                    shared.auto_ineligible = true;
+                    shared.note_selection_fallback(IdentityUnavailable::NoBtf);
+                    return PassAttempt::Userspace;
+                }
+            }
+            let threshold = shared.threshold;
+            PassAttempt::Kernel { threshold }
+        }
+    }
+}
+
+/// Run this pass's sweep attribution with a fresh per-pass kernel
+/// session, falling back to userspace within the same pins on any
+/// setup failure. The session never leaves this job: no cross-pass
+/// cache, no shared BPF state. Forced kernel bypasses the cost
+/// threshold only (`threshold: None`); resource and run caps still
+/// apply inside the proof.
+#[allow(clippy::too_many_arguments)]
+fn attribute_pass_with_kernel(
+    shared: &IdentityShared,
+    collection: &mut Collection,
+    bound: &Bound,
+    custody: ExaminedCustody,
+    segment_policy: SegmentPolicy,
+    reservations: &ReservationOwner,
+    shards: usize,
+    pools: ProofPools<'_>,
+    threshold: Option<usize>,
+) -> Option<Attributed> {
+    // One session attempt for this pass, outside the capture lock.
+    let session = {
+        let checks_locked = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+        // The trait object cannot be cloned; create the session while
+        // holding the lock (jobs run sequentially, the service tick
+        // never takes it). Mark the load attempt first.
+        let mut shared = checks_locked;
+        shared.loaded = true;
+        match shared.checks.create_session() {
+            Ok(session) => Some(session),
+            Err(reason) => {
+                let selection = shared.selection;
+                match selection {
+                    // Auto's first load failure is failed selection:
+                    // userspace with a finite reason, sticky.
+                    crate::cli::IdentityBackendSelection::Auto
+                        if shared.backend == IdentityBackend::Userspace =>
+                    {
+                        shared.auto_ineligible = true;
+                        shared.note_selection_fallback(reason);
+                    }
+                    // A later failure keeps `kernel`: runtime fallback.
+                    _ => shared.note_selection_fallback(reason),
+                }
+                None
+            }
+        }
+    };
+    let Some(mut session) = session else {
+        return attribute_sweep_with(
+            collection,
+            bound,
+            &bound.aggregate,
+            |sweep, unavailable, selected, index, budget| {
+                crate::discovery::confirm_shards::attribute_unselected_with_policy(
+                    sweep,
+                    unavailable,
+                    selected,
+                    index,
+                    budget,
+                    segment_policy,
+                    reservations,
+                    shards,
+                    &|| OsConfirmIo::with_pools(pools),
+                )
+            },
+        );
+    };
+    // Admitted anchors: the aggregate's proven sweep keys; examined
+    // anchors ride in custody. Held files only, never a pathname.
+    let admitted: Vec<(ObjectKey, PinnedObjectId)> =
+        bound.aggregate.sweep_match_keys().into_iter().collect();
+    let pass =
+        crate::discovery::kernel_identity::AnchorPass::prepare(&bound.aggregate, admitted, custody);
+    let install_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let mut installed = match session.install_anchors(pass, 1, install_deadline) {
+        Ok(installed) => installed,
+        Err(_) => {
+            let mut shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+            if shared.selection == crate::cli::IdentityBackendSelection::Auto
+                && shared.backend == IdentityBackend::Userspace
+            {
+                shared.auto_ineligible = true;
+            }
+            shared.note_fallback("anchor_not_installed");
+            drop(shared);
+            return attribute_sweep_with(
+                collection,
+                bound,
+                &bound.aggregate,
+                |sweep, unavailable, selected, index, budget| {
+                    crate::discovery::confirm_shards::attribute_unselected_with_policy(
+                        sweep,
+                        unavailable,
+                        selected,
+                        index,
+                        budget,
+                        segment_policy,
+                        reservations,
+                        shards,
+                        &|| OsConfirmIo::with_pools(pools),
+                    )
+                },
+            );
+        }
+    };
+    let probe_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut probe = crate::discovery::kernel_identity::KernelMemberProbe::new(
+        &mut installed,
+        OsConfirmIo::with_pools(pools),
+        probe_deadline,
+    );
+    if let Some(threshold) = threshold {
+        probe = probe.with_auto_threshold(threshold);
+    }
+    let (attributed, observed) = attribute_sweep_with_kernel(
+        collection,
+        bound,
+        segment_policy,
+        reservations,
+        shards,
+        &|| OsConfirmIo::with_pools(pools),
+        &mut probe,
+    );
+    // The wrapper's first batch fallback, if any, becomes the
+    // capture's first finite reason. A fully proved pass adds zero.
+    let fallback = observed.map(runtime_fallback_label);
+    drop(probe);
+    drop(installed);
+    drop(session);
+    {
+        let mut shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+        if shared.backend == IdentityBackend::Userspace
+            && shared.selection == crate::cli::IdentityBackendSelection::Auto
+        {
+            shared.backend = IdentityBackend::Kernel;
+        }
+        if let Some(reason) = fallback {
+            shared.note_fallback(&reason);
+        }
+    }
+    match attributed {
+        Some(attributed) => Some(attributed),
+        None => {
+            // Kernel expectations failed to install: same-pin
+            // userspace fallback with a finite reason.
+            {
+                let mut shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+                shared.note_fallback("anchor_not_installed");
+            }
+            attribute_sweep_with(
+                collection,
+                bound,
+                &bound.aggregate,
+                |sweep, unavailable, selected, index, budget| {
+                    crate::discovery::confirm_shards::attribute_unselected_with_policy(
+                        sweep,
+                        unavailable,
+                        selected,
+                        index,
+                        budget,
+                        segment_policy,
+                        reservations,
+                        shards,
+                        &|| OsConfirmIo::with_pools(pools),
+                    )
+                },
+            )
+        }
+    }
+}
+
+/// Kernel sweep attribution: the [`attribute_sweep_with`] prefix
+/// (index, selection, refused filtering) plus kernel slot
+/// expectations and the segment-proof hook. Setup failures return
+/// `None` so the caller runs the same-pin userspace fallback.
+fn attribute_sweep_with_kernel<Io, F>(
+    collection: &mut Collection,
+    bound: &Bound,
+    policy: SegmentPolicy,
+    owner: &ReservationOwner,
+    threads: usize,
+    make_io: &F,
+    probe: &mut crate::discovery::kernel_identity::KernelMemberProbe<'_, '_, '_, Io>,
+) -> (
+    Option<Attributed>,
+    Option<crate::discovery::kernel_identity::KernelFallbackReason>,
+)
+where
+    Io: crate::discovery::confirm_shards::ShardableIo,
+    Io::Pin: Send,
+    F: Fn() -> Io + Sync,
+{
+    if !collection.cap_hit {
+        return (None, None);
+    }
+    let modules = bound
+        .reconciled
+        .iter()
+        .map(|(_, _, module)| (module.scanned.key, Some(module.object)))
+        .chain(
+            bound
+                .unresolved
+                .iter()
+                .map(|(_, _, module, _)| (module.key, None)),
+        );
+    let match_keys = bound.aggregate.sweep_match_keys();
+    let complete: BTreeSet<u32> = collection
+        .members
+        .iter()
+        .filter(|member| {
+            matches!(member.status, MemberStatus::Scanned)
+                && !member
+                    .gaps
+                    .iter()
+                    .any(|gap| scan_skip_truncates(&gap.reason))
+        })
+        .map(|member| member.pid)
+        .collect();
+    let examined = collection
+        .members
+        .iter()
+        .filter(|member| complete.contains(&member.pid))
+        .flat_map(|member| member.examined.iter().copied());
+    let (mut index, mut refused) =
+        KnownKeyIndex::build(modules, &match_keys, examined, &bound.aggregate);
+    let selected: BTreeSet<u32> = collection.selected.iter().copied().collect();
+    let unselected_keys: BTreeSet<ObjectKey> = collection
+        .sweep
+        .iter()
+        .filter(|(pid, _)| !selected.contains(pid))
+        .flat_map(|(_, entries)| entries.iter().filter(|entry| is_caller_range(entry)))
+        .map(ObjectKey::of)
+        .collect();
+    refused.retain(|object| unselected_keys.contains(&object.key));
+    progress!(
+        "p11scope: attributing {} unselected processes by maps identity...",
+        collection.sweep.len().saturating_sub(selected.len())
+    );
+    if probe.install_expectations(&mut index).is_err() {
+        return (None, None);
+    }
+    let mut observing = FallbackObservingProof {
+        inner: probe.segment_proof(),
+        first_fallback: std::cell::Cell::new(None),
+    };
+    let mut attribution = crate::discovery::confirm_shards::attribute_unselected_with_segment_proof(
+        &collection.sweep,
+        &collection.sweep_unavailable,
+        &selected,
+        &index,
+        &mut collection.budget,
+        policy,
+        owner,
+        threads,
+        make_io,
+        &mut observing,
+    );
+    let changed = retain_unchanged(&mut attribution, &bound.aggregate);
+    let observed = observing.observed();
+    (
+        Some(Attributed {
+            attribution,
+            refused,
+            changed,
+        }),
+        observed,
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{
+        IdentityNumbering, IdentityRunShared, IdentityShared, IdentityUnavailable,
+        LiveIdentityChecks, ScriptedIdentityChecks, decide_pass_attempt, forced_kernel_refusal,
+        preflight_forced_kernel, runtime_fallback_label,
+    };
+    use crate::cli::IdentityBackendSelection;
+    use std::sync::atomic::Ordering;
+
+    fn shared_with(
+        selection: IdentityBackendSelection,
+        checks: ScriptedIdentityChecks,
+    ) -> (IdentityShared, *const ScriptedIdentityChecks) {
+        // The shared state owns the scripted checks; the raw pointer
+        // reads back call counts (the Arc outlives the test).
+        let checks = Box::new(checks);
+        let ptr: *const ScriptedIdentityChecks = &*checks;
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(IdentityRunShared::new(
+            selection, checks,
+        )));
+        (shared, ptr)
+    }
+
+    /// D3d: forced preflight refuses each arm with its finite label,
+    /// and cheap failures never reach the session attempt.
+    #[test]
+    fn d3d_preflight_refuses_each_arm_with_its_finite_label() {
+        for reason in [
+            IdentityUnavailable::NumberingMismatch,
+            IdentityUnavailable::NumberingUnknown,
+            IdentityUnavailable::KernelFixMissing,
+            IdentityUnavailable::NoTaskIterPidfd,
+            IdentityUnavailable::NoBtf,
+            IdentityUnavailable::PermissionDenied,
+            IdentityUnavailable::LoadFailed,
+            IdentityUnavailable::ProbeFailed,
+        ] {
+            let checks = ScriptedIdentityChecks::refuse(reason);
+            let result = preflight_forced_kernel(&checks);
+            assert_eq!(result, Err(reason), "arm {}", reason.label());
+            assert_eq!(
+                forced_kernel_refusal(reason),
+                format!(
+                    "--identity-backend kernel: kernel identity is unavailable: {}",
+                    reason.label()
+                )
+            );
+            // Cheap arms never load; session arms load exactly once.
+            let expect_session = matches!(
+                reason,
+                IdentityUnavailable::PermissionDenied
+                    | IdentityUnavailable::LoadFailed
+                    | IdentityUnavailable::ProbeFailed
+            );
+            assert_eq!(
+                checks.session_calls.load(Ordering::SeqCst),
+                usize::from(expect_session),
+                "arm {}",
+                reason.label()
+            );
+            assert!(
+                checks.numbering_calls.load(Ordering::SeqCst) >= 1,
+                "arm {}",
+                reason.label()
+            );
+        }
+    }
+
+    /// D3d: userspace never consults capability or probe sources.
+    #[test]
+    fn d3d_userspace_selection_never_loads_or_probes() {
+        let checks = ScriptedIdentityChecks::must_not_load();
+        // decide_pass_attempt must not call anything for userspace,
+        // with or without proof. checked via counts below using a
+        // shared handle (must_not_load panics only on session).
+        let (shared, ptr) = shared_with(IdentityBackendSelection::Userspace, checks);
+        for has_proof in [false, true] {
+            assert!(matches!(
+                decide_pass_attempt(&shared, has_proof),
+                super::PassAttempt::Userspace
+            ));
+        }
+        let checks = unsafe { &*ptr };
+        assert_eq!(checks.numbering_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(checks.btf_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(checks.session_calls.load(Ordering::SeqCst), 0);
+        let shared = shared.lock().unwrap();
+        assert_eq!(shared.summary().backend, super::IdentityBackend::Userspace);
+        assert_eq!(shared.summary().fallback, None);
+        assert!(!shared.loaded());
+    }
+
+    /// D3d: auto without proof never loads and stays userspace/null.
+    #[test]
+    fn d3d_auto_without_proof_never_loads() {
+        let (shared, ptr) = shared_with(
+            IdentityBackendSelection::Auto,
+            ScriptedIdentityChecks::must_not_load(),
+        );
+        assert!(matches!(
+            decide_pass_attempt(&shared, false),
+            super::PassAttempt::Userspace
+        ));
+        let checks = unsafe { &*ptr };
+        assert_eq!(checks.numbering_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(checks.btf_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(checks.session_calls.load(Ordering::SeqCst), 0);
+        let shared = shared.lock().unwrap();
+        assert_eq!(shared.summary().backend, super::IdentityBackend::Userspace);
+        assert_eq!(shared.summary().fallback, None);
+        assert!(!shared.loaded());
+    }
+
+    /// D3d: auto's first proof with cheap failures stays userspace
+    /// with the finite reason, sticky, without a session attempt.
+    #[test]
+    fn d3d_auto_cheap_failure_stays_userspace_sticky_without_session() {
+        for reason in [
+            IdentityUnavailable::NumberingMismatch,
+            IdentityUnavailable::NumberingUnknown,
+            IdentityUnavailable::KernelFixMissing,
+            IdentityUnavailable::NoTaskIterPidfd,
+            IdentityUnavailable::NoBtf,
+        ] {
+            let (shared, ptr) = shared_with(
+                IdentityBackendSelection::Auto,
+                ScriptedIdentityChecks::refuse(reason),
+            );
+            assert!(matches!(
+                decide_pass_attempt(&shared, true),
+                super::PassAttempt::Userspace
+            ));
+            // Sticky: a second proof pass consults nothing further.
+            assert!(matches!(
+                decide_pass_attempt(&shared, true),
+                super::PassAttempt::Userspace
+            ));
+            let checks = unsafe { &*ptr };
+            assert_eq!(
+                checks.session_calls.load(Ordering::SeqCst),
+                0,
+                "{}",
+                reason.label()
+            );
+            let shared = shared.lock().unwrap();
+            assert_eq!(shared.summary().backend, super::IdentityBackend::Userspace);
+            assert_eq!(shared.summary().fallback.as_deref(), Some(reason.label()));
+            assert!(!shared.loaded());
+        }
+    }
+
+    /// D3d: auto with passing cheap checks attempts kernel once per
+    /// pass decision (the session attempt itself is the eligibility
+    /// probe); the threshold rides along for the proof.
+    #[test]
+    fn d3d_auto_cheap_pass_attempts_kernel_with_threshold() {
+        let (shared, ptr) = shared_with(
+            IdentityBackendSelection::Auto,
+            ScriptedIdentityChecks::session_fails(IdentityUnavailable::ProbeFailed),
+        );
+        match decide_pass_attempt(&shared, true) {
+            super::PassAttempt::Kernel { threshold } => assert_eq!(
+                threshold,
+                Some(crate::discovery::kernel_identity::AUTO_KERNEL_PROOF_PID_THRESHOLD)
+            ),
+            super::PassAttempt::Userspace => panic!("cheap pass must attempt kernel"),
+        }
+        let checks = unsafe { &*ptr };
+        assert_eq!(checks.numbering_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(checks.btf_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(checks.session_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// D3d: forced kernel attempts every proof pass with no cost
+    /// threshold and skips no-proof passes without loading.
+    #[test]
+    fn d3d_forced_kernel_bypasses_threshold_only() {
+        let (shared, _) = shared_with(
+            IdentityBackendSelection::Kernel,
+            ScriptedIdentityChecks::session_fails(IdentityUnavailable::ProbeFailed),
+        );
+        assert!(matches!(
+            decide_pass_attempt(&shared, false),
+            super::PassAttempt::Userspace
+        ));
+        match decide_pass_attempt(&shared, true) {
+            super::PassAttempt::Kernel { threshold } => assert_eq!(threshold, None),
+            super::PassAttempt::Userspace => panic!("forced proof must attempt kernel"),
+        }
+    }
+
+    /// D3d: sanitization — raw deny/probe detail never reaches labels;
+    /// verifier EACCES stays `load_failed`, never permission.
+    #[test]
+    fn d3d_selection_reasons_are_finite_and_sanitized() {
+        use crate::attach::identity_iter::KernelDeny;
+        // NoBtf carries a path-bearing detail; the label drops it.
+        let deny =
+            KernelDeny::NoBtf("/sys/kernel/btf/vmlinux: Permission denied (os error 13)".into());
+        assert_eq!(
+            IdentityUnavailable::from_kernel_deny(deny).label(),
+            "no_btf"
+        );
+        for (deny, label) in [
+            (KernelDeny::FixMissing, "kernel_fix_missing"),
+            (KernelDeny::NoTaskIterPidfd, "no_task_iter_pidfd"),
+        ] {
+            assert_eq!(IdentityUnavailable::from_kernel_deny(deny).label(), label);
+        }
+        // Every label is finite: lowercase, digits, underscores only.
+        for reason in [
+            IdentityUnavailable::NoBtf,
+            IdentityUnavailable::KernelFixMissing,
+            IdentityUnavailable::NoTaskIterPidfd,
+            IdentityUnavailable::NumberingMismatch,
+            IdentityUnavailable::NumberingUnknown,
+            IdentityUnavailable::PermissionDenied,
+            IdentityUnavailable::LoadFailed,
+            IdentityUnavailable::ProbeFailed,
+        ] {
+            let label = reason.label();
+            assert!(
+                label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "{label}"
+            );
+            assert!(!label.contains('/'), "{label}");
+            assert!(
+                !label
+                    .bytes()
+                    .any(|b| b.is_ascii_digit() && label.len() > 20),
+                "{label}"
+            );
+        }
+        // Verifier rejection with EACCES is load, not permission.
+        let verifier = crate::attach::identity_iter::LoadError::Program(
+            aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(libc::EACCES),
+                verifier_log: aya_obj::VerifierLog::new("rejected: unbounded\n".to_string()),
+            },
+        );
+        assert!(!super::load_error_is_permission(&verifier));
+        assert_eq!(
+            super::map_live_load_error(verifier),
+            IdentityUnavailable::LoadFailed
+        );
+        // A bare EPERM without a verifier log is permission.
+        let denied = crate::attach::identity_iter::LoadError::Program(
+            aya::programs::ProgramError::LoadError {
+                io_error: std::io::Error::from_raw_os_error(libc::EPERM),
+                verifier_log: aya_obj::VerifierLog::new(String::new()),
+            },
+        );
+        assert!(super::load_error_is_permission(&denied));
+        assert_eq!(
+            super::map_live_load_error(denied),
+            IdentityUnavailable::PermissionDenied
+        );
+    }
+
+    /// D3d: runtime fallback rendering — label alone, except the fixed
+    /// target-run-limit detail.
+    #[test]
+    fn d3d_runtime_fallback_labels_are_finite() {
+        use crate::discovery::kernel_identity::KernelFallbackReason;
+        assert_eq!(
+            runtime_fallback_label(KernelFallbackReason::TargetLimit),
+            "fd_headroom: target_run_limit"
+        );
+        for (reason, label) in [
+            (KernelFallbackReason::BelowThreshold, "below_threshold"),
+            (KernelFallbackReason::FdHeadroom, "fd_headroom"),
+            (KernelFallbackReason::StreamInvalid, "stream_invalid"),
+            (KernelFallbackReason::Deadline, "deadline"),
+        ] {
+            assert_eq!(runtime_fallback_label(reason), label);
+        }
+    }
+
+    /// D3d: live numbering mapping — agree/mismatch/unknown are typed.
+    #[test]
+    fn d3d_live_numbering_maps_agree_mismatch_unknown() {
+        let live = LiveIdentityChecks;
+        // The live answer depends on this host; it must be one typed
+        // variant and must agree with PidNumbering::agrees.
+        let numbering = live.numbering();
+        let agrees = crate::pidns::numbering().agrees();
+        assert_eq!(numbering == IdentityNumbering::Agree, agrees);
+        // Injected mismatch/unknown map distinctly.
+        let _ = (IdentityNumbering::Mismatch, IdentityNumbering::Unknown);
+    }
+
+    /// D3d: auto's injected-threshold contract — a test threshold
+    /// rides to the kernel attempt unchanged (production uses 2,400;
+    /// forced kernel uses none).
+    #[test]
+    fn d3d_auto_injected_threshold_rides_to_kernel_attempt() {
+        for threshold in [Some(1), Some(7), None] {
+            let shared =
+                std::sync::Arc::new(std::sync::Mutex::new(IdentityRunShared::with_threshold(
+                    IdentityBackendSelection::Auto,
+                    threshold,
+                    Box::new(ScriptedIdentityChecks::session_fails(
+                        IdentityUnavailable::ProbeFailed,
+                    )),
+                )));
+            match decide_pass_attempt(&shared, true) {
+                super::PassAttempt::Kernel { threshold: got } => {
+                    assert_eq!(got, threshold, "injected threshold rides along")
+                }
+                super::PassAttempt::Userspace => panic!("cheap pass must attempt kernel"),
+            }
+        }
+    }
+
     #[test]
     fn d3b_failed_strict_census_never_reenumerates_or_restores_batch() {
         use std::os::fd::AsRawFd;

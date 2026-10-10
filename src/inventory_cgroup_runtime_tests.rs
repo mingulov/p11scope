@@ -46,6 +46,7 @@ impl<'a> ObservedDriver<'a> {
                 display: None,
                 semantic: None,
                 semantic_staged: false,
+                identity: None,
             },
             wrapper: None,
             tick: None,
@@ -649,6 +650,7 @@ fn run_public_selection(
             CaptureMode::Scan
         },
         crate::attach::BackendSelection::Auto,
+        None,
         &|| false,
         &|| {},
         false,
@@ -659,6 +661,7 @@ fn run_public_selection(
             pid_filter: None,
             second_signal: &|| false,
         },
+        None,
         None,
         None,
     )

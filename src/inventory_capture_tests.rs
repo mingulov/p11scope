@@ -1906,6 +1906,7 @@ fn stop_event_failure_keeps_native_cleanup_report_and_stdout() {
                 false,
                 &mut crate::inventory_output::WriterStdout(&mut stdout),
                 summary,
+                None,
             )
         },
         &|| log.borrow_mut().push("armed".into()),
@@ -2125,6 +2126,7 @@ fn native_output_boundary_control(
                 false,
                 &mut stdout,
                 summary,
+                None,
             );
             log.borrow_mut().push("output:result".into());
             outcome

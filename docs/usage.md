@@ -967,6 +967,18 @@ Limits that matter in pods:
   the effective cap and names `--max-events` only when the operator passed it.
   A truncated trace is always `PARTIAL` (observation cause `trace_truncated`),
   even when its stop drain was proven.
+- `--identity-backend auto|userspace|kernel` — the system sweep identity
+  proof backend for `inventory --system` only (D3d). `auto` (the default)
+  defers any identity load until the first nonempty proof plan, then uses
+  kernel proof when eligible; `userspace` never loads identity BPF;
+  `kernel` validates numbering/BTF, strict load and functional probe
+  before capture starts, or refuses with
+  `--identity-backend kernel: kernel identity is unavailable: <reason>`
+  (exit 1, before any capture output is created). An explicit value under
+  `--pid` or `--cgroup` is a usage error; the implicit default there
+  loads nothing and emits no `observation.identity` field. The document
+  discloses the choice in `observation.identity` (`backend`
+  `userspace` or `kernel`, plus a finite `fallback` reason or null).
 
 ### Environment (`P11SCOPE_*`)
 

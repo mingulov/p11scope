@@ -3,7 +3,8 @@ use crate::run::OwnedChild;
 use crate::{
     attach,
     discovery::engine::{
-        DeferredDiscoveryItem, Engine, EngineSession, IncompleteTerminalDrain, TerminalBatch,
+        DISCOVERY_HELD_CAP, DeferredDiscoveryItem, DiscoveryCapacityBlocked, Engine, EngineSession,
+        IncompleteTerminalDrain, TerminalBatch,
     },
 };
 use p11scope_ebpf_common::{
@@ -2095,6 +2096,17 @@ impl PauseIo for SessionPauseIo<'_> {
     }
 
     fn dequeue(&mut self) -> Result<Option<DiscoveryItem>, String> {
+        // Shared allowance, enforced structurally: a staged pop is a
+        // credit transfer and always proceeds, but a ring read needs a
+        // free credit. At zero room the coordinator gets an explicit
+        // capacity block — never an empty observation — so its cycle
+        // fails honestly instead of over-admitting.
+        let staged = self.session.staged_discovery_len();
+        if staged == 0
+            && staged.saturating_add(self.engine.discovery_held_len()) >= DISCOVERY_HELD_CAP
+        {
+            return Err("live discovery pull stopped at the shared storage allowance with records still unread".into());
+        }
         let item = self
             .session
             .discovery_dequeue()
@@ -2136,6 +2148,17 @@ impl PauseIo for SessionPauseIo<'_> {
         let child = self.child;
         let stop_candidate_seen = &mut self.stop_candidate_seen;
         let nested_deadline = std::cell::Cell::new(false);
+        // Every nested pull in this batch shares one budget seeded from
+        // the shared allowance beside the batch-local records; merges of
+        // those locals into pending are transfers, already counted.
+        let malformed = std::mem::take(&mut self.malformed);
+        let pull_budget = std::cell::Cell::new(
+            DISCOVERY_HELD_CAP
+                .saturating_sub(self.session.staged_discovery_len())
+                .saturating_sub(self.engine.discovery_held_len())
+                .saturating_sub(records.len())
+                .saturating_sub(malformed as usize),
+        );
         let mut collect = |session: &mut dyn EngineSession| {
             collect_timed_retirement(
                 session,
@@ -2144,6 +2167,7 @@ impl PauseIo for SessionPauseIo<'_> {
                 stop_candidate_seen,
                 pause_owned,
                 &nested_deadline,
+                &pull_budget,
             )
         };
         let terminal_dispatch = terminal_batch.is_some();
@@ -2154,12 +2178,14 @@ impl PauseIo for SessionPauseIo<'_> {
             Some(batch) => {
                 if let Err(error) = self.engine.terminal_batch_installable(&batch) {
                     *terminal_batch = Some(batch);
+                    self.malformed = self.malformed.saturating_add(malformed);
                     return Err(PauseBatchError::new(
                         format!("terminal discovery batch restore failed: {error:#}"),
                         None,
                     ));
                 }
                 if let Err(error) = self.engine.install_terminal_batch(batch, records) {
+                    self.malformed = self.malformed.saturating_add(malformed);
                     return Err(PauseBatchError::new(
                         format!("terminal discovery batch restore failed: {error:#}"),
                         None,
@@ -2174,7 +2200,7 @@ impl PauseIo for SessionPauseIo<'_> {
         let applied = self.engine.apply_discovery_batch_with(
             self.session,
             records,
-            std::mem::take(&mut self.malformed),
+            malformed,
             additions_allowed,
             terminal_dispatch,
             &mut collect,
@@ -2277,6 +2303,13 @@ impl PauseIo for SessionPauseIo<'_> {
         let child = self.child;
         let stop_candidate_seen = &mut self.stop_candidate_seen;
         let nested_deadline = std::cell::Cell::new(false);
+        // Nested pulls in this revalidation share one budget seeded from
+        // the shared allowance beside what the Engine already holds.
+        let pull_budget = std::cell::Cell::new(
+            DISCOVERY_HELD_CAP
+                .saturating_sub(self.session.staged_discovery_len())
+                .saturating_sub(self.engine.discovery_held_len()),
+        );
         let mut collect = |session: &mut dyn EngineSession| {
             collect_timed_retirement(
                 session,
@@ -2285,6 +2318,7 @@ impl PauseIo for SessionPauseIo<'_> {
                 stop_candidate_seen,
                 pause_owned,
                 &nested_deadline,
+                &pull_budget,
             )
         };
         let outcome =
@@ -2392,6 +2426,7 @@ fn collect_timed_retirement(
     stop_candidate_seen: &mut bool,
     pause_owned: bool,
     nested_deadline: &std::cell::Cell<bool>,
+    budget: &std::cell::Cell<usize>,
 ) -> Result<(Vec<DiscoveryRecord>, u64), anyhow::Error> {
     collect_timed_retirement_with(
         child.pid(),
@@ -2400,7 +2435,22 @@ fn collect_timed_retirement(
         pause_owned,
         Some(nested_deadline),
         || attach::monotonic_ns().ok_or_else(|| anyhow::anyhow!("monotonic clock read failed")),
-        || session.discovery_dequeue(),
+        // Shared allowance: staged pops are credit transfers and always
+        // proceed, but a ring read consumes one shared credit. At zero
+        // room with nothing staged the collect stops with a typed
+        // capacity block — never an empty observation — and the retained
+        // prefix travels with it.
+        || {
+            let staged_before = session.staged_discovery_len();
+            if budget.get() == 0 && staged_before == 0 {
+                return Err(DiscoveryCapacityBlocked.into());
+            }
+            let item = session.discovery_dequeue()?;
+            if item.is_some() && session.staged_discovery_len() == staged_before {
+                budget.set(budget.get().saturating_sub(1));
+            }
+            Ok(item)
+        },
         || owned_generation_retained(child).map_err(anyhow::Error::msg),
     )
 }
@@ -2448,6 +2498,17 @@ fn collect_timed_retirement_with(
         let item = match dequeue() {
             Ok(item) => item,
             Err(error) => {
+                // A capacity stop keeps its exact prefix and reports the
+                // allowance, never a transport failure: the operation
+                // retries after owned items settle.
+                if error.is::<DiscoveryCapacityBlocked>() {
+                    return Err(IncompleteTerminalDrain::capacity_blocked(
+                        records,
+                        malformed,
+                        unvalidated_records,
+                    )
+                    .into());
+                }
                 return Err(IncompleteTerminalDrain::new(
                     records,
                     malformed,
@@ -6767,5 +6828,496 @@ mod tests {
         coordinator.attempt_open = false;
         coordinator.begin_attempt();
         assert_eq!(coordinator.pending_diagnostic, None);
+    }
+
+    fn exec_record_for(pid: u32) -> DiscoveryRecord {
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_EXEC;
+        record.pid_tgid = u64::from(pid) << 32;
+        record.hook_ts_ns = u64::MAX;
+        record
+    }
+
+    /// One retiring harness: a live child, its retiring engine and owner,
+    /// and a session authorizing loader records with the terminal export.
+    fn pause_credit_harness() -> (OwnedChild, Engine, LoaderContextId, ScriptedSession) {
+        let child = OwnedChild::spawn("/bin/true".into(), Vec::new()).unwrap();
+        let (engine, owner) = Engine::retiring_loader_context(child.pid());
+        let mut session = ScriptedSession::with_records([], 16);
+        session.detach_exports = vec![terminal_export()];
+        (child, engine, owner, session)
+    }
+
+    /// H5 storage: pause and terminal-return batches use the same shared
+    /// credits. The real adapter dequeues owned records (malformed counted
+    /// beside them), applies a nonempty paused batch to completion with
+    /// and without a deadline, returns an error prefix with its original
+    /// owner/exports/timestamps, restores it move-only and dispatches
+    /// every record exactly once. One predispatch retry survives with the
+    /// same batch; owned pending moves with it. At full occupancy the
+    /// dequeue guard and the nested budget refuse with typed
+    /// capacity-blocked — never empty — while staged transfers still move.
+    /// Child cleanup keeps the retained batch owned until its honest
+    /// disposal. Work charges are observed exactly through the ceiling.
+    #[test]
+    fn pressure_credits_survive_pause_and_terminal_handoff() {
+        const WORK_CEILING: u64 = 16 * 1024 * 1024;
+
+        // Successful nonempty paused apply, no deadline: three loader
+        // records plus one malformed dequeued through the real adapter,
+        // applied, retired and dispatched exactly once.
+        let (child, mut engine, owner, mut session) = pause_credit_harness();
+        for (hook, malformed) in [(11u64, false), (0, true), (22, false), (33, false)] {
+            if malformed {
+                session
+                    .dequeues
+                    .push_back(Ok(Some(DiscoveryItem::Malformed)));
+            } else {
+                let mut record = loader_record_for(owner, child.pid());
+                record.hook_ts_ns = hook;
+                session
+                    .dequeues
+                    .push_back(Ok(Some(DiscoveryItem::Record(record))));
+            }
+        }
+        let (records, malformed) = with_session_io(&mut engine, &mut session, &child, |io| {
+            let mut records = Vec::new();
+            while let Some(item) = io.dequeue().expect("room to dequeue") {
+                if let DiscoveryItem::Record(record) = item {
+                    records.push(record);
+                }
+            }
+            (records, io.malformed)
+        });
+        assert_eq!(records.len(), 3);
+        assert_eq!(malformed, 1, "dequeue counts malformed beside records");
+        let mut terminal_batch = None;
+        let outcome = with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(records, None, true, true, &mut terminal_batch)
+                .expect("a clean paused apply succeeds")
+        });
+        // The malformed item honestly withholds required-complete: the
+        // batch applied and retired, but one unit was never validated.
+        assert!(!outcome.required_complete);
+        assert_eq!(engine.dispatched_loader_records(), 3);
+        assert!(terminal_batch.is_none());
+        assert_eq!(engine.terminal_journal_for_test(), None);
+        assert_eq!(engine.loader_context_state_for_test(owner), None);
+        assert_eq!(engine.discovery_held_len(), 0);
+        assert_eq!(engine.unvalidated_discovery_for_test(), 0);
+
+        // The same apply with a deadline installs it into the budget.
+        let (child, mut engine, owner, mut session) = pause_credit_harness();
+        let mut terminal_batch = None;
+        let outcome = with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(
+                vec![loader_record_for(owner, child.pid())],
+                Some(u64::MAX),
+                true,
+                true,
+                &mut terminal_batch,
+            )
+            .expect("a deadline apply succeeds")
+        });
+        // A single loader hit needs revalidation: incomplete is routine
+        // pause cycling, not failure — the record still dispatched.
+        assert!(!outcome.required_complete);
+        assert_eq!(engine.dispatched_loader_records(), 1);
+        assert_eq!(engine.installed_budget_deadline_for_test(), Some(u64::MAX));
+
+        // Pure renewals complete: nothing pending, nothing to revalidate.
+        let (child, mut engine, _owner, mut session) = pause_credit_harness();
+        let mut terminal_batch = None;
+        let outcome = with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(
+                vec![exec_record_for(5_000_001), exec_record_for(5_000_002)],
+                None,
+                true,
+                true,
+                &mut terminal_batch,
+            )
+            .expect("a renewal apply succeeds")
+        });
+        assert!(outcome.required_complete);
+        assert_eq!(engine.discovery_held_len(), 0);
+
+        // Error prefix round trip: two records plus a ring failure retain
+        // with original authority; the restored batch completes and every
+        // record dispatches exactly once — no clone, no replay.
+        let (child, mut engine, owner, mut session) = pause_credit_harness();
+        for hook in [11u64, 22] {
+            let mut record = loader_record_for(owner, child.pid());
+            record.hook_ts_ns = hook;
+            session
+                .dequeues
+                .push_back(Ok(Some(DiscoveryItem::Record(record))));
+        }
+        session
+            .dequeues
+            .push_back(Err(anyhow::anyhow!("scripted ring read failed")));
+        let mut terminal_batch = None;
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .expect("a failed terminal drain is loss, never a batch error")
+        });
+        let batch = terminal_batch.as_ref().expect("prefix retained");
+        assert_eq!((batch.record_count(), batch.complete()), (2, false));
+        assert_eq!(batch.authority.owner, owner);
+        assert_eq!(batch.authority.exports, [terminal_export()]);
+        assert_eq!(batch.tagged_owners(), [Some(owner), Some(owner)]);
+        assert_eq!(
+            batch.record_hook_stamps_for_test(),
+            [11, 22],
+            "original timing brackets survive"
+        );
+        assert_eq!(
+            engine.terminal_journal_for_test(),
+            Some((owner, false, false))
+        );
+        assert_eq!(engine.dispatched_loader_records(), 0);
+        assert_eq!(
+            engine.discovery_held_len(),
+            0,
+            "the engine released the prefix to its single coordinator owner"
+        );
+        let mut record = loader_record_for(owner, child.pid());
+        record.hook_ts_ns = 33;
+        session
+            .dequeues
+            .push_back(Ok(Some(DiscoveryItem::Record(record))));
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .expect("the restored batch completes")
+        });
+        assert!(terminal_batch.is_none(), "the batch moved exactly once");
+        assert_eq!(
+            engine.dispatched_loader_records(),
+            3,
+            "two retained plus one fresh dispatch exactly once"
+        );
+        assert_eq!(engine.terminal_journal_for_test(), None);
+        assert_eq!(engine.loader_context_state_for_test(owner), None);
+        assert_eq!(engine.discovery_held_len(), 0);
+
+        // Predispatch retry: the first failure keeps the same batch and
+        // owes exactly one retry; owned pending moves with the recovery.
+        let (child, mut engine, owner, mut session) = pause_credit_harness();
+        for hook in [11u64, 22] {
+            let mut record = loader_record_for(owner, child.pid());
+            record.hook_ts_ns = hook;
+            session
+                .dequeues
+                .push_back(Ok(Some(DiscoveryItem::Record(record))));
+        }
+        session
+            .dequeues
+            .push_back(Err(anyhow::anyhow!("scripted ring read failed")));
+        let mut terminal_batch = None;
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .expect("the prefix retains")
+        });
+        assert!(terminal_batch.is_some());
+        session.fail_counter_reads([true]);
+        let regain = vec![exec_record_for(5_000_001), exec_record_for(5_000_002)];
+        let error = with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(regain, None, true, false, &mut terminal_batch)
+                .expect_err("the failed predispatch errors")
+        });
+        assert!(
+            error.message.contains("batch application failed"),
+            "unexpected error: {}",
+            error.message
+        );
+        assert_eq!(
+            engine.terminal_journal_for_test(),
+            Some((owner, false, true)),
+            "exactly one retry is owed"
+        );
+        let batch = terminal_batch.as_ref().expect("same batch returned");
+        // The refused ordinary records joined the install: they ride the
+        // retry inside the batch, untagged, behind the retained prefix.
+        assert_eq!((batch.record_count(), batch.complete()), (4, false));
+        assert_eq!(batch.authority.owner, owner);
+        assert_eq!(
+            batch.tagged_owners(),
+            [Some(owner), Some(owner), None, None]
+        );
+        assert_eq!(
+            engine.discovery_held_len(),
+            0,
+            "install moved every record into the single returned batch"
+        );
+        let mut record = loader_record_for(owner, child.pid());
+        record.hook_ts_ns = 33;
+        session
+            .dequeues
+            .push_back(Ok(Some(DiscoveryItem::Record(record))));
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .expect("the retry completes")
+        });
+        assert!(terminal_batch.is_none());
+        assert_eq!(engine.dispatched_loader_records(), 3);
+        assert_eq!(engine.terminal_journal_for_test(), None);
+        assert_eq!(
+            engine.discovery_held_len(),
+            0,
+            "pending and batch both settled"
+        );
+        assert_eq!(engine.unvalidated_discovery_for_test(), 0);
+
+        // Owned pending moves: an ordinary apply refused by predispatch
+        // parks its records in pending, and the recovery dispatches them.
+        let (child, mut engine, _owner, mut session) = pause_credit_harness();
+        session.fail_counter_reads([true]);
+        let mut terminal_batch = None;
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(
+                vec![exec_record_for(5_000_001), exec_record_for(5_000_002)],
+                None,
+                true,
+                false,
+                &mut terminal_batch,
+            )
+            .expect_err("the failed predispatch errors")
+        });
+        assert_eq!(
+            engine.discovery_held_len(),
+            2,
+            "refused records park owned in pending"
+        );
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .expect("the recovery dispatches pending")
+        });
+        assert_eq!(engine.discovery_held_len(), 0);
+        assert_eq!(engine.unvalidated_discovery_for_test(), 0);
+
+        // Dequeue guard: staged pops are transfers and always proceed, but
+        // a ring read at full occupancy is an explicit capacity block.
+        let (child, mut engine, owner, mut session) = pause_credit_harness();
+        session.dequeues.extend((0..3_996).map(|_| {
+            Ok(Some(DiscoveryItem::Record(loader_record_for(
+                owner,
+                child.pid(),
+            ))))
+        }));
+        session
+            .dequeues
+            .push_back(Err(anyhow::anyhow!("scripted ring read failed")));
+        let mut terminal_batch = None;
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .expect("the prefix retains")
+        });
+        let batch = terminal_batch.as_ref().expect("prefix retained");
+        assert_eq!(batch.record_count(), 3_996);
+        // Install the batch into the engine so it counts as held while
+        // staging fills the last 100 credits; staged pops then transfer
+        // in order.
+        engine
+            .install_terminal_batch(terminal_batch.take().expect("prefix retained"), Vec::new())
+            .expect("the pending journal accepts its batch");
+        assert_eq!(engine.discovery_held_len(), 3_996);
+        session.dequeues.extend((0..100u32).map(|index| {
+            Ok(Some(DiscoveryItem::Record(exec_record_for(
+                5_000_000 + index,
+            ))))
+        }));
+        session.dequeues.extend((0..4u32).map(|index| {
+            Ok(Some(DiscoveryItem::Record(exec_record_for(
+                6_000_000 + index,
+            ))))
+        }));
+        let staged = session
+            .stage_discovery(100, engine.discovery_held_len())
+            .unwrap();
+        assert_eq!((staged.staged, staged.capacity_blocked), (100, false));
+        let pids = with_session_io(&mut engine, &mut session, &child, |io| {
+            let mut pids = Vec::new();
+            for _ in 0..100 {
+                match io.dequeue().expect("staged transfers proceed") {
+                    Some(DiscoveryItem::Record(record)) => {
+                        pids.push((record.pid_tgid >> 32) as u32)
+                    }
+                    _other => panic!("expected a staged record"),
+                }
+            }
+            pids
+        });
+        assert_eq!(pids, (5_000_000..5_000_100).collect::<Vec<_>>());
+        assert_eq!(session.staged_discovery_len(), 0);
+        // The transfers freed room: the next dequeue reads fresh.
+        let fresh = with_session_io(&mut engine, &mut session, &child, |io| {
+            io.dequeue().expect("freed room reads fresh")
+        });
+        assert!(matches!(
+            fresh,
+            Some(DiscoveryItem::Record(record)) if (record.pid_tgid >> 32) as u32 == 6_000_000
+        ));
+
+        // Full occupancy blocks the ring read with a typed refusal.
+        let (child, mut engine, owner, mut session) = pause_credit_harness();
+        session.dequeues.extend((0..DISCOVERY_HELD_CAP).map(|_| {
+            Ok(Some(DiscoveryItem::Record(loader_record_for(
+                owner,
+                child.pid(),
+            ))))
+        }));
+        session
+            .dequeues
+            .push_back(Err(anyhow::anyhow!("scripted ring read failed")));
+        session.dequeues.extend((0..8u32).map(|index| {
+            Ok(Some(DiscoveryItem::Record(exec_record_for(
+                6_000_000 + index,
+            ))))
+        }));
+        let mut terminal_batch = None;
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .expect("the prefix retains")
+        });
+        engine
+            .install_terminal_batch(terminal_batch.take().expect("prefix retained"), Vec::new())
+            .expect("the pending journal accepts its batch");
+        assert_eq!(engine.discovery_held_len(), DISCOVERY_HELD_CAP);
+        assert_eq!(session.staged_discovery_len(), 0);
+        let spare_before = session.dequeues.len();
+        // The budget stopped the retain at 4,096 before the scripted
+        // error: the error plus eight spare records stay queued.
+        assert_eq!(spare_before, 9);
+        let blocked = with_session_io(&mut engine, &mut session, &child, |io| {
+            io.dequeue().err().expect("full occupancy blocks")
+        });
+        assert!(
+            blocked.contains("shared storage allowance"),
+            "unexpected refusal: {blocked}"
+        );
+        assert_eq!(
+            session.dequeues.len(),
+            spare_before,
+            "a blocked dequeue never reads"
+        );
+
+        // Nested budget mechanics: staged pops transfer free, ring reads
+        // consume, and the stop carries its exact prefix.
+        let (child, _engine, _owner, mut session) = pause_credit_harness();
+        session.dequeues.extend((0..5u32).map(|index| {
+            Ok(Some(DiscoveryItem::Record(exec_record_for(
+                5_000_000 + index,
+            ))))
+        }));
+        session.stage_discovery(5, 0).expect("room to stage");
+        session.dequeues.extend((0..4u32).map(|index| {
+            Ok(Some(DiscoveryItem::Record(exec_record_for(
+                6_000_000 + index,
+            ))))
+        }));
+        let mut stop_seen = false;
+        let stopped = collect_timed_retirement(
+            &mut session,
+            &child,
+            None,
+            &mut stop_seen,
+            false,
+            &std::cell::Cell::new(false),
+            &std::cell::Cell::new(0),
+        )
+        .err()
+        .expect("zero budget stops");
+        let stopped = stopped
+            .downcast::<IncompleteTerminalDrain>()
+            .expect("typed capacity stop");
+        assert!(stopped.capacity_blocked && !stopped.backlog);
+        assert_eq!(stopped.records.len(), 5, "staged transfers move free");
+        assert_eq!(session.staged_discovery_len(), 0);
+        assert_eq!(session.dequeues.len(), 4, "no ring read past the stop");
+        let spare = collect_timed_retirement(
+            &mut session,
+            &child,
+            None,
+            &mut stop_seen,
+            false,
+            &std::cell::Cell::new(false),
+            &std::cell::Cell::new(3),
+        )
+        .err()
+        .expect("three units of room stop at the fourth");
+        // The spare EXEC pids never name the child, so no stop is seen.
+        assert!(!stop_seen);
+        let spare = spare
+            .downcast::<IncompleteTerminalDrain>()
+            .expect("typed capacity stop");
+        assert!(spare.capacity_blocked && !spare.backlog);
+        assert_eq!((spare.records.len(), spare.malformed), (3, 0));
+        assert_eq!(session.dequeues.len(), 1);
+
+        // Exact pause charges: records plus malformed once, never replayed.
+        let (child, mut engine, owner, mut session) = pause_credit_harness();
+        assert!(engine.budget_charge_for_test(WORK_CEILING - 4));
+        for (hook, malformed) in [(11u64, false), (0, true), (22, false), (33, false)] {
+            if malformed {
+                session
+                    .dequeues
+                    .push_back(Ok(Some(DiscoveryItem::Malformed)));
+            } else {
+                let mut record = loader_record_for(owner, child.pid());
+                record.hook_ts_ns = hook;
+                session
+                    .dequeues
+                    .push_back(Ok(Some(DiscoveryItem::Record(record))));
+            }
+        }
+        let mut terminal_batch = None;
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            let mut records = Vec::new();
+            while let Some(item) = io.dequeue().expect("room to dequeue") {
+                if let DiscoveryItem::Record(record) = item {
+                    records.push(record);
+                }
+            }
+            io.apply_batch(records, None, true, true, &mut terminal_batch)
+                .expect("the charged apply succeeds")
+        });
+        assert!(
+            !engine.budget_charge_for_test(1),
+            "three records plus one malformed consumed exactly four units"
+        );
+
+        // Child cleanup keeps the retained batch owned until honest
+        // disposal: exact records out, nothing left behind.
+        let (child, mut engine, owner, mut session) = pause_credit_harness();
+        for hook in [11u64, 22] {
+            let mut record = loader_record_for(owner, child.pid());
+            record.hook_ts_ns = hook;
+            session
+                .dequeues
+                .push_back(Ok(Some(DiscoveryItem::Record(record))));
+        }
+        session
+            .dequeues
+            .push_back(Err(anyhow::anyhow!("scripted ring read failed")));
+        let mut terminal_batch = None;
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .expect("the prefix retains")
+        });
+        let batch = terminal_batch.as_ref().expect("prefix retained");
+        assert_eq!((batch.record_count(), batch.complete()), (2, false));
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.detach_pause_links().expect("child link cleanup runs");
+            io.cleanup_terminal_batch_without_replay(&mut terminal_batch)
+                .expect("honest disposal succeeds")
+        });
+        assert!(terminal_batch.is_none(), "the batch moved out exactly once");
+        assert_eq!(engine.terminal_journal_for_test(), None);
+        assert_eq!(engine.loader_context_state_for_test(owner), None);
+        assert_eq!(engine.discovery_held_len(), 0);
+        assert_eq!(
+            engine.dispatched_loader_records(),
+            0,
+            "disposed, never replayed"
+        );
     }
 }

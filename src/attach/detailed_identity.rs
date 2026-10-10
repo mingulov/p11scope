@@ -1770,7 +1770,7 @@ impl ProofSession {
         drain: &mut crate::events::DiscoveryDrain<S>,
     ) -> Vec<crate::events::DiscoveryItem> {
         let mut stage = super::DiscoveryStage::default();
-        stage.stage(1, || drain.dequeue());
+        stage.stage(1, super::DiscoveryStage::CAPACITY, || drain.dequeue());
         stage.take()
     }
     #[cfg(test)]

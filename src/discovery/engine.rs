@@ -52,6 +52,7 @@ use p11scope_manifest::manifest::{
 };
 use p11scope_manifest::maps::{Device, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved};
 use pkcs11_module::{LinuxLayout, read_function_pointer};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::num::NonZeroU64;
@@ -403,6 +404,14 @@ pub struct Engine {
     /// or a completion with a working clock. Quantum/clock deferrals and
     /// absent candidates advance no attempt.
     pressure_attempts: u64,
+    /// The last frame collect stopped at the shared allowance with the
+    /// queue not observed empty. Sticky until the scheduler takes it: a
+    /// set flag schedules backlog service instead of a full sleep.
+    frame_fresh_blocked: bool,
+    /// Terminal-drain quanta that stopped at the shared allowance with
+    /// terminal work unfinished. Sticky evidence, like quiescence
+    /// overflow: a terminal drain that ends here never claims complete.
+    terminal_capacity_backlog: u64,
     /// Diagnostic high-water mark of held ordinary discovery records
     /// (pending plus terminal plus in-flight batch records). Never evidence.
     discovery_held_high_water: usize,
@@ -2526,9 +2535,17 @@ pub(crate) trait EngineSession {
     fn capture_policy(&self) -> CapturePolicy;
     fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>>;
     /// Moves up to `quantum` DISCOVERY items off the kernel ring into the
-    /// session's FIFO without applying any (RB-2). `discovery_dequeue`
-    /// serves that FIFO first, so ring order is kept.
-    fn stage_discovery(&mut self, quantum: usize) -> Result<usize>;
+    /// session's FIFO without applying any (RB-2), without letting staged
+    /// plus `engine_held` exceed the shared 4,096-item allowance.
+    /// `discovery_dequeue` serves that FIFO first, so ring order is kept.
+    fn stage_discovery(
+        &mut self,
+        quantum: usize,
+        engine_held: usize,
+    ) -> Result<crate::attach::DiscoveryStageOutcome>;
+    /// DISCOVERY items currently held in the session FIFO: staged items
+    /// hold shared-allowance credits until a dequeue transfers them.
+    fn staged_discovery_len(&self) -> usize;
     fn counter_snapshot(&self) -> Result<CounterSnapshot>;
     fn process_creation_tracking_unavailable(&self) -> Option<&str>;
     fn read_selection_table(
@@ -2596,8 +2613,16 @@ impl EngineSession for Session {
         Session::discovery_dequeue(self)
     }
 
-    fn stage_discovery(&mut self, quantum: usize) -> Result<usize> {
-        Session::stage_discovery(self, quantum)
+    fn stage_discovery(
+        &mut self,
+        quantum: usize,
+        engine_held: usize,
+    ) -> Result<crate::attach::DiscoveryStageOutcome> {
+        Session::stage_discovery(self, quantum, engine_held)
+    }
+
+    fn staged_discovery_len(&self) -> usize {
+        Session::staged_discovery_len(self)
     }
 
     fn counter_snapshot(&self) -> Result<CounterSnapshot> {
@@ -2757,7 +2782,7 @@ impl IncompleteTerminalDrain {
         }
     }
 
-    fn capacity_blocked(
+    pub(crate) fn capacity_blocked(
         records: Vec<DiscoveryRecord>,
         malformed: u64,
         unvalidated_records: u64,
@@ -2864,6 +2889,23 @@ impl std::fmt::Display for PressureOrderingBlocked {
 }
 
 impl std::error::Error for PressureOrderingBlocked {}
+
+/// A dequeue refused for shared-storage capacity: the pull stopped at the
+/// allowance with the queue not observed empty. Collectors map it to a
+/// capacity-blocked drain that retains its exact prefix; it is never
+/// empty, complete, backlog or failure evidence.
+#[derive(Debug)]
+pub(crate) struct DiscoveryCapacityBlocked;
+
+impl std::fmt::Display for DiscoveryCapacityBlocked {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "the live discovery pull stopped at the shared storage allowance with records still unread",
+        )
+    }
+}
+
+impl std::error::Error for DiscoveryCapacityBlocked {}
 
 /// The single queued request a pressure service pass may complete: its pid
 /// and the snapshot serial the pass revalidates before completing. A
@@ -3011,6 +3053,24 @@ struct ApplyOutcome {
 pub(crate) struct DiscoveryBatchOutcome {
     pub(crate) changed: bool,
     pub(crate) required_complete: bool,
+}
+
+/// Outcome of one between-frames backlog opportunity: whether dispatch
+/// changed engine state (`changed`, the same resync signal a frame's batch
+/// outcome carries), whether the pass moved work forward at all
+/// (`progressed`: fresh acquisition, retained-queue shrinkage through
+/// dispatch, a selected pressure attempt, or a state change), and whether
+/// more backlog remains after it (`pending`). The run loop sleeps nothing
+/// only when work remains *and* the pass progressed; a no-progress
+/// pending outcome returns to the normal readiness wait instead of
+/// hot-looping a stuck clock/capacity condition. A parked rotation reads
+/// back through `pending`, never as a separate loop signal. Pure queue
+/// cycling — a take or pull shed back whole — is not progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BacklogOutcome {
+    pub(crate) changed: bool,
+    pub(crate) progressed: bool,
+    pub(crate) pending: bool,
 }
 
 type BatchStart =
@@ -3308,6 +3368,17 @@ impl TerminalBatch {
     #[cfg(test)]
     pub(crate) fn complete(&self) -> bool {
         self.complete
+    }
+
+    #[cfg(test)]
+    /// Timing brackets of the batch records, in order, for handoff
+    /// tests that cannot name the private record vector.
+    #[cfg(test)]
+    pub(crate) fn record_hook_stamps_for_test(&self) -> Vec<u64> {
+        self.records
+            .iter()
+            .map(|queued| queued.record.hook_ts_ns)
+            .collect()
     }
 
     #[cfg(test)]
@@ -8036,6 +8107,8 @@ impl Engine {
             pressure_rotation_pending: false,
             pressure_service_passes: 0,
             pressure_attempts: 0,
+            frame_fresh_blocked: false,
+            terminal_capacity_backlog: 0,
             discovery_held_high_water: 0,
             held_records: BTreeSet::new(),
             paused_loader_views: BTreeSet::new(),
@@ -9861,6 +9934,9 @@ impl Engine {
     /// quantum stop is an `IncompleteTerminalDrain` with `backlog` set, so no
     /// route can mistake it for an empty ring, and the terminal routes retain
     /// its exact prefix as an incomplete batch until a later drain reads empty.
+    /// Test-only: every production pull goes through `nested_pull_capped`
+    /// or a bounded frame/terminal quantum under the shared allowance.
+    #[cfg(test)]
     fn collect_discovery_records(
         session: &mut dyn EngineSession,
     ) -> Result<(Vec<DiscoveryRecord>, u64)> {
@@ -9884,21 +9960,41 @@ impl Engine {
         Err(IncompleteTerminalDrain::backlog(records, malformed).into())
     }
 
-    /// Pulls up to `limit` items for a capacity-bounded frame quantum. Unlike
-    /// the backlog-signalling collector above, reaching the limit is an
-    /// ordinary stop, reported through `observed_empty`: only an observed
-    /// empty read proves the queue drained. A real dequeue failure still
-    /// carries its retained prefix with it.
-    fn collect_discovery_records_bounded(
+    /// Pulls up to `quantum` items for a capacity-bounded collector
+    /// quantum, consuming `budget` only for fresh ring reads. Staged pops
+    /// are credit transfers — the FIFO shrinks as the batch grows — and
+    /// cost nothing, so a staged backlog never under-admits fresh room.
+    /// Stops at the first observed empty read, at the quantum, or at an
+    /// exhausted budget with nothing staged to transfer; all three keep
+    /// their exact prefix. Only an observed empty read proves the queue
+    /// drained: a budget stop is never an empty observation. A real
+    /// dequeue failure still carries its retained prefix with it.
+    fn collect_discovery_records_budgeted(
         session: &mut dyn EngineSession,
-        limit: usize,
+        budget: &Cell<usize>,
+        quantum: usize,
     ) -> Result<(Vec<DiscoveryRecord>, u64, bool)> {
         let mut records = Vec::new();
         let mut malformed = 0u64;
-        for _ in 0..limit {
+        for _ in 0..quantum {
+            if budget.get() == 0 && session.staged_discovery_len() == 0 {
+                return Ok((records, malformed, false));
+            }
+            // A dequeue never grows the FIFO: an unchanged length means
+            // the item came off the ring (a fresh acquisition), a shrunk
+            // one means it transferred out of the FIFO (already counted).
+            let staged_before = session.staged_discovery_len();
             match session.discovery_dequeue() {
-                Ok(Some(crate::events::DiscoveryItem::Record(record))) => records.push(record),
+                Ok(Some(crate::events::DiscoveryItem::Record(record))) => {
+                    if session.staged_discovery_len() == staged_before {
+                        budget.set(budget.get().saturating_sub(1));
+                    }
+                    records.push(record);
+                }
                 Ok(Some(crate::events::DiscoveryItem::Malformed)) => {
+                    if session.staged_discovery_len() == staged_before {
+                        budget.set(budget.get().saturating_sub(1));
+                    }
                     malformed = malformed.saturating_add(1);
                 }
                 Ok(None) => return Ok((records, malformed, true)),
@@ -14469,12 +14565,16 @@ impl Engine {
         }
         let mut complete = true;
         let mut unvalidated_records = 0;
+        // The post-detach pull shares the allowance with everything staged
+        // and held: at zero room it reports capacity-blocked (an incomplete
+        // drain the journal continuation retries) instead of over-admitting.
+        let prearm_budget = Cell::new(self.shared_allowance_remaining(session, 0));
         let drained = begin_owned_prearm_retirement_with(
             &mut self.loader_registry,
             context,
             registry_attached,
             &mut errors,
-            || match Self::collect_discovery_records(session) {
+            || match Self::nested_pull_capped(session, &prearm_budget) {
                 // The prefix is already off the ring: retain it incomplete for
                 // the shared continuation instead of losing it with the drain.
                 Err(error) => {
@@ -15148,9 +15248,10 @@ impl Engine {
                     // Move-only: the handoff moves the records, so ownership
                     // is checked before the move; only a failed check keeps
                     // the originals for rejection.
-                    let owner_ok = self.terminal_batch.as_ref().is_some_and(|batch| {
-                        batch.authority.owner == context_id
-                    });
+                    let owner_ok = self
+                        .terminal_batch
+                        .as_ref()
+                        .is_some_and(|batch| batch.authority.owner == context_id);
                     if !owner_ok {
                         let error = if self.terminal_batch.is_none() {
                             anyhow!("terminal loader drain batch is missing")
@@ -15693,11 +15794,7 @@ impl Engine {
             let narrowed = self
                 .selection_bindings
                 .get(&record.binding_id)
-                .and_then(|binding| {
-                    self.views
-                        .iter()
-                        .find(|view| view.id() == binding.view)
-                })
+                .and_then(|binding| self.views.iter().find(|view| view.id() == binding.view))
                 .is_some_and(|view| {
                     protection.pids.insert(view.pid());
                     true
@@ -15710,11 +15807,7 @@ impl Engine {
 
     /// Protects the retained view owning a loader context. Reports whether
     /// the ownership narrowed to a retained view at all.
-    fn protect_loader_owner(
-        &self,
-        context: LoaderContextId,
-        pids: &mut BTreeSet<u32>,
-    ) -> bool {
+    fn protect_loader_owner(&self, context: LoaderContextId, pids: &mut BTreeSet<u32>) -> bool {
         self.loader_registry
             .context(context)
             .and_then(|context| {
@@ -15770,10 +15863,7 @@ impl Engine {
     /// not yet ruled out whose live request still carries the snapshot
     /// serial and passes the safe-service subset. Absent or renewed
     /// candidates are skipped without an attempt and never selected.
-    fn pressure_select_next(
-        &self,
-        protection: &PressureProtection,
-    ) -> Option<PressureSelection> {
+    fn pressure_select_next(&self, protection: &PressureProtection) -> Option<PressureSelection> {
         let episode = self.pressure_episode.as_ref()?;
         episode
             .snapshot
@@ -15823,9 +15913,9 @@ impl Engine {
         }
         if protection.block_all {
             return !self.views.iter().any(|view| view.pid() == pid)
-                && request.owner.is_none_or(|owner| {
-                    !self.views.iter().any(|view| view.id() == owner)
-                });
+                && request
+                    .owner
+                    .is_none_or(|owner| !self.views.iter().any(|view| view.id() == owner));
         }
         let mut views: Vec<ProcessViewId> = self
             .views
@@ -15866,8 +15956,7 @@ impl Engine {
     /// parked prefix for another rotation opportunity.
     fn pressure_view_shielded(&self, pid: u32) -> bool {
         (self.pressure_service_active || self.pressure_rotation_pending)
-            && (self.pressure_protection.block_all
-                || self.pressure_protection.pids.contains(&pid))
+            && (self.pressure_protection.block_all || self.pressure_protection.pids.contains(&pid))
     }
 
     fn acknowledge_owned_initial_exec(&mut self, view: ProcessViewId) -> bool {
@@ -16374,9 +16463,8 @@ impl Engine {
             .refresh_requested
             .get(&selection.pid)
             .is_none_or(|live| live.serial != selection.serial);
-        let attempted = completed
-            || self.deep_scans != scans_before
-            || self.loader_arms != arms_before;
+        let attempted =
+            completed || self.deep_scans != scans_before || self.loader_arms != arms_before;
         Ok(PressureServiceOutcome { changed, attempted })
     }
 
@@ -16460,9 +16548,7 @@ impl Engine {
                     // refusal: the episode waits untouched for the next
                     // opportunity instead of manufacturing queue overflow.
                     let clock_ok = crate::attach::monotonic_ns().is_some();
-                    if clock_ok
-                        && let Some(selection) = self.pressure_select_next(&protection)
-                    {
+                    if clock_ok && let Some(selection) = self.pressure_select_next(&protection) {
                         match self.pressure_service_pass(
                             session,
                             additions_allowed,
@@ -18372,24 +18458,25 @@ impl Engine {
         &mut self,
         session: &mut dyn EngineSession,
     ) -> Result<bool> {
-        let mut collect = Self::collect_discovery_records;
-        let (records, malformed, failure) = match Self::collect_discovery_records(session) {
-            Ok((records, malformed)) => (records, malformed, None),
-            Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
-                Ok(incomplete) if incomplete.backlog => {
-                    (incomplete.records, incomplete.malformed, None)
-                }
-                Ok(incomplete) => {
-                    self.account_unvalidated_discovery(incomplete.unvalidated_records);
-                    (
-                        incomplete.records,
-                        incomplete.malformed,
-                        Some(anyhow::Error::msg(incomplete.cause)),
-                    )
-                }
-                Err(error) => return Err(error),
-            },
+        let nested_budget = Cell::new(self.shared_allowance_remaining(session, 0));
+        let (records, malformed, failure) = match Self::collect_discovery_records_budgeted(
+            session,
+            &nested_budget,
+            LIVE_DISCOVERY_DRAIN_QUANTUM,
+        ) {
+            Ok((records, malformed, _)) => (records, malformed, None),
+            Err(error) => {
+                let incomplete = error.downcast::<IncompleteTerminalDrain>()?;
+                self.account_unvalidated_discovery(incomplete.unvalidated_records);
+                (
+                    incomplete.records,
+                    incomplete.malformed,
+                    Some(anyhow::Error::msg(incomplete.cause)),
+                )
+            }
         };
+        let mut collect =
+            |session: &mut dyn EngineSession| Self::nested_pull_capped(session, &nested_budget);
         let outcome = self.apply_discovery_batch_with(
             session,
             records,
@@ -18415,7 +18502,13 @@ impl Engine {
         records: Vec<DiscoveryRecord>,
         malformed: u64,
     ) -> Result<bool> {
-        let mut collect = Self::collect_discovery_records;
+        let nested_budget =
+            Cell::new(self.shared_allowance_remaining(
+                session,
+                records.len().saturating_add(malformed as usize),
+            ));
+        let mut collect =
+            |session: &mut dyn EngineSession| Self::nested_pull_capped(session, &nested_budget);
         Ok(self
             .apply_discovery_batch_with(
                 session,
@@ -18453,11 +18546,35 @@ impl Engine {
         post_q_record: &mut bool,
     ) -> Result<bool> {
         let mut changed = false;
-        let mut collect = Self::collect_discovery_records;
         loop {
+            // Bounded by the shared allowance: each quantum pulls staged
+            // transfers (free) plus fresh room, one work quantum at most.
+            // Pulling nothing with the Q unreached is the stuck state —
+            // nothing staged to transfer, no room to read — recorded with
+            // explicit unfinished evidence instead of spinning past it.
+            let remaining = self.shared_allowance_remaining(session, 0);
+            let staged_before = session.staged_discovery_len();
+            let quantum = staged_before
+                .saturating_add(remaining)
+                .min(LIVE_DISCOVERY_DRAIN_QUANTUM);
             let (records, malformed, post_q, backlog) =
-                session.collect_discovery_to_position(stop, LIVE_DISCOVERY_DRAIN_QUANTUM)?;
+                session.collect_discovery_to_position(stop, quantum)?;
             *post_q_record |= post_q;
+            if backlog && records.is_empty() && malformed == 0 {
+                debug_assert_eq!(quantum, 0, "only a zero quantum pulls nothing with backlog");
+                self.note_terminal_capacity_backlog();
+                return Ok(changed);
+            }
+            // Staged pops are credit transfers, not fresh acquisitions:
+            // only ring reads consume the nested pulls' share.
+            let transfers = staged_before.saturating_sub(session.staged_discovery_len());
+            let fresh = records
+                .len()
+                .saturating_add(malformed as usize)
+                .saturating_sub(transfers);
+            let nested_budget = Cell::new(remaining.saturating_sub(fresh));
+            let mut collect =
+                |session: &mut dyn EngineSession| Self::nested_pull_capped(session, &nested_budget);
             let outcome = self.apply_discovery_batch_with(
                 session,
                 records,
@@ -18491,27 +18608,39 @@ impl Engine {
         session: &mut dyn EngineSession,
     ) -> Result<bool> {
         let mut changed = false;
-        let mut collect = Self::collect_discovery_records;
         loop {
+            // Bounded by the shared allowance: staged transfers are free
+            // and fresh reads share one budget per quantum. Pulling
+            // nothing without observing empty is the stuck state —
+            // nothing staged to transfer, no room to read — recorded with
+            // explicit unfinished evidence instead of spinning past it.
+            let remaining = self.shared_allowance_remaining(session, 0);
+            let nested_budget = Cell::new(remaining);
             let (records, malformed, complete, failure) =
-                match Self::collect_discovery_records(session) {
-                    Ok((records, malformed)) => (records, malformed, true, None),
-                    Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
-                        Ok(incomplete) if incomplete.backlog => {
-                            (incomplete.records, incomplete.malformed, false, None)
-                        }
-                        Ok(incomplete) => {
-                            self.account_unvalidated_discovery(incomplete.unvalidated_records);
-                            (
-                                incomplete.records,
-                                incomplete.malformed,
-                                true,
-                                Some(anyhow::Error::msg(incomplete.cause)),
-                            )
-                        }
-                        Err(error) => return Err(error),
-                    },
+                match Self::collect_discovery_records_budgeted(
+                    session,
+                    &nested_budget,
+                    LIVE_DISCOVERY_DRAIN_QUANTUM,
+                ) {
+                    Ok((records, malformed, true)) => (records, malformed, true, None),
+                    Ok((records, malformed, false)) => (records, malformed, false, None),
+                    Err(error) => {
+                        let incomplete = error.downcast::<IncompleteTerminalDrain>()?;
+                        self.account_unvalidated_discovery(incomplete.unvalidated_records);
+                        (
+                            incomplete.records,
+                            incomplete.malformed,
+                            true,
+                            Some(anyhow::Error::msg(incomplete.cause)),
+                        )
+                    }
                 };
+            if !complete && records.is_empty() && malformed == 0 {
+                self.note_terminal_capacity_backlog();
+                return Ok(changed);
+            }
+            let mut collect =
+                |session: &mut dyn EngineSession| Self::nested_pull_capped(session, &nested_budget);
             let outcome = self.apply_discovery_batch_with(
                 session,
                 records,
@@ -18571,54 +18700,58 @@ impl Engine {
         self.with_live_frame(|engine| engine.apply_discovery_batch(session, records, malformed))
     }
 
-    /// One live frame's records: fresh pulls up to the shared held allowance
-    /// minus what this Engine already holds (pending plus terminal), in
-    /// collector quanta of at most `LIVE_DISCOVERY_DRAIN_QUANTUM`, stopping
-    /// at the first that empties the queue or at the allowance. A quantum
-    /// stop is backlog, never failure; excess records stay unread in ring
-    /// order for the next frame, and any overflow they cause is the
+    /// One live frame's records: fresh pulls up to the shared allowance
+    /// minus staged, Engine-held and already-pulled items, in collector
+    /// quanta of at most `LIVE_DISCOVERY_DRAIN_QUANTUM`, stopping at the
+    /// first that empties the queue or at the allowance. Pulled malformed
+    /// items hold credits like records until the batch accounts them. A
+    /// quantum stop is backlog, never failure; excess records stay unread
+    /// in ring order for the next frame, and any overflow they cause is the
     /// producer's `ring_loss`. A real dequeue failure aborts the route as
     /// before. `fresh_blocked` reports stopping for capacity without
-    /// observing an empty queue: capacity-blocked, never empty.
+    /// observing an empty queue — capacity-blocked, never empty — and is
+    /// also latched sticky so the scheduler services backlog instead of a
+    /// full sleep.
     fn collect_frame_discovery(
         &mut self,
         session: &mut dyn EngineSession,
     ) -> Result<(Vec<DiscoveryRecord>, u64, bool)> {
-        let held = self
-            .pending_discovery_records
-            .len()
-            .saturating_add(self.terminal_batch.as_ref().map_or(0, TerminalBatch::len));
-        let mut remaining = DISCOVERY_HELD_CAP.saturating_sub(held);
+        let budget = Cell::new(self.shared_allowance_remaining(session, 0));
         let mut records = Vec::new();
         let mut malformed = 0u64;
         let mut observed_empty = false;
         for _ in 0..LIVE_DISCOVERY_FRAME_QUANTA {
-            if remaining == 0 {
-                break;
-            }
-            let quantum = remaining.min(LIVE_DISCOVERY_DRAIN_QUANTUM);
-            match Self::collect_discovery_records_bounded(session, quantum) {
+            match Self::collect_discovery_records_budgeted(
+                session,
+                &budget,
+                LIVE_DISCOVERY_DRAIN_QUANTUM,
+            ) {
                 Ok((drained, drained_malformed, empty)) => {
-                    remaining = remaining.saturating_sub(drained.len());
-                    records.extend(drained);
-                    malformed = malformed.saturating_add(drained_malformed);
                     if empty {
                         observed_empty = true;
+                        records.extend(drained);
+                        malformed = malformed.saturating_add(drained_malformed);
                         break;
                     }
-                }
-                Err(error) => match error.downcast::<IncompleteTerminalDrain>() {
-                    Ok(incomplete) if incomplete.backlog => {
-                        remaining = remaining.saturating_sub(incomplete.records.len());
-                        records.extend(incomplete.records);
-                        malformed = malformed.saturating_add(incomplete.malformed);
+                    if drained.is_empty() && drained_malformed == 0 {
+                        // No credit and nothing staged to transfer: the
+                        // queue stays unobserved past the allowance.
+                        break;
                     }
-                    Ok(incomplete) => return Err(Self::generic_drain_error(incomplete.into())),
-                    Err(error) => return Err(error),
-                },
+                    records.extend(drained);
+                    malformed = malformed.saturating_add(drained_malformed);
+                }
+                // The budgeted pull only fails on a transport failure; its
+                // prefix is dropped with the route, never retained.
+                Err(error) => {
+                    let incomplete = error.downcast::<IncompleteTerminalDrain>()?;
+                    return Err(Self::generic_drain_error(incomplete.into()));
+                }
             }
         }
-        Ok((records, malformed, !observed_empty))
+        let fresh_blocked = !observed_empty;
+        self.frame_fresh_blocked = fresh_blocked;
+        Ok((records, malformed, fresh_blocked))
     }
 
     /// `drain_discovery_tick` (src/run.rs) aborts the run with `?` on this
@@ -18640,6 +18773,96 @@ impl Engine {
         self.pending_discovery_records
             .len()
             .saturating_add(self.terminal_batch.as_ref().map_or(0, TerminalBatch::len))
+    }
+
+    /// Userspace-owned discovery items outside the caller's batch locals:
+    /// the session FIFO plus Engine pending and terminal holdings. Every
+    /// fresh acquisition stops before exceeding the shared allowance minus
+    /// this. Staged malformed items hold credits like staged records until
+    /// a dequeue transfers them to their accounting boundary.
+    fn shared_discovery_held(&self, session: &dyn EngineSession) -> usize {
+        session
+            .staged_discovery_len()
+            .saturating_add(self.discovery_held_len())
+    }
+
+    /// Shared-allowance room for fresh acquisition beside `local` already
+    /// pulled batch-local items: the allowance minus staged, Engine-held
+    /// and local items. Malformed items pulled into the local batch count
+    /// like records until they are accounted.
+    fn shared_allowance_remaining(&self, session: &dyn EngineSession, local: usize) -> usize {
+        DISCOVERY_HELD_CAP
+            .saturating_sub(self.shared_discovery_held(session))
+            .saturating_sub(local)
+    }
+
+    /// One nested pull through the shared allowance: at most one work
+    /// quantum and never past `budget`, which the caller seeds from
+    /// `shared_allowance_remaining` and every nested pull consumes from.
+    /// An empty observation is genuine (the pull reached the queue end);
+    /// a quantum stop with allowance left is backlog; an allowance stop
+    /// is capacity-blocked. All three keep their exact prefix; none is
+    /// ever complete evidence.
+    fn nested_pull_capped(
+        session: &mut dyn EngineSession,
+        budget: &Cell<usize>,
+    ) -> Result<(Vec<DiscoveryRecord>, u64)> {
+        match Self::collect_discovery_records_budgeted(
+            session,
+            budget,
+            LIVE_DISCOVERY_DRAIN_QUANTUM,
+        ) {
+            Ok((records, malformed, true)) => Ok((records, malformed)),
+            Ok((records, malformed, false)) => {
+                // A full quantum with more pullable (budget or staged
+                // transfers left) is backlog; anything else stopped at
+                // the allowance with the queue not observed empty.
+                let pulled_full_quantum = records.len().saturating_add(malformed as usize)
+                    >= LIVE_DISCOVERY_DRAIN_QUANTUM;
+                if pulled_full_quantum && (budget.get() > 0 || session.staged_discovery_len() > 0) {
+                    Err(IncompleteTerminalDrain::backlog(records, malformed).into())
+                } else {
+                    Err(IncompleteTerminalDrain::capacity_blocked(records, malformed, 0).into())
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Whether retained discovery work waits between frames: pending or
+    /// staged records, a re-parked pressure rotation, or a frame collect
+    /// that stopped at the shared allowance. Schedules backlog service
+    /// instead of a full sleep.
+    pub(crate) fn discovery_backlog_pending(&self, staged_len: usize) -> bool {
+        self.frame_fresh_blocked
+            || self.pressure_rotation_pending
+            || !self.pending_discovery_records.is_empty()
+            || staged_len > 0
+    }
+
+    /// Takes the frame's fresh-blocked flag for the scheduler: a set flag
+    /// schedules backlog service instead of a full sleep, then clears.
+    pub(crate) fn take_frame_fresh_blocked(&mut self) -> bool {
+        std::mem::replace(&mut self.frame_fresh_blocked, false)
+    }
+
+    /// Records a terminal drain stopping at the shared allowance with
+    /// terminal work unfinished: 4,096 items are held and unsettled while
+    /// the queue was never observed empty. The count is sticky evidence
+    /// and the strict lossless verdict must fail on it; the drain returns
+    /// without settling deferrals and never claims complete.
+    fn note_terminal_capacity_backlog(&mut self) {
+        self.terminal_capacity_backlog = self.terminal_capacity_backlog.saturating_add(1);
+        self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+        self.mark_live_loss(
+            "terminal discovery drain",
+            "the terminal drain stopped at the shared discovery allowance with 4,096 items held unsettled and the queue never observed empty; terminal work is unfinished",
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_capacity_backlog_for_test(&self) -> u64 {
+        self.terminal_capacity_backlog
     }
 
     /// Records quiescence staging hitting the shared discovery allowance
@@ -18667,13 +18890,221 @@ impl Engine {
         self.discovery_held_high_water
     }
 
+    /// One between-frames backlog opportunity: at most one 256-item
+    /// ordinary dispatch quantum from the retained FIFO (pending first,
+    /// then staged transfers plus fresh room) or one selected
+    /// pressure-service transaction. A backlog pass never rearms or
+    /// claims an owned pause, never touches the frame clock or counter,
+    /// never reads aggregate maps or renders, and never runs an ordinary
+    /// whole-scope tick. It reuses the frame's 200 ms work budget and
+    /// checkpoints, scoped to the opportunity.
+    pub(crate) fn service_backlog_quantum(
+        &mut self,
+        session: &mut dyn EngineSession,
+    ) -> Result<BacklogOutcome> {
+        self.with_live_frame(|engine| engine.service_backlog_quantum_inner(session))
+    }
+
+    fn service_backlog_quantum_inner(
+        &mut self,
+        session: &mut dyn EngineSession,
+    ) -> Result<BacklogOutcome> {
+        let passes_before = self.pressure_service_passes;
+        let staged_before = session.staged_discovery_len();
+        let retained_before = self
+            .pending_discovery_records
+            .len()
+            .saturating_add(staged_before);
+        // The frame's fresh-blocked latch is one backlog opportunity, not
+        // a standing order: take it now so a later pending check reads
+        // the queues, and the pass below re-latches nothing. A pass that
+        // re-armed on every non-empty pull would zero-sleep against a
+        // sustained producer instead of returning to the readiness wait.
+        let fresh_was_blocked = self.take_frame_fresh_blocked();
+        // Retained FIFO first: pending records, then staged transfers
+        // plus fresh room. Nothing to do is a quiet outcome, not work.
+        if !fresh_was_blocked
+            && !self.pressure_rotation_pending
+            && self.pending_discovery_records.is_empty()
+            && staged_before == 0
+        {
+            return Ok(BacklogOutcome {
+                changed: false,
+                progressed: false,
+                pending: false,
+            });
+        }
+        let mut malformed = 0u64;
+        // Work charges accrue only at an item's first accounting boundary:
+        // a pending-take replay was charged by its original batch, so only
+        // a fresh pull (staged transfers plus new ring reads, neither
+        // charged before) charges here.
+        let mut fresh_records = 0usize;
+        let queued: Vec<QueuedDiscoveryRecord> = if self.pending_discovery_records.is_empty() {
+            // Staged transfers plus fresh room: staged pops move their
+            // permits without reserving, and only fresh ring reads
+            // consume the shared allowance. A latch-only pass pulls
+            // fresh room the frame could not reach; an empty pull is a
+            // quiet pass, not a re-latch.
+            let budget = Cell::new(self.shared_allowance_remaining(session, 0));
+            let (pulled, pulled_malformed, _) = Self::collect_discovery_records_budgeted(
+                session,
+                &budget,
+                LIVE_DISCOVERY_DRAIN_QUANTUM,
+            )
+            .map_err(Self::generic_drain_error)?;
+            malformed = pulled_malformed;
+            fresh_records = pulled.len();
+            pulled
+                .into_iter()
+                .map(|record| QueuedDiscoveryRecord {
+                    record,
+                    terminal_owner: None,
+                    terminal_exports: Vec::new(),
+                })
+                .collect()
+        } else {
+            let take = self
+                .pending_discovery_records
+                .len()
+                .min(LIVE_DISCOVERY_DRAIN_QUANTUM);
+            self.pending_discovery_records.drain(..take).collect()
+        };
+        self.charge_discovery_drain(fresh_records, malformed);
+        // A backlog pass is never pause-owned: nothing here was handed to
+        // a pause stop, and no stale pause-held set survives into it.
+        self.held_records = BTreeSet::new();
+        self.record_malformed_discovery(malformed);
+        let rest_len = self.pending_discovery_records.len();
+        let mut queued = match begin_discovery_batch(queued, self.update_counter_snapshot(session))
+        {
+            Ok(records) => records,
+            Err((error, records)) => {
+                // Counter authority failed: the quantum waits at the head
+                // of the queue, in order, for the next opportunity.
+                records
+                    .into_iter()
+                    .rev()
+                    .for_each(|record| self.pending_discovery_records.insert(0, record));
+                return Err(error);
+            }
+        };
+        let retained_pids: BTreeSet<_> = self.views.iter().map(ProcessView::pid).collect();
+        let mut deferred_exits = Vec::new();
+        if self.admits_generations() {
+            deferred_exits.extend(queued.extract_if(.., |queued| {
+                let record = &queued.record;
+                record.kind == DISCOVERY_KIND_LEADER_EXIT
+                    && !retained_pids.contains(&((record.pid_tgid >> 32) as u32))
+            }));
+        }
+        let nested_budget = Cell::new(self.shared_allowance_remaining(session, queued.len()));
+        let mut collect =
+            |session: &mut dyn EngineSession| Self::nested_pull_capped(session, &nested_budget);
+        let mut additions_allowed = true;
+        let mut closure = PauseClosure::new(malformed == 0);
+        let mut pending_views = PendingViewRetirements::new();
+        let leader_exit_assessments = self.pending_leader_exit_views.clone();
+        self.settle_leader_exit_assessments(
+            &leader_exit_assessments,
+            &mut pending_views,
+            &mut additions_allowed,
+            &mut closure,
+        );
+        let mut changed = self.process_discovery_records(
+            session,
+            &mut queued,
+            &mut pending_views,
+            &mut additions_allowed,
+            &mut collect,
+            &mut closure,
+        )?;
+        // Leftovers rejoin ahead of the unserviced rest (they were pulled
+        // earlier), except behind a held prefix the rotation restores
+        // below: the diverted stash stays adjacent to its parked prefix
+        // (episode atomicity, as in frames) with the rest after it.
+        let mut front_inserted = 0usize;
+        if self.pressure_service_passes != passes_before {
+            // One selected transaction per opportunity: the deferred tail
+            // waits for the next one instead of running a second pass.
+            queued.extend(deferred_exits);
+            if self.pressure_rotation_pending || self.frame_deferred {
+                self.pending_discovery_records.extend(queued);
+            } else {
+                front_inserted = queued.len();
+                queued
+                    .into_iter()
+                    .rev()
+                    .for_each(|record| self.pending_discovery_records.insert(0, record));
+            }
+        } else {
+            queued.extend(deferred_exits);
+            if !queued.is_empty() {
+                changed |= self.process_discovery_records(
+                    session,
+                    &mut queued,
+                    &mut pending_views,
+                    &mut additions_allowed,
+                    &mut collect,
+                    &mut closure,
+                )?;
+            }
+            front_inserted = queued.len();
+            queued
+                .into_iter()
+                .rev()
+                .for_each(|record| self.pending_discovery_records.insert(0, record));
+        }
+        // A re-park or a frame deferral appended behind the rest of the
+        // queue; restore FIFO order with the held prefix first.
+        if self.pressure_rotation_pending || self.frame_deferred {
+            let mut held = self
+                .pending_discovery_records
+                .split_off(rest_len.saturating_add(front_inserted));
+            held.extend(std::mem::take(&mut self.pending_discovery_records));
+            self.pending_discovery_records = held;
+        }
+        // Publish exactly like a frame batch: an accepted plan change
+        // resyncs consumers synchronously; a quiet pass only bumps the
+        // tail-skip counter. Retirement intents queued above persist in
+        // engine state for the next frame's ordinary tick — the pass
+        // yields instead of running it.
+        self.publish_batch_tail(changed)?;
+        // Forward movement only: fresh acquisition, retained shrinkage
+        // through dispatch, a selected attempt, or a state change. A take
+        // or pull shed back whole shrinks nothing and acquires nothing
+        // settled, so it correctly reports no progress.
+        let retained_after = self
+            .pending_discovery_records
+            .len()
+            .saturating_add(session.staged_discovery_len());
+        let progressed = changed
+            || self.pressure_service_passes != passes_before
+            || fresh_records != 0
+            || malformed != 0
+            || retained_after < retained_before;
+        Ok(BacklogOutcome {
+            changed,
+            progressed,
+            pending: self.discovery_backlog_pending(session.staged_discovery_len()),
+        })
+    }
+
     pub(crate) fn apply_discovery_batch(
         &mut self,
         session: &mut dyn EngineSession,
         records: Vec<DiscoveryRecord>,
         malformed: u64,
     ) -> Result<bool> {
-        let mut collect = Self::collect_discovery_records;
+        // Every nested pull in this batch shares one budget seeded from
+        // the shared allowance beside the batch-local records.
+        let nested_budget =
+            Cell::new(self.shared_allowance_remaining(
+                session,
+                records.len().saturating_add(malformed as usize),
+            ));
+        let mut collect =
+            |session: &mut dyn EngineSession| Self::nested_pull_capped(session, &nested_budget);
         self.apply_discovery_batch_with(
             session,
             records,
@@ -19071,7 +19502,12 @@ impl Engine {
             {
                 return Some(error);
             }
-            if let Err(error) = session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM) {
+            // Staged plus Engine-held never exceeds the shared allowance;
+            // whatever does not fit waits in the ring for the next staging
+            // call after the first batch (producer ring loss counts a real
+            // ring overflow meanwhile).
+            let held = self.discovery_held_len();
+            if let Err(error) = session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM, held) {
                 return Some(error);
             }
         }
@@ -19113,12 +19549,13 @@ impl Engine {
         let result = (|| {
             // Lifecycle producers have been live since the load, and the
             // static attach can take seconds: stage what they produced
-            // before the per-view phases add more (RB-2).
-            session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM)?;
+            // before the per-view phases add more (RB-2), within the
+            // shared allowance the Engine still holds nothing of.
+            let held = self.discovery_held_len();
+            session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM, held)?;
             let mut additions_allowed = true;
             let mut records = Vec::new();
             let mut pending_views = PendingViewRetirements::new();
-            let mut collect = Self::collect_discovery_records;
             let mut closure = PauseClosure::new(true);
             let mut fatal = None;
             let owned_generation = owned_child.map(OwnedChild::generation);
@@ -19166,8 +19603,11 @@ impl Engine {
                     &mut closure,
                 );
                 // Stage what the export attach let accumulate; the first
-                // batch applies it in ring order (RB-2).
-                session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM)?;
+                // batch applies it in ring order (RB-2). Anything past the
+                // shared allowance waits in the ring for the next staging
+                // call after that batch.
+                let held = self.discovery_held_len();
+                session.stage_discovery(LIVE_DISCOVERY_DRAIN_QUANTUM, held)?;
                 if owned_prearmed && let Some(generation) = owned_generation {
                     self.mark_owned_selection_pending(generation);
                 }
@@ -19177,6 +19617,11 @@ impl Engine {
                 crate::first_use_probe::DiscoveryStage::InitialExportsFinished,
                 &session,
             );
+            // The cleanup pass's nested pulls share one budget seeded
+            // from the shared allowance after all staging settled.
+            let nested_budget = Cell::new(self.shared_allowance_remaining(&session, records.len()));
+            let mut collect =
+                |session: &mut dyn EngineSession| Self::nested_pull_capped(session, &nested_budget);
             let cleanup = self.process_discovery_records(
                 &mut session,
                 &mut records,
@@ -19212,6 +19657,10 @@ pub(crate) mod session_fixture {
     pub(crate) struct ScriptedSession {
         pub(crate) capture_policy: Option<CapturePolicy>,
         pub(crate) dequeues: VecDeque<Result<Option<crate::events::DiscoveryItem>>>,
+        /// The staged FIFO, mirroring production: `stage_discovery` moves
+        /// scripted ring outcomes here, `discovery_dequeue` serves it
+        /// first, and staged items hold shared-allowance credits.
+        staged: VecDeque<crate::events::DiscoveryItem>,
         pub(crate) counters: CounterSnapshot,
         /// One entry per upcoming `counter_snapshot` call; `true` fails it.
         counter_script: RefCell<VecDeque<bool>>,
@@ -19421,12 +19870,45 @@ pub(crate) mod session_fixture {
         }
 
         fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>> {
+            if let Some(item) = self.staged.pop_front() {
+                return Ok(Some(item));
+            }
             self.dequeues.pop_front().unwrap_or(Ok(None))
         }
 
-        fn stage_discovery(&mut self, _: usize) -> Result<usize> {
+        fn stage_discovery(
+            &mut self,
+            quantum: usize,
+            engine_held: usize,
+        ) -> Result<crate::attach::DiscoveryStageOutcome> {
             self.stage_calls += 1;
-            Ok(0)
+            let shared_cap = crate::attach::DiscoveryStage::CAPACITY.saturating_sub(engine_held);
+            let mut staged = 0;
+            let mut capacity_blocked = false;
+            while staged < quantum && self.staged.len() < shared_cap {
+                match self.dequeues.pop_front() {
+                    Some(Ok(Some(item))) => {
+                        self.staged.push_back(item);
+                        staged += 1;
+                    }
+                    Some(outcome) => {
+                        self.dequeues.push_front(outcome);
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            if staged < quantum && self.staged.len() >= shared_cap {
+                capacity_blocked = true;
+            }
+            Ok(crate::attach::DiscoveryStageOutcome {
+                staged,
+                capacity_blocked,
+            })
+        }
+
+        fn staged_discovery_len(&self) -> usize {
+            self.staged.len()
         }
 
         fn counter_snapshot(&self) -> Result<CounterSnapshot> {
@@ -19715,6 +20197,18 @@ impl Engine {
 
     pub(crate) fn pending_discovery_records_for_test(&self) -> usize {
         self.pending_discovery_records.len()
+    }
+
+    /// A blank engine for cross-module tests that cannot name the private
+    /// constructor: pid scope on the test process, no views, no requests.
+    pub(crate) fn empty_for_test() -> Self {
+        Self::empty()
+    }
+
+    /// Charges the capture budget from cross-module tests: work charges
+    /// are observed exactly through the ceiling itself.
+    pub(crate) fn budget_charge_for_test(&mut self, units: u64) -> bool {
+        self.budget.charge(units)
     }
 
     /// `(owner, dispatch_started, retry_used)` of the private lifecycle journal.

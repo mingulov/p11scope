@@ -43,11 +43,15 @@ def launcher(spec_path):
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     save(spec["target_receipt"], {"pid": target.pid, "spawned": time.monotonic()})
     deadline = time.monotonic() + 10
-    while not Path(spec["ready"]).exists():
+    pid = None
+    while pid is None:
         assert target.poll() is None, "catalog workload exited before readiness"
         assert time.monotonic() < deadline, "catalog workload readiness watchdog"
-        time.sleep(0.01)
-    pid = int(Path(spec["ready"]).read_text().split()[1])
+        try:
+            pid = int(Path(spec["ready"]).read_text().split()[1])
+        except (OSError, IndexError, ValueError):
+            pid = None
+            time.sleep(0.01)
     assert pid == target.pid
     save(spec["target_receipt"], {"pid": pid, "ready": time.monotonic()})
     argv = [x.replace("TARGET_PID", str(pid)) for x in spec["observer"]]

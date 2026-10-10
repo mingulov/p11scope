@@ -565,6 +565,92 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         Ok((id, true))
     }
 
+    /// Commit one held exec handoff under its exact member permit (H6
+    /// slice 2): the moved original pin proves the same process, and the
+    /// borrowed permit proves current scope membership. Checks mirror
+    /// `commit_scoped_caller` — pid/generation match, permit check,
+    /// custody, finish — with no fallible tail after them. A live
+    /// candidate for this pid joins only when it already holds the
+    /// current incarnation; pid equality alone never adopts it.
+    /// Returns the successor and whether it was freshly minted.
+    pub(crate) fn commit_handoff_caller(
+        &mut self,
+        pid: u32,
+        pin: Source::Pin,
+        permit: crate::inspect_system::inventory_cgroup::CgroupAdmissionPermit<'_>,
+        now_ns: u64,
+    ) -> Result<(CallerId, bool), AdmitFailure> {
+        let failed = |reason: &str| AdmitFailure {
+            reason: reason.into(),
+            budget: None,
+        };
+        let current_start = self.source.start_time(pid);
+        let current_exe = self.source.exe_identity(pid);
+        if pid != permit.pid()
+            || permit.generation().start_time != current_start
+            || permit.generation().exe != current_exe
+            || !permit.check()
+            || !self.source.still_the_same(&pin)
+            || !permit.finish_check()
+        {
+            return Err(failed(
+                "cgroup transaction was interrupted or changed at handoff commit",
+            ));
+        }
+        if let Some(id) = self.live_by_pid.get(&pid).copied() {
+            let record = self
+                .record(id)
+                .ok_or_else(|| failed("retained cgroup caller disappeared"))?;
+            if record.retired || record.start_time != current_start || record.exe != current_exe {
+                return Err(failed(
+                    "the pid's live caller is not this handoff's current incarnation; \
+                     pid equality alone never adopts it",
+                ));
+            }
+            self.callers.get_mut(&id).unwrap().record.last_seen_ns = now_ns;
+            return Ok((id, false));
+        }
+        if self.callers.len() >= self.max_callers {
+            self.admit_refused = self.admit_refused.saturating_add(1);
+            let budget = BudgetRefusal {
+                resource: "callers",
+                limit: self.max_callers,
+                requested: self.callers.len().saturating_add(1),
+            };
+            return Err(AdmitFailure {
+                reason: "cgroup successor admission refused on the retained caller budget".into(),
+                budget: Some(budget),
+            });
+        }
+        let id = self
+            .mint()
+            .map_err(|_| failed("caller ID space exhausted"))?;
+        let incarnation = self.incarnations.get(&pid).copied().unwrap_or(0);
+        self.incarnations.insert(pid, incarnation.saturating_add(1));
+        self.callers.insert(
+            id,
+            TrackedCaller {
+                record: CallerRecord {
+                    id,
+                    pid,
+                    start_time: current_start,
+                    incarnation,
+                    exec_observed: current_exe.is_some(),
+                    exe: current_exe,
+                    authority: ImageAuthority::ScanPinned,
+                    lifecycle: CallerLifecycle::Mapped,
+                    lifecycle_reason: None,
+                    first_seen_ns: now_ns,
+                    last_seen_ns: now_ns,
+                    retired: false,
+                },
+                pin: Some(pin),
+            },
+        );
+        self.live_by_pid.insert(pid, id);
+        Ok((id, true))
+    }
+
     /// Reconcile's admission: the budget refusal carries its
     /// resource/limit/requested structurally; pin failures stay bare.
     fn try_admit(
@@ -622,6 +708,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
     /// `id`'s image ended while its pin held. It retires exec-retired with
     /// its evidence and the pid is admitted again as its successor. A
     /// retired or unknown `id` changes nothing.
+    #[cfg_attr(not(test), allow(dead_code))] // Reached only by tests today.
     pub(crate) fn exec_transition(
         &mut self,
         id: CallerId,

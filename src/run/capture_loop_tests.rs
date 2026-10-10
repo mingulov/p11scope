@@ -2380,6 +2380,7 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
         ended_ns: 2_000,
         passes: 1,
         usage_feed: true,
+        semantic_capture: crate::inventory_semantics::SemanticCaptureSummary::default(),
         native_witnesses: crate::discovery::native_binding::BindingCensus {
             rows: 0,
             bound: 0,

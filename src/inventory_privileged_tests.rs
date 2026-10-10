@@ -388,6 +388,7 @@ fn drive<L: CaptureLane<PidPin>>(
         display: None,
         semantic: None,
         semantic_staged: false,
+        identity: None,
     };
     let stop = Cell::new(false);
     let stop_now = || stop.get();
@@ -2441,6 +2442,7 @@ fn privileged_native_lane_sigint_during_extend_lp64() -> Result<()> {
         display: None,
         semantic: None,
         semantic_staged: false,
+        identity: None,
     };
     let stop = || flag.stopped();
     let clock = LoopClock {

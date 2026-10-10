@@ -4661,6 +4661,7 @@ fn native_semantic_stop_orders_gate_drain_finish_output() {
             false,
             &mut stdout,
             None,
+            None,
         );
         assert_eq!(outcome.exit_code(), 1, "{name} stdout fails the run");
         assert_eq!(outcome.event_log_confirmed(), Some(true));
@@ -4696,6 +4697,7 @@ fn native_semantic_stop_orders_gate_drain_finish_output() {
         true,
         false,
         &mut crate::inventory_output::WriterStdout(&mut document_bytes),
+        None,
         None,
     );
     assert_eq!(outcome.exit_code(), 1);
@@ -5247,6 +5249,7 @@ fn native_semantic_live_stream_retention_matches_snapshot() {
             true,
             &mut WriterStdout(&mut Vec::new()),
             None,
+            None,
         )
         .exit_code(),
         0
@@ -5312,6 +5315,7 @@ fn native_semantic_live_stream_retention_matches_snapshot() {
             false,
             true,
             &mut WriterStdout(&mut Vec::new()),
+            None,
             None,
         )
         .exit_code(),

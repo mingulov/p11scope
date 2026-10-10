@@ -252,9 +252,6 @@ pub(crate) struct LiveLane {
     gated: bool,
     finished: bool,
     stop_state: StopState,
-    q: Option<TerminalQuiescence>,
-    post_q_events: bool,
-    post_q_discovery: bool,
     final_drain: bool,
     ticks: u64,
     scan_refusals: u64,
@@ -344,9 +341,6 @@ impl AttestedSemanticLane {
                 gated: false,
                 finished: false,
                 stop_state: StopState::Running,
-                q: None,
-                post_q_events: false,
-                post_q_discovery: false,
                 final_drain: false,
                 ticks: 0,
                 scan_refusals: 0,
@@ -579,6 +573,62 @@ impl AttestedSemanticLane {
 /// poll bound) and records per quantum (one H0 collection quantum).
 pub(crate) const TERMINAL_DRAIN_QUANTA: usize = 16;
 pub(crate) const TERMINAL_DRAIN_QUANTUM: usize = 1024;
+
+/// Bound on terminal batches staged ahead of commit: one
+/// [`TERMINAL_DRAIN_QUANTA`] window each for the quiesce wait and the
+/// post-Q drain, plus the terminal Finish batch (always delivered last
+/// by [`run_semantic_stop`]).
+pub(crate) const TERMINAL_STAGED_BATCH_CAP: usize = 2 * TERMINAL_DRAIN_QUANTA + 1;
+
+/// Bounded terminal staging for the stop sequence. The quiesce wait is
+/// time-budgeted, not batch-budgeted, so a noisy producer can deliver
+/// an unbounded number of batches before Q; staging them all would
+/// hold an unbounded queue ahead of commit. `on_batch` feeds every
+/// drained batch here instead: beyond [`TERMINAL_STAGED_BATCH_CAP`]
+/// the oldest staged batch is shed (counted) so staging stays bounded
+/// while the terminal Finish batch — always delivered last — survives
+/// in delivery order. The caller discloses [`shed`](Self::shed)
+/// through the audited gap path.
+#[derive(Debug, Default)]
+pub(crate) struct TerminalBatchStage {
+    staged: std::collections::VecDeque<SemanticBatch>,
+    shed: usize,
+}
+
+impl TerminalBatchStage {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn push(&mut self, batch: SemanticBatch) {
+        if self.staged.len() >= TERMINAL_STAGED_BATCH_CAP {
+            self.staged.pop_front();
+            self.shed += 1;
+        }
+        self.staged.push_back(batch);
+    }
+
+    /// Batches currently staged, at most [`TERMINAL_STAGED_BATCH_CAP`].
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.staged.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.staged.is_empty()
+    }
+
+    /// Oldest batches shed beyond the cap: the caller discloses this
+    /// count through the audited gap path.
+    pub(crate) fn shed(&self) -> usize {
+        self.shed
+    }
+
+    pub(crate) fn into_batches(self) -> impl Iterator<Item = SemanticBatch> {
+        self.staged.into_iter()
+    }
+}
 
 /// One bounded cursor drain's outcome: records consumed (routed calls
 /// come back as batches through `on_batch`; the remainder counts as
@@ -937,10 +987,7 @@ impl AttestedSemanticLane {
                 waited: summary.waited,
             }
         };
-        live.q = summary.q;
         live.final_drain = summary.final_drain;
-        live.post_q_events = summary.post_q_events;
-        live.post_q_discovery = summary.post_q_discovery;
         live.unrouted_returns = live
             .unrouted_returns
             .saturating_add(summary.unrouted_returns);

@@ -1597,11 +1597,24 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         let Some(lane) = self.semantic.as_mut() else {
             return;
         };
-        let mut terminal = Vec::new();
+        let mut terminal = crate::inventory_semantics::TerminalBatchStage::new();
         lane.run_semantic_stop(&pins, std::time::Instant::now, |batch| {
             terminal.push(batch);
         });
-        for batch in terminal {
+        // The quiesce wait is time-budgeted, so staging is capped: shed
+        // oldest batches disclose through the audited gap path instead
+        // of queueing unboundedly ahead of commit.
+        let shed = terminal.shed();
+        if shed > 0 {
+            self.coordinator.note_scope_gap(
+                "semantic terminal drain truncated".into(),
+                format!(
+                    "shed {shed} oldest quiesce-wait batches beyond the {}-batch terminal stage",
+                    crate::inventory_semantics::TERMINAL_STAGED_BATCH_CAP
+                ),
+            );
+        }
+        for batch in terminal.into_batches() {
             self.coordinator.stage_semantic_batch(batch);
             let lane = match self.semantic.as_mut() {
                 Some(lane) => lane,

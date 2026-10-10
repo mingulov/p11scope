@@ -9165,6 +9165,8 @@ fn exec_refresh_attaches_provider_exports_before_readiness() {
 /// A consumed EXEC still publishes genuine overflow, but retiring its old
 /// loader must not forget the rescan owed to this retained provider owner.
 /// Owned views never use exploratory polling to recover missing loader hooks.
+/// Every queued request names a later record in the overflow batch, so the
+/// all-blocked head is genuinely unserviceable and the overflow stays visible.
 #[test]
 fn overflowing_retained_exec_refresh_rearms_after_queue_capacity_returns() {
     let (fixture, mut engine, mut session) = initial_export_route();
@@ -9197,7 +9199,13 @@ fn overflowing_retained_exec_refresh_rearms_after_queue_capacity_returns() {
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     assert_eq!(engine.discovery_truncated, 0);
 
-    apply_ordinary_batch(&mut engine, &mut session, vec![exec_record_for(pid)]).unwrap();
+    // The overflow batch names every queued request later, so no service pass
+    // is safe and the retained head is refused exactly once, as before.
+    let mut overflow_batch = vec![exec_record_for(pid)];
+    for offset in 0..MAX_PENDING_REFRESH as u32 {
+        overflow_batch.push(exec_record_for(4_000_000 + offset));
+    }
+    apply_ordinary_batch(&mut engine, &mut session, overflow_batch).unwrap();
 
     assert_eq!(
         engine.discovery_truncated, 1,
@@ -32148,5 +32156,923 @@ fn zero_or_failed_clock_keeps_refresh_order_and_requests() {
         scans
             .iter()
             .any(|(id, modules, _)| *id == view && !modules.is_empty())
+    );
+}
+
+/// H5 pressure mechanics: a fresh EXEC head parked at a full request map
+/// waits while an unprotected queued request is serviced, then dispatches
+/// into the freed slot with zero loss and exact FIFO order. The protected
+/// suffix keeps its original first-seen ages across the service pass (it is
+/// retained, not completed and re-added) and its renewal serials prove the
+/// head dispatched first and the suffix followed in ring order.
+#[test]
+fn pressure_parked_head_waits_for_unprotected_service() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    engine.frame_work_budget_ns = u64::MAX;
+    for offset in 0..255u32 {
+        assert!(
+            engine.request_refresh_consumed(4_000_000 + offset, Some(1_000 + u64::from(offset)))
+        );
+    }
+    assert!(engine.request_refresh_consumed(5_000_000, Some(2_000)));
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    let head_pid = 6_000_000u32;
+    let mut records: Vec<QueuedDiscoveryRecord> = std::iter::once(head_pid)
+        .chain((0..255u32).map(|offset| 4_000_000 + offset))
+        .map(refresh_exec)
+        .collect();
+    let mut session = ScriptedSession::with_records([], 0);
+    let mut collect = Engine::collect_discovery_records;
+    engine
+        .process_discovery_records(
+            &mut session,
+            &mut records,
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("pressure service keeps the batch alive");
+    assert!(
+        records.is_empty(),
+        "every parked record dispatched in order"
+    );
+    assert!(engine.pending_discovery_records.is_empty());
+    assert_eq!(
+        engine.discovery_truncated, 0,
+        "the parked head was serviced, not dropped"
+    );
+    assert!(
+        !engine.refresh_requested.contains_key(&5_000_000),
+        "the unprotected request was serviced"
+    );
+    let head = engine
+        .refresh_requested
+        .get(&head_pid)
+        .expect("the original head dispatched into the freed slot");
+    let mut previous = head.serial;
+    for offset in 0..255u32 {
+        let request = &engine.refresh_requested[&(4_000_000 + offset)];
+        assert_eq!(
+            request.first_seen_ns,
+            Some(1_000 + u64::from(offset)),
+            "protected suffix keeps its original age across service"
+        );
+        assert!(
+            request.serial > previous,
+            "suffix renewal serials follow the head in order"
+        );
+        previous = request.serial;
+    }
+    assert_eq!(engine.deep_scans, 0, "stale-only service scans nothing");
+    assert!(
+        session.attached_slots.is_empty(),
+        "stale-only service attaches nothing"
+    );
+}
+
+/// H5 all-blocked FIFO: every queued request names a later undispatched
+/// record, so no queued completion is safe; the original head is refused
+/// exactly once with explicit loss, and the suffix advances in order with
+/// original ages kept. A strict lossless verdict must fail on this batch,
+/// and a later tick still services the old requests.
+#[test]
+fn pressure_all_blocked_fifo_refuses_once_then_advances() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    engine.frame_work_budget_ns = u64::MAX;
+    for offset in 0..MAX_PENDING_REFRESH as u32 {
+        assert!(
+            engine.request_refresh_consumed(4_000_000 + offset, Some(1_000 + u64::from(offset)))
+        );
+    }
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    let head_pid = 6_000_000u32;
+    let mut records: Vec<QueuedDiscoveryRecord> = std::iter::once(head_pid)
+        .chain((0..MAX_PENDING_REFRESH as u32).map(|offset| 4_000_000 + offset))
+        .map(refresh_exec)
+        .collect();
+    let mut session = ScriptedSession::with_records([], 0);
+    let mut collect = Engine::collect_discovery_records;
+    engine
+        .process_discovery_records(
+            &mut session,
+            &mut records,
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("the all-blocked batch still advances");
+    assert!(
+        records.is_empty(),
+        "the suffix dispatched after the refusal"
+    );
+    assert_eq!(
+        engine.discovery_truncated, 1,
+        "the all-blocked head is refused exactly once"
+    );
+    assert!(
+        !engine.refresh_requested.contains_key(&head_pid),
+        "a refused head leaves no request behind"
+    );
+    assert_eq!(
+        engine.newcomer_ages.dropped_unknown, 1,
+        "the refused head keeps explicit dropped-age evidence"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live discovery refresh"
+                && skip.reason.contains("exceeded the bounded pending queue")),
+        "the refusal publishes explicit loss: {:?}",
+        engine.counters.object_skips
+    );
+    let mut previous = 0u64;
+    for offset in 0..MAX_PENDING_REFRESH as u32 {
+        let request = &engine.refresh_requested[&(4_000_000 + offset)];
+        assert_eq!(
+            request.first_seen_ns,
+            Some(1_000 + u64::from(offset)),
+            "suffix renewals keep their original ages"
+        );
+        assert!(
+            request.serial > previous,
+            "suffix renewal serials advance in exact order"
+        );
+        previous = request.serial;
+    }
+    assert_eq!(engine.deep_scans, 0, "the all-blocked case runs zero scans");
+    engine
+        .process_discovery_records(
+            &mut session,
+            &mut Vec::new(),
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("an empty follow-up pass is a no-op");
+    assert_eq!(
+        engine.discovery_truncated, 1,
+        "no further refusal without a new head"
+    );
+    refresh_inventory_once(&mut engine);
+    assert!(
+        engine.refresh_requested.is_empty(),
+        "a later tick still services the old requests"
+    );
+    assert_eq!(
+        engine.discovery_truncated, 1,
+        "later service never erases the historical loss"
+    );
+}
+
+/// H5 positive: a fresh EXEC head parked at a full request map waits while
+/// the service pass completes a live retained-provider refresh — a real
+/// rescan, loader rearm and provider publication — then dispatches into the
+/// freed slot with zero loss.
+#[test]
+fn pressure_services_unprotected_request_before_original_head() {
+    let mut fixture = RefreshFairnessFixture::new();
+    let retained = fixture.engine.views[0].id();
+    let retained_pid = fixture.engine.views[0].pid();
+    fixture.engine.frame_work_budget_ns = u64::MAX;
+    assert!(
+        fixture
+            .engine
+            .request_refresh_consumed(retained_pid, Some(1_000))
+    );
+    for offset in 0..255u32 {
+        assert!(
+            fixture
+                .engine
+                .request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+        );
+    }
+    assert_eq!(fixture.engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    let contexts_before = fixture.engine.loader_registry.ids_for_view(retained);
+    assert!(
+        contexts_before.is_empty(),
+        "initial discovery leaves arming to the ticks"
+    );
+    let scans_before = fixture.engine.deep_scans;
+    let head_pid = 6_000_000u32;
+    let mut dequeues = Vec::with_capacity(MAX_PENDING_REFRESH);
+    dequeues.push(exec_record_for(head_pid));
+    for offset in 0..255u32 {
+        dequeues.push(exec_record_for(4_000_000 + offset));
+    }
+    let mut session = ScriptedSession::with_records(dequeues, 0);
+    fixture
+        .engine
+        .drain_discovery_from(&mut session)
+        .expect("pressure service keeps the live frame alive");
+    let engine = &fixture.engine;
+    assert_eq!(
+        engine.discovery_truncated, 0,
+        "the parked head was serviced, not dropped"
+    );
+    assert_eq!(
+        engine.newcomer_ages.dropped_unknown, 0,
+        "no dropped age was recorded"
+    );
+    assert!(
+        engine.refresh_requested.is_empty(),
+        "service plus the ordinary tick drains every request"
+    );
+    assert!(
+        engine.deep_scans > scans_before,
+        "the service pass rescanned the live provider view"
+    );
+    assert!(
+        !session.attached_slots.is_empty(),
+        "the rescan republished the real provider"
+    );
+    let contexts_after = engine.loader_registry.ids_for_view(retained);
+    assert!(
+        !contexts_after.is_empty(),
+        "the service pass armed the serviced view"
+    );
+}
+
+/// H5 ordering, direct pass: a parked head waits while an unprotected stale
+/// request is serviced; the retained view's armed loader context, the
+/// pending terminal journal and every protected serial survive the service
+/// pass untouched, and the parked loader record still validates afterwards.
+#[test]
+fn pressure_ordering_direct_pass_keeps_loader_and_terminal_context() {
+    let (_fixture, mut engine, armed, loader_record, mut session) = armed_seed_route(1);
+    engine.frame_work_budget_ns = u64::MAX;
+    let pid = engine.views[0].pid();
+    // A pending terminal journal plus an incomplete batch holding a
+    // selection record under terminal authority. The owner is synthetic —
+    // the property under test is that the pass leaves pending terminal
+    // state alone, while the divert test covers genuine terminal interplay.
+    let journal_owner = LoaderContextId::from_case_id(250);
+    assert!(
+        engine.loader_registry.context(journal_owner).is_none(),
+        "the synthetic journal owner collides with nothing"
+    );
+    engine
+        .open_terminal_journal(journal_owner, Vec::new())
+        .unwrap();
+    let selection = successful_selection_record(pid, 9999, 0);
+    engine.retain_terminal_batch([selection], false, 0).unwrap();
+    assert!(engine.request_refresh_consumed(pid, Some(1_000)));
+    for offset in 0..254u32 {
+        assert!(
+            engine.request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+        );
+    }
+    assert!(engine.request_refresh_consumed(5_000_000, Some(3_000)));
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    // Only the retained pid is protected here (the parked loader names it);
+    // the fake requests are unprotected stale entries the service completes.
+    let real_before = engine.refresh_requested[&pid].clone();
+    // A drain would snapshot the session's loader-hit counter; the direct
+    // pass sets the same authority explicitly.
+    engine.counter_snapshot.loader_hits = 1;
+    let head_pid = 6_000_000u32;
+    let mut head = exec_record_for(head_pid);
+    head.hook_ts_ns = u64::MAX;
+    let mut records = vec![
+        QueuedDiscoveryRecord {
+            record: head,
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        },
+        QueuedDiscoveryRecord {
+            record: loader_record,
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        },
+    ];
+    let mut collect = Engine::collect_discovery_records;
+    engine
+        .process_discovery_records(
+            &mut session,
+            &mut records,
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("pressure service keeps the batch alive");
+    assert!(records.is_empty(), "the parked pair both dispatched");
+    assert_eq!(
+        engine.discovery_truncated, 0,
+        "the parked head was serviced, not dropped"
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&head_pid),
+        "the original head dispatched into the freed slot"
+    );
+    assert!(
+        !engine.refresh_requested.contains_key(&5_000_000),
+        "the unprotected request was serviced"
+    );
+    for offset in 0..254u32 {
+        assert!(
+            !engine.refresh_requested.contains_key(&(4_000_000 + offset)),
+            "unprotected stale requests are serviced, not retained"
+        );
+    }
+    assert_eq!(
+        engine.refresh_requested.get(&pid),
+        Some(&real_before),
+        "the protected live request keeps its serial and age across service"
+    );
+    assert_eq!(
+        engine.loader_records_accepted, 1,
+        "the parked loader record still validated against its live context"
+    );
+    assert!(
+        engine.loader_registry.context(armed).is_some(),
+        "the armed context survived the service pass"
+    );
+    assert!(
+        engine.terminal_journal.is_some(),
+        "the pending terminal journal survived the service pass"
+    );
+    let batch = engine
+        .terminal_batch_for_test()
+        .expect("the terminal batch survived the service pass");
+    assert!(!batch.complete(), "the terminal batch stays incomplete");
+    assert_eq!(
+        batch.record_count(),
+        1,
+        "the terminal batch keeps its record"
+    );
+}
+
+/// H5 divert: a service pass whose nested terminal drain pulls fresh session
+/// records stashes them behind the parked prefix instead of dispatching them
+/// first. The diverted loader keeps its terminal validation and still
+/// applies after the parked prefix; the head is serviced from the slot the
+/// pass frees elsewhere.
+#[test]
+fn pressure_service_diverts_nested_terminal_pulls_behind_parked() {
+    let (_fixture, mut engine, armed, _record, mut session) = armed_seed_route(1);
+    engine.frame_work_budget_ns = u64::MAX;
+    let pid = engine.views[0].pid();
+    assert!(engine.request_refresh_consumed(pid, Some(1_000)));
+    for offset in 0..254u32 {
+        assert!(
+            engine.request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+        );
+    }
+    assert!(engine.request_refresh_consumed(5_000_000, Some(3_000)));
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    let real_before = engine.refresh_requested[&pid].clone();
+    let terminal_loader = loader_record_for(armed, pid);
+    session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(
+        terminal_loader,
+    )))]
+    .into();
+    let head_pid = 6_000_000u32;
+    let mut records: Vec<QueuedDiscoveryRecord> = std::iter::once(head_pid)
+        .chain((0..254u32).map(|offset| 4_000_000 + offset))
+        .map(refresh_exec)
+        .collect();
+    let mut collect = Engine::collect_discovery_records;
+    engine
+        .process_discovery_records(
+            &mut session,
+            &mut records,
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("pressure service keeps the batch alive");
+    assert!(records.is_empty(), "the parked prefix both dispatched");
+    assert_eq!(
+        engine.discovery_truncated, 0,
+        "the parked head was serviced, not dropped"
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&head_pid),
+        "the original head dispatched into the freed slot"
+    );
+    assert!(
+        !engine.refresh_requested.contains_key(&5_000_000),
+        "the unprotected request was serviced"
+    );
+    assert_eq!(
+        engine.refresh_requested.get(&pid),
+        Some(&real_before),
+        "the blocked retirement keeps its serial and age"
+    );
+    assert_eq!(
+        engine.pending_discovery_records.len(),
+        1,
+        "the nested pull waits behind the parked prefix"
+    );
+    assert_eq!(
+        engine.pending_discovery_records[0].record.case_id,
+        terminal_loader.case_id
+    );
+    assert_eq!(
+        engine.pending_discovery_records[0].terminal_owner,
+        Some(armed),
+        "the diverted loader keeps its terminal validation"
+    );
+    assert!(
+        engine.terminal_journal.is_some(),
+        "the blocked terminal journal stays pending"
+    );
+    assert!(
+        engine.loader_registry.is_tombstoned(armed),
+        "the retiring context stays tombstoned, not removed"
+    );
+    engine
+        .drain_discovery_from(&mut session)
+        .expect("the next frame dispatches the diverted pull");
+    assert!(
+        engine.pending_discovery_records.is_empty(),
+        "the diverted pull dispatched after the parked prefix"
+    );
+    assert_eq!(
+        engine.loader_records_accepted, 1,
+        "the diverted terminal loader still applied"
+    );
+    assert!(
+        engine.terminal_journal.is_none(),
+        "the continued journal genuinely resolves"
+    );
+    assert!(
+        engine.terminal_batch_for_test().is_none(),
+        "the continued batch genuinely dispatches"
+    );
+    assert_eq!(
+        engine.discovery_truncated, 0,
+        "diverting never drops the pulled records"
+    );
+}
+
+/// H5 finiteness: one service pass per episode, no more; protected serials
+/// and ages survive; an all-blocked pair of fresh heads is refused honestly
+/// with zero service passes.
+#[test]
+fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    engine.frame_work_budget_ns = u64::MAX;
+    for offset in 0..255u32 {
+        assert!(
+            engine.request_refresh_consumed(4_000_000 + offset, Some(1_000 + u64::from(offset)))
+        );
+    }
+    assert!(engine.request_refresh_consumed(5_000_000, Some(2_000)));
+    assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    let ticks_before = engine.scheduler.under_cap_ticks_for_test();
+    let head_pid = 6_000_000u32;
+    let mut records: Vec<QueuedDiscoveryRecord> = std::iter::once(head_pid)
+        .chain((0..255u32).map(|offset| 4_000_000 + offset))
+        .map(refresh_exec)
+        .collect();
+    let mut session = ScriptedSession::with_records([], 0);
+    let mut collect = Engine::collect_discovery_records;
+    engine
+        .process_discovery_records(
+            &mut session,
+            &mut records,
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("pressure service keeps the batch alive");
+    assert_eq!(
+        engine.scheduler.under_cap_ticks_for_test() - ticks_before,
+        1,
+        "one head episode runs exactly one service pass"
+    );
+    assert_eq!(engine.discovery_truncated, 0);
+    assert!(engine.refresh_requested.contains_key(&head_pid));
+    for offset in 0..255u32 {
+        assert_eq!(
+            engine.refresh_requested[&(4_000_000 + offset)].first_seen_ns,
+            Some(1_000 + u64::from(offset)),
+            "protected suffix keeps its original age"
+        );
+    }
+    let (mut blocked, _dir) = engine_over_cgroup_naming(&[]);
+    blocked.frame_work_budget_ns = u64::MAX;
+    for offset in 0..MAX_PENDING_REFRESH as u32 {
+        assert!(
+            blocked.request_refresh_consumed(4_000_000 + offset, Some(1_000 + u64::from(offset)))
+        );
+    }
+    let ticks_before = blocked.scheduler.under_cap_ticks_for_test();
+    let mut records: Vec<QueuedDiscoveryRecord> = [6_000_000u32, 6_000_001u32]
+        .into_iter()
+        .chain((0..MAX_PENDING_REFRESH as u32).map(|offset| 4_000_000 + offset))
+        .map(refresh_exec)
+        .collect();
+    let mut session = ScriptedSession::with_records([], 0);
+    let mut collect = Engine::collect_discovery_records;
+    blocked
+        .process_discovery_records(
+            &mut session,
+            &mut records,
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("the all-blocked batch still advances");
+    assert_eq!(
+        blocked.scheduler.under_cap_ticks_for_test() - ticks_before,
+        0,
+        "all-blocked heads run zero service passes"
+    );
+    assert_eq!(
+        blocked.discovery_truncated, 2,
+        "each all-blocked head is refused exactly once"
+    );
+}
+
+/// H5 zero-quantum: a service pass that cannot attempt any scan defers
+/// every request with serials and ages intact and refuses the head once;
+/// a later pass with a working clock services it.
+#[test]
+fn pressure_zero_quantum_service_defers_and_refuses_once() {
+    let mut fixture = RefreshFairnessFixture::new();
+    let retained_pid = fixture.engine.views[0].pid();
+    fixture.engine.frame_work_budget_ns = u64::MAX;
+    fixture.engine.scheduler.set_tick_quantum_ns_for_test(0);
+    assert!(
+        fixture
+            .engine
+            .request_refresh_consumed(retained_pid, Some(1_000))
+    );
+    for offset in 0..255u32 {
+        assert!(
+            fixture
+                .engine
+                .request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+        );
+    }
+    assert_eq!(fixture.engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+    let real_before = fixture.engine.refresh_requested[&retained_pid].clone();
+    let scans_before = fixture.engine.deep_scans;
+    let ticks_before = fixture.engine.scheduler.under_cap_ticks_for_test();
+    let head_pid = 6_000_000u32;
+    let mut records: Vec<QueuedDiscoveryRecord> = std::iter::once(head_pid)
+        .chain((0..255u32).map(|offset| 4_000_000 + offset))
+        .map(refresh_exec)
+        .collect();
+    let mut session = ScriptedSession::with_records([], 0);
+    let mut collect = Engine::collect_discovery_records;
+    fixture
+        .engine
+        .process_discovery_records(
+            &mut session,
+            &mut records,
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("a deferred service pass keeps the batch alive");
+    assert_eq!(
+        fixture.engine.scheduler.under_cap_ticks_for_test() - ticks_before,
+        1,
+        "one head episode runs exactly one service pass"
+    );
+    assert_eq!(
+        fixture.engine.deep_scans, scans_before,
+        "a zero quantum attempts no scan"
+    );
+    assert_eq!(
+        fixture.engine.discovery_truncated, 1,
+        "the unserviceable head is refused exactly once"
+    );
+    assert!(
+        !fixture.engine.refresh_requested.contains_key(&head_pid),
+        "a refused head leaves no request behind"
+    );
+    assert_eq!(
+        fixture.engine.refresh_requested.get(&retained_pid),
+        Some(&real_before),
+        "the deferred live request keeps its serial and age"
+    );
+    fixture
+        .engine
+        .scheduler
+        .set_tick_quantum_ns_for_test(u64::MAX);
+    let mut dequeues = vec![exec_record_for(6_000_001u32)];
+    let mut session = ScriptedSession::with_records(std::mem::take(&mut dequeues), 0);
+    fixture
+        .engine
+        .drain_discovery_from(&mut session)
+        .expect("a later pass with a working clock services the head");
+    assert_eq!(
+        fixture.engine.discovery_truncated, 1,
+        "later service never erases the historical loss"
+    );
+    assert!(
+        fixture.engine.refresh_requested.is_empty(),
+        "the working-clock pass drains every request"
+    );
+}
+
+/// H5 guards: pause-owned batches, a tick's own leftover passes and spent
+/// frames never run a service pass. They keep bounded timing and honest
+/// refusal; a deferred prefix keeps its full service opportunity.
+#[test]
+fn pressure_guards_skip_service_for_pause_refresh_and_spent_frames() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    engine.frame_work_budget_ns = u64::MAX;
+    for offset in 0..MAX_PENDING_REFRESH as u32 {
+        assert!(
+            engine.request_refresh_consumed(4_000_000 + offset, Some(1_000 + u64::from(offset)))
+        );
+    }
+    engine.set_pause_owned_batch(true);
+    let ticks_before = engine.scheduler.under_cap_ticks_for_test();
+    let mut records: Vec<QueuedDiscoveryRecord> =
+        vec![refresh_exec(6_000_000u32), refresh_exec(4_000_000u32)];
+    let mut session = ScriptedSession::with_records([], 0);
+    let mut collect = Engine::collect_discovery_records;
+    engine
+        .process_discovery_records(
+            &mut session,
+            &mut records,
+            &mut PendingViewRetirements::new(),
+            &mut true,
+            &mut collect,
+            &mut PauseClosure::new(true),
+        )
+        .expect("a pause-owned batch keeps its bounded timing");
+    assert_eq!(
+        engine.scheduler.under_cap_ticks_for_test() - ticks_before,
+        0,
+        "pause-owned batches run no service pass"
+    );
+    assert_eq!(
+        engine.discovery_truncated, 1,
+        "a pause-owned head keeps honest immediate refusal"
+    );
+    engine.set_pause_owned_batch(false);
+
+    let (_fixture, mut tick_engine, _armed, _record, mut tick_session) = armed_seed_route(1);
+    tick_engine.frame_work_budget_ns = u64::MAX;
+    let tick_pid = tick_engine.views[0].pid();
+    assert!(tick_engine.request_refresh_consumed(tick_pid, Some(1_000)));
+    for offset in 0..255u32 {
+        assert!(
+            tick_engine
+                .request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+        );
+    }
+    let mut records = vec![refresh_exec(6_000_001u32)];
+    let ticks_before = tick_engine.scheduler.under_cap_ticks_for_test();
+    let mut closure = PauseClosure::new(true);
+    let mut tick_now = crate::attach::monotonic_ns;
+    let mut collect = Engine::collect_discovery_records;
+    tick_engine
+        .refresh_inventory(
+            &mut tick_session,
+            &mut true,
+            &mut records,
+            &mut PendingViewRetirements::new(),
+            &mut collect,
+            &mut closure,
+            &mut tick_now,
+        )
+        .expect("a tick dispatches its own leftovers");
+    assert_eq!(
+        tick_engine.scheduler.under_cap_ticks_for_test() - ticks_before,
+        1,
+        "a tick runs no nested service pass for its leftovers"
+    );
+    assert_eq!(
+        tick_engine.discovery_truncated, 1,
+        "a tick leftover keeps honest immediate refusal"
+    );
+    assert!(
+        !tick_engine.refresh_requested.contains_key(&6_000_001u32),
+        "a refused leftover leaves no request behind"
+    );
+
+    engine.frame_work_budget_ns = 0;
+    let ticks_before = engine.scheduler.under_cap_ticks_for_test();
+    let mut dequeues = vec![exec_record_for(6_000_002u32), exec_record_for(4_000_001u32)];
+    let mut session = ScriptedSession::with_records(std::mem::take(&mut dequeues), 0);
+    engine
+        .drain_discovery_from(&mut session)
+        .expect("a spent frame defers its records");
+    assert_eq!(
+        engine.scheduler.under_cap_ticks_for_test() - ticks_before,
+        0,
+        "a spent frame runs no tick at all"
+    );
+    assert_eq!(
+        engine.pending_discovery_records.len(),
+        2,
+        "a spent frame parks the whole prefix untouched"
+    );
+    assert_eq!(
+        engine.pending_discovery_records[0].record.pid_tgid >> 32,
+        6_000_002u32 as u64
+    );
+    assert_eq!(
+        engine.pending_discovery_records[1].record.pid_tgid >> 32,
+        4_000_001u32 as u64
+    );
+    assert_eq!(engine.discovery_truncated, 1, "deferral refuses nothing");
+    engine.frame_work_budget_ns = u64::MAX;
+    engine
+        .drain_discovery_from(&mut session)
+        .expect("the next frame dispatches the deferred prefix");
+    assert!(
+        engine.pending_discovery_records.is_empty(),
+        "the deferred prefix dispatched in order"
+    );
+    assert!(
+        engine.refresh_requested.is_empty(),
+        "the deferred prefix was serviced, not dropped"
+    );
+    assert_eq!(
+        engine.discovery_truncated, 1,
+        "deferral kept the full service opportunity"
+    );
+}
+
+/// H5 ordering vs the ordinary oracle: the same live batch — a fresh head,
+/// an armed loader record with its EXECs, an unrelated renewal and a pending
+/// terminal selection batch — dispatches identically whether the request map
+/// starts full (pressure service frees the slot) or one short of full (no
+/// pressure trips). Order within the batch is pinned by the shop test; here
+/// every accepted/rejected outcome, context id, rescan count and the terminal
+/// resolution must match.
+#[test]
+fn pressure_preserves_loader_exec_and_terminal_order() {
+    fn run_side(pressure: bool) -> (Engine, ScriptedSession) {
+        let (_fixture, mut engine, _armed, loader_record, mut session) = armed_seed_route(1);
+        engine.frame_work_budget_ns = u64::MAX;
+        let pid = engine.views[0].pid();
+        let journal_owner = LoaderContextId::from_case_id(250);
+        engine
+            .open_terminal_journal(journal_owner, Vec::new())
+            .unwrap();
+        engine
+            .retain_terminal_batch([successful_selection_record(pid, 9999, 0)], false, 0)
+            .unwrap();
+        assert!(engine.request_refresh_consumed(pid, Some(1_000)));
+        for offset in 0..254u32 {
+            assert!(
+                engine
+                    .request_refresh_consumed(4_000_000 + offset, Some(2_000 + u64::from(offset)))
+            );
+        }
+        if pressure {
+            assert!(engine.request_refresh_consumed(5_000_000, Some(3_000)));
+            assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
+        } else {
+            assert_eq!(
+                engine.refresh_requested.len(),
+                MAX_PENDING_REFRESH - 1,
+                "the oracle side never trips pressure"
+            );
+        }
+        // A drain would snapshot the session's loader-hit counter.
+        engine.counter_snapshot.loader_hits = 1;
+        let mut records = vec![
+            exec_record_for(6_000_000u32),
+            loader_record,
+            exec_record_for(pid),
+            exec_record_for(pid),
+            exec_record_for(4_000_000u32),
+        ];
+        for record in records.iter_mut().filter(|record| {
+            record.kind == DISCOVERY_KIND_EXEC && (record.pid_tgid >> 32) as u32 == 6_000_000u32
+        }) {
+            record.hook_ts_ns = u64::MAX;
+        }
+        apply_ordinary_batch(&mut engine, &mut session, records).unwrap();
+        (engine, session)
+    }
+    let (pressured, pressured_session) = run_side(true);
+    let (oracle, oracle_session) = run_side(false);
+    assert_eq!(
+        pressured.discovery_truncated, oracle.discovery_truncated,
+        "pressure and oracle agree on loss"
+    );
+    assert_eq!(
+        pressured.discovery_truncated, 0,
+        "the serviceable batch drops nothing on either side"
+    );
+    assert_eq!(
+        pressured.loader_records_accepted, oracle.loader_records_accepted,
+        "the parked loader is accepted on both sides"
+    );
+    assert_eq!(
+        pressured.loader_records_accepted, 1,
+        "the armed context validates the parked loader"
+    );
+    assert_eq!(
+        pressured.deep_scans, oracle.deep_scans,
+        "both sides rescan exactly once"
+    );
+    assert_eq!(
+        pressured.loader_arms(),
+        oracle.loader_arms(),
+        "both sides rearm exactly once"
+    );
+    assert_eq!(
+        pressured
+            .loader_registry
+            .ids_for_view(pressured.views[0].id()),
+        oracle.loader_registry.ids_for_view(oracle.views[0].id()),
+        "both sides retire and rearm the same context sequence"
+    );
+    // Both sides continue the synthetic journal, dispatch its selection
+    // record and then fail its registry removal identically; the journal
+    // stays pending with no batch on either side. Genuine terminal
+    // resolution is covered by the divert test's second act.
+    let pressured_journal = pressured
+        .terminal_journal
+        .expect("pressure leaves the synthetic journal pending");
+    let oracle_journal = oracle
+        .terminal_journal
+        .expect("the oracle leaves the synthetic journal pending");
+    assert_eq!(
+        (
+            pressured_journal.owner,
+            pressured_journal.dispatch_started,
+            pressured_journal.retry_used,
+        ),
+        (
+            oracle_journal.owner,
+            oracle_journal.dispatch_started,
+            oracle_journal.retry_used,
+        ),
+        "both sides resolve the terminal journal identically"
+    );
+    assert!(
+        pressured.terminal_batch_for_test().is_none() && oracle.terminal_batch_for_test().is_none(),
+        "the terminal batch dispatches on both sides"
+    );
+    // The synthetic journal blocks the live view's retirement on both sides,
+    // so both retain exactly the live request with identical renewal serials
+    // — which itself proves the EXECs dispatched in the same order — while
+    // every stale request drains.
+    for (engine, label) in [(&pressured, "pressure"), (&oracle, "oracle")] {
+        assert_eq!(
+            engine.refresh_requested.len(),
+            1,
+            "{label} retains exactly the live request"
+        );
+        assert!(
+            engine
+                .refresh_requested
+                .contains_key(&engine.views[0].pid()),
+            "{label} retains the live view's request"
+        );
+    }
+    // Both sides renew the live request twice after the head, in order; the
+    // absolute serials differ by the one extra request the pressure side
+    // seeds (the unprotected entry its service pass completes).
+    let pressured_live = &pressured.refresh_requested[&pressured.views[0].pid()];
+    let oracle_live = &oracle.refresh_requested[&oracle.views[0].pid()];
+    assert_eq!(
+        (pressured_live.serial, pressured_live.first_seen_ns),
+        (259, Some(1_000)),
+        "pressure renews the live request twice after the head"
+    );
+    assert_eq!(
+        (oracle_live.serial, oracle_live.first_seen_ns),
+        (258, Some(1_000)),
+        "the oracle renews the live request twice after the head"
+    );
+    assert_eq!(
+        pressured_session.attached_slots.len(),
+        oracle_session.attached_slots.len(),
+        "both sides publish the same provider attach"
+    );
+    // Each side builds its fixture in its own tempdir; normalize those
+    // paths so the comparison covers subjects and reasons, not temp names.
+    fn normalized(skips: &[Skipped]) -> Vec<(String, String)> {
+        skips
+            .iter()
+            .map(|skip| {
+                let subject = skip
+                    .subject
+                    .split('/')
+                    .next_back()
+                    .unwrap_or(&skip.subject)
+                    .to_string();
+                (subject, skip.reason.clone())
+            })
+            .collect()
+    }
+    assert_eq!(
+        normalized(&pressured.counters.object_skips),
+        normalized(&oracle.counters.object_skips),
+        "every rejection is identical on both sides"
     );
 }

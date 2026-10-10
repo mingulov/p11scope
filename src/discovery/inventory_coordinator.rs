@@ -6087,6 +6087,24 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// Heap-built cgroup-scope coordinator over `dir` (H6 slice 2
+    /// oracles): coverage begins here, like `cgroup_os_scene`.
+    fn boxed_cgroup_coordinator(
+        dir: &std::path::Path,
+        providers: Vec<PathBuf>,
+    ) -> Box<InventoryCoordinator<OsProcessSource>> {
+        let mut coordinator = InventoryCoordinator::new(
+            crate::scope::cgroup(dir).unwrap(),
+            HookRegistry::builtin(),
+            providers,
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        Box::new(coordinator)
+    }
+
     /// Heap-built PID-scope coordinator (H6 slice 2 oracles): see
     /// `NativeScene::boxed` for why multi-scene oracles box.
     fn boxed_os_coordinator(pid: u32) -> Box<InventoryCoordinator<OsProcessSource>> {
@@ -7892,6 +7910,13 @@ pub(crate) mod tests {
         );
     }
 
+    /// Heap-built retained-history scene (H6 slice 2 oracles): see
+    /// `NativeScene::boxed` for why multi-scene oracles box.
+    fn boxed_cgroup_retained_history_scene() -> (Box<NativeScene>, CallerId) {
+        let (native, caller) = cgroup_retained_history_scene();
+        (Box::new(native), caller)
+    }
+
     #[test]
     fn cgroup_reconcile_empty_scope_never_admits_outside_exec_successor() {
         let (mut native, caller) = cgroup_retained_history_scene();
@@ -7972,6 +7997,131 @@ pub(crate) mod tests {
         .unwrap();
         coordinator.begin_capture_coverage(CaptureScopeCoverage::Cgroup);
         (fixture, child, coordinator)
+    }
+
+    /// Heap-built OS scene (H6 slice 2 oracles): see
+    /// `NativeScene::boxed` for why multi-scene oracles box.
+    fn boxed_cgroup_os_scene() -> (
+        tempfile::TempDir,
+        crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild,
+        Box<InventoryCoordinator<crate::discovery::caller_registry::OsProcessSource>>,
+    ) {
+        let (fixture, child, coordinator) = cgroup_os_scene();
+        (fixture, child, Box::new(coordinator))
+    }
+
+    /// One witness read, both horizons, on an OS coordinator: the
+    /// scripted native proof channel (H6 slice 2 oracles).
+    fn stage_os_rows(
+        coordinator: &mut InventoryCoordinator<crate::discovery::caller_registry::OsProcessSource>,
+        identity: &mut OneTicket,
+        stamps: &Stamps,
+        domain: NativeDomainId,
+        rows: Vec<WitnessRow>,
+        now_ns: u64,
+    ) -> Vec<CallerEvent> {
+        let mut events = Vec::new();
+        for batch in [
+            stamps.read(domain, rows),
+            stamps.drain(domain),
+            stamps.read(domain, Vec::new()),
+        ] {
+            events.extend(
+                coordinator
+                    .stage_native(batch, &mut *identity, now_ns)
+                    .events,
+            );
+        }
+        events
+    }
+
+    /// Mint one held exec handoff on an OS coordinator through the
+    /// scripted native proof channel: a pre-admission row, then the
+    /// proving row that retires the caller and holds its custody (H6
+    /// slice 2 oracles). The handoff mechanics themselves are proven
+    /// with a real exec by the core recovery leg; these legs compose
+    /// the held handoff with scope-boundary transactions.
+    fn mint_os_handoff(
+        coordinator: &mut InventoryCoordinator<crate::discovery::caller_registry::OsProcessSource>,
+        caller: CallerId,
+        pid: u32,
+        leg: &str,
+    ) {
+        let domain = NativeDomainId::mint();
+        let mut identity = OneTicket { domain, ticket: 41 };
+        coordinator
+            .binder
+            .note_exec_coverage(ExecCoverage::scripted(domain, 0));
+        let seen = coordinator.adapter.record(caller).unwrap().first_seen_ns;
+        let stamps = Stamps::from(seen);
+        let object = AttachObjectId::scripted(0);
+        assert!(
+            stage_os_rows(
+                &mut *coordinator,
+                &mut identity,
+                &stamps,
+                domain,
+                vec![WitnessRow::scripted(
+                    domain,
+                    41,
+                    1,
+                    object,
+                    EndpointId(0),
+                    pid,
+                    seen + 100
+                )],
+                seen + 10,
+            )
+            .is_empty(),
+            "{leg}: the pre-admission row retires nothing"
+        );
+        let events = stage_os_rows(
+            &mut *coordinator,
+            &mut identity,
+            &stamps,
+            domain,
+            vec![WitnessRow::scripted(
+                domain,
+                41,
+                2,
+                object,
+                EndpointId(1),
+                pid,
+                seen + 200,
+            )],
+            seen + 10,
+        );
+        assert!(
+            matches!(
+                events.as_slice(),
+                [CallerEvent::Retired { id, .. }] if *id == caller
+            ),
+            "{leg}: the proving row retires the old image: {events:?}"
+        );
+        coordinator.commit_batch(false).unwrap();
+        assert!(
+            coordinator.pending_successors.contains_key(&caller),
+            "{leg}: the native proof holds its handoff"
+        );
+        assert_eq!(coordinator.adapter.live_id(pid), None, "{leg}");
+    }
+
+    /// One cgroup transaction end to end: collect, apply, commit, take
+    /// the completion (H6 slice 2 oracles).
+    fn cgroup_pass(
+        coordinator: &mut InventoryCoordinator<crate::discovery::caller_registry::OsProcessSource>,
+        state: CgroupWalkState,
+        limits: CgroupWalkLimits,
+        now_ns: u64,
+    ) -> CgroupCompletion {
+        let collection = coordinator
+            .cgroup_collector(state, limits, CollectionControl::new(None), None)
+            .unwrap()();
+        coordinator
+            .apply_cgroup_collection(collection, now_ns)
+            .unwrap();
+        coordinator.commit_batch(false).unwrap();
+        coordinator.take_cgroup_completion().unwrap()
     }
 
     pub(crate) fn cgroup_provider_scene() -> (
@@ -14747,6 +14897,1341 @@ pub(crate) mod tests {
             "one successor per ended caller: {again:?}"
         );
         assert_eq!(once.scene.coordinator.adapter.len(), 2);
+    }
+
+    /// H6 slice 2: outside exec cannot admit on reconcile/native paths; a
+    /// held handoff re-enters only through one fresh collection
+    /// transaction (fresh zero-origin end sample, exact member permit at
+    /// commit, no fallible tail). Rename/replace root, descendant move,
+    /// invalidate between prepare/end/commit, partial census, and stop all
+    /// preserve the boundary. Same-image re-entry keeps history; quiet
+    /// edges keep scope_membership_unproven.
+    #[test]
+    fn automatic_exec_cgroup_successor_requires_fresh_end_permit() {
+        use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+        use std::time::{Duration, Instant};
+
+        // Outside exec cannot admit: the scoped reconcile arm retires
+        // without minting or holding, and the native arm retires while
+        // holding the handoff for a later current-scope transaction.
+        {
+            let (mut native, caller) = cgroup_retained_history_scene();
+            native.scene.source.exec(7, 200, "/bin/outside");
+            let report = native.scene.coordinator.observe_empty_pass(
+                &mut UnavailableImageGuard,
+                &mut native.cookies,
+                "scoped collection has no positive member transaction",
+                2_000,
+            );
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert!(
+                matches!(
+                    report.events.as_slice(),
+                    [CallerEvent::Retired { id, .. }] if *id == caller
+                ),
+                "{:?}",
+                report.events
+            );
+            assert!(
+                native.scene.coordinator.pending_successors.is_empty(),
+                "scoped reconcile holds no handoff"
+            );
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), None);
+            assert_eq!(native.scene.coordinator.adapter.len(), 1);
+        }
+        {
+            let (mut native, caller) = cgroup_retained_history_scene();
+            let later = native.row(41, 2, 7, 200, 1);
+            let events = native.witness(vec![later]);
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [CallerEvent::Retired { id, .. }] if *id == caller
+                ),
+                "{events:?}"
+            );
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .pending_successors
+                    .contains_key(&caller),
+                "the native proof holds its handoff for re-entry"
+            );
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), None);
+            assert_eq!(native.scene.coordinator.adapter.len(), 1);
+        }
+
+        // Core recovery: a stale transaction (collected before the proof)
+        // cannot commit the held handoff; the fresh collection commits it
+        // under a new end sample and exact permit, and the successor
+        // serves useful new calls.
+        {
+            let build = tempfile::tempdir().unwrap();
+            let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let provider = gcc(
+                build.path(),
+                "scoped-provider.so",
+                &manifest.join("crates/discover/tests/fixture/version_matrix.c"),
+                &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+                &[],
+            );
+            gcc(
+                build.path(),
+                "scoped-driver",
+                &manifest.join("tests/fixtures/catalog-driver.c"),
+                &["-O2", "-Wall", "-Wextra", "-Werror"],
+                &["-ldl"],
+            );
+            let driver = build.path().join("scoped-driver");
+            let fixture = tempfile::tempdir().unwrap();
+            let ready = fixture.path().join("ready");
+            let child = OwnedStoppedChild::with_command(&format!(
+                "kill -STOP $$; exec {} --ready {} --call {}",
+                driver.display(),
+                ready.display(),
+                provider.display()
+            ));
+            let pid = child.id();
+            std::fs::write(fixture.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+            let mut coordinator = boxed_cgroup_coordinator(fixture.path(), vec![provider.clone()]);
+            let control = CollectionControl::new(None);
+            let collect = |coordinator: &mut InventoryCoordinator<OsProcessSource>,
+                           control: &CollectionControl| {
+                coordinator
+                    .cgroup_collector(
+                        CgroupWalkState::default(),
+                        CgroupWalkLimits::default(),
+                        control.clone(),
+                        None,
+                    )
+                    .unwrap()()
+            };
+            // Collection 1 (shell image): admit the old incarnation.
+            let collection = collect(&mut coordinator, &control);
+            coordinator
+                .apply_cgroup_collection(collection, 1_000)
+                .unwrap();
+            coordinator.commit_batch(false).unwrap();
+            let completion = coordinator.take_cgroup_completion().unwrap();
+            assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+            assert_eq!(completion.admitted, 1);
+            let old = coordinator.adapter.live_id(pid).unwrap();
+            // A transaction collected and applied before the proof: once
+            // the proof lands it carries the stale fence, so it cannot
+            // commit the handoff even though it walked a live member.
+            let stale = collect(&mut coordinator, &control);
+            coordinator.apply_cgroup_collection(stale, 2_000).unwrap();
+            assert_eq!(coordinator.adapter.live_id(pid), Some(old));
+            let shell_exe = OsProcessSource.exe_identity(pid);
+            // Exec into the provider driver; STOP deterministically after.
+            // SAFETY: these signals address only the retained owned child.
+            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGCONT) }, 0);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while OsProcessSource.exe_identity(pid) == shell_exe || !ready.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "owned child did not exec into the driver"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let mut status = 0;
+                // SAFETY: pid names only this retained owned child.
+                let waited = unsafe {
+                    libc::waitpid(
+                        pid as libc::pid_t,
+                        &mut status,
+                        libc::WUNTRACED | libc::WNOHANG,
+                    )
+                };
+                assert!(waited >= 0 && Instant::now() < deadline);
+                if waited == pid as libc::pid_t && libc::WIFSTOPPED(status) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // The proof lands while the stale transaction is applied:
+            // the old image ends, the handoff is held, and the stale
+            // transaction is fenced off from committing it.
+            let domain = NativeDomainId::mint();
+            let mut identity = OneTicket { domain, ticket: 41 };
+            coordinator
+                .binder
+                .note_exec_coverage(ExecCoverage::scripted(domain, 0));
+            let seen = coordinator.adapter.record(old).unwrap().first_seen_ns;
+            let stamps = Stamps::from(seen);
+            let mut stage = |coordinator: &mut InventoryCoordinator<OsProcessSource>,
+                             rows: Vec<WitnessRow>| {
+                let mut events = Vec::new();
+                for batch in [
+                    stamps.read(domain, rows),
+                    stamps.drain(domain),
+                    stamps.read(domain, Vec::new()),
+                ] {
+                    events.extend(
+                        coordinator
+                            .stage_native(batch, &mut identity, seen + 10)
+                            .events,
+                    );
+                }
+                events
+            };
+            let object = AttachObjectId::scripted(0);
+            let seen_at = |t: u64| seen + t;
+            assert!(
+                stage(
+                    &mut coordinator,
+                    vec![WitnessRow::scripted(
+                        domain,
+                        41,
+                        1,
+                        object,
+                        EndpointId(0),
+                        pid,
+                        seen_at(100)
+                    )]
+                )
+                .is_empty()
+            );
+            let events = stage(
+                &mut coordinator,
+                vec![WitnessRow::scripted(
+                    domain,
+                    41,
+                    2,
+                    object,
+                    EndpointId(1),
+                    pid,
+                    seen_at(200),
+                )],
+            );
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [CallerEvent::Retired { id, .. }] if *id == old
+                ),
+                "{events:?}"
+            );
+            coordinator.commit_batch(false).unwrap();
+            assert!(
+                coordinator.pending_successors.contains_key(&old),
+                "the stale transaction holds the handoff without committing"
+            );
+            assert_eq!(coordinator.adapter.live_id(pid), None);
+            let completion = coordinator.take_cgroup_completion().unwrap();
+            assert_ne!(
+                completion.outcome,
+                ScopedCollectionOutcome::Complete,
+                "the stale transaction proves nothing"
+            );
+            // The fresh collection commits the held handoff under its own
+            // end sample and exact member permit.
+            let fresh = collect(&mut coordinator, &control);
+            coordinator.apply_cgroup_collection(fresh, 3_000).unwrap();
+            coordinator.commit_batch(false).unwrap();
+            let completion = coordinator.take_cgroup_completion().unwrap();
+            assert_eq!(
+                completion.outcome,
+                ScopedCollectionOutcome::Complete,
+                "re-entry needs a new current-scope transaction"
+            );
+            assert!(
+                completion.events.iter().any(|event| matches!(
+                    event,
+                    CallerEvent::ExecRetired { old: ended, .. } if *ended == old
+                )),
+                "the handoff commits as a successor: {:?}",
+                completion.events
+            );
+            let successor = coordinator.adapter.live_id(pid).unwrap();
+            assert_ne!(successor, old);
+            let (_, pin) = coordinator.adapter.live_pin(pid).unwrap();
+            assert!(
+                OsProcessSource.still_the_same(pin),
+                "the successor rides original custody"
+            );
+            assert_eq!(coordinator.adapter.len(), 2);
+            // The successor serves useful new calls: attach its provider
+            // endpoints and re-project so the coverage note sees the
+            // attach; the quiet edge reads scope_membership_unproven
+            // until rows bind and count on it.
+            let endpoint = coordinator
+                .attach_set
+                .endpoints()
+                .next()
+                .map(|endpoint| (endpoint.id, endpoint.object))
+                .expect("the driver image admits provider endpoints");
+            coordinator.note_extend_receipt(&ExtendReceipt {
+                attached: vec![crate::attach::capture::AttachedEndpoint {
+                    id: endpoint.0,
+                    object: endpoint.1,
+                    at_ns: 4_000,
+                }],
+                custody: Some(ScopeCustody::CgroupHeld),
+                ..ExtendReceipt::default()
+            });
+            let refresh = collect(&mut coordinator, &control);
+            coordinator.apply_cgroup_collection(refresh, 4_000).unwrap();
+            coordinator.commit_batch(false).unwrap();
+            let edge = coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == successor)
+                .expect("the successor has an edge");
+            // The proving row named this pid before the successor
+            // admitted, so R-C51 honestly downgrades the successor's
+            // watch to use_before_admission (a proper unknown, never a
+            // false positive); truly quiet edges are pinned below.
+            assert_eq!(
+                coordinator.registry.coverage(edge),
+                UseCoverage::Unknown(UnknownReason::UseBeforeAdmission),
+                "pre-admission evidence downgrades the successor watch"
+            );
+            let restamps = Stamps::from(5_000);
+            let mut restage = |coordinator: &mut InventoryCoordinator<OsProcessSource>,
+                               rows: Vec<WitnessRow>| {
+                let mut events = Vec::new();
+                for batch in [
+                    restamps.read(domain, rows),
+                    restamps.drain(domain),
+                    restamps.read(domain, Vec::new()),
+                ] {
+                    events.extend(coordinator.stage_native(batch, &mut identity, 5_010).events);
+                }
+                events
+            };
+            // The first recovery row binds the successor (useful
+            // endpoints). Its pair stays count-dropped by the proving
+            // row's unbound decision — the pre-existing C7 dropped-pair
+            // rule, unchanged by this slice — so the edge reads
+            // witnessed, not counted.
+            assert!(
+                restage(
+                    &mut coordinator,
+                    vec![WitnessRow::scripted(
+                        domain, 41, 2, endpoint.1, endpoint.0, pid, 5_100
+                    )]
+                )
+                .is_empty()
+            );
+            coordinator.commit_batch(false).unwrap();
+            let edge = coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == successor)
+                .expect("the successor has an edge");
+            assert_eq!(
+                coordinator.registry.coverage(edge),
+                UseCoverage::Witnessed { first_ns: 5_100 },
+                "the successor serves useful endpoints"
+            );
+            assert_eq!(edge.entry_count, 0, "no count is invented on recovery");
+            let census = coordinator.binder.census();
+            assert_eq!(census.rows, 3, "pre-admission, proving, recovery");
+            // The pre-admission row re-resolves once the successor is
+            // live, but its pair stays count-dropped: the edge above
+            // still carries no count.
+            assert_eq!(census.bound, 2, "{census:?}");
+            assert_eq!(
+                census.unbound.get(&UnboundReason::ExecTransition),
+                Some(&1),
+                "only the proving row stays unbound: {census:?}"
+            );
+            // Later useful calls count on the successor: the rebound pair
+            // re-targets, so growth past the dropped first-sight base
+            // stages (F3-03) while the base itself is never re-attributed.
+            let mut growth =
+                WitnessRow::scripted(domain, 41, 2, endpoint.1, endpoint.0, pid, 5_200);
+            growth.entry_count = 2;
+            assert!(restage(&mut coordinator, vec![growth]).is_empty());
+            coordinator.commit_batch(false).unwrap();
+            let edge = coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == successor)
+                .expect("the successor has an edge");
+            assert_eq!(
+                coordinator.registry.coverage(edge),
+                UseCoverage::Counted {
+                    since_ns: 1_041,
+                    lossy: false
+                },
+                "useful new calls count on the successor"
+            );
+            assert_eq!(edge.entry_count, 1, "only growth past the base stages");
+            let census = coordinator.binder.census();
+            assert_eq!(census.rows, 4, "{census:?}");
+            assert_eq!(census.bound, 3, "{census:?}");
+            assert_eq!(
+                census.unbound.get(&UnboundReason::ExecTransition),
+                Some(&1),
+                "only the proving row stays unbound: {census:?}"
+            );
+            // The old history stays retained in the adapter lineage (the
+            // ExecRetired link), not as a fabricated counted edge: its
+            // only row never bound.
+            let record = coordinator.adapter.record(old).unwrap();
+            assert!(record.retired, "the old incarnation stays retired");
+            assert_eq!(record.pid, pid);
+            assert!(
+                coordinator.registry.edges().all(|edge| edge.caller != old),
+                "the old image keeps no counted edge"
+            );
+            // No second successor: replaying the proof changes nothing.
+            let mut events = Vec::new();
+            for batch in [
+                stamps.read(
+                    domain,
+                    vec![WitnessRow::scripted(
+                        domain,
+                        41,
+                        2,
+                        object,
+                        EndpointId(1),
+                        pid,
+                        seen_at(300),
+                    )],
+                ),
+                stamps.drain(domain),
+                stamps.read(domain, Vec::new()),
+            ] {
+                events.extend(
+                    coordinator
+                        .stage_native(batch, &mut identity, seen + 10)
+                        .events,
+                );
+            }
+            assert!(events.is_empty(), "{events:?}");
+            assert_eq!(coordinator.adapter.len(), 2);
+            let edge = coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == successor)
+                .expect("the successor has an edge");
+            assert_eq!(edge.entry_count, 1, "the replay stages no new growth");
+        }
+
+        // A collection issued by another root cannot apply: the fence
+        // and the retained root reject it before anything commits, and
+        // the held handoff waits for the original root.
+        {
+            let (mut native, caller) = boxed_cgroup_retained_history_scene();
+            let events = native.witness(vec![native.row(41, 2, 7, 200, 1)]);
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [CallerEvent::Retired { id, .. }] if *id == caller
+                ),
+                "{events:?}"
+            );
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .pending_successors
+                    .contains_key(&caller),
+                "the native proof holds its handoff"
+            );
+            let budget = native.scene.coordinator.attach_set.budget();
+            let edges = native.scene.coordinator.registry.edges().count();
+            let (other, _) = boxed_cgroup_retained_history_scene();
+            std::fs::write(other.scene._dir.path().join("cgroup.procs"), b"7\n").unwrap();
+            let collect = other
+                .scene
+                .coordinator
+                .cgroup_collector(
+                    CgroupWalkState::default(),
+                    CgroupWalkLimits::default(),
+                    CollectionControl::new(None),
+                    None,
+                )
+                .unwrap();
+            drop(other);
+            let foreign = collect();
+            let err = native
+                .scene
+                .coordinator
+                .apply_cgroup_collection(foreign, 3_000)
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("cgroup collection was not issued by this coordinator"),
+                "{err:?}"
+            );
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .pending_successors
+                    .contains_key(&caller),
+                "the refused collection holds the handoff for the original root"
+            );
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), None);
+            assert_eq!(native.scene.coordinator.adapter.len(), 1);
+            assert_eq!(
+                native.scene.coordinator.attach_set.budget(),
+                budget,
+                "the refused collection charges no budget"
+            );
+            assert_eq!(
+                native.scene.coordinator.registry.edges().count(),
+                edges,
+                "the refused collection stages no edge"
+            );
+        }
+
+        // Stop releases every held handoff exactly once: no successor
+        // commits, no retry is scheduled, and later collections start
+        // nothing.
+        {
+            let (mut native, caller) = boxed_cgroup_retained_history_scene();
+            let events = native.witness(vec![native.row(41, 2, 7, 200, 1)]);
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [CallerEvent::Retired { id, .. }] if *id == caller
+                ),
+                "{events:?}"
+            );
+            let collection = native
+                .scene
+                .coordinator
+                .cgroup_collector(
+                    CgroupWalkState::default(),
+                    CgroupWalkLimits::default(),
+                    CollectionControl::new(None),
+                    None,
+                )
+                .unwrap()();
+            native.scene.coordinator.stop();
+            assert!(
+                native.scene.coordinator.pending_successors.is_empty(),
+                "stop releases the held handoff"
+            );
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .any(|gap| gap.subject == "held exec handoffs released at stop"),
+                "the release is recorded once"
+            );
+            let err = native
+                .scene
+                .coordinator
+                .apply_cgroup_collection(collection, 3_000)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("the coordinator stopped"),
+                "{err:?}"
+            );
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), None);
+            assert_eq!(native.scene.coordinator.adapter.len(), 1);
+        }
+
+        // Cancelling a transaction commits nothing, but the held
+        // handoff survives for a fresher walk: cancel is not stop.
+        {
+            let (mut native, caller) = boxed_cgroup_retained_history_scene();
+            let events = native.witness(vec![native.row(41, 2, 7, 200, 1)]);
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [CallerEvent::Retired { id, .. }] if *id == caller
+                ),
+                "{events:?}"
+            );
+            let control = CollectionControl::new(None);
+            let collection = native
+                .scene
+                .coordinator
+                .cgroup_collector(
+                    CgroupWalkState::default(),
+                    CgroupWalkLimits::default(),
+                    control.clone(),
+                    None,
+                )
+                .unwrap()();
+            native
+                .scene
+                .coordinator
+                .apply_cgroup_collection(collection, 3_000)
+                .unwrap();
+            control.cancel();
+            native.scene.coordinator.commit_batch(false).unwrap();
+            let completion = native.scene.coordinator.take_cgroup_completion().unwrap();
+            assert_eq!(
+                completion.outcome,
+                ScopedCollectionOutcome::Cancelled(
+                    crate::scope::inventory_cgroup::CollectionStop::OperatorStop
+                )
+            );
+            assert_eq!(completion.admitted, 0);
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .pending_successors
+                    .contains_key(&caller),
+                "the cancelled transaction holds the handoff"
+            );
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), None);
+            assert_eq!(native.scene.coordinator.adapter.len(), 1);
+        }
+
+        // A truly quiet edge — attached and projected, never named by
+        // a row — reads scope_membership_unproven. The successor's
+        // use_before_admission above is that quiet state plus honest
+        // pre-admission evidence, never a false positive.
+        {
+            let (mut native, caller) = NativeScene::boxed();
+            native
+                .scene
+                .coordinator
+                .begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+            native.scene.attach_all(100, ScopeCustody::CgroupHeld);
+            native.scene.project(7, 120);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert_eq!(
+                native.scene.coverage(caller),
+                UseCoverage::Unknown(UnknownReason::ScopeMembershipUnproven)
+            );
+        }
+
+        // Renaming the root path changes nothing: the transaction walks
+        // the retained root handle, so the held handoff still commits
+        // under the original root.
+        {
+            let (fixture, child, mut coordinator) = boxed_cgroup_os_scene();
+            let pid = child.id();
+            let admitted = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                1_000,
+            );
+            assert_eq!(admitted.outcome, ScopedCollectionOutcome::Complete);
+            assert_eq!(admitted.admitted, 1);
+            let caller = coordinator.adapter.live_id(pid).unwrap();
+            mint_os_handoff(&mut coordinator, caller, pid, "rename");
+            let renamed = fixture.path().parent().unwrap().join("renamed-root");
+            std::fs::rename(fixture.path(), &renamed).unwrap();
+            let completion = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                2_000,
+            );
+            std::fs::rename(&renamed, fixture.path()).unwrap();
+            assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+            assert!(
+                completion.events.iter().any(|event| matches!(
+                    event,
+                    CallerEvent::ExecRetired { old, .. } if *old == caller
+                )),
+                "the handoff commits under the renamed root: {:?}",
+                completion.events
+            );
+            let successor = coordinator.adapter.live_id(pid).unwrap();
+            assert_ne!(successor, caller);
+            assert_eq!(coordinator.adapter.len(), 2);
+        }
+
+        // Replacing the root path cannot hijack the transaction: the
+        // walk follows the retained handle, so the impostor directory
+        // is never even opened and the handoff commits under the
+        // original root.
+        {
+            let (fixture, child, mut coordinator) = boxed_cgroup_os_scene();
+            let pid = child.id();
+            let admitted = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                1_000,
+            );
+            assert_eq!(admitted.admitted, 1);
+            let caller = coordinator.adapter.live_id(pid).unwrap();
+            mint_os_handoff(&mut coordinator, caller, pid, "replace");
+            let impostor = OwnedStoppedChild::new();
+            let impostor_pid = impostor.id();
+            let stash = fixture.path().parent().unwrap().join("original-root");
+            std::fs::rename(fixture.path(), &stash).unwrap();
+            std::fs::create_dir(fixture.path()).unwrap();
+            std::fs::write(
+                fixture.path().join("cgroup.procs"),
+                format!("{impostor_pid}\n"),
+            )
+            .unwrap();
+            let completion = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                2_000,
+            );
+            std::fs::remove_dir_all(fixture.path()).unwrap();
+            std::fs::rename(&stash, fixture.path()).unwrap();
+            assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+            assert!(
+                completion.events.iter().any(|event| matches!(
+                    event,
+                    CallerEvent::ExecRetired { old, .. } if *old == caller
+                )),
+                "the handoff commits under the original root: {:?}",
+                completion.events
+            );
+            assert_eq!(coordinator.adapter.live_id(impostor_pid), None);
+            assert_eq!(coordinator.adapter.len(), 2);
+        }
+
+        // A descendant replaced between collect and the final sample
+        // cannot reauthorize the retained generation: no permit, no
+        // commit, the handoff waits; restoring the leaf lets the next
+        // transaction commit it.
+        {
+            let (fixture, child, mut coordinator) = boxed_cgroup_os_scene();
+            let pid = child.id();
+            std::fs::write(fixture.path().join("cgroup.procs"), b"").unwrap();
+            let leaf = fixture.path().join("leaf");
+            std::fs::create_dir(&leaf).unwrap();
+            std::fs::write(leaf.join("cgroup.procs"), format!("{pid}\n")).unwrap();
+            let admitted = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                1_000,
+            );
+            assert_eq!(admitted.admitted, 1);
+            let caller = coordinator.adapter.live_id(pid).unwrap();
+            mint_os_handoff(&mut coordinator, caller, pid, "leaf");
+            let collection = coordinator
+                .cgroup_collector(
+                    CgroupWalkState::default(),
+                    CgroupWalkLimits::default(),
+                    CollectionControl::new(None),
+                    None,
+                )
+                .unwrap()();
+            coordinator
+                .apply_cgroup_collection(collection, 2_000)
+                .unwrap();
+            std::fs::rename(&leaf, fixture.path().join("old")).unwrap();
+            std::fs::create_dir(&leaf).unwrap();
+            std::fs::write(leaf.join("cgroup.procs"), format!("{pid}\n")).unwrap();
+            coordinator.commit_batch(false).unwrap();
+            let moved = coordinator.take_cgroup_completion().unwrap();
+            assert_ne!(moved.outcome, ScopedCollectionOutcome::Complete);
+            assert_eq!(moved.admitted, 0);
+            assert!(
+                coordinator.pending_successors.contains_key(&caller),
+                "the replaced leaf holds the handoff"
+            );
+            assert_eq!(coordinator.adapter.live_id(pid), None);
+            assert_eq!(coordinator.adapter.len(), 1);
+            std::fs::remove_dir_all(&leaf).unwrap();
+            std::fs::rename(fixture.path().join("old"), &leaf).unwrap();
+            let completion = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                3_000,
+            );
+            assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+            assert!(
+                completion.events.iter().any(|event| matches!(
+                    event,
+                    CallerEvent::ExecRetired { old, .. } if *old == caller
+                )),
+                "the restored leaf commits the handoff: {:?}",
+                completion.events
+            );
+            assert_eq!(coordinator.adapter.len(), 2);
+        }
+
+        // An exec proof landing between collect and apply invalidates
+        // the pending transaction: it commits nothing and the handoff
+        // waits for a fresh walk.
+        {
+            let (_fixture, child, mut coordinator) = boxed_cgroup_os_scene();
+            let pid = child.id();
+            let admitted = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                1_000,
+            );
+            assert_eq!(admitted.admitted, 1);
+            let caller = coordinator.adapter.live_id(pid).unwrap();
+            let collection = coordinator
+                .cgroup_collector(
+                    CgroupWalkState::default(),
+                    CgroupWalkLimits::default(),
+                    CollectionControl::new(None),
+                    None,
+                )
+                .unwrap()();
+            mint_os_handoff(&mut coordinator, caller, pid, "stale");
+            coordinator
+                .apply_cgroup_collection(collection, 2_000)
+                .unwrap();
+            coordinator.commit_batch(false).unwrap();
+            let stale = coordinator.take_cgroup_completion().unwrap();
+            assert_eq!(stale.admitted, 0);
+            assert_ne!(stale.outcome, ScopedCollectionOutcome::Complete);
+            assert!(
+                coordinator.pending_successors.contains_key(&caller),
+                "the invalidated transaction holds the handoff"
+            );
+            assert_eq!(coordinator.adapter.live_id(pid), None);
+            assert_eq!(coordinator.adapter.len(), 1);
+            let completion = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                3_000,
+            );
+            assert_eq!(completion.outcome, ScopedCollectionOutcome::Complete);
+            assert!(
+                completion.events.iter().any(|event| matches!(
+                    event,
+                    CallerEvent::ExecRetired { old, .. } if *old == caller
+                )),
+                "the fresh walk commits the handoff: {:?}",
+                completion.events
+            );
+            assert_eq!(coordinator.adapter.len(), 2);
+        }
+
+        // Partial passes never union into a commit for an unreached
+        // member: the handoff waits through every slice and commits
+        // once a pass reaches it with fresh samples.
+        {
+            let (fixture, child, mut coordinator) = boxed_cgroup_os_scene();
+            let pid = child.id();
+            let admitted = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                1_000,
+            );
+            assert_eq!(admitted.admitted, 1);
+            let caller = coordinator.adapter.live_id(pid).unwrap();
+            mint_os_handoff(&mut coordinator, caller, pid, "partial");
+            std::fs::write(
+                fixture.path().join("cgroup.procs"),
+                format!("4000000000\n4000000001\n4000000002\n{pid}\n"),
+            )
+            .unwrap();
+            let mut state = CgroupWalkState::default();
+            let mut committed = None;
+            for pass in 0..6 {
+                let limits = CgroupWalkLimits {
+                    members: 1,
+                    ..CgroupWalkLimits::default()
+                };
+                let completion = cgroup_pass(&mut coordinator, state, limits, 2_000 + pass);
+                assert_ne!(
+                    completion.outcome,
+                    ScopedCollectionOutcome::Complete,
+                    "partial passes never union into complete scope absence"
+                );
+                state = completion.state;
+                if pass == 0 {
+                    assert_eq!(coordinator.adapter.live_id(pid), None);
+                    assert!(
+                        coordinator.pending_successors.contains_key(&caller),
+                        "the first slice holds the handoff"
+                    );
+                }
+                if coordinator.adapter.live_id(pid).is_some() {
+                    committed = Some(completion.events);
+                    break;
+                }
+            }
+            let events = committed.expect("a later slice reaches the member");
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    CallerEvent::ExecRetired { old, .. } if *old == caller
+                )),
+                "the reaching slice commits the handoff: {events:?}"
+            );
+            assert_ne!(coordinator.adapter.live_id(pid).unwrap(), caller);
+            assert_eq!(coordinator.adapter.len(), 2);
+        }
+
+        // Same-image leave and re-entry keeps the original caller and
+        // its history without ever claiming continuous membership.
+        {
+            let (fixture, child, mut coordinator) = boxed_cgroup_os_scene();
+            let pid = child.id();
+            let first = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                1_000,
+            );
+            assert_eq!(first.outcome, ScopedCollectionOutcome::Complete);
+            assert_eq!(first.admitted, 1);
+            let caller = coordinator.adapter.live_id(pid).unwrap();
+            let before = coordinator.adapter.record(caller).unwrap().clone();
+            std::fs::write(fixture.path().join("cgroup.procs"), b"").unwrap();
+            let away = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                2_000,
+            );
+            assert_eq!(away.outcome, ScopedCollectionOutcome::Complete);
+            assert_eq!(away.admitted, 0);
+            assert_eq!(
+                away.scan_callers, 0,
+                "the leave pass validates no membership"
+            );
+            assert_eq!(coordinator.adapter.live_id(pid), Some(caller));
+            assert!(
+                !coordinator.adapter.record(caller).unwrap().retired,
+                "mere scope movement does not prove exit"
+            );
+            std::fs::write(fixture.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+            let back = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                3_000,
+            );
+            assert_eq!(back.outcome, ScopedCollectionOutcome::Complete);
+            assert_eq!(back.admitted, 0);
+            assert_eq!(back.scan_callers, 1);
+            assert_eq!(coordinator.adapter.live_id(pid), Some(caller));
+            let after = coordinator.adapter.record(caller).unwrap();
+            assert_eq!(after.first_seen_ns, before.first_seen_ns);
+            assert_eq!(after.exe, before.exe);
+            assert_eq!(after.start_time, before.start_time);
+            assert_eq!(after.incarnation, before.incarnation);
+            assert!(!after.retired);
+            assert_eq!(coordinator.adapter.len(), 1);
+        }
+    }
+
+    #[test]
+    fn automatic_exec_failed_exec_preserves_live_call() {
+        use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+
+        // A failed exec emits no lifecycle record: the producer hooks
+        // sched_process_exec, which fires only after the new image
+        // installs. At the coordinator the failure is covered absence
+        // — complete drains carrying no record, an unchanged image,
+        // continued same-image use — and the live call continues
+        // exactly: no successor, no cut, no rearm; the in-flight
+        // return still matches and following complete calls remain
+        // positive. Leader and nonleader attempts are indistinguishable
+        // here (rows and records key callers by tgid); the nonleader
+        // leg adds sibling exec activity to prove per-tgid isolation.
+
+        // Leader attempt, covered absence: the call entered before the
+        // attempt completes on the original caller, and following
+        // calls stay positive.
+        {
+            let (mut native, caller) = NativeScene::boxed();
+            native.answer(7, 500, 41);
+            assert!(
+                native
+                    .witness(vec![native.row(41, 1, 7, 100, 0)])
+                    .is_empty()
+            );
+            assert_eq!(
+                native.scene.coverage(caller),
+                UseCoverage::Counted {
+                    since_ns: 100,
+                    lossy: false
+                },
+                "the entered call binds and counts"
+            );
+            // The failed exec: a complete drain carrying no record for
+            // this tgid — covered absence, not missing data.
+            let receipt = native.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+                native.domain,
+                Vec::new(),
+                native.stamps.tick(),
+            )));
+            assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            // The in-flight return still matches the original caller.
+            native.counts_read(Vec::new(), vec![(41, 1, 0, 5)]);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            let edge = native
+                .scene
+                .coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == caller)
+                .expect("the live call keeps its edge");
+            assert_eq!(edge.entry_count, 5, "the return lands on the original");
+            assert_eq!(
+                native.scene.coverage(caller),
+                UseCoverage::Counted {
+                    since_ns: 100,
+                    lossy: false
+                }
+            );
+            // Following complete calls remain positive.
+            assert!(
+                native
+                    .witness(vec![native.row(41, 1, 7, 300, 0)])
+                    .is_empty()
+            );
+            native.counts_read(Vec::new(), vec![(41, 1, 0, 9)]);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            let edge = native
+                .scene
+                .coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == caller)
+                .expect("the live call keeps its edge");
+            assert_eq!(edge.entry_count, 9);
+            assert_eq!(edge.mapping, MappingState::Mapped, "no cut");
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(caller));
+            assert_eq!(native.scene.coordinator.adapter.len(), 1, "no successor");
+            assert!(
+                native.scene.coordinator.pending_successors.is_empty(),
+                "no rearm"
+            );
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .binder
+                    .take_transitions()
+                    .is_empty(),
+                "no ended-incarnation proof"
+            );
+        }
+
+        // Nonleader attempt with sibling exec activity: our tgid shows
+        // covered absence while a sibling really execs. Our live call
+        // continues untouched; only the sibling's old proof is refused.
+        {
+            let (mut native, caller) = NativeScene::boxed();
+            native.scene.source.spawn(8, 600);
+            let sibling = native
+                .scene
+                .coordinator
+                .adapter
+                .admit(8, ImageAuthority::ScanPinned, 150)
+                .unwrap();
+            native.answer(7, 500, 41);
+            native.answer(8, 600, 42);
+            assert!(
+                native
+                    .witness(vec![native.row(41, 1, 7, 100, 0)])
+                    .is_empty()
+            );
+            assert!(
+                native
+                    .witness(vec![native.row(42, 1, 8, 200, 0)])
+                    .is_empty()
+            );
+            // SAFETY: DiscoveryRecord contains only integer fields.
+            let mut exec_record: p11scope_ebpf_common::DiscoveryRecord =
+                unsafe { std::mem::zeroed() };
+            exec_record.hook_ts_ns = 250;
+            exec_record.pid_tgid = (u64::from(8u32) << 32) | u64::from(8u32);
+            exec_record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+            let receipt = native.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+                native.domain,
+                vec![exec_record],
+                native.stamps.tick(),
+            )));
+            assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            // Our in-flight return still matches; following calls stay
+            // positive, exactly as in the leader leg.
+            native.counts_read(Vec::new(), vec![(41, 1, 0, 5)]);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert!(
+                native
+                    .witness(vec![native.row(41, 1, 7, 300, 0)])
+                    .is_empty()
+            );
+            native.counts_read(Vec::new(), vec![(41, 1, 0, 9)]);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            let edge = native
+                .scene
+                .coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == caller)
+                .expect("the live call keeps its edge");
+            assert_eq!(edge.entry_count, 9);
+            assert_eq!(
+                native.scene.coverage(caller),
+                UseCoverage::Counted {
+                    since_ns: 100,
+                    lossy: false
+                }
+            );
+            // Control: the sibling's record landed — a new proof for
+            // the sibling is refused — while its established row
+            // attribution continues: a bare hint never evicts it.
+            {
+                use crate::discovery::native_binding::CallerLookup;
+                let coordinator = &native.scene.coordinator;
+                let lookup = &coordinator.adapter as &dyn CallerLookup<(u32, u64)>;
+                assert!(
+                    matches!(
+                        coordinator.binder.sight_current_binding(
+                            CurrentBindingRequest {
+                                caller: sibling,
+                                pid: 8,
+                                image: DomainCookie::scripted(native.domain, 42),
+                                exec_id: 1,
+                            },
+                            lookup,
+                            &mut native.cookies,
+                        ),
+                        Err(UnboundReason::ExecAfterAdmission)
+                    ),
+                    "the sibling record refuses new sibling proofs"
+                );
+            }
+            assert!(
+                native
+                    .witness(vec![native.row(42, 1, 8, 400, 0)])
+                    .is_empty()
+            );
+            let census = native.scene.coordinator.registry.witness_census();
+            assert_eq!(
+                census.bound, 4,
+                "established attribution continues: {census:?}"
+            );
+            assert!(
+                census.unbound.is_empty(),
+                "a hint alone unbinds nothing established: {census:?}"
+            );
+            assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(caller));
+            assert_eq!(native.scene.coordinator.adapter.live_id(8), Some(sibling));
+            assert_eq!(native.scene.coordinator.adapter.len(), 2, "no successor");
+            assert!(
+                native.scene.coordinator.pending_successors.is_empty(),
+                "no rearm"
+            );
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .binder
+                    .take_transitions()
+                    .is_empty(),
+                "a hint alone proves no ended incarnation"
+            );
+        }
+
+        // Real failed execve in both the leader and a nonleader thread:
+        // execve returns, the image never changes, no record exists.
+        // Against real custody the coordinator mints no phantom
+        // successor and cuts nothing.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("fail-exec.c"),
+                r#"#define _GNU_SOURCE
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
+#include <unistd.h>
+static void *try_exec(void *arg) {
+    (void)arg;
+    char *const argv[] = {"/x", NULL};
+    char *const envp[] = {NULL};
+    execve("/nonexistent-p11scope-failed-exec", argv, envp);
+    return (void *)(long)errno;
+}
+int main(void) {
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, try_exec, NULL) != 0) return 2;
+    void *thread_errno = 0;
+    pthread_join(tid, &thread_errno);
+    char *const argv[] = {"/x", NULL};
+    char *const envp[] = {NULL};
+    execve("/nonexistent-p11scope-failed-exec", argv, envp);
+    int main_errno = errno;
+    if (thread_errno == 0 || main_errno == 0) return 3;
+    kill(getpid(), SIGSTOP);
+    for (;;) pause();
+}
+"#,
+            )
+            .unwrap();
+            let bin = gcc(
+                dir.path(),
+                "fail-exec",
+                &dir.path().join("fail-exec.c"),
+                &["-O2", "-Wall", "-Wextra", "-Werror", "-pthread"],
+                &[],
+            );
+            let mut command = std::process::Command::new(&bin);
+            let child = OwnedStoppedChild::spawn_stopped(&mut command, |_| {});
+            let pid = child.id();
+            let fixture = tempfile::tempdir().unwrap();
+            std::fs::write(fixture.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+            let mut coordinator = boxed_cgroup_coordinator(fixture.path(), Vec::new());
+            let admitted = cgroup_pass(
+                &mut coordinator,
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                1_000,
+            );
+            assert_eq!(admitted.admitted, 1);
+            let caller = coordinator.adapter.live_id(pid).unwrap();
+            let before = coordinator.adapter.record(caller).unwrap().clone();
+            // Rows plus a covered-absence drain against real custody
+            // retire nothing.
+            let domain = NativeDomainId::mint();
+            let mut identity = OneTicket { domain, ticket: 41 };
+            coordinator
+                .binder
+                .note_exec_coverage(ExecCoverage::scripted(domain, 0));
+            let stamps = Stamps::from(before.first_seen_ns);
+            let object = AttachObjectId::scripted(0);
+            assert!(
+                stage_os_rows(
+                    &mut coordinator,
+                    &mut identity,
+                    &stamps,
+                    domain,
+                    vec![WitnessRow::scripted(
+                        domain,
+                        41,
+                        1,
+                        object,
+                        EndpointId(0),
+                        pid,
+                        before.first_seen_ns + 100
+                    )],
+                    before.first_seen_ns + 10,
+                )
+                .is_empty()
+            );
+            let receipt = coordinator.stage_native(
+                NativeBatch::Lifecycle(DiscoveryBatch::scripted(domain, Vec::new(), stamps.tick())),
+                &mut identity,
+                before.first_seen_ns + 20,
+            );
+            assert!(receipt.events.is_empty(), "{:?}", receipt.events);
+            coordinator.commit_batch(false).unwrap();
+            assert_eq!(coordinator.adapter.live_id(pid), Some(caller));
+            assert_eq!(coordinator.adapter.len(), 1, "no successor");
+            assert!(coordinator.pending_successors.is_empty(), "no rearm");
+            assert!(
+                coordinator.binder.take_transitions().is_empty(),
+                "no ended-incarnation proof"
+            );
+            let after = coordinator.adapter.record(caller).unwrap();
+            assert_eq!(after.start_time, before.start_time);
+            assert_eq!(after.exe, before.exe, "the failed exec changed no image");
+            assert!(!after.retired, "no cut");
+        }
+
+        // Successful twin: the same live call with real proof retires
+        // instead — old live operations end frozen, and a new instance
+        // recovers.
+        {
+            let (mut native, caller) = NativeScene::boxed();
+            native.answer(7, 500, 41);
+            assert!(
+                native
+                    .witness(vec![native.row(41, 1, 7, 100, 0)])
+                    .is_empty()
+            );
+            native.scene.source.exec(7, 200, "/bin/other");
+            let events = native.witness(vec![native.row(41, 2, 7, 1_600, 1)]);
+            let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+                panic!("real proof must recover: {events:?}");
+            };
+            assert_eq!(*old, caller);
+            let successor = *new;
+            let old_edge = native
+                .scene
+                .coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == caller)
+                .expect("the old edge stays retained");
+            assert_eq!(
+                old_edge.mapping,
+                MappingState::Ended,
+                "the cut ends old use"
+            );
+            assert_eq!(old_edge.entry_count, 1);
+            // A late return for the old image stages nowhere: neither
+            // the retired edge nor the successor moves.
+            native.counts_read(Vec::new(), vec![(41, 1, 0, 9)]);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            let old_edge = native
+                .scene
+                .coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == caller)
+                .expect("the old edge stays retained");
+            assert_eq!(old_edge.entry_count, 1, "retired operations stay frozen");
+            assert!(
+                native
+                    .scene
+                    .coordinator
+                    .registry
+                    .edges()
+                    .all(|edge| edge.caller != successor),
+                "old returns invent no successor edge"
+            );
+            // The new instance recovers: project its modules, then it
+            // binds, then counts growth.
+            native.scene.project(7, 1_700);
+            native.scene.coordinator.commit_batch(false).unwrap();
+            native.answer(7, 500, 41);
+            assert!(
+                native
+                    .witness(vec![native.row(41, 2, 7, 1_800, 0)])
+                    .is_empty()
+            );
+            assert_eq!(
+                native.scene.coverage(successor),
+                UseCoverage::Witnessed { first_ns: 1_800 },
+                "the successor serves useful endpoints"
+            );
+            let endpoint = native.scene.delta.endpoints[0];
+            let mut growth =
+                WitnessRow::scripted(native.domain, 41, 2, endpoint.object, endpoint.id, 7, 1_900);
+            growth.entry_count = 2;
+            assert!(native.witness(vec![growth]).is_empty());
+            let successor_edge = native
+                .scene
+                .coordinator
+                .registry
+                .edges()
+                .find(|edge| edge.caller == successor)
+                .expect("the successor has an edge");
+            assert_eq!(
+                successor_edge.entry_count, 1,
+                "growth past the dropped base stages"
+            );
+            assert_eq!(
+                native.scene.coverage(successor),
+                UseCoverage::Counted {
+                    since_ns: 1_071,
+                    lossy: false
+                },
+                "the new instance recovers counted use from the proving read"
+            );
+        }
     }
 
     #[test]

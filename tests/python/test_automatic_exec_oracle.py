@@ -27,6 +27,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 H6 = runpy.run_path(str(ROOT / "scripts/qualify-automatic-exec.py"))
@@ -209,8 +210,7 @@ def b_style_inputs():
 
 class ReaderReadinessTest(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(
-            prefix="h6-reader-", dir="/var/tmp/p11scope-ws-tmp")
+        self.temporary = tempfile.TemporaryDirectory(prefix="h6-reader-")
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name)
 
@@ -223,6 +223,9 @@ class ReaderReadinessTest(unittest.TestCase):
         self.addCleanup(reader.thread.join, 2)
         self.addCleanup(writer.close)
         return reader, writer
+
+    def test_reader_temporary_directory_uses_configured_temp_parent(self):
+        self.assertEqual(self.directory.parent, Path(tempfile.gettempdir()))
 
     def test_expect_line_waits_for_real_reader_delayed_ack(self):
         reader, writer = self.pipe_reader()
@@ -753,14 +756,30 @@ class GroupDeathObserverFinishTest(unittest.TestCase):
     def test_records_natural_exit_without_controller_signal(self):
         owned = self.observer()
         death_ns = time.monotonic_ns()
-        owned.popen.stdin.write("finish\n")
-        owned.popen.stdin.flush()
-        result = H6["finish_group_death_observer"](owned, death_ns, limit_seconds=1)
+        original_wait = owned.popen.wait
+
+        def finish_when_wait_begins(*args, **kwargs):
+            owned.popen.stdin.write("finish\n")
+            owned.popen.stdin.flush()
+            return original_wait(*args, **kwargs)
+
+        with mock.patch.object(owned.popen, "wait", side_effect=finish_when_wait_begins):
+            result = H6["finish_group_death_observer"](owned, death_ns, limit_seconds=1)
         self.assertEqual(result["rc"], 0)
         self.assertTrue(result["self_ended"])
         self.assertIsNone(result["controller_stop"])
         self.assertGreaterEqual(result["exited_ns"], death_ns)
         self.assertEqual(result["stopped_ns"], result["exited_ns"])
+
+    def test_refuses_exit_between_pre_kill_guard_and_death_proof(self):
+        owned = self.observer()
+        self.assertIsNone(owned.popen.poll())
+        owned.popen.stdin.write("finish\n")
+        owned.popen.stdin.flush()
+        self.assertEqual(owned.popen.wait(timeout=2), 0)
+        death_ns = time.monotonic_ns()
+        with self.assertRaisesRegex(H6["SetupError"], "exit ordering"):
+            H6["finish_group_death_observer"](owned, death_ns, limit_seconds=1)
 
     def test_clean_sigint_cleanup_cannot_qualify_as_natural_exit(self):
         owned = self.observer()

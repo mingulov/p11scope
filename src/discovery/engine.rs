@@ -19189,7 +19189,12 @@ impl Engine {
                     && !retained_pids.contains(&((record.pid_tgid >> 32) as u32))
             }));
         }
-        let nested_budget = Cell::new(self.shared_allowance_remaining(session, queued.len()));
+        // The deferred exits above stay owned beside the queue while the
+        // nested pulls run: they count against the budget they share.
+        let nested_budget = Cell::new(self.shared_allowance_remaining(
+            session,
+            queued.len().saturating_add(deferred_exits.len()),
+        ));
         let mut collect =
             |session: &mut dyn EngineSession| Self::nested_pull_capped(session, &nested_budget);
         let mut additions_allowed = true;
@@ -20439,3 +20444,100 @@ pub(crate) mod tests;
 #[cfg(test)]
 #[path = "publication_tests.rs"]
 pub(crate) mod publication_tests;
+
+#[cfg(test)]
+mod backlog_transfer_tests {
+    use super::session_fixture::ScriptedSession;
+    use super::*;
+
+    fn loader_record_for(context: LoaderContextId, pid: u32) -> DiscoveryRecord {
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_LOADER;
+        record.case_id = (context.get() - 1) as u8;
+        record.pid_tgid = u64::from(pid) << 32;
+        record
+    }
+
+    fn exec_record_for(pid: u32) -> DiscoveryRecord {
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_EXEC;
+        record.pid_tgid = u64::from(pid) << 32;
+        record.hook_ts_ns = u64::MAX;
+        record
+    }
+
+    fn leader_exit_record_for(pid: u32) -> DiscoveryRecord {
+        let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = DISCOVERY_KIND_LEADER_EXIT;
+        record.pid_tgid = u64::from(pid) << 32;
+        record
+    }
+
+    fn terminal_export() -> DynamicExportIdentity {
+        DynamicExportIdentity {
+            object: PinnedObjectId(7),
+            file_offset: 0x10,
+            cookie: 1,
+            abi: HookAbi::FunctionList,
+        }
+    }
+
+    fn queued(record: DiscoveryRecord) -> QueuedDiscoveryRecord {
+        QueuedDiscoveryRecord {
+            record,
+            terminal_owner: None,
+            terminal_exports: Vec::new(),
+        }
+    }
+
+    /// H5 transfer seam: deferred leader exits stay owned while the
+    /// backlog quantum's nested pulls run, so they count against the
+    /// nested budget. At full occupancy the retirement drain reads
+    /// nothing fresh past the shared allowance.
+    #[test]
+    fn deferred_exits_count_against_backlog_nested_pull_budget() {
+        const DEFERRED: usize = 8;
+        const SPARES: usize = 16;
+        let pid = std::process::id();
+        let (mut engine, owner) = Engine::retiring_loader_context(pid);
+        engine.scope = Scope::System;
+        // A full take: loader records for the retiring view plus
+        // deferred exits for unknown pids; the rest fills occupancy
+        // with filler that never names the retained pid.
+        for _ in 0..(LIVE_DISCOVERY_DRAIN_QUANTUM - DEFERRED) {
+            engine
+                .pending_discovery_records
+                .push(queued(loader_record_for(owner, pid)));
+        }
+        for index in 0..DEFERRED {
+            engine
+                .pending_discovery_records
+                .push(queued(leader_exit_record_for(7_000_000 + index as u32)));
+        }
+        for index in 0..(DISCOVERY_HELD_CAP - LIVE_DISCOVERY_DRAIN_QUANTUM) {
+            engine
+                .pending_discovery_records
+                .push(queued(exec_record_for(5_000_000 + index as u32)));
+        }
+        assert_eq!(engine.pending_discovery_records.len(), DISCOVERY_HELD_CAP);
+        let mut session = ScriptedSession::default();
+        session.detach_exports = vec![terminal_export()];
+        session.dequeues.extend((0..SPARES).map(|_| {
+            Ok(Some(crate::events::DiscoveryItem::Record(
+                loader_record_for(owner, pid),
+            )))
+        }));
+        engine
+            .service_backlog_quantum(&mut session)
+            .expect("the backlog quantum runs");
+        assert_eq!(
+            session.dequeues.len(),
+            SPARES,
+            "no fresh reads past the shared allowance"
+        );
+        assert!(
+            engine.discovery_held_len() + session.staged_discovery_len() <= DISCOVERY_HELD_CAP,
+            "retained holdings stay within the shared allowance"
+        );
+    }
+}

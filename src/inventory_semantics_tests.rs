@@ -7353,8 +7353,9 @@ fn automatic_exec_recovery_budget_failure_and_stop_are_finite() {
         assert!(conv.lane.take_recorded_gaps().is_empty());
     }
 
-    // Runtime wiring: the classic loop stops its host exactly once when
-    // the pass loop ends, before any retirement runs.
+    // Runtime wiring: with the stop already requested, the classic loop
+    // latches the host gate and runs zero passes — no new scan, attach,
+    // or successor work — stopping its host exactly once.
     {
         use crate::inventory_capture::{
             CollectJob, LaneHost, LoopClock, NativeLane, PassDriver, Publish,
@@ -7462,7 +7463,9 @@ fn automatic_exec_recovery_budget_failure_and_stop_are_finite() {
         }
         struct H6Driver {
             host: H6Host,
-            passes: usize,
+            collects: usize,
+            applies: usize,
+            commits: usize,
         }
         impl PassDriver<H6Pin> for H6Driver {
             type Host = H6Host;
@@ -7470,6 +7473,7 @@ fn automatic_exec_recovery_budget_failure_and_stop_are_finite() {
                 &mut self.host
             }
             fn collector(&mut self) -> CollectJob {
+                self.collects += 1;
                 CollectJob::Legacy(Box::new(|| {
                     Err(anyhow::anyhow!("no collection in the wiring probe"))
                 }))
@@ -7481,10 +7485,10 @@ fn automatic_exec_recovery_budget_failure_and_stop_are_finite() {
                 _now_ns: u64,
             ) -> anyhow::Result<crate::discovery::engine::inventory_coordinator::PassReport>
             {
-                self.passes += 1;
+                self.applies += 1;
                 Ok(
                     crate::discovery::engine::inventory_coordinator::PassReport {
-                        pass: self.passes as u64,
+                        pass: self.applies as u64,
                         scanned: 0,
                         maps_matched: 0,
                         native_callers: 0,
@@ -7497,6 +7501,7 @@ fn automatic_exec_recovery_budget_failure_and_stop_are_finite() {
                 )
             }
             fn commit(&mut self, _engine_changed: bool) -> anyhow::Result<()> {
+                self.commits += 1;
                 Ok(())
             }
         }
@@ -7506,7 +7511,9 @@ fn automatic_exec_recovery_budget_failure_and_stop_are_finite() {
                 stops: 0,
                 targets: H6Targets,
             },
-            passes: 0,
+            collects: 0,
+            applies: 0,
+            commits: 0,
         };
         let stop = || true;
         let clock = LoopClock {
@@ -7525,7 +7532,15 @@ fn automatic_exec_recovery_budget_failure_and_stop_are_finite() {
         );
         assert!(outcome.error.is_none());
         assert!(outcome.stopped.is_none());
-        assert_eq!(driver.passes, 1, "the probe runs its single pass");
-        assert_eq!(driver.host.stops, 1, "the loop stops its host exactly once");
+        assert_eq!(driver.collects, 0, "no new scan after a pre-requested stop");
+        assert_eq!(
+            driver.applies, 0,
+            "no apply, so no attach or successor work"
+        );
+        assert_eq!(driver.commits, 0, "no commit without a pass");
+        assert_eq!(
+            driver.host.stops, 1,
+            "the latch stops the host exactly once"
+        );
     }
 }

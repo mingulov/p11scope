@@ -45,8 +45,8 @@ use crate::discovery::scan::{
 };
 use crate::discovery::sweep_attribution::{
     AttributionLoss, IoResources, KnownKeyIndex, MatchedObject, ObjectChecks, OsConfirmIo,
-    PreparationKind, ProofPools, RefusedObject, ReservationOwner, SegmentPolicy,
-    SweepAttribution, SweptMember, is_caller_range, preparation_kind, retain_unchanged,
+    PreparationKind, ProofPools, RefusedObject, ReservationOwner, SegmentPolicy, SweepAttribution,
+    SweptMember, is_caller_range, preparation_kind, retain_unchanged,
 };
 use crate::discovery::sweep_attribution::{MemberProbe, OsMemberProbe, attribute_unselected};
 use crate::discovery::sweep_shards::{shard_count, shard_threads};
@@ -2884,8 +2884,7 @@ impl ProbeDir {
             // SAFETY: `geteuid` takes no arguments and always succeeds.
             let owned = stat.st_uid == unsafe { libc::geteuid() };
             // The mkdir mode honors umask; enforce 0700 exactly.
-            let mode =
-                unsafe { libc::fchmod(dirfd.as_raw_fd(), 0o700) } == 0;
+            let mode = unsafe { libc::fchmod(dirfd.as_raw_fd(), 0o700) } == 0;
             stat.st_mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32 && owned && mode
         };
         // SAFETY: `geteuid` takes no arguments and always succeeds.
@@ -3437,9 +3436,7 @@ struct SessionTakeout {
 /// peak. A failed census refuses: lazy init never opens handles it did
 /// not reserve.
 fn session_setup_admitted(headroom: Result<usize, String>) -> bool {
-    headroom.is_ok_and(|headroom| {
-        headroom >= crate::attach::identity_iter::SESSION_SETUP_PEAK_FDS
-    })
+    headroom.is_ok_and(|headroom| headroom >= crate::attach::identity_iter::SESSION_SETUP_PEAK_FDS)
 }
 
 /// Record a sticky session-setup failure (refused reservation or failed
@@ -3718,8 +3715,7 @@ where
     if !collection.cap_hit {
         return (None, None);
     }
-    let (mut index, selected, refused) =
-        sweep_proof_prefix(collection, bound, &bound.aggregate);
+    let (mut index, selected, refused) = sweep_proof_prefix(collection, bound, &bound.aggregate);
     progress!(
         "p11scope: attributing {} unselected processes by maps identity...",
         collection.sweep.len().saturating_sub(selected.len())
@@ -4275,9 +4271,13 @@ mod tests {
     #[test]
     fn d3d_session_setup_reservation_is_exact_at_the_peak() {
         use crate::attach::identity_iter::SESSION_SETUP_PEAK_FDS;
-        assert!(!super::session_setup_admitted(Ok(SESSION_SETUP_PEAK_FDS - 1)));
+        assert!(!super::session_setup_admitted(Ok(
+            SESSION_SETUP_PEAK_FDS - 1
+        )));
         assert!(!super::session_setup_admitted(Ok(0)));
-        assert!(!super::session_setup_admitted(Err("census failed".to_string())));
+        assert!(!super::session_setup_admitted(Err(
+            "census failed".to_string()
+        )));
         assert!(super::session_setup_admitted(Ok(SESSION_SETUP_PEAK_FDS)));
         assert!(super::session_setup_admitted(Ok(usize::MAX)));
     }
@@ -5194,11 +5194,7 @@ mod tests {
                 entry(0x3000_0000, b"r--p", 0x9999, "/usr/lib/libunknown.so"),
                 entry(0x3000_1000, b"r-xp", 0x9999, "/usr/lib/libunknown.so"),
             ];
-            collection.sweep = vec![
-                (30_001, unknown),
-                (30_002, Vec::new()),
-                (30_003, caller()),
-            ];
+            collection.sweep = vec![(30_001, unknown), (30_002, Vec::new()), (30_003, caller())];
             collection.sweep_unavailable = BTreeSet::from([30_003]);
             let bound = bind_collection(&mut collection);
             assert!(

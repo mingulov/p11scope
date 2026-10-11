@@ -43,6 +43,36 @@ pub(crate) struct CurrentPartitionReceipt {
     ids: Vec<InstanceId>,
 }
 impl CurrentPartitionReceipt {
+    /// Tests-only receipt: merge tests script receipt plumbing (order,
+    /// bounds) that only the synchronous accepted scan path mints.
+    /// Production construction stays move-only.
+    #[cfg(test)]
+    pub(crate) fn scripted(
+        domain: NativeDomainId,
+        image: ImageIdentity,
+        pin: Arc<PidPin>,
+        endpoint: Endpoint,
+        attachment_slot: u32,
+        watched: RetainedInventoryTarget,
+        epochs: CompleteEpochs,
+        fence: u64,
+        deadline: Instant,
+        ids: Vec<InstanceId>,
+    ) -> Self {
+        Self {
+            domain,
+            image,
+            pin,
+            endpoint,
+            attachment_slot,
+            watched,
+            epochs,
+            fence,
+            deadline,
+            ids,
+        }
+    }
+
     pub(crate) fn domain(&self) -> NativeDomainId {
         self.domain
     }
@@ -176,6 +206,26 @@ pub(crate) struct RoutedCall {
     token: Option<u64>,
 }
 impl RoutedCall {
+    /// Tests-only call: finalizer and terminal tests script Joined calls
+    /// with timeline tokens that only the audited router mints.
+    /// Production construction stays move-only.
+    #[cfg(test)]
+    pub(crate) fn scripted(
+        domain: NativeDomainId,
+        record: EventRecord,
+        route: Route,
+        endpoint: Option<Endpoint>,
+        token: Option<u64>,
+    ) -> Self {
+        Self {
+            domain,
+            record,
+            route,
+            endpoint,
+            token,
+        }
+    }
+
     pub(crate) fn token(&self) -> Option<u64> {
         self.token
     }
@@ -290,6 +340,40 @@ pub(crate) struct TickReport {
     pub(crate) scan_refusals: Vec<ImageQueryRefusal>,
 }
 impl TickReport {
+    /// Tests-only report: finalizer and terminal tests script batches
+    /// that only the audited collect→audit→route path mints. Production
+    /// construction stays move-only.
+    #[cfg(test)]
+    pub(crate) fn scripted(
+        outcomes: Vec<TickOutcome>,
+        current: Vec<CurrentPartitionReceipt>,
+    ) -> Self {
+        Self {
+            outcomes,
+            current,
+            ..Self::default()
+        }
+    }
+
+    /// Drain this report's current-partition receipts (refresh stashing).
+    pub(crate) fn take_current(&mut self) -> Vec<CurrentPartitionReceipt> {
+        std::mem::take(&mut self.current)
+    }
+
+    /// Merge lane-stashed refresh receipts behind this tick's own: fresh
+    /// receipts first, stashed appended, truncated to batch capacity so
+    /// the merged batch never refuses on bounds. Returns shed receipts.
+    pub(crate) fn merge_stashed_current(
+        &mut self,
+        stashed: Vec<CurrentPartitionReceipt>,
+    ) -> u64 {
+        self.current.extend(stashed);
+        let shed = self.current.len().saturating_sub(MAX_INSTANCES);
+        self.current.truncate(MAX_INSTANCES);
+        debug_assert!(self.current.len() <= MAX_INSTANCES);
+        shed as u64
+    }
+
     pub(crate) fn into_outcomes(self) -> Vec<TickOutcome> {
         self.outcomes
     }
@@ -2305,6 +2389,92 @@ mod tests {
     }
     fn capture(io: &ScriptIo) -> SemanticCapture {
         SemanticCapture::in_domain(io.domain, TickLimits::default()).unwrap()
+    }
+    fn stash_watched() -> RetainedInventoryTarget {
+        let pins = crate::discovery::identity::test_fixture::real_scan_pin(
+            &std::env::current_exe().unwrap(),
+            None,
+            1,
+            "held-test-image",
+        );
+        pins.retain_inventory_target(PinnedObjectId(0)).unwrap()
+    }
+    fn merge_receipt(
+        domain: NativeDomainId,
+        cookie: u64,
+        watched: &RetainedInventoryTarget,
+    ) -> CurrentPartitionReceipt {
+        CurrentPartitionReceipt::scripted(
+            domain,
+            ImageIdentity {
+                task_cookie: cookie,
+                exec_id: 1,
+            },
+            Arc::new(PidPin::test_proc_only(4321)),
+            Endpoint {
+                object: PinnedObjectId(0),
+                file_slot: 0,
+                offset: 0x1200,
+            },
+            0,
+            watched.share(),
+            CompleteEpochs {
+                local: 0,
+                global: 0,
+                fault: 0,
+                sticky: 0,
+                record_flags: 0,
+            },
+            0,
+            Instant::now() + Duration::from_secs(60),
+            Vec::new(),
+        )
+    }
+    #[test]
+    fn merge_stashed_current_appends_fresh_first() {
+        let domain = NativeDomainId::mint();
+        let watched = stash_watched();
+        let mut report = TickReport::scripted(
+            Vec::new(),
+            vec![
+                merge_receipt(domain, 1, &watched),
+                merge_receipt(domain, 2, &watched),
+            ],
+        );
+        let stashed = vec![
+            merge_receipt(domain, 3, &watched),
+            merge_receipt(domain, 4, &watched),
+        ];
+        assert_eq!(report.merge_stashed_current(stashed), 0);
+        let cookies: Vec<u64> = report
+            .current()
+            .iter()
+            .map(|receipt| receipt.image().task_cookie)
+            .collect();
+        assert_eq!(
+            cookies,
+            vec![1, 2, 3, 4],
+            "fresh receipts first, stashed appended"
+        );
+    }
+    #[test]
+    fn merge_stashed_current_truncates_to_batch_capacity() {
+        let domain = NativeDomainId::mint();
+        let watched = stash_watched();
+        let mut report = TickReport::scripted(
+            Vec::new(),
+            vec![merge_receipt(domain, 0, &watched)],
+        );
+        let stashed: Vec<_> = (1..=MAX_INSTANCES as u64)
+            .map(|cookie| merge_receipt(domain, cookie, &watched))
+            .collect();
+        assert_eq!(report.merge_stashed_current(stashed), 1);
+        assert_eq!(report.current().len(), MAX_INSTANCES);
+        assert_eq!(
+            report.current()[0].image().task_cookie,
+            0,
+            "the fresh receipt survives truncation"
+        );
     }
     fn prime(capture: &mut SemanticCapture, io: &mut ScriptIo) -> Route {
         io.call(1, 0);

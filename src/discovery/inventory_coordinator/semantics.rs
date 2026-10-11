@@ -4,7 +4,7 @@
 use super::*;
 use crate::discovery::caller_registry::OsProcessSource;
 use crate::discovery::caller_registry::instance_input::{
-    CallEvidence, CallStanding, ConversionRefusal, admit_call_from_evidence,
+    CallEvidence, CallStanding, ConversionRefusal, InstanceReason, admit_call_from_evidence,
     admit_registration_from_coverage, finalize_invalidation, tail_loss_from_negative,
 };
 use crate::discovery::instances::{MAX_INSTANCES, MAX_PENDING};
@@ -1080,18 +1080,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         && coverage.image() == evidence.image()
                         && coverage.instances().contains(&evidence.router())
                 });
-                let Some(coverage) = coverage else {
-                    return (Some(caller), Err(ConversionRefusal::Coverage));
+                // Joined is historical evidence: a call without same-batch
+                // current proof (cached, quiet provider) still adds
+                // history-only API returns under a disclosed reason, never
+                // current continuity and never a re-proof.
+                let standing = match coverage {
+                    Some(coverage) => CallStanding::Current(coverage),
+                    None => CallStanding::Historical(InstanceReason::SemanticLoss),
                 };
                 (
                     Some(caller),
-                    admit_call_from_evidence(
-                        evidence,
-                        binding,
-                        subset,
-                        CallStanding::Current(coverage),
-                        barrier,
-                    ),
+                    admit_call_from_evidence(evidence, binding, subset, standing, barrier),
                 )
             })
             .collect();
@@ -1205,6 +1204,348 @@ mod binding_window_tests {
             window_callers(&mut set, 2),
             vec![CallerId(2), CallerId(3)],
             "rotation continues where it left off: the full window stole no turn"
+        );
+    }
+}
+
+#[cfg(test)]
+mod finalizer_history_tests {
+    //! Receiptless Joined calls are historical evidence: the finalizer
+    //! admits them history-only instead of refusing coverage.
+    use super::*;
+    use crate::attach::capture::NativeDomainId;
+    use crate::attach::{BackendSelection, Scope};
+    use crate::discovery::caller_registry::instance_input::InstanceReason;
+    use crate::discovery::caller_registry::{
+        AdmissionState, ImageAuthority, ModuleInfo, OsProcessSource, RegistryLimits,
+    };
+    use crate::discovery::hooks::HookRegistry;
+    use crate::discovery::instances::{
+        CallFacts, EntryIp, EpochReading, InstanceId, InstanceRouter, MapRange, Route,
+        RouterLimits, StableObservation,
+    };
+    use crate::inventory_semantics::{AttestedSemanticLane, LaneCoverage, SemanticBatch};
+    use crate::semantic_capture::{Endpoint, RoutedCall, TickOutcome, TickReport};
+    use p11scope_ebpf_common::instance::STAMP_VALID;
+    use p11scope_ebpf_common::{Event, EventRecord, InstanceContinuity, InstanceStamp, capture};
+    use p11scope_manifest::identity::{inspect_file, mapping_file_key, open_object};
+    use p11scope_manifest::manifest::*;
+
+    struct HistoryFixture {
+        dir: tempfile::TempDir,
+        manifest: Manifest,
+        pins: PinnedObjects,
+        offsets: [u64; 2],
+    }
+
+    impl HistoryFixture {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("provider.so");
+            std::fs::copy("/bin/true", &path).unwrap();
+            let file = open_object(&path).unwrap();
+            let inspected = inspect_file(&file).unwrap();
+            let mapping = mapping_file_key(&file).unwrap();
+            let start = inspected
+                .executable_ranges
+                .iter()
+                .find(|(a, b)| b - a > 2)
+                .unwrap()
+                .0;
+            let offsets = [start, start + 1];
+            let functions =
+                match pkcs11_module::tables_for(pkcs11_module::Surface::LegacyFunctionList {
+                    version: cryptoki_sys::CK_VERSION {
+                        major: 2,
+                        minor: 40,
+                    },
+                }) {
+                    pkcs11_module::TableSet::Walk(spans) => spans
+                        .iter()
+                        .flat_map(|span| span.fields())
+                        .map(|field| {
+                            let resolution = match field.name {
+                                "C_SignInit" => Resolution::Resolved {
+                                    object: 0,
+                                    file_offset: offsets[0],
+                                },
+                                "C_Sign" => Resolution::Resolved {
+                                    object: 0,
+                                    file_offset: offsets[1],
+                                },
+                                _ => Resolution::NullPointer,
+                            };
+                            FunctionRecord {
+                                name: field.name.into(),
+                                resolution,
+                            }
+                        })
+                        .collect(),
+                    _ => panic!("2.40 is a full standard table"),
+                };
+            let path = path.to_str().unwrap().to_string();
+            let manifest = Manifest {
+                schema: SCHEMA.into(),
+                module_path: path.clone(),
+                objects: vec![ObjectRecord {
+                    id: 0,
+                    path: path.clone(),
+                    identity: inspected.identity.clone(),
+                }],
+                provenance_objects: vec![ProvenanceObject {
+                    path,
+                    device_major: mapping.device_major,
+                    device_minor: mapping.device_minor,
+                    inode: mapping.inode,
+                    identity: inspected.identity,
+                }],
+                interface_list: Acquisition::Absent,
+                surfaces: vec![SurfaceRecord {
+                    source: SurfaceSource::LegacyFunctionList,
+                    acquisition: Acquisition::Ok,
+                    version: Some(Version { major: 2, minor: 40 }),
+                    walk: WalkOutcome::Full,
+                    functions,
+                }],
+                vendor_interfaces: Vec::new(),
+                alias_groups: Vec::new(),
+                selection_evidence: Default::default(),
+            };
+            assert!(crate::manifest_input::validate_structure(&manifest).is_empty());
+            let pinning =
+                crate::discovery::identity::pin_manifest_objects_deferred(&manifest).unwrap();
+            assert!(pinning.stale.is_empty());
+            assert_eq!(pinning.pins.pinned().count(), 1);
+            Self {
+                dir,
+                manifest,
+                pins: pinning.pins,
+                offsets,
+            }
+        }
+
+        fn subset(&self) -> AttestedSubset {
+            let path = self.dir.path().join("operator-input.json");
+            std::fs::write(&path, serde_json::to_vec(&self.manifest).unwrap()).unwrap();
+            let engine = engine_for_test(Vec::new(), Vec::new(), self.pins.clone());
+            let prepared = prepare_attested_subset(&engine, &[path]);
+            let subset = prepared.subset.expect("nonempty validated operator subset");
+            assert_eq!(subset.plan().slots.len(), 2);
+            subset
+        }
+    }
+
+    fn router_ids(domain: NativeDomainId, count: usize) -> Vec<InstanceId> {
+        let mut router = InstanceRouter::new(domain, RouterLimits::default());
+        let ranges = (0..count)
+            .map(|n| {
+                let base = 0x7000_0000 + n as u64 * 0x10000;
+                MapRange::new(base, base + 0x3000, 0, true)
+            })
+            .collect();
+        router.observe_legacy(StableObservation {
+            file_slot: 0,
+            reading: EpochReading {
+                cookie: 71,
+                local: 1,
+                global: 0,
+                fault: 0,
+                record_flags: 0,
+                sticky: 0,
+            },
+            ranges,
+            fence: 0,
+        });
+        (0..count)
+            .map(|n| {
+                let stamp = InstanceStamp {
+                    epoch: 1,
+                    file_slot_plus1: 1,
+                    flags: STAMP_VALID,
+                    ..InstanceStamp::default()
+                };
+                match router.route(CallFacts {
+                    token: n as u64 + 1,
+                    domain,
+                    image: ImageIdentity {
+                        task_cookie: 71,
+                        exec_id: 0,
+                    },
+                    entry: stamp,
+                    ret: stamp,
+                    ip: EntryIp::new(0x7000_0000 + n as u64 * 0x10000 + 0x1000),
+                    attached_offset: Some(0x1000),
+                }) {
+                    Route::Joined(id) => id,
+                    other => panic!("fixture must route a real instance: {other:?}"),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn receiptless_joined_call_admits_as_history() {
+        let pid = std::process::id();
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::Pid(pid),
+            HookRegistry::builtin(),
+            Vec::new(),
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let module = ModuleKey::physical(7, 7, 777, None, "/task3/provider.so");
+        coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: "/task3/provider.so".into(),
+                key: module.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("task3".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(1),
+                admission_reasons: Vec::new(),
+            },
+            60,
+        );
+        coordinator.commit_batch(false).unwrap();
+        let fixture = HistoryFixture::new();
+        let mut lane =
+            AttestedSemanticLane::start(fixture.subset(), &Scope::Pid(pid), BackendSelection::Auto)
+                .expect("shell lane starts");
+        let detailed = lane.domain();
+        let image = ImageIdentity {
+            task_cookie: 7,
+            exec_id: 1,
+        };
+        coordinator
+            .semantic_bindings_mut()
+            .insert(SemanticCallerBinding::scripted(
+                caller,
+                module.clone(),
+                detailed,
+                image,
+                Arc::new(PidPin::test_proc_only(pid)),
+            ))
+            .unwrap();
+        let init_slot = lane
+            .subset()
+            .plan()
+            .slots
+            .iter()
+            .find(|slot| slot.names.len() == 1 && slot.names[0] == "C_SignInit")
+            .unwrap()
+            .index;
+        let slot = lane
+            .subset()
+            .plan()
+            .slots
+            .iter()
+            .find(|slot| slot.index == init_slot)
+            .unwrap();
+        let endpoint = Endpoint {
+            object: slot.object,
+            file_slot: 0,
+            offset: slot.file_offset,
+        };
+        let r0 = router_ids(detailed, 1)[0];
+        // The instance registers through proven coverage first; the later
+        // call arrives Joined but receiptless (cached, quiet provider).
+        let coverage = LaneCoverage::scripted(detailed, image, endpoint, vec![r0]);
+        let input = {
+            let binding = coordinator.semantic_bindings().get(caller).unwrap();
+            admit_registration_from_coverage(&coverage, binding, r0, 100, None)
+                .expect("scripted coverage registers")
+        };
+        coordinator.registry_mut().note_instance(input);
+        coordinator.commit_batch(false).unwrap();
+        let stamp = InstanceStamp {
+            epoch: 1,
+            file_slot_plus1: 1,
+            flags: STAMP_VALID,
+            ..InstanceStamp::default()
+        };
+        let routed = RoutedCall::scripted(
+            detailed,
+            EventRecord {
+                event: Event {
+                    slot: init_slot,
+                    session: 7,
+                    mechanism: 0x000d,
+                    capture: capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL,
+                    rv: 0,
+                    ts_ns: 110,
+                    image,
+                    ..Default::default()
+                },
+                continuity: InstanceContinuity {
+                    entry_stamp: stamp,
+                    return_stamp: stamp,
+                    entry_ip: 0x2200,
+                },
+            },
+            Route::Joined(r0),
+            Some(endpoint),
+            Some(1),
+        );
+        let batch = SemanticBatch::from_tick_report(
+            detailed,
+            TickReport::scripted(vec![TickOutcome::Call(routed)], Vec::new()),
+            Vec::new(),
+            130,
+        )
+        .unwrap();
+        coordinator.stage_semantic_batch(batch);
+        coordinator
+            .commit_batch_with_semantics(false, Some(&mut lane))
+            .unwrap();
+        let gaps: Vec<(String, String)> = coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+            .collect();
+        assert!(
+            !gaps.contains(&("semantic input refused".into(), "coverage".into())),
+            "receiptless Joined is history, not a coverage refusal: {gaps:?}"
+        );
+        let rows: Vec<_> = coordinator
+            .registry()
+            .instance_semantic_edges()
+            .map(|row| {
+                (
+                    row.api_returns,
+                    row.historical_only_returns,
+                    row.lossy,
+                    row.semantics.as_ref().map(|s| s.started()).unwrap_or(0),
+                    row.semantics.as_ref().map(|s| s.completed()).unwrap_or(0),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(Some(1), 1, true, 0, 0)],
+            "the receiptless call counts history-only without starting a machine"
+        );
+        let reasons: Vec<InstanceReason> = coordinator
+            .registry()
+            .instance_semantic_edges()
+            .next()
+            .unwrap()
+            .reasons
+            .iter()
+            .copied()
+            .collect();
+        assert!(
+            reasons.contains(&InstanceReason::SemanticLoss),
+            "history-only admission discloses its reason: {reasons:?}"
         );
     }
 }

@@ -3872,6 +3872,22 @@ def wait_caller_admitted(jsonl_path, pid, exe, timeout=90):
         pause_until(deadline, 0.2)
 
 
+# Narrow R5 limits: the producer rotates at 1 MiB, bounds compact identity
+# context at 64 KiB, and caps edge/instance changed-row batches at 4096.
+# Allow a context plus 2 KiB of envelope and two batches in this small leg.
+# Larger unrelated rows/populations explicitly refuse this admission gate.
+R5_STREAM_BYTES = 1_048_576
+R5_LINE_BYTES = 65_536 + 2048
+R5_STREAM_RECORDS = 2 * 4096
+R5_READ_BYTES = 16_384
+
+
+def check_r5_work(deadline=None):
+    check_dispatch()
+    if deadline is not None:
+        remaining_until(deadline)
+
+
 class R5AdmissionCursor:
     """Held, append-only stream boundary derived before the owned outside exec."""
     def __init__(self, path, owner, original_executable):
@@ -3892,12 +3908,14 @@ class R5AdmissionCursor:
             self.saved_bytes = self.complete_bytes
             admitted, committed = None, None
             for record in records:
+                check_r5_work()
                 event = record["event"]
                 if record["kind"] == "caller_event" and event.get("event") == "admitted":
                     context = r5_admitted_subject(event)
                     if context.get("pid") == owner.pid:
                         caller = r5_caller_context(event, owner, image)
-                        admitted = {"caller": caller["id"], "incarnation": caller["incarnation"]}
+                        admitted = {"caller": caller["id"], "incarnation": caller["incarnation"],
+                                    "subject": caller}
                         committed = None
                 elif record["kind"] == "pass_committed" and admitted is not None:
                     committed = r5_pass_receipt(record)
@@ -3908,51 +3926,90 @@ class R5AdmissionCursor:
                 raise SetupError("R5 original caller lacks complete same-stream admission/pass")
             self.retired_caller = admitted["caller"]
             self.retired_incarnation = admitted["incarnation"]
+            self.retired_subject = admitted["subject"]
             self.original_image, self.completed_pass = image, committed
         except BaseException:
             self.close()
             raise
 
-    def read(self):
-        check_dispatch()
+    def verify_stream(self):
         held, current = os.fstat(self.fd), self.path.stat(follow_symlinks=False)
         if (held.st_dev, held.st_ino) != self.identity or (
                 current.st_dev, current.st_ino) != self.identity or not stat.S_ISREG(current.st_mode):
             raise SetupError("R5 admission stream rotated or was replaced")
-        data = os.pread(self.fd, held.st_size, 0)
-        if len(data) < self.observed_bytes or hashlib.sha256(
-                data[:self.observed_bytes]).digest() != self.observed_digest:
-            raise SetupError("R5 admission stream truncated or rewrote observed history")
-        # Only newline-terminated records have authority. Retain even an
-        # incomplete tail's bytes to require subsequent reads to append to it.
-        complete = not data or data.endswith(b"\n")
-        lines = data.split(b"\n")[:-1]
-        records, last_time = [], 0
-        for seq, line in enumerate(lines):
-            try:
-                record = json.loads(line)
-            except (ValueError, UnicodeError) as error:
-                raise SetupError("R5 admission stream has a malformed complete record") from error
-            if (not isinstance(record, dict) or record.get("schema") != "p11scope/inventory-events/v1"
-                    or type(record.get("seq")) is not int or record["seq"] != seq
-                    or type(record.get("at_ns")) is not int or record["at_ns"] < last_time
-                    or not isinstance(record.get("kind"), str) or not isinstance(record.get("event"), dict)):
-                raise SetupError("R5 admission stream has unknown schema or invalid sequence/envelope")
-            if (seq == 0 and record["kind"] != "started") or (seq and record["kind"] == "started"):
-                raise SetupError("R5 admission stream is not the original observer run")
-            if record["kind"] in ("rotated", "retention_evicted", "ended"):
-                raise SetupError("R5 admission stream rotated, evicted history or ended")
-            last_time = record["at_ns"]
-            records.append(record)
-        self.observed_bytes, self.observed_digest = len(data), hashlib.sha256(data).digest()
-        self.complete_bytes = data.rfind(b"\n") + 1
-        check_dispatch()
-        return records, complete
+        if held.st_size > R5_STREAM_BYTES:
+            raise SetupError(f"R5 stream byte budget exceeded ({R5_STREAM_BYTES})")
+        if held.st_size < self.observed_bytes:
+            raise SetupError("R5 admission stream truncated observed history")
+        return held.st_size
+
+    def read(self, deadline=None):
+        check_r5_work(deadline)
+        size = self.verify_stream()  # before any data allocation
+        parse_start = getattr(self, "saved_bytes", 0)
+        seq, last_time = getattr(self, "seq", -1) + 1, getattr(self, "at_ns", 0)
+        records, pending = [], bytearray()
+        digest, prefix_digest = hashlib.sha256(), hashlib.sha256()
+        offset, complete_bytes = 0, parse_start
+        while offset < size:
+            check_r5_work(deadline)
+            chunk = os.pread(self.fd, min(R5_READ_BYTES, size - offset), offset)
+            check_r5_work(deadline)
+            if not chunk:
+                raise SetupError("R5 admission stream truncated during read")
+            digest.update(chunk)
+            check_r5_work(deadline)
+            prefix_size = min(len(chunk), max(0, self.observed_bytes - offset))
+            prefix_digest.update(memoryview(chunk)[:prefix_size])
+            check_r5_work(deadline)
+            index = max(0, parse_start - offset)
+            while index < len(chunk):
+                check_r5_work(deadline)
+                if seq >= R5_STREAM_RECORDS:
+                    raise SetupError(f"R5 stream record budget exceeded ({R5_STREAM_RECORDS})")
+                newline = chunk.find(b"\n", index)
+                end = len(chunk) if newline < 0 else newline
+                if len(pending) + end - index + (newline >= 0) > R5_LINE_BYTES:
+                    raise SetupError(f"R5 stream line byte budget exceeded ({R5_LINE_BYTES})")
+                pending.extend(memoryview(chunk)[index:end])
+                if newline < 0:
+                    break
+                try:
+                    record = json.loads(pending)
+                except (ValueError, UnicodeError) as error:
+                    raise SetupError("R5 admission stream has a malformed complete record") from error
+                check_r5_work(deadline)
+                if (not isinstance(record, dict) or record.get("schema") != "p11scope/inventory-events/v1"
+                        or type(record.get("seq")) is not int or record["seq"] != seq
+                        or type(record.get("at_ns")) is not int or record["at_ns"] < last_time
+                        or not isinstance(record.get("kind"), str) or not isinstance(record.get("event"), dict)):
+                    raise SetupError("R5 admission stream has unknown schema or invalid sequence/envelope")
+                if (seq == 0 and record["kind"] != "started") or (seq and record["kind"] == "started"):
+                    raise SetupError("R5 admission stream is not the original observer run")
+                if record["kind"] in ("rotated", "retention_evicted", "ended"):
+                    raise SetupError("R5 admission stream rotated, evicted history or ended")
+                last_time = record["at_ns"]
+                records.append(record)
+                seq += 1
+                complete_bytes = offset + newline + 1
+                pending.clear()
+                index = newline + 1
+            offset += len(chunk)
+        if prefix_digest.digest() != self.observed_digest:
+            raise SetupError("R5 admission stream rewrote observed history")
+        self.verify_stream()  # rotation/oversize during the bounded read refuses
+        check_r5_work(deadline)
+        self.observed_bytes, self.observed_digest = size, digest.digest()
+        self.complete_bytes = complete_bytes
+        # Parse only the suffix after the saved complete cursor. Previously
+        # observed bytes, including partial tails, still receive append checks.
+        return records, not pending
 
     def receipt(self):
         return {"stream_identity": list(self.identity), "bytes": self.saved_bytes,
                 "seq": self.seq, "at_ns": self.at_ns,
                 "retired_caller": self.retired_caller, "retired_incarnation": self.retired_incarnation,
+                "retired_subject": self.retired_subject,
                 "original_image": self.original_image, "completed_pass": self.completed_pass}
 
     def close(self):
@@ -3961,26 +4018,26 @@ class R5AdmissionCursor:
             self.fd = None
 
 
-def r5_admitted_subject(event):
+def r5_admitted_subject(event, subject="caller"):
     context = event.get("identity_context")
     if not isinstance(context, dict) or type(context.get("version")) is not int or context["version"] != 1:
         raise SetupError("R5 caller lacks supported complete identity context")
-    caller = context.get("caller")
+    caller = context.get(subject)
     if not isinstance(caller, dict):
         raise SetupError("R5 caller identity context is unavailable")
     return caller
 
 
-def r5_caller_context(event, owner, image):
-    caller = r5_admitted_subject(event)
+def r5_caller_context(event, owner, image, *, subject="caller", lifecycle="mapped"):
+    caller = r5_admitted_subject(event, subject)
     executable = caller.get("executable")
-    if (not isinstance(event.get("caller"), str) or not re.fullmatch(r"c[0-9]+", event["caller"])
-            or caller.get("id") != event["caller"] or type(caller.get("pid")) is not int
+    if (not isinstance(event.get(subject), str) or not re.fullmatch(r"c[0-9]+", event[subject])
+            or caller.get("id") != event[subject] or type(caller.get("pid")) is not int
             or caller["pid"] != owner.pid or type(caller.get("start_time")) is not int
             or caller["start_time"] != owner.identity["start_time"]
             or type(caller.get("incarnation")) is not int or caller["incarnation"] < 0
             or caller.get("authority") not in ("native_exact", "scan_pinned")
-            or caller.get("lifecycle") != "mapped" or caller.get("status") != "observed"
+            or caller.get("lifecycle") != lifecycle or caller.get("status") != "observed"
             or not isinstance(executable, dict)):
         raise SetupError("R5 caller context disagrees with owned birth/caller/incarnation")
     expected = {"path": image["path"], "dev": image["dev"], "ino": image["ino"],
@@ -3994,7 +4051,7 @@ def r5_caller_context(event, owner, image):
 
 def r5_pass_receipt(record):
     event = record["event"]
-    if type(event.get("pass")) is not int or event["pass"] < 1 or event.get("final", False) is not False:
+    if type(event.get("pass")) is not int or event["pass"] < 0 or event.get("final", False) is not False:
         raise SetupError("R5 admission lacks a live completing pass")
     return {"seq": record["seq"], "at_ns": record["at_ns"], "pass": event["pass"]}
 
@@ -4016,23 +4073,32 @@ def wait_r5_successor_admitted(jsonl_path, owner, executable, cursor, *, not_bef
         remaining_until(deadline)
         executable.verify()
         image = executable.image_receipt({"image": 1}, owner)
-        records, complete = cursor.read()
+        records, complete = cursor.read(deadline)
         admitted, committed = None, None
         for record in records:
+            check_r5_work(deadline)
             if record["seq"] <= cursor.seq:
                 continue
             event = record["event"]
-            if record["kind"] == "caller_event" and event.get("event") == "admitted":
-                context = r5_admitted_subject(event)
-                if context.get("pid") != owner.pid:
+            if record["kind"] == "caller_event" and event.get("event") in ("admitted", "exec_retired"):
+                subject = "new" if event["event"] == "exec_retired" else "caller"
+                context = r5_admitted_subject(event, subject)
+                if context.get("pid") != owner.pid and not (
+                        subject == "new" and event.get("old") == cursor.retired_caller):
                     continue
-                caller = r5_caller_context(event, owner, image)
+                if subject == "new":
+                    old = r5_caller_context(event, owner, cursor.original_image,
+                                            subject="old", lifecycle="exec_retired")
+                    if old != {**cursor.retired_subject, "lifecycle": "exec_retired"}:
+                        raise SetupError("R5 committed handoff changed the saved retired subject")
+                caller = r5_caller_context(event, owner, image, subject=subject)
                 if (caller["id"] == cursor.retired_caller
                         or caller["incarnation"] != cursor.retired_incarnation + 1
                         or record["at_ns"] < not_before_ns):
                     raise SetupError("R5 admission reused stale caller/incarnation or preceded verified re-entry")
                 admitted = {"caller": caller["id"], "incarnation": caller["incarnation"],
-                            "seq": record["seq"], "at_ns": record["at_ns"], "image": image}
+                            "seq": record["seq"], "at_ns": record["at_ns"], "image": image,
+                            "publication": event["event"]}
                 committed = None
             elif record["kind"] == "caller_event" and admitted is not None and (
                     event.get("caller") == admitted["caller"] or event.get("old") == admitted["caller"]):

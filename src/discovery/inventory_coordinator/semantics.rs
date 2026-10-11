@@ -442,6 +442,17 @@ impl SemanticBindingSet {
         Ok(())
     }
 
+    /// Tests-only binding insert over the production insert: driver
+    /// timing tests bind without the native proof (the bind proof is
+    /// pinned by the custody tests); conversion still runs production.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(
+        &mut self,
+        binding: SemanticCallerBinding,
+    ) -> Result<(), SemanticBindingRefusal> {
+        self.insert(binding)
+    }
+
     /// Up to MAX_PENDING bindings for one tick, from the persistent fair
     /// cursor. Every accepted binding is served in rotation.
     pub(crate) fn bindings_for_tick(&mut self) -> &[SemanticCallerBinding] {

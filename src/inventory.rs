@@ -62,6 +62,12 @@ const DOC_ID: &str = "p11scope/inventory/v1";
 /// Rescan interval inside a `--duration` observation window.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Maximum age of a staged semantic quantum before a tick commits it:
+/// a staged batch must finalize inside its receipts' 2s window even
+/// when collection runs long, instead of waiting for the next pass
+/// commit. Pinned below the receipt window by test.
+const STAGED_SEMANTIC_MAX_AGE: Duration = Duration::from_secs(1);
+
 struct DiagnosticRequest<'a> {
     path: Option<&'a Path>,
     pid_filter: Option<u32>,
@@ -1653,6 +1659,9 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         receipt.map(|_| {
             // The staged quantum published: the next tick may stage again.
             self.semantic_staged = false;
+            if let Some(lane) = self.semantic.as_mut() {
+                lane.note_semantic_published();
+            }
         })
     }
 
@@ -1680,6 +1689,23 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         if let Some(display) = self.display.as_mut() {
             display.tick();
         }
+        // A staged quantum must finalize inside its receipts' window
+        // even when collection runs long: commit a stale staged batch
+        // first, then stage fresh below. A failed commit backs off to
+        // the next staleness deadline instead of gap-spamming.
+        let stale = self.semantic_staged
+            && self
+                .semantic
+                .as_ref()
+                .and_then(|lane| lane.staged_semantic_age())
+                .is_some_and(|age| age >= STAGED_SEMANTIC_MAX_AGE);
+        if stale && let Err(error) = self.commit(false) {
+            self.coordinator
+                .note_scope_gap("semantic staged commit failed".into(), format!("{error:#}"));
+            if let Some(lane) = self.semantic.as_mut() {
+                lane.note_semantic_staged();
+            }
+        }
         // Regular and collection-time lane ticks share this hook: the
         // loop calls it between passes and while the pass's collection
         // runs. At most one quantum stages ahead of the next commit.
@@ -1697,6 +1723,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         let staged = match lane.tick(pins) {
             Ok(batch) => {
                 self.coordinator.stage_semantic_batch(batch);
+                lane.note_semantic_staged();
                 true
             }
             Err(_) => false,
@@ -1772,6 +1799,9 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             }
         }
         self.semantic_staged = false;
+        if let Some(lane) = self.semantic.as_mut() {
+            lane.note_semantic_published();
+        }
     }
 }
 
@@ -6322,6 +6352,337 @@ mod tests {
             render_json_from_presentation(&stream_view),
             render_json_from_presentation(&classic)
         );
+    }
+
+    mod driver_timing_tests {
+        //! Driver commit timing through the production publication path:
+        //! ticks commit stale staged batches, and the stop request
+        //! flushes staged evidence before native retirement. The
+        //! substituted lane I/O below is timing-only (ticks mint
+        //! scripted receipts, validation approves): receipt VALIDITY is
+        //! pinned by the real-H0 tests, while these tests pin commit
+        //! TIMING through the production stage/finalize/commit path.
+        //! The driver treats batches opaquely; nothing here inspects
+        //! or forges batch contents.
+        use super::*;
+        use crate::attach::BackendSelection;
+        use crate::attach::capture::NativeDomainId;
+        use crate::attach::image_query::CompleteEpochs;
+        use crate::discovery::engine::inventory_coordinator::semantics::{
+            AttestedSubset, SemanticCallerBinding,
+        };
+        use crate::discovery::identity::{PinnedObjectId, PinnedObjects};
+        use crate::discovery::instances::{
+            CallFacts, EntryIp, EpochReading, InstanceId, InstanceRouter, MapRange, Route,
+            RouterLimits, StableObservation,
+        };
+        use crate::inventory_semantics::{
+            AttestedSemanticLane, LaneDrainOutcome, LaneTestIo, SemanticBatch, SemanticRefusal,
+        };
+        use crate::semantic_capture::{
+            CurrentPartitionReceipt, CurrentReceiptRefusal, Endpoint, TickReport,
+        };
+        use p11scope_ebpf_common::InstanceStamp;
+        use p11scope_ebpf_common::instance::STAMP_VALID;
+        use std::sync::Arc;
+
+        fn router_ids(domain: NativeDomainId, count: usize) -> Vec<InstanceId> {
+            let image = ImageIdentity {
+                task_cookie: 71,
+                exec_id: 0,
+            };
+            let mut router = InstanceRouter::new(domain, RouterLimits::default());
+            let ranges = (0..count)
+                .map(|n| {
+                    let base = 0x7000_0000 + n as u64 * 0x10000;
+                    MapRange::new(base, base + 0x3000, 0, true)
+                })
+                .collect();
+            router.observe_legacy(StableObservation {
+                file_slot: 0,
+                reading: EpochReading {
+                    cookie: 71,
+                    local: 1,
+                    global: 0,
+                    fault: 0,
+                    record_flags: 0,
+                    sticky: 0,
+                },
+                ranges,
+                fence: 0,
+            });
+            (0..count)
+                .map(|n| {
+                    let stamp = InstanceStamp {
+                        epoch: 1,
+                        file_slot_plus1: 1,
+                        flags: STAMP_VALID,
+                        ..InstanceStamp::default()
+                    };
+                    match router.route(CallFacts {
+                        token: n as u64 + 1,
+                        domain,
+                        image,
+                        entry: stamp,
+                        ret: stamp,
+                        ip: EntryIp::new(0x7000_0000 + n as u64 * 0x10000 + 0x1000),
+                        attached_offset: Some(0x1000),
+                    }) {
+                        Route::Joined(id) => id,
+                        other => panic!("fixture must route a real instance: {other:?}"),
+                    }
+                })
+                .collect()
+        }
+
+        fn stub_subset() -> AttestedSubset {
+            let slot = crate::plan::Slot {
+                index: 0,
+                descriptor_index: crate::kinds::function_id("C_SignInit").unwrap() + 1,
+                object: PinnedObjectId(0),
+                object_path: "/stub-provider.so".into(),
+                file_offset: 0x1200,
+                names: vec!["C_SignInit".into()],
+                aliased: false,
+                semantics: crate::kinds::descriptor("C_SignInit").unwrap(),
+                semantic_authorized: true,
+                semantic_ambiguous: false,
+                fork_safe: true,
+                module_ids: vec![crate::plan::ModuleId(0)],
+            };
+            let plan = crate::plan::AttachPlan::from_slots(vec![slot]);
+            AttestedSubset::scripted(
+                plan,
+                PinnedObjects::empty(),
+                std::collections::BTreeMap::new(),
+            )
+        }
+
+        struct StubLaneIo {
+            image: ImageIdentity,
+            endpoint: Endpoint,
+            watched: crate::discovery::identity::RetainedInventoryTarget,
+            ids: Vec<InstanceId>,
+            quiesce: bool,
+            pending: bool,
+        }
+
+        impl StubLaneIo {
+            fn new(image: ImageIdentity, ids: Vec<InstanceId>) -> Self {
+                let pins = crate::discovery::identity::test_fixture::real_scan_pin(
+                    &std::env::current_exe().unwrap(),
+                    None,
+                    1,
+                    "held-test-image",
+                );
+                let watched = pins.retain_inventory_target(PinnedObjectId(0)).unwrap();
+                Self {
+                    image,
+                    endpoint: Endpoint {
+                        object: PinnedObjectId(0),
+                        file_slot: 0,
+                        offset: 0x1200,
+                    },
+                    watched,
+                    ids,
+                    quiesce: false,
+                    pending: false,
+                }
+            }
+        }
+
+        impl LaneTestIo for StubLaneIo {
+            fn validate_current(
+                &mut self,
+                _receipt: &CurrentPartitionReceipt,
+            ) -> Result<(), CurrentReceiptRefusal> {
+                Ok(())
+            }
+
+            fn tick(&mut self, domain: NativeDomainId) -> Result<SemanticBatch, SemanticRefusal> {
+                let id = self.ids.pop().expect("stub router ids exhausted");
+                let receipt = CurrentPartitionReceipt::scripted(
+                    domain,
+                    self.image,
+                    Arc::new(PidPin::test_proc_only(std::process::id())),
+                    self.endpoint,
+                    0,
+                    self.watched.share(),
+                    CompleteEpochs {
+                        local: 0,
+                        global: 0,
+                        fault: 0,
+                        sticky: 0,
+                        record_flags: 0,
+                    },
+                    0,
+                    Instant::now() + Duration::from_secs(60),
+                    vec![id],
+                );
+                SemanticBatch::from_tick_report(
+                    domain,
+                    TickReport::scripted(Vec::new(), vec![receipt]),
+                    Vec::new(),
+                    0,
+                )
+            }
+
+            fn refresh(
+                &mut self,
+                pin: Arc<PidPin>,
+                _slot: u32,
+            ) -> Result<(Vec<ImageIdentity>, Arc<PidPin>), SemanticRefusal> {
+                Ok((Vec::new(), pin))
+            }
+
+            fn has_pending_evidence(&self) -> bool {
+                self.pending
+            }
+
+            fn finish(&mut self, domain: NativeDomainId) -> SemanticBatch {
+                SemanticBatch::scripted(domain, Vec::new(), 0)
+            }
+
+            fn quiescent(&mut self) -> bool {
+                self.quiesce
+            }
+
+            fn positions(&mut self) -> Option<[(usize, usize); 2]> {
+                Some([(0, 0), (0, 0)])
+            }
+
+            fn drain_events_to(&mut self, _stop: usize, _quantum: usize) -> LaneDrainOutcome {
+                LaneDrainOutcome::default()
+            }
+
+            fn drain_discovery_to(&mut self, _stop: usize, _quantum: usize) -> LaneDrainOutcome {
+                LaneDrainOutcome::default()
+            }
+        }
+
+        struct DriverScene {
+            coordinator: InventoryCoordinator<OsProcessSource>,
+            lane: AttestedSemanticLane,
+            stub: StubLaneIo,
+        }
+
+        fn driver_scene(id_count: usize) -> DriverScene {
+            let image = ImageIdentity {
+                task_cookie: 7,
+                exec_id: 1,
+            };
+            let mut coordinator = coordinator();
+            let pid = std::process::id();
+            let caller = coordinator
+                .adapter_mut()
+                .admit(pid, ImageAuthority::ScanPinned, 50)
+                .unwrap();
+            let module = ModuleKey::physical(7, 7, 777, None, "/task3/provider.so");
+            coordinator.registry_mut().note_mapping(
+                caller,
+                pid,
+                ModuleInfo {
+                    path: "/task3/provider.so".into(),
+                    key: module.clone(),
+                    double_loaded: false,
+                    build_id: None,
+                    identity_source: Some("task3".into()),
+                    admission: AdmissionState::Admitted,
+                    admission_class: Some("exact".into()),
+                    admission_endpoints: Some(1),
+                    admission_reasons: Vec::new(),
+                },
+                60,
+            );
+            coordinator.commit_batch(false).unwrap();
+            let lane = AttestedSemanticLane::start(
+                stub_subset(),
+                &Scope::Pid(pid),
+                BackendSelection::Auto,
+            )
+            .expect("shell lane starts");
+            let domain = lane.domain();
+            coordinator
+                .semantic_bindings_mut()
+                .insert_for_test(SemanticCallerBinding::scripted(
+                    caller,
+                    module,
+                    domain,
+                    image,
+                    Arc::new(PidPin::test_proc_only(pid)),
+                ))
+                .unwrap();
+            let stub = StubLaneIo::new(image, router_ids(domain, id_count));
+            DriverScene {
+                coordinator,
+                lane,
+                stub,
+            }
+        }
+
+        #[test]
+        fn staged_max_age_sits_below_receipt_window() {
+            assert!(
+                STAGED_SEMANTIC_MAX_AGE
+                    < crate::semantic_capture::TickLimits::default().pending_for,
+                "staged evidence must finalize with margin inside the receipt window"
+            );
+        }
+
+        #[test]
+        fn stale_staged_batch_commits_on_tick_while_fresh_stays() {
+            let mut scene = driver_scene(2);
+            scene.lane.install_test_io(Box::new(scene.stub));
+            let mut driver = ClassicDriver {
+                coordinator: &mut scene.coordinator,
+                inventory_scope: None,
+                scope: InventoryRunScope::Pid(std::process::id()),
+                cgroup: None,
+                max_scan_pids: None,
+                guard: UnavailableImageGuard,
+                deadline: None,
+                identity: None,
+                display: None,
+                semantic: Some(scene.lane),
+                semantic_staged: false,
+            };
+            // The first tick stages; a fresh staged batch stays staged
+            // across further ticks instead of committing early.
+            driver.on_tick();
+            assert!(driver.semantic_staged, "the first tick stages");
+            assert_eq!(driver.coordinator.registry().instances().count(), 0);
+            driver.on_tick();
+            assert!(driver.semantic_staged, "a fresh staged batch stays staged");
+            assert_eq!(
+                driver.coordinator.registry().instances().count(),
+                0,
+                "nothing publishes before the staleness deadline"
+            );
+            // Age past the deadline: the next tick commits the stale
+            // batch first, then stages fresh.
+            driver.semantic.as_mut().unwrap().age_staged_for_test(
+                Instant::now() - STAGED_SEMANTIC_MAX_AGE - Duration::from_secs(1),
+            );
+            driver.on_tick();
+            assert!(
+                driver.semantic_staged,
+                "a fresh batch stages after the stale commit"
+            );
+            assert_eq!(
+                driver.coordinator.registry().instances().count(),
+                1,
+                "the stale batch publishes through the tick commit"
+            );
+            assert!(
+                driver
+                    .semantic
+                    .as_ref()
+                    .unwrap()
+                    .staged_semantic_age()
+                    .is_some_and(|age| age < STAGED_SEMANTIC_MAX_AGE),
+                "the restaged batch is fresh"
+            );
+        }
     }
 }
 

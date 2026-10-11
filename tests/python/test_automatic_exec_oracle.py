@@ -2635,6 +2635,45 @@ class R5FreshAdmissionTest(unittest.TestCase):
             "identity_context": {"version": 1, "old": old, "new": new}})
         return [retired, committed, self.record(5, "pass_committed", {"pass": 1})]
 
+    def successor_turnover(self, new_pid):
+        old = copy.deepcopy(self.fresh()[0]["event"]["identity_context"]["caller"])
+        old["lifecycle"] = "exec_retired"
+        if new_pid is None:
+            new = {"id": "c2", "pid": None, "incarnation": None, "start_time": None,
+                   "authority": None, "lifecycle": None, "executable": None, "status": "unavailable"}
+        else:
+            new = self.admission(4, "c2", 2)["event"]["identity_context"]["caller"]
+            new["pid"] = new_pid
+        return self.record(4, "caller_event", {"event": "exec_retired", "old": "c1", "new": "c2",
+            "identity_context": {"version": 1, "old": old, "new": new}})
+
+    def test_selected_successor_turnover_refuses_unavailable_new_context(self):
+        self.write(self.prefix + [self.fresh()[0], self.successor_turnover(None),
+                                  self.record(5, "pass_committed", {"pass": 1})])
+        with self.assertRaisesRegex(H6["SetupError"], "successor retired before admission completion"):
+            self.wait()
+
+    def test_selected_successor_turnover_refuses_conflicting_new_pid(self):
+        self.write(self.prefix + [self.fresh()[0], self.successor_turnover(self.owner.pid + 1),
+                                  self.record(5, "pass_committed", {"pass": 1})])
+        with self.assertRaisesRegex(H6["SetupError"], "successor retired before admission completion"):
+            self.wait()
+
+    def test_unrelated_turnover_does_not_retire_selected_successor(self):
+        for new_pid in (None, self.owner.pid + 1):
+            with self.subTest(new_pid=new_pid):
+                self.reset_cursor()
+                row = self.successor_turnover(new_pid)
+                row["event"]["old"] = "c9"
+                row["event"]["identity_context"]["old"] = {
+                    "id": "c9", "pid": None, "incarnation": None, "start_time": None,
+                    "authority": None, "lifecycle": None, "executable": None, "status": "unavailable"}
+                self.write(self.prefix + [self.fresh()[0], row,
+                                          self.record(5, "pass_committed", {"pass": 1})])
+                result = self.wait()
+                self.assertEqual((result["caller"], result["incarnation"], result["completed_pass"]["seq"]),
+                                 ("c1", 1, 5))
+
     def test_checkpoint_accepts_producer_initial_live_pass_zero_then_one(self):
         self.cursor.close()
         rows = copy.deepcopy(self.prefix)
@@ -3103,9 +3142,13 @@ class R5FreshAdmissionTest(unittest.TestCase):
         self.assert_refused()
 
     def test_retirement_before_completing_pass_is_refused(self):
+        old = self.successor_turnover(None)["event"]["identity_context"]["old"]
         self.write(self.prefix + [self.fresh()[0], self.record(4, "caller_event",
-            {"event": "retired", "caller": "c1"}), self.record(5, "pass_committed", {"pass": 2})])
-        self.assert_refused()
+            {"event": "retired", "caller": "c1", "reason": "caller retired",
+             "identity_context": {"version": 1, "caller": old}}),
+            self.record(5, "pass_committed", {"pass": 2})])
+        with self.assertRaisesRegex(H6["SetupError"], "successor retired before admission completion"):
+            self.wait()
 
     def test_actual_owned_executable_mismatch_prevents_admission(self):
         other = self.directory / "other-executable"

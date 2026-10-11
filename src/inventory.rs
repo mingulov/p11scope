@@ -1711,7 +1711,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             return;
         };
         let mut terminal = crate::inventory_semantics::TerminalBatchStage::new();
-        lane.run_semantic_stop(&pins, std::time::Instant::now, |batch| {
+        lane.run_semantic_drain(&pins, std::time::Instant::now, |batch| {
             terminal.push(batch);
         });
         // The quiesce wait is time-budgeted, so staging is capped: shed
@@ -1727,6 +1727,9 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                 ),
             );
         }
+        // Every drained batch commits while H0 still runs: drained
+        // receipts validate through the running lane, never behind
+        // Stopped.
         for batch in terminal.into_batches() {
             self.coordinator.stage_semantic_batch(batch);
             let lane = match self.semantic.as_mut() {
@@ -1741,6 +1744,26 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                     "semantic terminal commit failed".into(),
                     format!("{error:#}"),
                 );
+            }
+        }
+        // H0 stops once, after every drained batch was consumed and
+        // published; the terminal Finish batch commits separately.
+        if let Some(finish) = self
+            .semantic
+            .as_mut()
+            .and_then(|lane| lane.finish_semantic_stop())
+        {
+            self.coordinator.stage_semantic_batch(finish);
+            if let Some(lane) = self.semantic.as_mut() {
+                if let Err(error) = self
+                    .coordinator
+                    .commit_batch_with_semantics(false, Some(lane))
+                {
+                    self.coordinator.note_scope_gap(
+                        "semantic terminal commit failed".into(),
+                        format!("{error:#}"),
+                    );
+                }
             }
         }
         self.semantic_staged = false;

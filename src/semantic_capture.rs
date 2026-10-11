@@ -2683,11 +2683,7 @@ mod tests {
             let stamp = InstanceStamp::default();
             TickOutcome::Call(RoutedCall::scripted(
                 domain,
-                event_record_with_routing(
-                    p11scope_ebpf_common::Event::default(),
-                    stamp,
-                    0x2200,
-                ),
+                event_record_with_routing(p11scope_ebpf_common::Event::default(), stamp, 0x2200),
                 Route::Unknown(UnknownReason::PendingCapacity),
                 None,
                 Some(1),
@@ -2700,10 +2696,8 @@ mod tests {
         });
         assert!(invalidation.is_invalidation());
         assert!(!call().is_invalidation());
-        let mut report = TickReport::scripted(
-            (0..MAX_INSTANCES).map(|_| call()).collect(),
-            Vec::new(),
-        );
+        let mut report =
+            TickReport::scripted((0..MAX_INSTANCES).map(|_| call()).collect(), Vec::new());
         assert_eq!(report.merge_stashed_outcomes(vec![invalidation]), 1);
         assert_eq!(report.outcomes().len(), MAX_INSTANCES);
         assert!(
@@ -4331,7 +4325,10 @@ mod tests {
             );
             // The fault era moves: the next audit invalidates first,
             // then resolves every pending call behind it.
-            h0.io.health.push_back(Ok(Health { fault: 1, sticky: 0 }));
+            h0.io.health.push_back(Ok(Health {
+                fault: 1,
+                sticky: 0,
+            }));
             let pin: Arc<PidPin> = Arc::new(
                 fixture
                     .scene

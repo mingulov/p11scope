@@ -39,6 +39,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub(crate) mod detailed_identity;
+#[allow(dead_code)] // B2 records private facts; B3 supplies request-bound validation.
+mod pid_continuity;
+pub(crate) use pid_continuity::{PidContinuityRefusal, PidLifecycleTap};
 
 // I3 will consume this preparation capability; I2b installs no callers or links.
 #[allow(dead_code)]
@@ -1263,6 +1266,8 @@ pub struct Session {
     /// multi-group rebuild can reattach surviving siblings; pruned as the
     /// slot's last link detaches (see [`RetainedStaticTarget`]).
     retained_static: BTreeMap<u32, RetainedStaticTarget>,
+    pid_pairs: pid_continuity::PairBook,
+    pid_lifecycle: Option<PidLifecycleTap>,
     links: Vec<RegisteredLink>,
     /// Task 3 Stage A continuity witness: hook links, watched files and the
     /// refusal reason when instance routing is unavailable.
@@ -1343,6 +1348,21 @@ enum ProbeSide {
 
 type StaticEndpoint = (u32, ProbeSide);
 
+fn current_static_sides_from(links: &[RegisteredLink]) -> BTreeSet<StaticEndpoint> {
+    links
+        .iter()
+        .flat_map(|link| {
+            let side = match link.producer() {
+                ProducerProgram::UProbe(program) => static_probe_side(program),
+                _ => None,
+            };
+            link.slots()
+                .iter()
+                .filter_map(move |slot| side.map(|side| (*slot, side)))
+        })
+        .collect()
+}
+
 /// One link whose lifetime this session owns. Static, loader/export, and
 /// lifecycle links all remain in this one registry.
 enum RegisteredLink {
@@ -1350,6 +1370,7 @@ enum RegisteredLink {
         program: &'static str,
         slot: u32,
         id: UProbeLinkId,
+        registration: Option<pid_continuity::RegistrationId>,
     },
     /// One attached multi group side outside Aya's link table: the
     /// program, its member slots, and the live link fds (one per bisect
@@ -1358,6 +1379,7 @@ enum RegisteredLink {
         program: &'static str,
         slots: Vec<u32>,
         fds: Vec<OwnedFd>,
+        registration: Option<pid_continuity::RegistrationId>,
     },
     RawTracePoint {
         program: &'static str,
@@ -1674,6 +1696,7 @@ struct AttachOutcome {
     successful: BTreeSet<StaticEndpoint>,
     failures: Vec<(u32, String)>,
     completed: Vec<SlotCompletion>,
+    continuity_rounds: Vec<pid_continuity::AttachRound>,
     /// The run stopped early on fd exhaustion: members without a success
     /// or failure entry were never attempted. Fresh attach reports the one
     /// shared summary; the group rebuild records every remainder explicitly.
@@ -1758,11 +1781,23 @@ struct StaticGroup {
 /// attach used plus the pinned path/ABI it resolved. Retained so a
 /// multi-group rebuild can reattach surviving siblings without re-deriving
 /// identity; facts survive exactly while a link does.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct RetainedStaticTarget {
     slot: Slot,
     path: PathBuf,
     abi: ElfAbi,
+    held: Option<crate::discovery::identity::RetainedInventoryTarget>,
+}
+
+impl Clone for RetainedStaticTarget {
+    fn clone(&self) -> Self {
+        Self {
+            slot: self.slot.clone(),
+            path: self.path.clone(),
+            abi: self.abi,
+            held: self.held.as_ref().map(|target| target.share()),
+        }
+    }
 }
 
 /// Session-owned attachment authority. Fields and constructor stay private.
@@ -1909,6 +1944,7 @@ fn retain_from_successful(
                 slot: slot.clone(),
                 path: path.clone(),
                 abi: *abi,
+                held: None,
             },
         );
     }
@@ -1975,6 +2011,59 @@ struct MultiLinkBundle<T> {
     links: Vec<T>,
 }
 
+/// Publish the kept bundles through the same registry path used by initial
+/// attachment and survivor rebuilds. Retained facts follow live links.
+fn publish_kept_multi_bundles(
+    links: &mut Vec<RegisteredLink>,
+    retained: &mut BTreeMap<u32, RetainedStaticTarget>,
+    bundles: Vec<MultiLinkBundle<OwnedFd>>,
+    targets: &[RetainedStaticTarget],
+    pairs: &mut pid_continuity::PairBook,
+) {
+    for bundle in bundles {
+        links.push(RegisteredLink::MultiUProbe {
+            program: bundle.program,
+            slots: bundle.slots,
+            fds: bundle.links,
+            registration: pairs.register(),
+        });
+    }
+    for target in targets {
+        if links_cover_slot(links, target.slot.index) {
+            retained.insert(target.slot.index, target.clone());
+        }
+    }
+    prune_linkless_retained(retained, links);
+}
+
+/// Invalidate selected registration facts before taking ownership out of the
+/// live registry. The native detach callback cannot see an old valid stamp.
+fn extract_selected_links(
+    links: &mut Vec<RegisteredLink>,
+    pairs: &mut pid_continuity::PairBook,
+    mut select: impl FnMut(&RegisteredLink) -> bool,
+) -> Vec<RegisteredLink> {
+    let selected: Vec<_> = links.iter().map(&mut select).collect();
+    let affected = links
+        .iter()
+        .zip(&selected)
+        .filter(|(_, selected)| **selected)
+        .flat_map(|(link, _)| link.slots().iter().copied())
+        .collect();
+    pairs.invalidate(&affected);
+    let mut taken = Vec::new();
+    let mut retained = Vec::new();
+    for (link, selected) in std::mem::take(links).into_iter().zip(selected) {
+        if selected {
+            taken.push(link);
+        } else {
+            retained.push(link);
+        }
+    }
+    *links = retained;
+    taken
+}
+
 /// Explicit failure for a slot left without a completed pair when fd exhaustion
 /// stops attachment. Callers detach and deactivate exactly the failed indices,
 /// so an unlisted slot would stay link-less or keep an entry-less return link.
@@ -2006,10 +2095,28 @@ fn exhausted_multi(slot: u32, endpoints: usize, links: usize) -> (u32, String) {
 /// with one summary like singles; an unsupported kernel aborts with
 /// [`BackendFallbackRequired`]. Returns the live links (one bundle per
 /// attached side) plus the singles-shaped [`AttachOutcome`].
+#[cfg(test)]
 fn attach_target_groups_with<T>(
     groups: &[StaticGroup],
     completed_at: impl FnMut(&Slot) -> Option<u64>,
-    attach_link: impl FnMut(&'static str, &Path, &[(u64, u64)], bool) -> io::Result<T>,
+    mut attach_link: impl FnMut(&'static str, &Path, &[(u64, u64)], bool) -> io::Result<T>,
+) -> Result<(Vec<MultiLinkBundle<T>>, AttachOutcome), BackendFallbackRequired> {
+    attach_target_groups_observed_with(groups, completed_at, |program, path, sites, is_return| {
+        pid_continuity::NativeAttempt::run(monotonic_ns, || {
+            attach_link(program, path, sites, is_return)
+        })
+    })
+}
+
+fn attach_target_groups_observed_with<T>(
+    groups: &[StaticGroup],
+    completed_at: impl FnMut(&Slot) -> Option<u64>,
+    attach_link: impl FnMut(
+        &'static str,
+        &Path,
+        &[(u64, u64)],
+        bool,
+    ) -> pid_continuity::NativeAttempt<T, io::Error>,
 ) -> Result<(Vec<MultiLinkBundle<T>>, AttachOutcome), BackendFallbackRequired> {
     let (bundles, mut outcome) = attach_target_groups_unsettled(groups, completed_at, attach_link)?;
     if outcome.exhausted {
@@ -2034,21 +2141,32 @@ fn attach_target_groups_with<T>(
 fn attach_target_groups_unsettled<T>(
     groups: &[StaticGroup],
     mut completed_at: impl FnMut(&Slot) -> Option<u64>,
-    mut attach_link: impl FnMut(&'static str, &Path, &[(u64, u64)], bool) -> io::Result<T>,
+    mut attach_link: impl FnMut(
+        &'static str,
+        &Path,
+        &[(u64, u64)],
+        bool,
+    ) -> pid_continuity::NativeAttempt<T, io::Error>,
 ) -> Result<(Vec<MultiLinkBundle<T>>, AttachOutcome), BackendFallbackRequired> {
     let mut successful = BTreeSet::new();
     let mut failures = Vec::new();
     let mut completed = Vec::new();
+    let mut continuity_rounds = Vec::new();
     let mut bundles = Vec::new();
     let mut links_attached = 0usize;
     for group in groups {
+        let mut timing = pid_continuity::RoundClock::default();
         let sites: Vec<(u64, u64)> = group
             .members
             .iter()
             .map(|member| (member.offset, member.cookie))
             .collect();
         let (return_links, return_refused) = match bisect_attach(
-            &mut |slice| attach_link("p11_return", &group.path, slice, true),
+            &mut |slice| {
+                let attempt = attach_link("p11_return", &group.path, slice, true);
+                timing.observe_call(attempt.started_ns);
+                attempt.result
+            },
             &sites,
         ) {
             Ok(ok) => ok,
@@ -2068,6 +2186,7 @@ fn attach_target_groups_unsettled<T>(
                         successful,
                         failures,
                         completed,
+                        continuity_rounds,
                         exhausted: true,
                     },
                 ));
@@ -2115,7 +2234,11 @@ fn attach_target_groups_unsettled<T>(
             .map(|member| (member.offset, member.cookie))
             .collect();
         let (entry_links, entry_refused) = match bisect_attach(
-            &mut |slice| attach_link(group.entry_program, &group.path, slice, false),
+            &mut |slice| {
+                let attempt = attach_link(group.entry_program, &group.path, slice, false);
+                timing.observe_call(attempt.started_ns);
+                attempt.result
+            },
             &entry_sites,
         ) {
             Ok(ok) => ok,
@@ -2134,6 +2257,7 @@ fn attach_target_groups_unsettled<T>(
                         successful,
                         failures,
                         completed,
+                        continuity_rounds,
                         exhausted: true,
                     },
                 ));
@@ -2167,6 +2291,7 @@ fn attach_target_groups_unsettled<T>(
             entry_slots.push(member.slot.index);
         }
         if !entry_links.is_empty() {
+            continuity_rounds.push(timing.finish(entry_slots.clone()));
             bundles.push(MultiLinkBundle {
                 program: group.entry_program,
                 slots: entry_slots,
@@ -2180,6 +2305,7 @@ fn attach_target_groups_unsettled<T>(
             successful,
             failures,
             completed,
+            continuity_rounds,
             exhausted: false,
         },
     ))
@@ -2222,16 +2348,41 @@ fn detach_rebuild_round<T>(
 /// kept links contribute successes or completions; fd exhaustion and an
 /// unsupported kernel stop the run with every remainder recorded
 /// explicitly. Terminates: every dirty round strictly shrinks its group.
+#[cfg(test)]
 fn reattach_rebuilt_groups_with<T>(
     groups: &[StaticGroup],
-    mut completed_at: impl FnMut(&Slot) -> Option<u64>,
+    completed_at: impl FnMut(&Slot) -> Option<u64>,
     mut attach_link: impl FnMut(&'static str, &Path, &[(u64, u64)], bool) -> io::Result<T>,
+    detach_bundles: impl FnMut(Vec<MultiLinkBundle<T>>),
+) -> (Vec<MultiLinkBundle<T>>, AttachOutcome) {
+    reattach_rebuilt_groups_observed_with(
+        groups,
+        completed_at,
+        |program, path, sites, is_return| {
+            pid_continuity::NativeAttempt::run(monotonic_ns, || {
+                attach_link(program, path, sites, is_return)
+            })
+        },
+        detach_bundles,
+    )
+}
+
+fn reattach_rebuilt_groups_observed_with<T>(
+    groups: &[StaticGroup],
+    mut completed_at: impl FnMut(&Slot) -> Option<u64>,
+    mut attach_link: impl FnMut(
+        &'static str,
+        &Path,
+        &[(u64, u64)],
+        bool,
+    ) -> pid_continuity::NativeAttempt<T, io::Error>,
     mut detach_bundles: impl FnMut(Vec<MultiLinkBundle<T>>),
 ) -> (Vec<MultiLinkBundle<T>>, AttachOutcome) {
     let mut kept = Vec::new();
     let mut successful = BTreeSet::new();
     let mut failures = Vec::new();
     let mut completed = Vec::new();
+    let mut continuity_rounds = Vec::new();
     let mut exhausted = false;
     for (position, group) in groups.iter().enumerate() {
         let later = || {
@@ -2268,6 +2419,7 @@ fn reattach_rebuilt_groups_with<T>(
                             successful,
                             failures,
                             completed,
+                            continuity_rounds,
                             exhausted,
                         },
                     );
@@ -2299,6 +2451,7 @@ fn reattach_rebuilt_groups_with<T>(
                         successful,
                         failures,
                         completed,
+                        continuity_rounds,
                         exhausted,
                     },
                 );
@@ -2320,6 +2473,7 @@ fn reattach_rebuilt_groups_with<T>(
             if partials.is_empty() {
                 successful.extend(outcome.successful);
                 completed.extend(outcome.completed);
+                continuity_rounds.extend(outcome.continuity_rounds);
                 kept.extend(bundles);
             } else {
                 // The round's links all drop, so none of its successes or
@@ -2343,6 +2497,7 @@ fn reattach_rebuilt_groups_with<T>(
             successful,
             failures,
             completed,
+            continuity_rounds,
             exhausted,
         },
     )
@@ -2426,12 +2581,37 @@ fn static_attach_error(
     ))
 }
 
+#[cfg(test)]
 fn attach_targets_with(
     slots: &[Slot],
     policy: CapturePolicy,
     object_has_unsafe: bool,
-    mut abi_for: impl FnMut(&Slot) -> Result<ElfAbi>,
+    abi_for: impl FnMut(&Slot) -> Result<ElfAbi>,
     mut attach: impl FnMut(&'static str, &Slot, UProbeAttachPoint<'static>) -> Result<()>,
+    completed_at: impl FnMut(&Slot) -> Option<u64>,
+) -> Result<AttachOutcome> {
+    attach_targets_observed_with(
+        slots,
+        policy,
+        object_has_unsafe,
+        abi_for,
+        |program, slot, point| {
+            pid_continuity::NativeAttempt::run(monotonic_ns, || attach(program, slot, point))
+        },
+        completed_at,
+    )
+}
+
+fn attach_targets_observed_with(
+    slots: &[Slot],
+    policy: CapturePolicy,
+    object_has_unsafe: bool,
+    mut abi_for: impl FnMut(&Slot) -> Result<ElfAbi>,
+    mut attach: impl FnMut(
+        &'static str,
+        &Slot,
+        UProbeAttachPoint<'static>,
+    ) -> pid_continuity::NativeAttempt<(), anyhow::Error>,
     mut completed_at: impl FnMut(&Slot) -> Option<u64>,
 ) -> Result<AttachOutcome> {
     // Resolve every retained target ABI before the first return attachment.
@@ -2443,6 +2623,8 @@ fn attach_targets_with(
     let mut successful = BTreeSet::new();
     let mut failures = Vec::new();
     let mut completed = Vec::new();
+    let mut continuity_rounds = Vec::new();
+    let mut timings = BTreeMap::<u32, pid_continuity::RoundClock>::new();
     let mut return_attached = BTreeSet::new();
     // EMFILE ends the run with one summary: links are retained, so no later
     // slot could succeed once the table is full.
@@ -2471,7 +2653,12 @@ fn attach_targets_with(
         }
     };
     for (slot, _) in &targets {
-        match attach("p11_return", slot, slot_attach_point(slot)) {
+        let attempt = attach("p11_return", slot, slot_attach_point(slot));
+        timings
+            .entry(slot.index)
+            .or_default()
+            .observe_call(attempt.started_ns);
+        match attempt.result {
             Ok(()) => {
                 successful.insert(
                     static_endpoint("p11_return", slot.index)
@@ -2487,6 +2674,7 @@ fn attach_targets_with(
                         successful,
                         failures,
                         completed,
+                        continuity_rounds,
                         exhausted: true,
                     });
                 }
@@ -2513,13 +2701,24 @@ fn attach_targets_with(
             {
                 continue;
             }
-            match attach(program, slot, slot_attach_point(slot)) {
+            let attempt = attach(program, slot, slot_attach_point(slot));
+            timings
+                .entry(slot.index)
+                .or_default()
+                .observe_call(attempt.started_ns);
+            match attempt.result {
                 Ok(()) => {
                     successful.insert(
                         static_endpoint(program, slot.index)
                             .expect("selected entry program is a static endpoint"),
                     );
                     completed.push((slot.index, completed_at(slot)));
+                    continuity_rounds.push(
+                        timings
+                            .remove(&slot.index)
+                            .expect("return timing exists")
+                            .finish(vec![slot.index]),
+                    );
                 }
                 Err(error) => {
                     if is_fd_exhaustion(&error) {
@@ -2529,6 +2728,7 @@ fn attach_targets_with(
                             successful,
                             failures,
                             completed,
+                            continuity_rounds,
                             exhausted: true,
                         });
                     }
@@ -2541,6 +2741,7 @@ fn attach_targets_with(
         successful,
         failures,
         completed,
+        continuity_rounds,
         exhausted: false,
     })
 }
@@ -2847,6 +3048,78 @@ impl DiscoveryStage {
     pub(crate) fn len(&self) -> usize {
         self.items.len()
     }
+}
+
+/// Both lazy Session routes create and wire the one retained consumer here.
+pub(crate) fn ensure_pid_discovery_consumer_with<S: events::RecordSource>(
+    consumer: &mut Option<events::DiscoveryDrain<S>>,
+    tap: Option<&PidLifecycleTap>,
+    create: impl FnOnce() -> Result<events::DiscoveryDrain<S>>,
+) -> Result<bool> {
+    let created = consumer.is_none();
+    if created {
+        let mut drain = create().inspect_err(|_| {
+            if let Some(tap) = tap {
+                tap.observe_failure();
+            }
+        })?;
+        if let Some(tap) = tap {
+            drain
+                .attach_pid_lifecycle_tap(tap.clone())
+                .map_err(|reason| anyhow!("PID lifecycle consumer: {reason:?}"))?;
+        }
+        *consumer = Some(drain);
+    } else if let Some(tap) = tap {
+        consumer
+            .as_mut()
+            .expect("checked consumer")
+            .attach_pid_lifecycle_tap(tap.clone())
+            .map_err(|reason| anyhow!("PID lifecycle consumer: {reason:?}"))?;
+    }
+    Ok(created)
+}
+
+fn invalidate_pid_session(pairs: &mut pid_continuity::PairBook, tap: Option<&PidLifecycleTap>) {
+    pairs.invalidate_all();
+    if let Some(tap) = tap {
+        tap.invalidate_terminal();
+    }
+}
+
+/// The terminal collection's staged branch must refuse continuity before its
+/// early return, just as the raw bounded poll does before touching the ring.
+pub(crate) fn collect_staged_discovery_to_position<S: events::BoundedRecordSource>(
+    staged: &mut DiscoveryStage,
+    consumer: &mut events::DiscoveryDrain<S>,
+    stop: usize,
+    quantum: usize,
+) -> Result<(Vec<p11scope_ebpf_common::DiscoveryRecord>, u64, bool, bool)> {
+    consumer.invalidate_pid_lifecycle_terminal();
+    let mut records = Vec::new();
+    let mut malformed = 0u64;
+    let mut left = quantum;
+    while left > 0 {
+        let Some(item) = staged.pop() else {
+            break;
+        };
+        match item {
+            events::DiscoveryItem::Record(record) => records.push(record),
+            events::DiscoveryItem::Malformed => malformed = malformed.saturating_add(1),
+        }
+        left -= 1;
+    }
+    if left == 0 {
+        return Ok((records, malformed, false, true));
+    }
+    let (post_q_record, backlog) =
+        events::poll_discovery_to_position(consumer, stop, Some(left), |item| {
+            match item {
+                events::DiscoveryItem::Record(record) => records.push(record),
+                events::DiscoveryItem::Malformed => malformed = malformed.saturating_add(1),
+            }
+            std::ops::ControlFlow::Continue(())
+        })?;
+    Ok((records, malformed, post_q_record, backlog))
 }
 
 fn validate_runtime_maps(ebpf: &Ebpf, discovery_bytes: u32) -> Result<()> {
@@ -3216,18 +3489,7 @@ impl Session {
     }
 
     fn current_static_sides(&self) -> BTreeSet<StaticEndpoint> {
-        self.links
-            .iter()
-            .flat_map(|link| {
-                let side = match link.producer() {
-                    ProducerProgram::UProbe(program) => static_probe_side(program),
-                    _ => None,
-                };
-                link.slots()
-                    .iter()
-                    .filter_map(move |slot| side.map(|side| (*slot, side)))
-            })
-            .collect()
+        current_static_sides_from(&self.links)
     }
 
     pub(crate) fn validate_semantic_set(&self, attached: &AttachedSemanticSet) -> Result<()> {
@@ -3547,6 +3809,13 @@ impl Session {
             prepared_instance.expect("preparation established image program load result"),
         );
 
+        let pid_lifecycle = match uprobe_scope {
+            UProbeScope::OneProcess(pid) => {
+                Some(PidLifecycleTap::new(pid, discovery_domain.clone()))
+            }
+            UProbeScope::AllProcesses | UProbeScope::CallingProcess => None,
+        };
+
         Ok(Self {
             stop_gate: stop_gate.expect("preparation established the stop gate"),
             image_coverage,
@@ -3576,6 +3845,8 @@ impl Session {
             lifecycle_tracking_unavailable: None,
             process_creation_tracking_unavailable: None,
             retained_static: BTreeMap::new(),
+            pid_pairs: pid_continuity::PairBook::default(),
+            pid_lifecycle,
             links,
             instance,
             cleanup_worker: Some(CleanupWorker::pre_start()),
@@ -3600,6 +3871,32 @@ impl Session {
             .copied()
             .fold(0u64, u64::saturating_add);
         counter_snapshot_with(read, abi_refusals)
+    }
+
+    fn pid_attach_baseline(&mut self) -> Option<pid_continuity::AttachBaseline> {
+        if !matches!(self.uprobe_scope, UProbeScope::OneProcess(_)) {
+            return None;
+        }
+        let loss = (|| -> Result<u64> {
+            let counters: PerCpuArray<_, u64> =
+                PerCpuArray::try_from(self.ebpf.map("COUNTERS").context("COUNTERS map")?)?;
+            let values = counters.get(&DISCOVERY_COUNTER_RING_LOSS, 0)?;
+            pid_continuity::checked_discovery_loss(values.iter().copied())
+                .map_err(|reason| anyhow!("PID continuity loss baseline: {reason:?}"))
+        })()
+        .map_err(|_| pid_continuity::PidContinuityRefusal::Loss);
+        let fault = self
+            .pid_lifecycle
+            .as_ref()
+            .and_then(|tap| tap.facts().ok())
+            .map(|facts| facts.fault_serial);
+        let baseline = self.pid_pairs.prepare_baseline(loss, fault);
+        if baseline.is_none()
+            && let Some(tap) = &self.pid_lifecycle
+        {
+            tap.observe_failure();
+        }
+        baseline
     }
 
     pub(crate) fn preflight_targets(
@@ -3896,6 +4193,29 @@ impl Session {
                 Ok((slot.index, (path, abi)))
             })
             .collect::<Result<_>>()?;
+        let held_objects: BTreeMap<_, _> = targets
+            .iter()
+            .map(|slot| slot.object)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|object| (object, objects.retain_inventory_target(object).ok()))
+            .collect();
+        let prepared_targets: Vec<_> = targets
+            .iter()
+            .map(|slot| {
+                let (path, abi) = &attach_targets[&slot.index];
+                RetainedStaticTarget {
+                    slot: slot.clone(),
+                    path: path.clone(),
+                    abi: *abi,
+                    held: held_objects
+                        .get(&slot.object)
+                        .and_then(Option::as_ref)
+                        .map(|target| target.share()),
+                }
+            })
+            .collect();
+        let continuity_baseline = self.pid_attach_baseline();
         // Ordering I1: watched-file keys and SLOT_FILE before any link.
         self.instance
             .prepare_targets(&mut self.ebpf, targets, objects);
@@ -3905,7 +4225,8 @@ impl Session {
         } else {
             let ebpf = &mut self.ebpf;
             let links = &mut self.links;
-            attach_targets_with(
+            let pairs = &mut self.pid_pairs;
+            attach_targets_observed_with(
                 targets,
                 self.policy,
                 cfg!(feature = "unsafe-unvalidated-metadata"),
@@ -3916,25 +4237,37 @@ impl Session {
                         .1)
                 },
                 |program, slot, point| {
-                    let path = &attach_targets
-                        .get(&slot.index)
-                        .expect("every selected target has retained pinned facts")
-                        .0;
-                    let prog: &mut UProbe = ebpf
-                        .program_mut(program)
-                        .with_context(|| format!("program {program} missing from object"))?
-                        .try_into()?;
-                    match prog.attach([point], path, scope) {
-                        Ok(id) => {
-                            links.push(RegisteredLink::UProbe {
-                                program,
-                                slot: slot.index,
-                                id,
+                    let prepared =
+                        (|| -> Result<pid_continuity::NativeAttempt<(), anyhow::Error>> {
+                            let path = &attach_targets
+                                .get(&slot.index)
+                                .expect("every selected target has retained pinned facts")
+                                .0;
+                            let prog: &mut UProbe = ebpf
+                                .program_mut(program)
+                                .with_context(|| format!("program {program} missing from object"))?
+                                .try_into()?;
+                            let attempt = pid_continuity::NativeAttempt::run(monotonic_ns, || {
+                                prog.attach([point], path, scope)
                             });
-                            Ok(())
-                        }
-                        Err(error) => Err(static_attach_error(program, slot, error)),
-                    }
+                            let result = match attempt.result {
+                                Ok(id) => {
+                                    links.push(RegisteredLink::UProbe {
+                                        program,
+                                        slot: slot.index,
+                                        id,
+                                        registration: pairs.register(),
+                                    });
+                                    Ok(())
+                                }
+                                Err(error) => Err(static_attach_error(program, slot, error)),
+                            };
+                            Ok(pid_continuity::NativeAttempt {
+                                started_ns: attempt.started_ns,
+                                result,
+                            })
+                        })();
+                    prepared.unwrap_or_else(pid_continuity::NativeAttempt::not_attempted)
                 },
                 |_| monotonic_ns(),
             )?
@@ -3943,6 +4276,7 @@ impl Session {
             successful,
             failures,
             completed,
+            continuity_rounds,
             exhausted: _,
         } = outcome;
         retain_from_successful(
@@ -3950,6 +4284,24 @@ impl Session {
             targets,
             &attach_targets,
             &successful,
+        );
+        for target in prepared_targets {
+            if let Some(retained) = self.retained_static.get_mut(&target.slot.index) {
+                retained.held = target.held;
+            }
+        }
+        let current_sides = self.current_static_sides();
+        self.pid_pairs.seal(
+            &continuity_rounds,
+            continuity_baseline,
+            self.pid_lifecycle
+                .as_ref()
+                .and_then(|tap| tap.facts().ok())
+                .map(|facts| facts.fault_serial),
+            &self.links,
+            &current_sides,
+            &self.retained_static,
+            monotonic_ns,
         );
         self.successful_static.extend(successful);
         let failed: Vec<_> = failures.iter().map(|(slot, _)| *slot).collect();
@@ -3989,7 +4341,7 @@ impl Session {
             prog_fds.insert(program, multi_prog_fd(&mut self.ebpf, program)?);
         }
         let pid = multi_link_pid(self.uprobe_scope);
-        let (bundles, outcome) = attach_target_groups_with(
+        let (bundles, outcome) = attach_target_groups_observed_with(
             &groups,
             |_| monotonic_ns(),
             |program, path, slice, is_return| {
@@ -3998,16 +4350,18 @@ impl Session {
                     .copied()
                     .expect("every group side pre-resolved its program fd");
                 let (offsets, cookies): (Vec<u64>, Vec<u64>) = slice.iter().copied().unzip();
-                attach_group(prog_fd, pid, path, &offsets, &cookies, is_return)
+                pid_continuity::NativeAttempt::run(monotonic_ns, || {
+                    attach_group(prog_fd, pid, path, &offsets, &cookies, is_return)
+                })
             },
         )?;
-        for bundle in bundles {
-            self.links.push(RegisteredLink::MultiUProbe {
-                program: bundle.program,
-                slots: bundle.slots,
-                fds: bundle.links,
-            });
-        }
+        publish_kept_multi_bundles(
+            &mut self.links,
+            &mut self.retained_static,
+            bundles,
+            &[],
+            &mut self.pid_pairs,
+        );
         Ok(outcome)
     }
 
@@ -4067,6 +4421,7 @@ impl Session {
     pub fn detach_slots(&mut self, slots: &[Slot]) -> Result<DetachOutcome> {
         let requested: BTreeSet<_> = slots.iter().map(|slot| slot.index).collect();
         let Some(affected) = plan_group_rebuild(&self.links, &requested) else {
+            self.pid_pairs.invalidate(&requested);
             let detached = self.detach_links(|link| match link {
                 // A group link drops only with all its members.
                 RegisteredLink::MultiUProbe { slots, .. } => {
@@ -4126,6 +4481,7 @@ impl Session {
         for program in programs {
             prog_fds.insert(program, multi_prog_fd(&mut self.ebpf, program)?);
         }
+        self.pid_pairs.invalidate(affected);
         self.detach_links(|link| match link {
             RegisteredLink::MultiUProbe { slots, .. } => {
                 slots.iter().any(|slot| affected.contains(slot))
@@ -4133,8 +4489,9 @@ impl Session {
             _ => link.slots().iter().any(|slot| requested.contains(slot)),
         })?;
         prune_linkless_retained(&mut self.retained_static, &self.links);
+        let continuity_baseline = self.pid_attach_baseline();
         let pid = multi_link_pid(self.uprobe_scope);
-        let (bundles, outcome) = reattach_rebuilt_groups_with(
+        let (bundles, outcome) = reattach_rebuilt_groups_observed_with(
             &groups,
             |_| monotonic_ns(),
             |program, path, slice, is_return| {
@@ -4143,24 +4500,40 @@ impl Session {
                     .copied()
                     .expect("every rebuilt side pre-resolved its program fd");
                 let (offsets, cookies): (Vec<u64>, Vec<u64>) = slice.iter().copied().unzip();
-                attach_group(prog_fd, pid, path, &offsets, &cookies, is_return)
+                pid_continuity::NativeAttempt::run(monotonic_ns, || {
+                    attach_group(prog_fd, pid, path, &offsets, &cookies, is_return)
+                })
             },
             // Closing the owned fds detaches the rolled-back links.
             drop,
         );
-        for bundle in bundles {
-            self.links.push(RegisteredLink::MultiUProbe {
-                program: bundle.program,
-                slots: bundle.slots,
-                fds: bundle.links,
-            });
-        }
+        publish_kept_multi_bundles(
+            &mut self.links,
+            &mut self.retained_static,
+            bundles,
+            &survivors,
+            &mut self.pid_pairs,
+        );
         let AttachOutcome {
             successful,
             failures: mut rebuild_failures,
             completed: recompleted,
+            continuity_rounds,
             exhausted: _,
         } = outcome;
+        let current_sides = self.current_static_sides();
+        self.pid_pairs.seal(
+            &continuity_rounds,
+            continuity_baseline,
+            self.pid_lifecycle
+                .as_ref()
+                .and_then(|tap| tap.facts().ok())
+                .map(|facts| facts.fault_serial),
+            &self.links,
+            &current_sides,
+            &self.retained_static,
+            monotonic_ns,
+        );
         self.successful_static.extend(successful);
         for member in missing {
             rebuild_failures.push((
@@ -4201,6 +4574,7 @@ impl Session {
         second_signal: impl Fn() -> bool,
         out: &mut dyn std::io::Write,
     ) -> Result<()> {
+        invalidate_pid_session(&mut self.pid_pairs, self.pid_lifecycle.as_ref());
         let start = std::time::Instant::now();
         let had_links = !self.links.is_empty();
         let mut first_error = None;
@@ -4285,16 +4659,7 @@ impl Session {
     }
 
     fn detach_links(&mut self, mut select: impl FnMut(&RegisteredLink) -> bool) -> Result<()> {
-        let mut selected = Vec::new();
-        let mut retained = Vec::new();
-        for link in std::mem::take(&mut self.links) {
-            if select(&link) {
-                selected.push(link);
-            } else {
-                retained.push(link);
-            }
-        }
-        self.links = retained;
+        let selected = extract_selected_links(&mut self.links, &mut self.pid_pairs, &mut select);
 
         let mut first_error = None;
         for error in detach_selected_with(
@@ -4431,13 +4796,7 @@ impl Session {
         if let Some(item) = self.discovery_staged.pop() {
             return Ok(Some(item));
         }
-        if self.discovery_consumer.is_none() {
-            let consumer =
-                events::OwnedDiscoveryDrain::for_session(&self.ebpf, &self.discovery_domain)?;
-            self.discovery_consumer = Some(consumer);
-            self.wire_trace_consumers()
-                .map_err(|reason| anyhow!("private trace proof: {reason:?}"))?;
-        }
+        self.ensure_discovery_consumer()?;
         Ok(self
             .discovery_consumer
             .as_mut()
@@ -4456,12 +4815,19 @@ impl Session {
     }
 
     fn ensure_discovery_consumer(&mut self) -> Result<()> {
-        if self.discovery_consumer.is_none() {
-            let consumer =
-                events::OwnedDiscoveryDrain::for_session(&self.ebpf, &self.discovery_domain)?;
-            self.discovery_consumer = Some(consumer);
+        let created = ensure_pid_discovery_consumer_with(
+            &mut self.discovery_consumer,
+            self.pid_lifecycle.as_ref(),
+            || events::OwnedDiscoveryDrain::for_session(&self.ebpf, &self.discovery_domain),
+        )?;
+        if created {
             self.wire_trace_consumers()
-                .map_err(|reason| anyhow!("private trace proof: {reason:?}"))?;
+                .map_err(|reason| anyhow!("private trace proof: {reason:?}"))
+                .inspect_err(|_| {
+                    if let Some(tap) = &self.pid_lifecycle {
+                        tap.observe_failure();
+                    }
+                })?;
         }
         Ok(())
     }
@@ -4480,6 +4846,7 @@ impl Session {
         mut service_discovery: impl FnMut(&mut events::OwnedDiscoveryDrain),
         now: impl FnMut() -> std::time::Instant,
     ) -> Result<crate::run::StopState> {
+        invalidate_pid_session(&mut self.pid_pairs, self.pid_lifecycle.as_ref());
         if service_events.is_some() {
             self.ensure_events_consumer()?;
         }
@@ -4539,40 +4906,13 @@ impl Session {
         stop: usize,
         quantum: usize,
     ) -> Result<(Vec<p11scope_ebpf_common::DiscoveryRecord>, u64, bool, bool)> {
+        invalidate_pid_session(&mut self.pid_pairs, self.pid_lifecycle.as_ref());
         self.ensure_discovery_consumer()?;
-        let mut records = Vec::new();
-        let mut malformed = 0u64;
-        // Staged items left the ring before the stop was requested, so they
-        // precede Q and come first.
-        let mut left = quantum;
-        while left > 0 {
-            let Some(item) = self.discovery_staged.pop() else {
-                break;
-            };
-            match item {
-                events::DiscoveryItem::Record(record) => records.push(record),
-                events::DiscoveryItem::Malformed => malformed = malformed.saturating_add(1),
-            }
-            left -= 1;
-        }
-        if left == 0 {
-            return Ok((records, malformed, false, true));
-        }
         let consumer = self
             .discovery_consumer
             .as_mut()
             .context("retained DISCOVERY consumer vanished after creation")?;
-        let (post_q_record, backlog) =
-            events::poll_discovery_to_position(consumer, stop, Some(left), |item| {
-                match item {
-                    events::DiscoveryItem::Record(record) => records.push(record),
-                    events::DiscoveryItem::Malformed => {
-                        malformed = malformed.saturating_add(1);
-                    }
-                }
-                std::ops::ControlFlow::Continue(())
-            })?;
-        Ok((records, malformed, post_q_record, backlog))
+        collect_staged_discovery_to_position(&mut self.discovery_staged, consumer, stop, quantum)
     }
 
     #[allow(dead_code)] // Task 8 drives the Task 7 pause coordinator.
@@ -4989,6 +5329,7 @@ fn finish_producer_detach(
 
 impl Drop for Session {
     fn drop(&mut self) {
+        invalidate_pid_session(&mut self.pid_pairs, self.pid_lifecycle.as_ref());
         // Refuse continuity before closing any owned producer/hook link.
         self.image_coverage.fail();
         // Never block on a worker-owned link: leftovers move to the
@@ -7090,6 +7431,7 @@ mod tests {
             program,
             slots,
             fds: Vec::new(),
+            registration: None,
         }
     }
 
@@ -7521,7 +7863,513 @@ mod tests {
         let slot = group_slot(index, 1, SlotSemantics::COUNT_ONLY);
         let targets = group_targets(&[(index, path, ElfAbi::Lp64)]);
         let (path, abi) = targets.get(&index).cloned().unwrap();
-        RetainedStaticTarget { slot, path, abi }
+        RetainedStaticTarget {
+            slot,
+            path,
+            abi,
+            held: None,
+        }
+    }
+
+    #[test]
+    fn pid_continuity_attach_start_precedes_first_return_and_completion() {
+        use pid_continuity::{AttachBaseline, NativeAttempt, PairBook};
+        let (_dir, pins, target) = pid_continuity::tests::fixture();
+        let mut sibling = target.clone();
+        sibling.slot.index = 1;
+        sibling.slot.file_offset += 8;
+        let slots = [target.slot.clone(), sibling.slot.clone()];
+        let retained = BTreeMap::from([(0, target), (1, sibling)]);
+        let mut pairs = PairBook::default();
+        let mut links = Vec::new();
+        let times = std::cell::RefCell::new(std::collections::VecDeque::from([10, 20, 40, 50]));
+        let calls = std::cell::RefCell::new(Vec::new());
+        let outcome = attach_targets_observed_with(&slots, CapturePolicy::AggregateOnly, false,
+            |_| Ok(ElfAbi::Lp64),
+            |program, slot, point| NativeAttempt::run(|| times.borrow_mut().pop_front(), || {
+                assert!(matches!(point.location, UProbeAttachLocation::AbsoluteOffset(offset) if offset == slot.file_offset));
+                calls.borrow_mut().push((program, slot.index));
+                links.push(RegisteredLink::MultiUProbe {
+                    program, slots: vec![slot.index],
+                    fds: vec![File::open("/dev/null")?.into()], registration: pairs.register(),
+                });
+                Ok(())
+            }), |_| Some(55)).unwrap();
+        assert_eq!(
+            *calls.borrow(),
+            [
+                ("p11_return", 0),
+                ("p11_return", 1),
+                ("p11_entry", 0),
+                ("p11_entry", 1)
+            ]
+        );
+        let completions = std::cell::Cell::new(60);
+        pairs.seal(
+            &outcome.continuity_rounds,
+            Some(AttachBaseline { loss: 7, fault: 0 }),
+            Some(0),
+            &links,
+            &current_static_sides_from(&links),
+            &retained,
+            || {
+                let now = completions.get();
+                completions.set(now + 10);
+                Some(now)
+            },
+        );
+        let first = pairs
+            .stamp_for(
+                &slots[0],
+                &pins,
+                &links,
+                &current_static_sides_from(&links),
+                &retained,
+            )
+            .unwrap();
+        assert_eq!((first.started_ns, first.completed_ns), (10, 60));
+        assert!(
+            first.started_ns < 30 && first.completed_ns > 30,
+            "EXEC between return and entry cannot look like a completed earlier generation"
+        );
+        let second = pairs
+            .stamp_for(
+                &slots[1],
+                &pins,
+                &links,
+                &current_static_sides_from(&links),
+                &retained,
+            )
+            .unwrap();
+        assert_eq!((second.started_ns, second.completed_ns), (20, 70));
+        assert_eq!(
+            outcome.completed,
+            [(0, Some(55)), (1, Some(55))],
+            "private stamps do not replace existing public completion samples"
+        );
+    }
+
+    #[test]
+    fn pid_continuity_multi_invalidates_connected_survivors_before_detach() {
+        use pid_continuity::{AttachBaseline, AttachRound, PairBook};
+        let (_dir, pins, target) = pid_continuity::tests::fixture();
+        let targets: Vec<_> = (0..4)
+            .map(|index| {
+                let mut target = target.clone();
+                target.slot.index = index;
+                target.slot.file_offset += u64::from(index) * 8;
+                target
+            })
+            .collect();
+        let mut pairs = PairBook::default();
+        let mut links = Vec::new();
+        let mut retained = BTreeMap::new();
+        let bundles = [
+            ("p11_return", vec![0, 1]),
+            ("p11_entry", vec![0]),
+            ("p11_entry", vec![1, 2]),
+            ("p11_return", vec![2]),
+            ("p11_return", vec![3]),
+            ("p11_entry", vec![3]),
+        ]
+        .into_iter()
+        .map(|(program, slots)| MultiLinkBundle {
+            program,
+            slots,
+            links: vec![File::open("/dev/null").unwrap().into()],
+        })
+        .collect();
+        publish_kept_multi_bundles(&mut links, &mut retained, bundles, &targets, &mut pairs);
+        pairs.seal(
+            &[
+                AttachRound {
+                    slots: vec![0, 1, 2],
+                    started_ns: Some(10),
+                    last_call_ns: Some(20),
+                },
+                AttachRound {
+                    slots: vec![3],
+                    started_ns: Some(10),
+                    last_call_ns: Some(20),
+                },
+            ],
+            Some(AttachBaseline { loss: 0, fault: 0 }),
+            Some(0),
+            &links,
+            &current_static_sides_from(&links),
+            &retained,
+            || Some(30),
+        );
+        let requested = BTreeSet::from([0]);
+        let affected = plan_group_rebuild(&links, &requested).unwrap();
+        assert_eq!(affected, BTreeSet::from([0, 1, 2]));
+        pairs.invalidate(&affected);
+        let detached = extract_selected_links(&mut links, &mut pairs, |link| {
+            link.slots().iter().any(|slot| affected.contains(slot))
+        });
+        let failures = detach_selected_with(
+            detached
+                .into_iter()
+                .map(|link| (link.producer(), link))
+                .collect(),
+            |link| {
+                for target in targets.iter().take(3) {
+                    assert!(pairs.recorded_generation(target.slot.index).is_none());
+                    assert!(
+                        pairs
+                            .stamp_for(
+                                &target.slot,
+                                &pins,
+                                &links,
+                                &current_static_sides_from(&links),
+                                &retained
+                            )
+                            .is_none(),
+                        "all transitive survivors are invalid before the first native detach"
+                    );
+                }
+                assert!(
+                    pairs
+                        .stamp_for(
+                            &targets[3].slot,
+                            &pins,
+                            &links,
+                            &current_static_sides_from(&links),
+                            &retained
+                        )
+                        .is_some()
+                );
+                drop(link);
+                Err(io::Error::other("scripted native detach failure").into())
+            },
+        );
+        assert_eq!(failures.len(), 4);
+        assert!(
+            attachment_admission(
+                &failures.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                true
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pid_continuity_replace_partial_cleanup_and_fallback_invalidate() {
+        use pid_continuity::{AttachBaseline, AttachRound, NativeAttempt, PairBook};
+        let (_dir, pins, target) = pid_continuity::tests::fixture();
+        let mut sibling = target.clone();
+        sibling.slot.index = 1;
+        sibling.slot.file_offset += 8;
+        let targets = [target.clone(), sibling.clone()];
+        let slot = target.slot.clone();
+        let mut pairs = PairBook::default();
+        let mut links = pid_continuity::tests::pair(&mut pairs);
+        let mut retained = BTreeMap::from([(0, target.clone())]);
+        pairs.seal(
+            &[AttachRound {
+                slots: vec![0],
+                started_ns: Some(10),
+                last_call_ns: Some(20),
+            }],
+            Some(AttachBaseline { loss: 5, fault: 0 }),
+            Some(0),
+            &links,
+            &current_static_sides_from(&links),
+            &retained,
+            || Some(30),
+        );
+        let old_generation = pairs.recorded_generation(0).unwrap();
+        drop(extract_selected_links(&mut links, &mut pairs, |_| true));
+        assert!(pairs.recorded_generation(0).is_none());
+        prune_linkless_retained(&mut retained, &links);
+        let attach_targets = targets
+            .iter()
+            .map(|target| (target.slot.index, (target.path.clone(), target.abi)))
+            .collect();
+        let groups = group_static_slots(
+            &[slot.clone(), sibling.slot.clone()],
+            CapturePolicy::AggregateOnly,
+            false,
+            &attach_targets,
+        );
+        let (bundles, outcome) = attach_target_groups_observed_with(
+            &groups,
+            |_| Some(55),
+            |_, _, sites, is_return| {
+                NativeAttempt::run(
+                    || Some(40),
+                    || {
+                        if !is_return
+                            && sites
+                                .iter()
+                                .any(|(offset, _)| *offset == sibling.slot.file_offset)
+                        {
+                            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+                        }
+                        Ok(File::open("/dev/null")?.into())
+                    },
+                )
+            },
+        )
+        .unwrap();
+        publish_kept_multi_bundles(&mut links, &mut retained, bundles, &targets, &mut pairs);
+        pairs.seal(
+            &outcome.continuity_rounds,
+            Some(AttachBaseline { loss: 5, fault: 1 }),
+            Some(1),
+            &links,
+            &current_static_sides_from(&links),
+            &retained,
+            || Some(60),
+        );
+        assert!(pairs.recorded_generation(0).unwrap() > old_generation);
+        assert!(
+            pairs.recorded_generation(1).is_none(),
+            "the failed replacement entry has no pair authority"
+        );
+        let affected = plan_group_rebuild(&links, &BTreeSet::from([1])).unwrap();
+        assert_eq!(
+            affected,
+            BTreeSet::from([0, 1]),
+            "partial replacement cleanup includes its successful sibling"
+        );
+        let survivor = retained[&0].clone();
+        pairs.invalidate(&affected);
+        drop(extract_selected_links(&mut links, &mut pairs, |link| {
+            link.slots().iter().any(|slot| affected.contains(slot))
+        }));
+        assert!(pairs.recorded_generation(0).is_none());
+        prune_linkless_retained(&mut retained, &links);
+        let targets = BTreeMap::from([(0, (survivor.path.clone(), survivor.abi))]);
+        let groups = group_static_slots(
+            std::slice::from_ref(&slot),
+            CapturePolicy::AggregateOnly,
+            false,
+            &targets,
+        );
+        let (bundles, outcome) = reattach_rebuilt_groups_observed_with(
+            &groups,
+            |_| Some(75),
+            |_, _, _, _| NativeAttempt::run(|| Some(70), || Ok(File::open("/dev/null")?.into())),
+            drop,
+        );
+        publish_kept_multi_bundles(&mut links, &mut retained, bundles, &[survivor], &mut pairs);
+        pairs.seal(
+            &outcome.continuity_rounds,
+            Some(AttachBaseline { loss: 5, fault: 1 }),
+            Some(1),
+            &links,
+            &current_static_sides_from(&links),
+            &retained,
+            || Some(80),
+        );
+        assert!(
+            pairs
+                .stamp_for(
+                    &slot,
+                    &pins,
+                    &links,
+                    &current_static_sides_from(&links),
+                    &retained
+                )
+                .unwrap()
+                .generation
+                > old_generation
+        );
+        let domain = events::DiscoveryDomain::test_standin(801);
+        let tap = PidLifecycleTap::test_for(7, domain.clone());
+        tap.begin_read(Some(90));
+        tap.observe_empty(Some(90), 0, 0);
+        invalidate_pid_session(&mut pairs, Some(&tap)); // shared by producer detach and Drop, even with no links
+        assert_eq!(tap.facts(), Err(PidContinuityRefusal::Terminal));
+        assert!(pairs.recorded_generation(0).is_none());
+        drop(extract_selected_links(&mut links, &mut pairs, |_| true));
+        let fallback_domain = events::DiscoveryDomain::test_standin(801);
+        assert!(!domain.same_allocation(&fallback_domain));
+        let fallback_tap = PidLifecycleTap::test_for(7, fallback_domain.clone());
+        assert!(!tap.matches_domain(&fallback_domain));
+        assert_eq!(
+            fallback_tap.facts().unwrap(),
+            pid_continuity::LifecycleFacts::default()
+        );
+        let fallback = PairBook::default();
+        assert!(
+            fallback
+                .stamp_for(
+                    &slot,
+                    &pins,
+                    &links,
+                    &current_static_sides_from(&links),
+                    &retained
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pid_continuity_multi_publishes_only_final_kept_round_and_targets() {
+        use pid_continuity::{AttachBaseline, NativeAttempt, PairBook};
+        let (_dir, pins, target) = pid_continuity::tests::fixture();
+        let (_later_dir, _later_pins, mut later) = pid_continuity::tests::fixture();
+        later.slot.index = 3;
+        let survivors: Vec<_> = (0..3)
+            .map(|index| {
+                let mut target = target.clone();
+                target.slot.index = index;
+                target.slot.file_offset += u64::from(index) * 8;
+                target
+            })
+            .chain([later.clone()])
+            .collect();
+        let slots: Vec<_> = survivors.iter().map(|target| target.slot.clone()).collect();
+        let targets = survivors
+            .iter()
+            .map(|target| (target.slot.index, (target.path.clone(), target.abi)))
+            .collect();
+        let mut groups = group_static_slots(&slots, CapturePolicy::AggregateOnly, false, &targets);
+        groups.sort_by_key(|group| group.members[0].slot.index);
+        let poison = slots[1].file_offset;
+        for error in [libc::EMFILE, libc::ENOTSUP] {
+            let times = std::cell::Cell::new(100);
+            let (bundles, outcome) = reattach_rebuilt_groups_observed_with(
+                &groups,
+                |_| Some(190),
+                |_, path, sites, is_return| {
+                    NativeAttempt::run(
+                        || {
+                            let now = times.get();
+                            times.set(now + 1);
+                            Some(now)
+                        },
+                        || {
+                            if path == later.path {
+                                return Err(io::Error::from_raw_os_error(error));
+                            }
+                            if !is_return && sites.iter().any(|(offset, _)| *offset == poison) {
+                                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+                            }
+                            Ok(File::open("/dev/null")?.into())
+                        },
+                    )
+                },
+                drop,
+            );
+            assert_eq!(outcome.exhausted, error == libc::EMFILE);
+            assert_eq!(outcome.completed, [(0, Some(190)), (2, Some(190))]);
+            assert_eq!(outcome.continuity_rounds.len(), 1);
+            let round = &outcome.continuity_rounds[0];
+            assert_eq!(round.slots, [0, 2]);
+            assert_eq!(
+                (round.started_ns, round.last_call_ns),
+                (Some(106), Some(107)),
+                "the discarded wide round cannot lend its timing to final kept links"
+            );
+            let mut pairs = PairBook::default();
+            let mut links = Vec::new();
+            let mut retained = BTreeMap::new();
+            publish_kept_multi_bundles(&mut links, &mut retained, bundles, &survivors, &mut pairs);
+            assert_eq!(
+                retained.keys().copied().collect::<Vec<_>>(),
+                [0, 2],
+                "the actual kept survivor registry publication must restore its exact target"
+            );
+            pairs.seal(
+                &outcome.continuity_rounds,
+                Some(AttachBaseline { loss: 7, fault: 0 }),
+                Some(0),
+                &links,
+                &current_static_sides_from(&links),
+                &retained,
+                || Some(200),
+            );
+            let first = pairs
+                .stamp_for(
+                    &slots[0],
+                    &pins,
+                    &links,
+                    &current_static_sides_from(&links),
+                    &retained,
+                )
+                .unwrap();
+            let generation = first.generation;
+            assert_eq!((first.started_ns, first.completed_ns), (106, 200));
+            assert_eq!(
+                pairs
+                    .stamp_for(
+                        &slots[2],
+                        &pins,
+                        &links,
+                        &current_static_sides_from(&links),
+                        &retained
+                    )
+                    .unwrap()
+                    .generation,
+                generation
+            );
+            let second_survivor = retained[&2].clone();
+            let affected = plan_group_rebuild(&links, &BTreeSet::from([0])).unwrap();
+            assert_eq!(affected, BTreeSet::from([0, 2]));
+            pairs.invalidate(&affected);
+            drop(extract_selected_links(&mut links, &mut pairs, |link| {
+                link.slots().iter().any(|slot| affected.contains(slot))
+            }));
+            prune_linkless_retained(&mut retained, &links);
+            assert!(retained.is_empty());
+            let targets =
+                BTreeMap::from([(2, (second_survivor.path.clone(), second_survivor.abi))]);
+            let rebuilt = group_static_slots(
+                std::slice::from_ref(&second_survivor.slot),
+                CapturePolicy::AggregateOnly,
+                false,
+                &targets,
+            );
+            let (bundles, outcome) = reattach_rebuilt_groups_observed_with(
+                &rebuilt,
+                |_| Some(209),
+                |_, _, _, _| {
+                    NativeAttempt::run(
+                        || {
+                            let now = times.get();
+                            times.set(now + 1);
+                            Some(now)
+                        },
+                        || Ok(File::open("/dev/null")?.into()),
+                    )
+                },
+                drop,
+            );
+            publish_kept_multi_bundles(
+                &mut links,
+                &mut retained,
+                bundles,
+                &[second_survivor],
+                &mut pairs,
+            );
+            pairs.seal(
+                &outcome.continuity_rounds,
+                Some(AttachBaseline { loss: 7, fault: 0 }),
+                Some(0),
+                &links,
+                &current_static_sides_from(&links),
+                &retained,
+                || Some(210),
+            );
+            assert!(
+                pairs
+                    .stamp_for(
+                        &slots[2],
+                        &pins,
+                        &links,
+                        &current_static_sides_from(&links),
+                        &retained
+                    )
+                    .unwrap()
+                    .generation
+                    > generation,
+                "restored held facts remain usable for the next survivor rebuild"
+            );
+            assert!(!retained.contains_key(&0));
+        }
     }
 
     #[test]

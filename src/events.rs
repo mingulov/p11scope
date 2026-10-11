@@ -944,6 +944,7 @@ pub(crate) struct DiscoveryDrain<S> {
     source: S,
     _domain: Option<DiscoveryDomain>,
     trace_tap: Option<crate::attach::detailed_identity::ProofTap>,
+    pid_lifecycle_tap: Option<crate::attach::PidLifecycleTap>,
 }
 
 impl OwnedDiscoveryDrain {
@@ -969,11 +970,35 @@ impl OwnedDiscoveryDrain {
             source: ring,
             _domain: Some(domain.clone()),
             trace_tap: None,
+            pid_lifecycle_tap: None,
         })
     }
 }
 
 impl<S: RecordSource> DiscoveryDrain<S> {
+    pub(crate) fn attach_pid_lifecycle_tap(
+        &mut self,
+        tap: crate::attach::PidLifecycleTap,
+    ) -> Result<(), crate::attach::PidContinuityRefusal> {
+        if !self
+            ._domain
+            .as_ref()
+            .is_some_and(|domain| tap.matches_domain(domain))
+            || self
+                .pid_lifecycle_tap
+                .as_ref()
+                .is_some_and(|installed| !installed.same_observer(&tap))
+        {
+            tap.observe_failure();
+            if let Some(installed) = &self.pid_lifecycle_tap {
+                installed.observe_failure();
+            }
+            return Err(crate::attach::PidContinuityRefusal::Domain);
+        }
+        self.pid_lifecycle_tap = Some(tap);
+        Ok(())
+    }
+
     pub(crate) fn attach_trace_tap(
         &mut self,
         tap: crate::attach::detailed_identity::ProofTap,
@@ -994,6 +1019,7 @@ impl<S: RecordSource> DiscoveryDrain<S> {
             source,
             _domain: Some(domain),
             trace_tap: None,
+            pid_lifecycle_tap: None,
         }
     }
 
@@ -1003,6 +1029,7 @@ impl<S: RecordSource> DiscoveryDrain<S> {
             source,
             _domain: None,
             trace_tap: None,
+            pid_lifecycle_tap: None,
         }
     }
 
@@ -1020,6 +1047,17 @@ impl<S: RecordSource> DiscoveryDrain<S> {
     where
         S: BoundedRecordSource,
     {
+        self.dequeue_with_clock(crate::attach::monotonic_ns)
+    }
+
+    fn dequeue_with_clock(&mut self, clock: impl FnOnce() -> Option<u64>) -> Option<DiscoveryItem>
+    where
+        S: BoundedRecordSource,
+    {
+        let pid_started = self
+            .pid_lifecycle_tap
+            .as_ref()
+            .and_then(|tap| tap.begin_read(clock()));
         let started = self.trace_tap.as_ref().and_then(|tap| tap.read_started());
         let decoded = self
             .source
@@ -1028,17 +1066,41 @@ impl<S: RecordSource> DiscoveryDrain<S> {
                 Some(record) => DiscoveryItem::Record(record),
                 None => DiscoveryItem::Malformed,
             });
+        let empty_positions = if decoded.is_none()
+            && (self.pid_lifecycle_tap.is_some() || self.trace_tap.is_some())
+        {
+            Some(self.source.positions())
+        } else {
+            None
+        };
+        // Observe the first raw consumption before any caller can stage or hold it.
+        if let Some(tap) = &self.pid_lifecycle_tap {
+            match &decoded {
+                Some(DiscoveryItem::Record(record)) => tap.observe_record(record),
+                Some(DiscoveryItem::Malformed) => tap.observe_malformed(),
+                None => {
+                    let positions = empty_positions.expect("empty observed cursor");
+                    tap.observe_empty(pid_started, positions.producer, positions.consumer);
+                }
+            }
+        }
         if let Some(tap) = &self.trace_tap {
             match &decoded {
                 Some(DiscoveryItem::Record(record)) => tap.observe_discovery(record),
                 Some(DiscoveryItem::Malformed) => tap.observe_failure(),
                 None => {
-                    let positions = self.source.positions();
+                    let positions = empty_positions.expect("empty observed cursor");
                     tap.observe_empty(started, positions.producer == positions.consumer);
                 }
             }
         }
         decoded
+    }
+
+    pub(crate) fn invalidate_pid_lifecycle_terminal(&self) {
+        if let Some(tap) = &self.pid_lifecycle_tap {
+            tap.invalidate_terminal();
+        }
     }
 }
 
@@ -1078,6 +1140,7 @@ pub(crate) fn poll_discovery_to_position<S: BoundedRecordSource>(
     quantum: Option<usize>,
     mut f: impl FnMut(DiscoveryItem) -> ControlFlow<()>,
 ) -> Result<(bool, bool)> {
+    drain.invalidate_pid_lifecycle_terminal();
     let mut left = quantum;
     loop {
         if left == Some(0) {
@@ -1441,6 +1504,365 @@ mod tests {
                 })),
                 None => Ok(BoundedRecord::Pending),
             }
+        }
+    }
+
+    #[test]
+    fn pid_continuity_raw_cursor_observes_startup_lazy_metrics_once() {
+        use crate::attach::{DiscoveryStage, PidLifecycleTap, ensure_pid_discovery_consumer_with};
+        use p11scope_ebpf_common::DISCOVERY_EXEC_SAME_TASK_CANDIDATE;
+        for route in 0..3 {
+            let domain = DiscoveryDomain::test_standin(701);
+            let tap = PidLifecycleTap::test_for(7, domain.clone());
+            let mut exec = proof_lifecycle(7, 100, DISCOVERY_KIND_EXEC);
+            exec.case_id = DISCOVERY_EXEC_SAME_TASK_CANDIDATE;
+            let mut consumer = None;
+            let create = || {
+                Ok(DiscoveryDrain::over_domain(
+                    CursorScript::scripted([discovery_bytes(&exec)]),
+                    domain,
+                ))
+            };
+            assert!(ensure_pid_discovery_consumer_with(&mut consumer, Some(&tap), create).unwrap());
+            let drain = consumer.as_mut().unwrap();
+            assert!(
+                drain.trace_tap.is_none(),
+                "metrics and startup do not require trace proof"
+            );
+            let mut stage = DiscoveryStage::default();
+            let item = if route == 1 {
+                let item = drain.dequeue_with_clock(|| Some(200)).unwrap();
+                assert_eq!(
+                    tap.test_facts().unwrap().observation_serial,
+                    1,
+                    "first raw dequeue must observe before direct delivery"
+                );
+                item
+            } else {
+                let outcome = stage.stage(1, DiscoveryStage::CAPACITY, || {
+                    let item = drain.dequeue_with_clock(|| Some(200));
+                    assert_eq!(
+                        tap.test_facts().unwrap().observation_serial,
+                        1,
+                        "first raw dequeue must observe before startup or lazy staging"
+                    );
+                    item
+                });
+                assert_eq!(outcome.staged, 1);
+                stage.pop().unwrap()
+            };
+            let first = tap.test_facts().unwrap();
+            assert_eq!(first.latest_exec.unwrap().hook_ts_ns, 100);
+            let held = item;
+            assert!(matches!(held, DiscoveryItem::Record(_)));
+            assert_eq!(
+                tap.test_facts().unwrap(),
+                first,
+                "staged and held replay cannot acquire another observation key"
+            );
+            assert!(
+                !ensure_pid_discovery_consumer_with(&mut consumer, Some(&tap), || panic!(
+                    "reuse the original cursor"
+                ))
+                .unwrap()
+            );
+        }
+    }
+
+    fn pid_lifecycle_record(ts: u64, class: u8) -> DiscoveryRecord {
+        let mut record = proof_lifecycle(7, ts, DISCOVERY_KIND_EXEC);
+        record.case_id = class;
+        record
+    }
+
+    fn pid_cursor(
+        records: impl IntoIterator<Item = Vec<u8>>,
+    ) -> (DiscoveryDrain<CursorScript>, crate::attach::PidLifecycleTap) {
+        let domain = DiscoveryDomain::test_standin(702);
+        let tap = crate::attach::PidLifecycleTap::test_for(7, domain.clone());
+        let mut drain = DiscoveryDrain::over_domain(CursorScript::scripted(records), domain);
+        drain.attach_pid_lifecycle_tap(tap.clone()).unwrap();
+        (drain, tap)
+    }
+
+    #[test]
+    fn pid_continuity_frontier_requires_genuine_empty_cursor() {
+        use p11scope_ebpf_common::DISCOVERY_EXEC_SAME_TASK_CANDIDATE as SAME;
+        let (mut drain, tap) = pid_cursor([]);
+        assert!(drain.dequeue_with_clock(|| Some(200)).is_none());
+        let empty = tap.test_facts().unwrap().empty.unwrap();
+        assert_eq!(
+            (
+                empty.read_started_ns,
+                empty.producer_position,
+                empty.observation_serial
+            ),
+            (200, 0, 0)
+        );
+        drain.source.producer = 8;
+        assert_eq!(
+            discovery_drain_positions(&drain).producer,
+            8,
+            "a saved empty never conceals a later producer advance"
+        );
+        assert!(drain.dequeue_with_clock(|| Some(210)).is_none());
+        assert!(
+            tap.test_facts().unwrap().empty.is_none(),
+            "BUSY is not a genuine empty"
+        );
+        let (mut drain, tap) = pid_cursor([
+            discovery_bytes(&pid_lifecycle_record(100, SAME)),
+            discovery_bytes(&pid_lifecycle_record(101, SAME)),
+        ]);
+        let mut staged = crate::attach::DiscoveryStage::default();
+        assert_eq!(
+            staged
+                .stage(1, 1, || drain.dequeue_with_clock(|| Some(200)))
+                .staged,
+            1
+        );
+        assert!(
+            tap.test_facts().unwrap().empty.is_none(),
+            "quantum exhaustion cannot create an empty frontier"
+        );
+        let before = tap.test_facts().unwrap();
+        assert!(
+            staged
+                .stage(10, 1, || panic!("capacity stop must not read the ring"))
+                .capacity_blocked
+        );
+        assert_eq!(tap.test_facts().unwrap(), before);
+        assert!(discovery_head_pending(&drain));
+        staged.pop();
+        assert_eq!(
+            staged
+                .stage(1, 1, || drain.dequeue_with_clock(|| Some(210)))
+                .staged,
+            1
+        );
+        assert!(tap.test_facts().unwrap().empty.is_none());
+        assert!(drain.dequeue_with_clock(|| Some(220)).is_none());
+        let empty = tap.test_facts().unwrap().empty.unwrap();
+        assert_eq!(
+            (
+                empty.read_started_ns,
+                empty.producer_position,
+                empty.observation_serial
+            ),
+            (220, 16, 2)
+        );
+        for second in [0, 99, 100] {
+            let (mut drain, tap) = pid_cursor([
+                discovery_bytes(&pid_lifecycle_record(100, SAME)),
+                discovery_bytes(&pid_lifecycle_record(second, SAME)),
+            ]);
+            assert!(drain.dequeue_with_clock(|| Some(200)).is_some());
+            assert!(drain.dequeue_with_clock(|| Some(210)).is_some());
+            let facts = tap.test_facts().unwrap();
+            assert_eq!(facts.observation_serial, 2);
+            assert_eq!(facts.fault_serial, 1);
+            assert!(
+                facts.latest_exec.is_none(),
+                "zero, backward and equal lifecycle times refuse an ambiguous key"
+            );
+        }
+        for clock in [None, Some(0), Some(199)] {
+            let (mut drain, tap) = pid_cursor([]);
+            assert!(drain.dequeue_with_clock(|| Some(200)).is_none());
+            assert!(drain.dequeue_with_clock(|| clock).is_none());
+            assert!(tap.test_facts().unwrap().empty.is_none());
+            assert_eq!(tap.test_facts().unwrap().fault_serial, 1);
+        }
+    }
+
+    #[test]
+    fn pid_continuity_preserves_breaks_and_transport_faults() {
+        use crate::attach::{
+            PidContinuityRefusal, PidLifecycleTap, ensure_pid_discovery_consumer_with,
+        };
+        use p11scope_ebpf_common::{
+            DISCOVERY_EXEC_SAME_TASK_CANDIDATE as SAME, DISCOVERY_EXEC_TASK_REPLACED as REPLACED,
+            DISCOVERY_EXEC_UNKNOWN as UNKNOWN,
+        };
+        let exit = proof_lifecycle(7, 120, p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT);
+        let (mut drain, tap) = pid_cursor([
+            discovery_bytes(&pid_lifecycle_record(100, REPLACED)),
+            discovery_bytes(&pid_lifecycle_record(110, UNKNOWN)),
+            discovery_bytes(&exit),
+            discovery_bytes(&pid_lifecycle_record(130, SAME)),
+            discovery_bytes(&pid_lifecycle_record(140, SAME)),
+            vec![0],
+        ]);
+        let mut held = None;
+        for index in 0..5 {
+            let item = drain.dequeue_with_clock(|| Some(200 + index)).unwrap();
+            if index == 3 {
+                held = Some(item);
+            }
+        }
+        let latest = tap.test_facts().unwrap();
+        assert_eq!(latest.greatest_break_ns, Some(120));
+        let latest_exec = latest.latest_exec.unwrap();
+        assert_eq!(
+            (latest_exec.hook_ts_ns, latest_exec.observation_serial),
+            (140, 5)
+        );
+        let Some(DiscoveryItem::Record(old)) = held else {
+            panic!("held EXEC");
+        };
+        assert_eq!(old.hook_ts_ns, 130);
+        assert_ne!(
+            old.hook_ts_ns, latest_exec.hook_ts_ns,
+            "held replay cannot borrow the newer EXEC key"
+        );
+        assert_eq!(tap.test_facts().unwrap(), latest);
+        assert!(matches!(
+            drain.dequeue_with_clock(|| Some(210)),
+            Some(DiscoveryItem::Malformed)
+        ));
+        let failed = tap.test_facts().unwrap();
+        assert_eq!((failed.observation_serial, failed.fault_serial), (6, 1));
+        assert!(failed.latest_exec.is_none());
+        assert_eq!(failed.greatest_break_ns, Some(120));
+        assert!(drain.dequeue_with_clock(|| Some(220)).is_none());
+        assert_eq!(
+            tap.test_facts().unwrap().fault_serial,
+            1,
+            "a later empty never erases the transport fault"
+        );
+        let domain = DiscoveryDomain::test_standin(703);
+        let tap = PidLifecycleTap::test_for(7, domain.clone());
+        let mut consumer: Option<DiscoveryDrain<CursorScript>> = None;
+        assert!(
+            ensure_pid_discovery_consumer_with(&mut consumer, Some(&tap), || Err(anyhow::anyhow!(
+                "consumer construction failed"
+            )))
+            .is_err()
+        );
+        assert_eq!(tap.test_facts().unwrap().fault_serial, 1);
+        assert!(consumer.is_none());
+        assert!(
+            ensure_pid_discovery_consumer_with(&mut consumer, Some(&tap), || Ok(
+                DiscoveryDrain::over_domain(
+                    CursorScript::scripted([]),
+                    DiscoveryDomain::test_standin(703)
+                )
+            ))
+            .is_err(),
+            "the same map number cannot replace the retained allocation"
+        );
+        assert_eq!(tap.test_facts().unwrap().fault_serial, 2);
+        assert!(consumer.is_none());
+        assert!(
+            ensure_pid_discovery_consumer_with(&mut consumer, Some(&tap), || Ok(
+                DiscoveryDrain::over_domain(CursorScript::scripted([]), domain.clone())
+            ))
+            .unwrap()
+        );
+        assert!(
+            consumer
+                .as_mut()
+                .unwrap()
+                .dequeue_with_clock(|| Some(300))
+                .is_none()
+        );
+        let before = tap.test_facts().unwrap().fault_serial;
+        let replacement = PidLifecycleTap::test_for(7, domain);
+        assert_eq!(
+            consumer
+                .as_mut()
+                .unwrap()
+                .attach_pid_lifecycle_tap(replacement),
+            Err(PidContinuityRefusal::Domain)
+        );
+        assert_eq!(tap.test_facts().unwrap().fault_serial, before + 1);
+        assert!(tap.test_facts().unwrap().empty.is_none());
+        let (mut drain, tap) = pid_cursor([
+            discovery_bytes(&pid_lifecycle_record(150, SAME)),
+            discovery_bytes(&pid_lifecycle_record(145, REPLACED)),
+            discovery_bytes(&pid_lifecycle_record(160, SAME)),
+        ]);
+        for now in [200, 210, 220] {
+            drain.dequeue_with_clock(|| Some(now));
+        }
+        assert_eq!(tap.test_facts().unwrap().greatest_break_ns, Some(145));
+        assert_eq!(
+            tap.test_facts().unwrap().fault_serial,
+            1,
+            "an out-of-order breaking record is retained and faults continuity"
+        );
+    }
+
+    #[test]
+    fn pid_continuity_terminal_bypass_is_irreversible() {
+        use crate::attach::{
+            DiscoveryStage, PidContinuityRefusal, collect_staged_discovery_to_position,
+        };
+        use p11scope_ebpf_common::DISCOVERY_EXEC_SAME_TASK_CANDIDATE as SAME;
+        for route in 0..7 {
+            let records = match route {
+                3 | 4 => vec![discovery_bytes(&pid_lifecycle_record(100, SAME))],
+                5 => vec![vec![0]],
+                _ => vec![],
+            };
+            let (mut drain, tap) = pid_cursor([]);
+            assert!(drain.dequeue_with_clock(|| Some(200)).is_none());
+            assert!(tap.test_facts().unwrap().empty.is_some());
+            drain.source.producer = records.len() * 8;
+            drain.source.queue.extend(records);
+            if route == 2 {
+                drain.source.producer = 8;
+            } // BUSY below the terminal stop
+            let mut count = 0;
+            let mut malformed = 0;
+            let result = match route {
+                0 => poll_discovery_to_position(&mut drain, 0, Some(0), |_| panic!("zero quantum")),
+                1 => poll_discovery_to_position(&mut drain, 0, Some(1), |_| panic!("Reached")),
+                2 => poll_discovery_to_position(&mut drain, 8, Some(1), |_| panic!("BUSY")),
+                3 | 5 => poll_discovery_to_position(&mut drain, 8, Some(2), |item| {
+                    match item {
+                        DiscoveryItem::Record(_) => count += 1,
+                        DiscoveryItem::Malformed => malformed += 1,
+                    }
+                    ControlFlow::Continue(())
+                }),
+                4 => poll_discovery_to_position(&mut drain, 8, Some(1), |_| {
+                    count += 1;
+                    ControlFlow::Break(())
+                }),
+                _ => {
+                    let mut staged = DiscoveryStage::default();
+                    staged.stage(1, 1, || {
+                        Some(DiscoveryItem::Record(pid_lifecycle_record(100, SAME)))
+                    });
+                    let (records, bad, post, backlog) =
+                        collect_staged_discovery_to_position(&mut staged, &mut drain, 0, 1)
+                            .unwrap();
+                    count = records.len();
+                    malformed = bad;
+                    assert!(staged.len() == 0 && !post && backlog);
+                    Ok((post, backlog))
+                }
+            };
+            if route == 2 {
+                assert!(result.is_err());
+                drain.source.producer = 0;
+            } else {
+                assert!(result.is_ok());
+            }
+            assert_eq!(count, usize::from(matches!(route, 3 | 4 | 6)));
+            assert_eq!(malformed, u64::from(route == 5));
+            assert_eq!(
+                tap.test_facts(),
+                Err(PidContinuityRefusal::Terminal),
+                "every terminal route invalidates before returning"
+            );
+            assert!(drain.dequeue_with_clock(|| Some(300)).is_none());
+            assert_eq!(
+                tap.test_facts(),
+                Err(PidContinuityRefusal::Terminal),
+                "ordinary reads cannot restore terminal authority"
+            );
         }
     }
 

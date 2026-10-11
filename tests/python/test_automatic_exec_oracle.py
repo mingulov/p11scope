@@ -26,6 +26,7 @@ import textwrap
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
@@ -837,6 +838,605 @@ class ReaderReadinessTest(unittest.TestCase):
         self.assertFalse(reader.thread.is_alive())
         with self.assertRaisesRegex(ValueError, "decode"):
             H6["expect_line"](reader, 0, "NEW_READY", 2)
+
+    def test_real_pipe_preserves_split_utf8_ledgers_and_final_unterminated_line(self):
+        reader, writer = self.pipe_reader()
+        text = 'N3LEDGER {"kind":"first","text":"€"}\r\nN3LEDGER {"kind":"last"}'
+        data = text.encode()
+        split = data.index("€".encode()) + 1
+        os.write(writer.fileno(), data[:split])
+        os.write(writer.fileno(), data[split:])
+        writer.close()
+        self.assertEqual(reader.finish(), text.replace("\r\n", "\n"))
+        self.assertEqual(reader.records, [{"kind": "first", "text": "€"}, {"kind": "last"}])
+
+    def test_real_pipe_invalid_utf8_is_a_cleanup_error(self):
+        reader, writer = self.pipe_reader()
+        os.write(writer.fileno(), b"\xff")
+        writer.close()
+        with self.assertRaisesRegex(ValueError, "decode"):
+            reader.finish()
+
+
+class LegCleanupTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="h6-leg-cleanup-")
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name)
+        self.globals = H6["run_cell_backend"].__globals__
+        self.ctx = H6["Case"](SimpleNamespace(out=self.directory, uid=os.getuid(), gid=os.getgid()))
+        input_path = self.directory / "case-input"
+        input_path.write_text("owned input pin\n")
+        self.case_pin = H6["FilePin"](input_path)
+        self.ctx.pins = {"caller": self.case_pin}
+        self.ctx.provider_pin = self.case_pin
+        self.ctx.binary = self.case_pin
+        self.spawned, self.local_pins = [], []
+        self.addCleanup(self.release_test_resources)
+
+    def release_test_resources(self):
+        for owner, readers in self.spawned:
+            try:
+                pid, status = os.waitpid(owner.pid, os.WNOHANG)
+                if not pid or not (os.WIFEXITED(status) or os.WIFSIGNALED(status)):
+                    # waitpid proves this remains our actual unreaped child;
+                    # a completed/reused PID raises ChildProcessError instead.
+                    os.kill(owner.pid, 9)
+                    pid, status = os.waitpid(owner.pid, 0)
+                owner.popen.returncode = os.waitstatus_to_exitcode(status)
+            except ChildProcessError:
+                pass
+            for reader in readers:
+                reader.thread.join(2)
+            for stream in (owner.popen.stdin, owner.popen.stdout, owner.popen.stderr):
+                if stream is not None and not stream.closed:
+                    stream.close()
+            owner.close()
+        for pin in [*self.local_pins, self.case_pin]:
+            if getattr(pin, "fd", None) is not None:
+                try:
+                    pin.close()
+                except OSError:
+                    pass
+                pin.fd = None
+
+    def child(self, owners, readers, leg_dir, code=None, **_options):
+        owned = H6["spawn_owned"](owners,
+            [sys.executable, "-I", "-c", code or "import sys; print('alive',flush=True); sys.stdin.read()"],
+            os.getuid(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True)
+        stdout = H6["Reader"](owned.popen.stdout, Path(leg_dir) / f"child-{owned.pid}.out")
+        stderr = H6["Reader"](owned.popen.stderr, Path(leg_dir) / f"child-{owned.pid}.err")
+        readers.extend((stdout, stderr))
+        stdout.record = lambda *_args, **_kwargs: {"image": 0}
+        self.spawned.append((owned, [stdout, stderr]))
+        return owned, stdout, stderr
+
+    def patches(self, ready):
+        pin_class = H6["FilePin"]
+        def pin(path):
+            result = pin_class(path)
+            self.local_pins.append(result)
+            return result
+        def caller(owners, readers, leg_dir, *_args, **kwargs):
+            return self.child(owners, readers, leg_dir, **kwargs)
+        def observer(owners, readers, leg_dir, *_args, **kwargs):
+            owned, stdout, stderr = self.child(owners, readers, leg_dir, **kwargs)
+            return owned, stdout, stderr, time.monotonic_ns()
+        return mock.patch.dict(self.globals, {
+            "init_token": lambda *_args: dict(os.environ), "FilePin": pin,
+            "spawn_caller": caller, "spawn_observer": observer,
+            "observer_ready": ready, "stop_caller": lambda *_args: 0}), \
+            mock.patch.object(pin_class, "image_receipt", return_value={"image": 0})
+
+    def assert_released(self, resources=None):
+        for owner, readers in self.spawned if resources is None else resources:
+            self.assertIsNotNone(owner.popen.poll(), "prior owned process survived its leg")
+            self.assertFalse((Path("/proc") / str(owner.pid)).exists(), "prior child was not actually reaped")
+            self.assertIsNone(owner.pidfd, "prior pidfd survived its leg")
+            self.assertTrue(all(not reader.thread.is_alive() for reader in readers))
+            self.assertTrue(all(stream.closed for stream in
+                (owner.popen.stdin, owner.popen.stdout, owner.popen.stderr) if stream is not None))
+        os.fstat(self.case_pin.fd)
+
+    def test_failed_leg_reaps_before_next_observer(self):
+        def fail(*_args):
+            raise H6["SetupError"]("controlled setup failure")
+        patch, image_patch = self.patches(fail)
+        with patch, image_patch:
+            first = H6["run_cell_backend"](self.ctx, "pid-leader", "singles")
+            previous = list(self.spawned)
+            original_observer = self.globals["spawn_observer"]
+            observed = []
+            def next_observer(*args, **kwargs):
+                observed.append(all(owner.popen.poll() is not None for owner, _ in previous))
+                return original_observer(*args, **kwargs)
+            with mock.patch.dict(self.globals, {"spawn_observer": next_observer}):
+                second = H6["run_cell_backend"](self.ctx, "pid-leader", "multi")
+        self.assertFalse(first[0]["pass"])
+        self.assertFalse(second[0]["pass"])
+        self.assertEqual(observed, [True], "next observer began while the previous leg still lived")
+        self.assert_released()
+
+    def test_early_refusal_releases_all_owned_resources(self):
+        def refuse(*_args):
+            raise H6["BackendRefused"]("controlled backend refusal")
+        patch, image_patch = self.patches(refuse)
+        with patch, image_patch:
+            results = H6["run_cell_backend"](self.ctx, "pid-leader", "singles")
+        self.assertEqual([row["status"] for row in results], ["negative"] * 3)
+        self.assert_released()
+
+    def driven_patches(self, oracle):
+        def phase(caller, stdout, fn, count, delay, name, scope, image, group, phases, **_kwargs):
+            t0 = time.monotonic_ns()
+            phases.append({"fn": fn, "count": count, "phase": name, "image": image,
+                           "scope": scope, "t0": t0, "t1": t0 + 1})
+        def drain(capture, caller, stdout, fn, count, delay, name, image, phases):
+            phase(caller, stdout, fn, count, delay, name, "selected", image, None, phases)
+        def execute(caller, stdout, images, method, target):
+            images.append({"image": 1})
+            return {}, {}, time.monotonic_ns(), time.monotonic_ns()
+        def warm(capture, caller, stdout, image, phases, *_args, **_kwargs):
+            phase(caller, stdout, "C_GetInfo", 1, 0, "successor", "selected", 1, None, phases)
+            return {}
+        return mock.patch.dict(self.globals, {
+            "drain_trace_phase": drain, "n3_command": phase, "caller_exec": execute,
+            "warm_caller": warm, "stop_observer": lambda *_args: (0, time.monotonic_ns(), 0),
+            "finish_readers": lambda *_args: None, "provider_receipt": lambda *_args: dict(PIN),
+            "evaluate_trace_h6": oracle})
+
+    def run_driven_leg(self, oracle):
+        patch, image_patch = self.patches(lambda *_args: time.monotonic_ns())
+        leg_dir = self.directory / "driven"
+        leg_dir.mkdir()
+        (leg_dir / "trace.file.txt").write_text("controlled oracle input\n")
+        with patch, image_patch, self.driven_patches(oracle):
+            return H6["run_pid_caller_leg"](self.ctx, "pid-leader", "singles", "trace", leg_dir, False)
+
+    def test_oracle_exception_cleans_leg_resources(self):
+        def oracle(*_args):
+            raise ValueError("controlled oracle exception")
+        with self.assertRaisesRegex(ValueError, "controlled oracle exception"):
+            self.run_driven_leg(oracle)
+        self.assert_released()
+
+    def test_successful_leg_releases_fds_without_closing_case_pins(self):
+        result = self.run_driven_leg(lambda *_args: {"cell": "pid-leader", "leg": "trace/singles", "pass": True})
+        self.assertTrue(result["pass"])
+        self.assert_released()
+        self.assertTrue(all(pin.fd is None for pin in self.local_pins))
+        totals = dict(self.ctx.cleanup_totals)
+        for scope in self.ctx.scopes:
+            H6["cleanup_leg_resources"](scope)
+        self.assertEqual(self.ctx.cleanup_totals, totals)
+
+    def test_interrupted_leg_cleans_before_propagating(self):
+        def interrupt(*_args):
+            raise KeyboardInterrupt("controlled interruption")
+        patch, image_patch = self.patches(interrupt)
+        with patch, image_patch, self.assertRaises(KeyboardInterrupt):
+            H6["run_pid_caller_leg"](self.ctx, "pid-leader", "singles", "trace", self.directory / "interrupt", False)
+        self.assert_released()
+
+    def test_partial_spawn_failure_cleans_registered_child_and_started_reader(self):
+        spawned, started_readers = [], []
+        original_spawn, reader_class = H6["spawn_owned"], H6["Reader"]
+        original_init, original_read = reader_class.__init__, reader_class._read
+        def spawn(owners, argv, _uid, **options):
+            owned = original_spawn(owners, argv, os.getuid(), **options)
+            spawned.append(owned)
+            return owned
+        def delayed_read(reader):
+            time.sleep(0.1)
+            original_read(reader)
+        def fail_constructor(reader, *args):
+            original_init(reader, *args)
+            started_readers.append(reader)
+            raise OSError("controlled reader constructor failure")
+        @H6["owned_leg"]
+        def leg(ctx):
+            return H6["spawn_observer"](ctx.owners, ctx.readers, self.directory,
+                [sys.executable, "-I", "-c", "import time; print('alive',flush=True); time.sleep(30)"], dict(os.environ))
+        with mock.patch.dict(self.globals, {"spawn_owned": spawn}), \
+                mock.patch.object(reader_class, "_read", delayed_read), \
+                mock.patch.object(reader_class, "__init__", fail_constructor), \
+                self.assertRaisesRegex(OSError, "controlled reader constructor failure"):
+            leg(self.ctx)
+        try:
+            self.assertIsNotNone(spawned[0].popen.poll())
+            self.assertIsNone(spawned[0].pidfd)
+            self.assertFalse(started_readers[0].thread.is_alive(), "unregistered reader survived constructor failure")
+            self.assertTrue(spawned[0].popen.stdout.closed)
+        finally:
+            for reader in started_readers:
+                reader.thread.join(2)
+            for owner in spawned:
+                if owner.popen.poll() is None:
+                    owner.popen.kill()
+                    owner.popen.wait(timeout=2)
+                for stream in (owner.popen.stdout, owner.popen.stderr):
+                    if not stream.closed:
+                        stream.close()
+                owner.close()
+
+    def matrix(self, runner, *, pin_close_failure=False):
+        created_pins = []
+        pin_class = H6["FilePin"]
+        def pin(path):
+            value = pin_class(path)
+            created_pins.append(value)
+            if pin_close_failure and len(created_pins) == 1:
+                close = value.close
+                def fail_close():
+                    close()
+                    value.fd = None
+                    raise OSError("controlled final pin cleanup failure")
+                value.close = fail_close
+            return value
+        out = self.directory / "matrix"
+        argv = ["--binary", str(self.case_pin.path), "--provider", str(self.case_pin.path),
+                "--discover", str(self.case_pin.path), "--source-revision", "0" * 40,
+                "--uid", "1001", "--gid", "1001", "--cells", "pid-leader",
+                "--backends", "singles,multi", "--out", str(out)]
+        def cell(ctx, directory, backend):
+            return [runner(ctx, directory, backend)]
+        try:
+            with mock.patch.dict(self.globals, {"FilePin": pin,
+                    "compile_case_fixtures": lambda *_args: {}, "symbol_file_offset": lambda *_args: 0}), \
+                    mock.patch.dict(H6["CELL_RUNNERS"], {"pid-leader": cell}), \
+                    mock.patch.object(os, "geteuid", return_value=0):
+                rc = H6["main"](argv)
+            return rc, json.loads((out / "summary.json").read_text()), json.loads((out / "cleanup.json").read_text())
+        finally:
+            for value in created_pins:
+                if value.fd is not None:
+                    try:
+                        os.close(value.fd)
+                    except OSError:
+                        pass
+                    value.fd = None
+
+    def test_cleanup_failure_stops_matrix_and_fails_summary_even_after_setup_failure(self):
+        started = []
+        removed = []
+        class FailedGroup:
+            def remove(self):
+                removed.append(True)
+                raise OSError("controlled cgroup cleanup failure")
+        @H6["owned_leg"]
+        def runner(ctx, directory, backend):
+            started.append(backend)
+            self.child(ctx.owners, ctx.readers, directory)
+            ctx.groups.append(FailedGroup())
+            raise H6["SetupError"]("controlled primary setup failure")
+        try:
+            rc, summary, cleanup = self.matrix(runner)
+        except H6["LegCleanupError"] as error:
+            self.fail(f"cleanup failure escaped without a failed summary: {error}")
+        self.assertEqual(rc, 1)
+        self.assertEqual(started, ["singles"], "cleanup failure allowed another observer leg")
+        self.assertEqual(removed, [True], "final backstop repeated completed cleanup")
+        self.assertGreater(summary["failed"], 0)
+        self.assertTrue(any("controlled primary setup failure" in error and "controlled cgroup cleanup failure" in error
+                            for result in summary["legs"] for error in result["errors"]))
+        self.assertTrue(any("controlled cgroup cleanup failure" in error for error in cleanup["errors"]))
+        self.assert_released()
+
+    def test_final_cleanup_failure_prevents_a_success_summary(self):
+        @H6["owned_leg"]
+        def runner(ctx, directory, backend):
+            self.child(ctx.owners, ctx.readers, directory)
+            return {"cell": "pid-leader", "leg": backend, "status": "pass", "pass": True}
+        rc, summary, cleanup = self.matrix(runner, pin_close_failure=True)
+        self.assertEqual(rc, 1, "main decided success before final cleanup")
+        self.assertGreater(summary["failed"], 0)
+        self.assertTrue(any("controlled final pin cleanup failure" in error for error in cleanup["errors"]))
+        self.assert_released()
+
+    def test_ptrace_stopped_owned_child_is_killed_and_actually_reaped(self):
+        timer = None
+        code = ("import ctypes,os,signal,sys; libc=ctypes.CDLL(None,use_errno=True); "
+                "rc=libc.ptrace(0,0,0,0); print('trace='+str(rc),flush=True); "
+                "os.kill(os.getpid(),signal.SIGSTOP) if rc==0 else sys.exit(83); sys.stdin.read()")
+        @H6["owned_leg"]
+        def leg(ctx):
+            nonlocal timer
+            owner, stdout, _ = self.child(ctx.owners, ctx.readers, self.directory, code=code)
+            ctx.traced.append(owner)
+            stdout.wait(lambda reader: any(line.startswith("trace=") for line in reader.lines), 1)
+            if "trace=-1\n" in stdout.lines:
+                self.skipTest("host denies unprivileged tracing of the owned direct child")
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                if "t" in H6["proc_task_states"](owner.pid).values():
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("owned child never reached its real ptrace stop")
+            # A backstop bounds the RED control even when legacy Popen.poll
+            # mistakes the ptrace stop for process death. It never reaps it.
+            def kill_original():
+                try:
+                    owner.verify()
+                    os.kill(owner.pid, 9)
+                except (FileNotFoundError, ProcessLookupError):
+                    pass
+            timer = threading.Timer(1, kill_original)
+            timer.start()
+            raise H6["SetupError"]("controlled failure with ptrace-stopped child")
+        try:
+            with self.assertRaisesRegex(H6["SetupError"], "ptrace-stopped child"):
+                leg(self.ctx)
+            self.assert_released()
+        finally:
+            if timer is not None:
+                timer.cancel()
+                timer.join(2)
+
+    def test_pipe_cleanup_settles_reader_without_waiting_for_an_open_writer(self):
+        read_fd, write_fd = os.pipe()
+        stream, writer = os.fdopen(read_fd, encoding="utf-8"), os.fdopen(write_fd, "w")
+        scope = H6["LegContext"](self.ctx)
+        reader = H6["owned_reader"](scope.readers, H6["Reader"], stream, self.directory / "held-pipe.txt")
+        timer = threading.Timer(2, writer.close)
+        timer.start()
+        original_join = reader.thread.join
+        calls = []
+        def short_first_join(timeout=None):
+            calls.append(True)
+            return original_join(0.02 if len(calls) == 1 else timeout)
+        try:
+            with mock.patch.object(reader.thread, "join", side_effect=short_first_join), \
+                    self.assertRaises(H6["LegCleanupError"]):
+                H6["cleanup_leg_resources"](scope)
+            self.assertFalse(reader.thread.is_alive())
+            self.assertTrue(stream.closed)
+            self.assertFalse(writer.closed, "cleanup blocked closing a pipe still read by its thread")
+        finally:
+            timer.cancel()
+            writer.close()
+            timer.join(2)
+            reader.thread.join(2)
+            stream.close()
+
+    def test_rapid_main_releases_resources_before_reuse_and_death_observers(self):
+        cell_dir = self.directory / "rapid-chain"
+        trace_dir = cell_dir / "singles" / "trace"
+        trace_dir.mkdir(parents=True)
+        (trace_dir / "trace.file.txt").write_text("controlled oracle input\n")
+        order = []
+        def control(label):
+            @H6["owned_leg"]
+            def run(ctx, leg_dir, backend, env, *args):
+                self.assert_released()  # includes the preceding control on entry to death
+                image_pin = args[-1]
+                os.fstat(image_pin.fd)
+                self.assertTrue(all(pin.fd is not None for pin in self.local_pins))
+                order.append(label)
+                Path(leg_dir).mkdir(parents=True)
+                self.child(ctx.owners, ctx.readers, leg_dir)
+                return {"cell": "rapid-chain", "leg": label, "pass": True}
+            return run
+        patch, image_patch = self.patches(lambda *_args: time.monotonic_ns())
+        with patch, image_patch, self.driven_patches(lambda *_args: {"leg": "main", "pass": True}), \
+                mock.patch.dict(self.globals, {"run_reuse_control": control("reuse"),
+                                               "run_group_death_leg": control("death")}):
+            results = H6["run_rapid_chain"](self.ctx, cell_dir, "singles")
+        self.assertEqual(order, ["reuse", "death"])
+        self.assertEqual([row["leg"] for row in results], ["main", "reuse", "death"])
+        self.assertEqual([row["leg"] for row in self.ctx.completed_results], ["main", "reuse", "death"])
+        self.assert_released()
+        self.assertTrue(all(pin.fd is None for pin in self.local_pins))
+
+    def test_partial_pty_acquisition_closes_fds_and_settles_started_thread(self):
+        original_open, capture_class = H6["pty"].openpty, H6["PtyCapture"]
+        original_init = capture_class.__init__
+        for failure in ("before-reader", "after-reader", "spawn"):
+            with self.subTest(failure=failure):
+                fds, captures = [], []
+                def openpty():
+                    result = original_open()
+                    fds.extend(result)
+                    return result
+                def initialize(reader, *args):
+                    captures.append(reader)
+                    if failure != "before-reader":
+                        original_init(reader, *args)
+                    if failure != "spawn":
+                        raise OSError("controlled PTY acquisition failure")
+                def spawn(*_args, **_kwargs):
+                    raise OSError("controlled PTY acquisition failure")
+                @H6["owned_leg"]
+                def leg(ctx):
+                    H6["spawn_observer"](ctx.owners, ctx.readers, self.directory, [], dict(os.environ), live=True)
+                with mock.patch.object(H6["pty"], "openpty", side_effect=openpty), \
+                        mock.patch.object(capture_class, "__init__", initialize), \
+                        mock.patch.dict(self.globals, {"spawn_owned": spawn}), \
+                        self.assertRaisesRegex(OSError, "PTY acquisition failure"):
+                    leg(self.ctx)
+                for fd in fds:
+                    with self.assertRaises(OSError):
+                        os.fstat(fd)
+                self.assertIsNone(captures[0].master)
+                if captures[0].thread is not None:
+                    self.assertFalse(captures[0].thread.is_alive())
+                    self.assertEqual(captures[0].errors, [])
+        self.assertFalse(self.ctx.cleanup_failed)
+
+    def test_seized_child_is_enrolled_before_options_failure(self):
+        original_ptrace = H6["_ptrace"]
+        timer = None
+        @H6["owned_leg"]
+        def leg(ctx):
+            nonlocal timer
+            owner, _, _ = self.child(ctx.owners, ctx.readers, self.directory)
+            def kill_original():
+                try:
+                    owner.send(H6["signal"].SIGKILL)
+                except (OSError, ValueError):
+                    pass
+            timer = threading.Timer(1, kill_original)
+            timer.start()
+            def ptrace(request, pid, *args):
+                if request == H6["_PTRACE_SEIZE"]:
+                    try:
+                        return original_ptrace(request, pid, *args)
+                    except OSError as error:
+                        if error.errno == 1:
+                            self.skipTest("host denies unprivileged seizure of the owned direct child")
+                        raise
+                self.assertEqual(ctx.traced, [owner], "options failed before ptrace ownership enrollment")
+                raise OSError("controlled options acquisition failure")
+            with mock.patch.dict(self.globals, {"_ptrace": ptrace}):
+                H6["seize_until_exec"](owner.pid, ctx, owner)
+        try:
+            with self.assertRaisesRegex(OSError, "options acquisition failure"):
+                leg(self.ctx)
+            self.assert_released()
+        finally:
+            if timer is not None:
+                timer.cancel()
+                timer.join(2)
+
+    def test_later_leg_failure_retains_earlier_completed_result(self):
+        @H6["owned_leg"]
+        def success(ctx):
+            self.child(ctx.owners, ctx.readers, self.directory)
+            return {"cell": "pid-leader", "leg": "first", "status": "pass", "pass": True}
+        @H6["owned_leg"]
+        def failure(ctx):
+            self.assert_released()
+            self.child(ctx.owners, ctx.readers, self.directory)
+            raise H6["SetupError"]("controlled later failure")
+        def cell(ctx, *_args):
+            return [success(ctx), failure(ctx)]
+        with mock.patch.dict(H6["CELL_RUNNERS"], {"pid-leader": cell}):
+            results = H6["run_cell_backend"](self.ctx, "pid-leader", "singles")
+        self.assertEqual([row["pass"] for row in results], [True, False])
+        self.assertEqual(results[0]["leg"], "first")
+        self.assertIn("controlled later failure", results[1]["errors"][0])
+        self.assert_released()
+
+    def test_partial_process_validation_failure_reaps_registered_direct_child(self):
+        shared = H6["spawn_owned"].__globals__
+        acquired = []
+        def validation(_pid, _parent, _uid, popen):
+            acquired.append(popen)
+            raise OSError("controlled process validation failure")
+        @H6["owned_leg"]
+        def leg(ctx):
+            H6["spawn_owned"](ctx.owners,
+                [sys.executable, "-I", "-c", "import sys; sys.stdin.read()"], os.getuid(),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, start_new_session=True)
+        try:
+            with mock.patch.dict(shared, {"OwnedProcess": validation}), \
+                    self.assertRaisesRegex(OSError, "process validation failure"):
+                leg(self.ctx)
+            self.assertIsNotNone(acquired[0].poll())
+            self.assertFalse((Path("/proc") / str(acquired[0].pid)).exists())
+            self.assertTrue(all(stream.closed for stream in
+                (acquired[0].stdin, acquired[0].stdout, acquired[0].stderr)))
+        finally:
+            for popen in acquired:
+                if popen.poll() is None:
+                    popen.kill()
+                    popen.wait(2)
+                for stream in (popen.stdin, popen.stdout, popen.stderr):
+                    stream.close()
+
+    def ordinary_group_controls(self):
+        # Real directories/held FDs exercise the unchanged ownership checks.
+        # Only the cgroup filesystem magic and empty population are injected;
+        # no actual cgroup is created or migrated.
+        shared = H6["N3HARNESS"]["create_cgroup"].__globals__
+        return mock.patch.dict(shared, {"fs_magic": lambda _fd: 0x63677270}), \
+            mock.patch.object(H6["N3HARNESS"]["Cgroup"], "members", return_value=[])
+
+    def test_group_removal_follows_reap_reader_and_fd_cleanup(self):
+        patch, members = self.ordinary_group_controls()
+        removed = []
+        path = self.directory / "selected"
+        @H6["owned_leg"]
+        def leg(ctx):
+            self.child(ctx.owners, ctx.readers, self.directory)
+            _, wrapper = H6["create_tracked"](ctx, path)
+            remove = wrapper.remove
+            def after_reap():
+                self.assert_released()
+                removed.append(True)
+                remove()
+            wrapper.remove = after_reap
+        with patch, members:
+            leg(self.ctx)
+        self.assertEqual(removed, [True])
+        self.assertFalse(path.exists())
+
+    def test_partial_group_acquisition_removes_only_enrolled_directory(self):
+        shared = H6["N3HARNESS"]["create_cgroup"].__globals__
+        path = self.directory / "selected"
+        def acquisition(_path):
+            raise OSError("controlled group acquisition failure")
+        @H6["owned_leg"]
+        def leg(ctx):
+            H6["create_tracked"](ctx, path)
+        with mock.patch.dict(shared, {"fs_magic": lambda _fd: 0x63677270, "Cgroup": acquisition}), \
+                self.assertRaisesRegex(OSError, "group acquisition failure"):
+            leg(self.ctx)
+        self.assertFalse(path.exists())
+        self.assertFalse(self.ctx.cleanup_failed)
+
+    def test_replacement_is_enrolled_before_later_setup_failure(self):
+        patch, members = self.ordinary_group_controls()
+        path = self.directory / "selected"
+        @H6["owned_leg"]
+        def leg(ctx):
+            selected, wrapper = H6["create_tracked"](ctx, path)
+            replacement, new_wrapper, old_ino, new_ino = H6["replace_tracked"](ctx, selected, wrapper)
+            self.assertNotEqual(old_ino, new_ino)
+            self.assertIn(new_wrapper, ctx.groups)
+            raise H6["SetupError"]("controlled failure after replacement")
+        with patch, members, self.assertRaisesRegex(H6["SetupError"], "after replacement"):
+            leg(self.ctx)
+        self.assertFalse(path.exists(), "replacement survived its failed observer leg")
+        self.assertFalse(self.ctx.cleanup_failed)
+
+    def test_replacement_refuses_a_foreign_path_without_removing_it(self):
+        patch, members = self.ordinary_group_controls()
+        path, original = self.directory / "selected", self.directory / "original"
+        with patch, members:
+            scope = H6["LegContext"](self.ctx)
+            selected, wrapper = H6["create_tracked"](scope, path)
+            path.rename(original)
+            path.mkdir()
+            foreign_ino = path.stat().st_ino
+            with self.assertRaises(H6["LegCleanupError"]):
+                H6["replace_tracked"](scope, selected, wrapper)
+            self.assertEqual(path.stat().st_ino, foreign_ino)
+            self.assertTrue(original.exists())
+            self.assertTrue(self.ctx.cleanup_failed)
+            self.assertIsNone(selected.fd)
+            H6["cleanup_leg_resources"](scope)
+
+    def test_replacement_preserves_renamed_wrapper_identity_checks(self):
+        patch, members = self.ordinary_group_controls()
+        top, renamed = self.directory / "top", self.directory / "renamed"
+        @H6["owned_leg"]
+        def leg(ctx):
+            root, root_wrapper = H6["create_tracked"](ctx, top)
+            selected, selected_wrapper = H6["create_tracked"](ctx, top / "selected")
+            moves = []
+            H6["fixup_renamed_wrappers"](moves, root_wrapper, renamed, [(selected_wrapper, "selected")])
+            replacement, wrapper, old_ino, new_ino = H6["replace_tracked"](ctx, selected, selected_wrapper)
+            self.assertEqual(replacement.path, renamed / "selected")
+            self.assertNotEqual(old_ino, new_ino)
+            self.assertIn(wrapper, ctx.groups)
+            replacement.verify()
+        with patch, members:
+            leg(self.ctx)
+        self.assertFalse(top.exists())
+        self.assertFalse(renamed.exists())
 
 
 class ScriptEntryTest(unittest.TestCase):

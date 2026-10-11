@@ -6,6 +6,8 @@
 #define EXEC_EXISTS(field) __builtin_preserve_field_info(field, 2)
 #define EXEC_SIZE(field) __builtin_preserve_field_info(field, 1)
 #define EXEC_SIGNED(field) __builtin_preserve_field_info(field, 3)
+#define EXEC_LSHIFT(field) __builtin_preserve_field_info(field, 4)
+#define EXEC_RSHIFT(field) __builtin_preserve_field_info(field, 5)
 #define EXEC_READ(dst, field) \
     exec_read_kernel(&(dst), sizeof(dst), __builtin_preserve_access_index(&(field)))
 #else
@@ -53,7 +55,10 @@ __attribute__((noinline)) unsigned int p11_exec_dumpability(void)
 
     struct mm_struct___p11exec_scalar *scalar = mm;
     if (EXEC_EXISTS(scalar->flags)) {
-        if (EXEC_SIZE(scalar->flags) != sizeof(flags) || EXEC_SIGNED(scalar->flags))
+        /* Bitfield size describes its backing storage. Zero shifts require
+         * full-width word semantics, including an equivalent 64-bit field. */
+        if (EXEC_SIZE(scalar->flags) != sizeof(flags) || EXEC_SIGNED(scalar->flags) ||
+            EXEC_LSHIFT(scalar->flags) || EXEC_RSHIFT(scalar->flags))
             return 0;
         if (EXEC_READ(flags, scalar->flags))
             return 0;

@@ -3678,8 +3678,9 @@ mod tests {
         use crate::discovery::inventory_attach_set::{AttachObjectId, EndpointId};
         use crate::discovery::native_binding::NativeIdentity;
         use crate::inventory_semantics::{
-            AttestedSemanticLane, LaneTestIo, RefreshReceiptStash, SemanticBatch, SemanticRefusal,
-            effective_refresh_custody, merge_stash_into_report, stash_refresh_report,
+            AttestedSemanticLane, LaneDrainOutcome, LaneTestIo, RefreshReceiptStash, SemanticBatch,
+            SemanticRefusal, effective_refresh_custody, merge_stash_into_report,
+            stash_refresh_report,
         };
         use std::collections::HashMap;
 
@@ -3941,6 +3942,10 @@ mod tests {
             /// Merge/stash shed disclosed while driving (the lane owns
             /// this counter in production).
             shed: u64,
+            /// Serviced quanta after which the substituted producer
+            /// quiesces; each tick counts one.
+            quiesce_after: usize,
+            serviced: usize,
         }
 
         impl H0TestIo {
@@ -3953,6 +3958,8 @@ mod tests {
                     stash: RefreshReceiptStash::new(),
                     tick_advance: Duration::ZERO,
                     shed: 0,
+                    quiesce_after: 0,
+                    serviced: 0,
                 }
             }
         }
@@ -3969,6 +3976,7 @@ mod tests {
 
             fn tick(&mut self, domain: NativeDomainId) -> Result<SemanticBatch, SemanticRefusal> {
                 self.io.now += self.tick_advance;
+                self.serviced += 1;
                 let mut report = self
                     .capture
                     .tick_with(&mut self.io)
@@ -4002,6 +4010,22 @@ mod tests {
                 let report = self.capture.stop();
                 SemanticBatch::from_tick_report(domain, report, Vec::new(), now_ns())
                     .expect("H0 stop batches respect lane bounds")
+            }
+
+            fn quiescent(&mut self) -> bool {
+                self.serviced >= self.quiesce_after
+            }
+
+            fn positions(&mut self) -> Option<[(usize, usize); 2]> {
+                Some([(0, 0), (0, 0)])
+            }
+
+            fn drain_events_to(&mut self, _stop: usize, _quantum: usize) -> LaneDrainOutcome {
+                LaneDrainOutcome::default()
+            }
+
+            fn drain_discovery_to(&mut self, _stop: usize, _quantum: usize) -> LaneDrainOutcome {
+                LaneDrainOutcome::default()
             }
         }
 

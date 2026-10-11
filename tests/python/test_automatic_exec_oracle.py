@@ -14,6 +14,7 @@ Python subprocesses; no privileged observer capture or cgroups are run.
 """
 
 import copy
+from collections import Counter
 import inspect
 import io
 import json
@@ -2444,6 +2445,514 @@ class LegCleanupTest(unittest.TestCase):
         self.assertFalse(renamed.exists())
 
 
+class ControlledInventoryObserver:
+    """Unprivileged public-event seam fed by independently ledgered real children.
+
+    This simulates observer publication, never native/BPF qualification. The
+    production controller and event reader still own every gate and deadline.
+    """
+    def __init__(self, ctx, path, doc_path, provider, providers, membership=None, fault=None):
+        self.ctx, self.path, self.doc_path = ctx, path, doc_path
+        self.provider, self.providers, self.membership, self.fault = provider, providers, membership, fault
+        self.stop = threading.Event()
+        self.records, self.callers, self.last, self.instances, self.semantic = [], {}, {}, {}, {}
+        self.passed, self.previous_counts = -1, {}
+        self.module_ids = {value["path"]: f"m{index}" for index, value in enumerate(providers.values())}
+        self.started = time.monotonic_ns()
+        self.emit("started", {"scope": "system" if membership is None else "cgroup",
+            "clock": {"basis": "CLOCK_MONOTONIC", "unit": "ns"}, "started_ns": self.started})
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
+
+    def emit(self, kind, event):
+        record = {"schema": "p11scope/inventory-events/v1", "seq": len(self.records),
+                  "at_ns": time.monotonic_ns(), "kind": kind, "event": event}
+        self.records.append(record)
+        with self.path.open("a") as stream:
+            stream.write(json.dumps(record) + "\n")
+
+    def context(self, owner, ident, caller_id):
+        info = os.stat(ident["exe"])
+        return {"id": caller_id, "pid": owner.pid, "start_time": owner.identity["start_time"],
+            "incarnation": ident["gen"], "authority": "native_exact", "lifecycle": "mapped", "status": "observed",
+            "executable": {"path": ident["exe"], "dev": info.st_dev, "ino": info.st_ino,
+                "mtime_secs": info.st_mtime_ns // 1_000_000_000,
+                "mtime_nanos": info.st_mtime_ns % 1_000_000_000}}
+
+    def snapshot(self):
+        rows = [{"id": value["id"], "pid": value["pid"], "start_time": value["start_time"],
+            "incarnation": value["incarnation"], "lifecycle": value["lifecycle"],
+            "retired": value["lifecycle"] == "exec_retired", "image": {"exe": {"path": value["executable"]["path"]}}}
+            for value in self.callers.values()]
+        return {"schema": "p11scope/inventory/v1", "scope": "system" if self.membership is None else "cgroup",
+            "callers": rows, "modules": [{"id": self.module_ids[pin["path"]], "paths": [pin["path"]],
+                "identity": {"inode": pin["ino"], "sha256": pin["sha256"]}} for pin in self.providers.values()],
+            "edges": [{key: value for key, value in row.items() if key != "identity_context"}
+                      for row in self.last.values()], "instances": list(self.instances.values()),
+            "semantic_edges": list(self.semantic.values()), "gaps": [],
+            "observation": {"attach": {"selection": "singles", "fallback": None}}}
+
+    def sweep(self, final=False):
+        written = Counter()
+        for owner in list(self.ctx.owners):
+            reader = getattr(owner, "h6_test_reader", None)
+            if reader is None:
+                continue
+            parsed = H6["parse_inv_ledger"]("".join(reader.lines))
+            idents = parsed["idents"]
+            if not idents or idents[-1]["cell"] == "MF":
+                continue
+            if self.membership is not None and "/selected" not in self.membership.get(owner.pid, ""):
+                continue
+            for ident in idents:
+                caller_key = owner.pid, ident["gen"]
+                if caller_key not in self.callers:
+                    caller_id = f"c{len(self.callers)}"
+                    context = self.context(owner, ident, caller_id)
+                    old = self.callers.get((owner.pid, ident["gen"] - 1))
+                    self.callers[caller_key] = context
+                    if old:
+                        old["lifecycle"] = "exec_retired"
+                        self.emit("caller_event", {"event": "exec_retired", "old": old["id"], "new": caller_id,
+                            "identity_context": {"version": 1, "old": dict(old), "new": context}})
+                    else:
+                        self.emit("caller_event", {"event": "admitted", "caller": caller_id,
+                            "identity_context": {"version": 1, "caller": context}})
+                context = self.callers[caller_key]
+                ack = max((row for row in parsed["acks"] if row["gen"] == ident["gen"]),
+                          key=lambda row: row["t1"], default=None)
+                batches = [row for row in parsed["batches"] if row["gen"] == ident["gen"]
+                           and ack is not None and row["t1"] <= ack["t1"]]
+                for module_path, module_id in self.module_ids.items():
+                    if not any(row["gen"] == ident["gen"] and row["module"] == module_path for row in parsed["mapped"]):
+                        continue
+                    pin = next(pin for pin in self.providers.values() if pin["path"] == module_path)
+                    key = owner.pid, ident["gen"], module_path
+                    totals = H6["ledger_s1_totals"](batches, 0)
+                    count = totals[5].get(key, 0)
+                    last_seen = max((row["t1"] for row in batches if row["module"] == module_path), default=None)
+                    edge = {"caller": context["id"], "module": module_id, "mapping": {"state": "mapped"},
+                        "entries": {"count": count, "last_seen_ns": last_seen, "saturated": False,
+                                    "coverage": {"state": "counted" if count else "armed", "lossy": False}},
+                        "semantics": "unknown (semantic capture withheld)", "mechanisms": None, "operations": None,
+                        "identity_context": {"version": 1, "caller": dict(context), "module": {
+                            "id": module_id, "device_major": pin["mapping"]["dev"][0],
+                            "device_minor": pin["mapping"]["dev"][1], "inode": pin["ino"],
+                            "path": module_path, "status": "observed"}}}
+                    if module_path == self.provider["path"] and count:
+                        instance_id = f"i{context['id'][1:]}"
+                        mechanisms = [{"mechanism_hex": mech, "calls": value,
+                            "errors": totals[1].get(key + (mech,), 0)} for (*group, mech), value in totals[0].items()
+                            if tuple(group) == key]
+                        ops = {"calls": totals[4].get(key, 0), "completed": totals[2].get(key, 0),
+                            "failed": totals[3].get(key, 0), "unknown": 0, "orphans": 0, "dropped": 0,
+                            "last_seen_ns": last_seen}
+                        edge.update(semantics="observed", mechanisms=mechanisms, operations=ops)
+                        instance = {"id": instance_id, "caller": context["id"], "module": module_id,
+                            "state": "observed", "reason": None,
+                            "first_seen_ns": self.instances.get(instance_id, {}).get("first_seen_ns", last_seen),
+                            "last_seen_ns": last_seen}
+                        semantic = {"caller": context["id"], "module": module_id, "instance": instance_id,
+                            "entries": {"unit": "api_entries", "count": None, "observation": "unavailable"},
+                            "api_returns": {"count": count, "saturated": False, "historical_only_returns": 0},
+                            "semantics": "observed", "mechanisms": mechanisms, "operations": ops,
+                            "coverage": {"lossy": False, "reasons": []}}
+                        if ident["gen"] == 1:
+                            if self.fault == "admission-only":
+                                edge["entries"]["coverage"]["state"] = "armed"
+                            elif self.fault == "attachment-only":
+                                semantic.update(semantics="unknown", mechanisms=None, operations=None)
+                                semantic["api_returns"]["count"] = None
+                            elif self.fault == "wrong-birth":
+                                edge["identity_context"]["caller"]["start_time"] += 1
+                        if self.instances.get(instance_id) != instance:
+                            self.emit("instance_observed", instance)
+                            written["instance_events"] += 1
+                            self.instances[instance_id] = instance
+                        if self.semantic.get(instance_id) != semantic:
+                            self.emit("semantic_edge_observed", semantic)
+                            written["semantic_edge_events"] += 1
+                            self.semantic[instance_id] = semantic
+                    pair = context["id"], module_id
+                    if self.last.get(pair) != edge:
+                        self.emit("edge_observed", edge)
+                        written["edge_events"] += 1
+                        self.last[pair] = edge
+        self.passed += 1
+        self.emit("pass_committed", {"pass": self.passed, "final": final,
+            **{key: written[key] for key in ("edge_events", "instance_events", "semantic_edge_events")},
+            "edge_events_deferred": 0, "instance_events_deferred": 0, "semantic_edge_events_deferred": 0})
+
+    def run(self):
+        while not self.stop.wait(0.01):
+            self.sweep()
+
+    def finish(self):
+        self.stop.set()
+        self.thread.join(2)
+        self.sweep(final=True)
+        self.emit("ended", {"edges_unretained": 0, "instances_unretained": 0,
+            "semantic_edges_unretained": 0, "edge_events": 0, "instance_events": 0,
+            "semantic_edge_events": 0})
+        self.doc_path.write_text(json.dumps(self.snapshot()))
+        return 0, time.monotonic_ns(), 0
+
+
+class InventoryFixtureTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.provider = Path("/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so")
+        if not cls.provider.is_file() or not shutil.which("softhsm2-util"):
+            raise unittest.SkipTest("SoftHSM fixture dependencies unavailable")
+        cls.temporary = tempfile.TemporaryDirectory(prefix="h6-inventory-fixture-")
+        cls.addClassCleanup(cls.temporary.cleanup)
+        cls.directory = Path(cls.temporary.name)
+        cls.binary = cls.directory / "ledger"
+        cls.successor = cls.directory / "ledger2"
+        result = subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-Werror",
+            "-std=gnu11", str(ROOT / "tests/fixtures/public-cli/inventory-ledger.c"),
+            "-ldl", "-pthread", "-o", str(cls.binary)], capture_output=True, text=True, timeout=30)
+        if result.returncode:
+            raise AssertionError(result.stderr)
+        shutil.copyfile(cls.binary, cls.successor)
+        cls.successor.chmod(0o755)
+        tokens = cls.directory / "tokens"
+        tokens.mkdir(mode=0o700)
+        config = cls.directory / "softhsm2.conf"
+        config.write_text(f"directories.tokendir = {tokens}\nobjectstore.backend = file\nlog.level = ERROR\n")
+        cls.env = dict(os.environ, SOFTHSM2_CONF=str(config))
+        result = subprocess.run(["softhsm2-util", "--init-token", "--free", "--label",
+            "h6-control", "--so-pin", "5678", "--pin", "1234"], env=cls.env,
+            capture_output=True, text=True, timeout=10)
+        if result.returncode:
+            raise AssertionError(result.stderr)
+
+    def child(self, mode="exec-chain", seconds=3, extra=(), controlled=True):
+        deadline = time.monotonic_ns() + int(seconds * 1e9)
+        control = ["--h6-control", "--h6-deadline", str(deadline),
+                   "--h6-leg-deadline", str(deadline)] if controlled else []
+        proc = subprocess.Popen([str(self.binary), mode, "--cell", "TEST",
+            "--module", str(self.provider), *control, *extra], env=self.env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        reader = H6["Reader"](proc.stdout, self.directory / f"child-{proc.pid}.out")
+        def cleanup():
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(2)
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                stream.close()
+            reader.thread.join(2)
+        self.addCleanup(cleanup)
+        return proc, reader, deadline
+
+    def command(self, proc, reader, command, seq, deadline, gen=0, attempt=0):
+        proc.stdin.write(f"{command} {gen} {seq} {time.monotonic_ns()} {deadline} {attempt}\n")
+        proc.stdin.flush()
+        reader.wait(lambda r: any(line.startswith("ACK ") and f" seq={seq} " in line
+                    and f" gen={gen} " in line for line in r.lines), 2)
+        return H6["parse_inv_ledger"]("".join(reader.lines))
+
+    def test_control_holds_before_loading_and_flushes_each_actual_phase(self):
+        proc, reader, deadline = self.child()
+        reader.wait(lambda r: any(line.startswith("H6_READY ") for line in r.lines), 2)
+        self.assertFalse(H6["parse_inv_ledger"]("".join(reader.lines))["mapped"])
+        for attempt in (1, 2):
+            ledger = self.command(proc, reader, "W", attempt, deadline, attempt=attempt)
+            rows = [row for row in ledger["batches"] if row["phase"] == f"h6-warm{attempt}"]
+            self.assertEqual(sum(row["n"] for row in rows), 10)
+        ledger = self.command(proc, reader, "M", 3, deadline)
+        measured = [row for row in ledger["batches"] if row["phase"] == "h6-measured"]
+        self.assertEqual(sum(row["n"] for row in measured), 20)
+        failed = [row for row in ledger["batches"] if row["phase"] == "h6-failed"]
+        self.assertEqual([(row["fn"], row["n"], row["bad"]) for row in failed],
+                         [("C_VerifyInit", 1, 0), ("C_Verify", 1, 1)])
+        self.assertEqual(ledger["acks"][-1]["rv"], 0xc0)
+        self.assertIsNone(proc.poll())
+        self.command(proc, reader, "T", 4, deadline)
+        self.command(proc, reader, "F", 5, deadline)
+        self.assertEqual(proc.wait(2), 0)
+
+    def test_eof_and_initial_absolute_bound_end_the_actual_child(self):
+        for eof in (True, False):
+            with self.subTest(eof=eof):
+                proc, reader, _deadline = self.child(seconds=0.2)
+                reader.wait(lambda r: any(line.startswith("H6_READY ") for line in r.lines), 2)
+                if eof:
+                    proc.stdin.close()
+                self.assertEqual(proc.wait(2), 1)
+
+    def test_generation_bound_exec_successor_stays_idle_until_its_warmup(self):
+        proc, reader, deadline = self.child(extra=("--chain", f"leader:{self.successor}"))
+        reader.wait(lambda r: any(line.startswith("H6_READY ") for line in r.lines), 2)
+        self.command(proc, reader, "W", 1, deadline, attempt=1)
+        self.command(proc, reader, "T", 2, deadline)
+        self.command(proc, reader, "X", 3, deadline)
+        reader.wait(lambda r: any(line.startswith("H6_READY ") and " gen=1 " in line
+                                  for line in r.lines), 2)
+        ledger = H6["parse_inv_ledger"]("".join(reader.lines))
+        self.assertFalse([row for row in ledger["batches"] if row["gen"] == 1])
+        self.assertFalse([row for row in ledger["mapped"] if row["gen"] == 1])
+        self.command(proc, reader, "W", 1, deadline, gen=1, attempt=1)
+        self.command(proc, reader, "M", 2, deadline, gen=1)
+        self.command(proc, reader, "T", 3, deadline, gen=1)
+        self.command(proc, reader, "F", 4, deadline, gen=1)
+        self.assertEqual(proc.wait(2), 0)
+
+    def test_stale_duplicate_out_of_order_and_renewed_bounds_refuse(self):
+        controls = ("stale", "duplicate", "measure-before-warm", "renewed", "attempt")
+        for control in controls:
+            with self.subTest(control=control):
+                proc, reader, deadline = self.child()
+                reader.wait(lambda r: any(line.startswith("H6_READY ") for line in r.lines), 2)
+                first_bound = deadline - 1_000_000_000 if control == "renewed" else deadline
+                if control not in ("stale", "measure-before-warm"):
+                    self.command(proc, reader, "W", 1, first_bound, attempt=1)
+                gen = 1 if control == "stale" else 0
+                seq = 1 if control in ("stale", "duplicate", "measure-before-warm") else 2
+                attempt = 3 if control == "attempt" else 2
+                command = "M" if control == "measure-before-warm" else "W"
+                proc.stdin.write(f"{command} {gen} {seq} {time.monotonic_ns()} {deadline} {attempt}\n")
+                proc.stdin.flush()
+                self.assertEqual(proc.wait(2), 1)
+
+    def test_fixed_measurement_cannot_repeat_and_terminal_idle_eof_is_bounded(self):
+        proc, reader, deadline = self.child()
+        reader.wait(lambda r: any(line.startswith("H6_READY ") for line in r.lines), 2)
+        self.command(proc, reader, "W", 1, deadline, attempt=1)
+        self.command(proc, reader, "M", 2, deadline)
+        proc.stdin.write(f"M 0 3 {time.monotonic_ns()} {deadline} 0\n")
+        proc.stdin.flush()
+        self.assertEqual(proc.wait(2), 1)
+
+    def test_legacy_staged_late_single_call_and_second_gate_are_preserved(self):
+        second = self.directory / f"legacy-B-{time.monotonic_ns()}.so"
+        shutil.copyfile(self.provider, second)
+        gate = self.directory / f"legacy-gate-{time.monotonic_ns()}"
+        gate2 = self.directory / f"legacy-gate2-{time.monotonic_ns()}"
+        proc, reader, _deadline = self.child(mode="mech", controlled=False,
+            extra=("--module", str(second), "--iters", "1", "--late-from", "1",
+                   "--single-call", "1", "--gate", str(gate), "--gate2", str(gate2)))
+        reader.wait(lambda r: any(line.startswith("READY ") for line in r.lines), 2)
+        self.assertFalse([row for row in H6["parse_inv_ledger"]("".join(reader.lines))["mapped"]
+                          if row["module"] == str(second)])
+        gate.touch()
+        reader.wait(lambda r: any(" fn=C_Initialize " in line and f" module={second} " in line
+                                  for line in r.lines), 2)
+        ledger = H6["parse_inv_ledger"]("".join(reader.lines))
+        staged = [row for row in ledger["batches"] if row["module"] == str(second)]
+        self.assertEqual([(row["fn"], row["n"]) for row in staged],
+                         [("C_GetFunctionList", 1), ("C_Initialize", 1)])
+        self.assertIsNone(proc.poll())
+        gate2.touch()
+        self.assertEqual(proc.wait(2), 0)
+        reader.finish()
+        ledger = H6["parse_inv_ledger"]("".join(reader.lines))
+        self.assertFalse(ledger["controls"])
+        self.assertEqual(sum(row["n"] for row in ledger["batches"]
+            if row["module"] == str(second) and row["phase"] == "main"), 20)
+
+    def run_inventory_route(self, cell="system-mixed", fault=None):
+        owners, readers, pins = [], [], []
+        provider_pin = H6["FilePin"](self.provider)
+        self.addCleanup(provider_pin.close)
+        ctx = SimpleNamespace(args=SimpleNamespace(uid=os.getuid(), gid=os.getgid()),
+            owners=owners, readers=readers, groups=[], leg_pins=pins, traced=[],
+            pins={"ledger": SimpleNamespace(path=self.binary)}, provider_pin=provider_pin,
+            discover_pin=None)
+        ctx.scopes, ctx.completed_results, ctx.cleanup_errors = [], [], []
+        ctx.cleanup_failed = False
+        ctx.cleanup_totals = {"processes": 0, "readers": 0, "cgroups": 0, "pins": 0}
+        observers = []
+        membership, events = {}, []
+        def ordinary(owned, argv, uid, **kwargs):
+            for key in ("user", "group", "extra_groups"):
+                kwargs.pop(key, None)
+            return H6["N3HARNESS"]["spawn_owned"](owned, argv, uid, **kwargs)
+        real_ledger = H6["spawn_ledger"]
+        def ledger(*args):
+            owner, stdout, stderr = real_ledger(*args)
+            owner.h6_test_reader = stdout
+            if owner not in owners:
+                owners.append(owner)
+                readers.extend((stdout, stderr))
+            return owner, stdout, stderr
+        def observer(_ctx, leg_dir, *_args):
+            log, doc = leg_dir / "events.jsonl", leg_dir / "inventory.json"
+            log.write_text("")
+            a = H6["provider_receipt"](provider_pin)
+            providers = {"A": a}
+            if cell == "system-mixed":
+                b_pin = H6["FilePin"](leg_dir / "provider-B.so")
+                try:
+                    providers["B"] = H6["provider_receipt"](b_pin)
+                finally:
+                    b_pin.close()
+            injected = ControlledInventoryObserver(_ctx, log, doc, a, providers,
+                membership=None if cell == "system-mixed" else membership, fault=fault)
+            observers.append(injected)
+            return injected, None, None, injected.started, doc, log
+        def exec_stop(pid, **_kwargs):
+            deadline = time.monotonic() + 2
+            while not os.readlink(f"/proc/{pid}/exe").endswith("/ledger2"):
+                if time.monotonic() >= deadline:
+                    self.fail("actual child did not exec its held successor")
+                time.sleep(0.001)
+            owner = next(owner for owner in owners if owner.pid == pid)
+            owner.send(signal.SIGSTOP)
+            return time.monotonic_ns()
+        def group(_ctx, path):
+            path = Path(path)
+            def move(owner):
+                if path.name == "sub" and fault == "failed-move":
+                    raise H6["SetupError"]("controlled failed descendant verification")
+                membership[owner.pid] = str(path)
+                events.append(path.name)
+            return SimpleNamespace(path=path, move=move), None
+        def resume(pid):
+            if cell != "system-mixed":
+                self.assertTrue(membership[pid].endswith("/selected/sub"))
+            events.append("resume")
+            next(owner for owner in owners if owner.pid == pid).send(signal.SIGCONT)
+        patches = {"init_token": lambda *_args: self.env, "build_manifest": lambda *_args: None,
+            "spawn_owned": ordinary, "spawn_ledger": ledger, "spawn_inventory": observer,
+            "wait_inventory_ready": lambda *_args: time.monotonic_ns(),
+            "wait_passes": lambda *_args: 2,
+            "seize_until_exec": lambda _pid, scope, owner: scope.traced.append(owner),
+            "wait_exec_stop": exec_stop,
+            "ptrace_continue": resume, "create_tracked": group, "cgroup_of": lambda pid: membership[pid],
+            "ptrace_detach": lambda pid, scope: scope.traced.remove(
+                next(owner for owner in scope.traced if owner.pid == pid)),
+            "stop_inventory": lambda injected: injected.finish(),
+            "stop_receipt": lambda *_args: {},
+            "finish_readers": lambda rows: [row.finish() for row in rows if row is not None],
+            "evaluate_inventory_h6": lambda doc, ledgers, receipt: (doc, ledgers, receipt)}
+        actual_budget = H6["LegBudget"]
+        patches["LegBudget"] = lambda **_kwargs: actual_budget(inventory=True, budgets={"setup": 3,
+            "successor-recovery": 0.4 if fault not in (None, "failed-move") else 3,
+            "fixed-measurement": 8, "normal-stop": 2, "cleanup": 2}, leg_seconds=15)
+        self.route_events, self.route_owners, self.route_case = events, owners, ctx
+        try:
+            budget = H6["LegBudget"](inventory=True, budgets={"setup": 3,
+                "successor-recovery": 3, "fixed-measurement": 8, "normal-stop": 2, "cleanup": 2},
+                leg_seconds=15)
+            token = H6["ACTIVE_LEG"].set(budget)
+            function = H6["run_system_mixed" if cell == "system-mixed" else "run_cgroup_inventory_r5"]
+            with mock.patch.dict(function.__globals__, patches):
+                doc, ledgers, receipt = function(ctx,
+                    self.directory / f"mixed-{time.monotonic_ns()}", "singles")
+            self.route_events, self.route_owners = events, owners
+            return doc, ledgers, receipt
+        finally:
+            H6["ACTIVE_LEG"].reset(token)
+            for observer in observers:
+                observer.stop.set()
+                observer.thread.join(2)
+            for owner in owners:
+                if owner.popen.poll() is None:
+                    owner.popen.kill()
+                owner.popen.wait(2)
+                for stream in (owner.popen.stdin, owner.popen.stdout, owner.popen.stderr):
+                    if stream is not None:
+                        stream.close()
+                owner.close()
+            for reader in readers:
+                reader.thread.join(2)
+            for pin in pins:
+                pin.close()
+
+    def test_system_mixed_real_sibling_calls_overlap_target_measurement(self):
+        doc, ledgers, receipt = self.run_inventory_route()
+        measured = receipt["measured"]
+        for module in ("A", "B"):
+            path = receipt["providers"][module]["path"]
+            overlap = [row for row in ledgers["MS"]["batches"]
+                if row["module"] == path and row["fn"] != "C_GetFunctionList"
+                and row["t0"] <= measured["t1"] and row["t1"] >= measured["t0"]]
+            self.assertTrue(overlap, f"no real MS {module} calls overlap target fixed measurement")
+        result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+        self.assertTrue(result["pass"], result["errors"])
+        self.assertEqual(result["s1"]["measured_completed"], 20)
+        self.assertEqual(result["s1"]["measured_failed"], 2)
+
+    def test_r5_real_owned_target_reenters_before_resuming_and_measuring(self):
+        doc, ledgers, receipt = self.run_inventory_route(cell="cgroup-reentry")
+        self.assertLess(self.route_events.index("sub"), self.route_events.index("resume"))
+        self.assertEqual(receipt["scope_intervals"][1]["t0"], receipt["freeze"]["reentry_ns"])
+        result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+        self.assertTrue(result["pass"], result["errors"])
+
+    def test_final_semantic_history_cannot_disappear_after_measured_end(self):
+        doc, ledgers, receipt = self.run_inventory_route()
+        proof = receipt["inventory_control"]["measurements"][-1]["proof"]
+        semantic = next(row for row in doc["semantic_edges"] if row["instance"] == proof["instance"])
+        semantic["api_returns"]["count"] = 0
+        records = receipt["inventory_control"]["final_records"]
+        terminal = records[-2]
+        records.insert(len(records) - 2, {"schema": "p11scope/inventory-events/v1",
+            "seq": terminal["seq"], "at_ns": terminal["at_ns"],
+            "kind": "semantic_edge_observed", "event": copy.deepcopy(semantic)})
+        terminal["event"]["semantic_edge_events"] += 1
+        for seq, row in enumerate(records):
+            row["seq"] = seq
+        result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+        self.assertFalse(result["pass"], result)
+        self.assertTrue(any("historical" in error for error in result["errors"]), result["errors"])
+
+    def test_controlled_oracle_refuses_proof_phase_history_and_parity_twins(self):
+        original = self.run_inventory_route(cell="cgroup-reentry")
+        for fault in ("before-proof", "wrong-birth", "wrong-provider", "wrong-instance",
+                      "unretained", "missing-ended", "parity", "outside", "late-growth", "new-loss"):
+            with self.subTest(fault=fault):
+                doc, ledgers, receipt = copy.deepcopy(original)
+                control = receipt["inventory_control"]
+                phase = control["measurements"][-1]
+                proof, end = phase["proof"], phase["end"]
+                if fault == "before-proof":
+                    proof["observed_ns"] = phase["marker"]["ack"]["t0"] + 1
+                elif fault == "wrong-birth":
+                    proof["image"]["start_time"] += 1
+                elif fault == "wrong-provider":
+                    proof["provider"]["mapping"]["ino"] += 1
+                elif fault == "wrong-instance":
+                    proof["instance"] = "i999"
+                elif fault == "unretained":
+                    control["final_records"][-1]["event"]["semantic_edges_unretained"] = 1
+                elif fault == "missing-ended":
+                    control["final_records"].pop()
+                elif fault == "parity":
+                    doc["edges"][-1]["entries"]["count"] += 1
+                elif fault == "outside":
+                    receipt["scope_intervals"][1]["t0"] = phase["marker"]["ack"]["t1"] + 1
+                elif fault == "late-growth":
+                    end["counts"]["physical"] += 1
+                elif fault == "new-loss":
+                    end["semantic"]["event"]["coverage"]["lossy"] = True
+                result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+                self.assertFalse(result["pass"], (fault, result))
+                self.assertTrue(result["errors"])
+
+    def test_actual_routes_do_not_measure_without_attachment_or_s1_and_reap(self):
+        for cell in ("system-mixed", "cgroup-reentry"):
+            for fault in ("admission-only", "attachment-only", "wrong-birth"):
+                with self.subTest(cell=cell, fault=fault):
+                    with self.assertRaises((H6["SetupError"], TimeoutError)):
+                        self.run_inventory_route(cell=cell, fault=fault)
+                    self.assertFalse(self.route_case.cleanup_failed, self.route_case.cleanup_errors)
+                    for owner in self.route_owners:
+                        self.assertFalse(Path(f"/proc/{owner.pid}").exists())
+                        parsed = H6["parse_inv_ledger"]("".join(owner.h6_test_reader.lines))
+                        self.assertFalse([row for row in parsed["acks"]
+                            if row["gen"] == 1 and row["command"] == "M"])
+
+    def test_actual_r5_failed_descendant_verification_never_resumes_and_reaps(self):
+        with self.assertRaisesRegex(H6["SetupError"], "failed descendant verification"):
+            self.run_inventory_route(cell="cgroup-reentry", fault="failed-move")
+        self.assertNotIn("resume", self.route_events)
+        self.assertFalse(self.route_case.cleanup_failed, self.route_case.cleanup_errors)
+        self.assertTrue(all(not Path(f"/proc/{owner.pid}").exists() for owner in self.route_owners))
+
+
+
 class R5OrderingTest(unittest.TestCase):
     """Exercise the real R5 route with ordinary cgroup/ptrace seams."""
     def run_route(self, failed_move=False):
@@ -2501,8 +3010,31 @@ class R5OrderingTest(unittest.TestCase):
                     "completed_pass": {"seq": 5, "at_ns": 50, "pass": 3}}
         def checkpoint(*_args):
             state["events"].append("checkpoint")
-            return SimpleNamespace(receipt=lambda: {"seq": 2, "retired_caller": "c0",
-                                                    "retired_incarnation": 0})
+            return SimpleNamespace(seq=2, retired_caller="c0", retired_incarnation=0,
+                completed_pass={"seq": 2, "pass": 1},
+                receipt=lambda: {"seq": 2, "retired_caller": "c0", "retired_incarnation": 0})
+        class Protocol:
+            def __init__(self, owner, reader, executable):
+                self.owner, self.image = owner, 0
+            def ready(self, _deadline, *, image=None, executable=None):
+                if image is not None:
+                    self.image = image
+            def command(self, command, _deadline, attempt=0):
+                if command == "T" and self.image == 0:
+                    self.assert_inside()
+                if command == "X":
+                    assert state["membership"][self.owner.pid].endswith("/outside")
+                return {"batches": [], "ack": {"t0": 30, "t1": 40}}
+            def assert_inside(self):
+                assert state["membership"][self.owner.pid].endswith("/selected")
+            def warm(self, attempt, deadline):
+                return self.command("W", deadline, attempt)
+            def ledger(self):
+                return {"batches": []}
+            def dispatch(self, command, deadline, **_kwargs):
+                return self.command(command, deadline)
+            def complete(self, pending):
+                return pending
         def image(pin, _row, owner):
             pin.verify()
             owner.verify()
@@ -2515,13 +3047,21 @@ class R5OrderingTest(unittest.TestCase):
             "ptrace_continue": resume, "ptrace_detach": lambda *_args: None,
             "wait_caller_admitted": admission, "wait_r5_successor_admitted": admission,
             "r5_admission_checkpoint": checkpoint,
+            "wait_inventory_original_checkpoint": checkpoint,
+            "InventoryController": Protocol,
+            "wait_inventory_s1_ready": lambda _owner, _exe, _provider, admitted, *_args, **_kwargs:
+                {"incarnation": admitted["incarnation"], "observed_ns": time.monotonic_ns(),
+                 "deadline_ns": time.monotonic_ns() + 90_000_000_000, "provider": {}},
+            "wait_inventory_measured_boundary": lambda *_args, **_kwargs: {},
+            "inventory_final_records": lambda *_args: [],
             "cgroup_of": lambda pid: state["membership"][pid],
             "stop_inventory": lambda *_args: (0, time.monotonic_ns(), 0),
             "stop_receipt": lambda *_args: {}, "wait_process": lambda *_args: 0,
             "finish_readers": lambda *_args: None,
             "parse_inv_ledger": lambda *_args: {"batches": []},
             "counted_totals": lambda *_args: {}, "phase_window": lambda *_args: (30, 40, 1),
-            "provider_entry": lambda *_args: {}, "evaluate_inventory_h6": lambda _doc, _ledgers, receipt: receipt}
+            "provider_entry": lambda *_args: {}, "provider_receipt": lambda *_args: {},
+            "evaluate_inventory_h6": lambda _doc, _ledgers, receipt: receipt}
         try:
             with mock.patch.dict(H6["run_cgroup_inventory_r5"].__globals__, patches), \
                     mock.patch.object(H6["FilePin"], "image_receipt", image):
@@ -2533,7 +3073,7 @@ class R5OrderingTest(unittest.TestCase):
     def test_r5_reenters_while_exec_stopped_before_admission(self):
         receipt = self.run_route()
         self.assertEqual(self.state["events"],
-                         ["checkpoint", "exec-stop", "verified-reentry", "resume", "fresh-admission"])
+                         ["checkpoint", "checkpoint", "exec-stop", "verified-reentry", "resume", "fresh-admission"])
         self.assertEqual(self.state["resumes"], 1)
         edge = next(move["t"] for move in receipt["moves"] if move["note"] == "X-descendant-reentry")
         self.assertEqual(receipt["scope_intervals"][1]["t0"], edge)
@@ -3193,6 +3733,228 @@ class R5FreshAdmissionTest(unittest.TestCase):
                 self.wait()
         finally:
             H6["ACTIVE_LEG"].reset(token)
+
+
+class InventoryReadinessTest(unittest.TestCase):
+    setUp = R5FreshAdmissionTest.setUp
+    release = R5FreshAdmissionTest.release
+    record = R5FreshAdmissionTest.record
+    admission = R5FreshAdmissionTest.admission
+    write = R5FreshAdmissionTest.write
+
+    def prepare(self, mutation=None, *, partial=False, missing_pass=False, delayed=False,
+                deficit=0, gap=False, early=0, unrelated_gap=False, deferred=False):
+        fresh = [self.admission(3, "c1", 1), self.record(4, "pass_committed", {"pass": 1})]
+        self.write(self.prefix + fresh)
+        self.accepted = H6["wait_r5_successor_admitted"](self.log, self.owner, self.pin,
+            self.cursor, not_before_ns=103, timeout=1)
+        self.provider = H6["provider_receipt"](self.pin)
+        self.markers = []
+        self.sequence = 5
+        self.next_pass = 2
+        def attempt(number, deadline):
+            t = time.monotonic_ns()
+            batches = [{"cell": "RX", "pid": self.owner.pid,
+                "start": self.owner.identity["start_time"], "gen": 1, "exe": str(self.pin.path),
+                "module": str(self.pin.path), "fn": fn, "mech": "0x250", "n": 5,
+                "bad": 0, "phase": f"h6-warm{number}", "t0": t - 500, "t1": t - 100}
+                for fn in ("C_DigestInit", "C_Digest")]
+            ack = {"command": "W", "gen": 1, "attempt": number, "seq": number,
+                   "pid": self.owner.pid, "start": self.owner.identity["start_time"],
+                   "exe": str(self.pin.path), "t0": t - 600, "t1": t, "deadline": deadline,
+                   "idle": 1, "rv": 0}
+            caller = copy.deepcopy(fresh[0]["event"]["identity_context"]["caller"])
+            module = {"id": "m0", "device_major": self.provider["mapping"]["dev"][0],
+                "device_minor": self.provider["mapping"]["dev"][1], "inode": self.provider["ino"],
+                "path": str(self.pin.path), "status": "observed"}
+            count = number * 10 + early - deficit
+            physical = {"caller": "c1", "module": "m0", "mapping": {"state": "mapped"},
+                "entries": {"count": count, "last_seen_ns": t, "saturated": False,
+                            "coverage": {"state": "counted", "lossy": False}},
+                "identity_context": {"version": 1, "caller": caller, "module": module}}
+            instance = {"id": "i1", "caller": "c1", "module": "m0", "state": "observed", "reason": None}
+            semantic = {"caller": "c1", "module": "m0", "instance": "i1", "semantics": "observed",
+                "entries": {"unit": "api_entries", "count": None, "observation": "unavailable"},
+                "api_returns": {"count": count, "saturated": False, "historical_only_returns": 0},
+                "mechanisms": [{"mechanism_hex": "0x250", "calls": count, "errors": 0}],
+                "operations": {"calls": count, "completed": count // 2, "failed": 0,
+                               "unknown": 0, "orphans": 0, "dropped": 0, "last_seen_ns": t - 100},
+                "coverage": {"lossy": False, "reasons": []}}
+            if delayed and number == 1:
+                physical["entries"].update(count=8, last_seen_ns=t - 1000)
+            if mutation:
+                mutation(physical, instance, semantic)
+            payloads = [("edge_observed", physical), ("instance_observed", instance),
+                        ("semantic_edge_observed", semantic)]
+            if gap:
+                payloads.insert(0, ("gap_recorded", {"caller": "c9" if unrelated_gap else "c1", "module": "m0",
+                    "pid": self.owner.pid + 1 if unrelated_gap else self.owner.pid,
+                    "subject": "exact image authority unavailable" if unrelated_gap else "early coverage",
+                    "reason": "use_before_admission"}))
+            if not missing_pass:
+                payloads.append(("pass_committed", {"pass": self.next_pass,
+                    "edge_events": 1, "instance_events": 1, "semantic_edge_events": 1,
+                    "semantic_edge_events_deferred": 1 if deferred else 0}))
+                self.next_pass += 1
+            records = []
+            for kind, event in payloads:
+                row = self.record(self.sequence, kind, event)
+                row["at_ns"] = t + self.sequence
+                records.append(row)
+                self.sequence += 1
+            with self.log.open("ab") as stream:
+                for index, row in enumerate(records):
+                    stream.write(json.dumps(row).encode() + (b"" if partial and index == len(records) - 1 else b"\n"))
+            self.markers.append({"ack": ack, "batches": batches})
+            return self.markers[-1]
+        return attempt
+
+    def gate(self, callback, timeout=2, **kwargs):
+        return H6["wait_inventory_s1_ready"](self.owner, self.pin, self.pin,
+            self.accepted, self.cursor, callback, time.monotonic_ns() + int(timeout * 1e9), **kwargs)
+
+    def test_same_observer_physical_instance_s1_and_complete_pass_release(self):
+        result = self.gate(self.prepare())
+        self.assertEqual((result["caller"], result["module"], result["instance"]), ("c1", "m0", "i1"))
+        self.assertEqual(result["attempts"], 1)
+        self.assertEqual(result["baseline"]["physical"]["event"]["entries"]["count"], 10)
+        self.assertGreater(result["baseline"]["pass"]["seq"], result["baseline"]["semantic"]["seq"])
+
+    def test_unmapped_unattached_unknown_and_wrong_subjects_cannot_release(self):
+        def wrong_birth(p, _i, _s): p["identity_context"]["caller"]["start_time"] += 1
+        def wrong_incarnation(p, _i, _s): p["identity_context"]["caller"]["incarnation"] = 0
+        def wrong_provider(p, _i, _s): p["identity_context"]["module"]["inode"] += 1
+        def wrong_instance(_p, i, s): s["instance"] = "i9"
+        controls = [lambda p, _i, _s: p["mapping"].update(state="unknown"),
+            lambda p, _i, _s: p["entries"]["coverage"].update(state="armed"),
+            lambda _p, _i, s: s.update(semantics="unknown", mechanisms=None, operations=None),
+            lambda _p, i, _s: i.update(state="retired"),
+            lambda _p, _i, s: s["api_returns"].update(count=None),
+            lambda _p, _i, s: s["api_returns"].update(count=1),
+            wrong_birth, wrong_incarnation, wrong_provider, wrong_instance,
+            lambda _p, _i, s: s.update(caller="c9")]
+        for mutation in controls:
+            with self.subTest(mutation=mutation):
+                self.cursor.close()
+                self.write(self.prefix)
+                self.cursor = H6["r5_admission_checkpoint"](self.ctx, self.log, self.owner, self.pin)
+                callback = self.prepare(mutation)
+                with self.assertRaises((TimeoutError, H6["SetupError"])):
+                    self.gate(callback, timeout=0.2)
+                self.assertTrue(self.markers, "refusal control never executed its real attempt callback")
+
+    def test_partial_line_missing_pass_and_expired_proof_do_not_release(self):
+        for kwargs in ({"partial": True}, {"missing_pass": True}):
+            self.cursor.close()
+            self.write(self.prefix)
+            self.cursor = H6["r5_admission_checkpoint"](self.ctx, self.log, self.owner, self.pin)
+            with self.assertRaises(TimeoutError):
+                self.gate(self.prepare(**kwargs), timeout=0.2)
+            self.assertTrue(self.markers)
+        with self.assertRaises(TimeoutError):
+            H6["wait_inventory_s1_ready"](self.owner, self.pin, self.pin, self.accepted,
+                self.cursor, lambda *_args: self.fail("expired gate dispatched work"), time.monotonic_ns() - 1)
+
+    def test_delayed_physical_baseline_needs_actual_marker_work(self):
+        result = self.gate(self.prepare(delayed=True), timeout=3)
+        self.assertGreater(result["attempts"], 1)
+        self.assertEqual(result["baseline"]["physical"]["event"]["entries"]["count"], 20)
+
+    def test_honest_early_deficit_requires_physically_joined_finite_gap(self):
+        for gap in (True, False):
+            with self.subTest(gap=gap):
+                self.cursor.close()
+                self.write(self.prefix)
+                self.cursor = H6["r5_admission_checkpoint"](self.ctx, self.log, self.owner, self.pin)
+                callback = self.prepare(early=10, deficit=2, gap=gap)
+                t = time.monotonic_ns() - 1000000
+                prefix = [{"cell": "RX", "pid": self.owner.pid, "gen": 1,
+                    "module": str(self.pin.path), "fn": fn, "mech": "0x250", "n": 5,
+                    "bad": 0, "phase": "h6-setup", "t0": t, "t1": t + 10}
+                    for fn in ("C_DigestInit", "C_Digest")]
+                if gap:
+                    proof = self.gate(callback, prefix_batches=prefix)
+                    early = proof["baseline"]["early"]
+                    self.assertEqual((early["physical_expected"], early["physical_observed"],
+                                      early["physical_missed"]), (20, 18, 2))
+                    self.assertEqual(early["api_missed"], 2)
+                    self.assertTrue(early["gaps"])
+                    self.assertIsNone(early["populations"]["setup"]["observed_physical"])
+                    self.assertEqual(early["populations"]["warmup"]["expected"], 10)
+                else:
+                    with self.assertRaises(TimeoutError):
+                        self.gate(callback, timeout=0.2, prefix_batches=prefix)
+                    self.assertTrue(self.markers)
+
+    def test_cumulative_redraws_replace_the_same_instance_counters(self):
+        callback = self.prepare()
+        def redraw(number, deadline):
+            marker = callback(number, deadline)
+            rows = [json.loads(line) for line in self.log.read_text().splitlines()]
+            physical = next(row["event"] for row in reversed(rows) if row["kind"] == "edge_observed")
+            semantic = next(row["event"] for row in reversed(rows) if row["kind"] == "semantic_edge_observed")
+            t = time.monotonic_ns()
+            additions = [("edge_observed", physical), ("semantic_edge_observed", semantic),
+                ("pass_committed", {"pass": 3, "edge_events": 1, "instance_events": 0,
+                                    "semantic_edge_events": 1})]
+            with self.log.open("a") as stream:
+                for offset, (kind, event) in enumerate(additions):
+                    row = self.record(len(rows) + offset, kind, event)
+                    row["at_ns"] = t + offset
+                    stream.write(json.dumps(row) + "\n")
+            return marker
+        result = self.gate(redraw)
+        self.assertEqual(result["baseline"]["counts"]["physical"], 10)
+        self.assertEqual(result["baseline"]["counts"]["api"], 10)
+        self.assertEqual(result["baseline"]["counts"]["completed"], 5)
+
+    def test_pass_cannot_claim_zero_emissions_for_the_actual_proof_rows(self):
+        callback = self.prepare()
+        def invalid_accounting(number, deadline):
+            marker = callback(number, deadline)
+            rows = [json.loads(line) for line in self.log.read_text().splitlines()]
+            rows[-1]["event"].update(edge_events=0, instance_events=0, semantic_edge_events=0)
+            self.write(rows)
+            return marker
+        with self.assertRaisesRegex(H6["SetupError"], "accounting"):
+            self.gate(invalid_accounting)
+
+    def test_deferred_pass_and_unrelated_gap_cannot_release(self):
+        for kwargs in ({"deferred": True}, {"gap": True, "unrelated_gap": True,
+                                              "early": 10, "deficit": 2}):
+            with self.subTest(kwargs=kwargs):
+                self.cursor.close()
+                self.write(self.prefix)
+                self.cursor = H6["r5_admission_checkpoint"](self.ctx, self.log, self.owner, self.pin)
+                callback = self.prepare(**kwargs)
+                prefix = []
+                if kwargs.get("early"):
+                    t = time.monotonic_ns() - 1000000
+                    prefix = [{"cell": "RX", "pid": self.owner.pid, "gen": 1,
+                        "module": str(self.pin.path), "fn": fn, "mech": "0x250", "n": 5,
+                        "bad": 0, "phase": "h6-setup", "t0": t, "t1": t + 10}
+                        for fn in ("C_DigestInit", "C_Digest")]
+                with self.assertRaises(TimeoutError):
+                    self.gate(callback, timeout=0.2, prefix_batches=prefix)
+                self.assertTrue(self.markers)
+
+    def test_release_rechecks_expired_proof_and_actual_held_provider_custody(self):
+        provider_path = self.directory / "release-provider"
+        provider_path.write_bytes(b"owned held provider")
+        provider = H6["FilePin"](provider_path)
+        self.addCleanup(provider.close)
+        held = H6["provider_receipt"](provider)
+        controller = SimpleNamespace(dispatch=mock.Mock(), complete=mock.Mock())
+        proof = {"provider": held, "deadline_ns": time.monotonic_ns() - 1}
+        with self.assertRaises(TimeoutError):
+            H6["release_inventory_measurement"](controller, provider, proof,
+                time.monotonic_ns() + 1000000000)
+        controller.dispatch.assert_not_called()
+        proof["deadline_ns"] = time.monotonic_ns() + 1000000000
+        provider_path.write_bytes(b"changed held provider")
+        with self.assertRaises(ValueError):
+            H6["release_inventory_measurement"](controller, provider, proof, proof["deadline_ns"])
+        controller.dispatch.assert_not_called()
 
 
 class ScriptEntryTest(unittest.TestCase):
@@ -3996,8 +4758,8 @@ DONE cell=PX pid=1000 start=7777 gen=0 exe=/w/ledger status=ok
 IDENT cell=PX pid=1000 start=7777 gen=1 exe=/w/ledger2
 MAPPED cell=PX pid=1000 start=7777 gen=1 exe=/w/ledger2 module=/w/libA.so ino=201
 LEDGER cell=PX pid=1000 start=7777 gen=1 exe=/w/ledger2 module=/w/libA.so fn=C_GetFunctionList mech=- n=1 bad=0 phase=setup t0={g0} t1={g1}
-LEDGER cell=PX pid=1000 start=7777 gen=1 exe=/w/ledger2 module=/w/libA.so fn=C_DigestInit mech=0x250 n=10 bad=0 phase=main t0={h0} t1={h1}
-LEDGER cell=PX pid=1000 start=7777 gen=1 exe=/w/ledger2 module=/w/libA.so fn=C_Digest mech=0x250 n=10 bad=0 phase=main t0={h0} t1={h1}
+LEDGER cell=PX pid=1000 start=7777 gen=1 exe=/w/ledger2 module=/w/libA.so fn=C_DigestInit mech=0x250 n=11 bad=0 phase=main t0={h0} t1={h1}
+LEDGER cell=PX pid=1000 start=7777 gen=1 exe=/w/ledger2 module=/w/libA.so fn=C_Digest mech=0x250 n=11 bad=1 phase=main t0={h0} t1={h1}
 DONE cell=PX pid=1000 start=7777 gen=1 exe=/w/ledger2 status=ok
 """
 
@@ -4038,26 +4800,26 @@ def inventory_inputs(s1_expected=True):
                             "orphans": 0, "dropped": 0, "last_seen_ns": m1,
                             "active": []}},
             {"caller": "c1", "module": "m0",
-             "entries": {"count": 20, "coverage": {"state": "counted",
+             "entries": {"count": 22, "coverage": {"state": "counted",
                                                   "lossy": False}},
              "semantics": "observed",
              "mechanisms": [{"mechanism": 0x250, "mechanism_hex": "0x250",
                              "name": None, "operations": ["digest"],
-                             "calls": 20, "errors": 0, "last_seen_ns": h1,
+                             "calls": 22, "errors": 1, "last_seen_ns": h1,
                              "evidence": {"functions": ["C_DigestInit", "C_Digest"],
                                           "returns": [{"rv": 0, "rv_hex": "0x0",
                                                        "name": "CKR_OK"}],
                                           "truncated": False}}],
-             "operations": {"calls": 20, "started": 10, "completed": 10,
-                            "cancelled": 0, "failed": 0, "unknown": 0,
+             "operations": {"calls": 22, "started": 10, "completed": 10,
+                            "cancelled": 0, "failed": 1, "unknown": 0,
                             "orphans": 0, "dropped": 0, "last_seen_ns": h1,
                             "active": []}},
         ],
         "instances": [{"id": "i0", "caller": "c0", "module": "m0",
-                       "state": "active", "reason": None,
+                       "state": "observed", "reason": None,
                        "first_seen_ns": m0, "last_seen_ns": m1},
                       {"id": "i1", "caller": "c1", "module": "m0",
-                       "state": "active", "reason": None,
+                       "state": "observed", "reason": None,
                        "first_seen_ns": h0, "last_seen_ns": h1}],
         "semantic_edges": [
             {"caller": "c0", "module": "m0", "instance": "i0",
@@ -4071,10 +4833,10 @@ def inventory_inputs(s1_expected=True):
             {"caller": "c1", "module": "m0", "instance": "i1",
              "entries": {"unit": "api_entries", "count": None,
                         "observation": "unavailable"},
-             "api_returns": {"unit": "api_returns", "count": 20,
+             "api_returns": {"unit": "api_returns", "count": 22,
                              "saturated": False, "historical_only_returns": 0},
              "semantics": "observed", "mechanisms": [],
-             "operations": {"completed": 10, "failed": 0},
+             "operations": {"completed": 10, "failed": 1},
              "coverage": {"lossy": False, "reasons": []}},
         ],
         "gaps": [{"subject": "exact image authority unavailable", "detail": "test"}],
@@ -4098,9 +4860,9 @@ def inventory_inputs(s1_expected=True):
                    "0": {"exe": "/w/ledger", "retired": True},
                    "1": {"exe": "/w/ledger2", "retired": False}}}},
                "expected_edges": {"1000:0:A": {"counted": True, "count": 8},
-                                  "1000:1:A": {"counted": True, "count": 20}},
+                                  "1000:1:A": {"counted": True, "count": 22}},
                "measured": {"label": "gen1", "t0": h0 - 1, "t1": h1 + 1,
-                            "expected_calls": 20,
+                            "expected_calls": 22,
                             "phases": ["main:gen1", "teardown:gen1"]},
                "warmup": {"label": "gen0", "t0": m0 - 1, "t1": m1 + 1,
                           "expected_calls": 8,
@@ -4114,13 +4876,72 @@ def inventory_inputs(s1_expected=True):
 class InventoryTest(unittest.TestCase):
     maxDiff = 4000
 
+    def measured_sibling_control(self, target_success=9, target_failed=1):
+        doc, ledgers, receipt = inventory_inputs()
+        target = doc["edges"][1]
+        count = 2 * (target_success + target_failed)
+        target["entries"]["count"] = count
+        target["mechanisms"][0].update(calls=count, errors=target_failed)
+        target["operations"].update(calls=count, completed=target_success,
+                                    failed=target_failed)
+        doc["semantic_edges"][1]["api_returns"]["count"] = count
+        doc["semantic_edges"][1]["operations"].update(
+            completed=target_success, failed=target_failed)
+        target_batches = [batch for batch in ledgers["PX"]["batches"] if batch["gen"] == 1]
+        for batch in target_batches:
+            batch["n"] = target_success + target_failed
+            batch["bad"] = target_failed if batch["fn"] == "C_Digest" else 0
+        sibling = copy.deepcopy(doc["callers"][1])
+        sibling.update(id="c2", pid=2000, start_time=8888)
+        doc["callers"].append(sibling)
+        sibling_edge = copy.deepcopy(target)
+        sibling_edge.update(caller="c2")
+        sibling_edge["entries"]["count"] = 22
+        sibling_edge["mechanisms"][0].update(calls=22, errors=1)
+        sibling_edge["operations"].update(calls=22, completed=10, failed=1)
+        doc["edges"].append(sibling_edge)
+        sibling_instance = copy.deepcopy(doc["instances"][1])
+        sibling_instance.update(id="i2", caller="c2")
+        doc["instances"].append(sibling_instance)
+        sibling_semantic = copy.deepcopy(doc["semantic_edges"][1])
+        sibling_semantic.update(caller="c2", instance="i2")
+        sibling_semantic["api_returns"]["count"] = 22
+        sibling_semantic["operations"].update(completed=10, failed=1)
+        doc["semantic_edges"].append(sibling_semantic)
+        sibling_ledger = H6["parse_inv_ledger"]("")
+        for original in target_batches:
+            batch = dict(original, pid=2000, start=8888, n=11,
+                         bad=1 if original["fn"] == "C_Digest" else 0)
+            sibling_ledger["batches"].append(batch)
+        ledgers["MS"] = sibling_ledger
+        receipt["owned_pids"].append(2000)
+        receipt["expected_incarnations"]["2000"] = {
+            "gens": {"1": {"exe": sibling["image"]["exe"]["path"], "retired": False}}}
+        receipt["expected_edges"].update({"1000:1:A": {"counted": True, "count": count},
+                                          "2000:1:A": {"counted": True, "count": 22}})
+        receipt["measured"]["expected_calls"] = count + 22
+        return doc, ledgers, receipt
+
+    def test_reject_nine_target_completions_despite_ten_sibling_completions(self):
+        result = H6["evaluate_inventory_h6"](*self.measured_sibling_control())
+        self.assertFalse(result["pass"], result)
+        self.assertTrue(any("pid 1000 gen 1" in error and "fewer than 10" in error
+                            for error in result["errors"]), result["errors"])
+
+    def test_reject_target_without_failed_returns_despite_sibling_failures(self):
+        result = H6["evaluate_inventory_h6"](
+            *self.measured_sibling_control(target_success=10, target_failed=0))
+        self.assertFalse(result["pass"], result)
+        self.assertTrue(any("pid 1000 gen 1" in error and "failed return" in error
+                            for error in result["errors"]), result["errors"])
+
     def test_accept_inventory_control(self):
         doc, ledgers, receipt = inventory_inputs()
         result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
         self.assertTrue(result["pass"], result["errors"])
-        self.assertEqual(result["physical_entered"], 28)
-        self.assertEqual(result["physical_counted"], 28)
-        self.assertEqual(result["failed_ledgered"], 1)
+        self.assertEqual(result["physical_entered"], 30)
+        self.assertEqual(result["physical_counted"], 30)
+        self.assertEqual(result["failed_ledgered"], 2)
         self.assertEqual(result["s1"]["instances"], 2)
         self.assertEqual(result["s1"]["semantic_edges"], 2)
         self.assertEqual(result["completed_operations"], 13)

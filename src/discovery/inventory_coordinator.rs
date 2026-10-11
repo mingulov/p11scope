@@ -349,38 +349,16 @@ fn inventory_config(endpoint_budget: InventoryBudget) -> Result<InventoryDiscove
 /// off and exits record unfiltered, so genuine exits are never
 /// silently suppressed.
 fn exit_clocks_comparable() -> bool {
-    let active = std::fs::read_link("/proc/self/ns/time").ok();
-    let children = std::fs::read_link("/proc/self/ns/time_for_children").ok();
-    let offsets = std::fs::read_to_string("/proc/self/timens_offsets").ok();
-    exit_clocks_comparable_with(active.as_ref(), children.as_ref(), offsets.as_deref())
+    crate::attach::clock_origins_comparable()
 }
 
-/// Test seam for [`exit_clocks_comparable`]: the namespace comparison
-/// takes already-read symlink targets, so differing active/children
-/// namespaces are covered without privileged setup. `None` on any
-/// input reads incomparable (fail closed), as does a nonzero or
-/// unparseable monotonic offset.
+#[cfg(test)]
 fn exit_clocks_comparable_with(
     active: Option<&std::path::PathBuf>,
     children: Option<&std::path::PathBuf>,
     offsets: Option<&str>,
 ) -> bool {
-    let (Some(active), Some(children), Some(offsets)) = (active, children, offsets) else {
-        return false;
-    };
-    if active != children {
-        return false;
-    }
-    offsets.lines().any(|line| {
-        let mut fields = line.split_whitespace();
-        if fields.next() != Some("monotonic") {
-            return false;
-        }
-        let (Some(sec), Some(nsec)) = (fields.next(), fields.next()) else {
-            return false;
-        };
-        sec.parse::<i64>() == Ok(0) && nsec.parse::<i64>() == Ok(0)
-    })
+    crate::attach::clock_origins_comparable_with(active, children, offsets)
 }
 
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
@@ -18113,3 +18091,23 @@ mod demotion_retirement_tests;
 #[cfg(test)]
 #[path = "inventory_diagnostics_tests.rs"]
 mod inventory_diagnostics_tests;
+
+#[cfg(test)]
+mod continuity_clock_tests {
+    use super::*;
+    #[test]
+    fn pid_continuity_clock_origin_rejects_duplicate_and_malformed_offsets() {
+        let ns = std::path::PathBuf::from("time:[7]");
+        for text in [
+            "monotonic 0 0\nmonotonic 0 0",
+            "monotonic 1 0\nmonotonic 0 0",
+            "monotonic bad 0\nmonotonic 0 0",
+            "monotonic 0 0 extra",
+        ] {
+            assert!(
+                !exit_clocks_comparable_with(Some(&ns), Some(&ns), Some(text)),
+                "malformed/duplicate offset must not be rescued: {text}"
+            );
+        }
+    }
+}

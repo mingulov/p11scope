@@ -15145,7 +15145,10 @@ pub(crate) mod tests {
         };
         let fresh = *new;
         let record = reused.scene.coordinator.adapter.record(fresh).unwrap();
-        assert_eq!(record.first_seen_ns, 2_000, "the pass clock stamps first-seen");
+        assert_eq!(
+            record.first_seen_ns, 2_000,
+            "the pass clock stamps first-seen"
+        );
         assert_eq!(
             record.admitted_ns, 2_100,
             "detection time stamps the admission boundary"
@@ -15215,11 +15218,11 @@ pub(crate) mod tests {
         );
         let emitted = native.binder_only(vec![native.row(41, 2, 7, 1_100, 1)]);
         assert_eq!(emitted.len(), 1, "the real exec emits one transition");
-        let events = native.scene.coordinator.apply_exec_transition(
-            emitted[0],
-            &mut native.cookies,
-            1_200,
-        );
+        let events =
+            native
+                .scene
+                .coordinator
+                .apply_exec_transition(emitted[0], &mut native.cookies, 1_200);
         let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
             panic!("the transition retires the old incarnation: {events:?}");
         };

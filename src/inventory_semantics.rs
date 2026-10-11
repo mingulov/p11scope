@@ -634,8 +634,8 @@ pub(crate) const TERMINAL_DRAIN_QUANTUM: usize = 1024;
 
 /// Bound on terminal batches staged ahead of commit: one
 /// [`TERMINAL_DRAIN_QUANTA`] window each for the quiesce wait and the
-/// post-Q drain, plus the terminal Finish batch (always delivered last
-/// by [`run_semantic_stop`]).
+/// post-Q drain, plus one spare. The terminal Finish batch bypasses the
+/// stage: it commits separately after H0 stops.
 pub(crate) const TERMINAL_STAGED_BATCH_CAP: usize = 2 * TERMINAL_DRAIN_QUANTA + 1;
 
 /// Bounded terminal staging for the stop sequence. The quiesce wait is
@@ -643,10 +643,10 @@ pub(crate) const TERMINAL_STAGED_BATCH_CAP: usize = 2 * TERMINAL_DRAIN_QUANTA + 
 /// an unbounded number of batches before Q; staging them all would
 /// hold an unbounded queue ahead of commit. `on_batch` feeds every
 /// drained batch here instead: beyond [`TERMINAL_STAGED_BATCH_CAP`]
-/// the oldest staged batch is shed (counted) so staging stays bounded
-/// while the terminal Finish batch — always delivered last — survives
-/// in delivery order. The caller discloses [`shed`](Self::shed)
-/// through the audited gap path.
+/// the oldest staged batch is shed (counted) so staging stays bounded.
+/// The caller commits every staged batch before finishing H0, then
+/// commits the Finish batch separately; the caller discloses
+/// [`shed`](Self::shed) through the audited gap path.
 #[derive(Debug, Default)]
 pub(crate) struct TerminalBatchStage {
     staged: std::collections::VecDeque<SemanticBatch>,
@@ -750,18 +750,16 @@ pub(crate) struct SemanticStopSummary {
     pub final_drain: bool,
 }
 
-/// Independent terminal ownership over any [`SemanticStopIo`]: gate
+/// The terminal drain phases over any [`SemanticStopIo`]: gate
 /// immediately, run bounded audited H0 work while waiting up to
-/// `budget` for Q, capture both producer positions at proven Q, drain
-/// the same owned cursors to those positions in bounded quanta, then
-/// stop H0 once and finalize its terminal batch separately. Every
-/// drained batch reaches `on_batch` (the caller finalizes and consumes
-/// it) before the Finish batch is produced: a stop request is not
-/// Finish, and a legitimately drained last return still completes its
-/// operation under ordinary adjudication. On unproven Q or a read
-/// failure, positive history is preserved, semantic loss is declared,
-/// and only one explicitly bounded poll drains each cursor.
-pub(crate) fn run_semantic_stop(
+/// `budget` for Q, capture both producer positions at proven Q and drain
+/// the same owned cursors to those positions in bounded quanta. H0 keeps
+/// running: every drained batch reaches `on_batch` (the caller finalizes,
+/// consumes and publishes each) before any Finish batch is produced, so
+/// the caller commits drained batches before stopping H0. On unproven Q
+/// or a read failure, positive history is preserved, semantic loss is
+/// declared, and only one explicitly bounded poll drains each cursor.
+pub(crate) fn run_semantic_drain(
     io: &mut impl SemanticStopIo,
     budget: Duration,
     quanta: usize,
@@ -870,6 +868,24 @@ pub(crate) fn run_semantic_stop(
             summary.unrouted_returns = summary.unrouted_returns.saturating_add(events.records);
         }
     }
+    summary
+}
+
+/// Independent terminal ownership over any [`SemanticStopIo`]:
+/// [`run_semantic_drain`] delivers every drained batch to `on_batch`,
+/// then H0 stops once and its terminal batch finalizes separately. A
+/// stop request is not Finish: a legitimately drained last return still
+/// completes its operation under ordinary adjudication, never ahead of
+/// drained calls and never behind Stopped.
+pub(crate) fn run_semantic_stop(
+    io: &mut impl SemanticStopIo,
+    budget: Duration,
+    quanta: usize,
+    quantum: usize,
+    now: impl FnMut() -> Instant,
+    mut on_batch: impl FnMut(SemanticBatch),
+) -> SemanticStopSummary {
+    let mut summary = run_semantic_drain(io, budget, quanta, quantum, now, &mut on_batch);
     // After all drained batches are consumed and published, H0 stops
     // once: unresolved joins expire and the terminal negatives plus
     // semantic Finish finalize separately, never ahead of drained calls.
@@ -992,14 +1008,34 @@ impl AttestedSemanticLane {
         live.stop_state = StopState::StopRequested;
     }
 
-    /// The full independent terminal sequence over the live lane: gate
-    /// (if not already), wait up to [`STOP_QUIESCE_BUDGET`] with bounded
-    /// audited H0 work, drain owned cursors to Q, then stop H0 once.
-    /// Every drained batch reaches `on_batch` before the Finish batch;
-    /// the caller finalizes, consumes and publishes each in order. A
-    /// shell lane (failed startup) finishes nothing and reports no
-    /// drain: positive history elsewhere is untouched.
+    /// The full independent terminal sequence over the live lane: drain
+    /// first (every drained batch reaches `on_batch`), then stop H0 once
+    /// and deliver its Finish batch to `on_batch` last. A shell lane
+    /// (failed startup) finishes nothing and reports no drain: positive
+    /// history elsewhere is untouched.
     pub(crate) fn run_semantic_stop(
+        &mut self,
+        pins: &[Arc<PidPin>],
+        now: impl FnMut() -> Instant,
+        mut on_batch: impl FnMut(SemanticBatch),
+    ) -> SemanticStopSummary {
+        let mut summary = self.run_semantic_drain(pins, now, &mut on_batch);
+        if let Some(finish) = self.finish_semantic_stop() {
+            on_batch(finish);
+            if let Some(live) = self.live.as_ref() {
+                summary.continuity_cuts = live.continuity_cuts;
+            }
+        }
+        summary
+    }
+
+    /// The terminal drain phases over the live lane: gate (if not
+    /// already), wait up to [`STOP_QUIESCE_BUDGET`] with bounded audited
+    /// H0 work and drain owned cursors to Q. H0 keeps running: the caller
+    /// commits every drained batch before finishing H0, so no eligible
+    /// drained call sits behind Stopped. A shell lane (failed startup)
+    /// drains nothing and reports no drain.
+    pub(crate) fn run_semantic_drain(
         &mut self,
         pins: &[Arc<PidPin>],
         now: impl FnMut() -> Instant,
@@ -1030,7 +1066,7 @@ impl AttestedSemanticLane {
             pins: pins.to_vec(),
             domain,
         };
-        let summary = run_semantic_stop(
+        let summary = run_semantic_drain(
             &mut io,
             STOP_QUIESCE_BUDGET,
             TERMINAL_DRAIN_QUANTA,
@@ -1054,7 +1090,6 @@ impl AttestedSemanticLane {
             .saturating_add(summary.drain_batches as u64);
         live.semantic_loss = summary.semantic_loss;
         live.continuity_cuts = summary.continuity_cuts;
-        live.finished = true;
         if summary.post_q_events {
             eprintln!(
                 "p11scope: terminal semantic EVENTS drain: post-quiescence record past the Q \
@@ -1068,6 +1103,23 @@ impl AttestedSemanticLane {
             );
         }
         summary
+    }
+
+    /// Stop H0 once and return its terminal Finish batch, after every
+    /// drained batch was consumed and published. Unresolved joins expire;
+    /// the terminal negatives plus semantic Finish finalize separately,
+    /// never ahead of drained calls. Sets the lane finished. A shell lane
+    /// (failed startup) has nothing to finish: `None`.
+    pub(crate) fn finish_semantic_stop(&mut self) -> Option<SemanticBatch> {
+        let live = self.live.as_mut()?;
+        let domain = self.domain;
+        let report = live.capture.stop();
+        live.finished = true;
+        live.continuity_cuts = live.capture.continuity_cuts();
+        Some(
+            SemanticBatch::from_tick_report(domain, report, Vec::new(), now_ns())
+                .expect("H0 stop batches respect lane bounds"),
+        )
     }
 
     /// The sanitized lane summary: counts only, never instance
@@ -1257,5 +1309,252 @@ mod refresh_stash_tests {
             "beyond the cap the oldest receipts shed"
         );
         assert!(stash.take().is_empty(), "take drains the stash");
+    }
+}
+
+#[cfg(test)]
+mod terminal_drain_tests {
+    //! Drained batches reach `on_batch` before H0 stops: a legitimately
+    //! drained last return still completes under ordinary adjudication,
+    //! never behind Stopped.
+    use super::*;
+    use crate::discovery::identity::PinnedObjectId;
+    use crate::discovery::instances::{
+        CallFacts, EntryIp, EpochReading, InstanceId, InstanceRouter, MapRange, Route,
+        RouterLimits, StableObservation,
+    };
+    use crate::semantic_capture::RoutedCall;
+    use p11scope_ebpf_common::instance::STAMP_VALID;
+    use p11scope_ebpf_common::{Event, EventRecord, InstanceContinuity, InstanceStamp};
+
+    fn router_ids(domain: NativeDomainId, count: usize) -> Vec<InstanceId> {
+        let mut router = InstanceRouter::new(domain, RouterLimits::default());
+        let ranges = (0..count)
+            .map(|n| {
+                let base = 0x7000_0000 + n as u64 * 0x10000;
+                MapRange::new(base, base + 0x3000, 0, true)
+            })
+            .collect();
+        router.observe_legacy(StableObservation {
+            file_slot: 0,
+            reading: EpochReading {
+                cookie: 71,
+                local: 1,
+                global: 0,
+                fault: 0,
+                record_flags: 0,
+                sticky: 0,
+            },
+            ranges,
+            fence: 0,
+        });
+        (0..count)
+            .map(|n| {
+                let stamp = InstanceStamp {
+                    epoch: 1,
+                    file_slot_plus1: 1,
+                    flags: STAMP_VALID,
+                    ..InstanceStamp::default()
+                };
+                match router.route(CallFacts {
+                    token: n as u64 + 1,
+                    domain,
+                    image: ImageIdentity {
+                        task_cookie: 71,
+                        exec_id: 0,
+                    },
+                    entry: stamp,
+                    ret: stamp,
+                    ip: EntryIp::new(0x7000_0000 + n as u64 * 0x10000 + 0x1000),
+                    attached_offset: Some(0x1000),
+                }) {
+                    Route::Joined(id) => id,
+                    other => panic!("fixture must route a real instance: {other:?}"),
+                }
+            })
+            .collect()
+    }
+
+    /// One drained batch script: an empty quantum or a real Joined last
+    /// return with a timeline token.
+    enum BatchScript {
+        Empty,
+        LastReturn,
+    }
+
+    struct OrderIo {
+        domain: NativeDomainId,
+        quiesce_after: usize,
+        services: usize,
+        positions: [(usize, usize); 2],
+        scripts: Vec<BatchScript>,
+        finish_calls: usize,
+    }
+
+    impl OrderIo {
+        fn new(domain: NativeDomainId) -> Self {
+            Self {
+                domain,
+                quiesce_after: 0,
+                services: 0,
+                positions: [(0, 0), (0, 0)],
+                scripts: Vec::new(),
+                finish_calls: 0,
+            }
+        }
+
+        fn batch(&self, marker: u64, script: &BatchScript) -> SemanticBatch {
+            match script {
+                BatchScript::Empty => SemanticBatch::scripted(self.domain, Vec::new(), marker),
+                BatchScript::LastReturn => {
+                    let r0 = router_ids(self.domain, 1)[0];
+                    let stamp = InstanceStamp {
+                        epoch: 1,
+                        file_slot_plus1: 1,
+                        flags: STAMP_VALID,
+                        ..InstanceStamp::default()
+                    };
+                    let routed = RoutedCall::scripted(
+                        self.domain,
+                        EventRecord {
+                            event: Event {
+                                slot: 0,
+                                image: ImageIdentity {
+                                    task_cookie: 71,
+                                    exec_id: 0,
+                                },
+                                ..Default::default()
+                            },
+                            continuity: InstanceContinuity {
+                                entry_stamp: stamp,
+                                return_stamp: stamp,
+                                entry_ip: 0x2200,
+                            },
+                        },
+                        Route::Joined(r0),
+                        Some(Endpoint {
+                            object: PinnedObjectId(0),
+                            file_slot: 0,
+                            offset: 0x1200,
+                        }),
+                        Some(7),
+                    );
+                    SemanticBatch::from_tick_report(
+                        self.domain,
+                        TickReport::scripted(vec![TickOutcome::Call(routed)], Vec::new()),
+                        Vec::new(),
+                        marker,
+                    )
+                    .unwrap()
+                }
+            }
+        }
+    }
+
+    impl SemanticStopIo for OrderIo {
+        fn request_stop(&self) {}
+
+        fn quiescent(&self) -> bool {
+            self.services >= self.quiesce_after
+        }
+
+        fn service_quantum(&mut self) -> Result<Option<SemanticBatch>, SemanticRefusal> {
+            self.services += 1;
+            if self.scripts.is_empty() {
+                return Ok(None);
+            }
+            let marker = self.services as u64;
+            let script = self.scripts.remove(0);
+            Ok(Some(self.batch(marker, &script)))
+        }
+
+        fn positions(&mut self) -> Option<[(usize, usize); 2]> {
+            Some(self.positions)
+        }
+
+        fn drain_events_to(&mut self, _stop: usize, _quantum: usize) -> LaneDrainOutcome {
+            LaneDrainOutcome::default()
+        }
+
+        fn drain_discovery_to(&mut self, _stop: usize, _quantum: usize) -> LaneDrainOutcome {
+            LaneDrainOutcome::default()
+        }
+
+        fn finish_h0(&mut self) -> SemanticBatch {
+            self.finish_calls += 1;
+            SemanticBatch::scripted(self.domain, Vec::new(), u64::MAX)
+        }
+
+        fn continuity_cuts(&self) -> u64 {
+            0
+        }
+    }
+
+    fn test_clock(ticks: Vec<Duration>) -> impl FnMut() -> Instant {
+        let start = Instant::now();
+        let mut at = 0;
+        move || {
+            let step = ticks
+                .get(at)
+                .copied()
+                .unwrap_or(Duration::from_secs(3600 * 24 * 365));
+            at += 1;
+            start + step
+        }
+    }
+
+    #[test]
+    fn stop_orders_drained_last_return_before_finish() {
+        let domain = NativeDomainId::mint();
+        let mut io = OrderIo::new(domain);
+        io.quiesce_after = 2;
+        io.scripts = vec![BatchScript::LastReturn, BatchScript::Empty];
+        let mut markers = Vec::new();
+        let mut joined_tokens = Vec::new();
+        let summary = run_semantic_stop(
+            &mut io,
+            Duration::from_secs(5),
+            16,
+            1024,
+            test_clock(vec![Duration::ZERO; 4]),
+            |batch| {
+                markers.push(batch.observed_ns());
+                let (outcomes, _, _) = batch.into_parts();
+                for outcome in outcomes {
+                    if let TickOutcome::Call(call) = outcome {
+                        joined_tokens.push(call.token());
+                    }
+                }
+            },
+        );
+        assert_eq!(markers, vec![1, 2, u64::MAX]);
+        assert_eq!(io.finish_calls, 1, "H0 stops exactly once, last");
+        assert_eq!(
+            joined_tokens,
+            vec![Some(7)],
+            "the drained last return arrives before the Finish batch"
+        );
+        assert!(summary.final_drain);
+    }
+
+    #[test]
+    fn drain_phases_deliver_batches_without_finishing_h0() {
+        let domain = NativeDomainId::mint();
+        let mut io = OrderIo::new(domain);
+        io.quiesce_after = 2;
+        io.scripts = vec![BatchScript::LastReturn, BatchScript::Empty];
+        let mut markers = Vec::new();
+        let summary = run_semantic_drain(
+            &mut io,
+            Duration::from_secs(5),
+            16,
+            1024,
+            test_clock(vec![Duration::ZERO; 4]),
+            |batch| markers.push(batch.observed_ns()),
+        );
+        assert_eq!(markers, vec![1, 2]);
+        assert_eq!(io.finish_calls, 0, "drain phases never stop H0");
+        assert!(summary.quiesced);
+        assert!(summary.final_drain);
     }
 }

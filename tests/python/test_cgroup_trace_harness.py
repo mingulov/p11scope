@@ -434,7 +434,8 @@ class NativeMatrixFixtureTests(unittest.TestCase):
             self.skipTest('requires existing SoftHSM/gcc; installs nothing')
         self.scratch = tempfile.TemporaryDirectory(prefix='n3-matrix-native-')
         self.addCleanup(self.scratch.cleanup)
-        self.directory = Path(self.scratch.name)
+        self.directory = Path(self.scratch.name) / 'native paths with spaces'
+        self.directory.mkdir()
         self.executable = self.directory / 'trace-a'
         subprocess.run(['gcc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-pthread',
                         '-o', str(self.executable), str(ROOT / 'tests/fixtures/cgroup-trace/caller.c'),
@@ -550,6 +551,19 @@ class NativeMatrixFixtureTests(unittest.TestCase):
         before, after = self.exec_control('thread-exec', self.successor, 'nonleader')
         self.assertNotEqual((before['path'], before['ino']), (after['path'], after['ino']))
 
+    def test_exec_refuses_empty_and_over_capacity_paths(self):
+        for command in ('exec', 'thread-exec'):
+            for path in ('', 'x' * 4096):
+                with self.subTest(command=command, path_length=len(path)):
+                    owner, reader = self.start()
+                    reader.record('ready')
+                    self.image(reader, owner, self.executable, 0)
+                    owner.popen.stdin.write(f'{command} {path}\n')
+                    owner.popen.stdin.flush()
+                    self.assertEqual(owner.popen.wait(timeout=1), 2)
+                    self.assertFalse(any(row['kind'] == 'image' and row['image'] == 1
+                                         for row in reader.records))
+
     def test_short_native_start_gate_precedes_provider_calls_and_actual_exit(self):
         gate = self.directory / 'start-gate'
         owner, reader = self.start(('--start-gate', str(gate), '--auto-gate', str(gate),
@@ -613,7 +627,8 @@ class NativeFixtureTests(unittest.TestCase):
         if not provider.is_file() or not shutil.which('softhsm2-util') or not shutil.which('gcc'):
             self.skipTest('requires the existing SoftHSM fixture and gcc; installs nothing')
         with tempfile.TemporaryDirectory(prefix='n3-native-') as scratch:
-            directory = Path(scratch)
+            directory = Path(scratch) / 'native paths with spaces'
+            directory.mkdir()
             executable = directory / 'trace-a'
             subprocess.run(['gcc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-pthread',
                             '-o', str(executable), str(ROOT / 'tests/fixtures/cgroup-trace/caller.c'),

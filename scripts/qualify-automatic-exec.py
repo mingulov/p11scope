@@ -337,6 +337,26 @@ def _trace_successor_populations(trace, rows, in_window, receipt, images):
                            "observed_unknown": early_unknown, "deficit": missing}, errors
 
 
+def worker_early_population(rows, receipt, images, hints):
+    """Count only the original exact worker, independently of successor rows."""
+    worker = (receipt.get("b_setup", {}).get("worker_identity") or {}).get("tid")
+    observed = [row for index, row in enumerate(rows)
+                if (row["pid"], row["tid"], row["fn"], hints.get(index)) ==
+                   (receipt["pid"], worker, "C_Initialize", 0)]
+    named = sum(row["path"] is not None for row in observed)
+    errors = []
+    if not worker or worker == receipt["pid"] or len(observed) > 11:
+        errors.append("capability rows lack the exact worker or exceed its eleven calls")
+    if any(row["path"] is not None and (row["path"] != images[0]["path"]
+            or row["label"] != Path(images[0]["path"]).name) for row in observed):
+        errors.append("capability row falsely names the original worker image")
+    rvs = Counter(row["rv"] for row in observed)
+    if any(count > {"CKR_OK": 6, "CKR_GENERAL_ERROR": 5}.get(rv, 0) for rv, count in rvs.items()):
+        errors.append("capability returns exceed the independent six successes/five errors")
+    return {"expected": 11, "observed_named": named, "observed_unknown": len(observed) - named,
+            "deficit": max(0, 11 - len(observed)), "errors": errors}
+
+
 def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
     rows, counts, evidence, errors = N3_PARSE_TRACE(trace)
     errors.extend(stop_errors(receipt))
@@ -702,6 +722,8 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
             "link_losses": evidence[0].get("task_uprobe_link_losses") if evidence else None,
             "image_populations": populations, "image_generation_populations": generations,
             "phase_populations": {key: dict(value) for key, value in phase_populations.items()},
+            "capability_early_coverage": (worker_early_population(rows, receipt, images, row_image_hints)
+                                          if receipt.get("cell") == "leader-exit-exec" else None),
             "mandatory_calls": sum(mandatory.values()), "counts": counts,
             "evidence": evidence, "errors": errors}
 
@@ -1817,6 +1839,31 @@ def proc_task_states(pid):
     return states
 
 
+def proc_leader_identity(pid):
+    """Retained original leader fields that remain readable after thread exit."""
+    proc = Path("/proc") / str(pid)
+    text = (proc / "stat").read_text()
+    fields = text[text.rindex(")") + 2:].split()
+    return {"pid": int(text.split("(", 1)[0]), "state": fields[0],
+            "ppid": int(fields[1]), "start_time": int(fields[19]), "uid": proc.stat().st_uid}
+
+
+def proc_worker_identity(pid, tid):
+    """Birth and namespace identity of the exact task inside the owned group."""
+    task = Path("/proc") / str(pid) / "task" / str(tid)
+    text = (task / "stat").read_text()
+    fields = text[text.rindex(")") + 2:].split()
+    status = dict(line.split(":", 1) for line in (task / "status").read_text().splitlines())
+    identity = {"tid": int(text.split("(", 1)[0]), "tgid": int(status["Tgid"]),
+                "ppid": int(fields[1]), "start_time": int(fields[19]),
+                "uid": task.stat().st_uid,
+                "pid_namespace": (task / "ns/pid").stat().st_ino,
+                "time_namespace": (task / "ns/time").stat().st_ino}
+    if identity["tid"] != tid or identity["tgid"] != pid or identity["start_time"] <= 0:
+        raise SetupError("worker task is not the exact retained group member")
+    return identity
+
+
 def proc_provider_mapping(pid, provider_path):
     """Executable mapping of provider_path: (start, file_offset, dev, ino)."""
     with open(f"/proc/{pid}/maps") as handle:
@@ -1907,8 +1954,20 @@ class BDriver:
 
     def send(self, byte, name):
         check_dispatch()
-        self.owned.verify()
+        try:
+            self.owned.verify()
+        except FileNotFoundError:
+            # Linux removes the zombie leader's namespace links while its
+            # exact clone worker survives. Only mode2 may use this local
+            # fallback; the held group pidfd and original birth stay owned.
+            if getattr(self, "mode", None) != "2" or not hasattr(self, "worker_identity"):
+                raise
+            self.verify_zombie_worker()
         self.stamps[name] = monotonic_ns()  # lower bound before a fast child can read
+        if name == "B":
+            remaining_until(self.worker_barrier["deadline_ns"])
+            self.worker_barrier["released_ns"] = self.stamps[name]
+        check_dispatch()
         self.owned.popen.stdin.write(byte)
         self.owned.popen.stdin.flush()
 
@@ -1930,24 +1989,89 @@ class BDriver:
         return line
 
     def start_worker(self):
+        deadline = wait_deadline(10) if self.mode == "2" else None
         self.send("G", "G")
-        thread = self.expect("THREAD", timeout=10)
+        thread = self.expect("THREAD", timeout=remaining_until(deadline) if deadline else 10)
         fields = thread.split()
         self.worker_tid = int(fields[2])
         assert self.worker_tid != self.pid
         if self.mode == "2":
-            gone = self.expect("LEADER_EXIT", timeout=10)
-            assert int(gone.split()[1]) == self.pid
-            states = self.snapshot_tasks("leader_exit")
-            assert states.get(self.pid) == "Z", states
-            assert states.get(self.worker_tid) in ("R", "S"), states
+            if len(fields) != 5 or [int(value) for value in fields[1:4]] != [self.pid, self.worker_tid, self.worker_tid]:
+                raise SetupError("THREAD does not identify the exact owned worker")
+            self.worker_identity = proc_worker_identity(self.pid, self.worker_tid)
+            self.owned.zombie_worker_verify = self.verify_zombie_worker
+            gone = self.expect("LEADER_EXIT", timeout=remaining_until(deadline))
+            waiting = self.expect("WORKER_WAIT", timeout=remaining_until(deadline))
+            if any(len(line.split()) != 4 or [int(value) for value in line.split()[1:3]] !=
+                   [self.pid, self.worker_tid] for line in (gone, waiting)):
+                raise SetupError("leader intent/worker barrier ack names the wrong retained task")
+            while True:
+                remaining_until(deadline)
+                states = self.verify_worker_group()
+                observed = monotonic_ns()
+                remaining_until(deadline)
+                if states.get(self.pid) == "Z":
+                    break
+                pause_until(deadline, 0.005)
+            self.worker_barrier = {"proof_kind": "zombie-leader-worker-gate",
+                "leader": dict(self.owned.identity), "worker": dict(self.worker_identity),
+                "tasks": states, "pidfd_live": True, "started_ns": self.stamps["G"],
+                "thread_ns": int(fields[-1]), "intent_ns": int(gone.split()[-1]),
+                "wait_ns": int(waiting.split()[-1]), "observed_ns": observed, "deadline_ns": deadline}
+            self.send("B", "B")
+            released = self.expect("WORKER_RELEASE", timeout=remaining_until(deadline))
+            parts = released.split()
+            if (len(parts) != 4 or [int(value) for value in parts[1:3]] != [self.pid, self.worker_tid]
+                    or not self.stamps["B"] <= int(parts[-1]) <= self.stamps["WORKER_RELEASE"]):
+                raise SetupError("worker release ack lacks the exact bounded released worker")
+            self.worker_barrier["worker_release_ns"] = int(parts[-1])
         return thread
+
+    def verify_worker_group(self):
+        """Retain original group custody when only its recorded worker is live."""
+        states = self.snapshot_tasks("leader_exit")
+        original = self.owned.identity
+        leader = proc_leader_identity(self.pid)
+        if any(leader[key] != original[key] for key in ("pid", "ppid", "start_time", "uid")):
+            raise SetupError("leader is not the original retained process/birth/parent/uid")
+        worker = proc_worker_identity(self.pid, self.worker_tid)
+        if (worker != self.worker_identity or worker["tid"] == self.pid
+                or any(worker[key] != original[key] for key in
+                       ("ppid", "uid", "pid_namespace", "time_namespace"))):
+            raise SetupError("surviving worker birth/group/parent/uid/namespaces changed")
+        if states.get(self.worker_tid) not in ("R", "S", "D"):
+            raise SetupError("exact retained worker is absent or no longer live")
+        if states.get(self.pid) not in ("Z", "R", "S", "D"):
+            raise SetupError("original leader vanished or the group died")
+        if states[self.pid] != "Z":
+            try:
+                self.owned.verify()
+            except FileNotFoundError:
+                # The leader can exit between the live snapshot and ordinary
+                # verification. Confirm Z; never waive live-leader custody.
+                if proc_leader_identity(self.pid) != {**leader, "state": "Z"}:
+                    raise
+        elif leader["state"] != "Z":
+            raise SetupError("task snapshot disagrees with retained leader exit")
+        if self.owned.pidfd is None:
+            raise SetupError("original process pidfd was released")
+        poll = select.poll()
+        poll.register(self.owned.pidfd, select.POLLIN)
+        if poll.poll(0):
+            raise SetupError("retained group pidfd reports terminal group death")
+        return states
+
+    def verify_zombie_worker(self):
+        if self.verify_worker_group().get(self.pid) != "Z":
+            raise SetupError("worker custody lacks the original zombie leader")
 
     def pre_exec(self):
         done = self.expect("WORKER_DONE", timeout=10)
         fields = done.split()
         assert [int(fields[3]), int(fields[4]), int(fields[5])] == [11, 6, 5], done
         assert int(fields[2]) == self.worker_tid, done
+        if self.mode == "2" and int(fields[-1]) < self.worker_barrier["worker_release_ns"]:
+            raise SetupError("capability calls completed before the exact worker release")
         self.expect("EXEC_BODY", timeout=10)
         self.snapshot_tasks("exec_frame")
         return done
@@ -2015,7 +2139,8 @@ class BDriver:
     def b_setup_note(self):
         return {"token": self.token, "mode": self.mode, "measured": self.measured,
                 "delay_ms": self.delay_ms, "tasks": self.tasks, "lines": self.lines,
-                "stamps": self.stamps}
+                "stamps": self.stamps, "worker_identity": getattr(self, "worker_identity", None),
+                "worker_barrier": getattr(self, "worker_barrier", None)}
 
     def normalize(self, file_offset):
         """Translate receipts to N3LEDGER-schema records."""
@@ -2035,7 +2160,7 @@ class BDriver:
         for seq, rv in enumerate(pre_rvs):
             ledger.append({"kind": "call", "image": 0, "pid": self.pid, "tid": self.worker_tid,
                            "fn": "C_Initialize", "rv": rv, "phase": "pre", "scope": "selected",
-                           "sess": 0, "t0": self.stamps["G"], "t1": self.stamps["WORKER_DONE"],
+                           "sess": 0, "t0": self.stamps.get("B", self.stamps["G"]), "t1": self.stamps["WORKER_DONE"],
                            "seq": seq})
         failed = self.mode == "1"
         if failed:
@@ -2690,7 +2815,19 @@ def terminate_owned(owner):
         except (subprocess.TimeoutExpired, TimeoutError):
             owner.send(signal.SIGKILL)
             wait_process(owner.popen, 3)
-    except (ProcessLookupError, FileNotFoundError):
+    except FileNotFoundError:
+        # An H6 mode2 leader loses namespace links before group death. Keep
+        # the same exact-worker custody rule as dispatch, then kill through
+        # its held group pidfd and reap within the existing cleanup allowance.
+        verify = getattr(owner, "zombie_worker_verify", None)
+        if verify is not None:
+            verify()
+            try:
+                signal.pidfd_send_signal(owner.pidfd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # the verified group can die immediately before signal
+            wait_process(owner.popen, 3)
+    except ProcessLookupError:
         pass
 
 
@@ -3034,7 +3171,7 @@ def run_b_leg(ctx, cell, backend, observer_kind, leg_dir, mode, measured=25, del
     finish_readers([driver.stdout, driver.stderr, capture, errors])
     ledger = driver.normalize(ctx.b_file_offset)
     pre_phase = {"image": 0, "fn": "C_Initialize", "phase": "pre", "scope": "selected",
-                 "count": 11, "t0": driver.stamps["G"], "t1": driver.stamps["WORKER_DONE"]}
+                 "count": 11, "t0": driver.stamps.get("B", driver.stamps["G"]), "t1": driver.stamps["WORKER_DONE"]}
     if failed:
         post_phase = {"image": 0, "fn": "C_Initialize", "phase": "post", "scope": "selected",
                       "count": 18, "t0": driver.stamps["Rpost"], "t1": driver.stamps["DONE"]}
@@ -3128,22 +3265,94 @@ def run_pid_failed_exec(ctx, cell_dir, backend):
                       Path(cell_dir) / backend / "trace", "1")]
 
 
+def evaluate_worker_capability(result, receipt, backend):
+    """Independent worker-only early population; never a recovery positive."""
+    errors = []
+    capability = {"cell": "leader-exit-exec", "leg": f"capability-preexec/{backend}",
+                  "pass": False, "status": "error", "pre_exec_ledgered": 11,
+                  "note": "zombie-leader/live-worker activity; separate from post-exec recovery"}
+    try:
+        if (result.get("status") not in ("pass", "fail")
+                or result.get("pass") is not (result.get("status") == "pass")):
+            errors.append("failed/untested setup cannot demonstrate worker capability")
+        setup = receipt["b_setup"]
+        proof, worker = setup["worker_barrier"], setup["worker_identity"]
+        leader = proof["leader"]
+        pid, tid = receipt["pid"], worker["tid"]
+        image = next(row for row in receipt["images"] if row["image"] == 0)
+        tasks = {int(key): value for key, value in proof["tasks"].items()}
+        if (setup["mode"] != "2" or proof["proof_kind"] != "zombie-leader-worker-gate"
+                or proof["pidfd_live"] is not True or tasks.get(pid) != "Z"
+                or tasks.get(tid) not in ("R", "S", "D") or tid == pid
+                or set(receipt["known_tids"]) != {pid, tid}
+                or leader["pid"] != pid or leader["start_time"] != image["start_time"]
+                or worker != proof["worker"] or worker["tgid"] != pid or worker["start_time"] <= 0
+                or any(worker[key] != leader[key] for key in ("ppid", "uid", "pid_namespace", "time_namespace"))
+                or any(leader[key] != image[key] for key in ("pid_namespace", "time_namespace"))):
+            errors.append("capability lacks original zombie leader/exact live worker identity proof")
+        stamps, lines = setup["stamps"], setup["lines"]
+        times = [proof[key] for key in ("started_ns", "thread_ns", "intent_ns", "wait_ns",
+                                        "observed_ns", "released_ns", "worker_release_ns")]
+        if (not all(type(value) is int for value in times)
+                or not receipt["observer_ready_ns"] <= times[0]
+                or times != sorted(times) or not times[-1] <= stamps["WORKER_DONE"] <= receipt["observer_stopped_ns"]
+                or times[-1] >= proof["deadline_ns"]
+                or not 0 < proof["deadline_ns"] - times[0] <= 10_000_000_000
+                or stamps["G"] != times[0] or stamps["B"] != proof["released_ns"]):
+            errors.append("capability release lacks a fixed bounded proof before its calls")
+        for kind, key in (("THREAD", "thread_ns"), ("LEADER_EXIT", "intent_ns"),
+                          ("WORKER_WAIT", "wait_ns"), ("WORKER_RELEASE", "worker_release_ns")):
+            fields = lines[kind].split()
+            expected = [pid, tid, tid] if kind == "THREAD" else [pid, tid]
+            if (fields[0] != kind or [int(value) for value in fields[1:-1]] != expected
+                    or int(fields[-1]) != proof[key]):
+                errors.append(f"capability {kind} ack disagrees with its exact-worker barrier")
+        done = lines["WORKER_DONE"].split()
+        if (done[0] != "WORKER_DONE" or [int(value) for value in done[1:-1]] != [pid, tid, 11, 6, 5]
+                or not times[-1] <= int(done[-1]) <= stamps["WORKER_DONE"]):
+            errors.append("capability batch lacks its exact post-release worker completion")
+        pre = next(phase for phase in receipt["phases"] if phase["phase"] == "pre")
+        if pre["count"] != 11 or pre["t0"] != stamps["B"] or pre["t1"] != stamps["WORKER_DONE"]:
+            errors.append("capability phase includes time before the worker release")
+        # This population uses exact worker/function/generation keys, including
+        # disclosed missing prefixes, and never borrows a successor population.
+        population = result["capability_early_coverage"]
+        errors.extend(population["errors"])
+        named, unknown = population["observed_named"], population["observed_unknown"]
+        if any(type(value) is not int or value < 0 for value in (named, unknown)) or named + unknown > 11:
+            raise ValueError("capability captured population exceeds the independent eleven calls")
+        captured = named + unknown
+        early = {"expected": 11, "observed_named": named, "observed_unknown": unknown, "deficit": 11 - captured}
+        if any(population[key] != value for key, value in early.items()):
+            errors.append("capability population disagrees with its independent eleven-call prefix")
+        capability.update(pre_exec_captured=captured, early_coverage=early, task_states=tasks,
+                          worker_barrier=proof)
+        terminal = result["evidence"]
+        if len(terminal) != 1:
+            errors.append("capability lacks terminal capture evidence")
+        else:
+            ev = terminal[0]
+            errors.extend(_early_gap_errors(ev, early["deficit"]))
+            if (ev.get("privacy_mode") != "allowlisted" or ev.get("trace_truncated") is not False
+                    or any(ev.get(key, 0) for key in ("event_loss", "start_insert_failures", "unmatched_returns",
+                        "rv_update_failures", "process_tracking_failures", "process_tracking_evictions"))):
+                errors.append("capability capture reports truncation/policy or native event loss")
+    except (KeyError, TypeError, ValueError, IndexError, StopIteration) as error:
+        errors.append(f"missing/invalid worker barrier evidence: {error}")
+    if not errors:
+        capability["pass"] = None
+        capability["status"] = "demonstrated" if captured else "limitation"
+    capability["errors"] = errors
+    return capability
+
+
 def run_leader_exit_exec(ctx, cell_dir, backend):
     leg_dir = Path(cell_dir) / backend / "trace"
     result = run_b_leg(ctx, "leader-exit-exec", backend, "trace", leg_dir, "2")
-    # Explicit capability sub-result: zombie-leader/live-worker pre-exec
-    # activity is demonstrated iff the pre-exec phase was captured; it is
-    # never counted toward the post-exec positive.
+    if result.get("pass") is False and result.get("status") == "negative":
+        return [result]  # observer refused before a worker/barrier receipt existed
     receipt = json.loads((leg_dir / "receipt.json").read_text())
-    pre = (result.get("phase_populations", {}).get("pre", {}))
-    captured = (pre.get("named", 0) + pre.get("unknown", 0)) if isinstance(pre, dict) else 0
-    capability = {"cell": "leader-exit-exec", "leg": f"capability-preexec/{backend}",
-                  "status": "demonstrated" if captured > 0 else "limitation",
-                  "pass": None, "pre_exec_captured": captured,
-                  "pre_exec_ledgered": 11,
-                  "task_states": receipt.get("b_setup", {}).get("tasks", {}),
-                  "note": ("zombie-leader/live-worker pre-exec activity; "
-                           "never counted toward the post-exec positive")}
+    capability = evaluate_worker_capability(result, receipt, backend)
     write_json(leg_dir / "capability.json", capability)
     return [result, capability]
 
@@ -4311,19 +4520,33 @@ def main(argv=None):
     if ctx.cleanup_failed:
         results.append({"cell": "harness", "leg": "cleanup", "status": "error", "pass": False,
                         "errors": list(ctx.cleanup_errors)})
+    counts = {"passed": 0, "failed": 0, "negative": 0, "informational": 0}
+    for result in results:
+        passed, status = result.get("pass"), result.get("status")
+        capability = str(result.get("leg", "")).startswith("capability-preexec/")
+        if capability and passed is None and status in ("demonstrated", "limitation"):
+            counts["informational"] += 1
+        elif passed is False and status == "negative":
+            counts["negative"] += 1
+        elif not capability and passed is True and status == "pass":
+            counts["passed"] += 1
+        else:
+            counts["failed"] += 1
+    required_complete = counts["passed"] > 0 and counts["failed"] == counts["negative"] == 0
     summary = {
         "source_revision": args.source_revision,
         "candidate": ctx.binary.metadata(), "provider": ctx.provider_pin.metadata(),
         "abi": "Linux x86-64 LP64", "kernel": os.uname().release,
         "cells": [cell for cell in cells for _ in backends], "backends": list(backends),
         "legs": results,
-        "passed": sum(1 for result in results if result.get("pass")),
-        "failed": sum(1 for result in results if not result.get("pass")),
+        **counts, "required_complete": required_complete,
+        "complete": required_complete and set(cells) == set(CELLS) and set(backends) == set(BACKENDS),
         "unexecuted": [name for name in CELLS if name not in cells],
     }
     write_json(args.out / "summary.json", summary)
-    print(json.dumps({"passed": summary["passed"], "failed": summary["failed"], "out": str(args.out)}), flush=True)
-    return 0 if summary["failed"] == 0 else 1
+    print(json.dumps({**counts, "required_complete": required_complete,
+                      "complete": summary["complete"], "out": str(args.out)}), flush=True)
+    return 0 if required_complete else 1
 
 
 def spawn_inventory(ctx, leg_dir, scope_args, module_args, manifest_args,

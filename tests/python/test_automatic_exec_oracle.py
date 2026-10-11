@@ -514,12 +514,12 @@ class DetailedFixtureTest(unittest.TestCase):
                 raise AssertionError(result.stderr)
 
     def child(self, after=True, warm=False, failed=False, deadlines=None, short=False,
-              delay_ms=0, before_name="before"):
-        provider = str(self.directory / "provider.so")
+              delay_ms=0, before_name="before", mode=None, provider_name="provider.so"):
+        provider = str(self.directory / provider_name)
         suffix = "-short" if short else ""
         argv = ([str(self.directory / ("after" + suffix)), provider, str(os.getpid()), "43"] if after
                 else [str(self.directory / (before_name + suffix)), provider, str(self.directory / "after"),
-                      str(self.directory / "absent"), str(os.getpid()), "43", "1" if failed else "0"])
+                      str(self.directory / "absent"), str(os.getpid()), "43", mode or ("1" if failed else "0")])
         if warm or deadlines:
             argv += ["17", str(delay_ms), "1" if warm else "0"]
         if deadlines:
@@ -534,6 +534,7 @@ class DetailedFixtureTest(unittest.TestCase):
                 stream.close()
         self.addCleanup(cleanup)
         reader = H6["Reader"](proc.stdout, self.directory / f"child-{proc.pid}.txt")
+        proc.h6_reader = reader
         self.addCleanup(reader.thread.join, 2)
         index = 0
         def expect(prefix):
@@ -610,6 +611,238 @@ class DetailedFixtureTest(unittest.TestCase):
         now = time.monotonic_ns()
         return [now + 2_000_000_000, now + setup_ms * 1_000_000,
                 recovery_ms, measurement_ms, hold_ms]
+
+    def test_opt_in_mode2_has_no_real_provider_call_before_zombie_release(self):
+        # Instrument the real provider entry, so an early partial batch cannot
+        # hide behind a missing WORKER_DONE. The driver and clone stay real.
+        source = (ROOT / "tests/fixtures/detailed-nonleader-exec.c").read_text()
+        source = source.replace("    struct request *request = argument;",
+            "    struct request *request = argument;\n"
+            "    if (request->operation == 0) emit(\"CAPABILITY_CALL\", NULL, 0);", 1)
+        result = subprocess.run(["cc", *H6["B_CFLAGS"], "-DDETAILED_EXEC_PROVIDER", "-fPIC", "-shared",
+                                 "-x", "c", "-", "-ldl", "-o", str(self.directory / "provider-counted.so")],
+                                input=source, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        proc, expect, send = self.child(after=False, mode="2", deadlines=self.deadline_args(),
+                                        provider_name="provider-counted.so")
+        expect("READY")
+        send("G")
+        thread = expect("THREAD")
+        expect("LEADER_EXIT")
+        deadline = time.monotonic() + 0.3
+        while H6["proc_task_states"](proc.pid).get(proc.pid) != "Z":
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.001)
+        states = H6["proc_task_states"](proc.pid)
+        self.assertIn(states.get(int(thread[2])), ("R", "S"))
+        with self.assertRaises(TimeoutError, msg="real capability entry occurred before controller release"):
+            H6["expect_line"](proc.h6_reader, 0, "CAPABILITY_CALL", 0.04)
+        waiting = expect("WORKER_WAIT")
+        self.assertEqual(waiting[1:3], thread[1:3])
+        released_ns = time.monotonic_ns()
+        send("B")
+        released = expect("WORKER_RELEASE")
+        self.assertEqual(released[1:3], thread[1:3])
+        self.assertGreaterEqual(int(released[-1]), released_ns)
+        for _ in range(11):
+            self.assertGreaterEqual(int(expect("CAPABILITY_CALL")[-1]), int(released[-1]))
+        self.assertEqual([int(v) for v in expect("WORKER_DONE")[3:6]], [11, 6, 5])
+        expect("EXEC_BODY")
+        send("X")
+        expect("NEW_READY")
+        send("P")
+        expect("POST_BODY")
+        send("R")
+        self.assertEqual([int(v) for v in expect("NEW_DONE")[3:6]], [17, 9, 8])
+        send("F")
+        self.assertEqual(proc.wait(timeout=2), 0)
+
+    def mode2_driver(self, before_name="before"):
+        proc, expect, _send = self.child(after=False, mode="2", before_name=before_name,
+                                         deadlines=self.deadline_args(setup_ms=1500))
+        expect("READY")
+        driver = H6["BDriver"].__new__(H6["BDriver"])
+        driver.pid, driver.mode = proc.pid, "2"
+        driver.owned = H6["OwnedProcess"](proc.pid, os.getpid(), os.getuid(), proc)
+        self.addCleanup(driver.owned.close)
+        driver.birth = driver.owned.identity["start_time"]
+        driver.stdout, driver.index = proc.h6_reader, 0
+        driver.stamps, driver.lines, driver.tasks = {}, {}, {}
+        return proc, driver
+
+    def test_mode2_driver_proves_original_zombie_and_releases_exact_worker(self):
+        proc, driver = self.mode2_driver()
+        driver.start_worker()
+        self.assertIn("B", driver.stamps, "controller never released the opt-in worker")
+        proof = driver.worker_barrier
+        self.assertEqual(proof["tasks"][proc.pid], "Z")
+        self.assertIn(proof["tasks"][driver.worker_tid], ("R", "S"))
+        self.assertEqual(proof["worker"]["tid"], driver.worker_tid)
+        self.assertEqual(proof["worker"]["tgid"], proc.pid)
+        self.assertGreater(proof["worker"]["start_time"], 0)
+        self.assertEqual(proof["worker"]["pid_namespace"], driver.owned.identity["pid_namespace"])
+        self.assertLessEqual(proof["observed_ns"], proof["released_ns"])
+        self.assertLessEqual(proof["released_ns"], proof["worker_release_ns"])
+        driver.pre_exec()
+        # X dispatch must also work while /proc/<zombie leader>/ns is gone.
+        driver.send("X", "X")
+        driver.expect("NEW_READY")
+
+    def delayed_mode2_driver(self):
+        # A controlled pipe holds the original leader after LEADER_EXIT.
+        # The worker's barrier ack is real, and no deadline is lengthened.
+        source = (ROOT / "tests/fixtures/detailed-nonleader-exec.c").read_text()
+        source = source.replace("        (void)raw6(SYS_exit, 0, 0, 0, 0, 0, 0);",
+            "        char leader_gate;\n"
+            "        if (raw6(SYS_read, 3, (long)&leader_gate, 1, 0, 0, 0) != 1) fail(109);\n"
+            "        (void)raw6(SYS_exit, 0, 0, 0, 0, 0, 0);", 1)
+        # FD3 is prepared by the test's child before exec, without preexec_fn.
+        result = subprocess.run(["cc", *H6["B_CFLAGS"], "-x", "c", "-", "-ldl",
+                                 "-o", str(self.directory / "before-leader-held")],
+                                input=source, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, write_fd)
+        popen = subprocess.Popen
+        def spawn(argv, **kwargs):
+            script = "import os,sys; os.dup2(int(sys.argv[1]),3); os.set_inheritable(3,True); os.execv(sys.argv[2],sys.argv[2:])"
+            return popen([sys.executable, "-I", "-c", script, str(read_fd), *argv],
+                         pass_fds=(read_fd,), **kwargs)
+        try:
+            with mock.patch.object(subprocess, "Popen", spawn):
+                proc, driver = self.mode2_driver("before-leader-held")
+        finally:
+            os.close(read_fd)
+        return proc, driver, write_fd
+
+    def test_mode2_delayed_actual_leader_exit_is_polled(self):
+        proc, driver, leader_gate = self.delayed_mode2_driver()
+        observations = []
+        snapshot = H6["proc_task_states"]
+        def observe(pid):
+            states = snapshot(pid)
+            observations.append(states.get(pid))
+            if len(observations) == 2:
+                os.write(leader_gate, b"E")
+            return states
+        with mock.patch.dict(driver.start_worker.__globals__, {"proc_task_states": observe}):
+            try:
+                driver.start_worker()
+            except AssertionError as error:
+                self.fail(f"LEADER_EXIT intent was mistaken for actual exit: {error}")
+        self.assertGreaterEqual(len(observations), 3)
+        self.assertIn(observations[0], ("R", "S"))
+        self.assertEqual(observations[-1], "Z")
+        self.assertIn("B", driver.stamps)
+        self.assertIsNone(proc.poll())
+
+    def test_mode2_live_leader_at_expiry_refuses_release(self):
+        _proc, driver, _leader_gate = self.delayed_mode2_driver()
+        budget = H6["LegBudget"](budgets={"setup": 0.08})
+        token = H6["ACTIVE_LEG"].set(budget)
+        try:
+            with self.assertRaises((TimeoutError, H6["SetupError"])):
+                driver.start_worker()
+        finally:
+            H6["ACTIVE_LEG"].reset(token)
+        self.assertNotIn("B", driver.stamps)
+
+    def test_mode2_missing_worker_and_dead_group_refuse_release(self):
+        for state in ("missing", "zombie", "dead-group"):
+            with self.subTest(state=state):
+                proc, driver = self.mode2_driver()
+                snapshot = H6["proc_task_states"]
+                def observe(pid):
+                    states = snapshot(pid)
+                    if state == "missing":
+                        states.pop(driver.worker_tid, None)
+                    elif state == "zombie":
+                        states[driver.worker_tid] = "Z"
+                    else:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                    return states
+                with mock.patch.dict(driver.start_worker.__globals__, {"proc_task_states": observe}):
+                    try:
+                        with self.assertRaises((H6["SetupError"], OSError, ValueError)):
+                            driver.start_worker()
+                    except AssertionError as error:
+                        self.fail(f"worker refusal was an unclassified snapshot assertion: {error}")
+                self.assertNotIn("B", driver.stamps)
+
+    def test_mode2_changed_worker_birth_group_or_namespace_refuses_release(self):
+        for field in ("start_time", "tgid", "pid_namespace", "time_namespace"):
+            with self.subTest(field=field):
+                _proc, driver = self.mode2_driver()
+                calls = []
+                read = H6["proc_worker_identity"]
+                def changed(pid, tid):
+                    identity = read(pid, tid)
+                    calls.append(identity)
+                    if len(calls) > 1:
+                        identity[field] += 1
+                    return identity
+                with mock.patch.dict(driver.start_worker.__globals__, {"proc_worker_identity": changed}):
+                    with self.assertRaises(H6["SetupError"]):
+                        driver.start_worker()
+                self.assertNotIn("B", driver.stamps)
+
+    def test_mode2_vanished_worker_or_wrong_original_leader_refuses_release(self):
+        for broken in ("vanished", "leader-birth", "leader-parent", "leader-uid"):
+            with self.subTest(broken=broken):
+                _proc, driver = self.mode2_driver()
+                worker_read, leader_read = H6["proc_worker_identity"], H6["proc_leader_identity"]
+                calls = []
+                def worker(pid, tid):
+                    calls.append(True)
+                    if broken == "vanished" and len(calls) > 1:
+                        raise FileNotFoundError("controlled exact worker disappearance")
+                    return worker_read(pid, tid)
+                def leader(pid):
+                    identity = leader_read(pid)
+                    if broken != "vanished":
+                        field = {"leader-birth": "start_time", "leader-parent": "ppid", "leader-uid": "uid"}[broken]
+                        identity[field] += 1
+                    return identity
+                with mock.patch.dict(driver.start_worker.__globals__, {
+                        "proc_worker_identity": worker, "proc_leader_identity": leader}):
+                    with self.assertRaises((H6["SetupError"], FileNotFoundError)):
+                        driver.start_worker()
+                self.assertNotIn("B", driver.stamps)
+
+    def test_mode2_cleanup_reaps_the_owned_zombie_leader_group(self):
+        proc, driver = self.mode2_driver()
+        driver.start_worker()
+        driver.pre_exec()
+        ctx = H6["Case"](SimpleNamespace(out=self.directory))
+        ctx.owners.append(driver.owned)
+        ctx.readers.append(driver.stdout)
+        try:
+            H6["cleanup_leg_resources"](ctx)
+        except H6["LegCleanupError"] as error:
+            self.fail(f"zombie leader custody prevented owned-group cleanup: {error}")
+        self.assertEqual(proc.returncode, -9)
+        self.assertIsNone(driver.owned.pidfd)
+        self.assertFalse(driver.stdout.thread.is_alive())
+        self.assertEqual(ctx.owners, [])
+
+    def test_legacy_mode2_keeps_its_ungated_worker_protocol(self):
+        proc, expect, send = self.child(after=False, mode="2")
+        expect("READY")
+        send("G")
+        expect("THREAD")
+        # Legacy W and WORKER_DONE may race LEADER_EXIT; no barrier B exists.
+        done, _ = H6["expect_line"](proc.h6_reader, 0, "WORKER_DONE", 2)
+        self.assertEqual([int(v) for v in done.split()[3:6]], [11, 6, 5])
+        expect("EXEC_BODY")
+        send("X")
+        expect("NEW_READY")
+        send("P")
+        expect("POST_BODY")
+        send("R")
+        self.assertEqual([int(v) for v in expect("NEW_DONE")[3:6]], [17, 9, 8])
+        send("F")
+        self.assertEqual(proc.wait(timeout=2), 0)
 
     def test_opt_in_initial_g_expires_at_absolute_setup_bound(self):
         proc, expect, _send = self.child(after=False, short=True, deadlines=self.deadline_args(setup_ms=150))
@@ -738,6 +971,113 @@ class DetailedFixtureTest(unittest.TestCase):
         expect("POST_BODY")
         send("R")
         self.assertEqual(proc.wait(timeout=1), 92)
+
+
+class WorkerCapabilityTest(unittest.TestCase):
+    def inputs(self, captured=11):
+        leader = {"pid": 1000, "ppid": 900, "start_time": 7777, "uid": 1001,
+                  "pid_namespace": 1, "time_namespace": 2}
+        worker = {"tid": 1001, "tgid": 1000, "ppid": 900, "start_time": 8888,
+                  "uid": 1001, "pid_namespace": 1, "time_namespace": 2}
+        proof = {"proof_kind": "zombie-leader-worker-gate", "leader": leader, "worker": worker,
+                 "tasks": {1000: "Z", 1001: "S"}, "pidfd_live": True,
+                 "started_ns": READY + 10, "thread_ns": READY + 20, "intent_ns": READY + 30,
+                 "wait_ns": READY + 40, "observed_ns": READY + 50, "released_ns": READY + 60,
+                 "worker_release_ns": READY + 70, "deadline_ns": READY + 100_000_000}
+        lines = {"THREAD": f"THREAD 1000 1001 1001 {READY + 20}",
+                 "LEADER_EXIT": f"LEADER_EXIT 1000 1001 {READY + 30}",
+                 "WORKER_WAIT": f"WORKER_WAIT 1000 1001 {READY + 40}",
+                 "WORKER_RELEASE": f"WORKER_RELEASE 1000 1001 {READY + 70}",
+                 "WORKER_DONE": f"WORKER_DONE 1000 1001 11 6 5 {READY + 80}"}
+        receipt = base_receipt(images=[image_record(0, "/w/before", READY - 10)],
+            known_tids=[1000, 1001], b_setup={"mode": "2", "worker_identity": dict(worker),
+                "worker_barrier": proof, "lines": lines,
+                "stamps": {"G": READY + 10, "B": READY + 60, "WORKER_DONE": READY + 90}},
+            phases=[{"image": 0, "phase": "pre", "count": 11, "t0": READY + 60, "t1": READY + 90}])
+        ev = evidence()
+        if captured != 11:
+            ev.update(real_early_gap())
+        result = {"pass": True, "status": "pass", "cell": "leader-exit-exec", "leg": "trace/singles",
+                  "phase_populations": {"pre": {"named": captured}},
+                  "image_generation_populations": {0: {"named": captured}},
+                  "capability_early_coverage": {"expected": 11, "observed_named": captured, "observed_unknown": 0,
+                                                "deficit": 11 - captured, "errors": []},
+                  "early_coverage": {"expected": 12, "observed_named": captured + 1, "observed_unknown": 0,
+                                     "deficit": 11 - captured}, "evidence": [ev], "errors": []}
+        return result, receipt
+
+    def test_capability_counts_only_exact_worker_rows_and_rejects_false_names(self):
+        _result, receipt = self.inputs()
+        rows = H6["N3_PARSE_TRACE"](trace_text([
+            named_row(1000, 1001, "/w/before", "C_Initialize"),
+            unknown_row(1000, 1001, "C_Initialize", rv="CKR_GENERAL_ERROR"),
+            named_row(4242, 1001, "/w/before", "C_Initialize"),
+            named_row(1000, 4242, "/w/before", "C_Initialize"),
+            named_row(1000, 1000, "/w/after", "C_Initialize"),
+        ], 5, 5, evidence()))[0]
+        population = H6.get("worker_early_population")
+        self.assertTrue(callable(population), "capability has no independent exact-worker population check")
+        got = population(rows, receipt, {0: receipt["images"][0]}, {index: 0 for index in range(5)})
+        self.assertEqual(got, {"expected": 11, "observed_named": 1, "observed_unknown": 1, "deficit": 9,
+                              "errors": []})
+        rows[0]["path"] = "/w/impostor"
+        self.assertTrue(population(rows, receipt, {0: receipt["images"][0]}, {0: 0, 1: 0})["errors"])
+
+    def run_capability(self, result, receipt):
+        with tempfile.TemporaryDirectory(prefix="h6-capability-") as directory:
+            def leg(ctx, cell, backend, kind, leg_dir, mode):
+                Path(leg_dir).mkdir(parents=True)
+                if receipt is not None:
+                    H6["write_json"](Path(leg_dir) / "receipt.json", receipt)
+                return result
+            runner = H6["run_leader_exit_exec"]
+            with mock.patch.dict(runner.__globals__, {"run_b_leg": leg}):
+                return runner(None, directory, "singles")
+
+    def test_valid_barrier_records_capability_deficit_separately(self):
+        for captured, status in ((11, "demonstrated"), (4, "demonstrated"), (0, "limitation")):
+            with self.subTest(captured=captured):
+                result, receipt = self.inputs(captured)
+                rows = self.run_capability(result, receipt)
+                self.assertIs(rows[0], result)
+                cap = rows[1]
+                self.assertEqual(cap["status"], status)
+                self.assertIsNone(cap["pass"])
+                self.assertEqual(cap.get("early_coverage"), {"expected": 11, "observed_named": captured,
+                                                       "observed_unknown": 0, "deficit": 11 - captured})
+
+    def test_missing_or_insufficient_barrier_cannot_demonstrate_capability(self):
+        for broken in ("absent", "live-leader", "missing-worker", "dead-worker", "wrong-birth",
+                       "wrong-namespace", "no-pidfd", "missing-ack", "before-release", "expired", "no-evidence", "setup-error"):
+            with self.subTest(broken=broken):
+                result, receipt = self.inputs()
+                proof = receipt["b_setup"]["worker_barrier"]
+                if broken == "absent":
+                    del receipt["b_setup"]["worker_barrier"]
+                elif broken == "live-leader": proof["tasks"][1000] = "S"
+                elif broken == "missing-worker": del proof["tasks"][1001]
+                elif broken == "dead-worker": proof["tasks"][1001] = "Z"
+                elif broken == "wrong-birth": proof["worker"]["start_time"] += 1
+                elif broken == "wrong-namespace": proof["worker"]["pid_namespace"] += 1
+                elif broken == "no-pidfd": proof["pidfd_live"] = False
+                elif broken == "missing-ack": del receipt["b_setup"]["lines"]["WORKER_WAIT"]
+                elif broken == "before-release": proof["worker_release_ns"] = READY + 59
+                elif broken == "expired": proof["deadline_ns"] = READY + 49
+                elif broken == "no-evidence": result["evidence"] = []
+                else: result.update(status="error", **{"pass": False})
+                cap = self.run_capability(result, receipt)[1]
+                self.assertEqual(cap["status"], "error")
+                self.assertIs(cap["pass"], False)
+                self.assertTrue(cap["errors"])
+
+    def test_backend_refusal_before_receipt_keeps_its_negative_classification(self):
+        refusal = {"pass": False, "status": "negative", "leg": "trace/singles",
+                   "negative_reason": "unsupported backend", "errors": ["backend refused"]}
+        try:
+            rows = self.run_capability(refusal, None)
+        except FileNotFoundError as error:
+            self.fail(f"backend refusal became a fabricated missing-receipt error: {error}")
+        self.assertEqual(rows, [refusal])
 
 
 class LiveFrameTest(unittest.TestCase):
@@ -1406,7 +1746,8 @@ class LegCleanupTest(unittest.TestCase):
                 "--uid", "1001", "--gid", "1001", "--cells", "pid-leader",
                 "--backends", "singles,multi", "--out", str(out)]
         def cell(ctx, directory, backend):
-            return [runner(ctx, directory, backend)]
+            rows = runner(ctx, directory, backend)
+            return rows if isinstance(rows, list) else [rows]
         try:
             with mock.patch.dict(self.globals, {"FilePin": pin,
                     "compile_case_fixtures": lambda *_args: {}, "symbol_file_offset": lambda *_args: 0}), \
@@ -1422,6 +1763,39 @@ class LegCleanupTest(unittest.TestCase):
                     except OSError:
                         pass
                     value.fd = None
+
+    def test_informational_capability_neither_passes_nor_fails_required_matrix(self):
+        def runner(ctx, directory, backend):
+            return [{"pass": True, "status": "pass", "leg": f"trace/{backend}"},
+                    {"pass": None, "status": "demonstrated", "leg": f"capability-preexec/{backend}"}]
+        rc, summary, _ = self.matrix(runner)
+        self.assertEqual((rc, summary["passed"], summary["failed"]), (0, 2, 0))
+        self.assertEqual((summary["negative"], summary["informational"]), (0, 2))
+        self.assertTrue(summary["required_complete"])
+
+    def test_informational_only_population_cannot_complete_h6(self):
+        rc, summary, _ = self.matrix(lambda *_args: {
+            "pass": None, "status": "limitation", "leg": "capability-preexec/singles"})
+        self.assertEqual((summary["passed"], summary["failed"]), (0, 0))
+        self.assertEqual(summary["informational"], 2)
+        self.assertEqual(rc, 1)
+        self.assertFalse(summary["required_complete"])
+        self.assertFalse(summary["complete"])
+
+    def test_required_failure_and_backend_refusal_are_separate_nonpositives(self):
+        def runner(ctx, directory, backend):
+            return {"pass": False, "status": "fail" if backend == "singles" else "negative",
+                    "leg": f"trace/{backend}"}
+        rc, summary, _ = self.matrix(runner)
+        self.assertEqual((rc, summary["passed"], summary["failed"], summary.get("negative", -1)), (1, 0, 1, 1))
+        self.assertFalse(summary["required_complete"])
+
+    def test_truthy_nonboolean_and_failed_status_cannot_count_as_positive(self):
+        def runner(ctx, directory, backend):
+            return {"pass": 1 if backend == "singles" else True,
+                    "status": "pass" if backend == "singles" else "error", "leg": backend}
+        rc, summary, _ = self.matrix(runner)
+        self.assertEqual((rc, summary["passed"], summary["failed"]), (1, 0, 2))
 
     def test_cleanup_failure_stops_matrix_and_fails_summary_even_after_setup_failure(self):
         started = []
@@ -1986,6 +2360,15 @@ class TraceTest(unittest.TestCase):
         self.assertEqual(result["abandoned"], 1)
         self.assertEqual(result["named"], 3)
         self.assertEqual(result["unknown"], 3)
+
+    def test_worker_prefix_population_cannot_borrow_post_exec_named_calls(self):
+        text, ledger, receipt = b_style_inputs()
+        receipt.update(cell="leader-exit-exec", b_setup={"worker_identity": {"tid": 1042}})
+        result = H6["evaluate_trace_h6"](text, ledger, receipt)
+        self.assertTrue(result["pass"], result["errors"])
+        self.assertEqual(result["capability_early_coverage"], {
+            "expected": 11, "observed_named": 0, "observed_unknown": 3, "deficit": 8, "errors": []})
+        self.assertEqual(result["named"], 3)
 
     def test_reject_all_unknown_positive(self):
         text, ledger, receipt = caller_inputs()

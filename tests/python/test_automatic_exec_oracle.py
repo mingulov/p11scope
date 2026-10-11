@@ -20,6 +20,7 @@ import json
 import os
 import runpy
 import signal
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -2550,14 +2551,17 @@ class R5FreshAdmissionTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="h6-r5-admission-")
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name)
-        self.owner = H6["spawn_owned"]([], [sys.executable, "-I", "-c", "import sys; sys.stdin.read()"],
-            os.getuid(), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.owner = H6["spawn_owned"]([], [sys.executable, "-I", "-c",
+            "import os,sys; target=sys.stdin.readline().strip(); "
+            "os.execve(target, [target,'-S','-c','import sys;print(\"successor-ready\",flush=True);sys.stdin.read()'], "
+            "{'PYTHONHOME':sys.prefix}) if target else None"],
+            os.getuid(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.addCleanup(self.release)
         self.pin = H6["FilePin"](Path(sys.executable))
         self.ctx = SimpleNamespace(leg_pins=[])
         self.log = self.directory / "events.jsonl"
         self.prefix = [self.record(0, "started", {}), self.admission(1, "c0", 0),
-                       self.record(2, "pass_committed", {"pass": 1})]
+                       self.record(2, "pass_committed", {"pass": 0})]
         self.write(self.prefix)
         self.cursor = H6["r5_admission_checkpoint"](self.ctx, self.log, self.owner, self.pin)
 
@@ -2565,6 +2569,8 @@ class R5FreshAdmissionTest(unittest.TestCase):
         self.owner.popen.kill()
         self.owner.popen.wait(2)
         self.owner.popen.stdin.close()
+        self.owner.popen.stdout.close()
+        self.owner.popen.stderr.close()
         self.owner.close()
         if hasattr(self, "pin"):
             self.pin.close()
@@ -2573,6 +2579,22 @@ class R5FreshAdmissionTest(unittest.TestCase):
                 cursor.close()
 
     def record(self, seq, kind, event):
+        # Serialized shapes from started_payload/pass_payload and emit_commit
+        # (inventory_events.rs / inventory.rs), including the additive fields.
+        if kind == "started":
+            event = {"scope": "cgroup:/controlled/selected",
+                     "clock": {"basis": "CLOCK_MONOTONIC", "unit": "ns"},
+                     "started_ns": 100, "limits": {"callers": 4096, "modules": 4096,
+                         "edges": 32768, "endpoints": 1048576, "inventory_endpoints": 4096,
+                         "inventory_attach_modules": 4096, "semantic_state": 32768,
+                         "instance_semantic_resources": 1048576, "retained_history": 1024}, **event}
+        elif kind == "pass_committed":
+            event = {"scanned": 1, "maps_matched": 0, "native_callers": 0, "scan_callers": 1,
+                     "totals": {"callers": 1, "modules": 1, "edges": 1}, "new_gaps": 0,
+                     "suppressed_delta": 0, "gaps_suppressed": 0, "edge_events": 0,
+                     "edge_events_deferred": 0, "instance_events": 0, "instance_events_deferred": 0,
+                     "semantic_edge_events": 0, "semantic_edge_events_deferred": 0,
+                     "unbound_rows": [], "unbound_rows_truncated": 0, **event}
         return {"schema": "p11scope/inventory-events/v1", "seq": seq,
                 "at_ns": 100 + seq, "kind": kind, "event": event}
 
@@ -2600,7 +2622,309 @@ class R5FreshAdmissionTest(unittest.TestCase):
                                                not_before_ns=103, timeout=timeout)
 
     def fresh(self):
-        return [self.admission(3, "c1", 1), self.record(4, "pass_committed", {"pass": 2})]
+        return [self.admission(3, "c1", 1), self.record(4, "pass_committed", {"pass": 1})]
+
+    def turnover(self):
+        old = copy.deepcopy(self.prefix[1]["event"]["identity_context"]["caller"])
+        old["lifecycle"] = "exec_retired"
+        new = self.admission(4, "c1", 1)["event"]["identity_context"]["caller"]
+        new["authority"] = "scan_pinned"
+        retired = self.record(3, "caller_event", {"event": "retired", "caller": "c0",
+            "reason": "caller retired", "identity_context": {"version": 1, "caller": old}})
+        committed = self.record(4, "caller_event", {"event": "exec_retired", "old": "c0", "new": "c1",
+            "identity_context": {"version": 1, "old": old, "new": new}})
+        return [retired, committed, self.record(5, "pass_committed", {"pass": 1})]
+
+    def test_checkpoint_accepts_producer_initial_live_pass_zero_then_one(self):
+        self.cursor.close()
+        rows = copy.deepcopy(self.prefix)
+        rows[2]["event"]["pass"] = 0
+        self.write(rows + [self.record(3, "pass_committed", {"pass": 1})])
+        cursor = H6["r5_admission_checkpoint"](self.ctx, self.log, self.owner, self.pin)
+        self.assertEqual(cursor.receipt()["completed_pass"], {"seq": 3, "at_ns": 103, "pass": 1})
+        self.assertEqual(cursor.receipt()["retired_incarnation"], 0)
+
+    def test_producer_scoped_exec_retired_handoff_is_fresh_admission(self):
+        self.write(self.prefix + self.turnover())
+        result = self.wait(timeout=0.5)
+        self.assertEqual((result["caller"], result["incarnation"], result["seq"]), ("c1", 1, 4))
+        self.assertEqual(result["completed_pass"], {"seq": 5, "at_ns": 105, "pass": 1})
+        self.assertEqual(result["publication"], "exec_retired")
+
+    def test_checkpoint_refuses_invalid_or_terminal_initial_pass(self):
+        for payload in ({"pass": -1}, {"pass": True}, {"pass": 0.5}, {}, {"pass": 0, "final": True}):
+            with self.subTest(payload=payload):
+                rows = self.prefix[:2] + [self.record(2, "pass_committed", payload)]
+                self.write(rows)
+                with self.assertRaisesRegex(H6["SetupError"], "live completing pass"):
+                    H6["r5_admission_checkpoint"](self.ctx, self.log, self.owner, self.pin)
+
+    def test_checkpoint_partial_pass_zero_has_no_authority(self):
+        self.write(self.prefix[:2], json.dumps(self.prefix[2]).encode())
+        with self.assertRaisesRegex(H6["SetupError"], "admission/pass"):
+            H6["r5_admission_checkpoint"](self.ctx, self.log, self.owner, self.pin)
+
+    def test_successor_pass_must_be_a_later_nonnegative_live_integer(self):
+        for payload in ({"pass": 0}, {"pass": -1}, {"pass": True}, {"pass": 0.5}, {},
+                        {"pass": 1, "final": True}):
+            with self.subTest(payload=payload):
+                self.reset_cursor()
+                self.write(self.prefix + [self.fresh()[0], self.record(4, "pass_committed", payload)])
+                self.assert_refused()
+
+    def test_scoped_turnover_requires_exact_saved_old_subject(self):
+        mutations = (("id", "c9"), ("pid", self.owner.pid + 1),
+                     ("start_time", self.owner.identity["start_time"] + 1),
+                     ("incarnation", 1), ("authority", "scan_pinned"),
+                     ("lifecycle", "mapped"), ("status", "context_budget"),
+                     ("executable", {"path": "/wrong"}))
+        for field, value in mutations:
+            with self.subTest(field=field):
+                self.reset_cursor()
+                rows = self.turnover()
+                rows[1]["event"]["identity_context"]["old"][field] = value
+                self.write(self.prefix + rows)
+                self.assert_refused()
+        self.reset_cursor()
+        rows = self.turnover()
+        rows[1]["event"]["old"] = "c9"
+        rows[1]["event"]["identity_context"]["old"]["id"] = "c9"
+        self.write(self.prefix + rows)
+        self.assert_refused()
+
+    def test_scoped_turnover_validates_new_join_birth_executable_and_incarnation(self):
+        for field, value in (("id", "c9"), ("pid", self.owner.pid + 1),
+                             ("start_time", self.owner.identity["start_time"] + 1),
+                             ("incarnation", 0), ("executable", {"path": "/wrong"}),
+                             ("lifecycle", "exec_retired"), ("authority", "unknown")):
+            with self.subTest(field=field):
+                self.reset_cursor()
+                rows = self.turnover()
+                rows[1]["event"]["identity_context"]["new"][field] = value
+                self.write(self.prefix + rows)
+                self.assert_refused()
+        self.reset_cursor()
+        rows = self.turnover()
+        rows[1]["event"]["new"] = "c9"
+        self.write(self.prefix + rows)
+        self.assert_refused()
+
+    def test_scoped_turnover_refuses_stale_or_incomplete_context_and_clock(self):
+        for mutation in ("old-missing", "new-missing", "version", "sequence", "time"):
+            with self.subTest(mutation=mutation):
+                self.reset_cursor()
+                rows = self.turnover()
+                record, event = rows[1], rows[1]["event"]
+                if mutation.endswith("-missing"):
+                    event["identity_context"].pop(mutation.removesuffix("-missing"))
+                elif mutation == "version":
+                    event["identity_context"]["version"] = 2
+                elif mutation == "sequence":
+                    record["seq"] = 2
+                else:
+                    record["at_ns"] = 102
+                self.write(self.prefix + rows)
+                self.assert_refused()
+
+    def test_deferred_retirement_only_cannot_complete_successor_admission(self):
+        rows = self.turnover()
+        self.write(self.prefix + [rows[0], self.record(4, "pass_committed", {"pass": 1})])
+        self.assert_refused(expiry=True)
+
+    def test_scoped_committed_turnover_requires_complete_following_pass(self):
+        rows = self.turnover()
+        self.write(self.prefix + rows[:2])
+        self.assert_refused(expiry=True)
+        self.reset_cursor()
+        self.write(self.prefix + rows[:2], json.dumps(rows[2]).encode())
+        self.assert_refused(expiry=True)
+
+    def test_oversize_stream_refuses_before_read_allocation(self):
+        self.write(self.prefix, b"x" * 1_048_576)
+        reads, pread = [], os.pread
+        def read(fd, count, offset):
+            reads.append(count)
+            return pread(fd, count, offset)
+        with mock.patch.object(os, "pread", read), self.assertRaises(H6["SetupError"]):
+            self.cursor.read()
+        self.assertEqual(reads, [], "oversized stream allocated bytes before refusal")
+
+    def test_record_ceiling_refuses_a_small_record_flood(self):
+        rows = [self.record(seq, "snapshot", {}) for seq in range(3, 8192)]
+        with self.log.open("a") as stream:
+            stream.write("".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows))
+        self.assertLess(self.log.stat().st_size, 1_048_576)
+        records, complete = self.cursor.read()
+        self.assertTrue(complete)
+        self.assertEqual(len(records), 8189)
+        with self.log.open("a") as stream:
+            stream.write(json.dumps(self.record(8192, "snapshot", {})) + "\n")
+        with self.assertRaisesRegex(H6["SetupError"], "record.*budget"):
+            self.cursor.read()
+
+    def test_line_ceiling_refuses_complete_and_partial_rows(self):
+        for newline in (b"\n", b""):
+            with self.subTest(newline=bool(newline)):
+                self.reset_cursor()
+                row = self.record(3, "snapshot", {"oversize": "x" * 67_584})
+                self.write(self.prefix, json.dumps(row).encode() + newline)
+                with self.assertRaisesRegex(H6["SetupError"], "line.*budget"):
+                    self.cursor.read()
+
+    def test_reads_never_allocate_the_full_stream(self):
+        self.write(self.prefix + [self.record(seq, "snapshot", {}) for seq in range(3, 1003)])
+        reads, pread = [], os.pread
+        def read(fd, count, offset):
+            reads.append(count)
+            return pread(fd, count, offset)
+        with mock.patch.object(os, "pread", read):
+            self.cursor.read()
+        self.assertGreater(len(reads), 1)
+        self.assertLessEqual(max(reads), 16_384)
+
+    def test_deadline_interrupts_read_hash_and_parse_work(self):
+        for stage in ("read", "hash", "parse"):
+            with self.subTest(stage=stage):
+                self.reset_cursor()
+                self.write(self.prefix + [self.record(seq, "snapshot", {}) for seq in range(3, 23)])
+                now, decoded = [1_000_000_000], []
+                budget = H6["LegBudget"](inventory=True, clock=lambda: now[0],
+                                          budgets={"successor-recovery": 1})
+                budget.enter("successor-recovery", self.owner.pid)
+                loads, pread, sha256 = json.loads, os.pread, H6["hashlib"].sha256
+                def decode(*args, **kwargs):
+                    result = loads(*args, **kwargs)
+                    decoded.append(True)
+                    if stage == "parse":
+                        now[0] += 1_000_000_000
+                    return result
+                def read(*args):
+                    result = pread(*args)
+                    if stage == "read":
+                        now[0] += 1_000_000_000
+                    return result
+                class Hash:
+                    def __init__(self, data=b""):
+                        self.inner = sha256(data)
+                        if data and stage == "hash":
+                            now[0] += 1_000_000_000
+                    def update(self, data):
+                        self.inner.update(data)
+                        if stage == "hash":
+                            now[0] += 1_000_000_000
+                    def digest(self):
+                        return self.inner.digest()
+                token = H6["ACTIVE_LEG"].set(budget)
+                try:
+                    with mock.patch.object(json, "loads", decode), mock.patch.object(os, "pread", read), \
+                            mock.patch.object(H6["hashlib"], "sha256", Hash), \
+                            self.assertRaisesRegex(TimeoutError, "deadline"):
+                        self.cursor.read()
+                finally:
+                    H6["ACTIVE_LEG"].reset(token)
+                self.assertEqual(len(decoded), 1 if stage == "parse" else 0,
+                                 "stream work continued after the phase expired")
+
+    def test_helper_timeout_interrupts_parsing_without_an_active_leg(self):
+        self.write(self.prefix + self.fresh())
+        now, decoded, loads = [1_000_000_000], [], json.loads
+        def decode(*args, **kwargs):
+            result = loads(*args, **kwargs)
+            decoded.append(True)
+            now[0] += 1_000_000_000
+            return result
+        with mock.patch.dict(H6["wait_r5_successor_admitted"].__globals__, {"monotonic_ns": lambda: now[0]}), \
+                mock.patch.object(json, "loads", decode), self.assertRaises(TimeoutError):
+            self.wait(timeout=1)
+        self.assertEqual(len(decoded), 1)
+
+    def test_deadline_interrupts_admission_traversal_before_the_next_pass(self):
+        self.write(self.prefix + self.fresh())
+        now, passes = [1_000_000_000], []
+        budget = H6["LegBudget"](inventory=True, clock=lambda: now[0],
+                                  budgets={"successor-recovery": 1})
+        budget.enter("successor-recovery", self.owner.pid)
+        validate, pass_receipt = H6["r5_caller_context"], H6["r5_pass_receipt"]
+        def caller(*args, **kwargs):
+            result = validate(*args, **kwargs)
+            now[0] += 1_000_000_000
+            return result
+        def marker(record):
+            passes.append(record["seq"])
+            return pass_receipt(record)
+        token = H6["ACTIVE_LEG"].set(budget)
+        try:
+            with mock.patch.dict(H6["wait_r5_successor_admitted"].__globals__,
+                    {"r5_caller_context": caller, "r5_pass_receipt": marker}), \
+                    self.assertRaisesRegex(TimeoutError, "deadline"):
+                self.wait()
+        finally:
+            H6["ACTIVE_LEG"].reset(token)
+        self.assertEqual(passes, [], "traversal processed a pass after expiry")
+
+    def test_row_at_line_budget_is_accepted_without_overflow(self):
+        row = self.record(3, "snapshot", {"padding": ""})
+        row["event"]["padding"] = "x" * (67_584 - len(json.dumps(row).encode()) - 1)
+        encoded = json.dumps(row).encode() + b"\n"
+        self.assertEqual(len(encoded), 67_584)
+        self.write(self.prefix, encoded)
+        records, complete = self.cursor.read()
+        self.assertTrue(complete)
+        self.assertEqual([record["seq"] for record in records], [3])
+
+    def test_split_utf8_row_is_parsed_only_after_bounded_chunks_complete(self):
+        row = self.record(3, "snapshot", {"text": "€" * 18_000})
+        self.write(self.prefix, json.dumps(row, ensure_ascii=False).encode() + b"\n")
+        records, complete = self.cursor.read()
+        self.assertTrue(complete)
+        self.assertEqual(records[0]["event"]["text"], "€" * 18_000)
+
+    def test_scoped_turnover_binds_distinct_held_original_and_actual_successor(self):
+        # These three independently derived cursors precede a real ordinary
+        # Python exec. No ptrace, cgroup, provider, or native observer runs.
+        old_cursor = H6["r5_admission_checkpoint"](self.ctx, self.log, self.owner, self.pin)
+        new_cursor = H6["r5_admission_checkpoint"](self.ctx, self.log, self.owner, self.pin)
+        path = self.directory / "successor-python"
+        shutil.copyfile(self.pin.path, path)
+        path.chmod(0o755)
+        successor = H6["FilePin"](path)
+        self.addCleanup(successor.close)
+        self.owner.popen.stdin.write((str(path) + "\n").encode())
+        self.owner.popen.stdin.flush()
+        readable, _, _ = H6["select"].select([self.owner.popen.stdout], [], [], 2)
+        self.assertTrue(readable, "owned successor produced no startup acknowledgement")
+        if self.owner.popen.stdout.readline() != b"successor-ready\n":
+            self.fail(self.owner.popen.stderr.read().decode())
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                image = successor.image_receipt({"image": 1}, self.owner)
+                break
+            except (ValueError, FileNotFoundError):
+                if self.owner.popen.poll() is not None:
+                    self.fail(self.owner.popen.stderr.read().decode())
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.005)
+        self.assertNotEqual(image["ino"], self.cursor.original_image["ino"])
+        rows = self.turnover()
+        executable = {"path": image["path"], "dev": image["dev"], "ino": image["ino"],
+                      "mtime_secs": image["mtime_ns"] // 1_000_000_000,
+                      "mtime_nanos": image["mtime_ns"] % 1_000_000_000}
+        rows[1]["event"]["identity_context"]["new"]["executable"] = executable
+        for subject, cursor in (("old", old_cursor), ("new", new_cursor)):
+            bad = copy.deepcopy(rows)
+            context = bad[1]["event"]["identity_context"]
+            context[subject]["executable"] = copy.deepcopy(context["new" if subject == "old" else "old"]["executable"])
+            self.write(self.prefix + bad)
+            with self.assertRaisesRegex(H6["SetupError"], "held actual owned image"):
+                H6["wait_r5_successor_admitted"](self.log, self.owner, successor, cursor,
+                                               not_before_ns=103, timeout=2)
+        self.write(self.prefix + rows)
+        result = H6["wait_r5_successor_admitted"](self.log, self.owner, successor, self.cursor,
+                                                not_before_ns=103, timeout=2)
+        self.assertEqual(result["image"], image)
+        self.assertEqual(result["publication"], "exec_retired")
 
     def assert_refused(self, expiry=False):
         expected = TimeoutError if expiry else (H6["SetupError"], ValueError)
@@ -2612,7 +2936,7 @@ class R5FreshAdmissionTest(unittest.TestCase):
         result = self.wait()
         self.assertEqual((result["caller"], result["incarnation"], result["seq"], result["at_ns"]),
                          ("c1", 1, 3, 103))
-        self.assertEqual(result["completed_pass"], {"seq": 4, "at_ns": 104, "pass": 2})
+        self.assertEqual(result["completed_pass"], {"seq": 4, "at_ns": 104, "pass": 1})
         self.assertEqual(self.cursor.receipt()["retired_caller"], "c0")
         self.assertEqual(self.cursor.receipt()["retired_incarnation"], 0)
 

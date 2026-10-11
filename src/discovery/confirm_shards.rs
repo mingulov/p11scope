@@ -13,8 +13,8 @@ use crate::discovery::sweep_attribution::{
     AttributionLoss, ConfirmIo, Confirmation, FD_RESOURCE_REASON, FdLease, IoResources,
     KnownKeyIndex, MappedIdentities, MemberProbe, PreparationKind, PreparedConfirmation,
     ReservationOwner, ReservedPin, SegmentPolicy, SweepAttribution, attribute_one, budget_refusal,
-    confirm_with_resources, finish_confirmation, idle_needs_promotion, lost_with, preparation_kind,
-    proof_ranges, read_ranges_reserved,
+    confirm_with_resources, finish_confirmation, idle_needs_promotion, lost_with,
+    preparation_kind, prepare_confirmation, proof_ranges, read_ranges_reserved,
 };
 use crate::discovery::sweep_shards::{Transcript, record_read, replay_one};
 use p11scope_manifest::maps::{MapEntry, ObjectKey};
@@ -88,12 +88,13 @@ pub(crate) trait SegmentProof {
 
 /// The standalone adapter uses the same prepared ownership and batch minting
 /// seam as the later central segment hook; no scalar request constructor is
-/// exposed to the kernel owner.
+/// exposed to the kernel owner. The hook is dynamic so the production
+/// driver can route phase-D promotions through it.
 pub(crate) fn prove_and_finish_prepared<Io: ConfirmIo>(
     io: &mut Io,
     pid: u32,
     prepared: PreparedConfirmation<Io::Pin>,
-    hook: &mut impl SegmentProof,
+    hook: &mut (dyn SegmentProof + '_),
     resources: &IoResources,
     budget: &mut CaptureWorkBudget,
 ) -> Confirmation {
@@ -1190,8 +1191,24 @@ where
         for (at, mapped) in promotions {
             let (pid, entries) = &sweep[at];
             let mut io = make_io();
-            let confirmation =
-                confirm_with_resources(&mut io, *pid, &prove, budget, Some(&immediate));
+            // With a kernel hook installed, the promotion is a charged
+            // per-PID promotion, not a userspace reopen: prepare on a
+            // retained pin, prove through the shared hook (counting the
+            // attempt on the borrowed pidfd), and finish. A userspace
+            // answer falls back inside the same pin and is disclosed by
+            // the hook's own ledger. Pure-userspace promotions keep the
+            // direct confirmation below.
+            let confirmation = match hook.as_deref_mut() {
+                Some(hook) => {
+                    match prepare_confirmation(&mut io, *pid, &prove, budget, Some(&immediate)) {
+                        Ok(prepared) => {
+                            prove_and_finish_prepared(&mut io, *pid, prepared, hook, &immediate, budget)
+                        }
+                        Err(confirmation) => confirmation,
+                    }
+                }
+                None => confirm_with_resources(&mut io, *pid, &prove, budget, Some(&immediate)),
+            };
             let mut probe = FinishedProbe {
                 confirmation: Some(confirmation),
                 mapped,
@@ -1341,3 +1358,306 @@ where
 #[cfg(test)]
 #[path = "confirm_shards_tests.rs"]
 mod tests;
+
+/// Phase-D promotions under a kernel hook: the production driver must
+/// route them through the shared charged path (prepare on a retained
+/// pin, `hook.prove`, finish) instead of bypassing the hook with a
+/// userspace reopen. Inline here (not in `confirm_shards_tests.rs`) so
+/// the scripted hook and fd-backed pins stay with the driver fix.
+#[cfg(test)]
+mod kernel_promotion_tests {
+    use super::{
+        AcceptedKind, SegmentProof, attribute_unselected_with_segment_proof,
+    };
+    use crate::discovery::caller_registry::ExeIdentity;
+    use crate::discovery::identity::{
+        ExaminedObject, FileIdentity, MappedFile, PinnedObjectId,
+    };
+    use crate::discovery::kernel_identity::{ProofDecision, RunFailure};
+    use crate::discovery::scan::CaptureWorkBudget;
+    use crate::discovery::sweep_attribution::{
+        ConfirmIo, KnownKeyIndex, ObjectChecks, RANGE_NOT_MAPPED, ReservationOwner, SegmentPolicy,
+    };
+    use p11scope_manifest::maps::{Device, MapEntry, ObjectKey};
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+    use std::sync::{Arc, Mutex};
+
+    const PROVIDER: u64 = 7_001;
+    const LIBC: u64 = 7_002;
+    const OBJECT: PinnedObjectId = PinnedObjectId(1);
+    const PROMOTED: u32 = 1001;
+
+    fn key(inode: u64) -> ObjectKey {
+        ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode,
+        }
+    }
+
+    fn vm_file(inode: u64) -> FileIdentity {
+        FileIdentity { dev: 37, ino: inode }
+    }
+
+    fn entry(start: u64, perms: &[u8; 4], inode: u64, path: &str) -> MapEntry {
+        MapEntry {
+            start,
+            end: start + 0x1000,
+            permissions: *perms,
+            file_offset: 0,
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+
+    /// Phase 1 sees libc only (Idle); the confirmation re-read sees the
+    /// provider arrive (a caller), so the stale Idle promotes.
+    fn phase_one() -> Vec<MapEntry> {
+        vec![
+            entry(0x2000_0000, b"r--p", LIBC, "/usr/lib/libc.so.6"),
+            entry(0x2000_1000, b"r-xp", LIBC, "/usr/lib/libc.so.6"),
+        ]
+    }
+
+    fn confirm_maps() -> Vec<MapEntry> {
+        vec![
+            entry(
+                0x1000_0000,
+                b"r--p",
+                PROVIDER,
+                "/usr/lib/softhsm/libsofthsm2.so",
+            ),
+            entry(
+                0x1000_1000,
+                b"r-xp",
+                PROVIDER,
+                "/usr/lib/softhsm/libsofthsm2.so",
+            ),
+            entry(0x2000_0000, b"r--p", LIBC, "/usr/lib/libc.so.6"),
+            entry(0x2000_1000, b"r-xp", LIBC, "/usr/lib/libc.so.6"),
+        ]
+    }
+
+    struct Checks;
+
+    impl ObjectChecks for Checks {
+        fn nonunique_inodes(&self, _: PinnedObjectId) -> Result<Option<&'static str>, String> {
+            Ok(None)
+        }
+        fn unchanged(&self, _: PinnedObjectId) -> Result<bool, String> {
+            Ok(true)
+        }
+        fn mapped_identity(&self, _: PinnedObjectId) -> Result<MappedFile, String> {
+            Ok(MappedFile {
+                identity: vm_file(PROVIDER),
+                fs_magic: None,
+            })
+        }
+    }
+
+    fn index() -> KnownKeyIndex {
+        KnownKeyIndex::build(
+            [(key(PROVIDER), Some(OBJECT))],
+            &BTreeMap::from([(key(PROVIDER), OBJECT)]),
+            [ExaminedObject {
+                key: key(LIBC),
+                identity: vm_file(LIBC),
+                key_is_identity: false,
+            }],
+            &Checks,
+        )
+        .0
+    }
+
+    /// An fd-backed pin: the promotion borrows this fd, never a reopen.
+    struct Pin {
+        file: std::fs::File,
+    }
+
+    /// The scripted `/proc`: libc ranges read stale (remapped since the
+    /// sweep), provider ranges read their file. Every `open` is logged
+    /// with its fd so the test pins the borrowed pidfd to the charged pin.
+    struct FakeIo {
+        opens: Arc<Mutex<Vec<(u32, i32)>>>,
+    }
+
+    impl ConfirmIo for FakeIo {
+        type Pin = Pin;
+
+        fn borrowed_pidfd<'a>(
+            &self,
+            pin: &'a Self::Pin,
+        ) -> Option<std::os::fd::BorrowedFd<'a>> {
+            Some(pin.file.as_fd())
+        }
+
+        fn mapped_file(
+            &mut self,
+            _pid: u32,
+            start: u64,
+            _end: u64,
+        ) -> Result<FileIdentity, String> {
+            match start >> 28 {
+                1 => Ok(vm_file(PROVIDER)),
+                _ => Err(RANGE_NOT_MAPPED.into()),
+            }
+        }
+
+        fn open(&mut self, pid: u32) -> Result<Pin, String> {
+            let file = std::fs::File::open("/dev/null").map_err(|error| error.to_string())?;
+            self.opens
+                .lock()
+                .unwrap()
+                .push((pid, file.as_raw_fd()));
+            Ok(Pin { file })
+        }
+
+        fn start_time(&self, _pin: &Pin) -> Option<u64> {
+            Some(7_007)
+        }
+
+        fn still_the_same(&self, _pin: &Pin) -> bool {
+            true
+        }
+
+        fn exe(&self, _pid: u32) -> Option<ExeIdentity> {
+            Some(ExeIdentity {
+                dev: 1,
+                ino: 100,
+                mtime_secs: 10,
+                mtime_nanos: 0,
+                path: Some("/usr/bin/caller".into()),
+            })
+        }
+
+        fn maps(
+            &mut self,
+            pid: u32,
+            _budget: &mut CaptureWorkBudget,
+        ) -> Result<Vec<MapEntry>, String> {
+            assert_eq!(pid, PROMOTED, "only the promoted pid re-reads its maps");
+            Ok(confirm_maps())
+        }
+
+        fn gone(&self, _pid: u32) -> bool {
+            false
+        }
+    }
+
+    impl super::ShardableIo for FakeIo {
+        type Maps = std::io::Cursor<Vec<u8>>;
+
+        fn open_maps(&mut self, _pid: u32) -> std::io::Result<Self::Maps> {
+            panic!("the Idle segment never opens maps");
+        }
+
+        fn maps_now(&self) -> Option<u64> {
+            Some(1_000_000)
+        }
+    }
+
+    struct HookCall {
+        pids: Vec<u32>,
+        confirms: Vec<bool>,
+        pidfds: Vec<Option<i32>>,
+        userspace: bool,
+    }
+
+    /// The scripted kernel hook: records every batch (pids, Confirm vs
+    /// Idle, borrowed pidfds) and answers userspace, so the test sees
+    /// the substitution the driver must disclose.
+    struct ScriptedHook {
+        calls: Arc<Mutex<Vec<HookCall>>>,
+        reason: RunFailure,
+    }
+
+    impl SegmentProof for ScriptedHook {
+        fn prove<'r>(
+            &'r mut self,
+            batch: &super::AcceptedBatch<'_>,
+            _budget: &mut CaptureWorkBudget,
+            _resources: &crate::discovery::sweep_attribution::IoResources,
+        ) -> ProofDecision<'r> {
+            let mut call = HookCall {
+                pids: Vec::new(),
+                confirms: Vec::new(),
+                pidfds: Vec::new(),
+                userspace: true,
+            };
+            for request in batch.requests() {
+                call.pids.push(request.pid());
+                call.confirms
+                    .push(matches!(request.kind(), AcceptedKind::Confirm));
+                call.pidfds
+                    .push(request.pidfd().map(|fd| fd.as_raw_fd()));
+            }
+            self.calls.lock().unwrap().push(call);
+            ProofDecision::Userspace(self.reason)
+        }
+    }
+
+    /// The production driver consults the hook for the phase-D
+    /// promotion: one charged single-Confirm batch on the retained
+    /// pin's borrowed pidfd, and the userspace substitution disclosed
+    /// by the hook's answer while the member still attributes.
+    #[test]
+    fn phase_d_promotion_with_hook_charges_prepare_prove_finish_on_the_pin() {
+        let opens = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let make_io = || FakeIo {
+            opens: opens.clone(),
+        };
+        let sweep = vec![(PROMOTED, phase_one())];
+        let policy = SegmentPolicy::from_headroom(16, 1, sweep.len());
+        let owner = ReservationOwner::new(policy);
+        let mut budget = CaptureWorkBudget::default();
+        let mut hook = ScriptedHook {
+            calls: calls.clone(),
+            reason: RunFailure::TargetLimit,
+        };
+        let out = attribute_unselected_with_segment_proof(
+            &sweep,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &index(),
+            &mut budget,
+            policy,
+            &owner,
+            1,
+            &make_io,
+            &mut hook,
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            2,
+            "the promotion must consult the hook instead of bypassing it"
+        );
+        // The segment batch carries the Idle request without a pidfd.
+        assert_eq!(calls[0].pids, [PROMOTED]);
+        assert_eq!(calls[0].confirms, [false]);
+        assert_eq!(calls[0].pidfds, [None]);
+        // The promotion is a single charged Confirm borrowing the one
+        // retained pin: exactly one open, and the batch borrows its fd.
+        let opens = opens.lock().unwrap();
+        assert_eq!(opens.len(), 1, "the promotion opens one pin, never a reopen");
+        assert_eq!(opens[0].0, PROMOTED);
+        assert_eq!(calls[1].pids, [PROMOTED]);
+        assert_eq!(calls[1].confirms, [true]);
+        assert_eq!(
+            calls[1].pidfds,
+            [Some(opens[0].1)],
+            "the promotion proves on the borrowed pin, not a numeric reopen"
+        );
+        // The hook answered userspace for the promotion (the disclosed
+        // substitution), and the member still attributes inside its
+        // original pin through the userspace fallback.
+        assert!(calls[1].userspace);
+        assert_eq!(
+            out.members.iter().map(|member| member.pid).collect::<Vec<_>>(),
+            [PROMOTED],
+            "the promoted member attributes through the disclosed fallback"
+        );
+    }
+}

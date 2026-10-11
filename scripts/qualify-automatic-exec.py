@@ -1701,6 +1701,162 @@ def evaluate_inventory_h6(doc, ledgers, receipt):
                 "errors": [f"invalid independent evidence: {error}"]}
 
 
+def inventory_instance_history_errors(records, instance_id, caller, module, receipt, *, after_seq=-1):
+    """Accept stop loss only in the public final-commit/sweep interval."""
+    errors = []
+    passes = [row for row in records if row["kind"] == "pass_committed"]
+    finals = [row for row in passes if row["event"].get("final") is True]
+    ordinary = [row for row in passes if not row["event"].get("final")]
+    if (len(finals) != 1 or not ordinary or finals[0] != passes[-1]
+            or finals[0]["event"].get("pass") != ordinary[-1]["event"].get("pass")
+            or not ordinary[-1]["at_ns"] <= finals[0]["at_ns"] <= records[-1]["at_ns"]
+            <= receipt["observer_stopped_ns"]):
+        return ["Inventory normal stop lacks its exact terminal commit position"]
+    terminal_floor = ordinary[-1]["seq"]
+    retired_at = next((row["seq"] for row in records if row["kind"] == "caller_event"
+        and row["event"].get("event") == "exec_retired" and row["event"].get("old") == caller), None)
+    instances, semantics, previous = [], [], {}
+    for record in records:
+        row, kind = record["event"], record["kind"]
+        if not ((kind == "instance_observed" and row.get("id") == instance_id)
+                or (kind == "semantic_edge_observed" and row.get("instance") == instance_id)):
+            continue
+        if row.get("caller") != caller or row.get("module") != module:
+            errors.append("Inventory semantic history changes instance/caller/module identity")
+        (instances if kind == "instance_observed" else semantics).append(record)
+        if record["seq"] <= after_seq:
+            continue
+        terminal = terminal_floor < record["seq"] and record["at_ns"] <= records[-1]["at_ns"]
+        retired = retired_at is not None and retired_at < record["seq"]
+        if kind == "instance_observed":
+            state, reason = row.get("state"), row.get("reason")
+            if (state, reason) == ("observed", None):
+                continue
+            if (state == "retired" and reason == "instance_retired" and retired
+                    or state == "uncertain" and reason == "semantic_loss" and terminal and not retired):
+                continue
+            errors.append("Inventory instance history gained earlier or unexplained lost authority")
+        else:
+            api, ops = row.get("api_returns") or {}, row.get("operations")
+            counters = {"api": api.get("count"), "historical": api.get("historical_only_returns")}
+            if ops is not None:
+                counters.update({f"operation:{key}": ops.get(key) for key in
+                                 ("calls", "completed", "failed", "unknown", "orphans", "dropped")})
+            for mech in row.get("mechanisms") or []:
+                ident = mechanism_row_id(mech)
+                for field in ("calls", "errors"):
+                    key = f"mechanism:{ident}:{field}"
+                    if key in counters:
+                        errors.append("Inventory semantic history duplicates mechanism identity")
+                    counters[key] = mech.get(field)
+            if set(previous) - set(counters):
+                errors.append("Inventory semantic history erased positive counter fields")
+            had_returns = "api" in previous
+            for key, value in counters.items():
+                if value is None and key == "api" and not had_returns:
+                    continue
+                if type(value) is not int or value < previous.get(key, 0):
+                    errors.append("Inventory semantic history erased or regressed positive counters")
+                else:
+                    previous[key] = value
+            coverage = row.get("coverage") or {}
+            reasons = coverage.get("reasons")
+            if not isinstance(reasons, list) or reasons != sorted(set(reasons)):
+                errors.append("Inventory semantic history has invalid loss reasons")
+                continue
+            if coverage.get("lossy") is False and not reasons:
+                continue
+            if (coverage.get("lossy") is False and reasons == ["no_calls"] and not had_returns
+                    and api.get("count") is None and api.get("saturated") is False
+                    and api.get("historical_only_returns") == 0
+                    and row.get("semantics") == "unknown (no calls observed)"
+                    and row.get("mechanisms") is None and ops is None):
+                continue
+            allowed = {"instance_retired", "image_retired", "semantic_loss"} if retired else set()
+            stop = "capture_stopped" in reasons
+            if stop and terminal:
+                allowed |= {"capture_stopped", "semantic_loss"}
+            retirement_loss = retired and bool(set(reasons) & {"instance_retired", "image_retired"})
+            if (coverage.get("lossy") is not True or set(reasons) - allowed
+                    or not (stop and terminal and "semantic_loss" in reasons or retirement_loss)):
+                errors.append("Inventory semantic history gained earlier or unexplained loss")
+    if not instances or not semantics:
+        return errors + ["Inventory final semantic instance history is absent"]
+    final_instance, final_semantic = instances[-1]["event"], semantics[-1]["event"]
+    reasons = set((final_semantic.get("coverage") or {}).get("reasons") or [])
+    final_retired = (retired_at is not None and final_instance.get("state") == "retired"
+                     and final_instance.get("reason") == "instance_retired")
+    if (not {"capture_stopped", "semantic_loss"} <= reasons
+            or semantics[-1]["seq"] <= terminal_floor
+            or not final_retired and (instances[-1]["seq"] <= terminal_floor
+                or (final_instance.get("state"), final_instance.get("reason")) != ("uncertain", "semantic_loss"))):
+        errors.append("Inventory final instance lacks its supported capture-stopped transition")
+    return errors
+
+
+def inventory_sibling_s1_errors(doc, ledger, receipt, records):
+    """Judge attested MS history against MS's own in-capture ledger."""
+    errors, summaries = [], []
+    control = receipt["inventory_control"]
+    for ident in ledger["idents"]:
+        pid, gen = ident["pid"], ident["gen"]
+        callers = [row for row in doc["callers"] if row["pid"] == pid and row["incarnation"] == gen]
+        if (len(callers) != 1 or callers[0].get("start_time") != ident["start"]
+                or callers[0]["image"]["exe"]["path"] != ident["exe"]):
+            errors.append("SystemMixed sibling identity differs from its independent image ledger")
+            continue
+        caller = callers[0]["id"]
+        for name in control["sibling_providers"]:
+            if name in receipt.get("count_only_providers", []):
+                continue
+            path = receipt["providers"][name]["path"]
+            modules = [row["id"] for row in doc["modules"] if path in row.get("paths", [])]
+            label = f"SystemMixed sibling pid {pid} gen {gen} {name}"
+            if len(modules) != 1:
+                errors.append(f"{label}: attested module identity is ambiguous")
+                continue
+            module = modules[0]
+            instances = [row for row in doc["instances"] if (row["caller"], row["module"]) == (caller, module)]
+            semantic = [row for row in doc["semantic_edges"] if (row["caller"], row["module"]) == (caller, module)]
+            physical = [row for row in doc["edges"] if (row["caller"], row["module"]) == (caller, module)]
+            if (len(instances) != 1 or len(semantic) != 1 or len(physical) != 1
+                    or semantic[0]["instance"] != instances[0]["id"]):
+                errors.append(f"{label}: duplicate, extra or orphan semantic instance population")
+                continue
+            population = [row for row in ledger["batches"] if row["pid"] == pid and row["gen"] == gen
+                and row["t0"] >= receipt["observer_started_ns"] and row["t1"] <= receipt["observer_stopped_ns"]]
+            totals, key = ledger_s1_totals(population, 0), (pid, gen, path)
+            expected = {"calls": totals[4].get(key, 0), "completed": totals[2].get(key, 0),
+                "failed": totals[3].get(key, 0), "unknown": 0, "orphans": 0, "dropped": 0}
+            desired_mechs = {mech: [count, totals[1].get(key + (mech,), 0)]
+                for (*group, mech), count in totals[0].items() if tuple(group) == key}
+            for row in (physical[0], semantic[0]):
+                ops = row.get("operations") or {}
+                actual = {name: ops.get(name) for name in expected}
+                if (row.get("semantics") != "observed" or actual != expected
+                        or any(type(value) is not int for value in actual.values())
+                        or ops.get("cancelled", 0) != 0 or ops.get("active", [])):
+                    errors.append(f"{label}: S1 operation history disagrees with the sibling ledger")
+                mechs = row.get("mechanisms") or []
+                observed = {mechanism_row_id(mech): [mech.get("calls"), mech.get("errors")] for mech in mechs}
+                if (len(observed) != len(mechs) or observed != desired_mechs
+                        or any(type(value) is not int or value < 0
+                               for values in observed.values() for value in values)):
+                    errors.append(f"{label}: S1 mechanism history disagrees with the sibling ledger")
+            api = semantic[0].get("api_returns") or {}
+            if (type(api.get("count")) is not int or api["count"] != totals[5].get(key, 0)
+                    or api.get("saturated") is not False or api.get("historical_only_returns") != 0):
+                errors.append(f"{label}: S1 API returns disagree with the sibling ledger")
+            errors.extend(f"{label}: {error}" for error in inventory_instance_history_errors(
+                records, instances[0]["id"], caller, module, receipt))
+            summaries.append({"tuple": [ident["start"], caller, gen, module, instances[0]["id"]],
+                "api_returns": api.get("count"), "ledger_api_returns": totals[5].get(key, 0),
+                "operations": expected})
+    if not summaries:
+        errors.append("SystemMixed sibling attested semantic history is absent")
+    return errors, summaries
+
+
 def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
     """Fixed per-birth/caller/incarnation/module/instance measured exactness."""
     control = receipt["inventory_control"]
@@ -1747,6 +1903,8 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
         for row in doc.get(field, []):
             key = (row["caller"], row["module"]) if field == "edges" else (
                 row["id"] if field == "instances" else row["instance"])
+            if key in expected:
+                errors.append(f"Inventory duplicate final {field} identity")
             expected[key] = row
         if set(expected) != set(latest[kind]) or any(
                 {key: latest[kind][ident].get(key) for key in row} != row
@@ -1882,17 +2040,20 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
                              for mech, values in after["mechanisms"].items()}
             if final_mechs != desired_mechs:
                 errors.append(f"{label}: final historical mechanism totals changed")
-            if final_instance["state"] != "observed" and not (
-                    final_instance["state"] == "retired" and final_instance.get("reason") in
-                    ("image_retired", "instance_retired", "capture_stopped")):
-                errors.append(f"{label}: final instance gained unexplained lost authority")
+            errors.extend(f"{label}: {error}" for error in inventory_instance_history_errors(
+                records, proof["instance"], proof["caller"], proof["module"], receipt,
+                after_seq=end_record["seq"]))
         measured_completed += delta["completed"]
         measured_failed += delta["failed"]
         summaries.append({"tuple": list(stable), "early": baseline["early"], "measured": delta})
     if not measurements or {row["proof"]["incarnation"] for row in measurements} != {0, 1}:
         errors.append("Inventory required original/successor fixed measurements are missing")
+    sibling_s1 = []
     if control.get("sibling"):
         sibling = ledgers[control["sibling"]]["batches"]
+        sibling_errors, sibling_s1 = inventory_sibling_s1_errors(
+            doc, ledgers[control["sibling"]], receipt, records)
+        errors.extend(sibling_errors)
         if {stage["label"] for stage in control["stages"]} != {"exec", "recovery", "measurement"}:
             errors.append("SystemMixed actual target stage population is incomplete")
         for stage in control["stages"]:
@@ -1924,11 +2085,13 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
         for name in receipt.get("count_only_providers", []))}
     for row in doc.get("edges", []) + doc.get("semantic_edges", []):
         if row.get("module") in count_only and (row.get("mechanisms") is not None
-                or row.get("operations") is not None or not str(row.get("semantics", "unknown")).startswith("unknown")):
+                or row.get("operations") is not None or not str(row.get("semantics", "unknown")).startswith("unknown")
+                or (row.get("api_returns") or {}).get("count") is not None):
             errors.append("SystemMixed count-only provider publishes semantic positives")
     result.update({"pass": not errors, "status": "pass" if not errors else "fail", "errors": errors,
         "completed_operations": measured_completed, "s1": {"measured_completed": measured_completed,
             "measured_failed": measured_failed, "stable_instances": summaries,
+            "sibling_instances": sibling_s1,
             "instances": len(doc.get("instances", [])), "semantic_edges": len(doc.get("semantic_edges", []))}})
     return result
 
@@ -4170,10 +4333,11 @@ def seize_until_exec(pid, ctx, owner):
         _ptrace(_PTRACE_SETOPTIONS, pid, 0, _PTRACE_O_TRACEEXEC)
 
 
-def wait_exec_stop(pid, timeout=120):
+def wait_exec_stop(pid, timeout=120, *, deadline=None):
     """Wait for the TRACEEXEC trap-stop; returns the stop time (ns)."""
-    enter_phase("successor-recovery", key=pid)
-    deadline = wait_deadline(timeout)
+    if deadline is None:
+        enter_phase("successor-recovery", key=pid)
+        deadline = wait_deadline(timeout)
     while True:
         remaining_until(deadline)
         done_pid, status = os.waitpid(pid, os.WNOHANG)
@@ -4182,7 +4346,10 @@ def wait_exec_stop(pid, timeout=120):
                 raise SetupError(f"owned pid {pid} died while frozen for exec")
             if os.WIFSTOPPED(status) and os.WSTOPSIG(status) == signal.SIGTRAP:
                 if (status >> 16) == _PTRACE_EVENT_EXEC:
-                    return monotonic_ns()
+                    stopped = monotonic_ns()
+                    remaining_until(deadline)
+                    return stopped
+                remaining_until(deadline)
                 _ptrace(_PTRACE_CONT, pid)  # unrelated trap: resume
         if monotonic_ns() >= deadline:
             raise SetupError(f"owned pid {pid} never reached its exec stop")
@@ -4273,7 +4440,7 @@ class R5AdmissionCursor:
                     if context.get("pid") == owner.pid:
                         caller = r5_caller_context(event, owner, image)
                         admitted = {"caller": caller["id"], "incarnation": caller["incarnation"],
-                                    "subject": caller}
+                                    "subject": caller, "seq": record["seq"]}
                         committed = None
                 elif record["kind"] == "pass_committed" and admitted is not None:
                     committed = r5_pass_receipt(record)
@@ -4285,6 +4452,7 @@ class R5AdmissionCursor:
             self.retired_caller = admitted["caller"]
             self.retired_incarnation = admitted["incarnation"]
             self.retired_subject = admitted["subject"]
+            self.retired_admission_seq = admitted["seq"]
             self.original_image, self.completed_pass = image, committed
             self.saved_gaps = [record for record in records if record["kind"] == "gap_recorded"]
         except BaseException:
@@ -4479,12 +4647,14 @@ def wait_r5_successor_admitted(jsonl_path, owner, executable, cursor, *, not_bef
         pause_until(deadline, 0.2)
 
 
-def inventory_early_gaps(records, owner, caller, module):
-    """Only finite, physically joined evidence can explain an early deficit."""
+def inventory_early_gaps(records, owner, admission, module, lower, upper):
+    """Same-stream caller IDs bind birth/incarnation; PID-only gaps need its interval."""
     return [record for record in records if record["kind"] == "gap_recorded"
             and record["event"].get("module") == module
-            and (record["event"].get("caller") == caller
-                 or record["event"].get("pid") == owner.pid)
+            and record["seq"] > admission["seq"] and lower <= record["at_ns"] <= upper
+            and record["event"].get("pid") in (None, owner.pid)
+            and (record["event"].get("caller") == admission["caller"]
+                 or record["event"].get("caller") is None and record["event"].get("pid") == owner.pid)
             and record["event"].get("reason") in (
                 "use_before_admission", "before_admission", "before_semantic_boundary",
                 "retired_before_coverage", "instance_unproven", "provider_instance_unproven")]
@@ -4634,7 +4804,9 @@ def inventory_boundary(records, owner, image, provider, admission, floor, marker
         if values[0] > totals[0].get(key + (mech,), 0) or values[1] > totals[1].get(key + (mech,), 0):
             return None
     if entries["count"] < expected or counts["api"] < expected:
-        gaps = inventory_early_gaps(records, owner, selected, edge["module"])
+        lower = min(row["t0"] for row in prefix_batches
+                    if (row["pid"], row["gen"], row["module"]) == key)
+        gaps = inventory_early_gaps(records, owner, admission, edge["module"], lower, settled["at_ns"])
         if (exact or not gaps or type(entries.get("last_seen_ns")) is not int
                 or entries["last_seen_ns"] < last_call or entries["count"] < sum(row["n"] for row in warm)):
             return None
@@ -5001,7 +5173,8 @@ def inventory_target_phases(ctx, log_path, target, original_executable, successo
     initial_cursor = wait_inventory_original_checkpoint(ctx, log_path, target.owner,
                                                         original_executable, recovery0)
     initial_admission = {"caller": initial_cursor.retired_caller,
-        "incarnation": initial_cursor.retired_incarnation, "seq": initial_cursor.seq,
+        "incarnation": initial_cursor.retired_incarnation,
+        "seq": getattr(initial_cursor, "retired_admission_seq", initial_cursor.seq),
         "completed_pass": initial_cursor.completed_pass}
     initial = wait_inventory_s1_ready(target.owner, original_executable, provider,
         initial_admission, initial_cursor, target.warm, recovery0,
@@ -5026,19 +5199,25 @@ def inventory_target_phases(ctx, log_path, target, original_executable, successo
     recovery = inventory_phase_deadline("successor-recovery", 1)
     exec_start = monotonic_ns()
     target.command("X", recovery)
-    exec_stop = wait_exec_stop(target.owner.pid)
+    exec_stop = wait_exec_stop(target.owner.pid, deadline=recovery)
+    remaining_until(recovery)
     successor_executable.verify()
     stopped_image = successor_executable.image_receipt({"image": 1}, target.owner)
+    remaining_until(recovery)
     if sub:
         move_and_verify(sub, target.owner, moves, "X-descendant-reentry")
+        remaining_until(recovery)
         t_in = moves[-1]["t"]
     else:
         t_in = exec_stop
     successor_executable.verify()
     successor_executable.image_receipt({"image": 1}, target.owner)
+    remaining_until(recovery)
     if sibling:
         sibling.warm(2, sibling_deadline)
+    remaining_until(recovery)
     ptrace_continue(target.owner.pid)
+    remaining_until(recovery)
     resumed = monotonic_ns()
     stages.append({"label": "exec", "t0": exec_start, "t1": resumed})
     if sibling:

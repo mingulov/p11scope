@@ -289,6 +289,69 @@ def rapid_successor_inputs():
     return trace_text(lines, len(lines), len(lines), evidence()), ledger, receipt
 
 
+class InventoryExecDeadlineTest(unittest.TestCase):
+    def test_exec_stop_cannot_extend_the_existing_image_recovery_deadline(self):
+        now = [1_000_000_000]
+        budget = H6["LegBudget"](inventory=True, clock=lambda: now[0],
+                                 budgets={"successor-recovery": 0.05})
+        budget.enter("successor-recovery", 1)
+        deadline = budget.phase_deadline_ns
+        now[0] = 1_040_000_000
+        def stop(_pid, _flags):
+            now[0] = 1_060_000_000
+            return 1234, (H6["_PTRACE_EVENT_EXEC"] << 16) | (signal.SIGTRAP << 8) | 0x7f
+        token = H6["ACTIVE_LEG"].set(budget)
+        try:
+            with mock.patch.dict(H6["wait_exec_stop"].__globals__, {"monotonic_ns": lambda: now[0]}), \
+                    mock.patch.object(os, "waitpid", stop), self.assertRaises(TimeoutError):
+                H6["wait_exec_stop"](1234, timeout=0.05, deadline=deadline)
+            self.assertNotIn(("successor-recovery", 1234), budget.deadlines)
+        finally:
+            H6["ACTIVE_LEG"].reset(token)
+
+    def test_exec_stop_before_expiry_preserves_image_key_and_legacy_wait_is_bounded(self):
+        for explicit in (True, False):
+            with self.subTest(explicit=explicit):
+                now = [1_000_000_000]
+                budget = H6["LegBudget"](inventory=True, clock=lambda: now[0],
+                                         budgets={"successor-recovery": 0.05})
+                budget.enter("successor-recovery", 1)
+                deadline = budget.phase_deadline_ns
+                now[0] = 1_040_000_000
+                def stop(_pid, _flags):
+                    now[0] = 1_049_000_000
+                    return 1234, (H6["_PTRACE_EVENT_EXEC"] << 16) | (signal.SIGTRAP << 8) | 0x7f
+                token = H6["ACTIVE_LEG"].set(budget)
+                try:
+                    with mock.patch.dict(H6["wait_exec_stop"].__globals__, {"monotonic_ns": lambda: now[0]}), \
+                            mock.patch.object(os, "waitpid", stop):
+                        kwargs = {"deadline": deadline} if explicit else {}
+                        self.assertEqual(H6["wait_exec_stop"](1234, timeout=0.05, **kwargs), now[0])
+                    self.assertEqual(("successor-recovery", 1234) in budget.deadlines, not explicit)
+                finally:
+                    H6["ACTIVE_LEG"].reset(token)
+
+    def test_expired_unrelated_trap_cannot_dispatch_continue(self):
+        now = [1_000_000_000]
+        budget = H6["LegBudget"](inventory=True, clock=lambda: now[0],
+                                 budgets={"successor-recovery": 0.05})
+        budget.enter("successor-recovery", 1)
+        deadline = budget.phase_deadline_ns
+        def stop(_pid, _flags):
+            now[0] += 60_000_000
+            return 1234, (signal.SIGTRAP << 8) | 0x7f
+        continuation = mock.Mock()
+        token = H6["ACTIVE_LEG"].set(budget)
+        try:
+            with mock.patch.dict(H6["wait_exec_stop"].__globals__,
+                    {"monotonic_ns": lambda: now[0], "_ptrace": continuation}), \
+                    mock.patch.object(os, "waitpid", stop), self.assertRaises(TimeoutError):
+                H6["wait_exec_stop"](1234, deadline=deadline)
+            continuation.assert_not_called()
+        finally:
+            H6["ACTIVE_LEG"].reset(token)
+
+
 class BDispatchClockTest(unittest.TestCase):
     def test_expired_leg_prevents_real_pipe_dispatch(self):
         read_fd, write_fd = os.pipe()
@@ -2557,6 +2620,15 @@ class ControlledInventoryObserver:
                             "api_returns": {"count": count, "saturated": False, "historical_only_returns": 0},
                             "semantics": "observed", "mechanisms": mechanisms, "operations": ops,
                             "coverage": {"lossy": False, "reasons": []}}
+                        retired = context["lifecycle"] == "exec_retired"
+                        if retired:
+                            instance.update(state="retired", reason="instance_retired")
+                            semantic["coverage"] = {"lossy": True, "reasons": ["instance_retired"]}
+                        if final:
+                            if not retired:
+                                instance.update(state="uncertain", reason="semantic_loss")
+                            semantic["coverage"] = {"lossy": True, "reasons": sorted(
+                                set(semantic["coverage"]["reasons"]) | {"capture_stopped", "semantic_loss"})}
                         if ident["gen"] == 1:
                             if self.fault == "admission-only":
                                 edge["entries"]["coverage"]["state"] = "armed"
@@ -2578,7 +2650,8 @@ class ControlledInventoryObserver:
                         self.emit("edge_observed", edge)
                         written["edge_events"] += 1
                         self.last[pair] = edge
-        self.passed += 1
+        if not final:
+            self.passed += 1
         self.emit("pass_committed", {"pass": self.passed, "final": final,
             **{key: written[key] for key in ("edge_events", "instance_events", "semantic_edge_events")},
             "edge_events_deferred": 0, "instance_events_deferred": 0, "semantic_edge_events_deferred": 0})
@@ -2591,7 +2664,7 @@ class ControlledInventoryObserver:
         self.stop.set()
         self.thread.join(2)
         self.sweep(final=True)
-        self.emit("ended", {"edges_unretained": 0, "instances_unretained": 0,
+        self.emit("ended", {"ended_ns": time.monotonic_ns(), "edges_unretained": 0, "instances_unretained": 0,
             "semantic_edges_unretained": 0, "edge_events": 0, "instance_events": 0,
             "semantic_edge_events": 0})
         self.doc_path.write_text(json.dumps(self.snapshot()))
@@ -2763,7 +2836,18 @@ class InventoryFixtureTest(unittest.TestCase):
         ctx.cleanup_failed = False
         ctx.cleanup_totals = {"processes": 0, "readers": 0, "cgroups": 0, "pins": 0}
         observers = []
-        membership, events = {}, []
+        membership, events, exec_deadline = {}, [], []
+        real_pin = H6["leg_pin"]
+        def pinned(scope, path):
+            pin = real_pin(scope, path)
+            actual_verify = pin.verify
+            def verify():
+                actual_verify()
+                if pin.path.name == "ledger2" and exec_deadline and (
+                        fault == "late-reentry" or fault == "late-resume" and "sub" in events):
+                    time.sleep(max(0, (exec_deadline[0] - time.monotonic_ns()) / 1e9) + 0.005)
+            pin.verify = verify
+            return pin
         def ordinary(owned, argv, uid, **kwargs):
             for key in ("user", "group", "extra_groups"):
                 kwargs.pop(key, None)
@@ -2791,7 +2875,7 @@ class InventoryFixtureTest(unittest.TestCase):
                 membership=None if cell == "system-mixed" else membership, fault=fault)
             observers.append(injected)
             return injected, None, None, injected.started, doc, log
-        def exec_stop(pid, **_kwargs):
+        def exec_stop(pid, **kwargs):
             deadline = time.monotonic() + 2
             while not os.readlink(f"/proc/{pid}/exe").endswith("/ledger2"):
                 if time.monotonic() >= deadline:
@@ -2799,6 +2883,9 @@ class InventoryFixtureTest(unittest.TestCase):
                 time.sleep(0.001)
             owner = next(owner for owner in owners if owner.pid == pid)
             owner.send(signal.SIGSTOP)
+            exec_deadline.append(kwargs["deadline"])
+            if fault == "late-stop":
+                time.sleep(max(0, (exec_deadline[0] - time.monotonic_ns()) / 1e9) + 0.005)
             return time.monotonic_ns()
         def group(_ctx, path):
             path = Path(path)
@@ -2813,7 +2900,7 @@ class InventoryFixtureTest(unittest.TestCase):
                 self.assertTrue(membership[pid].endswith("/selected/sub"))
             events.append("resume")
             next(owner for owner in owners if owner.pid == pid).send(signal.SIGCONT)
-        patches = {"init_token": lambda *_args: self.env, "build_manifest": lambda *_args: None,
+        patches = {"init_token": lambda *_args: self.env, "build_manifest": lambda *_args: None, "leg_pin": pinned,
             "spawn_owned": ordinary, "spawn_ledger": ledger, "spawn_inventory": observer,
             "wait_inventory_ready": lambda *_args: time.monotonic_ns(),
             "wait_passes": lambda *_args: 2,
@@ -2873,6 +2960,9 @@ class InventoryFixtureTest(unittest.TestCase):
         self.assertTrue(result["pass"], result["errors"])
         self.assertEqual(result["s1"]["measured_completed"], 20)
         self.assertEqual(result["s1"]["measured_failed"], 2)
+        sibling = result["s1"]["sibling_instances"][0]
+        self.assertEqual((sibling["api_returns"], sibling["ledger_api_returns"]), (47, 47))
+        self.assertEqual(sibling["operations"]["completed"], 22)
 
     def test_r5_real_owned_target_reenters_before_resuming_and_measuring(self):
         doc, ledgers, receipt = self.run_inventory_route(cell="cgroup-reentry")
@@ -2880,6 +2970,58 @@ class InventoryFixtureTest(unittest.TestCase):
         self.assertEqual(receipt["scope_intervals"][1]["t0"], receipt["freeze"]["reentry_ns"])
         result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
         self.assertTrue(result["pass"], result["errors"])
+
+    def change_semantic_tail(self, doc, receipt, instance_id, coverage, state=None, *, earlier=False):
+        """Publish changed public rows with exact final parity/accounting."""
+        semantic = next(row for row in doc["semantic_edges"] if row["instance"] == instance_id)
+        semantic["coverage"] = coverage
+        additions = [("semantic_edge_observed", copy.deepcopy(semantic))]
+        if state is not None:
+            instance = next(row for row in doc["instances"] if row["id"] == instance_id)
+            instance.update(state=state, reason="semantic_loss")
+            additions.insert(0, ("instance_observed", copy.deepcopy(instance)))
+        records = receipt["inventory_control"]["final_records"]
+        index = next(i for i in reversed(range(len(records)))
+                     if records[i]["kind"] == "pass_committed" and records[i]["event"].get("final"))
+        terminal = records[index]
+        rows = [{"schema": terminal["schema"], "kind": kind, "at_ns": terminal["at_ns"],
+                 "event": row} for kind, row in additions]
+        counts = Counter(kind for kind, _row in additions)
+        if earlier:
+            event = dict(terminal["event"], final=False)
+            for kind, field in (("instance_observed", "instance_events"),
+                                ("semantic_edge_observed", "semantic_edge_events")):
+                event[field] = counts[kind]
+            rows.append({"schema": terminal["schema"], "kind": "pass_committed",
+                         "at_ns": terminal["at_ns"], "event": event})
+        else:
+            terminal["event"]["instance_events"] += counts["instance_observed"]
+            terminal["event"]["semantic_edge_events"] += counts["semantic_edge_observed"]
+        records[index:index] = rows
+        for seq, row in enumerate(records):
+            row["seq"] = seq
+
+    def test_producer_normal_stop_retains_history_and_ends_uncertain(self):
+        doc, ledgers, receipt = self.run_inventory_route(cell="cgroup-reentry")
+        instance = receipt["inventory_control"]["measurements"][-1]["proof"]["instance"]
+        self.change_semantic_tail(doc, receipt, instance,
+            {"lossy": True, "reasons": ["capture_stopped", "semantic_loss"]}, "uncertain")
+        result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+        self.assertTrue(result["pass"], result["errors"])
+
+    def test_unexplained_or_early_final_semantic_loss_cannot_pass(self):
+        original = self.run_inventory_route(cell="cgroup-reentry")
+        for coverage, state, earlier in (
+                ({"lossy": True, "reasons": ["semantic_loss"]}, None, False),
+                ({"lossy": True, "reasons": ["capture_stopped", "semantic_loss"]}, "uncertain", True),
+                ({"lossy": True, "reasons": ["capture_stopped", "semantic_loss", "task_retired"]},
+                 "uncertain", False)):
+            with self.subTest(coverage=coverage, earlier=earlier):
+                doc, ledgers, receipt = copy.deepcopy(original)
+                instance = receipt["inventory_control"]["measurements"][-1]["proof"]["instance"]
+                self.change_semantic_tail(doc, receipt, instance, coverage, state, earlier=earlier)
+                result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+                self.assertFalse(result["pass"], result)
 
     def test_final_semantic_history_cannot_disappear_after_measured_end(self):
         doc, ledgers, receipt = self.run_inventory_route()
@@ -2897,6 +3039,110 @@ class InventoryFixtureTest(unittest.TestCase):
         result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
         self.assertFalse(result["pass"], result)
         self.assertTrue(any("historical" in error for error in result["errors"]), result["errors"])
+
+    def test_sibling_duplicate_api_returns_cannot_borrow_target_s1_proof(self):
+        doc, ledgers, receipt = self.run_inventory_route()
+        pid = ledgers["MS"]["idents"][0]["pid"]
+        caller = next(row["id"] for row in doc["callers"] if row["pid"] == pid)
+        module = next(row["id"] for row in doc["modules"]
+                      if receipt["providers"]["A"]["path"] in row["paths"])
+        for row in doc["semantic_edges"]:
+            if (row["caller"], row["module"]) == (caller, module):
+                row["api_returns"]["count"] += 100
+        for record in receipt["inventory_control"]["final_records"]:
+            row = record["event"]
+            if record["kind"] == "semantic_edge_observed" and (row["caller"], row["module"]) == (caller, module):
+                row["api_returns"]["count"] += 100
+        result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+        self.assertFalse(result["pass"], result)
+
+    def test_sibling_history_instance_and_count_only_withholding_twins(self):
+        original = self.run_inventory_route()
+        for fault in ("mechanism", "operation", "orphans", "unknown", "dropped", "historical",
+                      "earlier-loss", "final-loss", "birth", "extra-instance", "orphan-instance",
+                      "duplicate-instance", "duplicate-semantic", "count-only-api"):
+            with self.subTest(fault=fault):
+                doc, ledgers, receipt = copy.deepcopy(original)
+                pid = ledgers["MS"]["idents"][0]["pid"]
+                caller = next(row for row in doc["callers"] if row["pid"] == pid)
+                semantic = next(row for row in doc["semantic_edges"] if row["caller"] == caller["id"])
+                instance = next(row for row in doc["instances"] if row["id"] == semantic["instance"])
+                records = receipt["inventory_control"]["final_records"]
+                matching = [row["event"] for row in records if row["kind"] == "semantic_edge_observed"
+                            and row["event"]["instance"] == semantic["instance"]]
+                rows = [semantic, *matching]
+                additions = []
+                if fault == "mechanism":
+                    for row in rows:
+                        row["mechanisms"][0]["calls"] += 1
+                elif fault == "operation":
+                    for row in rows:
+                        row["operations"]["completed"] += 1
+                elif fault in ("orphans", "unknown", "dropped"):
+                    for row in rows:
+                        row["operations"][fault] += 1
+                elif fault == "historical":
+                    for row in rows:
+                        row["api_returns"]["historical_only_returns"] += 1
+                elif fault == "earlier-loss":
+                    matching[0]["coverage"] = {"lossy": True, "reasons": ["semantic_loss"]}
+                elif fault == "final-loss":
+                    semantic["coverage"] = matching[-1]["coverage"] = {"lossy": True, "reasons": ["semantic_loss"]}
+                elif fault == "birth":
+                    caller["start_time"] += 1
+                elif fault == "duplicate-instance":
+                    doc["instances"].append(copy.deepcopy(instance))
+                elif fault == "duplicate-semantic":
+                    doc["semantic_edges"].append(copy.deepcopy(semantic))
+                elif fault == "extra-instance":
+                    extra = dict(instance, id="i999")
+                    doc["instances"].append(extra)
+                    additions.append(("instance_observed", extra))
+                elif fault == "orphan-instance":
+                    extra = dict(semantic, instance="i999")
+                    doc["semantic_edges"].append(extra)
+                    additions.append(("semantic_edge_observed", extra))
+                elif fault == "count-only-api":
+                    module = next(row["id"] for row in doc["modules"]
+                                  if receipt["providers"]["B"]["path"] in row["paths"])
+                    extra = {**semantic, "instance": "i999", "module": module,
+                             "semantics": "unknown (semantic capture withheld)", "mechanisms": None, "operations": None}
+                    doc["semantic_edges"].append(extra)
+                    additions.append(("semantic_edge_observed", extra))
+                if additions:
+                    index = next(i for i in reversed(range(len(records)))
+                        if records[i]["kind"] == "pass_committed" and records[i]["event"].get("final"))
+                    terminal = records[index]
+                    for kind, row in additions:
+                        field = "instance_events" if kind == "instance_observed" else "semantic_edge_events"
+                        terminal["event"][field] += 1
+                    records[index:index] = [{"schema": terminal["schema"], "kind": kind,
+                        "at_ns": terminal["at_ns"], "event": copy.deepcopy(row)} for kind, row in additions]
+                    for seq, row in enumerate(records):
+                        row["seq"] = seq
+                result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+                self.assertFalse(result["pass"], (fault, result))
+                self.assertTrue(any("sibling" in error or "duplicate final" in error or "count-only" in error
+                                    for error in result["errors"]), (fault, result["errors"]))
+
+    def test_sibling_no_call_prefix_is_supported_but_positive_history_cannot_regress(self):
+        original = self.run_inventory_route()
+        for fault in ("initial-no-calls", "later-no-calls", "duplicate-prefix"):
+            with self.subTest(fault=fault):
+                doc, ledgers, receipt = copy.deepcopy(original)
+                pid = ledgers["MS"]["idents"][0]["pid"]
+                caller = next(row["id"] for row in doc["callers"] if row["pid"] == pid)
+                rows = [row["event"] for row in receipt["inventory_control"]["final_records"]
+                        if row["kind"] == "semantic_edge_observed" and row["event"]["caller"] == caller]
+                if fault == "duplicate-prefix":
+                    rows[0]["api_returns"]["count"] += 100
+                else:
+                    row = rows[0 if fault == "initial-no-calls" else 1]
+                    row.update(semantics="unknown (no calls observed)", mechanisms=None, operations=None,
+                               coverage={"lossy": False, "reasons": ["no_calls"]})
+                    row["api_returns"]["count"] = None
+                result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+                self.assertEqual(result["pass"], fault == "initial-no-calls", (fault, result["errors"]))
 
     def test_controlled_oracle_refuses_proof_phase_history_and_parity_twins(self):
         original = self.run_inventory_route(cell="cgroup-reentry")
@@ -2938,6 +3184,18 @@ class InventoryFixtureTest(unittest.TestCase):
                     with self.assertRaises((H6["SetupError"], TimeoutError)):
                         self.run_inventory_route(cell=cell, fault=fault)
                     self.assertFalse(self.route_case.cleanup_failed, self.route_case.cleanup_errors)
+
+    def test_expired_exec_stop_reentry_or_resume_do_not_dispatch_and_reap(self):
+        for fault in ("late-stop", "late-reentry", "late-resume"):
+            with self.subTest(fault=fault):
+                with self.assertRaises(TimeoutError):
+                    self.run_inventory_route(cell="cgroup-reentry", fault=fault)
+                self.assertNotIn("resume", self.route_events)
+                self.assertEqual("sub" in self.route_events, fault == "late-resume")
+                self.assertFalse(self.route_case.cleanup_failed, self.route_case.cleanup_errors)
+                for owner in self.route_owners:
+                    self.assertIsNotNone(owner.popen.poll())
+                    self.assertIsNone(owner.pidfd)
                     for owner in self.route_owners:
                         self.assertFalse(Path(f"/proc/{owner.pid}").exists())
                         parsed = H6["parse_inv_ledger"]("".join(owner.h6_test_reader.lines))
@@ -3907,6 +4165,55 @@ class InventoryReadinessTest(unittest.TestCase):
         self.assertEqual(result["baseline"]["counts"]["physical"], 10)
         self.assertEqual(result["baseline"]["counts"]["api"], 10)
         self.assertEqual(result["baseline"]["counts"]["completed"], 5)
+
+    def test_old_caller_gap_cannot_excuse_current_image_deficit_at_the_same_pid(self):
+        callback = self.prepare(early=10, deficit=2, gap=True)
+        def old_gap(number, deadline):
+            marker = callback(number, deadline)
+            rows = [json.loads(line) for line in self.log.read_text().splitlines()]
+            for row in rows:
+                if row["kind"] == "gap_recorded":
+                    row["event"]["caller"] = "c0"
+            self.write(rows)
+            return marker
+        t = time.monotonic_ns() - 1000000
+        prefix = [{"cell": "RX", "pid": self.owner.pid, "gen": 1,
+            "module": str(self.pin.path), "fn": fn, "mech": "0x250", "n": 5,
+            "bad": 0, "phase": "h6-setup", "t0": t, "t1": t + 10}
+            for fn in ("C_DigestInit", "C_Digest")]
+        with self.assertRaises((TimeoutError, H6["SetupError"])):
+            self.gate(old_gap, timeout=0.2, prefix_batches=prefix)
+        self.assertTrue(self.markers, "wrong-caller refusal never attempted the real warmup callback")
+
+    def test_pid_only_gap_requires_current_admission_and_early_call_interval(self):
+        for stale in (False, True):
+            with self.subTest(stale=stale):
+                self.cursor.close()
+                self.write(self.prefix)
+                self.cursor = H6["r5_admission_checkpoint"](self.ctx, self.log, self.owner, self.pin)
+                callback = self.prepare(early=10, deficit=2, gap=True)
+                def pid_gap(number, deadline):
+                    marker = callback(number, deadline)
+                    rows = [json.loads(line) for line in self.log.read_text().splitlines()]
+                    for row in rows:
+                        if row["kind"] == "gap_recorded":
+                            row["event"]["caller"] = None
+                            if stale:
+                                row["at_ns"] = 105  # after admission, before this image's actual calls
+                    self.write(rows)
+                    return marker
+                t = time.monotonic_ns() - 1000000
+                prefix = [{"cell": "RX", "pid": self.owner.pid, "gen": 1,
+                    "module": str(self.pin.path), "fn": fn, "mech": "0x250", "n": 5,
+                    "bad": 0, "phase": "h6-setup", "t0": t, "t1": t + 10}
+                    for fn in ("C_DigestInit", "C_Digest")]
+                if stale:
+                    with self.assertRaises((TimeoutError, H6["SetupError"])):
+                        self.gate(pid_gap, timeout=0.2, prefix_batches=prefix)
+                else:
+                    proof = self.gate(pid_gap, prefix_batches=prefix)
+                    self.assertEqual(proof["baseline"]["early"]["physical_missed"], 2)
+                self.assertTrue(self.markers)
 
     def test_pass_cannot_claim_zero_emissions_for_the_actual_proof_rows(self):
         callback = self.prepare()

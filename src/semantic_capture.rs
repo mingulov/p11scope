@@ -3857,45 +3857,6 @@ mod tests {
             }
         }
 
-        /// A coordinator scene with one bound caller: admit, map,
-        /// identity evidence, image proof, then a direct bind. The
-        /// bind-loop tests cover production binding; the commit tails
-        /// below start from the bound state.
-        fn bound_operation_scene(image: ImageIdentity) -> (CustodyScene, CallerId) {
-            let mut scene = CustodyScene::new();
-            let pid = std::process::id();
-            let caller = scene.admit(pid, 50);
-            scene.map(caller, pid, 60);
-            let detailed = scene.detailed;
-            let module = scene.module.clone();
-            scene.answer(pid, detailed, image.task_cookie);
-            scene.bind_image(
-                detailed,
-                vec![(image.task_cookie, image.exec_id, pid, 100)],
-                1_000,
-            );
-            let pin = Arc::new(
-                scene
-                    .coordinator
-                    .adapter()
-                    .live_pin(pid)
-                    .and_then(|(_, pin)| pin.try_clone().ok())
-                    .unwrap(),
-            );
-            scene
-                .coordinator
-                .bind_semantic_caller_with_pin(
-                    caller,
-                    module,
-                    detailed,
-                    image,
-                    &mut scene.identity,
-                    pin,
-                )
-                .unwrap();
-            (scene, caller)
-        }
-
         /// Attested subset over the two ScriptIo semantic slots, aligned
         /// to `ScriptIo::endpoint` so real routed Init/Sign calls convert.
         fn operation_subset()
@@ -4489,168 +4450,121 @@ mod tests {
             }
         }
 
-        /// Terminal commit timing through real H0 and the real
-        /// coordinator: a drained Init/Sign pair commits promptly
-        /// (inside `on_batch` during the drain) and completes one
-        /// operation, while buffering the same batch through a delayed
-        /// quiescence wait expires its receipt and completes nothing.
-        /// Both legs share everything except validation timing: the
-        /// buffered leg is the base ordering.
+        /// Terminal drain through production with real H0 receipts
+        /// under delayed quiescence: Q arrives after 4 servicing
+        /// quanta, each aging H0 1s (4s total, past the 2s receipt
+        /// window). Every drained batch commits promptly in its own
+        /// quantum through the production drain and receipt finalizer,
+        /// so the drained Init/Sign pair validates fresh and completes
+        /// one operation. Both orders run: a receipt minted by the
+        /// drain itself, and a refresh receipt stashed before the stop
+        /// (flushed by the drain's pre-flush).
         #[test]
-        fn prompt_terminal_commit_completes_operation_while_buffered_expiry_cannot() {
-            use crate::discovery::caller_registry::instance_input::{
-                CallEvidence, CallStanding, InstanceReason, admit_call_from_evidence,
-                admit_registration_from_coverage,
-            };
-            use crate::inventory_semantics::LaneCoverage;
+        fn prompt_drain_commits_complete_operation_under_delayed_quiescence() {
+            use crate::discovery::caller_registry::instance_input::InstanceReason;
 
-            let image = ImageIdentity {
-                task_cookie: 7,
-                exec_id: 1,
-            };
-            // Delayed quiescence: the drain waits 4s of the 5s stop
-            // budget, past the 2s receipt window. Both relations pin
-            // to the real production constants so the timing stays
-            // honest.
-            let wait = Duration::from_secs(4);
-            assert!(wait < crate::run::STOP_QUIESCE_BUDGET);
-            for buffered in [false, true] {
-                let (mut scene, caller) = bound_operation_scene(image);
-                let subset = operation_subset();
-                let detailed = scene.detailed;
-                let mut io = ScriptIo::new(detailed);
-                io.output_image = Some(image);
-                let mut capture = capture(&io);
-                assert!(wait > capture.limits.pending_for);
-                io.semantic_call("C_SignInit", 0, 0);
-                io.records.back_mut().unwrap().event.image = image;
-                io.semantic_call("C_Sign", 0, 0);
-                io.records.back_mut().unwrap().event.image = image;
-                let tick = capture.tick_with(&mut io).unwrap();
-                assert_eq!(
-                    tick.current().len(),
-                    1,
-                    "the drained batch mints one receipt"
-                );
-                let joined: Vec<_> = tick.calls().collect();
-                assert_eq!(joined.len(), 2, "Init/Sign both route");
-                for call in &joined {
-                    assert!(
-                        matches!(call.route(), Route::Joined(id)
-                            if tick.current()[0].instances().contains(&id)),
-                        "both routed ids are covered by the receipt"
-                    );
-                }
-                if buffered {
-                    // The base ordering: the whole batch waits out the
-                    // drain before any commit validates it.
-                    io.now += wait;
-                }
-                let mut scratch = TickReport::default();
-                let validated =
-                    capture.validate_current_with(&mut io, &tick.current()[0], &mut scratch);
-                // The finalizer's standing rule: a validated same-batch
-                // coverage admits Current, anything else is history-only
-                // and registers nothing.
-                let coverage = match validated {
-                    Ok(()) => {
-                        let first = &tick.current()[0];
-                        Some(LaneCoverage::scripted(
-                            first.domain(),
-                            first.image(),
-                            first.endpoint(),
-                            first.instances().to_vec(),
-                        ))
-                    }
-                    Err(_) => None,
+            for prestashed in [false, true] {
+                let image = ImageIdentity {
+                    task_cookie: 7,
+                    exec_id: 1,
                 };
-                let (registrations, calls) = {
-                    let binding = scene.coordinator.semantic_bindings().get(caller).unwrap();
-                    let registrations = match &coverage {
-                        Some(coverage) => coverage
-                            .instances()
-                            .iter()
-                            .map(|id| {
-                                admit_registration_from_coverage(coverage, binding, *id, 100, None)
-                                    .expect("validated coverage registers")
-                            })
-                            .collect::<Vec<_>>(),
-                        None => Vec::new(),
-                    };
-                    let calls = tick
-                        .into_outcomes()
-                        .into_iter()
-                        .filter_map(|outcome| match outcome {
-                            TickOutcome::Call(routed) => Some(routed),
-                            _ => None,
-                        })
-                        .map(|routed| {
-                            let evidence =
-                                CallEvidence::from_routed(routed).expect("drained calls joined");
-                            let standing = match &coverage {
-                                Some(coverage)
-                                    if coverage.instances().contains(&evidence.router()) =>
-                                {
-                                    CallStanding::Current(coverage)
-                                }
-                                _ => CallStanding::Historical(InstanceReason::SemanticLoss),
-                            };
-                            admit_call_from_evidence(evidence, binding, &subset, standing, None)
-                                .expect("drained calls convert")
-                        })
-                        .collect::<Vec<_>>();
-                    (registrations, calls)
-                };
-                assert_eq!(calls.len(), 2);
-                for input in registrations {
-                    scene.coordinator.registry_mut().note_instance(input);
-                }
-                for input in calls {
-                    scene
-                        .coordinator
-                        .registry_mut()
-                        .observe_instance_semantic(input);
-                }
-                scene.coordinator.commit_batch(false).unwrap();
-                if buffered {
-                    assert_eq!(
-                        validated,
-                        Err(CurrentReceiptRefusal::Deadline),
-                        "buffering through delayed quiescence expires the receipt"
-                    );
-                    assert_eq!(
-                        scene.coordinator.registry().instances().count(),
-                        0,
-                        "the expired batch registers nothing"
-                    );
-                    assert!(
-                        operation_edge_rows(&scene)
-                            .iter()
-                            .all(|row| row.3 == 0 && row.4 == 0),
-                        "the expired batch starts and completes no operation"
-                    );
-                    assert!(
-                        scene
+                let mut fixture = bound_lane_scene(image);
+                let domain = fixture.lane.domain();
+                let mut h0 = H0TestIo::new(domain);
+                h0.io.output_image = Some(image);
+                h0.io.semantic_call("C_SignInit", 0, 0);
+                h0.io.records.back_mut().unwrap().event.image = image;
+                h0.io.semantic_call("C_Sign", 0, 0);
+                h0.io.records.back_mut().unwrap().event.image = image;
+                if prestashed {
+                    // A quiet refresh proves the partition before the
+                    // stop; its proof waits stashed for the pre-flush.
+                    let pin: Arc<PidPin> = Arc::new(
+                        fixture
+                            .scene
                             .coordinator
-                            .registry()
-                            .gaps()
-                            .iter()
-                            .any(|gap| gap.subject == "instance semantics refused"
-                                && gap.reason == "instance_unproven"),
-                        "the expired calls refuse through the audited path"
+                            .adapter()
+                            .live_pin(std::process::id())
+                            .and_then(|(_, pin)| pin.try_clone().ok())
+                            .unwrap(),
                     );
-                } else {
-                    assert_eq!(
-                        validated,
-                        Ok(()),
-                        "a prompt terminal commit validates while fresh"
-                    );
-                    assert_eq!(
-                        operation_edge_rows(&scene),
-                        vec![(Some(2), 0, false, 1, 1)],
-                        "the promptly committed Init/Sign pair completes one operation"
-                    );
+                    let (images, _effective) = h0.refresh(pin, 0).unwrap();
+                    assert_eq!(images, vec![image]);
+                    assert!(h0.has_pending_evidence());
                 }
+                // Delayed quiescence: Q after 4 quanta of the 5s stop
+                // budget, each quantum aging H0 1s. The 4s total passes
+                // the 2s receipt window: only prompt per-quantum
+                // commits validate fresh.
+                assert!(
+                    Duration::from_secs(4) < crate::run::STOP_QUIESCE_BUDGET,
+                    "the delayed quiescence fits the stop budget"
+                );
+                h0.tick_advance = Duration::from_secs(1);
+                h0.quiesce_after = 4;
+                fixture.lane.install_test_io(Box::new(h0));
+                let summary = fixture.lane.run_semantic_drain_committing(
+                    &mut fixture.scene.coordinator,
+                    &[],
+                    Instant::now,
+                );
+                assert!(summary.quiesced, "prestashed={prestashed}: quiesces");
+                assert!(
+                    summary.final_drain,
+                    "prestashed={prestashed}: drains exactly to Q"
+                );
+                assert!(
+                    !summary.semantic_loss,
+                    "prestashed={prestashed}: no semantic loss"
+                );
+                assert_eq!(
+                    summary.drain_batches, 1,
+                    "prestashed={prestashed}: exactly the Init/Sign quantum commits"
+                );
+                // H0 stops once, after every drained batch published;
+                // the terminal Finish batch commits separately.
+                let finish = fixture.lane.finish_semantic_stop().unwrap();
+                fixture.scene.coordinator.stage_semantic_batch(finish);
+                fixture
+                    .scene
+                    .coordinator
+                    .commit_batch_with_semantics(false, Some(&mut fixture.lane))
+                    .unwrap();
+                let gaps: Vec<(String, String)> = fixture
+                    .scene
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+                    .collect();
+                assert!(
+                    !gaps.iter().any(|gap| gap.0 == "semantic receipt refused"),
+                    "prestashed={prestashed}: the drained proof validates: {gaps:?}"
+                );
+                assert_eq!(
+                    operation_edge_rows(&fixture.scene),
+                    vec![(Some(2), 0, true, 1, 1)],
+                    "prestashed={prestashed}: the drained Init/Sign pair completes one operation; \
+                     the terminal stop discloses lossy"
+                );
+                let reasons: Vec<InstanceReason> = fixture
+                    .scene
+                    .coordinator
+                    .registry()
+                    .instance_semantic_edges()
+                    .next()
+                    .unwrap()
+                    .reasons
+                    .iter()
+                    .copied()
+                    .collect();
+                assert_eq!(
+                    reasons,
+                    vec![InstanceReason::SemanticLoss, InstanceReason::CaptureStopped],
+                    "prestashed={prestashed}: only the terminal stop fences the completed \
+                     operation (boundary plus cause)"
+                );
             }
         }
     }

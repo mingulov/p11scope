@@ -597,6 +597,63 @@ class SameObserverCounterTest(unittest.TestCase):
         with self.assertRaisesRegex(TimeoutError, "budget exhausted"):
             H6["warm_successor"](self.capture, self.image, attempt, mode="profile", max_attempts=1, timeout=1)
 
+    def test_retry_receipt_keeps_later_displayed_warm_return_in_early_coverage(self):
+        doc, _, ledger, receipt = profile_inputs()
+        # Put the independent fixture history before the real helper interval.
+        shift = time.monotonic_ns() - READY - 1_000_000_000
+        for row in [*ledger, *receipt["images"], *receipt["phases"],
+                    receipt["warmup"], receipt["measured"],
+                    *receipt["exec_transitions"], receipt["exec_transitions"][0]["request"]]:
+            for key in ("t", "t0", "t1"):
+                if key in row:
+                    row[key] += shift
+        for key in ("observer_started_ns", "observer_ready_ns", "observer_stopped_ns", "scope_created_ns"):
+            receipt[key] += shift
+        ledger = [row for row in ledger if row.get("phase") != "successor-marker"]
+        receipt["phases"] = [row for row in receipt["phases"] if row["phase"] != "successor-marker"]
+        os.write(self.slave, live_frame([("C_Initialize", 3, 1, 1)]).encode())
+        warm_calls = []
+        def attempt(seq, _remaining):
+            t0 = time.monotonic_ns()
+            # Attempt 1 completes without a redraw. During attempt 2 the
+            # observer displays only attempt 1; both controlled attempts are retained.
+            if seq == 2:
+                os.write(self.slave, live_frame([("C_Initialize", 3, 1, 1), ("C_GetInfo", 1, 0, 0)]).encode())
+            call = call_record(1, "C_GetInfo", 0, f"warm-{seq}", "selected", t0, time.monotonic_ns())
+            warm_calls.append(call)
+            return call["phase"]
+        proof = H6["warm_successor"](self.capture, self.image, attempt, mode="profile", max_attempts=2, timeout=2)
+        self.assertEqual(proof["attempts"], 2)
+        self.assertEqual(proof["snapshot"]["functions"]["C_GetInfo"]["calls"], 1)
+        ledger.extend(warm_calls)
+        receipt["successor_ready"] = [proof]
+        receipt["warmup"].update(t1=warm_calls[-1]["t1"], expected_calls=5,
+                                 phases=["pre", "warm-1", "warm-2"])
+        receipt["phases"].extend({"image": 1, "fn": "C_GetInfo", "phase": call["phase"],
+            "scope": "selected", "count": 1, "t0": call["t0"], "t1": call["t1"]} for call in warm_calls)
+        measured_t0 = time.monotonic_ns()
+        for index, call in enumerate(row for row in ledger if row.get("phase") == "post"):
+            call.update(t0=measured_t0 + index * 20, t1=measured_t0 + index * 20 + 10)
+        receipt["measured"].update(t0=measured_t0, t1=measured_t0 + 40)
+        next(row for row in receipt["phases"] if row["phase"] == "post").update(
+            t0=measured_t0, t1=measured_t0 + 40)
+        os.write(self.slave, live_frame([("C_Initialize", 5, 2, 1), ("C_GetInfo", 2, 0, 0)]).encode())
+        H6["_output_wait"](self.capture,
+            lambda: True if self.capture.frames and self.capture.frames[-1]["totals"] == [7, 2, 1] else None,
+            time.monotonic_ns() + 1_000_000_000)
+        receipt["observer_stopped_ns"] = time.monotonic_ns()
+        doc["functions"][1]["calls"] = 2
+        for mode in ("profile", "metrics"):
+            with self.subTest(mode=mode):
+                result = H6[f"evaluate_{mode}_h6"](
+                    profile_doc(doc["functions"], mode=mode), "".join(self.capture.lines), ledger, receipt)
+                self.assertTrue(result["pass"], result)
+                self.assertEqual(result["completed_calls"], 7)
+                self.assertEqual(result["returned_errors"], 2)
+                self.assertEqual(result["measured_calls"], 2)
+                self.assertEqual(result["early_coverage"],
+                    {"expected": 5, "observed_named": 5, "observed_unknown": 0, "deficit": 0})
+
 
 def real_early_gap():
     return {"completeness": "PARTIAL", "verdict_detail": "concrete_gap", "unprotected_live_windows": 1,
@@ -1357,6 +1414,83 @@ def profile_inputs():
 
 
 class AggregateReadinessTest(unittest.TestCase):
+    def early_population(self, observed_calls, observed_errors, expected_errors=1):
+        doc, _, ledger, receipt = profile_inputs()
+        early = [row for row in ledger if row["kind"] == "call" and row.get("phase") == "pre"]
+        for index, call in enumerate(early):
+            call["rv"] = 5 if index < expected_errors else 0
+        stdout = (live_frame([("C_Initialize", observed_calls, observed_errors, 1)])
+                  + live_frame([("C_Initialize", observed_calls, observed_errors, 1), ("C_GetInfo", 1, 0, 0)])
+                  + live_frame([("C_Initialize", observed_calls + 2, observed_errors + 1, 1),
+                                ("C_GetInfo", 1, 0, 0)]))
+        frames = H6["parse_live_frames"](stdout)
+        receipt["successor_ready"][0].update(baseline=frames[0], snapshot=frames[1],
+            output_cursor=frames[0]["cursor"], proof_cursor=frames[1]["cursor"])
+        doc["functions"][0].update(calls=observed_calls + 2, errors=observed_errors + 1)
+        return doc, stdout, ledger, receipt
+
+    def test_exact_early_population_cannot_change_an_error_into_success(self):
+        doc, stdout, ledger, receipt = self.early_population(3, 0)
+        for mode in ("profile", "metrics"):
+            with self.subTest(mode=mode):
+                result = H6[f"evaluate_{mode}_h6"](
+                    profile_doc(doc["functions"], mode=mode), stdout, ledger, receipt)
+                self.assertFalse(result["pass"], result)
+                self.assertEqual(result["early_coverage"]["deficit"], 0)
+                self.assertTrue(any("early aggregate" in error for error in result["errors"]), result)
+
+    def test_disclosed_early_deficit_accepts_only_feasible_return_subsets(self):
+        # Three independent early calls: F failures and 3-F successes.
+        # Seeing two returns permits only the literal success/error subsets below.
+        for expected_errors, observed_errors, passes in (
+                (1, 0, True), (1, 1, True), (1, 2, False),
+                (2, 0, False), (2, 1, True), (2, 2, True)):
+            for mode in ("profile", "metrics"):
+                with self.subTest(expected_errors=expected_errors, observed_errors=observed_errors, mode=mode):
+                    doc, stdout, ledger, receipt = self.early_population(2, observed_errors, expected_errors)
+                    doc = profile_doc(doc["functions"], mode=mode)
+                    doc["evidence"].update(real_early_gap())
+                    result = H6[f"evaluate_{mode}_h6"](doc, stdout, ledger, receipt)
+                    self.assertEqual(result["pass"], passes, result)
+                    self.assertEqual(result["early_coverage"]["deficit"], 1)
+
+    def test_warm_and_measured_function_overlap_is_ambiguous(self):
+        doc, _, ledger, receipt = profile_inputs()
+        for row in [*ledger, *receipt["phases"]]:
+            if row.get("phase") == "successor-marker":
+                row["fn"] = "C_Initialize"
+        stdout = (live_frame([("C_Initialize", 3, 1, 1)])
+                  + live_frame([("C_Initialize", 4, 1, 1)])
+                  + live_frame([("C_Initialize", 6, 2, 1)]))
+        frames = H6["parse_live_frames"](stdout)
+        receipt["successor_ready"][0].update(marker_fn="C_Initialize", baseline=frames[0], snapshot=frames[1],
+            output_cursor=frames[0]["cursor"], proof_cursor=frames[1]["cursor"])
+        doc["functions"] = [profile_function("C_Initialize", 6, 2, 1)]
+        for mode in ("profile", "metrics"):
+            with self.subTest(mode=mode):
+                result = H6[f"evaluate_{mode}_h6"](
+                    profile_doc(doc["functions"], mode=mode), stdout, ledger, receipt)
+                self.assertFalse(result["pass"], result)
+                self.assertTrue(any("warm" in error and "measured" in error for error in result["errors"]), result)
+
+    def test_final_warm_counters_cannot_disappear_or_exceed_their_return_population(self):
+        for count, returned_errors in ((0, 0), (2, 0), (1, 1)):
+            for mode in ("profile", "metrics"):
+                with self.subTest(count=count, returned_errors=returned_errors, mode=mode):
+                    doc, stdout, ledger, receipt = profile_inputs()
+                    doc["functions"][1].update(calls=count, errors=returned_errors)
+                    stdout = stdout[:receipt["successor_ready"][0]["proof_cursor"]]
+                    rows = [("C_Initialize", 5, 2, 1)]
+                    if count:
+                        rows.append(("C_GetInfo", count, returned_errors, 0))
+                    stdout += live_frame(rows)
+                    doc = profile_doc(doc["functions"], mode=mode)
+                    # Even a real observation-gap disclosure cannot justify
+                    # regressing a cumulative counter or creating extra RVs.
+                    doc["evidence"].update(real_early_gap())
+                    result = H6[f"evaluate_{mode}_h6"](doc, stdout, ledger, receipt)
+                    self.assertFalse(result["pass"], result)
+
     def test_native_loss_is_red_even_with_exact_measured_counters(self):
         doc, stdout, ledger, receipt = profile_inputs()
         doc["evidence"]["event_loss"] = 1

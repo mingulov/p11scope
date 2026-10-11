@@ -78,6 +78,10 @@ impl StopGate {
         self.word().fetch_or(STOP_GATE_STOP, Ordering::SeqCst);
     }
 
+    pub(crate) fn stop_requested(&self) -> bool {
+        self.word().load(Ordering::SeqCst) & STOP_GATE_STOP != 0
+    }
+
     /// True only when the stop bit is set and no body is admitted.
     pub(crate) fn quiescent(&self) -> bool {
         self.word()
@@ -108,5 +112,38 @@ impl Drop for StopGate {
         unsafe {
             libc::munmap(self.cell.as_ptr().cast(), self.len);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn pid_continuity_stop_bit_refuses_with_bodies_in_flight() {
+        let len = 4096;
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        let gate = StopGate {
+            cell: NonNull::new(base.cast()).unwrap(),
+            len,
+        };
+        gate.word().store(3, Ordering::SeqCst);
+        assert!(!gate.stop_requested());
+        gate.request_stop();
+        assert_eq!(gate.in_flight(), 3);
+        assert!(!gate.quiescent());
+        assert!(
+            gate.stop_requested(),
+            "STOP must refuse before admitted bodies become quiescent"
+        );
     }
 }

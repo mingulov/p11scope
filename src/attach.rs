@@ -41,7 +41,14 @@ use std::sync::Arc;
 pub(crate) mod detailed_identity;
 #[allow(dead_code)] // B2 records private facts; B3 supplies request-bound validation.
 mod pid_continuity;
-pub(crate) use pid_continuity::{PidContinuityRefusal, PidLifecycleTap};
+#[cfg(test)]
+pub(crate) use pid_continuity::clock_origins_comparable_with;
+#[cfg(test)]
+pub(crate) use pid_continuity::engine_fixture::{PidSessionFixture, PreflightChange};
+pub(crate) use pid_continuity::{
+    ExecBinding, PhysicalGapSummary, PidContinuityRefusal, PidLifecycleTap, PreservationReceipt,
+    clock_origins_comparable,
+};
 
 // I3 will consume this preparation capability; I2b installs no callers or links.
 #[allow(dead_code)]
@@ -480,6 +487,14 @@ fn test_seeded_owner_poison() -> u64 {
     }
 }
 
+fn owner_limit_from_start(ebpf: &Ebpf) -> Result<u64> {
+    let map = ebpf.map("START").context("START map")?;
+    let Map::HashMap(data) = map else {
+        bail!("unexpected START map variant");
+    };
+    owner_limit_for_start(read_map_metadata("START", data)?)
+}
+
 fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) -> Result<()> {
     validate_identity_inventory(
         ebpf.maps()
@@ -497,13 +512,7 @@ fn prepare_identity(ebpf: &mut Ebpf, scope: &Scope, child: Option<&OwnedChild>) 
         ..Default::default()
     };
     let owner = ThreadOwnerControl {
-        limit: {
-            let map = ebpf.map("START").context("START map")?;
-            let Map::HashMap(data) = map else {
-                bail!("unexpected START map variant");
-            };
-            owner_limit_for_start(read_map_metadata("START", data)?)?
-        },
+        limit: owner_limit_from_start(ebpf)?,
         poison: test_seeded_owner_poison(),
         ..Default::default()
     };
@@ -1267,6 +1276,8 @@ pub struct Session {
     /// slot's last link detaches (see [`RetainedStaticTarget`]).
     retained_static: BTreeMap<u32, RetainedStaticTarget>,
     pid_pairs: pid_continuity::PairBook,
+    pid_health: pid_continuity::OwnerHealth,
+    prepared_owner_limit: u64,
     pid_lifecycle: Option<PidLifecycleTap>,
     links: Vec<RegisteredLink>,
     /// Task 3 Stage A continuity witness: hook links, watched files and the
@@ -2102,7 +2113,7 @@ fn attach_target_groups_with<T>(
     mut attach_link: impl FnMut(&'static str, &Path, &[(u64, u64)], bool) -> io::Result<T>,
 ) -> Result<(Vec<MultiLinkBundle<T>>, AttachOutcome), BackendFallbackRequired> {
     attach_target_groups_observed_with(groups, completed_at, |program, path, sites, is_return| {
-        pid_continuity::NativeAttempt::run(monotonic_ns, || {
+        pid_continuity::NativeAttempt::run(pid_continuity::comparable_monotonic_ns, || {
             attach_link(program, path, sites, is_return)
         })
     })
@@ -2359,7 +2370,7 @@ fn reattach_rebuilt_groups_with<T>(
         groups,
         completed_at,
         |program, path, sites, is_return| {
-            pid_continuity::NativeAttempt::run(monotonic_ns, || {
+            pid_continuity::NativeAttempt::run(pid_continuity::comparable_monotonic_ns, || {
                 attach_link(program, path, sites, is_return)
             })
         },
@@ -2596,7 +2607,9 @@ fn attach_targets_with(
         object_has_unsafe,
         abi_for,
         |program, slot, point| {
-            pid_continuity::NativeAttempt::run(monotonic_ns, || attach(program, slot, point))
+            pid_continuity::NativeAttempt::run(pid_continuity::comparable_monotonic_ns, || {
+                attach(program, slot, point)
+            })
         },
         completed_at,
     )
@@ -3614,6 +3627,7 @@ impl Session {
         let mut root_seed = None;
         let mut image_query = None;
         let mut prepared_instance = None;
+        let mut prepared_owner_limit = None;
         let preparation = prepare_session_with(object_has_unsafe, |step| {
             match step {
                 SessionPreparation::ValidatePolicy => {
@@ -3645,6 +3659,9 @@ impl Session {
                 SessionPreparation::PrepareIdentity => {
                     prepare_identity(&mut ebpf, scope, owned_child)
                         .context("preparing required image identity and thread ownership")?;
+                    // START metadata is immutable. Retain the same validated
+                    // capacity-derived limit initialized and read back above.
+                    prepared_owner_limit = Some(owner_limit_from_start(&ebpf)?);
                 }
                 SessionPreparation::PublishDescriptors => {
                     let mut semantics: Array<_, SlotSemantics> =
@@ -3846,6 +3863,9 @@ impl Session {
             process_creation_tracking_unavailable: None,
             retained_static: BTreeMap::new(),
             pid_pairs: pid_continuity::PairBook::default(),
+            pid_health: pid_continuity::OwnerHealth::default(),
+            prepared_owner_limit: prepared_owner_limit
+                .expect("identity preparation retained exact owner limit"),
             pid_lifecycle,
             links,
             instance,
@@ -3873,18 +3893,49 @@ impl Session {
         counter_snapshot_with(read, abi_refusals)
     }
 
-    fn pid_attach_baseline(&mut self) -> Option<pid_continuity::AttachBaseline> {
-        if !matches!(self.uprobe_scope, UProbeScope::OneProcess(_)) {
-            return None;
-        }
+    fn read_pid_health(&mut self) -> std::result::Result<u64, PidContinuityRefusal> {
+        let tap = self
+            .pid_lifecycle
+            .as_ref()
+            .ok_or(PidContinuityRefusal::Unavailable)?;
+        let owner = (|| -> Result<ThreadOwnerControl> {
+            let control: Array<_, ThreadOwnerControl> =
+                Array::try_from(self.ebpf.map("OWNER_CTL").context("OWNER_CTL map")?)?;
+            Ok(control.get(&0, 0)?)
+        })()
+        .map_err(|_| PidContinuityRefusal::Unavailable);
         let loss = (|| -> Result<u64> {
             let counters: PerCpuArray<_, u64> =
                 PerCpuArray::try_from(self.ebpf.map("COUNTERS").context("COUNTERS map")?)?;
-            let values = counters.get(&DISCOVERY_COUNTER_RING_LOSS, 0)?;
-            pid_continuity::checked_discovery_loss(values.iter().copied())
-                .map_err(|reason| anyhow!("PID continuity loss baseline: {reason:?}"))
+            pid_continuity::checked_discovery_loss(
+                counters
+                    .get(&DISCOVERY_COUNTER_RING_LOSS, 0)?
+                    .iter()
+                    .copied(),
+            )
+            .map_err(|reason| anyhow!("PID continuity loss: {reason:?}"))
         })()
-        .map_err(|_| pid_continuity::PidContinuityRefusal::Loss);
+        .map_err(|_| PidContinuityRefusal::Loss);
+        self.pid_health
+            .check(owner, loss, self.prepared_owner_limit, tap)
+    }
+
+    pub(crate) fn mutation_stopped(&self) -> bool {
+        self.stop_gate.stop_requested()
+            || self.producers_detached
+            || !self.detach_failures.is_empty()
+            || self.pid_health.terminal()
+            || self
+                .pid_lifecycle
+                .as_ref()
+                .is_some_and(|tap| tap.facts().is_err())
+    }
+
+    fn pid_attach_baseline(&mut self) -> Option<pid_continuity::AttachBaseline> {
+        if !matches!(self.uprobe_scope, UProbeScope::OneProcess(_)) || self.mutation_stopped() {
+            return None;
+        }
+        let loss = self.read_pid_health();
         let fault = self
             .pid_lifecycle
             .as_ref()
@@ -3897,6 +3948,122 @@ impl Session {
             tap.observe_failure();
         }
         baseline
+    }
+
+    pub(crate) fn physical_gap_summary(&self) -> PhysicalGapSummary {
+        self.pid_pairs.gap_summary()
+    }
+
+    pub(crate) fn bind_exec(
+        &self,
+        view: &crate::process::ProcessView,
+        serial: u64,
+        record: &p11scope_ebpf_common::DiscoveryRecord,
+    ) -> Option<ExecBinding> {
+        if self.mutation_stopped()
+            || !matches!(self.uprobe_scope, UProbeScope::OneProcess(pid) if pid.get() == view.pid())
+        {
+            return None;
+        }
+        ExecBinding::bind(
+            self.pid_lifecycle.as_ref()?,
+            &self.discovery_domain,
+            view,
+            serial,
+            record,
+        )
+    }
+
+    pub(crate) fn prepare_preservation(
+        &mut self,
+        binding: &ExecBinding,
+        view: &crate::process::ProcessView,
+        serial: u64,
+        slots: &[Slot],
+        ordinary: &[Slot],
+        objects: &PinnedObjects,
+    ) -> Option<PreservationReceipt> {
+        if self.mutation_stopped() {
+            return None;
+        }
+        let loss = self.read_pid_health().ok()?;
+        let sides = self.current_static_sides();
+        let pairs = pid_continuity::CurrentPairs {
+            book: &self.pid_pairs,
+            links: &self.links,
+            sides: &sides,
+            retained: &self.retained_static,
+        };
+        let tap = self.pid_lifecycle.as_ref()?;
+        let receipt = pairs.prepare(
+            binding,
+            tap,
+            &self.discovery_domain,
+            view,
+            serial,
+            slots,
+            ordinary,
+            objects,
+            loss,
+        )?;
+        pairs
+            .validate(
+                &receipt,
+                binding,
+                tap,
+                &self.discovery_domain,
+                view,
+                serial,
+                objects,
+                loss,
+                || {
+                    self.discovery_consumer
+                        .as_ref()
+                        .map(events::discovery_drain_positions)
+                },
+            )
+            .then_some(receipt)
+    }
+
+    pub(crate) fn validate_preservation(
+        &mut self,
+        receipt: &PreservationReceipt,
+        binding: &ExecBinding,
+        view: &crate::process::ProcessView,
+        serial: u64,
+        objects: &PinnedObjects,
+    ) -> bool {
+        if self.mutation_stopped() {
+            return false;
+        }
+        let Ok(loss) = self.read_pid_health() else {
+            return false;
+        };
+        let Some(tap) = self.pid_lifecycle.as_ref() else {
+            return false;
+        };
+        let sides = self.current_static_sides();
+        let pairs = pid_continuity::CurrentPairs {
+            book: &self.pid_pairs,
+            links: &self.links,
+            sides: &sides,
+            retained: &self.retained_static,
+        };
+        pairs.validate(
+            receipt,
+            binding,
+            tap,
+            &self.discovery_domain,
+            view,
+            serial,
+            objects,
+            loss,
+            || {
+                self.discovery_consumer
+                    .as_ref()
+                    .map(events::discovery_drain_positions)
+            },
+        )
     }
 
     pub(crate) fn preflight_targets(
@@ -4178,7 +4345,14 @@ impl Session {
         if let Some(slot) = targets.iter().find(|slot| self.has_slot_link(slot.index)) {
             bail!("slot {} already has an owned probe link", slot.index);
         }
+        if !targets.is_empty() && self.mutation_stopped() {
+            bail!("static attachment refused while Session is stopping or detached");
+        }
+        self.pid_pairs.retarget_gap(targets, objects);
         attachment_admission(&self.detach_failures, !targets.is_empty())?;
+        if targets.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
         let attach_targets: BTreeMap<_, _> = targets
             .iter()
             // By capture-local pinned ID only. There is deliberately no by-path
@@ -4247,9 +4421,10 @@ impl Session {
                                 .program_mut(program)
                                 .with_context(|| format!("program {program} missing from object"))?
                                 .try_into()?;
-                            let attempt = pid_continuity::NativeAttempt::run(monotonic_ns, || {
-                                prog.attach([point], path, scope)
-                            });
+                            let attempt = pid_continuity::NativeAttempt::run(
+                                pid_continuity::comparable_monotonic_ns,
+                                || prog.attach([point], path, scope),
+                            );
                             let result = match attempt.result {
                                 Ok(id) => {
                                     links.push(RegisteredLink::UProbe {
@@ -4301,7 +4476,7 @@ impl Session {
             &self.links,
             &current_sides,
             &self.retained_static,
-            monotonic_ns,
+            pid_continuity::comparable_monotonic_ns,
         );
         self.successful_static.extend(successful);
         let failed: Vec<_> = failures.iter().map(|(slot, _)| *slot).collect();
@@ -4350,7 +4525,7 @@ impl Session {
                     .copied()
                     .expect("every group side pre-resolved its program fd");
                 let (offsets, cookies): (Vec<u64>, Vec<u64>) = slice.iter().copied().unzip();
-                pid_continuity::NativeAttempt::run(monotonic_ns, || {
+                pid_continuity::NativeAttempt::run(pid_continuity::comparable_monotonic_ns, || {
                     attach_group(prog_fd, pid, path, &offsets, &cookies, is_return)
                 })
             },
@@ -4500,7 +4675,7 @@ impl Session {
                     .copied()
                     .expect("every rebuilt side pre-resolved its program fd");
                 let (offsets, cookies): (Vec<u64>, Vec<u64>) = slice.iter().copied().unzip();
-                pid_continuity::NativeAttempt::run(monotonic_ns, || {
+                pid_continuity::NativeAttempt::run(pid_continuity::comparable_monotonic_ns, || {
                     attach_group(prog_fd, pid, path, &offsets, &cookies, is_return)
                 })
             },
@@ -4532,7 +4707,7 @@ impl Session {
             &self.links,
             &current_sides,
             &self.retained_static,
-            monotonic_ns,
+            pid_continuity::comparable_monotonic_ns,
         );
         self.successful_static.extend(successful);
         for member in missing {
@@ -4654,13 +4829,50 @@ impl Session {
         self.root_seed.take()
     }
 
-    fn has_slot_link(&self, slot: u32) -> bool {
+    pub(crate) fn has_slot_link(&self, slot: u32) -> bool {
         links_cover_slot(&self.links, slot)
     }
 
     fn detach_links(&mut self, mut select: impl FnMut(&RegisteredLink) -> bool) -> Result<()> {
-        let selected = extract_selected_links(&mut self.links, &mut self.pid_pairs, &mut select);
-
+        // Resolve singles' fallible program lookup before extracting any
+        // ownership. A refused lookup keeps all native handles untouched and
+        // therefore opens no physical detach episode.
+        let choices: Vec<_> = self.links.iter().map(&mut select).collect();
+        for (link, chosen) in self.links.iter().zip(&choices) {
+            if !chosen {
+                continue;
+            }
+            if let RegisteredLink::UProbe { program, .. } = link {
+                let _: &mut UProbe = self
+                    .ebpf
+                    .program_mut(program)
+                    .with_context(|| format!("program {program} missing before static detach"))?
+                    .try_into()?;
+            }
+        }
+        let mut choices = choices.into_iter();
+        let selected = extract_selected_links(&mut self.links, &mut self.pid_pairs, |_| {
+            choices.next().expect("one choice per original link")
+        });
+        let affected: BTreeSet<_> = selected
+            .iter()
+            .filter(|link| {
+                matches!(
+                    link,
+                    RegisteredLink::UProbe { .. } | RegisteredLink::MultiUProbe { .. }
+                )
+            })
+            .flat_map(|link| link.slots().iter().copied())
+            .collect();
+        // All fallible group/program preparation has finished; these exact
+        // owned handles are about to enter the first actual detach attempt.
+        if matches!(self.uprobe_scope, UProbeScope::OneProcess(_)) {
+            self.pid_pairs.begin_gap(
+                &affected,
+                pid_continuity::comparable_monotonic_ns(),
+                &self.retained_static,
+            );
+        }
         let mut first_error = None;
         for error in detach_selected_with(
             selected

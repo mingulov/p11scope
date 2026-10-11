@@ -459,6 +459,8 @@ pub struct Engine {
     scheduler: DiscoveryScheduler,
     loader_records_accepted: u64,
     timings: CausalTimings,
+    physical_gap: crate::attach::PhysicalGapSummary,
+    continuity_deferred: bool,
     /// Per-stage wall-time accumulation (Phase 2): scan, pin, bind, plan,
     /// merge, projection, attach, plus the terminal cleanup overhead. The
     /// run loop merges these into its own drain/cleanup spans at snapshot.
@@ -498,7 +500,7 @@ pub struct Engine {
     /// while still recorded as attached. At most one marker per retained
     /// view: the next refresh rearms even an unchanged plan, ordinary-delta
     /// churn or a completed rearm clears it, and view removal prunes it.
-    exec_rearm_views: BTreeSet<ProcessViewId>,
+    exec_rearm_views: BTreeMap<ProcessViewId, Option<u64>>,
     pid_descendant_gaps: u64,
     /// Multi-group rebuild windows this capture published: one per rebuilt
     /// group per rebuild transaction. Ungated by scope — a rebuild blinds
@@ -2523,11 +2525,12 @@ type DiscoveryCollector<'a> =
 /// direct reads it replaces exactly.
 type TickClock<'a> = dyn FnMut() -> Option<u64> + 'a;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct RefreshRequest {
     first_seen_ns: Option<u64>,
     serial: u64,
     owner: Option<ProcessViewId>,
+    exec_binding: Option<crate::attach::ExecBinding>,
 }
 type SlotCompletion = (u32, Option<u64>);
 type TargetAttachResult = (Vec<u32>, Vec<SlotCompletion>);
@@ -2537,6 +2540,44 @@ type TargetAttachResult = (Vec<u32>, Vec<SlotCompletion>);
 /// BPF object; `Session` is the only production implementation and every method
 /// is a plain delegation to the existing inherent one.
 pub(crate) trait EngineSession {
+    fn has_slot_link(&self, _: u32) -> bool {
+        false
+    }
+    fn physical_gap_summary(&self) -> crate::attach::PhysicalGapSummary {
+        crate::attach::PhysicalGapSummary::default()
+    }
+    fn mutation_stopped(&self) -> bool {
+        false
+    }
+    fn bind_exec(
+        &self,
+        _: &ProcessView,
+        _: u64,
+        _: &DiscoveryRecord,
+    ) -> Option<crate::attach::ExecBinding> {
+        None
+    }
+    fn prepare_preservation(
+        &mut self,
+        _: &crate::attach::ExecBinding,
+        _: &ProcessView,
+        _: u64,
+        _: &[plan::Slot],
+        _: &[plan::Slot],
+        _: &PinnedObjects,
+    ) -> Option<crate::attach::PreservationReceipt> {
+        None
+    }
+    fn validate_preservation(
+        &mut self,
+        _: &crate::attach::PreservationReceipt,
+        _: &crate::attach::ExecBinding,
+        _: &ProcessView,
+        _: u64,
+        _: &PinnedObjects,
+    ) -> bool {
+        false
+    }
     fn capture_policy(&self) -> CapturePolicy;
     fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>>;
     /// Moves up to `quantum` DISCOVERY items off the kernel ring into the
@@ -2610,6 +2651,44 @@ pub(crate) trait EngineSession {
 }
 
 impl EngineSession for Session {
+    fn has_slot_link(&self, slot: u32) -> bool {
+        Session::has_slot_link(self, slot)
+    }
+    fn physical_gap_summary(&self) -> crate::attach::PhysicalGapSummary {
+        Session::physical_gap_summary(self)
+    }
+    fn mutation_stopped(&self) -> bool {
+        Session::mutation_stopped(self)
+    }
+    fn bind_exec(
+        &self,
+        view: &ProcessView,
+        serial: u64,
+        record: &DiscoveryRecord,
+    ) -> Option<crate::attach::ExecBinding> {
+        Session::bind_exec(self, view, serial, record)
+    }
+    fn prepare_preservation(
+        &mut self,
+        binding: &crate::attach::ExecBinding,
+        view: &ProcessView,
+        serial: u64,
+        slots: &[plan::Slot],
+        ordinary: &[plan::Slot],
+        objects: &PinnedObjects,
+    ) -> Option<crate::attach::PreservationReceipt> {
+        Session::prepare_preservation(self, binding, view, serial, slots, ordinary, objects)
+    }
+    fn validate_preservation(
+        &mut self,
+        receipt: &crate::attach::PreservationReceipt,
+        binding: &crate::attach::ExecBinding,
+        view: &ProcessView,
+        serial: u64,
+        objects: &PinnedObjects,
+    ) -> bool {
+        Session::validate_preservation(self, receipt, binding, view, serial, objects)
+    }
     fn capture_policy(&self) -> CapturePolicy {
         Session::capture_policy(self)
     }
@@ -2987,6 +3066,7 @@ struct LiveCandidate {
     manifest_selection_admissions: Vec<ManifestSelectionAdmission>,
     manifest_inventory_slots: BTreeMap<plan::AttachKey, plan::Slot>,
     loader_plan_proof: Option<LoaderPlanProof>,
+    exec_preservations: Vec<PreparedPreservation>,
 }
 
 struct LoaderPlanCache {
@@ -3008,6 +3088,13 @@ struct PreparedExecRearm {
     view: ProcessViewId,
     serial: u64,
     slots: Vec<plan::Slot>,
+    preservation: Option<crate::attach::PreservationReceipt>,
+}
+
+struct PreparedPreservation {
+    view: ProcessViewId,
+    serial: u64,
+    receipt: crate::attach::PreservationReceipt,
 }
 
 /// Transient baseline for one loader transaction, never a second retained
@@ -8156,6 +8243,8 @@ impl Engine {
             scheduler: DiscoveryScheduler::new(),
             loader_records_accepted: 0,
             timings: CausalTimings::default(),
+            physical_gap: crate::attach::PhysicalGapSummary::default(),
+            continuity_deferred: false,
             stage_timings: crate::timing::StageTimings::new(),
             newcomer_first_seen: BTreeMap::new(),
             newcomer_ages: crate::timing::NewcomerStats::new(),
@@ -8176,7 +8265,7 @@ impl Engine {
             expected_target_exit: false,
             pending_leader_exit_views: BTreeSet::new(),
             counted_leader_exit_views: BTreeSet::new(),
-            exec_rearm_views: BTreeSet::new(),
+            exec_rearm_views: BTreeMap::new(),
             pid_descendant_gaps: 0,
             multi_rebuild_gaps: 0,
             admitted_cgroup_views: BTreeMap::new(),
@@ -8319,6 +8408,12 @@ impl Engine {
     /// not a lost record: the causal timing still measures it.
     pub(crate) fn note_owned_pause_gap(&mut self, reason: &str) {
         self.mark_partial("owned pause", reason);
+    }
+
+    fn cancellation_requested(&self) -> bool {
+        self.cancel_flag
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Whether the running live frame must stop taking on work items (H-1):
@@ -9003,7 +9098,18 @@ impl Engine {
             // U-14: mirrors how `slots` reads the plan, but counts only what
             // `plan.is_active` still has attached right now.
             active_slots: self.plan.active_slot_count(),
-            attach_gap_ms: self.timings.max_gap_ms(),
+            attach_gap_ms: if self.physical_gap.open
+                || self.physical_gap.unknown
+                || self.timings.invalidated
+            {
+                None
+            } else {
+                self.timings
+                    .max_gap_ms()
+                    .into_iter()
+                    .chain(self.physical_gap.max_gap_ns.map(|ns| ns / 1_000_000))
+                    .max()
+            },
             loader_discovery: self.loader_discovery(),
             discovery_ring_loss: self.counter_snapshot.ring_loss,
             discovery_state_failures: self.counter_snapshot.export_state_failures,
@@ -9757,9 +9863,34 @@ impl Engine {
         }
     }
 
+    fn sync_physical_gap(&mut self, session: &dyn EngineSession) {
+        let next = session.physical_gap_summary();
+        if next == self.physical_gap {
+            return;
+        }
+        self.physical_gap = next;
+        if next.episodes != 0 {
+            self.mark_partial("physical static probe gap", if next.open || next.unknown {
+                "an actual static detach opened a physical coverage interval whose final exact pairs or clock remain incomplete"
+            } else { "static probes detached and final exact pairs reattached; the physical coverage interval remains in history" });
+        }
+    }
+
     fn record_apply_timing(&mut self, outcome: &ApplyOutcome) {
         for (modules, completed) in &outcome.static_completions {
-            self.complete_causal_timing(modules, *completed);
+            let initial: BTreeSet<_> = modules
+                .iter()
+                .filter(|module| {
+                    self.physical_gap.episodes == 0
+                        || self
+                            .timings
+                            .modules
+                            .get(*module)
+                            .is_none_or(|timing| timing.attach_complete_ns.is_none())
+                })
+                .cloned()
+                .collect();
+            self.complete_causal_timing(&initial, *completed);
         }
         for module in &outcome.static_failures {
             self.timings.lose(module);
@@ -10158,7 +10289,7 @@ impl Engine {
         consumed: bool,
         owner: Option<ProcessViewId>,
     ) -> bool {
-        let existing = self.refresh_requested.get(&pid).copied();
+        let existing = self.refresh_requested.get(&pid).cloned();
         if existing.is_some() && !consumed {
             return true;
         }
@@ -10184,7 +10315,7 @@ impl Engine {
         let Some(serial) = self.last_refresh_serial.checked_add(1) else {
             if consumed {
                 self.discovery_truncated = self.discovery_truncated.saturating_add(1);
-                let refresh_seen = existing.and_then(|request| request.first_seen_ns);
+                let refresh_seen = existing.as_ref().and_then(|request| request.first_seen_ns);
                 let diff_seen = self.newcomer_first_seen.get(&pid).copied().flatten();
                 let seen = match (refresh_seen, diff_seen) {
                     (Some(a), Some(b)) => Some(a.min(b)),
@@ -10215,11 +10346,19 @@ impl Engine {
         self.refresh_requested.insert(
             pid,
             RefreshRequest {
-                first_seen_ns: existing.map_or(now_ns, |request| request.first_seen_ns),
+                first_seen_ns: existing
+                    .as_ref()
+                    .map_or(now_ns, |request| request.first_seen_ns),
                 serial,
                 owner,
+                exec_binding: None,
             },
         );
+        if let Some(owner) = owner
+            && let Some(marker) = self.exec_rearm_views.get_mut(&owner)
+        {
+            *marker = Some(serial);
+        }
         true
     }
 
@@ -10859,6 +10998,7 @@ impl Engine {
             manifest_selection_admissions,
             manifest_inventory_slots,
             loader_plan_proof: None,
+            exec_preservations: Vec::new(),
         })
     }
 
@@ -10973,6 +11113,7 @@ impl Engine {
                 // No manifest/selection admission can use rollback inventory.
                 manifest_inventory_slots: BTreeMap::new(),
                 loader_plan_proof: None,
+                exec_preservations: Vec::new(),
             }
         } else {
             self.loader_plan_cache = None;
@@ -11058,6 +11199,31 @@ impl Engine {
         self.live_candidate(pinned, raw_modules, skipped)
     }
 
+    fn lower_registered_retries(&self, session: &dyn EngineSession, candidate: &mut LiveCandidate) {
+        let held: Vec<_> = candidate
+            .delta
+            .new
+            .extract_if(.., |slot| session.has_slot_link(slot.index))
+            .collect();
+        candidate.delta.replace.extend(held);
+        // A detach preflight can leave the native handles untouched while the
+        // failed candidate deactivates their cookies. The planner never reuses
+        // those cookies: retire their actual handles before attaching retries.
+        for slot in &self.plan.slots {
+            if !self.plan.is_active(slot.index)
+                && session.has_slot_link(slot.index)
+                && !candidate
+                    .delta
+                    .retire
+                    .iter()
+                    .chain(&candidate.delta.replace)
+                    .any(|selected| selected.index == slot.index)
+            {
+                candidate.delta.retire.push(slot.clone());
+            }
+        }
+    }
+
     fn apply_candidate(
         &mut self,
         session: &mut dyn EngineSession,
@@ -11067,6 +11233,13 @@ impl Engine {
         extra_views: &[&ProcessView],
     ) -> Result<ApplyOutcome> {
         let mut outcome = ApplyOutcome::default();
+        if self.continuity_deferred || self.cancellation_requested() || session.mutation_stopped() {
+            *additions_allowed = false;
+            return Ok(outcome);
+        }
+        if !preflighted {
+            self.lower_registered_retries(session, &mut candidate);
+        }
         let targets: Vec<_> = candidate
             .delta
             .new
@@ -11098,7 +11271,9 @@ impl Engine {
             &self.pinned,
             targets_ok,
         );
-        outcome.changed |= self.latch_candidate_ambiguity(&candidate.plan);
+        if candidate.exec_preservations.is_empty() {
+            outcome.changed |= self.latch_candidate_ambiguity(&candidate.plan);
+        }
         let generation_stale = !admission.stale_views.is_empty();
         outcome.stale_views = admission.stale_views;
         outcome.missing_contexts = admission.missing_contexts;
@@ -11133,6 +11308,39 @@ impl Engine {
         // link mutation below there is no rollback and no early return, so
         // identity, planner, and history work all has to be proven here.
         self.preflight_candidate_publication(&candidate)?;
+        let preservation_ok = !self.cancellation_requested()
+            && !session.mutation_stopped()
+            && candidate.exec_preservations.iter().all(|prepared| {
+                self.views
+                    .iter()
+                    .find(|view| view.id() == prepared.view)
+                    .is_some_and(|view| {
+                        self.refresh_requested
+                            .get(&view.pid())
+                            .is_some_and(|request| {
+                                request.owner == Some(prepared.view)
+                                    && request.serial == prepared.serial
+                                    && request.exec_binding.as_ref().is_some_and(|binding| {
+                                        session.validate_preservation(
+                                            &prepared.receipt,
+                                            binding,
+                                            view,
+                                            prepared.serial,
+                                            &candidate.pinned,
+                                        )
+                                    })
+                            })
+                    })
+            });
+        if !preservation_ok {
+            self.continuity_deferred = true;
+            *additions_allowed = false;
+            self.mark_partial("live exec continuity", "current Session/request/target/health/frontier refused preservation before mutation; refresh remains pending");
+            return Ok(outcome);
+        }
+        if !candidate.exec_preservations.is_empty() {
+            outcome.changed |= self.latch_candidate_ambiguity(&candidate.plan);
+        }
 
         let selected: Vec<_> = candidate
             .delta
@@ -11143,6 +11351,7 @@ impl Engine {
             .collect();
         let detach_slots_start = crate::attach::monotonic_ns();
         let detach_slots_outcome = session.detach_slots(&selected);
+        self.sync_physical_gap(session);
         self.stage_timings.span(
             crate::timing::StageKind::Attach,
             "detach_slots",
@@ -11214,6 +11423,7 @@ impl Engine {
                             .collect();
                         let detach_failed_slots_start = crate::attach::monotonic_ns();
                         let detach_failed_slots_outcome = session.detach_slots(&failed_slots);
+                        self.sync_physical_gap(session);
                         self.stage_timings.span(
                             crate::timing::StageKind::Attach,
                             "detach_failed_slots",
@@ -11403,6 +11613,7 @@ impl Engine {
                 .collect();
             self.unpaused_loader_views.extend(views);
         }
+        self.sync_physical_gap(session);
         self.finalize_candidate(
             session,
             candidate,
@@ -11412,6 +11623,7 @@ impl Engine {
             additions_allowed,
             &mut outcome,
         );
+        self.sync_physical_gap(session);
         Ok(outcome)
     }
 
@@ -11508,6 +11720,7 @@ impl Engine {
     /// targets stay owned by the ordinary delta.
     fn prepare_exec_rearm(
         &self,
+        session: &mut dyn EngineSession,
         view: ProcessViewId,
         serial: u64,
         candidate: &LiveCandidate,
@@ -11529,10 +11742,28 @@ impl Engine {
         } else {
             Vec::new()
         };
+        let ordinary: Vec<_> = candidate
+            .delta
+            .retire
+            .iter()
+            .chain(&candidate.delta.replace)
+            .cloned()
+            .collect();
+        let preservation = request.exec_binding.as_ref().and_then(|binding| {
+            session.prepare_preservation(
+                binding,
+                retained,
+                serial,
+                &slots,
+                &ordinary,
+                &candidate.pinned,
+            )
+        });
         Some(PreparedExecRearm {
             view,
             serial,
             slots,
+            preservation,
         })
     }
 
@@ -11558,7 +11789,15 @@ impl Engine {
         if renewed {
             return false;
         }
-        candidate.delta.replace.extend(prepared.slots);
+        if let Some(receipt) = prepared.preservation {
+            candidate.exec_preservations.push(PreparedPreservation {
+                view: prepared.view,
+                serial: prepared.serial,
+                receipt,
+            });
+        } else {
+            candidate.delta.replace.extend(prepared.slots);
+        }
         true
     }
 
@@ -11577,14 +11816,15 @@ impl Engine {
     /// completing with them silently dead.
     fn lower_exec_rearms(
         &mut self,
+        session: &mut dyn EngineSession,
         candidate: &mut LiveCandidate,
         refreshed: &BTreeSet<ProcessViewId>,
         serviced: &BTreeMap<u32, u64>,
-    ) -> Vec<ProcessViewId> {
+    ) -> Vec<(ProcessViewId, u64)> {
         let marked: Vec<ProcessViewId> = refreshed
             .iter()
             .copied()
-            .filter(|view| self.exec_rearm_views.contains(view))
+            .filter(|view| self.exec_rearm_views.contains_key(view))
             .collect();
         let mut lowered = Vec::new();
         for view in marked {
@@ -11597,17 +11837,34 @@ impl Engine {
             let Some(serial) = serial else {
                 continue;
             };
-            if let Some(prepared) = self.prepare_exec_rearm(view, serial, candidate)
+            if let Some(prepared) = self.prepare_exec_rearm(session, view, serial, candidate)
                 && self.consume_exec_rearm(candidate, prepared)
             {
-                lowered.push(view);
+                lowered.push((view, serial));
                 continue;
             }
-            if Self::exec_rearm_moot(view, candidate) {
-                lowered.push(view);
+            let current = self
+                .views
+                .iter()
+                .find(|old| old.id() == view)
+                .and_then(|old| self.refresh_requested.get(&old.pid()));
+            if current
+                .is_some_and(|request| request.owner == Some(view) && request.serial == serial)
+                && self.exec_rearm_views.get(&view) == Some(&Some(serial))
+                && Self::exec_rearm_moot(view, candidate)
+            {
+                lowered.push((view, serial));
             }
         }
         lowered
+    }
+
+    fn settle_exec_rearms(&mut self, serviced: impl IntoIterator<Item = (ProcessViewId, u64)>) {
+        for (view, serial) in serviced {
+            if self.exec_rearm_views.get(&view) == Some(&Some(serial)) {
+                self.exec_rearm_views.remove(&view);
+            }
+        }
     }
 
     /// Whether an exec marker's work is already done: none of the view's
@@ -11805,6 +12062,7 @@ impl Engine {
                     .collect();
                 let detach_selection_start = crate::attach::monotonic_ns();
                 let detach_selection_outcome = session.detach_slots(&detach);
+                self.sync_physical_gap(session);
                 self.stage_timings.span(
                     crate::timing::StageKind::Attach,
                     "detach_selection",
@@ -11940,6 +12198,7 @@ impl Engine {
                 .collect();
             let detach_rollback_start = crate::attach::monotonic_ns();
             let detach_rollback_outcome = session.detach_slots(&rollback);
+            self.sync_physical_gap(session);
             self.stage_timings.span(
                 crate::timing::StageKind::Attach,
                 "detach_rollback",
@@ -12125,6 +12384,7 @@ impl Engine {
         if !orphaned_selection.is_empty() {
             let detach_orphaned_start = crate::attach::monotonic_ns();
             let detach_orphaned_outcome = session.detach_slots(&orphaned_selection);
+            self.sync_physical_gap(session);
             self.stage_timings.span(
                 crate::timing::StageKind::Attach,
                 "detach_orphaned_selection",
@@ -12152,6 +12412,7 @@ impl Engine {
             .retire_unpinned_targets(&cleaned_pins, self.plan.slots.len());
         let detach_retired_start = crate::attach::monotonic_ns();
         let detach_retired_outcome = session.detach_slots(&retired);
+        self.sync_physical_gap(session);
         self.stage_timings.span(
             crate::timing::StageKind::Attach,
             "detach_retired",
@@ -16202,6 +16463,7 @@ impl Engine {
 
     fn dispatch_lifecycle_record(
         &mut self,
+        session: &mut dyn EngineSession,
         record: &DiscoveryRecord,
         pending_views: &mut PendingViewRetirements,
     ) -> Option<ProcessViewId> {
@@ -16223,20 +16485,43 @@ impl Engine {
                     self.record_unmatched_cgroup_leader_exit(record);
                 }
             }
+            let mut refreshed_serial = None;
             if cause == RetirementCause::ExpectedRemoval {
                 self.queue_leader_exit_assessment(view);
             } else {
                 if let Some(admission) = self.admitted_cgroup_views.get_mut(&view) {
                     admission.closed_ns = None;
                 }
-                self.request_refresh_consumed_for_view(pid, crate::attach::monotonic_ns(), view);
+                let accepted = self.request_refresh_consumed_for_view(
+                    pid,
+                    crate::attach::monotonic_ns(),
+                    view,
+                );
+                if record.kind == DISCOVERY_KIND_EXEC {
+                    if accepted {
+                        let request = self
+                            .refresh_requested
+                            .get_mut(&pid)
+                            .expect("accepted refresh request");
+                        refreshed_serial = Some(request.serial);
+                        request.exec_binding = self
+                            .views
+                            .iter()
+                            .find(|retained| retained.id() == view)
+                            .and_then(|retained| {
+                                session.bind_exec(retained, request.serial, record)
+                            });
+                    } else if let Some(request) = self.refresh_requested.get_mut(&pid) {
+                        request.exec_binding = None;
+                    }
+                }
                 self.queue_retirement(view, cause, pending_views);
             }
             if record.kind == DISCOVERY_KIND_EXEC && cause == RetirementCause::ExecRefresh {
                 // A matched EXEC may have killed this view's PID-bound static
                 // links. The refresh rearms them even when the rescan
                 // re-accepts the same targets; removal prunes the marker.
-                self.exec_rearm_views.insert(view);
+                self.exec_rearm_views.insert(view, refreshed_serial);
             }
             (cause == RetirementCause::ExecRefresh).then_some(view)
         } else if record.kind == DISCOVERY_KIND_EXEC
@@ -16444,7 +16729,8 @@ impl Engine {
                 deferred_mismatches,
             ),
             DISCOVERY_KIND_EXEC | DISCOVERY_KIND_LEADER_EXIT => {
-                if let Some(view) = self.dispatch_lifecycle_record(&record, pending_views) {
+                if let Some(view) = self.dispatch_lifecycle_record(session, &record, pending_views)
+                {
                     exec_refresh_views.insert(view);
                 }
                 Ok(DiscoveryRecordOutcome::applied(false, true))
@@ -18133,7 +18419,12 @@ impl Engine {
             admission_start,
             crate::attach::monotonic_ns(),
         );
-        let mut changed = self.latch_candidate_ambiguity(&candidate.plan);
+        let mut changed =
+            if matches!(self.scope, Scope::Pid(_)) && !self.exec_rearm_views.is_empty() {
+                false // The final candidate latches only after its preservation check.
+            } else {
+                self.latch_candidate_ambiguity(&candidate.plan)
+            };
         self.pending_rejected_keys
             .extend(admission.newly_rejected_keys.iter().copied());
         if !admission.stale_views.is_empty() {
@@ -18306,8 +18597,9 @@ impl Engine {
         // be dead while still recorded as attached. Global file links remain
         // governed by the ordinary delta. Lowered before admission so
         // the forced targets are preflighted like any other replacement.
+        self.lower_registered_retries(session, &mut candidate);
         let lowered_exec_rearms =
-            self.lower_exec_rearms(&mut candidate, &refreshed_ok, &serviced_requests);
+            self.lower_exec_rearms(session, &mut candidate, &refreshed_ok, &serviced_requests);
         let admission_start = crate::attach::monotonic_ns();
         let admission =
             self.inventory_candidate_admission(session, &candidate, &removed, new_views);
@@ -18317,7 +18609,19 @@ impl Engine {
             admission_start,
             crate::attach::monotonic_ns(),
         );
-        changed |= self.latch_candidate_ambiguity(&candidate.plan);
+        if !candidate.exec_preservations.is_empty()
+            && (!admission.targets_ok
+                || !admission.stale_views.is_empty()
+                || !admission.missing_contexts.is_empty())
+        {
+            self.continuity_deferred = true;
+            *additions_allowed = false;
+            self.mark_partial("live exec continuity", "preservation candidate lost its preflight or original custody; refresh remains pending before static mutation");
+            return Ok(changed);
+        }
+        if candidate.exec_preservations.is_empty() {
+            changed |= self.latch_candidate_ambiguity(&candidate.plan);
+        }
         self.pending_rejected_keys
             .extend(admission.newly_rejected_keys.iter().copied());
         let conservative_only = admission.requires_conservative_apply(mutation_started);
@@ -18404,9 +18708,7 @@ impl Engine {
             // consumed. A refusal mutated nothing — like the stale-view and
             // preflight exits above — and keeps every marker for the retry
             // the retained request owns.
-            for view in lowered_exec_rearms {
-                self.exec_rearm_views.remove(&view);
-            }
+            self.settle_exec_rearms(lowered_exec_rearms);
         }
         // Only a published newcomer is retained and armed. An unpublished one
         // committed nothing, so it stays in `new_views` for release and is
@@ -18460,6 +18762,28 @@ impl Engine {
         )?;
         if !outcome.accepted() {
             return Ok(changed);
+        }
+        if matches!(self.scope, Scope::Pid(_)) && self.physical_gap.open {
+            let failed_views: BTreeSet<_> = self
+                .modules
+                .iter()
+                .filter_map(|module| {
+                    self.pinned
+                        .owned_timing_key(module.object)
+                        .filter(|key| outcome.static_failures.contains(key))
+                        .map(|_| module.scanned.view)
+                })
+                .collect();
+            let retry_pids: Vec<_> = self
+                .views
+                .iter()
+                .filter(|view| failed_views.contains(&view.id()) && view.still_the_same())
+                .map(ProcessView::pid)
+                .collect();
+            for pid in retry_pids {
+                failed_refresh_pids.insert(pid);
+                self.request_refresh(pid, crate::attach::monotonic_ns());
+            }
         }
         if conservative_only || !*additions_allowed {
             failed_refresh_pids.extend(retirement_views.iter().filter_map(|view| {
@@ -19336,6 +19660,7 @@ impl Engine {
         collect: &mut DiscoveryCollector<'_>,
         deadline: Option<u64>,
     ) -> Result<DiscoveryBatchOutcome> {
+        self.continuity_deferred = false;
         self.budget.set_deadline(deadline);
         let result = self.apply_discovery_batch_inner(
             session,
@@ -19864,6 +20189,7 @@ pub(crate) mod session_fixture {
     #[derive(Default)]
     pub(crate) struct ScriptedSession {
         pub(crate) capture_policy: Option<CapturePolicy>,
+        pub(crate) pid_continuity: Option<RefCell<crate::attach::PidSessionFixture>>,
         pub(crate) dequeues: VecDeque<Result<Option<crate::events::DiscoveryItem>>>,
         /// The staged FIFO, mirroring production: `stage_discovery` moves
         /// scripted ring outcomes here, `discovery_dequeue` serves it
@@ -20075,6 +20401,70 @@ pub(crate) mod session_fixture {
     }
 
     impl EngineSession for ScriptedSession {
+        fn has_slot_link(&self, slot: u32) -> bool {
+            self.pid_continuity
+                .as_ref()
+                .is_some_and(|state| state.borrow().has_slot_link(slot))
+        }
+        fn physical_gap_summary(&self) -> crate::attach::PhysicalGapSummary {
+            self.pid_continuity
+                .as_ref()
+                .map(|state| state.borrow().gap_summary())
+                .unwrap_or_default()
+        }
+        fn mutation_stopped(&self) -> bool {
+            self.pid_continuity
+                .as_ref()
+                .is_some_and(|state| !self.detach_failures.is_empty() || state.borrow().stopped())
+        }
+        fn bind_exec(
+            &self,
+            view: &ProcessView,
+            serial: u64,
+            record: &DiscoveryRecord,
+        ) -> Option<crate::attach::ExecBinding> {
+            if self.mutation_stopped() {
+                return None;
+            }
+            self.pid_continuity
+                .as_ref()?
+                .borrow()
+                .bind(view, serial, record)
+        }
+        fn prepare_preservation(
+            &mut self,
+            binding: &crate::attach::ExecBinding,
+            view: &ProcessView,
+            serial: u64,
+            slots: &[plan::Slot],
+            ordinary: &[plan::Slot],
+            objects: &PinnedObjects,
+        ) -> Option<crate::attach::PreservationReceipt> {
+            if self.mutation_stopped() {
+                return None;
+            }
+            self.pid_continuity
+                .as_mut()?
+                .borrow_mut()
+                .prepare(binding, view, serial, slots, ordinary, objects)
+        }
+        fn validate_preservation(
+            &mut self,
+            receipt: &crate::attach::PreservationReceipt,
+            binding: &crate::attach::ExecBinding,
+            view: &ProcessView,
+            serial: u64,
+            objects: &PinnedObjects,
+        ) -> bool {
+            if self.mutation_stopped() {
+                return false;
+            }
+            self.pid_continuity.as_mut().is_some_and(|state| {
+                state
+                    .borrow_mut()
+                    .validate(receipt, binding, view, serial, objects)
+            })
+        }
         fn capture_policy(&self) -> CapturePolicy {
             self.capture_policy.unwrap_or(CapturePolicy::Allowlisted)
         }
@@ -20170,6 +20560,9 @@ pub(crate) mod session_fixture {
             if let Some(Some(pid)) = self.preflight_losses.borrow_mut().pop_front() {
                 kill_and_reap(pid);
             }
+            if let Some(continuity) = &self.pid_continuity {
+                continuity.borrow_mut().at_preflight();
+            }
             let refused = self
                 .preflight_refusals
                 .borrow_mut()
@@ -20185,12 +20578,19 @@ pub(crate) mod session_fixture {
         fn attach_targets(
             &mut self,
             slots: &[plan::Slot],
-            _: &PinnedObjects,
+            objects: &PinnedObjects,
         ) -> Result<TargetAttachResult> {
             attachment_admission(&self.detach_failures, !slots.is_empty())?;
             self.attached_slots.push(slots.len());
+            let physical = self
+                .pid_continuity
+                .as_mut()
+                .map(|continuity| continuity.borrow_mut().attach(slots, objects));
             if let Some(pid) = self.kill_on_attach.take() {
                 kill_and_reap(pid);
+            }
+            if let Some(physical) = physical {
+                return Ok(physical);
             }
             Ok((
                 slots
@@ -20204,13 +20604,30 @@ pub(crate) mod session_fixture {
 
         fn replace_targets(
             &mut self,
-            _: &mut plan::AttachPlan,
+            plan: &mut plan::AttachPlan,
             slots: &[plan::Slot],
-            _: &PinnedObjects,
+            objects: &PinnedObjects,
         ) -> Result<ReplacementOutcome> {
             self.replaced_slot_indices
                 .push(slots.iter().map(|slot| slot.index).collect());
             attachment_admission(&self.detach_failures, !slots.is_empty())?;
+            if let Some(continuity) = &mut self.pid_continuity {
+                let (failed, completed) = continuity.borrow_mut().attach(slots, objects);
+                let failed_slots: Vec<_> = slots
+                    .iter()
+                    .filter(|slot| failed.contains(&slot.index))
+                    .cloned()
+                    .collect();
+                let rebuild = continuity.borrow_mut().detach(&failed_slots);
+                for slot in failed_slots {
+                    plan.deactivate(slot.index);
+                }
+                return Ok(ReplacementOutcome {
+                    completed,
+                    rebuild,
+                    failed_detach: false,
+                });
+            }
             Ok(ReplacementOutcome::default())
         }
 
@@ -20221,17 +20638,31 @@ pub(crate) mod session_fixture {
             if let Some(Some(pid)) = self.detach_losses.pop_front() {
                 kill_and_reap(pid);
             }
-            if self
-                .detach_slot_premutation_script
-                .pop_front()
-                .unwrap_or(false)
-            {
+            let untouched_refusal = if slots.is_empty() && self.pid_continuity.is_some() {
+                false
+            } else {
+                self.detach_slot_premutation_script
+                    .pop_front()
+                    .unwrap_or(false)
+            };
+            if untouched_refusal {
                 bail!("scripted program fd resolution failed before any link mutation");
             }
-            if self.detach_slot_script.pop_front().unwrap_or(false) {
+            let native_failure = if slots.is_empty() && self.pid_continuity.is_some() {
+                false
+            } else {
+                self.detach_slot_script.pop_front().unwrap_or(false)
+            };
+            if native_failure {
+                if let Some(continuity) = &mut self.pid_continuity {
+                    continuity.borrow_mut().detach(slots);
+                }
                 self.detach_failures
                     .push("scripted one-shot slot detach failed".into());
                 bail!("scripted one-shot slot detach failed");
+            }
+            if let Some(continuity) = &mut self.pid_continuity {
+                return Ok(continuity.borrow_mut().detach(slots));
             }
             Ok(self.detach_rebuild_script.pop_front().unwrap_or_default())
         }

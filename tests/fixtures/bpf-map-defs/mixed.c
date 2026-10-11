@@ -17,6 +17,13 @@ HELPER(p11_link_fork_allowed)
 HELPER(p11_instance_entry)
 HELPER(p11_instance_return)
 HELPER(p11_instance_exec)
+/* Finite no-argument kernel-only helper boundary, not a dumpability model. */
+__attribute__((noinline, used)) unsigned p11_exec_dumpability(void) {
+    void *task = ((void *(*)(void))158)();
+    unsigned long flags = 0;
+    return !((long (*)(void *, unsigned, const void *))113)(&flags, sizeof(flags), task)
+        && flags == 1;
+}
 #ifdef OWNER_GLOBAL
 #define OWNER_LINKAGE
 #else
@@ -50,7 +57,9 @@ SEC("tp_btf/task_newtask") int task_newtask(void *ctx) {
 #endif
     return result;
 }
-SEC("raw_tp/sched_process_exec") int sched_process_exec(void *ctx) { return p11_owner_cleanup(ctx); }
+SEC("raw_tp/sched_process_exec") int sched_process_exec(void *ctx) {
+    return p11_owner_cleanup(ctx) + p11_exec_dumpability();
+}
 SEC("raw_tp/sched_process_exit") int sched_process_exit(void *ctx) {
     return p11_owner_cleanup(ctx) + p11_root_current_exit(ctx);
 }

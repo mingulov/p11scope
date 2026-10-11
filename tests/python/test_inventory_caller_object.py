@@ -39,7 +39,7 @@ PROGRAMS = {"p11_usage_entry_lp64", "p11_usage_entry_ia32", "dl_debug_state",
             "function_list_entry", "function_list_return", "interface_list_entry",
             "interface_list_return", "interface_list_worker", "interface_entry",
             "interface_return", "sched_process_exec", "sched_process_exit"}
-SYMBOLS = {"p11_owner_lease", "p11_owner_refund", "p11_read_ia32_arg",
+SYMBOLS = {"p11_owner_lease", "p11_owner_refund", "p11_read_ia32_arg", "p11_exec_dumpability",
            "p11_link_current_identity"}
 MASK = (1 << 64) - 1
 VALUE = 40  # CALLER_USE layout version 2: the 32-byte witness plus entry_count
@@ -61,6 +61,9 @@ class CallerManifestTests(unittest.TestCase):
             if variant.endswith("small-discovery"):
                 maps["DISCOVERY"]["max_entries"] = 4096
             checker.validate_inventory(variant, maps, PROGRAMS, SYMBOLS)
+            with self.subTest(variant=variant, missing_exec=True), self.assertRaisesRegex(RuntimeError, "missing required .text helpers"):
+                checker.validate_inventory(variant, maps, PROGRAMS,
+                                           SYMBOLS - {"p11_exec_dumpability"})
             for name in maps:
                 for field in checker.MAP_FIELDS:
                     changed = {key: dict(value) for key, value in maps.items()}

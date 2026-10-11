@@ -27,22 +27,24 @@ use aya_ebpf::programs::{ProbeContext, RawTracePointContext, RetProbeContext};
 use aya_ebpf::{helpers, EbpfContext as _};
 #[cfg(not(feature = "inventory-only"))]
 use core::mem::MaybeUninit;
+#[cfg(feature = "inventory-only")]
+use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
 #[cfg_attr(feature = "inventory-only", allow(unused_imports))]
 use p11scope_ebpf_common::{
-    bucket_of, capture, classify_task_newtask, cookie_descriptor, cookie_slot,
+    bucket_of, capture, classify_exec_task, classify_task_newtask, cookie_descriptor, cookie_slot,
     decode_export_attach_cookie, discovery_pause_coalesced, discovery_pause_enabled,
     discovery_state_take_failed, discovery_state_take_scope_lost, discovery_table_slots,
     discovery_usable_prefix, discovery_version_class, event_type, image_pair_matches,
     interface_continuation_next, interface_continuation_pack, interface_continuation_unpack,
-    lifecycle, normalize_target_word, read_ia32_arg_with, return_allows_mechanism, shape,
-    stop_gate_admit_with, target_layout_from_cs, target_stack_arg_address, target_word_end,
-    valid_config, valid_loader_cookie, CallStart, DiscoveryRecord, Event, FunctionNameKey,
-    EventRecord, ImageIdentity, InstanceContinuity, LinuxLayout, PauseKey, RvKey, SlotSemantics,
-    SlotStats, StartKey, StartState,
-    StateKey, ARG_NONE, CFG_FLAGS, COALESCED_NO_HELPER_RC, DISCOVERY_BYTES,
-    DISCOVERY_COUNTER_CELLS, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
-    DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
-    DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, DISCOVERY_COUNTER_RING_LOSS,
+    interface_flags_class, lifecycle, normalize_target_word, read_ia32_arg_with,
+    return_allows_mechanism, shape, stop_gate_admit_with, target_layout_from_cs,
+    target_stack_arg_address, target_word_end, valid_config, valid_loader_cookie, CallStart,
+    DiscoveryRecord, Event, EventRecord, FunctionNameKey, ImageIdentity, InstanceContinuity,
+    LinuxLayout, PauseKey, RvKey, SlotSemantics, SlotStats, StartKey, StartState, StateKey,
+    ARG_NONE, CFG_FLAGS, COALESCED_NO_HELPER_RC, DISCOVERY_BYTES, DISCOVERY_COUNTER_CELLS,
+    DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES, DISCOVERY_COUNTER_EXPORT_STATE_FAILURES,
+    DISCOVERY_COUNTER_LOADER_HITS, DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES,
+    DISCOVERY_COUNTER_RING_LOSS, DISCOVERY_EXEC_SAME_TASK_CANDIDATE, DISCOVERY_EXEC_UNKNOWN,
     DISCOVERY_INTERFACES, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
     DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN,
     DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LOADER, DISCOVERY_NAME_EXACT_STANDARD,
@@ -56,13 +58,10 @@ use p11scope_ebpf_common::{
     FLAG_CGROUP_FILTER, FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
     FLAG_SYSTEM_FILTER, FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE, LOADER_STATE_PRESENT,
     MAX_DESCRIPTORS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, NATIVE_OWNER_SLOT_BOUND, PAUSE_ARMED,
-    PAUSE_REQUESTED, RING_BYTES, RV_ENTRIES, SESSION_NONE, START_ENTRIES, STATE_DOMAIN_EXPORT,
-    STACK_GUARD_ENTRIES, STATE_DOMAIN_SELECTION, TAIL_CALLS_ENTRIES,
+    PAUSE_REQUESTED, RING_BYTES, RV_ENTRIES, SESSION_NONE, STACK_GUARD_ENTRIES, START_ENTRIES,
+    STATE_DOMAIN_EXPORT, STATE_DOMAIN_SELECTION, TAIL_CALLS_ENTRIES,
     TAIL_CALLS_INTERFACE_WORKER_SLOT, TAIL_CALLS_NO_PRIVATE_STACK_INDEX, USER_TYPE_NONE,
-    interface_flags_class,
 };
-#[cfg(feature = "inventory-only")]
-use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 use p11scope_ebpf_common::{
     EVIDENCE_TEMPLATE_TAIL_FAILURES, FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA, MAX_ATTRS,
@@ -1761,7 +1760,7 @@ fn dl_debug_state_impl(ctx: ProbeContext) -> u32 {
 }
 
 #[inline(never)]
-fn emit_lifecycle(kind: u8, scope: ScopeAuth, pause_eligible: bool) {
+fn emit_lifecycle(kind: u8, case_id: u8, scope: ScopeAuth, pause_eligible: bool) {
     let Some(mut entry) = reserve_discovery() else {
         return;
     };
@@ -1769,6 +1768,7 @@ fn emit_lifecycle(kind: u8, scope: ScopeAuth, pause_eligible: bool) {
     // SAFETY: the shared initializer completed before every field write.
     unsafe {
         core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).kind), kind);
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*raw).case_id), case_id);
     }
     let pid_tgid = helpers::bpf_get_current_pid_tgid();
     finish_discovery_record(entry, scope, pause_eligible, pid_tgid, 0);
@@ -1794,7 +1794,15 @@ fn sched_process_exec_impl(_ctx: RawTracePointContext) -> u32 {
         p11_instance_exec()
     };
     if let Some(scope) = scope_auth() {
-        emit_lifecycle(DISCOVERY_KIND_EXEC, scope, true);
+        let old_pid = _ctx.arg::<u64>(1);
+        let pid_tgid = helpers::bpf_get_current_pid_tgid();
+        // Replacement/invalid IDs need no kernel dumpability read. Equal
+        // leader IDs still require the checked current-kernel predicate.
+        let mut class = classify_exec_task(old_pid, pid_tgid, 1);
+        if class == DISCOVERY_EXEC_SAME_TASK_CANDIDATE {
+            class = classify_exec_task(old_pid, pid_tgid, unsafe { p11_exec_dumpability() });
+        }
+        emit_lifecycle(DISCOVERY_KIND_EXEC, class, scope, true);
     }
     0
 }
@@ -1822,7 +1830,12 @@ fn sched_process_exit_impl(_ctx: RawTracePointContext) -> u32 {
         return 0;
     }
     if let Some(scope) = scope_auth() {
-        emit_lifecycle(DISCOVERY_KIND_LEADER_EXIT, scope, false);
+        emit_lifecycle(
+            DISCOVERY_KIND_LEADER_EXIT,
+            DISCOVERY_EXEC_UNKNOWN,
+            scope,
+            false,
+        );
     }
     0
 }
@@ -2545,6 +2558,7 @@ fn p11_entry_template_second_impl(ctx: ProbeContext) -> u32 {
 }
 
 unsafe extern "C" {
+    fn p11_exec_dumpability() -> u32;
     #[cfg(not(feature = "inventory-only"))]
     fn p11_root_current_tag() -> u64;
     #[cfg(not(feature = "inventory-only"))]

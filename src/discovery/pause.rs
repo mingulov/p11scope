@@ -2152,12 +2152,18 @@ impl PauseIo for SessionPauseIo<'_> {
         // the shared allowance beside the batch-local records; merges of
         // those locals into pending are transfers, already counted.
         let malformed = std::mem::take(&mut self.malformed);
+        // The reconcile above may hold the terminal batch
+        // coordinator-side: its records are still owned, so they count
+        // against fresh acquisition until the install below moves them
+        // back into the engine.
+        let coordinator_held = terminal_batch.as_ref().map_or(0, TerminalBatch::len);
         let pull_budget = std::cell::Cell::new(
             DISCOVERY_HELD_CAP
                 .saturating_sub(self.session.staged_discovery_len())
                 .saturating_sub(self.engine.discovery_held_len())
                 .saturating_sub(records.len())
-                .saturating_sub(malformed as usize),
+                .saturating_sub(malformed as usize)
+                .saturating_sub(coordinator_held),
         );
         let mut collect = |session: &mut dyn EngineSession| {
             collect_timed_retirement(
@@ -7318,6 +7324,81 @@ mod tests {
             engine.dispatched_loader_records(),
             0,
             "disposed, never replayed"
+        );
+    }
+
+    /// H5 transfer seam: a coordinator-held terminal batch still owns its
+    /// records while the retry reconciles, so the nested pull budget seeds
+    /// against it. At full occupancy the retry reads nothing fresh: the
+    /// batch stays retained and the ring stays queued for a later turn.
+    #[test]
+    fn coordinator_held_terminal_batch_counts_against_nested_pull_budget() {
+        // Retain a full-capacity prefix into the coordinator-held batch,
+        // then install it so the engine holds full occupancy.
+        let (child, mut engine, owner, mut session) = pause_credit_harness();
+        session.dequeues.extend((0..DISCOVERY_HELD_CAP).map(|_| {
+            Ok(Some(DiscoveryItem::Record(loader_record_for(
+                owner,
+                child.pid(),
+            ))))
+        }));
+        session
+            .dequeues
+            .push_back(Err(anyhow::anyhow!("scripted ring read failed")));
+        session.dequeues.extend((0..8u32).map(|index| {
+            Ok(Some(DiscoveryItem::Record(exec_record_for(
+                6_000_000 + index,
+            ))))
+        }));
+        let mut terminal_batch = None;
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .expect("the prefix retains")
+        });
+        assert_eq!(
+            terminal_batch
+                .as_ref()
+                .expect("prefix retained")
+                .record_count(),
+            DISCOVERY_HELD_CAP
+        );
+        engine
+            .install_terminal_batch(terminal_batch.take().expect("prefix retained"), Vec::new())
+            .expect("the pending journal accepts its batch");
+        assert_eq!(engine.discovery_held_len(), DISCOVERY_HELD_CAP);
+        // The retry's ring reads would succeed: drop the scripted error so
+        // only the shared allowance stands between the drain and the spares.
+        assert!(
+            session
+                .dequeues
+                .pop_front()
+                .expect("scripted error queued")
+                .is_err()
+        );
+        assert_eq!(session.dequeues.len(), 8);
+        // The retry reconciles the batch coordinator-side before seeding
+        // its nested budget: at full occupancy it reads nothing fresh.
+        with_session_io(&mut engine, &mut session, &child, |io| {
+            io.apply_batch(Vec::new(), None, true, false, &mut terminal_batch)
+                .expect_err("full occupancy refuses fresh acquisition");
+        });
+        assert_eq!(
+            session.dequeues.len(),
+            8,
+            "a refused retry never reads the ring"
+        );
+        assert_eq!(
+            engine.discovery_held_len(),
+            0,
+            "the refused batch returns coordinator-side"
+        );
+        assert_eq!(
+            terminal_batch
+                .as_ref()
+                .expect("batch retained")
+                .record_count(),
+            DISCOVERY_HELD_CAP,
+            "nothing acquired past the shared allowance"
         );
     }
 }

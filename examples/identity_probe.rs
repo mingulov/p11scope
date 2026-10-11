@@ -59,6 +59,19 @@ fn deny_check(btf_path: Option<PathBuf>) -> ! {
 }
 
 fn probe(dir: PathBuf, generation: u64) -> ! {
+    // A fresh unique subdir per run: fixture writes are exclusive, so a
+    // reused DIR would fail on rerun. `create_dir` fails if the name
+    // already exists — never adopt or clean a pre-existing path.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let subdir = dir.join(format!("probe-{}-{nanos}", std::process::id()));
+    if let Err(error) = std::fs::create_dir(&subdir) {
+        println!("PROBE FAIL dir: {error}");
+        std::process::exit(4);
+    }
+    let dir = subdir;
     if let Err(deny) = ii::ensure_kernel_identity_btf() {
         println!("PROBE FAIL deny: {}", deny.reason());
         std::process::exit(4);

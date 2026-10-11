@@ -142,6 +142,12 @@ pub(crate) struct CallerRecord {
     pub lifecycle: CallerLifecycle,
     pub lifecycle_reason: Option<String>,
     pub first_seen_ns: u64,
+    /// When the incarnation was admitted, on the observer's
+    /// `CLOCK_MONOTONIC`: the boundary stale native records order
+    /// against. The scan path admits after its collection, so this is
+    /// the admission detection time, never the pass-start `now` that
+    /// `first_seen_ns` keeps for scan-window comparisons.
+    pub admitted_ns: u64,
     pub last_seen_ns: u64,
     pub retired: bool,
 }
@@ -430,6 +436,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     lifecycle: CallerLifecycle::Mapped,
                     lifecycle_reason: None,
                     first_seen_ns: now_ns,
+                    admitted_ns: now_ns,
                     last_seen_ns: now_ns,
                     retired: false,
                 },
@@ -487,11 +494,16 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         })
     }
 
+    /// Commit one prepared scoped caller under its exact member permit.
+    /// `now_ns` is the pass clock for scan-window stamps; `admitted_ns`
+    /// is the actual admission detection time, the boundary stale
+    /// native records order against.
     pub(crate) fn commit_scoped_caller(
         &mut self,
         prepared: PreparedScopedCaller<Source::Pin>,
         permit: crate::inspect_system::inventory_cgroup::CgroupAdmissionPermit<'_>,
         now_ns: u64,
+        admitted_ns: u64,
     ) -> Result<(CallerId, bool), AdmitFailure> {
         let failed = |reason: &str| AdmitFailure {
             reason: reason.into(),
@@ -555,6 +567,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     lifecycle: CallerLifecycle::Mapped,
                     lifecycle_reason: None,
                     first_seen_ns: now_ns,
+                    admitted_ns,
                     last_seen_ns: now_ns,
                     retired: false,
                 },
@@ -575,6 +588,9 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
     /// candidate for this pid joins only when it already holds the
     /// current incarnation; pid equality alone never adopts it.
     /// Returns the successor and whether it was freshly minted.
+    /// `now_ns` is the pass clock for scan-window stamps; `admitted_ns`
+    /// is the actual admission detection time, the boundary stale
+    /// native records order against.
     pub(crate) fn commit_handoff_caller(
         &mut self,
         pid: u32,
@@ -582,6 +598,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         permit: crate::inspect_system::inventory_cgroup::CgroupAdmissionPermit<'_>,
         generation: crate::inspect_system::MemberGeneration,
         now_ns: u64,
+        admitted_ns: u64,
     ) -> Result<(CallerId, bool), AdmitFailure> {
         let failed = |reason: &str| AdmitFailure {
             reason: reason.into(),
@@ -644,6 +661,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     lifecycle: CallerLifecycle::Mapped,
                     lifecycle_reason: None,
                     first_seen_ns: now_ns,
+                    admitted_ns,
                     last_seen_ns: now_ns,
                     retired: false,
                 },
@@ -661,6 +679,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         pid: u32,
         authority: ImageAuthority,
         now_ns: u64,
+        detected_ns: u64,
     ) -> Result<CallerId, AdmitFailure> {
         if self.live_by_pid.contains_key(&pid) {
             return Err(AdmitFailure {
@@ -686,11 +705,18 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                 budget: Some(refusal),
             });
         }
-        self.admit(pid, authority, now_ns)
-            .map_err(|error| AdmitFailure {
+        let id = self.admit(pid, authority, now_ns).map_err(|error| {
+            AdmitFailure {
                 reason: format!("{error:#}"),
                 budget: None,
-            })
+            }
+        })?;
+        self.callers
+            .get_mut(&id)
+            .expect("the admitted caller retains its record")
+            .record
+            .admitted_ns = detected_ns;
+        Ok(id)
     }
 
     fn retire(&mut self, id: CallerId, lifecycle: CallerLifecycle, reason: String, now_ns: u64) {
@@ -764,7 +790,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         let handoff = self.retire_for_exec_handoff(id, now_ns);
         let commit = match handoff {
             Some((pid, pin)) => self.admit_retained_successor(pid, pin, authority, now_ns),
-            None => self.commit_retained_successor(pid, None, authority, now_ns),
+            None => self.commit_retained_successor(pid, None, authority, now_ns, now_ns),
         };
         vec![match commit {
             Ok(new) => CallerEvent::ExecRetired { old: id, new },
@@ -812,7 +838,9 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         authority: ImageAuthority,
         now_ns: u64,
     ) -> Result<CallerId, AdmitFailure> {
-        self.commit_retained_successor(pid, Some(pin), authority, now_ns)
+        // The exec path carries a fresh `now_ns` already, so it is the
+        // detection time too.
+        self.commit_retained_successor(pid, Some(pin), authority, now_ns, now_ns)
     }
 
     /// The one retained-custody commit behind every exec handoff: the native
@@ -824,6 +852,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         pin: Option<Source::Pin>,
         authority: ImageAuthority,
         now_ns: u64,
+        detected_ns: u64,
     ) -> Result<CallerId, AdmitFailure> {
         let Some(pin) = pin else {
             return Err(AdmitFailure {
@@ -897,6 +926,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     lifecycle: CallerLifecycle::Mapped,
                     lifecycle_reason: None,
                     first_seen_ns: now_ns,
+                    admitted_ns: detected_ns,
                     last_seen_ns: now_ns,
                     retired: false,
                 },
@@ -919,10 +949,28 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         authority_for: &mut dyn FnMut(u32) -> ImageAuthority,
         now_ns: u64,
     ) -> Vec<CallerEvent> {
+        self.reconcile_detected(observed, authority_for, now_ns, now_ns)
+    }
+
+    /// Reconcile with an explicit admission detection time: `now_ns` is
+    /// the pass clock for scan-window stamps (`first_seen_ns` and
+    /// retirement/last-seen), while `detected_ns` is when the
+    /// admissions below were actually detected — the boundary stale
+    /// native records order against (`admitted_ns`). The production
+    /// scan path samples detection after its collection; callers that
+    /// admit at the pass clock use [`Self::reconcile`].
+    pub(crate) fn reconcile_detected(
+        &mut self,
+        observed: &BTreeSet<u32>,
+        authority_for: &mut dyn FnMut(u32) -> ImageAuthority,
+        now_ns: u64,
+        detected_ns: u64,
+    ) -> Vec<CallerEvent> {
         self.reconcile_inner(
             observed,
             authority_for,
             now_ns,
+            detected_ns,
             SuccessorAdmission::Unrestricted,
             &mut || true,
         )
@@ -938,6 +986,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         self.reconcile_inner(
             &BTreeSet::new(),
             &mut |_| ImageAuthority::ScanPinned,
+            now_ns,
             now_ns,
             SuccessorAdmission::ScopedDenied,
             work,
@@ -962,6 +1011,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         observed: &BTreeSet<u32>,
         authority_for: &mut dyn FnMut(u32) -> ImageAuthority,
         now_ns: u64,
+        detected_ns: u64,
         admission: SuccessorAdmission,
         work: &mut dyn FnMut() -> bool,
     ) -> Vec<CallerEvent> {
@@ -1042,7 +1092,9 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                         "executable image changed while the generation pin held (exec)".into(),
                         now_ns,
                     );
-                    match self.commit_retained_successor(pid, pin, authority, now_ns) {
+                    let commit =
+                        self.commit_retained_successor(pid, pin, authority, now_ns, detected_ns);
+                    match commit {
                         Ok(new) => events.push(CallerEvent::ExecRetired { old: id, new }),
                         Err(failure) => events.push(CallerEvent::AdmitFailed {
                             pid,
@@ -1102,7 +1154,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     events.push(self.retired_event(id));
                     continue;
                 }
-                match self.try_admit(pid, authority_for(pid), now_ns) {
+                match self.try_admit(pid, authority_for(pid), now_ns, detected_ns) {
                     Ok(new) => events.push(CallerEvent::Reused { old: id, new }),
                     Err(failure) => events.push(CallerEvent::AdmitFailed {
                         pid,
@@ -1118,7 +1170,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             if self.live_by_pid.contains_key(&pid) {
                 continue;
             }
-            match self.try_admit(pid, authority_for(pid), now_ns) {
+            match self.try_admit(pid, authority_for(pid), now_ns, detected_ns) {
                 Ok(id) => events.push(CallerEvent::Admitted { id }),
                 Err(failure) => events.push(CallerEvent::AdmitFailed {
                     pid,

@@ -39,6 +39,7 @@ and cleanup receipts are recorded in summary.json.
 import argparse
 from collections import Counter, defaultdict, deque
 from functools import wraps
+from contextvars import ContextVar
 import ctypes
 import errno
 import codecs
@@ -80,6 +81,116 @@ RV_NAMES = {0: "CKR_OK", 5: "CKR_GENERAL_ERROR"}
 
 def monotonic_ns():
     return time.monotonic_ns()
+
+
+OBSERVER_STOP_SECONDS = 60
+INVENTORY_STOP_SECONDS = 30
+CLEANUP_SECONDS = 5
+ACTIVE_LEG = ContextVar("h6_owned_leg_budget", default=None)
+
+
+class LegBudget:
+    """Absolute monotonic limits; revisiting a phase never buys more time."""
+    def __init__(self, inventory=False, clock=None, budgets=None, leg_seconds=None):
+        self.clock = clock or monotonic_ns
+        # Setup includes token init (30), manifest generation (180), and the
+        # Inventory first pass (120). Their individual limits stay unchanged.
+        self.budgets = {"setup": 330, "successor-recovery": 90 if inventory else 15,
+                        "fixed-measurement": 180 if inventory else 60,
+                        "normal-stop": INVENTORY_STOP_SECONDS if inventory else OBSERVER_STOP_SECONDS,
+                        "cleanup": CLEANUP_SECONDS}
+        self.budgets.update(budgets or {})
+        if any(not 0 < value < float("inf") for value in self.budgets.values()):
+            raise ValueError("phase budgets must be positive and finite")
+        # The rapid chain has at most three distinct successors. Every other
+        # phase has one deadline, including cleanup after forced cancellation.
+        total = sum(self.budgets.values()) + 2 * self.budgets["successor-recovery"]
+        seconds = total if leg_seconds is None else leg_seconds
+        if not 0 < seconds < float("inf"):
+            raise ValueError("leg budget must be positive and finite")
+        self.started_ns = self.clock()
+        self.deadline_ns = self.started_ns + int(seconds * 1e9)
+        self.deadlines = {}
+        self.enter("setup")
+
+    def enter(self, phase, key=0):
+        if phase != "cleanup":
+            self.remaining()  # Expired work cannot dispatch by changing phase.
+        identity = (phase, key)
+        if identity not in self.deadlines:
+            if phase == "successor-recovery" and sum(
+                    name == phase for name, _key in self.deadlines) >= 3:
+                raise TimeoutError("successor recovery phase budget exhausted")
+            self.deadlines[identity] = min(self.deadline_ns,
+                self.clock() + int(self.budgets[phase] * 1e9))
+        self.phase, self.phase_deadline_ns = phase, self.deadlines[identity]
+        self.remaining()
+
+    def remaining(self, seconds=None):
+        deadline = min(self.deadline_ns, getattr(self, "phase_deadline_ns", self.deadline_ns))
+        left = (deadline - self.clock()) / 1e9
+        if left <= 0:
+            raise TimeoutError(f"{getattr(self, 'phase', 'leg')} deadline exhausted")
+        return left if seconds is None else min(seconds, left)
+
+
+def enter_phase(name, key=0):
+    if budget := ACTIVE_LEG.get():
+        budget.enter(name, key)
+
+
+def remaining_seconds(seconds):
+    if not 0 < seconds < float("inf"):
+        raise TimeoutError("finite wait budget exhausted")
+    budget = ACTIVE_LEG.get()
+    return budget.remaining(seconds) if budget else seconds
+
+
+def wait_deadline(seconds):
+    return monotonic_ns() + int(remaining_seconds(seconds) * 1e9)
+
+
+def remaining_until(deadline):
+    return remaining_seconds((deadline - monotonic_ns()) / 1e9)
+
+
+def check_dispatch():
+    if budget := ACTIVE_LEG.get():
+        budget.remaining()
+
+
+def wait_process(child, seconds):
+    return child.wait(timeout=remaining_seconds(seconds))
+
+
+def pause_until(deadline, interval):
+    time.sleep(min(interval, remaining_until(deadline)))
+
+
+def transport_poll_seconds(reader):
+    # A transport spans phases; only the absolute leg caps its background
+    # polling. Foreground proof/ack waits additionally enforce their phase.
+    if reader.budget is None:
+        return 0.2
+    remaining = (reader.budget.deadline_ns - reader.budget.clock()) / 1e9
+    if remaining <= 0:
+        raise TimeoutError("owned transport leg deadline exhausted")
+    return min(0.2, remaining)
+
+
+def stop_errors(receipt):
+    errors = []
+    if receipt.get("forced_cleanup"):
+        errors.append("observer required forced cleanup after its normal stop deadline")
+    if "stop_latency_seconds" in receipt and not (
+            0 <= receipt["stop_latency_seconds"] <= receipt.get("stop_limit_seconds", 5)):
+        errors.append("observer exceeded its declared normal stop limit")
+    return errors
+
+
+def stop_receipt(owned, latency, limit=OBSERVER_STOP_SECONDS):
+    return getattr(owned, "stop_receipt", {
+        "stop_latency_seconds": latency, "stop_limit_seconds": limit})
 
 
 def sha256_file(path):
@@ -228,6 +339,7 @@ def _trace_successor_populations(trace, rows, in_window, receipt, images):
 
 def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
     rows, counts, evidence, errors = N3_PARSE_TRACE(trace)
+    errors.extend(stop_errors(receipt))
     if receipt.get("expect_empty"):
         if rows:
             errors.append("stop-before-collection leg captured rows")
@@ -767,7 +879,7 @@ def evaluate_trace_h6(trace, ledger, receipt, file_trace=None):
 # ---------------------------------------------------------------------------
 
 def _evaluate_aggregate_h6(doc, stdout_text, ledger, receipt, mode):
-    errors = []
+    errors = stop_errors(receipt)
     if receipt.get("backend_refused"):
         return {"pass": False, "status": "negative", "cell": receipt.get("cell"),
                 "leg": receipt.get("leg"), "negative_reason": receipt["backend_refused"],
@@ -1182,7 +1294,7 @@ def ledger_s1_totals(batches, started_ns):
 
 
 def _evaluate_inventory_h6(doc, ledgers, receipt):
-    errors = []
+    errors = stop_errors(receipt)
     if receipt.get("backend_refused"):
         return {"pass": False, "status": "negative", "cell": receipt.get("cell"),
                 "leg": receipt.get("leg"), "negative_reason": receipt["backend_refused"],
@@ -1528,22 +1640,35 @@ def evaluate_inventory_h6(doc, ledgers, receipt):
 OwnedProcess = N3HARNESS["OwnedProcess"]
 Reader = N3HARNESS["Reader"]
 FilePin = N3HARNESS["FilePin"]
-spawn_owned = N3HARNESS["spawn_owned"]
 cleanup_processes = N3HARNESS["cleanup_processes"]
 cleanup_cgroups = N3HARNESS["cleanup_cgroups"]
 create_cgroup = N3HARNESS["create_cgroup"]
 cgroup_of = N3HARNESS["cgroup_of"]
 process_identity = N3HARNESS["process_identity"]
 wait_capture_started = N3HARNESS["wait_capture_started"]
-n3_command = N3HARNESS["command"]
 signal_cleanup = N3HARNESS["signal_cleanup"]
 cleanup_section = N3HARNESS["cleanup_section"]
+
+
+def spawn_owned(*args, **kwargs):
+    check_dispatch()
+    return N3HARNESS["spawn_owned"](*args, **kwargs)
+
+
+def n3_command(caller, reader, fn, count, delay, phase, scope, image=0,
+               group=None, phases=None, spaced=False, acknowledgement_seconds=10):
+    if phase == "measured":
+        enter_phase("fixed-measurement")
+    check_dispatch()
+    return N3HARNESS["command"](caller, reader, fn, count, delay, phase, scope,
+        image, group, phases, spaced, remaining_seconds(acknowledgement_seconds))
 
 
 class Reader(N3HARNESS["Reader"]):
     """Private cancellable pipe reader; preserve the shared ledger interface."""
     def __init__(self, stream, path):
         self.stop = threading.Event()
+        self.budget = ACTIVE_LEG.get()
         super().__init__(stream, path)
 
     def _read(self):
@@ -1567,7 +1692,7 @@ class Reader(N3HARNESS["Reader"]):
                         self.records.append(json.loads(line[9:]))
                     self.updates.put(None)
                 while not self.stop.is_set():
-                    if not select.select([fd], [], [], 0.2)[0]:
+                    if not select.select([fd], [], [], transport_poll_seconds(self))[0]:
                         continue
                     chunk = os.read(fd, 4096)
                     if not chunk:
@@ -1587,21 +1712,44 @@ class Reader(N3HARNESS["Reader"]):
                         record(line + "\n")
                     if len(pending.encode()) > 65536:
                         raise ValueError("owned output exceeds bounded fixture limit")
-        except (ValueError, UnicodeError, OSError) as error:
+        except (ValueError, UnicodeError, OSError, TimeoutError) as error:
             self.errors.append(str(error))
         finally:
             self.updates.put(None)
 
     def finish(self):
-        self.thread.join(timeout=3)
+        try:
+            self.thread.join(timeout=remaining_seconds(3))
+        except TimeoutError:
+            self.errors.append("owned output deadline exhausted before reader cancellation")
+            self.stop.set()
+            self.thread.join(timeout=0)
+            raise
         if self.thread.is_alive():
             self.errors.append("owned output did not finish cleanly before reader cancellation")
             self.stop.set()
-            self.thread.join(timeout=1)
+            self.thread.join(timeout=remaining_seconds(1))
             raise ValueError("owned output did not finish cleanly before reader cancellation")
         if self.errors:
             raise ValueError("owned output did not finish cleanly: " + "; ".join(self.errors))
         return "".join(self.lines)
+
+    def wait(self, predicate, seconds=10):
+        deadline = wait_deadline(seconds)
+        while True:
+            remaining = remaining_until(deadline)
+            if self.errors:
+                raise ValueError("; ".join(self.errors))
+            result = predicate(self)
+            if result:
+                remaining_until(deadline)
+                return result
+            if not self.thread.is_alive():
+                raise TimeoutError("owned fixture/capture readiness acknowledgement missing")
+            try:
+                self.updates.get(timeout=min(remaining, 0.2))
+            except queue.Empty:
+                pass
 
 
 def owned_reader(readers, reader_class, *args):
@@ -1620,14 +1768,19 @@ def owned_reader(readers, reader_class, *args):
 
 def expect_line(reader, index, prefix, timeout):
     """Wait for the next line with prefix; returns (line, next_index)."""
-    deadline = time.monotonic() + timeout
+    deadline = wait_deadline(timeout)
     while True:
+        try:
+            remaining = remaining_until(deadline)
+        except TimeoutError as error:
+            raise TimeoutError(f"timed out waiting for {prefix}") from error
         if reader.errors:
             raise ValueError("; ".join(reader.errors))
         while index < len(reader.lines):
             line = reader.lines[index]
             index += 1
             if line.startswith(prefix):
+                remaining_until(deadline)
                 return line, index
         if not reader.thread.is_alive():
             # The reader may have appended its last line during the scan.
@@ -1636,9 +1789,6 @@ def expect_line(reader, index, prefix, timeout):
             if reader.errors:
                 raise ValueError("; ".join(reader.errors))
             raise EOFError(f"stream ended waiting for {prefix}")
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError(f"timed out waiting for {prefix}")
         try:
             reader.updates.get(timeout=min(remaining, 0.5))
         except queue.Empty:
@@ -1731,8 +1881,13 @@ class BDriver:
         absent = self.leg_dir / "must-not-exist"
         argv = [str(before_pin.path), str(provider_pin.path), str(after_pin.path),
                str(absent), str(os.getpid()), str(token), mode, str(measured), str(delay_ms)]
-        if mode != "1":
-            argv.append("1")  # opt-in real successor W commands; legacy mode1 unchanged
+        argv.append("0" if mode == "1" else "1")
+        budget = ACTIVE_LEG.get() or LegBudget()
+        argv.extend(str(value) for value in (
+            budget.deadline_ns, budget.deadlines["setup", 0],
+            int(budget.budgets["successor-recovery"] * 1000),
+            int(budget.budgets["fixed-measurement"] * 1000),
+            int((budget.budgets["normal-stop"] + budget.budgets["cleanup"]) * 1000)))
         self.token = token
         self.owned = spawn_owned(
             owners, argv, uid, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -1751,6 +1906,7 @@ class BDriver:
         return line.rstrip("\n")
 
     def send(self, byte, name):
+        check_dispatch()
         self.owned.verify()
         self.stamps[name] = monotonic_ns()  # lower bound before a fast child can read
         self.owned.popen.stdin.write(byte)
@@ -1797,6 +1953,7 @@ class BDriver:
         return done
 
     def do_exec(self):
+        enter_phase("successor-recovery", key=1)
         self.send("X", "X")
         if self.mode == "1":
             failed = self.expect("EXEC_FAILED", timeout=10)
@@ -1829,6 +1986,7 @@ class BDriver:
         return phase
 
     def post_exec(self):
+        enter_phase("fixed-measurement")
         self.send("P", "P")
         self.expect("POST_BODY", timeout=10)
         self.send("R", "R")
@@ -1840,6 +1998,7 @@ class BDriver:
         return done
 
     def post_fail(self):
+        enter_phase("fixed-measurement")
         self.send("R", "Rpost")
         done = self.expect("DONE", timeout=10)
         fields = done.split()
@@ -1847,8 +2006,9 @@ class BDriver:
         return done
 
     def finish(self):
+        enter_phase("cleanup")
         self.send("F", "F")
-        rc = self.owned.popen.wait(timeout=10)
+        rc = wait_process(self.owned.popen, 10)
         assert rc == 0, rc
         return rc
 
@@ -1980,11 +2140,12 @@ def init_token(workload_dir, uid, gid, label):
                       "log.level = ERROR\n")
     config.chmod(0o644)
     env = dict(os.environ, SOFTHSM2_CONF=str(config))
+    check_dispatch()
     proc = subprocess.run(
         ["softhsm2-util", "--init-token", "--free", "--label", label,
          "--so-pin", "5678", "--pin", "1234"],
         env=env, user=uid, group=gid, extra_groups=[], text=True,
-        capture_output=True, timeout=30)
+        capture_output=True, timeout=remaining_seconds(30))
     if proc.returncode != 0:
         raise SetupError(f"token init failed: {proc.stderr[-1000:]}")
     return env
@@ -1996,10 +2157,11 @@ def build_manifest(discover_pin, module_path, out_path, env, uid, gid):
     out_path = Path(out_path)
     if out_path.exists():
         raise SetupError(f"manifest path already exists: {out_path}")
+    check_dispatch()
     proc = subprocess.run(
         [str(discover_pin.path), "--module", str(module_path), "-o", str(out_path)],
         env=env, user=uid, group=gid, extra_groups=[], text=True,
-        capture_output=True, timeout=180)
+        capture_output=True, timeout=remaining_seconds(180))
     if proc.returncode != 0 or not out_path.is_file():
         raise SetupError(f"manifest build failed: {proc.stderr[-1000:]}")
     manifest = json.loads(out_path.read_text())
@@ -2076,6 +2238,7 @@ class PtyCapture:
     """Own and drain one PTY master; Linux EIO after slave close is EOF."""
     def __init__(self, master, path):
         self.master, self.path = master, Path(path)
+        self.budget = ACTIVE_LEG.get()
         self.lines, self.frames, self.errors = [], [], []
         self.updates = queue.Queue()
         self.stop = threading.Event()
@@ -2089,7 +2252,7 @@ class PtyCapture:
         try:
             with self.path.open("w", encoding="utf-8") as output:
                 while not self.stop.is_set():
-                    if not select.select([self.master], [], [], 0.2)[0]:
+                    if not select.select([self.master], [], [], transport_poll_seconds(self))[0]:
                         continue
                     try:
                         chunk = os.read(self.master, 4096)
@@ -2116,7 +2279,7 @@ class PtyCapture:
                 decoder.decode(b"", final=True)
                 if not self.errors:
                     self.frames = parse_live_frames(text, final=True)
-        except (ValueError, UnicodeError, OSError) as error:
+        except (ValueError, UnicodeError, OSError, TimeoutError) as error:
             self.errors.append(str(error))
         finally:
             os.close(self.master)
@@ -2124,11 +2287,17 @@ class PtyCapture:
             self.updates.put(None)
 
     def finish(self, timeout=5):
-        self.thread.join(timeout)
+        try:
+            self.thread.join(remaining_seconds(timeout))
+        except TimeoutError:
+            self.errors.append("owned PTY deadline exhausted before reader cancellation")
+            self.stop.set()
+            self.thread.join(0)
+            raise
         if self.thread.is_alive():
             self.errors.append("owned PTY reader did not reach EOF")
             self.stop.set()
-            self.thread.join(1)
+            self.thread.join(remaining_seconds(1))
             raise TimeoutError("owned PTY reader did not reach EOF")
         if self.errors:
             raise ValueError("; ".join(self.errors))
@@ -2136,16 +2305,13 @@ class PtyCapture:
 
 def _output_wait(capture, predicate, deadline_ns):
     while True:
-        if monotonic_ns() >= deadline_ns:
-            raise TimeoutError("successor public proof deadline exhausted")
+        remaining = remaining_until(deadline_ns)
         if capture.errors:
             raise SetupError("; ".join(capture.errors))
         result = predicate()
         if result is not None:
+            remaining_until(deadline_ns)
             return result
-        remaining = (deadline_ns - monotonic_ns()) / 1e9
-        if remaining <= 0:
-            raise TimeoutError("successor public proof deadline exhausted")
         if not capture.thread.is_alive():
             raise EOFError("observer stream ended before successor public proof")
         try:
@@ -2164,7 +2330,8 @@ def warm_successor(capture, image, attempt, mode="trace", marker_fn="C_GetInfo",
     if mode not in ("trace", "profile", "metrics") or not 1 <= max_attempts <= 40 or not 0 < timeout <= 20:
         raise ValueError("invalid successor warm-up budget")
     started = monotonic_ns()
-    deadline = started + int(timeout * 1e9)
+    enter_phase("successor-recovery", key=image["image"])
+    deadline = wait_deadline(timeout)
     baseline = None
     if mode == "trace":
         cursor = len(capture.lines) if output_cursor is None else output_cursor
@@ -2173,10 +2340,9 @@ def warm_successor(capture, image, attempt, mode="trace", marker_fn="C_GetInfo",
         cursor = baseline["cursor"]
     phases = []
     for seq in range(1, max_attempts + 1):
-        remaining = (deadline - monotonic_ns()) / 1e9
-        if remaining <= 0:
-            raise TimeoutError("successor warm-up deadline exhausted")
+        remaining = remaining_until(deadline)
         phases.append(attempt(seq, remaining))
+        remaining_until(deadline)
         # A bounded observation interval permits another real attempt when
         # discovery is still cold; it never substitutes a sleep for proof.
         attempt_deadline = min(deadline, monotonic_ns() + 500_000_000)
@@ -2221,7 +2387,7 @@ def warm_caller(capture, caller, stdout, image, phases, mode="trace", group=None
 def drain_trace_phase(capture, caller, stdout, fn, count, delay, phase, image, phases, group=None):
     cursor = len(capture.lines)
     n3_command(caller, stdout, fn, count, delay, phase, "selected", image, group, phases)
-    deadline = monotonic_ns() + 10_000_000_000
+    deadline = wait_deadline(10)
     def population():
         matched = [match for line in capture.lines[cursor:]
                    if (match := ROW.fullmatch(line.strip())) and int(match["pid"]) == caller.pid
@@ -2284,22 +2450,33 @@ def observer_ready(owned, errors, backend, timeout=20):
     raise SetupError(f"observer never reached capturing (rc={rc}): {tail[-1000:]}")
 
 
-def stop_observer(owned, limit_seconds=90):
-    """SIGINT stop; returns (rc, stopped_ns, latency_seconds).
-
-    Detach runs ~15 links/s on this host (139 links after a SoftHSM
-    attach), so a clean stop takes 9-15 s; the kill fallback stays as
-    the finite backstop.
-    """
+def stop_observer(owned, limit_seconds=OBSERVER_STOP_SECONDS):
+    """One declared normal-stop limit; forced cleanup can never pass."""
+    enter_phase("normal-stop")
     begin = monotonic_ns()
+    deadline = wait_deadline(limit_seconds)
+    check_dispatch()
     owned.send(signal.SIGINT)
+    forced, cleanup_latency = False, 0
     try:
-        rc = owned.popen.wait(timeout=limit_seconds + 5)
-    except subprocess.TimeoutExpired:
-        owned.popen.kill()
-        rc = owned.popen.wait(timeout=5)
+        rc = wait_process(owned.popen, remaining_until(deadline))
+        normal_end = monotonic_ns()
+        forced = normal_end > deadline
+    except (subprocess.TimeoutExpired, TimeoutError):
+        forced = True
+        normal_end = monotonic_ns()
+    if forced:
+        enter_phase("cleanup")
+        cleanup_started = monotonic_ns()
+        owned.send(signal.SIGKILL)
+        rc = wait_process(owned.popen, CLEANUP_SECONDS)
+        cleanup_latency = (monotonic_ns() - cleanup_started) / 1e9
     stopped = monotonic_ns()
-    return rc, stopped, (stopped - begin) / 1e9
+    latency = (normal_end - begin) / 1e9
+    owned.stop_receipt = {"stop_limit_seconds": limit_seconds, "stop_latency_seconds": latency,
+                          "forced_cleanup": forced, "cleanup_limit_seconds": CLEANUP_SECONDS,
+                          "cleanup_latency_seconds": cleanup_latency}
+    return rc, stopped, latency
 
 
 def spawn_caller(owners, readers, leg_dir, caller_pin, provider_pin, uid, gid, env,
@@ -2320,6 +2497,8 @@ def caller_exec(caller, stdout, images, method, target_pin):
     """Drive one caller exec/thread-exec; returns (request, receipt, t0, t1)."""
     if method not in ("exec", "thread-exec"):
         raise SetupError(f"unknown exec method {method}")
+    enter_phase("successor-recovery", key=len(images))
+    check_dispatch()
     caller.verify()
     t0 = monotonic_ns()
     caller.popen.stdin.write(f"{method} {target_pin.path}\n")
@@ -2340,11 +2519,13 @@ def caller_exec(caller, stdout, images, method, target_pin):
 
 
 def stop_caller(caller, stdout, image, timeout=10):
+    enter_phase("cleanup")
+    check_dispatch()
     caller.verify()
     caller.popen.stdin.write("stop\n")
     caller.popen.stdin.flush()
     stdout.record("ack", image, "done", seconds=timeout)
-    return caller.popen.wait(timeout=timeout)
+    return wait_process(caller.popen, timeout)
 
 
 def spawn_ledger(owners, readers, leg_dir, argv, env, uid, gid, tag):
@@ -2365,8 +2546,9 @@ def wait_usage_armed(jsonl_path, wants, timeout=90):
     admitted caller_event identity, then edge_observed coverage states.
     Returns the arming evidence; raises SetupError on timeout.
     """
-    deadline = time.monotonic() + timeout
+    deadline = wait_deadline(timeout)
     while True:
+        remaining_until(deadline)
         try:
             text = Path(jsonl_path).read_text()
         except FileNotFoundError:
@@ -2406,9 +2588,9 @@ def wait_usage_armed(jsonl_path, wants, timeout=90):
                    if len(armed.get((pid, exe), set())) < count]
         if not missing:
             return {f"{pid} {exe}": sorted(modules) for (pid, exe), modules in armed.items()}
-        if time.monotonic() >= deadline:
+        if monotonic_ns() >= deadline:
             raise SetupError(f"usage never armed for {missing}")
-        time.sleep(0.5)
+        pause_until(deadline, 0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -2483,7 +2665,7 @@ def reap_traced_child(owner):
         signal.pidfd_send_signal(owner.pidfd, signal.SIGKILL)
     except ProcessLookupError:
         pass
-    deadline = time.monotonic() + 3  # existing bounded SIGKILL reap allowance
+    deadline = wait_deadline(3)
     while True:
         try:
             pid, status = os.waitpid(owner.pid, os.WNOHANG | 0x40000000)  # __WALL
@@ -2494,9 +2676,22 @@ def reap_traced_child(owner):
         if pid and (os.WIFEXITED(status) or os.WIFSIGNALED(status)):
             owner.popen.returncode = os.waitstatus_to_exitcode(status)
             return
-        if time.monotonic() >= deadline:
-            raise TimeoutError("traced owned child did not exit after bounded SIGKILL")
-        time.sleep(0.01)
+        pause_until(deadline, 0.01)
+
+
+def terminate_owned(owner):
+    """Keep the shared custody checks, with this leg's remaining cleanup time."""
+    if owner.popen.poll() is not None:
+        return
+    try:
+        owner.send(signal.SIGTERM)
+        try:
+            wait_process(owner.popen, 2)
+        except (subprocess.TimeoutExpired, TimeoutError):
+            owner.send(signal.SIGKILL)
+            wait_process(owner.popen, 3)
+    except (ProcessLookupError, FileNotFoundError):
+        pass
 
 
 def wait_terminal_child(owner):
@@ -2514,11 +2709,29 @@ def wait_terminal_child(owner):
 
 
 def cleanup_leg_resources(ctx, close_pins=True):
+    # The final case backstop has no live leg context. It still gets one
+    # finite cleanup allowance, shared by every remaining child and reader.
+    token = None
+    if ACTIVE_LEG.get() is None:
+        token = ACTIVE_LEG.set(LegBudget())
+    try:
+        return _cleanup_leg_resources(ctx, close_pins)
+    finally:
+        if token is not None:
+            ACTIVE_LEG.reset(token)
+
+
+def _cleanup_leg_resources(ctx, close_pins=True):
     """Reap before settling readers/FDs and removing corresponding owned groups."""
     case = getattr(ctx, "case", ctx)
     failures = []
     with cleanup_section():
         owners, readers, groups = list(ctx.owners), list(ctx.readers), list(ctx.groups)
+        if owners or readers:
+            try:
+                enter_phase("cleanup")
+            except TimeoutError as error:
+                failures.append(f"cleanup budget: {error}")
         case.cleanup_totals["readers"] += len(readers)
         for owner in list(ctx.traced):
             try:
@@ -2528,7 +2741,7 @@ def cleanup_leg_resources(ctx, close_pins=True):
         pending = []
         for owner in owners:
             try:
-                N3HARNESS["terminate"](owner)
+                terminate_owned(owner)
             except Exception as error:
                 failures.append(f"process {owner.pid}: {type(error).__name__}: {error}")
             try:
@@ -2588,7 +2801,8 @@ def cleanup_leg_resources(ctx, close_pins=True):
         # Keep unproven children and their corresponding groups held for the
         # final backstop; cleanup failure already prevents another live leg.
         ctx.owners[:] = pending
-        ctx.readers.clear()
+        ctx.readers[:] = [reader for reader in readers
+                         if getattr(reader, "thread", None) is not None and reader.thread.is_alive()]
         if failures:
             case.cleanup_failed = True
             case.cleanup_errors.extend(failures)
@@ -2606,11 +2820,15 @@ class LegContext:
         return getattr(self.parent, name)
 
 
-def owned_leg(function):
+def owned_leg(function=None, *, inventory=False):
+    if function is None:
+        return lambda target: owned_leg(target, inventory=inventory)
     @wraps(function)
     def run(ctx, *args, **kwargs):
         with cleanup_section():
             scope = LegContext(ctx)
+            scope.budget = LegBudget(inventory=inventory)
+        token = ACTIVE_LEG.set(scope.budget)
         primary = None
         try:
             result = function(scope, *args, **kwargs)
@@ -2620,13 +2838,16 @@ def owned_leg(function):
             raise
         finally:
             try:
-                cleanup_leg_resources(scope)
-            except LegCleanupError as error:
-                if primary is not None:
-                    raise LegCleanupError(f"{error}; primary {type(primary).__name__}: {primary}") from primary
-                raise
-            if primary is None and isinstance(result, dict):
-                scope.case.completed_results.append(result)
+                try:
+                    cleanup_leg_resources(scope)
+                except LegCleanupError as error:
+                    if primary is not None:
+                        raise LegCleanupError(f"{error}; primary {type(primary).__name__}: {primary}") from primary
+                    raise
+                if primary is None and isinstance(result, dict):
+                    scope.case.completed_results.append(result)
+            finally:
+                ACTIVE_LEG.reset(token)
     return run
 
 
@@ -2718,7 +2939,7 @@ def run_pid_caller_leg(ctx, cell, backend, observer_kind, leg_dir, same_path, pr
         "observer_rc": obs_rc, "caller_rc": caller_rc,
         "observer_started_ns": started, "observer_ready_ns": ready,
         "observer_stopped_ns": stopped, "scope_created_ns": ctx.scope_created_ns,
-        "stop_latency_seconds": latency, "stop_limit_seconds": 60,
+        **stop_receipt(owned, latency),
         "pid_namespace": caller.identity["pid_namespace"],
         "time_namespace": caller.identity["time_namespace"],
         "measured": {"label": "stable", "t0": measured["t0"], "t1": measured["t1"],
@@ -2790,7 +3011,7 @@ def run_b_leg(ctx, cell, backend, observer_kind, leg_dir, mode, measured=25, del
         ready = observer_ready(owned, errors, backend)
     except BackendRefused as refused:
         driver.owned.popen.kill()
-        driver.owned.popen.wait(timeout=5)
+        wait_process(driver.owned.popen, 5)
         receipt = {"cell": cell, "leg": f"{observer_kind}/{backend}",
                    "backend_refused": str(refused)}
         result = (evaluate_trace_h6("", [], receipt) if observer_kind == "trace"
@@ -2865,7 +3086,7 @@ def run_b_leg(ctx, cell, backend, observer_kind, leg_dir, mode, measured=25, del
         "observer_rc": obs_rc, "caller_rc": caller_rc,
         "observer_started_ns": started, "observer_ready_ns": ready,
         "observer_stopped_ns": stopped, "scope_created_ns": ctx.scope_created_ns,
-        "stop_latency_seconds": latency, "stop_limit_seconds": 60,
+        **stop_receipt(owned, latency),
         "pid_namespace": driver.owned.identity["pid_namespace"],
         "time_namespace": driver.owned.identity["time_namespace"],
         "measured": {"label": "stable", "t0": post_phase["t0"], "t1": post_phase["t1"],
@@ -2991,7 +3212,7 @@ def run_rapid_chain(ctx, cell_dir, backend):
         "observer_rc": obs_rc, "caller_rc": caller_rc,
         "observer_started_ns": started, "observer_ready_ns": ready,
         "observer_stopped_ns": stopped, "scope_created_ns": ctx.scope_created_ns,
-        "stop_latency_seconds": latency, "stop_limit_seconds": 60,
+        **stop_receipt(owned, latency),
         "pid_namespace": caller.identity["pid_namespace"],
         "time_namespace": caller.identity["time_namespace"],
         "measured": {"label": "stable", "t0": measured["t0"], "t1": measured["t1"],
@@ -3064,7 +3285,7 @@ def run_reuse_control(ctx, leg_dir, backend, env, dead_pid, image_pin):
         "observer_rc": obs_rc, "caller_rc": caller_rc,
         "observer_started_ns": started, "observer_ready_ns": ready,
         "observer_stopped_ns": stopped, "scope_created_ns": ctx.scope_created_ns,
-        "stop_latency_seconds": latency, "stop_limit_seconds": 60,
+        **stop_receipt(owned, latency),
         "pid_namespace": caller.identity["pid_namespace"],
         "time_namespace": caller.identity["time_namespace"],
         "measured": {"label": "host", "t0": measured["t0"], "t1": measured["t1"],
@@ -3093,11 +3314,27 @@ def finish_group_death_observer(owned, death_ns, limit_seconds=60):
     if owned.popen.poll() is not None:
         raise SetupError("observer already exited at the group-death check; "
                          "exit ordering is unproven")
-    remaining = max(0, (death_ns + int(limit_seconds * 1e9) - monotonic_ns()) / 1e9)
+    enter_phase("normal-stop")
+    deadline = death_ns + int(limit_seconds * 1e9)
     try:
-        rc = owned.popen.wait(timeout=remaining)
-    except subprocess.TimeoutExpired:
-        rc, stopped, latency = stop_observer(owned)
+        rc = wait_process(owned.popen, remaining_until(deadline))
+    except (subprocess.TimeoutExpired, TimeoutError):
+        # The autonomous-exit allowance is exhausted. Any controller stop
+        # belongs to cleanup, with no second normal-stop allowance.
+        enter_phase("cleanup")
+        cleanup_started = monotonic_ns()
+        owned.send(signal.SIGINT)
+        try:
+            rc = wait_process(owned.popen, 2)
+        except (subprocess.TimeoutExpired, TimeoutError):
+            owned.send(signal.SIGKILL)
+            rc = wait_process(owned.popen, 3)
+        stopped = monotonic_ns()
+        latency = (cleanup_started - death_ns) / 1e9
+        owned.stop_receipt = {"stop_limit_seconds": limit_seconds,
+            "stop_latency_seconds": latency, "forced_cleanup": True,
+            "cleanup_limit_seconds": CLEANUP_SECONDS,
+            "cleanup_latency_seconds": (stopped - cleanup_started) / 1e9}
         return {"rc": rc, "stopped_ns": stopped, "latency_seconds": latency,
                 "self_ended": False, "exited_ns": None,
                 "controller_stop": "SIGINT/kill-fallback"}
@@ -3155,7 +3392,7 @@ def run_group_death_leg(ctx, leg_dir, backend, env, image_pin):
     dead_pid = caller.pid
     kill_ns = monotonic_ns()
     os.killpg(caller.pid, signal.SIGKILL)
-    caller_rc = caller.popen.wait(timeout=10)
+    caller_rc = wait_process(caller.popen, 10)
     proc_gone = not (Path("/proc") / str(dead_pid)).exists()
     death_ns = monotonic_ns()
     observer_finish = finish_group_death_observer(
@@ -3164,7 +3401,7 @@ def run_group_death_leg(ctx, leg_dir, backend, env, image_pin):
                                observer_finish["latency_seconds"])
     deadline = death_ns + GROUP_DEATH_DWELL_NS
     while monotonic_ns() < deadline:
-        time.sleep(0.05)
+        pause_until(deadline, 0.05)
     dwell_end = monotonic_ns()
     finish_readers([stdout, capture, errors])
     ledger = list(stdout.records)
@@ -3178,7 +3415,7 @@ def run_group_death_leg(ctx, leg_dir, backend, env, image_pin):
         "observer_rc": obs_rc, "caller_rc": caller_rc,
         "observer_started_ns": started, "observer_ready_ns": ready,
         "observer_stopped_ns": stopped, "scope_created_ns": ctx.scope_created_ns,
-        "stop_latency_seconds": latency, "stop_limit_seconds": 60,
+        **stop_receipt(owned, latency),
         "pid_namespace": caller.identity["pid_namespace"],
         "time_namespace": caller.identity["time_namespace"],
         "measured": {"label": "pre-death", "t0": measured["t0"], "t1": measured["t1"],
@@ -3244,6 +3481,7 @@ def run_cgroup_r2(ctx, cell_dir, backend):
         write_json(leg_dir / "result.json", result)
         return result
     phases = []
+    enter_phase("fixed-measurement")
     n3_command(caller, stdout, "C_GenerateRandom", 3, 100, "warm", "selected",
                0, selected, phases)
     t_out = monotonic_ns()
@@ -3277,7 +3515,7 @@ def run_cgroup_r2(ctx, cell_dir, backend):
         "observer_rc": obs_rc, "caller_rc": caller_rc,
         "observer_started_ns": started, "observer_ready_ns": ready,
         "observer_stopped_ns": stopped, "scope_created_ns": ctx.scope_created_ns,
-        "stop_latency_seconds": latency, "stop_limit_seconds": 60,
+        **stop_receipt(owned, latency),
         "pid_namespace": caller.identity["pid_namespace"],
         "time_namespace": caller.identity["time_namespace"],
         "measured": {"label": "pre-replacement stable", "t0": warmup["t0"], "t1": warmup["t1"],
@@ -3344,8 +3582,10 @@ def seize_until_exec(pid, ctx, owner):
 
 def wait_exec_stop(pid, timeout=120):
     """Wait for the TRACEEXEC trap-stop; returns the stop time (ns)."""
-    deadline = time.monotonic() + timeout
+    enter_phase("successor-recovery", key=pid)
+    deadline = wait_deadline(timeout)
     while True:
+        remaining_until(deadline)
         done_pid, status = os.waitpid(pid, os.WNOHANG)
         if done_pid == pid:
             if os.WIFEXITED(status) or os.WIFSIGNALED(status):
@@ -3354,12 +3594,13 @@ def wait_exec_stop(pid, timeout=120):
                 if (status >> 16) == _PTRACE_EVENT_EXEC:
                     return monotonic_ns()
                 _ptrace(_PTRACE_CONT, pid)  # unrelated trap: resume
-        if time.monotonic() >= deadline:
+        if monotonic_ns() >= deadline:
             raise SetupError(f"owned pid {pid} never reached its exec stop")
-        time.sleep(0.01)
+        pause_until(deadline, 0.01)
 
 
 def ptrace_continue(pid):
+    check_dispatch()
     _ptrace(_PTRACE_CONT, pid)
 
 
@@ -3371,8 +3612,9 @@ def ptrace_detach(pid, ctx):
 
 def wait_caller_admitted(jsonl_path, pid, exe, timeout=90):
     """Wait for caller_event/admitted for (pid, exe) in an inventory event log."""
-    deadline = time.monotonic() + timeout
+    deadline = wait_deadline(timeout)
     while True:
+        remaining_until(deadline)
         try:
             text = Path(jsonl_path).read_text()
         except FileNotFoundError:
@@ -3393,15 +3635,16 @@ def wait_caller_admitted(jsonl_path, pid, exe, timeout=90):
                 return {"caller": event.get("caller"),
                         "incarnation": caller.get("incarnation"),
                         "at_ns": record.get("at_ns")}
-        if time.monotonic() >= deadline:
+        if monotonic_ns() >= deadline:
             raise SetupError(f"caller ({pid}, {exe}) never admitted")
-        time.sleep(0.2)
+        pause_until(deadline, 0.2)
 
 
 def wait_passes(jsonl_path, count, timeout=120):
     """Wait until the event log holds >= count pass_committed records."""
-    deadline = time.monotonic() + timeout
+    deadline = wait_deadline(timeout)
     while True:
+        remaining_until(deadline)
         try:
             text = Path(jsonl_path).read_text()
         except FileNotFoundError:
@@ -3410,13 +3653,14 @@ def wait_passes(jsonl_path, count, timeout=120):
                      if '"pass_committed"' in line)
         if passes >= count:
             return passes
-        if time.monotonic() >= deadline:
+        if monotonic_ns() >= deadline:
             raise SetupError(f"only {passes}/{count} inventory passes committed")
-        time.sleep(0.5)
+        pause_until(deadline, 0.5)
 
 
 def move_and_verify(cgroup, caller, moves, note):
     """Move an owned caller; record the verified membership interval edge."""
+    check_dispatch()
     cgroup.move(caller)
     actual = cgroup_of(caller.pid)
     moves.append({"t": monotonic_ns(), "cgroup": actual, "note": note})
@@ -3546,6 +3790,7 @@ def run_cgroup_r1(ctx, cell_dir, backend):
     assert cgroup_of(caller.pid).endswith("selected-renamed")
     # The N3 group object still points at the old path: verify by raw path.
     begin = monotonic_ns()
+    check_dispatch()
     caller.popen.stdin.write("calls C_GetSessionInfo 3 100 renamed selected\n")
     caller.popen.stdin.flush()
     stdout.record("ack", 1, "renamed")
@@ -3573,7 +3818,7 @@ def run_cgroup_r1(ctx, cell_dir, backend):
         "observer_rc": obs_rc, "caller_rc": caller_rc,
         "observer_started_ns": started, "observer_ready_ns": ready,
         "observer_stopped_ns": stopped, "scope_created_ns": ctx.scope_created_ns,
-        "stop_latency_seconds": latency, "stop_limit_seconds": 60,
+        **stop_receipt(owned, latency),
         "pid_namespace": caller.identity["pid_namespace"],
         "time_namespace": caller.identity["time_namespace"],
         "measured": {"label": "post-reentry", "t0": measured["t0"], "t1": measured["t1"],
@@ -3635,7 +3880,7 @@ def counted_totals(batches, started_ns):
     return totals
 
 
-@owned_leg
+@owned_leg(inventory=True)
 def run_cgroup_inventory_r5(ctx, cell_dir, backend):
     """R5: post-reentry S1 inventory; successor frozen until admission proof."""
     leg_dir = Path(cell_dir) / backend / "inventory"
@@ -3691,6 +3936,8 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
         write_json(leg_dir / "result.json", result)
         return result
     wait_passes(log_path, 2)
+    enter_phase("fixed-measurement")
+    check_dispatch()
     gate_x.touch()
     gate_s.touch()
     out_x.wait(lambda r: any(line.startswith("DONE ") and " gen=0 " in line
@@ -3701,17 +3948,19 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
     admitted = wait_caller_admitted(log_path, x_pid, str(ledger2))
     t_in = monotonic_ns()
     move_and_verify(sub, owned_x, moves, "X-descendant-reentry")
+    enter_phase("fixed-measurement")
     ptrace_continue(x_pid)
     out_x.wait(lambda r: any(line.startswith("DONE ") and " gen=1 " in line
                              for line in r.lines), 180)
     out_s.wait(lambda r: any(line.startswith("DONE ") for line in r.lines), 60)
     settled = wait_passes(log_path, wait_passes(log_path, 1) + 2)
     obs_rc, stopped, latency = stop_inventory(owned)
+    enter_phase("cleanup")
     ptrace_detach(x_pid, ctx)
     owned_x.popen.send_signal(signal.SIGINT)
     owned_s.popen.send_signal(signal.SIGINT)
-    x_rc = owned_x.popen.wait(timeout=15)
-    s_rc = owned_s.popen.wait(timeout=15)
+    x_rc = wait_process(owned_x.popen, 15)
+    s_rc = wait_process(owned_s.popen, 15)
     finish_readers([out_x, err_x, out_s, err_s, capture, errors])
     ledgers = {"RX": parse_inv_ledger("".join(out_x.lines)),
                "RS0": parse_inv_ledger("".join(out_s.lines))}
@@ -3733,6 +3982,7 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
         "moves": moves,
         "observer_started_ns": started, "observer_ready_ns": ready,
         "observer_stopped_ns": stopped, "observer_rc": obs_rc,
+        **stop_receipt(owned, latency, INVENTORY_STOP_SECONDS),
         "manual_rebind": False, "s1_expected": True,
         "providers": {"A": provider_entry(provider.path)},
         "expected_incarnations": {
@@ -3766,7 +4016,7 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
     return result
 
 
-@owned_leg
+@owned_leg(inventory=True)
 def run_system_mixed(ctx, cell_dir, backend):
     """system-mixed: execing + sibling same-file callers, attested + count-only.
 
@@ -3837,6 +4087,8 @@ def run_system_mixed(ctx, cell_dir, backend):
         write_json(leg_dir / "result.json", result)
         return result
     wait_passes(log_path, 2)
+    enter_phase("fixed-measurement")
+    check_dispatch()
     gate_e.touch()
     gate_s.touch()
     gate_f.touch()
@@ -3844,6 +4096,7 @@ def run_system_mixed(ctx, cell_dir, backend):
                              for line in r.lines), 120)
     exec_stop_ns = wait_exec_stop(e_pid)
     admitted = wait_caller_admitted(log_path, e_pid, str(ledger2))
+    enter_phase("fixed-measurement")
     ptrace_continue(e_pid)
     out_e.wait(lambda r: any(line.startswith("DONE ") and " gen=1 " in line
                              for line in r.lines), 180)
@@ -3851,12 +4104,13 @@ def run_system_mixed(ctx, cell_dir, backend):
     out_f.wait(lambda r: any(line.startswith("DONE ") for line in r.lines), 120)
     settled = wait_passes(log_path, wait_passes(log_path, 1) + 2)
     obs_rc, stopped, latency = stop_inventory(owned)
+    enter_phase("cleanup")
     ptrace_detach(e_pid, ctx)
     for owned_p in (owned_e, owned_s, owned_f):
         owned_p.popen.send_signal(signal.SIGINT)
-    e_rc = owned_e.popen.wait(timeout=15)
-    s_rc = owned_s.popen.wait(timeout=15)
-    f_rc = owned_f.popen.wait(timeout=15)
+    e_rc = wait_process(owned_e.popen, 15)
+    s_rc = wait_process(owned_s.popen, 15)
+    f_rc = wait_process(owned_f.popen, 15)
     finish_readers([out_e, err_e, out_s, err_s, out_f, err_f, capture, errors])
     ledgers = {"MX": parse_inv_ledger("".join(out_e.lines)),
                "MS": parse_inv_ledger("".join(out_s.lines)),
@@ -3874,6 +4128,7 @@ def run_system_mixed(ctx, cell_dir, backend):
         "owned_pids": [e_pid, s_pid, f_pid], "foreign_pids": [f_pid],
         "observer_started_ns": started, "observer_ready_ns": ready,
         "observer_stopped_ns": stopped, "observer_rc": obs_rc,
+        **stop_receipt(owned, latency, INVENTORY_STOP_SECONDS),
         "manual_rebind": False, "s1_expected": True,
         "providers": {"A": provider_entry(provider_a.path),
                       "B": provider_entry(provider_b)},
@@ -4092,8 +4347,9 @@ def spawn_inventory(ctx, leg_dir, scope_args, module_args, manifest_args,
 
 def wait_inventory_ready(owned, errors, log_path, backend, timeout=120):
     """Wait for the first committed pass; BackendRefused on explicit refusal."""
-    deadline = time.monotonic() + timeout
+    deadline = wait_deadline(timeout)
     while True:
+        remaining_until(deadline)
         try:
             text = Path(log_path).read_text()
         except FileNotFoundError:
@@ -4107,22 +4363,13 @@ def wait_inventory_ready(owned, errors, log_path, backend, timeout=120):
                 raise BackendRefused(f"{backend}: {tail.strip()[-500:]}")
             raise SetupError(f"inventory observer exited rc={rc} before first pass: "
                              f"{tail[-1000:]}")
-        if time.monotonic() >= deadline:
+        if monotonic_ns() >= deadline:
             raise SetupError("inventory observer never committed a pass")
-        time.sleep(0.5)
+        pause_until(deadline, 0.5)
 
 
-def stop_inventory(owned, limit_seconds=30):
-    """SIGINT stop; returns (rc, stopped_ns, latency_seconds)."""
-    begin = monotonic_ns()
-    owned.send(signal.SIGINT)
-    try:
-        rc = owned.popen.wait(timeout=limit_seconds + 10)
-    except subprocess.TimeoutExpired:
-        owned.popen.kill()
-        rc = owned.popen.wait(timeout=10)
-    stopped = monotonic_ns()
-    return rc, stopped, (stopped - begin) / 1e9
+def stop_inventory(owned, limit_seconds=INVENTORY_STOP_SECONDS):
+    return stop_observer(owned, limit_seconds)
 
 
 def wait_ledger_line(reader, prefix, timeout=120):
@@ -4188,7 +4435,7 @@ def run_cgroup_stop_before(ctx, cell_dir, backend):
                "observer_rc": obs_rc, "caller_rc": caller_rc,
                "observer_started_ns": started, "observer_ready_ns": ready,
                "observer_stopped_ns": stopped,
-               "stop_latency_seconds": latency, "stop_limit_seconds": 60,
+               **stop_receipt(owned, latency),
                "expect_empty": True}
     result = evaluate_trace_h6("".join(capture.lines), [], receipt,
                                (leg_dir / "trace.file.txt").read_text())
@@ -4256,6 +4503,7 @@ def run_cgroup_stop_during(ctx, cell_dir, backend):
                1, sub, phases)
     obs_rc, stopped, latency = stop_observer(owned)
     begin = monotonic_ns()
+    check_dispatch()
     caller.popen.stdin.write("calls C_GetSessionInfo 1 0 still-post selected\n")
     caller.popen.stdin.flush()
     stdout.record("ack", 1, "still-post")
@@ -4281,7 +4529,7 @@ def run_cgroup_stop_during(ctx, cell_dir, backend):
         "observer_rc": obs_rc, "caller_rc": caller_rc,
         "observer_started_ns": started, "observer_ready_ns": ready,
         "observer_stopped_ns": stopped, "scope_created_ns": ctx.scope_created_ns,
-        "stop_latency_seconds": latency, "stop_limit_seconds": 60,
+        **stop_receipt(owned, latency),
         "pid_namespace": caller.identity["pid_namespace"],
         "time_namespace": caller.identity["time_namespace"],
         "measured": {"label": "post-reentry", "t0": measured["t0"], "t1": measured["t1"],

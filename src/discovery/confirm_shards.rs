@@ -1387,7 +1387,8 @@ mod kernel_promotion_tests {
     use crate::discovery::kernel_identity::{ProofDecision, RunFailure};
     use crate::discovery::scan::CaptureWorkBudget;
     use crate::discovery::sweep_attribution::{
-        ConfirmIo, KnownKeyIndex, ObjectChecks, RANGE_NOT_MAPPED, ReservationOwner, SegmentPolicy,
+        AttributionLoss, ConfirmIo, KnownKeyIndex, ObjectChecks, RANGE_NOT_MAPPED,
+        ReservationOwner, SegmentPolicy,
     };
     use p11scope_manifest::maps::{Device, MapEntry, ObjectKey};
     use std::collections::{BTreeMap, BTreeSet};
@@ -1489,11 +1490,23 @@ mod kernel_promotion_tests {
         file: std::fs::File,
     }
 
+    /// One pin touch in prepare → prove → finish order, shared by the
+    /// scripted I/O and the scripted hook so the test pins the whole
+    /// sequence to a single pin identity.
+    #[derive(Debug, PartialEq, Eq)]
+    enum PinEvent {
+        Open { pid: u32, fd: i32 },
+        Prove { pid: u32, fd: Option<i32> },
+        StillSame { fd: i32 },
+        StartTime { fd: i32 },
+    }
+
     /// The scripted `/proc`: libc ranges read stale (remapped since the
     /// sweep), provider ranges read their file. Every `open` is logged
     /// with its fd so the test pins the borrowed pidfd to the charged pin.
     struct FakeIo {
         opens: Arc<Mutex<Vec<(u32, i32)>>>,
+        trace: Arc<Mutex<Vec<PinEvent>>>,
     }
 
     impl ConfirmIo for FakeIo {
@@ -1518,14 +1531,24 @@ mod kernel_promotion_tests {
         fn open(&mut self, pid: u32) -> Result<Pin, String> {
             let file = std::fs::File::open("/dev/null").map_err(|error| error.to_string())?;
             self.opens.lock().unwrap().push((pid, file.as_raw_fd()));
+            self.trace.lock().unwrap().push(PinEvent::Open {
+                pid,
+                fd: file.as_raw_fd(),
+            });
             Ok(Pin { file })
         }
 
-        fn start_time(&self, _pin: &Pin) -> Option<u64> {
+        fn start_time(&self, pin: &Pin) -> Option<u64> {
+            self.trace.lock().unwrap().push(PinEvent::StartTime {
+                fd: pin.file.as_raw_fd(),
+            });
             Some(7_007)
         }
 
-        fn still_the_same(&self, _pin: &Pin) -> bool {
+        fn still_the_same(&self, pin: &Pin) -> bool {
+            self.trace.lock().unwrap().push(PinEvent::StillSame {
+                fd: pin.file.as_raw_fd(),
+            });
             true
         }
 
@@ -1570,14 +1593,18 @@ mod kernel_promotion_tests {
         confirms: Vec<bool>,
         pidfds: Vec<Option<i32>>,
         userspace: bool,
+        reason: Option<RunFailure>,
     }
 
     /// The scripted kernel hook: records every batch (pids, Confirm vs
     /// Idle, borrowed pidfds) and answers userspace, so the test sees
-    /// the substitution the driver must disclose.
+    /// the substitution the driver must disclose. The recorded
+    /// `userspace` flag and `reason` are derived from the answer
+    /// actually returned, never hardcoded.
     struct ScriptedHook {
         calls: Arc<Mutex<Vec<HookCall>>>,
         reason: RunFailure,
+        trace: Arc<Mutex<Vec<PinEvent>>>,
     }
 
     impl SegmentProof for ScriptedHook {
@@ -1587,20 +1614,29 @@ mod kernel_promotion_tests {
             _budget: &mut CaptureWorkBudget,
             _resources: &crate::discovery::sweep_attribution::IoResources,
         ) -> ProofDecision<'r> {
+            let decision = ProofDecision::Userspace(self.reason);
             let mut call = HookCall {
                 pids: Vec::new(),
                 confirms: Vec::new(),
                 pidfds: Vec::new(),
-                userspace: true,
+                userspace: matches!(decision, ProofDecision::Userspace(_)),
+                reason: match decision {
+                    ProofDecision::Userspace(reason) => Some(reason),
+                    ProofDecision::Kernel(_) => None,
+                },
             };
             for request in batch.requests() {
                 call.pids.push(request.pid());
                 call.confirms
                     .push(matches!(request.kind(), AcceptedKind::Confirm));
                 call.pidfds.push(request.pidfd().map(|fd| fd.as_raw_fd()));
+                self.trace.lock().unwrap().push(PinEvent::Prove {
+                    pid: request.pid(),
+                    fd: request.pidfd().map(|fd| fd.as_raw_fd()),
+                });
             }
             self.calls.lock().unwrap().push(call);
-            ProofDecision::Userspace(self.reason)
+            decision
         }
     }
 
@@ -1612,8 +1648,10 @@ mod kernel_promotion_tests {
     fn phase_d_promotion_with_hook_charges_prepare_prove_finish_on_the_pin() {
         let opens = Arc::new(Mutex::new(Vec::new()));
         let calls = Arc::new(Mutex::new(Vec::new()));
+        let trace = Arc::new(Mutex::new(Vec::new()));
         let make_io = || FakeIo {
             opens: opens.clone(),
+            trace: trace.clone(),
         };
         let sweep = vec![(PROMOTED, phase_one())];
         let policy = SegmentPolicy::from_headroom(16, 1, sweep.len());
@@ -1622,6 +1660,7 @@ mod kernel_promotion_tests {
         let mut hook = ScriptedHook {
             calls: calls.clone(),
             reason: RunFailure::TargetLimit,
+            trace: trace.clone(),
         };
         let out = attribute_unselected_with_segment_proof(
             &sweep,
@@ -1676,14 +1715,17 @@ mod kernel_promotion_tests {
     }
 
     /// The immediate path (`retained == 0`) consults the hook for its
-    /// phase-D promotion too: one charged single-Confirm batch on the
-    /// retained pin's borrowed pidfd, never a hook-bypassing reopen.
+    /// phase-D promotion too: prepare → prove → finish in order on one
+    /// pin, and the hook's userspace fallback (with its reason) in the
+    /// confirmation record — never a hook-bypassing reopen.
     #[test]
     fn immediate_promotion_with_hook_charges_prepare_prove_finish_on_the_pin() {
         let opens = Arc::new(Mutex::new(Vec::new()));
         let calls = Arc::new(Mutex::new(Vec::new()));
+        let trace = Arc::new(Mutex::new(Vec::new()));
         let make_io = || FakeIo {
             opens: opens.clone(),
+            trace: trace.clone(),
         };
         let sweep = vec![(PROMOTED, phase_one())];
         // Headroom 5 keeps the immediate envelope (headroom >= 3) while
@@ -1696,6 +1738,7 @@ mod kernel_promotion_tests {
         let mut hook = ScriptedHook {
             calls: calls.clone(),
             reason: RunFailure::TargetLimit,
+            trace: trace.clone(),
         };
         let out = attribute_unselected_with_segment_proof(
             &sweep,
@@ -1729,7 +1772,29 @@ mod kernel_promotion_tests {
             [Some(opens[0].1)],
             "the promotion proves on the borrowed pin, not a numeric reopen"
         );
+        // The hook's answer for the promotion call, as returned: a
+        // userspace fallback carrying its reason (both derived from
+        // the actual `ProofDecision`, never hardcoded).
         assert!(calls[0].userspace);
+        assert_eq!(calls[0].reason, Some(RunFailure::TargetLimit));
+        // The full charged sequence ran in order on that one pin:
+        // prepare opened it, prove borrowed it, finish held it.
+        assert_eq!(
+            *trace.lock().unwrap(),
+            [
+                PinEvent::Open {
+                    pid: PROMOTED,
+                    fd: opens[0].1
+                },
+                PinEvent::Prove {
+                    pid: PROMOTED,
+                    fd: Some(opens[0].1)
+                },
+                PinEvent::StillSame { fd: opens[0].1 },
+                PinEvent::StartTime { fd: opens[0].1 },
+            ],
+            "prepare, prove and finish must share one pin in order"
+        );
         assert_eq!(
             out.members
                 .iter()
@@ -1737,6 +1802,30 @@ mod kernel_promotion_tests {
                 .collect::<Vec<_>>(),
             [PROMOTED],
             "the promoted member attributes through the disclosed fallback"
+        );
+        // The fallback the hook declared is what the confirmation
+        // record holds: the provider match is proven by userspace
+        // `map_files` evidence (kernel evidence would be rejected —
+        // the index holds no anchor slots), with finish's start time
+        // and no losses.
+        assert_eq!(out.members.len(), 1);
+        let member = &out.members[0];
+        assert_eq!(member.start_time, 7_007);
+        assert_eq!(member.objects.len(), 1);
+        assert_eq!(member.objects[0].key, key(PROVIDER));
+        assert_eq!(member.objects[0].object, OBJECT);
+        // The only loss is the scripted libc staleness (the fixture
+        // reads libc ranges stale by design): nothing rejects the
+        // provider fallback evidence itself.
+        assert_eq!(
+            out.losses,
+            BTreeMap::from([(AttributionLoss::MappingChanged, 1)])
+        );
+        let (loss, detail) = &out.member_losses[&PROMOTED];
+        assert_eq!(*loss, AttributionLoss::MappingChanged);
+        assert!(
+            detail.contains(&format!("inode {LIBC}")),
+            "the loss must name the stale libc key, not the provider: {detail}"
         );
     }
 }

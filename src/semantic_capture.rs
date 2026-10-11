@@ -3608,6 +3608,7 @@ mod tests {
         //! One custody Arc through H0 refresh, coordinator binding, tick and
         //! receipt validation: H0's `ptr_eq` gates refuse any re-duplication.
         use super::*;
+        use crate::attach::BackendSelection;
         use crate::attach::Scope;
         use crate::attach::capture::{
             CaptureHealth, CapturePhase, CookieQuery, DiscoveryBatch, DomainCookie, ExecCoverage,
@@ -3615,12 +3616,16 @@ mod tests {
         };
         use crate::discovery::caller_registry::{
             AdmissionState, CallerId, ImageAuthority, ModuleInfo, ModuleKey, OsProcessSource,
-            RegistryLimits,
+            RegistryLimits, now_ns,
         };
         use crate::discovery::engine::inventory_coordinator::{InventoryCoordinator, NativeBatch};
         use crate::discovery::hooks::HookRegistry;
         use crate::discovery::inventory_attach_set::{AttachObjectId, EndpointId};
         use crate::discovery::native_binding::NativeIdentity;
+        use crate::inventory_semantics::{
+            AttestedSemanticLane, LaneTestIo, RefreshReceiptStash, SemanticBatch, SemanticRefusal,
+            effective_refresh_custody, merge_stash_into_report, stash_refresh_report,
+        };
         use std::collections::HashMap;
 
         #[derive(Default)]
@@ -3866,6 +3871,138 @@ mod tests {
             )
         }
 
+        /// Tests-only substituted H0 I/O behind a lane: the real H0
+        /// decisions (refresh/tick/validate/stop) through `ScriptIo`,
+        /// with the production stash/merge/batch helpers. Installed
+        /// into a shell lane so tests drive the production
+        /// stage→finalize→commit path without a live Session.
+        struct H0TestIo {
+            capture: SemanticCapture,
+            io: ScriptIo,
+            stash: RefreshReceiptStash,
+            /// Clock advance applied at the start of every tick:
+            /// quiescence tests age receipts per serviced quantum.
+            tick_advance: Duration,
+            /// Merge/stash shed disclosed while driving (the lane owns
+            /// this counter in production).
+            shed: u64,
+        }
+
+        impl H0TestIo {
+            fn new(domain: NativeDomainId) -> Self {
+                let io = ScriptIo::new(domain);
+                let capture = capture(&io);
+                Self {
+                    capture,
+                    io,
+                    stash: RefreshReceiptStash::new(),
+                    tick_advance: Duration::ZERO,
+                    shed: 0,
+                }
+            }
+        }
+
+        impl LaneTestIo for H0TestIo {
+            fn validate_current(
+                &mut self,
+                receipt: &CurrentPartitionReceipt,
+            ) -> Result<(), CurrentReceiptRefusal> {
+                let mut scratch = TickReport::default();
+                self.capture
+                    .validate_current_with(&mut self.io, receipt, &mut scratch)
+            }
+
+            fn tick(&mut self, domain: NativeDomainId) -> Result<SemanticBatch, SemanticRefusal> {
+                self.io.now += self.tick_advance;
+                let mut report = self
+                    .capture
+                    .tick_with(&mut self.io)
+                    .map_err(|_| SemanticRefusal::Unavailable)?;
+                self.shed = self
+                    .shed
+                    .saturating_add(merge_stash_into_report(&mut self.stash, &mut report));
+                SemanticBatch::from_tick_report(domain, report, Vec::new(), now_ns())
+            }
+
+            fn refresh(
+                &mut self,
+                pin: Arc<PidPin>,
+                slot: u32,
+            ) -> Result<(Vec<ImageIdentity>, Arc<PidPin>), SemanticRefusal> {
+                let mut report = self
+                    .capture
+                    .refresh_with(&mut self.io, pin.clone(), slot)
+                    .map_err(|_| SemanticRefusal::Unavailable)?;
+                let effective = effective_refresh_custody(&report, pin);
+                let (images, shed) = stash_refresh_report(&mut self.stash, &mut report);
+                self.shed = self.shed.saturating_add(shed);
+                Ok((images, effective))
+            }
+
+            fn has_pending_evidence(&self) -> bool {
+                !self.stash.is_empty()
+            }
+
+            fn finish(&mut self, domain: NativeDomainId) -> SemanticBatch {
+                let report = self.capture.stop();
+                SemanticBatch::from_tick_report(domain, report, Vec::new(), now_ns())
+                    .expect("H0 stop batches respect lane bounds")
+            }
+        }
+
+        /// A coordinator scene bound to a lane's own domain: the bind
+        /// proof runs in the lane's domain exactly as in production, so
+        /// the lane's receipts finalize against the stored binding.
+        struct LaneScene {
+            scene: CustodyScene,
+            lane: AttestedSemanticLane,
+        }
+
+        fn bound_lane_scene(image: ImageIdentity) -> LaneScene {
+            let lane = AttestedSemanticLane::start(
+                operation_subset(),
+                &Scope::Pid(std::process::id()),
+                BackendSelection::Auto,
+            )
+            .expect("shell lane starts");
+            let domain = lane.domain();
+            let mut scene = CustodyScene::new();
+            scene.coordinator.note_extend_receipt(&ExtendReceipt {
+                activated_roots: true,
+                exec_coverage: Some(ExecCoverage::scripted(domain, 0)),
+                ..ExtendReceipt::default()
+            });
+            let pid = std::process::id();
+            let caller = scene.admit(pid, 50);
+            scene.map(caller, pid, 60);
+            scene.answer(pid, domain, image.task_cookie);
+            scene.bind_image(
+                domain,
+                vec![(image.task_cookie, image.exec_id, pid, 100)],
+                1_000,
+            );
+            let pin = Arc::new(
+                scene
+                    .coordinator
+                    .adapter()
+                    .live_pin(pid)
+                    .and_then(|(_, pin)| pin.try_clone().ok())
+                    .unwrap(),
+            );
+            scene
+                .coordinator
+                .bind_semantic_caller_with_pin(
+                    caller,
+                    scene.module.clone(),
+                    domain,
+                    image,
+                    &mut scene.identity,
+                    pin,
+                )
+                .unwrap();
+            LaneScene { scene, lane }
+        }
+
         /// Published semantic edge rows: (api returns, historical-only
         /// returns, lossy, started, completed).
         fn operation_edge_rows(scene: &CustodyScene) -> Vec<(Option<u64>, u64, bool, u64, u64)> {
@@ -4077,104 +4214,92 @@ mod tests {
             );
         }
 
-        /// Quiet registration end to end: a no-call refresh proves the
-        /// quiet provider's partition, the proof waits the normal 1s
-        /// pass schedule for the next tick batch, validates there, and
-        /// registers through the real coordinator commit. Past the
-        /// receipt window the same proof refuses and registers nothing.
+        /// Quiet registration end to end through the production lane
+        /// and finalizer: a no-call refresh proves the quiet provider's
+        /// partition, the proof waits the normal 1s pass schedule, the
+        /// next lane tick stages it, and the pass commit finalizes it
+        /// into one registration. Past the receipt window the same
+        /// proof refuses through the audited path and registers
+        /// nothing.
         #[test]
         fn quiet_refresh_registers_through_next_tick_batch() {
-            use crate::discovery::caller_registry::instance_input::admit_registration_from_coverage;
-            use crate::inventory_semantics::{
-                LaneCoverage, RefreshReceiptStash, merge_stash_into_report, stash_refresh_report,
-            };
-
             let image = ImageIdentity {
                 task_cookie: 7,
                 exec_id: 1,
             };
             for buffered in [false, true] {
-                let (mut scene, caller) = bound_operation_scene(image);
-                let detailed = scene.detailed;
-                let mut io = ScriptIo::new(detailed);
-                io.output_image = Some(image);
-                let mut capture = capture(&io);
-                let pin = io.pin.clone();
-                let mut refresh = capture.refresh_with(&mut io, pin, 0).unwrap();
-                assert_eq!(
-                    refresh.current().len(),
-                    1,
-                    "the accepted refresh mints one receipt"
+                let mut fixture = bound_lane_scene(image);
+                let domain = fixture.lane.domain();
+                let mut h0 = H0TestIo::new(domain);
+                h0.io.output_image = Some(image);
+                let pin: Arc<PidPin> = Arc::new(
+                    fixture
+                        .scene
+                        .coordinator
+                        .adapter()
+                        .live_pin(std::process::id())
+                        .and_then(|(_, pin)| pin.try_clone().ok())
+                        .unwrap(),
                 );
-                assert!(
-                    !refresh.current()[0].instances().is_empty(),
-                    "the quiet proof carries instances to register"
-                );
-                let mut stash = RefreshReceiptStash::new();
-                let (images, shed) = stash_refresh_report(&mut stash, &mut refresh);
-                assert_eq!(shed, 0);
+                // The production refresh: one accepted no-call scan,
+                // stashed for the next tick batch.
+                let (images, _effective) = h0.refresh(pin, 0).unwrap();
                 assert_eq!(images, vec![image]);
+                assert_eq!(h0.shed, 0);
+                assert!(h0.has_pending_evidence());
                 // The normal pass schedule (1s) or past the receipt
                 // window (3s > 2s pending): only timing differs.
-                io.now += Duration::from_secs(if buffered { 3 } else { 1 });
-                let mut tick = capture.tick_with(&mut io).unwrap();
+                h0.io.now += Duration::from_secs(if buffered { 3 } else { 1 });
+                fixture.lane.install_test_io(Box::new(h0));
+                // The next tick batch through the lane, finalized by
+                // the pass commit beside the physical evidence.
+                let batch = {
+                    let bindings = fixture
+                        .scene
+                        .coordinator
+                        .semantic_bindings_mut()
+                        .bindings_for_tick();
+                    fixture.lane.tick(bindings).unwrap()
+                };
                 assert!(
-                    tick.calls().next().is_none(),
-                    "the quiet tick routes no calls"
+                    !batch.is_empty(),
+                    "the tick batch carries the stashed quiet proof"
                 );
-                assert_eq!(merge_stash_into_report(&mut stash, &mut tick), 0);
-                assert_eq!(tick.current().len(), 1);
-                let mut scratch = TickReport::default();
-                let validated =
-                    capture.validate_current_with(&mut io, &tick.current()[0], &mut scratch);
+                fixture.scene.coordinator.stage_semantic_batch(batch);
+                fixture
+                    .scene
+                    .coordinator
+                    .commit_batch_with_semantics(false, Some(&mut fixture.lane))
+                    .unwrap();
+                let gaps: Vec<(String, String)> = fixture
+                    .scene
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+                    .collect();
                 if buffered {
                     assert_eq!(
-                        validated,
-                        Err(CurrentReceiptRefusal::Deadline),
-                        "past the window the quiet proof expires"
-                    );
-                    assert_eq!(
-                        scene.coordinator.registry().instances().count(),
+                        fixture.scene.coordinator.registry().instances().count(),
                         0,
                         "an expired proof registers nothing"
                     );
+                    assert!(
+                        gaps.contains(&(
+                            "semantic receipt refused".to_string(),
+                            "deadline".to_string()
+                        )),
+                        "the expired proof refuses through the audited path: {gaps:?}"
+                    );
                     continue;
                 }
-                assert_eq!(
-                    validated,
-                    Ok(()),
-                    "the stashed quiet proof validates at the next tick"
-                );
-                // The finalizer's registration half: every covered id
-                // registers from the validated coverage's own fields.
-                let first = &tick.current()[0];
-                let coverage = LaneCoverage::scripted(
-                    first.domain(),
-                    first.image(),
-                    first.endpoint(),
-                    first.instances().to_vec(),
-                );
-                let registrations = {
-                    let binding = scene.coordinator.semantic_bindings().get(caller).unwrap();
-                    coverage
-                        .instances()
-                        .iter()
-                        .map(|id| {
-                            admit_registration_from_coverage(&coverage, binding, *id, 100, None)
-                                .expect("validated coverage registers")
-                        })
-                        .collect::<Vec<_>>()
-                };
                 assert!(
-                    !registrations.is_empty(),
-                    "quiet registration stages at least one instance"
+                    !gaps.iter().any(|gap| gap.0 == "semantic receipt refused"),
+                    "the fresh proof validates: {gaps:?}"
                 );
-                for input in registrations {
-                    scene.coordinator.registry_mut().note_instance(input);
-                }
-                scene.coordinator.commit_batch(false).unwrap();
                 assert_eq!(
-                    scene.coordinator.registry().instances().count(),
+                    fixture.scene.coordinator.registry().instances().count(),
                     1,
                     "the quiet proof registers one instance at commit"
                 );

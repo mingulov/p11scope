@@ -145,6 +145,13 @@ impl SemanticBatch {
         self.observed_ns
     }
 
+    /// Whether the batch carries no outcomes, receipts or negatives:
+    /// tests assert quiet ticks stage or commit nothing.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.outcomes.is_empty() && self.current.is_empty() && self.negatives.is_empty()
+    }
+
     /// The batch's own cut fence, if any: the maximum cut-barrier
     /// ordinal the lane staged. The finalizer carries the cut's
     /// barrier into the queued ordinary quantum; tokens admitted by
@@ -187,6 +194,19 @@ impl std::fmt::Debug for LaneCoverage {
 }
 
 impl LaneCoverage {
+    /// Decompose a receipt the lane owner just validated through H0
+    /// into the conversion's registration and standing proof. The
+    /// caller validated this exact receipt; the coverage carries its
+    /// fields unchanged.
+    pub(crate) fn from_validated_receipt(receipt: &CurrentPartitionReceipt) -> Self {
+        Self {
+            domain: receipt.domain(),
+            image: receipt.image(),
+            endpoint: receipt.endpoint(),
+            ids: receipt.instances().to_vec(),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn scripted(
         domain: NativeDomainId,
@@ -219,6 +239,35 @@ impl LaneCoverage {
     }
 }
 
+/// Tests-only substituted H0 I/O behind the lane: the lane's tick,
+/// refresh, receipt validation and stop servicing run the real H0
+/// collect→audit→route decisions through this I/O instead of the live
+/// Session. No live Session exists in tests, so production never
+/// installs it; every batch it produces still funnels through the
+/// production stash/merge/batch/finalize/commit path.
+#[cfg(test)]
+pub(crate) trait LaneTestIo {
+    /// The real H0 receipt validation through substituted I/O.
+    fn validate_current(
+        &mut self,
+        receipt: &CurrentPartitionReceipt,
+    ) -> Result<(), CurrentReceiptRefusal>;
+    /// The real H0 tick plus the production stash merge and batch
+    /// construction.
+    fn tick(&mut self, domain: NativeDomainId) -> Result<SemanticBatch, SemanticRefusal>;
+    /// The real H0 refresh plus the production stash and custody
+    /// derivation.
+    fn refresh(
+        &mut self,
+        pin: Arc<PidPin>,
+        slot: u32,
+    ) -> Result<(Vec<ImageIdentity>, Arc<PidPin>), SemanticRefusal>;
+    /// Whether stashed evidence awaits a tick (the stop pre-flush gate).
+    fn has_pending_evidence(&self) -> bool;
+    /// The real H0 stop plus the production Finish batch construction.
+    fn finish(&mut self, domain: NativeDomainId) -> SemanticBatch;
+}
+
 /// One optional Detailed lane: the Session owner, H0 `SemanticCapture`
 /// driver and proof-bearing batch supplier. Without a live Session (no
 /// manifests, or a refused startup) every H0-driving method refuses
@@ -229,6 +278,17 @@ pub(crate) struct AttestedSemanticLane {
     domain: NativeDomainId,
     live: Option<Box<LiveLane>>,
     startup_failed: bool,
+    /// Tests-only substituted H0 I/O (see [`LaneTestIo`]): installed
+    /// by tests that drive the production finalize path without a
+    /// live Session.
+    #[cfg(test)]
+    test_io: Option<Box<dyn LaneTestIo>>,
+    /// Tests-only stop/finish state beside `test_io`, mirroring the
+    /// live lane's gate: regular ticks refuse once stopping.
+    #[cfg(test)]
+    test_gated: bool,
+    #[cfg(test)]
+    test_finished: bool,
     #[cfg(test)]
     recorded_gaps: Vec<PhysicalSemanticGap>,
     #[cfg(test)]
@@ -406,6 +466,12 @@ impl AttestedSemanticLane {
             live: None,
             startup_failed: false,
             #[cfg(test)]
+            test_io: None,
+            #[cfg(test)]
+            test_gated: false,
+            #[cfg(test)]
+            test_finished: false,
+            #[cfg(test)]
             recorded_gaps: Vec::new(),
             #[cfg(test)]
             scripted_barrier: None,
@@ -462,6 +528,12 @@ impl AttestedSemanticLane {
             })),
             startup_failed: false,
             #[cfg(test)]
+            test_io: None,
+            #[cfg(test)]
+            test_gated: false,
+            #[cfg(test)]
+            test_finished: false,
+            #[cfg(test)]
             recorded_gaps: Vec::new(),
             #[cfg(test)]
             scripted_barrier: None,
@@ -487,13 +559,31 @@ impl AttestedSemanticLane {
         self.domain
     }
 
-    /// Whether the lane owns a live Session and H0 driver.
+    /// Install tests-only substituted H0 I/O (see [`LaneTestIo`]):
+    /// the lane then drives the real H0 decisions through it, so tests
+    /// exercise the production finalize path without a live Session.
+    /// Production never installs it.
+    #[cfg(test)]
+    pub(crate) fn install_test_io(&mut self, io: Box<dyn LaneTestIo>) {
+        self.test_io = Some(io);
+    }
+
+    /// Whether the lane owns a live Session and H0 driver (or, in
+    /// tests, substituted H0 I/O).
     pub(crate) fn is_live(&self) -> bool {
+        #[cfg(test)]
+        if self.test_io.is_some() {
+            return true;
+        }
         self.live.is_some()
     }
 
     /// Whether the terminal sequence finished (H0 stopped).
     pub(crate) fn is_finished(&self) -> bool {
+        #[cfg(test)]
+        if self.test_finished {
+            return true;
+        }
         self.live.as_ref().is_some_and(|live| live.finished)
     }
 
@@ -505,6 +595,16 @@ impl AttestedSemanticLane {
         bindings: &[SemanticCallerBinding],
     ) -> Result<SemanticBatch, SemanticRefusal> {
         let domain = self.domain;
+        #[cfg(test)]
+        if let Some(test) = self.test_io.as_mut() {
+            if self.test_gated || self.test_finished {
+                return Err(SemanticRefusal::Unavailable);
+            }
+            // Targets resolve through the substituted I/O; the H0 tick,
+            // stash merge and batch construction are the shared ones.
+            let _ = bindings;
+            return test.tick(domain);
+        }
         let Some(live) = self.live.as_mut() else {
             return Err(SemanticRefusal::Unavailable);
         };
@@ -554,6 +654,13 @@ impl AttestedSemanticLane {
         pin: Arc<PidPin>,
         slot: u32,
     ) -> Result<(Vec<ImageIdentity>, Arc<PidPin>), SemanticRefusal> {
+        #[cfg(test)]
+        if let Some(test) = self.test_io.as_mut() {
+            if self.test_gated || self.test_finished {
+                return Err(SemanticRefusal::Unavailable);
+            }
+            return test.refresh(pin, slot);
+        }
         let Some(live) = self.live.as_mut() else {
             return Err(SemanticRefusal::Unavailable);
         };
@@ -644,23 +751,24 @@ impl AttestedSemanticLane {
     /// The actual-owner receipt validator: the live lane re-proves
     /// custody, attachment, epoch and partition against the Session's
     /// retained binding/router state through H0. The shell has no
-    /// Session to re-prove through and refuses.
+    /// Session to re-prove through and refuses. In tests with
+    /// substituted H0 I/O, the same H0 validation runs through it.
     pub(crate) fn validate_current(
         &mut self,
         receipt: &CurrentPartitionReceipt,
     ) -> Result<LaneCoverage, CurrentReceiptRefusal> {
+        #[cfg(test)]
+        if let Some(test) = self.test_io.as_mut() {
+            test.validate_current(receipt)?;
+            return Ok(LaneCoverage::from_validated_receipt(receipt));
+        }
         let Some(live) = self.live.as_mut() else {
             return Err(CurrentReceiptRefusal::Custody);
         };
         let mut report = TickReport::default();
         live.capture
             .validate_current(&mut live.session, receipt, &mut report)?;
-        Ok(LaneCoverage {
-            domain: receipt.domain(),
-            image: receipt.image(),
-            endpoint: receipt.endpoint(),
-            ids: receipt.instances().to_vec(),
-        })
+        Ok(LaneCoverage::from_validated_receipt(receipt))
     }
 
     /// Gaps the shell consumed, in order. Tests assert adjudication
@@ -1119,6 +1227,11 @@ impl AttestedSemanticLane {
     /// bounded audited H0 work. One producer's stop never certifies the
     /// other: Inventory's own terminal path is independent.
     pub(crate) fn request_semantic_stop(&mut self) {
+        #[cfg(test)]
+        if self.test_io.is_some() {
+            self.test_gated = true;
+            return;
+        }
         let Some(live) = self.live.as_mut() else {
             return;
         };
@@ -1490,10 +1603,17 @@ impl AttestedSemanticLane {
     /// drained batch was consumed and published. Unresolved joins expire;
     /// the terminal negatives plus semantic Finish finalize separately,
     /// never ahead of drained calls. Sets the lane finished. A shell lane
-    /// (failed startup) has nothing to finish: `None`.
+    /// (failed startup) has nothing to finish: `None`. In tests with
+    /// substituted H0 I/O, the same H0 stop runs through it.
     pub(crate) fn finish_semantic_stop(&mut self) -> Option<SemanticBatch> {
-        let live = self.live.as_mut()?;
         let domain = self.domain;
+        #[cfg(test)]
+        if let Some(test) = self.test_io.as_mut() {
+            let batch = test.finish(domain);
+            self.test_finished = true;
+            return Some(batch);
+        }
+        let live = self.live.as_mut()?;
         let live = &mut **live;
         // Finish touches only the capture: the stop batch constructor
         // stays shared with the drain's stop io. The stash already

@@ -1,6 +1,6 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Session-private physical pair facts. These facts cannot spare an Engine
-//! replacement; request-bound validation belongs to the later Engine service.
+//! replacement without an exact request-bound preservation receipt.
 
 use super::{ProbeSide, RegisteredLink, RetainedStaticTarget, StaticEndpoint};
 use crate::discovery::identity::{PinnedObjects, RetainedInventoryTarget};
@@ -25,6 +25,72 @@ pub(crate) enum PidContinuityRefusal {
     Target,
     Terminal,
     Unavailable,
+}
+
+#[derive(Default)]
+pub(super) struct OwnerHealth {
+    last: Option<[u64; 4]>,
+    last_loss: Option<u64>,
+    terminal_poison: bool,
+}
+impl OwnerHealth {
+    pub(super) fn terminal(&self) -> bool {
+        self.terminal_poison
+    }
+    pub(super) fn check(
+        &mut self,
+        owner: Result<p11scope_ebpf_common::ThreadOwnerControl, PidContinuityRefusal>,
+        loss: Result<u64, PidContinuityRefusal>,
+        expected_limit: u64,
+        tap: &PidLifecycleTap,
+    ) -> Result<u64, PidContinuityRefusal> {
+        let checked = (|| {
+            if self.terminal_poison {
+                return Err(PidContinuityRefusal::Terminal);
+            }
+            let owner = owner?;
+            if owner.poison != 0 {
+                self.terminal_poison = true;
+                return Err(PidContinuityRefusal::Terminal);
+            }
+            if expected_limit == 0
+                || expected_limit == u64::MAX
+                || owner.limit != expected_limit
+                || owner.outstanding > owner.limit
+            {
+                return Err(PidContinuityRefusal::Unavailable);
+            }
+            let counters = [
+                owner.admission_failures,
+                owner.reclamation_failures,
+                owner.abandoned_start,
+                owner.abandoned_discovery,
+            ];
+            if counters.contains(&u64::MAX)
+                || self.last.is_some_and(|previous| {
+                    counters.iter().zip(previous).any(|(now, old)| *now < old)
+                })
+            {
+                return Err(PidContinuityRefusal::Fault);
+            }
+            let loss = loss?;
+            if loss == u64::MAX || self.last_loss.is_some_and(|previous| loss < previous) {
+                return Err(PidContinuityRefusal::Loss);
+            }
+            if self.last.is_some_and(|previous| previous != counters)
+                || self.last_loss.is_some_and(|previous| loss > previous)
+            {
+                tap.observe_failure();
+            }
+            self.last = Some(counters);
+            self.last_loss = Some(loss);
+            Ok(loss)
+        })();
+        if checked.is_err() {
+            tap.observe_failure();
+        }
+        checked
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +184,7 @@ pub(super) struct PairBook {
     last_loss: Option<u64>,
     stamps: BTreeMap<u32, PairStamp>,
     exhausted: bool,
+    gaps: PhysicalGaps,
 }
 
 impl PairBook {
@@ -156,6 +223,61 @@ impl PairBook {
         self.stamps.retain(|slot, _| !slots.contains(slot));
     }
 
+    pub(super) fn gap_summary(&self) -> PhysicalGapSummary {
+        self.gaps.summary
+    }
+    pub(super) fn begin_gap(
+        &mut self,
+        slots: &BTreeSet<u32>,
+        start: Option<u64>,
+        retained: &BTreeMap<u32, RetainedStaticTarget>,
+    ) {
+        self.gaps.begin(slots, start);
+        for slot in slots {
+            if !self.gaps.affected.contains(slot) {
+                continue;
+            }
+            if let Some(target) = retained.get(slot).and_then(|target| {
+                target
+                    .held
+                    .as_ref()
+                    .map(|held| (target.slot.clone(), held.share()))
+            }) {
+                self.gaps.targets.entry(*slot).or_insert(target);
+            } else {
+                self.gaps.summary.unknown = true;
+            }
+        }
+    }
+
+    /// A failed pair keeps its old aggregate cookie inactive. A later retry
+    /// may use a fresh cookie, but closes this episode only for the same held
+    /// target and offset once its exact final pair seals. The current sealed
+    /// pair supplies the approved descriptor, which may have been downgraded.
+    pub(super) fn retarget_gap(&mut self, slots: &[Slot], objects: &PinnedObjects) {
+        let remapped: Vec<_> = self
+            .gaps
+            .targets
+            .iter()
+            .filter_map(|(old, (original, held))| {
+                slots
+                    .iter()
+                    .find(|candidate| {
+                        original.file_offset == candidate.file_offset
+                            && held.check_unchanged() == Ok(true)
+                            && held.same_object_as(objects, candidate.object)
+                    })
+                    .map(|candidate| (*old, candidate.clone(), held.share()))
+            })
+            .collect();
+        for (old, candidate, held) in remapped {
+            self.gaps.affected.remove(&old);
+            self.gaps.targets.remove(&old);
+            self.gaps.affected.insert(candidate.index);
+            self.gaps.targets.insert(candidate.index, (candidate, held));
+        }
+    }
+
     pub(super) fn invalidate_all(&mut self) {
         self.stamps.clear();
     }
@@ -184,6 +306,9 @@ impl PairBook {
         );
         let Some(baseline) = baseline.filter(|baseline| Some(baseline.fault) == fault_serial)
         else {
+            if self.gaps.summary.open {
+                self.gaps.summary.unknown = true;
+            }
             return;
         };
         if self.exhausted {
@@ -191,6 +316,9 @@ impl PairBook {
         }
         for round in rounds {
             let Some(started_ns) = round.started_ns.filter(|start| *start != 0) else {
+                if self.gaps.summary.open {
+                    self.gaps.summary.unknown = true;
+                }
                 continue;
             };
             let Some(last_call_ns) = round.last_call_ns.filter(|last| *last >= started_ns) else {
@@ -200,6 +328,9 @@ impl PairBook {
             let Some(completed_ns) =
                 completed_at().filter(|end| *end > started_ns && *end >= last_call_ns)
             else {
+                if self.gaps.summary.open {
+                    self.gaps.summary.unknown = true;
+                }
                 continue;
             };
             let selected: BTreeSet<_> = round.slots.iter().copied().collect();
@@ -251,6 +382,7 @@ impl PairBook {
                 );
             }
         }
+        self.gaps.complete(&self.stamps);
     }
 
     pub(super) fn stamp_for(
@@ -417,6 +549,9 @@ struct LifecycleObserver {
     pid: NonZeroU32,
     domain: DiscoveryDomain,
     state: Mutex<LifecycleState>,
+    resample_read_clock: bool,
+    #[cfg(test)]
+    read_clocks: Mutex<std::collections::VecDeque<Option<u64>>>,
 }
 
 /// A clone observes the Session's existing raw cursor; it owns no consumer.
@@ -429,6 +564,9 @@ impl PidLifecycleTap {
             pid,
             domain,
             state: Mutex::new(LifecycleState::default()),
+            resample_read_clock: true,
+            #[cfg(test)]
+            read_clocks: Mutex::new(std::collections::VecDeque::new()),
         }))
     }
 
@@ -457,6 +595,21 @@ impl PidLifecycleTap {
 
     /// Clear the prior frontier even when the next result is BUSY or malformed.
     pub(crate) fn begin_read(&self, started_ns: Option<u64>) -> Option<u64> {
+        // The raw cursor's generic clock is not an origin proof. Production
+        // samples again only AFTER origin validation, immediately before read.
+        #[cfg(test)]
+        let started_ns = self
+            .0
+            .read_clocks
+            .lock()
+            .ok()
+            .and_then(|mut clocks| clocks.pop_front())
+            .unwrap_or(started_ns);
+        let started_ns = if self.0.resample_read_clock {
+            started_ns.and_then(|_| comparable_monotonic_ns())
+        } else {
+            started_ns.filter(|_| clock_origins_comparable())
+        };
         let mut state = self.0.state.lock().ok()?;
         state.facts.empty = None;
         state.read_valid = false;
@@ -585,12 +738,373 @@ impl PidLifecycleTap {
 
     #[cfg(test)]
     pub(crate) fn test_for(pid: u32, domain: DiscoveryDomain) -> Self {
-        Self::new(NonZeroU32::new(pid).unwrap(), domain)
+        Self(Arc::new(LifecycleObserver {
+            pid: NonZeroU32::new(pid).unwrap(),
+            domain,
+            state: Mutex::new(LifecycleState::default()),
+            resample_read_clock: false,
+            read_clocks: Mutex::new(std::collections::VecDeque::new()),
+        }))
     }
 
     #[cfg(test)]
     pub(crate) fn test_facts(&self) -> Result<LifecycleFacts, PidContinuityRefusal> {
         self.facts()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PhysicalGapSummary {
+    pub(crate) episodes: u64,
+    pub(crate) max_gap_ns: Option<u64>,
+    pub(crate) open: bool,
+    pub(crate) unknown: bool,
+}
+#[derive(Default)]
+pub(super) struct PhysicalGaps {
+    summary: PhysicalGapSummary,
+    affected: BTreeSet<u32>,
+    targets: BTreeMap<u32, (Slot, RetainedInventoryTarget)>,
+    started_ns: Option<u64>,
+    last_complete_ns: Option<u64>,
+    exhausted: bool,
+}
+impl PhysicalGaps {
+    pub(super) fn begin(&mut self, slots: &BTreeSet<u32>, started: Option<u64>) {
+        if slots.is_empty() || self.exhausted {
+            return;
+        }
+        if !self.summary.open {
+            let Some(episodes) = self.summary.episodes.checked_add(1) else {
+                self.summary.unknown = true;
+                self.summary.open = true;
+                self.exhausted = true;
+                return;
+            };
+            self.summary.episodes = episodes;
+            self.started_ns = started.filter(|time| {
+                *time != 0
+                    && self
+                        .last_complete_ns
+                        .is_none_or(|previous| *time > previous)
+            });
+            self.summary.unknown |= self.started_ns.is_none();
+            self.summary.open = true;
+        }
+        for slot in slots {
+            if self.affected.len() >= p11scope_ebpf_common::MAX_SLOTS as usize
+                && !self.affected.contains(slot)
+            {
+                self.exhausted = true;
+                self.summary.unknown = true;
+                return;
+            }
+            self.affected.insert(*slot);
+        }
+    }
+    pub(super) fn complete(&mut self, stamps: &BTreeMap<u32, PairStamp>) {
+        if !self.summary.open || self.exhausted || self.affected.is_empty() {
+            return;
+        }
+        let final_times: Option<Vec<_>> = self
+            .affected
+            .iter()
+            .map(|slot| stamps.get(slot).map(|stamp| stamp.completed_ns))
+            .collect();
+        let Some(final_times) = final_times else {
+            return;
+        };
+        let Some(completed) = final_times.into_iter().max().filter(|time| *time != 0) else {
+            self.summary.unknown = true;
+            return;
+        };
+        match self
+            .started_ns
+            .and_then(|start| completed.checked_sub(start))
+            .filter(|gap| *gap != 0)
+        {
+            Some(gap) => {
+                self.summary.max_gap_ns = Some(
+                    self.summary
+                        .max_gap_ns
+                        .map_or(gap, |previous| previous.max(gap)),
+                )
+            }
+            None => self.summary.unknown = true,
+        }
+        self.last_complete_ns = Some(completed);
+        self.summary.open = false;
+        self.affected.clear();
+        self.targets.clear();
+        self.started_ns = None;
+    }
+}
+
+/// Fresh clock origin, shared with the inventory coordinator's exit filter.
+pub(crate) fn clock_origins_comparable() -> bool {
+    let active = std::fs::read_link("/proc/self/ns/time").ok();
+    let children = std::fs::read_link("/proc/self/ns/time_for_children").ok();
+    let offsets = std::fs::read_to_string("/proc/self/timens_offsets").ok();
+    clock_origins_comparable_with(active.as_ref(), children.as_ref(), offsets.as_deref())
+}
+
+pub(crate) fn clock_origins_comparable_with(
+    active: Option<&std::path::PathBuf>,
+    children: Option<&std::path::PathBuf>,
+    offsets: Option<&str>,
+) -> bool {
+    let (Some(active), Some(children), Some(offsets)) = (active, children, offsets) else {
+        return false;
+    };
+    if active != children {
+        return false;
+    }
+    let mut monotonic = None;
+    for line in offsets.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some("monotonic") {
+            continue;
+        }
+        if monotonic.is_some() {
+            return false;
+        }
+        let (Some(sec), Some(nsec)) = (fields.next(), fields.next()) else {
+            return false;
+        };
+        if fields.next().is_some() {
+            return false;
+        }
+        let (Ok(sec), Ok(nsec)) = (sec.parse::<i64>(), nsec.parse::<i64>()) else {
+            return false;
+        };
+        monotonic = Some(sec == 0 && nsec == 0);
+    }
+    monotonic == Some(true)
+}
+
+pub(super) fn comparable_monotonic_ns() -> Option<u64> {
+    clock_origins_comparable()
+        .then(super::monotonic_ns)
+        .flatten()
+}
+
+/// Private retained owners: allocation identity, not reusable numeric IDs.
+#[derive(Clone)]
+pub(crate) struct ExecBinding {
+    tap: PidLifecycleTap,
+    domain: DiscoveryDomain,
+    admission: crate::process::ViewAdmission,
+    pid: u32,
+    serial: u64,
+    key: ExecObservation,
+}
+impl std::fmt::Debug for ExecBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExecBinding")
+            .field("serial", &self.serial)
+            .field("key", &self.key)
+            .finish_non_exhaustive()
+    }
+}
+impl PartialEq for ExecBinding {
+    fn eq(&self, other: &Self) -> bool {
+        self.serial == other.serial
+            && self.pid == other.pid
+            && self.key == other.key
+            && self.tap.same_observer(&other.tap)
+            && self.domain.same_allocation(&other.domain)
+            && self.admission.same_allocation(&other.admission)
+    }
+}
+impl Eq for ExecBinding {}
+impl ExecBinding {
+    pub(super) fn bind(
+        tap: &PidLifecycleTap,
+        domain: &DiscoveryDomain,
+        view: &crate::process::ProcessView,
+        serial: u64,
+        record: &DiscoveryRecord,
+    ) -> Option<Self> {
+        if serial == 0
+            || !tap.matches_domain(domain)
+            || !view.still_the_same()
+            || tap.0.pid.get() != view.pid()
+            || record.kind != DISCOVERY_KIND_EXEC
+        {
+            return None;
+        }
+        let key = tap.facts().ok()?.latest_exec?;
+        let class = match record.case_id {
+            DISCOVERY_EXEC_SAME_TASK_CANDIDATE => ExecClass::SameTaskCandidate,
+            DISCOVERY_EXEC_TASK_REPLACED => ExecClass::TaskReplaced,
+            DISCOVERY_EXEC_UNKNOWN => ExecClass::Unknown,
+            _ => return None,
+        };
+        if key.pid != view.pid()
+            || key.pid != (record.pid_tgid >> 32) as u32
+            || key.class != class
+            || key.hook_ts_ns != record.hook_ts_ns
+        {
+            return None;
+        }
+        Some(Self {
+            tap: tap.clone(),
+            domain: domain.clone(),
+            admission: view.view_admission(),
+            pid: view.pid(),
+            serial,
+            key,
+        })
+    }
+    fn matches(
+        &self,
+        tap: &PidLifecycleTap,
+        domain: &DiscoveryDomain,
+        view: &crate::process::ProcessView,
+        serial: u64,
+    ) -> bool {
+        serial == self.serial
+            && self.pid == view.pid()
+            && view.still_the_same()
+            && self.tap.same_observer(tap)
+            && self.domain.same_allocation(domain)
+            && tap.matches_domain(domain)
+            && self.admission.same_allocation(&view.view_admission())
+            && tap.facts().ok().and_then(|facts| facts.latest_exec) == Some(self.key)
+    }
+}
+
+struct ReceiptPair {
+    slot: Slot,
+    generation: u64,
+    entry: RegistrationId,
+    return_: RegistrationId,
+}
+/// Cannot be constructed by Engine, serialized, or converted from a class bit.
+pub(crate) struct PreservationReceipt {
+    binding: ExecBinding,
+    empty: EmptyRead,
+    pairs: Vec<ReceiptPair>,
+    loss: u64,
+    fault: u64,
+}
+
+pub(super) struct CurrentPairs<'a> {
+    pub(super) book: &'a PairBook,
+    pub(super) links: &'a [RegisteredLink],
+    pub(super) sides: &'a BTreeSet<StaticEndpoint>,
+    pub(super) retained: &'a BTreeMap<u32, RetainedStaticTarget>,
+}
+impl CurrentPairs<'_> {
+    #[allow(clippy::too_many_arguments)] // One Session-owned fact set and its exact request.
+    pub(super) fn prepare(
+        &self,
+        binding: &ExecBinding,
+        tap: &PidLifecycleTap,
+        domain: &DiscoveryDomain,
+        view: &crate::process::ProcessView,
+        serial: u64,
+        slots: &[Slot],
+        ordinary: &[Slot],
+        objects: &PinnedObjects,
+        loss: u64,
+    ) -> Option<PreservationReceipt> {
+        if !binding.matches(tap, domain, view, serial)
+            || binding.key.class != ExecClass::SameTaskCandidate
+            || slots.is_empty()
+            || !clock_origins_comparable()
+        {
+            return None;
+        }
+        let facts = tap.facts().ok()?;
+        let empty = facts.empty?;
+        if empty.read_started_ns <= binding.key.hook_ts_ns
+            || empty.observation_serial != facts.observation_serial
+        {
+            return None;
+        }
+        let requested: BTreeSet<_> = ordinary.iter().map(|slot| slot.index).collect();
+        let affected = super::plan_group_rebuild(self.links, &requested).unwrap_or(requested);
+        let mut seen = BTreeSet::new();
+        let pairs: Option<Vec<_>> = slots
+            .iter()
+            .map(|slot| {
+                if !seen.insert(slot.index) || affected.contains(&slot.index) {
+                    return None;
+                }
+                let stamp =
+                    self.book
+                        .stamp_for(slot, objects, self.links, self.sides, self.retained)?;
+                if stamp.completed_ns >= binding.key.hook_ts_ns
+                    || facts
+                        .greatest_break_ns
+                        .is_some_and(|time| time >= stamp.started_ns)
+                    || stamp.baseline.loss != loss
+                    || stamp.baseline.fault != facts.fault_serial
+                {
+                    return None;
+                }
+                Some(ReceiptPair {
+                    slot: slot.clone(),
+                    generation: stamp.generation,
+                    entry: stamp.entry,
+                    return_: stamp.return_,
+                })
+            })
+            .collect();
+        Some(PreservationReceipt {
+            binding: binding.clone(),
+            empty,
+            pairs: pairs?,
+            loss,
+            fault: facts.fault_serial,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)] // Revalidate exactly the carried private proof against current owners.
+    pub(super) fn validate(
+        &self,
+        receipt: &PreservationReceipt,
+        binding: &ExecBinding,
+        tap: &PidLifecycleTap,
+        domain: &DiscoveryDomain,
+        view: &crate::process::ProcessView,
+        serial: u64,
+        objects: &PinnedObjects,
+        loss: u64,
+        positions: impl FnOnce() -> Option<aya::maps::ring_buf::RingBufPositions>,
+    ) -> bool {
+        if receipt.binding != *binding
+            || !binding.matches(tap, domain, view, serial)
+            || !clock_origins_comparable()
+            || loss != receipt.loss
+        {
+            return false;
+        }
+        if !receipt.pairs.iter().all(|pair| {
+            self.book
+                .stamp_for(&pair.slot, objects, self.links, self.sides, self.retained)
+                .is_some_and(|stamp| {
+                    stamp.generation == pair.generation
+                        && stamp.entry == pair.entry
+                        && stamp.return_ == pair.return_
+                })
+        }) {
+            return false;
+        }
+        // Held-file and registry checks can perform I/O. Sample the retained
+        // cursor only after those checks, then compare its observation serial.
+        let Some(positions) = positions() else {
+            return false;
+        };
+        let Ok(facts) = tap.facts() else {
+            return false;
+        };
+        facts.fault_serial == receipt.fault
+            && facts.empty == Some(receipt.empty)
+            && facts.observation_serial == receipt.empty.observation_serial
+            && positions.producer == receipt.empty.producer_position
+            && positions.consumer == positions.producer
     }
 }
 
@@ -916,5 +1430,723 @@ pub(super) mod tests {
         timing.observe_call(Some(20));
         timing.observe_call(Some(19));
         assert!(timing.finish(vec![0]).started_ns.is_none());
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod engine_fixture {
+    use super::*;
+    use crate::events::{BoundedRecord, BoundedRecordSource, DiscoveryDrain, RecordSource};
+    use crate::process::ProcessView;
+    use aya::maps::ring_buf::RingBufPositions;
+    use p11scope_ebpf_common::ThreadOwnerControl;
+    use std::collections::VecDeque;
+
+    type RawHealthRead = (
+        Result<ThreadOwnerControl, PidContinuityRefusal>,
+        Result<Vec<u64>, PidContinuityRefusal>,
+    );
+
+    pub(crate) enum PreflightChange {
+        Producer,
+        Observation,
+        Health,
+        Registration,
+        Stop,
+        Clock,
+        Exit(u32),
+        Cancel(Arc<std::sync::atomic::AtomicBool>),
+    }
+
+    struct Cursor {
+        records: std::cell::RefCell<VecDeque<Vec<u8>>>,
+        producer: std::cell::Cell<usize>,
+        consumer: std::cell::Cell<usize>,
+    }
+    impl RecordSource for Cursor {
+        fn next_record(&mut self) -> Option<impl std::ops::Deref<Target = [u8]> + '_> {
+            let bytes = self.records.borrow_mut().pop_front()?;
+            self.consumer.set(self.consumer.get() + bytes.len());
+            Some(bytes)
+        }
+    }
+    impl BoundedRecordSource for Cursor {
+        fn positions(&self) -> RingBufPositions {
+            RingBufPositions {
+                producer: self.producer.get(),
+                consumer: self.consumer.get(),
+                capacity: 1 << 20,
+            }
+        }
+        fn consumer(&self) -> usize {
+            self.consumer.get()
+        }
+        fn bounded_record(
+            &mut self,
+            _: usize,
+        ) -> anyhow::Result<BoundedRecord<impl std::ops::Deref<Target = [u8]> + '_>> {
+            Ok(BoundedRecord::Item(Vec::<u8>::new()))
+        }
+    }
+
+    /// Only native handles/maps/clocks are scripted. Current pairs, held files,
+    /// generation publication and raw cursor observation use production reducers.
+    pub(crate) struct PidSessionFixture {
+        pub(super) book: PairBook,
+        pub(super) links: Vec<RegisteredLink>,
+        pub(super) retained: BTreeMap<u32, RetainedStaticTarget>,
+        pub(super) tap: PidLifecycleTap,
+        drain: DiscoveryDrain<Cursor>,
+        health: OwnerHealth,
+        pub(crate) owner: Result<ThreadOwnerControl, PidContinuityRefusal>,
+        pub(crate) loss: Result<Vec<u64>, PidContinuityRefusal>,
+        pub(crate) prepared_limit: u64,
+        pub(crate) health_reads: usize,
+        pub(crate) health_phases: Vec<&'static str>,
+        prepared_count: usize,
+        pub(crate) health_script: VecDeque<RawHealthRead>,
+        pub(crate) preflight_change: Option<PreflightChange>,
+        pub(crate) clock_offsets: Option<String>,
+        pub(crate) stop_word: u64,
+        pub(crate) native_failures: BTreeSet<(u32, &'static str)>,
+        pub(crate) native_clocks: std::collections::VecDeque<Option<u64>>,
+        pub(crate) completion_clocks: std::collections::VecDeque<Option<u64>>,
+        pub(crate) detach_clocks: std::collections::VecDeque<Option<u64>>,
+        pub(crate) detach_delay: std::time::Duration,
+        pub(crate) completion_delay: std::time::Duration,
+    }
+    impl PidSessionFixture {
+        pub(crate) fn new(view: &ProcessView) -> Self {
+            let domain = DiscoveryDomain::test_standin(7);
+            let tap = PidLifecycleTap::test_for(view.pid(), domain.clone());
+            let mut drain = DiscoveryDrain::over_domain(
+                Cursor {
+                    records: std::cell::RefCell::new(VecDeque::new()),
+                    producer: std::cell::Cell::new(0),
+                    consumer: std::cell::Cell::new(0),
+                },
+                domain,
+            );
+            drain.attach_pid_lifecycle_tap(tap.clone()).unwrap();
+            Self {
+                book: PairBook::default(),
+                links: Vec::new(),
+                retained: BTreeMap::new(),
+                tap,
+                drain,
+                health: OwnerHealth::default(),
+                owner: Ok(ThreadOwnerControl {
+                    limit: 17,
+                    ..Default::default()
+                }),
+                loss: Ok(vec![0]),
+                prepared_limit: 17,
+                health_reads: 0,
+                health_phases: Vec::new(),
+                prepared_count: 0,
+                health_script: VecDeque::new(),
+                preflight_change: None,
+                clock_offsets: Some("monotonic 0 0".into()),
+                stop_word: 0,
+                native_failures: BTreeSet::new(),
+                native_clocks: VecDeque::new(),
+                completion_clocks: VecDeque::new(),
+                detach_clocks: VecDeque::new(),
+                detach_delay: std::time::Duration::ZERO,
+                completion_delay: std::time::Duration::ZERO,
+            }
+        }
+        fn sides(&self) -> BTreeSet<StaticEndpoint> {
+            super::super::current_static_sides_from(&self.links)
+        }
+        pub(crate) fn attach(
+            &mut self,
+            slots: &[Slot],
+            objects: &PinnedObjects,
+        ) -> (Vec<u32>, Vec<(u32, Option<u64>)>) {
+            if slots.is_empty() {
+                return (Vec::new(), Vec::new());
+            }
+            self.book.retarget_gap(slots, objects);
+            self.health_phases.push("attach");
+            let loss = self.read_health();
+            let baseline = self
+                .book
+                .prepare_baseline(loss, self.tap.facts().ok().map(|f| f.fault_serial));
+            for slot in slots {
+                assert!(
+                    !self.has_slot_link(slot.index),
+                    "no overlapping registered pairs"
+                );
+                let held = objects.retain_inventory_target(slot.object).unwrap();
+                self.retained.insert(
+                    slot.index,
+                    RetainedStaticTarget {
+                        slot: slot.clone(),
+                        path: held.attach_path(),
+                        abi: held.abi(),
+                        held: Some(held),
+                    },
+                );
+            }
+            let origin = self.origin_inputs();
+            let links = &mut self.links;
+            let book = &mut self.book;
+            let failures = &self.native_failures;
+            let clocks = &mut self.native_clocks;
+            let outcome = super::super::attach_targets_observed_with(
+                slots,
+                super::super::CapturePolicy::Allowlisted,
+                false,
+                |slot| {
+                    objects
+                        .abi_for(slot.object)
+                        .ok_or_else(|| anyhow::anyhow!("missing exact ABI"))
+                },
+                |program, slot, _| {
+                    let started = clocks.pop_front().unwrap_or_else(|| Self::sample(&origin));
+                    NativeAttempt::run(
+                        || started,
+                        || {
+                            if failures.contains(&(slot.index, program))
+                                || failures.contains(&(u32::MAX, program))
+                            {
+                                return Err(anyhow::anyhow!("scripted native side failure"));
+                            }
+                            let fd = std::fs::File::open("/dev/null")?;
+                            links.push(RegisteredLink::MultiUProbe {
+                                program,
+                                slots: vec![slot.index],
+                                fds: vec![fd.into()],
+                                registration: book.register(),
+                            });
+                            Ok(())
+                        },
+                    )
+                },
+                |_| Self::sample(&origin),
+            )
+            .unwrap();
+            std::thread::sleep(self.completion_delay);
+            let sides = super::super::current_static_sides_from(&self.links);
+            let completion_clocks = &mut self.completion_clocks;
+            self.book.seal(
+                &outcome.continuity_rounds,
+                baseline,
+                self.tap.facts().ok().map(|f| f.fault_serial),
+                &self.links,
+                &sides,
+                &self.retained,
+                || {
+                    completion_clocks
+                        .pop_front()
+                        .unwrap_or_else(|| Self::sample(&origin))
+                },
+            );
+            (
+                outcome.failures.into_iter().map(|(slot, _)| slot).collect(),
+                outcome.completed,
+            )
+        }
+        pub(crate) fn group_all(&mut self) {
+            let members: Vec<_> = self.retained.keys().copied().collect();
+            self.links.clear();
+            self.book.invalidate_all();
+            let mut timing = RoundClock::default();
+            for program in ["p11_return", "p11_entry"] {
+                let attempt = NativeAttempt::run(comparable_monotonic_ns, || {
+                    std::fs::File::open("/dev/null")
+                });
+                timing.observe_call(attempt.started_ns);
+                self.links.push(RegisteredLink::MultiUProbe {
+                    program,
+                    slots: members.clone(),
+                    fds: vec![attempt.result.unwrap().into()],
+                    registration: self.book.register(),
+                });
+            }
+            self.health_phases.push("attach");
+            let loss = self.read_health();
+            let baseline = self
+                .book
+                .prepare_baseline(loss, self.tap.facts().ok().map(|facts| facts.fault_serial));
+            let sides = super::super::current_static_sides_from(&self.links);
+            self.book.seal(
+                &[timing.finish(members)],
+                baseline,
+                self.tap.facts().ok().map(|facts| facts.fault_serial),
+                &self.links,
+                &sides,
+                &self.retained,
+                comparable_monotonic_ns,
+            );
+        }
+        pub(crate) fn detach(&mut self, slots: &[Slot]) -> super::super::DetachOutcome {
+            let requested: BTreeSet<_> = slots.iter().map(|slot| slot.index).collect();
+            let affected = super::super::plan_group_rebuild(&self.links, &requested);
+            let survivors: Vec<_> = affected
+                .as_ref()
+                .map(|affected| {
+                    affected
+                        .difference(&requested)
+                        .filter_map(|slot| self.retained.get(slot).cloned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let regrouped: Vec<_> = survivors.iter().map(|target| target.slot.clone()).collect();
+            let targets = survivors
+                .iter()
+                .map(|target| (target.slot.index, (target.path.clone(), target.abi)))
+                .collect();
+            let groups = super::super::group_static_slots(
+                &regrouped,
+                super::super::CapturePolicy::Allowlisted,
+                false,
+                &targets,
+            );
+            let rebuilt_groups = affected.as_ref().map_or(0, |affected| {
+                super::super::affected_group_count(&self.links, affected)
+            });
+            let selected =
+                super::super::extract_selected_links(&mut self.links, &mut self.book, |link| {
+                    link.slots()
+                        .iter()
+                        .any(|slot| affected.as_ref().unwrap_or(&requested).contains(slot))
+                });
+            let actual = selected
+                .iter()
+                .flat_map(|link| link.slots().iter().copied())
+                .collect();
+            let start = self
+                .detach_clocks
+                .pop_front()
+                .unwrap_or_else(|| Self::sample(&self.origin_inputs()));
+            self.book.begin_gap(&actual, start, &self.retained);
+            // The gap has already begun before the native close/detach work.
+            std::thread::sleep(self.detach_delay);
+            drop(selected);
+            super::super::prune_linkless_retained(&mut self.retained, &self.links);
+            if groups.is_empty() {
+                return super::super::DetachOutcome::default();
+            }
+            self.health_phases.push("attach");
+            let loss = self.read_health();
+            let baseline = self
+                .book
+                .prepare_baseline(loss, self.tap.facts().ok().map(|facts| facts.fault_serial));
+            let failures = &self.native_failures;
+            let (bundles, outcome) = super::super::reattach_rebuilt_groups_observed_with(
+                &groups,
+                |_| comparable_monotonic_ns(),
+                |program, _, sites, _| {
+                    NativeAttempt::run(comparable_monotonic_ns, || {
+                        if sites
+                            .iter()
+                            .any(|(_, cookie)| failures.contains(&(*cookie as u32, program)))
+                        {
+                            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                        }
+                        std::fs::File::open("/dev/null").map(Into::into)
+                    })
+                },
+                drop,
+            );
+            super::super::publish_kept_multi_bundles(
+                &mut self.links,
+                &mut self.retained,
+                bundles,
+                &survivors,
+                &mut self.book,
+            );
+            let sides = super::super::current_static_sides_from(&self.links);
+            self.book.seal(
+                &outcome.continuity_rounds,
+                baseline,
+                self.tap.facts().ok().map(|facts| facts.fault_serial),
+                &self.links,
+                &sides,
+                &self.retained,
+                comparable_monotonic_ns,
+            );
+            super::super::DetachOutcome {
+                recompleted: outcome.completed,
+                rebuild_failures: outcome.failures,
+                rebuilt_groups,
+            }
+        }
+        fn origin_inputs(
+            &self,
+        ) -> (
+            Option<std::path::PathBuf>,
+            Option<std::path::PathBuf>,
+            Option<String>,
+        ) {
+            let ns = std::path::PathBuf::from("time:[7]");
+            (Some(ns.clone()), Some(ns), self.clock_offsets.clone())
+        }
+        fn sample(
+            origin: &(
+                Option<std::path::PathBuf>,
+                Option<std::path::PathBuf>,
+                Option<String>,
+            ),
+        ) -> Option<u64> {
+            clock_origins_comparable_with(origin.0.as_ref(), origin.1.as_ref(), origin.2.as_deref())
+                .then(comparable_monotonic_ns)
+                .flatten()
+        }
+        pub(crate) fn identities(&self) -> Vec<(u32, u64, u64)> {
+            self.retained
+                .keys()
+                .filter_map(|slot| {
+                    let (entry, return_) = current_pair(*slot, &self.links, &self.sides())?;
+                    Some((*slot, entry.0, return_.0))
+                })
+                .collect()
+        }
+        pub(crate) fn invalidate_generations(&mut self) {
+            self.book.invalidate_all();
+        }
+        pub(crate) fn pair_times(&self, slot: u32) -> (u64, u64) {
+            let stamp = &self.book.stamps[&slot];
+            (stamp.started_ns, stamp.completed_ns)
+        }
+        pub(crate) fn scripted_read_clocks(&self, values: impl IntoIterator<Item = Option<u64>>) {
+            *self.tap.0.read_clocks.lock().unwrap() = values.into_iter().collect();
+        }
+        pub(crate) fn terminal(&self) {
+            self.tap.invalidate_terminal();
+        }
+        pub(crate) fn gap_summary(&self) -> PhysicalGapSummary {
+            self.book.gap_summary()
+        }
+        pub(crate) fn stopped(&self) -> bool {
+            self.stop_word & p11scope_ebpf_common::STOP_GATE_STOP != 0
+                || self.tap.facts().is_err()
+                || self.health.terminal()
+        }
+        fn origin(&self) -> bool {
+            let ns = std::path::PathBuf::from("time:[7]");
+            clock_origins_comparable_with(Some(&ns), Some(&ns), self.clock_offsets.as_deref())
+        }
+        fn read_health(&mut self) -> Result<u64, PidContinuityRefusal> {
+            self.health_reads += 1;
+            if let Some((owner, loss)) = self.health_script.pop_front() {
+                self.owner = owner;
+                self.loss = loss;
+            }
+            let loss = self.loss.clone().and_then(checked_discovery_loss);
+            self.health
+                .check(self.owner, loss, self.prepared_limit, &self.tap)
+        }
+        pub(crate) fn bind(
+            &self,
+            view: &ProcessView,
+            serial: u64,
+            record: &DiscoveryRecord,
+        ) -> Option<ExecBinding> {
+            if self.stopped() {
+                return None;
+            }
+            ExecBinding::bind(&self.tap, &self.tap.0.domain, view, serial, record)
+        }
+        pub(crate) fn has_slot_link(&self, slot: u32) -> bool {
+            self.links.iter().any(|link| link.slots().contains(&slot))
+        }
+        pub(crate) fn prepare(
+            &mut self,
+            binding: &ExecBinding,
+            view: &ProcessView,
+            serial: u64,
+            slots: &[Slot],
+            ordinary: &[Slot],
+            objects: &PinnedObjects,
+        ) -> Option<PreservationReceipt> {
+            if self.stopped() || !self.origin() {
+                return None;
+            }
+            self.health_phases.push("prepare");
+            let loss = self.read_health().ok()?;
+            let sides = self.sides();
+            let pairs = CurrentPairs {
+                book: &self.book,
+                links: &self.links,
+                sides: &sides,
+                retained: &self.retained,
+            };
+            let receipt = pairs.prepare(
+                binding,
+                &self.tap,
+                &self.tap.0.domain,
+                view,
+                serial,
+                slots,
+                ordinary,
+                objects,
+                loss,
+            )?;
+            if !pairs.validate(
+                &receipt,
+                binding,
+                &self.tap,
+                &self.tap.0.domain,
+                view,
+                serial,
+                objects,
+                loss,
+                || Some(crate::events::discovery_drain_positions(&self.drain)),
+            ) {
+                return None;
+            }
+            self.prepared_count += 1;
+            Some(receipt)
+        }
+        pub(crate) fn validate(
+            &mut self,
+            receipt: &PreservationReceipt,
+            binding: &ExecBinding,
+            view: &ProcessView,
+            serial: u64,
+            objects: &PinnedObjects,
+        ) -> bool {
+            if self.stopped() || !self.origin() {
+                return false;
+            }
+            self.health_phases.push("apply");
+            let Ok(loss) = self.read_health() else {
+                return false;
+            };
+            let sides = self.sides();
+            let pairs = CurrentPairs {
+                book: &self.book,
+                links: &self.links,
+                sides: &sides,
+                retained: &self.retained,
+            };
+            pairs.validate(
+                receipt,
+                binding,
+                &self.tap,
+                &self.tap.0.domain,
+                view,
+                serial,
+                objects,
+                loss,
+                || Some(crate::events::discovery_drain_positions(&self.drain)),
+            )
+        }
+        pub(crate) fn raw_fault(&mut self) {
+            let cursor = self.drain.source();
+            cursor.records.borrow_mut().push_back(vec![0]);
+            cursor.producer.set(cursor.producer.get() + 1);
+            assert!(matches!(
+                self.drain.dequeue(),
+                Some(crate::events::DiscoveryItem::Malformed)
+            ));
+            assert!(self.drain.dequeue().is_none());
+        }
+        pub(crate) fn busy_frontier(&mut self) {
+            let cursor = self.drain.source();
+            cursor.producer.set(cursor.producer.get() + 8);
+            assert!(self.drain.dequeue().is_none());
+        }
+        pub(crate) fn at_preflight(&mut self) {
+            if self.prepared_count == 0 {
+                return;
+            }
+            match self.preflight_change.take() {
+                Some(PreflightChange::Producer) => self
+                    .drain
+                    .source()
+                    .producer
+                    .set(self.drain.source().producer.get() + 8),
+                Some(PreflightChange::Observation) => self.raw_fault(),
+                Some(PreflightChange::Health) => {
+                    self.owner = self
+                        .owner
+                        .map(|owner| ThreadOwnerControl { poison: 1, ..owner })
+                }
+                Some(PreflightChange::Registration) => self.book.invalidate_all(),
+                Some(PreflightChange::Stop) => {
+                    self.stop_word = p11scope_ebpf_common::STOP_GATE_STOP | 3
+                }
+                Some(PreflightChange::Clock) => self.clock_offsets = Some("monotonic 1 0".into()),
+                Some(PreflightChange::Exit(pid)) => {
+                    let pid = pid as libc::pid_t;
+                    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+                    let mut status = 0;
+                    assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+                }
+                Some(PreflightChange::Cancel(flag)) => {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed)
+                }
+                None => (),
+            }
+        }
+        pub(crate) fn observe(&mut self, record: DiscoveryRecord) {
+            // DiscoveryRecord is the strict fixed-width wire type. Copy its full
+            // bytes into the source consumed by the actual decoder/observer.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    (&record as *const DiscoveryRecord).cast::<u8>(),
+                    std::mem::size_of::<DiscoveryRecord>(),
+                )
+            }
+            .to_vec();
+            if !self.origin() {
+                self.scripted_read_clocks([None, None]);
+            }
+            let cursor = self.drain.source();
+            cursor.records.borrow_mut().push_back(bytes);
+            cursor
+                .producer
+                .set(cursor.producer.get() + std::mem::size_of::<DiscoveryRecord>());
+            assert!(
+                matches!(
+                    self.drain.dequeue(),
+                    Some(crate::events::DiscoveryItem::Record(_))
+                ),
+                "the positive/finite lifecycle fixture must decode as a genuine Record"
+            );
+            assert!(self.drain.dequeue().is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod b3_health_tests {
+    use super::*;
+    use p11scope_ebpf_common::ThreadOwnerControl;
+    #[test]
+    fn pid_continuity_checked_owner_health_uses_gauge_and_sticky_faults() {
+        let tap = PidLifecycleTap::test_for(1, DiscoveryDomain::test_standin(7));
+        let mut health = OwnerHealth::default();
+        let mut owner = ThreadOwnerControl {
+            limit: 17,
+            outstanding: 9,
+            ..Default::default()
+        };
+        assert_eq!(
+            health.check(Ok(owner), Ok(4), 17, &tap),
+            Ok(4),
+            "healthy exact prepared map control grants a checked baseline"
+        );
+        owner.outstanding = 3;
+        assert_eq!(
+            health.check(Ok(owner), Ok(4), 17, &tap),
+            Ok(4),
+            "outstanding is a decreasing gauge"
+        );
+        let initial = tap.facts().unwrap().fault_serial;
+        owner.admission_failures = 1;
+        assert!(health.check(Ok(owner), Ok(4), 17, &tap).is_ok());
+        assert!(
+            tap.facts().unwrap().fault_serial > initial,
+            "new cumulative uncertainty invalidates old generations"
+        );
+        let before = tap.facts().unwrap().fault_serial;
+        assert!(
+            health
+                .check(Err(PidContinuityRefusal::Unavailable), Ok(4), 17, &tap)
+                .is_err()
+        );
+        assert!(
+            tap.facts().unwrap().fault_serial > before,
+            "an unreadable interval cannot disappear after recovery"
+        );
+        let unknown_interval = tap.facts().unwrap().fault_serial;
+        assert_eq!(health.check(Ok(owner), Ok(4), 17, &tap), Ok(4));
+        assert_eq!(
+            tap.facts().unwrap().fault_serial,
+            unknown_interval,
+            "readability recovery retains the fault that invalidated old generations"
+        );
+        assert_eq!(
+            health.check(
+                Ok(p11scope_ebpf_common::ThreadOwnerControl {
+                    admission_failures: 0,
+                    ..owner
+                }),
+                Ok(4),
+                17,
+                &tap
+            ),
+            Err(PidContinuityRefusal::Fault),
+            "cumulative counters may not decline like the outstanding gauge"
+        );
+        assert!(health.check(Ok(owner), Ok(3), 17, &tap).is_err());
+        let before_loss = tap.facts().unwrap().fault_serial;
+        assert_eq!(health.check(Ok(owner), Ok(5), 17, &tap), Ok(5));
+        assert!(
+            tap.facts().unwrap().fault_serial > before_loss,
+            "fresh transport loss faults the old generation while allowing a later checked recovery baseline"
+        );
+        owner.poison = 1;
+        assert!(health.check(Ok(owner), Ok(4), 17, &tap).is_err());
+        owner.poison = 0;
+        assert!(
+            health.check(Ok(owner), Ok(4), 17, &tap).is_err(),
+            "poison is terminal for the frozen maps"
+        );
+        for bad in [
+            ThreadOwnerControl { limit: 16, ..owner },
+            ThreadOwnerControl {
+                outstanding: 18,
+                ..owner
+            },
+            ThreadOwnerControl {
+                abandoned_discovery: u64::MAX,
+                ..owner
+            },
+        ] {
+            let mut health = OwnerHealth::default();
+            assert!(health.check(Ok(bad), Ok(4), 17, &tap).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+    #[test]
+    fn pid_continuity_physical_gap_boundaries_are_cumulative() {
+        let (_dir, pins, target) = tests::fixture();
+        let retained = BTreeMap::from([(0, target)]);
+        let mut book = PairBook::default();
+        let sides = BTreeSet::from([(0, ProbeSide::Return), (0, ProbeSide::Entry)]);
+        for (start, complete) in [(10, 30), (100, 150)] {
+            book.begin_gap(&BTreeSet::from([0]), Some(start), &retained);
+            assert!(
+                book.gap_summary().open,
+                "first necessary detach must persist before reattachment"
+            );
+            let links = tests::pair(&mut book);
+            book.seal(
+                &[AttachRound {
+                    slots: vec![0],
+                    started_ns: Some(start + 1),
+                    last_call_ns: Some(start + 2),
+                }],
+                Some(AttachBaseline { loss: 0, fault: 0 }),
+                Some(0),
+                &links,
+                &sides,
+                &retained,
+                || Some(complete),
+            );
+            assert!(
+                book.stamp_for(&retained[&0].slot, &pins, &links, &sides, &retained)
+                    .is_some()
+            );
+            assert!(!book.gap_summary().open);
+        }
+        assert_eq!(book.gap_summary().episodes, 2);
+        assert_eq!(
+            book.gap_summary().max_gap_ns,
+            Some(50),
+            "healthy time between separate episodes must never count as dark time"
+        );
+        book.begin_gap(&BTreeSet::from([0]), None, &retained);
+        assert!(book.gap_summary().unknown);
     }
 }

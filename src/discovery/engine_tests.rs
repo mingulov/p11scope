@@ -1737,7 +1737,11 @@ fn frame_deferred_loader_records_keep_their_context_until_dispatch() {
     let pid = engine.views[0].pid();
     let mut pending_views = PendingViewRetirements::new();
     assert_eq!(
-        engine.dispatch_lifecycle_record(&exec_record_for(pid), &mut pending_views),
+        engine.dispatch_lifecycle_record(
+            &mut ScriptedSession::default(),
+            &exec_record_for(pid),
+            &mut pending_views
+        ),
         Some(view)
     );
     assert_eq!(
@@ -1788,7 +1792,11 @@ fn frame_deferred_loader_records_resolve_rt_add_before_exec_retirement() {
         let (_fixture, mut engine, context, mut add, mut session) = armed_seed_route(2);
         let pid = engine.views[0].pid();
         let mut pending_views = PendingViewRetirements::new();
-        engine.dispatch_lifecycle_record(&exec_record_for(pid), &mut pending_views);
+        engine.dispatch_lifecycle_record(
+            &mut ScriptedSession::default(),
+            &exec_record_for(pid),
+            &mut pending_views,
+        );
         engine.update_counter_snapshot(&session).unwrap();
         add.announced_count = 1;
         let queued = QueuedDiscoveryRecord {
@@ -2367,9 +2375,17 @@ fn publication_reuse_preserves_refusal_and_overflow_history() {
     engine.broad_admit = true;
     let mut pending = PendingViewRetirements::new();
     for offset in 0..MAX_PENDING_REFRESH as u32 {
-        engine.dispatch_lifecycle_record(&exec_record_for(4_000_000 + offset), &mut pending);
+        engine.dispatch_lifecycle_record(
+            &mut ScriptedSession::default(),
+            &exec_record_for(4_000_000 + offset),
+            &mut pending,
+        );
     }
-    engine.dispatch_lifecycle_record(&exec_record_for(4_001_000), &mut pending);
+    engine.dispatch_lifecycle_record(
+        &mut ScriptedSession::default(),
+        &exec_record_for(4_001_000),
+        &mut pending,
+    );
     assert_eq!(engine.discovery_truncated, 1);
     assert_eq!(engine.newcomer_ages.dropped_unknown, 1);
     // The next successful provider transaction models recovery, after the
@@ -3104,7 +3120,11 @@ fn leader_exit_dispatch_is_two_phase_and_uses_the_admitted_view() {
     let mut pending_views = PendingViewRetirements::new();
 
     assert_eq!(
-        engine.dispatch_lifecycle_record(&record, &mut pending_views),
+        engine.dispatch_lifecycle_record(
+            &mut ScriptedSession::default(),
+            &record,
+            &mut pending_views
+        ),
         None
     );
     assert!(pending_views.is_empty(), "dispatch does not retire yet");
@@ -3156,15 +3176,15 @@ fn cgroup_ingress_admission_and_delayed_exit_are_generation_bounded() {
     delayed.pid_tgid = u64::from(pid) << 32;
     delayed.hook_ts_ns = admitted;
     let mut pending = PendingViewRetirements::new();
-    engine.dispatch_lifecycle_record(&delayed, &mut pending);
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &delayed, &mut pending);
     assert_eq!(engine.pid_descendant_gaps(), 1);
 
     let mut short_lived: DiscoveryRecord = unsafe { std::mem::zeroed() };
     short_lived.kind = DISCOVERY_KIND_LEADER_EXIT;
     short_lived.pid_tgid = u64::from(pid.saturating_add(1)) << 32;
     short_lived.hook_ts_ns = admitted;
-    engine.dispatch_lifecycle_record(&short_lived, &mut pending);
-    engine.dispatch_lifecycle_record(&short_lived, &mut pending);
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &short_lived, &mut pending);
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &short_lived, &mut pending);
     assert_eq!(engine.pid_descendant_gaps(), 2);
 }
 
@@ -3204,13 +3224,13 @@ fn cgroup_same_pid_unseen_generation_after_closed_interval_counts_once() {
     exit.pid_tgid = u64::from(pid) << 32;
     exit.hook_ts_ns = admitted;
     let mut pending = PendingViewRetirements::new();
-    engine.dispatch_lifecycle_record(&exit, &mut pending);
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
     assert_eq!(engine.pid_descendant_gaps(), 0);
 
     exit.hook_ts_ns = admitted.saturating_add(1);
-    engine.dispatch_lifecycle_record(&exit, &mut pending);
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
     assert_eq!(engine.pid_descendant_gaps(), 1);
-    engine.dispatch_lifecycle_record(&exit, &mut pending);
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
     assert_eq!(engine.pid_descendant_gaps(), 1);
 }
 
@@ -3236,7 +3256,7 @@ fn cgroup_live_sibling_exec_refreshes_after_leader_interval_closed() {
     exec.hook_ts_ns = admitted.saturating_add(1);
     let mut pending = PendingViewRetirements::new();
 
-    engine.dispatch_lifecycle_record(&exec, &mut pending);
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exec, &mut pending);
 
     assert_eq!(
         pending.get(&ProcessViewId(34)),
@@ -3368,7 +3388,7 @@ fn cgroup_exec_rejects_a_stale_retained_generation() {
     exec.hook_ts_ns = admitted.saturating_add(1);
     let mut pending = PendingViewRetirements::new();
 
-    engine.dispatch_lifecycle_record(&exec, &mut pending);
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exec, &mut pending);
 
     assert!(pending.is_empty());
     assert!(!engine.refresh_requested.contains_key(&child.id()));
@@ -3454,11 +3474,11 @@ fn preattach_stale_removal_closes_admission_before_view_deletion() {
     exit.pid_tgid = u64::from(pid) << 32;
     exit.hook_ts_ns = admitted;
     let mut pending = PendingViewRetirements::new();
-    engine.dispatch_lifecycle_record(&exit, &mut pending);
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
     assert_eq!(engine.pid_descendant_gaps(), 0);
 
     exit.hook_ts_ns = closed.saturating_add(1);
-    engine.dispatch_lifecycle_record(&exit, &mut pending);
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
     assert_eq!(engine.pid_descendant_gaps(), 1);
 }
 
@@ -3547,19 +3567,19 @@ fn cgroup_unmatched_exit_overflow_latches_one_lower_bound() {
         exit.kind = DISCOVERY_KIND_LEADER_EXIT;
         exit.pid_tgid = (index as u64 + 1) << 32;
         exit.hook_ts_ns = index as u64 + 1;
-        engine.dispatch_lifecycle_record(&exit, &mut pending);
+        engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
     }
     let after_overflow = engine.pid_descendant_gaps();
     let mut replay: DiscoveryRecord = unsafe { std::mem::zeroed() };
     replay.kind = DISCOVERY_KIND_LEADER_EXIT;
     replay.pid_tgid = (MAX_SCAN_PIDS as u64 + 1) << 32;
     replay.hook_ts_ns = MAX_SCAN_PIDS as u64 + 1;
-    engine.dispatch_lifecycle_record(&replay, &mut pending);
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &replay, &mut pending);
     let mut further: DiscoveryRecord = unsafe { std::mem::zeroed() };
     further.kind = DISCOVERY_KIND_LEADER_EXIT;
     further.pid_tgid = (MAX_SCAN_PIDS as u64 + 2) << 32;
     further.hook_ts_ns = MAX_SCAN_PIDS as u64 + 2;
-    engine.dispatch_lifecycle_record(&further, &mut pending);
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &further, &mut pending);
     assert_eq!(after_overflow, MAX_SCAN_PIDS as u64 + 1);
     assert_eq!(engine.pid_descendant_gaps(), after_overflow);
     assert_eq!(
@@ -3597,8 +3617,8 @@ fn system_scope_admits_new_generations_and_counts_unmatched_exits() {
     short_lived.pid_tgid = u64::from(pid.saturating_add(1)) << 32;
     short_lived.hook_ts_ns = admitted;
     let mut pending = PendingViewRetirements::new();
-    engine.dispatch_lifecycle_record(&short_lived, &mut pending);
-    engine.dispatch_lifecycle_record(&short_lived, &mut pending);
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &short_lived, &mut pending);
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &short_lived, &mut pending);
     assert_eq!(engine.pid_descendant_gaps(), 2);
 }
 
@@ -3612,14 +3632,14 @@ fn system_scope_ledger_overflow_latches_partial_with_system_subject() {
         exit.kind = DISCOVERY_KIND_LEADER_EXIT;
         exit.pid_tgid = (index as u64 + 1) << 32;
         exit.hook_ts_ns = index as u64 + 1;
-        engine.dispatch_lifecycle_record(&exit, &mut pending);
+        engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
     }
     let after_overflow = engine.pid_descendant_gaps();
     let mut further: DiscoveryRecord = unsafe { std::mem::zeroed() };
     further.kind = DISCOVERY_KIND_LEADER_EXIT;
     further.pid_tgid = (MAX_SCAN_PIDS as u64 + 2) << 32;
     further.hook_ts_ns = MAX_SCAN_PIDS as u64 + 2;
-    engine.dispatch_lifecycle_record(&further, &mut pending);
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &further, &mut pending);
     assert_eq!(after_overflow, MAX_SCAN_PIDS as u64 + 1);
     assert_eq!(engine.pid_descendant_gaps(), after_overflow);
     assert!(engine.cgroup_ingress_overflow);
@@ -3855,7 +3875,7 @@ fn batch_exit_dominates_exec_before_dead_pin_promotion() {
         record(DISCOVERY_KIND_EXEC, child.id(), hook_ts_ns),
         record(DISCOVERY_KIND_LEADER_EXIT, child.id(), hook_ts_ns),
     ] {
-        engine.dispatch_lifecycle_record(&record, &mut pending);
+        engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &record, &mut pending);
     }
     engine.promote_stale_execs(&mut pending);
 
@@ -3888,7 +3908,7 @@ fn batch_exit_dominates_exec_before_dead_pin_promotion() {
     child.kill().unwrap();
     child.wait().unwrap();
     let mut pending = PendingViewRetirements::new();
-    engine.dispatch_lifecycle_record(&exec, &mut pending);
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exec, &mut pending);
     engine.promote_stale_execs(&mut pending);
     assert_eq!(
         pending.get(&ProcessViewId(19)),
@@ -5648,7 +5668,11 @@ fn refresh_request_queue_is_bounded_with_explicit_overflow() {
     let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
     let mut pending = PendingViewRetirements::new();
     for pid in 1..=(MAX_PENDING_REFRESH as u32 + 44) {
-        engine.dispatch_lifecycle_record(&exec_record_for(pid), &mut pending);
+        engine.dispatch_lifecycle_record(
+            &mut ScriptedSession::default(),
+            &exec_record_for(pid),
+            &mut pending,
+        );
     }
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     assert_eq!(engine.discovery_truncated, 44);
@@ -7559,7 +7583,7 @@ fn delayed_pre_admission_exec_cannot_refresh_a_reused_pid() {
     engine.views.push(view);
     let mut pending = PendingViewRetirements::new();
 
-    engine.dispatch_lifecycle_record(&delayed, &mut pending);
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &delayed, &mut pending);
 
     assert!(pending.is_empty());
     assert!(!engine.refresh_requested.contains_key(&std::process::id()));
@@ -7708,7 +7732,7 @@ fn expected_exit_waits_for_the_original_process_pin() {
     let mut engine = Engine::empty();
     engine.views.push(view);
     let mut pending = PendingViewRetirements::new();
-    engine.dispatch_lifecycle_record(&record, &mut pending);
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &record, &mut pending);
 
     assert!(
         pending.is_empty(),
@@ -9194,7 +9218,11 @@ fn overflowing_retained_exec_refresh_rearms_after_queue_capacity_returns() {
     for offset in 0..MAX_PENDING_REFRESH as u32 {
         let earlier_pid = 4_000_000 + offset;
         assert_ne!(earlier_pid, pid, "the owned generation is not queued yet");
-        engine.dispatch_lifecycle_record(&exec_record_for(earlier_pid), &mut pending);
+        engine.dispatch_lifecycle_record(
+            &mut ScriptedSession::default(),
+            &exec_record_for(earlier_pid),
+            &mut pending,
+        );
     }
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     assert_eq!(engine.discovery_truncated, 0);
@@ -9227,7 +9255,11 @@ fn overflowing_retained_exec_refresh_rearms_after_queue_capacity_returns() {
     // EXEC burst keeps the next ordinary batch full: retrying the same owed
     // refresh must neither count another lost record nor stall inventory.
     for offset in 0..MAX_PENDING_REFRESH as u32 {
-        engine.dispatch_lifecycle_record(&exec_record_for(4_000_000 + offset), &mut pending);
+        engine.dispatch_lifecycle_record(
+            &mut ScriptedSession::default(),
+            &exec_record_for(4_000_000 + offset),
+            &mut pending,
+        );
     }
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
@@ -9328,12 +9360,28 @@ int C_GetInterface(const char *name, void *version, void **out, unsigned long fl
 const TABLED_RUNNER_C: &str = r#"
 #include <dlfcn.h>
 #include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
 int main(int argc, char **argv) {
     if (argc != 3) return 2;
+    if (getenv("P11S_REEXEC") != NULL) {
+        unsetenv("P11S_REEXEC");
+        if (write(1, "E", 1) != 1) return 9;
+    }
     void *handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (handle == NULL) return 3;
     char command;
     while (read(0, &command, 1) == 1) {
+        if (command == 's' || command == 'd') {
+            setenv("P11S_REEXEC", "1", 1);
+            char alternate[4096];
+            if (command == 'd') {
+                if (strlen(argv[0]) + 6 >= sizeof(alternate)) return 10;
+                strcpy(alternate, argv[0]); strcat(alternate, ".copy");
+            }
+            execl(command == 'd' ? alternate : argv[0], argv[0], argv[1], argv[2], (char *)NULL);
+            return 8;
+        }
         if (command != 'c') return 5;
         dlclose(handle);
         handle = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
@@ -9376,6 +9424,32 @@ fn wait_tabled_mapping(pid: u32, library: &std::path::Path) {
 }
 
 impl TabledSeedProvider {
+    fn reexec(&mut self, different: bool) {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        if different {
+            std::fs::copy(
+                self.dir.path().join("tabled-runner"),
+                self.dir.path().join("tabled-runner.copy"),
+            )
+            .unwrap();
+        }
+        self.child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(if different { b"d" } else { b"s" })
+            .unwrap();
+        let output = self.child.stdout.as_mut().unwrap();
+        assert!(
+            system_scope_poll_fd(output.as_raw_fd(), std::time::Duration::from_secs(5)).unwrap()
+        );
+        let mut ack = [0];
+        output.read_exact(&mut ack).unwrap();
+        assert_eq!(ack, *b"E");
+        wait_tabled_mapping(self.child.id(), &self.dir.path().join("tabled-provider.so"));
+    }
+
     fn spawn_peer(&mut self, stem: &str) -> (u32, PathBuf) {
         let library = compile_tabled_provider(self.dir.path(), stem);
         (self.spawn_peer_library(&library), library)
@@ -9634,7 +9708,7 @@ fn automatic_exec_global_links_survive_caller_exec() {
                     binding.abi,
                 ));
             }
-            assert!(!engine.exec_rearm_views.contains(&view));
+            assert!(!engine.exec_rearm_views.contains_key(&view));
             assert!(!engine.refresh_requested.contains_key(&pid));
             let scans = engine.deep_scans;
             apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
@@ -9732,7 +9806,7 @@ fn automatic_exec_global_changed_plan_replaces_only_changed_targets() {
             [sibling_context]
         );
         assert!(engine.capture_facts.history.decoded.is_superset(&decoded));
-        assert!(!engine.exec_rearm_views.contains(&ProcessViewId(0)));
+        assert!(!engine.exec_rearm_views.contains_key(&ProcessViewId(0)));
         assert!(!engine.refresh_requested.contains_key(&pid));
     }
 }
@@ -9751,14 +9825,14 @@ fn automatic_exec_global_aborted_refresh_retries_and_settles() {
         session.refuse_preflights([false, true]);
         apply_ordinary_batch(&mut engine, &mut session, vec![exec_record_for(pid)]).unwrap();
         assert_eq!(session.preflight_targets.borrow().len(), preflights + 2);
-        assert!(engine.exec_rearm_views.contains(&view));
-        let request = engine.refresh_requested[&pid];
+        assert!(engine.exec_rearm_views.contains_key(&view));
+        let request = engine.refresh_requested[&pid].clone();
         assert_eq!(request.owner, Some(view));
         assert!(session.detached_slot_indices.iter().all(Vec::is_empty));
 
         let retry = apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
         assert!(retry.required_complete);
-        assert!(!engine.exec_rearm_views.contains(&view));
+        assert!(!engine.exec_rearm_views.contains_key(&view));
         assert!(!engine.refresh_requested.contains_key(&pid));
         assert_eq!(engine.plan.slots, slots);
         assert!(slots.iter().all(|slot| engine.plan.is_active(slot.index)));
@@ -9775,7 +9849,7 @@ fn automatic_exec_global_aborted_refresh_retries_and_settles() {
             apply_ordinary_batch(&mut engine, &mut session, vec![exec_record_for(pid)]).unwrap();
         assert!(repeated.required_complete);
         assert_ne!(engine.loader_registry.ids_for_view(view), refreshed);
-        assert!(!engine.exec_rearm_views.contains(&view));
+        assert!(!engine.exec_rearm_views.contains_key(&view));
         assert!(!engine.refresh_requested.contains_key(&pid));
         let scans = engine.deep_scans;
         apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
@@ -10202,7 +10276,7 @@ fn automatic_exec_aborted_tick_retry_still_rearms_pid_targets() {
         "the aborted tick retains the refresh request for retry"
     );
     assert!(
-        engine.exec_rearm_views.contains(&view_id),
+        engine.exec_rearm_views.contains_key(&view_id),
         "the aborted tick retains the exec marker for the retry"
     );
     assert!(
@@ -10282,7 +10356,7 @@ fn automatic_exec_aborted_tick_retry_still_rearms_pid_targets() {
         "original process custody is retained, never reopened by PID"
     );
     assert!(
-        !engine.exec_rearm_views.contains(&view_id),
+        !engine.exec_rearm_views.contains_key(&view_id),
         "the completed rearm clears the marker"
     );
 }
@@ -17386,7 +17460,11 @@ impl LoaderPlanningFixture {
         // A real consumed-EXEC loss is historical input to both paired engines.
         let mut pending = PendingViewRetirements::new();
         for offset in 0..=MAX_PENDING_REFRESH as u32 {
-            engine.dispatch_lifecycle_record(&exec_record_for(4_000_000 + offset), &mut pending);
+            engine.dispatch_lifecycle_record(
+                &mut ScriptedSession::default(),
+                &exec_record_for(4_000_000 + offset),
+                &mut pending,
+            );
         }
         engine.refresh_requested.clear();
         engine.publish_current_capture_facts().unwrap();
@@ -18872,6 +18950,7 @@ fn post_attach_generation_loss_detaches_and_cannot_commit_stale_candidate() {
         manifest_selection_admissions: Vec::new(),
         manifest_inventory_slots: BTreeMap::new(),
         loader_plan_proof: None,
+        exec_preservations: Vec::new(),
     };
     commit_cleaned_candidate_identity(
         &mut candidate,
@@ -29057,11 +29136,19 @@ fn genuine_exec_overflow_keeps_explicit_refresh_queue_loss() {
     engine.scope = Scope::System;
     let mut pending = PendingViewRetirements::new();
     for offset in 0..MAX_PENDING_REFRESH as u32 {
-        engine.dispatch_lifecycle_record(&exec_record_for(4_000_000 + offset), &mut pending);
+        engine.dispatch_lifecycle_record(
+            &mut ScriptedSession::default(),
+            &exec_record_for(4_000_000 + offset),
+            &mut pending,
+        );
     }
     let requested = engine.refresh_requested.clone();
 
-    engine.dispatch_lifecycle_record(&exec_record_for(4_001_000), &mut pending);
+    engine.dispatch_lifecycle_record(
+        &mut ScriptedSession::default(),
+        &exec_record_for(4_001_000),
+        &mut pending,
+    );
 
     assert_eq!(engine.refresh_requested, requested);
     assert_eq!(engine.discovery_truncated, 1);
@@ -29075,7 +29162,11 @@ fn genuine_exec_overflow_keeps_explicit_refresh_queue_loss() {
                 && skip.reason.contains("exceeded the bounded pending queue")),
         "a real EXEC request was dropped and must remain visible"
     );
-    engine.dispatch_lifecycle_record(&exec_record_for(4_000_000), &mut pending);
+    engine.dispatch_lifecycle_record(
+        &mut ScriptedSession::default(),
+        &exec_record_for(4_000_000),
+        &mut pending,
+    );
     assert_eq!(engine.discovery_truncated, 1, "already-queued EXEC is free");
 }
 
@@ -29094,7 +29185,11 @@ fn polling_engine_with_full_exec_queue(
     }
     let mut pending = PendingViewRetirements::new();
     for offset in 0..MAX_PENDING_REFRESH as u32 {
-        engine.dispatch_lifecycle_record(&exec_record_for(4_000_000 + offset), &mut pending);
+        engine.dispatch_lifecycle_record(
+            &mut ScriptedSession::default(),
+            &exec_record_for(4_000_000 + offset),
+            &mut pending,
+        );
     }
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     assert_eq!(engine.discovery_truncated, 0);
@@ -32799,16 +32894,16 @@ fn refresh_completion_interleaving(same_pid: bool) {
 fn refresh_retry_preserves_newer_serial_and_first_seen() {
     let mut engine = Engine::empty();
     assert!(engine.request_refresh_consumed(42, Some(10)));
-    let first = engine.refresh_requested[&42];
+    let first = engine.refresh_requested[&42].clone();
     assert!(engine.request_refresh_consumed(42, Some(20)));
-    let newer = engine.refresh_requested[&42];
+    let newer = engine.refresh_requested[&42].clone();
     assert!(newer.serial > first.serial);
     assert_eq!(newer.first_seen_ns, Some(10));
     assert!(engine.request_refresh(42, Some(30)));
     assert!(engine.request_refresh(42, None));
-    assert_eq!(engine.refresh_requested[&42], newer);
+    assert_eq!(engine.refresh_requested[&42].clone(), newer);
     engine.complete_refresh_requests(&BTreeMap::from([(42, first.serial)]), &BTreeSet::new());
-    assert_eq!(engine.refresh_requested[&42], newer);
+    assert_eq!(engine.refresh_requested[&42].clone(), newer);
     assert!(engine.request_refresh_consumed(43, None));
     assert!(engine.request_refresh_consumed(43, Some(40)));
     assert_eq!(engine.refresh_requested[&43].first_seen_ns, None);
@@ -32821,7 +32916,11 @@ fn refresh_retry_preserves_newer_serial_and_first_seen() {
     let view = engine.views[0].id();
     let mut pending = PendingViewRetirements::new();
     for offset in 0..MAX_PENDING_REFRESH as u32 {
-        engine.dispatch_lifecycle_record(&exec_record_for(4_000_000 + offset), &mut pending);
+        engine.dispatch_lifecycle_record(
+            &mut ScriptedSession::default(),
+            &exec_record_for(4_000_000 + offset),
+            &mut pending,
+        );
     }
     let requested = engine.refresh_requested.clone();
     for _ in 0..2 {
@@ -32885,7 +32984,11 @@ fn refresh_retry_preserves_newer_serial_and_first_seen() {
     engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     assert!(!engine.plan.slots.is_empty());
     for offset in 0..MAX_PENDING_REFRESH as u32 {
-        engine.dispatch_lifecycle_record(&exec_record_for(4_000_000 + offset), &mut pending);
+        engine.dispatch_lifecycle_record(
+            &mut ScriptedSession::default(),
+            &exec_record_for(4_000_000 + offset),
+            &mut pending,
+        );
     }
     assert!(!engine.request_refresh(pid, Some(50)));
     let before = engine.deep_scans;
@@ -32930,19 +33033,25 @@ fn refresh_serial_exhaustion_refuses_without_reuse() {
     let mut engine = Engine::empty();
     engine.last_refresh_serial = u64::MAX - 1;
     assert!(engine.request_refresh_consumed(42, Some(10_000_000)));
-    let last = engine.refresh_requested[&42];
+    let last = engine.refresh_requested[&42].clone();
     assert_eq!(last.serial, u64::MAX);
     assert!(!engine.request_refresh_consumed(42, Some(20_000_000)));
     assert!(!engine.request_refresh_consumed(43, Some(30_000_000)));
     assert_eq!(engine.last_refresh_serial, u64::MAX);
-    assert_eq!(engine.refresh_requested, BTreeMap::from([(42, last)]));
+    assert_eq!(
+        engine.refresh_requested,
+        BTreeMap::from([(42, last.clone())])
+    );
     assert_eq!(engine.discovery_truncated, 2);
     assert_eq!(engine.newcomer_ages.dropped, 1);
     assert_eq!(engine.newcomer_ages.max_dropped_age_ms, Some(10));
     assert_eq!(engine.newcomer_ages.dropped_unknown, 1);
     assert!(engine.request_refresh(42, Some(40)));
     assert!(!engine.request_refresh(43, Some(40)));
-    assert_eq!(engine.refresh_requested, BTreeMap::from([(42, last)]));
+    assert_eq!(
+        engine.refresh_requested,
+        BTreeMap::from([(42, last.clone())])
+    );
     assert_eq!(
         engine.discovery_truncated, 2,
         "a retry is not another consumed record"
@@ -33007,14 +33116,14 @@ fn refresh_completion_clears_only_serviced_stale_requests() {
         outcome,
         DiscoveryRecordOutcome::Rejected(RecordRejection::SelectionUnattributed)
     ));
-    let replacement = engine.refresh_requested[&pid];
+    let replacement = engine.refresh_requested[&pid].clone();
     assert_eq!(replacement.owner, None);
     engine.queue_retirement(
         view,
         RetirementCause::ExpectedRemoval,
         &mut PendingViewRetirements::new(),
     );
-    assert_eq!(engine.refresh_requested[&pid], replacement);
+    assert_eq!(engine.refresh_requested[&pid].clone(), replacement);
     assert!(
         engine.counters.object_skips.iter().any(|skip| {
             skip.subject == "live interface selection"
@@ -33055,20 +33164,24 @@ fn matched_lifecycle_refresh_keeps_owner_for_proven_exit() {
     fixture.engine.scope = Scope::Pid(pid);
     assert!(!fixture.engine.plan.slots.is_empty());
     assert!(fixture.engine.request_refresh(pid, Some(10_000_000)));
-    let first = fixture.engine.refresh_requested[&pid];
+    let first = fixture.engine.refresh_requested[&pid].clone();
     let mut pending = PendingViewRetirements::new();
-    fixture
-        .engine
-        .dispatch_lifecycle_record(&exec_record_for(pid), &mut pending);
-    let renewed = fixture.engine.refresh_requested[&pid];
+    fixture.engine.dispatch_lifecycle_record(
+        &mut ScriptedSession::default(),
+        &exec_record_for(pid),
+        &mut pending,
+    );
+    let renewed = fixture.engine.refresh_requested[&pid].clone();
     assert_eq!(renewed.owner, Some(view));
     assert!(renewed.serial > first.serial);
     assert_eq!(renewed.first_seen_ns, first.first_seen_ns);
     fixture.children[0].reap().unwrap();
     assert_eq!(fixture.engine.views[0].original_exited(), Ok(true));
-    fixture
-        .engine
-        .dispatch_lifecycle_record(&exec_record_for(pid), &mut pending);
+    fixture.engine.dispatch_lifecycle_record(
+        &mut ScriptedSession::default(),
+        &exec_record_for(pid),
+        &mut pending,
+    );
     fixture.engine.promote_stale_execs(&mut pending);
     assert_eq!(pending.get(&view), Some(&RetirementCause::ExpectedRemoval));
     assert!(
@@ -33262,7 +33375,7 @@ fn pressure_parked_head_waits_for_unprotected_service() {
         .expect("the original head dispatched into the freed slot");
     let mut previous = head.serial;
     for offset in 0..255u32 {
-        let request = &engine.refresh_requested[&(4_000_000 + offset)];
+        let request = &engine.refresh_requested[&(4_000_000 + offset)].clone();
         assert_eq!(
             request.first_seen_ns,
             Some(1_000 + u64::from(offset)),
@@ -33323,9 +33436,9 @@ fn backlog_quantum_runs_one_pressure_transaction_then_yields() {
         );
     }
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
-    let pid_before = engine.refresh_requested[&pid];
-    let decoy_before = engine.refresh_requested[&decoy];
-    let unprotected_before = engine.refresh_requested[&unprotected];
+    let pid_before = engine.refresh_requested[&pid].clone();
+    let decoy_before = engine.refresh_requested[&decoy].clone();
+    let unprotected_before = engine.refresh_requested[&unprotected].clone();
     // The suffix names every fake, so pid-order selection serves the
     // decoy first and the unprotected request second.
     let head_pid = 6_000_000u32;
@@ -33473,7 +33586,7 @@ fn backlog_quantum_runs_one_pressure_transaction_then_yields() {
     );
     let mut previous = serial_before + 1;
     for offset in 0..253u32 {
-        let request = &engine.refresh_requested[&(4_000_000 + offset)];
+        let request = &engine.refresh_requested[&(4_000_000 + offset)].clone();
         assert_eq!(
             request.first_seen_ns,
             Some(2_000 + u64::from(offset)),
@@ -33836,11 +33949,11 @@ fn pressure_services_unprotected_request_before_original_head() {
             .is_empty(),
         "the decoy request starts with settled old contexts"
     );
-    let pid_before = engine.refresh_requested[&pid];
-    let decoy_before = engine.refresh_requested[&decoy];
-    let unprotected_before = engine.refresh_requested[&unprotected];
+    let pid_before = engine.refresh_requested[&pid].clone();
+    let decoy_before = engine.refresh_requested[&decoy].clone();
+    let unprotected_before = engine.refresh_requested[&unprotected].clone();
     let unrelated_before: Vec<RefreshRequest> = (0..253u32)
-        .map(|offset| engine.refresh_requested[&(4_000_000 + offset)])
+        .map(|offset| engine.refresh_requested[&(4_000_000 + offset)].clone())
         .collect();
     let unrelated_unchanged = |engine: &Engine| {
         for (offset, before) in unrelated_before.iter().enumerate() {
@@ -34078,7 +34191,7 @@ fn pressure_services_unprotected_request_before_original_head() {
     );
     let mut previous = serial_before + 1;
     for offset in 0..253u32 {
-        let request = &engine.refresh_requested[&(4_000_000 + offset)];
+        let request = &engine.refresh_requested[&(4_000_000 + offset)].clone();
         assert_eq!(
             request.first_seen_ns,
             Some(2_000 + u64::from(offset)),
@@ -34294,7 +34407,7 @@ fn pressure_ordering_direct_pass_keeps_loader_and_terminal_context() {
     // Only the retained pid is protected here (the parked loader names it);
     // the fake requests are unprotected stale entries, of which the service
     // completes exactly its lowest selection.
-    let real_before = engine.refresh_requested[&pid];
+    let real_before = engine.refresh_requested[&pid].clone();
     let scans_before = engine.deep_scans;
     // A drain would snapshot the session's loader-hit counter; the direct
     // pass sets the same authority explicitly.
@@ -34429,8 +34542,8 @@ fn pressure_service_diverts_nested_terminal_pulls_behind_parked() {
     }
     assert!(engine.request_refresh_consumed(5_000_000, Some(3_000)));
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
-    let pid_before = engine.refresh_requested[&pid];
-    let pid2_before = engine.refresh_requested[&pid2];
+    let pid_before = engine.refresh_requested[&pid].clone();
+    let pid2_before = engine.refresh_requested[&pid2].clone();
     let terminal_loader = loader_record_for(armed, pid);
     session.dequeues = [Ok(Some(crate::events::DiscoveryItem::Record(
         terminal_loader,
@@ -34610,9 +34723,9 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
         );
     }
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
-    let fail_a_before = engine.refresh_requested[&fail_a];
-    let fail_b_before = engine.refresh_requested[&fail_b];
-    let pid_before = engine.refresh_requested[&pid];
+    let fail_a_before = engine.refresh_requested[&fail_a].clone();
+    let fail_b_before = engine.refresh_requested[&fail_b].clone();
+    let pid_before = engine.refresh_requested[&pid].clone();
     let success_serial_before = engine.refresh_requested[&success].serial;
     // Absent cursor: no ordinary tick ever ran, so H1 fairness starts
     // untouched; the episode must neither need nor move it.
@@ -34707,7 +34820,7 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
     engine.refresh_requested.remove(&absent);
     let newcomer = 7_000_000u32;
     assert!(engine.request_refresh_consumed(newcomer, Some(5_000)));
-    let newcomer_before = engine.refresh_requested[&newcomer];
+    let newcomer_before = engine.refresh_requested[&newcomer].clone();
     assert_eq!(engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     // Second opportunity: the absent entry is skipped and the next low-ID
     // selection fails the same honest way. No indefinite retry of the
@@ -34829,7 +34942,7 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
     );
     let mut previous = 0u64;
     for offset in 0..251u32 {
-        let request = &engine.refresh_requested[&(4_000_000 + offset)];
+        let request = &engine.refresh_requested[&(4_000_000 + offset)].clone();
         assert_eq!(
             request.first_seen_ns,
             Some(2_000 + u64::from(offset)),
@@ -34869,7 +34982,7 @@ fn pressure_attempt_rotation_is_finite_and_keeps_serials() {
             &mut PauseClosure::new(true),
         )
         .expect("the renewal dispatch keeps the batch alive");
-    let renewed = engine.refresh_requested[&success];
+    let renewed = engine.refresh_requested[&success].clone();
     assert!(
         renewed.serial > retry_serial && renewed.serial > success_serial_before,
         "the consumed renewal keeps a newer serial than every older entry"
@@ -34939,7 +35052,7 @@ fn pressure_zero_quantum_service_defers_and_refuses_once() {
         );
     }
     assert_eq!(fixture.engine.refresh_requested.len(), MAX_PENDING_REFRESH);
-    let real_before = fixture.engine.refresh_requested[&retained_pid];
+    let real_before = fixture.engine.refresh_requested[&retained_pid].clone();
     let scans_before = fixture.engine.deep_scans;
     let ticks_before = fixture.engine.scheduler.under_cap_ticks_for_test();
     let head_pid = 6_000_000u32;
@@ -36330,4 +36443,1262 @@ fn discovery_terminal_capacity_failure_is_visible_and_finite() {
     assert_eq!(session.staged_discovery_len(), 0);
     assert!(engine.pending_discovery_records.is_empty());
     assert_eq!(engine.loader_context_state_for_test(owner), None);
+}
+
+fn continuity_route() -> (TabledSeedProvider, Engine, ScriptedSession) {
+    let (fixture, engine, mut session) = exec_rearm_pid_route();
+    let mut continuity = crate::attach::PidSessionFixture::new(&engine.views[0]);
+    continuity.attach(&engine.plan.slots, &engine.pinned);
+    assert_eq!(continuity.identities().len(), engine.plan.slots.len());
+    session.pid_continuity = Some(std::cell::RefCell::new(continuity));
+    (fixture, engine, session)
+}
+
+fn observed_candidate_exec(engine: &Engine, session: &mut ScriptedSession) -> DiscoveryRecord {
+    let mut record = exec_record_for(engine.views[0].pid());
+    record.case_id = p11scope_ebpf_common::DISCOVERY_EXEC_SAME_TASK_CANDIDATE;
+    record.pid_tgid |= u64::from(engine.views[0].pid());
+    assert!(valid_discovery_record(&record));
+    session
+        .pid_continuity
+        .as_mut()
+        .unwrap()
+        .borrow_mut()
+        .observe(record);
+    record
+}
+
+#[test]
+fn automatic_exec_pid_continuity_same_file_keeps_registered_pairs() {
+    for policy in [CapturePolicy::Allowlisted, CapturePolicy::AggregateOnly] {
+        let (mut fixture, mut engine, mut session) = continuity_route();
+        session.capture_policy = Some(policy);
+        let old = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities();
+        let admission = engine.views[0].view_admission();
+        let history = engine.capture_facts.history.clone();
+        fixture.reexec(false);
+        let record = observed_candidate_exec(&engine, &mut session);
+        let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+        assert!(outcome.required_complete);
+        assert_eq!(
+            session
+                .pid_continuity
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .identities(),
+            old,
+            "healthy same-file EXEC must retain both exact registered sides"
+        );
+        assert!(session.detached_slot_indices.iter().all(Vec::is_empty));
+        assert!(admission.same_allocation(&engine.views[0].view_admission()));
+        assert_eq!(engine.capture_facts.history.modules, history.modules);
+        assert_eq!(engine.capture_facts.history.decoded, history.decoded);
+    }
+}
+
+#[test]
+fn automatic_exec_pid_continuity_different_executable_keeps_unchanged_pairs() {
+    let (mut fixture, mut engine, mut session) = continuity_route();
+    let old = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .identities();
+    fixture.reexec(true);
+    let record = observed_candidate_exec(&engine, &mut session);
+    assert!(
+        apply_ordinary_batch(&mut engine, &mut session, vec![record])
+            .unwrap()
+            .required_complete
+    );
+    assert_eq!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities(),
+        old,
+        "a different executable retaining the held provider must preserve its exact pairs"
+    );
+    let replacement = fixture.replace_mapped_provider();
+    engine.module_hints.push(replacement);
+    let record = observed_candidate_exec(&engine, &mut session);
+    assert!(
+        apply_ordinary_batch(&mut engine, &mut session, vec![record])
+            .unwrap()
+            .required_complete
+    );
+    let new = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .identities();
+    assert_eq!(new.len(), engine.plan.active_slot_count());
+    assert!(
+        old.iter()
+            .all(|(slot, _, _)| !new.iter().any(|(current, _, _)| current == slot)),
+        "a changed real held provider follows its ordinary new/retire delta"
+    );
+}
+
+fn continuity_exec_class(
+    engine: &Engine,
+    session: &mut ScriptedSession,
+    class: u8,
+) -> DiscoveryRecord {
+    let mut record = exec_record_for(engine.views[0].pid());
+    record.pid_tgid |= u64::from(engine.views[0].pid());
+    record.case_id = class;
+    assert!(valid_discovery_record(&record));
+    session
+        .pid_continuity
+        .as_mut()
+        .unwrap()
+        .borrow_mut()
+        .observe(record);
+    record
+}
+
+#[test]
+fn automatic_exec_pid_continuity_cold_replaced_unknown_rearm() {
+    for class in [0, 1, 2] {
+        let (_fixture, mut engine, mut session) = continuity_route();
+        let old = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities();
+        if class == 1 {
+            session
+                .pid_continuity
+                .as_mut()
+                .unwrap()
+                .borrow_mut()
+                .invalidate_generations();
+        }
+        let record = continuity_exec_class(&engine, &mut session, class);
+        assert!(
+            apply_ordinary_batch(&mut engine, &mut session, vec![record])
+                .unwrap()
+                .required_complete
+        );
+        let new = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities();
+        assert_ne!(new, old);
+        assert_eq!(new.len(), engine.plan.active_slot_count());
+        assert!(!engine.exec_rearm_views.contains_key(&ProcessViewId(0)));
+    }
+}
+
+#[test]
+fn automatic_exec_pid_continuity_completed_recovery_allows_next_leader() {
+    let (mut fixture, mut engine, mut session) = continuity_route();
+    fixture.reexec(false);
+    let record = continuity_exec_class(&engine, &mut session, 2);
+    assert!(
+        apply_ordinary_batch(&mut engine, &mut session, vec![record])
+            .unwrap()
+            .required_complete
+    );
+    let recovered = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .identities();
+    let history = engine.capture_facts.history.clone();
+    fixture.reexec(false);
+    let record = observed_candidate_exec(&engine, &mut session);
+    assert!(
+        apply_ordinary_batch(&mut engine, &mut session, vec![record])
+            .unwrap()
+            .required_complete
+    );
+    assert_eq!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities(),
+        recovered
+    );
+    assert_eq!(engine.capture_facts.history.modules, history.modules);
+    assert_eq!(engine.capture_facts.history.decoded, history.decoded);
+}
+
+#[test]
+fn automatic_exec_pid_continuity_dropped_or_secure_exec_cannot_borrow_generation() {
+    for lost in [false, true] {
+        let (_fixture, mut engine, mut session) = continuity_route();
+        let old = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities();
+        if lost {
+            session.pid_continuity.as_mut().unwrap().borrow_mut().loss = Ok(vec![1]);
+            session.counters.ring_loss = 1;
+        } else {
+            // A secure/unknown EXEC observed first but never dispatched still
+            // breaks the old generation; a later ordinary EXEC cannot hide it.
+            continuity_exec_class(&engine, &mut session, 0);
+        }
+        let record = observed_candidate_exec(&engine, &mut session);
+        assert!(
+            apply_ordinary_batch(&mut engine, &mut session, vec![record])
+                .unwrap()
+                .required_complete
+        );
+        let recovered = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities();
+        assert_ne!(recovered, old);
+        let record = observed_candidate_exec(&engine, &mut session);
+        assert!(
+            apply_ordinary_batch(&mut engine, &mut session, vec![record])
+                .unwrap()
+                .required_complete
+        );
+        assert_eq!(
+            session
+                .pid_continuity
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .identities(),
+            recovered
+        );
+        if lost {
+            assert_eq!(engine.capture_facts().discovery_ring_loss, 1);
+        }
+    }
+}
+
+#[test]
+fn automatic_exec_pid_continuity_held_exec_requires_exact_first_cursor_key() {
+    for condition in 0..10 {
+        let (_fixture, mut engine, mut session) = continuity_route();
+        let old = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities();
+        let mut record = exec_record_for(engine.views[0].pid());
+        record.pid_tgid |= u64::from(engine.views[0].pid());
+        record.case_id = 1;
+        match condition {
+            0 => {
+                session
+                    .pid_continuity
+                    .as_mut()
+                    .unwrap()
+                    .borrow_mut()
+                    .observe(record);
+                let later = observed_candidate_exec(&engine, &mut session);
+                assert!(later.hook_ts_ns > record.hook_ts_ns);
+            }
+            1 => {
+                session
+                    .pid_continuity
+                    .as_mut()
+                    .unwrap()
+                    .borrow_mut()
+                    .observe(record);
+                session
+                    .pid_continuity
+                    .as_mut()
+                    .unwrap()
+                    .borrow_mut()
+                    .observe(record);
+            }
+            2 => {
+                session
+                    .pid_continuity
+                    .as_mut()
+                    .unwrap()
+                    .borrow_mut()
+                    .observe(record);
+                engine.dispatch_lifecycle_record(
+                    &mut session,
+                    &record,
+                    &mut PendingViewRetirements::new(),
+                );
+                record.hook_ts_ns = 0;
+                session
+                    .pid_continuity
+                    .as_mut()
+                    .unwrap()
+                    .borrow_mut()
+                    .observe(record);
+            }
+            3 => {
+                record.hook_ts_ns = session
+                    .pid_continuity
+                    .as_ref()
+                    .unwrap()
+                    .borrow()
+                    .pair_times(0)
+                    .1;
+                session
+                    .pid_continuity
+                    .as_mut()
+                    .unwrap()
+                    .borrow_mut()
+                    .observe(record);
+            }
+            4 => {
+                session
+                    .pid_continuity
+                    .as_ref()
+                    .unwrap()
+                    .borrow()
+                    .scripted_read_clocks([Some(record.hook_ts_ns), Some(record.hook_ts_ns)]);
+                session
+                    .pid_continuity
+                    .as_mut()
+                    .unwrap()
+                    .borrow_mut()
+                    .observe(record);
+            }
+            5 => {
+                let mut breaking = record;
+                breaking.case_id = 2;
+                breaking.hook_ts_ns = session
+                    .pid_continuity
+                    .as_ref()
+                    .unwrap()
+                    .borrow()
+                    .pair_times(0)
+                    .0;
+                session
+                    .pid_continuity
+                    .as_mut()
+                    .unwrap()
+                    .borrow_mut()
+                    .observe(breaking);
+                session
+                    .pid_continuity
+                    .as_mut()
+                    .unwrap()
+                    .borrow_mut()
+                    .observe(record);
+            }
+            6 => {
+                session
+                    .pid_continuity
+                    .as_mut()
+                    .unwrap()
+                    .borrow_mut()
+                    .observe(record);
+                session
+                    .pid_continuity
+                    .as_mut()
+                    .unwrap()
+                    .borrow_mut()
+                    .preflight_change = Some(crate::attach::PreflightChange::Observation);
+            }
+            7 => {
+                let mut later = record;
+                later.hook_ts_ns += 1;
+                session
+                    .pid_continuity
+                    .as_mut()
+                    .unwrap()
+                    .borrow_mut()
+                    .observe(later);
+                session
+                    .pid_continuity
+                    .as_mut()
+                    .unwrap()
+                    .borrow_mut()
+                    .observe(record);
+            }
+            8 => {
+                session
+                    .pid_continuity
+                    .as_mut()
+                    .unwrap()
+                    .borrow_mut()
+                    .observe(record);
+                session
+                    .pid_continuity
+                    .as_mut()
+                    .unwrap()
+                    .borrow_mut()
+                    .raw_fault();
+            }
+            _ => {
+                session
+                    .pid_continuity
+                    .as_mut()
+                    .unwrap()
+                    .borrow_mut()
+                    .observe(record);
+                session
+                    .pid_continuity
+                    .as_mut()
+                    .unwrap()
+                    .borrow_mut()
+                    .busy_frontier();
+            }
+        }
+        let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+        let new = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities();
+        assert!(
+            new != old || !outcome.required_complete,
+            "ambiguous/held/strict-equality input {condition} cannot complete by preservation"
+        );
+    }
+}
+
+#[test]
+fn automatic_exec_pid_continuity_renewal_and_settlement_keep_serviced_serial() {
+    let (_fixture, mut engine, mut session) = continuity_route();
+    let pid = engine.views[0].pid();
+    let view = engine.views[0].id();
+    let record = observed_candidate_exec(&engine, &mut session);
+    let mut pending = PendingViewRetirements::new();
+    engine.dispatch_lifecycle_record(&mut session, &record, &mut pending);
+    let first = engine.refresh_requested[&pid].clone();
+    assert!(first.exec_binding.is_some());
+    assert!(engine.request_refresh(pid, Some(u64::MAX)));
+    assert_eq!(engine.refresh_requested[&pid], first);
+    assert!(engine.request_refresh_consumed(pid, Some(u64::MAX)));
+    let second = engine.refresh_requested[&pid].clone();
+    assert!(second.serial > first.serial);
+    assert!(second.exec_binding.is_none());
+    assert_eq!(second.first_seen_ns, first.first_seen_ns);
+    assert_eq!(engine.exec_rearm_views[&view], Some(second.serial));
+    engine.complete_refresh_requests(&BTreeMap::from([(pid, first.serial)]), &BTreeSet::new());
+    assert_eq!(engine.refresh_requested[&pid], second);
+    let record = observed_candidate_exec(&engine, &mut session);
+    engine.dispatch_lifecycle_record(&mut session, &record, &mut pending);
+    let bound = engine.refresh_requested[&pid].clone();
+    assert!(bound.exec_binding.is_some());
+    let mut wrong = crate::attach::PidSessionFixture::new(&engine.views[0]);
+    wrong.attach(&engine.plan.slots, &engine.pinned);
+    let record = observed_candidate_exec(&engine, &mut session);
+    engine.dispatch_lifecycle_record(&mut session, &record, &mut pending);
+    let bound = engine.refresh_requested[&pid].clone();
+    wrong.observe(record);
+    assert!(
+        wrong
+            .bind(&engine.views[0], bound.serial, &record)
+            .is_some(),
+        "the wrong Session has its own otherwise valid observed key"
+    );
+    assert!(
+        wrong
+            .prepare(
+                bound.exec_binding.as_ref().unwrap(),
+                &engine.views[0],
+                bound.serial,
+                &engine.plan.slots,
+                &[],
+                &engine.pinned
+            )
+            .is_none(),
+        "reused numeric domain must not borrow another observer allocation"
+    );
+    let fresh_view = ProcessView::open(view, pid).unwrap();
+    let candidate = engine
+        .live_candidate(
+            engine.pinned.clone(),
+            engine.modules.iter().map(|m| m.scanned.clone()).collect(),
+            Vec::new(),
+        )
+        .unwrap();
+    assert!(
+        session
+            .prepare_preservation(
+                bound.exec_binding.as_ref().unwrap(),
+                &fresh_view,
+                bound.serial,
+                &candidate.plan.slots,
+                &[],
+                &candidate.pinned
+            )
+            .is_none(),
+        "new admission allocation cannot borrow custody"
+    );
+    let prepared = engine
+        .prepare_exec_rearm(&mut session, view, bound.serial, &candidate)
+        .unwrap();
+    assert!(prepared.preservation.is_some());
+    assert!(engine.request_refresh_consumed(pid, Some(u64::MAX)));
+    let renewed = engine.refresh_requested[&pid].clone();
+    let mut candidate = candidate;
+    assert!(!engine.consume_exec_rearm(&mut candidate, prepared));
+    assert!(candidate.delta.replace.is_empty());
+    engine.settle_exec_rearms([(view, bound.serial)]);
+    assert_eq!(engine.exec_rearm_views[&view], Some(renewed.serial));
+    let mut moot = engine
+        .live_candidate(
+            engine.pinned.clone(),
+            engine.modules.iter().map(|m| m.scanned.clone()).collect(),
+            Vec::new(),
+        )
+        .unwrap();
+    moot.delta.replace = moot.plan.slots.clone();
+    assert!(
+        engine
+            .lower_exec_rearms(
+                &mut session,
+                &mut moot,
+                &BTreeSet::from([view]),
+                &BTreeMap::from([(pid, bound.serial)])
+            )
+            .is_empty(),
+        "an old serviced serial cannot settle the ordinary-delta moot branch"
+    );
+    let current_record = observed_candidate_exec(&engine, &mut session);
+    engine.dispatch_lifecycle_record(&mut session, &current_record, &mut pending);
+    let serial = engine.refresh_requested[&pid].serial;
+    let mut carried = engine
+        .live_candidate(
+            engine.pinned.clone(),
+            engine.modules.iter().map(|m| m.scanned.clone()).collect(),
+            Vec::new(),
+        )
+        .unwrap();
+    let prepared = engine
+        .prepare_exec_rearm(&mut session, view, serial, &carried)
+        .unwrap();
+    assert!(prepared.preservation.is_some());
+    assert!(engine.consume_exec_rearm(&mut carried, prepared));
+    let newer = observed_candidate_exec(&engine, &mut session);
+    engine.dispatch_lifecycle_record(&mut session, &newer, &mut pending);
+    let newest = engine.refresh_requested[&pid].clone();
+    let old_pairs = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .identities();
+    let outcome = engine
+        .apply_candidate(&mut session, carried, &mut true, false, &[])
+        .unwrap();
+    assert!(outcome.refused());
+    assert_eq!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities(),
+        old_pairs
+    );
+    engine.settle_exec_rearms([(view, serial)]);
+    assert_eq!(engine.exec_rearm_views[&view], Some(newest.serial));
+    assert_eq!(engine.refresh_requested[&pid], newest);
+    engine.last_refresh_serial = u64::MAX;
+    let refused = observed_candidate_exec(&engine, &mut session);
+    engine.dispatch_lifecycle_record(&mut session, &refused, &mut pending);
+    assert!(engine.refresh_requested[&pid].exec_binding.is_none());
+    assert_eq!(engine.exec_rearm_views[&view], None);
+    let (_fixture, mut engine, mut session) = continuity_route();
+    let pid = engine.views[0].pid();
+    let view = engine.views[0].id();
+    for offset in 0..MAX_PENDING_REFRESH as u32 {
+        assert!(engine.request_refresh_consumed(4_000_000 + offset, Some(1)));
+    }
+    let record = observed_candidate_exec(&engine, &mut session);
+    engine.dispatch_lifecycle_record(&mut session, &record, &mut PendingViewRetirements::new());
+    assert!(!engine.refresh_requested.contains_key(&pid));
+    assert_eq!(
+        engine.exec_rearm_views[&view], None,
+        "full queue grants no previous positive binding"
+    );
+    engine.refresh_requested.clear();
+    assert!(engine.request_refresh(pid, Some(2)));
+    assert!(engine.refresh_requested[&pid].exec_binding.is_none());
+    assert_eq!(
+        engine.exec_rearm_views[&view],
+        Some(engine.refresh_requested[&pid].serial)
+    );
+}
+
+#[test]
+fn automatic_exec_pid_continuity_apply_recheck_refuses_before_mutation() {
+    for condition in 0..8 {
+        let (_fixture, mut engine, mut session) = continuity_route();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        engine.set_cancel_flag(cancel.clone());
+        let change = match condition {
+            0 => crate::attach::PreflightChange::Producer,
+            1 => crate::attach::PreflightChange::Observation,
+            2 => crate::attach::PreflightChange::Health,
+            3 => crate::attach::PreflightChange::Registration,
+            4 => crate::attach::PreflightChange::Stop,
+            5 => crate::attach::PreflightChange::Clock,
+            6 => crate::attach::PreflightChange::Exit(engine.views[0].pid()),
+            _ => crate::attach::PreflightChange::Cancel(cancel),
+        };
+        let old = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities();
+        let detach_count = session.detached_slot_indices.len();
+        let replacement_count = session.replaced_slot_indices.len();
+        let record = observed_candidate_exec(&engine, &mut session);
+        session
+            .pid_continuity
+            .as_mut()
+            .unwrap()
+            .borrow_mut()
+            .preflight_change = Some(change);
+        let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+        assert!(!outcome.required_complete, "late proof failure must defer");
+        assert_eq!(
+            session
+                .pid_continuity
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .identities(),
+            old
+        );
+        assert_eq!(
+            session.detached_slot_indices.len(),
+            detach_count,
+            "final recheck precedes any static detach call"
+        );
+        assert_eq!(session.replaced_slot_indices.len(), replacement_count);
+        assert!(
+            engine
+                .refresh_requested
+                .contains_key(&engine.views[0].pid())
+        );
+        assert!(engine.exec_rearm_views.contains_key(&engine.views[0].id()));
+        if condition == 0 {
+            session
+                .pid_continuity
+                .as_mut()
+                .unwrap()
+                .borrow_mut()
+                .raw_fault();
+            assert!(
+                apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+                    .unwrap()
+                    .required_complete
+            );
+            assert_ne!(
+                session
+                    .pid_continuity
+                    .as_ref()
+                    .unwrap()
+                    .borrow()
+                    .identities(),
+                old,
+                "a later batch performs fresh conservative lowering after frontier refusal"
+            );
+            assert!(engine.refresh_requested.is_empty());
+        }
+    }
+}
+
+#[test]
+fn automatic_exec_pid_continuity_direct_health_clock_stop_fail_closed() {
+    use p11scope_ebpf_common::ThreadOwnerControl;
+    for condition in 0..15 {
+        let (_fixture, mut engine, mut session) = continuity_route();
+        let old = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities();
+        assert_eq!(engine.counter_snapshot.ring_loss, 0);
+        let record = observed_candidate_exec(&engine, &mut session);
+        {
+            let mut state = session.pid_continuity.as_mut().unwrap().borrow_mut();
+            match condition {
+                0 => {
+                    state.owner = Ok(ThreadOwnerControl {
+                        limit: 17,
+                        poison: 1,
+                        ..Default::default()
+                    })
+                }
+                1 => state.owner = Err(crate::attach::PidContinuityRefusal::Unavailable),
+                2 => {
+                    state.owner = Ok(ThreadOwnerControl {
+                        limit: 16,
+                        ..Default::default()
+                    })
+                }
+                3 => {
+                    state.owner = Ok(ThreadOwnerControl {
+                        limit: 17,
+                        outstanding: 18,
+                        ..Default::default()
+                    })
+                }
+                4 => {
+                    state.owner = Ok(ThreadOwnerControl {
+                        limit: 17,
+                        abandoned_start: u64::MAX,
+                        ..Default::default()
+                    })
+                }
+                5 => state.loss = Ok(vec![u64::MAX, 1]),
+                6 => state.loss = Ok(vec![1]),
+                7 => state.clock_offsets = None,
+                8 => state.stop_word = p11scope_ebpf_common::STOP_GATE_STOP | 3,
+                9 => state.terminal(),
+                10 => state.clock_offsets = Some("monotonic -1 0".into()),
+                11 => state.clock_offsets = Some("monotonic 0 0\nmonotonic 0 0".into()),
+                12 => state.loss = Err(crate::attach::PidContinuityRefusal::Loss),
+                13 => {
+                    state.owner = Ok(ThreadOwnerControl {
+                        limit: 17,
+                        admission_failures: 1,
+                        ..Default::default()
+                    })
+                }
+                _ => (),
+            }
+        }
+        if condition == 14 {
+            engine.set_cancel_flag(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                true,
+            )));
+            assert!(
+                !engine.frame_work_exhausted(),
+                "outside a frame cancellation still has to block apply explicitly"
+            );
+        }
+        let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+        assert!(
+            session
+                .pid_continuity
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .identities()
+                != old
+                || !outcome.required_complete
+        );
+    }
+    let (_fixture, mut engine, mut session) = continuity_route();
+    let old = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .identities();
+    let record = observed_candidate_exec(&engine, &mut session);
+    let before = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .health_reads;
+    session
+        .pid_continuity
+        .as_mut()
+        .unwrap()
+        .borrow_mut()
+        .health_script = std::collections::VecDeque::from([
+        (
+            Ok(ThreadOwnerControl {
+                limit: 17,
+                outstanding: 9,
+                ..Default::default()
+            }),
+            Ok(vec![0]),
+        ),
+        (
+            Ok(ThreadOwnerControl {
+                limit: 17,
+                outstanding: 3,
+                ..Default::default()
+            }),
+            Ok(vec![0]),
+        ),
+    ]);
+    assert!(
+        apply_ordinary_batch(&mut engine, &mut session, vec![record])
+            .unwrap()
+            .required_complete
+    );
+    assert_eq!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities(),
+        old
+    );
+    let state = session.pid_continuity.as_ref().unwrap().borrow();
+    let reads = state.health_reads - before;
+    assert!(reads >= 2);
+    assert_eq!(
+        reads,
+        state
+            .health_phases
+            .iter()
+            .filter(|phase| matches!(**phase, "prepare" | "apply"))
+            .count()
+    );
+    assert!(
+        state
+            .health_phases
+            .windows(2)
+            .any(|phases| phases == ["prepare", "apply"]),
+        "prepare AND final apply read raw health; decreasing outstanding remains healthy"
+    );
+    drop(state);
+    // Clock comparability is required when the old sample is taken. Restoring
+    // zero offsets later cannot legitimize that generation or empty frontier.
+    for generation in [false, true] {
+        let (_fixture, mut engine, mut session) = continuity_route();
+        if generation {
+            let slots = engine.plan.slots.clone();
+            let pins = engine.pinned.clone();
+            let mut state = session.pid_continuity.as_mut().unwrap().borrow_mut();
+            state.detach(&slots);
+            state.clock_offsets = None;
+            state.attach(&slots, &pins);
+            state.clock_offsets = Some("monotonic 0 0".into());
+        } else {
+            session
+                .pid_continuity
+                .as_mut()
+                .unwrap()
+                .borrow_mut()
+                .clock_offsets = None;
+        }
+        let record = observed_candidate_exec(&engine, &mut session);
+        session
+            .pid_continuity
+            .as_mut()
+            .unwrap()
+            .borrow_mut()
+            .clock_offsets = Some("monotonic 0 0".into());
+        let old = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities();
+        assert!(
+            apply_ordinary_batch(&mut engine, &mut session, vec![record])
+                .unwrap()
+                .required_complete
+        );
+        assert_ne!(
+            session
+                .pid_continuity
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .identities(),
+            old
+        );
+    }
+}
+
+#[test]
+fn automatic_exec_pid_continuity_partial_single_multi_retry_keeps_gap() {
+    let (_fixture, mut engine, mut session) = continuity_route();
+    let record = continuity_exec_class(&engine, &mut session, 2);
+    session.fail_slot_detaches_before_mutation([true]);
+    assert!(
+        !apply_ordinary_batch(&mut engine, &mut session, vec![record])
+            .unwrap()
+            .required_complete
+    );
+    assert_eq!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .gap_summary()
+            .episodes,
+        0,
+        "untouched preflight refusal starts no fabricated physical episode"
+    );
+    assert!(
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+            .unwrap()
+            .required_complete
+    );
+    assert_eq!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .gap_summary()
+            .episodes,
+        1,
+        "retry records actual necessary detach"
+    );
+    assert!(
+        !session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .gap_summary()
+            .open
+    );
+    for failed_program in ["p11_entry", "p11_return"] {
+        let (_fixture, mut engine, mut session) = continuity_route();
+        let history = engine.capture_facts.history.clone();
+        let failed = engine.plan.slots[0].index;
+        session
+            .pid_continuity
+            .as_mut()
+            .unwrap()
+            .borrow_mut()
+            .native_failures
+            .insert((u32::MAX, failed_program));
+        let record = continuity_exec_class(&engine, &mut session, 2);
+        assert!(
+            !apply_ordinary_batch(&mut engine, &mut session, vec![record])
+                .unwrap()
+                .required_complete
+        );
+        assert!(!engine.plan.is_active(failed));
+        assert!(
+            !session
+                .pid_continuity
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .has_slot_link(failed),
+            "partial return/entry cleanup removes the actual handle"
+        );
+        assert!(
+            session
+                .pid_continuity
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .gap_summary()
+                .open
+        );
+        assert_eq!(
+            session
+                .pid_continuity
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .identities()
+                .len(),
+            engine.plan.active_slot_count()
+        );
+        session
+            .pid_continuity
+            .as_mut()
+            .unwrap()
+            .borrow_mut()
+            .native_failures
+            .clear();
+        let retry = apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+        assert!(retry.changed);
+        assert!(
+            engine.refresh_requested.is_empty(),
+            "the repaired pairs settle the owed refresh"
+        );
+        assert!(
+            !session
+                .pid_continuity
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .gap_summary()
+                .open,
+            "all exact endpoint pairs complete on fresh-cookie retry"
+        );
+        let recovered = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities();
+        assert_eq!(recovered.len(), 3);
+        assert_eq!(recovered.len(), engine.plan.active_slot_count());
+        let record = observed_candidate_exec(&engine, &mut session);
+        assert!(
+            apply_ordinary_batch(&mut engine, &mut session, vec![record])
+                .unwrap()
+                .required_complete
+        );
+        assert_eq!(
+            session
+                .pid_continuity
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .identities(),
+            recovered,
+            "a later leader preserves only the final retry pairs"
+        );
+        assert_eq!(engine.capture_facts.history.modules, history.modules);
+        assert_eq!(engine.capture_facts.history.decoded, history.decoded);
+    }
+    let (_fixture, mut engine, mut session) = continuity_route();
+    let pid = engine.views[0].pid();
+    let slots = engine.plan.slots.clone();
+    let history = engine.capture_facts.history.clone();
+    session
+        .pid_continuity
+        .as_mut()
+        .unwrap()
+        .borrow_mut()
+        .group_all();
+    let record = observed_candidate_exec(&engine, &mut session);
+    engine.dispatch_lifecycle_record(&mut session, &record, &mut PendingViewRetirements::new());
+    let serial = engine.refresh_requested[&pid].serial;
+    let mut candidate = engine
+        .live_candidate(
+            engine.pinned.clone(),
+            engine.modules.iter().map(|m| m.scanned.clone()).collect(),
+            Vec::new(),
+        )
+        .unwrap();
+    candidate.delta.replace = vec![slots[0].clone()];
+    let prepared = engine
+        .prepare_exec_rearm(&mut session, engine.views[0].id(), serial, &candidate)
+        .unwrap();
+    assert!(
+        prepared.preservation.is_none(),
+        "ordinary rebuild owns every connected supposedly spared survivor"
+    );
+    session
+        .pid_continuity
+        .as_mut()
+        .unwrap()
+        .borrow_mut()
+        .native_failures
+        .insert((slots[1].index, "p11_entry"));
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut true, false, &[])
+        .unwrap();
+    assert!(outcome.accepted());
+    assert!(!engine.plan.is_active(slots[1].index));
+    assert!(engine.plan.is_active(slots[0].index) && engine.plan.is_active(slots[2].index));
+    assert_eq!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities()
+            .len(),
+        2
+    );
+    assert!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .gap_summary()
+            .open,
+        "missing final survivor keeps the transitive episode open"
+    );
+    session
+        .pid_continuity
+        .as_mut()
+        .unwrap()
+        .borrow_mut()
+        .native_failures
+        .clear();
+    assert!(engine.request_refresh(pid, crate::attach::monotonic_ns()));
+    assert!(
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+            .unwrap()
+            .required_complete
+    );
+    assert!(
+        !session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .gap_summary()
+            .open
+    );
+    assert_eq!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities()
+            .len(),
+        engine.plan.active_slot_count()
+    );
+    assert!(engine.multi_rebuild_gaps > 0);
+    assert_eq!(engine.capture_facts.history.modules, history.modules);
+    assert_eq!(engine.capture_facts.history.decoded, history.decoded);
+    let (_fixture, mut engine, mut session) = continuity_route();
+    let record = continuity_exec_class(&engine, &mut session, 2);
+    session.fail_slot_detaches([true]);
+    assert!(
+        !apply_ordinary_batch(&mut engine, &mut session, vec![record])
+            .unwrap()
+            .required_complete
+    );
+    let gap = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .gap_summary();
+    assert_eq!(gap.episodes, 1);
+    assert!(
+        gap.open,
+        "a native detach error cannot erase the already opened episode"
+    );
+    assert!(session.mutation_stopped());
+}
+
+#[test]
+fn automatic_exec_pid_continuity_physical_gap_history_is_cumulative() {
+    let (_fixture, mut engine, mut session) = continuity_route();
+    for _ in 0..2 {
+        let record = continuity_exec_class(&engine, &mut session, 2);
+        assert!(
+            apply_ordinary_batch(&mut engine, &mut session, vec![record])
+                .unwrap()
+                .required_complete
+        );
+    }
+    let gaps = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .gap_summary();
+    assert_eq!(gaps.episodes, 2);
+    assert!(!gaps.open);
+    assert!(gaps.max_gap_ns.is_some());
+    let record = observed_candidate_exec(&engine, &mut session);
+    assert!(
+        apply_ordinary_batch(&mut engine, &mut session, vec![record])
+            .unwrap()
+            .required_complete
+    );
+    assert_eq!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .gap_summary(),
+        gaps,
+        "preservation never clears previous physical history"
+    );
+    let (_fixture, mut engine, mut session) = continuity_route();
+    {
+        let mut state = session.pid_continuity.as_mut().unwrap().borrow_mut();
+        state.detach_delay = std::time::Duration::from_millis(5);
+        state.completion_delay = std::time::Duration::from_millis(5);
+    }
+    let record = continuity_exec_class(&engine, &mut session, 2);
+    assert!(
+        apply_ordinary_batch(&mut engine, &mut session, vec![record])
+            .unwrap()
+            .required_complete
+    );
+    assert!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .gap_summary()
+            .max_gap_ns
+            .unwrap()
+            >= 10_000_000,
+        "the interval starts before actual detach work and includes the delay before final registration completion"
+    );
+    let (_fixture, mut engine, mut session) = continuity_route();
+    let history = engine.capture_facts.history.clone();
+    session
+        .pid_continuity
+        .as_mut()
+        .unwrap()
+        .borrow_mut()
+        .completion_clocks = std::collections::VecDeque::from([None; 3]);
+    let record = continuity_exec_class(&engine, &mut session, 2);
+    assert!(
+        apply_ordinary_batch(&mut engine, &mut session, vec![record])
+            .unwrap()
+            .required_complete
+    );
+    let missing = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .gap_summary();
+    assert!(
+        missing.open && missing.unknown,
+        "missing final completion cannot close the physical episode"
+    );
+    let record = observed_candidate_exec(&engine, &mut session);
+    assert!(
+        apply_ordinary_batch(&mut engine, &mut session, vec![record])
+            .unwrap()
+            .required_complete
+    );
+    let recovered = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .gap_summary();
+    assert!(!recovered.open && recovered.unknown);
+    let record = observed_candidate_exec(&engine, &mut session);
+    assert!(
+        apply_ordinary_batch(&mut engine, &mut session, vec![record])
+            .unwrap()
+            .required_complete
+    );
+    assert_eq!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .gap_summary(),
+        recovered
+    );
+    assert_eq!(engine.capture_facts.history.modules, history.modules);
+    assert_eq!(engine.capture_facts.history.decoded, history.decoded);
 }

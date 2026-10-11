@@ -1816,6 +1816,14 @@ impl ProofSession {
         self.test_sample_view_with_link(view, work, b"/owned/fixture")
     }
     #[cfg(test)]
+    pub(crate) fn test_sample_os_view(
+        &self,
+        view: &crate::process::ProcessView,
+        work: &mut TraceWorkTicket,
+    ) -> Result<TraceSeed, TraceWorkError> {
+        self.sample_from(view, work, &mut OsSample { view })
+    }
+    #[cfg(test)]
     pub(crate) fn test_sample_cgroup<'a>(
         &'a self,
         candidate: &mut CgroupCandidate,

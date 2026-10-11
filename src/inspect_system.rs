@@ -2680,6 +2680,9 @@ pub(crate) enum IdentityUnavailable {
     PermissionDenied,
     LoadFailed,
     ProbeFailed,
+    /// Lazy session setup refused before opening anything: the FD
+    /// headroom cannot cover the setup/probe peak.
+    FdHeadroom,
 }
 
 impl IdentityUnavailable {
@@ -2693,6 +2696,7 @@ impl IdentityUnavailable {
             Self::PermissionDenied => "permission_denied",
             Self::LoadFailed => "load_failed",
             Self::ProbeFailed => "probe_failed",
+            Self::FdHeadroom => "fd_headroom",
         }
     }
 
@@ -2730,6 +2734,10 @@ pub(crate) enum IdentityBtf {
 pub(crate) trait IdentityChecks: Send {
     fn numbering(&self) -> IdentityNumbering;
     fn btf(&self) -> IdentityBtf;
+    /// File-descriptor headroom above the census reserve, for the lazy
+    /// session-setup reservation. Production runs the strict census;
+    /// the injected test source answers from its canned headroom.
+    fn setup_headroom(&self) -> Result<usize, String>;
     /// Full strict-load plus functional-probe validation, returning a
     /// fresh loaded session on success. Production loads BPF; the
     /// injected test source answers from its canned outcome.
@@ -2764,6 +2772,10 @@ impl IdentityChecks for LiveIdentityChecks {
             }
             Err(crate::attach::identity_iter::KernelDeny::NoBtf(_)) => IdentityBtf::NoBtf,
         }
+    }
+
+    fn setup_headroom(&self) -> Result<usize, String> {
+        SegmentPolicy::try_snapshot(0, 0).map(|policy| policy.headroom)
     }
 
     fn create_session(
@@ -3099,12 +3111,15 @@ fn runtime_fallback_label(
 pub(crate) struct ScriptedIdentityChecks {
     pub numbering: IdentityNumbering,
     pub btf: IdentityBtf,
+    /// `setup_headroom` outcome: ample unless a test scripts scarcity.
+    pub headroom: Result<usize, String>,
     /// `create_session` outcome: always `Err` in unit tests (a real
     /// session needs BPF; success is covered by privileged cells).
     /// `None` panics if called, proving no-load paths.
     pub session: Option<IdentityUnavailable>,
     pub numbering_calls: std::sync::atomic::AtomicUsize,
     pub btf_calls: std::sync::atomic::AtomicUsize,
+    pub headroom_calls: std::sync::atomic::AtomicUsize,
     pub session_calls: std::sync::atomic::AtomicUsize,
 }
 
@@ -3127,16 +3142,19 @@ impl ScriptedIdentityChecks {
             IdentityUnavailable::NoBtf => (IdentityNumbering::Agree, IdentityBtf::NoBtf, None),
             IdentityUnavailable::PermissionDenied
             | IdentityUnavailable::LoadFailed
-            | IdentityUnavailable::ProbeFailed => {
+            | IdentityUnavailable::ProbeFailed
+            | IdentityUnavailable::FdHeadroom => {
                 (IdentityNumbering::Agree, IdentityBtf::Ok, Some(reason))
             }
         };
         Self {
             numbering,
             btf,
+            headroom: Ok(usize::MAX),
             session,
             numbering_calls: std::sync::atomic::AtomicUsize::new(0),
             btf_calls: std::sync::atomic::AtomicUsize::new(0),
+            headroom_calls: std::sync::atomic::AtomicUsize::new(0),
             session_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -3146,9 +3164,11 @@ impl ScriptedIdentityChecks {
         Self {
             numbering: IdentityNumbering::Agree,
             btf: IdentityBtf::Ok,
+            headroom: Ok(usize::MAX),
             session: Some(reason),
             numbering_calls: std::sync::atomic::AtomicUsize::new(0),
             btf_calls: std::sync::atomic::AtomicUsize::new(0),
+            headroom_calls: std::sync::atomic::AtomicUsize::new(0),
             session_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -3158,9 +3178,11 @@ impl ScriptedIdentityChecks {
         Self {
             numbering: IdentityNumbering::Agree,
             btf: IdentityBtf::Ok,
+            headroom: Ok(usize::MAX),
             session: None,
             numbering_calls: std::sync::atomic::AtomicUsize::new(0),
             btf_calls: std::sync::atomic::AtomicUsize::new(0),
+            headroom_calls: std::sync::atomic::AtomicUsize::new(0),
             session_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -3178,6 +3200,12 @@ impl IdentityChecks for ScriptedIdentityChecks {
         self.btf_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.btf
+    }
+
+    fn setup_headroom(&self) -> Result<usize, String> {
+        self.headroom_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.headroom.clone()
     }
 
     fn create_session(
@@ -3260,6 +3288,21 @@ pub(crate) fn collect_system_with_identity(
     let bound = bind_collection(&mut collection);
     timings.span(StageKind::Bind, "assemble", bind_start, monotonic_ns());
     let confirm_start = monotonic_ns();
+    // Per-pass kernel decision under the capture lock: userspace never
+    // loads; auto without proof never loads; otherwise cheap checks
+    // first, then at most one session attempt for this pass. Lazy
+    // session init runs BEFORE the census: the setup peak is reserved
+    // inside the takeout, and the census below counts the retained
+    // session handles before the one-shot reconcile adopts the
+    // allowance. Session FDs are unleased but counted, and no segment
+    // worker or pin is live yet, so the reconcile boundary stays
+    // quiescent.
+    let has_proof = sweep_has_proof_plan(&collection, &bound);
+    let attempt = decide_pass_attempt(&shared, has_proof);
+    let takeout = match &attempt {
+        PassAttempt::Kernel { .. } => take_session_for_pass(&shared),
+        PassAttempt::Userspace => None,
+    };
     let shards = shard_count(collection.sweep.len(), shard_threads());
     let held = custody.as_mut().expect("identity scan owns custody");
     let ready = !held.failed()
@@ -3278,11 +3321,6 @@ pub(crate) fn collect_system_with_identity(
     };
     let segment_policy = identity_confirmation_policy(held, census).map_err(anyhow::Error::msg)?;
     let reservations = held.owner.clone();
-    // Per-pass kernel decision under the capture lock: userspace never
-    // loads; auto without proof never loads; otherwise cheap checks
-    // first, then at most one session attempt for this pass.
-    let has_proof = sweep_has_proof_plan(&collection, &bound);
-    let attempt = decide_pass_attempt(&shared, has_proof);
     let attributed = with_confirmation_pools(
         shards,
         segment_policy,
@@ -3308,6 +3346,7 @@ pub(crate) fn collect_system_with_identity(
             ),
             PassAttempt::Kernel { threshold } => attribute_pass_with_kernel(
                 &shared,
+                takeout,
                 &mut collection,
                 &bound,
                 custody.take().expect("identity scan owns custody"),
@@ -3394,6 +3433,32 @@ struct SessionTakeout {
     generation: u64,
 }
 
+/// Whether the measured setup headroom covers the session setup/probe
+/// peak. A failed census refuses: lazy init never opens handles it did
+/// not reserve.
+fn session_setup_admitted(headroom: Result<usize, String>) -> bool {
+    headroom.is_ok_and(|headroom| {
+        headroom >= crate::attach::identity_iter::SESSION_SETUP_PEAK_FDS
+    })
+}
+
+/// Record a sticky session-setup failure (refused reservation or failed
+/// creation) with its first finite reason: auto's first failure is
+/// failed selection (userspace, sticky); a later one keeps `kernel` as
+/// a runtime fallback.
+fn note_session_failure(shared: &mut IdentityRunShared, reason: IdentityUnavailable) {
+    let selection = shared.selection;
+    match selection {
+        crate::cli::IdentityBackendSelection::Auto
+            if shared.backend == IdentityBackend::Userspace =>
+        {
+            shared.auto_ineligible = true;
+            shared.note_selection_fallback(reason);
+        }
+        _ => shared.note_selection_fallback(reason),
+    }
+}
+
 /// Take this pass's kernel session from the capture-owned state: reuse
 /// the live session when one is held, otherwise attempt the single
 /// capture-level session creation. A failed creation is sticky with its
@@ -3416,6 +3481,14 @@ fn take_session_for_pass(shared: &IdentityShared) -> Option<SessionTakeout> {
         Some(session) => session,
         None if shared.session_failed => return None,
         None => {
+            // Reserve the setup/probe FD peak before opening anything.
+            // A refused reservation is sticky with the finite reason,
+            // like a failed creation — but nothing was loaded.
+            if !session_setup_admitted(shared.checks.setup_headroom()) {
+                shared.session_failed = true;
+                note_session_failure(&mut shared, IdentityUnavailable::FdHeadroom);
+                return None;
+            }
             // The trait object cannot be cloned; create the session while
             // holding the lock (jobs run sequentially, the service tick
             // never takes it). Mark the load attempt first.
@@ -3424,19 +3497,7 @@ fn take_session_for_pass(shared: &IdentityShared) -> Option<SessionTakeout> {
                 Ok(session) => session,
                 Err(reason) => {
                     shared.session_failed = true;
-                    let selection = shared.selection;
-                    match selection {
-                        // Auto's first load failure is failed selection:
-                        // userspace with a finite reason, sticky.
-                        crate::cli::IdentityBackendSelection::Auto
-                            if shared.backend == IdentityBackend::Userspace =>
-                        {
-                            shared.auto_ineligible = true;
-                            shared.note_selection_fallback(reason);
-                        }
-                        // A later failure keeps `kernel`: runtime fallback.
-                        _ => shared.note_selection_fallback(reason),
-                    }
+                    note_session_failure(&mut shared, reason);
                     return None;
                 }
             }
@@ -3472,10 +3533,13 @@ fn apply_kernel_fallback(
 /// The pass installs fresh anchors under its takeout generation and always
 /// returns the session, so sticky status and counters survive across
 /// passes. Forced kernel bypasses the cost threshold only (`threshold:
-/// None`); resource and run caps still apply inside the proof.
+/// None`); resource and run caps still apply inside the proof. The
+/// takeout is created before the census (see the caller), so a missing
+/// one here is an already-recorded setup failure, never a fresh attempt.
 #[allow(clippy::too_many_arguments)]
 fn attribute_pass_with_kernel(
     shared: &IdentityShared,
+    takeout: Option<SessionTakeout>,
     collection: &mut Collection,
     bound: &Bound,
     custody: ExaminedCustody,
@@ -3485,7 +3549,6 @@ fn attribute_pass_with_kernel(
     pools: ProofPools<'_>,
     threshold: Option<usize>,
 ) -> Option<Attributed> {
-    let takeout = take_session_for_pass(shared);
     let Some(takeout) = takeout else {
         return attribute_sweep_with(
             collection,
@@ -3730,6 +3793,7 @@ mod tests {
             IdentityUnavailable::PermissionDenied,
             IdentityUnavailable::LoadFailed,
             IdentityUnavailable::ProbeFailed,
+            IdentityUnavailable::FdHeadroom,
         ] {
             let checks = ScriptedIdentityChecks::refuse(reason);
             match preflight_forced_kernel(&checks) {
@@ -3749,6 +3813,7 @@ mod tests {
                 IdentityUnavailable::PermissionDenied
                     | IdentityUnavailable::LoadFailed
                     | IdentityUnavailable::ProbeFailed
+                    | IdentityUnavailable::FdHeadroom
             );
             assert_eq!(
                 checks.session_calls.load(Ordering::SeqCst),
@@ -3999,6 +4064,7 @@ mod tests {
             IdentityUnavailable::PermissionDenied,
             IdentityUnavailable::LoadFailed,
             IdentityUnavailable::ProbeFailed,
+            IdentityUnavailable::FdHeadroom,
         ] {
             let label = reason.label();
             assert!(
@@ -4159,6 +4225,73 @@ mod tests {
                 assert_eq!(checks.btf_calls.load(Ordering::SeqCst), btf);
             }
         }
+    }
+
+    /// D3d: first-use session setup under scarce FDs refuses before
+    /// opening anything: no session attempt, nothing loaded, the finite
+    /// `fd_headroom` reason recorded, sticky across later passes.
+    #[test]
+    fn d3d_first_use_low_fd_refuses_before_session_proof() {
+        use crate::attach::identity_iter::SESSION_SETUP_PEAK_FDS;
+        for headroom in [
+            Ok(SESSION_SETUP_PEAK_FDS - 1),
+            Ok(0),
+            Err("identity file-descriptor census is unavailable".to_string()),
+        ] {
+            for selection in [
+                IdentityBackendSelection::Auto,
+                IdentityBackendSelection::Kernel,
+            ] {
+                let mut checks =
+                    ScriptedIdentityChecks::session_fails(IdentityUnavailable::ProbeFailed);
+                checks.headroom = headroom.clone();
+                let (shared, ptr) = shared_with(selection, checks);
+                assert!(
+                    take_session_for_pass(&shared).is_none(),
+                    "{selection:?} low-FD first use must refuse: {headroom:?}"
+                );
+                // A second pass retries nothing.
+                assert!(take_session_for_pass(&shared).is_none());
+                let checks = unsafe { &*ptr };
+                assert_eq!(
+                    checks.session_calls.load(Ordering::SeqCst),
+                    0,
+                    "{selection:?} refused setup must not reach the session attempt"
+                );
+                assert_eq!(
+                    checks.headroom_calls.load(Ordering::SeqCst),
+                    1,
+                    "{selection:?} reserves once per capture, not once per pass"
+                );
+                let shared = shared.lock().unwrap();
+                assert_eq!(shared.summary().fallback.as_deref(), Some("fd_headroom"));
+                assert!(!shared.loaded(), "refused setup loads nothing");
+            }
+        }
+    }
+
+    /// D3d: the setup reservation admits exactly the peak and above, and
+    /// refuses scarcity plus census failure.
+    #[test]
+    fn d3d_session_setup_reservation_is_exact_at_the_peak() {
+        use crate::attach::identity_iter::SESSION_SETUP_PEAK_FDS;
+        assert!(!super::session_setup_admitted(Ok(SESSION_SETUP_PEAK_FDS - 1)));
+        assert!(!super::session_setup_admitted(Ok(0)));
+        assert!(!super::session_setup_admitted(Err("census failed".to_string())));
+        assert!(super::session_setup_admitted(Ok(SESSION_SETUP_PEAK_FDS)));
+        assert!(super::session_setup_admitted(Ok(usize::MAX)));
+    }
+
+    /// D3d: the live setup headroom is the strict census headroom (a
+    /// measured value, never the scripted ample default).
+    #[test]
+    fn d3d_live_setup_headroom_reports_the_strict_census() {
+        let live = LiveIdentityChecks.setup_headroom();
+        let headroom = live.expect("a healthy host censuses its FDs");
+        assert!(
+            headroom < usize::MAX,
+            "live headroom is measured, not scripted-ample"
+        );
     }
 
     /// D3d fix (I1): a within-batch fallback recorded in the session ledger

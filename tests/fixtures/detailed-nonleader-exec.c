@@ -319,6 +319,7 @@ struct worker_args {
     call_fn call;
     int go;
     unsigned long parent;
+    int controller_gate;
     struct request exec;
 };
 
@@ -349,10 +350,16 @@ static int worker(void *argument) {
     if (raw6(SYS_prctl, PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0, 0)
         || (unsigned long)raw6(SYS_getppid, 0, 0, 0, 0, 0, 0) != args->parent) fail(100);
     receive_until(args->go, 'W', h6_setup);
-    unsigned long success = 0, errors = 0;
-    calls(args->call, 0, 11, &success, &errors, 0);
     unsigned long pid = (unsigned long)raw6(SYS_getpid, 0, 0, 0, 0, 0, 0);
     unsigned long tid = (unsigned long)raw6(SYS_gettid, 0, 0, 0, 0, 0, 0);
+    if (args->controller_gate) {
+        unsigned long waiting[] = { pid, tid };
+        emit("WORKER_WAIT", waiting, 2);
+        receive_until(0, 'B', h6_setup);
+        emit("WORKER_RELEASE", waiting, 2);
+    }
+    unsigned long success = 0, errors = 0;
+    calls(args->call, 0, 11, &success, &errors, 0);
     unsigned long completed[] = { pid, tid, 11, success, errors };
     emit("WORKER_DONE", completed, 5);
     /* Python enters successor recovery before X. Start the fixture's finite
@@ -485,6 +492,7 @@ int main(int argc, char **argv) {
     char *next_envp[] = { "LC_ALL=C", NULL };
     struct worker_args args = {
         .call = call, .go = go[0], .parent = parent,
+        .controller_gate = opt_in && argv[6][0] == '2',
         .exec = { .rv = 5, .token = token, .operation = 1,
                   .expect_failure = argv[6][0] == '1',
                   .exec_path = argv[6][0] == '1' ? argv[3] : argv[2],
@@ -498,11 +506,15 @@ int main(int argc, char **argv) {
     if (tid <= 0 || __atomic_load_n(&child_tid, __ATOMIC_ACQUIRE) != tid) return 12;
     unsigned long started[] = { pid, (unsigned long)tid, (unsigned long)child_tid };
     emit("THREAD", started, 3);
-    write_all(go[1], "W", 1);
+    if (!args.controller_gate) write_all(go[1], "W", 1);
     if (argv[6][0] == '2') {
         /* Leader thread-exit: the worker owns the rest of the protocol. */
         unsigned long gone[] = { pid, (unsigned long)tid };
         emit("LEADER_EXIT", gone, 2);
+        /* Opt-in worker publishes its wait only after LEADER_EXIT intent.
+         * No provider call can run until the controller proves the retained
+         * original zombie leader plus exact live worker and sends B. */
+        if (args.controller_gate) write_all(go[1], "W", 1);
         (void)raw6(SYS_exit, 0, 0, 0, 0, 0, 0);
         fail(104);
     }

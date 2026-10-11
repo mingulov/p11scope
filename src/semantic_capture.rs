@@ -932,6 +932,17 @@ impl SemanticCapture {
         } else if healthy {
             match result {
                 Ok(proof) => {
+                    // Retry custody: when an earlier accepted refresh
+                    // retained an Arc for this task and the bind then
+                    // failed, the retry offers a fresh duplicate. Adopt
+                    // H0's retained Arc instead so the retry reuses the
+                    // same custody; `accept_scan` still gates domain,
+                    // exec monotonicity and currency afterwards.
+                    let pin = self
+                        .bindings
+                        .get(&proof.image().task_cookie)
+                        .map(|binding| binding.pin.clone())
+                        .unwrap_or(pin);
                     let job = ScanJob {
                         image: proof.image(),
                         endpoint,
@@ -3912,6 +3923,107 @@ mod tests {
             assert_eq!(
                 capture.validate_current_with(&mut io, &tick.current()[0], &mut scratch),
                 Ok(())
+            );
+        }
+
+        #[test]
+        fn failed_bind_retry_reuses_h0_retained_arc_through_production_loop() {
+            let mut scene = CustodyScene::new();
+            let pid = std::process::id();
+            let caller = scene.admit(pid, 50);
+            scene.map(caller, pid, 60);
+            let detailed = scene.detailed;
+            let module = scene.module.clone();
+            let image = ImageIdentity {
+                task_cookie: 7,
+                exec_id: 1,
+            };
+            // H0 shares the bind domain exactly as a live lane would;
+            // the scan proves the same image the coordinator proof
+            // expects.
+            let mut io = ScriptIo::new(detailed);
+            io.output_image = Some(image);
+            let mut capture = capture(&io);
+            let targets = vec![(caller, pid, 0u32, module)];
+            let mut passed: Vec<Arc<PidPin>> = Vec::new();
+            let mut minted: Vec<Option<Arc<PidPin>>> = Vec::new();
+            // The lane's refresh contract over substituted H0 I/O: the
+            // images plus the effective custody Arc, derived through the
+            // same shared helper production uses.
+            macro_rules! drive_pass {
+                () => {{
+                    let mut refresh = |pin: Arc<PidPin>, slot: u32| {
+                        passed.push(pin.clone());
+                        let report =
+                            capture
+                                .refresh_with(&mut io, pin.clone(), slot)
+                                .map_err(|_| {
+                                    crate::inventory_semantics::SemanticRefusal::Unavailable
+                                })?;
+                        let images: Vec<ImageIdentity> = report
+                            .current()
+                            .iter()
+                            .map(|receipt| receipt.image())
+                            .collect();
+                        let effective =
+                            crate::inventory_semantics::effective_refresh_custody(&report, pin);
+                        minted.push(
+                            report
+                                .current()
+                                .first()
+                                .map(|receipt| receipt.original_pin().clone()),
+                        );
+                        Ok((images, effective))
+                    };
+                    crate::inventory::bind_semantic_candidates(
+                        &mut scene.coordinator,
+                        detailed,
+                        &mut scene.identity,
+                        &targets,
+                        &mut refresh,
+                    );
+                }};
+            }
+            // Pass N: the refresh accepts (H0 retains Arc A) but the
+            // coordinator proof refuses without identity evidence.
+            drive_pass!();
+            assert!(
+                scene.coordinator.semantic_bindings().get(caller).is_none(),
+                "pass N binds nothing without identity evidence"
+            );
+            assert_eq!(passed.len(), 1);
+            let retained = minted[0].as_ref().expect("pass N refresh mints a receipt");
+            assert!(
+                Arc::ptr_eq(retained, &passed[0]),
+                "H0 retains the exact pass-N refresh Arc"
+            );
+            // Pass N+1: identity evidence arrives; the retry duplicates
+            // a fresh Arc B but must bind through H0's retained Arc A.
+            scene.answer(pid, detailed, 7);
+            scene.bind_image(detailed, vec![(7, 1, pid, 100)], 1_000);
+            drive_pass!();
+            assert_eq!(passed.len(), 2);
+            assert!(
+                !Arc::ptr_eq(&passed[0], &passed[1]),
+                "each pass duplicates its pin fresh: the retry really offers Arc B"
+            );
+            assert_eq!(minted.len(), 2);
+            let retried = minted[1]
+                .as_ref()
+                .expect("the retry refresh mints a receipt");
+            assert!(
+                Arc::ptr_eq(retried, &passed[0]),
+                "the retry receipt carries the retained Arc"
+            );
+            let bound = scene
+                .coordinator
+                .semantic_bindings()
+                .get(caller)
+                .expect("the retry binds after an accepted-refresh/failed-bind pass")
+                .pin();
+            assert!(
+                Arc::ptr_eq(&bound, &passed[0]),
+                "the retry binding shares H0's retained Arc A, not the fresh duplicate"
             );
         }
 

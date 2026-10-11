@@ -19,6 +19,7 @@ import io
 import json
 import os
 import runpy
+import signal
 import subprocess
 import sys
 import tempfile
@@ -2440,6 +2441,391 @@ class LegCleanupTest(unittest.TestCase):
             leg(self.ctx)
         self.assertFalse(top.exists())
         self.assertFalse(renamed.exists())
+
+
+class R5OrderingTest(unittest.TestCase):
+    """Exercise the real R5 route with ordinary cgroup/ptrace seams."""
+    def run_route(self, failed_move=False):
+        temporary = tempfile.TemporaryDirectory(prefix="h6-r5-order-")
+        self.addCleanup(temporary.cleanup)
+        directory = Path(temporary.name)
+        source = directory / "source"
+        source.write_bytes(b"controlled executable")
+        source.chmod(0o755)
+        state = {"stopped": False, "membership": {}, "events": [], "resumes": 0}
+        self.state = state
+        owners, pins = [], []
+        ctx = SimpleNamespace(args=SimpleNamespace(uid=os.getuid(), gid=os.getgid()),
+            owners=owners, readers=[], groups=[], leg_pins=pins, traced=[],
+            pins={"ledger": SimpleNamespace(path=source)},
+            provider_pin=SimpleNamespace(path=source), discover_pin=None)
+        def group(_ctx, path):
+            path = Path(path)
+            def move(owner):
+                if path.name == "sub":
+                    self.assertTrue(state["stopped"], "descendant migration released user code")
+                    if failed_move:
+                        raise H6["SetupError"]("controlled failed descendant verification")
+                    state["events"].append("verified-reentry")
+                state["membership"][owner.pid] = str(path)
+            return SimpleNamespace(path=path, move=move), None
+        def ledger(_owners, _readers, _leg_dir, _argv, _env, _uid, _gid, tag):
+            owner = SimpleNamespace(pid=1000 + len(owners),
+                identity={"pid": 1000 + len(owners), "start_time": 7777},
+                verify=lambda: None, popen=SimpleNamespace(send_signal=lambda _sig: None))
+            owners.append(owner)
+            reader = SimpleNamespace(lines=[], wait=lambda *_args: None)
+            return owner, reader, reader
+        def observer(_ctx, leg_dir, *_args):
+            log_path, doc_path = leg_dir / "events.jsonl", leg_dir / "inventory.json"
+            log_path.write_text("")
+            doc_path.write_text("{}")
+            return SimpleNamespace(), None, None, 10, doc_path, log_path
+        def stop(_pid, **_kwargs):
+            state["stopped"] = True
+            state["events"].append("exec-stop")
+            return time.monotonic_ns()
+        def resume(_pid):
+            self.assertTrue(state["stopped"])
+            self.assertTrue(state["membership"][1000].endswith("/selected/sub"))
+            state["stopped"] = False
+            state["resumes"] += 1
+            state["events"].append("resume")
+        def admission(*_args, **_kwargs):
+            self.assertTrue(state["membership"][1000].endswith("/selected/sub"),
+                            "R5 attempted admission while outside selected descendants")
+            self.assertFalse(state["stopped"], "R5 attempted admission before resume")
+            state["events"].append("fresh-admission")
+            return {"caller": "c1", "incarnation": 1, "seq": 4, "at_ns": 40,
+                    "completed_pass": {"seq": 5, "at_ns": 50, "pass": 3}}
+        def checkpoint(*_args):
+            state["events"].append("checkpoint")
+            return SimpleNamespace(receipt=lambda: {"seq": 2, "retired_caller": "c0",
+                                                    "retired_incarnation": 0})
+        def image(pin, _row, owner):
+            pin.verify()
+            owner.verify()
+            return {"pid": owner.pid, "start_time": 7777, **pin.metadata()}
+        patches = {"init_token": lambda *_args: {}, "build_manifest": lambda *_args: None,
+            "create_tracked": group, "spawn_ledger": ledger, "spawn_inventory": observer,
+            "wait_ledger_line": lambda *_args, **_kwargs: None,
+            "wait_inventory_ready": lambda *_args: 20, "wait_passes": lambda *_args: 2,
+            "seize_until_exec": lambda *_args: None, "wait_exec_stop": stop,
+            "ptrace_continue": resume, "ptrace_detach": lambda *_args: None,
+            "wait_caller_admitted": admission, "wait_r5_successor_admitted": admission,
+            "r5_admission_checkpoint": checkpoint,
+            "cgroup_of": lambda pid: state["membership"][pid],
+            "stop_inventory": lambda *_args: (0, time.monotonic_ns(), 0),
+            "stop_receipt": lambda *_args: {}, "wait_process": lambda *_args: 0,
+            "finish_readers": lambda *_args: None,
+            "parse_inv_ledger": lambda *_args: {"batches": []},
+            "counted_totals": lambda *_args: {}, "phase_window": lambda *_args: (30, 40, 1),
+            "provider_entry": lambda *_args: {}, "evaluate_inventory_h6": lambda _doc, _ledgers, receipt: receipt}
+        try:
+            with mock.patch.dict(H6["run_cgroup_inventory_r5"].__globals__, patches), \
+                    mock.patch.object(H6["FilePin"], "image_receipt", image):
+                return H6["run_cgroup_inventory_r5"].__wrapped__(ctx, directory, "singles")
+        finally:
+            for pin in pins:
+                pin.close()
+
+    def test_r5_reenters_while_exec_stopped_before_admission(self):
+        receipt = self.run_route()
+        self.assertEqual(self.state["events"],
+                         ["checkpoint", "exec-stop", "verified-reentry", "resume", "fresh-admission"])
+        self.assertEqual(self.state["resumes"], 1)
+        edge = next(move["t"] for move in receipt["moves"] if move["note"] == "X-descendant-reentry")
+        self.assertEqual(receipt["scope_intervals"][1]["t0"], edge)
+        self.assertEqual(receipt["freeze"]["checkpoint"]["retired_caller"], "c0")
+        self.assertEqual(receipt["freeze"]["admitted"]["completed_pass"]["pass"], 3)
+
+    def test_r5_failed_descendant_verification_never_resumes(self):
+        with self.assertRaisesRegex(H6["SetupError"], "failed descendant verification"):
+            self.run_route(failed_move=True)
+        self.assertEqual(self.state["resumes"], 0)
+
+
+class R5FreshAdmissionTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="h6-r5-admission-")
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name)
+        self.owner = H6["spawn_owned"]([], [sys.executable, "-I", "-c", "import sys; sys.stdin.read()"],
+            os.getuid(), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(self.release)
+        self.pin = H6["FilePin"](Path(sys.executable))
+        self.ctx = SimpleNamespace(leg_pins=[])
+        self.log = self.directory / "events.jsonl"
+        self.prefix = [self.record(0, "started", {}), self.admission(1, "c0", 0),
+                       self.record(2, "pass_committed", {"pass": 1})]
+        self.write(self.prefix)
+        self.cursor = H6["r5_admission_checkpoint"](self.ctx, self.log, self.owner, self.pin)
+
+    def release(self):
+        self.owner.popen.kill()
+        self.owner.popen.wait(2)
+        self.owner.popen.stdin.close()
+        self.owner.close()
+        if hasattr(self, "pin"):
+            self.pin.close()
+        if hasattr(self, "ctx"):
+            for cursor in self.ctx.leg_pins:
+                cursor.close()
+
+    def record(self, seq, kind, event):
+        return {"schema": "p11scope/inventory-events/v1", "seq": seq,
+                "at_ns": 100 + seq, "kind": kind, "event": event}
+
+    def admission(self, seq, caller_id, incarnation):
+        info = self.pin.initial
+        caller = {"id": caller_id, "pid": self.owner.pid,
+                  "start_time": self.owner.identity["start_time"], "incarnation": incarnation,
+                  "authority": "native_exact", "lifecycle": "mapped", "status": "observed",
+                  "executable": {"path": str(self.pin.path), "dev": info.st_dev,
+                      "ino": info.st_ino, "mtime_secs": info.st_mtime_ns // 1_000_000_000,
+                      "mtime_nanos": info.st_mtime_ns % 1_000_000_000}}
+        return self.record(seq, "caller_event", {"event": "admitted", "caller": caller_id,
+                              "identity_context": {"version": 1, "caller": caller}})
+
+    def write(self, records, tail=b""):
+        self.log.write_bytes(b"".join(json.dumps(row).encode() + b"\n" for row in records) + tail)
+
+    def reset_cursor(self):
+        self.cursor.close()
+        self.write(self.prefix)
+        self.cursor = H6["r5_admission_checkpoint"](self.ctx, self.log, self.owner, self.pin)
+
+    def wait(self, timeout=2):
+        return H6["wait_r5_successor_admitted"](self.log, self.owner, self.pin, self.cursor,
+                                               not_before_ns=103, timeout=timeout)
+
+    def fresh(self):
+        return [self.admission(3, "c1", 1), self.record(4, "pass_committed", {"pass": 2})]
+
+    def assert_refused(self, expiry=False):
+        expected = TimeoutError if expiry else (H6["SetupError"], ValueError)
+        with self.assertRaises(expected):
+            self.wait(timeout=0.1 if expiry else 2)
+
+    def test_fresh_owned_successor_requires_and_records_completing_pass(self):
+        self.write(self.prefix + self.fresh())
+        result = self.wait()
+        self.assertEqual((result["caller"], result["incarnation"], result["seq"], result["at_ns"]),
+                         ("c1", 1, 3, 103))
+        self.assertEqual(result["completed_pass"], {"seq": 4, "at_ns": 104, "pass": 2})
+        self.assertEqual(self.cursor.receipt()["retired_caller"], "c0")
+        self.assertEqual(self.cursor.receipt()["retired_incarnation"], 0)
+
+    def test_scan_pinned_complete_identity_is_admission(self):
+        rows = self.fresh()
+        rows[0]["event"]["identity_context"]["caller"]["authority"] = "scan_pinned"
+        self.write(self.prefix + rows)
+        self.assertEqual(self.wait()["caller"], "c1")
+
+    def test_old_same_pid_path_prefix_never_satisfies_fresh_gate(self):
+        self.assert_refused(expiry=True)
+
+    def test_old_caller_or_incarnation_beyond_cursor_is_refused(self):
+        for caller, incarnation in (("c0", 1), ("c1", 0), ("c0", 0)):
+            with self.subTest(caller=caller, incarnation=incarnation):
+                self.reset_cursor()
+                self.write(self.prefix + [self.admission(3, caller, incarnation), self.fresh()[1]])
+                self.assert_refused()
+
+    def test_wrong_birth_or_executable_physical_metadata_is_refused(self):
+        for field in ("start_time", "pid", "dev", "ino", "mtime_secs", "mtime_nanos", "path"):
+            with self.subTest(field=field):
+                self.reset_cursor()
+                rows = self.fresh()
+                caller = rows[0]["event"]["identity_context"]["caller"]
+                target = caller if field in ("start_time", "pid") else caller["executable"]
+                target[field] = target[field] + 1 if isinstance(target[field], int) else "/wrong/path"
+                self.write(self.prefix + rows)
+                self.assert_refused(expiry=field == "pid")
+
+    def test_wrong_caller_context_authority_or_lifecycle_is_refused(self):
+        for field, value in (("id", "c9"), ("authority", "unknown"), ("lifecycle", "exec_retired"),
+                             ("status", "context_budget"), ("incarnation", True)):
+            with self.subTest(field=field):
+                self.reset_cursor()
+                rows = self.fresh()
+                rows[0]["event"]["identity_context"]["caller"][field] = value
+                self.write(self.prefix + rows)
+                self.assert_refused()
+
+    def test_unknown_identity_context_version_is_refused(self):
+        rows = self.fresh()
+        rows[0]["event"]["identity_context"]["version"] = 2
+        self.write(self.prefix + rows)
+        self.assert_refused()
+
+    def test_malformed_identity_context_is_a_clear_setup_refusal(self):
+        rows = self.fresh()
+        rows[0]["event"]["identity_context"] = ["malformed"]
+        self.write(self.prefix + rows)
+        with self.assertRaises(H6["SetupError"]):
+            self.wait()
+
+    def test_gate_keeps_original_owner_and_stream_custody(self):
+        self.write(self.prefix + self.fresh())
+        impostor = SimpleNamespace(pid=self.owner.pid, identity=dict(self.owner.identity))
+        with self.assertRaisesRegex(H6["SetupError"], "original owner"):
+            H6["wait_r5_successor_admitted"](self.log, impostor, self.pin, self.cursor,
+                                           not_before_ns=103, timeout=2)
+        with self.assertRaisesRegex(H6["SetupError"], "observer stream"):
+            H6["wait_r5_successor_admitted"](self.directory / "other.jsonl", self.owner,
+                                           self.pin, self.cursor, not_before_ns=103, timeout=2)
+
+    def test_completing_a_partial_pass_can_unlock_only_after_newline(self):
+        rows = self.fresh()
+        self.write(self.prefix + rows[:1], json.dumps(rows[1]).encode())
+        def complete(_deadline, _interval):
+            with self.log.open("ab") as stream:
+                stream.write(b"\n")
+        with mock.patch.dict(H6["wait_r5_successor_admitted"].__globals__, {"pause_until": complete}):
+            self.assertEqual(self.wait()["completed_pass"]["seq"], 4)
+
+    def test_cursor_derives_retired_identity_only_from_committed_owned_records(self):
+        self.cursor.close()
+        self.write(self.prefix[:2])
+        with self.assertRaisesRegex(H6["SetupError"], "admission/pass"):
+            H6["r5_admission_checkpoint"](self.ctx, self.log, self.owner, self.pin)
+
+    def test_stream_rotation_marker_and_terminal_pass_are_refused(self):
+        self.write(self.prefix + [self.record(3, "rotated", {})])
+        self.assert_refused()
+        self.reset_cursor()
+        rows = self.fresh()
+        rows[1]["event"]["final"] = True
+        self.write(self.prefix + rows)
+        self.assert_refused()
+
+    def test_gate_error_reaps_stopped_child_and_releases_stream_fd(self):
+        case = H6["Case"](SimpleNamespace(out=self.directory, uid=os.getuid(), gid=os.getgid()))
+        acquired = []
+        @H6["owned_leg"](inventory=True)
+        def leg(ctx):
+            owner = H6["spawn_owned"](ctx.owners,
+                [sys.executable, "-I", "-c", "import time; time.sleep(30)"], os.getuid(),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            log = self.directory / "cleanup-events.jsonl"
+            rows = copy.deepcopy(self.prefix)
+            rows[1]["event"]["identity_context"]["caller"]["pid"] = owner.pid
+            rows[1]["event"]["identity_context"]["caller"]["start_time"] = owner.identity["start_time"]
+            log.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            cursor = H6["r5_admission_checkpoint"](ctx, log, owner, self.pin)
+            acquired.extend((owner, cursor))
+            owner.send(signal.SIGSTOP)
+            os.waitpid(owner.pid, os.WUNTRACED)
+            with log.open("a") as stream:
+                stream.write("{malformed}\n")
+            H6["wait_r5_successor_admitted"](log, owner, self.pin, cursor,
+                                           not_before_ns=103, timeout=2)
+        with self.assertRaisesRegex(H6["SetupError"], "malformed"):
+            leg(case)
+        owner, cursor = acquired
+        self.assertIsNotNone(owner.popen.poll())
+        self.assertFalse((Path("/proc") / str(owner.pid)).exists())
+        self.assertIsNone(owner.pidfd)
+        self.assertIsNone(cursor.fd)
+        os.fstat(self.pin.fd)
+
+    def test_partial_last_line_cannot_complete_admission(self):
+        rows = self.fresh()
+        self.write(self.prefix + rows[:1], json.dumps(rows[1]).encode())
+        self.assert_refused(expiry=True)
+
+    def test_complete_pass_alone_cannot_borrow_stale_prefix_admission(self):
+        self.write(self.prefix + [self.fresh()[1] | {"seq": 3}])
+        self.assert_refused(expiry=True)
+
+    def test_admission_without_completing_pass_expires(self):
+        self.write(self.prefix + self.fresh()[:1])
+        self.assert_refused(expiry=True)
+
+    def test_malformed_complete_record_and_unknown_schema_are_refused(self):
+        self.write(self.prefix, b"{broken}\n")
+        self.assert_refused()
+        self.reset_cursor()
+        rows = self.fresh()
+        rows[0]["schema"] = "p11scope/inventory-events/v999"
+        self.write(self.prefix + rows)
+        self.assert_refused()
+
+    def test_rotated_or_truncated_stream_cannot_restart_at_zero(self):
+        self.log.rename(self.directory / "prior.jsonl")
+        self.write(self.prefix + self.fresh())
+        self.assert_refused()
+
+    def test_truncated_original_stream_is_refused(self):
+        self.write(self.prefix[:1])
+        self.assert_refused()
+
+    def test_rewritten_prefix_and_sequence_discontinuity_are_refused(self):
+        changed = copy.deepcopy(self.prefix)
+        changed[0]["at_ns"] = 99
+        self.write(changed + self.fresh())
+        self.assert_refused()
+        self.reset_cursor()
+        rows = self.fresh()
+        rows[0]["seq"] = 99
+        self.write(self.prefix + rows)
+        self.assert_refused()
+
+    def test_admission_before_verified_reentry_is_refused(self):
+        rows = self.fresh()
+        rows[0]["at_ns"] = 102
+        self.write(self.prefix + rows)
+        self.assert_refused()
+
+    def test_retirement_before_completing_pass_is_refused(self):
+        self.write(self.prefix + [self.fresh()[0], self.record(4, "caller_event",
+            {"event": "retired", "caller": "c1"}), self.record(5, "pass_committed", {"pass": 2})])
+        self.assert_refused()
+
+    def test_actual_owned_executable_mismatch_prevents_admission(self):
+        other = self.directory / "other-executable"
+        other.write_bytes(b"different executable")
+        pin = H6["FilePin"](other)
+        self.addCleanup(pin.close)
+        self.write(self.prefix + self.fresh())
+        with self.assertRaisesRegex(ValueError, "actual owned process executable"):
+            H6["wait_r5_successor_admitted"](self.log, self.owner, pin, self.cursor,
+                                           not_before_ns=103, timeout=2)
+
+    def test_original_recovery_deadline_is_not_renewed_by_admission_wait(self):
+        self.write(self.prefix + self.fresh())
+        now = [1_000_000_000]
+        budget = H6["LegBudget"](inventory=True, clock=lambda: now[0],
+                                  budgets={"successor-recovery": 0.01})
+        budget.enter("successor-recovery", self.owner.pid)
+        now[0] += 10_000_000
+        token = H6["ACTIVE_LEG"].set(budget)
+        try:
+            with self.assertRaisesRegex(TimeoutError, "deadline"):
+                self.wait(timeout=90)
+        finally:
+            H6["ACTIVE_LEG"].reset(token)
+
+    def test_expiry_during_final_file_verification_cannot_return_admission(self):
+        self.write(self.prefix + self.fresh())
+        now = [1_000_000_000]
+        budget = H6["LegBudget"](inventory=True, clock=lambda: now[0],
+                                  budgets={"successor-recovery": 1})
+        budget.enter("successor-recovery", self.owner.pid)
+        verify, calls = self.pin.verify, []
+        def expire():
+            verify()
+            calls.append(True)
+            if len(calls) == 2:
+                now[0] += 1_000_000_000
+        token = H6["ACTIVE_LEG"].set(budget)
+        try:
+            with mock.patch.object(self.pin, "verify", expire), \
+                    self.assertRaisesRegex(TimeoutError, "deadline"):
+                self.wait()
+        finally:
+            H6["ACTIVE_LEG"].reset(token)
 
 
 class ScriptEntryTest(unittest.TestCase):

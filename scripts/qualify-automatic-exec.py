@@ -53,6 +53,7 @@ import queue
 import re
 import runpy
 import shutil
+import stat
 import signal
 import select
 import subprocess
@@ -3775,8 +3776,10 @@ def run_cgroup_r2(ctx, cell_dir, backend):
 # post-date the admission the observer itself publishes in its event log.
 # The harness freezes the owned successor at exec (PTRACE_O_TRACEEXEC stops
 # it before its first user instruction) and resumes it only after the
-# public caller_event/admitted record for the new image is observed. This
-# is harness-side scheduling of an owned process: it never touches
+# public caller_event/admitted record for the new image is observed. R5
+# instead re-enters its descendant while stopped, resumes, and requires a
+# fresh completing admission pass; its successor S1 warmup is a separate gate.
+# This is harness-side scheduling of an owned process: it never touches
 # observer links or BPF state, and the ledger's t0/t1 stay truthful.
 
 _LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
@@ -3866,6 +3869,184 @@ def wait_caller_admitted(jsonl_path, pid, exe, timeout=90):
                         "at_ns": record.get("at_ns")}
         if monotonic_ns() >= deadline:
             raise SetupError(f"caller ({pid}, {exe}) never admitted")
+        pause_until(deadline, 0.2)
+
+
+class R5AdmissionCursor:
+    """Held, append-only stream boundary derived before the owned outside exec."""
+    def __init__(self, path, owner, original_executable):
+        self.path = Path(path)
+        self.owner, self.birth_identity = owner, dict(owner.identity)
+        self.fd = os.open(self.path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(self.fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise SetupError("R5 admission stream is not a regular file")
+            self.identity = info.st_dev, info.st_ino
+            self.observed_bytes, self.observed_digest = 0, hashlib.sha256(b"").digest()
+            original_executable.verify()
+            image = original_executable.image_receipt({"image": 0}, owner)
+            records, _complete = self.read()
+            self.seq = records[-1]["seq"] if records else -1
+            self.at_ns = records[-1]["at_ns"] if records else 0
+            self.saved_bytes = self.complete_bytes
+            admitted, committed = None, None
+            for record in records:
+                event = record["event"]
+                if record["kind"] == "caller_event" and event.get("event") == "admitted":
+                    context = r5_admitted_subject(event)
+                    if context.get("pid") == owner.pid:
+                        caller = r5_caller_context(event, owner, image)
+                        admitted = {"caller": caller["id"], "incarnation": caller["incarnation"]}
+                        committed = None
+                elif record["kind"] == "pass_committed" and admitted is not None:
+                    committed = r5_pass_receipt(record)
+                elif record["kind"] == "caller_event" and admitted is not None and (
+                        event.get("caller") == admitted["caller"] or event.get("old") == admitted["caller"]):
+                    raise SetupError("R5 original caller was already retired")
+            if admitted is None or committed is None:
+                raise SetupError("R5 original caller lacks complete same-stream admission/pass")
+            self.retired_caller = admitted["caller"]
+            self.retired_incarnation = admitted["incarnation"]
+            self.original_image, self.completed_pass = image, committed
+        except BaseException:
+            self.close()
+            raise
+
+    def read(self):
+        check_dispatch()
+        held, current = os.fstat(self.fd), self.path.stat(follow_symlinks=False)
+        if (held.st_dev, held.st_ino) != self.identity or (
+                current.st_dev, current.st_ino) != self.identity or not stat.S_ISREG(current.st_mode):
+            raise SetupError("R5 admission stream rotated or was replaced")
+        data = os.pread(self.fd, held.st_size, 0)
+        if len(data) < self.observed_bytes or hashlib.sha256(
+                data[:self.observed_bytes]).digest() != self.observed_digest:
+            raise SetupError("R5 admission stream truncated or rewrote observed history")
+        # Only newline-terminated records have authority. Retain even an
+        # incomplete tail's bytes to require subsequent reads to append to it.
+        complete = not data or data.endswith(b"\n")
+        lines = data.split(b"\n")[:-1]
+        records, last_time = [], 0
+        for seq, line in enumerate(lines):
+            try:
+                record = json.loads(line)
+            except (ValueError, UnicodeError) as error:
+                raise SetupError("R5 admission stream has a malformed complete record") from error
+            if (not isinstance(record, dict) or record.get("schema") != "p11scope/inventory-events/v1"
+                    or type(record.get("seq")) is not int or record["seq"] != seq
+                    or type(record.get("at_ns")) is not int or record["at_ns"] < last_time
+                    or not isinstance(record.get("kind"), str) or not isinstance(record.get("event"), dict)):
+                raise SetupError("R5 admission stream has unknown schema or invalid sequence/envelope")
+            if (seq == 0 and record["kind"] != "started") or (seq and record["kind"] == "started"):
+                raise SetupError("R5 admission stream is not the original observer run")
+            if record["kind"] in ("rotated", "retention_evicted", "ended"):
+                raise SetupError("R5 admission stream rotated, evicted history or ended")
+            last_time = record["at_ns"]
+            records.append(record)
+        self.observed_bytes, self.observed_digest = len(data), hashlib.sha256(data).digest()
+        self.complete_bytes = data.rfind(b"\n") + 1
+        check_dispatch()
+        return records, complete
+
+    def receipt(self):
+        return {"stream_identity": list(self.identity), "bytes": self.saved_bytes,
+                "seq": self.seq, "at_ns": self.at_ns,
+                "retired_caller": self.retired_caller, "retired_incarnation": self.retired_incarnation,
+                "original_image": self.original_image, "completed_pass": self.completed_pass}
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+def r5_admitted_subject(event):
+    context = event.get("identity_context")
+    if not isinstance(context, dict) or type(context.get("version")) is not int or context["version"] != 1:
+        raise SetupError("R5 caller lacks supported complete identity context")
+    caller = context.get("caller")
+    if not isinstance(caller, dict):
+        raise SetupError("R5 caller identity context is unavailable")
+    return caller
+
+
+def r5_caller_context(event, owner, image):
+    caller = r5_admitted_subject(event)
+    executable = caller.get("executable")
+    if (not isinstance(event.get("caller"), str) or not re.fullmatch(r"c[0-9]+", event["caller"])
+            or caller.get("id") != event["caller"] or type(caller.get("pid")) is not int
+            or caller["pid"] != owner.pid or type(caller.get("start_time")) is not int
+            or caller["start_time"] != owner.identity["start_time"]
+            or type(caller.get("incarnation")) is not int or caller["incarnation"] < 0
+            or caller.get("authority") not in ("native_exact", "scan_pinned")
+            or caller.get("lifecycle") != "mapped" or caller.get("status") != "observed"
+            or not isinstance(executable, dict)):
+        raise SetupError("R5 caller context disagrees with owned birth/caller/incarnation")
+    expected = {"path": image["path"], "dev": image["dev"], "ino": image["ino"],
+                "mtime_secs": image["mtime_ns"] // 1_000_000_000,
+                "mtime_nanos": image["mtime_ns"] % 1_000_000_000}
+    if any(executable.get(key) != value or type(executable.get(key)) is not type(value)
+           for key, value in expected.items()):
+        raise SetupError("R5 caller executable differs from the held actual owned image")
+    return caller
+
+
+def r5_pass_receipt(record):
+    event = record["event"]
+    if type(event.get("pass")) is not int or event["pass"] < 1 or event.get("final", False) is not False:
+        raise SetupError("R5 admission lacks a live completing pass")
+    return {"seq": record["seq"], "at_ns": record["at_ns"], "pass": event["pass"]}
+
+
+def r5_admission_checkpoint(ctx, path, owner, original_executable):
+    with cleanup_section():
+        cursor = R5AdmissionCursor(path, owner, original_executable)
+        ctx.leg_pins.append(cursor)
+    return cursor
+
+
+def wait_r5_successor_admitted(jsonl_path, owner, executable, cursor, *, not_before_ns, timeout=90):
+    """Fresh identity admission only; provider/S1 readiness is a separate gate."""
+    if (Path(jsonl_path) != cursor.path or owner is not cursor.owner
+            or owner.identity != cursor.birth_identity):
+        raise SetupError("R5 admission wait changed the retained observer stream or original owner")
+    deadline = wait_deadline(timeout)
+    while True:
+        remaining_until(deadline)
+        executable.verify()
+        image = executable.image_receipt({"image": 1}, owner)
+        records, complete = cursor.read()
+        admitted, committed = None, None
+        for record in records:
+            if record["seq"] <= cursor.seq:
+                continue
+            event = record["event"]
+            if record["kind"] == "caller_event" and event.get("event") == "admitted":
+                context = r5_admitted_subject(event)
+                if context.get("pid") != owner.pid:
+                    continue
+                caller = r5_caller_context(event, owner, image)
+                if (caller["id"] == cursor.retired_caller
+                        or caller["incarnation"] != cursor.retired_incarnation + 1
+                        or record["at_ns"] < not_before_ns):
+                    raise SetupError("R5 admission reused stale caller/incarnation or preceded verified re-entry")
+                admitted = {"caller": caller["id"], "incarnation": caller["incarnation"],
+                            "seq": record["seq"], "at_ns": record["at_ns"], "image": image}
+                committed = None
+            elif record["kind"] == "caller_event" and admitted is not None and (
+                    event.get("caller") == admitted["caller"] or event.get("old") == admitted["caller"]):
+                raise SetupError("R5 successor retired before admission completion")
+            elif record["kind"] == "pass_committed" and admitted is not None:
+                committed = r5_pass_receipt(record)
+                if committed["pass"] <= cursor.completed_pass["pass"]:
+                    raise SetupError("R5 completing pass borrowed pre-exec history")
+        if complete and admitted is not None and committed is not None:
+            remaining_until(deadline)
+            executable.verify()
+            executable.image_receipt({"image": 1}, owner)
+            remaining_until(deadline)
+            return {**admitted, "completed_pass": committed}
         pause_until(deadline, 0.2)
 
 
@@ -4111,16 +4292,18 @@ def counted_totals(batches, started_ns):
 
 @owned_leg(inventory=True)
 def run_cgroup_inventory_r5(ctx, cell_dir, backend):
-    """R5: post-reentry S1 inventory; successor frozen until admission proof."""
+    """R5: re-enter while exec-stopped, then prove fresh successor admission."""
     leg_dir = Path(cell_dir) / backend / "inventory"
     (leg_dir / "workload").mkdir(mode=0o755, parents=True, exist_ok=True)
     env = init_token(leg_dir / "workload", ctx.args.uid, ctx.args.gid, "h6-r5")
     ledger_bin = leg_dir / "ledger"
     shutil.copyfile(ctx.pins["ledger"].path, ledger_bin)
     ledger_bin.chmod(0o755)
+    original_executable = leg_pin(ctx, ledger_bin)
     ledger2 = leg_dir / "ledger2"
     shutil.copyfile(ctx.pins["ledger"].path, ledger2)
     ledger2.chmod(0o755)
+    successor_executable = leg_pin(ctx, ledger2)
     provider = ctx.provider_pin
     manifest_path = leg_dir / "manifest-A.json"
     build_manifest(ctx.discover_pin, provider.path, manifest_path, env,
@@ -4171,14 +4354,22 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
     gate_s.touch()
     out_x.wait(lambda r: any(line.startswith("DONE ") and " gen=0 " in line
                              for line in r.lines), 120)
+    checkpoint = r5_admission_checkpoint(ctx, log_path, owned_x, original_executable)
+    checkpoint_receipt = checkpoint.receipt()
     t_out = monotonic_ns()
     move_and_verify(outside, owned_x, moves, "X-exit-for-exec")
     exec_stop_ns = wait_exec_stop(x_pid)
-    admitted = wait_caller_admitted(log_path, x_pid, str(ledger2))
-    t_in = monotonic_ns()
+    successor_executable.verify()
+    stopped_image = successor_executable.image_receipt({"image": 1}, owned_x)
     move_and_verify(sub, owned_x, moves, "X-descendant-reentry")
-    enter_phase("fixed-measurement")
+    t_in = moves[-1]["t"]
+    successor_executable.verify()
+    successor_executable.image_receipt({"image": 1}, owned_x)
     ptrace_continue(x_pid)
+    resumed_ns = monotonic_ns()
+    admitted = wait_r5_successor_admitted(log_path, owned_x, successor_executable, checkpoint,
+                                         not_before_ns=t_in)
+    enter_phase("fixed-measurement")
     out_x.wait(lambda r: any(line.startswith("DONE ") and " gen=1 " in line
                              for line in r.lines), 180)
     out_s.wait(lambda r: any(line.startswith("DONE ") for line in r.lines), 60)
@@ -4235,7 +4426,9 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
         "cell_endings": {"RX": {"how": "exited" if x_rc == 0 else "signaled", "rc": x_rc},
                          "RS0": {"how": "exited" if s_rc == 0 else "signaled", "rc": s_rc}},
         "requested_backend": backend,
-        "freeze": {"exec_stop_ns": exec_stop_ns, "admitted": admitted,
+        "freeze": {"exec_stop_ns": exec_stop_ns, "stopped_image": stopped_image,
+                   "checkpoint": checkpoint_receipt, "reentry_ns": t_in,
+                   "resumed_ns": resumed_ns, "admitted": admitted,
                    "settled_passes": settled},
     }
     doc = json.loads(doc_path.read_text())

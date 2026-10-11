@@ -27,6 +27,15 @@ struct mm_struct {
     struct { unsigned long __mm_flags; } flags;
 #elif EXEC_SHAPE == 13
     struct { void *__mm_flags[1]; } flags;
+#elif EXEC_SHAPE == 14
+    unsigned long unrelated:1;
+    unsigned long flags:63;
+#elif EXEC_SHAPE == 15
+    unsigned long flags:1;
+    unsigned long unrelated:63;
+#elif EXEC_SHAPE == 16
+    /* A full-width bitfield has the same checked word semantics as shape 1. */
+    unsigned long flags:64;
 #else
 #error unknown EXEC_SHAPE
 #endif

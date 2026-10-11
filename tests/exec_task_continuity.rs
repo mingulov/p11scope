@@ -3,6 +3,8 @@
 
 use std::{fs, path::Path, process::Command};
 
+const EXEC_TARGET_SHAPES: u32 = 16;
+
 fn compile(source: &str, output: &Path, bpf: bool, shape: Option<u32>) {
     let mut compiler = Command::new("clang-18");
     compiler.args(["-O2", "-g", "-Wall", "-Wextra", "-Werror"]);
@@ -175,7 +177,7 @@ fn exec_task_core_supported_and_unknown_shapes_take_safe_compiled_paths() {
     assert!(pristine.maps.is_empty(), "the native predicate has no maps");
     assert!(pristine.programs.is_empty(), "the predicate adds no hook");
     let wrapper = load_only_wrapper(temp.path());
-    for shape in 1..=13 {
+    for shape in 1..=EXEC_TARGET_SHAPES {
         let target = temp.path().join(format!("target-{shape}.o"));
         compile(
             "tests/fixtures/exec-task/core-target.c",
@@ -219,12 +221,12 @@ fn exec_task_core_supported_and_unknown_shapes_take_safe_compiled_paths() {
                 .any(|ins| ins.code == 0x85 && ins.imm == 0x0bad_2310),
             "each shape retains real Aya poison behind an incompatible-path guard"
         );
-        for flags in [0, 1, 2, 3, (1u64 << 63) | 1] {
+        for flags in [1, 0, 2, 3, (1u64 << 63) | 1] {
             let (result, reads) = execute_predicate(function, flags, false, false, 0);
-            let expected = u64::from(matches!(shape, 1 | 2) && flags & 3 == 1);
+            let expected = u64::from(matches!(shape, 1 | 2 | 16) && flags & 3 == 1);
             assert_eq!(result, expected, "shape={shape} flags={flags}");
             let expected_reads = match shape {
-                1 | 2 => 2,
+                1 | 2 | 16 => 2,
                 6 | 7 => 0,
                 _ => 1,
             };
@@ -250,7 +252,7 @@ fn exec_task_core_shapes_kernel_load_without_attachment() {
     let temp = tempfile::tempdir().unwrap();
     let _wrapper = load_only_wrapper(temp.path());
     let bytes = fs::read(temp.path().join("load-only.o")).unwrap();
-    for shape in 1..=13 {
+    for shape in 1..=EXEC_TARGET_SHAPES {
         let target = temp.path().join(format!("target-{shape}.o"));
         compile(
             "tests/fixtures/exec-task/core-target.c",

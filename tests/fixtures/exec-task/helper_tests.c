@@ -5,6 +5,7 @@
 /* Model only CO-RE metadata and the two kernel helper boundaries. The
  * predicate body and all refusal branches are the actual production unit. */
 static int layout, has_exec_state, has_mm, word_bytes, ptr_bytes, signed_word;
+static int scalar_lshift, scalar_rshift;
 static int null_task, failed_read, reads;
 static int exists(const char *field)
 {
@@ -28,6 +29,8 @@ static int field_size(const char *field)
 #define EXEC_EXISTS(field) exists(#field)
 #define EXEC_SIZE(field) field_size(#field)
 #define EXEC_SIGNED(field) signed_word
+#define EXEC_LSHIFT(field) scalar_lshift
+#define EXEC_RSHIFT(field) scalar_rshift
 #include "exec_task.c"
 
 static struct task_struct___p11exec current;
@@ -47,6 +50,7 @@ static void reset(int shape)
     layout = shape;
     has_exec_state = 0; has_mm = 1;
     word_bytes = ptr_bytes = 8; signed_word = 0;
+    scalar_lshift = scalar_rshift = 0;
     null_task = failed_read = reads = 0;
     current.mm = &mm_flags;
     mm_flags = 1;
@@ -79,6 +83,10 @@ int main(void)
         }
     }
     reset(1); signed_word = 1;
+    assert(!p11_exec_dumpability() && reads == 1);
+    reset(1); scalar_rshift = 1;
+    assert(!p11_exec_dumpability() && reads == 1);
+    reset(1); scalar_lshift = scalar_rshift = 63;
     assert(!p11_exec_dumpability() && reads == 1);
     reset(0);
     assert(!p11_exec_dumpability() && reads == 1);

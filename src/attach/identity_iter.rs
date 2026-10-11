@@ -1721,8 +1721,8 @@ pub fn write_probe_fixture(dir: &Path) -> io::Result<ProbeFixture> {
     // text (matched verbatim) cannot race a path swap.
     let dir = std::fs::read_link(format!("/proc/self/fd/{}", dirfd.as_raw_fd()))?;
     let write_new = |name: &str, bytes: &[u8]| -> io::Result<()> {
-        let cname = std::ffi::CString::new(name)
-            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        let cname =
+            std::ffi::CString::new(name).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
         // SAFETY: `openat` under the verified directory fd; `O_EXCL`
         // fails on any pre-existing name (file or symlink) instead of
         // truncating or following it.
@@ -7824,7 +7824,10 @@ mod tests {
         let victim = dir.path().join("victim");
         std::fs::write(&victim, b"victim bytes").expect("write victim");
         std::os::unix::fs::symlink(&victim, dir.path().join("probe-a")).expect("plant link");
-        assert!(write_probe_fixture(dir.path()).is_err(), "symlinked fixture must fail");
+        assert!(
+            write_probe_fixture(dir.path()).is_err(),
+            "symlinked fixture must fail"
+        );
         assert_eq!(
             std::fs::read(&victim).expect("read victim"),
             b"victim bytes",
@@ -7845,7 +7848,10 @@ mod tests {
         let dir = probe_tempdir();
         let squatter = dir.path().join("probe-b");
         std::fs::write(&squatter, b"squatter bytes").expect("write squatter");
-        assert!(write_probe_fixture(dir.path()).is_err(), "precreated fixture must fail");
+        assert!(
+            write_probe_fixture(dir.path()).is_err(),
+            "precreated fixture must fail"
+        );
         assert_eq!(
             std::fs::read(&squatter).expect("read squatter"),
             b"squatter bytes",
@@ -7862,7 +7868,10 @@ mod tests {
         std::fs::create_dir(&target).expect("create target");
         let link = dir.path().join("linked");
         std::os::unix::fs::symlink(&target, &link).expect("plant dir link");
-        assert!(write_probe_fixture(&link).is_err(), "symlinked dir must fail");
+        assert!(
+            write_probe_fixture(&link).is_err(),
+            "symlinked dir must fail"
+        );
         assert!(
             std::fs::read_dir(&target)
                 .expect("read target")

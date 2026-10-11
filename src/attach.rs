@@ -44,7 +44,9 @@ mod pid_continuity;
 #[cfg(test)]
 pub(crate) use pid_continuity::clock_origins_comparable_with;
 #[cfg(test)]
-pub(crate) use pid_continuity::engine_fixture::{PidSessionFixture, PreflightChange};
+pub(crate) use pid_continuity::engine_fixture::{
+    AttachmentBoundaryChange, PidSessionFixture, PreflightChange,
+};
 pub(crate) use pid_continuity::{
     ExecBinding, PhysicalGapSummary, PidContinuityRefusal, PidLifecycleTap, PreservationReceipt,
     clock_origins_comparable,
@@ -1304,6 +1306,41 @@ pub(crate) fn attachment_admission(
         );
     }
     Ok(())
+}
+
+fn static_attachment_baseline_with<S>(
+    state: &mut S,
+    acquire: impl FnOnce(&mut S) -> Option<pid_continuity::AttachBaseline>,
+    mutation_stopped: impl FnOnce(&S) -> bool,
+) -> Result<Option<pid_continuity::AttachBaseline>> {
+    let baseline = acquire(state);
+    // The fresh read may have latched terminal poison after the caller's
+    // earlier admission. Healthy unavailable proof still permits cold/global
+    // attachment; explicit stop, terminal or detach state never does.
+    if mutation_stopped(state) {
+        bail!("static attachment refused while Session is stopping or detached");
+    }
+    Ok(baseline)
+}
+
+fn refused_group_rebuild(
+    members: impl IntoIterator<Item = u32>,
+    rebuilt_groups: u64,
+    reason: &str,
+) -> DetachOutcome {
+    DetachOutcome {
+        recompleted: Vec::new(),
+        rebuild_failures: members
+            .into_iter()
+            .map(|member| {
+                (
+                    member,
+                    format!("slot {member} was not reattached: {reason}"),
+                )
+            })
+            .collect(),
+        rebuilt_groups,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4389,7 +4426,11 @@ impl Session {
                 }
             })
             .collect();
-        let continuity_baseline = self.pid_attach_baseline();
+        let continuity_baseline = static_attachment_baseline_with(
+            self,
+            Session::pid_attach_baseline,
+            Session::mutation_stopped,
+        )?;
         // Ordering I1: watched-file keys and SLOT_FILE before any link.
         self.instance
             .prepare_targets(&mut self.ebpf, targets, objects);
@@ -4664,7 +4705,23 @@ impl Session {
             _ => link.slots().iter().any(|slot| requested.contains(slot)),
         })?;
         prune_linkless_retained(&mut self.retained_static, &self.links);
-        let continuity_baseline = self.pid_attach_baseline();
+        let continuity_baseline = match static_attachment_baseline_with(
+            self,
+            Session::pid_attach_baseline,
+            Session::mutation_stopped,
+        ) {
+            Ok(baseline) => baseline,
+            Err(error) => {
+                let report = refused_group_rebuild(
+                    affected.difference(requested).copied(),
+                    rebuilt_groups,
+                    &error.to_string(),
+                );
+                self.attach_failures
+                    .extend(report.rebuild_failures.iter().cloned());
+                return Ok(report);
+            }
+        };
         let pid = multi_link_pid(self.uprobe_scope);
         let (bundles, outcome) = reattach_rebuilt_groups_observed_with(
             &groups,

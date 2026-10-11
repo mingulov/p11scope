@@ -36448,7 +36448,9 @@ fn discovery_terminal_capacity_failure_is_visible_and_finite() {
 fn continuity_route() -> (TabledSeedProvider, Engine, ScriptedSession) {
     let (fixture, engine, mut session) = exec_rearm_pid_route();
     let mut continuity = crate::attach::PidSessionFixture::new(&engine.views[0]);
-    continuity.attach(&engine.plan.slots, &engine.pinned);
+    continuity
+        .attach(&engine.plan.slots, &engine.pinned)
+        .unwrap();
     assert_eq!(continuity.identities().len(), engine.plan.slots.len());
     session.pid_continuity = Some(std::cell::RefCell::new(continuity));
     (fixture, engine, session)
@@ -36901,7 +36903,7 @@ fn automatic_exec_pid_continuity_renewal_and_settlement_keep_serviced_serial() {
     let bound = engine.refresh_requested[&pid].clone();
     assert!(bound.exec_binding.is_some());
     let mut wrong = crate::attach::PidSessionFixture::new(&engine.views[0]);
-    wrong.attach(&engine.plan.slots, &engine.pinned);
+    wrong.attach(&engine.plan.slots, &engine.pinned).unwrap();
     let record = observed_candidate_exec(&engine, &mut session);
     engine.dispatch_lifecycle_record(&mut session, &record, &mut pending);
     let bound = engine.refresh_requested[&pid].clone();
@@ -37287,7 +37289,7 @@ fn automatic_exec_pid_continuity_direct_health_clock_stop_fail_closed() {
             let mut state = session.pid_continuity.as_mut().unwrap().borrow_mut();
             state.detach(&slots);
             state.clock_offsets = None;
-            state.attach(&slots, &pins);
+            state.attach(&slots, &pins).unwrap();
             state.clock_offsets = Some("monotonic 0 0".into());
         } else {
             session
@@ -37701,4 +37703,372 @@ fn automatic_exec_pid_continuity_physical_gap_history_is_cumulative() {
     );
     assert_eq!(engine.capture_facts.history.modules, history.modules);
     assert_eq!(engine.capture_facts.history.decoded, history.decoded);
+}
+
+#[test]
+fn automatic_exec_pid_continuity_first_attachment_poison_stops_map_and_native_work() {
+    let (_provider, engine, mut session) = exec_rearm_pid_route();
+    let mut state = crate::attach::PidSessionFixture::new(&engine.views[0]);
+    state.owner.as_mut().unwrap().poison = 1;
+    state.owner.as_mut().unwrap().outstanding = 3;
+    session.pid_continuity = Some(std::cell::RefCell::new(state));
+    assert!(!session.mutation_stopped(), "poison has not yet been read");
+    assert_eq!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .health_reads,
+        0
+    );
+
+    let attached = session.attach_targets(&engine.plan.slots, &engine.pinned);
+    let state = session.pid_continuity.as_ref().unwrap().borrow();
+    assert_eq!(state.health_reads, 1, "no earlier receipt preparation read");
+    assert_eq!(state.health_phases, ["attach"]);
+    assert!(
+        state.stopped(),
+        "the direct OWNER_CTL read latched terminal poison"
+    );
+    assert_eq!(
+        state.native_attach_calls, 0,
+        "poison must stop the same native attempt"
+    );
+    assert_eq!(
+        state.target_map_prepares, 0,
+        "admission precedes target map writes"
+    );
+    assert!(state.identities().is_empty());
+    assert!(attached.is_err());
+}
+
+#[test]
+fn automatic_exec_pid_continuity_attachment_boundary_rechecks_stop_and_terminal_state() {
+    use crate::attach::AttachmentBoundaryChange::{
+        DetachFailure, ProducersDetached, Stop, Terminal,
+    };
+    for change in [Stop, Terminal, ProducersDetached, DetachFailure] {
+        let (_provider, engine, mut session) = exec_rearm_pid_route();
+        let mut state = crate::attach::PidSessionFixture::new(&engine.views[0]);
+        state.attachment_boundary_change = Some(change);
+        session.pid_continuity = Some(std::cell::RefCell::new(state));
+        assert!(!session.mutation_stopped());
+        let attached = session.attach_targets(&engine.plan.slots, &engine.pinned);
+        let state = session.pid_continuity.as_ref().unwrap().borrow();
+        assert_eq!(state.health_reads, 1);
+        assert!(state.stopped());
+        if matches!(change, Stop) {
+            assert_eq!(state.stop_word, p11scope_ebpf_common::STOP_GATE_STOP | 3);
+        }
+        assert_eq!(
+            state.native_attach_calls, 0,
+            "{change:?} after baseline acquisition"
+        );
+        assert_eq!(state.target_map_prepares, 0);
+        assert!(state.identities().is_empty());
+        assert!(attached.is_err());
+    }
+}
+
+#[test]
+fn automatic_exec_pid_continuity_already_stopped_attachment_does_no_work() {
+    use crate::attach::AttachmentBoundaryChange::{
+        DetachFailure, ProducersDetached, Stop, Terminal,
+    };
+    for change in [Stop, Terminal, ProducersDetached, DetachFailure] {
+        let (_provider, engine, mut session) = exec_rearm_pid_route();
+        let mut state = crate::attach::PidSessionFixture::new(&engine.views[0]);
+        match change {
+            Stop => state.stop_word = p11scope_ebpf_common::STOP_GATE_STOP | 3,
+            Terminal => state.terminal(),
+            ProducersDetached => state.producers_detached = true,
+            DetachFailure => state
+                .detach_failures
+                .push("known detach uncertainty".into()),
+        }
+        session.pid_continuity = Some(std::cell::RefCell::new(state));
+        assert!(session.mutation_stopped());
+        assert!(
+            session
+                .attach_targets(&engine.plan.slots, &engine.pinned)
+                .is_err()
+        );
+        let state = session.pid_continuity.as_ref().unwrap().borrow();
+        assert_eq!(state.health_reads, 0);
+        assert_eq!(state.native_attach_calls, 0);
+        assert_eq!(state.target_map_prepares, 0);
+        assert!(state.identities().is_empty());
+    }
+}
+
+#[test]
+fn automatic_exec_pid_continuity_unavailable_attachment_baseline_stays_conservative() {
+    for unavailable in 0..3 {
+        let (_provider, engine, mut session) = exec_rearm_pid_route();
+        let mut state = crate::attach::PidSessionFixture::new(&engine.views[0]);
+        match unavailable {
+            0 => state.owner = Err(crate::attach::PidContinuityRefusal::Unavailable),
+            1 => state.prepared_limit = 0,
+            2 => state.uprobe_scope = aya::programs::uprobe::UProbeScope::AllProcesses,
+            _ => unreachable!(),
+        }
+        session.pid_continuity = Some(std::cell::RefCell::new(state));
+        let (failed, completed) = session
+            .attach_targets(&engine.plan.slots, &engine.pinned)
+            .unwrap();
+        assert!(failed.is_empty());
+        assert_eq!(completed.len(), engine.plan.slots.len());
+        let state = session.pid_continuity.as_ref().unwrap().borrow();
+        assert!(!state.stopped());
+        assert_eq!(state.health_reads, usize::from(unavailable != 2));
+        assert_eq!(state.target_map_prepares, 1);
+        assert_eq!(state.native_attach_calls, 2 * engine.plan.slots.len());
+        assert_eq!(state.identities().len(), engine.plan.slots.len());
+    }
+}
+
+#[test]
+fn automatic_exec_pid_continuity_multi_boundary_refusal_reports_every_survivor() {
+    use crate::attach::AttachmentBoundaryChange::{
+        DetachFailure, ProducersDetached, Stop, Terminal,
+    };
+    for change in [
+        None,
+        Some(Stop),
+        Some(Terminal),
+        Some(ProducersDetached),
+        Some(DetachFailure),
+    ] {
+        let (_provider, mut engine, mut session) = continuity_route();
+        let slots = engine.plan.slots.clone();
+        let (maps_before, native_before, reads_before) = {
+            let mut state = session.pid_continuity.as_mut().unwrap().borrow_mut();
+            state.group_all();
+            if let Some(change) = change {
+                state.attachment_boundary_change = Some(change);
+                if matches!(change, DetachFailure) {
+                    // A missing retained sibling still requires failure reporting.
+                    state.forget_retained_target(slots[2].index);
+                }
+            } else {
+                let mut poisoned = *state.owner.as_ref().unwrap();
+                poisoned.poison = 1;
+                poisoned.outstanding = 3;
+                state.health_script.push_back((Ok(poisoned), Ok(vec![0])));
+            }
+            (
+                state.target_map_prepares,
+                state.native_attach_calls,
+                state.health_reads,
+            )
+        };
+        assert!(
+            !session.mutation_stopped(),
+            "the transition happens after actual detach"
+        );
+        let mut candidate = engine
+            .live_candidate(
+                engine.pinned.clone(),
+                engine
+                    .modules
+                    .iter()
+                    .map(|module| module.scanned.clone())
+                    .collect(),
+                Vec::new(),
+            )
+            .unwrap();
+        candidate.delta.replace = vec![slots[0].clone()];
+        let outcome = engine
+            .apply_candidate(&mut session, candidate, &mut true, false, &[])
+            .unwrap();
+        assert!(outcome.accepted());
+        let state = session.pid_continuity.as_ref().unwrap().borrow();
+        assert_eq!(
+            state.health_reads,
+            reads_before + 1,
+            "no preservation preparation"
+        );
+        assert!(state.stopped());
+        assert_eq!(
+            state.native_attach_calls, native_before,
+            "{change:?} must stop survivor reattach"
+        );
+        assert_eq!(state.target_map_prepares, maps_before);
+        assert!(state.identities().is_empty());
+        assert!(
+            state.gap_summary().open,
+            "the real detached episode stays open"
+        );
+        assert!(engine.physical_gap.open);
+        assert!(engine.multi_rebuild_gaps > 0);
+        for slot in &slots {
+            assert!(
+                !engine.plan.is_active(slot.index),
+                "slot {} must not be falsely active",
+                slot.index
+            );
+        }
+        assert!(!outcome.required_complete());
+    }
+}
+
+#[test]
+fn automatic_exec_pid_continuity_multi_unavailable_baseline_rebuilds_conservatively() {
+    for global in [false, true] {
+        let (_provider, mut engine, mut session) = continuity_route();
+        let slots = engine.plan.slots.clone();
+        let native_before = {
+            let mut state = session.pid_continuity.as_mut().unwrap().borrow_mut();
+            state.group_all();
+            if global {
+                state.uprobe_scope = aya::programs::uprobe::UProbeScope::AllProcesses;
+            } else {
+                state.owner = Err(crate::attach::PidContinuityRefusal::Unavailable);
+            }
+            state.native_attach_calls
+        };
+        let mut candidate = engine
+            .live_candidate(
+                engine.pinned.clone(),
+                engine
+                    .modules
+                    .iter()
+                    .map(|module| module.scanned.clone())
+                    .collect(),
+                Vec::new(),
+            )
+            .unwrap();
+        candidate.delta.replace = vec![slots[0].clone()];
+        let outcome = engine
+            .apply_candidate(&mut session, candidate, &mut true, false, &[])
+            .unwrap();
+        assert!(outcome.required_complete());
+        let state = session.pid_continuity.as_ref().unwrap().borrow();
+        assert!(!state.stopped());
+        assert!(state.native_attach_calls > native_before);
+        assert_eq!(state.identities().len(), slots.len());
+        assert_eq!(engine.plan.active_slot_count(), slots.len());
+        assert!(
+            state.gap_summary().open,
+            "unavailable proof cannot seal the physical interval"
+        );
+    }
+}
+
+struct InitialTimingAfterPhysicalEpisode {
+    _prior_provider: TabledSeedProvider,
+    _new_provider: TabledSeedProvider,
+    engine: Engine,
+    session: ScriptedSession,
+    slots: Vec<plan::Slot>,
+    owners: BTreeMap<plan::ModuleId, PinnedTimingKey>,
+    new_owner: PinnedTimingKey,
+}
+
+impl InitialTimingAfterPhysicalEpisode {
+    fn new() -> Self {
+        let (prior_provider, mut engine, mut session) = continuity_route();
+        let record = continuity_exec_class(&engine, &mut session, 2);
+        assert!(
+            apply_ordinary_batch(&mut engine, &mut session, vec![record])
+                .unwrap()
+                .required_complete
+        );
+        assert_eq!(engine.physical_gap.episodes, 1);
+        assert!(!engine.physical_gap.open);
+        let (new_provider, new_engine, _) = exec_rearm_pid_route();
+        let slots = new_engine.plan.slots[..2].to_vec();
+        let owners = rebuild_timing_owners(&new_engine.pinned, &new_engine.plan);
+        let new_owner = owners[&slots[0].module_ids[0]].clone();
+        assert!(
+            slots
+                .iter()
+                .all(|slot| slot_timing_keys(slot, &owners) == vec![new_owner.clone()])
+        );
+        assert!(
+            !engine.timings.modules.contains_key(&new_owner),
+            "the held provider has a new timing owner"
+        );
+        engine.observe_causal_timing(&BTreeSet::from([new_owner.clone()]), 10_000_000);
+        Self {
+            _prior_provider: prior_provider,
+            _new_provider: new_provider,
+            engine,
+            session,
+            slots,
+            owners,
+            new_owner,
+        }
+    }
+
+    fn completions(&self, timestamps: [Option<u64>; 2]) -> ApplyOutcome {
+        let mut outcome = ApplyOutcome::default();
+        outcome.record_completions(
+            &self.slots,
+            &self.owners,
+            self.slots
+                .iter()
+                .zip(timestamps)
+                .map(|(slot, timestamp)| (slot.index, timestamp))
+                .collect(),
+        );
+        assert_eq!(
+            outcome.static_completions.len(),
+            2,
+            "one real completion per slot"
+        );
+        outcome
+    }
+}
+
+#[test]
+fn automatic_exec_pid_continuity_new_owner_initial_gap_uses_every_slot_after_an_episode() {
+    let mut case = InitialTimingAfterPhysicalEpisode::new();
+    let outcome = case.completions([Some(20_000_000), Some(80_000_000)]);
+    case.engine.record_apply_timing(&outcome);
+    assert_eq!(
+        case.engine.timings.gap_ns(&case.new_owner),
+        Some(70_000_000)
+    );
+    assert_eq!(
+        case.engine.timings.modules[&case.new_owner].attach_complete_ns,
+        Some(80_000_000)
+    );
+}
+
+#[test]
+fn automatic_exec_pid_continuity_new_owner_later_missing_completion_stays_lost() {
+    let mut case = InitialTimingAfterPhysicalEpisode::new();
+    let outcome = case.completions([Some(20_000_000), None]);
+    case.engine.record_apply_timing(&outcome);
+    assert!(case.engine.timings.modules[&case.new_owner].lost);
+    assert_eq!(case.engine.timings.gap_ns(&case.new_owner), None);
+    let later = case.completions([Some(80_000_000), Some(90_000_000)]);
+    case.engine.record_apply_timing(&later);
+    assert!(case.engine.timings.modules[&case.new_owner].lost);
+    assert_eq!(case.engine.timings.gap_ns(&case.new_owner), None);
+}
+
+#[test]
+fn automatic_exec_pid_continuity_completed_owner_keeps_initial_gap_across_later_recovery() {
+    let mut case = InitialTimingAfterPhysicalEpisode::new();
+    let owner = BTreeSet::from([case.new_owner.clone()]);
+    case.engine.complete_causal_timing(&owner, Some(20_000_000));
+    case.engine.complete_causal_timing(&owner, Some(80_000_000));
+    let initial = case.engine.timings.modules[&case.new_owner];
+    let record = continuity_exec_class(&case.engine, &mut case.session, 2);
+    assert!(
+        apply_ordinary_batch(&mut case.engine, &mut case.session, vec![record])
+            .unwrap()
+            .required_complete
+    );
+    assert_eq!(case.engine.physical_gap.episodes, 2);
+    let recovery = case.completions([Some(500_000_000), Some(900_000_000)]);
+    case.engine.record_apply_timing(&recovery);
+    assert_eq!(case.engine.timings.modules[&case.new_owner], initial);
+    assert_eq!(
+        case.engine.timings.gap_ns(&case.new_owner),
+        Some(70_000_000)
+    );
 }

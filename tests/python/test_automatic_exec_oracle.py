@@ -287,6 +287,30 @@ def rapid_successor_inputs():
 
 
 class BDispatchClockTest(unittest.TestCase):
+    def test_expired_leg_prevents_real_pipe_dispatch(self):
+        read_fd, write_fd = os.pipe()
+        os.set_blocking(read_fd, False)
+        now = [1_000_000_000]
+        budget = H6["LegBudget"](clock=lambda: now[0], budgets={"setup": 0.1})
+        driver = H6["BDriver"].__new__(H6["BDriver"])
+        driver.stamps = {}
+        class Pipe:
+            def write(self, byte): os.write(write_fd, byte.encode())
+            def flush(self): pass
+        driver.owned = SimpleNamespace(verify=lambda: None, popen=SimpleNamespace(stdin=Pipe()))
+        token = H6["ACTIVE_LEG"].set(budget)
+        try:
+            now[0] += 100_000_000
+            with self.assertRaises(TimeoutError):
+                driver.send("W", "expired")
+            with self.assertRaises(BlockingIOError):
+                os.read(read_fd, 1)
+            self.assertEqual(driver.stamps, {})
+        finally:
+            H6["ACTIVE_LEG"].reset(token)
+            os.close(write_fd)
+            os.close(read_fd)
+
     def test_dispatch_lower_bound_precedes_a_real_child_read(self):
         read_fd, write_fd = os.pipe()
         observed = []
@@ -311,6 +335,145 @@ class BDispatchClockTest(unittest.TestCase):
             os.close(write_fd)
             reader.join(1)
             os.close(read_fd)
+
+
+class PhaseDeadlineTest(unittest.TestCase):
+    def test_open_pipe_and_pty_transports_expire_at_the_leg_bound(self):
+        with tempfile.TemporaryDirectory(prefix="h6-transport-deadline-") as directory:
+            for kind in ("pipe", "pty"):
+                with self.subTest(kind=kind):
+                    budget = H6["LegBudget"](leg_seconds=0.05)
+                    token = H6["ACTIVE_LEG"].set(budget)
+                    stream = None
+                    if kind == "pipe":
+                        read_fd, held = os.pipe()
+                        stream = os.fdopen(read_fd, encoding="utf-8")
+                        reader = H6["Reader"](stream, Path(directory) / "pipe.txt")
+                    else:
+                        master, held = H6["pty"].openpty()
+                        reader = H6["PtyCapture"](master, Path(directory) / "pty.txt")
+                    H6["ACTIVE_LEG"].reset(token)
+                    try:
+                        reader.thread.join(0.4)
+                        self.assertFalse(reader.thread.is_alive(), "open transport survived its finite leg")
+                        self.assertTrue(any("deadline" in error for error in reader.errors), reader.errors)
+                    finally:
+                        reader.stop.set()
+                        os.close(held)
+                        reader.thread.join(1)
+                        if stream is not None:
+                            stream.close()
+
+    def test_reader_cannot_accept_proof_after_its_phase_expires(self):
+        now = [1_000_000_000]
+        budget = H6["LegBudget"](clock=lambda: now[0], budgets={"setup": 0.1})
+        class Updates:
+            def get(self, timeout):
+                now[0] += 250_000_000  # Scheduling delays do not renew the wait.
+        reader = H6["Reader"].__new__(H6["Reader"])
+        reader.errors, reader.updates = [], Updates()
+        reader.thread = SimpleNamespace(is_alive=lambda: True)
+        checked = []
+        def predicate(_reader):
+            checked.append(True)
+            return {"proof": "late"} if len(checked) > 1 else None
+        token = H6["ACTIVE_LEG"].set(budget)
+        try:
+            with mock.patch.dict(H6["Reader"].wait.__globals__, {"monotonic_ns": lambda: now[0]}), \
+                    self.assertRaises(TimeoutError):
+                reader.wait(predicate, 10)
+            self.assertEqual(len(checked), 1, "late proof was examined after the absolute phase limit")
+        finally:
+            H6["ACTIVE_LEG"].reset(token)
+
+    def test_repeated_waits_and_reentry_consume_one_absolute_phase(self):
+        now = [1_000_000_000]
+        budget = H6["LegBudget"](clock=lambda: now[0], budgets={"setup": 2})
+        self.assertEqual(budget.remaining(10), 2)
+        now[0] += 750_000_000
+        budget.enter("setup")
+        self.assertEqual(budget.remaining(10), 1.25)
+        now[0] += 1_250_000_000
+        with self.assertRaises(TimeoutError):
+            budget.remaining(10)
+
+    def test_recovery_attempts_do_not_renew_phase_or_leg_age(self):
+        now = [1_000_000_000]
+        budget = H6["LegBudget"](clock=lambda: now[0], budgets={"successor-recovery": 1})
+        budget.enter("successor-recovery", key=1)
+        original = budget.phase_deadline_ns
+        now[0] += 600_000_000
+        budget.enter("successor-recovery", key=1)
+        self.assertEqual(budget.phase_deadline_ns, original)
+        self.assertEqual(budget.remaining(15), 0.4)
+        now[0] += 400_000_000
+        with self.assertRaises(TimeoutError):
+            budget.enter("successor-recovery", key=1)
+
+    def test_short_leg_caps_a_later_phase(self):
+        now = [1_000_000_000]
+        budget = H6["LegBudget"](clock=lambda: now[0], leg_seconds=1)
+        now[0] += 900_000_000
+        budget.enter("fixed-measurement")
+        self.assertEqual(budget.remaining(60), 0.1)
+        now[0] += 100_000_000
+        with self.assertRaises(TimeoutError):
+            budget.remaining(60)
+
+    def test_stop_wait_and_receipt_use_same_limit(self):
+        now = [1_000_000_000]
+        class Child:
+            def wait(self, timeout):
+                now[0] += int(timeout * 1e9) - 1
+                return 0
+        owner = SimpleNamespace(send=lambda _signal: None, popen=Child())
+        globals_ = H6["stop_observer"].__globals__
+        with mock.patch.dict(globals_, {"monotonic_ns": lambda: now[0]}):
+            rc, stopped, latency = H6["stop_observer"](owner)
+        self.assertEqual(rc, 0)
+        self.assertLessEqual(latency, 60)
+        self.assertEqual(owner.stop_receipt["stop_limit_seconds"], 60)
+        self.assertFalse(owner.stop_receipt["forced_cleanup"])
+        self.assertEqual(owner.stop_receipt["stop_latency_seconds"], latency)
+        self.assertEqual(stopped, now[0])
+
+    def test_forced_stop_is_failed_even_if_cleanup_reaps_zero_status(self):
+        now = [1_000_000_000]
+        class Child:
+            def wait(self, timeout):
+                now[0] += int(timeout * 1e9)
+                if not getattr(self, "killed", False):
+                    raise subprocess.TimeoutExpired("owned child", timeout)
+                return 0
+        child = Child()
+        def send(signum):
+            if signum == H6["signal"].SIGKILL:
+                child.killed = True
+        owner = SimpleNamespace(send=send, popen=child)
+        globals_ = H6["stop_inventory"].__globals__
+        with mock.patch.dict(globals_, {"monotonic_ns": lambda: now[0]}):
+            rc, _, latency = H6["stop_inventory"](owner)
+        self.assertEqual(rc, 0)
+        self.assertEqual(latency, 30)
+        self.assertTrue(owner.stop_receipt["forced_cleanup"])
+        self.assertEqual(owner.stop_receipt["cleanup_latency_seconds"], 5)
+        text, ledger, receipt = b_style_inputs()
+        receipt.update(owner.stop_receipt)
+        result = H6["evaluate_trace_h6"](text, ledger, receipt)
+        self.assertFalse(result["pass"], result)
+        self.assertTrue(any("forced" in error for error in result["errors"]), result)
+
+    def test_forced_cleanup_refuses_aggregate_and_inventory_zero_status(self):
+        doc, stdout_text, ledger, receipt = profile_inputs()
+        receipt["forced_cleanup"] = True
+        result = H6["evaluate_profile_h6"](doc, stdout_text, ledger, receipt)
+        self.assertFalse(result["pass"], result)
+        self.assertTrue(any("forced" in error for error in result["errors"]), result)
+        doc, ledgers, receipt = inventory_inputs()
+        receipt["forced_cleanup"] = True
+        result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+        self.assertFalse(result["pass"], result)
+        self.assertTrue(any("forced" in error for error in result["errors"]), result)
 
 
 class RapidSuccessorTest(unittest.TestCase):
@@ -341,20 +504,25 @@ class DetailedFixtureTest(unittest.TestCase):
         cls.directory = Path(cls.temporary.name)
         source = ROOT / "tests/fixtures/detailed-nonleader-exec.c"
         for name, flags in (("provider.so", ["-DDETAILED_EXEC_PROVIDER", "-fPIC", "-shared"]),
-                            ("before", []), ("after", ["-DDETAILED_EXEC_AFTER"])):
+                            ("before", []), ("after", ["-DDETAILED_EXEC_AFTER"]),
+                            ("before-short", ["-DDETAILED_EXEC_LEGACY_WAIT_NS=50000000UL"]),
+                            ("after-short", ["-DDETAILED_EXEC_AFTER", "-DDETAILED_EXEC_LEGACY_WAIT_NS=50000000UL"])):
             result = subprocess.run(["cc", *H6["B_CFLAGS"], *flags, str(source), "-ldl",
                                      "-o", str(cls.directory / name)],
                                     capture_output=True, text=True, timeout=30)
             if result.returncode:
                 raise AssertionError(result.stderr)
 
-    def child(self, after=True, warm=False, failed=False):
+    def child(self, after=True, warm=False, failed=False, deadlines=None, short=False, delay_ms=0):
         provider = str(self.directory / "provider.so")
-        argv = ([str(self.directory / "after"), provider, str(os.getpid()), "43"] if after
-                else [str(self.directory / "before"), provider, str(self.directory / "after"),
+        suffix = "-short" if short else ""
+        argv = ([str(self.directory / ("after" + suffix)), provider, str(os.getpid()), "43"] if after
+                else [str(self.directory / ("before" + suffix)), provider, str(self.directory / "after"),
                       str(self.directory / "absent"), str(os.getpid()), "43", "1" if failed else "0"])
-        if warm:
-            argv += ["17", "0", "1"]
+        if warm or deadlines:
+            argv += ["17", str(delay_ms), "1" if warm else "0"]
+        if deadlines:
+            argv += [str(value) for value in deadlines]
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True)
         def cleanup():
@@ -436,6 +604,80 @@ class DetailedFixtureTest(unittest.TestCase):
         self.assertEqual([int(v) for v in expect("DONE")[3:7]], [29, 15, 14, 5])
         send("F")
         self.assertEqual(proc.wait(timeout=2), 0)
+
+    def deadline_args(self, hold_ms=500, recovery_ms=500, setup_ms=500):
+        now = time.monotonic_ns()
+        return [now + 2_000_000_000, now + setup_ms * 1_000_000,
+                recovery_ms, 500, hold_ms]
+
+    def test_opt_in_initial_g_expires_at_absolute_setup_bound(self):
+        proc, expect, _send = self.child(after=False, short=True, deadlines=self.deadline_args(setup_ms=150))
+        expect("READY")
+        time.sleep(0.08)
+        self.assertIsNone(proc.poll(), "H6 G wait still used the independent legacy bound")
+        self.assertEqual(proc.wait(timeout=1), 92)
+
+    def test_opt_in_terminal_hold_survives_delayed_stop_then_expires(self):
+        for finish in (True, False):
+            with self.subTest(finish=finish):
+                proc, expect, send = self.child(short=True, deadlines=self.deadline_args(hold_ms=200))
+                expect("NEW_READY")
+                send("P")
+                expect("POST_BODY")
+                send("R")
+                expect("NEW_DONE")
+                time.sleep(0.1)
+                self.assertIsNone(proc.poll(), "fixture died inside permitted observer stop")
+                if finish:
+                    send("F")
+                self.assertEqual(proc.wait(timeout=1), 0 if finish else 92)
+
+    def test_opt_in_failed_join_covers_same_terminal_hold_and_exact_counts(self):
+        proc, expect, send = self.child(after=False, failed=True, short=True,
+                                       deadlines=self.deadline_args(hold_ms=300))
+        ready = expect("READY")
+        send("G")
+        thread = expect("THREAD")
+        expect("WORKER_DONE")
+        expect("EXEC_BODY")
+        send("X")
+        failed = expect("EXEC_FAILED")
+        self.assertEqual(failed[1:3], thread[1:3])
+        self.assertEqual(ready[1], failed[1])
+        send("R")
+        self.assertEqual([int(v) for v in expect("DONE")[3:7]], [29, 15, 14, 5])
+        time.sleep(0.15)
+        self.assertIsNone(proc.poll(), "failed-exec join ended before permitted terminal hold")
+        send("F")
+        self.assertEqual(proc.wait(timeout=1), 0)
+
+    def test_legacy_terminal_hold_retains_its_independent_default_bound(self):
+        proc, expect, send = self.child(short=True)
+        expect("NEW_READY")
+        send("P")
+        expect("POST_BODY")
+        send("R")
+        expect("NEW_DONE")
+        self.assertEqual(proc.wait(timeout=1), 92)
+
+    def test_opt_in_warm_commands_do_not_renew_recovery_deadline(self):
+        proc, expect, send = self.child(warm=True, short=True, deadlines=self.deadline_args(recovery_ms=180))
+        expect("NEW_READY")
+        for sequence in (1, 2, 3):
+            send("W")
+            self.assertEqual(int(expect("WARM_DONE")[3]), sequence)
+            time.sleep(0.04)
+        self.assertEqual(proc.wait(timeout=0.1), 92)
+
+    def test_opt_in_measurement_pacing_cannot_dispatch_past_phase_bound(self):
+        deadlines = self.deadline_args()
+        deadlines[3] = 60
+        proc, expect, send = self.child(deadlines=deadlines, delay_ms=100)
+        expect("NEW_READY")
+        send("P")
+        expect("POST_BODY")
+        send("R")
+        self.assertEqual(proc.wait(timeout=1), 92)
 
 
 class LiveFrameTest(unittest.TestCase):
@@ -939,6 +1181,30 @@ class LegCleanupTest(unittest.TestCase):
                 (owner.popen.stdin, owner.popen.stdout, owner.popen.stderr) if stream is not None))
         os.fstat(self.case_pin.fd)
 
+    def test_expired_cleanup_still_cancels_reader_and_marks_custody_failed(self):
+        scope = H6["LegContext"](self.ctx)
+        owner, reader, _errors = self.child(scope.owners, scope.readers, self.directory)
+        now = [1_000_000_000]
+        budget = H6["LegBudget"](clock=lambda: now[0], budgets={"cleanup": 0.1})
+        budget.enter("cleanup")
+        now[0] += 100_000_000
+        token = H6["ACTIVE_LEG"].set(budget)
+        try:
+            with self.assertRaises(H6["LegCleanupError"]):
+                H6["cleanup_leg_resources"](scope)
+            self.assertTrue(reader.stop.is_set(), "deadline expiry bypassed sticky reader cancellation")
+            self.assertTrue(self.ctx.cleanup_failed)
+            self.assertTrue(any("deadline" in error for error in self.ctx.cleanup_errors))
+        finally:
+            H6["ACTIVE_LEG"].reset(token)
+        reader.thread.join(1)
+        try:
+            H6["cleanup_leg_resources"](scope)
+        except H6["LegCleanupError"]:
+            pass  # The original cancellation remains an honest failed outcome.
+        self.assertIsNotNone(owner.popen.poll())
+        self.assertIsNone(owner.pidfd)
+
     def test_failed_leg_reaps_before_next_observer(self):
         def fail(*_args):
             raise H6["SetupError"]("controlled setup failure")
@@ -1419,7 +1685,7 @@ class LegCleanupTest(unittest.TestCase):
         self.assert_released()
 
     def test_partial_process_validation_failure_reaps_registered_direct_child(self):
-        shared = H6["spawn_owned"].__globals__
+        shared = H6["N3HARNESS"]["spawn_owned"].__globals__
         acquired = []
         def validation(_pid, _parent, _uid, popen):
             acquired.append(popen)
@@ -1502,8 +1768,8 @@ class LegCleanupTest(unittest.TestCase):
                 raise OSError("controlled signal failure")
             def failed_wait(_owner):
                 raise TimeoutError("controlled terminal wait failure")
-            with mock.patch.dict(H6["N3HARNESS"], {"terminate": failed_signal}), \
-                    mock.patch.dict(self.globals, {"wait_terminal_child": failed_wait}), \
+            with mock.patch.dict(self.globals, {"terminate_owned": failed_signal,
+                                                "wait_terminal_child": failed_wait}), \
                     self.assertRaises(H6["LegCleanupError"]):
                 H6["cleanup_leg_resources"](scope)
             self.assertEqual(scope.owners, [owner], "failed terminal wait discarded child ownership")

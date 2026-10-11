@@ -1160,6 +1160,26 @@ pub struct StrictIdentity {
     pub target_fd: OwnedFd,
 }
 
+/// FDs one strict identity load retains: the 5 maps (`anchors`,
+/// `anchor_slots`, `anchor_observed`, `config`, `scope_bitmap`) plus
+/// the 2 verified programs, plus the 2 cloned program fds above.
+/// Pinned against `vma_identity.c` by `strict_load_fd_cost_matches_object`.
+pub(crate) const STRICT_LOAD_RETAINED_FDS: usize = 9;
+
+/// FDs the functional probe holds above its probe object: the child
+/// pipe read end, the 2 anchor files, the observer pidfd, and one
+/// attach link plus its iterator (runs are sequential).
+pub(crate) const FUNCTIONAL_PROBE_TRANSIENT_FDS: usize = 6;
+
+/// FDs a session setup may hold at peak: the probe load plus the probe
+/// transients, with one spare for the fork pipe pair and the BTF read
+/// (both closed before the peak). The fresh load after the probe drop,
+/// and the diagnostic follow-up load on failure, each hold at most the
+/// retained count. Lazy session init must reserve this peak before
+/// opening anything.
+pub(crate) const SESSION_SETUP_PEAK_FDS: usize =
+    STRICT_LOAD_RETAINED_FDS + FUNCTIONAL_PROBE_TRANSIENT_FDS + 1;
+
 /// Strict load: maps plus both `iter/task_vma` programs, with CO-RE
 /// relocated against readable `btf`. A successful return means both
 /// programs passed the verifier and both fds are retained. EVERY
@@ -7849,6 +7869,29 @@ mod tests {
                 .next()
                 .is_none(),
             "the fixture write descended into a symlinked dir"
+        );
+    }
+
+    /// The strict-load FD cost pins the object surface: one fd per `.maps`
+    /// definition plus one per `iter/task_vma` program, plus the two
+    /// cloned program fds [`StrictIdentity`] retains. Any map/program
+    /// added to `vma_identity.c` must update the reservation first.
+    #[test]
+    fn strict_load_fd_cost_matches_object() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let source = std::fs::read_to_string(root.join("crates/ebpf/native/vma_identity.c"))
+            .expect("read vma_identity.c");
+        let maps = source.matches("SEC(\".maps\")").count();
+        let programs = source.matches("SEC(\"iter/task_vma\")").count();
+        assert_eq!(
+            STRICT_LOAD_RETAINED_FDS,
+            maps + programs + 2,
+            "strict load retains one fd per map/program plus 2 clones: {maps} maps, {programs} programs"
+        );
+        assert_eq!(
+            SESSION_SETUP_PEAK_FDS,
+            STRICT_LOAD_RETAINED_FDS + FUNCTIONAL_PROBE_TRANSIENT_FDS + 1,
+            "setup peak is the probe load plus probe transients plus the fork/BTF spare"
         );
     }
 

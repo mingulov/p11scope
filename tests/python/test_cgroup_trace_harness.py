@@ -561,6 +561,7 @@ class NativeMatrixFixtureTests(unittest.TestCase):
                     owner.popen.stdin.write(f'{command} {path}\n')
                     owner.popen.stdin.flush()
                     self.assertEqual(owner.popen.wait(timeout=1), 2)
+                    reader.finish()
                     self.assertFalse(any(row['kind'] == 'image' and row['image'] == 1
                                          for row in reader.records))
 

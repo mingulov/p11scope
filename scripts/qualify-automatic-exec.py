@@ -4080,6 +4080,9 @@ def wait_r5_successor_admitted(jsonl_path, owner, executable, cursor, *, not_bef
             if record["seq"] <= cursor.seq:
                 continue
             event = record["event"]
+            if record["kind"] == "caller_event" and admitted is not None and (
+                    event.get("caller") == admitted["caller"] or event.get("old") == admitted["caller"]):
+                raise SetupError("R5 successor retired before admission completion")
             if record["kind"] == "caller_event" and event.get("event") in ("admitted", "exec_retired"):
                 subject = "new" if event["event"] == "exec_retired" else "caller"
                 context = r5_admitted_subject(event, subject)
@@ -4100,9 +4103,6 @@ def wait_r5_successor_admitted(jsonl_path, owner, executable, cursor, *, not_bef
                             "seq": record["seq"], "at_ns": record["at_ns"], "image": image,
                             "publication": event["event"]}
                 committed = None
-            elif record["kind"] == "caller_event" and admitted is not None and (
-                    event.get("caller") == admitted["caller"] or event.get("old") == admitted["caller"]):
-                raise SetupError("R5 successor retired before admission completion")
             elif record["kind"] == "pass_committed" and admitted is not None:
                 committed = r5_pass_receipt(record)
                 if committed["pass"] <= cursor.completed_pass["pass"]:

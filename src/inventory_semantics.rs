@@ -1714,7 +1714,7 @@ mod terminal_drain_tests {
     };
     use crate::semantic_capture::RoutedCall;
     use p11scope_ebpf_common::instance::STAMP_VALID;
-    use p11scope_ebpf_common::{Event, EventRecord, InstanceContinuity, InstanceStamp};
+    use p11scope_ebpf_common::{Event, InstanceStamp};
 
     fn router_ids(domain: NativeDomainId, count: usize) -> Vec<InstanceId> {
         let mut router = InstanceRouter::new(domain, RouterLimits::default());
@@ -1805,8 +1805,8 @@ mod terminal_drain_tests {
                     };
                     let routed = RoutedCall::scripted(
                         self.domain,
-                        EventRecord {
-                            event: Event {
+                        crate::semantic_capture::event_record_with_routing(
+                            Event {
                                 slot: 0,
                                 image: ImageIdentity {
                                     task_cookie: 71,
@@ -1814,12 +1814,9 @@ mod terminal_drain_tests {
                                 },
                                 ..Default::default()
                             },
-                            continuity: InstanceContinuity {
-                                entry_stamp: stamp,
-                                return_stamp: stamp,
-                                entry_ip: 0x2200,
-                            },
-                        },
+                            stamp,
+                            0x2200,
+                        ),
                         Route::Joined(r0),
                         Some(Endpoint {
                             object: PinnedObjectId(0),

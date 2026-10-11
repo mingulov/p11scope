@@ -257,6 +257,27 @@ impl fmt::Debug for RoutedCall {
     }
 }
 
+/// Tests-only record: finalizer and terminal tests script Joined calls
+/// with routing continuity that only the audited router mints. The helper
+/// lives in the allowlisted router plumbing so non-allowed test fixtures
+/// never name the private routing fields. Production construction stays
+/// move-only.
+#[cfg(test)]
+pub(crate) fn event_record_with_routing(
+    event: p11scope_ebpf_common::Event,
+    stamp: p11scope_ebpf_common::InstanceStamp,
+    ip: u64,
+) -> EventRecord {
+    EventRecord {
+        event,
+        continuity: p11scope_ebpf_common::InstanceContinuity {
+            entry_stamp: stamp,
+            return_stamp: stamp,
+            entry_ip: ip,
+        },
+    }
+}
+
 pub(crate) enum InvalidationScope {
     CoverageFailed,
     AuthorityExhausted,

@@ -2981,7 +2981,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         let mut events = Vec::new();
         for transition in self.binder.take_transitions() {
-            events.extend(self.apply_exec_transition(transition, &mut *identity, now_ns));
+            events.extend(self.apply_exec_transition(
+                transition,
+                &mut *identity,
+                now_ns,
+                &mut crate::attach::monotonic_ns,
+            ));
         }
         self.apply_reconcile_events(&events, now_ns);
         self.registry
@@ -4839,6 +4844,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         transition: ExecTransition,
         identity: &mut dyn NativeIdentity<Source::Pin>,
         now_ns: u64,
+        detected: &mut dyn FnMut() -> Option<u64>,
     ) -> Vec<CallerEvent> {
         let caller = transition.caller();
         let transition_pid = transition.pid();
@@ -4914,7 +4920,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let authority = resolver.resolve(transition_pid);
         let (native_failures, scan_pinned) = resolver.finish();
         self.record_authority_gaps(native_failures, scan_pinned);
-        self.commit_pending_successor(caller, authority, now_ns)
+        self.commit_pending_successor(caller, authority, now_ns, detected)
     }
 
     /// Mint one held exec handoff for a proven transition (H6 slice 2).
@@ -4981,6 +4987,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         old: CallerId,
         authority: ImageAuthority,
         now_ns: u64,
+        detected: &mut dyn FnMut() -> Option<u64>,
     ) -> Vec<CallerEvent> {
         let Some(pending) = self.pending_successors.remove(&old) else {
             return Vec::new();
@@ -4994,17 +5001,28 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 Vec::new()
             }
             Ok(None) => {
-                match self
-                    .adapter
-                    .admit_retained_successor(pid, pending.custody, authority, now_ns)
-                {
+                let events = match self.adapter.admit_retained_successor(
+                    pid,
+                    pending.custody,
+                    authority,
+                    now_ns,
+                    detected,
+                ) {
                     Ok(new) => vec![CallerEvent::ExecRetired { old, new }],
                     Err(failure) => vec![CallerEvent::AdmitFailed {
                         pid,
                         reason: format!("post-exec re-admission failed: {}", failure.reason),
                         budget: failure.budget,
                     }],
+                };
+                // A failed detection clock falls back explicitly before
+                // subsequent exit attribution (F7a): exits record
+                // unfiltered with their gap, never against a silent
+                // pass-start stamp.
+                if self.adapter.take_detection_clock_failed() {
+                    self.exit_clocks_comparable = false;
                 }
+                events
             }
             Err(failure) => vec![CallerEvent::AdmitFailed {
                 pid,
@@ -14414,6 +14432,7 @@ pub(crate) mod tests {
                 caller,
                 ImageAuthority::ScanPinned,
                 1_300,
+                &mut crate::attach::monotonic_ns,
             );
             let [CallerEvent::AdmitFailed { reason, .. }] = events.as_slice() else {
                 panic!("a turned-over generation must refuse: {events:?}");
@@ -14444,6 +14463,7 @@ pub(crate) mod tests {
                 caller,
                 ImageAuthority::ScanPinned,
                 1_300,
+                &mut crate::attach::monotonic_ns,
             );
             let [CallerEvent::AdmitFailed { reason, .. }] = events.as_slice() else {
                 panic!("a newer image before commit must refuse: {events:?}");
@@ -14467,6 +14487,7 @@ pub(crate) mod tests {
                 caller,
                 ImageAuthority::ScanPinned,
                 1_300,
+                &mut crate::attach::monotonic_ns,
             );
             let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
                 panic!("a clean held handoff must commit: {events:?}");
@@ -14534,23 +14555,29 @@ pub(crate) mod tests {
             let delayed = two.scene.coordinator.binder.take_transitions();
             assert_eq!(delayed.len(), 1, "the second domain proves independently");
             assert_eq!(delayed[0].caller(), caller);
-            let events =
-                two.scene
-                    .coordinator
-                    .apply_exec_transition(first[0], &mut two.cookies, 1_200);
+            let events = two.scene.coordinator.apply_exec_transition(
+                first[0],
+                &mut two.cookies,
+                1_200,
+                &mut || Some(1_200),
+            );
             assert!(
                 matches!(events.as_slice(), [CallerEvent::ExecRetired { old, .. }] if *old == caller),
                 "{events:?}"
             );
-            let events =
-                two.scene
-                    .coordinator
-                    .apply_exec_transition(delayed[0], &mut two.cookies, 1_300);
+            let events = two.scene.coordinator.apply_exec_transition(
+                delayed[0],
+                &mut two.cookies,
+                1_300,
+                &mut || Some(1_300),
+            );
             assert!(events.is_empty(), "delayed proof mints nothing: {events:?}");
-            let events =
-                two.scene
-                    .coordinator
-                    .apply_exec_transition(first[0], &mut two.cookies, 1_400);
+            let events = two.scene.coordinator.apply_exec_transition(
+                first[0],
+                &mut two.cookies,
+                1_400,
+                &mut || Some(1_400),
+            );
             assert!(
                 events.is_empty(),
                 "replayed proof mints nothing: {events:?}"
@@ -14741,7 +14768,12 @@ pub(crate) mod tests {
                 held_stop
                     .scene
                     .coordinator
-                    .commit_pending_successor(caller, ImageAuthority::ScanPinned, 1_300)
+                    .commit_pending_successor(
+                        caller,
+                        ImageAuthority::ScanPinned,
+                        1_300,
+                        &mut || Some(1_300),
+                    )
                     .is_empty(),
                 "no commit after the release"
             );
@@ -14997,10 +15029,12 @@ pub(crate) mod tests {
                 .all(|edge| edge.caller != fresh),
             "the fresh incarnation inherits no history"
         );
-        let stale =
-            dead.scene
-                .coordinator
-                .apply_exec_transition(delayed[0], &mut dead.cookies, 2_200);
+        let stale = dead.scene.coordinator.apply_exec_transition(
+            delayed[0],
+            &mut dead.cookies,
+            2_200,
+            &mut || Some(2_200),
+        );
         assert!(
             stale.is_empty(),
             "a delayed transition for a dead caller attaches nothing: {stale:?}"
@@ -15026,18 +15060,22 @@ pub(crate) mod tests {
                 .is_empty(),
             "a replayed proof emits no second transition"
         );
-        let events =
-            once.scene
-                .coordinator
-                .apply_exec_transition(emitted[0], &mut once.cookies, 1_200);
+        let events = once.scene.coordinator.apply_exec_transition(
+            emitted[0],
+            &mut once.cookies,
+            1_200,
+            &mut || Some(1_200),
+        );
         assert!(
             matches!(events.as_slice(), [CallerEvent::ExecRetired { old, .. }] if *old == leader),
             "{events:?}"
         );
-        let again =
-            once.scene
-                .coordinator
-                .apply_exec_transition(emitted[0], &mut once.cookies, 1_300);
+        let again = once.scene.coordinator.apply_exec_transition(
+            emitted[0],
+            &mut once.cookies,
+            1_300,
+            &mut || Some(1_300),
+        );
         assert!(
             again.is_empty(),
             "one successor per ended caller: {again:?}"
@@ -15438,11 +15476,12 @@ pub(crate) mod tests {
         );
         let emitted = native.binder_only(vec![native.row(41, 2, 7, 1_100, 1)]);
         assert_eq!(emitted.len(), 1, "the real exec emits one transition");
-        let events =
-            native
-                .scene
-                .coordinator
-                .apply_exec_transition(emitted[0], &mut native.cookies, 1_200);
+        let events = native.scene.coordinator.apply_exec_transition(
+            emitted[0],
+            &mut native.cookies,
+            1_200,
+            &mut || Some(1_200),
+        );
         let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
             panic!("the transition retires the old incarnation: {events:?}");
         };
@@ -15479,6 +15518,121 @@ pub(crate) mod tests {
         assert!(receipt.events.is_empty());
         native.scene.coordinator.commit_batch(false).unwrap();
         assert_eq!(link_losses(&native), 1, "a fresh exit still records once");
+    }
+
+    /// H6 stale attribution, native retained successor (F7a): the
+    /// supplied `now_ns` may be a stale pass-start stamp, so admission
+    /// samples the detection clock after validation instead. A clock
+    /// failure stamps zero and takes the gap fallback explicitly
+    /// through the commit path — before subsequent exit attribution.
+    #[test]
+    fn native_successor_admission_samples_detection_after_validation() {
+        fn exit_record(pid: u32, hook_ts_ns: u64) -> p11scope_ebpf_common::DiscoveryRecord {
+            // SAFETY: DiscoveryRecord contains only integer fields.
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.hook_ts_ns = hook_ts_ns;
+            record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+            record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+            record
+        }
+
+        // Earlier supplied timestamp: the boundary is the fresh
+        // detection sample, never the stale pass-start stamp.
+        let (mut stale, _leader) = NativeScene::new();
+        stale.answer(7, 500, 41);
+        assert!(
+            stale
+                .binder_only(vec![stale.row(41, 1, 7, 100, 0)])
+                .is_empty()
+        );
+        let emitted = stale.binder_only(vec![stale.row(41, 2, 7, 1_100, 1)]);
+        let events = stale.scene.coordinator.apply_exec_transition(
+            emitted[0],
+            &mut stale.cookies,
+            1_200,
+            &mut || Some(5_000),
+        );
+        let [CallerEvent::ExecRetired { new, .. }] = events.as_slice() else {
+            panic!("the transition must commit: {events:?}");
+        };
+        let record = stale
+            .scene
+            .coordinator
+            .adapter
+            .record(*new)
+            .expect("the successor is recorded");
+        assert_eq!(
+            record.admitted_ns, 5_000,
+            "detection sampled after validation, not the stale supplied 1200"
+        );
+        assert_eq!(
+            record.first_seen_ns, 1_200,
+            "scan-window semantics keep the supplied stamp"
+        );
+
+        // Clock failure: zero stamp plus the explicit gap fallback,
+        // propagated by the commit path itself — then the old exit
+        // records unfiltered, never silently suppressed.
+        let (mut failed, _leader) = NativeScene::new();
+        failed.answer(7, 500, 41);
+        assert!(
+            failed
+                .binder_only(vec![failed.row(41, 1, 7, 100, 0)])
+                .is_empty()
+        );
+        let emitted = failed.binder_only(vec![failed.row(41, 2, 7, 1_100, 1)]);
+        let events = failed.scene.coordinator.apply_exec_transition(
+            emitted[0],
+            &mut failed.cookies,
+            1_200,
+            &mut || None,
+        );
+        let [CallerEvent::ExecRetired { new, .. }] = events.as_slice() else {
+            panic!("admission still commits on clock failure: {events:?}");
+        };
+        let record = failed
+            .scene
+            .coordinator
+            .adapter
+            .record(*new)
+            .expect("the successor is recorded");
+        assert_eq!(
+            record.admitted_ns, 0,
+            "clock failure stamps zero, never the silent pass-start 1200"
+        );
+        assert!(
+            !failed.scene.coordinator.exit_clocks_comparable,
+            "the commit path propagates the failure into the gap fallback"
+        );
+        failed
+            .scene
+            .coordinator
+            .apply_reconcile_events(&events, 1_200);
+        failed.scene.coordinator.commit_batch(false).unwrap();
+        let receipt = failed.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            failed.domain,
+            vec![exit_record(7, 100)],
+            failed.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        failed.scene.coordinator.commit_batch(false).unwrap();
+        let subjects = failed.gap_subjects();
+        assert_eq!(
+            subjects
+                .iter()
+                .filter(|subject| subject.as_str() == "leader task link loss")
+                .count(),
+            1,
+            "the exit records unfiltered: {subjects:?}"
+        );
+        assert_eq!(
+            subjects
+                .iter()
+                .filter(|subject| subject.as_str() == "leader-exit clocks unvalidated")
+                .count(),
+            1,
+            "one gap notes the unvalidated clocks: {subjects:?}"
+        );
     }
 
     /// H6 stale attribution, clock comparability: the detector agrees

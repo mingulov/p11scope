@@ -943,6 +943,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
     /// pids. Every transition is an event; failures to admit are events,
     /// never silent. `authority_for` resolves the image authority per pid,
     /// so one pass can mix native-exact and scan-pinned incarnations.
+    #[cfg_attr(not(test), allow(dead_code))] // Reached only by tests today.
     pub(crate) fn reconcile(
         &mut self,
         observed: &BTreeSet<u32>,

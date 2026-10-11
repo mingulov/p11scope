@@ -1655,24 +1655,107 @@ pub struct ProbeFixture {
 /// Write the §6.5 fixture into `dir` (one page per file, deterministic
 /// contents) and self-validate the discrimination the probe asserts:
 /// the link shares `a`'s inode, the copy shares its bytes but not its
-/// inode, and `b` differs in both. Stale `hardlink`/`copy` names from a
-/// previous run over a surviving dir are unlinked first, so a rerun can
-/// never see a previous run's inodes.
+/// inode, and `b` differs in both.
+///
+/// Exclusive by construction: `dir` must be a directory we own (a final
+/// symlink is refused, never followed), every fixture file is created
+/// `O_CREAT|O_EXCL|O_NOFOLLOW` under the open directory fd, and any
+/// pre-existing name fails instead of truncating or following. There is
+/// no rerun-over-a-surviving-dir path: each probe owns a fresh dir.
 pub fn write_probe_fixture(dir: &Path) -> io::Result<ProbeFixture> {
-    let dir = std::fs::canonicalize(dir)?;
+    use std::os::unix::ffi::OsStrExt as _;
+    let owned = |what: &str| io::Error::new(io::ErrorKind::PermissionDenied, what);
+    let cdir = std::ffi::CString::new(dir.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    // SAFETY: `open` of a NUL-terminated path; `O_NOFOLLOW` refuses a
+    // final symlink while resolving intermediate components as usual.
+    let raw = unsafe {
+        libc::open(
+            cdir.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful `open` returned a new owned fd.
+    let dirfd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `fstat` on a live fd with a writable out-param.
+    if unsafe { libc::fstat(dirfd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful `fstat` initialized `stat`.
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT as u32 != libc::S_IFDIR as u32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "probe fixture dir is not a directory",
+        ));
+    }
+    // SAFETY: `geteuid` takes no arguments and always succeeds.
+    if stat.st_uid != unsafe { libc::geteuid() } {
+        return Err(owned("probe fixture dir is not owned by us"));
+    }
+    // The canonical path is pinned to the open fd, so the child's maps
+    // text (matched verbatim) cannot race a path swap.
+    let dir = std::fs::read_link(format!("/proc/self/fd/{}", dirfd.as_raw_fd()))?;
+    let write_new = |name: &str, bytes: &[u8]| -> io::Result<()> {
+        let cname = std::ffi::CString::new(name)
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+        // SAFETY: `openat` under the verified directory fd; `O_EXCL`
+        // fails on any pre-existing name (file or symlink) instead of
+        // truncating or following it.
+        let raw = unsafe {
+            libc::openat(
+                dirfd.as_raw_fd(),
+                cname.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the successful `openat` returned a new owned fd.
+        let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
+        use io::Write as _;
+        file.write_all(bytes)?;
+        // The fd closes here; nothing else in the probe holds the fixture
+        // open past its write.
+        drop(file);
+        Ok(())
+    };
     let a_bytes: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
     let b_bytes: Vec<u8> = (0..4096u32).map(|i| ((i % 241) as u8) ^ 0x5A).collect();
     let a = dir.join("probe-a");
     let b = dir.join("probe-b");
     let hardlink = dir.join("probe-a-link");
     let copy = dir.join("probe-a-copy");
-    std::fs::write(&a, &a_bytes)?;
-    std::fs::write(&b, &b_bytes)?;
-    for stale in [&hardlink, &copy] {
-        let _ = std::fs::remove_file(stale);
+    write_new("probe-a", &a_bytes)?;
+    write_new("probe-b", &b_bytes)?;
+    let link_old = std::ffi::CString::new("probe-a").expect("static name has no NUL");
+    let link_new = std::ffi::CString::new("probe-a-link").expect("static name has no NUL");
+    // SAFETY: `linkat` under the verified directory fd; flags 0 never
+    // follows a symlink, and `probe-a` above is the regular file this
+    // call just created exclusively.
+    if unsafe {
+        libc::linkat(
+            dirfd.as_raw_fd(),
+            link_old.as_ptr(),
+            dirfd.as_raw_fd(),
+            link_new.as_ptr(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
     }
-    std::fs::hard_link(&a, &hardlink)?;
-    std::fs::write(&copy, &a_bytes)?;
+    write_new("probe-a-copy", &a_bytes)?;
+    // The verified 0700 owned dir admits no other writer, so the
+    // path reads below are exact. The directory fd stays open through
+    // them and closes with this scope.
+    let _dir_guard = dirfd;
     use std::os::unix::fs::MetadataExt as _;
     let ino = |path: &Path| std::fs::metadata(path).map(|meta| meta.ino());
     let (ino_a, ino_b, ino_link, ino_copy) = (ino(&a)?, ino(&b)?, ino(&hardlink)?, ino(&copy)?);
@@ -7711,6 +7794,62 @@ mod tests {
             assert_eq!(hits, 1, "exactly one exec VMA for {}", path.display());
         }
         child.reap();
+    }
+
+    /// A precreated `probe-a` symlink is never followed: the fixture
+    /// write fails and the link target keeps its bytes. Unprivileged.
+    #[test]
+    fn write_probe_fixture_rejects_symlink_fixtures() {
+        let dir = probe_tempdir();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"victim bytes").expect("write victim");
+        std::os::unix::fs::symlink(&victim, dir.path().join("probe-a")).expect("plant link");
+        assert!(write_probe_fixture(dir.path()).is_err(), "symlinked fixture must fail");
+        assert_eq!(
+            std::fs::read(&victim).expect("read victim"),
+            b"victim bytes",
+            "the fixture write followed a precreated symlink"
+        );
+        assert!(
+            std::fs::symlink_metadata(dir.path().join("probe-a"))
+                .expect("stat link")
+                .is_symlink(),
+            "the planted link was replaced"
+        );
+    }
+
+    /// A precreated regular `probe-b` is never truncated: exclusive
+    /// creation fails and the existing bytes survive. Unprivileged.
+    #[test]
+    fn write_probe_fixture_rejects_precreated_files() {
+        let dir = probe_tempdir();
+        let squatter = dir.path().join("probe-b");
+        std::fs::write(&squatter, b"squatter bytes").expect("write squatter");
+        assert!(write_probe_fixture(dir.path()).is_err(), "precreated fixture must fail");
+        assert_eq!(
+            std::fs::read(&squatter).expect("read squatter"),
+            b"squatter bytes",
+            "the fixture write truncated a precreated file"
+        );
+    }
+
+    /// A symlinked fixture directory is never descended into: the write
+    /// fails without touching the link target. Unprivileged.
+    #[test]
+    fn write_probe_fixture_rejects_symlinked_dir() {
+        let dir = probe_tempdir();
+        let target = dir.path().join("real");
+        std::fs::create_dir(&target).expect("create target");
+        let link = dir.path().join("linked");
+        std::os::unix::fs::symlink(&target, &link).expect("plant dir link");
+        assert!(write_probe_fixture(&link).is_err(), "symlinked dir must fail");
+        assert!(
+            std::fs::read_dir(&target)
+                .expect("read target")
+                .next()
+                .is_none(),
+            "the fixture write descended into a symlinked dir"
+        );
     }
 
     /// §6.5 on the host: a hard link to an anchored file reads back its

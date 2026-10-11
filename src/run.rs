@@ -17309,6 +17309,247 @@ mod trace_identity_consumer_tests {
         }
     }
 
+    struct ExecChild {
+        child: std::process::Child,
+        input: std::process::ChildStdin,
+        output: std::process::ChildStdout,
+    }
+    impl ExecChild {
+        fn start(path: &Path, successor: &Path) -> Self {
+            let mut child = std::process::Command::new(path)
+                .args([std::ffi::OsStr::new("old"), successor.as_os_str()])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut owned = Self {
+                input: child.stdin.take().unwrap(),
+                output: child.stdout.take().unwrap(),
+                child,
+            };
+            owned.ack(b'O');
+            owned
+        }
+        fn ack(&mut self, expected: u8) {
+            use std::io::Read as _;
+            use std::os::fd::AsRawFd as _;
+            let mut fd = libc::pollfd {
+                fd: self.output.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                assert!(!remaining.is_zero(), "child acknowledgement timed out");
+                let timeout = i32::try_from(remaining.as_millis())
+                    .unwrap_or(i32::MAX)
+                    .max(1);
+                // SAFETY: one valid pollfd, bounded wait, no borrowed buffer survives.
+                let result = unsafe { libc::poll(&mut fd, 1, timeout) };
+                if result < 0
+                    && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                {
+                    continue;
+                }
+                assert_eq!(result, 1, "child acknowledgement absent");
+                break;
+            }
+            let mut byte = [0];
+            self.output.read_exact(&mut byte).unwrap();
+            assert_eq!(byte[0], expected);
+        }
+        fn command(&mut self, command: u8, expected: u8) {
+            self.input.write_all(&[command]).unwrap();
+            self.ack(expected);
+        }
+    }
+    impl Drop for ExecChild {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    fn exec_child_binaries(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let source = dir.join("exec.c");
+        let old = dir.join("old");
+        let successor = dir.join("successor");
+        std::fs::write(
+            &source,
+            r#"#include <unistd.h>
+#include <string.h>
+int main(int argc, char **argv) {
+    char stage = argc > 1 && strcmp(argv[1], "next") == 0 ? 'N' : 'O';
+    if (write(1, &stage, 1) != 1) return 2;
+    char command;
+    while (read(0, &command, 1) == 1) {
+        if (command == 'f') {
+            char *args[] = {"/proc/p11scope-missing-exec", 0};
+            execv(args[0], args);
+            if (write(1, "F", 1) != 1) return 3;
+        } else if (command == 's' || command == 'c') {
+            char *path = command == 's' ? argv[0] : argv[2];
+            char *args[] = {path, "next", 0};
+            execv(path, args);
+            return 4;
+        }
+    }
+    return 0;
+}
+"#,
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("gcc")
+                .args(["-O0", "-o"])
+                .arg(&old)
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::copy(&old, &successor).unwrap();
+        (old, successor)
+    }
+
+    fn runtime_call(
+        c: &mut Consumer,
+        io: &driver::Io,
+        identities: &Option<TraceIdentityStore>,
+        key: semantics::ProcessKey,
+        session: u64,
+    ) -> u64 {
+        let ts = io.proof.test_time() + 1;
+        io.proof.test_set_time(ts + 1);
+        c.feed_with_tap(
+            io.proof.test_events_domain(),
+            [event(key, ts, session)],
+            identities.as_ref().unwrap(),
+            None,
+            Some(&io.proof),
+        );
+        ts
+    }
+
+    // Catches successor renewal/publication bypassing the original view or
+    // waiting forever after an invalidated seed. The actual child exec and OS
+    // executable reads drive the production proof service and trace reducer;
+    // only native transport records/cookie/health reads use the existing seam.
+    #[test]
+    fn automatic_exec_retained_child_publishes_successor_trace_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old_path, successor_path) = exec_child_binaries(dir.path());
+        for command in *b"csf" {
+            let mut child = ExecChild::start(&old_path, &successor_path);
+            let pid = child.child.id();
+            let scope = Scope::Pid(pid);
+            let (mut engine, mut io, admission) = driver::os_pid_fixture(pid);
+            io.cookie.set(Some(11));
+            let proof = io.proof.clone();
+            let old_key =
+                semantics::ProcessKey::history(proof.test_events_domain().id(), 11, 0, pid);
+            let mut identities = Some(TraceIdentityStore::new(proof.clone()));
+            let mut c = Consumer::new(&proof);
+            c.scope = scope;
+            frame(&mut engine, &mut io, &mut identities);
+            runtime_call(&mut c, &io, &identities, old_key, 1);
+            frame(&mut engine, &mut io, &mut identities);
+            driver::empty(&io);
+            frame(&mut engine, &mut io, &mut identities);
+            let old_ts = runtime_call(&mut c, &io, &identities, old_key, 2);
+            let old_named = format!("exe=\"{}\" sess#", old_path.display());
+            assert!(c.lines().last().unwrap().contains(&old_named));
+            child.command(command, if command == b'f' { b'F' } else { b'N' });
+            let next_path = if command == b'c' {
+                &successor_path
+            } else {
+                &old_path
+            };
+            assert_eq!(
+                std::fs::read_link(format!("/proc/{pid}/exe")).unwrap(),
+                *next_path
+            );
+            if command == b'f' {
+                runtime_call(&mut c, &io, &identities, old_key, 3);
+                assert!(c.lines().last().unwrap().contains(&old_named));
+                assert!(driver::retains_view(&engine, &admission));
+                assert_eq!(c.stdout, *c.file.as_ref().unwrap());
+                assert_eq!(c.tracer.raw_calls(), 3);
+                assert_eq!(c.state.semantic_evidence().semantic_history_drops, 0);
+                driver::retire_original_view(&mut engine);
+                frame(&mut engine, &mut io, &mut identities);
+                drop(identities);
+                assert_eq!(proof.usage(), (0, 0), "failed exec releases reservations");
+                continue;
+            }
+            let exec_ts = proof.test_time() + 1;
+            proof.test_set_time(exec_ts + 1);
+            driver::exec_pid(&io, pid, exec_ts, pid);
+            let successor_key = semantics::ProcessKey {
+                exec_id: 1,
+                ..old_key
+            };
+            let early = runtime_call(&mut c, &io, &identities, successor_key, 3);
+            assert!(!c.lines().last().unwrap().contains("exe=\""));
+            let emitted = c.stdout.clone();
+            frame(&mut engine, &mut io, &mut identities);
+            assert_eq!(
+                identities
+                    .as_ref()
+                    .unwrap()
+                    .lookup(successor_key, early)
+                    .path(),
+                None,
+                "old receipt cannot name the successor, including same-path exec"
+            );
+            runtime_call(&mut c, &io, &identities, successor_key, 4);
+            frame(&mut engine, &mut io, &mut identities);
+            driver::empty(&io);
+            frame(&mut engine, &mut io, &mut identities);
+            let useful = runtime_call(&mut c, &io, &identities, successor_key, 5);
+            let named = format!("exe=\"{}\" sess#", next_path.display());
+            let line = c.lines().last().unwrap().to_string();
+            assert!(line.contains(&named), "{line}");
+            assert!(line.contains(" C_OpenSession "), "{line}");
+            assert_eq!(
+                identities.as_ref().unwrap().lookup(old_key, useful).path(),
+                old_path.to_str(),
+                "historical proof keeps its original executable"
+            );
+            assert_eq!(
+                identities
+                    .as_ref()
+                    .unwrap()
+                    .lookup(successor_key, early)
+                    .path(),
+                None,
+                "a fresh receipt cannot retroactively name the early call"
+            );
+            assert!(c.stdout.starts_with(&emitted));
+            c.feed_with_tap(
+                proof.test_events_domain(),
+                [event(old_key, old_ts + 1, 6)],
+                identities.as_ref().unwrap(),
+                None,
+                Some(&proof),
+            );
+            // The history gate rejects an older exec after observing the
+            // successor, even while the immutable old receipt remains stored.
+            let delayed = c.lines().last().unwrap().to_string();
+            assert!(delayed.contains("Unknown executable"), "{delayed}");
+            assert!(!delayed.contains(&named), "{delayed}");
+            assert_eq!(c.stdout, *c.file.as_ref().unwrap());
+            assert!(driver::retains_view(&engine, &admission));
+            assert_eq!(c.tracer.raw_calls(), 6);
+            assert_eq!(c.state.semantic_evidence().semantic_history_drops, 1);
+            driver::retire_original_view(&mut engine);
+            frame(&mut engine, &mut io, &mut identities);
+            drop(identities);
+            assert_eq!(proof.usage(), (0, 0), "all reservations return once");
+        }
+    }
+
     // Catches retroactive repair of emitted warm-up rows, inclusive S1 lookup,
     // or naming before the producer actually transfers the verified receipt.
     #[test]

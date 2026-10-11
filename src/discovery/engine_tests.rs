@@ -30150,6 +30150,7 @@ pub(crate) mod detailed_proof_driver {
         pub(crate) cookie_reads: Cell<usize>,
         pub(crate) health_reads: Cell<usize>,
         pub(crate) samples: Cell<usize>,
+        sample_os: bool,
         expire_on_sample: Cell<Option<usize>>,
         slow_sample: Cell<Option<ProcessViewId>>,
         slow_cookie_pid: Cell<Option<u32>>,
@@ -30192,7 +30193,9 @@ pub(crate) mod detailed_proof_driver {
         ) -> Result<TraceSeed, TraceWorkError> {
             let n = self.samples.get() + 1;
             self.samples.set(n);
-            let result = if self.slow_sample.get() == Some(view.id()) {
+            let result = if self.sample_os {
+                self.proof.test_sample_os_view(view, work)
+            } else if self.slow_sample.get() == Some(view.id()) {
                 self.proof.test_sample_view_after_link(view, work, &mut || {
                     self.proof.test_set_time(self.proof.test_time() + 5_000_000);
                 })
@@ -30285,6 +30288,7 @@ pub(crate) mod detailed_proof_driver {
                 cookie_reads: Cell::new(0),
                 health_reads: Cell::new(0),
                 samples: Cell::new(0),
+                sample_os: false,
                 expire_on_sample: Cell::new(None),
                 slow_sample: Cell::new(None),
                 slow_cookie_pid: Cell::new(None),
@@ -30301,6 +30305,25 @@ pub(crate) mod detailed_proof_driver {
             })
             .unwrap();
         accepted
+    }
+    pub(crate) fn os_pid_fixture(pid: u32) -> (Engine, Io, crate::process::ViewAdmission) {
+        let (mut engine, mut io) = fixture();
+        engine.scope = Scope::Pid(pid);
+        engine.views.clear();
+        engine
+            .views
+            .push(ProcessView::open(ProcessViewId(0), pid).unwrap());
+        io.proof = ProofSession::test_scope(&engine.scope, true);
+        io.proof.test_set_time(6);
+        io.sample_os = true;
+        let admission = engine.views[0].view_admission();
+        (engine, io, admission)
+    }
+    pub(crate) fn retains_view(engine: &Engine, admission: &crate::process::ViewAdmission) -> bool {
+        engine
+            .views
+            .first()
+            .is_some_and(|view| admission.same_allocation(&view.view_admission()))
     }
     pub(crate) fn seed(engine: &mut Engine, io: &mut Io) {
         assert!(service(engine, io).is_empty());
@@ -30354,8 +30377,11 @@ pub(crate) mod detailed_proof_driver {
         assert!(drain.dequeue().is_none());
     }
     fn exec(io: &Io, ts: u64, tid: u32) {
+        exec_pid(io, std::process::id(), ts, tid);
+    }
+    pub(crate) fn exec_pid(io: &Io, pid: u32, ts: u64, tid: u32) {
         let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
-        record.pid_tgid = (u64::from(std::process::id()) << 32) | u64::from(tid);
+        record.pid_tgid = (u64::from(pid) << 32) | u64::from(tid);
         record.hook_ts_ns = ts;
         record.kind = DISCOVERY_KIND_EXEC;
         let bytes = unsafe {

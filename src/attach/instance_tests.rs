@@ -733,6 +733,7 @@ fn privileged_semantic_capture_multi_reload_and_rebound_successor() -> Result<()
                 program,
                 slots,
                 fds,
+                ..
             } => {
                 ensure!(slots == &[0] && fds.len() == 1);
                 Ok(*program)
@@ -914,6 +915,7 @@ fn native_full_image_multi_query_and_scan(abi: ElfAbi) -> Result<()> {
                 program,
                 slots,
                 fds,
+                ..
             } => {
                 ensure!(slots == &[plan.slots[0].index] && fds.len() == 1);
                 Ok(*program)

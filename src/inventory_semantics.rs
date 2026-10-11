@@ -243,8 +243,7 @@ pub(crate) struct AttestedSemanticLane {
 
 /// Bound on refresh receipts stashed ahead of the next tick: one tick
 /// quantum's worth of quiet no-call registrations.
-pub(crate) const MAX_STASHED_REFRESH_RECEIPTS: usize =
-    crate::discovery::instances::MAX_PENDING;
+pub(crate) const MAX_STASHED_REFRESH_RECEIPTS: usize = crate::discovery::instances::MAX_PENDING;
 
 /// Bounded lane stash for refresh receipts: a no-call refresh proves a
 /// current partition for a quiet provider, and that proof must reach a

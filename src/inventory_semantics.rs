@@ -3,7 +3,8 @@
 
 use crate::attach::capture::NativeDomainId;
 use crate::attach::{AttachedSemanticSet, BackendSelection, Scope, Session};
-use crate::discovery::caller_registry::now_ns;
+use crate::discovery::caller_registry::{OsProcessSource, now_ns};
+use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
 use crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding;
 use crate::process::PidPin;
 use crate::run::{STOP_QUIESCE_BUDGET, StopState, TerminalQuiescence};
@@ -710,23 +711,25 @@ pub(crate) const TERMINAL_DRAIN_QUANTUM: usize = 1024;
 /// [`TERMINAL_DRAIN_QUANTA`] window each for the quiesce wait and the
 /// post-Q drain, plus one spare. The terminal Finish batch bypasses the
 /// stage: it commits separately after H0 stops.
+#[cfg(test)]
 pub(crate) const TERMINAL_STAGED_BATCH_CAP: usize = 2 * TERMINAL_DRAIN_QUANTA + 1;
 
-/// Bounded terminal staging for the stop sequence. The quiesce wait is
-/// time-budgeted, not batch-budgeted, so a noisy producer can deliver
-/// an unbounded number of batches before Q; staging them all would
-/// hold an unbounded queue ahead of commit. `on_batch` feeds every
-/// drained batch here instead: beyond [`TERMINAL_STAGED_BATCH_CAP`]
-/// the oldest staged batch is shed (counted) so staging stays bounded.
-/// The caller commits every staged batch before finishing H0, then
-/// commits the Finish batch separately; the caller discloses
-/// [`shed`](Self::shed) through the audited gap path.
+/// Tests-only bounded terminal staging: the scripted stop tests feed
+/// `on_batch` here to pin bound/order/Finish-last behavior. Production
+/// commits every drained batch promptly during the drain instead of
+/// staging through the wait, so drained receipts never expire ahead
+/// of validation; the quiesce wait is time-budgeted, not
+/// batch-budgeted, so a noisy producer can deliver an unbounded number
+/// of batches before Q, and beyond [`TERMINAL_STAGED_BATCH_CAP`] the
+/// oldest staged batch sheds (counted) so staging stays bounded.
+#[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct TerminalBatchStage {
     staged: std::collections::VecDeque<SemanticBatch>,
     shed: usize,
 }
 
+#[cfg(test)]
 impl TerminalBatchStage {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -833,6 +836,12 @@ pub(crate) struct SemanticStopSummary {
 /// the caller commits drained batches before stopping H0. On unproven Q
 /// or a read failure, positive history is preserved, semantic loss is
 /// declared, and only one explicitly bounded poll drains each cursor.
+///
+/// Tests-only: scripted stop tests drive the phases through fakes.
+/// Production drains through
+/// [`AttestedSemanticLane::run_semantic_drain_committing`], which
+/// mirrors these phases while committing every batch promptly.
+#[cfg(test)]
 pub(crate) fn run_semantic_drain(
     io: &mut impl SemanticStopIo,
     budget: Duration,
@@ -1085,6 +1094,25 @@ impl SemanticStopIo for LiveStopIo<'_> {
     }
 }
 
+/// One terminal stop-io over the live lane's parts, built per quantum
+/// so the lane borrows release for the commit between quanta.
+fn terminal_io_for<'a>(
+    live: &'a mut LiveLane,
+    domain: NativeDomainId,
+    pins: &[Arc<PidPin>],
+) -> LiveStopIo<'a> {
+    LiveStopIo {
+        session: &mut live.session,
+        capture: &mut live.capture,
+        pins: pins.to_vec(),
+        domain,
+        stash: Some(LiveStashDrain {
+            stash: &mut live.stashed_refresh,
+            shed: &mut live.scan_refusals,
+        }),
+    }
+}
+
 impl AttestedSemanticLane {
     /// Gate the Detailed producer immediately on stop request. New
     /// regular ticks refuse from here; only the terminal sequence runs
@@ -1128,6 +1156,10 @@ impl AttestedSemanticLane {
     /// commits every drained batch before finishing H0, so no eligible
     /// drained call sits behind Stopped. A shell lane (failed startup)
     /// drains nothing and reports no drain.
+    ///
+    /// Tests-only (used by the composed test stop): production drains
+    /// through [`run_semantic_drain_committing`](Self::run_semantic_drain_committing).
+    #[cfg(test)]
     pub(crate) fn run_semantic_drain(
         &mut self,
         pins: &[Arc<PidPin>],
@@ -1200,6 +1232,258 @@ impl AttestedSemanticLane {
             );
         }
         summary
+    }
+
+    /// The production terminal drain: the same phases as
+    /// [`run_semantic_drain`], but every serviced batch commits
+    /// immediately — through the running lane, before the next
+    /// quantum — instead of buffering through the wait. A drained
+    /// receipt otherwise expires (2s pending window) inside a long
+    /// quiescence wait (5s budget) before validation. The lane borrows
+    /// release between quanta so each batch commits through the lane's
+    /// validation authority; holding one stop-io borrow across the
+    /// whole drain cannot commit mid-drain. A shell lane (failed
+    /// startup) drains nothing and reports no drain.
+    pub(crate) fn run_semantic_drain_committing(
+        &mut self,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        pins: &[Arc<PidPin>],
+        mut now: impl FnMut() -> Instant,
+    ) -> SemanticStopSummary {
+        let domain = self.domain;
+        let mut summary = SemanticStopSummary {
+            quiesced: false,
+            waited: Duration::ZERO,
+            q: None,
+            drain_batches: 0,
+            quiesce_refusals: 0,
+            post_q_events: false,
+            post_q_discovery: false,
+            unrouted_returns: 0,
+            continuity_cuts: self
+                .live
+                .as_mut()
+                .map(|live| terminal_io_for(live, domain, pins).continuity_cuts())
+                .unwrap_or(0),
+            semantic_loss: false,
+            final_drain: false,
+        };
+        {
+            let Some(live) = self.live.as_mut() else {
+                return summary;
+            };
+            terminal_io_for(live, domain, pins).request_stop();
+            live.gated = true;
+        }
+        // A stop before the next tick must not strand stashed quiet
+        // evidence: flush it through one terminal quantum first, since
+        // the quiesce wait below may service nothing on immediate Q.
+        if self
+            .live
+            .as_ref()
+            .is_some_and(|live| !live.stashed_refresh.is_empty())
+        {
+            match self.service_terminal_quantum_committing(coordinator, pins) {
+                Ok(true) => summary.drain_batches += 1,
+                Ok(false) => {}
+                Err(_) => summary.quiesce_refusals += 1,
+            }
+        }
+        let start = now();
+        summary.quiesced = loop {
+            if self
+                .live
+                .as_mut()
+                .is_some_and(|live| terminal_io_for(live, domain, pins).quiescent())
+            {
+                break true;
+            }
+            if now().saturating_duration_since(start) >= STOP_QUIESCE_BUDGET {
+                break false;
+            }
+            match self.service_terminal_quantum_committing(coordinator, pins) {
+                Ok(true) => summary.drain_batches += 1,
+                Ok(false) => {}
+                Err(_) => summary.quiesce_refusals += 1,
+            }
+        };
+        summary.waited = now().saturating_duration_since(start);
+        if summary.quiesced {
+            match self
+                .live
+                .as_mut()
+                .and_then(|live| terminal_io_for(live, domain, pins).positions())
+            {
+                Some(current) => {
+                    let q = TerminalQuiescence {
+                        events_q: current[0].1,
+                        discovery_q: current[1].1,
+                    };
+                    summary.q = Some(q);
+                    let mut reached = current[0].0 >= q.events_q && current[1].0 >= q.discovery_q;
+                    for _ in 0..TERMINAL_DRAIN_QUANTA {
+                        if reached {
+                            break;
+                        }
+                        match self.service_terminal_quantum_committing(coordinator, pins) {
+                            Ok(true) => summary.drain_batches += 1,
+                            Ok(false) => {}
+                            Err(_) => summary.quiesce_refusals += 1,
+                        }
+                        match self
+                            .live
+                            .as_mut()
+                            .and_then(|live| terminal_io_for(live, domain, pins).positions())
+                        {
+                            Some(current) => {
+                                reached =
+                                    current[0].0 >= q.events_q && current[1].0 >= q.discovery_q;
+                            }
+                            None => {
+                                summary.semantic_loss = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !summary.semantic_loss {
+                        let events = self
+                            .live
+                            .as_mut()
+                            .map(|live| {
+                                terminal_io_for(live, domain, pins)
+                                    .drain_events_to(q.events_q, TERMINAL_DRAIN_QUANTUM)
+                            })
+                            .unwrap_or_default();
+                        let discovery = self
+                            .live
+                            .as_mut()
+                            .map(|live| {
+                                terminal_io_for(live, domain, pins)
+                                    .drain_discovery_to(q.discovery_q, TERMINAL_DRAIN_QUANTUM)
+                            })
+                            .unwrap_or_default();
+                        summary.post_q_events = events.post_q;
+                        summary.post_q_discovery = discovery.post_q;
+                        summary.unrouted_returns =
+                            summary.unrouted_returns.saturating_add(events.records);
+                        if events.failed || discovery.failed {
+                            summary.semantic_loss = true;
+                        } else if reached
+                            && !events.backlog
+                            && !discovery.backlog
+                            && !events.post_q
+                            && !discovery.post_q
+                        {
+                            summary.final_drain = true;
+                        }
+                    }
+                }
+                None => summary.semantic_loss = true,
+            }
+        }
+        if !summary.quiesced || summary.semantic_loss {
+            // Unproven Q or a read failure: preserve positive history,
+            // declare semantic loss, and drain only one explicitly bounded
+            // poll per cursor under the existing terminal bound.
+            summary.semantic_loss = true;
+            if let Some(current) = self
+                .live
+                .as_mut()
+                .and_then(|live| terminal_io_for(live, domain, pins).positions())
+            {
+                let events = self
+                    .live
+                    .as_mut()
+                    .map(|live| {
+                        terminal_io_for(live, domain, pins)
+                            .drain_events_to(current[0].1, TERMINAL_DRAIN_QUANTUM)
+                    })
+                    .unwrap_or_default();
+                let _ = self.live.as_mut().map(|live| {
+                    terminal_io_for(live, domain, pins)
+                        .drain_discovery_to(current[1].1, TERMINAL_DRAIN_QUANTUM)
+                });
+                summary.unrouted_returns = summary.unrouted_returns.saturating_add(events.records);
+            }
+        }
+        if let Some(live) = self.live.as_mut() {
+            live.stop_state = if summary.quiesced {
+                StopState::Quiesced { at: Instant::now() }
+            } else {
+                StopState::QuiescenceUnproven {
+                    waited: summary.waited,
+                }
+            };
+            live.final_drain = summary.final_drain;
+            live.unrouted_returns = live
+                .unrouted_returns
+                .saturating_add(summary.unrouted_returns);
+            live.drained_batches = live
+                .drained_batches
+                .saturating_add(summary.drain_batches as u64);
+            live.semantic_loss = summary.semantic_loss;
+            // Commits during the drain advance cuts through the lane,
+            // so the end value reads the capture fresh instead of the
+            // drain-start summary.
+            live.continuity_cuts = live.capture.continuity_cuts();
+            summary.continuity_cuts = live.continuity_cuts;
+        }
+        if summary.post_q_events {
+            eprintln!(
+                "p11scope: terminal semantic EVENTS drain: post-quiescence record past the Q \
+                 positions (ungated writer)"
+            );
+        }
+        if summary.post_q_discovery {
+            eprintln!(
+                "p11scope: terminal semantic DISCOVERY drain: post-quiescence record past the Q \
+                 positions (ungated writer)"
+            );
+        }
+        summary
+    }
+
+    /// Service one terminal quantum and commit its batch immediately
+    /// through the running lane. `Ok(true)` is a committed batch,
+    /// `Ok(false)` a quiet tick, `Err` a quiesce refusal (the wait
+    /// continues).
+    fn service_terminal_quantum_committing(
+        &mut self,
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        pins: &[Arc<PidPin>],
+    ) -> Result<bool, SemanticRefusal> {
+        let domain = self.domain;
+        let batch = {
+            let Some(live) = self.live.as_mut() else {
+                return Err(SemanticRefusal::Unavailable);
+            };
+            terminal_io_for(live, domain, pins).service_quantum()?
+        };
+        match batch {
+            Some(batch) => {
+                Self::commit_drained_batch(coordinator, self, batch);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Commit one drained batch beside the lane's stop: stage, then
+    /// finalize through the running lane's validation authority. A
+    /// terminal failure records a gap instead of losing Inventory's
+    /// stop.
+    fn commit_drained_batch(
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        lane: &mut AttestedSemanticLane,
+        batch: SemanticBatch,
+    ) {
+        coordinator.stage_semantic_batch(batch);
+        if let Err(error) = coordinator.commit_batch_with_semantics(false, Some(lane)) {
+            coordinator.note_scope_gap(
+                "semantic terminal commit failed".into(),
+                format!("{error:#}"),
+            );
+        }
     }
 
     /// Stop H0 once and return its terminal Finish batch, after every
@@ -1661,5 +1945,139 @@ mod terminal_drain_tests {
         assert_eq!(io.finish_calls, 0, "drain phases never stop H0");
         assert!(summary.quiesced);
         assert!(summary.final_drain);
+    }
+
+    /// A time-aware drain script: each serviced quantum advances the
+    /// shared drain clock by one second and mints its batch then, so
+    /// the test observes commit timing against receipt deadlines.
+    struct TimedDrainIo {
+        domain: NativeDomainId,
+        quiesce_after: usize,
+        services: usize,
+        elapsed: std::rc::Rc<std::cell::Cell<Duration>>,
+    }
+
+    impl TimedDrainIo {
+        fn new(domain: NativeDomainId, elapsed: std::rc::Rc<std::cell::Cell<Duration>>) -> Self {
+            Self {
+                domain,
+                quiesce_after: 0,
+                services: 0,
+                elapsed,
+            }
+        }
+    }
+
+    impl SemanticStopIo for TimedDrainIo {
+        fn request_stop(&self) {}
+
+        fn quiescent(&self) -> bool {
+            self.services >= self.quiesce_after
+        }
+
+        fn service_quantum(&mut self) -> Result<Option<SemanticBatch>, SemanticRefusal> {
+            self.services += 1;
+            self.elapsed
+                .set(self.elapsed.get() + Duration::from_secs(1));
+            Ok(Some(SemanticBatch::scripted(
+                self.domain,
+                Vec::new(),
+                self.elapsed.get().as_secs(),
+            )))
+        }
+
+        fn positions(&mut self) -> Option<[(usize, usize); 2]> {
+            Some([(0, 0), (0, 0)])
+        }
+
+        fn drain_events_to(&mut self, _stop: usize, _quantum: usize) -> LaneDrainOutcome {
+            LaneDrainOutcome::default()
+        }
+
+        fn drain_discovery_to(&mut self, _stop: usize, _quantum: usize) -> LaneDrainOutcome {
+            LaneDrainOutcome::default()
+        }
+
+        fn finish_h0(&mut self) -> SemanticBatch {
+            SemanticBatch::scripted(self.domain, Vec::new(), u64::MAX)
+        }
+
+        fn continuity_cuts(&self) -> u64 {
+            0
+        }
+    }
+
+    /// Drained batches commit promptly during the drain: with delayed
+    /// quiescence (Q after 4s of the 5s budget), every batch commits
+    /// inside the 2s receipt window it was minted in.
+    #[test]
+    fn prompt_terminal_commit_beats_receipt_deadlines_under_delayed_quiescence() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let domain = NativeDomainId::mint();
+        let elapsed = Rc::new(Cell::new(Duration::ZERO));
+        let mut io = TimedDrainIo::new(domain, Rc::clone(&elapsed));
+        io.quiesce_after = 4;
+        let start = Instant::now();
+        let clock = Rc::clone(&elapsed);
+        let mut commits: Vec<(u64, u64)> = Vec::new();
+        let summary = run_semantic_drain(
+            &mut io,
+            Duration::from_secs(5),
+            16,
+            1024,
+            move || start + clock.get(),
+            |batch| commits.push((batch.observed_ns(), elapsed.get().as_secs())),
+        );
+        assert!(summary.quiesced);
+        assert_eq!(summary.drain_batches, 4);
+        assert_eq!(summary.waited, Duration::from_secs(4));
+        assert_eq!(
+            commits,
+            vec![(1, 1), (2, 2), (3, 3), (4, 4)],
+            "each drained batch commits in the quantum that minted it"
+        );
+        for (minted, committed) in &commits {
+            assert!(
+                committed.saturating_sub(*minted) < 2,
+                "batch minted at {minted}s commits at {committed}s: inside the 2s receipt window"
+            );
+        }
+    }
+
+    /// Buffering drained batches through the wait (the base ordering)
+    /// expires early receipts: the same delayed quiescence leaves the
+    /// first batch 3s old at commit, past its 2s receipt window.
+    #[test]
+    fn buffered_terminal_commit_expires_early_receipts() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let domain = NativeDomainId::mint();
+        let elapsed = Rc::new(Cell::new(Duration::ZERO));
+        let mut io = TimedDrainIo::new(domain, Rc::clone(&elapsed));
+        io.quiesce_after = 4;
+        let start = Instant::now();
+        let clock = Rc::clone(&elapsed);
+        let mut staged: Vec<u64> = Vec::new();
+        let summary = run_semantic_drain(
+            &mut io,
+            Duration::from_secs(5),
+            16,
+            1024,
+            move || start + clock.get(),
+            |batch| staged.push(batch.observed_ns()),
+        );
+        assert!(summary.quiesced);
+        assert_eq!(staged, vec![1, 2, 3, 4]);
+        // The base ordering commits everything after the drain ends.
+        let committed = elapsed.get().as_secs();
+        assert_eq!(committed, 4);
+        let oldest_gap = committed - staged[0];
+        assert!(
+            oldest_gap >= 2,
+            "buffering must strand the first batch past its receipt window, got {oldest_gap}s"
+        );
     }
 }

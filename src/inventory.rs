@@ -1714,9 +1714,10 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
 
     fn on_lane_stopped(&mut self) {
         // The lane's independent terminal sequence: drain owned cursors
-        // to Q, then stop H0 once. Every drained batch commits beside
-        // the lane's stop before the Finish batch; a terminal failure
-        // records a gap instead of losing Inventory's stop.
+        // to Q, then stop H0 once. Every drained batch commits promptly
+        // during the drain, beside the lane's stop and before the Finish
+        // batch; a terminal failure records a gap instead of losing
+        // Inventory's stop.
         if !self
             .semantic
             .as_ref()
@@ -1741,45 +1742,16 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             .iter()
             .map(|binding| binding.pin())
             .collect();
-        let Some(lane) = self.semantic.as_mut() else {
+        // Borrow-split: the drain borrows the lane per quantum and the
+        // coordinator between quanta, committing every drained batch
+        // while H0 still runs instead of buffering through the wait.
+        // Buffering would expire drained receipts (2s pending window)
+        // inside a long quiescence wait (5s budget) before validation.
+        let (coordinator, semantic) = (&mut self.coordinator, &mut self.semantic);
+        let Some(lane) = semantic.as_mut() else {
             return;
         };
-        let mut terminal = crate::inventory_semantics::TerminalBatchStage::new();
-        lane.run_semantic_drain(&pins, std::time::Instant::now, |batch| {
-            terminal.push(batch);
-        });
-        // The quiesce wait is time-budgeted, so staging is capped: shed
-        // oldest batches disclose through the audited gap path instead
-        // of queueing unboundedly ahead of commit.
-        let shed = terminal.shed();
-        if shed > 0 {
-            self.coordinator.note_scope_gap(
-                "semantic terminal drain truncated".into(),
-                format!(
-                    "shed {shed} oldest quiesce-wait batches beyond the {}-batch terminal stage",
-                    crate::inventory_semantics::TERMINAL_STAGED_BATCH_CAP
-                ),
-            );
-        }
-        // Every drained batch commits while H0 still runs: drained
-        // receipts validate through the running lane, never behind
-        // Stopped.
-        for batch in terminal.into_batches() {
-            self.coordinator.stage_semantic_batch(batch);
-            let lane = match self.semantic.as_mut() {
-                Some(lane) => lane,
-                None => break,
-            };
-            if let Err(error) = self
-                .coordinator
-                .commit_batch_with_semantics(false, Some(lane))
-            {
-                self.coordinator.note_scope_gap(
-                    "semantic terminal commit failed".into(),
-                    format!("{error:#}"),
-                );
-            }
-        }
+        lane.run_semantic_drain_committing(coordinator, &pins, std::time::Instant::now);
         // H0 stops once, after every drained batch was consumed and
         // published; the terminal Finish batch commits separately.
         if let Some(finish) = self

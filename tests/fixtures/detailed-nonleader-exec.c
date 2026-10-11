@@ -59,6 +59,12 @@ static unsigned long clock_ns(void) {
     return (unsigned long)now.tv_sec * 1000000000UL + (unsigned long)now.tv_nsec;
 }
 
+static unsigned long bounded_phase_deadline(unsigned long milliseconds, unsigned long leg) {
+    if (!leg) return 0; /* receive_until keeps the legacy 30 s default. */
+    unsigned long deadline = clock_ns() + milliseconds * 1000000UL;
+    return deadline < leg ? deadline : leg;
+}
+
 static void write_all(int fd, const char *buffer, size_t length) {
     while (length) {
         long written = raw6(SYS_write, fd, (long)buffer, (long)length, 0, 0, 0);
@@ -135,13 +141,16 @@ struct request {
     char *const *exec_argv;
     char *const *exec_envp;
     unsigned long deadline_ns;
+    unsigned long leg_deadline_ns;
+    unsigned long measurement_ms;
+    unsigned long post_deadline_ns;
 };
 
 #ifdef DETAILED_EXEC_PROVIDER
 
 __attribute__((noinline, visibility("default")))
 unsigned long C_Initialize(void *argument) {
-    const struct request *request = argument;
+    struct request *request = argument;
     __asm__ volatile("" ::: "memory");
     if (request->operation == 1) {
         unsigned long fields[] = {
@@ -154,9 +163,14 @@ unsigned long C_Initialize(void *argument) {
         long result = raw6(SYS_execve, (long)request->exec_path,
                            (long)request->exec_argv, (long)request->exec_envp, 0, 0, 0);
         if (!request->expect_failure || result != -ENOENT) fail(95);
+        /* This failed-post phase owns R, the actual RV5 return and all 17
+         * remaining calls. Store its deadline in the still-live request so
+         * the worker cannot start another measurement allowance on return. */
+        request->post_deadline_ns = bounded_phase_deadline(request->measurement_ms,
+                                                         request->leg_deadline_ns);
         unsigned long failed[] = { fields[0], fields[1], (unsigned long)-result, request->token };
         emit("EXEC_FAILED", failed, 4);
-        receive_until(0, 'R', request->deadline_ns);
+        receive_until(0, 'R', request->post_deadline_ns);
     } else if (request->operation == 2) {
         unsigned long fields[] = {
             (unsigned long)raw6(SYS_getpid, 0, 0, 0, 0, 0, 0),
@@ -253,9 +267,7 @@ static unsigned long h6_leg, h6_setup, h6_recovery_ms, h6_measurement_ms, h6_hol
 static unsigned long h6_call_deadline;
 
 static unsigned long phase_deadline(unsigned long milliseconds) {
-    if (!h6_leg) return 0; /* receive_until keeps the legacy 30 s default. */
-    unsigned long deadline = clock_ns() + milliseconds * 1000000UL;
-    return deadline < h6_leg ? deadline : h6_leg;
+    return bounded_phase_deadline(milliseconds, h6_leg);
 }
 
 static unsigned long positive(const char *text) {
@@ -332,7 +344,7 @@ static void kernel_join(int *child_tid) {
 }
 
 static int worker(void *argument) {
-    const struct worker_args *args = argument;
+    struct worker_args *args = argument;
     /* Parent-death custody is per-thread; clone does not copy the setting. */
     if (raw6(SYS_prctl, PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0, 0)
         || (unsigned long)raw6(SYS_getppid, 0, 0, 0, 0, 0, 0) != args->parent) fail(100);
@@ -343,11 +355,14 @@ static int worker(void *argument) {
     unsigned long tid = (unsigned long)raw6(SYS_gettid, 0, 0, 0, 0, 0, 0);
     unsigned long completed[] = { pid, tid, 11, success, errors };
     emit("WORKER_DONE", completed, 5);
+    /* Python enters successor recovery before X. Start the fixture's finite
+     * recovery wait before EXEC_BODY publishes the frame awaiting X. */
+    args->exec.deadline_ns = phase_deadline(h6_recovery_ms);
     unsigned long actual_rv = args->call((void *)&args->exec);
     /* The successful branch cannot return; errno2 is never a PKCS#11 RV. */
     if (!args->exec.expect_failure || actual_rv != 5) fail(97);
     ++errors;
-    h6_call_deadline = phase_deadline(h6_measurement_ms);
+    h6_call_deadline = args->exec.post_deadline_ns;
     calls(args->call, 0, 17, &success, &errors, 0);
     unsigned long done[] = { pid, tid, 29, success, errors, actual_rv };
     emit("DONE", done, 6);
@@ -474,7 +489,7 @@ int main(int argc, char **argv) {
                   .expect_failure = argv[6][0] == '1',
                   .exec_path = argv[6][0] == '1' ? argv[3] : argv[2],
                   .exec_argv = next_argv, .exec_envp = next_envp,
-                  .deadline_ns = h6_leg }
+                  .leg_deadline_ns = h6_leg, .measurement_ms = h6_measurement_ms }
     };
     _Alignas(4) int child_tid = -1;
     int flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD

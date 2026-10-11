@@ -846,20 +846,42 @@ def _evaluate_aggregate_h6(doc, stdout_text, ledger, receipt, mode):
         snapshot = proofs[-1].get("snapshot", {}).get("functions", {})
         expected_measured = Counter(call["fn"] for call in measured_calls)
         expected_measured_errors = Counter(call["fn"] for call in measured_calls if call["rv"])
+        if any(proof["marker_fn"] in expected_measured for proof in proofs):
+            errors.append("aggregate warm and measured functions overlap without an observed complete boundary")
+        # A returned warm call can reach a later redraw than the readiness
+        # marker. Warm/measurement functions are deliberately distinct: only
+        # measured functions use exact observed snapshot deltas. All final
+        # observed returns of other functions remain in the early population.
         stable_completed = Counter({fn: got_completed[fn] - snapshot.get(fn, {}).get("calls", 0)
-                                    for fn in set(got_completed) | set(snapshot)})
+                                    for fn in expected_measured})
         stable_errors = Counter({fn: got_errors[fn] - snapshot.get(fn, {}).get("errors", 0)
-                                 for fn in set(got_errors) | set(snapshot)})
+                                 for fn in expected_measured})
         if stable_completed != expected_measured or stable_errors != expected_measured_errors:
             errors.append("stable measured aggregate population disagrees with its fixed ledger")
         early_expected = Counter(call["fn"] for call in in_window if call not in measured_calls)
-        early_observed = Counter({fn: row["calls"] for fn, row in snapshot.items()})
-        if any(early_observed[fn] > early_expected[fn] for fn in early_observed):
+        early_functions = set(early_expected) | set(got_completed) | set(snapshot)
+        early_observed = Counter({fn: snapshot.get(fn, {}).get("calls", 0) if fn in expected_measured
+                                  else got_completed[fn] for fn in early_functions})
+        early_errors = Counter({fn: snapshot.get(fn, {}).get("errors", 0) if fn in expected_measured
+                                else got_errors[fn] for fn in early_functions})
+        if any(not 0 <= early_observed[fn] <= early_expected[fn] for fn in early_functions):
             errors.append("duplicate return or outside-scope early aggregate population")
+        for proof in proofs:
+            before, after = proof["baseline"]["functions"], proof["snapshot"]["functions"]
+            if any(not before.get(fn, {}).get(field, 0) <= after.get(fn, {}).get(field, 0) <= terminal[fn]
+                   for fn in set(before) | set(after)
+                   for field, terminal in (("calls", got_completed), ("errors", got_errors))):
+                errors.append("aggregate cumulative counters regress across readiness/final frames")
         early_allowed_errors = Counter(call["fn"] for call in in_window
                                        if call not in measured_calls and call["rv"])
-        if any(row["errors"] > early_allowed_errors[fn] for fn, row in snapshot.items()):
-            errors.append("early aggregate returned errors exceed independently ledgered population")
+        for fn in early_functions:
+            expected, failed = early_expected[fn], early_allowed_errors[fn]
+            observed = early_observed[fn]
+            observed_errors = early_errors[fn]
+            # A deficit may omit successes or failures, but it cannot turn
+            # an independently failed return into a captured success.
+            if not max(0, observed - (expected - failed)) <= observed_errors <= min(failed, observed):
+                errors.append(f"early aggregate returned RV population is infeasible: function {fn}")
         missing = sum(max(0, early_expected[fn] - early_observed[fn]) for fn in early_expected)
         early_coverage = {"expected": sum(early_expected.values()),
                           "observed_named": sum(early_observed.values()), "observed_unknown": 0,

@@ -850,8 +850,16 @@ fn run_ticking(
     let started = NativeLane::start(lane, scene, windows(), None)
         .map_err(|(_, reason)| reason)
         .unwrap();
-    let scans = move || log.borrow().iter().filter(|entry| *entry == "scan").count();
-    let stop = move || scans() >= passes;
+    // Completed passes stop after publication (F9): counting scans
+    // would fire during the Nth apply, before its native half, and the
+    // restored post-apply split would skip its extension.
+    let publishes = move || {
+        log.borrow()
+            .iter()
+            .filter(|entry| *entry == "publish:pass")
+            .count()
+    };
+    let stop = move || publishes() >= passes;
     let clock = LoopClock {
         deadline: Some(Instant::now() + Duration::from_secs(600)),
         stop: &stop,
@@ -959,6 +967,106 @@ fn the_lane_follows_the_contract_order_from_startup_through_stop() {
     assert_eq!(stopped.summary.passes, 2);
     assert_eq!(stopped.summary.attached, 2);
     assert!(matches!(stopped.summary.retirement, Retirement::Closed(_)));
+}
+
+/// F9 mid-apply cancellation: a stop landing during apply latches
+/// before the pass's native half — no new target extension or
+/// successor admission starts — while the applied pass still commits,
+/// publishes, and owned-drains. The joiner would admit on a second
+/// scan, proving no second pass runs.
+#[test]
+fn mid_apply_cancellation_skips_extension_and_successor_mint_but_preserves_applied_data() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    scene.source.spawn(8, 800);
+    scene.joiner = Some((8, 800, 2));
+    let lane = ScriptedLane::new(&log);
+    let started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    // The stop fires as soon as the first apply logs "scan": during
+    // the apply, before its native half.
+    let scans = {
+        let log = Rc::clone(&log);
+        move || log.borrow().iter().filter(|entry| *entry == "scan").count()
+    };
+    let stop = move || scans() >= 1;
+    let clock = LoopClock {
+        deadline: Some(Instant::now() + Duration::from_secs(600)),
+        stop: &stop,
+        interval: Duration::ZERO,
+        tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    let mut pass_publications = 0;
+    let stopped = run_classic(
+        &mut scene,
+        Some(started),
+        &clock,
+        &mut |scene: &mut Scene, point| {
+            match point {
+                Publish::Pass { .. } => {
+                    scene.note("publish:pass");
+                    pass_publications += 1;
+                }
+                Publish::Retiring {
+                    attached, budget, ..
+                } => scene.note(format!(
+                    "publish:retiring {attached} {}",
+                    budget.as_millis()
+                )),
+                Publish::Stop { .. } => scene.note("publish:stop"),
+            }
+            Ok(())
+        },
+    )
+    .unwrap()
+    .expect("the owned stop still drains");
+    assert_eq!(stopped.summary.passes, 1, "the in-flight pass still runs");
+    assert_eq!(pass_publications, 1, "the applied pass is published");
+    let captured = entries(&log);
+    assert_eq!(
+        captured.iter().filter(|entry| *entry == "scan").count(),
+        1,
+        "no second pass starts after the stop: {captured:?}"
+    );
+    assert_eq!(
+        captured
+            .iter()
+            .filter(|entry| entry.starts_with("extend["))
+            .count(),
+        1,
+        "only the startup extend runs: {captured:?}"
+    );
+    assert!(
+        !captured.iter().any(|entry| entry == "take_target_delta"),
+        "no target delta is taken after the stop: {captured:?}"
+    );
+    assert_eq!(
+        captured.iter().filter(|entry| *entry == "commit").count(),
+        2,
+        "the applied pass commits, then the stop's terminal commit runs: {captured:?}"
+    );
+    assert!(
+        captured.iter().any(|entry| entry == "publish:stop"),
+        "the stop still publishes: {captured:?}"
+    );
+    assert!(
+        captured.iter().any(|entry| entry == "begin_stop"),
+        "retirement still begins: {captured:?}"
+    );
+    // The applied incarnation stands; the joiner never admits.
+    let _ = scene.caller(PID);
+    assert_eq!(
+        scene.coordinator.adapter().len(),
+        1,
+        "no successor or joiner mints after the stop"
+    );
+    assert_eq!(
+        scene.coordinator.adapter().live_id(8),
+        None,
+        "the second-scan joiner never admits"
+    );
 }
 
 #[test]
@@ -2379,11 +2487,18 @@ fn the_display_ticks_after_each_lane_service_without_reordering_it() {
     let started = NativeLane::start(lane, &mut scene, windows(), None)
         .map_err(|(_, reason)| reason)
         .unwrap();
-    let scans = {
+    // Completed passes stop after publication (F9): counting scans
+    // would fire during the second apply and skip its extension.
+    let publishes = {
         let log = Rc::clone(&log);
-        move || log.borrow().iter().filter(|entry| *entry == "scan").count()
+        move || {
+            log.borrow()
+                .iter()
+                .filter(|entry| *entry == "publish:pass")
+                .count()
+        }
     };
-    let stop = move || scans() >= 2;
+    let stop = move || publishes() >= 2;
     let clock = LoopClock {
         deadline: Some(Instant::now() + Duration::from_secs(600)),
         stop: &stop,

@@ -241,6 +241,52 @@ pub(crate) struct AttestedSemanticLane {
     last_conversion_barrier: Option<u64>,
 }
 
+/// Bound on refresh receipts stashed ahead of the next tick: one tick
+/// quantum's worth of quiet no-call registrations.
+pub(crate) const MAX_STASHED_REFRESH_RECEIPTS: usize =
+    crate::discovery::instances::MAX_PENDING;
+
+/// Bounded lane stash for refresh receipts: a no-call refresh proves a
+/// current partition for a quiet provider, and that proof must reach a
+/// batch (the next tick merges it) instead of dropping. Beyond
+/// [`MAX_STASHED_REFRESH_RECEIPTS`] the oldest receipts shed (counted);
+/// a later scan re-mints superseded proof.
+#[derive(Debug, Default)]
+pub(crate) struct RefreshReceiptStash {
+    stashed: std::collections::VecDeque<CurrentPartitionReceipt>,
+    shed: u64,
+}
+
+impl RefreshReceiptStash {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stash one refresh's receipts in order. Returns receipts shed past
+    /// the cap: the caller discloses the count as refused endpoints.
+    pub(crate) fn push_all(&mut self, receipts: Vec<CurrentPartitionReceipt>) -> u64 {
+        let mut shed = 0;
+        self.stashed.extend(receipts);
+        while self.stashed.len() > MAX_STASHED_REFRESH_RECEIPTS {
+            self.stashed.pop_front();
+            shed += 1;
+        }
+        self.shed = self.shed.saturating_add(shed);
+        shed
+    }
+
+    /// Oldest receipts shed beyond the cap: disclosed as refused
+    /// endpoints by the caller.
+    pub(crate) fn shed(&self) -> u64 {
+        self.shed
+    }
+
+    /// Drain the stash in order into the next tick batch.
+    pub(crate) fn take(&mut self) -> Vec<CurrentPartitionReceipt> {
+        std::mem::take(&mut self.stashed).into_iter().collect()
+    }
+}
+
 /// The live lane: the owned Detailed `Session` (the sole retained EVENTS
 /// cursor, maps and links), its H0 `SemanticCapture` driver, the sealed
 /// attachment receipt, and the terminal ownership state. Counts only;
@@ -259,6 +305,7 @@ pub(crate) struct LiveLane {
     unrouted_returns: u64,
     drained_batches: u64,
     semantic_loss: bool,
+    stashed_refresh: RefreshReceiptStash,
 }
 
 impl std::fmt::Debug for LiveLane {
@@ -348,6 +395,7 @@ impl AttestedSemanticLane {
                 unrouted_returns: 0,
                 drained_batches: 0,
                 semantic_loss: false,
+                stashed_refresh: RefreshReceiptStash::new(),
             })),
             startup_failed: false,
             #[cfg(test)]
@@ -401,7 +449,7 @@ impl AttestedSemanticLane {
             return Err(SemanticRefusal::Unavailable);
         }
         let pins: Vec<Arc<PidPin>> = bindings.iter().map(SemanticCallerBinding::pin).collect();
-        let report = live
+        let mut report = live
             .capture
             .tick(&mut live.session, &pins)
             .map_err(|_| SemanticRefusal::Unavailable)?;
@@ -410,13 +458,20 @@ impl AttestedSemanticLane {
             .scan_refusals
             .saturating_add(report.scan_refusals.len() as u64);
         live.continuity_cuts = live.capture.continuity_cuts();
+        // Quiet no-call registrations stashed since the last tick join
+        // this batch behind its own fresh receipts.
+        let stashed = live.stashed_refresh.take();
+        let shed = report.merge_stashed_current(stashed);
+        live.scan_refusals = live.scan_refusals.saturating_add(shed);
         SemanticBatch::from_tick_report(domain, report, Vec::new(), now_ns())
     }
 
     /// One bounded no-call refresh for an unbound candidate pin through
     /// the same owned Session: the accepted scan's images come back as
     /// binding hints, still to be re-proven by the coordinator proof.
-    /// The images are claims only; custody and attachment re-verify.
+    /// The images are claims only; custody and attachment re-verify. The
+    /// scan's receipts stash for the next tick batch, so a quiet
+    /// provider's proof registers instead of dropping.
     pub(crate) fn refresh_candidate(
         &mut self,
         pin: Arc<PidPin>,
@@ -428,18 +483,21 @@ impl AttestedSemanticLane {
         if live.gated || live.finished {
             return Err(SemanticRefusal::Unavailable);
         }
-        let report = live
+        let mut report = live
             .capture
             .refresh(&mut live.session, pin, slot)
             .map_err(|_| SemanticRefusal::Unavailable)?;
         live.scan_refusals = live
             .scan_refusals
             .saturating_add(report.scan_refusals.len() as u64);
-        Ok(report
+        let images = report
             .current()
             .iter()
             .map(|receipt| receipt.image())
-            .collect())
+            .collect();
+        let shed = live.stashed_refresh.push_all(report.take_current());
+        live.scan_refusals = live.scan_refusals.saturating_add(shed);
+        Ok(images)
     }
 
     pub(crate) fn apply_physical_gaps(
@@ -1131,5 +1189,73 @@ impl SemanticCaptureSummary {
             "stop_quiescence": self.stop_quiescence.label(),
             "final_drain": self.final_drain,
         })
+    }
+}
+
+#[cfg(test)]
+mod refresh_stash_tests {
+    use super::*;
+    use crate::attach::image_query::CompleteEpochs;
+    use crate::discovery::identity::PinnedObjectId;
+    use crate::discovery::identity::RetainedInventoryTarget;
+    use crate::discovery::identity::test_fixture;
+
+    fn stashed_receipt(
+        domain: NativeDomainId,
+        cookie: u64,
+        watched: &RetainedInventoryTarget,
+    ) -> CurrentPartitionReceipt {
+        CurrentPartitionReceipt::scripted(
+            domain,
+            ImageIdentity {
+                task_cookie: cookie,
+                exec_id: 1,
+            },
+            Arc::new(PidPin::test_proc_only(4321)),
+            Endpoint {
+                object: PinnedObjectId(0),
+                file_slot: 0,
+                offset: 0x1200,
+            },
+            0,
+            watched.share(),
+            CompleteEpochs {
+                local: 0,
+                global: 0,
+                fault: 0,
+                sticky: 0,
+                record_flags: 0,
+            },
+            0,
+            Instant::now() + Duration::from_secs(60),
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn refresh_stash_bounds_sheds_oldest_and_drains_in_order() {
+        let domain = NativeDomainId::mint();
+        let pins = test_fixture::real_scan_pin(
+            &std::env::current_exe().unwrap(),
+            None,
+            1,
+            "held-test-image",
+        );
+        let watched = pins.retain_inventory_target(PinnedObjectId(0)).unwrap();
+        let mut stash = RefreshReceiptStash::new();
+        assert!(stash.take().is_empty());
+        let receipts: Vec<_> = (0..MAX_STASHED_REFRESH_RECEIPTS as u64 + 2)
+            .map(|cookie| stashed_receipt(domain, cookie, &watched))
+            .collect();
+        assert_eq!(stash.push_all(receipts), 2);
+        assert_eq!(stash.shed(), 2);
+        let drained = stash.take();
+        assert_eq!(drained.len(), MAX_STASHED_REFRESH_RECEIPTS);
+        assert_eq!(
+            drained[0].image().task_cookie,
+            2,
+            "beyond the cap the oldest receipts shed"
+        );
+        assert!(stash.take().is_empty(), "take drains the stash");
     }
 }

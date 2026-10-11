@@ -2998,8 +2998,10 @@ struct LoaderPlanCache {
 /// One Engine-minted exec rearm: a single refresh request's matched owner
 /// whose rescan re-accepted the same static targets, lowered into the
 /// existing detach/replace transaction because PID-bound links may be dead
-/// while still recorded as attached. Minted only inside `Engine` from one
-/// selected request plus actual custody/scope/target preparation; consumed
+/// while still recorded as attached. Global scopes carry no forced slots;
+/// their marker settles with the accepted context/ordinary-delta refresh.
+/// Minted only inside `Engine` from one selected request plus actual
+/// custody/scope/target preparation; consumed
 /// by the candidate path. No public scalar constructor, `Clone`, `Default`,
 /// serialized form, or authority booleans.
 struct PreparedExecRearm {
@@ -11500,9 +11502,10 @@ impl Engine {
     /// Mints one exec rearm for an exec-refreshed view: the refresh request
     /// still names this exact matched owner at the tick's checked serial,
     /// original custody is live, and the rescan re-accepted the same static
-    /// targets. Anything else mints nothing: a renewed serial, a lost
-    /// generation, or a changed plan stays owned by the ordinary delta or a
-    /// later attempt.
+    /// targets. System/Cgroup file links survive caller exec, so their token
+    /// carries no forced slots. Anything else mints nothing: a renewed serial
+    /// or a lost generation stays owned by a later attempt, and changed PID
+    /// targets stay owned by the ordinary delta.
     fn prepare_exec_rearm(
         &self,
         view: ProcessViewId,
@@ -11517,10 +11520,15 @@ impl Engine {
         if request.owner != Some(view) || request.serial != serial {
             return None;
         }
-        let slots = Self::unchanged_exec_targets(view, candidate);
-        if slots.is_empty() {
-            return None;
-        }
+        let slots = if matches!(self.scope, Scope::Pid(_)) {
+            let slots = Self::unchanged_exec_targets(view, candidate);
+            if slots.is_empty() {
+                return None;
+            }
+            slots
+        } else {
+            Vec::new()
+        };
         Some(PreparedExecRearm {
             view,
             serial,
@@ -11529,10 +11537,11 @@ impl Engine {
     }
 
     /// Lowers one minted rearm into the existing replacement transaction: the
-    /// unchanged accepted targets detach and reattach at their same
+    /// unchanged accepted PID targets detach and reattach at their same
     /// object/offset/slot through `detach_slots`/`replace_targets`. The
     /// request binding is rechecked first: a renewal since minting owns the
-    /// retry, and this attempt retires without touching the delta.
+    /// retry, and this attempt retires without touching the delta. A global
+    /// token leaves the ordinary delta intact and only settles after apply.
     fn consume_exec_rearm(
         &self,
         candidate: &mut LiveCandidate,
@@ -11553,9 +11562,10 @@ impl Engine {
         true
     }
 
-    /// Forces exec-refreshed views whose rescan re-accepted the same static
-    /// targets through the existing detach/replace transaction. Only views
-    /// carrying a matched-EXEC marker, a matched owner at the tick's checked
+    /// Forces PID exec-refreshed views whose rescan re-accepted the same static
+    /// targets through the existing detach/replace transaction. Global scope
+    /// markers settle with their context refresh without forced slots. Only
+    /// views carrying a matched-EXEC marker, a matched owner at the tick's checked
     /// serial, and live original custody mint a rearm, and only their own
     /// unchanged active targets are lowered — unrelated views' links are
     /// never touched. Lowering reports the consumed views but clears nothing:
@@ -18292,8 +18302,9 @@ impl Engine {
         let mut candidate =
             self.inventory_candidate(&removed, &refreshed_scans, new_views, skipped)?;
         // Exec-refreshed views whose rescan re-accepted the same static
-        // targets force them through detach/replace: PID-bound links may be
-        // dead while still recorded as attached. Lowered before admission so
+        // PID targets force them through detach/replace: PID-bound links may
+        // be dead while still recorded as attached. Global file links remain
+        // governed by the ordinary delta. Lowered before admission so
         // the forced targets are preflighted like any other replacement.
         let lowered_exec_rearms =
             self.lower_exec_rearms(&mut candidate, &refreshed_ok, &serviced_requests);
@@ -18387,8 +18398,9 @@ impl Engine {
             self.apply_candidate(session, candidate, additions_allowed, true, &extra_views)?;
         self.record_apply_timing(&outcome);
         if !outcome.refused() {
-            // The apply mutated: forced slots detached/replaced, or were
-            // deactivated for a `delta.new` retry, so their markers are
+            // The apply completed: forced PID slots detached/replaced, or were
+            // deactivated for a `delta.new` retry, and global markers settled
+            // with the context/ordinary-delta refresh, so their markers are
             // consumed. A refusal mutated nothing — like the stale-view and
             // preflight exits above — and keeps every marker for the retry
             // the retained request owns.

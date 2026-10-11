@@ -9269,8 +9269,8 @@ fn overflowing_retained_exec_refresh_rearms_after_queue_capacity_returns() {
 }
 
 /// H6 slice 1 fixture: a live child mapping a provider that publishes a real
-/// static 2.40 function table in its data mappings, so the real scan decodes
-/// identical tables — hence an identical static plan — on every pass. Only
+/// static 2.40 function table in its data mappings and getter exports. The
+/// ordinary initial scan accepts the same getter targets on every pass. Only
 /// the EXEC hint and the scripted link failures are synthetic.
 struct TabledSeedProvider {
     child: std::process::Child,
@@ -9329,10 +9329,17 @@ const TABLED_RUNNER_C: &str = r#"
 #include <dlfcn.h>
 #include <unistd.h>
 int main(int argc, char **argv) {
-    if (argc != 2) return 2;
+    if (argc != 3) return 2;
     void *handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (handle == NULL) return 3;
-    sleep(30);
+    char command;
+    while (read(0, &command, 1) == 1) {
+        if (command != 'c') return 5;
+        dlclose(handle);
+        handle = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
+        if (handle == NULL) return 4;
+        if (write(1, "C", 1) != 1) return 6;
+    }
     dlclose(handle);
     return 0;
 }
@@ -9371,14 +9378,36 @@ fn wait_tabled_mapping(pid: u32, library: &std::path::Path) {
 impl TabledSeedProvider {
     fn spawn_peer(&mut self, stem: &str) -> (u32, PathBuf) {
         let library = compile_tabled_provider(self.dir.path(), stem);
+        (self.spawn_peer_library(&library), library)
+    }
+
+    fn spawn_peer_library(&mut self, library: &std::path::Path) -> u32 {
         let child = std::process::Command::new(self.dir.path().join("tabled-runner"))
-            .arg(&library)
+            .arg(library)
+            .arg(self.dir.path().join("tabled-replacement.so"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let pid = child.id();
         self.peers.push(child);
-        wait_tabled_mapping(pid, &library);
-        (pid, library)
+        wait_tabled_mapping(pid, library);
+        pid
+    }
+
+    fn replace_mapped_provider(&mut self) -> PathBuf {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        let replacement = compile_tabled_provider(self.dir.path(), "tabled-replacement");
+        self.child.stdin.as_mut().unwrap().write_all(b"c").unwrap();
+        let output = self.child.stdout.as_mut().unwrap();
+        assert!(
+            system_scope_poll_fd(output.as_raw_fd(), std::time::Duration::from_secs(5)).unwrap()
+        );
+        let mut ack = [0];
+        output.read_exact(&mut ack).unwrap();
+        assert_eq!(ack, *b"C");
+        replacement
     }
 }
 
@@ -9400,6 +9429,9 @@ fn loaded_tabled_provider() -> (TabledSeedProvider, ProcessView, PathBuf) {
     );
     let child = std::process::Command::new(&runner)
         .arg(&library)
+        .arg(dir.path().join("tabled-replacement.so"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
     let pid = child.id();
@@ -9455,13 +9487,36 @@ fn exec_rearm_cgroup_twin_route() -> (
     ScriptedSession,
     tempfile::TempDir,
 ) {
+    exec_rearm_global_twin_route(false, false)
+}
+
+fn exec_rearm_global_twin_route(
+    system: bool,
+    shared: bool,
+) -> (
+    TabledSeedProvider,
+    Engine,
+    ScriptedSession,
+    tempfile::TempDir,
+) {
     let (mut fixture, view, library0) = loaded_tabled_provider();
     let pid0 = view.pid();
-    let (pid1, library1) = fixture.spawn_peer("tabled-sibling");
+    let (pid1, library1) = if shared {
+        (fixture.spawn_peer_library(&library0), library0.clone())
+    } else {
+        fixture.spawn_peer("tabled-sibling")
+    };
     let peer_view = ProcessView::open(ProcessViewId(1), pid1).unwrap();
     let (cgroup_engine, scope_dir) = engine_over_cgroup_naming(&[pid0, pid1]);
     let mut engine = Engine::empty();
-    engine.scope = cgroup_engine.scope;
+    engine.scope = if system {
+        // Only the two retained, explicitly requested views are rescanned;
+        // the system enumeration cannot admit unrelated host processes.
+        engine.max_scan_pids = 0;
+        Scope::System
+    } else {
+        cgroup_engine.scope
+    };
     engine.next_view_id = 2;
     engine.module_hints = vec![library0, library1];
     engine.views.push(view);
@@ -9495,12 +9550,248 @@ fn exec_rearm_cgroup_twin_route() -> (
     (fixture, engine, session, scope_dir)
 }
 
+#[test]
+fn automatic_exec_global_links_survive_caller_exec() {
+    for system in [false, true] {
+        for shared in [false, true] {
+            let (_fixture, mut engine, mut session, _scope_dir) =
+                exec_rearm_global_twin_route(system, shared);
+            let pid = engine.views[0].pid();
+            let view = engine.views[0].id();
+            let original = engine.views[0].view_admission();
+            let sibling = engine.views[1].view_admission();
+            let context = engine.loader_registry.ids_for_view(view)[0];
+            let sibling_context = engine.loader_registry.ids_for_view(ProcessViewId(1))[0];
+            let slots = engine.plan.slots.clone();
+            let registered = engine.capture_facts.module_keys.clone();
+            let modules = engine.capture_facts.history.modules.clone();
+            let decoded = engine.capture_facts.history.decoded.clone();
+            let attaches: usize = session.attached_slots.iter().sum();
+            assert!(!slots.is_empty());
+            assert!(slots.iter().all(|slot| engine.plan.is_active(slot.index)));
+            let first_objects: BTreeSet<_> = engine
+                .modules
+                .iter()
+                .filter(|module| module.scanned.view == view)
+                .map(|module| module.object)
+                .collect();
+            let sibling_objects: BTreeSet<_> = engine
+                .modules
+                .iter()
+                .filter(|module| module.scanned.view == ProcessViewId(1))
+                .map(|module| module.object)
+                .collect();
+            assert_eq!(
+                !first_objects.is_disjoint(&sibling_objects),
+                shared,
+                "the held provider twin must exercise its intended sharing"
+            );
+
+            let outcome =
+                apply_ordinary_batch(&mut engine, &mut session, vec![exec_record_for(pid)])
+                    .expect("the global exec refresh applies");
+            assert!(outcome.required_complete);
+            assert!(
+                session.detached_slot_indices.iter().all(Vec::is_empty),
+                "{} shared={shared}: unchanged global links detach: {:?}",
+                engine.scope.kind(),
+                session.detached_slot_indices
+            );
+            assert!(session.replaced_slot_indices.iter().all(Vec::is_empty));
+            assert_eq!(session.attached_slots.iter().sum::<usize>(), attaches);
+            assert_eq!(engine.plan.slots, slots);
+            assert!(slots.iter().all(|slot| engine.plan.is_active(slot.index)));
+            assert_eq!(engine.capture_facts.module_keys, registered);
+            assert_eq!(engine.capture_facts.history.modules, modules);
+            assert_eq!(engine.capture_facts.history.decoded, decoded);
+            assert!(original.same_allocation(&engine.views[0].view_admission()));
+            assert!(sibling.same_allocation(&engine.views[1].view_admission()));
+            assert_ne!(engine.loader_registry.ids_for_view(view), [context]);
+            assert_eq!(
+                engine.loader_registry.ids_for_view(ProcessViewId(1)),
+                [sibling_context]
+            );
+            assert_eq!(
+                engine.loader_context_state_for_test(sibling_context),
+                Some("live")
+            );
+            let bindings: Vec<_> = engine
+                .selection_bindings
+                .values()
+                .filter(|binding| {
+                    binding.context == sibling_context && binding.attached && !binding.retired
+                })
+                .collect();
+            assert!(
+                !bindings.is_empty(),
+                "the sibling retains registered exports"
+            );
+            for binding in bindings {
+                assert!(session.has_dynamic_export(
+                    sibling_context,
+                    (binding.object, binding.file_offset),
+                    binding.id,
+                    binding.abi,
+                ));
+            }
+            assert!(!engine.exec_rearm_views.contains(&view));
+            assert!(!engine.refresh_requested.contains_key(&pid));
+            let scans = engine.deep_scans;
+            apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+            assert_eq!(
+                engine.deep_scans, scans,
+                "settled global markers never rescan"
+            );
+            assert!(session.detached_slot_indices.iter().all(Vec::is_empty));
+        }
+    }
+}
+
+#[test]
+fn automatic_exec_global_changed_plan_replaces_only_changed_targets() {
+    for system in [false, true] {
+        let (mut fixture, mut engine, mut session, _scope_dir) =
+            exec_rearm_global_twin_route(system, false);
+        let pid = engine.views[0].pid();
+        let caller_objects: BTreeSet<_> = engine
+            .modules
+            .iter()
+            .filter(|module| module.scanned.view == ProcessViewId(0))
+            .map(|module| module.object)
+            .collect();
+        let old: BTreeSet<_> = engine
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| caller_objects.contains(&slot.object))
+            .map(|slot| slot.index)
+            .collect();
+        let sibling_slots: BTreeSet<_> = engine
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| !caller_objects.contains(&slot.object))
+            .map(|slot| slot.index)
+            .collect();
+        assert!(!old.is_empty() && !sibling_slots.is_empty());
+        let attaches: usize = session.attached_slots.iter().sum();
+        let original = engine.views[0].view_admission();
+        let decoded = engine.capture_facts.history.decoded.clone();
+        let sibling_context = engine.loader_registry.ids_for_view(ProcessViewId(1))[0];
+
+        // The child really unmaps its provider and maps another held file.
+        // The ordinary new/retire delta replaces its physical targets;
+        // the global exec exemption must not retain a changed plan.
+        let replacement = fixture.replace_mapped_provider();
+        engine.module_hints.push(replacement.clone());
+        let outcome =
+            apply_ordinary_batch(&mut engine, &mut session, vec![exec_record_for(pid)]).unwrap();
+        assert!(outcome.required_complete);
+        let detached: BTreeSet<_> = session
+            .detached_slot_indices
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        let replaced: BTreeSet<_> = session
+            .replaced_slot_indices
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        assert_eq!(detached, old);
+        assert!(replaced.is_empty(), "no unchanged target is force-replaced");
+        assert!(old.iter().all(|index| !engine.plan.is_active(*index)));
+        assert!(
+            sibling_slots
+                .iter()
+                .all(|index| engine.plan.is_active(*index))
+        );
+        let objects: BTreeSet<_> = engine
+            .modules
+            .iter()
+            .filter(|module| module.scanned.path == replacement.display().to_string())
+            .map(|module| module.object)
+            .collect();
+        assert!(!objects.is_empty());
+        let new: Vec<_> = engine
+            .plan
+            .slots
+            .iter()
+            .filter(|slot| objects.contains(&slot.object))
+            .collect();
+        assert!(!new.is_empty());
+        assert!(new.iter().all(|slot| engine.plan.is_active(slot.index)));
+        assert_eq!(
+            session.attached_slots.iter().sum::<usize>() - attaches,
+            new.len()
+        );
+        assert!(original.same_allocation(&engine.views[0].view_admission()));
+        assert_eq!(
+            engine.loader_registry.ids_for_view(ProcessViewId(1)),
+            [sibling_context]
+        );
+        assert!(engine.capture_facts.history.decoded.is_superset(&decoded));
+        assert!(!engine.exec_rearm_views.contains(&ProcessViewId(0)));
+        assert!(!engine.refresh_requested.contains_key(&pid));
+    }
+}
+
+#[test]
+fn automatic_exec_global_aborted_refresh_retries_and_settles() {
+    for system in [false, true] {
+        let (_fixture, mut engine, mut session, _scope_dir) =
+            exec_rearm_global_twin_route(system, true);
+        let pid = engine.views[0].pid();
+        let view = engine.views[0].id();
+        let slots = engine.plan.slots.clone();
+        let modules = engine.capture_facts.history.modules.clone();
+        let sibling_context = engine.loader_registry.ids_for_view(ProcessViewId(1))[0];
+        let preflights = session.preflight_targets.borrow().len();
+        session.refuse_preflights([false, true]);
+        apply_ordinary_batch(&mut engine, &mut session, vec![exec_record_for(pid)]).unwrap();
+        assert_eq!(session.preflight_targets.borrow().len(), preflights + 2);
+        assert!(engine.exec_rearm_views.contains(&view));
+        let request = engine.refresh_requested[&pid];
+        assert_eq!(request.owner, Some(view));
+        assert!(session.detached_slot_indices.iter().all(Vec::is_empty));
+
+        let retry = apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+        assert!(retry.required_complete);
+        assert!(!engine.exec_rearm_views.contains(&view));
+        assert!(!engine.refresh_requested.contains_key(&pid));
+        assert_eq!(engine.plan.slots, slots);
+        assert!(slots.iter().all(|slot| engine.plan.is_active(slot.index)));
+        assert_eq!(engine.capture_facts.history.modules, modules);
+        assert_eq!(
+            engine.loader_registry.ids_for_view(ProcessViewId(1)),
+            [sibling_context]
+        );
+        let refreshed = engine.loader_registry.ids_for_view(view);
+
+        // A later EXEC owns fresh refresh work; it completes once, and an
+        // idle batch cannot revive either the aborted or the settled marker.
+        let repeated =
+            apply_ordinary_batch(&mut engine, &mut session, vec![exec_record_for(pid)]).unwrap();
+        assert!(repeated.required_complete);
+        assert_ne!(engine.loader_registry.ids_for_view(view), refreshed);
+        assert!(!engine.exec_rearm_views.contains(&view));
+        assert!(!engine.refresh_requested.contains_key(&pid));
+        let scans = engine.deep_scans;
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+        assert_eq!(engine.deep_scans, scans);
+        assert!(session.detached_slot_indices.iter().all(Vec::is_empty));
+        assert!(session.replaced_slot_indices.iter().all(Vec::is_empty));
+        assert_eq!(engine.plan.slots, slots);
+    }
+}
+
 /// H6 slice 1: an EXEC whose rescan re-accepts the same static targets must
 /// still run those PID-bound links through detach/replace and rearm
 /// loader/exports — never retain them as silently dead. Real held provider
 /// files plus the original live processes throughout; only the EXEC hint and
-/// the scripted link failures are synthetic. The cgroup twin proves the
-/// sibling's unrelated links stay installed, and the failure twins prove no
+/// the scripted link failures are synthetic. The cgroup twin proves all
+/// unchanged global links stay installed, and the failure twins prove no
 /// active-without-link publication and no duplicate counts.
 #[test]
 fn automatic_exec_unchanged_plan_rearms_pid_targets() {
@@ -9598,7 +9889,7 @@ fn automatic_exec_unchanged_plan_rearms_pid_targets() {
         "original process custody is retained, never reopened by PID"
     );
 
-    // --- Cgroup twin: the sibling's unrelated links stay installed. ---
+    // --- Cgroup twin: both callers' unchanged global links stay installed. ---
     let (_twin, mut engine, mut session, _scope_dir) = exec_rearm_cgroup_twin_route();
     let pid0 = engine.views[0].pid();
     let sibling_context = engine.loader_registry.ids_for_view(ProcessViewId(1))[0];
@@ -9651,12 +9942,14 @@ fn automatic_exec_unchanged_plan_rearms_pid_targets() {
         .copied()
         .collect();
     assert_eq!(
-        detached, first_slots,
-        "only the exec'd view detaches; sibling links stay installed"
+        detached,
+        BTreeSet::new(),
+        "neither caller's unchanged global links detach"
     );
     assert_eq!(
-        replaced, first_slots,
-        "only the exec'd view replaces; sibling links stay installed"
+        replaced,
+        BTreeSet::new(),
+        "neither caller's unchanged global links replace"
     );
     assert_eq!(
         engine.loader_registry.ids_for_view(ProcessViewId(1)),

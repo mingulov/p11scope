@@ -4140,15 +4140,9 @@ mod tests {
             b"foreign",
             "drop deleted unknown contents of the probe dir"
         );
-        assert!(
-            path.is_dir(),
-            "drop removed a non-empty probe dir"
-        );
+        assert!(path.is_dir(), "drop removed a non-empty probe dir");
         for name in ["probe-a", "probe-b", "probe-a-link", "probe-a-copy"] {
-            assert!(
-                !path.join(name).exists(),
-                "drop left fixture {name} behind"
-            );
+            assert!(!path.join(name).exists(), "drop left fixture {name} behind");
         }
     }
 

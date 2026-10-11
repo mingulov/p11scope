@@ -2769,27 +2769,118 @@ fn map_live_load_error(error: crate::attach::identity_iter::LoadError) -> Identi
 /// follow-up strict load only to distinguish a permission refusal from
 /// a verifier/object failure when the session load fails.
 /// A minimal RAII probe directory (std only: `tempfile` is a
-/// dev-dependency): unique per call, removed on drop.
+/// dev-dependency): unique per call, removed on drop. Exclusive by
+/// construction: atomic 0700 creation (never adopt a pre-existing
+/// path), an owned-uid check, and cleanup restricted to the owned dir.
 struct ProbeDir {
     path: std::path::PathBuf,
+    uid: u32,
 }
 
 impl ProbeDir {
     fn create() -> Result<Self, IdentityUnavailable> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Unpredictable as well as unique: a local squatter cannot
+        // precreate the probe path of a privileged run.
+        let seed = std::collections::hash_map::RandomState::new();
+        let random = {
+            use std::hash::{BuildHasher as _, Hash as _, Hasher as _};
+            let mut hasher = seed.build_hasher();
+            std::process::id().hash(&mut hasher);
+            id.hash(&mut hasher);
+            hasher.finish()
+        };
         let path = std::env::temp_dir().join(format!(
-            "p11scope-identity-probe-{}-{id}",
+            "p11scope-identity-probe-{}-{id}-{random:016x}",
             std::process::id()
         ));
-        std::fs::create_dir_all(&path).map_err(|_| IdentityUnavailable::ProbeFailed)?;
-        Ok(Self { path })
+        Self::create_at(&path)
+    }
+
+    fn create_at(path: &std::path::Path) -> Result<Self, IdentityUnavailable> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::unix::ffi::OsStrExt as _;
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| IdentityUnavailable::ProbeFailed)?;
+        // SAFETY: `mkdir` of a NUL-terminated path. Atomic: any
+        // pre-existing name (dir, file or symlink) fails instead of
+        // being adopted.
+        if unsafe { libc::mkdir(cpath.as_ptr(), 0o700) } != 0 {
+            return Err(IdentityUnavailable::ProbeFailed);
+        }
+        // Pin the fresh directory before verifying it: every check and
+        // the mode fix below run against the open fd, never the path.
+        // SAFETY: `open` of a NUL-terminated path; `O_NOFOLLOW` refuses
+        // a swapped-in symlink instead of following it.
+        let raw = unsafe {
+            libc::open(
+                cpath.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            unsafe {
+                libc::rmdir(cpath.as_ptr());
+            }
+            return Err(IdentityUnavailable::ProbeFailed);
+        }
+        // SAFETY: the successful `open` returned a new owned fd.
+        let dirfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        // SAFETY: `fstat` on a live fd with a writable out-param.
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let verified = unsafe { libc::fstat(dirfd.as_raw_fd(), stat.as_mut_ptr()) } == 0 && {
+            // SAFETY: the successful `fstat` initialized `stat`.
+            let stat = unsafe { stat.assume_init() };
+            // SAFETY: `geteuid` takes no arguments and always succeeds.
+            let owned = stat.st_uid == unsafe { libc::geteuid() };
+            // The mkdir mode honors umask; enforce 0700 exactly.
+            let mode =
+                unsafe { libc::fchmod(dirfd.as_raw_fd(), 0o700) } == 0;
+            stat.st_mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32 && owned && mode
+        };
+        // SAFETY: `geteuid` takes no arguments and always succeeds.
+        let uid = unsafe { libc::geteuid() };
+        drop(dirfd);
+        if !verified {
+            // Best-effort cleanup of the directory mkdir just made.
+            // `rmdir` removes empty dirs only, so a swapped-in foreign
+            // path loses at most an empty dir — never contents.
+            unsafe {
+                libc::rmdir(cpath.as_ptr());
+            }
+            return Err(IdentityUnavailable::ProbeFailed);
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            uid,
+        })
+    }
+
+    /// Whether `path` is still the directory this value created: a
+    /// directory owned by the creation uid (a swapped-in symlink or
+    /// foreign path is never ours).
+    fn owns(path: &std::path::Path, uid: u32) -> bool {
+        use std::os::unix::ffi::OsStrExt as _;
+        let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `lstat` as in `create_at`.
+        if unsafe { libc::lstat(cpath.as_ptr(), stat.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        // SAFETY: the successful `lstat` initialized `stat`.
+        let stat = unsafe { stat.assume_init() };
+        stat.st_mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32 && stat.st_uid == uid
     }
 }
 
 impl Drop for ProbeDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        if Self::owns(&self.path, self.uid) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -3605,9 +3696,9 @@ where
 mod tests {
     use super::{
         IdentityNumbering, IdentityRunShared, IdentityShared, IdentityUnavailable,
-        LiveIdentityChecks, ScriptedIdentityChecks, apply_kernel_fallback, decide_pass_attempt,
-        forced_kernel_refusal, preflight_forced_kernel, runtime_fallback_label,
-        take_session_for_pass,
+        LiveIdentityChecks, ProbeDir, ScriptedIdentityChecks, apply_kernel_fallback,
+        decide_pass_attempt, forced_kernel_refusal, preflight_forced_kernel,
+        runtime_fallback_label, take_session_for_pass,
     };
     use crate::cli::IdentityBackendSelection;
     use std::sync::atomic::Ordering;
@@ -3794,6 +3885,90 @@ mod tests {
             super::PassAttempt::Kernel { threshold } => assert_eq!(threshold, None),
             super::PassAttempt::Userspace => panic!("forced proof must attempt kernel"),
         }
+    }
+
+    /// A precreated dir, symlink or file at the probe path is refused,
+    /// never adopted: exclusive creation fails and the squatter survives.
+    #[test]
+    fn probe_dir_rejects_precreated_dir() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let scratch = tempfile::tempdir().expect("probe scratch");
+        // A precreated directory with a sentinel inside.
+        let taken = scratch.path().join("taken");
+        std::fs::create_dir(&taken).expect("precreate dir");
+        std::fs::write(taken.join("sentinel"), b"sentinel").expect("write sentinel");
+        assert!(
+            ProbeDir::create_at(&taken).is_err(),
+            "a precreated probe dir must be refused, not adopted"
+        );
+        assert_eq!(
+            std::fs::read(taken.join("sentinel")).expect("read sentinel"),
+            b"sentinel"
+        );
+        // A precreated symlink to a victim dir.
+        let victim = scratch.path().join("victim");
+        std::fs::create_dir(&victim).expect("create victim");
+        let link = scratch.path().join("linked");
+        std::os::unix::fs::symlink(&victim, &link).expect("plant link");
+        assert!(
+            ProbeDir::create_at(&link).is_err(),
+            "a symlinked probe path must be refused, not followed"
+        );
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("stat link")
+                .is_symlink()
+        );
+        // A precreated regular file.
+        let file = scratch.path().join("file");
+        std::fs::write(&file, b"squatter").expect("write squatter");
+        assert!(
+            ProbeDir::create_at(&file).is_err(),
+            "a precreated probe file must be refused"
+        );
+        // The happy path is an owned 0700 dir, removed on drop.
+        let fresh = scratch.path().join("fresh");
+        let dir = ProbeDir::create_at(&fresh).expect("fresh probe dir");
+        let meta = std::fs::symlink_metadata(&fresh).expect("stat fresh");
+        assert!(meta.is_dir());
+        assert_eq!(meta.uid(), unsafe { libc::geteuid() });
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700);
+        drop(dir);
+        assert!(!fresh.exists(), "drop removes the owned probe dir");
+    }
+
+    /// `Drop` removes only the directory this value created: a swapped-in
+    /// symlink is left alone and its target keeps its bytes.
+    #[test]
+    fn probe_dir_drop_skips_swapped_symlink() {
+        let scratch = tempfile::tempdir().expect("probe scratch");
+        let path = scratch.path().join("probe");
+        let dir = ProbeDir::create_at(&path).expect("fresh probe dir");
+        std::fs::remove_dir(&path).expect("remove probe dir");
+        let victim = scratch.path().join("victim");
+        std::fs::create_dir(&victim).expect("create victim");
+        std::fs::write(victim.join("keep"), b"keep").expect("write keep");
+        std::os::unix::fs::symlink(&victim, &path).expect("swap in link");
+        drop(dir);
+        assert_eq!(
+            std::fs::read(victim.join("keep")).expect("read keep"),
+            b"keep",
+            "drop deleted through a swapped-in symlink"
+        );
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .expect("stat link")
+                .is_symlink(),
+            "drop removed the swapped-in symlink"
+        );
+    }
+
+    /// Fresh probe dirs are unique per call.
+    #[test]
+    fn probe_dir_names_are_unique() {
+        let first = ProbeDir::create().expect("first probe dir");
+        let second = ProbeDir::create().expect("second probe dir");
+        assert_ne!(first.path, second.path, "probe dir names collided");
     }
 
     /// D3d: sanitization — raw deny/probe detail never reaches labels;

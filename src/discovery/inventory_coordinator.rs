@@ -336,16 +336,41 @@ fn inventory_config(endpoint_budget: InventoryBudget) -> Result<InventoryDiscove
 /// opt into one — in both cases a nonzero offset breaks direct
 /// comparison, and a positive offset would suppress genuine exits.
 /// The exact condition is a zero monotonic offset in this process's
-/// own time namespace, whatever namespace that is (comparing against
-/// PID 1 would miss a container-wide offset and fails under
-/// restricted `/proc` views). Anything unreadable or unparseable is
-/// an unknown offset, never comparable: the stale-exit guard then
-/// stays off and exits record unfiltered, so genuine exits are never
+/// ACTIVE time namespace, whatever namespace that is (comparing
+/// against PID 1 would miss a container-wide offset and fails under
+/// restricted `/proc` views). `/proc/self/timens_offsets` exposes
+/// `time_ns_for_children` (see `proc_timens_show_offsets` in
+/// kernel/time/namespace.c), while the observer's clock uses its
+/// active namespace; when `/proc/self/ns/time` and
+/// `/proc/self/ns/time_for_children` differ, the offsets do not
+/// describe the active namespace and the clocks are incomparable
+/// (man time_namespaces). Anything unreadable or unparseable is an
+/// unknown offset, never comparable: the stale-exit guard then stays
+/// off and exits record unfiltered, so genuine exits are never
 /// silently suppressed.
 fn exit_clocks_comparable() -> bool {
-    let Ok(offsets) = std::fs::read_to_string("/proc/self/timens_offsets") else {
+    let active = std::fs::read_link("/proc/self/ns/time").ok();
+    let children = std::fs::read_link("/proc/self/ns/time_for_children").ok();
+    let offsets = std::fs::read_to_string("/proc/self/timens_offsets").ok();
+    exit_clocks_comparable_with(active.as_ref(), children.as_ref(), offsets.as_deref())
+}
+
+/// Test seam for [`exit_clocks_comparable`]: the namespace comparison
+/// takes already-read symlink targets, so differing active/children
+/// namespaces are covered without privileged setup. `None` on any
+/// input reads incomparable (fail closed), as does a nonzero or
+/// unparseable monotonic offset.
+fn exit_clocks_comparable_with(
+    active: Option<&std::path::PathBuf>,
+    children: Option<&std::path::PathBuf>,
+    offsets: Option<&str>,
+) -> bool {
+    let (Some(active), Some(children), Some(offsets)) = (active, children, offsets) else {
         return false;
     };
+    if active != children {
+        return false;
+    }
     offsets.lines().any(|line| {
         let mut fields = line.split_whitespace();
         if fields.next() != Some("monotonic") {
@@ -15454,12 +15479,20 @@ pub(crate) mod tests {
     }
 
     /// H6 stale attribution, clock comparability: the detector agrees
-    /// with this process's own time-namespace offsets, whatever they
-    /// are — zero monotonic offset reads comparable, anything else
-    /// (or anything unreadable) reads unvalidated.
+    /// with this process's ACTIVE time namespace — identical
+    /// active/children namespaces plus a zero monotonic offset read
+    /// comparable, anything else (or anything unreadable) reads
+    /// unvalidated.
     #[test]
     fn exit_clock_comparability_matches_this_process_offsets() {
-        let expected = std::fs::read_to_string("/proc/self/timens_offsets")
+        let namespaces_match = match (
+            std::fs::read_link("/proc/self/ns/time"),
+            std::fs::read_link("/proc/self/ns/time_for_children"),
+        ) {
+            (Ok(active), Ok(children)) => active == children,
+            _ => false,
+        };
+        let offsets_zero = std::fs::read_to_string("/proc/self/timens_offsets")
             .ok()
             .and_then(|offsets| {
                 offsets.lines().find_map(|line| {
@@ -15474,8 +15507,55 @@ pub(crate) mod tests {
             .unwrap_or(false);
         assert_eq!(
             super::exit_clocks_comparable(),
-            expected,
-            "the detector reads this process's own offsets"
+            namespaces_match && offsets_zero,
+            "the detector reads this process's active time namespace"
+        );
+    }
+
+    /// H6 stale attribution, active time namespace (F7b): the offsets
+    /// file exposes `time_ns_for_children`, so differing active and
+    /// children namespaces read incomparable even with a zero offset —
+    /// otherwise an offset active namespace plus a zero-offset
+    /// children namespace would wrongly enable comparison and suppress
+    /// genuine exits. Anything unreadable stays incomparable (closed).
+    #[test]
+    fn differing_time_namespaces_read_incomparable_despite_zero_offsets() {
+        let active: std::path::PathBuf = "time:[4026531834]".into();
+        let children_same: std::path::PathBuf = "time:[4026531834]".into();
+        let children_other: std::path::PathBuf = "time:[4026532900]".into();
+        let zero = "monotonic           0         0\nboottime            0         0\n";
+        let offset = "monotonic           5         0\nboottime            0         0\n";
+        assert!(
+            super::exit_clocks_comparable_with(Some(&active), Some(&children_same), Some(zero)),
+            "identical namespaces with a zero offset compare"
+        );
+        assert!(
+            !super::exit_clocks_comparable_with(Some(&active), Some(&children_other), Some(zero)),
+            "differing namespaces never compare, even with a zero offset"
+        );
+        assert!(
+            !super::exit_clocks_comparable_with(Some(&active), Some(&children_same), Some(offset)),
+            "a nonzero offset never compares"
+        );
+        assert!(
+            !super::exit_clocks_comparable_with(None, Some(&children_same), Some(zero)),
+            "an unreadable active namespace reads incomparable"
+        );
+        assert!(
+            !super::exit_clocks_comparable_with(Some(&active), None, Some(zero)),
+            "an unreadable children namespace reads incomparable"
+        );
+        assert!(
+            !super::exit_clocks_comparable_with(Some(&active), Some(&children_same), None),
+            "unreadable offsets read incomparable"
+        );
+        assert!(
+            !super::exit_clocks_comparable_with(
+                Some(&active),
+                Some(&children_same),
+                Some("monotonic           xx         0\n")
+            ),
+            "unparseable offsets read incomparable"
         );
     }
 

@@ -2312,6 +2312,9 @@ GROUP_DEATH_EXIT_LIMIT_NS = 60_000_000_000
 
 def finish_group_death_observer(owned, death_ns, limit_seconds=60):
     """Wait for natural exit; a bounded signal fallback is cleanup only."""
+    if owned.popen.poll() is not None:
+        raise SetupError("observer already exited at the group-death check; "
+                         "exit ordering is unproven")
     remaining = max(0, (death_ns + int(limit_seconds * 1e9) - monotonic_ns()) / 1e9)
     try:
         rc = owned.popen.wait(timeout=remaining)

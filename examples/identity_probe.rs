@@ -191,11 +191,11 @@ fn probe_code(dir: PathBuf, generation: u64) -> i32 {
                 return 0;
             }
             println!("PROBE FAIL verdicts");
-            return 4;
+            4
         }
         Err(error) => {
             println!("PROBE FAIL {}: {}", error.stage, error.detail);
-            return 4;
+            4
         }
     }
 }

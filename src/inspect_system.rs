@@ -2820,10 +2820,13 @@ fn map_live_load_error(error: crate::attach::identity_iter::LoadError) -> Identi
 /// A minimal RAII probe directory (std only: `tempfile` is a
 /// dev-dependency): unique per call, removed on drop. Exclusive by
 /// construction: atomic 0700 creation (never adopt a pre-existing
-/// path), an owned-uid check, and cleanup restricted to the owned dir.
+/// path), an owned-uid check, and cleanup restricted to the created
+/// directory's identity (device + inode).
 struct ProbeDir {
     path: std::path::PathBuf,
     uid: u32,
+    dev: libc::dev_t,
+    ino: libc::ino_t,
 }
 
 impl ProbeDir {
@@ -2869,6 +2872,9 @@ impl ProbeDir {
             )
         };
         if raw < 0 {
+            // Best-effort cleanup of the directory mkdir just made.
+            // `rmdir` removes empty dirs only, so a swapped-in foreign
+            // path loses at most an empty dir — never contents.
             unsafe {
                 libc::rmdir(cpath.as_ptr());
             }
@@ -2878,19 +2884,8 @@ impl ProbeDir {
         let dirfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
         // SAFETY: `fstat` on a live fd with a writable out-param.
         let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-        let verified = unsafe { libc::fstat(dirfd.as_raw_fd(), stat.as_mut_ptr()) } == 0 && {
-            // SAFETY: the successful `fstat` initialized `stat`.
-            let stat = unsafe { stat.assume_init() };
-            // SAFETY: `geteuid` takes no arguments and always succeeds.
-            let owned = stat.st_uid == unsafe { libc::geteuid() };
-            // The mkdir mode honors umask; enforce 0700 exactly.
-            let mode = unsafe { libc::fchmod(dirfd.as_raw_fd(), 0o700) } == 0;
-            stat.st_mode & libc::S_IFMT == libc::S_IFDIR && owned && mode
-        };
-        // SAFETY: `geteuid` takes no arguments and always succeeds.
-        let uid = unsafe { libc::geteuid() };
-        drop(dirfd);
-        if !verified {
+        if unsafe { libc::fstat(dirfd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+            drop(dirfd);
             // Best-effort cleanup of the directory mkdir just made.
             // `rmdir` removes empty dirs only, so a swapped-in foreign
             // path loses at most an empty dir — never contents.
@@ -2899,16 +2894,48 @@ impl ProbeDir {
             }
             return Err(IdentityUnavailable::ProbeFailed);
         }
+        // SAFETY: the successful `fstat` initialized `stat`.
+        let stat = unsafe { stat.assume_init() };
+        // SAFETY: `geteuid` takes no arguments and always succeeds.
+        let uid = unsafe { libc::geteuid() };
+        let owned = stat.st_mode & libc::S_IFMT == libc::S_IFDIR && stat.st_uid == uid;
+        if !owned {
+            drop(dirfd);
+            // Best-effort cleanup of the directory mkdir just made.
+            // `rmdir` removes empty dirs only, so a swapped-in foreign
+            // path loses at most an empty dir — never contents.
+            unsafe {
+                libc::rmdir(cpath.as_ptr());
+            }
+            return Err(IdentityUnavailable::ProbeFailed);
+        }
+        // Only the verified-owned fd is modified: the mkdir mode honors
+        // umask, so enforce 0700 exactly here.
+        if unsafe { libc::fchmod(dirfd.as_raw_fd(), 0o700) } != 0 {
+            drop(dirfd);
+            // Best-effort cleanup of the directory mkdir just made.
+            // `rmdir` removes empty dirs only, so a swapped-in foreign
+            // path loses at most an empty dir — never contents.
+            unsafe {
+                libc::rmdir(cpath.as_ptr());
+            }
+            return Err(IdentityUnavailable::ProbeFailed);
+        }
+        let (dev, ino) = (stat.st_dev, stat.st_ino);
+        drop(dirfd);
         Ok(Self {
             path: path.to_path_buf(),
             uid,
+            dev,
+            ino,
         })
     }
 
-    /// Whether `path` is still the directory this value created: a
-    /// directory owned by the creation uid (a swapped-in symlink or
-    /// foreign path is never ours).
-    fn owns(path: &std::path::Path, uid: u32) -> bool {
+    /// Whether `path` is still the directory this value created: the
+    /// same device/inode directory owned by the creation uid (a
+    /// swapped-in symlink, replacement dir, or foreign path is never
+    /// ours).
+    fn owns(path: &std::path::Path, uid: u32, dev: libc::dev_t, ino: libc::ino_t) -> bool {
         use std::os::unix::ffi::OsStrExt as _;
         let Ok(cpath) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
             return false;
@@ -2920,13 +2947,16 @@ impl ProbeDir {
         }
         // SAFETY: the successful `lstat` initialized `stat`.
         let stat = unsafe { stat.assume_init() };
-        stat.st_mode & libc::S_IFMT == libc::S_IFDIR && stat.st_uid == uid
+        stat.st_mode & libc::S_IFMT == libc::S_IFDIR
+            && stat.st_uid == uid
+            && stat.st_dev == dev
+            && stat.st_ino == ino
     }
 }
 
 impl Drop for ProbeDir {
     fn drop(&mut self) {
-        if Self::owns(&self.path, self.uid) {
+        if Self::owns(&self.path, self.uid, self.dev, self.ino) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
     }
@@ -4021,6 +4051,32 @@ mod tests {
                 .expect("stat link")
                 .is_symlink(),
             "drop removed the swapped-in symlink"
+        );
+    }
+
+    /// `Drop` removes only the directory this value created: a swapped-in
+    /// same-uid replacement directory is left alone, and the renamed-away
+    /// original is left alone too — neither is deleted.
+    #[test]
+    fn probe_dir_drop_skips_swapped_dir() {
+        let scratch = tempfile::tempdir().expect("probe scratch");
+        let path = scratch.path().join("probe");
+        let dir = ProbeDir::create_at(&path).expect("fresh probe dir");
+        std::fs::write(path.join("orig"), b"orig").expect("write orig");
+        let moved = scratch.path().join("original-away");
+        std::fs::rename(&path, &moved).expect("rename original away");
+        std::fs::create_dir(&path).expect("plant replacement dir");
+        std::fs::write(path.join("replacement"), b"replacement").expect("write replacement");
+        drop(dir);
+        assert_eq!(
+            std::fs::read(moved.join("orig")).expect("read orig"),
+            b"orig",
+            "drop deleted the renamed-away original"
+        );
+        assert_eq!(
+            std::fs::read(path.join("replacement")).expect("read replacement"),
+            b"replacement",
+            "drop deleted a swapped-in replacement dir"
         );
     }
 

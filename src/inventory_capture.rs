@@ -417,8 +417,9 @@ pub(crate) trait LaneHost<Pin> {
     /// the stop's terminal `stage_native` quanta (witness counts,
     /// lifecycle evidence including leader-exit link loss, and staged
     /// semantic batches) still absorb and publish through the final
-    /// commit. The classic loop calls this exactly once per run, right
-    /// after the driver's own prompt gate.
+    /// commit. The classic loop calls this exactly once per run: in-loop
+    /// when a PID/System stop latches before new apply/commit work,
+    /// otherwise right after the driver's own prompt gate.
     fn stop_coordinator(&mut self) {}
 }
 
@@ -885,7 +886,9 @@ impl<L> NativeLane<L> {
     }
 
     /// The bounded stop (invariant 4). Needs one full pass after
-    /// activation: the loop guarantees it before calling.
+    /// activation: the loop guarantees it before calling (a stop latched
+    /// before the first pass completed takes
+    /// `stop_cancelled_unscoped_startup` instead).
     pub(crate) fn stop<Pin, H>(self, host: &mut H) -> Stopped<L>
     where
         L: CaptureLane<Pin>,
@@ -896,8 +899,9 @@ impl<L> NativeLane<L> {
     }
 
     /// A scoped startup stop retires the activated capture without
-    /// collecting or inventing a pass. Legacy successful stops still need
-    /// their first pass; errors use the separate failure path below.
+    /// collecting or inventing a pass. A latched PID/System startup stop
+    /// takes the sibling unscoped path; errors use the separate failure
+    /// path below.
     fn stop_cancelled_scoped_startup<Pin, H>(
         self,
         host: &mut H,
@@ -913,6 +917,22 @@ impl<L> NativeLane<L> {
             CaptureScopeCoverage::Cgroup
         ));
         debug_assert!(control.check().is_err(), "scoped startup must be cancelled");
+        self.stop_after_error(host)
+    }
+
+    /// A latched PID/System startup stop (F9) retires the activated
+    /// capture without collecting or inventing a pass: like the scoped
+    /// variant, a successful zero-pass stop, not a failure.
+    fn stop_cancelled_unscoped_startup<Pin, H>(self, host: &mut H) -> Stopped<L>
+    where
+        L: CaptureLane<Pin>,
+        H: LaneHost<Pin> + ?Sized,
+    {
+        debug_assert_eq!(self.passes, 0);
+        debug_assert!(!matches!(
+            self.capture.scope_coverage(),
+            CaptureScopeCoverage::Cgroup
+        ));
         self.stop_after_error(host)
     }
 
@@ -1102,6 +1122,12 @@ pub(crate) struct LoopClock<'a> {
 impl LoopClock<'_> {
     fn ending(&self) -> bool {
         (self.stop)() || self.deadline.is_none_or(|end| Instant::now() >= end)
+    }
+    /// A stop the loop must honor before new work: an operator stop or a
+    /// passed deadline. Unlike `ending`, no deadline reads as "run the
+    /// single snapshot pass", not as "already ended" (F9).
+    fn stop_requested(&self) -> bool {
+        (self.stop)() || self.deadline.is_some_and(|end| Instant::now() >= end)
     }
 }
 
@@ -1395,9 +1421,11 @@ pub(crate) enum Publish<'a> {
     },
 }
 
-/// The classic loop, scan or native: passes until the clock ends it (never
-/// before one full pass after activation), service ticks between them, and
-/// — for the native lane — the bounded stop and its commit. The final
+/// The classic loop, scan or native: passes until the clock ends it (an
+/// operator stop or passed deadline ends it before the first pass too:
+/// without a collection control the loop gates the host and runs zero
+/// passes, like a cancelled scoped startup), service ticks between them,
+/// and — for the native lane — the bounded stop and its commit. The final
 /// sinks are the caller's.
 /// The loop outcome keeps stopped native ownership even when capture or
 /// publication failed, so terminal sinks precede an unsettled blocking drop.
@@ -1436,6 +1464,9 @@ where
     D: PassDriver<Pin>,
     L: CaptureLane<Pin>,
 {
+    // A PID/System stop latched in-loop (F9): the post-loop host gate is
+    // then skipped, so the host still stops exactly once per run.
+    let mut stop_latched = false;
     let running = match initial_error {
         Some(error) => Err(error),
         None => (|| -> Result<()> {
@@ -1464,8 +1495,16 @@ where
                     }
                     break;
                 }
-                // Legacy activation still gets one pass. Scoped startup
-                // honors an already requested stop before scanner work.
+                // A requested stop wins before a pass starts. Scoped
+                // startup honors it above; PID/System have no collection
+                // control to latch, so the loop gates the host itself
+                // (F9) and runs zero passes — the old legacy behavior
+                // always ran pass 0.
+                if control.is_none() && clock.stop_requested() {
+                    driver.host().stop_coordinator();
+                    stop_latched = true;
+                    break;
+                }
                 if passes > 0 && clock.ending() {
                     break;
                 }
@@ -1490,6 +1529,15 @@ where
                 });
                 if let Some(control) = &control {
                     latch_collection_stop(control, clock);
+                }
+                if control.is_none() && clock.stop_requested() {
+                    // The stop landed mid-pass: gate the host before
+                    // apply/commit, so nothing collected after the stop is
+                    // applied, attached, or minted a successor (F9). The
+                    // owned stop drain still runs after the loop.
+                    driver.host().stop_coordinator();
+                    stop_latched = true;
+                    break;
                 }
                 let mut report = match lane.as_mut() {
                     Some(lane) => driver.apply(collected, lane.identity(), now)?,
@@ -1577,7 +1625,11 @@ where
     driver.on_stop_requested();
     // The host gate runs with the driver's: terminal EXEC records retire
     // without minting successors, while terminal staging still drains.
-    driver.host().stop_coordinator();
+    // A PID/System stop already latched in-loop stays single: the loop
+    // stops its host exactly once per run.
+    if !stop_latched {
+        driver.host().stop_coordinator();
+    }
     let Some(lane) = lane else {
         // Publish the failure gap without repeating the failed scan/pass.
         if error.is_some() {
@@ -1610,6 +1662,8 @@ where
         && control.check().is_err()
     {
         lane.stop_cancelled_scoped_startup(driver.host(), &control)
+    } else if lane.passes == 0 && stop_latched {
+        lane.stop_cancelled_unscoped_startup(driver.host())
     } else {
         lane.stop(driver.host())
     };
@@ -1836,3 +1890,411 @@ pub(crate) fn finish_native<L, T>(
 #[cfg(test)]
 #[path = "inventory_capture_tests.rs"]
 pub(crate) mod tests;
+
+/// Finding 9: a PID/System stop (no collection control) latches the host
+/// gate before any new apply/commit work — zero passes when pre-requested,
+/// no apply/commit when it lands mid-pass — while the owned stop drain
+/// still runs and the host still stops exactly once.
+#[cfg(test)]
+mod stop_latch_tests {
+    use super::*;
+    use crate::attach::capture::{CaptureHealth, CapturePhase, ExecCoverage};
+    use crate::discovery::identity::RetainedInventoryTarget;
+    use crate::discovery::inventory_attach_set::AttachObjectId;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct F9Pin;
+    struct F9Targets;
+    impl CaptureTargets for F9Targets {
+        fn target(&self, _object: AttachObjectId) -> Option<&RetainedInventoryTarget> {
+            None
+        }
+    }
+
+    struct F9Host {
+        stops: usize,
+        stages: usize,
+        targets: F9Targets,
+    }
+    impl F9Host {
+        fn new() -> Self {
+            Self {
+                stops: 0,
+                stages: 0,
+                targets: F9Targets,
+            }
+        }
+    }
+    impl LaneHost<F9Pin> for F9Host {
+        fn begin_capture_coverage(&mut self, _scope: CaptureScopeCoverage) {}
+        fn abandon_capture_coverage(&mut self) {}
+        fn note_extend_receipt(&mut self, _receipt: &ExtendReceipt) {}
+        fn note_capture_custody(&mut self, _custody: &ScopeCustody) {}
+        fn take_target_delta(&mut self) -> TargetDelta {
+            TargetDelta::default()
+        }
+        fn capture_targets(&self) -> &dyn CaptureTargets {
+            &self.targets
+        }
+        fn stage_native(
+            &mut self,
+            _batch: NativeBatch,
+            _identity: &mut dyn NativeIdentity<F9Pin>,
+            _now_ns: u64,
+        ) -> NativeReceipt {
+            self.stages += 1;
+            NativeReceipt::default()
+        }
+        fn end_capture_coverage(&mut self, _at_ns: u64) {}
+        fn note_native_lane(&mut self) {}
+        fn note_scope_gap(&mut self, _subject: String, _reason: String) {}
+        fn note_refresh_loss(&mut self, _reason: String) {}
+        fn stop_coordinator(&mut self) {
+            self.stops += 1;
+        }
+    }
+
+    struct F9Driver {
+        host: F9Host,
+        collects: usize,
+        applies: usize,
+        commits: usize,
+        applied: Rc<Cell<usize>>,
+        arm_stop_on_collect: Option<Rc<Cell<bool>>>,
+    }
+    impl F9Driver {
+        fn new() -> Self {
+            Self {
+                host: F9Host::new(),
+                collects: 0,
+                applies: 0,
+                commits: 0,
+                applied: Rc::new(Cell::new(0)),
+                arm_stop_on_collect: None,
+            }
+        }
+        fn report(&self) -> PassReport {
+            PassReport {
+                pass: self.applies as u64,
+                scanned: 0,
+                maps_matched: 0,
+                native_callers: 0,
+                scan_callers: 0,
+                engine_changed: false,
+                pending_refresh: Vec::new(),
+                events: Vec::new(),
+                timings: crate::timing::StageTimings::new(),
+            }
+        }
+    }
+    impl PassDriver<F9Pin> for F9Driver {
+        type Host = F9Host;
+        fn host(&mut self) -> &mut F9Host {
+            &mut self.host
+        }
+        fn collector(&mut self) -> CollectJob {
+            self.collects += 1;
+            if let Some(arm) = &self.arm_stop_on_collect {
+                arm.set(true);
+            }
+            CollectJob::Legacy(Box::new(|| {
+                Err(anyhow!("no collection in the stop-latch probe"))
+            }))
+        }
+        fn apply(
+            &mut self,
+            _collected: CollectedPass,
+            _identity: &mut dyn NativeIdentity<F9Pin>,
+            _now_ns: u64,
+        ) -> Result<PassReport> {
+            self.applies += 1;
+            self.applied.set(self.applies);
+            Ok(self.report())
+        }
+        fn commit(&mut self, _engine_changed: bool) -> Result<()> {
+            self.commits += 1;
+            Ok(())
+        }
+    }
+
+    struct F9Lane {
+        domain: NativeDomainId,
+        activated: bool,
+        begin_stops: usize,
+    }
+    impl F9Lane {
+        fn new() -> Self {
+            Self {
+                domain: NativeDomainId::mint(),
+                activated: false,
+                begin_stops: 0,
+            }
+        }
+    }
+    impl NativeIdentity<F9Pin> for F9Lane {
+        fn owner_image(&mut self, _pid: u32) -> Option<ImageIdentity> {
+            None
+        }
+        fn query_cookie(&mut self, _domain: NativeDomainId, _pin: &F9Pin) -> CookieQuery {
+            CookieQuery::NoCookie
+        }
+    }
+    impl CaptureLane<F9Pin> for F9Lane {
+        fn domain(&self) -> NativeDomainId {
+            self.domain
+        }
+        fn scope_coverage(&self) -> CaptureScopeCoverage {
+            CaptureScopeCoverage::System
+        }
+        fn extend(
+            &mut self,
+            _delta: TargetDelta,
+            _targets: &dyn CaptureTargets,
+            _window: ExtendWindow,
+        ) -> ExtendReceipt {
+            let mut receipt = ExtendReceipt {
+                custody: Some(ScopeCustody::System),
+                ..ExtendReceipt::default()
+            };
+            if !self.activated {
+                self.activated = true;
+                receipt.activated_roots = true;
+                receipt.exec_coverage = Some(ExecCoverage::scripted(self.domain, now_ns()));
+            }
+            receipt
+        }
+        fn service_discovery(&mut self, _window: ReadWindow) -> DiscoveryBatch {
+            DiscoveryBatch::scripted(self.domain, Vec::new(), now_ns())
+        }
+        fn read_witnesses(&mut self, _window: ReadWindow) -> WitnessBatch {
+            let stamp = now_ns();
+            WitnessBatch {
+                domain: self.domain,
+                phase: CapturePhase::Active,
+                rows: Vec::new(),
+                integrity: Vec::new(),
+                integrity_total: 0,
+                visited: 0,
+                sweep_completed: true,
+                sweeps_completed: 1,
+                row_bound_reached: false,
+                deadline_reached: false,
+                read_failures: Vec::new(),
+                unrecorded_rows: 0,
+                sweep_gaps: false,
+                counts: Vec::new(),
+                refresh_sweep_completed: true,
+                refresh_sweep_gaps: false,
+                refresh_deadline_reached: false,
+                refresh_sweeps_completed: 1,
+                seen_rows: 0,
+                pair_limit: 64,
+                lifecycle_loss: None,
+                lifecycle_proven_ns: 0,
+                health: CaptureHealth::default(),
+                health_regression: None,
+                health_unproven: None,
+                health_baseline_ns: 0,
+                health_read_ns: stamp,
+                rows_anchor_ns: stamp,
+                rows_read_ns: stamp,
+                counts_read_ns: stamp,
+                changed_objects: Vec::new(),
+                custody: ScopeCustody::System,
+                custody_proven_ns: None,
+                unsettled: false,
+            }
+        }
+        fn begin_stop(&mut self) {
+            self.begin_stops += 1;
+        }
+        fn poll_retirement(&mut self, _deadline: Instant) -> Result<bool> {
+            Ok(true)
+        }
+        fn cleanup(&self) -> Option<CleanupSummary> {
+            None
+        }
+    }
+
+    fn probe_clock(stop: &dyn Fn() -> bool) -> LoopClock<'_> {
+        LoopClock {
+            deadline: None,
+            stop,
+            interval: Duration::from_secs(60),
+            tick: Duration::from_millis(10),
+            collection_tick: Duration::from_millis(10),
+        }
+    }
+
+    #[test]
+    fn pre_requested_stop_runs_zero_passes_with_no_apply_or_commit() {
+        let mut driver = F9Driver::new();
+        let stop = || true;
+        let clock = probe_clock(&stop);
+        let mut pass_publications = 0;
+        let outcome = run_classic_finalizing(
+            &mut driver,
+            None::<NativeLane<F9Lane>>,
+            &clock,
+            None,
+            &mut |_, point| {
+                if matches!(point, Publish::Pass { .. }) {
+                    pass_publications += 1;
+                }
+                Ok(())
+            },
+        );
+        assert!(outcome.error.is_none());
+        assert!(outcome.stopped.is_none());
+        assert_eq!(driver.collects, 0, "no new scan after a pre-requested stop");
+        assert_eq!(
+            driver.applies, 0,
+            "no apply, so no attach or successor work"
+        );
+        assert_eq!(driver.commits, 0, "no commit without a pass");
+        assert_eq!(pass_publications, 0, "no pass was published");
+        assert_eq!(
+            driver.host.stops, 1,
+            "the latch stops the host exactly once"
+        );
+    }
+
+    #[test]
+    fn mid_pass_stop_skips_apply_and_commit() {
+        let mut driver = F9Driver::new();
+        let stop_flag = Rc::new(Cell::new(false));
+        driver.arm_stop_on_collect = Some(Rc::clone(&stop_flag));
+        let stop = || stop_flag.get();
+        let clock = probe_clock(&stop);
+        let mut pass_publications = 0;
+        let outcome = run_classic_finalizing(
+            &mut driver,
+            None::<NativeLane<F9Lane>>,
+            &clock,
+            None,
+            &mut |_, point| {
+                if matches!(point, Publish::Pass { .. }) {
+                    pass_publications += 1;
+                }
+                Ok(())
+            },
+        );
+        assert!(outcome.error.is_none());
+        assert!(outcome.stopped.is_none());
+        assert_eq!(driver.collects, 1, "the in-flight collection already ran");
+        assert_eq!(
+            driver.applies, 0,
+            "no apply after the stop, so no successor is minted"
+        );
+        assert_eq!(driver.commits, 0, "no commit after the stop");
+        assert_eq!(pass_publications, 0, "no pass was published");
+        assert_eq!(
+            driver.host.stops, 1,
+            "the latch stops the host exactly once"
+        );
+    }
+
+    #[test]
+    fn stop_after_a_completed_pass_still_stops_the_host_exactly_once() {
+        let mut driver = F9Driver::new();
+        let applied = Rc::clone(&driver.applied);
+        let stop = move || applied.get() >= 1;
+        let clock = probe_clock(&stop);
+        let mut pass_publications = 0;
+        let outcome = run_classic_finalizing(
+            &mut driver,
+            None::<NativeLane<F9Lane>>,
+            &clock,
+            None,
+            &mut |_, point| {
+                if matches!(point, Publish::Pass { .. }) {
+                    pass_publications += 1;
+                }
+                Ok(())
+            },
+        );
+        assert!(outcome.error.is_none());
+        assert!(outcome.stopped.is_none());
+        assert_eq!(driver.applies, 1, "the completed pass still applies");
+        assert_eq!(driver.commits, 1, "the completed pass still commits");
+        assert_eq!(pass_publications, 1, "the completed pass is published");
+        assert_eq!(driver.host.stops, 1, "the host stops exactly once");
+    }
+
+    #[test]
+    fn pre_requested_stop_with_a_lane_drains_without_a_pass() {
+        let mut driver = F9Driver::new();
+        let started =
+            NativeLane::start(F9Lane::new(), driver.host(), LaneWindows::PROVISIONAL, None)
+                .map_err(|(_, reason)| reason)
+                .unwrap();
+        let stop = || true;
+        let clock = probe_clock(&stop);
+        let mut pass_publications = 0;
+        let mut stop_publications = 0;
+        let outcome =
+            run_classic_finalizing(&mut driver, Some(started), &clock, None, &mut |_, point| {
+                match point {
+                    Publish::Pass { .. } => pass_publications += 1,
+                    Publish::Stop { .. } => stop_publications += 1,
+                    Publish::Retiring { .. } => {}
+                }
+                Ok(())
+            });
+        assert!(outcome.error.is_none());
+        let stopped = outcome.stopped.expect("the owned stop still drains");
+        assert_eq!(stopped.summary.passes, 0);
+        assert_eq!(driver.collects, 0, "no new scan after a pre-requested stop");
+        assert_eq!(
+            driver.applies, 0,
+            "no apply, so no attach or successor work"
+        );
+        assert_eq!(driver.commits, 1, "only the stop's terminal commit runs");
+        assert_eq!(pass_publications, 0, "no pass was published");
+        assert_eq!(stop_publications, 1, "the stop still publishes");
+        assert_eq!(
+            driver.host.stops, 1,
+            "the latch stops the host exactly once"
+        );
+        assert!(driver.host.stages > 0, "the terminal sweep still stages");
+        assert_eq!(stopped.capture.begin_stops, 1, "retirement still begins");
+    }
+
+    #[test]
+    fn mid_first_pass_stop_with_a_lane_drains_without_apply() {
+        let mut driver = F9Driver::new();
+        let started =
+            NativeLane::start(F9Lane::new(), driver.host(), LaneWindows::PROVISIONAL, None)
+                .map_err(|(_, reason)| reason)
+                .unwrap();
+        let stop_flag = Rc::new(Cell::new(false));
+        driver.arm_stop_on_collect = Some(Rc::clone(&stop_flag));
+        let stop = || stop_flag.get();
+        let clock = probe_clock(&stop);
+        let mut pass_publications = 0;
+        let outcome =
+            run_classic_finalizing(&mut driver, Some(started), &clock, None, &mut |_, point| {
+                if matches!(point, Publish::Pass { .. }) {
+                    pass_publications += 1;
+                }
+                Ok(())
+            });
+        assert!(outcome.error.is_none());
+        let stopped = outcome.stopped.expect("the owned stop still drains");
+        assert_eq!(stopped.summary.passes, 0);
+        assert_eq!(driver.collects, 1, "the in-flight collection already ran");
+        assert_eq!(
+            driver.applies, 0,
+            "no apply after the stop, so no successor is minted"
+        );
+        assert_eq!(driver.commits, 1, "only the stop's terminal commit runs");
+        assert_eq!(pass_publications, 0, "no pass was published");
+        assert_eq!(
+            driver.host.stops, 1,
+            "the latch stops the host exactly once"
+        );
+        assert!(driver.host.stages > 0, "the terminal sweep still stages");
+        assert_eq!(stopped.capture.begin_stops, 1, "retirement still begins");
+    }
+}

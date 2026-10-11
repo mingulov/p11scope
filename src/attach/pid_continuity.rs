@@ -1458,6 +1458,14 @@ pub(crate) mod engine_fixture {
         Cancel(Arc<std::sync::atomic::AtomicBool>),
     }
 
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum AttachmentBoundaryChange {
+        Stop,
+        Terminal,
+        ProducersDetached,
+        DetachFailure,
+    }
+
     struct Cursor {
         records: std::cell::RefCell<VecDeque<Vec<u8>>>,
         producer: std::cell::Cell<usize>,
@@ -1508,6 +1516,12 @@ pub(crate) mod engine_fixture {
         pub(crate) preflight_change: Option<PreflightChange>,
         pub(crate) clock_offsets: Option<String>,
         pub(crate) stop_word: u64,
+        pub(crate) uprobe_scope: aya::programs::uprobe::UProbeScope,
+        pub(crate) producers_detached: bool,
+        pub(crate) detach_failures: Vec<String>,
+        pub(crate) attachment_boundary_change: Option<AttachmentBoundaryChange>,
+        pub(crate) target_map_prepares: usize,
+        pub(crate) native_attach_calls: usize,
         pub(crate) native_failures: BTreeSet<(u32, &'static str)>,
         pub(crate) native_clocks: std::collections::VecDeque<Option<u64>>,
         pub(crate) completion_clocks: std::collections::VecDeque<Option<u64>>,
@@ -1548,6 +1562,14 @@ pub(crate) mod engine_fixture {
                 preflight_change: None,
                 clock_offsets: Some("monotonic 0 0".into()),
                 stop_word: 0,
+                uprobe_scope: aya::programs::uprobe::UProbeScope::OneProcess(
+                    NonZeroU32::new(view.pid()).unwrap(),
+                ),
+                producers_detached: false,
+                detach_failures: Vec::new(),
+                attachment_boundary_change: None,
+                target_map_prepares: 0,
+                native_attach_calls: 0,
                 native_failures: BTreeSet::new(),
                 native_clocks: VecDeque::new(),
                 completion_clocks: VecDeque::new(),
@@ -1563,16 +1585,21 @@ pub(crate) mod engine_fixture {
             &mut self,
             slots: &[Slot],
             objects: &PinnedObjects,
-        ) -> (Vec<u32>, Vec<(u32, Option<u64>)>) {
+        ) -> anyhow::Result<super::super::TargetAttachResult> {
             if slots.is_empty() {
-                return (Vec::new(), Vec::new());
+                return Ok((Vec::new(), Vec::new()));
+            }
+            if self.stopped() {
+                anyhow::bail!("static attachment refused while Session is stopping or detached");
             }
             self.book.retarget_gap(slots, objects);
-            self.health_phases.push("attach");
-            let loss = self.read_health();
-            let baseline = self
-                .book
-                .prepare_baseline(loss, self.tap.facts().ok().map(|f| f.fault_serial));
+            super::super::attachment_admission(&self.detach_failures, true)?;
+            let baseline = super::super::static_attachment_baseline_with(
+                self,
+                Self::attach_baseline,
+                Self::stopped,
+            )?;
+            self.target_map_prepares += 1;
             for slot in slots {
                 assert!(
                     !self.has_slot_link(slot.index),
@@ -1594,6 +1621,7 @@ pub(crate) mod engine_fixture {
             let book = &mut self.book;
             let failures = &self.native_failures;
             let clocks = &mut self.native_clocks;
+            let native_calls = &mut self.native_attach_calls;
             let outcome = super::super::attach_targets_observed_with(
                 slots,
                 super::super::CapturePolicy::Allowlisted,
@@ -1608,6 +1636,7 @@ pub(crate) mod engine_fixture {
                     NativeAttempt::run(
                         || started,
                         || {
+                            *native_calls += 1;
                             if failures.contains(&(slot.index, program))
                                 || failures.contains(&(u32::MAX, program))
                             {
@@ -1643,10 +1672,10 @@ pub(crate) mod engine_fixture {
                         .unwrap_or_else(|| Self::sample(&origin))
                 },
             );
-            (
+            Ok((
                 outcome.failures.into_iter().map(|(slot, _)| slot).collect(),
                 outcome.completed,
-            )
+            ))
         }
         pub(crate) fn group_all(&mut self) {
             let members: Vec<_> = self.retained.keys().copied().collect();
@@ -1655,6 +1684,7 @@ pub(crate) mod engine_fixture {
             let mut timing = RoundClock::default();
             for program in ["p11_return", "p11_entry"] {
                 let attempt = NativeAttempt::run(comparable_monotonic_ns, || {
+                    self.native_attach_calls += 1;
                     std::fs::File::open("/dev/null")
                 });
                 timing.observe_call(attempt.started_ns);
@@ -1693,6 +1723,16 @@ pub(crate) mod engine_fixture {
                         .collect()
                 })
                 .unwrap_or_default();
+            let missing: Vec<_> = affected
+                .as_ref()
+                .map(|affected| {
+                    affected
+                        .difference(&requested)
+                        .filter(|slot| !self.retained.contains_key(slot))
+                        .copied()
+                        .collect()
+                })
+                .unwrap_or_default();
             let regrouped: Vec<_> = survivors.iter().map(|target| target.slot.clone()).collect();
             let targets = survivors
                 .iter()
@@ -1726,20 +1766,31 @@ pub(crate) mod engine_fixture {
             std::thread::sleep(self.detach_delay);
             drop(selected);
             super::super::prune_linkless_retained(&mut self.retained, &self.links);
-            if groups.is_empty() {
+            let Some(affected) = affected else {
                 return super::super::DetachOutcome::default();
-            }
-            self.health_phases.push("attach");
-            let loss = self.read_health();
-            let baseline = self
-                .book
-                .prepare_baseline(loss, self.tap.facts().ok().map(|facts| facts.fault_serial));
+            };
+            let baseline = match super::super::static_attachment_baseline_with(
+                self,
+                Self::attach_baseline,
+                Self::stopped,
+            ) {
+                Ok(baseline) => baseline,
+                Err(error) => {
+                    return super::super::refused_group_rebuild(
+                        affected.difference(&requested).copied(),
+                        rebuilt_groups,
+                        &error.to_string(),
+                    );
+                }
+            };
             let failures = &self.native_failures;
+            let native_calls = &mut self.native_attach_calls;
             let (bundles, outcome) = super::super::reattach_rebuilt_groups_observed_with(
                 &groups,
                 |_| comparable_monotonic_ns(),
                 |program, _, sites, _| {
                     NativeAttempt::run(comparable_monotonic_ns, || {
+                        *native_calls += 1;
                         if sites
                             .iter()
                             .any(|(_, cookie)| failures.contains(&(*cookie as u32, program)))
@@ -1768,11 +1819,15 @@ pub(crate) mod engine_fixture {
                 &self.retained,
                 comparable_monotonic_ns,
             );
-            super::super::DetachOutcome {
+            let mut report = super::super::DetachOutcome {
                 recompleted: outcome.completed,
                 rebuild_failures: outcome.failures,
                 rebuilt_groups,
-            }
+            };
+            report.rebuild_failures.extend(missing.into_iter().map(|member| {
+                (member, format!("slot {member} was not reattached: no retained attach facts for a live group member"))
+            }));
+            report
         }
         fn origin_inputs(
             &self,
@@ -1807,6 +1862,9 @@ pub(crate) mod engine_fixture {
         pub(crate) fn invalidate_generations(&mut self) {
             self.book.invalidate_all();
         }
+        pub(crate) fn forget_retained_target(&mut self, slot: u32) {
+            self.retained.remove(&slot);
+        }
         pub(crate) fn pair_times(&self, slot: u32) -> (u64, u64) {
             let stamp = &self.book.stamps[&slot];
             (stamp.started_ns, stamp.completed_ns)
@@ -1822,8 +1880,44 @@ pub(crate) mod engine_fixture {
         }
         pub(crate) fn stopped(&self) -> bool {
             self.stop_word & p11scope_ebpf_common::STOP_GATE_STOP != 0
+                || self.producers_detached
+                || !self.detach_failures.is_empty()
                 || self.tap.facts().is_err()
                 || self.health.terminal()
+        }
+        fn attach_baseline(&mut self) -> Option<AttachBaseline> {
+            let baseline = if !matches!(
+                self.uprobe_scope,
+                aya::programs::uprobe::UProbeScope::OneProcess(_)
+            ) || self.stopped()
+            {
+                None
+            } else {
+                self.health_phases.push("attach");
+                let loss = self.read_health();
+                let baseline = self
+                    .book
+                    .prepare_baseline(loss, self.tap.facts().ok().map(|facts| facts.fault_serial));
+                if baseline.is_none() {
+                    self.tap.observe_failure();
+                }
+                baseline
+            };
+            match self.attachment_boundary_change.take() {
+                Some(AttachmentBoundaryChange::Stop) => {
+                    self.stop_word = p11scope_ebpf_common::STOP_GATE_STOP | 3;
+                }
+                Some(AttachmentBoundaryChange::Terminal) => self.tap.invalidate_terminal(),
+                Some(AttachmentBoundaryChange::ProducersDetached) => {
+                    self.producers_detached = true;
+                }
+                Some(AttachmentBoundaryChange::DetachFailure) => {
+                    self.detach_failures
+                        .push("scripted detach uncertainty".into());
+                }
+                None => {}
+            }
+            baseline
         }
         fn origin(&self) -> bool {
             let ns = std::path::PathBuf::from("time:[7]");

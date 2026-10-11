@@ -9877,19 +9877,26 @@ impl Engine {
     }
 
     fn record_apply_timing(&mut self, outcome: &ApplyOutcome) {
+        // Freeze owner eligibility before any slot completion updates it. A
+        // newly incomplete owner needs every slot's completion (including a
+        // missing timestamp); later physical recovery of an already complete
+        // owner must not extend its initial interval through healthy time.
+        let initial_owners: BTreeSet<_> = outcome
+            .static_completions
+            .iter()
+            .flat_map(|(modules, _)| modules)
+            .filter(|module| {
+                self.physical_gap.episodes == 0
+                    || self
+                        .timings
+                        .modules
+                        .get(*module)
+                        .is_none_or(|timing| timing.attach_complete_ns.is_none())
+            })
+            .cloned()
+            .collect();
         for (modules, completed) in &outcome.static_completions {
-            let initial: BTreeSet<_> = modules
-                .iter()
-                .filter(|module| {
-                    self.physical_gap.episodes == 0
-                        || self
-                            .timings
-                            .modules
-                            .get(*module)
-                            .is_none_or(|timing| timing.attach_complete_ns.is_none())
-                })
-                .cloned()
-                .collect();
+            let initial: BTreeSet<_> = modules.intersection(&initial_owners).cloned().collect();
             self.complete_causal_timing(&initial, *completed);
         }
         for module in &outcome.static_failures {
@@ -20590,7 +20597,7 @@ pub(crate) mod session_fixture {
                 kill_and_reap(pid);
             }
             if let Some(physical) = physical {
-                return Ok(physical);
+                return physical;
             }
             Ok((
                 slots
@@ -20612,7 +20619,16 @@ pub(crate) mod session_fixture {
                 .push(slots.iter().map(|slot| slot.index).collect());
             attachment_admission(&self.detach_failures, !slots.is_empty())?;
             if let Some(continuity) = &mut self.pid_continuity {
-                let (failed, completed) = continuity.borrow_mut().attach(slots, objects);
+                let attached = continuity.borrow_mut().attach(slots, objects);
+                let (failed, completed) = match attached {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        for slot in slots {
+                            plan.deactivate(slot.index);
+                        }
+                        return Err(error);
+                    }
+                };
                 let failed_slots: Vec<_> = slots
                     .iter()
                     .filter(|slot| failed.contains(&slot.index))

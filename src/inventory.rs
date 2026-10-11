@@ -1327,6 +1327,73 @@ impl ClassicDriver<'_> {
             |lane| lane.semantic_summary(),
         )
     }
+
+    /// The lane's independent terminal sequence: publish any
+    /// pass-staged quantum, drain owned cursors to Q, then stop H0
+    /// once. Every drained batch commits promptly during the drain,
+    /// beside the lane's stop and before the Finish batch; a terminal
+    /// failure records a gap instead of losing Inventory's stop. Runs
+    /// at stop request (before native retirement) with the
+    /// post-retirement hook as a no-op safety net.
+    fn run_semantic_terminal_sequence(&mut self) {
+        if !self
+            .semantic
+            .as_ref()
+            .is_some_and(|lane| lane.is_live() && !lane.is_finished())
+        {
+            return;
+        }
+        // Publish any pass-staged quantum first: the terminal drain
+        // must never backpressure behind it.
+        if self.semantic_staged
+            && let Err(error) = self.commit(false)
+        {
+            self.coordinator.note_scope_gap(
+                "semantic terminal commit failed".into(),
+                format!("{error:#}"),
+            );
+        }
+        let pins: Vec<std::sync::Arc<PidPin>> = self
+            .coordinator
+            .semantic_bindings_mut()
+            .bindings_for_tick()
+            .iter()
+            .map(|binding| binding.pin())
+            .collect();
+        // Borrow-split: the drain borrows the lane per quantum and the
+        // coordinator between quanta, committing every drained batch
+        // while H0 still runs instead of buffering through the wait.
+        // Buffering would expire drained receipts (2s pending window)
+        // inside a long quiescence wait (5s budget) before validation.
+        let (coordinator, semantic) = (&mut self.coordinator, &mut self.semantic);
+        let Some(lane) = semantic.as_mut() else {
+            return;
+        };
+        lane.run_semantic_drain_committing(coordinator, &pins, std::time::Instant::now);
+        // H0 stops once, after every drained batch was consumed and
+        // published; the terminal Finish batch commits separately.
+        if let Some(finish) = self
+            .semantic
+            .as_mut()
+            .and_then(|lane| lane.finish_semantic_stop())
+        {
+            self.coordinator.stage_semantic_batch(finish);
+            if let Some(lane) = self.semantic.as_mut()
+                && let Err(error) = self
+                    .coordinator
+                    .commit_batch_with_semantics(false, Some(lane))
+            {
+                self.coordinator.note_scope_gap(
+                    "semantic terminal commit failed".into(),
+                    format!("{error:#}"),
+                );
+            }
+        }
+        self.semantic_staged = false;
+        if let Some(lane) = self.semantic.as_mut() {
+            lane.note_semantic_published();
+        }
+    }
 }
 
 /// Optional lane startup: no manifests means no Detailed Session, maps,
@@ -1737,71 +1804,17 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         if let Some(lane) = self.semantic.as_mut() {
             lane.request_semantic_stop();
         }
+        // Flush staged and stashed evidence NOW, before native
+        // retirement runs: retirement's 5-10s budget exceeds the 2s
+        // receipt window, so evidence must finalize here instead of
+        // after it. The post-retirement hook below is then a no-op.
+        self.run_semantic_terminal_sequence();
     }
 
     fn on_lane_stopped(&mut self) {
-        // The lane's independent terminal sequence: drain owned cursors
-        // to Q, then stop H0 once. Every drained batch commits promptly
-        // during the drain, beside the lane's stop and before the Finish
-        // batch; a terminal failure records a gap instead of losing
-        // Inventory's stop.
-        if !self
-            .semantic
-            .as_ref()
-            .is_some_and(|lane| lane.is_live() && !lane.is_finished())
-        {
-            return;
-        }
-        // Publish any pass-staged quantum first: the terminal drain
-        // must never backpressure behind it.
-        if self.semantic_staged
-            && let Err(error) = self.commit(false)
-        {
-            self.coordinator.note_scope_gap(
-                "semantic terminal commit failed".into(),
-                format!("{error:#}"),
-            );
-        }
-        let pins: Vec<std::sync::Arc<PidPin>> = self
-            .coordinator
-            .semantic_bindings_mut()
-            .bindings_for_tick()
-            .iter()
-            .map(|binding| binding.pin())
-            .collect();
-        // Borrow-split: the drain borrows the lane per quantum and the
-        // coordinator between quanta, committing every drained batch
-        // while H0 still runs instead of buffering through the wait.
-        // Buffering would expire drained receipts (2s pending window)
-        // inside a long quiescence wait (5s budget) before validation.
-        let (coordinator, semantic) = (&mut self.coordinator, &mut self.semantic);
-        let Some(lane) = semantic.as_mut() else {
-            return;
-        };
-        lane.run_semantic_drain_committing(coordinator, &pins, std::time::Instant::now);
-        // H0 stops once, after every drained batch was consumed and
-        // published; the terminal Finish batch commits separately.
-        if let Some(finish) = self
-            .semantic
-            .as_mut()
-            .and_then(|lane| lane.finish_semantic_stop())
-        {
-            self.coordinator.stage_semantic_batch(finish);
-            if let Some(lane) = self.semantic.as_mut()
-                && let Err(error) = self
-                    .coordinator
-                    .commit_batch_with_semantics(false, Some(lane))
-            {
-                self.coordinator.note_scope_gap(
-                    "semantic terminal commit failed".into(),
-                    format!("{error:#}"),
-                );
-            }
-        }
-        self.semantic_staged = false;
-        if let Some(lane) = self.semantic.as_mut() {
-            lane.note_semantic_published();
-        }
+        // Safety net for the same terminal sequence (a no-op once the
+        // stop request above already ran it before native retirement).
+        self.run_semantic_terminal_sequence();
     }
 }
 
@@ -6681,6 +6694,56 @@ mod tests {
                     .staged_semantic_age()
                     .is_some_and(|age| age < STAGED_SEMANTIC_MAX_AGE),
                 "the restaged batch is fresh"
+            );
+        }
+
+        #[test]
+        fn stop_request_flushes_staged_evidence_before_retirement() {
+            let mut scene = driver_scene(2);
+            // Stashed quiet evidence awaits the stop; the producer is
+            // already quiet, so the drain pre-flushes then quiesces.
+            scene.stub.pending = true;
+            scene.stub.quiesce = true;
+            scene.lane.install_test_io(Box::new(scene.stub));
+            let mut driver = ClassicDriver {
+                coordinator: &mut scene.coordinator,
+                inventory_scope: None,
+                scope: InventoryRunScope::Pid(std::process::id()),
+                cgroup: None,
+                max_scan_pids: None,
+                guard: UnavailableImageGuard,
+                deadline: None,
+                identity: None,
+                display: None,
+                semantic: Some(scene.lane),
+                semantic_staged: false,
+            };
+            driver.on_tick();
+            assert!(driver.semantic_staged, "one quantum stages");
+            assert_eq!(driver.coordinator.registry().instances().count(), 0);
+            // The stop request flushes before native retirement would
+            // run: the staged quantum publishes, the drain pre-flushes
+            // stashed evidence, and H0 finishes.
+            driver.on_stop_requested();
+            assert!(
+                !driver.semantic_staged,
+                "the staged quantum publishes at stop request"
+            );
+            assert_eq!(
+                driver.coordinator.registry().instances().count(),
+                2,
+                "staged plus pre-flushed evidence publish before retirement"
+            );
+            assert!(
+                driver.semantic.as_ref().unwrap().is_finished(),
+                "H0 stops at stop request"
+            );
+            // The post-retirement hook is a no-op once finished.
+            driver.on_lane_stopped();
+            assert_eq!(
+                driver.coordinator.registry().instances().count(),
+                2,
+                "the safety net publishes nothing twice"
             );
         }
     }

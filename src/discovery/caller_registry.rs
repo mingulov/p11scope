@@ -837,10 +837,20 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         let authority = authority_for(pid);
         let handoff = self.retire_for_exec_handoff(id, now_ns);
         let commit = match handoff {
-            Some((pid, pin)) => self.admit_retained_successor(pid, pin, authority, now_ns),
-            None => {
-                self.commit_retained_successor(pid, None, authority, now_ns, &mut || Some(now_ns))
-            }
+            Some((pid, pin)) => self.admit_retained_successor(
+                pid,
+                pin,
+                authority,
+                now_ns,
+                &mut crate::attach::monotonic_ns,
+            ),
+            None => self.commit_retained_successor(
+                pid,
+                None,
+                authority,
+                now_ns,
+                &mut crate::attach::monotonic_ns,
+            ),
         };
         vec![match commit {
             Ok(new) => CallerEvent::ExecRetired { old: id, new },
@@ -880,17 +890,19 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
     /// Admit one exec successor on retained custody (H6 slice 2): the moved
     /// original pin proves the same process. A dead pin, a live pid
     /// collision, a full caller budget, or a zombie refuses; nothing here
-    /// reopens the successor by scalar PID.
+    /// reopens the successor by scalar PID. `detected` samples the
+    /// admission detection time per incarnation, after validation
+    /// (F7a): the supplied `now_ns` may be a stale pass-start stamp and
+    /// must never stand in for detection.
     pub(crate) fn admit_retained_successor(
         &mut self,
         pid: u32,
         pin: Source::Pin,
         authority: ImageAuthority,
         now_ns: u64,
+        detected: &mut dyn FnMut() -> Option<u64>,
     ) -> Result<CallerId, AdmitFailure> {
-        // The exec path carries a fresh `now_ns` already, so it is the
-        // detection time too.
-        self.commit_retained_successor(pid, Some(pin), authority, now_ns, &mut || Some(now_ns))
+        self.commit_retained_successor(pid, Some(pin), authority, now_ns, detected)
     }
 
     /// The one retained-custody commit behind every exec handoff: the native

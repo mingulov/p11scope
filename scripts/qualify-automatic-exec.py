@@ -38,6 +38,7 @@ and cleanup receipts are recorded in summary.json.
 
 import argparse
 from collections import Counter, defaultdict, deque
+from functools import wraps
 import ctypes
 import errno
 import codecs
@@ -1539,6 +1540,83 @@ signal_cleanup = N3HARNESS["signal_cleanup"]
 cleanup_section = N3HARNESS["cleanup_section"]
 
 
+class Reader(N3HARNESS["Reader"]):
+    """Private cancellable pipe reader; preserve the shared ledger interface."""
+    def __init__(self, stream, path):
+        self.stop = threading.Event()
+        super().__init__(stream, path)
+
+    def _read(self):
+        try:
+            fd = self.stream.fileno()
+        except (OSError, ValueError):
+            # Finite in-memory controls keep the shared decode/error behavior.
+            return super()._read()
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        pending, total = "", 0
+        try:
+            with self.path.open("w", encoding="utf-8") as output:
+                def record(line):
+                    line = line.replace("\r\n", "\n")
+                    if len(line.encode()) > 65536:
+                        raise ValueError("owned output exceeds bounded fixture limit")
+                    self.lines.append(line)
+                    output.write(line)
+                    output.flush()
+                    if line.startswith("N3LEDGER "):
+                        self.records.append(json.loads(line[9:]))
+                    self.updates.put(None)
+                while not self.stop.is_set():
+                    if not select.select([fd], [], [], 0.2)[0]:
+                        continue
+                    chunk = os.read(fd, 4096)
+                    if not chunk:
+                        pending += decoder.decode(b"", final=True)
+                        if pending and not self.errors:
+                            record(pending)
+                        break
+                    total += len(chunk)
+                    piece = decoder.decode(chunk)
+                    if total > 8 * 1024 * 1024 and not self.errors:
+                        self.errors.append("owned output exceeds bounded fixture limit")
+                    if self.errors:
+                        continue  # drain an over-limit child without retaining more output
+                    pending += piece
+                    while "\n" in pending:
+                        line, pending = pending.split("\n", 1)
+                        record(line + "\n")
+                    if len(pending.encode()) > 65536:
+                        raise ValueError("owned output exceeds bounded fixture limit")
+        except (ValueError, UnicodeError, OSError) as error:
+            self.errors.append(str(error))
+        finally:
+            self.updates.put(None)
+
+    def finish(self):
+        self.thread.join(timeout=3)
+        if self.thread.is_alive():
+            self.stop.set()
+            self.thread.join(timeout=1)
+            raise ValueError("owned output did not finish cleanly before reader cancellation")
+        if self.errors:
+            raise ValueError("owned output did not finish cleanly: " + "; ".join(self.errors))
+        return "".join(self.lines)
+
+
+def owned_reader(readers, reader_class, *args):
+    """Enroll before a constructor can start a thread and then fail."""
+    with cleanup_section():
+        reader = reader_class.__new__(reader_class)
+        reader.thread = None
+        if reader_class is PtyCapture:
+            reader.master = args[0]
+        else:
+            reader.stream = args[0]
+        readers.append(reader)
+        reader_class.__init__(reader, *args)
+    return reader
+
+
 def expect_line(reader, index, prefix, timeout):
     """Wait for the next line with prefix; returns (line, next_index)."""
     deadline = time.monotonic() + timeout
@@ -1659,9 +1737,8 @@ class BDriver:
             owners, argv, uid, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, env=env, user=uid, group=gid,
             extra_groups=[], start_new_session=True)
-        self.stdout = Reader(self.owned.popen.stdout, self.leg_dir / "b.stdout.txt")
-        self.stderr = Reader(self.owned.popen.stderr, self.leg_dir / "b.stderr.txt")
-        readers.extend((self.stdout, self.stderr))
+        self.stdout = owned_reader(readers, Reader, self.owned.popen.stdout, self.leg_dir / "b.stdout.txt")
+        self.stderr = owned_reader(readers, Reader, self.owned.popen.stderr, self.leg_dir / "b.stderr.txt")
         self.pid = self.owned.pid
         self.birth = self.owned.identity["start_time"]
 
@@ -1854,7 +1931,7 @@ CALLER_CFLAGS = ["-O2", "-Wall", "-Wextra", "-Werror"]
 LEDGER_CFLAGS = ["-O1", "-Wall", "-Wextra", "-Werror"]
 
 
-def compile_case_fixtures(bin_dir):
+def compile_case_fixtures(bin_dir, owned_pins=None):
     """Compile every H6 workload from repo fixtures into the case bin dir."""
     bin_dir = Path(bin_dir)
     bin_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
@@ -1880,8 +1957,14 @@ def compile_case_fixtures(bin_dir):
             raise SetupError(f"fixture build failed for {name}: {proc.stderr[-2000:]}")
     for name in ("provider.so", "before", "after", "caller", "ledger"):
         (bin_dir / name).chmod(0o755)
-    return {name: FilePin(bin_dir / name)
-            for name in ("provider.so", "before", "after", "caller", "ledger")}
+    pins = {}
+    for name in ("provider.so", "before", "after", "caller", "ledger"):
+        with cleanup_section():
+            pin = FilePin(bin_dir / name)
+            if owned_pins is not None:
+                owned_pins.append(pin)
+            pins[name] = pin
+    return pins
 
 
 def init_token(workload_dir, uid, gid, label):
@@ -2036,6 +2119,7 @@ class PtyCapture:
             self.errors.append(str(error))
         finally:
             os.close(self.master)
+            self.master = None
             self.updates.put(None)
 
     def finish(self, timeout=5):
@@ -2156,24 +2240,26 @@ def spawn_observer(owners, readers, leg_dir, argv, env, live=False):
     """Spawn an observer; returns (owned, capture, errors, started_ns)."""
     started = monotonic_ns()
     if live:
-        master, slave = pty.openpty()
-        try:
-            owned = spawn_owned(owners, argv, 0, stdin=subprocess.DEVNULL,
-                                stdout=slave, stderr=subprocess.PIPE,
-                                text=True, env=env, start_new_session=True)
-            capture = PtyCapture(master, Path(leg_dir) / "observer.stdout.txt")
-        except BaseException:
-            os.close(master)
-            raise
-        finally:
-            os.close(slave)
+        with cleanup_section():
+            master, slave = pty.openpty()
+            before = len(readers)
+            try:
+                capture = owned_reader(readers, PtyCapture, master, Path(leg_dir) / "observer.stdout.txt")
+                owned = spawn_owned(owners, argv, 0, stdin=subprocess.DEVNULL,
+                                    stdout=slave, stderr=subprocess.PIPE,
+                                    text=True, env=env, start_new_session=True)
+            except BaseException:
+                if len(readers) == before:
+                    os.close(master)
+                raise
+            finally:
+                os.close(slave)
     else:
         owned = spawn_owned(owners, argv, 0, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, env=env, start_new_session=True)
-        capture = Reader(owned.popen.stdout, Path(leg_dir) / "observer.stdout.txt")
-    errors = Reader(owned.popen.stderr, Path(leg_dir) / "observer.stderr.txt")
-    readers.extend((capture, errors))
+        capture = owned_reader(readers, Reader, owned.popen.stdout, Path(leg_dir) / "observer.stdout.txt")
+    errors = owned_reader(readers, Reader, owned.popen.stderr, Path(leg_dir) / "observer.stderr.txt")
     return owned, capture, errors, started
 
 
@@ -2223,9 +2309,8 @@ def spawn_caller(owners, readers, leg_dir, caller_pin, provider_pin, uid, gid, e
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, env=env, user=uid, group=gid, extra_groups=[],
         start_new_session=True)
-    stdout = Reader(owned.popen.stdout, Path(leg_dir) / f"{tag}.ledger.jsonl")
-    stderr = Reader(owned.popen.stderr, Path(leg_dir) / f"{tag}.stderr.txt")
-    readers.extend((stdout, stderr))
+    stdout = owned_reader(readers, Reader, owned.popen.stdout, Path(leg_dir) / f"{tag}.ledger.jsonl")
+    stderr = owned_reader(readers, Reader, owned.popen.stderr, Path(leg_dir) / f"{tag}.stderr.txt")
     return owned, stdout, stderr
 
 
@@ -2266,9 +2351,8 @@ def spawn_ledger(owners, readers, leg_dir, argv, env, uid, gid, tag):
         owners, argv, uid, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, env=env, user=uid, group=gid,
         extra_groups=[], start_new_session=True)
-    stdout = Reader(owned.popen.stdout, Path(leg_dir) / f"{tag}.out")
-    stderr = Reader(owned.popen.stderr, Path(leg_dir) / f"{tag}.err")
-    readers.extend((stdout, stderr))
+    stdout = owned_reader(readers, Reader, owned.popen.stdout, Path(leg_dir) / f"{tag}.out")
+    stderr = owned_reader(readers, Reader, owned.popen.stderr, Path(leg_dir) / f"{tag}.err")
     return owned, stdout, stderr
 
 
@@ -2374,8 +2458,155 @@ class Case:
         self.owners: list = []
         self.readers: list = []
         self.groups: list = []
+        self.leg_pins: list = []
+        self.traced: list = []
+        self.scopes: list = []
+        self.completed_results: list = []
+        self.cleanup_errors: list = []
+        self.cleanup_failed = False
+        self.cleanup_totals = {"processes": 0, "readers": 0, "cgroups": 0, "pins": 0}
         self.results: dict = {}
         self.scope_created_ns = monotonic_ns()
+
+
+class LegCleanupError(RuntimeError):
+    """An owned cleanup failure stops the matrix, including after another error."""
+
+
+def reap_traced_child(owner):
+    """Use the held pidfd and a real terminal wait status, never Popen.poll."""
+    # Popen can translate a ptrace stop into a negative return code. SIGKILL
+    # releases that stop; waitpid must still prove actual death and reap it.
+    try:
+        signal.pidfd_send_signal(owner.pidfd, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + 3  # existing bounded SIGKILL reap allowance
+    while True:
+        try:
+            pid, status = os.waitpid(owner.pid, os.WNOHANG | 0x40000000)  # __WALL
+        except ChildProcessError:
+            if owner.popen.returncode is not None and not (Path("/proc") / str(owner.pid)).exists():
+                return
+            raise SetupError("traced owned child lacks a terminal reap proof")
+        if pid and (os.WIFEXITED(status) or os.WIFSIGNALED(status)):
+            owner.popen.returncode = os.waitstatus_to_exitcode(status)
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError("traced owned child did not exit after bounded SIGKILL")
+        time.sleep(0.01)
+
+
+def cleanup_leg_resources(ctx, close_pins=True):
+    """Reap before settling readers/FDs and removing corresponding owned groups."""
+    case = getattr(ctx, "case", ctx)
+    failures = []
+    with cleanup_section():
+        owners, readers, groups = list(ctx.owners), list(ctx.readers), list(ctx.groups)
+        for key, resources in (("processes", owners), ("readers", readers), ("cgroups", groups)):
+            case.cleanup_totals[key] += len(resources)
+        for owner in list(ctx.traced):
+            try:
+                reap_traced_child(owner)
+            except Exception as error:
+                failures.append(f"traced process {owner.pid}: {type(error).__name__}: {error}")
+        ctx.traced.clear()
+        for owner in owners:
+            try:
+                N3HARNESS["terminate"](owner)
+            except Exception as error:
+                failures.append(f"process {owner.pid}: {type(error).__name__}: {error}")
+        for reader in readers:
+            try:
+                thread = getattr(reader, "thread", None)
+                if thread is not None and thread.ident is not None:
+                    reader.finish()
+                elif isinstance(reader, PtyCapture) and reader.master is not None:
+                    os.close(reader.master)
+                    reader.master = None
+            except Exception as error:
+                failures.append(f"reader: {type(error).__name__}: {error}")
+        for reader in readers:
+            stream = getattr(reader, "stream", None)
+            if stream is not None and not stream.closed:
+                try:
+                    stream.close()
+                except Exception as error:
+                    failures.append(f"reader stream: {type(error).__name__}: {error}")
+        for owner in owners:
+            for stream in (owner.popen.stdin, owner.popen.stdout, owner.popen.stderr):
+                if stream is not None and not stream.closed:
+                    try:
+                        stream.close()
+                    except Exception as error:
+                        failures.append(f"process stream: {type(error).__name__}: {error}")
+            try:
+                owner.close()
+            except Exception as error:
+                failures.append(f"process FD: {type(error).__name__}: {error}")
+        for group in reversed(groups):
+            try:
+                group.remove()
+            except Exception as error:
+                failures.append(f"cgroup: {type(error).__name__}: {error}")
+        ctx.owners.clear()
+        ctx.readers.clear()
+        ctx.groups.clear()
+        if close_pins:
+            for pin in reversed(ctx.leg_pins):
+                try:
+                    pin.close()
+                    pin.fd = None
+                    case.cleanup_totals["pins"] += 1
+                except Exception as error:
+                    failures.append(f"leg pin: {type(error).__name__}: {error}")
+            ctx.leg_pins.clear()
+        if failures:
+            case.cleanup_failed = True
+            case.cleanup_errors.extend(failures)
+            raise LegCleanupError("owned leg cleanup failed: " + "; ".join(failures))
+
+
+class LegContext:
+    """Private resource lists; case inputs and earlier results stay with the case."""
+    def __init__(self, parent):
+        self.parent, self.case = parent, getattr(parent, "case", parent)
+        self.owners, self.readers, self.groups, self.leg_pins, self.traced = [], [], [], [], []
+        self.case.scopes.append(self)
+
+    def __getattr__(self, name):
+        return getattr(self.parent, name)
+
+
+def owned_leg(function):
+    @wraps(function)
+    def run(ctx, *args, **kwargs):
+        with cleanup_section():
+            scope = LegContext(ctx)
+        primary = None
+        try:
+            result = function(scope, *args, **kwargs)
+            return result
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            try:
+                cleanup_leg_resources(scope)
+            except LegCleanupError as error:
+                if primary is not None:
+                    raise LegCleanupError(f"{error}; primary {type(primary).__name__}: {primary}") from primary
+                raise
+            if primary is None and isinstance(result, dict):
+                scope.case.completed_results.append(result)
+    return run
+
+
+def leg_pin(ctx, path):
+    with cleanup_section():
+        pin = FilePin(path)
+        ctx.leg_pins.append(pin)
+    return pin
 
 
 def write_json(path, value):
@@ -2387,6 +2618,7 @@ def finish_readers(readers):
         reader.finish()
 
 
+@owned_leg
 def run_pid_caller_leg(ctx, cell, backend, observer_kind, leg_dir, same_path, prefix=()):
     """One pid-scope caller leg: warm, exec, measured, stop, judge."""
     leg_dir = Path(leg_dir)
@@ -2395,14 +2627,14 @@ def run_pid_caller_leg(ctx, cell, backend, observer_kind, leg_dir, same_path, pr
     image_a = leg_dir / "caller-a"
     shutil.copyfile(ctx.pins["caller"].path, image_a)
     image_a.chmod(0o755)
-    pin_a = FilePin(image_a)
+    pin_a = leg_pin(ctx, image_a)
     if same_path:
         pin_b, image_b = pin_a, image_a
     else:
         image_b = leg_dir / "caller-b"
         shutil.copyfile(ctx.pins["caller"].path, image_b)
         image_b.chmod(0o755)
-        pin_b = FilePin(image_b)
+        pin_b = leg_pin(ctx, image_b)
     provider = ctx.provider_pin
     caller, stdout, _ = spawn_caller(ctx.owners, ctx.readers, leg_dir, pin_a, provider,
                                      ctx.args.uid, ctx.args.gid, env, prefix=prefix)
@@ -2502,6 +2734,7 @@ def run_pid_reexec(ctx, cell_dir, backend):
             for kind in ("trace", "profile", "metrics")]
 
 
+@owned_leg
 def run_b_leg(ctx, cell, backend, observer_kind, leg_dir, mode, measured=25, delay_ms=300):
     """One workload-B leg: cold/failed/leader-exit exec under an observer."""
     leg_dir = Path(leg_dir)
@@ -2666,6 +2899,7 @@ def run_leader_exit_exec(ctx, cell_dir, backend):
     return [result, capability]
 
 
+@owned_leg
 def run_rapid_chain(ctx, cell_dir, backend):
     """Bounded 3-exec leader chain (A->B->A->B) plus reuse and group-death legs."""
     leg_dir = Path(cell_dir) / backend / "trace"
@@ -2676,7 +2910,7 @@ def run_rapid_chain(ctx, cell_dir, backend):
         path = leg_dir / name
         shutil.copyfile(ctx.pins["caller"].path, path)
         path.chmod(0o755)
-        pins[name] = FilePin(path)
+        pins[name] = leg_pin(ctx, path)
     provider = ctx.provider_pin
     caller, stdout, _ = spawn_caller(ctx.owners, ctx.readers, leg_dir, pins["caller-a"],
                                      provider, ctx.args.uid, ctx.args.gid, env)
@@ -2748,6 +2982,10 @@ def run_rapid_chain(ctx, cell_dir, backend):
                                (leg_dir / "trace.file.txt").read_text())
     write_json(leg_dir / "receipt.json", receipt)
     write_json(leg_dir / "result.json", result)
+    # The copied images remain pinned for the following controls. The main
+    # observer leg must release every process/reader/group before they start.
+    cleanup_leg_resources(ctx, close_pins=False)
+    ctx.case.completed_results.append(result)
     control = run_reuse_control(ctx, Path(cell_dir) / backend / "reuse", backend, env,
                                 dead_pid, pins["caller-a"])
     death = run_group_death_leg(ctx, Path(cell_dir) / backend / "group-death",
@@ -2755,6 +2993,7 @@ def run_rapid_chain(ctx, cell_dir, backend):
     return [result, control, death]
 
 
+@owned_leg
 def run_reuse_control(ctx, leg_dir, backend, env, dead_pid, image_pin):
     """Fresh same-image host under --system: independent admission, no history."""
     leg_dir = Path(leg_dir)
@@ -2840,6 +3079,7 @@ def finish_group_death_observer(owned, death_ns, limit_seconds=60):
             "self_ended": True, "exited_ns": exited, "controller_stop": None}
 
 
+@owned_leg
 def run_group_death_leg(ctx, leg_dir, backend, env, image_pin):
     """Whole-group death ends --pid capture: no post-death rows.
 
@@ -2941,6 +3181,7 @@ def run_group_death_leg(ctx, leg_dir, backend, env, image_pin):
     return result
 
 
+@owned_leg
 def run_cgroup_r2(ctx, cell_dir, backend):
     """Observed-dir replacement: the new dir is not silently re-admitted."""
     leg_dir = Path(cell_dir) / backend / "replacement"
@@ -2949,7 +3190,7 @@ def run_cgroup_r2(ctx, cell_dir, backend):
     image = leg_dir / "caller-a"
     shutil.copyfile(ctx.pins["caller"].path, image)
     image.chmod(0o755)
-    pin = FilePin(image)
+    pin = leg_pin(ctx, image)
     provider = ctx.provider_pin
     root, _ = create_tracked(ctx, Path("/sys/fs/cgroup") / f"p11scope-h6-{uuid.uuid4().hex[:8]}")
     selected, selected_w = create_tracked(ctx, root.path / "selected")
@@ -2979,21 +3220,12 @@ def run_cgroup_r2(ctx, cell_dir, backend):
                0, selected, phases)
     t_out = monotonic_ns()
     move_and_verify(outside, caller, moves, "exit-for-replacement")
-    old_ino = selected.path.stat().st_ino
-    os.rmdir(selected.path)
-    os.mkdir(selected.path, 0o755)
-    new_ino = selected.path.stat().st_ino
-    assert new_ino != old_ino
+    selected, selected_w, old_ino, new_ino = replace_tracked(ctx, selected, selected_w)
     moves.append({"t": monotonic_ns(), "cgroup": str(selected.path),
                   "note": f"replaced old-ino={old_ino} new-ino={new_ino}"})
-    # The stale wrapper tracks the removed dir; move into the new dir by
-    # raw path (same string, new inode) and verify membership manually.
-    caller.verify()
-    with open(selected.path / "cgroup.procs", "w") as handle:
-        handle.write(f"{caller.pid}\n")
-    actual = cgroup_of(caller.pid)
-    assert actual == "/" + str(selected.path.relative_to("/sys/fs/cgroup")), actual
-    moves.append({"t": monotonic_ns(), "cgroup": actual, "note": "replacement-entry"})
+    # The new dir is held and enrolled for cleanup, but the observer still
+    # owns its original scope identity and must refuse silent re-admission.
+    actual = move_and_verify(selected, caller, moves, "replacement-entry")
     n3_command(caller, stdout, "C_GenerateRandom", 3, 100, "replaced", "selected",
                0, None, phases)
     assert cgroup_of(caller.pid) == actual
@@ -3001,14 +3233,8 @@ def run_cgroup_r2(ctx, cell_dir, backend):
     caller_rc = stop_caller(caller, stdout, 0)
     finish_readers([stdout, capture, errors])
     ledger = list(stdout.records)
-    # Explicit replacement-dir cleanup (the stale wrapper cannot remove it).
-    procs = (selected.path / "cgroup.procs").read_text().split()
-    assert not procs, procs
-    os.rmdir(selected.path)
-    selected_w.group.close()
-    os.close(selected_w.parent_fd)
-    ctx.groups.remove(selected_w)
-    moves.append({"t": monotonic_ns(), "cgroup": str(selected.path), "note": "replaced-removed"})
+    # The leg adapter removes the enrolled replacement after reaping both
+    # children and closing their readers/FDs, including on oracle failure.
     warmup = next(p for p in phases if p["phase"] == "warm")
     receipt = {
         "cell": "cgroup-reentry", "leg": f"replacement/{backend}", "scope_kind": "cgroup",
@@ -3077,10 +3303,15 @@ def _ptrace(request, pid, addr=0, data=0):
     return result
 
 
-def seize_until_exec(pid):
+def seize_until_exec(pid, ctx, owner):
     """Seize an owned pid; its next exec trap-stops before user code."""
-    _ptrace(_PTRACE_SEIZE, pid)
-    _ptrace(_PTRACE_SETOPTIONS, pid, 0, _PTRACE_O_TRACEEXEC)
+    if owner.pid != pid or owner not in ctx.owners:
+        raise SetupError("ptrace target is not the leg's registered owned child")
+    with cleanup_section():
+        owner.verify()
+        _ptrace(_PTRACE_SEIZE, pid)
+        ctx.traced.append(owner)  # before options acquisition can fail
+        _ptrace(_PTRACE_SETOPTIONS, pid, 0, _PTRACE_O_TRACEEXEC)
 
 
 def wait_exec_stop(pid, timeout=120):
@@ -3104,8 +3335,10 @@ def ptrace_continue(pid):
     _ptrace(_PTRACE_CONT, pid)
 
 
-def ptrace_detach(pid):
-    _ptrace(_PTRACE_DETACH, pid)
+def ptrace_detach(pid, ctx):
+    with cleanup_section():
+        _ptrace(_PTRACE_DETACH, pid)
+        ctx.traced[:] = [owner for owner in ctx.traced if owner.pid != pid]
 
 
 def wait_caller_admitted(jsonl_path, pid, exe, timeout=90):
@@ -3169,6 +3402,38 @@ def create_tracked(ctx, path):
     return group, ctx.groups[before]
 
 
+def replace_tracked(ctx, selected, wrapper):
+    """Replace only the held empty directory and immediately own its successor."""
+    if wrapper not in ctx.groups or wrapper.group is not selected:
+        raise SetupError("replacement target is not the leg's owned cgroup")
+    with cleanup_section():
+        old_ino, path = selected.identity[1], selected.path
+        # Retain the removed inode until the new directory is acquired so
+        # inode reuse cannot erase the identity distinction under test.
+        held = os.dup(selected.fd)
+        try:
+            try:
+                wrapper.remove()  # retains parent/path/held-FD and emptiness checks
+            except Exception as error:
+                case = getattr(ctx, "case", ctx)
+                detail = f"replacement cgroup: {type(error).__name__}: {error}"
+                case.cleanup_failed = True
+                case.cleanup_errors.append(detail)
+                raise LegCleanupError(detail) from error
+            finally:
+                # CreatedDirectory.remove closes its group and parent FDs on
+                # success or refusal. Do not retry a closed wrapper later.
+                ctx.groups.remove(wrapper)
+                getattr(ctx, "case", ctx).cleanup_totals["cgroups"] += 1
+            replacement, enrolled = create_tracked(ctx, path)
+            new_ino = replacement.identity[1]
+            if new_ino == old_ino:
+                raise SetupError("replacement cgroup reused the held original inode")
+            return replacement, enrolled, old_ino, new_ino
+        finally:
+            os.close(held)
+
+
 def fixup_renamed_wrappers(moves, top_wrapper, new_top, children):
     """Repoint cleanup wrappers after an owned rename; verify + record.
 
@@ -3188,6 +3453,7 @@ def fixup_renamed_wrappers(moves, top_wrapper, new_top, children):
     moves.append({"t": monotonic_ns(), "cgroup": str(new_top), "note": "rename-held"})
 
 
+@owned_leg
 def run_cgroup_r1(ctx, cell_dir, backend):
     """Inside -> outside exec -> descendant re-entry, same-image move, rename."""
     leg_dir = Path(cell_dir) / backend / "trace"
@@ -3198,7 +3464,7 @@ def run_cgroup_r1(ctx, cell_dir, backend):
         path = leg_dir / name
         shutil.copyfile(ctx.pins["caller"].path, path)
         path.chmod(0o755)
-        pins[name] = FilePin(path)
+        pins[name] = leg_pin(ctx, path)
     provider = ctx.provider_pin
     root, _ = create_tracked(ctx, Path("/sys/fs/cgroup") / f"p11scope-h6-{uuid.uuid4().hex[:8]}")
     selected, selected_w = create_tracked(ctx, root.path / "selected")
@@ -3341,6 +3607,7 @@ def counted_totals(batches, started_ns):
     return totals
 
 
+@owned_leg
 def run_cgroup_inventory_r5(ctx, cell_dir, backend):
     """R5: post-reentry S1 inventory; successor frozen until admission proof."""
     leg_dir = Path(cell_dir) / backend / "inventory"
@@ -3380,14 +3647,14 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
     s_pid = owned_s.pid
     move_and_verify(selected, owned_x, moves, "X-initial")
     move_and_verify(selected, owned_s, moves, "S0-initial")
-    seize_until_exec(x_pid)
+    seize_until_exec(x_pid, ctx, owned_x)
     owned, capture, errors, started, doc_path, log_path = spawn_inventory(
         ctx, leg_dir, ["--cgroup", str(selected.path)], [], ["--manifest", str(manifest_path)],
         backend, 300)
     try:
         ready = wait_inventory_ready(owned, errors, log_path, backend)
     except BackendRefused as refused:
-        ptrace_detach(x_pid)
+        ptrace_detach(x_pid, ctx)
         owned_x.popen.send_signal(signal.SIGINT)
         owned_s.popen.send_signal(signal.SIGINT)
         receipt = {"cell": "cgroup-reentry", "leg": f"inventory/{backend}",
@@ -3412,7 +3679,7 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
     out_s.wait(lambda r: any(line.startswith("DONE ") for line in r.lines), 60)
     settled = wait_passes(log_path, wait_passes(log_path, 1) + 2)
     obs_rc, stopped, latency = stop_inventory(owned)
-    ptrace_detach(x_pid)
+    ptrace_detach(x_pid, ctx)
     owned_x.popen.send_signal(signal.SIGINT)
     owned_s.popen.send_signal(signal.SIGINT)
     x_rc = owned_x.popen.wait(timeout=15)
@@ -3471,6 +3738,7 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
     return result
 
 
+@owned_leg
 def run_system_mixed(ctx, cell_dir, backend):
     """system-mixed: execing + sibling same-file callers, attested + count-only.
 
@@ -3525,14 +3793,14 @@ def run_system_mixed(ctx, cell_dir, backend):
     wait_ledger_line(out_f, "READY ", timeout=60)
     e_pid, s_pid, f_pid = owned_e.pid, owned_s.pid, owned_f.pid
     provider_f.unlink()
-    seize_until_exec(e_pid)
+    seize_until_exec(e_pid, ctx, owned_e)
     owned, capture, errors, started, doc_path, log_path = spawn_inventory(
         ctx, leg_dir, ["--system"], [], ["--manifest", str(manifest_path)],
         backend, 300)
     try:
         ready = wait_inventory_ready(owned, errors, log_path, backend)
     except BackendRefused as refused:
-        ptrace_detach(e_pid)
+        ptrace_detach(e_pid, ctx)
         for owned_p in (owned_e, owned_s, owned_f):
             owned_p.popen.send_signal(signal.SIGINT)
         receipt = {"cell": "system-mixed", "leg": f"inventory/{backend}",
@@ -3555,7 +3823,7 @@ def run_system_mixed(ctx, cell_dir, backend):
     out_f.wait(lambda r: any(line.startswith("DONE ") for line in r.lines), 120)
     settled = wait_passes(log_path, wait_passes(log_path, 1) + 2)
     obs_rc, stopped, latency = stop_inventory(owned)
-    ptrace_detach(e_pid)
+    ptrace_detach(e_pid, ctx)
     for owned_p in (owned_e, owned_s, owned_f):
         owned_p.popen.send_signal(signal.SIGINT)
     e_rc = owned_e.popen.wait(timeout=15)
@@ -3650,11 +3918,18 @@ def run_cell_backend(ctx, cell, backend):
     """Run one cell x backend; SetupError becomes a recorded error result."""
     cell_dir = ctx.out / cell
     cell_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+    completed_before = len(ctx.completed_results)
     try:
         results = CELL_RUNNERS[cell](ctx, cell_dir, backend)
+    except LegCleanupError as error:
+        ctx.cleanup_failed = True
+        results = [*ctx.completed_results[completed_before:],
+                   {"pass": False, "status": "error", "cell": cell, "leg": backend,
+                    "errors": [f"{type(error).__name__}: {error}"]}]
     except (SetupError, TimeoutError, AssertionError, OSError,
             ValueError, subprocess.SubprocessError) as error:
-        results = [{"pass": False, "status": "error", "cell": cell,
+        results = [*ctx.completed_results[completed_before:],
+                   {"pass": False, "status": "error", "cell": cell,
                     "leg": backend, "errors": [f"{type(error).__name__}: {error}"]}]
     for result in results:
         result.setdefault("cell", cell)
@@ -3720,56 +3995,52 @@ def main(argv=None):
                 pins.append(ctx.provider_pin)
                 ctx.discover_pin = FilePin(args.discover)
                 pins.append(ctx.discover_pin)
-            ctx.pins = compile_case_fixtures(args.out / "bin")
+            ctx.pins = compile_case_fixtures(args.out / "bin", pins)
             ctx.b_file_offset = symbol_file_offset(
                 str(args.out / "bin" / "provider.so"), "C_Initialize")
             for cell in cells:
                 for backend in backends:
                     results.extend(run_cell_backend(ctx, cell, backend))
-            summary = {
-                "source_revision": args.source_revision,
-                "candidate": ctx.binary.metadata(),
-                "provider": ctx.provider_pin.metadata(),
-                "abi": "Linux x86-64 LP64", "kernel": os.uname().release,
-                "cells": [cell for cell in cells for _ in backends],
-                "backends": list(backends),
-                "legs": results,
-                "passed": sum(1 for result in results if result.get("pass")),
-                "failed": sum(1 for result in results if not result.get("pass")),
-                "unexecuted": [name for name in CELLS if name not in cells],
-            }
-            write_json(args.out / "summary.json", summary)
-            print(json.dumps({"passed": summary["passed"], "failed": summary["failed"],
-                              "out": str(args.out)}), flush=True)
-            return 0 if summary["failed"] == 0 else 1
+                    if ctx.cleanup_failed:
+                        break
+                if ctx.cleanup_failed:
+                    break
         finally:
             with cleanup_section():
-                cleanup_receipt["processes"] = len(ctx.owners)
-                cleanup_receipt["cgroups"] = len(ctx.groups)
-                try:
-                    cleanup_processes(ctx.owners)
-                except Exception as error:  # noqa: BLE001 - receipt must record
-                    cleanup_receipt["errors"].append(f"processes: {error}")
-                for reader in ctx.readers:
-                    if isinstance(reader, PtyCapture):
-                        try:
-                            reader.finish()
-                        except (ValueError, TimeoutError) as error:
-                            cleanup_receipt["errors"].append(f"PTY reader: {error}")
-                try:
-                    cleanup_cgroups(ctx.groups)
-                except Exception as error:  # noqa: BLE001 - receipt must record
-                    cleanup_receipt["errors"].append(f"cgroups: {error}")
-                for pin in reversed(pins):
+                for scope in reversed(ctx.scopes):
                     try:
-                        pin.close()
-                        cleanup_receipt["pins"] += 1
-                    except Exception as error:  # noqa: BLE001 - receipt must record
-                        cleanup_receipt["errors"].append(f"pin: {error}")
+                        cleanup_leg_resources(scope)
+                    except LegCleanupError:
+                        pass  # the adapter has retained every failure on the case
+                ctx.leg_pins.extend(pins)
+                pins.clear()
+                try:
+                    cleanup_leg_resources(ctx)
+                except LegCleanupError:
+                    pass
+                cleanup_receipt.update(ctx.cleanup_totals, errors=list(ctx.cleanup_errors))
                 try:
                     write_json(args.out / "cleanup.json", cleanup_receipt)
                 except OSError as error:
+                    ctx.cleanup_failed = True
+                    ctx.cleanup_errors.append(f"cleanup receipt unwritable: {error}")
                     print(f"cleanup receipt unwritable: {error}", flush=True)
+    if ctx.cleanup_failed:
+        results.append({"cell": "harness", "leg": "cleanup", "status": "error", "pass": False,
+                        "errors": list(ctx.cleanup_errors)})
+    summary = {
+        "source_revision": args.source_revision,
+        "candidate": ctx.binary.metadata(), "provider": ctx.provider_pin.metadata(),
+        "abi": "Linux x86-64 LP64", "kernel": os.uname().release,
+        "cells": [cell for cell in cells for _ in backends], "backends": list(backends),
+        "legs": results,
+        "passed": sum(1 for result in results if result.get("pass")),
+        "failed": sum(1 for result in results if not result.get("pass")),
+        "unexecuted": [name for name in CELLS if name not in cells],
+    }
+    write_json(args.out / "summary.json", summary)
+    print(json.dumps({"passed": summary["passed"], "failed": summary["failed"], "out": str(args.out)}), flush=True)
+    return 0 if summary["failed"] == 0 else 1
 
 
 def spawn_inventory(ctx, leg_dir, scope_args, module_args, manifest_args,
@@ -3786,9 +4057,8 @@ def spawn_inventory(ctx, leg_dir, scope_args, module_args, manifest_args,
     owned = spawn_owned(ctx.owners, argv, 0, stdin=subprocess.DEVNULL,
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                         text=True, env=dict(os.environ), start_new_session=True)
-    capture = Reader(owned.popen.stdout, leg_dir / f"{tag}.stdout.txt")
-    errors = Reader(owned.popen.stderr, leg_dir / f"{tag}.stderr.txt")
-    ctx.readers.extend((capture, errors))
+    capture = owned_reader(ctx.readers, Reader, owned.popen.stdout, leg_dir / f"{tag}.stdout.txt")
+    errors = owned_reader(ctx.readers, Reader, owned.popen.stderr, leg_dir / f"{tag}.stderr.txt")
     return owned, capture, errors, started, doc_path, log_path
 
 
@@ -3849,6 +4119,7 @@ def ledger_pids(reader):
     return pids
 
 
+@owned_leg
 def run_cgroup_stop_before(ctx, cell_dir, backend):
     """R3: stop before the first completed collection; capture stays empty."""
     leg_dir = Path(cell_dir) / backend / "stop-before"
@@ -3857,7 +4128,7 @@ def run_cgroup_stop_before(ctx, cell_dir, backend):
     image = leg_dir / "caller-a"
     shutil.copyfile(ctx.pins["caller"].path, image)
     image.chmod(0o755)
-    pin = FilePin(image)
+    pin = leg_pin(ctx, image)
     provider = ctx.provider_pin
     root, _ = create_tracked(ctx, Path("/sys/fs/cgroup") / f"p11scope-h6-{uuid.uuid4().hex[:8]}")
     selected, _ = create_tracked(ctx, root.path / "selected")
@@ -3898,6 +4169,7 @@ def run_cgroup_stop_before(ctx, cell_dir, backend):
     return result
 
 
+@owned_leg
 def run_cgroup_stop_during(ctx, cell_dir, backend):
     """R4: stop during final membership work; completed phases stay intact."""
     leg_dir = Path(cell_dir) / backend / "stop-during"
@@ -3908,7 +4180,7 @@ def run_cgroup_stop_during(ctx, cell_dir, backend):
         path = leg_dir / name
         shutil.copyfile(ctx.pins["caller"].path, path)
         path.chmod(0o755)
-        pins[name] = FilePin(path)
+        pins[name] = leg_pin(ctx, path)
     provider = ctx.provider_pin
     root, _ = create_tracked(ctx, Path("/sys/fs/cgroup") / f"p11scope-h6-{uuid.uuid4().hex[:8]}")
     selected, _ = create_tracked(ctx, root.path / "selected")

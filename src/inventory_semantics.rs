@@ -288,6 +288,10 @@ pub(crate) struct AttestedSemanticLane {
     domain: NativeDomainId,
     live: Option<Box<LiveLane>>,
     startup_failed: bool,
+    /// When the lane's latest batch was staged for commit: the driver
+    /// stamps it on stage and clears it on publish, so a tick can
+    /// commit a staged batch before its receipts expire.
+    staged_at: Option<Instant>,
     /// Tests-only substituted H0 I/O (see [`LaneTestIo`]): installed
     /// by tests that drive the production finalize path without a
     /// live Session.
@@ -488,6 +492,7 @@ impl AttestedSemanticLane {
             domain,
             live: None,
             startup_failed: false,
+            staged_at: None,
             #[cfg(test)]
             test_io: None,
             #[cfg(test)]
@@ -550,6 +555,7 @@ impl AttestedSemanticLane {
                 stashed_refresh: RefreshReceiptStash::new(),
             })),
             startup_failed: false,
+            staged_at: None,
             #[cfg(test)]
             test_io: None,
             #[cfg(test)]
@@ -580,6 +586,32 @@ impl AttestedSemanticLane {
 
     pub(crate) fn domain(&self) -> NativeDomainId {
         self.domain
+    }
+
+    /// Stamp the lane's latest batch staged: the driver calls this
+    /// when it stages a tick batch for commit.
+    pub(crate) fn note_semantic_staged(&mut self) {
+        self.staged_at = Some(Instant::now());
+    }
+
+    /// Clear the staged stamp: the driver calls this when a commit
+    /// publishes the staged quantum.
+    pub(crate) fn note_semantic_published(&mut self) {
+        self.staged_at = None;
+    }
+
+    /// How long the staged quantum has awaited publication, if one is
+    /// staged: the driver commits a stale staged batch on tick, so
+    /// staged evidence finalizes inside its receipt window.
+    pub(crate) fn staged_semantic_age(&self) -> Option<Duration> {
+        self.staged_at.map(|at| at.elapsed())
+    }
+
+    /// Backdate the staged stamp (tests age a staged batch without
+    /// sleeping through the staleness deadline).
+    #[cfg(test)]
+    pub(crate) fn age_staged_for_test(&mut self, at: Instant) {
+        self.staged_at = Some(at);
     }
 
     /// Install tests-only substituted H0 I/O (see [`LaneTestIo`]):

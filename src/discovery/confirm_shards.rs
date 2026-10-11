@@ -1043,6 +1043,7 @@ where
                 budget,
                 &immediate,
                 make_io,
+                hook.as_deref_mut(),
             );
             position += 1;
             continue;
@@ -1091,6 +1092,7 @@ where
                 budget,
                 &immediate,
                 make_io,
+                hook.as_deref_mut(),
             );
             position += 1;
             continue;
@@ -1242,6 +1244,7 @@ fn immediate_one<Io: ShardableIo, F: Fn() -> Io>(
     budget: &mut CaptureWorkBudget,
     resources: &IoResources,
     make_io: &F,
+    hook: Option<&mut (dyn SegmentProof + '_)>,
 ) {
     let (pid, entries) = &sweep[position];
     let recorded = record(
@@ -1293,16 +1296,28 @@ fn immediate_one<Io: ShardableIo, F: Fn() -> Io>(
             MappedIdentities::new(),
         ),
         PreparedState::Failed(confirmation) => (Some(confirmation), prepared.mapped),
-        PreparedState::Idle { .. } if idle_needs_promotion(index, entries, &prepared.mapped) => (
-            Some(confirm_with_resources(
-                &mut make_io(),
-                *pid,
-                prove,
-                budget,
-                Some(resources),
-            )),
-            prepared.mapped,
-        ),
+        PreparedState::Idle { .. } if idle_needs_promotion(index, entries, &prepared.mapped) => {
+            // With a kernel hook installed, the promotion is a charged
+            // per-PID promotion, not a userspace reopen: prepare on a
+            // retained pin, prove through the shared hook (counting the
+            // attempt on the borrowed pidfd), and finish. Pure-userspace
+            // (`None`) keeps the direct confirmation below, byte-identical.
+            let confirmation = match hook {
+                Some(hook) => {
+                    let mut io = make_io();
+                    match prepare_confirmation(&mut io, *pid, prove, budget, Some(resources)) {
+                        Ok(prepared) => prove_and_finish_prepared(
+                            &mut io, *pid, prepared, hook, resources, budget,
+                        ),
+                        Err(confirmation) => confirmation,
+                    }
+                }
+                None => {
+                    confirm_with_resources(&mut make_io(), *pid, prove, budget, Some(resources))
+                }
+            };
+            (Some(confirmation), prepared.mapped)
+        }
         _ => (None, prepared.mapped),
     };
     attribute_one(
@@ -1650,6 +1665,71 @@ mod kernel_promotion_tests {
         // substitution), and the member still attributes inside its
         // original pin through the userspace fallback.
         assert!(calls[1].userspace);
+        assert_eq!(
+            out.members
+                .iter()
+                .map(|member| member.pid)
+                .collect::<Vec<_>>(),
+            [PROMOTED],
+            "the promoted member attributes through the disclosed fallback"
+        );
+    }
+
+    /// The immediate path (`retained == 0`) consults the hook for its
+    /// phase-D promotion too: one charged single-Confirm batch on the
+    /// retained pin's borrowed pidfd, never a hook-bypassing reopen.
+    #[test]
+    fn immediate_promotion_with_hook_charges_prepare_prove_finish_on_the_pin() {
+        let opens = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let make_io = || FakeIo {
+            opens: opens.clone(),
+        };
+        let sweep = vec![(PROMOTED, phase_one())];
+        // Headroom 5 keeps the immediate envelope (headroom >= 3) while
+        // forcing `retained == 0` (no workers), so this PID runs through
+        // `immediate_one`.
+        let policy = SegmentPolicy::from_headroom(5, 1, sweep.len());
+        assert_eq!(policy.retained, 0);
+        let owner = ReservationOwner::new(policy);
+        let mut budget = CaptureWorkBudget::default();
+        let mut hook = ScriptedHook {
+            calls: calls.clone(),
+            reason: RunFailure::TargetLimit,
+        };
+        let out = attribute_unselected_with_segment_proof(
+            &sweep,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &index(),
+            &mut budget,
+            policy,
+            &owner,
+            1,
+            &make_io,
+            &mut hook,
+        );
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the immediate promotion must consult the hook instead of bypassing it"
+        );
+        let opens = opens.lock().unwrap();
+        assert_eq!(
+            opens.len(),
+            1,
+            "the promotion opens one pin, never a reopen"
+        );
+        assert_eq!(opens[0].0, PROMOTED);
+        assert_eq!(calls[0].pids, [PROMOTED]);
+        assert_eq!(calls[0].confirms, [true]);
+        assert_eq!(
+            calls[0].pidfds,
+            [Some(opens[0].1)],
+            "the promotion proves on the borrowed pin, not a numeric reopen"
+        );
+        assert!(calls[0].userspace);
         assert_eq!(
             out.members
                 .iter()

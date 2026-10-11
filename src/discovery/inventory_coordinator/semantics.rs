@@ -491,6 +491,67 @@ impl InventoryCoordinator<OsProcessSource> {
         identity: &mut dyn NativeIdentity<PidPin>,
     ) -> Result<(), SemanticBindingRefusal> {
         use SemanticBindingRefusal as Refusal;
+        let pid = match self.checked_binding_pid(caller, &module, domain, image, identity)? {
+            None => return Ok(()),
+            Some(pid) => pid,
+        };
+        // The single duplication, only on the accept path: the stored Arc
+        // is then shared with H0 refresh/ticks and gap episodes.
+        let pin = self
+            .adapter
+            .live_pin(pid)
+            .and_then(|(_, pin)| pin.try_clone().ok())
+            .map(Arc::new)
+            .ok_or(Refusal::ImageUnproven(UnboundReason::CallerExited))?;
+        self.semantic_bindings.insert(SemanticCallerBinding {
+            caller,
+            module,
+            domain,
+            image,
+            pin,
+        })
+    }
+
+    /// Bind one semantic caller through H0 refresh custody: identical proof
+    /// to [`bind_semantic_caller`](Self::bind_semantic_caller), but the
+    /// stored Arc is the exact one the caller gives H0's `refresh_candidate`,
+    /// never a re-duplication. H0's `ptr_eq` gates refuse any other Arc.
+    /// Re-proof of an accepted binding keeps the stored Arc.
+    pub(crate) fn bind_semantic_caller_with_pin(
+        &mut self,
+        caller: CallerId,
+        module: ModuleKey,
+        domain: NativeDomainId,
+        image: ImageIdentity,
+        identity: &mut dyn NativeIdentity<PidPin>,
+        pin: Arc<PidPin>,
+    ) -> Result<(), SemanticBindingRefusal> {
+        match self.checked_binding_pid(caller, &module, domain, image, identity)? {
+            None => Ok(()),
+            Some(_) => self.semantic_bindings.insert(SemanticCallerBinding {
+                caller,
+                module,
+                domain,
+                image,
+                pin,
+            }),
+        }
+    }
+
+    /// The shared bind check-and-prove prologue: the caller must be the
+    /// live incarnation for its pid, with its original pin and a fully
+    /// established mapping bracketed by fresh same-custody queries. An
+    /// accepted binding re-proves in place (`None`: nothing to insert);
+    /// otherwise the fresh proof passed for the returned pid.
+    fn checked_binding_pid(
+        &mut self,
+        caller: CallerId,
+        module: &ModuleKey,
+        domain: NativeDomainId,
+        image: ImageIdentity,
+        identity: &mut dyn NativeIdentity<PidPin>,
+    ) -> Result<Option<u32>, SemanticBindingRefusal> {
+        use SemanticBindingRefusal as Refusal;
         // The live incarnation for its pid: a reused pid number names
         // another incarnation or none, never this binding.
         let pid = {
@@ -514,28 +575,14 @@ impl InventoryCoordinator<OsProcessSource> {
             if existing.image() != image {
                 return Err(Refusal::ImageUnproven(UnboundReason::ExecAmbiguous));
             }
-            if existing.module() != &module {
+            if existing.module() != module {
                 return Err(Refusal::ModuleConflict);
             }
-            self.prove_binding(caller, pid, &module, domain, image, identity)?;
-            return Ok(());
+            self.prove_binding(caller, pid, module, domain, image, identity)?;
+            return Ok(None);
         }
-        self.prove_binding(caller, pid, &module, domain, image, identity)?;
-        // The single duplication, only on the accept path: the stored Arc
-        // is then shared with H0 refresh/ticks and gap episodes.
-        let pin = self
-            .adapter
-            .live_pin(pid)
-            .and_then(|(_, pin)| pin.try_clone().ok())
-            .map(Arc::new)
-            .ok_or(Refusal::ImageUnproven(UnboundReason::CallerExited))?;
-        self.semantic_bindings.insert(SemanticCallerBinding {
-            caller,
-            module,
-            domain,
-            image,
-            pin,
-        })
+        self.prove_binding(caller, pid, module, domain, image, identity)?;
+        Ok(Some(pid))
     }
 
     /// Fresh proof for one binding: a proven current sighting in this

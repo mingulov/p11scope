@@ -1611,9 +1611,29 @@ fn ordinary_entry_width_specialization_refuses_before_observation() {
     );
     assert!(production.contains("attach_path_for(slot.object)"));
     assert!(production.contains("abi_for(slot.object)"));
+    let abi_resolution = "collect::<Result<_>>()?";
+    let observed_attachment = "attach_targets_observed_with(";
+    require_before(
+        production,
+        abi_resolution,
+        observed_attachment,
+        "retained ABI resolution before observed attachment",
+    )
+    .unwrap();
+    let late_abi = production.replacen(abi_resolution, "", 1).replacen(
+        observed_attachment,
+        &format!("{observed_attachment}{abi_resolution}"),
+        1,
+    );
     assert!(
-        production.find("collect::<Result<_>>()?").unwrap()
-            < production.find("attach_targets_with(").unwrap()
+        require_before(
+            &late_abi,
+            abi_resolution,
+            observed_attachment,
+            "retained ABI resolution before observed attachment",
+        )
+        .is_err(),
+        "ABI resolution after the observed helper must be refused"
     );
 }
 

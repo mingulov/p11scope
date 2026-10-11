@@ -411,6 +411,43 @@ class CapacityOracleTests(unittest.TestCase):
             lambda _m, _l, late: late["budgets"]["inventory_attach_modules"].update(occupied=61),
             1, "CAPACITY-REFUSAL-RECORDS")
 
+    def test_refusal_rejects_refusing_every_provider(self):
+        def refuse_all(manifest, _ledger, late):
+            limit = manifest["limit"]
+            sizes = {provider["key"]: len(provider["offsets"]) for provider in manifest["providers"]}
+            for module, provider in zip(late["modules"], manifest["providers"]):
+                unique = sizes[provider["key"]]
+                module["admission"] = {"state": "refused", "endpoints": None,
+                                        "reasons": [f"module needs {unique} more; only {limit} attach slots "
+                                                    f"are available; 0 are in use (0 active, 0 retired) \u2014 "
+                                                    f"refusing to attach a prefix; to capture one provider, "
+                                                    f"name it with --module <path>"]}
+            late["budgets"]["inventory_endpoints"]["occupied"] = 0
+            late["budgets"]["inventory_attach_modules"]["occupied"] = 0
+            late["budgets"]["endpoints"]["occupied"] = 0
+            for edge in late["edges"]:
+                edge["entries"]["count"] = 0
+        self.run_refusal_case(refuse_all, 1, "CAPACITY-REFUSAL-MINIMAL")
+
+    def test_refusal_rejects_unnecessary_second_refusal(self):
+        def refuse_two(manifest, _ledger, late):
+            limit = manifest["limit"]
+            sizes = {provider["key"]: len(provider["offsets"]) for provider in manifest["providers"]}
+            extra = manifest["providers"][-2]
+            unique = sizes[extra["key"]]
+            admitted = sum(sizes[provider["key"]] for provider in manifest["providers"][:-2])
+            late["modules"][-2]["admission"] = {"state": "refused", "endpoints": None,
+                                                "reasons": [f"module needs {unique} more; only {limit} attach slots "
+                                                            f"are available; {admitted} are in use ({admitted} active, "
+                                                            f"0 retired; held by /owned/0.so 68) \u2014 refusing to "
+                                                            f"attach a prefix; to capture one provider, name it "
+                                                            f"with --module <path>"]}
+            late["budgets"]["inventory_endpoints"]["occupied"] = admitted
+            late["budgets"]["inventory_attach_modules"]["occupied"] = len(manifest["providers"]) - 2
+            late["budgets"]["endpoints"]["occupied"] = admitted
+            late["edges"][-2]["entries"]["count"] = 0
+        self.run_refusal_case(refuse_two, 1, "CAPACITY-REFUSAL-MINIMAL")
+
     def test_refusal_scan_lane_is_nonqualifying(self):
         def scan(manifest, _ledger, late):
             manifest["expect_lane"] = "scan"

@@ -38,22 +38,18 @@ and cleanup receipts are recorded in summary.json.
 
 import argparse
 from collections import Counter, defaultdict, deque
-import copy
 import ctypes
 import hashlib
 import json
 import os
 from pathlib import Path
 import queue
-import random
 import re
 import runpy
 import shutil
 import signal
-import stat
 import subprocess
 import sys
-import threading
 import time
 import uuid
 
@@ -1674,7 +1670,7 @@ def observer_ready(owned, errors, backend, timeout=20):
     try:
         wait_capture_started(errors, seconds=timeout)
         return monotonic_ns()
-    except (TimeoutError, ValueError) as error:
+    except (TimeoutError, ValueError):
         pass
     rc = owned.popen.poll()
     tail = "".join(errors.lines[-20:])

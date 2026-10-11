@@ -39,6 +39,10 @@ and cleanup receipts are recorded in summary.json.
 import argparse
 from collections import Counter, defaultdict, deque
 import ctypes
+import errno
+import codecs
+import pty
+import threading
 import hashlib
 import json
 import os
@@ -48,6 +52,7 @@ import re
 import runpy
 import shutil
 import signal
+import select
 import subprocess
 import sys
 import time
@@ -106,6 +111,118 @@ def _without_sink(value):
             scheduling.pop(field, None)
         value["scheduling"] = scheduling
     return value
+
+
+def _early_gap_errors(ev, missing):
+    if not missing:
+        return []
+    observation = ev.get("gap_classes", {}).get("observation", {})
+    # Link-loss counts from an independently abandoned frame alone say
+    # nothing about unobserved successor calls. Do not fabricate native loss
+    # or broaden a count-only attribution verdict into an observation gap.
+    relevant = (ev.get("unprotected_live_windows", 0) > 0
+                and "unprotected_live_windows" in observation.get("causes", []))
+    if (ev.get("completeness") != "PARTIAL" or ev.get("verdict_detail") != "concrete_gap"
+            or observation.get("status") != "lossy" or not relevant):
+        return ["early deficit lacks relevant real product concrete-gap/PARTIAL evidence"]
+    return []
+
+
+def _trace_successor_populations(trace, rows, in_window, receipt, images):
+    """Match exact stable groups; never kth-match an early missing prefix.
+
+    Saved public stream cursors partition sequential owned image generations.
+    The fixture is idle before each exec; completed stable groups are drained
+    before a later exec. Keys also carry image and measured/early phase class.
+    """
+    errors, hints, matches = [], {}, {}
+    proofs = receipt.get("successor_ready", [])
+    positions = [index for index, line in enumerate(trace.splitlines()) if ROW.fullmatch(line)]
+    boundaries = sorted((proof["output_cursor"], proof["image"]) for proof in proofs)
+    for proof in proofs:
+        index = proof["proof_cursor"] - 1
+        lines = trace.splitlines()
+        match = ROW.fullmatch(lines[index]) if 0 <= index < len(lines) else None
+        image = images[proof["image"]]
+        if (proof["proof_kind"] != "trace-row" or not match
+                or int(match["pid"]) != image["pid"] or match["fn"] != proof["marker_fn"]
+                or not match["path"] or json.loads(match["path"]) != image["path"]
+                or json.loads(match["label"]) != Path(image["path"]).name):
+            errors.append("successor proof does not identify a fresh correctly named public marker row")
+    if len(proofs) > 1:
+        if receipt.get("trace_generation_guards") is not True or len({proof["marker_fn"] for proof in proofs}) != len(proofs):
+            errors.append("reused successor generations lack distinguishable public marker guards")
+        lines = trace.splitlines()
+        for transition in receipt.get("exec_transitions", []):
+            proof = next(proof for proof in proofs if proof["image"] == transition["to_image"])
+            previous = images[transition["from_image"]]
+            drained = [phase for phase in receipt.get("phases", [])
+                       if phase["image"] == previous["image"] and "output_end" in phase]
+            if not drained:
+                errors.append("reused successor generation lacks a drained prior public phase boundary")
+            for phase in drained:
+                cursor, end = phase["output_cursor"], phase["output_end"]
+                observed = [match for line in lines[cursor:end] if (match := ROW.fullmatch(line))
+                            and int(match["pid"]) == previous["pid"] and match["fn"] == phase["fn"]]
+                if (not 0 <= cursor < end <= proof["output_cursor"] or len(observed) != phase["count"]
+                        or any(not match["path"] or json.loads(match["path"]) != previous["path"] for match in observed)):
+                    errors.append("prior public phase drain guard disagrees with its independent population/image")
+    wants = defaultdict(list)
+    got = defaultdict(list)
+    for call in in_window:
+        proof = next((proof for proof in proofs if proof["image"] == call["image"]), None)
+        group = "measured" if proof and call["t0"] >= proof["observed_ns"] else "early"
+        wants[call["image"], call["pid"], call["tid"], call["fn"], group].append(call)
+    initial_image = min(images)
+    for index, row in enumerate(rows):
+        image_id = initial_image
+        for cursor, candidate in boundaries:
+            if positions[index] >= cursor:
+                image_id = candidate
+        candidates = {call["image"] for call in in_window
+                      if (call["pid"], call["tid"], call["fn"]) == (row["pid"], row["tid"], row["fn"])}
+        if len(candidates) == 1:
+            image_id = next(iter(candidates))
+        hints[index] = image_id
+        group = "early"
+        # A saved, validated readiness cursor separates shared warm/measured
+        # function keys. Never use rendered timestamps as workload time.
+        image_proof = next((proof for proof in proofs if proof["image"] == image_id), None)
+        if image_proof and positions[index] >= image_proof["proof_cursor"]:
+            key = image_id, row["pid"], row["tid"], row["fn"], "measured"
+            if key in wants:
+                group = "measured"
+        got[image_id, row["pid"], row["tid"], row["fn"], group].append((index, row))
+    early_expected = early_named = early_unknown = missing = 0
+    for key in wants.keys() | got.keys():
+        expected, observed = wants[key], got[key]
+        if len(observed) > len(expected):
+            errors.append("duplicate return or outside-scope or foreign count in guarded public population")
+        if key[-1] == "measured":
+            if len(observed) != len(expected):
+                errors.append("stable measured population disagrees with its fixed ledger")
+            if any(row["path"] is None for _, row in observed):
+                errors.append("stable measured positive contains unknown executable rows")
+            # Only an exact group permits order-matching provider return codes.
+            if len(expected) == len(observed):
+                for (index, _), call in zip(observed, expected):
+                    matches[index] = call
+        else:
+            early_expected += len(expected)
+            early_named += sum(row["path"] is not None for _, row in observed)
+            early_unknown += sum(row["path"] is None for _, row in observed)
+            missing += max(0, len(expected) - len(observed))
+            # An exact early group can compare RV order; a deficit only
+            # compares its multiset upper bound, never assigns kth calls.
+            allowed = Counter(RV_NAMES[call["rv"]] for call in expected)
+            actual_rvs = Counter(row["rv"] for _, row in observed)
+            if any(actual_rvs[rv] > allowed[rv] for rv in actual_rvs):
+                errors.append("early provider returns exceed independently ledgered RV population")
+            if len(expected) == len(observed):
+                for (index, _), call in zip(observed, expected):
+                    matches[index] = call
+    return matches, hints, {"expected": early_expected, "observed_named": early_named,
+                           "observed_unknown": early_unknown, "deficit": missing}, errors
 
 
 def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
@@ -299,41 +416,52 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
     for _, call in sorted(enumerate(in_window), key=lambda pair: (pair[1]["t0"], pair[0])):
         expected_calls[call["pid"], call["tid"], call["fn"]].append(call)
     actual = Counter((row["pid"], row["tid"], row["fn"]) for row in rows)
-    for key in sorted(actual.keys() | mandatory.keys()):
-        if mandatory[key] == 0 and actual[key] > 0:
-            errors.append(
-                f"outside-scope or foreign count: captured {actual[key]} rows for no "
-                f"ledgered in-scope call: {key}")
-        elif actual[key] > mandatory[key]:
-            errors.append(
-                f"duplicate return: captured {actual[key]} rows for {mandatory[key]} "
-                f"ledgered calls: {key}")
-        elif actual[key] < mandatory[key]:
-            errors.append(
-                f"captured provider-call population disagrees with ledger: {key}: "
-                f"ledger {mandatory[key]} captured {actual[key]}")
-    # H6-DELTA: order-matched attribution. When lossless and per-key exact,
-    # the k-th row of a key is the k-th ledger call: reused keys across
-    # generations (rapid-chain) attribute by order. Under loss or mismatch
-    # there is no attribution: reused keys are ambiguous (fail, like N3).
-    lossless = bool(evidence) and all(
-        evidence[0].get(field, 0) == 0
-        for field in ("event_loss", "start_insert_failures", "unmatched_returns",
-                      "rv_update_failures", "cgroup_scope_failures",
-                      "process_tracking_failures", "process_tracking_evictions"))
-    exact = all(actual[key] == mandatory[key] for key in actual.keys() | mandatory.keys())
-    order_match: dict = {}
+    early_coverage = None
+    row_image_hints = {}
     ambiguous_keys = [key for key, ids in expected_images.items() if len(ids) != 1]
-    if lossless and exact and mandatory:
-        per_key_rows: dict = defaultdict(list)
-        for index, row in enumerate(rows):
-            per_key_rows[row["pid"], row["tid"], row["fn"]].append((index, row))
-        for key, ledgered in expected_calls.items():
-            for (index, _), call in zip(sorted(per_key_rows.get(key, [])), list(ledgered)):
-                order_match[index] = call
-    elif ambiguous_keys:
-        errors.append("ambiguous image generation for a reused key under loss; "
-                      "a stronger oracle is required")
+    order_match = {}
+    if receipt.get("successor_ready"):
+        order_match, row_image_hints, early_coverage, population_errors = _trace_successor_populations(
+            trace, rows, in_window, receipt, images)
+        errors.extend(population_errors)
+        errors.extend(_early_gap_errors(evidence[0] if evidence else {}, early_coverage["deficit"]))
+        ambiguous_keys = []  # Independently guarded by public stream cursors.
+    else:
+        for key in sorted(actual.keys() | mandatory.keys()):
+            if mandatory[key] == 0 and actual[key] > 0:
+                errors.append(
+                    f"outside-scope or foreign count: captured {actual[key]} rows for no "
+                    f"ledgered in-scope call: {key}")
+            elif actual[key] > mandatory[key]:
+                errors.append(
+                    f"duplicate return: captured {actual[key]} rows for {mandatory[key]} "
+                    f"ledgered calls: {key}")
+            elif actual[key] < mandatory[key]:
+                errors.append(
+                    f"captured provider-call population disagrees with ledger: {key}: "
+                    f"ledger {mandatory[key]} captured {actual[key]}")
+        # H6-DELTA: order-matched attribution. When lossless and per-key exact,
+        # the k-th row of a key is the k-th ledger call: reused keys across
+        # generations (rapid-chain) attribute by order. Under loss or mismatch
+        # there is no attribution: reused keys are ambiguous (fail, like N3).
+        lossless = bool(evidence) and all(
+            evidence[0].get(field, 0) == 0
+            for field in ("event_loss", "start_insert_failures", "unmatched_returns",
+                          "rv_update_failures", "cgroup_scope_failures",
+                          "process_tracking_failures", "process_tracking_evictions"))
+        exact = all(actual[key] == mandatory[key] for key in actual.keys() | mandatory.keys())
+        order_match: dict = {}
+        ambiguous_keys = [key for key, ids in expected_images.items() if len(ids) != 1]
+        if lossless and exact and mandatory:
+            per_key_rows: dict = defaultdict(list)
+            for index, row in enumerate(rows):
+                per_key_rows[row["pid"], row["tid"], row["fn"]].append((index, row))
+            for key, ledgered in expected_calls.items():
+                for (index, _), call in zip(sorted(per_key_rows.get(key, [])), list(ledgered)):
+                    order_match[index] = call
+        elif ambiguous_keys:
+            errors.append("ambiguous image generation for a reused key under loss; "
+                          "a stronger oracle is required")
     # H6-DELTA: pid/system purity (no global fallback links).
     if scope_kind == "pid":
         for row in rows:
@@ -370,11 +498,12 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
                 if row["path"] != image["path"] or row["label"] != Path(image["path"]).name:
                     false_names += 1
             else:
-                ids = expected_images.get(key, set())
+                ids = {row_image_hints[index]} if index in row_image_hints else expected_images.get(key, set())
                 if (len(ids) != 1 or row["path"] != images[next(iter(ids))]["path"]
                         or row["label"] != Path(row["path"]).name):
                     false_names += 1
-        ids = {matched["image"]} if matched is not None else expected_images.get(key, set())
+        ids = ({matched["image"]} if matched is not None else
+               {row_image_hints[index]} if index in row_image_hints else expected_images.get(key, set()))
         if len(ids) == 1:
             image_id = next(iter(ids))
             field = "named" if row["path"] else "unknown"
@@ -383,7 +512,7 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
             first_rows.setdefault(image_id, (index, row))
             if matched is not None:
                 phase_populations[matched["phase"]][field] += 1
-            elif expected_calls[key]:
+            elif not early_coverage and expected_calls[key]:
                 phase_populations[expected_calls[key].popleft()["phase"]][field] += 1
     if false_names:
         errors.append("capture published an executable other than the independently observed image")
@@ -410,9 +539,9 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
     # returns, completed operations, named calls and unknowns are distinct
     # units: entries minus returns must equal the ledgered abandoned count.
     abandoned = receipt.get("abandoned_expected", 0)
-    entered = len(in_window) + abandoned
+    entered = len(rows) + abandoned
     if counts and any([counts[0].get("stats_entered") != entered,
-                       counts[0].get("stats_returned") != len(in_window),
+                       counts[0].get("stats_returned") != len(rows),
                        counts[0].get("raw_calls") != len(rows)]):
         errors.append("terminal counts disagree with independently accounted physical entries/"
                       "returns/completions")
@@ -450,7 +579,8 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
             "calls": len(rows), "named": named, "unknown": unknown, "false_names": false_names,
             "named_share": named / len(rows) if rows else None,
             "unknown_share": unknown / len(rows) if rows else None,
-            "physical_entered": entered, "api_returned": len(in_window),
+            "physical_entered": entered, "api_returned": len(rows),
+            "expected_api_returns": len(in_window), "early_coverage": early_coverage,
             "completed_operations": len(rows), "abandoned": abandoned,
             "pre_ready_calls": pre_ready, "post_stop_calls": post_stop,
             "out_of_scope_calls": out_of_scope,
@@ -511,7 +641,7 @@ def _check_group_death_proof(death, receipt):
     return errors
 
 
-def _check_measured_warmup(calls, receipt, ready, stop, start):
+def _check_measured_warmup(calls, receipt, ready, stop, start, capture_kind="public"):
     """Shared measured/warmup gate. Returns (measured_calls, warmup_calls, errors)."""
     errors = []
     measured = receipt.get("measured")
@@ -541,6 +671,42 @@ def _check_measured_warmup(calls, receipt, ready, stop, start):
                 not warmup["t0"] <= call["t0"] <= call["t1"] <= warmup["t1"]
                 for call in warmup_calls):
             errors.append("warm-up phase disagrees with its declared ledger population/window")
+    # Inventory retains its existing admission/ptrace contract. This policy
+    # is explicit at its call site; it is not provider readiness qualification.
+    if capture_kind == "inventory-admission":
+        return measured_calls, warmup_calls, errors
+    transitions = receipt.get("exec_transitions", [])
+    if not transitions:
+        if receipt.get("successor_policy") != "no-transition":
+            errors.append("no-transition control lacks its explicit successor exemption")
+        if receipt.get("successor_ready"):
+            errors.append("no-transition control carries a successor proof")
+        return measured_calls, warmup_calls, errors
+    proofs = receipt.get("successor_ready", [])
+    expected_images = {transition["to_image"] for transition in transitions}
+    if (receipt.get("successor_policy") != "public-successor"
+            or len(proofs) != len(expected_images)
+            or {proof.get("image") for proof in proofs} != expected_images):
+        errors.append("missing current-image public successor readiness proof")
+        return measured_calls, warmup_calls, errors
+    for proof in proofs:
+        attempts = [call for call in warmup_calls
+                    if call["image"] == proof["image"] and call["phase"] in proof.get("phases", [])]
+        image = next((image for image in receipt["images"] if image["image"] == proof["image"]), None)
+        if image is None:
+            errors.append("successor proof lacks an independent current-image receipt")
+            continue
+        if (proof.get("proof_kind") not in ("trace-row", "live-counter")
+                or not 1 <= proof.get("attempts", 0) == len(attempts) <= proof.get("max_attempts", 0) <= 40
+                or not image.get("t", start) <= proof["started_ns"] <= proof["observed_ns"] <= proof["deadline_ns"]
+                or not 0 < proof["deadline_ns"] - proof["started_ns"] <= 20_000_000_000
+                or not 0 <= proof["output_cursor"] < proof["proof_cursor"]
+                or any(call["fn"] != proof["marker_fn"] or not
+                       proof["started_ns"] <= call["t0"] <= call["t1"] <= proof["observed_ns"]
+                       for call in attempts)
+                or any(call["t0"] < proof["observed_ns"] for call in measured_calls
+                       if call["image"] == proof["image"])):
+            errors.append("invalid bounded successor warm-up/proof or measurement before successor readiness")
     return measured_calls, warmup_calls, errors
 
 
@@ -664,20 +830,56 @@ def _evaluate_aggregate_h6(doc, stdout_text, ledger, receipt, mode):
         got_completed[label] += function.get("calls", 0)
         got_errors[label] += function.get("errors", 0)
         got_in_flight[label] += function.get("in_flight", 0)
-    for fn in sorted(set(expect_completed) | set(got_completed)):
-        if got_completed[fn] > expect_completed[fn]:
-            errors.append(
-                f"duplicate return: function {fn}: captured {got_completed[fn]} completed "
-                f"for {expect_completed[fn]} ledgered calls")
-        elif got_completed[fn] < expect_completed[fn]:
-            errors.append(
-                f"aggregate population disagrees with ledger: function {fn}: "
-                f"ledger {expect_completed[fn]} captured {got_completed[fn]}")
-    for fn in sorted(set(expect_errors) | set(got_errors)):
-        if got_errors[fn] != expect_errors[fn]:
-            errors.append(
-                f"aggregate returned-error population disagrees with ledger: function {fn}: "
-                f"ledger {expect_errors[fn]} captured {got_errors[fn]}")
+    early_coverage = None
+    if receipt.get("successor_ready"):
+        frames = parse_live_frames(stdout_text)
+        proofs = receipt["successor_ready"]
+        for proof in proofs:
+            if (proof["proof_kind"] != "live-counter" or proof.get("baseline") not in frames
+                    or proof.get("snapshot") not in frames
+                    or proof["baseline"]["cursor"] != proof["output_cursor"]
+                    or proof["snapshot"]["cursor"] != proof["proof_cursor"]
+                    or proof["snapshot"]["start_cursor"] < proof["output_cursor"]
+                    or proof["snapshot"]["functions"].get(proof["marker_fn"], {}).get("calls", 0)
+                    <= proof["baseline"]["functions"].get(proof["marker_fn"], {}).get("calls", 0)):
+                errors.append("successor proof lacks a fresh same-observer complete counter snapshot")
+        snapshot = proofs[-1].get("snapshot", {}).get("functions", {})
+        expected_measured = Counter(call["fn"] for call in measured_calls)
+        expected_measured_errors = Counter(call["fn"] for call in measured_calls if call["rv"])
+        stable_completed = Counter({fn: got_completed[fn] - snapshot.get(fn, {}).get("calls", 0)
+                                    for fn in set(got_completed) | set(snapshot)})
+        stable_errors = Counter({fn: got_errors[fn] - snapshot.get(fn, {}).get("errors", 0)
+                                 for fn in set(got_errors) | set(snapshot)})
+        if stable_completed != expected_measured or stable_errors != expected_measured_errors:
+            errors.append("stable measured aggregate population disagrees with its fixed ledger")
+        early_expected = Counter(call["fn"] for call in in_window if call not in measured_calls)
+        early_observed = Counter({fn: row["calls"] for fn, row in snapshot.items()})
+        if any(early_observed[fn] > early_expected[fn] for fn in early_observed):
+            errors.append("duplicate return or outside-scope early aggregate population")
+        early_allowed_errors = Counter(call["fn"] for call in in_window
+                                       if call not in measured_calls and call["rv"])
+        if any(row["errors"] > early_allowed_errors[fn] for fn, row in snapshot.items()):
+            errors.append("early aggregate returned errors exceed independently ledgered population")
+        missing = sum(max(0, early_expected[fn] - early_observed[fn]) for fn in early_expected)
+        early_coverage = {"expected": sum(early_expected.values()),
+                          "observed_named": sum(early_observed.values()), "observed_unknown": 0,
+                          "deficit": missing}
+        errors.extend(_early_gap_errors(doc.get("evidence", {}), missing))
+    else:
+        for fn in sorted(set(expect_completed) | set(got_completed)):
+            if got_completed[fn] > expect_completed[fn]:
+                errors.append(
+                    f"duplicate return: function {fn}: captured {got_completed[fn]} completed "
+                    f"for {expect_completed[fn]} ledgered calls")
+            elif got_completed[fn] < expect_completed[fn]:
+                errors.append(
+                    f"aggregate population disagrees with ledger: function {fn}: "
+                    f"ledger {expect_completed[fn]} captured {got_completed[fn]}")
+        for fn in sorted(set(expect_errors) | set(got_errors)):
+            if got_errors[fn] != expect_errors[fn]:
+                errors.append(
+                    f"aggregate returned-error population disagrees with ledger: function {fn}: "
+                    f"ledger {expect_errors[fn]} captured {got_errors[fn]}")
     for fn in sorted(set(abandoned_by_fn) | set(got_in_flight)):
         if got_in_flight[fn] != abandoned_by_fn[fn]:
             errors.append(
@@ -686,16 +888,26 @@ def _evaluate_aggregate_h6(doc, stdout_text, ledger, receipt, mode):
     total_completed = sum(got_completed.values())
     total_errors = sum(got_errors.values())
     total_in_flight = sum(got_in_flight.values())
-    match = re.search(
-        r"(\d+) completed calls; (\d+) returned errors; (\d+) entries without an observed return\.",
-        stdout_text)
-    if not match or tuple(int(v) for v in match.groups()) != (
-            total_completed, total_errors, total_in_flight):
+    if receipt.get("successor_ready"):
+        frames = parse_live_frames(stdout_text)
+        match_totals = frames[-1]["totals"] if frames else None
+        if frames and frames[-1]["functions"] != {
+                fn: {"calls": got_completed[fn], "errors": got_errors[fn], "in_flight": got_in_flight[fn]}
+                for fn in got_completed if got_completed[fn] or got_in_flight[fn]}:
+            errors.append("aggregate last complete frame disagrees with JSON function counters")
+    else:
+        matches = list(LIVE_TOTALS.finditer(stdout_text))
+        match_totals = [int(v) for v in matches[-1].groups()] if matches else None
+    if match_totals != [total_completed, total_errors, total_in_flight]:
         errors.append("aggregate stdout totals disagree with the JSON document")
     abandoned = sum(abandoned_by_fn.values())
     if receipt.get("abandoned_expected", 0) != abandoned:
         errors.append("receipt abandoned count disagrees with its per-function attribution")
     ev = doc.get("evidence", {})
+    if any(ev.get(field, 0) != 0 for field in
+           ("event_loss", "start_insert_failures", "unmatched_returns", "rv_update_failures",
+            "cgroup_scope_failures", "process_tracking_failures", "process_tracking_evictions")):
+        errors.append("aggregate capture reports event/identity loss in this no-loss cell")
     if ev.get("attach_failures"):
         errors.append("aggregate capture reports attach failures")
     if (ev.get("attach_backend") or {}).get("fallback") is not None:
@@ -711,8 +923,9 @@ def _evaluate_aggregate_h6(doc, stdout_text, ledger, receipt, mode):
             "completed_calls": total_completed, "returned_errors": total_errors,
             "in_flight": total_in_flight, "abandoned": abandoned,
             "named_calls": named_calls, "unknown_calls": unknown_calls,
-            "physical_entered": len(in_window) + abandoned,
-            "api_returned": len(in_window),
+            "physical_entered": total_completed + abandoned,
+            "api_returned": total_completed, "expected_api_returns": len(in_window),
+            "early_coverage": early_coverage,
             "pre_ready_calls": pre_ready, "post_stop_calls": post_stop,
             "out_of_scope_calls": out_of_scope,
             "measured_calls": len(measured_calls), "warmup_calls": len(warmup_calls),
@@ -969,7 +1182,7 @@ def _evaluate_inventory_h6(doc, ledgers, receipt):
     start, ready, stop = (receipt[field] for field in
                           ("observer_started_ns", "observer_ready_ns", "observer_stopped_ns"))
     measured_calls, warmup_calls, gate_errors = _check_measured_warmup(
-        calls, receipt, ready, stop, start)
+        calls, receipt, ready, stop, start, capture_kind="inventory-admission")
     errors.extend(gate_errors)
     in_window, pre_ready, post_stop, out_of_scope, boundary_errors = _select_in_window(
         calls, receipt, ready, stop)
@@ -1412,10 +1625,13 @@ class BDriver:
         self.lines: dict = {}
         self.tasks: dict = {}
         self.index = 0
+        self.warm_calls = []
         token = int.from_bytes(os.urandom(8), "little") | 1
         absent = self.leg_dir / "must-not-exist"
         argv = [str(before_pin.path), str(provider_pin.path), str(after_pin.path),
                str(absent), str(os.getpid()), str(token), mode, str(measured), str(delay_ms)]
+        if mode != "1":
+            argv.append("1")  # opt-in real successor W commands; legacy mode1 unchanged
         self.token = token
         self.owned = spawn_owned(
             owners, argv, uid, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -1436,9 +1652,9 @@ class BDriver:
 
     def send(self, byte, name):
         self.owned.verify()
+        self.stamps[name] = monotonic_ns()  # lower bound before a fast child can read
         self.owned.popen.stdin.write(byte)
         self.owned.popen.stdin.flush()
-        self.stamps[name] = monotonic_ns()
 
     def snapshot_tasks(self, name):
         self.tasks[name] = proc_task_states(self.pid)
@@ -1497,6 +1713,20 @@ class BDriver:
         assert proc_birth_ticks(self.pid) == self.birth
         self.snapshot_tasks("post_exec")
         return line
+
+    def warm_attempt(self, sequence, remaining):
+        phase = f"successor-1-{sequence}"
+        self.send("W", phase)
+        done = self.expect("WARM_DONE", timeout=remaining)
+        fields = [int(field) for field in done.split()[1:]]
+        if (fields[:4] != [self.pid, self.pid, sequence, 0]
+                or not self.stamps[phase] <= fields[4] <= fields[5] <= self.stamps["WARM_DONE"]):
+            raise SetupError("WARM_DONE does not match the independently issued real call")
+        self.warm_calls.append({"kind": "call", "image": 1, "pid": self.pid, "tid": self.pid,
+                                "fn": "C_GetInfo", "rv": fields[3], "phase": phase,
+                                "scope": "selected", "sess": 0, "seq": sequence,
+                                "t0": fields[4], "t1": fields[5]})
+        return phase
 
     def post_exec(self):
         self.send("P", "P")
@@ -1570,6 +1800,12 @@ class BDriver:
             ledger.append({"kind": "target", "image": 1, "fn": "C_Initialize",
                            "dev": self.maps1[2], "ino": self.maps1[3], "file_offset": file_offset,
                            "vaddr": self.maps1[0] + (file_offset - self.maps1[1])})
+            if self.warm_calls:
+                offset = symbol_file_offset(self.provider_pin.path, "C_GetInfo")
+                ledger.append({"kind": "target", "image": 1, "fn": "C_GetInfo",
+                               "dev": self.maps1[2], "ino": self.maps1[3], "file_offset": offset,
+                               "vaddr": self.maps1[0] + (offset - self.maps1[1])})
+                ledger.extend(self.warm_calls)
             post_rvs = [0] + [5 if i % 2 == 1 else 0 for i in range(1, self.measured)]
             for seq, rv in enumerate(post_rvs):
                 ledger.append({"kind": "call", "image": 1, "pid": self.pid, "tid": self.pid,
@@ -1669,13 +1905,251 @@ def build_manifest(discover_pin, module_path, out_path, env, uid, gid):
     return manifest
 
 
-def spawn_observer(owners, readers, leg_dir, argv, env):
+LIVE_PREFIX = "\x1b[2J\x1b[H"
+LIVE_TOTALS = re.compile(r"(\d+) completed calls; (\d+) returned errors; (\d+) entries without an observed return\.")
+LIVE_ROW = re.compile(r"(\S+)\s+(\d+)\s+(\d+)\s+\S+\s+\S+\s+\S+\s+(\d+)")
+
+
+def parse_live_frames(text, final=True):
+    """Parse complete public LiveDisplay snapshots, never sum redraws.
+
+    Cursors are character offsets in the captured stream, not rendered wall
+    clocks. A frame commits only at its terminating Evidence line/newline.
+    """
+    if len(text.encode("utf-8")) > 8 * 1024 * 1024:
+        raise ValueError("owned PTY output exceeds bounded byte limit")
+    frames = []
+    offset = 0
+    while offset < len(text):
+        if not text.startswith(LIVE_PREFIX, offset):
+            if not final and LIVE_PREFIX.startswith(text[offset:]):
+                break
+            raise ValueError("malformed public live frame prefix")
+        next_frame = text.find(LIVE_PREFIX, offset + len(LIVE_PREFIX))
+        if next_frame < 0 and not final:
+            partial = text.rfind("\x1b", offset + len(LIVE_PREFIX))
+            if partial >= 0 and LIVE_PREFIX.startswith(text[partial:]):
+                next_frame = partial
+        end = next_frame if next_frame >= 0 else len(text)
+        frame = text[offset + len(LIVE_PREFIX):end].replace("\r\n", "\n")
+        if len(frame.encode("utf-8")) > 65536:
+            raise ValueError("public live frame exceeds bounded size")
+        lines = frame.splitlines(keepends=True)
+        terminated = bool(lines and lines[-1].startswith("Evidence: ") and lines[-1].endswith("\n"))
+        if not terminated:
+            if final or next_frame >= 0:
+                raise ValueError("incomplete public live frame")
+            break
+        if not lines[0].startswith("p11scope — ") or "\x1b" in frame:
+            raise ValueError("malformed public live frame")
+        totals = [LIVE_TOTALS.fullmatch(line.strip()) for line in lines]
+        totals = [match for match in totals if match]
+        headers = [index for index, line in enumerate(lines) if line.startswith("FUNCTION ")]
+        if len(totals) != 1 or len(headers) != 1:
+            raise ValueError("malformed public live summary/table")
+        functions = {}
+        for line in lines[headers[0] + 1:]:
+            if line.startswith("(~ = "):
+                break
+            match = LIVE_ROW.fullmatch(line.strip())
+            if not match or match[1] in functions:
+                raise ValueError("malformed or duplicate public live function row")
+            functions[match[1]] = dict(zip(("calls", "errors", "in_flight"),
+                                          (int(match[2]), int(match[3]), int(match[4]))))
+        total = [int(value) for value in totals[0].groups()]
+        if total != [sum(row[field] for row in functions.values())
+                     for field in ("calls", "errors", "in_flight")]:
+            raise ValueError("public live totals disagree with function rows")
+        frames.append({"cursor": end, "start_cursor": offset, "functions": functions,
+                       "totals": total, "evidence_line": lines[-1].strip()})
+        offset = end
+    return frames
+
+
+class PtyCapture:
+    """Own and drain one PTY master; Linux EIO after slave close is EOF."""
+    def __init__(self, master, path):
+        self.master, self.path = master, Path(path)
+        self.lines, self.frames, self.errors = [], [], []
+        self.updates = queue.Queue()
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._read, daemon=True)
+        self.thread.start()
+
+    def _read(self):
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        text = ""
+        total = 0
+        try:
+            with self.path.open("w", encoding="utf-8") as output:
+                while not self.stop.is_set():
+                    if not select.select([self.master], [], [], 0.2)[0]:
+                        continue
+                    try:
+                        chunk = os.read(self.master, 4096)
+                    except OSError as error:
+                        if error.errno == errno.EIO:
+                            break
+                        raise
+                    if not chunk:
+                        break
+                    piece = decoder.decode(chunk)
+                    total += len(chunk)
+                    if total > 8 * 1024 * 1024 and not self.errors:
+                        self.errors.append("owned PTY output exceeds bounded byte limit")
+                    if not self.errors:
+                        output.write(piece)
+                        output.flush()
+                        text += piece
+                        try:
+                            self.frames = parse_live_frames(text, final=False)
+                            self.lines = [text]
+                        except ValueError as error:
+                            self.errors.append(str(error))
+                    self.updates.put(None)
+                decoder.decode(b"", final=True)
+                if not self.errors:
+                    self.frames = parse_live_frames(text, final=True)
+        except (ValueError, UnicodeError, OSError) as error:
+            self.errors.append(str(error))
+        finally:
+            os.close(self.master)
+            self.updates.put(None)
+
+    def finish(self, timeout=5):
+        self.thread.join(timeout)
+        if self.thread.is_alive():
+            self.stop.set()
+            self.thread.join(1)
+            raise TimeoutError("owned PTY reader did not reach EOF")
+        if self.errors:
+            raise ValueError("; ".join(self.errors))
+
+
+def _output_wait(capture, predicate, deadline_ns):
+    while True:
+        if monotonic_ns() >= deadline_ns:
+            raise TimeoutError("successor public proof deadline exhausted")
+        if capture.errors:
+            raise SetupError("; ".join(capture.errors))
+        result = predicate()
+        if result is not None:
+            return result
+        remaining = (deadline_ns - monotonic_ns()) / 1e9
+        if remaining <= 0:
+            raise TimeoutError("successor public proof deadline exhausted")
+        if not capture.thread.is_alive():
+            raise EOFError("observer stream ended before successor public proof")
+        try:
+            capture.updates.get(timeout=min(remaining, 0.2))
+        except queue.Empty:
+            pass
+
+
+def warm_successor(capture, image, attempt, mode="trace", marker_fn="C_GetInfo",
+                   max_attempts=20, timeout=15, output_cursor=None):
+    """Bound real single-call attempts and require this observer's fresh proof.
+
+    attempt(seq, remaining_seconds) returns a distinct independently ledgered
+    phase. All calls/attempts remain in that ledger, including dark attempts.
+    """
+    if mode not in ("trace", "profile", "metrics") or not 1 <= max_attempts <= 40 or not 0 < timeout <= 20:
+        raise ValueError("invalid successor warm-up budget")
+    started = monotonic_ns()
+    deadline = started + int(timeout * 1e9)
+    baseline = None
+    if mode == "trace":
+        cursor = len(capture.lines) if output_cursor is None else output_cursor
+    else:
+        baseline = _output_wait(capture, lambda: capture.frames[-1] if capture.frames else None, deadline)
+        cursor = baseline["cursor"]
+    phases = []
+    for seq in range(1, max_attempts + 1):
+        remaining = (deadline - monotonic_ns()) / 1e9
+        if remaining <= 0:
+            raise TimeoutError("successor warm-up deadline exhausted")
+        phases.append(attempt(seq, remaining))
+        # A bounded observation interval permits another real attempt when
+        # discovery is still cold; it never substitutes a sleep for proof.
+        attempt_deadline = min(deadline, monotonic_ns() + 500_000_000)
+        def fresh_proof():
+            if mode == "trace":
+                for index in range(cursor, len(capture.lines)):
+                    match = ROW.fullmatch(capture.lines[index].strip())
+                    if (match and int(match["pid"]) == image["pid"]
+                            and match["fn"] == marker_fn and match["rv"] == "CKR_OK" and match["path"]
+                            and json.loads(match["path"]) == image["path"]
+                            and json.loads(match["label"]) == Path(image["path"]).name):
+                        return {"proof_cursor": index + 1}
+            else:
+                before = baseline["functions"].get(marker_fn, {}).get("calls", 0)
+                for frame in capture.frames:
+                    if (frame["start_cursor"] >= cursor
+                            and frame["functions"].get(marker_fn, {}).get("calls", 0) > before):
+                        return {"proof_cursor": frame["cursor"], "baseline": baseline,
+                                "snapshot": frame}
+            return None
+        try:
+            proof = _output_wait(capture, fresh_proof, attempt_deadline)
+        except TimeoutError:
+            continue
+        return {"image": image["image"], "started_ns": started, "observed_ns": monotonic_ns(),
+                "deadline_ns": deadline, "attempts": seq, "max_attempts": max_attempts,
+                "output_cursor": cursor, "proof_kind": "trace-row" if mode == "trace" else "live-counter",
+                "marker_fn": marker_fn, "phases": phases, **proof}
+    raise TimeoutError("successor warm-up attempt budget exhausted")
+
+
+def warm_caller(capture, caller, stdout, image, phases, mode="trace", group=None, output_cursor=None,
+                marker_fn="C_GetInfo"):
+    def attempt(seq, remaining):
+        phase = f"successor-{image['image']}-{seq}"
+        n3_command(caller, stdout, marker_fn, 1, 0, phase, "selected",
+                   image["image"], group, phases, acknowledgement_seconds=remaining)
+        return phase
+    return warm_successor(capture, image, attempt, mode, marker_fn=marker_fn, output_cursor=output_cursor)
+
+
+def drain_trace_phase(capture, caller, stdout, fn, count, delay, phase, image, phases, group=None):
+    cursor = len(capture.lines)
+    n3_command(caller, stdout, fn, count, delay, phase, "selected", image, group, phases)
+    deadline = monotonic_ns() + 10_000_000_000
+    def population():
+        matched = [match for line in capture.lines[cursor:]
+                   if (match := ROW.fullmatch(line.strip())) and int(match["pid"]) == caller.pid
+                   and match["fn"] == fn]
+        return len(matched) if len(matched) >= count else None
+    _output_wait(capture, population, deadline)
+    phases[-1].update(output_cursor=cursor, output_end=len(capture.lines))
+
+
+def warmup_receipt(phases, measured_t0):
+    early = [phase for phase in phases if phase["t1"] <= measured_t0]
+    return {"label": "early including successor attempts", "t0": min(phase["t0"] for phase in early),
+            "t1": max(phase["t1"] for phase in early), "expected_calls": sum(phase["count"] for phase in early),
+            "phases": [phase["phase"] for phase in early]}
+
+
+def spawn_observer(owners, readers, leg_dir, argv, env, live=False):
     """Spawn an observer; returns (owned, capture, errors, started_ns)."""
     started = monotonic_ns()
-    owned = spawn_owned(owners, argv, 0, stdin=subprocess.DEVNULL,
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        text=True, env=env, start_new_session=True)
-    capture = Reader(owned.popen.stdout, Path(leg_dir) / "observer.stdout.txt")
+    if live:
+        master, slave = pty.openpty()
+        try:
+            owned = spawn_owned(owners, argv, 0, stdin=subprocess.DEVNULL,
+                                stdout=slave, stderr=subprocess.PIPE,
+                                text=True, env=env, start_new_session=True)
+            capture = PtyCapture(master, Path(leg_dir) / "observer.stdout.txt")
+        except BaseException:
+            os.close(master)
+            raise
+        finally:
+            os.close(slave)
+    else:
+        owned = spawn_owned(owners, argv, 0, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=env, start_new_session=True)
+        capture = Reader(owned.popen.stdout, Path(leg_dir) / "observer.stdout.txt")
     errors = Reader(owned.popen.stderr, Path(leg_dir) / "observer.stderr.txt")
     readers.extend((capture, errors))
     return owned, capture, errors, started
@@ -1924,7 +2398,7 @@ def run_pid_caller_leg(ctx, cell, backend, observer_kind, leg_dir, same_path, pr
                "--mode", mode, *backend_args, "--duration", "120s",
                "-o", str(leg_dir / f"{observer_kind}.json")]
     owned, capture, errors, started = spawn_observer(
-        ctx.owners, ctx.readers, leg_dir, argv, env)
+        ctx.owners, ctx.readers, leg_dir, argv, env, live=observer_kind != "trace")
     try:
         ready = observer_ready(owned, errors, backend)
     except BackendRefused as refused:
@@ -1936,11 +2410,16 @@ def run_pid_caller_leg(ctx, cell, backend, observer_kind, leg_dir, same_path, pr
         write_json(leg_dir / "result.json", result)
         return result
     phases = []
-    n3_command(caller, stdout, "C_GenerateRandom", 3, 100, "warm", "selected",
-               0, None, phases)
+    if observer_kind == "trace":
+        drain_trace_phase(capture, caller, stdout, "C_GenerateRandom", 3, 100, "warm", 0, phases)
+    else:
+        n3_command(caller, stdout, "C_GenerateRandom", 3, 100, "warm", "selected", 0, None, phases)
+    output_cursor = len(capture.lines) if observer_kind == "trace" else None
     request, _, t0, t1 = caller_exec(caller, stdout, images, "exec", pin_b)
     transitions = [{"from_image": 0, "to_image": 1, "mode": "leader",
                     "same_path": bool(same_path), "t0": t0, "t1": t1, "request": request}]
+    proof = warm_caller(capture, caller, stdout, images[-1], phases, observer_kind,
+                        output_cursor=output_cursor)
     n3_command(caller, stdout, "C_GetSessionInfo", 10, 200, "measured", "selected",
                1, None, phases)
     obs_rc, stopped, latency = stop_observer(owned)
@@ -1948,7 +2427,6 @@ def run_pid_caller_leg(ctx, cell, backend, observer_kind, leg_dir, same_path, pr
     finish_readers([stdout, capture, errors])
     ledger = list(stdout.records)
     measured = next(p for p in phases if p["phase"] == "measured")
-    warmup = next(p for p in phases if p["phase"] == "warm")
     receipt = {
         "cell": cell, "leg": f"{observer_kind}/{backend}", "scope_kind": "pid",
         "pid": caller.pid, "known_tids": [caller.pid], "owned_pids": [caller.pid],
@@ -1963,10 +2441,10 @@ def run_pid_caller_leg(ctx, cell, backend, observer_kind, leg_dir, same_path, pr
         "time_namespace": caller.identity["time_namespace"],
         "measured": {"label": "stable", "t0": measured["t0"], "t1": measured["t1"],
                      "expected_calls": 10, "phases": ["measured"]},
-        "warmup": {"label": "pre", "t0": warmup["t0"], "t1": warmup["t1"],
-                   "expected_calls": 3, "phases": ["warm"]},
+        "warmup": warmup_receipt(phases, measured["t0"]),
+        "successor_policy": "public-successor", "successor_ready": [proof],
         "exec_transitions": transitions, "phases": phases,
-        "require_named": True, "require_named_images": [1], "first_unknown_images": [1],
+        "require_named": True, "require_named_images": [1], "first_unknown_images": [],
         "manual_rebind": False, "abandoned_expected": 0, "abandoned_by_fn": {},
         "reuse_expected": {"session": True, "va": bool(same_path)},
         "session_reuse": session_reuse_from(ledger), "va_reuse": va_reuse_from(ledger),
@@ -2024,7 +2502,7 @@ def run_b_leg(ctx, cell, backend, observer_kind, leg_dir, mode, measured=25, del
                "--mode", agg, *backend_args, "--duration", "180s",
                "-o", str(leg_dir / f"{observer_kind}.json")]
     owned, capture, errors, started = spawn_observer(
-        ctx.owners, ctx.readers, leg_dir, argv, env)
+        ctx.owners, ctx.readers, leg_dir, argv, env, live=observer_kind != "trace")
     try:
         ready = observer_ready(owned, errors, backend)
     except BackendRefused as refused:
@@ -2038,11 +2516,14 @@ def run_b_leg(ctx, cell, backend, observer_kind, leg_dir, mode, measured=25, del
         return result
     driver.start_worker()
     driver.pre_exec()
+    output_cursor = len(capture.lines) if observer_kind == "trace" else None
     driver.do_exec()
     failed = mode == "1"
     if failed:
         driver.post_fail()
     else:
+        proof = warm_successor(capture, {"image": 1, "pid": driver.pid, "path": driver.exe1},
+                               driver.warm_attempt, observer_kind, output_cursor=output_cursor)
         driver.post_exec()
     obs_rc, stopped, latency = stop_observer(owned)
     caller_rc = driver.finish()
@@ -2087,6 +2568,10 @@ def run_b_leg(ctx, cell, backend, observer_kind, leg_dir, mode, measured=25, del
         require_named_images = [1]
         require_named = True
         abandoned = 1
+    warm_phases = [{"image": 1, "fn": "C_GetInfo", "phase": call["phase"],
+                    "scope": "selected", "count": 1, "t0": call["t0"], "t1": call["t1"]}
+                   for call in driver.warm_calls]
+    phases = [pre_phase, *warm_phases, post_phase]
     receipt = {
         "cell": cell, "leg": f"{observer_kind}/{backend}", "scope_kind": "pid",
         "pid": driver.pid, "known_tids": [driver.pid, driver.worker_tid],
@@ -2102,9 +2587,10 @@ def run_b_leg(ctx, cell, backend, observer_kind, leg_dir, mode, measured=25, del
         "time_namespace": driver.owned.identity["time_namespace"],
         "measured": {"label": "stable", "t0": post_phase["t0"], "t1": post_phase["t1"],
                      "expected_calls": post_phase["count"], "phases": ["post"]},
-        "warmup": {"label": "pre", "t0": pre_phase["t0"], "t1": pre_phase["t1"],
-                   "expected_calls": 11, "phases": ["pre"]},
-        "exec_transitions": transitions, "phases": [pre_phase, post_phase],
+        "warmup": warmup_receipt(phases, post_phase["t0"]),
+        "successor_policy": "no-transition" if failed else "public-successor",
+        "successor_ready": [] if failed else [proof],
+        "exec_transitions": transitions, "phases": phases,
         "require_named": require_named, "require_named_images": require_named_images,
         "first_unknown_images": [],
         "manual_rebind": False, "abandoned_expected": abandoned,
@@ -2189,26 +2675,29 @@ def run_rapid_chain(ctx, cell_dir, backend):
         write_json(leg_dir / "result.json", result)
         return [result]
     phases = []
-    # Same function in every generation: order-matched attribution.
-    n3_command(caller, stdout, "C_GenerateRandom", 2, 50, "warm", "selected",
-               0, None, phases)
+    # Sequential public stream boundaries distinguish reused function keys.
+    drain_trace_phase(capture, caller, stdout, "C_GenerateRandom", 2, 50, "warm", 0, phases)
     order = [("caller-b", 1, "gen1"), ("caller-a", 2, "gen2"), ("caller-b", 3, "measured")]
-    transitions = []
+    transitions, proofs = [], []
     for name, image, phase in order:
+        output_cursor = len(capture.lines)
         request, _, t0, t1 = caller_exec(caller, stdout, images, "exec", pins[name])
         transitions.append({"from_image": image - 1, "to_image": image, "mode": "leader",
                             "same_path": False, "t0": t0, "t1": t1, "request": request})
+        proofs.append(warm_caller(capture, caller, stdout, images[-1], phases,
+                                  output_cursor=output_cursor,
+                                  marker_fn={1: "C_GetInfo", 2: "C_GetSessionInfo",
+                                             3: "C_GenerateRandom"}[image]))
         count = 10 if phase == "measured" else 2
         delay = 200 if phase == "measured" else 50
-        n3_command(caller, stdout, "C_GenerateRandom", count, delay, phase, "selected",
-                   image, None, phases)
+        fn = {1: "C_GenerateRandom", 2: "C_GetInfo", 3: "C_GetSessionInfo"}[image]
+        drain_trace_phase(capture, caller, stdout, fn, count, delay, phase, image, phases)
     obs_rc, stopped, latency = stop_observer(owned)
     dead_pid = caller.pid
     caller_rc = stop_caller(caller, stdout, 3)
     finish_readers([stdout, capture, errors])
     ledger = list(stdout.records)
     measured = next(p for p in phases if p["phase"] == "measured")
-    warmup = next(p for p in phases if p["phase"] == "warm")
     receipt = {
         "cell": "rapid-chain", "leg": f"trace/{backend}", "scope_kind": "pid",
         "pid": dead_pid, "known_tids": [dead_pid], "owned_pids": [dead_pid],
@@ -2223,11 +2712,11 @@ def run_rapid_chain(ctx, cell_dir, backend):
         "time_namespace": caller.identity["time_namespace"],
         "measured": {"label": "stable", "t0": measured["t0"], "t1": measured["t1"],
                      "expected_calls": 10, "phases": ["measured"]},
-        "warmup": {"label": "pre", "t0": warmup["t0"], "t1": warmup["t1"],
-                   "expected_calls": 2, "phases": ["warm"]},
+        "warmup": warmup_receipt(phases, measured["t0"]),
+        "successor_policy": "public-successor", "successor_ready": proofs, "trace_generation_guards": True,
         "exec_transitions": transitions, "phases": phases,
         "require_named": True, "require_named_images": [3],
-        "first_unknown_images": [1, 2, 3],
+        "first_unknown_images": [],
         "manual_rebind": False, "abandoned_expected": 0, "abandoned_by_fn": {},
         "reuse_expected": {"session": True},
         "session_reuse": session_reuse_from(ledger),
@@ -2295,7 +2784,7 @@ def run_reuse_control(ctx, leg_dir, backend, env, dead_pid, image_pin):
                    "expected_calls": 0, "phases": []},
         "exec_transitions": [], "phases": phases,
         "require_named": True, "require_named_images": [0], "first_unknown_images": [],
-        "manual_rebind": False, "abandoned_expected": 0, "abandoned_by_fn": {},
+        "successor_policy": "no-transition", "manual_rebind": False, "abandoned_expected": 0, "abandoned_by_fn": {},
         "reuse_expected": {}, "requested_backend": backend,
     }
     result = evaluate_trace_h6("".join(capture.lines), ledger, receipt,
@@ -2408,7 +2897,7 @@ def run_group_death_leg(ctx, leg_dir, backend, env, image_pin):
                    "expected_calls": 0, "phases": []},
         "exec_transitions": [], "phases": phases,
         "require_named": True, "require_named_images": [0], "first_unknown_images": [],
-        "manual_rebind": False, "abandoned_expected": 0, "abandoned_by_fn": {},
+        "successor_policy": "no-transition", "manual_rebind": False, "abandoned_expected": 0, "abandoned_by_fn": {},
         "reuse_expected": {}, "requested_backend": backend,
         "group_death": {
             "kill": "SIGKILL/killpg", "group_size_before": group_size_before,
@@ -2521,7 +3010,7 @@ def run_cgroup_r2(ctx, cell_dir, backend):
                    "expected_calls": 0, "phases": []},
         "exec_transitions": [], "phases": phases,
         "require_named": False, "require_named_images": [], "first_unknown_images": [],
-        "manual_rebind": False, "abandoned_expected": 0, "abandoned_by_fn": {},
+        "successor_policy": "no-transition", "manual_rebind": False, "abandoned_expected": 0, "abandoned_by_fn": {},
         "reuse_expected": {}, "requested_backend": backend,
     }
     result = evaluate_trace_h6("".join(capture.lines), ledger, receipt,
@@ -2720,6 +3209,7 @@ def run_cgroup_r1(ctx, cell_dir, backend):
     move_and_verify(outside, caller, moves, "exit")
     n3_command(caller, stdout, "C_GetInfo", 3, 50, "aside", "outside",
                0, outside, phases)
+    output_cursor = len(capture.lines)
     request, _, t0, t1 = caller_exec(caller, stdout, images, "thread-exec", pins["caller-b"])
     transitions = [{"from_image": 0, "to_image": 1, "mode": "nonleader",
                     "same_path": False, "scope": "outside",
@@ -2728,6 +3218,8 @@ def run_cgroup_r1(ctx, cell_dir, backend):
                1, outside, phases)
     t_in = monotonic_ns()
     move_and_verify(sub, caller, moves, "descendant-reentry")
+    proof = warm_caller(capture, caller, stdout, images[-1], phases, group=sub,
+                        output_cursor=output_cursor)
     n3_command(caller, stdout, "C_GetSessionInfo", 10, 200, "measured", "selected",
                1, sub, phases)
     move_and_verify(selected, caller, moves, "same-image-move")
@@ -2751,7 +3243,6 @@ def run_cgroup_r1(ctx, cell_dir, backend):
     finish_readers([stdout, capture, errors])
     ledger = list(stdout.records)
     measured = next(p for p in phases if p["phase"] == "measured")
-    warmup = next(p for p in phases if p["phase"] == "warm")
     receipt = {
         "cell": "cgroup-reentry", "leg": f"trace/{backend}", "scope_kind": "cgroup",
         "owned_pids": [caller.pid],
@@ -2771,10 +3262,10 @@ def run_cgroup_r1(ctx, cell_dir, backend):
         "time_namespace": caller.identity["time_namespace"],
         "measured": {"label": "post-reentry", "t0": measured["t0"], "t1": measured["t1"],
                      "expected_calls": 10, "phases": ["measured"]},
-        "warmup": {"label": "pre", "t0": warmup["t0"], "t1": warmup["t1"],
-                   "expected_calls": 5, "phases": ["warm"]},
+        "warmup": warmup_receipt(phases, measured["t0"]),
+        "successor_policy": "public-successor", "successor_ready": [proof],
         "exec_transitions": transitions, "phases": phases,
-        "require_named": True, "require_named_images": [1], "first_unknown_images": [1],
+        "require_named": True, "require_named_images": [1], "first_unknown_images": [],
         "manual_rebind": False, "abandoned_expected": 0, "abandoned_by_fn": {},
         "reuse_expected": {"session": True},
         "session_reuse": session_reuse_from(ledger),
@@ -3237,6 +3728,12 @@ def main(argv=None):
                     cleanup_processes(ctx.owners)
                 except Exception as error:  # noqa: BLE001 - receipt must record
                     cleanup_receipt["errors"].append(f"processes: {error}")
+                for reader in ctx.readers:
+                    if isinstance(reader, PtyCapture):
+                        try:
+                            reader.finish()
+                        except (ValueError, TimeoutError) as error:
+                            cleanup_receipt["errors"].append(f"PTY reader: {error}")
                 try:
                     cleanup_cgroups(ctx.groups)
                 except Exception as error:  # noqa: BLE001 - receipt must record
@@ -3420,12 +3917,15 @@ def run_cgroup_stop_during(ctx, cell_dir, backend):
                0, selected, phases)
     t_out = monotonic_ns()
     move_and_verify(outside, caller, moves, "exit")
+    output_cursor = len(capture.lines)
     request, _, t0, t1 = caller_exec(caller, stdout, images, "thread-exec", pins["caller-b"])
     transitions = [{"from_image": 0, "to_image": 1, "mode": "nonleader",
                     "same_path": False, "scope": "outside",
                     "t0": t0, "t1": t1, "request": request}]
     t_in = monotonic_ns()
     move_and_verify(sub, caller, moves, "descendant-reentry")
+    proof = warm_caller(capture, caller, stdout, images[-1], phases, group=sub,
+                        output_cursor=output_cursor)
     n3_command(caller, stdout, "C_GetSessionInfo", 10, 200, "measured", "selected",
                1, sub, phases)
     # Final membership work continues around the stop: one call strictly
@@ -3445,7 +3945,6 @@ def run_cgroup_stop_during(ctx, cell_dir, backend):
     finish_readers([stdout, capture, errors])
     ledger = list(stdout.records)
     measured = next(p for p in phases if p["phase"] == "measured")
-    warmup = next(p for p in phases if p["phase"] == "warm")
     receipt = {
         "cell": "cgroup-reentry", "leg": f"stop-during/{backend}", "scope_kind": "cgroup",
         "owned_pids": [caller.pid],
@@ -3465,10 +3964,10 @@ def run_cgroup_stop_during(ctx, cell_dir, backend):
         "time_namespace": caller.identity["time_namespace"],
         "measured": {"label": "post-reentry", "t0": measured["t0"], "t1": measured["t1"],
                      "expected_calls": 10, "phases": ["measured"]},
-        "warmup": {"label": "pre", "t0": warmup["t0"], "t1": warmup["t1"],
-                   "expected_calls": 5, "phases": ["warm"]},
+        "warmup": warmup_receipt(phases, measured["t0"]),
+        "successor_policy": "public-successor", "successor_ready": [proof],
         "exec_transitions": transitions, "phases": phases,
-        "require_named": True, "require_named_images": [1], "first_unknown_images": [1],
+        "require_named": True, "require_named_images": [1], "first_unknown_images": [],
         "manual_rebind": False, "abandoned_expected": 0, "abandoned_by_fn": {},
         "reuse_expected": {"session": True},
         "session_reuse": session_reuse_from(ledger),

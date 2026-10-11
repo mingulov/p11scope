@@ -4125,13 +4125,17 @@ fn discovery_stage_quantum(staged_len: usize, engine_held: usize) -> usize {
 }
 
 /// Stages one quiescence poll's discovery items up to the shared allowance.
-/// Stops at the cap with `overflow` set instead of growing past it; the
-/// first unstaged record stays unread in the ring, and the caller stops
-/// draining discovery on later polls once `overflow` is set. Staged
+/// Stops at the cap instead of growing past it; the first unstaged record
+/// stays unread in the ring, and the caller stops draining discovery on
+/// later polls once `overflow` is set. At the cap the transport positions
+/// decide: a proven-empty transport is the exact-N lossless positive and
+/// trips nothing, while anything still unread trips `overflow`. Staged
 /// malformed items hold credits like staged records until the quiesced
 /// batch accounts them.
-fn stage_quiesced_discovery_items(
-    mut next: impl FnMut() -> Option<crate::events::DiscoveryItem>,
+fn stage_quiesced_discovery_items<D>(
+    transport: &mut D,
+    mut next: impl FnMut(&mut D) -> Option<crate::events::DiscoveryItem>,
+    mut transport_empty: impl FnMut(&D) -> bool,
     staged_records: &mut Vec<p11scope_ebpf_common::DiscoveryRecord>,
     staged_malformed: &mut u64,
     cap: usize,
@@ -4143,10 +4147,13 @@ fn stage_quiesced_discovery_items(
             .saturating_add(*staged_malformed as usize)
             >= cap
         {
+            if transport_empty(transport) {
+                return;
+            }
             *overflow = true;
             return;
         }
-        match next() {
+        match next(transport) {
             Some(crate::events::DiscoveryItem::Record(record)) => staged_records.push(record),
             Some(crate::events::DiscoveryItem::Malformed) => {
                 *staged_malformed = staged_malformed.saturating_add(1);
@@ -4952,7 +4959,12 @@ fn capture_profile(
                     return;
                 }
                 stage_quiesced_discovery_items(
-                    || discovery_drain.dequeue(),
+                    &mut *discovery_drain,
+                    |drain| drain.dequeue(),
+                    |drain| {
+                        let positions = crate::events::discovery_drain_positions(drain);
+                        positions.producer == positions.consumer
+                    },
                     &mut staged_records,
                     &mut staged_malformed,
                     quiesce_cap,
@@ -5680,7 +5692,12 @@ fn capture_trace(
                     return;
                 }
                 stage_quiesced_discovery_items(
-                    || discovery_drain.dequeue(),
+                    &mut *discovery_drain,
+                    |drain| drain.dequeue(),
+                    |drain| {
+                        let positions = crate::events::discovery_drain_positions(drain);
+                        positions.producer == positions.consumer
+                    },
                     &mut staged_records,
                     &mut staged_malformed,
                     quiesce_cap,
@@ -16261,7 +16278,9 @@ mod tests {
         let mut malformed = 0u64;
         let mut overflow = false;
         stage_quiesced_discovery_items(
-            || script.next().unwrap(),
+            &mut script,
+            |script| script.next().unwrap(),
+            |_| panic!("the probe runs only at the cap"),
             &mut staged,
             &mut malformed,
             4096,
@@ -16287,7 +16306,9 @@ mod tests {
         let mut malformed = 0u64;
         let mut overflow = false;
         stage_quiesced_discovery_items(
-            || script.next().unwrap(),
+            &mut script,
+            |script| script.next().unwrap(),
+            |_| false,
             &mut staged,
             &mut malformed,
             1,
@@ -16304,7 +16325,9 @@ mod tests {
         let mut malformed = 0u64;
         let mut overflow = false;
         stage_quiesced_discovery_items(
-            || script.next().unwrap(),
+            &mut script,
+            |script| script.next().unwrap(),
+            |_| false,
             &mut staged,
             &mut malformed,
             0,
@@ -16498,8 +16521,10 @@ mod tests {
     /// occupancy never exceeds it, the first unstaged record stays
     /// unread, malformed items hold credits like records, and the owned
     /// prefix drains in order. Unresolved N+1 reports truncation failure;
-    /// an empty quiescence stages nothing and reports nothing. Both
-    /// capture loops stage through the shared helper — never a test-only
+    /// an empty quiescence stages nothing and reports nothing, and a
+    /// staged-at-cap poll over a proven-empty transport is the lossless
+    /// positive, never overflow. Both capture loops stage through the
+    /// shared helper — never a test-only
     /// duplicate — and skip discovery polling once overflow trips while
     /// EVENTS/stop polling continues.
     #[test]
@@ -16535,7 +16560,9 @@ mod tests {
         .into_iter();
         let mut overflow = false;
         stage_quiesced_discovery_items(
-            || script.next().unwrap(),
+            &mut script,
+            |script| script.next().unwrap(),
+            |_| false,
             &mut staged_records,
             &mut staged_malformed,
             quiesce_cap,
@@ -16547,7 +16574,9 @@ mod tests {
         assert_eq!(script.len(), 1, "the first unstaged record stays unread");
         let mut script = vec![Some(DiscoveryItem::Record(record(4_097)))].into_iter();
         stage_quiesced_discovery_items(
-            || script.next().unwrap(),
+            &mut script,
+            |script| script.next().unwrap(),
+            |_| false,
             &mut staged_records,
             &mut staged_malformed,
             quiesce_cap,
@@ -16577,7 +16606,9 @@ mod tests {
         .into_iter();
         let mut overflow = false;
         stage_quiesced_discovery_items(
-            || script.next().unwrap(),
+            &mut script,
+            |script| script.next().unwrap(),
+            |_| false,
             &mut staged_records,
             &mut staged_malformed,
             quiesce_cap,
@@ -16603,7 +16634,9 @@ mod tests {
         let mut overflow = false;
         for _ in 0..3 {
             stage_quiesced_discovery_items(
-                || script.next().unwrap(),
+                &mut script,
+                |script| script.next().unwrap(),
+                |_| false,
                 &mut staged_records,
                 &mut staged_malformed,
                 held_cap,
@@ -16633,7 +16666,9 @@ mod tests {
         let mut overflow = false;
         for _ in 0..3 {
             stage_quiesced_discovery_items(
-                || None,
+                &mut (),
+                |_| None,
+                |_| panic!("the probe runs only at the cap"),
                 &mut staged_records,
                 &mut staged_malformed,
                 quiesce_cap,
@@ -16647,6 +16682,51 @@ mod tests {
             0,
             "no overflow means no failure to report"
         );
+
+        // The exact-N empty positive: staged at the cap with a
+        // proven-empty transport stages nothing, trips nothing, and
+        // consumes nothing — full occupancy alone is never loss.
+        let (mut staged_records, mut staged_malformed) = split_staged_discovery(
+            (0..4_096u32)
+                .map(|pid| DiscoveryItem::Record(record(pid)))
+                .collect(),
+        );
+        let mut script = vec![None].into_iter();
+        let mut overflow = false;
+        stage_quiesced_discovery_items(
+            &mut script,
+            |script| script.next().unwrap(),
+            |_| true,
+            &mut staged_records,
+            &mut staged_malformed,
+            quiesce_cap,
+            &mut overflow,
+        );
+        assert_eq!(staged_records.len(), 4_096);
+        assert!(!overflow, "a proven-empty transport is lossless");
+        assert_eq!(script.len(), 1, "the probe dequeues nothing");
+
+        // The N+1 twin: staged at the cap with anything still unread
+        // trips overflow and leaves the record unread.
+        let (mut staged_records, mut staged_malformed) = split_staged_discovery(
+            (0..4_096u32)
+                .map(|pid| DiscoveryItem::Record(record(pid)))
+                .collect(),
+        );
+        let mut script = vec![Some(DiscoveryItem::Record(record(4_096)))].into_iter();
+        let mut overflow = false;
+        stage_quiesced_discovery_items(
+            &mut script,
+            |script| script.next().unwrap(),
+            |_| false,
+            &mut staged_records,
+            &mut staged_malformed,
+            quiesce_cap,
+            &mut overflow,
+        );
+        assert_eq!(staged_records.len(), 4_096);
+        assert!(overflow, "an unread record past the cap trips overflow");
+        assert_eq!(script.len(), 1, "the N+1 record stays unread");
 
         // Both modes stage through the shared helper: exactly one call per
         // loop, the per-poll overflow guard plus the report guard, exactly

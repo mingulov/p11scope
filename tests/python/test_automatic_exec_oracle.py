@@ -1134,6 +1134,106 @@ class LegCleanupTest(unittest.TestCase):
         self.assertTrue(any("controlled final pin cleanup failure" in error for error in cleanup["errors"]))
         self.assert_released()
 
+    def test_child_exit_between_poll_and_signal_is_reaped_before_next_leg(self):
+        started, races = [], []
+        @H6["owned_leg"]
+        def runner(ctx, directory, backend):
+            # Reading returncode has no wait side effect; Popen.poll would
+            # itself reap the zombie and hide the production cleanup race.
+            for previous, _ in self.spawned:
+                self.assertIsNotNone(previous.popen.returncode, "previous child lacked a terminal reap")
+                self.assertFalse((Path("/proc") / str(previous.pid)).exists())
+                self.assertIsNone(previous.pidfd)
+            started.append(backend)
+            owner, _, _ = self.child(ctx.owners, ctx.readers, directory)
+            send = owner.send
+            def exit_during_signal(signum):
+                owner.popen.stdin.close()
+                deadline = time.monotonic() + 1
+                while time.monotonic() < deadline:
+                    if "Z" in H6["proc_task_states"](owner.pid).values():
+                        break
+                    time.sleep(0.01)
+                else:
+                    self.fail("owned child did not naturally exit before verified signal")
+                try:
+                    return send(signum)
+                except FileNotFoundError:
+                    races.append(backend)
+                    raise
+            owner.send = exit_during_signal
+            return {"cell": "pid-leader", "leg": backend, "status": "pass", "pass": True}
+        rc, summary, cleanup = self.matrix(runner)
+        self.assertEqual(rc, 0, "the next leg saw an unreaped previous child")
+        self.assertEqual(started, ["singles", "multi"])
+        self.assertEqual(races, ["singles", "multi"])
+        self.assertEqual(summary["failed"], 0)
+        self.assertEqual(cleanup["errors"], [])
+        for owner, _ in self.spawned:
+            self.assertEqual(owner.popen.returncode, 0)
+        self.assert_released()
+
+    def cancellation_during_normal_finish(self, kind):
+        started, readers = [], []
+        held = []
+        @H6["owned_leg"]
+        def runner(ctx, directory, backend):
+            started.append(backend)
+            if backend != "singles":
+                return {"cell": "pid-leader", "leg": backend, "pass": True}
+            if kind == "pipe":
+                read_fd, write_fd = os.pipe()
+                stream, writer = os.fdopen(read_fd, encoding="utf-8"), os.fdopen(write_fd, "w")
+                held.append(writer)
+                reader = H6["owned_reader"](ctx.readers, H6["Reader"], stream, directory / "held-pipe.txt")
+            else:
+                master, slave = H6["pty"].openpty()
+                held.append(slave)
+                reader = H6["owned_reader"](ctx.readers, H6["PtyCapture"], master, directory / "held-pty.txt")
+            readers.append(reader)
+            join = reader.thread.join
+            calls = []
+            def short_first_join(timeout=None):
+                calls.append(True)
+                return join(0.02 if len(calls) == 1 else timeout)
+            with mock.patch.object(reader.thread, "join", side_effect=short_first_join):
+                H6["finish_readers"]([reader])
+            self.fail("forced reader cancellation unexpectedly returned normally")
+        try:
+            rc, summary, cleanup = self.matrix(runner)
+            self.assertEqual(rc, 1)
+            self.assertEqual(started, ["singles"], "reader cleanup failure allowed the next backend")
+            self.assertTrue(any("reader" in error for error in cleanup["errors"]))
+            self.assertTrue(any("primary" in error for row in summary["legs"] for error in row["errors"]))
+            reader = readers[0]
+            self.assertTrue(reader.stop.is_set())
+            self.assertFalse(reader.thread.is_alive())
+            if kind == "pipe":
+                self.assertTrue(reader.stream.closed)
+                self.assertFalse(held[0].closed)
+            else:
+                self.assertIsNone(reader.master)
+                os.fstat(held[0])
+            with self.assertRaises((ValueError, TimeoutError)):
+                reader.finish()
+        finally:
+            for writer in held:
+                if isinstance(writer, int):
+                    os.close(writer)
+                else:
+                    writer.close()
+            for reader in readers:
+                reader.stop.set()
+                reader.thread.join(2)
+                if getattr(reader, "stream", None) is not None:
+                    reader.stream.close()
+
+    def test_pipe_cancellation_during_normal_finish_stops_matrix(self):
+        self.cancellation_during_normal_finish("pipe")
+
+    def test_pty_cancellation_during_normal_finish_stops_matrix(self):
+        self.cancellation_during_normal_finish("pty")
+
     def test_ptrace_stopped_owned_child_is_killed_and_actually_reaped(self):
         timer = None
         code = ("import ctypes,os,signal,sys; libc=ctypes.CDLL(None,use_errno=True); "
@@ -1361,17 +1461,71 @@ class LegCleanupTest(unittest.TestCase):
         @H6["owned_leg"]
         def leg(ctx):
             self.child(ctx.owners, ctx.readers, self.directory)
+            pin = H6["leg_pin"](ctx, self.case_pin.path)
+            self.local_pins.append(pin)
+            pin_fd = pin.fd
             _, wrapper = H6["create_tracked"](ctx, path)
             remove = wrapper.remove
             def after_reap():
-                self.assert_released()
-                removed.append(True)
-                remove()
+                try:
+                    self.assert_released()
+                    self.assertIsNone(pin.fd, "local pin remained held when group removal began")
+                    with self.assertRaises(OSError):
+                        os.fstat(pin_fd)
+                    removed.append(True)
+                finally:
+                    remove()
             wrapper.remove = after_reap
         with patch, members:
             leg(self.ctx)
         self.assertEqual(removed, [True])
         self.assertFalse(path.exists())
+
+    def test_failed_terminal_wait_retains_owner_and_group_for_final_backstop(self):
+        patch, members = self.ordinary_group_controls()
+        scope = H6["LegContext"](self.ctx)
+        path = self.directory / "selected"
+        with patch, members:
+            owner = H6["spawn_owned"](scope.owners,
+                [sys.executable, "-I", "-c", "import sys; sys.stdin.read()"], os.getuid(),
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                text=True, start_new_session=True)
+            self.spawned.append((owner, []))
+            group, wrapper = H6["create_tracked"](scope, path)
+            removed = []
+            remove = wrapper.remove
+            def record_removal():
+                removed.append(True)
+                remove()
+            wrapper.remove = record_removal
+            def failed_signal(_owner):
+                raise OSError("controlled signal failure")
+            def failed_wait(_owner):
+                raise TimeoutError("controlled terminal wait failure")
+            with mock.patch.dict(H6["N3HARNESS"], {"terminate": failed_signal}), \
+                    mock.patch.dict(self.globals, {"wait_terminal_child": failed_wait}), \
+                    self.assertRaises(H6["LegCleanupError"]):
+                H6["cleanup_leg_resources"](scope)
+            self.assertEqual(scope.owners, [owner], "failed terminal wait discarded child ownership")
+            self.assertEqual(scope.groups, [wrapper])
+            os.fstat(owner.pidfd)
+            os.fstat(group.fd)
+            self.assertEqual(removed, [], "group was removed before owned-child terminal proof")
+            self.assertTrue(self.ctx.cleanup_failed)
+            self.assertEqual(self.ctx.cleanup_totals["processes"], 0)
+            self.assertEqual(self.ctx.cleanup_totals["cgroups"], 0)
+            errors = list(self.ctx.cleanup_errors)
+            H6["cleanup_leg_resources"](scope)
+            self.assert_released()
+            self.assertFalse(path.exists())
+            self.assertEqual(removed, [True])
+            self.assertEqual(self.ctx.cleanup_errors, errors)
+            self.assertEqual(self.ctx.cleanup_totals["processes"], 1)
+            self.assertEqual(self.ctx.cleanup_totals["cgroups"], 1)
+            totals = dict(self.ctx.cleanup_totals)
+            H6["cleanup_leg_resources"](scope)
+            self.assertEqual(self.ctx.cleanup_totals, totals)
+            self.assertTrue(self.ctx.cleanup_failed)
 
     def test_partial_group_acquisition_removes_only_enrolled_directory(self):
         shared = H6["N3HARNESS"]["create_cgroup"].__globals__

@@ -1757,6 +1757,35 @@ mod tests {
                 tick.outcomes()
             );
         }
+
+        #[test]
+        fn drained_receipt_expires_inside_quiescence_wait_but_validates_promptly() {
+            let mut io = ScriptIo::new(NativeDomainId::mint());
+            let mut capture = capture(&io);
+            io.call_image(1, 1, 0);
+            let tick = capture.tick_with(&mut io).unwrap();
+            assert_eq!(
+                tick.current().len(),
+                1,
+                "the drained call mints its receipt"
+            );
+            let receipt = &tick.current()[0];
+            let mut scratch = TickReport::default();
+            // A prompt terminal commit (inside `on_batch` during the
+            // drain) validates while the receipt is fresh.
+            assert_eq!(
+                capture.validate_current_with(&mut io, receipt, &mut scratch),
+                Ok(())
+            );
+            // Buffered through a full quiescence wait, the 2s pending
+            // window expires inside the 5s stop budget.
+            io.now += Duration::from_secs(5);
+            assert_eq!(
+                capture.validate_current_with(&mut io, receipt, &mut scratch),
+                Err(CurrentReceiptRefusal::Deadline)
+            );
+        }
+
         #[test]
         fn native_semantic_receipt_revalidates_readback_and_postscan_health() {
             // Exercise the actual Session readback decision, alongside the shared
@@ -4128,6 +4157,171 @@ mod tests {
                     1,
                     "the quiet proof registers one instance at commit"
                 );
+            }
+        }
+
+        /// Terminal commit timing through real H0 and the real
+        /// coordinator: a drained Init/Sign pair commits promptly
+        /// (inside `on_batch` during the drain) and completes one
+        /// operation, while buffering the same batch through a delayed
+        /// quiescence wait expires its receipt and completes nothing.
+        /// Both legs share everything except validation timing: the
+        /// buffered leg is the base ordering.
+        #[test]
+        fn prompt_terminal_commit_completes_operation_while_buffered_expiry_cannot() {
+            use crate::discovery::caller_registry::instance_input::{
+                CallEvidence, CallStanding, InstanceReason, admit_call_from_evidence,
+                admit_registration_from_coverage,
+            };
+            use crate::inventory_semantics::LaneCoverage;
+
+            let image = ImageIdentity {
+                task_cookie: 7,
+                exec_id: 1,
+            };
+            // Delayed quiescence: the drain waits 4s of the 5s stop
+            // budget, past the 2s receipt window. Both relations pin
+            // to the real production constants so the timing stays
+            // honest.
+            let wait = Duration::from_secs(4);
+            assert!(wait < crate::run::STOP_QUIESCE_BUDGET);
+            for buffered in [false, true] {
+                let (mut scene, caller) = bound_operation_scene(image);
+                let subset = operation_subset();
+                let detailed = scene.detailed;
+                let mut io = ScriptIo::new(detailed);
+                io.output_image = Some(image);
+                let mut capture = capture(&io);
+                assert!(wait > capture.limits.pending_for);
+                io.semantic_call("C_SignInit", 0, 0);
+                io.records.back_mut().unwrap().event.image = image;
+                io.semantic_call("C_Sign", 0, 0);
+                io.records.back_mut().unwrap().event.image = image;
+                let tick = capture.tick_with(&mut io).unwrap();
+                assert_eq!(
+                    tick.current().len(),
+                    1,
+                    "the drained batch mints one receipt"
+                );
+                let joined: Vec<_> = tick.calls().collect();
+                assert_eq!(joined.len(), 2, "Init/Sign both route");
+                for call in &joined {
+                    assert!(
+                        matches!(call.route(), Route::Joined(id)
+                            if tick.current()[0].instances().contains(&id)),
+                        "both routed ids are covered by the receipt"
+                    );
+                }
+                if buffered {
+                    // The base ordering: the whole batch waits out the
+                    // drain before any commit validates it.
+                    io.now += wait;
+                }
+                let mut scratch = TickReport::default();
+                let validated =
+                    capture.validate_current_with(&mut io, &tick.current()[0], &mut scratch);
+                // The finalizer's standing rule: a validated same-batch
+                // coverage admits Current, anything else is history-only
+                // and registers nothing.
+                let coverage = match validated {
+                    Ok(()) => {
+                        let first = &tick.current()[0];
+                        Some(LaneCoverage::scripted(
+                            first.domain(),
+                            first.image(),
+                            first.endpoint(),
+                            first.instances().to_vec(),
+                        ))
+                    }
+                    Err(_) => None,
+                };
+                let (registrations, calls) = {
+                    let binding = scene.coordinator.semantic_bindings().get(caller).unwrap();
+                    let registrations = match &coverage {
+                        Some(coverage) => coverage
+                            .instances()
+                            .iter()
+                            .map(|id| {
+                                admit_registration_from_coverage(coverage, binding, *id, 100, None)
+                                    .expect("validated coverage registers")
+                            })
+                            .collect::<Vec<_>>(),
+                        None => Vec::new(),
+                    };
+                    let calls = tick
+                        .into_outcomes()
+                        .into_iter()
+                        .filter_map(|outcome| match outcome {
+                            TickOutcome::Call(routed) => Some(routed),
+                            _ => None,
+                        })
+                        .map(|routed| {
+                            let evidence =
+                                CallEvidence::from_routed(routed).expect("drained calls joined");
+                            let standing = match &coverage {
+                                Some(coverage)
+                                    if coverage.instances().contains(&evidence.router()) =>
+                                {
+                                    CallStanding::Current(coverage)
+                                }
+                                _ => CallStanding::Historical(InstanceReason::SemanticLoss),
+                            };
+                            admit_call_from_evidence(evidence, binding, &subset, standing, None)
+                                .expect("drained calls convert")
+                        })
+                        .collect::<Vec<_>>();
+                    (registrations, calls)
+                };
+                assert_eq!(calls.len(), 2);
+                for input in registrations {
+                    scene.coordinator.registry_mut().note_instance(input);
+                }
+                for input in calls {
+                    scene
+                        .coordinator
+                        .registry_mut()
+                        .observe_instance_semantic(input);
+                }
+                scene.coordinator.commit_batch(false).unwrap();
+                if buffered {
+                    assert_eq!(
+                        validated,
+                        Err(CurrentReceiptRefusal::Deadline),
+                        "buffering through delayed quiescence expires the receipt"
+                    );
+                    assert_eq!(
+                        scene.coordinator.registry().instances().count(),
+                        0,
+                        "the expired batch registers nothing"
+                    );
+                    assert!(
+                        operation_edge_rows(&scene)
+                            .iter()
+                            .all(|row| row.3 == 0 && row.4 == 0),
+                        "the expired batch starts and completes no operation"
+                    );
+                    assert!(
+                        scene
+                            .coordinator
+                            .registry()
+                            .gaps()
+                            .iter()
+                            .any(|gap| gap.subject == "instance semantics refused"
+                                && gap.reason == "instance_unproven"),
+                        "the expired calls refuse through the audited path"
+                    );
+                } else {
+                    assert_eq!(
+                        validated,
+                        Ok(()),
+                        "a prompt terminal commit validates while fresh"
+                    );
+                    assert_eq!(
+                        operation_edge_rows(&scene),
+                        vec![(Some(2), 0, false, 1, 1)],
+                        "the promptly committed Init/Sign pair completes one operation"
+                    );
+                }
             }
         }
     }

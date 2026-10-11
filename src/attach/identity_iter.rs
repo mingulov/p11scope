@@ -1176,12 +1176,13 @@ pub(crate) const STRICT_LOAD_RETAINED_FDS: usize = 10;
 pub(crate) const FUNCTIONAL_PROBE_TRANSIENT_FDS: usize = 5;
 
 /// FDs a session setup may hold at peak: the probe load (10) plus the
-/// probe transients (5), with one spare for the fork pipe pair and the
-/// BTF read (both closed before the peak). The fresh load after the
-/// probe drop, and the diagnostic follow-up load on failure, each hold
-/// at most the retained count. Lazy session init must reserve this peak
-/// before opening anything. Live privileged proof of the peak rides the
-/// later D3d live cells.
+/// probe transients (5), plus the ProbeDir verification fd held through
+/// setup (the former spare; the fork pipe pair and the BTF read both
+/// close before the peak). The fresh load after the probe drop, and the
+/// diagnostic follow-up load on failure, each hold at most the retained
+/// count. Lazy session init must reserve this peak before opening
+/// anything. Live privileged proof of the peak rides the later D3d live
+/// cells.
 pub(crate) const SESSION_SETUP_PEAK_FDS: usize =
     STRICT_LOAD_RETAINED_FDS + FUNCTIONAL_PROBE_TRANSIENT_FDS + 1;
 

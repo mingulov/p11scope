@@ -5511,13 +5511,26 @@ fn live_discovery_host_contract_is_opaque_fixed_purpose_and_owned_child_only() {
         "TAIL_CALLS worker readback must be required",
     );
     let worker_attach = attach.replacen(
-        "match attach(program, slot, slot_attach_point(slot))",
-        "match attach(\"interface_list_worker\", slot, slot_attach_point(slot))",
+        "attach(program, slot, slot_attach_point(slot))",
+        "attach(\"interface_list_worker\", slot, slot_attach_point(slot))",
         1,
     );
-    assert_rejects_attach_mutation(
-        &worker_attach,
-        "interface-list worker must not gain an attach site",
+    assert_ne!(
+        attach, worker_attach,
+        "worker attach-site mutation must apply"
+    );
+    assert_eq!(
+        assert_live_discovery_host_contract(
+            &worker_attach,
+            &scope,
+            &events,
+            &hooks,
+            &engine,
+            &main,
+            &run,
+        )
+        .unwrap_err(),
+        "interface-list worker must be loaded but never attached"
     );
     let benign_worker_comment = attach.replacen(
         "fn attach_targets_with(",

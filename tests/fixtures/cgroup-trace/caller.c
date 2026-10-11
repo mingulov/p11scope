@@ -7,6 +7,7 @@
  * exec|thread-exec PATH; stop. Auto: --start-gate PATH --auto-gate PATH
  * [--auto-count N --auto-delay-ms N --canary PRIVATE_VALUE]. */
 #define _GNU_SOURCE
+#include <ctype.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -165,6 +166,17 @@ static void exec_image(const char *path, const char *mode) {
   execl(path, path, module, next_image, "outside", (char *)NULL); perror("exec"); exit(1);
 }
 static void *thread_exec(void *path) { exec_image(path, "nonleader"); return NULL; }
+static int parse_exec_path(const char *line, const char *command, char *path, size_t capacity) {
+  size_t command_length = strlen(command);
+  if (strncmp(line, command, command_length) || !isspace((unsigned char)line[command_length])) return 0;
+  const char *start = line + command_length;
+  while (*start && *start != '\n' && *start != '\r' && isspace((unsigned char)*start)) start++;
+  size_t length = strcspn(start, "\r\n");
+  if (!length || length >= capacity || !strchr(start, '\n')) return -1;
+  memcpy(path, start, length);
+  path[length] = '\0';
+  return 1;
+}
 int main(int argc, char **argv) {
   if (sizeof(void *) != 8 || sizeof(unsigned long) != 8 || argc < 4) return 2;
   module = argv[1]; image = strtoul(argv[2], NULL, 10); scope = argv[3];
@@ -199,12 +211,16 @@ int main(int argc, char **argv) {
     if (sscanf(line, "spaced %63s %lu %lu %63s %63s", fn, &n, &ms, phase, next_scope) == 5) {
       scope = next_scope; calls(fn, n, ms, phase, 1); continue;
     }
-    if (sscanf(line, "thread-exec %4095s", path) == 1) {
+    int path_result = parse_exec_path(line, "thread-exec", path, sizeof path);
+    if (path_result < 0) return 2;
+    if (path_result > 0) {
       pthread_t thread;
       if (pthread_create(&thread, NULL, thread_exec, path) || pthread_join(thread, NULL)) return 1;
       return 1;
     }
-    if (sscanf(line, "exec %4095s", path) == 1) {
+    path_result = parse_exec_path(line, "exec", path, sizeof path);
+    if (path_result < 0) return 2;
+    if (path_result > 0) {
       exec_image(path, "leader"); return 1;
     }
     return 2;

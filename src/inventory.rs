@@ -1437,8 +1437,8 @@ fn bind_semantic_callers(
         return;
     }
     // Accepted bindings re-prove in place through the same custody.
-    // The full window is rotation-neutral (cursor advances by exactly
-    // the length), so re-proof never steals the tick window's turn.
+    // The full window is rotation-neutral (storage and cursor untouched),
+    // so re-proof never steals the tick window's turn.
     let rebind: Vec<(CallerId, ModuleKey, ImageIdentity)> = {
         let len = coordinator.semantic_bindings().len();
         coordinator

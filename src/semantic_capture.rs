@@ -4115,11 +4115,22 @@ mod tests {
 
         #[test]
         fn failed_bind_retry_reuses_h0_retained_arc_through_production_loop() {
+            let mut lane = AttestedSemanticLane::start(
+                operation_subset(),
+                &Scope::Pid(std::process::id()),
+                BackendSelection::Auto,
+            )
+            .expect("shell lane starts");
+            let domain = lane.domain();
             let mut scene = CustodyScene::new();
+            scene.coordinator.note_extend_receipt(&ExtendReceipt {
+                activated_roots: true,
+                exec_coverage: Some(ExecCoverage::scripted(domain, 0)),
+                ..ExtendReceipt::default()
+            });
             let pid = std::process::id();
             let caller = scene.admit(pid, 50);
             scene.map(caller, pid, 60);
-            let detailed = scene.detailed;
             let module = scene.module.clone();
             let image = ImageIdentity {
                 task_cookie: 7,
@@ -4128,43 +4139,26 @@ mod tests {
             // H0 shares the bind domain exactly as a live lane would;
             // the scan proves the same image the coordinator proof
             // expects.
-            let mut io = ScriptIo::new(detailed);
-            io.output_image = Some(image);
-            let mut capture = capture(&io);
+            let mut h0 = H0TestIo::new(domain);
+            h0.io.output_image = Some(image);
+            lane.install_test_io(Box::new(h0));
             let targets = vec![(caller, pid, 0u32, module)];
             let mut passed: Vec<Arc<PidPin>> = Vec::new();
-            let mut minted: Vec<Option<Arc<PidPin>>> = Vec::new();
-            // The lane's refresh contract over substituted H0 I/O: the
-            // images plus the effective custody Arc, derived through the
-            // same shared helper production uses.
+            let mut minted: Vec<(Vec<ImageIdentity>, Arc<PidPin>)> = Vec::new();
+            // The production bind loop over the lane's own refresh: the
+            // refresh closure records each pass's offered pin and the
+            // images plus effective custody Arc the lane reports.
             macro_rules! drive_pass {
                 () => {{
                     let mut refresh = |pin: Arc<PidPin>, slot: u32| {
                         passed.push(pin.clone());
-                        let report =
-                            capture
-                                .refresh_with(&mut io, pin.clone(), slot)
-                                .map_err(|_| {
-                                    crate::inventory_semantics::SemanticRefusal::Unavailable
-                                })?;
-                        let images: Vec<ImageIdentity> = report
-                            .current()
-                            .iter()
-                            .map(|receipt| receipt.image())
-                            .collect();
-                        let effective =
-                            crate::inventory_semantics::effective_refresh_custody(&report, pin);
-                        minted.push(
-                            report
-                                .current()
-                                .first()
-                                .map(|receipt| receipt.original_pin().clone()),
-                        );
-                        Ok((images, effective))
+                        let report = lane.refresh_candidate_with_custody(pin, slot)?;
+                        minted.push((report.0.clone(), report.1.clone()));
+                        Ok(report)
                     };
                     crate::inventory::bind_semantic_candidates(
                         &mut scene.coordinator,
-                        detailed,
+                        domain,
                         &mut scene.identity,
                         &targets,
                         &mut refresh,
@@ -4179,15 +4173,15 @@ mod tests {
                 "pass N binds nothing without identity evidence"
             );
             assert_eq!(passed.len(), 1);
-            let retained = minted[0].as_ref().expect("pass N refresh mints a receipt");
+            assert_eq!(minted[0].0, vec![image]);
             assert!(
-                Arc::ptr_eq(retained, &passed[0]),
+                Arc::ptr_eq(&minted[0].1, &passed[0]),
                 "H0 retains the exact pass-N refresh Arc"
             );
             // Pass N+1: identity evidence arrives; the retry duplicates
             // a fresh Arc B but must bind through H0's retained Arc A.
-            scene.answer(pid, detailed, 7);
-            scene.bind_image(detailed, vec![(7, 1, pid, 100)], 1_000);
+            scene.answer(pid, domain, 7);
+            scene.bind_image(domain, vec![(7, 1, pid, 100)], 1_000);
             drive_pass!();
             assert_eq!(passed.len(), 2);
             assert!(
@@ -4195,11 +4189,9 @@ mod tests {
                 "each pass duplicates its pin fresh: the retry really offers Arc B"
             );
             assert_eq!(minted.len(), 2);
-            let retried = minted[1]
-                .as_ref()
-                .expect("the retry refresh mints a receipt");
+            assert_eq!(minted[1].0, vec![image]);
             assert!(
-                Arc::ptr_eq(retried, &passed[0]),
+                Arc::ptr_eq(&minted[1].1, &passed[0]),
                 "the retry receipt carries the retained Arc"
             );
             let bound = scene
@@ -4211,6 +4203,41 @@ mod tests {
             assert!(
                 Arc::ptr_eq(&bound, &passed[0]),
                 "the retry binding shares H0's retained Arc A, not the fresh duplicate"
+            );
+            // The retry receipt finalizes through the lane: the next
+            // tick stages the stashed retry proof and the commit
+            // registers it against the retained Arc.
+            let batch = {
+                let bindings = scene
+                    .coordinator
+                    .semantic_bindings_mut()
+                    .bindings_for_tick();
+                lane.tick(bindings).unwrap()
+            };
+            assert!(
+                !batch.is_empty(),
+                "the tick batch carries the stashed retry proof"
+            );
+            scene.coordinator.stage_semantic_batch(batch);
+            scene
+                .coordinator
+                .commit_batch_with_semantics(false, Some(&mut lane))
+                .unwrap();
+            let gaps: Vec<(String, String)> = scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+                .collect();
+            assert!(
+                !gaps.iter().any(|gap| gap.0 == "semantic receipt refused"),
+                "the retry proof validates through the retained Arc: {gaps:?}"
+            );
+            assert_eq!(
+                scene.coordinator.registry().instances().count(),
+                1,
+                "the retry receipt registers one instance at commit"
             );
         }
 

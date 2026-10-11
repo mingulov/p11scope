@@ -3897,6 +3897,7 @@ mod tests {
             capture: SemanticCapture,
             io: ScriptIo,
             stash: RefreshReceiptStash,
+            last_refresh_deadline: Option<Instant>,
             /// Clock advance applied at the start of every tick:
             /// quiescence tests age receipts per serviced quantum.
             tick_advance: Duration,
@@ -3917,6 +3918,7 @@ mod tests {
                     capture,
                     io,
                     stash: RefreshReceiptStash::new(),
+                    last_refresh_deadline: None,
                     tick_advance: Duration::ZERO,
                     shed: 0,
                     quiesce_after: 0,
@@ -3957,6 +3959,8 @@ mod tests {
                     .capture
                     .refresh_with(&mut self.io, pin.clone(), slot)
                     .map_err(|_| SemanticRefusal::Unavailable)?;
+                self.last_refresh_deadline =
+                    report.current().first().map(|receipt| receipt.deadline);
                 let effective = effective_refresh_custody(&report, pin);
                 let (images, shed) = stash_refresh_report(&mut self.stash, &mut report);
                 self.shed = self.shed.saturating_add(shed);
@@ -4448,6 +4452,97 @@ mod tests {
                     "the quiet proof registers one instance at commit"
                 );
             }
+        }
+
+        /// Drive a quiet refresh receipt through ClassicDriver using
+        /// H0's actual minting, stash merge and receipt validator. The
+        /// original proof clock ages before the driver stages it.
+        fn classic_tick_with_aged_refresh(remaining: Duration) -> CustodyScene {
+            let image = ImageIdentity {
+                task_cookie: 7,
+                exec_id: 1,
+            };
+            let mut fixture = bound_lane_scene(image);
+            let domain = fixture.lane.domain();
+            let pin = fixture
+                .scene
+                .coordinator
+                .semantic_bindings()
+                .find_by_image(domain, image)
+                .unwrap()
+                .pin();
+            let mut h0 = H0TestIo::new(domain);
+            h0.io.output_image = Some(image);
+            h0.capture.limits.pending_for = Duration::from_secs(2);
+            let staged_at = Instant::now();
+            h0.io.now = staged_at - (Duration::from_secs(2) - remaining);
+            let (images, retained) = h0.refresh(pin.clone(), 0).unwrap();
+            assert_eq!(images, vec![image]);
+            assert!(Arc::ptr_eq(&retained, &pin));
+            assert!(h0.has_pending_evidence());
+            assert_eq!(
+                h0.last_refresh_deadline
+                    .unwrap()
+                    .saturating_duration_since(staged_at),
+                remaining,
+                "the original H0 receipt has the selected lifetime at staging"
+            );
+            // Aging preserves the minted deadline: no re-proof or new
+            // receipt is supplied by this no-call tick.
+            h0.io.now = staged_at;
+            fixture.lane.install_test_io(Box::new(h0));
+            let _lane = crate::inventory::classic_semantic_tick_for_test(
+                &mut fixture.scene.coordinator,
+                fixture.lane,
+            );
+            fixture.scene
+        }
+
+        #[test]
+        fn short_lived_refresh_receipt_commits_through_classic_driver() {
+            for (remaining, expected_instances) in
+                [(Duration::from_millis(300), 1), (Duration::ZERO, 0)]
+            {
+                let scene = classic_tick_with_aged_refresh(remaining);
+                assert_eq!(
+                    scene.coordinator.registry().instances().count(),
+                    expected_instances,
+                    "original remaining={remaining:?}: registration follows real H0 validation"
+                );
+                let refusals: Vec<&str> = scene
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .filter(|gap| gap.subject == "semantic receipt refused")
+                    .map(|gap| gap.reason.as_str())
+                    .collect();
+                if remaining.is_zero() {
+                    assert_eq!(refusals, vec!["deadline"]);
+                } else {
+                    assert!(
+                        refusals.is_empty(),
+                        "fresh receipt refuses nothing: {refusals:?}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn longer_lived_refresh_receipt_commits_through_classic_driver() {
+            // Above the old 1s threshold, publication still must be
+            // prompt: later tick scheduling cannot guarantee the
+            // remaining original receipt window will survive.
+            let scene = classic_tick_with_aged_refresh(Duration::from_millis(1_500));
+            assert_eq!(scene.coordinator.registry().instances().count(), 1);
+            assert!(
+                scene
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .all(|gap| gap.subject != "semantic receipt refused")
+            );
         }
 
         /// Terminal drain through production with real H0 receipts

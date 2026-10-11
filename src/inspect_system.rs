@@ -2827,6 +2827,10 @@ struct ProbeDir {
     uid: u32,
     dev: libc::dev_t,
     ino: libc::ino_t,
+    /// The verified directory fd, held for the value's whole life so
+    /// `Drop` unlinks the known fixture names through it (never the
+    /// path): a post-check replacement is unreachable by fd.
+    dirfd: std::os::fd::OwnedFd,
 }
 
 impl ProbeDir {
@@ -2922,12 +2926,12 @@ impl ProbeDir {
             return Err(IdentityUnavailable::ProbeFailed);
         }
         let (dev, ino) = (stat.st_dev, stat.st_ino);
-        drop(dirfd);
         Ok(Self {
             path: path.to_path_buf(),
             uid,
             dev,
             ino,
+            dirfd,
         })
     }
 
@@ -2956,9 +2960,28 @@ impl ProbeDir {
 
 impl Drop for ProbeDir {
     fn drop(&mut self) {
-        if Self::owns(&self.path, self.uid, self.dev, self.ino) {
-            let _ = std::fs::remove_dir_all(&self.path);
+        use std::os::fd::AsRawFd as _;
+        if !Self::owns(&self.path, self.uid, self.dev, self.ino) {
+            return;
         }
+        // Bounded cleanup, not a recursive delete: only the four
+        // fixture names the probe writes are unlinked, through the
+        // held directory fd (never the path), so a replacement
+        // swapped in after the check above loses nothing — its
+        // unknown names are never touched, and the fd still points
+        // at the created directory. Per-name errors are ignored: a
+        // partial probe write leaves only a subset behind. The final
+        // `rmdir` removes empty dirs only, so a swapped-in non-empty
+        // dir survives with its contents intact; worst case a
+        // swapped-in EMPTY dir is removed.
+        for name in [c"probe-a", c"probe-b", c"probe-a-link", c"probe-a-copy"] {
+            // SAFETY: `unlinkat` of a static NUL-terminated name on
+            // the live held dirfd; flags 0 never unlinks directories.
+            unsafe {
+                libc::unlinkat(self.dirfd.as_raw_fd(), name.as_ptr(), 0);
+            }
+        }
+        let _ = std::fs::remove_dir(&self.path);
     }
 }
 
@@ -4093,6 +4116,40 @@ mod tests {
             b"replacement",
             "drop deleted a swapped-in replacement dir"
         );
+    }
+
+    /// `Drop` deletes at most the four known fixture names plus the
+    /// directory itself when empty: unknown contents in the owned dir
+    /// survive with their bytes intact, and the still-non-empty dir
+    /// survives too. Fully-swapped paths are already skipped by the
+    /// identity pre-check (see the tests above); this pins the deletion
+    /// bound, so a replacement swapped in after the check can lose
+    /// nothing but an empty dir.
+    #[test]
+    fn probe_dir_drop_preserves_unknown_contents() {
+        let scratch = tempfile::tempdir().expect("probe scratch");
+        let path = scratch.path().join("probe");
+        let dir = ProbeDir::create_at(&path).expect("fresh probe dir");
+        for name in ["probe-a", "probe-b", "probe-a-link", "probe-a-copy"] {
+            std::fs::write(path.join(name), b"fixture").expect("write fixture");
+        }
+        std::fs::write(path.join("foreign"), b"foreign").expect("write foreign");
+        drop(dir);
+        assert_eq!(
+            std::fs::read(path.join("foreign")).expect("read foreign"),
+            b"foreign",
+            "drop deleted unknown contents of the probe dir"
+        );
+        assert!(
+            path.is_dir(),
+            "drop removed a non-empty probe dir"
+        );
+        for name in ["probe-a", "probe-b", "probe-a-link", "probe-a-copy"] {
+            assert!(
+                !path.join(name).exists(),
+                "drop left fixture {name} behind"
+            );
+        }
     }
 
     /// Fresh probe dirs are unique per call.

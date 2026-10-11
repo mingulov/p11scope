@@ -145,6 +145,12 @@ impl SemanticBatch {
         self.observed_ns
     }
 
+    /// Current receipts must reach validation promptly, preserving
+    /// their original window even after time spent in the refresh stash.
+    pub(crate) fn has_current_receipts(&self) -> bool {
+        !self.current.is_empty()
+    }
+
     /// Whether the batch carries no outcomes, receipts or negatives:
     /// tests assert quiet ticks stage or commit nothing.
     #[cfg(test)]
@@ -289,8 +295,8 @@ pub(crate) struct AttestedSemanticLane {
     live: Option<Box<LiveLane>>,
     startup_failed: bool,
     /// When the lane's latest batch was staged for commit: the driver
-    /// stamps it on stage and clears it on publish, so a tick can
-    /// commit a staged batch before its receipts expire.
+    /// stamps it on stage and clears it on publish, bounding the wait
+    /// for receipt-free evidence and backing off failed commits.
     staged_at: Option<Instant>,
     /// Tests-only substituted H0 I/O (see [`LaneTestIo`]): installed
     /// by tests that drive the production finalize path without a
@@ -601,8 +607,7 @@ impl AttestedSemanticLane {
     }
 
     /// How long the staged quantum has awaited publication, if one is
-    /// staged: the driver commits a stale staged batch on tick, so
-    /// staged evidence finalizes inside its receipt window.
+    /// staged: the driver commits stale staged evidence on tick.
     pub(crate) fn staged_semantic_age(&self) -> Option<Duration> {
         self.staged_at.map(|at| at.elapsed())
     }

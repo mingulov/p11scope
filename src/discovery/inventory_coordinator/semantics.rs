@@ -1235,7 +1235,6 @@ mod finalizer_history_tests {
         dir: tempfile::TempDir,
         manifest: Manifest,
         pins: PinnedObjects,
-        offsets: [u64; 2],
     }
 
     impl HistoryFixture {
@@ -1323,7 +1322,6 @@ mod finalizer_history_tests {
                 dir,
                 manifest,
                 pins: pinning.pins,
-                offsets,
             }
         }
 

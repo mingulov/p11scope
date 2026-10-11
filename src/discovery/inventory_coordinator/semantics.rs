@@ -1303,7 +1303,10 @@ mod finalizer_history_tests {
                 surfaces: vec![SurfaceRecord {
                     source: SurfaceSource::LegacyFunctionList,
                     acquisition: Acquisition::Ok,
-                    version: Some(Version { major: 2, minor: 40 }),
+                    version: Some(Version {
+                        major: 2,
+                        minor: 40,
+                    }),
                     walk: WalkOutcome::Full,
                     functions,
                 }],

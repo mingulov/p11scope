@@ -1227,7 +1227,7 @@ mod finalizer_history_tests {
     use crate::inventory_semantics::{AttestedSemanticLane, LaneCoverage, SemanticBatch};
     use crate::semantic_capture::{Endpoint, RoutedCall, TickOutcome, TickReport};
     use p11scope_ebpf_common::instance::STAMP_VALID;
-    use p11scope_ebpf_common::{Event, EventRecord, InstanceContinuity, InstanceStamp, capture};
+    use p11scope_ebpf_common::{Event, InstanceStamp, capture};
     use p11scope_manifest::identity::{inspect_file, mapping_file_key, open_object};
     use p11scope_manifest::manifest::*;
 
@@ -1475,8 +1475,8 @@ mod finalizer_history_tests {
         };
         let routed = RoutedCall::scripted(
             detailed,
-            EventRecord {
-                event: Event {
+            crate::semantic_capture::event_record_with_routing(
+                Event {
                     slot: init_slot,
                     session: 7,
                     mechanism: 0x000d,
@@ -1486,12 +1486,9 @@ mod finalizer_history_tests {
                     image,
                     ..Default::default()
                 },
-                continuity: InstanceContinuity {
-                    entry_stamp: stamp,
-                    return_stamp: stamp,
-                    entry_ip: 0x2200,
-                },
-            },
+                stamp,
+                0x2200,
+            ),
             Route::Joined(r0),
             Some(endpoint),
             Some(1),

@@ -16,7 +16,6 @@ import copy
 import inspect
 import json
 import runpy
-import sys
 import unittest
 from pathlib import Path
 
@@ -651,7 +650,6 @@ class AggregateTest(unittest.TestCase):
         receipt["scope_intervals"] = [
             {"pid": 1000, "membership": "selected", "t0": READY, "t1": STOP}]
         ledger = copy.deepcopy(ledger)
-        pre0 = READY + 100_000_000
         for call in ledger:
             if call.get("phase") == "pre":
                 call["scope"] = "outside"

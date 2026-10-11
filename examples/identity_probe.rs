@@ -59,14 +59,34 @@ fn deny_check(btf_path: Option<PathBuf>) -> ! {
 }
 
 /// One probe run's private subdir, removed when this guard drops —
-/// on success and on every `PROBE FAIL` path alike.
+/// on success and on every `PROBE FAIL` path alike. Cleanup is bound
+/// to the created directory's identity (device/inode/owner): a
+/// swapped-in replacement is never deleted.
 struct ProbeSubdir {
     path: PathBuf,
+    dev: u64,
+    ino: u64,
+    uid: u32,
 }
 
 impl Drop for ProbeSubdir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
+        if Self::owns(&self.path, self.dev, self.ino, self.uid) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+impl ProbeSubdir {
+    /// Whether `path` is still the directory this guard created: a
+    /// directory with the recorded owner and device/inode (a swapped-in
+    /// symlink or foreign path is never ours).
+    fn owns(path: &std::path::Path, dev: u64, ino: u64, uid: u32) -> bool {
+        use std::os::unix::fs::MetadataExt as _;
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return false;
+        };
+        meta.is_dir() && meta.uid() == uid && meta.dev() == dev && meta.ino() == ino
     }
 }
 
@@ -103,8 +123,32 @@ fn create_probe_subdir(dir: &std::path::Path) -> Result<ProbeSubdir, String> {
         }
         return Err(error.to_string());
     }
+    // Verify the opened fd before chmoding it: a directory we own.
+    // Its device/inode bind the cleanup guard below.
+    // SAFETY: `fstat` on a live fd with a writable out-param.
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `geteuid` takes no arguments and always succeeds.
+    let euid = unsafe { libc::geteuid() };
+    let identity = if unsafe { libc::fstat(raw, stat.as_mut_ptr()) } == 0 {
+        // SAFETY: the successful `fstat` initialized `stat`.
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT == libc::S_IFDIR && stat.st_uid == euid {
+            Some((stat.st_dev, stat.st_ino))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let Some((dev, ino)) = identity else {
+        unsafe {
+            libc::close(raw);
+            libc::rmdir(path.as_ptr());
+        }
+        return Err("probe subdir is not an owned directory".to_string());
+    };
     // The mkdir mode honors umask, so enforce 0700 exactly on the
-    // opened fd: private under any umask.
+    // verified-owned fd: private under any umask.
     // SAFETY: `fchmod` on the live fd from the `open` above.
     let chmod_error = if unsafe { libc::fchmod(raw, 0o700) } != 0 {
         Some(std::io::Error::last_os_error())
@@ -121,7 +165,12 @@ fn create_probe_subdir(dir: &std::path::Path) -> Result<ProbeSubdir, String> {
         }
         return Err(error.to_string());
     }
-    Ok(ProbeSubdir { path: subdir })
+    Ok(ProbeSubdir {
+        path: subdir,
+        dev,
+        ino,
+        uid: euid,
+    })
 }
 
 fn probe(dir: PathBuf, generation: u64) -> ! {
@@ -558,6 +607,26 @@ mod tests {
         let path = subdir.path.clone();
         drop(subdir);
         assert!(!path.exists(), "the guard must remove the subdir");
+    }
+
+    /// A swapped-in replacement dir is never deleted: the guard only
+    /// removes the directory it created.
+    #[test]
+    fn probe_subdir_drop_preserves_replacement_dir() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let subdir = create_probe_subdir(scratch.path()).expect("create subdir");
+        let path = subdir.path.clone();
+        let parked = scratch.path().join("parked");
+        std::fs::rename(&path, &parked).expect("park original");
+        std::fs::create_dir(&path).expect("plant replacement");
+        std::fs::write(path.join("keep"), b"keep").expect("write keep");
+        drop(subdir);
+        assert_eq!(
+            std::fs::read(path.join("keep")).expect("read keep"),
+            b"keep",
+            "drop deleted a replacement dir"
+        );
+        assert!(parked.is_dir(), "the created dir must be left parked");
     }
 
     /// A probe run removes its subdir on every exit: repeated runs

@@ -363,10 +363,7 @@ impl TickReport {
     /// Merge lane-stashed refresh receipts behind this tick's own: fresh
     /// receipts first, stashed appended, truncated to batch capacity so
     /// the merged batch never refuses on bounds. Returns shed receipts.
-    pub(crate) fn merge_stashed_current(
-        &mut self,
-        stashed: Vec<CurrentPartitionReceipt>,
-    ) -> u64 {
+    pub(crate) fn merge_stashed_current(&mut self, stashed: Vec<CurrentPartitionReceipt>) -> u64 {
         self.current.extend(stashed);
         let shed = self.current.len().saturating_sub(MAX_INSTANCES);
         self.current.truncate(MAX_INSTANCES);
@@ -2461,10 +2458,7 @@ mod tests {
     fn merge_stashed_current_truncates_to_batch_capacity() {
         let domain = NativeDomainId::mint();
         let watched = stash_watched();
-        let mut report = TickReport::scripted(
-            Vec::new(),
-            vec![merge_receipt(domain, 0, &watched)],
-        );
+        let mut report = TickReport::scripted(Vec::new(), vec![merge_receipt(domain, 0, &watched)]);
         let stashed: Vec<_> = (1..=MAX_INSTANCES as u64)
             .map(|cookie| merge_receipt(domain, cookie, &watched))
             .collect();
@@ -3440,9 +3434,7 @@ mod tests {
             AdmissionState, CallerId, ImageAuthority, ModuleInfo, ModuleKey, OsProcessSource,
             RegistryLimits,
         };
-        use crate::discovery::engine::inventory_coordinator::{
-            InventoryCoordinator, NativeBatch,
-        };
+        use crate::discovery::engine::inventory_coordinator::{InventoryCoordinator, NativeBatch};
         use crate::discovery::hooks::HookRegistry;
         use crate::discovery::inventory_attach_set::{AttachObjectId, EndpointId};
         use crate::discovery::native_binding::NativeIdentity;
@@ -3538,12 +3530,7 @@ mod tests {
                 );
             }
 
-            fn witness_read(
-                &mut self,
-                domain: NativeDomainId,
-                rows: Vec<WitnessRow>,
-                at_ns: u64,
-            ) {
+            fn witness_read(&mut self, domain: NativeDomainId, rows: Vec<WitnessRow>, at_ns: u64) {
                 let batch = WitnessBatch {
                     domain,
                     phase: CapturePhase::Active,

@@ -246,7 +246,17 @@ def run_cell(args, root, label, *, json_output=True, first_signal=None,
                         raise AssertionError("PTY stop did not produce real EAGAIN")
                 finally:
                     os.close(probe)
-            if capture_ready and first_signal is not None and not signal_sent:
+            # signal-progress cancels a staged multi-write stream mid-flow: an
+            # immediate stop now latches before apply/commit (F9) and yields
+            # an empty instant report with no stream left to cancel, so the
+            # capture signal waits for pass 0's publication (emitted after
+            # its commit). Other cases keep the immediate trigger.
+            progress_staged = (
+                args.case != "signal-progress"
+                or b"p11scope: pass 0:" in stderr
+                or b"p11scope: pass 0:" in stdout
+            )
+            if capture_ready and first_signal is not None and not signal_sent and progress_staged:
                 os.kill(observer.pid, first_signal)
                 signals.append({"signal": first_signal, "sent": now, "phase": "capture"})
                 signal_sent = True

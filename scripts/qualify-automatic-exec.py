@@ -73,6 +73,19 @@ IMAGE_FIELDS = ("image", "pid", "start_time", "path", "dev", "ino", "mtime_ns",
 CELLS = ("pid-leader", "pid-reexec", "pid-nonleader-cold", "pid-failed-exec",
          "leader-exit-exec", "rapid-chain", "cgroup-reentry", "system-mixed")
 BACKENDS = ("singles", "multi")
+# Completion requires every recovery/control leg run by each selected cell.
+# Worker capability is an independent informational population, not one of
+# these required positives.
+REQUIRED_LEGS = {
+    "pid-leader": ("trace", "profile", "metrics"),
+    "pid-reexec": ("trace", "profile", "metrics"),
+    "pid-nonleader-cold": ("trace", "profile", "metrics"),
+    "pid-failed-exec": ("trace",),
+    "leader-exit-exec": ("trace",),
+    "rapid-chain": ("trace", "reuse", "group-death"),
+    "cgroup-reentry": ("trace", "replacement", "stop-before", "stop-during", "inventory"),
+    "system-mixed": ("inventory",),
+}
 CANARIES = ("H6_PRIVATE_BUFFER_44c1d7", "H6_PRIVATE_ENV_9e02b4", "H6_PRIVATE_ARG_71f5aa")
 
 # Fixture RV values to presented CKR names (workload-B uses RV 0 and 5 only).
@@ -3275,6 +3288,8 @@ def evaluate_worker_capability(result, receipt, backend):
         if (result.get("status") not in ("pass", "fail")
                 or result.get("pass") is not (result.get("status") == "pass")):
             errors.append("failed/untested setup cannot demonstrate worker capability")
+        if receipt["requested_backend"] != backend:
+            errors.append("capability receipt backend differs from the requested backend")
         setup = receipt["b_setup"]
         proof, worker = setup["worker_barrier"], setup["worker_identity"]
         leader = proof["leader"]
@@ -3333,6 +3348,11 @@ def evaluate_worker_capability(result, receipt, backend):
         else:
             ev = terminal[0]
             errors.extend(_early_gap_errors(ev, early["deficit"]))
+            attach = ev.get("attach_backend")
+            if not isinstance(attach, dict) or attach.get("selection") != backend:
+                errors.append("capability capture backend differs from the requested backend")
+            if isinstance(attach, dict) and attach.get("fallback") is not None:
+                errors.append("capability capture installed a fallback link: no global fallback allowed")
             if (ev.get("privacy_mode") != "allowlisted" or ev.get("trace_truncated") is not False
                     or any(ev.get(key, 0) for key in ("event_loss", "start_insert_failures", "unmatched_returns",
                         "rv_update_failures", "process_tracking_failures", "process_tracking_evictions"))):
@@ -4433,6 +4453,39 @@ def run_cell_backend(ctx, cell, backend):
     return results
 
 
+def required_recovery_coverage(batches, cells, backends):
+    """Require one exact positive per requested recovery leg, without new rows."""
+    expected = {(cell, f"{kind}/{backend}") for cell in cells for backend in backends
+                for kind in REQUIRED_LEGS[cell]}
+    rows = defaultdict(list)
+    coverage = {"required": len(expected), "positive": 0, "missing": [],
+                "nonpositive": [], "duplicates": [], "unexpected": []}
+    for cell, backend, results in batches:
+        required = {(cell, f"{kind}/{backend}") for kind in REQUIRED_LEGS[cell]}
+        optional = {(cell, f"capability-preexec/{backend}")} if cell == "leader-exit-exec" else set()
+        for result in results:
+            identity = (result.get("cell"), result.get("leg"))
+            if identity in required:
+                rows[identity].append(result)
+            elif identity not in optional:
+                coverage["unexpected"].append({"cell": identity[0], "leg": identity[1],
+                                               "requested_cell": cell, "requested_backend": backend})
+    for cell, leg in sorted(expected):
+        matches = rows.get((cell, leg), [])
+        identity = {"cell": cell, "leg": leg}
+        if not matches:
+            coverage["missing"].append(identity)
+        elif len(matches) != 1:
+            coverage["duplicates"].append({**identity, "count": len(matches)})
+        elif matches[0].get("pass") is True and matches[0].get("status") == "pass":
+            coverage["positive"] += 1
+        else:
+            coverage["nonpositive"].append({**identity, "pass": matches[0].get("pass"),
+                                            "status": matches[0].get("status")})
+    coverage["complete"] = coverage["positive"] == coverage["required"] and not coverage["unexpected"]
+    return coverage
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Installed automatic exec/scope recovery acceptance (H6 slice 4). "
@@ -4477,6 +4530,7 @@ def main(argv=None):
     ctx = Case(args)
     pins = []
     results = []
+    result_batches = []
     cleanup_receipt: dict = {"processes": 0, "cgroups": 0, "pins": 0, "errors": []}
     with signal_cleanup():
         try:
@@ -4492,7 +4546,9 @@ def main(argv=None):
                 str(args.out / "bin" / "provider.so"), "C_Initialize")
             for cell in cells:
                 for backend in backends:
-                    results.extend(run_cell_backend(ctx, cell, backend))
+                    batch = run_cell_backend(ctx, cell, backend)
+                    results.extend(batch)
+                    result_batches.append((cell, backend, batch))
                     if ctx.cleanup_failed:
                         break
                 if ctx.cleanup_failed:
@@ -4532,14 +4588,15 @@ def main(argv=None):
             counts["passed"] += 1
         else:
             counts["failed"] += 1
-    required_complete = counts["passed"] > 0 and counts["failed"] == counts["negative"] == 0
+    coverage = required_recovery_coverage(result_batches, cells, backends)
+    required_complete = coverage["complete"] and counts["failed"] == counts["negative"] == 0
     summary = {
         "source_revision": args.source_revision,
         "candidate": ctx.binary.metadata(), "provider": ctx.provider_pin.metadata(),
         "abi": "Linux x86-64 LP64", "kernel": os.uname().release,
         "cells": [cell for cell in cells for _ in backends], "backends": list(backends),
         "legs": results,
-        **counts, "required_complete": required_complete,
+        **counts, "required_coverage": coverage, "required_complete": required_complete,
         "complete": required_complete and set(cells) == set(CELLS) and set(backends) == set(BACKENDS),
         "unexecuted": [name for name in CELLS if name not in cells],
     }

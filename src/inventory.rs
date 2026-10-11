@@ -1490,13 +1490,22 @@ fn bind_semantic_callers(
         else {
             continue;
         };
-        let images = match lane.refresh_candidate(pin, slot) {
+        // One custody Arc through refresh and binding: H0 retains this
+        // exact Arc, so the stored binding must share it (H0's `ptr_eq`
+        // gates refuse any re-duplication).
+        let images = match lane.refresh_candidate(pin.clone(), slot) {
             Ok(images) => images,
             Err(_) => continue,
         };
         for image in images {
-            let _ =
-                coordinator.bind_semantic_caller(caller, module.clone(), domain, image, identity);
+            let _ = coordinator.bind_semantic_caller_with_pin(
+                caller,
+                module.clone(),
+                domain,
+                image,
+                identity,
+                pin.clone(),
+            );
         }
     }
 }

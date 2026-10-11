@@ -3256,4 +3256,293 @@ mod tests {
             }
         }
     }
+
+    mod custody_chain_tests {
+        //! One custody Arc through H0 refresh, coordinator binding, tick and
+        //! receipt validation: H0's `ptr_eq` gates refuse any re-duplication.
+        use super::*;
+        use crate::attach::Scope;
+        use crate::attach::capture::{
+            CaptureHealth, CapturePhase, CookieQuery, DiscoveryBatch, DomainCookie, ExecCoverage,
+            ExtendReceipt, ScopeCustody, WitnessBatch, WitnessRow,
+        };
+        use crate::discovery::caller_registry::{
+            AdmissionState, CallerId, ImageAuthority, ModuleInfo, ModuleKey, OsProcessSource,
+            RegistryLimits,
+        };
+        use crate::discovery::engine::inventory_coordinator::{
+            InventoryCoordinator, NativeBatch,
+        };
+        use crate::discovery::hooks::HookRegistry;
+        use crate::discovery::inventory_attach_set::{AttachObjectId, EndpointId};
+        use crate::discovery::native_binding::NativeIdentity;
+        use std::collections::HashMap;
+
+        #[derive(Default)]
+        struct ChainIdentity {
+            answers: HashMap<(u32, NativeDomainId), CookieQuery>,
+        }
+
+        impl NativeIdentity<PidPin> for ChainIdentity {
+            fn owner_image(&mut self, _pid: u32) -> Option<ImageIdentity> {
+                None
+            }
+
+            fn query_cookie(&mut self, domain: NativeDomainId, pin: &PidPin) -> CookieQuery {
+                self.answers
+                    .get(&(pin.pid(), domain))
+                    .cloned()
+                    .unwrap_or(CookieQuery::NoCookie)
+            }
+        }
+
+        std::thread_local! {
+            static SIGHT_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(1_005) };
+        }
+
+        fn sight_clock() -> Option<u64> {
+            SIGHT_NS.with(|clock| Some(clock.get()))
+        }
+
+        struct CustodyScene {
+            coordinator: InventoryCoordinator<OsProcessSource>,
+            identity: ChainIdentity,
+            detailed: NativeDomainId,
+            module: ModuleKey,
+        }
+
+        impl CustodyScene {
+            fn new() -> Self {
+                let mut coordinator = InventoryCoordinator::new(
+                    Scope::Pid(std::process::id()),
+                    HookRegistry::builtin(),
+                    Vec::new(),
+                    OsProcessSource,
+                    RegistryLimits::default_limits(),
+                )
+                .unwrap();
+                let detailed = NativeDomainId::mint();
+                coordinator.note_extend_receipt(&ExtendReceipt {
+                    activated_roots: true,
+                    exec_coverage: Some(ExecCoverage::scripted(detailed, 0)),
+                    ..ExtendReceipt::default()
+                });
+                coordinator.set_semantic_binding_clock(sight_clock);
+                Self {
+                    coordinator,
+                    identity: ChainIdentity::default(),
+                    detailed,
+                    module: ModuleKey::physical(7, 7, 777, None, "/task3/provider.so"),
+                }
+            }
+
+            fn admit(&mut self, pid: u32, at_ns: u64) -> CallerId {
+                self.coordinator
+                    .adapter_mut()
+                    .admit(pid, ImageAuthority::ScanPinned, at_ns)
+                    .unwrap()
+            }
+
+            fn map(&mut self, caller: CallerId, pid: u32, at_ns: u64) {
+                let info = ModuleInfo {
+                    path: "/task3/provider.so".into(),
+                    key: self.module.clone(),
+                    double_loaded: false,
+                    build_id: None,
+                    identity_source: Some("task3".into()),
+                    admission: AdmissionState::Admitted,
+                    admission_class: Some("exact".into()),
+                    admission_endpoints: Some(1),
+                    admission_reasons: Vec::new(),
+                };
+                self.coordinator
+                    .registry_mut()
+                    .note_mapping(caller, pid, info, at_ns);
+                self.coordinator.commit_batch(false).unwrap();
+            }
+
+            fn answer(&mut self, pid: u32, domain: NativeDomainId, ticket: u64) {
+                self.identity.answers.insert(
+                    (pid, domain),
+                    CookieQuery::Cookie(DomainCookie::scripted(domain, ticket)),
+                );
+            }
+
+            fn witness_read(
+                &mut self,
+                domain: NativeDomainId,
+                rows: Vec<WitnessRow>,
+                at_ns: u64,
+            ) {
+                let batch = WitnessBatch {
+                    domain,
+                    phase: CapturePhase::Active,
+                    rows,
+                    integrity: Vec::new(),
+                    integrity_total: 0,
+                    visited: 0,
+                    sweep_completed: true,
+                    sweeps_completed: 1,
+                    row_bound_reached: false,
+                    deadline_reached: false,
+                    read_failures: Vec::new(),
+                    unrecorded_rows: 0,
+                    sweep_gaps: false,
+                    counts: Vec::new(),
+                    refresh_sweep_completed: true,
+                    refresh_sweep_gaps: false,
+                    refresh_deadline_reached: false,
+                    refresh_sweeps_completed: 1,
+                    seen_rows: 0,
+                    pair_limit: 65_536,
+                    health: CaptureHealth {
+                        discovery_counters: Some([0; 5]),
+                        ..CaptureHealth::default()
+                    },
+                    health_regression: None,
+                    health_unproven: None,
+                    health_baseline_ns: 0,
+                    health_read_ns: at_ns,
+                    rows_anchor_ns: at_ns + 1,
+                    rows_read_ns: at_ns + 1,
+                    counts_read_ns: at_ns + 1,
+                    changed_objects: Vec::new(),
+                    custody: ScopeCustody::System,
+                    custody_proven_ns: None,
+                    lifecycle_proven_ns: u64::MAX,
+                    lifecycle_loss: None,
+                    unsettled: false,
+                };
+                self.coordinator.stage_native(
+                    NativeBatch::Witness(Box::new(batch)),
+                    &mut self.identity,
+                    at_ns + 2,
+                );
+            }
+
+            fn drain(&mut self, domain: NativeDomainId, at_ns: u64) {
+                let batch = DiscoveryBatch::scripted(domain, Vec::new(), at_ns);
+                self.coordinator.stage_native(
+                    NativeBatch::Lifecycle(batch),
+                    &mut self.identity,
+                    at_ns + 1,
+                );
+            }
+
+            fn bind_image(
+                &mut self,
+                domain: NativeDomainId,
+                rows: Vec<(u64, u64, u32, u64)>,
+                at_ns: u64,
+            ) {
+                let rows = rows
+                    .into_iter()
+                    .map(|(ticket, exec, tgid, t0)| {
+                        WitnessRow::scripted(
+                            domain,
+                            ticket,
+                            exec,
+                            AttachObjectId::scripted(0),
+                            EndpointId(0),
+                            tgid,
+                            t0,
+                        )
+                    })
+                    .collect();
+                self.witness_read(domain, rows, at_ns);
+                self.drain(domain, at_ns + 10);
+                self.witness_read(domain, Vec::new(), at_ns + 20);
+                self.coordinator.commit_batch(false).unwrap();
+            }
+        }
+
+        #[test]
+        fn refresh_bind_tick_validate_share_one_custody_arc() {
+            let mut scene = CustodyScene::new();
+            let pid = std::process::id();
+            let caller = scene.admit(pid, 50);
+            scene.map(caller, pid, 60);
+            let detailed = scene.detailed;
+            let module = scene.module.clone();
+            let image = ImageIdentity {
+                task_cookie: 7,
+                exec_id: 1,
+            };
+            scene.answer(pid, detailed, 7);
+            scene.bind_image(detailed, vec![(7, 1, pid, 100)], 1_000);
+            // The production refresh pin: one duplication off the live pin,
+            // given to H0's refresh (inventory.rs `bind_semantic_callers`).
+            let pin: Arc<PidPin> = Arc::new(
+                scene
+                    .coordinator
+                    .adapter()
+                    .live_pin(pid)
+                    .and_then(|(_, pin)| pin.try_clone().ok())
+                    .unwrap(),
+            );
+            // H0 serves this pin's targets through the same Arc.
+            let mut io = ScriptIo::new(NativeDomainId::mint());
+            io.pin = pin.clone();
+            let mut capture = capture(&io);
+            let refresh = capture.refresh_with(&mut io, pin.clone(), 0).unwrap();
+            assert_eq!(
+                refresh.current().len(),
+                1,
+                "the accepted refresh scan mints one receipt"
+            );
+            let refreshed = refresh.current()[0].original_pin().clone();
+            assert!(
+                Arc::ptr_eq(&refreshed, &pin),
+                "H0 retains the exact refresh Arc"
+            );
+            // The binding stores the passed Arc, never a re-duplication.
+            scene
+                .coordinator
+                .bind_semantic_caller_with_pin(
+                    caller,
+                    module,
+                    detailed,
+                    image,
+                    &mut scene.identity,
+                    pin.clone(),
+                )
+                .unwrap();
+            let bound = scene
+                .coordinator
+                .semantic_bindings()
+                .get(caller)
+                .unwrap()
+                .pin();
+            assert!(
+                Arc::ptr_eq(&bound, &pin),
+                "the stored binding shares the refresh Arc"
+            );
+            // The refresh receipt validates through the retained Arc.
+            let mut scratch = TickReport::default();
+            assert_eq!(
+                capture.validate_current_with(&mut io, &refresh.current()[0], &mut scratch),
+                Ok(())
+            );
+            // A fresh-image tick scans through the binding pin: the minted
+            // receipt shares it and validates.
+            io.call_image(2, 1, 0);
+            let tick = capture.tick_with(&mut io).unwrap();
+            assert!(
+                tick.calls().any(|call| matches!(
+                    call.route(),
+                    crate::discovery::instances::Route::Joined(_)
+                )),
+                "the tick serves the fresh image"
+            );
+            assert_eq!(tick.current().len(), 1);
+            assert!(
+                Arc::ptr_eq(tick.current()[0].original_pin(), &bound),
+                "the tick receipt shares the binding Arc"
+            );
+            assert_eq!(
+                capture.validate_current_with(&mut io, &tick.current()[0], &mut scratch),
+                Ok(())
+            );
+        }
+    }
 }

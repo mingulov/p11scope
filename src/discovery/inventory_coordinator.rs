@@ -2782,6 +2782,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let Some(caller) = self.adapter.live_id(pid) else {
                 continue;
             };
+            // A hook that predates the live incarnation's admission is
+            // the old image's delayed record (or a reused pid's): PID
+            // equality alone cannot select the live caller.
+            if self
+                .adapter
+                .record(caller)
+                .is_some_and(|incarnation| record.hook_ts_ns < incarnation.first_seen_ns)
+            {
+                continue;
+            }
             let holds = self
                 .adapter
                 .live_pin(pid)
@@ -14774,6 +14784,7 @@ pub(crate) mod tests {
         later.answer(8, 600, 42);
         later.witness(vec![later.row(41, 1, 7, 100, 0)]);
         let mut exit_record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        exit_record.hook_ts_ns = 1_500;
         exit_record.pid_tgid = (u64::from(7u32) << 32) | u64::from(7u32);
         exit_record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
         later.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
@@ -14897,6 +14908,107 @@ pub(crate) mod tests {
             "one successor per ended caller: {again:?}"
         );
         assert_eq!(once.scene.coordinator.adapter.len(), 2);
+    }
+
+    /// H6 stale attribution: a leader exit whose hook predates the live
+    /// caller's admission is the old image's delayed record, never the
+    /// live incarnation's link loss — PID equality alone cannot select
+    /// it. A delayed old-image exit and a reused-PID exit both stay
+    /// silent; a fresh exit still records exactly once.
+    #[test]
+    fn stale_leader_exits_never_cut_a_later_incarnation() {
+        fn exit_record(pid: u32, hook_ts_ns: u64) -> p11scope_ebpf_common::DiscoveryRecord {
+            // SAFETY: DiscoveryRecord contains only integer fields.
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.hook_ts_ns = hook_ts_ns;
+            record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+            record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+            record
+        }
+        fn link_losses(native: &NativeScene) -> usize {
+            native
+                .gap_subjects()
+                .iter()
+                .filter(|subject| subject.as_str() == "leader task link loss")
+                .count()
+        }
+
+        // Delayed old-image exit: the hook predates pid 7's admission
+        // at 50, so it records nothing on the live incarnation.
+        let (mut native, _leader) = NativeScene::new();
+        native.answer(7, 500, 41);
+        native.witness(vec![native.row(41, 1, 7, 100, 0)]);
+        let receipt = native.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            native.domain,
+            vec![exit_record(7, 40)],
+            native.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(link_losses(&native), 0, "a pre-admission exit stays silent");
+        // Control: a fresh exit for the live incarnation still records.
+        let receipt = native.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            native.domain,
+            vec![exit_record(7, 1_500)],
+            native.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(link_losses(&native), 1, "a fresh exit still records once");
+
+        // Reused PID: pid 7 exits, the pid is reused by a fresh
+        // generation admitted at 2,100, and the old image's delayed
+        // exit (hook 1,500) lands on nothing.
+        let (mut reused, _leader) = NativeScene::new();
+        reused.scene.source.kill(7);
+        let events = reused.scene.coordinator.adapter.reconcile(
+            &BTreeSet::new(),
+            &mut |_| ImageAuthority::ScanPinned,
+            2_000,
+        );
+        reused
+            .scene
+            .coordinator
+            .apply_reconcile_events(&events, 2_000);
+        reused.scene.coordinator.commit_batch(false).unwrap();
+        reused.scene.source.spawn(7, 900);
+        let observed: BTreeSet<u32> = [7].into_iter().collect();
+        let events = reused.scene.coordinator.adapter.reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            2_100,
+        );
+        let [CallerEvent::Admitted { id }] = events.as_slice() else {
+            panic!("the reused pid admits fresh: {events:?}");
+        };
+        let fresh = *id;
+        reused
+            .scene
+            .coordinator
+            .apply_reconcile_events(&events, 2_100);
+        reused.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(reused.scene.coordinator.adapter.live_id(7), Some(fresh));
+        let receipt = reused.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            reused.domain,
+            vec![exit_record(7, 1_500)],
+            reused.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        reused.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            link_losses(&reused),
+            0,
+            "the old image's delayed exit never cuts the fresh incarnation"
+        );
+        // Control: a fresh exit for the new incarnation still records.
+        let receipt = reused.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            reused.domain,
+            vec![exit_record(7, 2_500)],
+            reused.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        reused.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(link_losses(&reused), 1, "a fresh exit still records once");
     }
 
     /// H6 slice 2: outside exec cannot admit on reconcile/native paths; a

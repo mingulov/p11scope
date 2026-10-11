@@ -567,7 +567,9 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
 
     /// Commit one held exec handoff under its exact member permit (H6
     /// slice 2): the moved original pin proves the same process, and the
-    /// borrowed permit proves current scope membership. Checks mirror
+    /// borrowed permit proves current scope membership. The verified
+    /// pre-sample generation arrives with the call, so commit performs
+    /// no identity reads of its own. Checks mirror
     /// `commit_scoped_caller` — pid/generation match, permit check,
     /// custody, finish — with no fallible tail after them. A live
     /// candidate for this pid joins only when it already holds the
@@ -578,17 +580,15 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         pid: u32,
         pin: Source::Pin,
         permit: crate::inspect_system::inventory_cgroup::CgroupAdmissionPermit<'_>,
+        generation: crate::inspect_system::MemberGeneration,
         now_ns: u64,
     ) -> Result<(CallerId, bool), AdmitFailure> {
         let failed = |reason: &str| AdmitFailure {
             reason: reason.into(),
             budget: None,
         };
-        let current_start = self.source.start_time(pid);
-        let current_exe = self.source.exe_identity(pid);
         if pid != permit.pid()
-            || permit.generation().start_time != current_start
-            || permit.generation().exe != current_exe
+            || generation != *permit.generation()
             || !permit.check()
             || !self.source.still_the_same(&pin)
             || !permit.finish_check()
@@ -601,7 +601,10 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             let record = self
                 .record(id)
                 .ok_or_else(|| failed("retained cgroup caller disappeared"))?;
-            if record.retired || record.start_time != current_start || record.exe != current_exe {
+            if record.retired
+                || record.start_time != generation.start_time
+                || record.exe != generation.exe
+            {
                 return Err(failed(
                     "the pid's live caller is not this handoff's current incarnation; \
                      pid equality alone never adopts it",
@@ -633,10 +636,10 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                 record: CallerRecord {
                     id,
                     pid,
-                    start_time: current_start,
+                    start_time: generation.start_time,
                     incarnation,
-                    exec_observed: current_exe.is_some(),
-                    exe: current_exe,
+                    exec_observed: generation.exe.is_some(),
+                    exe: generation.exe,
                     authority: ImageAuthority::ScanPinned,
                     lifecycle: CallerLifecycle::Mapped,
                     lifecycle_reason: None,

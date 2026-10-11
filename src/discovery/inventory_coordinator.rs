@@ -5112,7 +5112,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     if preparation.generation().start_time == mint_start
                         && preparation.generation().exe == mint_exe
                     {
-                        prepared_handoffs.insert(pid, old);
+                        // The verified pre-sample generation travels with
+                        // the handoff: commit matches it against the end
+                        // sample with no identity reads of its own.
+                        prepared_handoffs.insert(pid, (old, preparation.generation().clone()));
                     }
                     continue;
                 }
@@ -5197,7 +5200,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // Held handoffs commit under their own exact member permits:
             // borrow the permit, commit the moved custody, finish. No
             // permit this transaction holds the handoff for a fresher one.
-            for (pid, old) in prepared_handoffs {
+            for (pid, (old, generation)) in prepared_handoffs {
                 let Some(pending) = self.pending_successors.remove(&old) else {
                     continue;
                 };
@@ -5205,10 +5208,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     self.pending_successors.insert(old, pending);
                     continue;
                 };
-                match self
-                    .adapter
-                    .commit_handoff_caller(pid, pending.custody, permit, *now_ns)
-                {
+                match self.adapter.commit_handoff_caller(
+                    pid,
+                    pending.custody,
+                    permit,
+                    generation,
+                    *now_ns,
+                ) {
                     Ok((new, admitted)) => {
                         allowed.insert(pid);
                         if admitted {
@@ -15009,6 +15015,128 @@ pub(crate) mod tests {
         assert!(receipt.events.is_empty());
         reused.scene.coordinator.commit_batch(false).unwrap();
         assert_eq!(link_losses(&reused), 1, "a fresh exit still records once");
+    }
+
+    /// A scripted source that counts identity reads and can diverge from
+    /// the collection's truth: post-sample commits must use the verified
+    /// generation, never fresh reads.
+    struct CountingSource {
+        inner: crate::discovery::caller_registry::tests::ScriptedSource,
+        identity_reads: std::rc::Rc<Cell<u64>>,
+        divergent: std::rc::Rc<Cell<bool>>,
+    }
+
+    impl crate::discovery::caller_registry::ProcessSource for CountingSource {
+        type Pin = (u32, u64);
+
+        fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
+            self.inner.open(pid)
+        }
+
+        fn still_the_same(&self, pin: &Self::Pin) -> bool {
+            self.inner.still_the_same(pin)
+        }
+
+        fn start_time(&self, pid: u32) -> Option<u64> {
+            self.identity_reads
+                .set(self.identity_reads.get().saturating_add(1));
+            if self.divergent.get() {
+                return Some(123_456_789);
+            }
+            self.inner.start_time(pid)
+        }
+
+        fn exe_identity(&self, pid: u32) -> Option<ExeIdentity> {
+            self.identity_reads
+                .set(self.identity_reads.get().saturating_add(1));
+            if self.divergent.get() {
+                return Some(ExeIdentity {
+                    dev: 4242,
+                    ino: 4242,
+                    mtime_secs: 0,
+                    mtime_nanos: 0,
+                    path: Some("/diverged".into()),
+                });
+            }
+            self.inner.exe_identity(pid)
+        }
+
+        fn gone(&self, pid: u32) -> bool {
+            self.inner.gone(pid)
+        }
+    }
+
+    /// H6 commit order: a held handoff commits under its verified
+    /// pre-sample generation with zero post-sample identity reads. A
+    /// source that diverges after the end sample still commits the
+    /// verified generation — fresh reads never override it.
+    #[test]
+    fn handoff_commit_uses_the_verified_generation_without_post_sample_reads() {
+        let child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let pid = child.id();
+        let fixture = tempfile::tempdir().unwrap();
+        std::fs::write(fixture.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+        let mut coordinator = InventoryCoordinator::new(
+            crate::scope::cgroup(fixture.path()).unwrap(),
+            HookRegistry::builtin(),
+            Vec::new(),
+            crate::discovery::caller_registry::OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        coordinator.begin_capture_coverage(CaptureScopeCoverage::Cgroup);
+        let mut collection = coordinator
+            .cgroup_collector(
+                CgroupWalkState::default(),
+                CgroupWalkLimits::default(),
+                CollectionControl::new(None),
+                None,
+            )
+            .unwrap()();
+        // The pre-sample preparation: the walk shows the live member and
+        // its generation is verified before the end sample runs.
+        let preparation = collection.preparation(pid).expect("member prepared");
+        assert!(preparation.check(), "the walk shows the live member");
+        let verified = preparation.generation().clone();
+        let mut requested = BTreeSet::new();
+        requested.insert(pid);
+        collection.sample_end(&requested);
+        let permit = collection.permit(pid).expect("the end sample permits");
+        assert_eq!(
+            permit.generation(),
+            &verified,
+            "the member is stable across the sample"
+        );
+
+        // Commit under a source that diverges after the end sample: the
+        // handoff still commits its verified generation, reading nothing.
+        let identity_reads = std::rc::Rc::new(Cell::new(0));
+        let divergent = std::rc::Rc::new(Cell::new(false));
+        let mut inner = crate::discovery::caller_registry::tests::ScriptedSource::default();
+        inner.spawn_matching_process(pid);
+        let pin = inner.open(pid).expect("the scripted member opens");
+        let source = CountingSource {
+            inner,
+            identity_reads: std::rc::Rc::clone(&identity_reads),
+            divergent: std::rc::Rc::clone(&divergent),
+        };
+        let mut adapter = CallerAdapter::new(source);
+        divergent.set(true);
+        let (id, admitted) = adapter
+            .commit_handoff_caller(pid, pin, permit, verified.clone(), 3_000)
+            .map_err(|failure| failure.reason)
+            .expect("the verified generation commits");
+        assert!(admitted, "the handoff mints its successor");
+        assert_eq!(
+            identity_reads.get(),
+            0,
+            "commit performs no post-sample identity reads"
+        );
+        let record = adapter.record(id).expect("successor retained");
+        assert_eq!(record.start_time, verified.start_time);
+        assert_eq!(record.exe, verified.exe);
+        assert_eq!(adapter.live_id(pid), Some(id));
     }
 
     /// H6 slice 2: outside exec cannot admit on reconcile/native paths; a

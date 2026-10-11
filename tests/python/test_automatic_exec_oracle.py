@@ -9,13 +9,22 @@ duplicate return, missing measured phase, manual-rebind path) and the
 nonempty ledger-matched accept, plus order-attribution, purity,
 abandoned-accounting, reuse, profile/metrics and inventory legs.
 
-No privilege, no fixtures, no observer: every input is synthetic.
+Oracle inputs are synthetic. Harness controls use ordinary owned pipes and
+Python subprocesses; no privileged observer capture or cgroups are run.
 """
 
 import copy
 import inspect
+import io
 import json
+import os
 import runpy
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -196,6 +205,99 @@ def b_style_inputs():
     ]
     text = trace_text(rows, 6, 5, evidence(in_flight=1, losses=1))
     return text, ledger, receipt
+
+
+class ReaderReadinessTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix="h6-reader-", dir="/var/tmp/p11scope-ws-tmp")
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name)
+
+    def pipe_reader(self):
+        read_fd, write_fd = os.pipe()
+        stream = os.fdopen(read_fd, encoding="utf-8")
+        writer = os.fdopen(write_fd, "w", encoding="utf-8")
+        reader = H6["Reader"](stream, self.directory / "reader.txt")
+        self.addCleanup(stream.close)
+        self.addCleanup(reader.thread.join, 2)
+        self.addCleanup(writer.close)
+        return reader, writer
+
+    def test_expect_line_waits_for_real_reader_delayed_ack(self):
+        reader, writer = self.pipe_reader()
+
+        def write_ack():
+            writer.write("unrelated\nNEW_READY image=1\n")
+            writer.flush()
+
+        timer = threading.Timer(0.05, write_ack)
+        self.addCleanup(timer.join, 2)
+        timer.start()
+        self.assertEqual(H6["expect_line"](reader, 0, "NEW_READY", 2),
+                         ("NEW_READY image=1\n", 2))
+
+    def test_expect_line_eof_is_bounded(self):
+        reader, writer = self.pipe_reader()
+        writer.close()
+        reader.thread.join(2)
+        self.assertFalse(reader.thread.is_alive())
+        with self.assertRaisesRegex(EOFError, "stream ended"):
+            H6["expect_line"](reader, 0, "NEW_READY", 2)
+
+    def test_expect_line_preserves_timeout_with_open_stream(self):
+        reader, _ = self.pipe_reader()
+        with self.assertRaisesRegex(TimeoutError, "timed out"):
+            H6["expect_line"](reader, 0, "NEW_READY", 0.05)
+
+    def test_expect_line_surfaces_real_reader_error(self):
+        stream = io.TextIOWrapper(io.BytesIO(b"\xff"), encoding="utf-8")
+        self.addCleanup(stream.close)
+        reader = H6["Reader"](stream, self.directory / "bad-reader.txt")
+        reader.thread.join(2)
+        self.assertFalse(reader.thread.is_alive())
+        with self.assertRaisesRegex(ValueError, "decode"):
+            H6["expect_line"](reader, 0, "NEW_READY", 2)
+
+
+class ScriptEntryTest(unittest.TestCase):
+    def test_main_entry_sees_all_registered_cell_helpers(self):
+        code = textwrap.dedent("""\
+            import runpy
+            import sys
+
+            class EntryChecked(Exception):
+                pass
+
+            def check_entry(frame, event, arg):
+                if (event == "call" and frame.f_code.co_name == "main"
+                        and frame.f_code.co_filename == sys.argv[1]):
+                    helpers = ("spawn_inventory", "wait_inventory_ready",
+                               "stop_inventory", "wait_ledger_line",
+                               "run_cgroup_stop_before", "run_cgroup_stop_during")
+                    missing = [name for name in helpers
+                               if not callable(frame.f_globals.get(name))]
+                    assert not missing, f"undefined cell helpers at main entry: {missing}"
+                    raise EntryChecked
+                return check_entry
+
+            sys.settrace(check_entry)
+            try:
+                runpy.run_path(sys.argv[1], run_name="__main__")
+            except EntryChecked:
+                print("all cell helpers available before main body")
+            else:
+                raise AssertionError("script did not invoke main")
+            finally:
+                sys.settrace(None)
+            """)
+        result = subprocess.run(
+            [sys.executable, "-B", "-c", code,
+             str(ROOT / "scripts/qualify-automatic-exec.py")],
+            text=True, capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(),
+                         "all cell helpers available before main body")
 
 
 class TraceTest(unittest.TestCase):
@@ -474,7 +576,11 @@ def group_death_inputs():
                      "kill_ns": death - 1000, "death_ns": death,
                      "reaped": True, "proc_gone": True,
                      "manufactured_reuse": False, "replacement_leg": "reuse/singles",
-                     "min_dwell_ns": 2_000_000_000, "observer_self_ended": False})
+                     "min_dwell_ns": 2_000_000_000,
+                     "post_death_checked_ns": STOP,
+                     "observer_self_ended": True, "observer_exited_ns": STOP,
+                     "observer_exit_limit_ns": 60_000_000_000,
+                     "controller_stop": None})
     rows = [named_row(1000, 1000, "/w/caller-a", "C_GenerateRandom"),
             named_row(1000, 1000, "/w/caller-a", "C_GenerateRandom")]
     text = trace_text(rows, 2, 2, evidence())
@@ -493,12 +599,59 @@ class GroupDeathTest(unittest.TestCase):
         self.assertEqual(result["physical_entered"], 2)
         self.assertEqual(result["api_returned"], 2)
 
-    def test_accept_self_ended_observer(self):
+    def test_reject_controller_stopped_observer(self):
         text, ledger, receipt = group_death_inputs()
         receipt = copy.deepcopy(receipt)
-        receipt["group_death"]["observer_self_ended"] = True
+        receipt["group_death"]["observer_self_ended"] = False
+        receipt["group_death"]["controller_stop"] = "SIGINT/kill-fallback"
         result = H6["evaluate_trace_h6"](text, ledger, receipt)
-        self.assertTrue(result["pass"], result["errors"])
+        self.assertFalse(result["pass"])
+        self.assertTrue(any("autonomously" in error for error in result["errors"]),
+                        result["errors"])
+
+    def test_reject_missing_natural_exit_receipt(self):
+        text, ledger, receipt = group_death_inputs()
+        del receipt["group_death"]["observer_exited_ns"]
+        result = H6["evaluate_trace_h6"](text, ledger, receipt)
+        self.assertFalse(result["pass"])
+        self.assertTrue(any("exit timestamp" in error for error in result["errors"]),
+                        result["errors"])
+
+    def test_reject_natural_exit_before_kill(self):
+        text, ledger, receipt = group_death_inputs()
+        receipt["group_death"]["observer_exited_ns"] = READY
+        result = H6["evaluate_trace_h6"](text, ledger, receipt)
+        self.assertFalse(result["pass"])
+        self.assertTrue(any("exit timestamp" in error for error in result["errors"]),
+                        result["errors"])
+
+    def test_reject_natural_exit_after_declared_deadline(self):
+        text, ledger, receipt = group_death_inputs()
+        receipt["group_death"]["observer_exit_limit_ns"] = 1_000_000_000
+        result = H6["evaluate_trace_h6"](text, ledger, receipt)
+        self.assertFalse(result["pass"])
+        self.assertTrue(any("exit deadline" in error for error in result["errors"]),
+                        result["errors"])
+
+    def test_reject_forced_signal_even_with_self_ended_flag(self):
+        for forced_signal in ("SIGINT", "SIGKILL"):
+            with self.subTest(signal=forced_signal):
+                text, ledger, receipt = group_death_inputs()
+                receipt["group_death"]["controller_stop"] = forced_signal
+                result = H6["evaluate_trace_h6"](text, ledger, receipt)
+                self.assertFalse(result["pass"])
+                self.assertTrue(any("autonomously" in error for error in result["errors"]),
+                                result["errors"])
+
+    def test_reject_missing_or_unbounded_exit_deadline(self):
+        for limit in (None, 0, -1, 60_000_000_001):
+            with self.subTest(limit=limit):
+                text, ledger, receipt = group_death_inputs()
+                receipt["group_death"]["observer_exit_limit_ns"] = limit
+                result = H6["evaluate_trace_h6"](text, ledger, receipt)
+                self.assertFalse(result["pass"])
+                self.assertTrue(any("exit deadline" in error for error in result["errors"]),
+                                result["errors"])
 
     def test_reject_post_death_row(self):
         _, ledger, receipt = group_death_inputs()
@@ -528,8 +681,8 @@ class GroupDeathTest(unittest.TestCase):
     def test_reject_short_dwell(self):
         text, ledger, receipt = group_death_inputs()
         receipt = copy.deepcopy(receipt)
-        receipt["group_death"]["kill_ns"] = STOP - 2
-        receipt["group_death"]["death_ns"] = STOP - 1
+        receipt["group_death"]["post_death_checked_ns"] = (
+            receipt["group_death"]["death_ns"] + 1)
         result = H6["evaluate_trace_h6"](text, ledger, receipt)
         self.assertFalse(result["pass"])
         self.assertTrue(any("dwell is too short" in error for error in result["errors"]),
@@ -579,6 +732,44 @@ class GroupDeathWiringTest(unittest.TestCase):
     def test_dwell_bounds(self):
         self.assertGreaterEqual(H6["GROUP_DEATH_DWELL_NS"], H6["GROUP_DEATH_MIN_DWELL_NS"])
         self.assertGreater(H6["GROUP_DEATH_MIN_DWELL_NS"], 0)
+
+
+class GroupDeathObserverFinishTest(unittest.TestCase):
+    def observer(self):
+        code = ("import signal, sys; "
+                "signal.signal(signal.SIGINT, lambda *_: sys.exit(0)); "
+                "print('READY', flush=True); sys.stdin.readline()")
+        owners = []
+        self.addCleanup(H6["cleanup_processes"], owners)
+        owned = H6["spawn_owned"](
+            owners, [sys.executable, "-B", "-c", code], os.getuid(),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+        self.addCleanup(owned.popen.stdout.close)
+        self.addCleanup(owned.popen.stdin.close)
+        self.assertEqual(owned.popen.stdout.readline(), "READY\n")
+        return owned
+
+    def test_records_natural_exit_without_controller_signal(self):
+        owned = self.observer()
+        death_ns = time.monotonic_ns()
+        owned.popen.stdin.write("finish\n")
+        owned.popen.stdin.flush()
+        result = H6["finish_group_death_observer"](owned, death_ns, limit_seconds=1)
+        self.assertEqual(result["rc"], 0)
+        self.assertTrue(result["self_ended"])
+        self.assertIsNone(result["controller_stop"])
+        self.assertGreaterEqual(result["exited_ns"], death_ns)
+        self.assertEqual(result["stopped_ns"], result["exited_ns"])
+
+    def test_clean_sigint_cleanup_cannot_qualify_as_natural_exit(self):
+        owned = self.observer()
+        result = H6["finish_group_death_observer"](
+            owned, time.monotonic_ns(), limit_seconds=0.05)
+        self.assertEqual(result["rc"], 0)
+        self.assertFalse(result["self_ended"])
+        self.assertIsNone(result["exited_ns"])
+        self.assertEqual(result["controller_stop"], "SIGINT/kill-fallback")
 
 
 def profile_doc(functions, mode="profile", scope="pid"):

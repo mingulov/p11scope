@@ -472,6 +472,8 @@ def _check_group_death_proof(death, receipt):
     errors = []
     if receipt.get("observer_rc") != 0:
         errors.append("observer did not exit successfully")
+    if death.get("observer_self_ended") is not True or death.get("controller_stop") is not None:
+        errors.append("observer did not end capture autonomously after group death")
     if receipt.get("caller_rc") != -signal.SIGKILL:
         errors.append("group-death caller was not reaped as whole-group SIGKILLed")
     if death.get("kill") != "SIGKILL/killpg":
@@ -486,13 +488,25 @@ def _check_group_death_proof(death, receipt):
         errors.append("group-death leg names no independently admitted replacement control")
     ready, stop = receipt.get("observer_ready_ns"), receipt.get("observer_stopped_ns")
     kill_ns, death_ns = death.get("kill_ns"), death.get("death_ns")
+    exited_ns = death.get("observer_exited_ns")
+    exit_limit_ns = death.get("observer_exit_limit_ns")
+    if not (isinstance(exited_ns, int) and isinstance(kill_ns, int)
+            and isinstance(stop, int) and kill_ns < exited_ns == stop):
+        errors.append("group-death observer exit timestamp is missing or outside its natural exit")
+    if not (isinstance(exit_limit_ns, int) and 0 < exit_limit_ns <= GROUP_DEATH_EXIT_LIMIT_NS):
+        errors.append("group-death observer exit deadline is missing or unbounded")
+    elif (isinstance(exited_ns, int) and isinstance(death_ns, int)
+          and exited_ns - death_ns > exit_limit_ns):
+        errors.append("group-death observer exceeded its autonomous exit deadline")
     if not (isinstance(kill_ns, int) and isinstance(death_ns, int)
             and isinstance(ready, int) and isinstance(stop, int)
             and ready < kill_ns <= death_ns < stop):
         errors.append("group-death kill/death stamps are not inside the observer interval")
     else:
         min_dwell = death.get("min_dwell_ns", 0)
-        if not isinstance(min_dwell, int) or stop - death_ns < min_dwell:
+        checked_ns = death.get("post_death_checked_ns")
+        if (not isinstance(min_dwell, int) or not isinstance(checked_ns, int)
+                or checked_ns < stop or checked_ns - death_ns < min_dwell):
             errors.append("post-death dwell is too short to prove capture ended")
     return errors
 
@@ -1294,12 +1308,19 @@ def expect_line(reader, index, prefix, timeout):
     """Wait for the next line with prefix; returns (line, next_index)."""
     deadline = time.monotonic() + timeout
     while True:
+        if reader.errors:
+            raise ValueError("; ".join(reader.errors))
         while index < len(reader.lines):
             line = reader.lines[index]
             index += 1
             if line.startswith(prefix):
                 return line, index
-        if reader.finished:
+        if not reader.thread.is_alive():
+            # The reader may have appended its last line during the scan.
+            if index < len(reader.lines):
+                continue
+            if reader.errors:
+                raise ValueError("; ".join(reader.errors))
             raise EOFError(f"stream ended waiting for {prefix}")
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -2286,6 +2307,23 @@ def run_reuse_control(ctx, leg_dir, backend, env, dead_pid, image_pin):
 
 GROUP_DEATH_DWELL_NS = 3_000_000_000
 GROUP_DEATH_MIN_DWELL_NS = 2_000_000_000
+GROUP_DEATH_EXIT_LIMIT_NS = 60_000_000_000
+
+
+def finish_group_death_observer(owned, death_ns, limit_seconds=60):
+    """Wait for natural exit; a bounded signal fallback is cleanup only."""
+    remaining = max(0, (death_ns + int(limit_seconds * 1e9) - monotonic_ns()) / 1e9)
+    try:
+        rc = owned.popen.wait(timeout=remaining)
+    except subprocess.TimeoutExpired:
+        rc, stopped, latency = stop_observer(owned)
+        return {"rc": rc, "stopped_ns": stopped, "latency_seconds": latency,
+                "self_ended": False, "exited_ns": None,
+                "controller_stop": "SIGINT/kill-fallback"}
+    exited = monotonic_ns()
+    return {"rc": rc, "stopped_ns": exited,
+            "latency_seconds": (exited - death_ns) / 1e9,
+            "self_ended": True, "exited_ns": exited, "controller_stop": None}
 
 
 def run_group_death_leg(ctx, leg_dir, backend, env, image_pin):
@@ -2293,9 +2331,9 @@ def run_group_death_leg(ctx, leg_dir, backend, env, image_pin):
 
     Brief line 101, death half: drive a nonempty named pre-death phase
     under --pid, SIGKILL the entire owned process group at once, prove
-    death via waitpid plus /proc disappearance, keep the observer up
-    through a bounded post-death dwell, then require the capture to
-    hold only pre-death rows. Numeric PID reuse is never manufactured
+    death via waitpid plus /proc disappearance, wait boundedly for the
+    observer to exit autonomously, then require only pre-death rows
+    through the post-death dwell. Numeric PID reuse is never manufactured
     (no sysctl); the real independently admitted replacement is the
     sibling reuse leg, named in the receipt.
     """
@@ -2329,6 +2367,8 @@ def run_group_death_leg(ctx, leg_dir, backend, env, image_pin):
     # PID capture alive. Liveness before and death after are proven by
     # the harness (pidfd identity, waitpid, /proc), never by p11scope.
     caller.verify()
+    if owned.popen.poll() is not None:
+        raise SetupError("observer exited before the whole-group kill")
     group_size_before = len(list((Path("/proc") / str(caller.pid) / "task").iterdir()))
     dead_pid = caller.pid
     kill_ns = monotonic_ns()
@@ -2336,17 +2376,14 @@ def run_group_death_leg(ctx, leg_dir, backend, env, image_pin):
     caller_rc = caller.popen.wait(timeout=10)
     proc_gone = not (Path("/proc") / str(dead_pid)).exists()
     death_ns = monotonic_ns()
+    observer_finish = finish_group_death_observer(
+        owned, death_ns, limit_seconds=GROUP_DEATH_EXIT_LIMIT_NS / 1e9)
+    obs_rc, stopped, latency = (observer_finish["rc"], observer_finish["stopped_ns"],
+                               observer_finish["latency_seconds"])
     deadline = death_ns + GROUP_DEATH_DWELL_NS
     while monotonic_ns() < deadline:
         time.sleep(0.05)
     dwell_end = monotonic_ns()
-    if owned.popen.poll() is None:
-        observer_self_ended = False
-        obs_rc, stopped, latency = stop_observer(owned)
-    else:
-        # The observer ended capture by itself after the group death.
-        observer_self_ended = True
-        obs_rc, stopped, latency = owned.popen.poll(), dwell_end, 0.0
     finish_readers([stdout, capture, errors])
     ledger = list(stdout.records)
     measured = phases[0]
@@ -2376,7 +2413,11 @@ def run_group_death_leg(ctx, leg_dir, backend, env, image_pin):
             "reaped": caller.popen.returncode is not None, "proc_gone": proc_gone,
             "manufactured_reuse": False, "replacement_leg": f"reuse/{backend}",
             "min_dwell_ns": GROUP_DEATH_MIN_DWELL_NS,
-            "observer_self_ended": observer_self_ended,
+            "post_death_checked_ns": dwell_end,
+            "observer_self_ended": observer_finish["self_ended"],
+            "observer_exited_ns": observer_finish["exited_ns"],
+            "observer_exit_limit_ns": GROUP_DEATH_EXIT_LIMIT_NS,
+            "controller_stop": observer_finish["controller_stop"],
         },
     }
     result = evaluate_trace_h6("".join(capture.lines), ledger, receipt,
@@ -3209,10 +3250,6 @@ def main(argv=None):
                     print(f"cleanup receipt unwritable: {error}", flush=True)
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
-
-
 def spawn_inventory(ctx, leg_dir, scope_args, module_args, manifest_args,
                     backend, duration_s, tag="inventory"):
     """Spawn an inventory observer; returns (owned, capture, errors, started, paths)."""
@@ -3439,3 +3476,7 @@ def run_cgroup_stop_during(ctx, cell_dir, backend):
     write_json(leg_dir / "receipt.json", receipt)
     write_json(leg_dir / "result.json", result)
     return result
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

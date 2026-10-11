@@ -705,12 +705,12 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                 budget: Some(refusal),
             });
         }
-        let id = self.admit(pid, authority, now_ns).map_err(|error| {
-            AdmitFailure {
+        let id = self
+            .admit(pid, authority, now_ns)
+            .map_err(|error| AdmitFailure {
                 reason: format!("{error:#}"),
                 budget: None,
-            }
-        })?;
+            })?;
         self.callers
             .get_mut(&id)
             .expect("the admitted caller retains its record")

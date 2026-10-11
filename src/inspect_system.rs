@@ -45,8 +45,8 @@ use crate::discovery::scan::{
 };
 use crate::discovery::sweep_attribution::{
     AttributionLoss, IoResources, KnownKeyIndex, MatchedObject, ObjectChecks, OsConfirmIo,
-    ProofPools, RefusedObject, ReservationOwner, SegmentPolicy, SweepAttribution, SweptMember,
-    is_caller_range, retain_unchanged,
+    PreparationKind, ProofPools, RefusedObject, ReservationOwner, SegmentPolicy,
+    SweepAttribution, SweptMember, is_caller_range, preparation_kind, retain_unchanged,
 };
 use crate::discovery::sweep_attribution::{MemberProbe, OsMemberProbe, attribute_unselected};
 use crate::discovery::sweep_shards::{shard_count, shard_threads};
@@ -1371,23 +1371,15 @@ fn attribute_sweep(
     )
 }
 
-/// [`attribute_sweep`] with the attribution itself supplied: serial over
-/// a probe, or sharded (C7 A5).
-fn attribute_sweep_with(
-    collection: &mut Collection,
+/// The shared sweep-attribution prefix: this pass's key index, the
+/// selected set, and the refused objects filtered to unselected caller
+/// keys. Both attribution paths and the auto/kernel proof gate build
+/// exactly this, so the gate sees the plan attribution would run.
+fn sweep_proof_prefix(
+    collection: &Collection,
     bound: &Bound,
     checks: &dyn ObjectChecks,
-    attribute: impl FnOnce(
-        &[(u32, Vec<MapEntry>)],
-        &BTreeSet<u32>,
-        &BTreeSet<u32>,
-        &KnownKeyIndex,
-        &mut CaptureWorkBudget,
-    ) -> SweepAttribution,
-) -> Option<Attributed> {
-    if !collection.cap_hit {
-        return None;
-    }
+) -> (KnownKeyIndex, BTreeSet<u32>, Vec<RefusedObject>) {
     let modules = bound
         .reconciled
         .iter()
@@ -1433,6 +1425,51 @@ fn attribute_sweep_with(
         .map(ObjectKey::of)
         .collect();
     refused.retain(|object| unselected_keys.contains(&object.key));
+    (index, selected, refused)
+}
+
+/// Whether this pass holds a nonempty admitted proof plan: the cap hit
+/// with an unselected, available sweep PID whose preparation is not
+/// settled. Slots-independent: preparation consults the snapshot and
+/// the index only, never installed anchors. No-proof passes load and
+/// record nothing.
+fn sweep_has_proof_plan(collection: &Collection, bound: &Bound) -> bool {
+    if !collection.cap_hit {
+        return false;
+    }
+    let (index, selected, _) = sweep_proof_prefix(collection, bound, &bound.aggregate);
+    collection.sweep.iter().any(|(pid, entries)| {
+        !matches!(
+            preparation_kind(
+                *pid,
+                entries,
+                &collection.sweep_unavailable,
+                &selected,
+                &index
+            ),
+            PreparationKind::Settled
+        )
+    })
+}
+
+/// [`attribute_sweep`] with the attribution itself supplied: serial over
+/// a probe, or sharded (C7 A5).
+fn attribute_sweep_with(
+    collection: &mut Collection,
+    bound: &Bound,
+    checks: &dyn ObjectChecks,
+    attribute: impl FnOnce(
+        &[(u32, Vec<MapEntry>)],
+        &BTreeSet<u32>,
+        &BTreeSet<u32>,
+        &KnownKeyIndex,
+        &mut CaptureWorkBudget,
+    ) -> SweepAttribution,
+) -> Option<Attributed> {
+    if !collection.cap_hit {
+        return None;
+    }
+    let (index, selected, refused) = sweep_proof_prefix(collection, bound, checks);
     progress!(
         "p11scope: attributing {} unselected processes by maps identity...",
         collection.sweep.len().saturating_sub(selected.len())
@@ -3244,7 +3281,7 @@ pub(crate) fn collect_system_with_identity(
     // Per-pass kernel decision under the capture lock: userspace never
     // loads; auto without proof never loads; otherwise cheap checks
     // first, then at most one session attempt for this pass.
-    let has_proof = collection.cap_hit && !collection.sweep.is_empty();
+    let has_proof = sweep_has_proof_plan(&collection, &bound);
     let attempt = decide_pass_attempt(&shared, has_proof);
     let attributed = with_confirmation_pools(
         shards,
@@ -3618,45 +3655,8 @@ where
     if !collection.cap_hit {
         return (None, None);
     }
-    let modules = bound
-        .reconciled
-        .iter()
-        .map(|(_, _, module)| (module.scanned.key, Some(module.object)))
-        .chain(
-            bound
-                .unresolved
-                .iter()
-                .map(|(_, _, module, _)| (module.key, None)),
-        );
-    let match_keys = bound.aggregate.sweep_match_keys();
-    let complete: BTreeSet<u32> = collection
-        .members
-        .iter()
-        .filter(|member| {
-            matches!(member.status, MemberStatus::Scanned)
-                && !member
-                    .gaps
-                    .iter()
-                    .any(|gap| scan_skip_truncates(&gap.reason))
-        })
-        .map(|member| member.pid)
-        .collect();
-    let examined = collection
-        .members
-        .iter()
-        .filter(|member| complete.contains(&member.pid))
-        .flat_map(|member| member.examined.iter().copied());
-    let (mut index, mut refused) =
-        KnownKeyIndex::build(modules, &match_keys, examined, &bound.aggregate);
-    let selected: BTreeSet<u32> = collection.selected.iter().copied().collect();
-    let unselected_keys: BTreeSet<ObjectKey> = collection
-        .sweep
-        .iter()
-        .filter(|(pid, _)| !selected.contains(pid))
-        .flat_map(|(_, entries)| entries.iter().filter(|entry| is_caller_range(entry)))
-        .map(ObjectKey::of)
-        .collect();
-    refused.retain(|object| unselected_keys.contains(&object.key));
+    let (mut index, selected, refused) =
+        sweep_proof_prefix(collection, bound, &bound.aggregate);
     progress!(
         "p11scope: attributing {} unselected processes by maps identity...",
         collection.sweep.len().saturating_sub(selected.len())
@@ -5048,6 +5048,40 @@ mod tests {
                 .notes
                 .iter()
                 .any(|note| note.reason.starts_with("attribution complete"))
+        }
+
+        /// Capped with zero charged ranges (an unexamined-only snapshot,
+        /// an empty snapshot, and an unavailable caller): the old cap-hit
+        /// proxy claims proof, but the proof-plan gate must refuse it —
+        /// while the unmodified over-cap cell keeps its plan.
+        #[test]
+        fn no_proof_gate_refuses_capped_zero_proof_plan() {
+            let mut collection = over_cap(&[]);
+            let unknown = vec![
+                entry(0x3000_0000, b"r--p", 0x9999, "/usr/lib/libunknown.so"),
+                entry(0x3000_1000, b"r-xp", 0x9999, "/usr/lib/libunknown.so"),
+            ];
+            collection.sweep = vec![
+                (30_001, unknown),
+                (30_002, Vec::new()),
+                (30_003, caller()),
+            ];
+            collection.sweep_unavailable = BTreeSet::from([30_003]);
+            let bound = bind_collection(&mut collection);
+            assert!(
+                collection.cap_hit && !collection.sweep.is_empty(),
+                "fixture must trip the old cap-hit proxy"
+            );
+            assert!(
+                !sweep_has_proof_plan(&collection, &bound),
+                "capped-but-zero-proof must hold no proof plan"
+            );
+            let mut full = over_cap(&[]);
+            let full_bound = bind_collection(&mut full);
+            assert!(
+                sweep_has_proof_plan(&full, &full_bound),
+                "the charged over-cap cell keeps its proof plan"
+            );
         }
 
         #[test]

@@ -607,7 +607,9 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
     /// slice 2): the moved original pin proves the same process, and the
     /// borrowed permit proves current scope membership. The verified
     /// pre-sample generation arrives with the call, so commit performs
-    /// no identity reads of its own. Checks mirror
+    /// no post-sample generation recapture; permit.check() custody
+    /// liveness reread excepted (refuses on mismatch, supplies no
+    /// replacement identity). Checks mirror
     /// `commit_scoped_caller` — pid/generation match, permit check,
     /// custody, finish — with no fallible tail after them. A live
     /// candidate for this pid joins only when it already holds the

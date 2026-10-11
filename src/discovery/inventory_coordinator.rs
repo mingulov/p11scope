@@ -5222,7 +5222,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     {
                         // The verified pre-sample generation travels with
                         // the handoff: commit matches it against the end
-                        // sample with no identity reads of its own.
+                        // sample with no post-sample generation recapture;
+                        // permit.check() custody liveness reread excepted
+                        // (refuses on mismatch, supplies no replacement
+                        // identity).
                         prepared_handoffs.insert(pid, (old, preparation.generation().clone()));
                     }
                     continue;

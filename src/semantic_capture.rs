@@ -352,6 +352,14 @@ pub(crate) enum TickOutcome {
     Invalidation(Invalidation),
     Other(OtherRecord),
 }
+impl TickOutcome {
+    /// Whether this outcome is an H0 invalidation (a negative):
+    /// bounded stashes and merges shed positives first so loss
+    /// boundaries survive overflow.
+    pub(crate) fn is_invalidation(&self) -> bool {
+        matches!(self, TickOutcome::Invalidation(_))
+    }
+}
 #[derive(Default, Debug)]
 pub(crate) struct TickReport {
     outcomes: Vec<TickOutcome>,
@@ -401,13 +409,28 @@ impl TickReport {
 
     /// Merge lane-stashed refresh outcomes behind this tick's own,
     /// truncated to batch capacity like the receipts. Returns shed
-    /// outcomes.
+    /// outcomes. Truncation sheds positives first: a merged
+    /// invalidation is H2's loss boundary, while a shed call is
+    /// disclosed through the refusal count. Positions increase
+    /// monotonically, so the oldest outcome still carries the minimum
+    /// barrier when only invalidations remain.
     pub(crate) fn merge_stashed_outcomes(&mut self, stashed: Vec<TickOutcome>) -> u64 {
         self.outcomes.extend(stashed);
-        let shed = self.outcomes.len().saturating_sub(MAX_INSTANCES);
-        self.outcomes.truncate(MAX_INSTANCES);
+        let mut shed = 0u64;
+        while self.outcomes.len() > MAX_INSTANCES {
+            if let Some(at) = self
+                .outcomes
+                .iter()
+                .position(|outcome| !outcome.is_invalidation())
+            {
+                self.outcomes.remove(at);
+            } else {
+                self.outcomes.remove(0);
+            }
+            shed += 1;
+        }
         debug_assert!(self.outcomes.len() <= MAX_INSTANCES);
-        shed as u64
+        shed
     }
 
     pub(crate) fn into_outcomes(self) -> Vec<TickOutcome> {
@@ -2653,6 +2676,44 @@ mod tests {
             "the fresh receipt survives truncation"
         );
     }
+    #[test]
+    fn merge_stashed_outcomes_sheds_calls_before_invalidations() {
+        let domain = NativeDomainId::mint();
+        let call = || {
+            let stamp = InstanceStamp::default();
+            TickOutcome::Call(RoutedCall::scripted(
+                domain,
+                event_record_with_routing(
+                    p11scope_ebpf_common::Event::default(),
+                    stamp,
+                    0x2200,
+                ),
+                Route::Unknown(UnknownReason::PendingCapacity),
+                None,
+                Some(1),
+            ))
+        };
+        let invalidation = TickOutcome::Invalidation(Invalidation {
+            domain,
+            scope: InvalidationScope::FaultEra,
+            position: Some(1025),
+        });
+        assert!(invalidation.is_invalidation());
+        assert!(!call().is_invalidation());
+        let mut report = TickReport::scripted(
+            (0..MAX_INSTANCES).map(|_| call()).collect(),
+            Vec::new(),
+        );
+        assert_eq!(report.merge_stashed_outcomes(vec![invalidation]), 1);
+        assert_eq!(report.outcomes().len(), MAX_INSTANCES);
+        assert!(
+            report
+                .outcomes()
+                .iter()
+                .any(|outcome| matches!(outcome, TickOutcome::Invalidation(_))),
+            "the merged invalidation survives a full batch: a call sheds instead"
+        );
+    }
     fn prime(capture: &mut SemanticCapture, io: &mut ScriptIo) -> Route {
         io.call(1, 0);
         let report = capture.tick_with(io).unwrap();
@@ -4238,6 +4299,80 @@ mod tests {
                 scene.coordinator.registry().instances().count(),
                 1,
                 "the retry receipt registers one instance at commit"
+            );
+        }
+
+        /// Stash overflow preserves the fault-era invalidation: with
+        /// 1024 pending calls, the next audit emits the FaultEra
+        /// invalidation first and resolves all 1024 calls behind it, so
+        /// the refresh report holds 1025 outcomes against the 1024-item
+        /// stash. The shed outcome must be a call, never the
+        /// invalidation: the merged batch finalizes the exact
+        /// H0-minted loss boundary through the production commit.
+        #[test]
+        fn stash_overflow_preserves_fault_era_invalidation_at_1024_pending() {
+            let image = ImageIdentity {
+                task_cookie: 7,
+                exec_id: 1,
+            };
+            let mut fixture = bound_lane_scene(image);
+            let domain = fixture.lane.domain();
+            let mut h0 = H0TestIo::new(domain);
+            h0.io.output_image = Some(image);
+            // Image 7 never scans: every record parks Pending.
+            h0.io.fail_cookie = Some(image.task_cookie);
+            for _ in 0..MAX_PENDING {
+                h0.io.call(image.task_cookie, 0);
+            }
+            let parked = h0.tick(domain).unwrap();
+            assert!(
+                parked.is_empty(),
+                "all 1024 records park pending with no scan to resolve them"
+            );
+            // The fault era moves: the next audit invalidates first,
+            // then resolves every pending call behind it.
+            h0.io.health.push_back(Ok(Health { fault: 1, sticky: 0 }));
+            let pin: Arc<PidPin> = Arc::new(
+                fixture
+                    .scene
+                    .coordinator
+                    .adapter()
+                    .live_pin(std::process::id())
+                    .and_then(|(_, pin)| pin.try_clone().ok())
+                    .unwrap(),
+            );
+            let (images, _effective) = h0.refresh(pin, 0).unwrap();
+            assert!(images.is_empty());
+            assert_eq!(
+                h0.shed, 1,
+                "1025 outcomes against the 1024-item stash shed exactly one"
+            );
+            fixture.lane.install_test_io(Box::new(h0));
+            // The next lane tick merges the stashed evidence and the
+            // pass commit finalizes it: H2 must see the exact
+            // H0-minted FaultEra boundary, not a refusal count.
+            let batch = {
+                let bindings = fixture
+                    .scene
+                    .coordinator
+                    .semantic_bindings_mut()
+                    .bindings_for_tick();
+                fixture.lane.tick(bindings).unwrap()
+            };
+            assert!(
+                !batch.is_empty(),
+                "the tick batch carries the stashed overflow evidence"
+            );
+            fixture.scene.coordinator.stage_semantic_batch(batch);
+            fixture
+                .scene
+                .coordinator
+                .commit_batch_with_semantics(false, Some(&mut fixture.lane))
+                .unwrap();
+            assert_eq!(
+                fixture.lane.take_last_conversion_barrier(),
+                Some(MAX_PENDING as u64 + 1),
+                "the FaultEra invalidation survives the stash: its position fences conversion"
             );
         }
 

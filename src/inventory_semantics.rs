@@ -327,7 +327,12 @@ impl RefreshReceiptStash {
 
     /// Stash one refresh's receipts and outcomes in order. Returns items
     /// shed past the cap: the caller discloses the count as refused
-    /// endpoints.
+    /// endpoints. Outcome overflow sheds positives first: an
+    /// invalidation is H2's loss boundary (a shed boundary is silent
+    /// semantic loss), while a shed call is disclosed through the
+    /// refusal count. Positions increase monotonically, so the oldest
+    /// outcome still carries the minimum barrier when only
+    /// invalidations remain.
     pub(crate) fn push_all(
         &mut self,
         receipts: Vec<CurrentPartitionReceipt>,
@@ -341,7 +346,15 @@ impl RefreshReceiptStash {
         }
         self.outcomes.extend(outcomes);
         while self.outcomes.len() > MAX_STASHED_REFRESH_RECEIPTS {
-            self.outcomes.pop_front();
+            if let Some(at) = self
+                .outcomes
+                .iter()
+                .position(|outcome| !outcome.is_invalidation())
+            {
+                self.outcomes.remove(at);
+            } else {
+                self.outcomes.pop_front();
+            }
             shed += 1;
         }
         self.shed = self.shed.saturating_add(shed);

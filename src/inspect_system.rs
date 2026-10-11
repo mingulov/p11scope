@@ -2885,7 +2885,7 @@ impl ProbeDir {
             let owned = stat.st_uid == unsafe { libc::geteuid() };
             // The mkdir mode honors umask; enforce 0700 exactly.
             let mode = unsafe { libc::fchmod(dirfd.as_raw_fd(), 0o700) } == 0;
-            stat.st_mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32 && owned && mode
+            stat.st_mode & libc::S_IFMT == libc::S_IFDIR && owned && mode
         };
         // SAFETY: `geteuid` takes no arguments and always succeeds.
         let uid = unsafe { libc::geteuid() };
@@ -2920,7 +2920,7 @@ impl ProbeDir {
         }
         // SAFETY: the successful `lstat` initialized `stat`.
         let stat = unsafe { stat.assume_init() };
-        stat.st_mode & libc::S_IFMT as u32 == libc::S_IFDIR as u32 && stat.st_uid == uid
+        stat.st_mode & libc::S_IFMT == libc::S_IFDIR && stat.st_uid == uid
     }
 }
 

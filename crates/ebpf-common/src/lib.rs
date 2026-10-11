@@ -441,6 +441,30 @@ pub const DISCOVERY_KIND_INTERFACE_RETURN: u8 = 4;
 pub const DISCOVERY_KIND_EXEC: u8 = 5;
 pub const DISCOVERY_KIND_LEADER_EXIT: u8 = 6;
 
+/// Private EXEC classification: candidacy alone never proves paired links.
+pub const DISCOVERY_EXEC_UNKNOWN: u8 = 0;
+pub const DISCOVERY_EXEC_SAME_TASK_CANDIDATE: u8 = 1;
+pub const DISCOVERY_EXEC_TASK_REPLACED: u8 = 2;
+
+fn valid_exec_leader(pid_tgid: u64) -> bool {
+    let tid = pid_tgid as u32;
+    tid != 0 && tid <= i32::MAX as u32 && tid == (pid_tgid >> 32) as u32
+}
+
+/// The raw old_pid argument must be checked before narrowing. The native
+/// predicate is finite: only an exact checked 1 authorizes candidacy.
+pub fn classify_exec_task(old_pid: u64, pid_tgid: u64, user_dumpable: u32) -> u8 {
+    if old_pid == 0 || old_pid > i32::MAX as u64 || !valid_exec_leader(pid_tgid) {
+        DISCOVERY_EXEC_UNKNOWN
+    } else if old_pid != u64::from(pid_tgid as u32) {
+        DISCOVERY_EXEC_TASK_REPLACED
+    } else if user_dumpable == 1 {
+        DISCOVERY_EXEC_SAME_TASK_CANDIDATE
+    } else {
+        DISCOVERY_EXEC_UNKNOWN
+    }
+}
+
 pub const DISCOVERY_NAME_NA: u8 = 0;
 pub const DISCOVERY_NAME_EXACT_STANDARD: u8 = 1;
 pub const DISCOVERY_NAME_OTHER: u8 = 2;
@@ -887,7 +911,12 @@ pub fn valid_discovery_record(record: &DiscoveryRecord) -> bool {
             matches!(
                 record.status_flags,
                 0 | DISCOVERY_STATUS_COALESCED_NO_HELPER
-            ) && record.case_id == 0
+            ) && matches!(
+                record.case_id,
+                DISCOVERY_EXEC_UNKNOWN
+                    | DISCOVERY_EXEC_SAME_TASK_CANDIDATE
+                    | DISCOVERY_EXEC_TASK_REPLACED
+            ) && valid_exec_leader(record.pid_tgid)
                 && record.announced_count == 0
                 && zero_discovery_payload(record)
         }
@@ -2358,6 +2387,7 @@ mod tests {
     fn discovery_record(kind: u8) -> DiscoveryRecord {
         let mut record: DiscoveryRecord = unsafe { core::mem::zeroed() };
         record.kind = kind;
+        record.pid_tgid = (17u64 << 32) | 17;
         record
     }
 
@@ -2366,6 +2396,114 @@ mod tests {
         record.table_ptr = 0x1000;
         record.symbol_id = 1;
         record
+    }
+
+    /// A finite native candidacy value must survive decoding without making
+    /// any other lifecycle payload admissible.
+    #[test]
+    fn exec_task_decoder_accepts_only_finite_classes_and_valid_leader_ids() {
+        let mut record = discovery_record(DISCOVERY_KIND_EXEC);
+        record.hook_ts_ns = 10;
+        record.pid_tgid = (17u64 << 32) | 17;
+        record.case_id = 1;
+        assert!(
+            valid_discovery_record(&record),
+            "checked same-task EXEC candidacy must be decoded"
+        );
+        for class in [0, 1, 2] {
+            record.case_id = class;
+            assert!(valid_discovery_record(&record), "finite EXEC class {class}");
+        }
+        for class in 3..=u8::MAX {
+            record.case_id = class;
+            assert!(
+                !valid_discovery_record(&record),
+                "invalid EXEC class {class}"
+            );
+        }
+        for ids in [0, 17, 17u64 << 32, (17u64 << 32) | 18, u64::MAX] {
+            record.case_id = 1;
+            record.pid_tgid = ids;
+            assert!(!valid_discovery_record(&record), "invalid EXEC IDs {ids}");
+        }
+    }
+
+    #[test]
+    fn exec_task_classification_requires_checked_equal_leader_and_user_dumpability() {
+        let leader = (17u64 << 32) | 17;
+        let maximum = i32::MAX as u64;
+        for (old, current, dumpable, expected) in [
+            (17, leader, 1, 1),
+            (maximum, (maximum << 32) | maximum, 1, 1),
+            (17, leader, 0, 0),
+            (17, leader, 2, 0),
+            (17, leader, u32::MAX, 0),
+            (18, leader, 0, 2),
+            (18, leader, 1, 2),
+            (0, leader, 1, 0),
+            (u64::MAX, leader, 1, 0),
+            (1u64 << 32 | 17, leader, 1, 0),
+            (i32::MAX as u64 + 1, leader, 1, 0),
+            (17, 0, 1, 0),
+            (17, 17, 1, 0),
+            (17, 17u64 << 32, 1, 0),
+            (17, (17u64 << 32) | 18, 1, 0),
+            (17, (1u64 << 63) | (1u64 << 31), 1, 0),
+            (u32::MAX as u64, u64::MAX, 1, 0),
+        ] {
+            assert_eq!(
+                classify_exec_task(old, current, dumpable),
+                expected,
+                "old={old} current={current} dumpable={dumpable}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_task_decoder_retains_zero_payload_reserved_and_pause_contract() {
+        let mutations: &[fn(&mut DiscoveryRecord)] = &[
+            |r| r.table_ptr = 1,
+            |r| r.interface_flags = 1,
+            |r| r.pointers[0] = 1,
+            |r| r.pointers[DISCOVERY_POINTERS - 1] = 1,
+            |r| r.interface_index = 1,
+            |r| r.name_class = 1,
+            |r| r.status_flags = DISCOVERY_STATUS_READ_FAILURE,
+            |r| r.usable_n = 1,
+            |r| r.pointers_attempted = 1,
+            |r| r.completed_prefix = 1,
+            |r| r.version_major = 1,
+            |r| r.version_minor = 1,
+            |r| r.selection_version_class = 1,
+            |r| r.reserved_zero[0] = 1,
+            |r| r.symbol_id = 1,
+            |r| r.announced_count = 1,
+            |r| r.reserved_tail_zero[3] = 1,
+            |r| r.return_rv = 1,
+            |r| r.request_flags = 1,
+            |r| r.binding_id = 1,
+            |r| r.send_signal_rc = COALESCED_NO_HELPER_RC,
+            |r| r.send_signal_rc = i64::MAX,
+        ];
+        for class in [0, 1, 2] {
+            let mut record = discovery_record(DISCOVERY_KIND_EXEC);
+            record.case_id = class;
+            for mutate in mutations {
+                let mut bad = record;
+                mutate(&mut bad);
+                assert!(!valid_discovery_record(&bad));
+            }
+            record.status_flags = DISCOVERY_STATUS_COALESCED_NO_HELPER;
+            record.send_signal_rc = COALESCED_NO_HELPER_RC;
+            assert!(valid_discovery_record(&record));
+            record.send_signal_rc = 0;
+            assert!(!valid_discovery_record(&record));
+        }
+        for class in 1..=u8::MAX {
+            let mut exit = discovery_record(DISCOVERY_KIND_LEADER_EXIT);
+            exit.case_id = class;
+            assert!(!valid_discovery_record(&exit));
+        }
     }
 
     /// Mutation caught: a malformed private value or phase-owned field reaches
@@ -2392,7 +2530,7 @@ mod tests {
         assert!(!valid_discovery_record(&export));
 
         let mut non_loader_case = discovery_record(DISCOVERY_KIND_EXEC);
-        non_loader_case.case_id = 1;
+        non_loader_case.case_id = 3;
         assert!(!valid_discovery_record(&non_loader_case));
 
         let mut invalid_loader = discovery_record(DISCOVERY_KIND_LOADER);

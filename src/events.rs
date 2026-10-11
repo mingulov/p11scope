@@ -1726,7 +1726,7 @@ mod tests {
     }
     fn proof_lifecycle(pid: u32, ts: u64, kind: u8) -> DiscoveryRecord {
         let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
-        record.pid_tgid = u64::from(pid) << 32;
+        record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
         record.hook_ts_ns = ts;
         record.kind = kind;
         record
@@ -2167,6 +2167,37 @@ mod tests {
         let mut malformed = record;
         malformed.reserved_tail_zero[0] = 1;
         assert!(decode_discovery(&discovery_bytes(&malformed)).is_none());
+    }
+
+    #[test]
+    fn exec_task_decode_keeps_920_byte_transport_and_private_finite_class() {
+        let mut record = proof_lifecycle(7, 9, DISCOVERY_KIND_EXEC);
+        for class in 0..=2 {
+            record.case_id = class;
+            let bytes = discovery_bytes(&record);
+            assert_eq!(bytes.len(), 920);
+            assert_eq!(bytes[865], class);
+            assert_eq!(decode_discovery(&bytes).unwrap().case_id, class);
+            assert!(decode_discovery(&bytes[..919]).is_none());
+            let mut long = bytes;
+            long.push(0);
+            assert!(decode_discovery(&long).is_none());
+        }
+        for class in 3..=u8::MAX {
+            record.case_id = class;
+            assert!(decode_discovery(&discovery_bytes(&record)).is_none());
+        }
+        record.case_id = 1;
+        for pid_tgid in [0, 7 << 32, (7 << 32) | 8, (1 << 63) | (1 << 31)] {
+            record.pid_tgid = pid_tgid;
+            assert!(decode_discovery(&discovery_bytes(&record)).is_none());
+        }
+        record.pid_tgid = (7 << 32) | 7;
+        record.reserved_tail_zero[0] = 1;
+        assert!(decode_discovery(&discovery_bytes(&record)).is_none());
+        record.reserved_tail_zero[0] = 0;
+        record.announced_count = 1;
+        assert!(decode_discovery(&discovery_bytes(&record)).is_none());
     }
 
     /// Regression: one retained reader advances through backlog once, rejects

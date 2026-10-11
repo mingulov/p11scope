@@ -224,6 +224,52 @@ class MapDefsTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unclassified"):
             checker.inspect(self.mutate([(symbase + hook * 24 + 6, "H", elf.indices["uprobe"])], obj))
 
+    def test_exec_predicate_boundary(self):
+        obj = Path(self.temp.name) / "exec-linkage.o"
+        subprocess.run(["clang-18", "-target", "bpfel", "-g", "-O2", "-DHELPERS", "-c",
+                        str(ROOT / "tests/fixtures/bpf-map-defs/mixed.c"), "-o", str(obj)],
+                       check=True, capture_output=True)
+        checker.inspect(obj)
+        body, elf, btf = self.metadata(obj)
+        helper_index = next(i for i, symbol in enumerate(elf.symbols)
+                            if symbol[0] == "p11_exec_dumpability")
+        helper = elf.symbols[helper_index]
+        symbol_at = elf.sections[".symtab"][0][4] + helper_index * 24
+        function = next(node for node in btf.types[1:]
+                        if node[:2] == (12, "p11_exec_dumpability"))
+        function_at = elf.sections[".BTF"][0][4] + function[6]
+        scalar = btf.resolve(btf.types[function[2]][2])
+        pointer_proto = next(node[2] for node in btf.types[1:]
+                             if node[:2] == (12, "p11_owner_cleanup"))
+        raw = elf.sections[".text"][1][helper[4]:helper[4] + helper[5]]
+        read_at = [elf.sections[".text"][0][4] + helper[4] + pos
+                   for pos in range(0, len(raw), 8)
+                   if raw[pos] == 0x85 and struct.unpack_from("<i", raw, pos + 4)[0] == 113]
+        self.assertEqual(len(read_at), 1)
+        row, relocations = elf.sections[".relraw_tp/sched_process_exec"]
+        calls = []
+        for pos in range(0, len(relocations), 16):
+            address, info = struct.unpack_from("<QQ", relocations, pos)
+            if elf.symbols[info >> 32][0] == helper[0]:
+                calls.append(elf.sections["raw_tp/sched_process_exec"][0][4] + address)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(body[calls[0]:calls[0] + 2], b"\x85\x10")
+        cases = {
+            "local": ([(symbol_at + 4, "B", 2)], "EXEC.*GLOBAL"),
+            "hidden": ([(symbol_at + 5, "B", 2)], "EXEC.*GLOBAL"),
+            "wrong_section": ([(symbol_at + 6, "H", elf.indices["uprobe"])], "EXEC.*GLOBAL"),
+            "static_btf": ([(function_at + 4, "I", 12 << 24)], "EXEC.*GLOBAL"),
+            "pointer_argument": ([(function_at + 8, "I", pointer_proto)], "no-argument scalar"),
+            "signed_result": ([(elf.sections[".BTF"][0][4] + scalar[6] + 12,
+                                "I", (1 << 24) | 32)], "unsigned u32"),
+            "user_read": ([(read_at[0] + 4, "i", 112)], "only current-task and kernel-read"),
+            "map_lookup": ([(read_at[0] + 4, "i", 1)], "only current-task and kernel-read"),
+            "uncalled": ([(calls[0], "H", 0xb7)], "no reachable call boundary"),
+        }
+        for name, (changes, message) in cases.items():
+            with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, message):
+                checker.validate_exec_helpers(checker.Elf(self.mutate(changes, obj).read_bytes()))
+
     def test_classic_uprobe_kernel_stack(self):
         """A classic uprobe program with a frame must carry a tail call (the
         verifier then keeps the task's kernel stack instead of a shared
@@ -405,7 +451,7 @@ class MapDefsTests(unittest.TestCase):
             row, code = elf.sections[section]
             remove_calls.extend((row[4] + i, "H", 0xb7) for i in range(0, len(code), 8)
                                 if code[i:i+2] == b"\x85\x10")
-        self.assertEqual(len(remove_calls), 3)
+        self.assertEqual(len(remove_calls), 4)
         cases = {
             "public": ([(at + 4, "B", 0x12)], "owner.*LOCAL"),
             "hidden_only": ([(at + 5, "B", 2)], "owner.*LOCAL"),

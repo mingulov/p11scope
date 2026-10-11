@@ -112,11 +112,11 @@ class IdentityCoreTests(unittest.TestCase):
         # translation-unit set separate; the independent core fixture above
         # still owns its no-fork/no-START object boundary.
         self.assertEqual(' '.join(units.split()),
-                         'BpfFlavor::InventoryGlobal => &["task_owner"], '
-                         'BpfFlavor::InventoryCallers => &["image_identity", "task_owner"], '
+                         'BpfFlavor::InventoryGlobal => &["task_owner", "exec_task"], '
+                         'BpfFlavor::InventoryCallers => &["image_identity", "task_owner", "exec_task"], '
                          'BpfFlavor::Detailed => &[ "image_identity", "image_identity_fork", '
                          '"image_identity_query", '
-                         '"task_owner", "root_affiliation", "instance_epoch", ],')
+                         '"task_owner", "root_affiliation", "instance_epoch", "exec_task", ],')
 
 
 if __name__ == "__main__":

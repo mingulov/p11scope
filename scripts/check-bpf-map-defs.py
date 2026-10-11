@@ -391,6 +391,7 @@ REQUIRED_GLOBAL_HELPERS = frozenset({
 })
 REQUIRED_GLOBAL_OWNER_HELPERS = frozenset({"p11_owner_lease", "p11_owner_refund"})
 REQUIRED_GLOBAL_SCALAR_HELPERS = frozenset({"p11_read_ia32_arg"})
+REQUIRED_GLOBAL_EXEC_HELPERS = frozenset({"p11_exec_dumpability"})
 REQUIRED_LOCAL_OWNER_HELPERS = frozenset({
     "p11_owner_cleanup", "p11_owner_start_get",
     "p11_owner_start_insert", "p11_owner_start_remove", "p11_owner_discovery_get",
@@ -613,6 +614,33 @@ def validate_owner_helpers(elf, inventory=False):
                 if inventory else REQUIRED_LOCAL_OWNER_HELPERS)
     validate_private_helpers(elf, "p11_owner_", required,
                              OPTIONAL_LOCAL_OWNER_HELPERS, "owner", exported, "OWNER_CTL", inventory=inventory)
+
+
+def validate_exec_helpers(elf, inventory=False):
+    """Keep EXEC candidacy behind one no-argument, no-map kernel predicate."""
+    validate_private_helpers(elf, "p11_exec_", frozenset(), frozenset(), "EXEC",
+                             REQUIRED_GLOBAL_EXEC_HELPERS, inventory=inventory)
+    selected = [symbol for symbol in elf.symbols if symbol[0] == "p11_exec_dumpability"]
+    if not selected:
+        return  # Generic fixtures have no lifecycle producer.
+    helper = selected[0]
+    btf = Btf(elf.sections[".BTF"][1])
+    function = next(node for node in btf.types[1:] if node[:2] == (12, helper[0]))
+    scalar = btf.resolve(btf.types[function[2]][2])
+    if scalar[5] != (32,):
+        raise RuntimeError("EXEC predicate requires an unsigned u32 return")
+    body = checked_slice(elf.sections[".text"][1], helper[4], helper[5], "EXEC body")
+    calls = set()
+    for pos in range(0, len(body), 8):
+        op, reg, _, imm = struct.unpack_from("<BBhi", body, pos)
+        if op == 0x18:
+            raise RuntimeError("EXEC predicate cannot carry map/global-data relocations")
+        if op == 0x85:
+            if reg >> 4 or imm not in {113, 158}:
+                raise RuntimeError("EXEC predicate permits only current-task and kernel-read helpers")
+            calls.add(imm)
+    if calls != {113, 158}:
+        raise RuntimeError("EXEC predicate requires both checked kernel helper boundaries")
 
 
 def validate_diagnostic_helper_linkage(elf):
@@ -1418,6 +1446,7 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
             raise RuntimeError("native BTF DATASEC missing ELF .maps section")
     validate_ia32_reader(elf, inventory)
     validate_owner_helpers(elf, inventory)
+    validate_exec_helpers(elf, inventory)
     if not inventory:
         validate_root_helpers(elf)
         validate_diagnostic_helper_linkage(elf)
@@ -1435,7 +1464,8 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
     image_helpers = (frozenset({"p11_link_current_identity"}) if callers else
                      frozenset() if inventory else REQUIRED_GLOBAL_HELPERS)
     return maps, classify(records, sections, allowed_text_globals | image_helpers
-                          | REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS,
+                          | REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS
+                          | REQUIRED_GLOBAL_EXEC_HELPERS,
                           inventory=inventory), {
         record[-1] for record in records
     }
@@ -1474,7 +1504,8 @@ def classify(records, sections, allowed_text_globals=frozenset(), *, inventory=F
         if bind != "GLOBAL" or visibility != "DEFAULT":
             raise RuntimeError(f"unclassified global function {name} in {location}")
         if name in (REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_OWNER_HELPERS
-                    | REQUIRED_GLOBAL_SCALAR_HELPERS | DIAGNOSTIC_GLOBAL_HELPERS):
+                    | REQUIRED_GLOBAL_SCALAR_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS
+                    | DIAGNOSTIC_GLOBAL_HELPERS):
             if name in allowed_text_globals and location == ".text":
                 helpers.add(name)
                 continue
@@ -1685,6 +1716,7 @@ def validate_inventory(variant, maps, programs, symbols):
             raise RuntimeError(f"inventory contains forbidden detailed symbols: {sorted(forbidden)}")
     required_helpers = (REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS
                         if inventory else REQUIRED_GLOBAL_HELPERS)
+    required_helpers |= REQUIRED_GLOBAL_EXEC_HELPERS
     if callers:
         required_helpers |= {"p11_link_current_identity"}
     missing_helpers = required_helpers - symbols
@@ -1737,7 +1769,8 @@ def self_test():
     assert len(SAFE_PROGRAMS) == 18
     assert len(UNSAFE_PROGRAMS) == 23
     assert not INSTANCE_PROGRAMS & INVENTORY_PROGRAMS
-    good = (SAFE_MAPS, SAFE_PROGRAMS, {"p11_entry"} | REQUIRED_GLOBAL_HELPERS)
+    good = (SAFE_MAPS, SAFE_PROGRAMS,
+            {"p11_entry"} | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS)
     diagnostic = (
         UNSAFE_MAPS,
         UNSAFE_PROGRAMS,
@@ -1751,7 +1784,7 @@ def self_test():
             "walk_template_impl-1",
             "walk_template_types-0",
             "walk_template_types-1",
-        } | REQUIRED_GLOBAL_HELPERS,
+        } | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS,
     )
     validate_policy_inventory(good, diagnostic)
     validate_inventory("wide-default", WIDE_MAPS, SAFE_PROGRAMS, good[2])
@@ -1760,7 +1793,7 @@ def self_test():
     def rejected(check, *arguments):
         if check is validate_inventory:
             *prefix, symbols = arguments
-            arguments = (*prefix, symbols | REQUIRED_GLOBAL_HELPERS)
+            arguments = (*prefix, symbols | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS)
         errors = io.StringIO()
         try:
             with contextlib.redirect_stderr(errors):

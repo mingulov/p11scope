@@ -31,7 +31,8 @@ PROGRAMS = {"p11_usage_entry_lp64", "p11_usage_entry_ia32", "dl_debug_state",
             "function_list_entry", "function_list_return", "interface_list_entry",
             "interface_list_return", "interface_list_worker", "interface_entry",
             "interface_return", "sched_process_exec", "sched_process_exit"}
-SYMBOLS = {"p11_owner_lease", "p11_owner_refund", "p11_read_ia32_arg"}
+SYMBOLS = {"p11_owner_lease", "p11_owner_refund", "p11_read_ia32_arg",
+           "p11_exec_dumpability"}
 
 class InventoryManifestTests(unittest.TestCase):
     def test_exact_inventory_and_mutated_policy_shapes(self):
@@ -39,6 +40,9 @@ class InventoryManifestTests(unittest.TestCase):
             checker.validate_inventory("inventory", MAPS, PROGRAMS, SYMBOLS)
         except (RuntimeError, KeyError) as error:
             self.fail(f"inventory ABI is not admitted: {error}")
+        with self.assertRaisesRegex(RuntimeError, "missing required .text helpers"):
+            checker.validate_inventory("inventory", MAPS, PROGRAMS,
+                                       SYMBOLS - {"p11_exec_dumpability"})
         for name in MAPS:
             for field in checker.MAP_FIELDS:
                 changed = {key: dict(value) for key, value in MAPS.items()}

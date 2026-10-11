@@ -95,6 +95,8 @@ fn main() {
     println!("cargo:rerun-if-changed=crates/ebpf/native/stop_gate.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/exec_task.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/exec_task.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/root_affiliation.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/root_affiliation.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/instance_epoch.c");
@@ -201,8 +203,8 @@ fn build_variant(
     // Only caller Inventory retains the exact identity core. Neither Inventory
     // flavor has a fork wrapper, root affiliation, or START dependency.
     let native_units: &[&str] = match flavor {
-        BpfFlavor::InventoryGlobal => &["task_owner"],
-        BpfFlavor::InventoryCallers => &["image_identity", "task_owner"],
+        BpfFlavor::InventoryGlobal => &["task_owner", "exec_task"],
+        BpfFlavor::InventoryCallers => &["image_identity", "task_owner", "exec_task"],
         BpfFlavor::Detailed => &[
             "image_identity",
             "image_identity_fork",
@@ -210,6 +212,7 @@ fn build_variant(
             "task_owner",
             "root_affiliation",
             "instance_epoch",
+            "exec_task",
         ],
     };
     let mut native_bitcodes = Vec::new();
@@ -348,6 +351,8 @@ fn build_variant(
         append_flag("-C");
         append_flag("link-arg=--export=p11_link_current_identity");
     }
+    append_flag("-C");
+    append_flag("link-arg=--export=p11_exec_dumpability");
     if !inventory {
         for flag in [
             "-C",

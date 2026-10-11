@@ -30669,14 +30669,19 @@ pub(crate) mod detailed_proof_driver {
             .unwrap();
         assert!(drain.dequeue().is_none());
     }
-    fn exec(io: &Io, ts: u64, tid: u32) {
-        exec_pid(io, std::process::id(), ts, tid);
+    fn exec(io: &Io, ts: u64, old_tid: u32) {
+        exec_pid(io, std::process::id(), ts, old_tid);
     }
-    pub(crate) fn exec_pid(io: &Io, pid: u32, ts: u64, tid: u32) {
+    pub(crate) fn exec_pid(io: &Io, pid: u32, ts: u64, old_tid: u32) {
         let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
-        record.pid_tgid = (u64::from(pid) << 32) | u64::from(tid);
+        // sched_process_exec exposes the post-de_thread leader IDs. The old
+        // caller TID distinguishes task replacement in the private finite class.
+        record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+        record.case_id =
+            p11scope_ebpf_common::classify_exec_task(u64::from(old_tid), record.pid_tgid, 0);
         record.hook_ts_ns = ts;
         record.kind = DISCOVERY_KIND_EXEC;
+        assert!(p11scope_ebpf_common::valid_discovery_record(&record));
         let bytes = unsafe {
             std::slice::from_raw_parts(
                 (&record as *const DiscoveryRecord).cast::<u8>(),

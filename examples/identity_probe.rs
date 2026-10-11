@@ -67,13 +67,29 @@ struct ProbeSubdir {
     dev: u64,
     ino: u64,
     uid: u32,
+    dirfd: std::os::fd::OwnedFd,
 }
 
 impl Drop for ProbeSubdir {
     fn drop(&mut self) {
-        if Self::owns(&self.path, self.dev, self.ino, self.uid) {
-            let _ = std::fs::remove_dir_all(&self.path);
+        use std::os::fd::AsRawFd as _;
+        if !Self::owns(&self.path, self.dev, self.ino, self.uid) {
+            return;
         }
+        // Bounded cleanup, mirroring ProbeDir: only the four fixture
+        // names the probe writes are unlinked, through the held
+        // directory fd (never the path), so a replacement swapped in
+        // after the check above loses nothing — its unknown names are
+        // never touched, and the fd still points at the created
+        // directory. The final `remove_dir` removes empty dirs only.
+        for name in [c"probe-a", c"probe-b", c"probe-a-link", c"probe-a-copy"] {
+            // SAFETY: `unlinkat` of a static NUL-terminated name on
+            // the live held dirfd; flags 0 never unlinks directories.
+            unsafe {
+                libc::unlinkat(self.dirfd.as_raw_fd(), name.as_ptr(), 0);
+            }
+        }
+        let _ = std::fs::remove_dir(&self.path);
     }
 }
 
@@ -95,6 +111,7 @@ impl ProbeSubdir {
 /// clean one), then `fchmod` on the opened fd so the mode holds under
 /// any umask.
 fn create_probe_subdir(dir: &std::path::Path) -> Result<ProbeSubdir, String> {
+    use std::os::fd::FromRawFd as _;
     use std::os::unix::ffi::OsStrExt as _;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -150,26 +167,26 @@ fn create_probe_subdir(dir: &std::path::Path) -> Result<ProbeSubdir, String> {
     // The mkdir mode honors umask, so enforce 0700 exactly on the
     // verified-owned fd: private under any umask.
     // SAFETY: `fchmod` on the live fd from the `open` above.
-    let chmod_error = if unsafe { libc::fchmod(raw, 0o700) } != 0 {
-        Some(std::io::Error::last_os_error())
-    } else {
-        None
-    };
-    // SAFETY: `close` on the live fd from the `open` above.
-    unsafe {
-        libc::close(raw);
-    }
-    if let Some(error) = chmod_error {
+    if unsafe { libc::fchmod(raw, 0o700) } != 0 {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: `close`/`rmdir` on the live fd/path from above.
         unsafe {
+            libc::close(raw);
             libc::rmdir(path.as_ptr());
         }
         return Err(error.to_string());
     }
+    // Retain the verified fd for drop-bound cleanup: unlinks go
+    // through it, never the path.
+    // SAFETY: `raw` is a live owned fd from the `open` above, moved
+    // into the guard exactly once here.
+    let dirfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
     Ok(ProbeSubdir {
         path: subdir,
         dev,
         ino,
         uid: euid,
+        dirfd,
     })
 }
 
@@ -627,6 +644,33 @@ mod tests {
             "drop deleted a replacement dir"
         );
         assert!(parked.is_dir(), "the created dir must be left parked");
+    }
+
+    /// Bounded cleanup: drop unlinks only the four fixture names the
+    /// probe writes, then removes the dir only when empty. An unknown
+    /// entry (a replacement's content, or anything planted after the
+    /// identity check) is never deleted and blocks the final removal.
+    #[test]
+    fn probe_subdir_drop_ignores_unknown_names() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let subdir = create_probe_subdir(scratch.path()).expect("create subdir");
+        let path = subdir.path.clone();
+        std::fs::write(path.join("probe-a"), b"a").expect("write fixture");
+        std::fs::write(path.join("foreign"), b"foreign").expect("write foreign");
+        drop(subdir);
+        assert_eq!(
+            std::fs::read(path.join("foreign")).expect("read foreign"),
+            b"foreign",
+            "drop deleted an unknown name"
+        );
+        assert!(
+            !path.join("probe-a").exists(),
+            "drop must unlink the known fixture names"
+        );
+        assert!(
+            path.is_dir(),
+            "a non-empty dir must survive the empty-only final removal"
+        );
     }
 
     /// A probe run removes its subdir on every exit: repeated runs

@@ -1210,10 +1210,11 @@ fn deferred_endpoints_are_resubmitted_on_the_next_pass() {
     );
 }
 
-/// Invariant 4.1: a stop requested before the first pass (a signal during
-/// activation) still gets one full pass after activation.
+/// Invariant 4.1 (F9): a stop requested before the first pass (a signal
+/// during activation) runs zero passes: the host gate latches before any
+/// scan, and the owned stop drain still runs.
 #[test]
-fn a_stop_requested_during_startup_still_runs_one_full_pass() {
+fn a_stop_requested_during_startup_runs_zero_passes() {
     let log = Log::default();
     let mut scene = Scene::new(&log);
     let lane = ScriptedLane::new(&log);
@@ -1230,19 +1231,19 @@ fn a_stop_requested_during_startup_still_runs_one_full_pass() {
     let stopped = run_classic(&mut scene, Some(started), &clock, &mut |_, _| Ok(()))
         .unwrap()
         .unwrap();
-    assert_eq!(stopped.summary.passes, 1);
+    assert_eq!(stopped.summary.passes, 0);
     let log = entries(&log);
-    let scan = log
-        .iter()
-        .position(|entry| entry == "scan")
-        .expect("one scan");
-    let end = log
-        .iter()
-        .position(|entry| entry == "end_capture_coverage")
-        .unwrap();
-    assert!(scan < end, "{log:?}");
-    assert_eq!(log.iter().filter(|entry| *entry == "scan").count(), 1);
-    assert_eq!(scene.coordinator.passes(), 1);
+    assert!(
+        !log.iter()
+            .any(|entry| entry == "scan" || entry == "collect"),
+        "{log:?}"
+    );
+    assert!(
+        log.iter().any(|entry| entry == "end_capture_coverage"),
+        "{log:?}"
+    );
+    assert!(log.iter().any(|entry| entry == "begin_stop"), "{log:?}");
+    assert_eq!(scene.coordinator.passes(), 0);
 }
 
 /// Invariant 5: retirement past its budget reads unsettled with a gap; the

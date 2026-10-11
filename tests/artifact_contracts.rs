@@ -12579,6 +12579,29 @@ fn license_legal_surface_accepts_only_quoted_upstream_provenance_names() {
     }
 }
 
+fn source_uses_private_record_fields(source: &str) -> bool {
+    // Preserve the two sanctioned lane identifiers: the counts-only summary
+    // and the same-consumer drain spelling.
+    let scan = source
+        .replace("continuity_cuts", "")
+        .replace("poll_records_to_position", "");
+    [
+        "entry_ip",
+        "entry_stamp",
+        "return_stamp",
+        "poll_records",
+        "decode_record",
+    ]
+    .iter()
+    .any(|field| scan.contains(field))
+        || scan.match_indices(".continuity").any(|(offset, field)| {
+            scan[offset + field.len()..]
+                .chars()
+                .next()
+                .is_none_or(|next| !next.is_alphanumeric() && next != '_')
+        })
+}
+
 /// Task 3 Stage A privacy contract: the private entry IP and the continuity
 /// stamps are read from CALL records only by the instance router plumbing and
 /// its tests. A renderer, reducer, or report that names them is a leak path.
@@ -12595,6 +12618,33 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
         // Test-only assertions that the public projection omits private fields.
         "src/s1_tests.rs",
     ];
+    let refuses = |path: &str, source: &str| {
+        !allowed.contains(&path) && source_uses_private_record_fields(source)
+    };
+    for path in ["src/render.rs", "src/output.rs"] {
+        for source in [
+            "record.continuity",
+            "let data = record.continuity;",
+            "render(record.continuity)",
+            "render(record.entry_ip)",
+            "report.entry_stamp = record.entry_stamp;",
+            "report.return_stamp = record.return_stamp;",
+            "let records = poll_records(&mut reader);",
+            "let record = decode_record(bytes);",
+            "render(outcome.continuity_rounds, record.entry_ip)",
+            "if engine.continuity_deferred { render(record.continuity); }",
+        ] {
+            assert!(refuses(path, source), "{path} must refuse {source:?}");
+        }
+        for source in [
+            "let rounds = outcome.continuity_rounds;",
+            "if engine.continuity_deferred {}",
+            "let cuts = report.continuity_cuts;",
+            "let events = poll_records_to_position();",
+        ] {
+            assert!(!refuses(path, source), "{path} must accept {source:?}");
+        }
+    }
     assert!(
         read("src/lib.rs").contains("#[cfg(test)]\nmod s1_tests;"),
         "the public projection privacy sentinel must remain test-only"
@@ -12620,25 +12670,7 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
                 continue;
             }
             let source = fs::read_to_string(&path).expect("read source");
-            // Strip the two sanctioned lane identifiers before scanning:
-            // `continuity_cuts` is a counts-only summary field (Task5 item 7)
-            // and `poll_records_to_position` is the sanctioned same-consumer
-            // drain defined in allowlisted src/events.rs (Task5 item 2). Any
-            // raw use of the six tokens below anywhere still fails.
-            let scan = source
-                .replace("continuity_cuts", "")
-                .replace("poll_records_to_position", "");
-            if [
-                "entry_ip",
-                "entry_stamp",
-                "return_stamp",
-                ".continuity",
-                "poll_records",
-                "decode_record",
-            ]
-            .iter()
-            .any(|field| scan.contains(field))
-            {
+            if source_uses_private_record_fields(&source) {
                 users.push(path.to_string_lossy().into_owned());
             }
         }

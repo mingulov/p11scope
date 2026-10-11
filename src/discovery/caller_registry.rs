@@ -272,6 +272,10 @@ pub(crate) struct CallerAdapter<Source: ProcessSource> {
     max_callers: usize,
     admit_refused: u64,
     scoped_retire_cursor: Option<u32>,
+    /// A per-incarnation detection-clock read failed (F7a): the
+    /// coordinator takes the gap fallback explicitly. Sticky until
+    /// taken.
+    detection_clock_failed: bool,
 }
 
 /// Why one admission attempt failed: an honest pin failure, or a budget
@@ -301,7 +305,16 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             max_callers: DEFAULT_MAX_CALLERS,
             admit_refused: 0,
             scoped_retire_cursor: None,
+            detection_clock_failed: false,
         }
+    }
+
+    /// Take and clear the detection-clock failure flag (F7a): true
+    /// when a per-incarnation stamp saw a clock-read failure since the
+    /// last take. The coordinator disables the stale-exit guard on
+    /// true, never a silent pass-start stamp.
+    pub(crate) fn take_detection_clock_failed(&mut self) -> bool {
+        std::mem::take(&mut self.detection_clock_failed)
     }
 
     /// The caller budget this adapter enforces at admission. The
@@ -495,15 +508,19 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
     }
 
     /// Commit one prepared scoped caller under its exact member permit.
-    /// `now_ns` is the pass clock for scan-window stamps; `admitted_ns`
-    /// is the actual admission detection time, the boundary stale
-    /// native records order against.
+    /// `now_ns` is the pass clock for scan-window stamps; `detected`
+    /// samples the actual admission detection time per incarnation,
+    /// after the permit/custody validation below — the boundary stale
+    /// native records order against. On clock-read failure the stamp
+    /// is zero (the guard never filters) and the failure flag is set
+    /// for the coordinator's explicit gap fallback, never a silent
+    /// pass-start stamp.
     pub(crate) fn commit_scoped_caller(
         &mut self,
         prepared: PreparedScopedCaller<Source::Pin>,
         permit: crate::inspect_system::inventory_cgroup::CgroupAdmissionPermit<'_>,
         now_ns: u64,
-        admitted_ns: u64,
+        detected: &mut dyn FnMut() -> Option<u64>,
     ) -> Result<(CallerId, bool), AdmitFailure> {
         let failed = |reason: &str| AdmitFailure {
             reason: reason.into(),
@@ -547,6 +564,14 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                 budget: Some(budget),
             });
         }
+        // Per-incarnation detection (F7a): after the validation above.
+        let admitted_ns = match detected() {
+            Some(stamp) => stamp.max(now_ns),
+            None => {
+                self.detection_clock_failed = true;
+                0
+            }
+        };
         let id = self
             .mint()
             .map_err(|_| failed("caller ID space exhausted"))?;
@@ -588,9 +613,10 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
     /// candidate for this pid joins only when it already holds the
     /// current incarnation; pid equality alone never adopts it.
     /// Returns the successor and whether it was freshly minted.
-    /// `now_ns` is the pass clock for scan-window stamps; `admitted_ns`
-    /// is the actual admission detection time, the boundary stale
-    /// native records order against.
+    /// `now_ns` is the pass clock for scan-window stamps; `detected`
+    /// samples the actual admission detection time per incarnation,
+    /// after the validation below. On clock-read failure the stamp is
+    /// zero with the failure flag set, never a silent pass-start stamp.
     pub(crate) fn commit_handoff_caller(
         &mut self,
         pid: u32,
@@ -598,7 +624,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         permit: crate::inspect_system::inventory_cgroup::CgroupAdmissionPermit<'_>,
         generation: crate::inspect_system::MemberGeneration,
         now_ns: u64,
-        admitted_ns: u64,
+        detected: &mut dyn FnMut() -> Option<u64>,
     ) -> Result<(CallerId, bool), AdmitFailure> {
         let failed = |reason: &str| AdmitFailure {
             reason: reason.into(),
@@ -642,6 +668,14 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                 budget: Some(budget),
             });
         }
+        // Per-incarnation detection (F7a): after the validation above.
+        let admitted_ns = match detected() {
+            Some(stamp) => stamp.max(now_ns),
+            None => {
+                self.detection_clock_failed = true;
+                0
+            }
+        };
         let id = self
             .mint()
             .map_err(|_| failed("caller ID space exhausted"))?;
@@ -674,12 +708,17 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
 
     /// Reconcile's admission: the budget refusal carries its
     /// resource/limit/requested structurally; pin failures stay bare.
+    /// `detected` samples the admission detection time per incarnation,
+    /// after the pin/liveness/generation validation inside `admit` —
+    /// never a sweep-start sample shared across admissions. On
+    /// clock-read failure the stamp is zero with the failure flag set,
+    /// never a silent pass-start stamp.
     fn try_admit(
         &mut self,
         pid: u32,
         authority: ImageAuthority,
         now_ns: u64,
-        detected_ns: u64,
+        detected: &mut dyn FnMut() -> Option<u64>,
     ) -> Result<CallerId, AdmitFailure> {
         if self.live_by_pid.contains_key(&pid) {
             return Err(AdmitFailure {
@@ -711,11 +750,18 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                 reason: format!("{error:#}"),
                 budget: None,
             })?;
+        let admitted_ns = match detected() {
+            Some(stamp) => stamp.max(now_ns),
+            None => {
+                self.detection_clock_failed = true;
+                0
+            }
+        };
         self.callers
             .get_mut(&id)
             .expect("the admitted caller retains its record")
             .record
-            .admitted_ns = detected_ns;
+            .admitted_ns = admitted_ns;
         Ok(id)
     }
 
@@ -790,7 +836,9 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         let handoff = self.retire_for_exec_handoff(id, now_ns);
         let commit = match handoff {
             Some((pid, pin)) => self.admit_retained_successor(pid, pin, authority, now_ns),
-            None => self.commit_retained_successor(pid, None, authority, now_ns, now_ns),
+            None => {
+                self.commit_retained_successor(pid, None, authority, now_ns, &mut || Some(now_ns))
+            }
         };
         vec![match commit {
             Ok(new) => CallerEvent::ExecRetired { old: id, new },
@@ -840,19 +888,22 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
     ) -> Result<CallerId, AdmitFailure> {
         // The exec path carries a fresh `now_ns` already, so it is the
         // detection time too.
-        self.commit_retained_successor(pid, Some(pin), authority, now_ns, now_ns)
+        self.commit_retained_successor(pid, Some(pin), authority, now_ns, &mut || Some(now_ns))
     }
 
     /// The one retained-custody commit behind every exec handoff: the native
     /// transition path, the scan-proven path, and the coordinator's pending
-    /// successor commit share these checks, in this order.
+    /// successor commit share these checks, in this order. `detected`
+    /// samples the admission detection time per incarnation, after the
+    /// custody/liveness validation above; on clock-read failure the
+    /// stamp is zero with the failure flag set.
     fn commit_retained_successor(
         &mut self,
         pid: u32,
         pin: Option<Source::Pin>,
         authority: ImageAuthority,
         now_ns: u64,
-        detected_ns: u64,
+        detected: &mut dyn FnMut() -> Option<u64>,
     ) -> Result<CallerId, AdmitFailure> {
         let Some(pin) = pin else {
             return Err(AdmitFailure {
@@ -906,6 +957,14 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         }
         let start_time = self.source.start_time(pid);
         let exe = self.source.exe_identity(pid);
+        // Per-incarnation detection (F7a): after the validation above.
+        let admitted_ns = match detected() {
+            Some(stamp) => stamp.max(now_ns),
+            None => {
+                self.detection_clock_failed = true;
+                0
+            }
+        };
         let id = self.mint().map_err(|error| AdmitFailure {
             reason: format!("{error:#}"),
             budget: None,
@@ -926,7 +985,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     lifecycle: CallerLifecycle::Mapped,
                     lifecycle_reason: None,
                     first_seen_ns: now_ns,
-                    admitted_ns: detected_ns,
+                    admitted_ns,
                     last_seen_ns: now_ns,
                     retired: false,
                 },
@@ -950,28 +1009,31 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         authority_for: &mut dyn FnMut(u32) -> ImageAuthority,
         now_ns: u64,
     ) -> Vec<CallerEvent> {
-        self.reconcile_detected(observed, authority_for, now_ns, now_ns)
+        self.reconcile_detected(observed, authority_for, now_ns, &mut || Some(now_ns))
     }
 
-    /// Reconcile with an explicit admission detection time: `now_ns` is
-    /// the pass clock for scan-window stamps (`first_seen_ns` and
-    /// retirement/last-seen), while `detected_ns` is when the
-    /// admissions below were actually detected — the boundary stale
-    /// native records order against (`admitted_ns`). The production
-    /// scan path samples detection after its collection; callers that
-    /// admit at the pass clock use [`Self::reconcile`].
+    /// Reconcile with a per-incarnation admission detection clock:
+    /// `now_ns` is the pass clock for scan-window stamps
+    /// (`first_seen_ns` and retirement/last-seen), while `detected` is
+    /// sampled once per admitted incarnation, after its
+    /// generation/liveness/executable/reuse validation — the boundary
+    /// stale native records order against (`admitted_ns`). The
+    /// production scan path passes the monotonic clock; callers that
+    /// admit at the pass clock use [`Self::reconcile`]. On clock-read
+    /// failure the incarnation stamps zero with the failure flag set,
+    /// never a silent pass-start stamp.
     pub(crate) fn reconcile_detected(
         &mut self,
         observed: &BTreeSet<u32>,
         authority_for: &mut dyn FnMut(u32) -> ImageAuthority,
         now_ns: u64,
-        detected_ns: u64,
+        detected: &mut dyn FnMut() -> Option<u64>,
     ) -> Vec<CallerEvent> {
         self.reconcile_inner(
             observed,
             authority_for,
             now_ns,
-            detected_ns,
+            detected,
             SuccessorAdmission::Unrestricted,
             &mut || true,
         )
@@ -988,7 +1050,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             &BTreeSet::new(),
             &mut |_| ImageAuthority::ScanPinned,
             now_ns,
-            now_ns,
+            &mut || Some(now_ns),
             SuccessorAdmission::ScopedDenied,
             work,
         )
@@ -1012,7 +1074,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         observed: &BTreeSet<u32>,
         authority_for: &mut dyn FnMut(u32) -> ImageAuthority,
         now_ns: u64,
-        detected_ns: u64,
+        detected: &mut dyn FnMut() -> Option<u64>,
         admission: SuccessorAdmission,
         work: &mut dyn FnMut() -> bool,
     ) -> Vec<CallerEvent> {
@@ -1094,7 +1156,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                         now_ns,
                     );
                     let commit =
-                        self.commit_retained_successor(pid, pin, authority, now_ns, detected_ns);
+                        self.commit_retained_successor(pid, pin, authority, now_ns, detected);
                     match commit {
                         Ok(new) => events.push(CallerEvent::ExecRetired { old: id, new }),
                         Err(failure) => events.push(CallerEvent::AdmitFailed {
@@ -1155,7 +1217,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     events.push(self.retired_event(id));
                     continue;
                 }
-                match self.try_admit(pid, authority_for(pid), now_ns, detected_ns) {
+                match self.try_admit(pid, authority_for(pid), now_ns, detected) {
                     Ok(new) => events.push(CallerEvent::Reused { old: id, new }),
                     Err(failure) => events.push(CallerEvent::AdmitFailed {
                         pid,
@@ -1171,7 +1233,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             if self.live_by_pid.contains_key(&pid) {
                 continue;
             }
-            match self.try_admit(pid, authority_for(pid), now_ns, detected_ns) {
+            match self.try_admit(pid, authority_for(pid), now_ns, detected) {
                 Ok(id) => events.push(CallerEvent::Admitted { id }),
                 Err(failure) => events.push(CallerEvent::AdmitFailed {
                     pid,

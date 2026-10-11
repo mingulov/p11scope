@@ -2018,16 +2018,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             scan_pinned: 0,
         };
         let reconcile_start = crate::attach::monotonic_ns();
-        // Admission detection runs after the collection: stale native
-        // records order against when the incarnation was actually
-        // detected, never the pass-start clock (F7).
-        let detected_ns = crate::attach::monotonic_ns().unwrap_or(0).max(now_ns);
+        // Admission detection runs per incarnation, after its
+        // generation/liveness/executable/reuse validation: stale
+        // native records order against when the incarnation was
+        // actually detected, never the pass-start clock or a
+        // sweep-start sample shared across admissions (F7a). On
+        // clock-read failure the guard falls back explicitly (below),
+        // never a silent pass-start stamp.
         let mut events = self.adapter.reconcile_detected(
             &observed,
             &mut |pid| resolver.resolve(pid),
             now_ns,
-            detected_ns,
+            &mut crate::attach::monotonic_ns,
         );
+        if self.adapter.take_detection_clock_failed() {
+            self.exit_clocks_comparable = false;
+        }
         let (native_failures, scan_pinned) = resolver.finish();
         self.apply_reconcile_events(&events, now_ns);
         self.record_authority_gaps(native_failures, scan_pinned);
@@ -2157,16 +2163,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut events = if matches!(resolver.engine.scope, Scope::Cgroup { .. }) {
             self.adapter.reconcile_scoped(now_ns, &mut || true)
         } else {
-            // Detection runs after the collection: admissions order
-            // against detection time, never the pass-start clock (F7).
-            let detected_ns = crate::attach::monotonic_ns().unwrap_or(0).max(now_ns);
+            // Detection runs per incarnation, after its validation:
+            // admissions order against detection time, never the
+            // pass-start clock (F7a).
             self.adapter.reconcile_detected(
                 &BTreeSet::new(),
                 &mut |pid| resolver.resolve(pid),
                 now_ns,
-                detected_ns,
+                &mut crate::attach::monotonic_ns,
             )
         };
+        if self.adapter.take_detection_clock_failed() {
+            self.exit_clocks_comparable = false;
+        }
         let (native_failures, scan_pinned) = resolver.finish();
         self.apply_reconcile_events(&events, now_ns);
         self.record_authority_gaps(native_failures, scan_pinned);
@@ -5251,19 +5260,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 BTreeSet::new()
             };
             collection.sample_end(&requested);
-            // Admission detection runs at commit, after the end sample:
-            // stale native records order against detection time, never
-            // the pass-start clock (F7).
-            let admitted_ns = crate::attach::monotonic_ns().unwrap_or(0).max(*now_ns);
+            // Admission detection runs per incarnation at commit, after
+            // the end sample and the commit validation: stale native
+            // records order against detection time, never the
+            // pass-start clock (F7a).
             let mut allowed = BTreeSet::new();
             for (pid, pin) in prepared {
                 let Some(permit) = collection.permit(pid) else {
                     continue;
                 };
-                match self
-                    .adapter
-                    .commit_scoped_caller(pin, permit, *now_ns, admitted_ns)
-                {
+                match self.adapter.commit_scoped_caller(
+                    pin,
+                    permit,
+                    *now_ns,
+                    &mut crate::attach::monotonic_ns,
+                ) {
                     Ok((id, admitted)) => {
                         allowed.insert(pid);
                         if admitted {
@@ -5295,7 +5306,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     permit,
                     generation,
                     *now_ns,
-                    admitted_ns,
+                    &mut crate::attach::monotonic_ns,
                 ) {
                     Ok((new, admitted)) => {
                         allowed.insert(pid);
@@ -5310,6 +5321,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         budget: failure.budget,
                     }),
                 }
+            }
+            if self.adapter.take_detection_clock_failed() {
+                self.exit_clocks_comparable = false;
             }
             scoped_scan_callers = allowed.len();
             let mut catalog = collection.catalog(&allowed);
@@ -15138,7 +15152,7 @@ pub(crate) mod tests {
             &observed,
             &mut |_| ImageAuthority::ScanPinned,
             2_000,
-            2_100,
+            &mut || Some(2_100),
         );
         let [CallerEvent::Reused { new, .. }] = events.as_slice() else {
             panic!("one pass retires the old incarnation and admits the reuse: {events:?}");
@@ -15184,6 +15198,184 @@ pub(crate) mod tests {
         assert!(receipt.events.is_empty());
         reused.scene.coordinator.commit_batch(false).unwrap();
         assert_eq!(link_losses(&reused), 1, "a fresh exit still records once");
+    }
+
+    /// H6 stale attribution, turnover during reconciliation (F7a):
+    /// two incarnations admitted in one sweep each stamp after their
+    /// own validation. Pid 7 reuses and pid 8 exec-changes; the sweep
+    /// meets 7 first (2100) then 8 (2200). An old exit for pid 8 at
+    /// 2150 predates 8's admission and stays silent; a fresh exit at
+    /// 2500 still records. A sweep-start sample shared across both
+    /// admissions cuts the successor (link loss 1 vs 0).
+    #[test]
+    fn turnover_during_reconciliation_stamps_each_admission_after_its_validation() {
+        fn exit_record(pid: u32, hook_ts_ns: u64) -> p11scope_ebpf_common::DiscoveryRecord {
+            // SAFETY: DiscoveryRecord contains only integer fields.
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.hook_ts_ns = hook_ts_ns;
+            record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+            record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+            record
+        }
+        fn link_losses(native: &NativeScene) -> usize {
+            native
+                .gap_subjects()
+                .iter()
+                .filter(|subject| subject.as_str() == "leader task link loss")
+                .count()
+        }
+
+        let (mut scene, _leader) = NativeScene::new();
+        scene.scene.source.spawn(8, 600);
+        let observed8: BTreeSet<u32> = [7, 8].into_iter().collect();
+        let events = scene.scene.coordinator.adapter.reconcile(
+            &observed8,
+            &mut |_| ImageAuthority::ScanPinned,
+            100,
+        );
+        scene.scene.coordinator.apply_reconcile_events(&events, 100);
+        scene.scene.coordinator.commit_batch(false).unwrap();
+        // Mid-sweep turnover: pid 7 reuses (new generation), pid 8
+        // execs (same generation, new image). The sweep meets 7 first.
+        scene.scene.source.kill(7);
+        scene.scene.source.spawn(7, 900);
+        scene.scene.source.exec(8, 200, "/bin/driver2");
+        let observed: BTreeSet<u32> = [7, 8].into_iter().collect();
+        // The detection clock advances mid-sweep: pid 7's successor
+        // stamps 2100, pid 8's 2200.
+        let mut stamps = [2_100, 2_200].into_iter();
+        let events = scene.scene.coordinator.adapter.reconcile_detected(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            2_000,
+            &mut || stamps.next(),
+        );
+        assert_eq!(events.len(), 2, "{events:?}");
+        let [first, second] = events.as_slice() else {
+            panic!("two successors admit in sweep order: {events:?}");
+        };
+        let (fresh7, fresh8) = match (first, second) {
+            (
+                CallerEvent::Reused { new: fresh7, .. },
+                CallerEvent::ExecRetired { new: fresh8, .. },
+            ) => (*fresh7, *fresh8),
+            _ => panic!("pid 7 reuses first, pid 8 execs second: {events:?}"),
+        };
+        let record7 = scene.scene.coordinator.adapter.record(fresh7).unwrap();
+        let record8 = scene.scene.coordinator.adapter.record(fresh8).unwrap();
+        assert_eq!(
+            record7.admitted_ns, 2_100,
+            "the first admission stamps its own detection"
+        );
+        assert_eq!(
+            record8.admitted_ns, 2_200,
+            "the mid-sweep admission stamps after its own validation, not the sweep start"
+        );
+        scene
+            .scene
+            .coordinator
+            .apply_reconcile_events(&events, 2_000);
+        scene.scene.coordinator.commit_batch(false).unwrap();
+        // The pid-8 successor was detected after pid 7's, so an exit
+        // at 2150 predates its admission and stays silent.
+        let receipt = scene.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            scene.domain,
+            vec![exit_record(8, 2_150)],
+            scene.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        scene.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(
+            link_losses(&scene),
+            0,
+            "the mid-sweep old exit stays silent"
+        );
+        // Control: a fresh exit for the successor still records.
+        let receipt = scene.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            scene.domain,
+            vec![exit_record(8, 2_500)],
+            scene.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        scene.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(link_losses(&scene), 1, "a fresh exit still records once");
+    }
+
+    /// H6 stale attribution, detection-clock failure (F7a): when the
+    /// per-incarnation stamp cannot read the clock, the incarnation
+    /// stamps zero (the guard never filters it) and the coordinator
+    /// takes the gap fallback explicitly — never a silent pass-start
+    /// stamp. Exits then record unfiltered with one unvalidated-clocks
+    /// gap.
+    #[test]
+    fn detection_clock_failure_takes_the_gap_fallback_explicitly() {
+        fn exit_record(pid: u32, hook_ts_ns: u64) -> p11scope_ebpf_common::DiscoveryRecord {
+            // SAFETY: DiscoveryRecord contains only integer fields.
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.hook_ts_ns = hook_ts_ns;
+            record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+            record.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+            record
+        }
+
+        let (mut scene, _leader) = NativeScene::new();
+        scene.scene.source.kill(7);
+        scene.scene.source.spawn(7, 900);
+        let observed: BTreeSet<u32> = [7].into_iter().collect();
+        let events = scene.scene.coordinator.adapter.reconcile_detected(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            2_000,
+            &mut || None,
+        );
+        let [CallerEvent::Reused { new, .. }] = events.as_slice() else {
+            panic!("the reuse admits despite the clock failure: {events:?}");
+        };
+        let fresh = *new;
+        let record = scene.scene.coordinator.adapter.record(fresh).unwrap();
+        assert_eq!(
+            record.admitted_ns, 0,
+            "clock failure stamps zero, never the silent pass-start 2000"
+        );
+        assert!(
+            scene
+                .scene
+                .coordinator
+                .adapter
+                .take_detection_clock_failed(),
+            "the failure flag is set for the coordinator"
+        );
+        // Production takes the gap fallback explicitly here.
+        scene.scene.coordinator.exit_clocks_comparable = false;
+        scene
+            .scene
+            .coordinator
+            .apply_reconcile_events(&events, 2_000);
+        scene.scene.coordinator.commit_batch(false).unwrap();
+        let receipt = scene.stage(NativeBatch::Lifecycle(DiscoveryBatch::scripted(
+            scene.domain,
+            vec![exit_record(7, 100)],
+            scene.stamps.tick(),
+        )));
+        assert!(receipt.events.is_empty());
+        scene.scene.coordinator.commit_batch(false).unwrap();
+        let subjects = scene.gap_subjects();
+        assert_eq!(
+            subjects
+                .iter()
+                .filter(|subject| subject.as_str() == "leader task link loss")
+                .count(),
+            1,
+            "the exit records unfiltered: {subjects:?}"
+        );
+        assert_eq!(
+            subjects
+                .iter()
+                .filter(|subject| subject.as_str() == "leader-exit clocks unvalidated")
+                .count(),
+            1,
+            "one gap notes the unvalidated clocks: {subjects:?}"
+        );
     }
 
     /// H6 stale attribution, exec successor: the native transition path
@@ -15445,7 +15637,9 @@ pub(crate) mod tests {
         let mut adapter = CallerAdapter::new(source);
         divergent.set(true);
         let (id, admitted) = adapter
-            .commit_handoff_caller(pid, pin, permit, verified.clone(), 3_000, 3_100)
+            .commit_handoff_caller(pid, pin, permit, verified.clone(), 3_000, &mut || {
+                Some(3_100)
+            })
             .map_err(|failure| failure.reason)
             .expect("the verified generation commits");
         assert!(admitted, "the handoff mints its successor");

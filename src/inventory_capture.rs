@@ -676,6 +676,19 @@ impl<L> NativeLane<L> {
         self.stage_pass_evidence(host)
     }
 
+    /// The pass's native half when a stop landed during its apply (F9):
+    /// the already-applied owned drain still stages, but no NEW target
+    /// extension starts after the stop. The host is already latched, so
+    /// the staged evidence drains while successor mint refuses.
+    pub(crate) fn after_pass_stopped<Pin, H>(&mut self, host: &mut H) -> Vec<CallerEvent>
+    where
+        L: CaptureLane<Pin>,
+        H: LaneHost<Pin> + ?Sized,
+    {
+        self.passes += 1;
+        self.stage_pass_evidence(host)
+    }
+
     /// Scoped admission needs the held lifecycle and witness transitions
     /// before its final sample; this phase takes no new target delta.
     pub(crate) fn before_cgroup_commit<Pin, H>(&mut self, host: &mut H) -> Vec<CallerEvent>
@@ -1543,9 +1556,20 @@ where
                     Some(lane) => driver.apply(collected, lane.identity(), now)?,
                     None => driver.apply(collected, &mut ScanOnlyIdentity, now)?,
                 };
+                // A stop that landed during apply latches before the
+                // pass's native half: the already-applied owned drain
+                // still stages and commits below, but no NEW target
+                // extension or successor admission starts after it (F9).
+                let stopped_in_apply = control.is_none() && clock.stop_requested();
+                if stopped_in_apply {
+                    driver.host().stop_coordinator();
+                    stop_latched = true;
+                }
                 if let Some(lane) = lane.as_mut() {
                     report.events.extend(if control.is_some() {
                         lane.before_cgroup_commit(driver.host())
+                    } else if stopped_in_apply {
+                        lane.after_pass_stopped(driver.host())
                     } else {
                         lane.after_pass(driver.host())
                     });
@@ -1580,6 +1604,12 @@ where
                         now_ns: published_ns,
                     },
                 )?;
+                if stopped_in_apply {
+                    // The applied pass published; the latched stop ends
+                    // the run before any new sleep, tick, or pass work.
+                    // The owned stop drain still runs after the loop.
+                    break;
+                }
                 rescan = lane.as_mut().is_some_and(NativeLane::take_recovery_rescan);
                 let next = if rescan {
                     Instant::now()
@@ -1587,6 +1617,7 @@ where
                     Instant::now() + clock.interval
                 };
                 let mut schedule = TickSchedule::starting(Instant::now(), clock.tick);
+                let mut cancelled_in_sleep = false;
                 loop {
                     let now = Instant::now();
                     if clock.ending()
@@ -1598,6 +1629,16 @@ where
                         break;
                     }
                     std::thread::sleep(schedule.wait(now).min(next - now));
+                    // A stop that landed during the sleep latches before
+                    // the tick: no tick work stages on an unstopped host
+                    // after cancellation (F9). The owned stop drain still
+                    // runs after the loop.
+                    if control.is_none() && clock.stop_requested() {
+                        driver.host().stop_coordinator();
+                        stop_latched = true;
+                        cancelled_in_sleep = true;
+                        break;
+                    }
                     // The ring first, then the display; the schedule is fixed-rate,
                     // so the draw never delays the next ring service.
                     if let Some(lane) = lane.as_mut() {
@@ -1608,6 +1649,9 @@ where
                         latch_collection_stop(control, clock);
                     }
                     schedule.advance(Instant::now());
+                }
+                if cancelled_in_sleep {
+                    break;
                 }
             }
             Ok(())
@@ -1916,6 +1960,8 @@ mod stop_latch_tests {
         stops: usize,
         stages: usize,
         targets: F9Targets,
+        stop_calls: Option<Rc<Cell<u64>>>,
+        stage_marks: Vec<(u64, usize)>,
     }
     impl F9Host {
         fn new() -> Self {
@@ -1923,6 +1969,8 @@ mod stop_latch_tests {
                 stops: 0,
                 stages: 0,
                 targets: F9Targets,
+                stop_calls: None,
+                stage_marks: Vec::new(),
             }
         }
     }
@@ -1944,6 +1992,8 @@ mod stop_latch_tests {
             _now_ns: u64,
         ) -> NativeReceipt {
             self.stages += 1;
+            let calls = self.stop_calls.as_ref().map_or(0, |calls| calls.get());
+            self.stage_marks.push((calls, self.stops));
             NativeReceipt::default()
         }
         fn end_capture_coverage(&mut self, _at_ns: u64) {}
@@ -2022,6 +2072,7 @@ mod stop_latch_tests {
         domain: NativeDomainId,
         activated: bool,
         begin_stops: usize,
+        extends: usize,
     }
     impl F9Lane {
         fn new() -> Self {
@@ -2029,6 +2080,7 @@ mod stop_latch_tests {
                 domain: NativeDomainId::mint(),
                 activated: false,
                 begin_stops: 0,
+                extends: 0,
             }
         }
     }
@@ -2053,6 +2105,7 @@ mod stop_latch_tests {
             _targets: &dyn CaptureTargets,
             _window: ExtendWindow,
         ) -> ExtendReceipt {
+            self.extends += 1;
             let mut receipt = ExtendReceipt {
                 custody: Some(ScopeCustody::System),
                 ..ExtendReceipt::default()
@@ -2295,6 +2348,155 @@ mod stop_latch_tests {
             "the latch stops the host exactly once"
         );
         assert!(driver.host.stages > 0, "the terminal sweep still stages");
+        assert_eq!(stopped.capture.begin_stops, 1, "retirement still begins");
+    }
+
+    #[test]
+    fn passed_deadline_runs_zero_passes_with_no_apply_or_commit() {
+        let mut driver = F9Driver::new();
+        let stop = || false;
+        let clock = LoopClock {
+            deadline: Some(Instant::now() - Duration::from_secs(1)),
+            stop: &stop,
+            interval: Duration::from_secs(60),
+            tick: Duration::from_millis(10),
+            collection_tick: Duration::from_millis(10),
+        };
+        let mut pass_publications = 0;
+        let outcome = run_classic_finalizing(
+            &mut driver,
+            None::<NativeLane<F9Lane>>,
+            &clock,
+            None,
+            &mut |_, point| {
+                if matches!(point, Publish::Pass { .. }) {
+                    pass_publications += 1;
+                }
+                Ok(())
+            },
+        );
+        assert!(outcome.error.is_none());
+        assert!(outcome.stopped.is_none());
+        assert_eq!(driver.collects, 0, "no new scan after a passed deadline");
+        assert_eq!(
+            driver.applies, 0,
+            "no apply, so no attach or successor work"
+        );
+        assert_eq!(driver.commits, 0, "no commit without a pass");
+        assert_eq!(pass_publications, 0, "no pass was published");
+        assert_eq!(
+            driver.host.stops, 1,
+            "the latch stops the host exactly once"
+        );
+    }
+
+    #[test]
+    fn stop_during_apply_skips_target_extension_but_commits_applied_data() {
+        let mut driver = F9Driver::new();
+        let started =
+            NativeLane::start(F9Lane::new(), driver.host(), LaneWindows::PROVISIONAL, None)
+                .map_err(|(_, reason)| reason)
+                .unwrap();
+        let applied = Rc::clone(&driver.applied);
+        let stop = move || applied.get() >= 1;
+        let clock = probe_clock(&stop);
+        let mut pass_publications = 0;
+        let outcome =
+            run_classic_finalizing(&mut driver, Some(started), &clock, None, &mut |_, point| {
+                if matches!(point, Publish::Pass { .. }) {
+                    pass_publications += 1;
+                }
+                Ok(())
+            });
+        assert!(outcome.error.is_none());
+        let stopped = outcome.stopped.expect("the owned stop still drains");
+        assert_eq!(driver.applies, 1, "the in-flight apply already ran");
+        assert_eq!(
+            driver.commits, 2,
+            "the applied pass commits, then the stop's terminal commit runs"
+        );
+        assert_eq!(pass_publications, 1, "the completed pass is published");
+        assert_eq!(
+            stopped.capture.extends, 1,
+            "only the startup extend runs: no new target extension starts after the stop"
+        );
+        assert_eq!(
+            driver.host.stops, 1,
+            "the latch stops the host exactly once"
+        );
+        assert!(driver.host.stages > 0, "the terminal sweep still stages");
+        assert_eq!(stopped.capture.begin_stops, 1, "retirement still begins");
+    }
+
+    #[test]
+    fn sleep_cancellation_latches_before_tick_work() {
+        // The stop flips deterministically mid-sleep: the first pass
+        // makes four stop() calls before its first sleep can end
+        // (pass-top gate, post-collection gate, post-apply gate, first
+        // sleep-top check), so a stop that reads true from the fifth
+        // call lands during a sleep on every run. A tick that stages
+        // while the stop is pending mints successors on an unstopped
+        // host.
+        const FLIP_AFTER: u64 = 4;
+        let mut driver = F9Driver::new();
+        let calls = Rc::new(Cell::new(0u64));
+        driver.host.stop_calls = Some(Rc::clone(&calls));
+        let started =
+            NativeLane::start(F9Lane::new(), driver.host(), LaneWindows::PROVISIONAL, None)
+                .map_err(|(_, reason)| reason)
+                .unwrap();
+        let stop_calls = Rc::clone(&calls);
+        let stop = move || {
+            let next = stop_calls.get() + 1;
+            stop_calls.set(next);
+            next > FLIP_AFTER
+        };
+        let clock = LoopClock {
+            deadline: Some(Instant::now() + Duration::from_secs(60)),
+            stop: &stop,
+            interval: Duration::from_secs(60),
+            tick: Duration::from_millis(1),
+            collection_tick: Duration::from_millis(10),
+        };
+        let mut pass_publications = 0;
+        let outcome =
+            run_classic_finalizing(&mut driver, Some(started), &clock, None, &mut |_, point| {
+                if matches!(point, Publish::Pass { .. }) {
+                    pass_publications += 1;
+                }
+                Ok(())
+            });
+        assert!(outcome.error.is_none());
+        let stopped = outcome.stopped.expect("the owned stop still drains");
+        assert!(
+            calls.get() > FLIP_AFTER,
+            "the stop flipped during the run ({} calls)",
+            calls.get()
+        );
+        assert_eq!(driver.applies, 1, "the completed pass still applies");
+        assert_eq!(
+            driver.commits, 2,
+            "the applied pass commits, then the stop's terminal commit runs"
+        );
+        assert_eq!(pass_publications, 1, "the completed pass is published");
+        assert_eq!(
+            driver.host.stops, 1,
+            "the latch stops the host exactly once"
+        );
+        assert!(
+            !driver
+                .host
+                .stage_marks
+                .iter()
+                .any(|(at, stops)| *at >= FLIP_AFTER && *stops == 0),
+            "no tick work stages while a stop is pending: {:?}",
+            driver.host.stage_marks
+        );
+        assert!(
+            driver.host.stage_marks.iter().any(|(_, stops)| *stops == 1),
+            "the owned drain still stages after the latch: {:?}",
+            driver.host.stage_marks
+        );
         assert_eq!(stopped.capture.begin_stops, 1, "retirement still begins");
     }
 }

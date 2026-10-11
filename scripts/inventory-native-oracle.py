@@ -6921,6 +6921,11 @@ def capacity_refusal_judgment(directory, manifest, providers, owners, calls, all
     census = doc.get("budgets", {}).get("endpoints", {})
     result.ok(name, "*", "CAPACITY-REFUSAL-CENSUS", census.get("occupied") == admitted_endpoints,
               f"retained endpoint census must equal admitted endpoints: {census}")
+    refused_sizes = sorted(len(providers[key][2]) for key in refused)
+    result.ok(name, "*", "CAPACITY-REFUSAL-MINIMAL",
+              bool(refused_sizes) and admitted_endpoints + refused_sizes[0] > limit,
+              f"refused set is not the minimal whole-module excess over the limit: "
+              f"admitted={admitted_endpoints} refused={refused_sizes} limit={limit}")
     owned_paths = {provider[0]["path"] for provider in providers.values()}
     expected = [gap for gap in doc.get("gaps", []) if gap.get("subject") == "inventory attach set refused module"]
     for gap in expected:
@@ -6990,6 +6995,11 @@ def capacity_refusal_judgment(directory, manifest, providers, owners, calls, all
             result.ok(name, "*", "CAPACITY-RETIREMENT", observation.get("retirement") == manifest["require_retirement"]
                       and observation.get("settlement") == "unsettled",
                       "required retirement gate or current semantic-settlement contract changed")
+        exact_admitted = [pair for pair, count in expected_counts.items() if pair[1] in admitted
+                          and (edges.get(pair) or {}).get("entries", {}).get("count") == count and count > 0]
+        result.ok(name, "*", "CAPACITY-REFUSAL-ADMITTED", bool(exact_admitted),
+                  "no exact admitted native positive: every demanded provider is refused, so the "
+                  "refusal retains no observed demand")
     result.add(name, "*", "CAPACITY-DENOMINATORS", "pass",
                f"attached physical endpoints={admitted_endpoints}; refused physical endpoints={refused_endpoints}; "
                f"actually called physical endpoints={len(called_union)}")

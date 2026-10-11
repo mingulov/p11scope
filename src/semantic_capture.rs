@@ -361,6 +361,12 @@ impl TickReport {
         std::mem::take(&mut self.current)
     }
 
+    /// Drain this report's outcomes (refresh stashing preserves
+    /// invalidations beside the receipts).
+    pub(crate) fn take_outcomes(&mut self) -> Vec<TickOutcome> {
+        std::mem::take(&mut self.outcomes)
+    }
+
     /// Merge lane-stashed refresh receipts behind this tick's own: fresh
     /// receipts first, stashed appended, truncated to batch capacity so
     /// the merged batch never refuses on bounds. Returns shed receipts.
@@ -369,6 +375,17 @@ impl TickReport {
         let shed = self.current.len().saturating_sub(MAX_INSTANCES);
         self.current.truncate(MAX_INSTANCES);
         debug_assert!(self.current.len() <= MAX_INSTANCES);
+        shed as u64
+    }
+
+    /// Merge lane-stashed refresh outcomes behind this tick's own,
+    /// truncated to batch capacity like the receipts. Returns shed
+    /// outcomes.
+    pub(crate) fn merge_stashed_outcomes(&mut self, stashed: Vec<TickOutcome>) -> u64 {
+        self.outcomes.extend(stashed);
+        let shed = self.outcomes.len().saturating_sub(MAX_INSTANCES);
+        self.outcomes.truncate(MAX_INSTANCES);
+        debug_assert!(self.outcomes.len() <= MAX_INSTANCES);
         shed as u64
     }
 
@@ -890,15 +907,27 @@ impl SemanticCapture {
             report.scan_refusals.push(ImageQueryRefusal::Coverage);
             return Ok(report);
         };
-        let Some(deadline) = io.now().checked_add(self.limits.scan_slice) else {
+        // The scan I/O window stays one slice (as in the tick path's
+        // attempt deadline), while the minted proof stays provable for
+        // the full pending window: a quiet provider's refresh receipt
+        // waits the normal pass interval for the next tick batch, and a
+        // 50ms receipt deadline would expire it first. Validation still
+        // re-proves custody, attachment, epochs and partition live.
+        let Some(scan_deadline) = io.now().checked_add(self.limits.scan_slice) else {
+            self.exhaust(&mut report);
+            return Ok(report);
+        };
+        let Some(proof_deadline) = io.now().checked_add(self.limits.pending_for) else {
             self.exhaust(&mut report);
             return Ok(report);
         };
         let fence = self.router.fence();
         report.scans = 1;
-        let result = io.scan_selected(&pin, endpoint, deadline, fence, &|| self.router.fence());
+        let result = io.scan_selected(&pin, endpoint, scan_deadline, fence, &|| {
+            self.router.fence()
+        });
         let healthy = self.audit(io, &mut report);
-        if io.now() >= deadline {
+        if io.now() >= scan_deadline {
             report.scan_refusals.push(ImageQueryRefusal::Deadline);
         } else if healthy {
             match result {
@@ -908,7 +937,7 @@ impl SemanticCapture {
                         endpoint,
                         slot,
                         pin,
-                        deadline,
+                        deadline: proof_deadline,
                     };
                     self.accept_scan(io, proof, &job, fence, &mut report);
                 }
@@ -1625,6 +1654,98 @@ mod tests {
             );
         }
 
+        #[test]
+        fn refresh_receipt_survives_realistic_pass_interval_into_next_tick() {
+            use crate::inventory_semantics::{
+                RefreshReceiptStash, merge_stash_into_report, stash_refresh_report,
+            };
+
+            let mut io = ScriptIo::new(NativeDomainId::mint());
+            let mut capture = capture(&io);
+            let pin = io.pin.clone();
+            let minted_at = io.now;
+            let mut refresh = capture.refresh_with(&mut io, pin, 0).unwrap();
+            assert_eq!(
+                refresh.current().len(),
+                1,
+                "the accepted refresh mints one receipt"
+            );
+            // The quiet provider's proof waits the normal pass interval
+            // for the next tick batch (1s passes; the scan slice is only
+            // 50ms), carried by the real lane stash through the shared
+            // production round-trip.
+            let mut stash = RefreshReceiptStash::new();
+            let (images, shed) = stash_refresh_report(&mut stash, &mut refresh);
+            assert_eq!(shed, 0);
+            assert_eq!(images.len(), 1);
+            io.now += Duration::from_secs(1);
+            let mut tick = capture.tick_with(&mut io).unwrap();
+            assert!(
+                tick.calls().next().is_none(),
+                "the quiet tick routes no calls"
+            );
+            assert_eq!(merge_stash_into_report(&mut stash, &mut tick), 0);
+            assert_eq!(tick.current().len(), 1);
+            assert_eq!(
+                tick.current()[0].deadline,
+                minted_at + capture.limits.pending_for,
+                "a refresh receipt stays provable across the normal pass interval"
+            );
+            let mut scratch = TickReport::default();
+            assert_eq!(
+                capture.validate_current_with(&mut io, &tick.current()[0], &mut scratch),
+                Ok(()),
+                "the stashed quiet proof validates at the next tick"
+            );
+        }
+
+        #[test]
+        fn refresh_outcomes_reach_next_tick_instead_of_dropping() {
+            use crate::inventory_semantics::{
+                RefreshReceiptStash, merge_stash_into_report, stash_refresh_report,
+            };
+
+            let mut io = ScriptIo::new(NativeDomainId::mint());
+            let mut capture = capture(&io);
+            let pin = io.pin.clone();
+            // The second refresh supersedes the first image on the same
+            // pin: H0 retires the prior image with an invalidation.
+            let first = capture.refresh_with(&mut io, pin.clone(), 0).unwrap();
+            assert_eq!(first.current().len(), 1);
+            io.output_image = Some(ImageIdentity {
+                task_cookie: 2,
+                exec_id: 1,
+            });
+            let mut second = capture.refresh_with(&mut io, pin, 0).unwrap();
+            assert_eq!(second.current().len(), 1);
+            assert!(
+                second.outcomes().iter().any(|item| matches!(
+                    item,
+                    TickOutcome::Invalidation(value)
+                        if matches!(value.scope(), InvalidationScope::ImageRetired(_))
+                )),
+                "the superseding refresh must carry its invalidation: {:?}",
+                second.outcomes()
+            );
+            // The shared round-trip preserves the outcomes beside the
+            // receipts into the next tick batch.
+            let mut stash = RefreshReceiptStash::new();
+            let (images, shed) = stash_refresh_report(&mut stash, &mut second);
+            assert_eq!(shed, 0);
+            assert_eq!(images.len(), 1);
+            let mut tick = capture.tick_with(&mut io).unwrap();
+            assert_eq!(merge_stash_into_report(&mut stash, &mut tick), 0);
+            assert_eq!(tick.current().len(), 1);
+            assert!(
+                tick.outcomes().iter().any(|item| matches!(
+                    item,
+                    TickOutcome::Invalidation(value)
+                        if matches!(value.scope(), InvalidationScope::ImageRetired(_))
+                )),
+                "the stashed invalidation must reach the tick batch: {:?}",
+                tick.outcomes()
+            );
+        }
         #[test]
         fn native_semantic_receipt_revalidates_readback_and_postscan_health() {
             // Exercise the actual Session readback decision, alongside the shared
@@ -3614,6 +3735,97 @@ mod tests {
             }
         }
 
+        /// A coordinator scene with one bound caller: admit, map,
+        /// identity evidence, image proof, then a direct bind. The
+        /// bind-loop tests cover production binding; the commit tails
+        /// below start from the bound state.
+        fn bound_operation_scene(image: ImageIdentity) -> (CustodyScene, CallerId) {
+            let mut scene = CustodyScene::new();
+            let pid = std::process::id();
+            let caller = scene.admit(pid, 50);
+            scene.map(caller, pid, 60);
+            let detailed = scene.detailed;
+            let module = scene.module.clone();
+            scene.answer(pid, detailed, image.task_cookie);
+            scene.bind_image(
+                detailed,
+                vec![(image.task_cookie, image.exec_id, pid, 100)],
+                1_000,
+            );
+            let pin = Arc::new(
+                scene
+                    .coordinator
+                    .adapter()
+                    .live_pin(pid)
+                    .and_then(|(_, pin)| pin.try_clone().ok())
+                    .unwrap(),
+            );
+            scene
+                .coordinator
+                .bind_semantic_caller_with_pin(
+                    caller,
+                    module,
+                    detailed,
+                    image,
+                    &mut scene.identity,
+                    pin,
+                )
+                .unwrap();
+            (scene, caller)
+        }
+
+        /// Attested subset over the two ScriptIo semantic slots, aligned
+        /// to `ScriptIo::endpoint` so real routed Init/Sign calls convert.
+        fn operation_subset()
+        -> crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset {
+            use crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset;
+            use crate::discovery::identity::{PinnedObjectId, PinnedObjects};
+            let slot = |index: u32, name: &str, offset: u64| crate::plan::Slot {
+                index,
+                descriptor_index: crate::kinds::function_id(name).unwrap() + 1,
+                object: PinnedObjectId(0),
+                object_path: "/operation-probe.so".into(),
+                file_offset: offset,
+                names: vec![name.into()],
+                aliased: false,
+                semantics: crate::kinds::descriptor(name).unwrap(),
+                semantic_authorized: true,
+                semantic_ambiguous: false,
+                fork_safe: true,
+                module_ids: vec![crate::plan::ModuleId(0)],
+            };
+            let plan = crate::plan::AttachPlan::from_slots(vec![
+                slot(0, "C_SignInit", 0x1200),
+                slot(1, "C_Sign", 0x1300),
+            ]);
+            AttestedSubset::scripted(
+                plan,
+                PinnedObjects::empty(),
+                std::collections::BTreeMap::new(),
+            )
+        }
+
+        /// Published semantic edge rows: (api returns, historical-only
+        /// returns, lossy, started, completed).
+        fn operation_edge_rows(scene: &CustodyScene) -> Vec<(Option<u64>, u64, bool, u64, u64)> {
+            scene
+                .coordinator
+                .registry()
+                .instance_semantic_edges()
+                .map(|row| {
+                    let started = row.semantics.as_ref().map(|s| s.started()).unwrap_or(0);
+                    let completed = row.semantics.as_ref().map(|s| s.completed()).unwrap_or(0);
+                    (
+                        row.api_returns,
+                        row.historical_only_returns,
+                        row.lossy,
+                        started,
+                        completed,
+                    )
+                })
+                .collect()
+        }
+
         #[test]
         fn refresh_bind_tick_validate_share_one_custody_arc() {
             let mut scene = CustodyScene::new();
@@ -3701,6 +3913,110 @@ mod tests {
                 capture.validate_current_with(&mut io, &tick.current()[0], &mut scratch),
                 Ok(())
             );
+        }
+
+        /// Quiet registration end to end: a no-call refresh proves the
+        /// quiet provider's partition, the proof waits the normal 1s
+        /// pass schedule for the next tick batch, validates there, and
+        /// registers through the real coordinator commit. Past the
+        /// receipt window the same proof refuses and registers nothing.
+        #[test]
+        fn quiet_refresh_registers_through_next_tick_batch() {
+            use crate::discovery::caller_registry::instance_input::admit_registration_from_coverage;
+            use crate::inventory_semantics::{
+                LaneCoverage, RefreshReceiptStash, merge_stash_into_report, stash_refresh_report,
+            };
+
+            let image = ImageIdentity {
+                task_cookie: 7,
+                exec_id: 1,
+            };
+            for buffered in [false, true] {
+                let (mut scene, caller) = bound_operation_scene(image);
+                let detailed = scene.detailed;
+                let mut io = ScriptIo::new(detailed);
+                io.output_image = Some(image);
+                let mut capture = capture(&io);
+                let pin = io.pin.clone();
+                let mut refresh = capture.refresh_with(&mut io, pin, 0).unwrap();
+                assert_eq!(
+                    refresh.current().len(),
+                    1,
+                    "the accepted refresh mints one receipt"
+                );
+                assert!(
+                    !refresh.current()[0].instances().is_empty(),
+                    "the quiet proof carries instances to register"
+                );
+                let mut stash = RefreshReceiptStash::new();
+                let (images, shed) = stash_refresh_report(&mut stash, &mut refresh);
+                assert_eq!(shed, 0);
+                assert_eq!(images, vec![image]);
+                // The normal pass schedule (1s) or past the receipt
+                // window (3s > 2s pending): only timing differs.
+                io.now += Duration::from_secs(if buffered { 3 } else { 1 });
+                let mut tick = capture.tick_with(&mut io).unwrap();
+                assert!(
+                    tick.calls().next().is_none(),
+                    "the quiet tick routes no calls"
+                );
+                assert_eq!(merge_stash_into_report(&mut stash, &mut tick), 0);
+                assert_eq!(tick.current().len(), 1);
+                let mut scratch = TickReport::default();
+                let validated =
+                    capture.validate_current_with(&mut io, &tick.current()[0], &mut scratch);
+                if buffered {
+                    assert_eq!(
+                        validated,
+                        Err(CurrentReceiptRefusal::Deadline),
+                        "past the window the quiet proof expires"
+                    );
+                    assert_eq!(
+                        scene.coordinator.registry().instances().count(),
+                        0,
+                        "an expired proof registers nothing"
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    validated,
+                    Ok(()),
+                    "the stashed quiet proof validates at the next tick"
+                );
+                // The finalizer's registration half: every covered id
+                // registers from the validated coverage's own fields.
+                let first = &tick.current()[0];
+                let coverage = LaneCoverage::scripted(
+                    first.domain(),
+                    first.image(),
+                    first.endpoint(),
+                    first.instances().to_vec(),
+                );
+                let registrations = {
+                    let binding = scene.coordinator.semantic_bindings().get(caller).unwrap();
+                    coverage
+                        .instances()
+                        .iter()
+                        .map(|id| {
+                            admit_registration_from_coverage(&coverage, binding, *id, 100, None)
+                                .expect("validated coverage registers")
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert!(
+                    !registrations.is_empty(),
+                    "quiet registration stages at least one instance"
+                );
+                for input in registrations {
+                    scene.coordinator.registry_mut().note_instance(input);
+                }
+                scene.coordinator.commit_batch(false).unwrap();
+                assert_eq!(
+                    scene.coordinator.registry().instances().count(),
+                    1,
+                    "the quiet proof registers one instance at commit"
+                );
+            }
         }
     }
 }

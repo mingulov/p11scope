@@ -245,14 +245,17 @@ pub(crate) struct AttestedSemanticLane {
 /// quantum's worth of quiet no-call registrations.
 pub(crate) const MAX_STASHED_REFRESH_RECEIPTS: usize = crate::discovery::instances::MAX_PENDING;
 
-/// Bounded lane stash for refresh receipts: a no-call refresh proves a
-/// current partition for a quiet provider, and that proof must reach a
-/// batch (the next tick merges it) instead of dropping. Beyond
-/// [`MAX_STASHED_REFRESH_RECEIPTS`] the oldest receipts shed (counted);
+/// Bounded lane stash for refresh evidence: a no-call refresh proves
+/// a current partition for a quiet provider, and that proof must reach
+/// a batch (the next tick merges it) instead of dropping. The refresh's
+/// accompanying outcomes (invalidations from superseded proof) stash
+/// beside the receipts, never discarded. Beyond
+/// [`MAX_STASHED_REFRESH_RECEIPTS`] the oldest of each shed (counted);
 /// a later scan re-mints superseded proof.
 #[derive(Debug, Default)]
 pub(crate) struct RefreshReceiptStash {
     stashed: std::collections::VecDeque<CurrentPartitionReceipt>,
+    outcomes: std::collections::VecDeque<TickOutcome>,
     shed: u64,
 }
 
@@ -261,17 +264,32 @@ impl RefreshReceiptStash {
         Self::default()
     }
 
-    /// Stash one refresh's receipts in order. Returns receipts shed past
-    /// the cap: the caller discloses the count as refused endpoints.
-    pub(crate) fn push_all(&mut self, receipts: Vec<CurrentPartitionReceipt>) -> u64 {
+    /// Stash one refresh's receipts and outcomes in order. Returns items
+    /// shed past the cap: the caller discloses the count as refused
+    /// endpoints.
+    pub(crate) fn push_all(
+        &mut self,
+        receipts: Vec<CurrentPartitionReceipt>,
+        outcomes: Vec<TickOutcome>,
+    ) -> u64 {
         let mut shed = 0;
         self.stashed.extend(receipts);
         while self.stashed.len() > MAX_STASHED_REFRESH_RECEIPTS {
             self.stashed.pop_front();
             shed += 1;
         }
+        self.outcomes.extend(outcomes);
+        while self.outcomes.len() > MAX_STASHED_REFRESH_RECEIPTS {
+            self.outcomes.pop_front();
+            shed += 1;
+        }
         self.shed = self.shed.saturating_add(shed);
         shed
+    }
+
+    /// Whether the stash holds nothing to merge.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.stashed.is_empty() && self.outcomes.is_empty()
     }
 
     /// Tests-only shed count: production discloses `push_all`'s return
@@ -281,10 +299,42 @@ impl RefreshReceiptStash {
         self.shed
     }
 
-    /// Drain the stash in order into the next tick batch.
+    /// Drain the stashed receipts in order into the next tick batch.
     pub(crate) fn take(&mut self) -> Vec<CurrentPartitionReceipt> {
         std::mem::take(&mut self.stashed).into_iter().collect()
     }
+
+    /// Drain the stashed outcomes in order into the next tick batch.
+    pub(crate) fn take_outcomes(&mut self) -> Vec<TickOutcome> {
+        std::mem::take(&mut self.outcomes).into_iter().collect()
+    }
+}
+
+/// Stash one refresh report's receipts and outcomes for the next tick
+/// batch, returning the binding-hint images and the shed count. Shared
+/// by the live refresh path; tests drive it with real H0 reports.
+pub(crate) fn stash_refresh_report(
+    stash: &mut RefreshReceiptStash,
+    report: &mut TickReport,
+) -> (Vec<ImageIdentity>, u64) {
+    let images = report
+        .current()
+        .iter()
+        .map(|receipt| receipt.image())
+        .collect();
+    let shed = stash.push_all(report.take_current(), report.take_outcomes());
+    (images, shed)
+}
+
+/// Merge the lane's stashed refresh evidence behind a tick report's
+/// own, returning the merge shed count. Shared by regular ticks and
+/// terminal quanta so quiet proofs register on every path.
+pub(crate) fn merge_stash_into_report(
+    stash: &mut RefreshReceiptStash,
+    report: &mut TickReport,
+) -> u64 {
+    let shed = report.merge_stashed_current(stash.take());
+    shed.saturating_add(report.merge_stashed_outcomes(stash.take_outcomes()))
 }
 
 /// The live lane: the owned Detailed `Session` (the sole retained EVENTS
@@ -459,9 +509,8 @@ impl AttestedSemanticLane {
             .saturating_add(report.scan_refusals.len() as u64);
         live.continuity_cuts = live.capture.continuity_cuts();
         // Quiet no-call registrations stashed since the last tick join
-        // this batch behind its own fresh receipts.
-        let stashed = live.stashed_refresh.take();
-        let shed = report.merge_stashed_current(stashed);
+        // this batch behind its own fresh evidence.
+        let shed = merge_stash_into_report(&mut live.stashed_refresh, &mut report);
         live.scan_refusals = live.scan_refusals.saturating_add(shed);
         SemanticBatch::from_tick_report(domain, report, Vec::new(), now_ns())
     }
@@ -495,7 +544,7 @@ impl AttestedSemanticLane {
             .iter()
             .map(|receipt| receipt.image())
             .collect();
-        let shed = live.stashed_refresh.push_all(report.take_current());
+        let shed = live.stashed_refresh.push_all(report.take_current(), report.take_outcomes());
         live.scan_refusals = live.scan_refusals.saturating_add(shed);
         Ok(images)
     }
@@ -893,6 +942,15 @@ pub(crate) fn run_semantic_stop(
     summary
 }
 
+/// The terminal stash drain: quiet refresh evidence stashed since
+/// the last tick merges into terminal quanta (a stop before the next
+/// tick must not strand it), with merge shed disclosed through the
+/// lane's refusal counter.
+struct LiveStashDrain<'a> {
+    stash: &'a mut RefreshReceiptStash,
+    shed: &'a mut u64,
+}
+
 /// The live [`SemanticStopIo`]: the lane's own Session and H0 driver.
 /// DISCOVERY servicing and remainder drains touch only this lane's
 /// cursors; nothing here stages Inventory-domain authority.
@@ -901,6 +959,7 @@ struct LiveStopIo<'a> {
     capture: &'a mut SemanticCapture,
     pins: Vec<Arc<PidPin>>,
     domain: NativeDomainId,
+    stash: Option<LiveStashDrain<'a>>,
 }
 
 impl SemanticStopIo for LiveStopIo<'_> {
@@ -921,10 +980,18 @@ impl SemanticStopIo for LiveStopIo<'_> {
                 Ok(None) | Err(_) => break,
             }
         }
-        let report = self
+        let mut report = self
             .capture
             .tick(&mut *self.session, &self.pins)
             .map_err(|_| SemanticRefusal::Unavailable)?;
+        // Quiet evidence stashed since the last tick joins this
+        // terminal quantum behind its own: a stop before the next tick
+        // still registers it. The merge runs before the emptiness
+        // check, so stashed-only evidence still produces a batch.
+        if let Some(drain) = self.stash.as_mut() {
+            let shed = merge_stash_into_report(drain.stash, &mut report);
+            *drain.shed = drain.shed.saturating_add(shed);
+        }
         if report.outcomes().is_empty() && report.current().is_empty() {
             return Ok(None);
         }
@@ -1066,6 +1133,10 @@ impl AttestedSemanticLane {
             capture: &mut live.capture,
             pins: pins.to_vec(),
             domain,
+            stash: Some(LiveStashDrain {
+                stash: &mut live.stashed_refresh,
+                shed: &mut live.scan_refusals,
+            }),
         };
         let summary = run_semantic_drain(
             &mut io,
@@ -1116,12 +1187,14 @@ impl AttestedSemanticLane {
         let domain = self.domain;
         let live = &mut **live;
         // Finish touches only the capture: the stop batch constructor
-        // stays shared with the drain's stop io.
+        // stays shared with the drain's stop io. The stash already
+        // drained through the terminal quanta, never behind Stopped.
         let mut io = LiveStopIo {
             session: &mut live.session,
             capture: &mut live.capture,
             pins: Vec::new(),
             domain,
+            stash: None,
         };
         let batch = io.finish_h0();
         live.finished = true;
@@ -1306,7 +1379,7 @@ mod refresh_stash_tests {
         let receipts: Vec<_> = (0..MAX_STASHED_REFRESH_RECEIPTS as u64 + 2)
             .map(|cookie| stashed_receipt(domain, cookie, &watched))
             .collect();
-        assert_eq!(stash.push_all(receipts), 2);
+        assert_eq!(stash.push_all(receipts, Vec::new()), 2);
         assert_eq!(stash.shed(), 2);
         let drained = stash.take();
         assert_eq!(drained.len(), MAX_STASHED_REFRESH_RECEIPTS);

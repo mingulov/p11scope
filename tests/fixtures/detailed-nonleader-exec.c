@@ -7,12 +7,13 @@
  * nonleader exec (the leader emits LEADER_EXIT, then exits; the worker owns
  * everything after THREAD). The provider additionally
  * exports a v2.40 C_GetFunctionList table (slot 0 is the real C_Initialize, the
- * rest honest NOT_SUPPORTED stubs) so public scan-only discovery can attach;
+ * C_GetInfo is the zero-return warm-up marker, the rest distinct stubs) so public scan-only discovery can attach;
  * the driver calls the getter once before READY. The getter itself is never a
  * probed slot, so single-slot libtest counts are unchanged. Optional
  * argv[7]/argv[8] set the after-image measured total (default 17) and the
  * inter-call delay in ms (default 0); defaults preserve the exact legacy
- * NEW_DONE counts.
+ * NEW_DONE counts. Opt-in argv[9]=1 (after argv[6]=1) admits real single-call
+ * W warm-up commands before P; WARM_DONE carries sequence/RV/call timestamps.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -83,7 +84,7 @@ static void emit(const char *phase, const unsigned long *fields, size_t count) {
     write_all(1, buffer, length);
 }
 
-static void receive(int fd, char expected) {
+static char receive_command(int fd) {
     unsigned long deadline = clock_ns() + 30000000000UL;
     for (;;) {
         unsigned long now = clock_ns();
@@ -96,9 +97,13 @@ static void receive(int fd, char expected) {
         char byte;
         long got = raw6(SYS_read, fd, (long)&byte, 1, 0, 0, 0);
         if (got == -EINTR) continue;
-        if (got != 1 || byte != expected) fail(94);
-        return;
+        if (got != 1) fail(94);
+        return byte;
     }
+}
+
+static void receive(int fd, char expected) {
+    if (receive_command(fd) != expected) fail(94);
 }
 
 struct request {
@@ -143,12 +148,12 @@ unsigned long C_Initialize(void *argument) {
 }
 
 /* v2.40 table for public-scan attachment: slot 0 is the real C_Initialize, slot 3
- * is the real getter (matching observed real-provider tables), and every other
+ * is the real getter and slot 2 is the real warm-up marker; every other
  * slot is an exported named stub the fixture never calls. Each stub has a
  * distinct address and a distinct constant body so identical-code folding
  * cannot alias the table. Slot order matches the provider the scan names. */
 #define EXEC_NAMED_STUBS \
-    Y(C_Finalize, 1) Y(C_GetInfo, 2) \
+    Y(C_Finalize, 1) \
     Y(C_GetSlotList, 4) Y(C_GetSlotInfo, 5) Y(C_GetTokenInfo, 6) \
     Y(C_GetMechanismList, 7) Y(C_GetMechanismInfo, 8) \
     Y(C_InitToken, 9) Y(C_InitPIN, 10) Y(C_SetPIN, 11) \
@@ -177,6 +182,13 @@ unsigned long C_Initialize(void *argument) {
 EXEC_NAMED_STUBS
 #undef Y
 
+__attribute__((noinline, visibility("default")))
+unsigned long C_GetInfo(void *argument) {
+    (void)argument;
+    __asm__ volatile("" ::: "memory");
+    return 0;
+}
+
 struct exec_function_list {
     unsigned char major, minor;
     void *functions[68];
@@ -191,6 +203,7 @@ unsigned long C_GetFunctionList(void **list) {
         function_list.major = 2;
         function_list.minor = 40;
         function_list.functions[0] = (void *)C_Initialize;
+        function_list.functions[2] = (void *)C_GetInfo;
         function_list.functions[3] = (void *)C_GetFunctionList;
 #define Y(name, n) function_list.functions[n] = (void *)name;
         EXEC_NAMED_STUBS
@@ -302,13 +315,15 @@ static int worker(void *argument) {
 
 int main(int argc, char **argv) {
 #ifdef DETAILED_EXEC_AFTER
-    if (argc != 4 && argc != 5 && argc != 6) return 2;
+    if (argc < 4 || argc > 7) return 2;
     unsigned long parent = positive(argv[2]), token = positive(argv[3]);
     unsigned long measured = argc > 4 ? positive(argv[4]) : 17;
     unsigned long delay_ms = argc > 5 ? nonnegative(argv[5]) : 0;
+    int warm = argc > 6;
+    if (warm && (argv[6][0] != '1' || argv[6][1])) return 3;
     if (measured < 1 || measured > 10000 || delay_ms > 60000) return 3;
 #else
-    if (argc != 7 && argc != 8 && argc != 9) return 2;
+    if (argc < 7 || argc > 10) return 2;
     unsigned long parent = positive(argv[4]), token = positive(argv[5]);
     if (argv[2][0] != '/' || argv[3][0] != '/'
         || (argv[6][0] != '0' && argv[6][0] != '1' && argv[6][0] != '2') || argv[6][1]) return 3;
@@ -317,6 +332,7 @@ int main(int argc, char **argv) {
     unsigned long passthrough_delay = argc > 8 ? nonnegative(argv[8]) : 0;
     if (passthrough_measured < 1 || passthrough_measured > 10000
         || passthrough_delay > 60000) return 3;
+    if (argc > 9 && (argv[9][0] != '1' || argv[9][1])) return 3;
     struct stat absent;
     if (lstat(argv[3], &absent) == 0 || errno != ENOENT) return 4;
 #endif
@@ -339,7 +355,24 @@ int main(int argc, char **argv) {
                               (unsigned long)physical.st_dev, (unsigned long)physical.st_ino, token };
 #ifdef DETAILED_EXEC_AFTER
     emit("NEW_READY", ready, 5);
-    receive(0, 'P');
+    if (warm) {
+        call_fn warm_call = (call_fn)dlsym(provider, "C_GetInfo");
+        if (!warm_call) return 16;
+        unsigned long sequence = 0;
+        for (;;) {
+            char command = receive_command(0);
+            if (command == 'P') break;
+            if (command != 'W' || ++sequence > 40) fail(106);
+            unsigned long t0 = clock_ns();
+            unsigned long warm_rv = warm_call(NULL);
+            unsigned long t1 = clock_ns();
+            if (warm_rv != 0) fail(107);
+            unsigned long warmed[] = { pid, pid, sequence, warm_rv, t0, t1 };
+            emit("WARM_DONE", warmed, 6);
+        }
+    } else {
+        receive(0, 'P');
+    }
     struct request held = { .rv = 0, .token = token, .operation = 2 };
     unsigned long rv = call(&held);
     if (rv != 0) fail(102);
@@ -360,7 +393,7 @@ int main(int argc, char **argv) {
     if (pipe2(go, O_CLOEXEC)) return 11;
     /* Everything the execing frame dereferences is prepared before clone,
      * including the optional measured-phase pacing passthrough. */
-    char *next_argv[7];
+    char *next_argv[8];
     next_argv[0] = argv[2];
     next_argv[1] = argv[1];
     next_argv[2] = argv[4];
@@ -368,6 +401,7 @@ int main(int argc, char **argv) {
     int next_argc = 4;
     if (argc > 7) next_argv[next_argc++] = argv[7];
     if (argc > 8) next_argv[next_argc++] = argv[8];
+    if (argc > 9) next_argv[next_argc++] = argv[9];
     next_argv[next_argc] = NULL;
     char *next_envp[] = { "LC_ALL=C", NULL };
     struct worker_args args = {

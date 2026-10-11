@@ -100,13 +100,41 @@ def base_receipt(**over):
                "observer_stopped_ns": STOP, "scope_created_ns": START - 1,
                "pid_namespace": 1, "time_namespace": 2,
                "stop_latency_seconds": 0.1, "stop_limit_seconds": 5,
-               "manual_rebind": False, "abandoned_expected": 0,
+               "successor_policy": "no-transition", "manual_rebind": False, "abandoned_expected": 0,
                "reuse_expected": {}, "requested_backend": "singles"}
     receipt.update(over)
     return receipt
 
 
-def caller_inputs():
+def add_trace_successor_control(text, ledger, receipt):
+    measured = receipt["measured"]
+    population = [call for call in ledger if call["kind"] == "call" and call["phase"] in measured["phases"]]
+    image_id = population[0]["image"]
+    image = next(row for row in receipt["images"] if row["image"] == image_id)
+    t0 = measured["t0"] - 1000
+    marker = call_record(image_id, "C_GetInfo", 0, "successor-marker", "selected", t0, t0 + 10)
+    ledger.extend((target_record(image_id, "C_GetInfo"), marker))
+    receipt["phases"].append({"image": image_id, "fn": "C_GetInfo", "phase": "successor-marker",
+                              "scope": "selected", "count": 1, "t0": t0, "t1": t0 + 10})
+    receipt["warmup"]["t1"] = t0 + 10
+    receipt["warmup"]["expected_calls"] += 1
+    receipt["warmup"]["phases"].append("successor-marker")
+    receipt["first_unknown_images"] = []
+    rows, counts, evs, _ = H6["N3_PARSE_TRACE"](text)
+    early = len(rows) - len(population)
+    lines = text.splitlines()[3:-2]
+    for index in range(early, len(lines)):
+        match = H6["ROW"].fullmatch(lines[index])
+        lines[index] = named_row(int(match["pid"]), int(match["tid"]), image["path"], match["fn"], match["rv"])
+    lines.insert(early, named_row(image["pid"], image["pid"], image["path"], "C_GetInfo"))
+    receipt["successor_policy"] = "public-successor"
+    receipt["successor_ready"] = [{"image": image_id, "proof_kind": "trace-row", "started_ns": t0,
+        "observed_ns": t0 + 20, "deadline_ns": t0 + 1_000_000_000, "attempts": 1, "max_attempts": 20,
+        "output_cursor": 3 + early, "proof_cursor": 4 + early, "marker_fn": "C_GetInfo", "phases": ["successor-marker"]}]
+    return trace_text(lines, counts[0]["stats_entered"] + 1, counts[0]["stats_returned"] + 1, evs[0]), ledger, receipt
+
+
+def caller_inputs(raw=False):
     """Leader exec A->B, pid scope: the nonempty ledger-matched control."""
     warm0 = READY + 100_000_000
     meas0 = READY + 500_000_000
@@ -156,10 +184,10 @@ def caller_inputs():
     ]
     # In-window: 2 warm + 1 setup + 3 measured = 6 (gen0 setup is pre-ready).
     text = trace_text(rows, 6, 6, evidence())
-    return text, ledger, receipt
+    return (text, ledger, receipt) if raw else add_trace_successor_control(text, ledger, receipt)
 
 
-def b_style_inputs():
+def b_style_inputs(raw=False):
     """Nonleader exec with an abandoned in-flight frame and rv-5 pattern."""
     pre0 = READY + 100_000_000
     post0 = READY + 600_000_000
@@ -205,7 +233,498 @@ def b_style_inputs():
         named_row(1000, 1000, "/w/after", "C_Initialize", "CKR_GENERAL_ERROR"),
     ]
     text = trace_text(rows, 6, 5, evidence(in_flight=1, losses=1))
-    return text, ledger, receipt
+    return (text, ledger, receipt) if raw else add_trace_successor_control(text, ledger, receipt)
+
+
+def live_frame(functions, evidence_line="Evidence: 4/4 probes attached → PARTIAL: attribution withheld (count-only slots)"):
+    completed = sum(row[1] for row in functions)
+    errors = sum(row[2] for row in functions)
+    opened = sum(row[3] for row in functions)
+    return ("\x1b[2J\x1b[Hp11scope — pid scope — up 00:00:01 — mode profile — privacy=allowlisted — provider\n"
+            + profile_stdout(completed, errors, opened).split("\n", 1)[1]
+            + "FUNCTION CALLS ERR p50~ p95~ p99~ IN-FLIGHT\n"
+            + "".join(f"{fn} {calls} {err} 1µs 1µs 1µs {flight}\n"
+                      for fn, calls, err, flight in functions)
+            + "(~ = log2-bucket approximation, lower bound)\n" + evidence_line + "\n")
+
+
+def rapid_successor_inputs():
+    text, ledger, receipt = caller_inputs()
+    lines = text.splitlines()[3:-2]
+    old_proof = receipt["successor_ready"][0]
+    for row in ledger:
+        if row.get("phase") == "measured": row["phase"] = "middle"
+    middle = next(phase for phase in receipt["phases"] if phase["phase"] == "measured")
+    middle.update(phase="middle", output_cursor=old_proof["proof_cursor"], output_end=3 + len(lines))
+    receipt["phases"][0].update(output_cursor=3, output_end=5)
+    image = image_record(2, "/w/caller-c", READY + 700_000_000)
+    request = {"kind": "exec", "image": 1, "pid": 1000, "tid": 1000, "start_time": 7777,
+               "mode": "leader", "path": image["path"], "scope": "selected", "t": READY + 600_000_000}
+    ledger.extend((request, image, target_record(2, "C_GenerateRandom"), target_record(2, "C_GetSessionInfo")))
+    t0 = READY + 800_000_000
+    marker = call_record(2, "C_GenerateRandom", 0, "successor-2", "selected", t0, t0 + 10)
+    ledger.extend((marker, call_record(2, "C_GetSessionInfo", 0, "measured", "selected", t0 + 100, t0 + 110),
+                   call_record(2, "C_GetSessionInfo", 0, "measured", "selected", t0 + 120, t0 + 130)))
+    receipt["images"].append(image)
+    receipt["exec_transitions"].append({"from_image": 1, "to_image": 2, "mode": "leader", "same_path": False,
+                                        "t0": request["t"] - 1, "t1": image["t"] + 1, "request": request})
+    receipt["phases"].extend(({"image": 2, "fn": "C_GenerateRandom", "phase": marker["phase"], "scope": "selected",
+                               "count": 1, "t0": t0, "t1": t0 + 10},
+                              {"image": 2, "fn": "C_GetSessionInfo", "phase": "measured", "scope": "selected",
+                               "count": 2, "t0": t0 + 100, "t1": t0 + 130}))
+    receipt["successor_ready"].append({"image": 2, "proof_kind": "trace-row", "started_ns": t0,
+        "observed_ns": t0 + 20, "deadline_ns": t0 + 1_000_000_000, "attempts": 1, "max_attempts": 20,
+        "output_cursor": 3 + len(lines), "proof_cursor": 4 + len(lines), "marker_fn": "C_GenerateRandom", "phases": [marker["phase"]]})
+    receipt["warmup"].update(t1=t0 + 10, expected_calls=7, phases=["warm", "successor-marker", "middle", marker["phase"]])
+    receipt["measured"].update(t0=t0 + 100, t1=t0 + 130, expected_calls=2)
+    receipt["trace_generation_guards"] = True
+    receipt["require_named_images"] = [2]
+    lines.extend((named_row(1000, 1000, image["path"], "C_GenerateRandom"),
+                  named_row(1000, 1000, image["path"], "C_GetSessionInfo"),
+                  named_row(1000, 1000, image["path"], "C_GetSessionInfo")))
+    return trace_text(lines, len(lines), len(lines), evidence()), ledger, receipt
+
+
+class BDispatchClockTest(unittest.TestCase):
+    def test_dispatch_lower_bound_precedes_a_real_child_read(self):
+        read_fd, write_fd = os.pipe()
+        observed = []
+        def receive():
+            self.assertEqual(os.read(read_fd, 1), b"W")
+            observed.append(time.monotonic_ns())
+        reader = threading.Thread(target=receive)
+        reader.start()
+        class Pipe:
+            def write(self, byte): os.write(write_fd, byte.encode())
+            def flush(self): reader.join(1)
+        class Owner:
+            def verify(self): pass
+        driver = H6["BDriver"].__new__(H6["BDriver"])
+        driver.owned, driver.stamps = Owner(), {}
+        driver.owned.popen = mock.Mock(stdin=Pipe())
+        try:
+            driver.send("W", "warm")
+            self.assertEqual(len(observed), 1)
+            self.assertLessEqual(driver.stamps["warm"], observed[0])
+        finally:
+            os.close(write_fd)
+            reader.join(1)
+            os.close(read_fd)
+
+
+class RapidSuccessorTest(unittest.TestCase):
+    def test_distinct_returned_markers_and_prior_drains_disambiguate_reused_keys(self):
+        text, ledger, receipt = rapid_successor_inputs()
+        result = H6["evaluate_trace_h6"](text, ledger, receipt)
+        self.assertTrue(result["pass"], result["errors"])
+        self.assertEqual(result["measured_calls"], 2)
+        self.assertEqual(result["image_generation_populations"][2], {"named": 3, "unknown": 0})
+
+    def test_missing_wrong_or_stale_prior_drain_keeps_generations_ambiguous(self):
+        for change in ("missing", "stale", "wrong", "reused-marker"):
+            text, ledger, receipt = rapid_successor_inputs()
+            middle = next(phase for phase in receipt["phases"] if phase["phase"] == "middle")
+            if change == "missing": del middle["output_end"]
+            elif change == "stale": middle["output_end"] += 1
+            elif change == "wrong": middle["output_cursor"] += 1
+            else: receipt["successor_ready"][1]["marker_fn"] = "C_GetInfo"
+            result = H6["evaluate_trace_h6"](text, ledger, receipt)
+            self.assertFalse(result["pass"], result)
+
+
+class DetailedFixtureTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory(prefix="h6-fixture-")
+        cls.addClassCleanup(cls.temporary.cleanup)
+        cls.directory = Path(cls.temporary.name)
+        source = ROOT / "tests/fixtures/detailed-nonleader-exec.c"
+        for name, flags in (("provider.so", ["-DDETAILED_EXEC_PROVIDER", "-fPIC", "-shared"]),
+                            ("before", []), ("after", ["-DDETAILED_EXEC_AFTER"])):
+            result = subprocess.run(["cc", *H6["B_CFLAGS"], *flags, str(source), "-ldl",
+                                     "-o", str(cls.directory / name)],
+                                    capture_output=True, text=True, timeout=30)
+            if result.returncode:
+                raise AssertionError(result.stderr)
+
+    def child(self, after=True, warm=False, failed=False):
+        provider = str(self.directory / "provider.so")
+        argv = ([str(self.directory / "after"), provider, str(os.getpid()), "43"] if after
+                else [str(self.directory / "before"), provider, str(self.directory / "after"),
+                      str(self.directory / "absent"), str(os.getpid()), "43", "1" if failed else "0"])
+        if warm:
+            argv += ["17", "0", "1"]
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        def cleanup():
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=2)
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                stream.close()
+        self.addCleanup(cleanup)
+        reader = H6["Reader"](proc.stdout, self.directory / f"child-{proc.pid}.txt")
+        self.addCleanup(reader.thread.join, 2)
+        index = 0
+        def expect(prefix):
+            nonlocal index
+            line, index = H6["expect_line"](reader, index, prefix, 2)
+            return line.split()
+        def send(command):
+            proc.stdin.write(command)
+            proc.stdin.flush()
+        return proc, expect, send
+
+    def test_legacy_after_defaults_remain_17_calls(self):
+        proc, expect, send = self.child()
+        expect("NEW_READY")
+        send("P")
+        expect("POST_BODY")
+        send("R")
+        done = expect("NEW_DONE")
+        self.assertEqual([int(v) for v in done[3:6]], [17, 9, 8])
+        send("F")
+        self.assertEqual(proc.wait(timeout=2), 0)
+
+    def test_opt_in_real_w_attempts_precede_fixed_measurement(self):
+        proc, expect, send = self.child(warm=True)
+        expect("NEW_READY")
+        for sequence in (1, 2):
+            send("W")
+            done = expect("WARM_DONE")
+            self.assertEqual([int(v) for v in done[3:5]], [sequence, 0])
+            self.assertLessEqual(int(done[5]), int(done[6]))
+        send("P")
+        expect("POST_BODY")
+        send("R")
+        self.assertEqual([int(v) for v in expect("NEW_DONE")[3:6]], [17, 9, 8])
+        send("F")
+        self.assertEqual(proc.wait(timeout=2), 0)
+
+    def test_nonleader_exec_legacy_defaults_and_opt_in_warmup(self):
+        for warm in (False, True):
+            with self.subTest(warm=warm):
+                proc, expect, send = self.child(after=False, warm=warm)
+                expect("READY")
+                send("G")
+                expect("THREAD")
+                expect("WORKER_DONE")
+                expect("EXEC_BODY")
+                send("X")
+                expect("NEW_READY")
+                if warm:
+                    send("W")
+                    self.assertEqual([int(v) for v in expect("WARM_DONE")[3:5]], [1, 0])
+                send("P")
+                expect("POST_BODY")
+                send("R")
+                self.assertEqual([int(v) for v in expect("NEW_DONE")[3:6]], [17, 9, 8])
+                send("F")
+                self.assertEqual(proc.wait(timeout=2), 0)
+
+    def test_failed_exec_retains_exact_29_15_14_control(self):
+        proc, expect, send = self.child(after=False, failed=True)
+        expect("READY")
+        send("G")
+        expect("THREAD")
+        expect("WORKER_DONE")
+        expect("EXEC_BODY")
+        send("X")
+        expect("EXEC_FAILED")
+        send("R")
+        self.assertEqual([int(v) for v in expect("DONE")[3:7]], [29, 15, 14, 5])
+        send("F")
+        self.assertEqual(proc.wait(timeout=2), 0)
+
+
+class LiveFrameTest(unittest.TestCase):
+    def parse(self, text, final=True):
+        self.assertTrue(callable(H6.get("parse_live_frames")), "bounded complete-frame parser missing")
+        return H6["parse_live_frames"](text, final=final)
+
+    def test_complete_cumulative_frames_use_last_snapshot(self):
+        frames = self.parse(live_frame([("C_GetInfo", 1, 0, 0)])
+                            + live_frame([("C_GetInfo", 2, 0, 0)]))
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(frames[-1]["functions"]["C_GetInfo"]["calls"], 2)
+        self.assertEqual(frames[-1]["totals"], [2, 0, 0])
+
+    def test_incomplete_frame_waits_until_evidence_terminates(self):
+        text = live_frame([("C_GetInfo", 1, 0, 0)])
+        self.assertEqual(self.parse(text[:-1], final=False), [])
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            self.parse(text[:-1])
+
+    def test_malformed_duplicate_and_overflow_frames_fail(self):
+        for text in (live_frame([("C_GetInfo", 1, 0, 0), ("C_GetInfo", 1, 0, 0)]),
+                     live_frame([("C_GetInfo", 1, 0, 0)]).replace("1 completed calls", "3 completed calls"),
+                     "\x1b[2J\x1b[H" + "x" * 65537):
+            with self.subTest(text=text[:70]), self.assertRaises(ValueError):
+                self.parse(text)
+
+    def test_empty_eof_has_no_proof(self):
+        self.assertEqual(self.parse(""), [])
+
+
+class WarmSuccessorTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="h6-warm-")
+        self.addCleanup(self.temporary.cleanup)
+        read_fd, write_fd = os.pipe()
+        self.stream = os.fdopen(read_fd, encoding="utf-8")
+        self.writer = os.fdopen(write_fd, "w", encoding="utf-8")
+        self.capture = H6["Reader"](self.stream, Path(self.temporary.name) / "capture.txt")
+        self.addCleanup(self.stream.close)
+        self.addCleanup(self.capture.thread.join, 2)
+        self.addCleanup(self.writer.close)
+        self.image = {"image": 1, "pid": 1000, "path": "/w/after"}
+
+    def emit(self, row):
+        self.writer.write(row + "\n")
+        self.writer.flush()
+
+    def test_retry_preserves_actual_attempt_sequence(self):
+        attempts = []
+        def attempt(seq, remaining):
+            self.assertGreater(remaining, 0)
+            attempts.append(seq)
+            self.emit(unknown_row(1000, 1000, "C_GetInfo") if seq == 1 else
+                      named_row(1000, 1000, "/w/after", "C_GetInfo"))
+            return f"warm-{seq}"
+        proof = H6["warm_successor"](self.capture, self.image, attempt, max_attempts=2, timeout=2)
+        self.assertEqual(attempts, [1, 2])
+        self.assertEqual(proof["phases"], ["warm-1", "warm-2"])
+        self.assertEqual(proof["attempts"], 2)
+        self.assertLessEqual(proof["observed_ns"], proof["deadline_ns"])
+
+    def test_old_unknown_wrong_and_stale_rows_cannot_prove_successor(self):
+        self.emit(named_row(1000, 1000, "/w/after", "C_GetInfo"))
+        H6["expect_line"](self.capture, 0, "21:", 1)
+        def attempt(seq, _remaining):
+            for row in (unknown_row(1000, 1000, "C_GetInfo"),
+                        named_row(1000, 1000, "/w/before", "C_GetInfo"),
+                        named_row(1000, 1000, "/w/after", "C_GenerateRandom")):
+                self.emit(row)
+            return f"warm-{seq}"
+        with self.assertRaisesRegex(TimeoutError, "budget exhausted"):
+            H6["warm_successor"](self.capture, self.image, attempt, max_attempts=1, timeout=2)
+
+    def test_absolute_deadline_cannot_accept_late_attempt_ack(self):
+        def attempt(seq, _remaining):
+            time.sleep(0.07)
+            self.emit(named_row(1000, 1000, "/w/after", "C_GetInfo"))
+            H6["expect_line"](self.capture, 0, "21:", 1)
+            return f"warm-{seq}"
+        with self.assertRaisesRegex(TimeoutError, "exhausted"):
+            H6["warm_successor"](self.capture, self.image, attempt, timeout=0.05)
+
+    def test_eof_cannot_prove_successor(self):
+        self.writer.close()
+        self.capture.thread.join(1)
+        with self.assertRaisesRegex(EOFError, "stream ended"):
+            H6["warm_successor"](self.capture, self.image, lambda seq, remaining: f"warm-{seq}", timeout=1)
+
+
+class PtyCaptureTest(unittest.TestCase):
+    def test_reader_timeout_closes_its_owned_master(self):
+        with tempfile.TemporaryDirectory(prefix="h6-pty-timeout-") as directory:
+            master, slave = os.openpty()
+            capture = H6["PtyCapture"](master, Path(directory) / "stdout.txt")
+            try:
+                with self.assertRaises(TimeoutError):
+                    capture.finish(timeout=0.05)
+                self.assertFalse(capture.thread.is_alive())
+                with self.assertRaises(OSError):
+                    os.fstat(master)
+            finally:
+                os.close(slave)
+                capture.thread.join(2)
+
+    def test_real_split_frame_and_linux_eio_close_are_eof(self):
+        with tempfile.TemporaryDirectory(prefix="h6-pty-") as directory:
+            master, slave = os.openpty()
+            capture = H6["PtyCapture"](master, Path(directory) / "stdout.txt")
+            data = live_frame([("C_GetInfo", 1, 0, 0)]).encode()
+            child = subprocess.Popen([sys.executable, "-c",
+                "import os,time; data=" + repr(data) + "; os.write(1,data[:3]); time.sleep(.03); os.write(1,data[3:])"],
+                stdout=slave, stderr=subprocess.PIPE)
+            os.close(slave)
+            try:
+                self.assertEqual(child.wait(timeout=2), 0)
+                capture.finish()
+                self.assertEqual(capture.frames[-1]["totals"], [1, 0, 0])
+                with self.assertRaises(OSError):
+                    os.fstat(master)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                child.wait(timeout=2)
+                child.stderr.close()
+                capture.thread.join(2)
+
+
+class SameObserverCounterTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="h6-counter-")
+        self.addCleanup(self.temporary.cleanup)
+        master, self.slave = os.openpty()
+        self.capture = H6["PtyCapture"](master, Path(self.temporary.name) / "capture.txt")
+        def close():
+            os.close(self.slave)
+            self.capture.finish()
+        self.addCleanup(close)
+        self.image = {"image": 1, "pid": 1000, "path": "/w/after"}
+
+    def frame(self, count):
+        os.write(self.slave, live_frame([("C_GetInfo", count, 0, 0)]).encode())
+
+    def test_actual_pty_counter_advance_supplies_complete_snapshots(self):
+        self.frame(1)
+        def attempt(seq, _remaining):
+            self.frame(2)
+            return f"warm-{seq}"
+        proof = H6["warm_successor"](self.capture, self.image, attempt, mode="metrics", timeout=1)
+        self.assertEqual(proof["proof_kind"], "live-counter")
+        self.assertEqual(proof["baseline"]["functions"]["C_GetInfo"]["calls"], 1)
+        self.assertEqual(proof["snapshot"]["functions"]["C_GetInfo"]["calls"], 2)
+        self.assertGreaterEqual(proof["snapshot"]["start_cursor"], proof["output_cursor"])
+
+    def test_fresh_identical_redraw_is_not_a_counter_advance(self):
+        self.frame(1)
+        def attempt(seq, _remaining):
+            self.frame(1)
+            return f"warm-{seq}"
+        with self.assertRaisesRegex(TimeoutError, "budget exhausted"):
+            H6["warm_successor"](self.capture, self.image, attempt, mode="profile", max_attempts=1, timeout=1)
+
+
+def real_early_gap():
+    return {"completeness": "PARTIAL", "verdict_detail": "concrete_gap", "unprotected_live_windows": 1,
+            "gap_classes": {"observation": {"status": "lossy", "causes": ["unprotected_live_windows"]}}}
+
+
+class EarlyCoverageTest(unittest.TestCase):
+    def deficit(self, gap=True):
+        text, ledger, receipt = caller_inputs()
+        proof = receipt["successor_ready"][0]
+        # The entered/returned attempt is independent even when no public row survives.
+        call = next(row for row in ledger if row.get("phase") == "successor-marker" and row["kind"] == "call")
+        missed = dict(call, phase="successor-missed", t0=call["t0"] - 20, t1=call["t0"] - 10)
+        ledger.append(missed)
+        receipt["phases"].append({"image": 1, "fn": "C_GetInfo", "phase": missed["phase"],
+                                  "scope": "selected", "count": 1, "t0": missed["t0"], "t1": missed["t1"]})
+        receipt["warmup"]["expected_calls"] += 1
+        receipt["warmup"]["phases"].append(missed["phase"])
+        proof["started_ns"] = missed["t0"]
+        proof["phases"].insert(0, missed["phase"])
+        proof["attempts"] = 2
+        rows, counts, evs, _ = H6["N3_PARSE_TRACE"](text)
+        if gap:
+            evs[0].update(real_early_gap())
+        return trace_text(text.splitlines()[3:-2], counts[0]["stats_entered"], counts[0]["stats_returned"], evs[0]), ledger, receipt
+
+    def test_honest_early_deficit_keeps_exact_nonempty_measurement(self):
+        text, ledger, receipt = self.deficit()
+        result = H6["evaluate_trace_h6"](text, ledger, receipt)
+        self.assertTrue(result["pass"], result["errors"])
+        self.assertEqual(result["early_coverage"], {"expected": 5, "observed_named": 3, "observed_unknown": 1, "deficit": 1})
+        self.assertEqual(result["measured_calls"], 3)
+        self.assertEqual(result["api_returned"], 7)
+        self.assertEqual(result["expected_api_returns"], 8)
+
+    def test_deficit_requires_relevant_real_gap(self):
+        for gap in ({}, {"verdict_detail": "attribution_only"}, {"task_uprobe_link_losses": 3},
+                    {**real_early_gap(), "unprotected_live_windows": 0},
+                    {**real_early_gap(), "completeness": "COMPLETE"}):
+            with self.subTest(gap=gap):
+                text, ledger, receipt = self.deficit(gap=False)
+                rows, counts, evs, _ = H6["N3_PARSE_TRACE"](text)
+                evs[0].update(gap)
+                text = trace_text(text.splitlines()[3:-2], 7, 7, evs[0])
+                result = H6["evaluate_trace_h6"](text, ledger, receipt)
+                self.assertFalse(result["pass"])
+                self.assertIn("early deficit lacks relevant real product concrete-gap/PARTIAL evidence", result["errors"])
+
+    def test_stable_missing_duplicate_zero_unknown_and_native_loss_stay_red(self):
+        for change in ("missing", "duplicate", "zero", "unknown", "native-loss"):
+            with self.subTest(change=change):
+                text, ledger, receipt = self.deficit()
+                lines = text.splitlines()[3:-2]
+                if change == "missing": lines.pop()
+                elif change == "duplicate": lines.append(lines[-1])
+                elif change == "zero": lines = lines[:-3]
+                elif change == "unknown": lines[-1] = unknown_row(1000, 1000, "C_GetSessionInfo")
+                ev = evidence(**real_early_gap(), event_loss=1 if change == "native-loss" else 0)
+                result = H6["evaluate_trace_h6"](trace_text(lines, len(lines), len(lines), ev), ledger, receipt)
+                self.assertFalse(result["pass"], result)
+
+
+class SuccessorGateTest(unittest.TestCase):
+    def test_rejects_missing_successor_proof_despite_initial_ready(self):
+        text, ledger, receipt = caller_inputs(raw=True)
+        result = H6["evaluate_trace_h6"](text, ledger, receipt)
+        self.assertFalse(result["pass"])
+        self.assertTrue(any("successor" in error for error in result["errors"]), result)
+
+    def test_missing_independent_successor_image_receipt_is_a_red_verdict(self):
+        text, ledger, receipt = caller_inputs()
+        receipt["images"] = receipt["images"][:1]
+        result = H6["evaluate_trace_h6"](text, ledger, receipt)
+        self.assertFalse(result["pass"])
+        self.assertTrue(any("image" in error for error in result["errors"]), result)
+
+    def test_rejects_invalid_deadline_attempt_or_current_image_receipt(self):
+        for changes in ({"attempts": 0}, {"attempts": 2}, {"max_attempts": 0},
+                        {"deadline_ns": READY}, {"deadline_ns": STOP + 30_000_000_000},
+                        {"image": 0}, {"observed_ns": STOP}, {"proof_kind": "fixture-ready"}):
+            with self.subTest(changes=changes):
+                text, ledger, receipt = caller_inputs()
+                receipt["successor_ready"][0].update(changes)
+                self.assertFalse(H6["evaluate_trace_h6"](text, ledger, receipt)["pass"])
+
+    def test_wrong_old_or_unknown_public_marker_cannot_support_receipt(self):
+        for path in ("/w/before", "/w/wrong", None):
+            text, ledger, receipt = caller_inputs()
+            proof = receipt["successor_ready"][0]
+            lines = text.splitlines()
+            lines[proof["proof_cursor"] - 1] = (unknown_row(1000, 1000, "C_GetInfo") if path is None
+                                              else named_row(1000, 1000, path, "C_GetInfo"))
+            result = H6["evaluate_trace_h6"]("\n".join(lines) + "\n", ledger, receipt)
+            self.assertFalse(result["pass"])
+            self.assertTrue(any("public marker" in error for error in result["errors"]), result)
+
+    def test_rejects_empty_successor_warmup(self):
+        text, ledger, receipt = caller_inputs(raw=True)
+        receipt["successor_policy"] = "public-successor"
+        receipt["successor_ready"] = [{"image": 1, "proof_kind": "trace-row",
+            "started_ns": READY + 300_000_000, "observed_ns": READY + 400_000_000,
+            "deadline_ns": READY + 2_000_000_000, "max_attempts": 20, "attempts": 0,
+            "output_cursor": 3, "proof_cursor": 4, "marker_fn": "C_GetInfo", "phases": []}]
+        result = H6["evaluate_trace_h6"](text, ledger, receipt)
+        self.assertFalse(result["pass"])
+        self.assertTrue(any("successor" in error for error in result["errors"]), result)
+
+    def test_rejects_measurement_before_successor_proof(self):
+        text, ledger, receipt = caller_inputs(raw=True)
+        receipt["successor_policy"] = "public-successor"
+        receipt["successor_ready"] = [{"image": 1, "proof_kind": "trace-row",
+            "started_ns": READY + 300_000_000, "observed_ns": READY + 900_000_000,
+            "deadline_ns": READY + 2_000_000_000, "max_attempts": 20, "attempts": 1,
+            "output_cursor": 3, "proof_cursor": 4, "marker_fn": "C_GetInfo", "phases": ["warm-successor"]}]
+        result = H6["evaluate_trace_h6"](text, ledger, receipt)
+        self.assertFalse(result["pass"])
+        self.assertTrue(any("successor" in error for error in result["errors"]), result)
+
+    def test_rejects_stale_public_proof_cursor(self):
+        text, ledger, receipt = caller_inputs(raw=True)
+        receipt["successor_policy"] = "public-successor"
+        receipt["successor_ready"] = [{"image": 1, "proof_kind": "trace-row",
+            "started_ns": READY + 300_000_000, "observed_ns": READY + 400_000_000,
+            "deadline_ns": READY + 2_000_000_000, "max_attempts": 20, "attempts": 1,
+            "output_cursor": 4, "proof_cursor": 4, "marker_fn": "C_GetInfo", "phases": ["warm-successor"]}]
+        result = H6["evaluate_trace_h6"](text, ledger, receipt)
+        self.assertFalse(result["pass"])
+        self.assertTrue(any("successor" in error for error in result["errors"]), result)
 
 
 class ReaderReadinessTest(unittest.TestCase):
@@ -310,26 +829,26 @@ class TraceTest(unittest.TestCase):
         text, ledger, receipt = caller_inputs()
         result = H6["evaluate_trace_h6"](text, ledger, receipt)
         self.assertTrue(result["pass"], result["errors"])
-        self.assertEqual(result["calls"], 6)
-        self.assertEqual(result["named"], 4)
-        self.assertEqual(result["unknown"], 2)
+        self.assertEqual(result["calls"], 7)
+        self.assertEqual(result["named"], 6)
+        self.assertEqual(result["unknown"], 1)
         self.assertEqual(result["false_names"], 0)
-        self.assertEqual(result["physical_entered"], 6)
-        self.assertEqual(result["api_returned"], 6)
+        self.assertEqual(result["physical_entered"], 7)
+        self.assertEqual(result["api_returned"], 7)
         self.assertEqual(result["measured_calls"], 3)
-        self.assertEqual(result["warmup_calls"], 2)
-        self.assertEqual(result["order_matched"], 6)
+        self.assertEqual(result["warmup_calls"], 3)
+        self.assertEqual(result["order_matched"], 7)
 
     def test_accept_b_style_control(self):
         text, ledger, receipt = b_style_inputs()
         result = H6["evaluate_trace_h6"](text, ledger, receipt)
         self.assertTrue(result["pass"], result["errors"])
-        self.assertEqual(result["physical_entered"], 6)
-        self.assertEqual(result["api_returned"], 5)
-        self.assertEqual(result["completed_operations"], 5)
+        self.assertEqual(result["physical_entered"], 7)
+        self.assertEqual(result["api_returned"], 6)
+        self.assertEqual(result["completed_operations"], 6)
         self.assertEqual(result["abandoned"], 1)
-        self.assertEqual(result["named"], 1)
-        self.assertEqual(result["unknown"], 4)
+        self.assertEqual(result["named"], 3)
+        self.assertEqual(result["unknown"], 3)
 
     def test_reject_all_unknown_positive(self):
         text, ledger, receipt = caller_inputs()
@@ -461,10 +980,11 @@ class TraceTest(unittest.TestCase):
             named_row(1000, 1000, "/w/chain-b", "C_GenerateRandom"),
         ]
         text = trace_text(rows, 3, 3, evidence())
+        text, ledger, receipt = add_trace_successor_control(text, ledger, receipt)
         result = H6["evaluate_trace_h6"](text, ledger, receipt)
         self.assertTrue(result["pass"], result["errors"])
-        self.assertEqual(result["order_matched"], 3)
-        self.assertEqual(result["image_generation_populations"][1], {"named": 1, "unknown": 1})
+        self.assertEqual(result["order_matched"], 4)
+        self.assertEqual(result["image_generation_populations"][1], {"named": 3, "unknown": 0})
 
     def test_reject_ambiguous_reused_key_under_loss(self):
         """Same reused key, but one row lost: no attribution possible."""
@@ -825,8 +1345,74 @@ def profile_inputs():
     receipt["abandoned_by_fn"] = {"C_Initialize": 1}
     # Ledger: 3 pre (1 failed) + 2 post (1 failed), 1 abandoned.
     doc = profile_doc([profile_function("C_Initialize", 5, 2, 1),
-                       profile_function("C_Finalize", 0, 0, 0)])
-    return doc, profile_stdout(5, 2, 1), ledger, receipt
+                       profile_function("C_GetInfo", 1), profile_function("C_Finalize", 0)])
+    stdout = (live_frame([("C_Initialize", 3, 1, 1)])
+              + live_frame([("C_Initialize", 3, 1, 1), ("C_GetInfo", 1, 0, 0)])
+              + live_frame([("C_Initialize", 5, 2, 1), ("C_GetInfo", 1, 0, 0)]))
+    frames = H6["parse_live_frames"](stdout)
+    proof = receipt["successor_ready"][0]
+    proof.update(proof_kind="live-counter", baseline=frames[0], snapshot=frames[1],
+                 output_cursor=frames[0]["cursor"], proof_cursor=frames[1]["cursor"])
+    return doc, stdout, ledger, receipt
+
+
+class AggregateReadinessTest(unittest.TestCase):
+    def test_native_loss_is_red_even_with_exact_measured_counters(self):
+        doc, stdout, ledger, receipt = profile_inputs()
+        doc["evidence"]["event_loss"] = 1
+        result = H6["evaluate_profile_h6"](doc, stdout, ledger, receipt)
+        self.assertFalse(result["pass"], result)
+        self.assertTrue(any("loss" in error for error in result["errors"]), result)
+
+    def test_saved_snapshot_and_last_complete_frame_are_both_required(self):
+        for change in ("stale", "forged", "last-frame"):
+            with self.subTest(change=change):
+                doc, stdout, ledger, receipt = profile_inputs()
+                proof = receipt["successor_ready"][0]
+                if change == "stale":
+                    proof["snapshot"] = proof["baseline"]
+                    proof["proof_cursor"] = proof["output_cursor"]
+                elif change == "forged":
+                    proof["snapshot"] = copy.deepcopy(proof["snapshot"])
+                    proof["snapshot"]["functions"]["C_GetInfo"]["calls"] += 1
+                else:
+                    stdout += live_frame([("C_Initialize", 4, 2, 1), ("C_GetInfo", 1, 0, 0)])
+                self.assertFalse(H6["evaluate_profile_h6"](doc, stdout, ledger, receipt)["pass"])
+
+    def test_cumulative_redraws_are_not_added_together(self):
+        doc, stdout, ledger, receipt = profile_inputs()
+        stdout += live_frame([("C_Initialize", 5, 2, 1), ("C_GetInfo", 1, 0, 0)])
+        result = H6["evaluate_profile_h6"](doc, stdout, ledger, receipt)
+        self.assertTrue(result["pass"], result["errors"])
+        self.assertEqual(result["completed_calls"], 6)
+
+    def test_early_deficit_uses_observed_baseline_and_real_gap(self):
+        for disclose in (True, False):
+            with self.subTest(disclose=disclose):
+                doc, stdout, ledger, receipt = profile_inputs()
+                proof = receipt["successor_ready"][0]
+                call = next(row for row in ledger if row["kind"] == "call" and row.get("phase") == "successor-marker")
+                missed = dict(call, phase="successor-missed", t0=call["t0"] - 20, t1=call["t0"] - 10)
+                ledger.append(missed)
+                proof.update(started_ns=missed["t0"], attempts=2, phases=[missed["phase"], call["phase"]])
+                receipt["warmup"]["phases"].append(missed["phase"])
+                receipt["warmup"]["expected_calls"] += 1
+                if disclose: doc["evidence"].update(real_early_gap())
+                result = H6["evaluate_profile_h6"](doc, stdout, ledger, receipt)
+                self.assertEqual(result["pass"], disclose, result["errors"])
+                self.assertEqual(result["early_coverage"]["deficit"], 1)
+                self.assertEqual(result["measured_calls"], 2)
+
+    def test_dropped_duplicate_zero_and_unknown_stable_aggregates_are_red(self):
+        for count in (0, 1, 3):
+            doc, stdout, ledger, receipt = profile_inputs()
+            doc["functions"][0]["calls"] = 3 + count
+            result = H6["evaluate_profile_h6"](doc, stdout, ledger, receipt)
+            self.assertFalse(result["pass"])
+            self.assertTrue(any("stable measured" in error for error in result["errors"]), result)
+        doc, stdout, ledger, receipt = profile_inputs()
+        doc["functions"][0]["names"] = ["unknown"]
+        self.assertFalse(H6["evaluate_profile_h6"](doc, stdout, ledger, receipt)["pass"])
 
 
 class AggregateTest(unittest.TestCase):
@@ -836,16 +1422,16 @@ class AggregateTest(unittest.TestCase):
         doc, stdout_text, ledger, receipt = profile_inputs()
         result = H6["evaluate_profile_h6"](doc, stdout_text, ledger, receipt)
         self.assertTrue(result["pass"], result["errors"])
-        self.assertEqual(result["completed_calls"], 5)
+        self.assertEqual(result["completed_calls"], 6)
         self.assertEqual(result["returned_errors"], 2)
         self.assertEqual(result["in_flight"], 1)
-        self.assertEqual(result["named_calls"], 5)
+        self.assertEqual(result["named_calls"], 6)
         self.assertEqual(result["unknown_calls"], 0)
-        self.assertEqual(result["physical_entered"], 6)
+        self.assertEqual(result["physical_entered"], 7)
 
     def test_accept_metrics_control(self):
         doc, stdout_text, ledger, receipt = profile_inputs()
-        doc = profile_doc([profile_function("C_Initialize", 5, 2, 1)], mode="metrics")
+        doc = profile_doc([profile_function("C_Initialize", 5, 2, 1), profile_function("C_GetInfo", 1)], mode="metrics")
         receipt = copy.deepcopy(receipt)
         receipt["leg"] = "metrics/singles"
         result = H6["evaluate_metrics_h6"](doc, stdout_text, ledger, receipt)
@@ -891,7 +1477,7 @@ class AggregateTest(unittest.TestCase):
 
     def test_reject_metrics_identity_leak(self):
         doc, stdout_text, ledger, receipt = profile_inputs()
-        doc = profile_doc([profile_function("C_Initialize", 5, 2, 1)], mode="metrics")
+        doc = profile_doc([profile_function("C_Initialize", 5, 2, 1), profile_function("C_GetInfo", 1)], mode="metrics")
         doc["sessions"] = {"opened": 1}
         receipt = copy.deepcopy(receipt)
         receipt["leg"] = "metrics/singles"

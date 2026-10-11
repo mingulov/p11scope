@@ -1707,7 +1707,7 @@ pub fn write_probe_fixture(dir: &Path) -> io::Result<ProbeFixture> {
     }
     // SAFETY: the successful `fstat` initialized `stat`.
     let stat = unsafe { stat.assume_init() };
-    if stat.st_mode & libc::S_IFMT as u32 != libc::S_IFDIR as u32 {
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "probe fixture dir is not a directory",

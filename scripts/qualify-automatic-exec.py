@@ -1595,6 +1595,7 @@ class Reader(N3HARNESS["Reader"]):
     def finish(self):
         self.thread.join(timeout=3)
         if self.thread.is_alive():
+            self.errors.append("owned output did not finish cleanly before reader cancellation")
             self.stop.set()
             self.thread.join(timeout=1)
             raise ValueError("owned output did not finish cleanly before reader cancellation")
@@ -2125,6 +2126,7 @@ class PtyCapture:
     def finish(self, timeout=5):
         self.thread.join(timeout)
         if self.thread.is_alive():
+            self.errors.append("owned PTY reader did not reach EOF")
             self.stop.set()
             self.thread.join(1)
             raise TimeoutError("owned PTY reader did not reach EOF")
@@ -2497,25 +2499,44 @@ def reap_traced_child(owner):
         time.sleep(0.01)
 
 
+def wait_terminal_child(owner):
+    """Confirm/reap after bounded termination, including an exit during send."""
+    try:
+        pid, status = os.waitpid(owner.pid, os.WNOHANG | 0x40000000)  # __WALL
+    except ChildProcessError:
+        if owner.popen.returncode is not None and not (Path("/proc") / str(owner.pid)).exists():
+            return  # a prior terminal Popen/raw wait already reaped this child
+        raise SetupError("owned child lacks a terminal reap proof")
+    if pid and (os.WIFEXITED(status) or os.WIFSIGNALED(status)):
+        owner.popen.returncode = os.waitstatus_to_exitcode(status)
+        return
+    raise SetupError("owned child has no terminal status after bounded termination")
+
+
 def cleanup_leg_resources(ctx, close_pins=True):
     """Reap before settling readers/FDs and removing corresponding owned groups."""
     case = getattr(ctx, "case", ctx)
     failures = []
     with cleanup_section():
         owners, readers, groups = list(ctx.owners), list(ctx.readers), list(ctx.groups)
-        for key, resources in (("processes", owners), ("readers", readers), ("cgroups", groups)):
-            case.cleanup_totals[key] += len(resources)
+        case.cleanup_totals["readers"] += len(readers)
         for owner in list(ctx.traced):
             try:
                 reap_traced_child(owner)
             except Exception as error:
                 failures.append(f"traced process {owner.pid}: {type(error).__name__}: {error}")
-        ctx.traced.clear()
+        pending = []
         for owner in owners:
             try:
                 N3HARNESS["terminate"](owner)
             except Exception as error:
                 failures.append(f"process {owner.pid}: {type(error).__name__}: {error}")
+            try:
+                wait_terminal_child(owner)
+            except Exception as error:
+                pending.append(owner)
+                failures.append(f"process reap {owner.pid}: {type(error).__name__}: {error}")
+        ctx.traced[:] = [owner for owner in ctx.traced if owner in pending]
         for reader in readers:
             try:
                 thread = getattr(reader, "thread", None)
@@ -2540,18 +2561,11 @@ def cleanup_leg_resources(ctx, close_pins=True):
                         stream.close()
                     except Exception as error:
                         failures.append(f"process stream: {type(error).__name__}: {error}")
-            try:
-                owner.close()
-            except Exception as error:
-                failures.append(f"process FD: {type(error).__name__}: {error}")
-        for group in reversed(groups):
-            try:
-                group.remove()
-            except Exception as error:
-                failures.append(f"cgroup: {type(error).__name__}: {error}")
-        ctx.owners.clear()
-        ctx.readers.clear()
-        ctx.groups.clear()
+            if owner not in pending:
+                try:
+                    owner.close()
+                except Exception as error:
+                    failures.append(f"process FD: {type(error).__name__}: {error}")
         if close_pins:
             for pin in reversed(ctx.leg_pins):
                 try:
@@ -2561,6 +2575,20 @@ def cleanup_leg_resources(ctx, close_pins=True):
                 except Exception as error:
                     failures.append(f"leg pin: {type(error).__name__}: {error}")
             ctx.leg_pins.clear()
+        if not pending:
+            for group in reversed(groups):
+                try:
+                    group.remove()
+                except Exception as error:
+                    failures.append(f"cgroup: {type(error).__name__}: {error}")
+            case.cleanup_totals["cgroups"] += len(groups)
+            ctx.groups.clear()
+        # Count released ownership once, even when a failed proof is retried.
+        case.cleanup_totals["processes"] += len(owners) - len(pending)
+        # Keep unproven children and their corresponding groups held for the
+        # final backstop; cleanup failure already prevents another live leg.
+        ctx.owners[:] = pending
+        ctx.readers.clear()
         if failures:
             case.cleanup_failed = True
             case.cleanup_errors.extend(failures)

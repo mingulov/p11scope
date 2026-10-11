@@ -3326,7 +3326,22 @@ pub(crate) fn collect_system_with_identity(
     // allowance. Session FDs are unleased but counted, and no segment
     // worker or pin is live yet, so the reconcile boundary stays
     // quiescent.
-    let has_proof = sweep_has_proof_plan(&collection, &bound);
+    // Explicit userspace never attempts kernel, so its decision needs no
+    // proof plan: skip the index build entirely (perf). The decide path
+    // stays correct because userspace decides `Userspace` for either
+    // `has_proof` value (see `d3d_userspace_selection_never_loads_or_probes`).
+    let explicit_userspace = matches!(
+        shared
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .selection,
+        crate::cli::IdentityBackendSelection::Userspace
+    );
+    let has_proof = if explicit_userspace {
+        false
+    } else {
+        sweep_has_proof_plan(&collection, &bound)
+    };
     let attempt = decide_pass_attempt(&shared, has_proof);
     let takeout = match &attempt {
         PassAttempt::Kernel { .. } => take_session_for_pass(&shared),
@@ -5242,7 +5257,10 @@ mod tests {
         /// Capped with zero charged ranges (an unexamined-only snapshot,
         /// an empty snapshot, and an unavailable caller): the old cap-hit
         /// proxy claims proof, but the proof-plan gate must refuse it —
-        /// while the unmodified over-cap cell keeps its plan.
+        /// while the unmodified over-cap cell keeps its plan. The computed
+        /// zero-proof gate feeds the pass decision with must-not-load checks
+        /// (`session: None` panics if called): no session attempt, no
+        /// capability consultation, no fallback recorded.
         #[test]
         fn no_proof_gate_refuses_capped_zero_proof_plan() {
             let mut collection = over_cap(&[]);
@@ -5257,10 +5275,42 @@ mod tests {
                 collection.cap_hit && !collection.sweep.is_empty(),
                 "fixture must trip the old cap-hit proxy"
             );
-            assert!(
-                !sweep_has_proof_plan(&collection, &bound),
-                "capped-but-zero-proof must hold no proof plan"
-            );
+            let gate = sweep_has_proof_plan(&collection, &bound);
+            assert!(!gate, "capped-but-zero-proof must hold no proof plan");
+            for selection in [
+                crate::cli::IdentityBackendSelection::Auto,
+                crate::cli::IdentityBackendSelection::Kernel,
+            ] {
+                let (shared, ptr) =
+                    super::shared_with(selection, ScriptedIdentityChecks::must_not_load());
+                assert!(
+                    matches!(decide_pass_attempt(&shared, gate), PassAttempt::Userspace),
+                    "{selection:?} zero-proof must stay userspace"
+                );
+                let checks = unsafe { &*ptr };
+                assert_eq!(
+                    checks
+                        .numbering_calls
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "{selection:?} zero-proof consults no numbering"
+                );
+                assert_eq!(
+                    checks.btf_calls.load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "{selection:?} zero-proof consults no BTF"
+                );
+                assert_eq!(
+                    checks
+                        .session_calls
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "{selection:?} zero-proof attempts no session"
+                );
+                let shared = shared.lock().unwrap();
+                assert_eq!(shared.summary().fallback, None);
+                assert!(!shared.loaded());
+            }
             let mut full = over_cap(&[]);
             let full_bound = bind_collection(&mut full);
             assert!(

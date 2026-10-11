@@ -62,10 +62,8 @@ const DOC_ID: &str = "p11scope/inventory/v1";
 /// Rescan interval inside a `--duration` observation window.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Maximum age of a staged semantic quantum before a tick commits it:
-/// a staged batch must finalize inside its receipts' 2s window even
-/// when collection runs long, instead of waiting for the next pass
-/// commit. Pinned below the receipt window by test.
+/// Maximum wait for staged semantic evidence without current receipts.
+/// Receipt-bearing batches publish during the tick that stages them.
 const STAGED_SEMANTIC_MAX_AGE: Duration = Duration::from_secs(1);
 
 struct DiagnosticRequest<'a> {
@@ -1308,6 +1306,29 @@ struct ClassicDriver<'a> {
     semantic_staged: bool,
 }
 
+/// Exercise the production driver tick with substituted lane I/O.
+#[cfg(test)]
+pub(crate) fn classic_semantic_tick_for_test(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    lane: crate::inventory_semantics::AttestedSemanticLane,
+) -> crate::inventory_semantics::AttestedSemanticLane {
+    let mut driver = ClassicDriver {
+        coordinator,
+        inventory_scope: None,
+        scope: InventoryRunScope::Pid(std::process::id()),
+        cgroup: None,
+        max_scan_pids: None,
+        guard: UnavailableImageGuard,
+        deadline: None,
+        identity: None,
+        display: None,
+        semantic: Some(lane),
+        semantic_staged: false,
+    };
+    driver.on_tick();
+    driver.semantic.take().unwrap()
+}
+
 impl ClassicDriver<'_> {
     /// A pass warning: stderr on the classic path; under the dashboard
     /// (which must never scribble beside its screen) the log tail, kept
@@ -1756,10 +1777,9 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         if let Some(display) = self.display.as_mut() {
             display.tick();
         }
-        // A staged quantum must finalize inside its receipts' window
-        // even when collection runs long: commit a stale staged batch
-        // first, then stage fresh below. A failed commit backs off to
-        // the next staleness deadline instead of gap-spamming.
+        // Bound the wait for staged evidence even when collection runs
+        // long. Failed commits retry at the next staleness deadline
+        // instead of gap-spamming.
         let stale = self.semantic_staged
             && self
                 .semantic
@@ -1789,9 +1809,26 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         // The borrow ends with the tick: the batch owns its outcomes.
         let staged = match lane.tick(pins) {
             Ok(batch) => {
+                // Original receipt lifetimes include time already spent
+                // in the refresh stash. Publish during this tick: no
+                // later service interval can guarantee timely validation.
+                let publish_now = batch.has_current_receipts();
                 self.coordinator.stage_semantic_batch(batch);
                 lane.note_semantic_staged();
-                true
+                if publish_now {
+                    match self.commit(false) {
+                        Ok(()) => false,
+                        Err(error) => {
+                            self.coordinator.note_scope_gap(
+                                "semantic staged commit failed".into(),
+                                format!("{error:#}"),
+                            );
+                            true
+                        }
+                    }
+                } else {
+                    true
+                }
             }
             Err(_) => false,
         };
@@ -6372,11 +6409,9 @@ mod tests {
         //! ticks commit stale staged batches, and the stop request
         //! flushes staged evidence before native retirement. The
         //! substituted lane I/O below is timing-only (ticks mint
-        //! scripted receipts, validation approves): receipt VALIDITY is
+        //! scripted receipts, validation approves): receipt validity is
         //! pinned by the real-H0 tests, while these tests pin commit
-        //! TIMING through the production stage/finalize/commit path.
-        //! The driver treats batches opaquely; nothing here inspects
-        //! or forges batch contents.
+        //! timing through the production stage/finalize/commit path.
         use super::*;
         use crate::attach::BackendSelection;
         use crate::attach::capture::NativeDomainId;
@@ -6390,7 +6425,8 @@ mod tests {
             RouterLimits, StableObservation,
         };
         use crate::inventory_semantics::{
-            AttestedSemanticLane, LaneDrainOutcome, LaneTestIo, SemanticBatch, SemanticRefusal,
+            AttestedSemanticLane, LaneCollectionRefusal, LaneDrainOutcome, LaneNegative,
+            LaneTestIo, SemanticBatch, SemanticRefusal,
         };
         use crate::semantic_capture::{
             CurrentPartitionReceipt, CurrentReceiptRefusal, Endpoint, TickReport,
@@ -6478,6 +6514,7 @@ mod tests {
             ids: Vec<InstanceId>,
             quiesce: bool,
             pending: bool,
+            receipt_free: bool,
         }
 
         impl StubLaneIo {
@@ -6500,6 +6537,7 @@ mod tests {
                     ids,
                     quiesce: false,
                     pending: false,
+                    receipt_free: false,
                 }
             }
         }
@@ -6513,6 +6551,15 @@ mod tests {
             }
 
             fn tick(&mut self, domain: NativeDomainId) -> Result<SemanticBatch, SemanticRefusal> {
+                if self.receipt_free {
+                    return Ok(SemanticBatch::scripted(
+                        domain,
+                        vec![LaneNegative::CollectionRefused {
+                            reason: LaneCollectionRefusal::CollectionFailed,
+                        }],
+                        0,
+                    ));
+                }
                 let id = self.ids.pop().expect("stub router ids exhausted");
                 let receipt = CurrentPartitionReceipt::scripted(
                     domain,
@@ -6634,17 +6681,9 @@ mod tests {
         }
 
         #[test]
-        fn staged_max_age_sits_below_receipt_window() {
-            assert!(
-                STAGED_SEMANTIC_MAX_AGE
-                    < crate::semantic_capture::TickLimits::default().pending_for,
-                "staged evidence must finalize with margin inside the receipt window"
-            );
-        }
-
-        #[test]
-        fn stale_staged_batch_commits_on_tick_while_fresh_stays() {
+        fn receipt_free_staged_batch_commits_on_tick_while_fresh_stays() {
             let mut scene = driver_scene(2);
+            scene.stub.receipt_free = true;
             scene.lane.install_test_io(Box::new(scene.stub));
             let mut driver = ClassicDriver {
                 coordinator: &mut scene.coordinator,
@@ -6663,11 +6702,11 @@ mod tests {
             // across further ticks instead of committing early.
             driver.on_tick();
             assert!(driver.semantic_staged, "the first tick stages");
-            assert_eq!(driver.coordinator.registry().instances().count(), 0);
+            assert!(driver.coordinator.registry().gaps().is_empty());
             driver.on_tick();
             assert!(driver.semantic_staged, "a fresh staged batch stays staged");
             assert_eq!(
-                driver.coordinator.registry().instances().count(),
+                driver.coordinator.registry().gaps().len(),
                 0,
                 "nothing publishes before the staleness deadline"
             );
@@ -6682,7 +6721,13 @@ mod tests {
                 "a fresh batch stages after the stale commit"
             );
             assert_eq!(
-                driver.coordinator.registry().instances().count(),
+                driver
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .filter(|gap| gap.subject == "semantic collection refused")
+                    .count(),
                 1,
                 "the stale batch publishes through the tick commit"
             );
@@ -6705,6 +6750,20 @@ mod tests {
             scene.stub.pending = true;
             scene.stub.quiesce = true;
             scene.lane.install_test_io(Box::new(scene.stub));
+            // Seed an unpublished batch to exercise the stop hook's
+            // fallback flush (ordinary receipt-bearing ticks now
+            // publish immediately).
+            let batch = scene
+                .lane
+                .tick(
+                    scene
+                        .coordinator
+                        .semantic_bindings_mut()
+                        .bindings_for_tick(),
+                )
+                .unwrap();
+            scene.coordinator.stage_semantic_batch(batch);
+            scene.lane.note_semantic_staged();
             let mut driver = ClassicDriver {
                 coordinator: &mut scene.coordinator,
                 inventory_scope: None,
@@ -6716,9 +6775,8 @@ mod tests {
                 identity: None,
                 display: None,
                 semantic: Some(scene.lane),
-                semantic_staged: false,
+                semantic_staged: true,
             };
-            driver.on_tick();
             assert!(driver.semantic_staged, "one quantum stages");
             assert_eq!(driver.coordinator.registry().instances().count(), 0);
             // The stop request flushes before native retirement would

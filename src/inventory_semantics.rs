@@ -274,8 +274,9 @@ impl RefreshReceiptStash {
         shed
     }
 
-    /// Oldest receipts shed beyond the cap: disclosed as refused
-    /// endpoints by the caller.
+    /// Tests-only shed count: production discloses `push_all`'s return
+    /// as refused endpoints instead.
+    #[cfg(test)]
     pub(crate) fn shed(&self) -> u64 {
         self.shed
     }
@@ -870,12 +871,11 @@ pub(crate) fn run_semantic_drain(
     summary
 }
 
-/// Independent terminal ownership over any [`SemanticStopIo`]:
+/// Tests-only composed stop over any [`SemanticStopIo`]:
 /// [`run_semantic_drain`] delivers every drained batch to `on_batch`,
-/// then H0 stops once and its terminal batch finalizes separately. A
-/// stop request is not Finish: a legitimately drained last return still
-/// completes its operation under ordinary adjudication, never ahead of
-/// drained calls and never behind Stopped.
+/// then H0 stops once and its terminal batch finalizes separately.
+/// Production commits between the split drain/finish phases instead.
+#[cfg(test)]
 pub(crate) fn run_semantic_stop(
     io: &mut impl SemanticStopIo,
     budget: Duration,
@@ -1007,11 +1007,13 @@ impl AttestedSemanticLane {
         live.stop_state = StopState::StopRequested;
     }
 
-    /// The full independent terminal sequence over the live lane: drain
+    /// Tests-only composed terminal sequence over the live lane: drain
     /// first (every drained batch reaches `on_batch`), then stop H0 once
-    /// and deliver its Finish batch to `on_batch` last. A shell lane
-    /// (failed startup) finishes nothing and reports no drain: positive
-    /// history elsewhere is untouched.
+    /// and deliver its Finish batch to `on_batch` last. Production
+    /// commits between the split phases instead. A shell lane (failed
+    /// startup) finishes nothing and reports no drain: positive history
+    /// elsewhere is untouched.
+    #[cfg(test)]
     pub(crate) fn run_semantic_stop(
         &mut self,
         pins: &[Arc<PidPin>],
@@ -1112,13 +1114,19 @@ impl AttestedSemanticLane {
     pub(crate) fn finish_semantic_stop(&mut self) -> Option<SemanticBatch> {
         let live = self.live.as_mut()?;
         let domain = self.domain;
-        let report = live.capture.stop();
+        let live = &mut **live;
+        // Finish touches only the capture: the stop batch constructor
+        // stays shared with the drain's stop io.
+        let mut io = LiveStopIo {
+            session: &mut live.session,
+            capture: &mut live.capture,
+            pins: Vec::new(),
+            domain,
+        };
+        let batch = io.finish_h0();
         live.finished = true;
         live.continuity_cuts = live.capture.continuity_cuts();
-        Some(
-            SemanticBatch::from_tick_report(domain, report, Vec::new(), now_ns())
-                .expect("H0 stop batches respect lane bounds"),
-        )
+        Some(batch)
     }
 
     /// The sanitized lane summary: counts only, never instance

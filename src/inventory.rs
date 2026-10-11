@@ -1754,16 +1754,15 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             .and_then(|lane| lane.finish_semantic_stop())
         {
             self.coordinator.stage_semantic_batch(finish);
-            if let Some(lane) = self.semantic.as_mut() {
-                if let Err(error) = self
+            if let Some(lane) = self.semantic.as_mut()
+                && let Err(error) = self
                     .coordinator
                     .commit_batch_with_semantics(false, Some(lane))
-                {
-                    self.coordinator.note_scope_gap(
-                        "semantic terminal commit failed".into(),
-                        format!("{error:#}"),
-                    );
-                }
+            {
+                self.coordinator.note_scope_gap(
+                    "semantic terminal commit failed".into(),
+                    format!("{error:#}"),
+                );
             }
         }
         self.semantic_staged = false;

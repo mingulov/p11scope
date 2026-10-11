@@ -47,6 +47,7 @@ impl CurrentPartitionReceipt {
     /// bounds) that only the synchronous accepted scan path mints.
     /// Production construction stays move-only.
     #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn scripted(
         domain: NativeDomainId,
         image: ImageIdentity,

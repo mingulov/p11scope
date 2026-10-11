@@ -1023,7 +1023,7 @@ class WorkerCapabilityTest(unittest.TestCase):
         rows[0]["path"] = "/w/impostor"
         self.assertTrue(population(rows, receipt, {0: receipt["images"][0]}, {0: 0, 1: 0})["errors"])
 
-    def run_capability(self, result, receipt):
+    def run_capability(self, result, receipt, backend="singles"):
         with tempfile.TemporaryDirectory(prefix="h6-capability-") as directory:
             def leg(ctx, cell, backend, kind, leg_dir, mode):
                 Path(leg_dir).mkdir(parents=True)
@@ -1032,7 +1032,7 @@ class WorkerCapabilityTest(unittest.TestCase):
                 return result
             runner = H6["run_leader_exit_exec"]
             with mock.patch.dict(runner.__globals__, {"run_b_leg": leg}):
-                return runner(None, directory, "singles")
+                return runner(None, directory, backend)
 
     def test_valid_barrier_records_capability_deficit_separately(self):
         for captured, status in ((11, "demonstrated"), (4, "demonstrated"), (0, "limitation")):
@@ -1045,6 +1045,44 @@ class WorkerCapabilityTest(unittest.TestCase):
                 self.assertIsNone(cap["pass"])
                 self.assertEqual(cap.get("early_coverage"), {"expected": 11, "observed_named": captured,
                                                        "observed_unknown": 0, "deficit": 11 - captured})
+
+    def test_backend_mismatch_or_fallback_cannot_demonstrate_capability(self):
+        for backend in ("singles", "multi"):
+            other = "multi" if backend == "singles" else "singles"
+            for refused in ("selection", "fallback", "request", "missing-selection"):
+                with self.subTest(backend=backend, refused=refused):
+                    result, receipt = self.inputs()
+                    receipt["requested_backend"] = backend
+                    result.update(leg=f"trace/{backend}", status="fail", **{"pass": False})
+                    attach = result["evidence"][0]["attach_backend"]
+                    attach["selection"] = backend
+                    if refused == "selection": attach["selection"] = other
+                    elif refused == "fallback": attach["fallback"] = other
+                    elif refused == "request": receipt["requested_backend"] = other
+                    else: del attach["selection"]
+                    rows = self.run_capability(result, receipt, backend)
+                    self.assertIs(rows[0], result)
+                    self.assertIs(rows[0]["pass"], False)
+                    self.assertEqual(rows[1]["status"], "error")
+                    self.assertIs(rows[1]["pass"], False)
+                    self.assertTrue(rows[1]["errors"])
+
+    def test_valid_backend_capability_survives_a_later_recovery_failure(self):
+        for backend in ("singles", "multi"):
+            with self.subTest(backend=backend):
+                result, receipt = self.inputs(4)
+                receipt["requested_backend"] = backend
+                result["evidence"][0]["attach_backend"]["selection"] = backend
+                result.update(leg=f"trace/{backend}", status="fail", errors=["post-exec successor rows missing"],
+                              **{"pass": False})
+                rows = self.run_capability(result, receipt, backend)
+                self.assertIs(rows[0], result)
+                self.assertIs(rows[0]["pass"], False)
+                cap = rows[1]
+                self.assertEqual((cap["leg"], cap["status"], cap["pre_exec_captured"], cap["early_coverage"]["deficit"]),
+                                 (f"capability-preexec/{backend}", "demonstrated", 4, 7))
+                self.assertIsNone(cap["pass"])
+                self.assertEqual(cap["errors"], [])
 
     def test_missing_or_insufficient_barrier_cannot_demonstrate_capability(self):
         for broken in ("absent", "live-leader", "missing-worker", "dead-worker", "wrong-birth",
@@ -1726,7 +1764,8 @@ class LegCleanupTest(unittest.TestCase):
                         stream.close()
                 owner.close()
 
-    def matrix(self, runner, *, pin_close_failure=False):
+    def matrix(self, runner, *, pin_close_failure=False, cells=("pid-leader",),
+               backends=("singles", "multi")):
         created_pins = []
         pin_class = H6["FilePin"]
         def pin(path):
@@ -1740,18 +1779,19 @@ class LegCleanupTest(unittest.TestCase):
                     raise OSError("controlled final pin cleanup failure")
                 value.close = fail_close
             return value
-        out = self.directory / "matrix"
+        self.matrix_count = getattr(self, "matrix_count", 0) + 1
+        out = self.directory / f"matrix-{self.matrix_count}"
         argv = ["--binary", str(self.case_pin.path), "--provider", str(self.case_pin.path),
                 "--discover", str(self.case_pin.path), "--source-revision", "0" * 40,
-                "--uid", "1001", "--gid", "1001", "--cells", "pid-leader",
-                "--backends", "singles,multi", "--out", str(out)]
+                "--uid", "1001", "--gid", "1001", "--cells", ",".join(cells),
+                "--backends", ",".join(backends), "--out", str(out)]
         def cell(ctx, directory, backend):
             rows = runner(ctx, directory, backend)
             return rows if isinstance(rows, list) else [rows]
         try:
             with mock.patch.dict(self.globals, {"FilePin": pin,
                     "compile_case_fixtures": lambda *_args: {}, "symbol_file_offset": lambda *_args: 0}), \
-                    mock.patch.dict(H6["CELL_RUNNERS"], {"pid-leader": cell}), \
+                    mock.patch.dict(H6["CELL_RUNNERS"], {name: cell for name in cells}), \
                     mock.patch.object(os, "geteuid", return_value=0):
                 rc = H6["main"](argv)
             return rc, json.loads((out / "summary.json").read_text()), json.loads((out / "cleanup.json").read_text())
@@ -1768,14 +1808,119 @@ class LegCleanupTest(unittest.TestCase):
         def runner(ctx, directory, backend):
             return [{"pass": True, "status": "pass", "leg": f"trace/{backend}"},
                     {"pass": None, "status": "demonstrated", "leg": f"capability-preexec/{backend}"}]
-        rc, summary, _ = self.matrix(runner)
+        rc, summary, _ = self.matrix(runner, cells=("leader-exit-exec",))
         self.assertEqual((rc, summary["passed"], summary["failed"]), (0, 2, 0))
         self.assertEqual((summary["negative"], summary["informational"]), (0, 2))
         self.assertTrue(summary["required_complete"])
 
+    def test_positive_backend_cannot_mask_an_empty_or_informational_backend(self):
+        for multi in ([], [{"pass": None, "status": "demonstrated", "leg": "capability-preexec/multi"}]):
+            with self.subTest(multi=multi):
+                def runner(ctx, directory, backend):
+                    return [{"pass": True, "status": "pass", "leg": "trace/singles"}] if backend == "singles" else multi
+                rc, summary, _ = self.matrix(runner, cells=("leader-exit-exec",))
+                self.assertEqual((summary["passed"], summary["failed"], summary["negative"]), (1, 0, 0))
+                self.assertEqual(summary["informational"], len(multi))
+                self.assertEqual(rc, 1, "one backend's positive filled the other's required recovery result")
+                self.assertFalse(summary["required_complete"])
+                self.assertFalse(summary["complete"])
+                self.assertEqual(summary["required_coverage"]["missing"],
+                                 [{"cell": "leader-exit-exec", "leg": "trace/multi"}])
+
+    def test_every_requested_cell_requires_each_distinct_recovery_leg(self):
+        required = {"pid-leader": ("trace", "profile", "metrics"),
+                    "pid-reexec": ("trace", "profile", "metrics"),
+                    "pid-nonleader-cold": ("trace", "profile", "metrics"),
+                    "pid-failed-exec": ("trace",), "leader-exit-exec": ("trace",),
+                    "rapid-chain": ("trace", "reuse", "group-death"),
+                    "cgroup-reentry": ("trace", "replacement", "stop-before", "stop-during", "inventory"),
+                    "system-mixed": ("inventory",)}
+        for cell, kinds in required.items():
+            for missing in kinds:
+                with self.subTest(cell=cell, missing=missing):
+                    def runner(ctx, directory, backend):
+                        present = kinds if backend == "singles" else [kind for kind in kinds if kind != missing]
+                        return [{"pass": True, "status": "pass", "leg": f"{kind}/{backend}"} for kind in present]
+                    rc, summary, _ = self.matrix(runner, cells=(cell,))
+                    self.assertEqual((summary["failed"], summary["negative"]), (0, 0))
+                    self.assertGreater(summary["passed"], 0)
+                    self.assertEqual(rc, 1, "other positive legs filled an omitted recovery leg")
+                    self.assertFalse(summary["required_complete"])
+                    self.assertEqual(summary["required_coverage"]["missing"],
+                                     [{"cell": cell, "leg": f"{missing}/multi"}])
+
+    def test_duplicate_and_wrong_result_identities_cannot_complete_matrix(self):
+        for wrong in ("duplicate", "cell", "backend", "kind"):
+            with self.subTest(wrong=wrong):
+                def runner(ctx, directory, backend):
+                    rows = [{"pass": True, "status": "pass", "leg": f"{kind}/{backend}"}
+                            for kind in ("trace", "profile", "metrics")]
+                    if backend == "multi":
+                        if wrong == "duplicate": rows.append(dict(rows[-1]))
+                        elif wrong == "cell": rows[-1]["cell"] = "pid-reexec"
+                        elif wrong == "backend": rows[-1]["leg"] = "metrics/singles"
+                        else: rows[-1]["leg"] = "inventory/multi"
+                    return rows
+                rc, summary, _ = self.matrix(runner)
+                self.assertEqual((summary["failed"], summary["negative"]), (0, 0))
+                self.assertEqual(rc, 1, "duplicate/wrong recovery identity was accepted")
+                self.assertFalse(summary["required_complete"])
+
+    def test_rows_from_another_invocation_cannot_fill_required_identity(self):
+        for swapped in ("cell", "backend"):
+            with self.subTest(swapped=swapped):
+                def runner(ctx, directory, backend):
+                    cell = {"pid-leader": "pid-reexec", "pid-reexec": "pid-leader"}[directory.name] if swapped == "cell" else directory.name
+                    selected = {"singles": "multi", "multi": "singles"}[backend] if swapped == "backend" else backend
+                    return [{"cell": cell, "leg": f"{kind}/{selected}", "pass": True, "status": "pass"}
+                            for kind in ("trace", "profile", "metrics")]
+                rc, summary, _ = self.matrix(runner, cells=("pid-leader", "pid-reexec"))
+                self.assertEqual((summary["passed"], summary["failed"], summary["negative"]), (12, 0, 0))
+                self.assertEqual(rc, 1, "rows were credited to a different cell/backend invocation")
+                self.assertFalse(summary["required_complete"])
+
+    def test_all_selected_names_cannot_claim_complete_with_an_empty_cell(self):
+        def runner(ctx, directory, backend):
+            if directory.name == "system-mixed":
+                return []
+            kinds = {"pid-leader": ("trace", "profile", "metrics"),
+                     "pid-reexec": ("trace", "profile", "metrics"),
+                     "pid-nonleader-cold": ("trace", "profile", "metrics"),
+                     "pid-failed-exec": ("trace",), "leader-exit-exec": ("trace",),
+                     "rapid-chain": ("trace", "reuse", "group-death"),
+                     "cgroup-reentry": ("trace", "replacement", "stop-before", "stop-during", "inventory")}
+            return [{"pass": True, "status": "pass", "leg": f"{kind}/{backend}"} for kind in kinds[directory.name]]
+        rc, summary, _ = self.matrix(runner, cells=H6["CELLS"])
+        self.assertEqual((summary["failed"], summary["negative"]), (0, 0))
+        self.assertEqual(rc, 1)
+        self.assertFalse(summary["required_complete"])
+        self.assertFalse(summary["complete"])
+
+    def test_all_required_cell_backend_leg_results_complete_matrix(self):
+        def runner(ctx, directory, backend):
+            kinds = {"pid-leader": ("trace", "profile", "metrics"),
+                     "pid-reexec": ("trace", "profile", "metrics"),
+                     "pid-nonleader-cold": ("trace", "profile", "metrics"),
+                     "pid-failed-exec": ("trace",), "leader-exit-exec": ("trace",),
+                     "rapid-chain": ("trace", "reuse", "group-death"),
+                     "cgroup-reentry": ("trace", "replacement", "stop-before", "stop-during", "inventory"),
+                     "system-mixed": ("inventory",)}
+            rows = [{"pass": True, "status": "pass", "leg": f"{kind}/{backend}"} for kind in kinds[directory.name]]
+            if directory.name == "leader-exit-exec":
+                rows.append({"pass": None, "status": "limitation", "leg": f"capability-preexec/{backend}"})
+            return rows
+        rc, summary, _ = self.matrix(runner, cells=H6["CELLS"])
+        self.assertEqual((rc, summary["passed"], summary["failed"], summary["negative"], summary["informational"]),
+                         (0, 40, 0, 0, 2))
+        self.assertTrue(summary["required_complete"])
+        self.assertTrue(summary["complete"])
+        self.assertEqual(summary["required_coverage"], {"required": 40, "positive": 40, "missing": [],
+                          "nonpositive": [], "duplicates": [], "unexpected": [], "complete": True})
+
     def test_informational_only_population_cannot_complete_h6(self):
-        rc, summary, _ = self.matrix(lambda *_args: {
-            "pass": None, "status": "limitation", "leg": "capability-preexec/singles"})
+        rc, summary, _ = self.matrix(lambda ctx, directory, backend: {
+            "pass": None, "status": "limitation", "leg": f"capability-preexec/{backend}"},
+            cells=("leader-exit-exec",))
         self.assertEqual((summary["passed"], summary["failed"]), (0, 0))
         self.assertEqual(summary["informational"], 2)
         self.assertEqual(rc, 1)
@@ -1786,9 +1931,13 @@ class LegCleanupTest(unittest.TestCase):
         def runner(ctx, directory, backend):
             return {"pass": False, "status": "fail" if backend == "singles" else "negative",
                     "leg": f"trace/{backend}"}
-        rc, summary, _ = self.matrix(runner)
+        rc, summary, _ = self.matrix(runner, cells=("leader-exit-exec",))
         self.assertEqual((rc, summary["passed"], summary["failed"], summary.get("negative", -1)), (1, 0, 1, 1))
         self.assertFalse(summary["required_complete"])
+        self.assertEqual(summary["required_coverage"]["missing"], [])
+        self.assertEqual(summary["required_coverage"]["nonpositive"], [
+            {"cell": "leader-exit-exec", "leg": "trace/multi", "pass": False, "status": "negative"},
+            {"cell": "leader-exit-exec", "leg": "trace/singles", "pass": False, "status": "fail"}])
 
     def test_truthy_nonboolean_and_failed_status_cannot_count_as_positive(self):
         def runner(ctx, directory, backend):
@@ -1827,8 +1976,8 @@ class LegCleanupTest(unittest.TestCase):
         @H6["owned_leg"]
         def runner(ctx, directory, backend):
             self.child(ctx.owners, ctx.readers, directory)
-            return {"cell": "pid-leader", "leg": backend, "status": "pass", "pass": True}
-        rc, summary, cleanup = self.matrix(runner, pin_close_failure=True)
+            return {"leg": f"trace/{backend}", "status": "pass", "pass": True}
+        rc, summary, cleanup = self.matrix(runner, pin_close_failure=True, cells=("pid-failed-exec",))
         self.assertEqual(rc, 1, "main decided success before final cleanup")
         self.assertGreater(summary["failed"], 0)
         self.assertTrue(any("controlled final pin cleanup failure" in error for error in cleanup["errors"]))
@@ -1862,8 +2011,8 @@ class LegCleanupTest(unittest.TestCase):
                     races.append(backend)
                     raise
             owner.send = exit_during_signal
-            return {"cell": "pid-leader", "leg": backend, "status": "pass", "pass": True}
-        rc, summary, cleanup = self.matrix(runner)
+            return {"leg": f"trace/{backend}", "status": "pass", "pass": True}
+        rc, summary, cleanup = self.matrix(runner, cells=("pid-failed-exec",))
         self.assertEqual(rc, 0, "the next leg saw an unreaped previous child")
         self.assertEqual(started, ["singles", "multi"])
         self.assertEqual(races, ["singles", "multi"])

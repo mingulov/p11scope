@@ -266,6 +266,16 @@ pub(crate) trait LaneTestIo {
     fn has_pending_evidence(&self) -> bool;
     /// The real H0 stop plus the production Finish batch construction.
     fn finish(&mut self, domain: NativeDomainId) -> SemanticBatch;
+    /// Whether the substituted producer is quiescent (scripted per
+    /// test; servicing advances it).
+    fn quiescent(&mut self) -> bool;
+    /// Current (consumer, producer) for the owned EVENTS and DISCOVERY
+    /// cursors, in that order. `None` is an unreadable ring.
+    fn positions(&mut self) -> Option<[(usize, usize); 2]>;
+    /// Bounded EVENTS remainder drain to `stop`.
+    fn drain_events_to(&mut self, stop: usize, quantum: usize) -> LaneDrainOutcome;
+    /// Bounded DISCOVERY drain to `stop`: cursor servicing only.
+    fn drain_discovery_to(&mut self, stop: usize, quantum: usize) -> LaneDrainOutcome;
 }
 
 /// One optional Detailed lane: the Session owner, H0 `SemanticCapture`
@@ -1467,6 +1477,60 @@ impl CommittingDrainBackend for LiveCommittingDrain<'_> {
     }
 }
 
+/// Tests-only [`CommittingDrainBackend`] over substituted H0 I/O: the
+/// lane services real quanta and commits through the production path.
+/// Quiescence and cursor positions are scripted per test through the
+/// installed I/O; servicing advances them.
+#[cfg(test)]
+struct TestCommittingDrain<'a> {
+    lane: &'a mut AttestedSemanticLane,
+    coordinator: &'a mut InventoryCoordinator<OsProcessSource>,
+}
+
+#[cfg(test)]
+impl TestCommittingDrain<'_> {
+    fn test_io(&mut self) -> &mut dyn LaneTestIo {
+        self.lane
+            .test_io
+            .as_mut()
+            .expect("test drain needs substituted H0 I/O")
+            .as_mut()
+    }
+}
+
+#[cfg(test)]
+impl CommittingDrainBackend for TestCommittingDrain<'_> {
+    fn request_stop(&mut self) {
+        self.lane.request_semantic_stop();
+    }
+
+    fn quiescent(&mut self) -> bool {
+        self.test_io().quiescent()
+    }
+
+    fn has_pending_evidence(&mut self) -> bool {
+        self.test_io().has_pending_evidence()
+    }
+
+    fn service_and_commit(&mut self) -> Result<bool, SemanticRefusal> {
+        // Targets resolve through the substituted I/O; pins stay empty.
+        self.lane
+            .service_terminal_quantum_committing(&mut *self.coordinator, &[])
+    }
+
+    fn positions(&mut self) -> Option<[(usize, usize); 2]> {
+        self.test_io().positions()
+    }
+
+    fn drain_events_to(&mut self, stop: usize, quantum: usize) -> LaneDrainOutcome {
+        self.test_io().drain_events_to(stop, quantum)
+    }
+
+    fn drain_discovery_to(&mut self, stop: usize, quantum: usize) -> LaneDrainOutcome {
+        self.test_io().drain_discovery_to(stop, quantum)
+    }
+}
+
 impl AttestedSemanticLane {
     /// Gate the Detailed producer immediately on stop request. New
     /// regular ticks refuse from here; only the terminal sequence runs
@@ -1597,13 +1661,28 @@ impl AttestedSemanticLane {
     /// [`run_committing_drain`] phases, so every serviced batch commits
     /// immediately — through the running lane, before the next
     /// quantum — instead of buffering through the wait. A shell lane
-    /// (failed startup) drains nothing and reports no drain.
+    /// (failed startup) drains nothing and reports no drain. In tests
+    /// with substituted H0 I/O, the same phases run through it.
     pub(crate) fn run_semantic_drain_committing(
         &mut self,
         coordinator: &mut InventoryCoordinator<OsProcessSource>,
         pins: &[Arc<PidPin>],
         now: impl FnMut() -> Instant,
     ) -> SemanticStopSummary {
+        #[cfg(test)]
+        if self.test_io.is_some() {
+            let mut backend = TestCommittingDrain {
+                lane: &mut *self,
+                coordinator,
+            };
+            return run_committing_drain(
+                &mut backend,
+                STOP_QUIESCE_BUDGET,
+                TERMINAL_DRAIN_QUANTA,
+                TERMINAL_DRAIN_QUANTUM,
+                now,
+            );
+        }
         if self.live.is_none() {
             return SemanticStopSummary {
                 quiesced: false,
@@ -1668,13 +1747,17 @@ impl AttestedSemanticLane {
     ) -> Result<bool, SemanticRefusal> {
         #[cfg(test)]
         if self.test_io.is_some() {
-            return match self.test_service_tick()? {
-                Some(batch) => {
-                    Self::commit_drained_batch(coordinator, self, batch);
-                    Ok(true)
-                }
-                None => Ok(false),
-            };
+            let domain = self.domain;
+            let batch = self
+                .test_io
+                .as_mut()
+                .expect("substituted H0 I/O checked above")
+                .tick(domain)?;
+            if batch.is_empty() {
+                return Ok(false);
+            }
+            Self::commit_drained_batch(coordinator, self, batch);
+            return Ok(true);
         }
         let domain = self.domain;
         let batch = {
@@ -1690,24 +1773,6 @@ impl AttestedSemanticLane {
             }
             None => Ok(false),
         }
-    }
-
-    /// Tests-only single serviced quantum without committing: the real
-    /// H0 tick through substituted I/O, past the stop gate like the
-    /// live drain. `None` is a quiet tick. Production always commits
-    /// serviced batches promptly; the buffered test leg holds them to
-    /// prove buffering expires receipts.
-    #[cfg(test)]
-    pub(crate) fn test_service_tick(&mut self) -> Result<Option<SemanticBatch>, SemanticRefusal> {
-        let domain = self.domain;
-        let Some(test) = self.test_io.as_mut() else {
-            return Err(SemanticRefusal::Unavailable);
-        };
-        let batch = test.tick(domain)?;
-        if batch.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(batch))
     }
 
     /// Commit one drained batch beside the lane's stop: stage, then

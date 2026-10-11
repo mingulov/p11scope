@@ -58,29 +58,99 @@ fn deny_check(btf_path: Option<PathBuf>) -> ! {
     }
 }
 
-fn probe(dir: PathBuf, generation: u64) -> ! {
-    // A fresh unique subdir per run: fixture writes are exclusive, so a
-    // reused DIR would fail on rerun. `create_dir` fails if the name
-    // already exists — never adopt or clean a pre-existing path.
+/// One probe run's private subdir, removed when this guard drops —
+/// on success and on every `PROBE FAIL` path alike.
+struct ProbeSubdir {
+    path: PathBuf,
+}
+
+impl Drop for ProbeSubdir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// A fresh unique `DIR/probe-<pid>-<nanos>` subdir with guaranteed
+/// 0700: atomic `mkdir` (a pre-existing name fails — never adopt or
+/// clean one), then `fchmod` on the opened fd so the mode holds under
+/// any umask.
+fn create_probe_subdir(dir: &std::path::Path) -> Result<ProbeSubdir, String> {
+    use std::os::unix::ffi::OsStrExt as _;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or(0);
     let subdir = dir.join(format!("probe-{}-{nanos}", std::process::id()));
-    if let Err(error) = std::fs::create_dir(&subdir) {
-        println!("PROBE FAIL dir: {error}");
-        std::process::exit(4);
+    let path =
+        std::ffi::CString::new(subdir.as_os_str().as_bytes()).map_err(|error| error.to_string())?;
+    // SAFETY: `mkdir` of a NUL-terminated path. Atomic: a pre-existing
+    // name fails instead of being adopted.
+    if unsafe { libc::mkdir(path.as_ptr(), 0o700) } != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
     }
-    let dir = subdir;
+    // SAFETY: `open` of a NUL-terminated path; `O_NOFOLLOW` refuses a
+    // swapped-in symlink instead of following it.
+    let raw = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            libc::rmdir(path.as_ptr());
+        }
+        return Err(error.to_string());
+    }
+    // The mkdir mode honors umask, so enforce 0700 exactly on the
+    // opened fd: private under any umask.
+    // SAFETY: `fchmod` on the live fd from the `open` above.
+    let chmod_error = if unsafe { libc::fchmod(raw, 0o700) } != 0 {
+        Some(std::io::Error::last_os_error())
+    } else {
+        None
+    };
+    // SAFETY: `close` on the live fd from the `open` above.
+    unsafe {
+        libc::close(raw);
+    }
+    if let Some(error) = chmod_error {
+        unsafe {
+            libc::rmdir(path.as_ptr());
+        }
+        return Err(error.to_string());
+    }
+    Ok(ProbeSubdir { path: subdir })
+}
+
+fn probe(dir: PathBuf, generation: u64) -> ! {
+    std::process::exit(probe_code(dir, generation));
+}
+
+fn probe_code(dir: PathBuf, generation: u64) -> i32 {
+    // A fresh unique subdir per run: fixture writes are exclusive, so a
+    // reused DIR would fail on rerun. Creation fails if the name
+    // already exists — never adopt or clean a pre-existing path. The
+    // guard removes the subdir on every return below.
+    let subdir = match create_probe_subdir(&dir) {
+        Ok(subdir) => subdir,
+        Err(error) => {
+            println!("PROBE FAIL dir: {error}");
+            return 4;
+        }
+    };
+    let dir = subdir.path.clone();
+    let _guard = subdir;
     if let Err(deny) = ii::ensure_kernel_identity_btf() {
         println!("PROBE FAIL deny: {}", deny.reason());
-        std::process::exit(4);
+        return 4;
     }
     let btf = match aya::Btf::from_sys_fs() {
         Ok(btf) => btf,
         Err(error) => {
             println!("PROBE FAIL btf: {error}");
-            std::process::exit(4);
+            return 4;
         }
     };
     let mut loaded = match ii::load_identity_object_strict(&btf) {
@@ -90,7 +160,7 @@ fn probe(dir: PathBuf, generation: u64) -> ! {
             if let Some(log) = ii::verifier_log_of(&error) {
                 println!("--- verifier log ---\n{log}");
             }
-            std::process::exit(4);
+            return 4;
         }
     };
     match ii::run_functional_probe(&dir, &mut loaded, generation) {
@@ -118,14 +188,14 @@ fn probe(dir: PathBuf, generation: u64) -> ! {
                 && report.stale_unmatched;
             if pass {
                 println!("PROBE PASS");
-                std::process::exit(0);
+                return 0;
             }
             println!("PROBE FAIL verdicts");
-            std::process::exit(4);
+            return 4;
         }
         Err(error) => {
             println!("PROBE FAIL {}: {}", error.stage, error.detail);
-            std::process::exit(4);
+            return 4;
         }
     }
 }
@@ -455,5 +525,51 @@ fn main() {
             );
         }
         _ => usage(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The probe subdir is 0700 even under a permissive umask, and the
+    /// guard removes it on drop.
+    #[test]
+    fn probe_subdir_is_private_and_removed() {
+        struct UmaskRestore(u32);
+        impl Drop for UmaskRestore {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::umask(self.0);
+                }
+            }
+        }
+        let scratch = tempfile::tempdir().expect("scratch");
+        let previous = unsafe { libc::umask(0) };
+        let _restore = UmaskRestore(previous);
+        let subdir = create_probe_subdir(scratch.path()).expect("create subdir");
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::symlink_metadata(&subdir.path)
+            .expect("stat subdir")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "the probe subdir must be 0700 under any umask");
+        let path = subdir.path.clone();
+        drop(subdir);
+        assert!(!path.exists(), "the guard must remove the subdir");
+    }
+
+    /// A probe run removes its subdir on every exit: repeated runs
+    /// never accumulate directories.
+    #[test]
+    fn probe_run_removes_its_subdir() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let _code = probe_code(scratch.path().to_path_buf(), 1);
+        let mut entries = std::fs::read_dir(scratch.path()).expect("read scratch");
+        assert!(
+            entries.next().is_none(),
+            "a probe run must not leave its subdir behind"
+        );
     }
 }

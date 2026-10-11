@@ -1162,21 +1162,26 @@ pub struct StrictIdentity {
 
 /// FDs one strict identity load retains: the 5 maps (`anchors`,
 /// `anchor_slots`, `anchor_observed`, `config`, `scope_bitmap`) plus
-/// the 2 verified programs, plus the 2 cloned program fds above.
+/// the 2 verified programs, plus the 2 cloned program fds above, plus
+/// the one shared BTF fd aya retains through program data (one distinct
+/// fd via `Arc`; `iter` loads fail when its BTF load fails, so a
+/// successful strict load holds it).
 /// Pinned against `vma_identity.c` by `strict_load_fd_cost_matches_object`.
-pub(crate) const STRICT_LOAD_RETAINED_FDS: usize = 9;
+pub(crate) const STRICT_LOAD_RETAINED_FDS: usize = 10;
 
-/// FDs the functional probe holds above its probe object: the child
-/// pipe read end, the 2 anchor files, the observer pidfd, and one
-/// attach link plus its iterator (runs are sequential).
-pub(crate) const FUNCTIONAL_PROBE_TRANSIENT_FDS: usize = 6;
+/// FDs the functional probe holds above its probe object at its iterator
+/// peak: the 2 anchor files, the observer pidfd, and one attach link
+/// plus its iterator (runs are sequential). The fork pipe's read end
+/// closes before the first iterator runs, so it is not counted.
+pub(crate) const FUNCTIONAL_PROBE_TRANSIENT_FDS: usize = 5;
 
-/// FDs a session setup may hold at peak: the probe load plus the probe
-/// transients, with one spare for the fork pipe pair and the BTF read
-/// (both closed before the peak). The fresh load after the probe drop,
-/// and the diagnostic follow-up load on failure, each hold at most the
-/// retained count. Lazy session init must reserve this peak before
-/// opening anything.
+/// FDs a session setup may hold at peak: the probe load (10) plus the
+/// probe transients (5), with one spare for the fork pipe pair and the
+/// BTF read (both closed before the peak). The fresh load after the
+/// probe drop, and the diagnostic follow-up load on failure, each hold
+/// at most the retained count. Lazy session init must reserve this peak
+/// before opening anything. Live privileged proof of the peak rides the
+/// later D3d live cells.
 pub(crate) const SESSION_SETUP_PEAK_FDS: usize =
     STRICT_LOAD_RETAINED_FDS + FUNCTIONAL_PROBE_TRANSIENT_FDS + 1;
 
@@ -7883,8 +7888,9 @@ mod tests {
 
     /// The strict-load FD cost pins the object surface: one fd per `.maps`
     /// definition plus one per `iter/task_vma` program, plus the two
-    /// cloned program fds [`StrictIdentity`] retains. Any map/program
-    /// added to `vma_identity.c` must update the reservation first.
+    /// cloned program fds [`StrictIdentity`] retains, plus the one shared
+    /// BTF fd aya retains through program data. Any map/program added to
+    /// `vma_identity.c` must update the reservation first.
     #[test]
     fn strict_load_fd_cost_matches_object() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -7892,15 +7898,41 @@ mod tests {
             .expect("read vma_identity.c");
         let maps = source.matches("SEC(\".maps\")").count();
         let programs = source.matches("SEC(\"iter/task_vma\")").count();
+        // The shared BTF fd is verifiable without privileges: the embedded
+        // object carries non-empty BTF, and aya loads it into the kernel
+        // and retains the fd in every program's data (one distinct fd via
+        // `Arc`), failing `iter` loads when that BTF load fails — so a
+        // successful strict load holds it.
+        let object = aya_obj::Object::parse(IDENTITY_OBJECT).expect("parse identity object");
+        let has_btf = object
+            .btf
+            .as_ref()
+            .is_some_and(|btf| !btf.to_bytes().is_empty());
+        assert!(
+            has_btf,
+            "identity object carries BTF, so strict load retains the shared BTF fd"
+        );
         assert_eq!(
             STRICT_LOAD_RETAINED_FDS,
-            maps + programs + 2,
-            "strict load retains one fd per map/program plus 2 clones: {maps} maps, {programs} programs"
+            maps + programs + 2 + 1,
+            "strict load retains one fd per map/program plus 2 clones plus the shared BTF fd: {maps} maps, {programs} programs"
+        );
+        // The probe transients are the 2 anchor files, the observer pidfd,
+        // and one attach link plus its iterator (runs are sequential). The
+        // fork pipe's read end closes before the first iterator runs, so it
+        // is not part of the peak.
+        assert_eq!(
+            FUNCTIONAL_PROBE_TRANSIENT_FDS, 5,
+            "probe peak is 2 anchor files + pidfd + link + iter; the fork pipe closes first"
         );
         assert_eq!(
             SESSION_SETUP_PEAK_FDS,
             STRICT_LOAD_RETAINED_FDS + FUNCTIONAL_PROBE_TRANSIENT_FDS + 1,
             "setup peak is the probe load plus probe transients plus the fork/BTF spare"
+        );
+        assert_eq!(
+            SESSION_SETUP_PEAK_FDS, 16,
+            "the setup peak stays 16 (10 + 5 + 1), conservative for the traced path"
         );
     }
 

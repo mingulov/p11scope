@@ -450,15 +450,22 @@ impl SemanticBindingSet {
 
     /// The bounded-selection primitive behind `bindings_for_tick`: up to
     /// `limit` bindings from the persistent fair cursor. Tests pin rotation
-    /// with small limits; production always passes MAX_PENDING.
+    /// with small limits; production always passes MAX_PENDING. Rotation is
+    /// lazy: each call rotates by the previously consumed window, so every
+    /// accepted binding is served in turn. A full-set window is
+    /// order-neutral: it serves every binding without rotating storage or
+    /// touching the cursor, so re-proof never steals the tick window's turn.
     pub(crate) fn windowed(&mut self, limit: usize) -> &[SemanticCallerBinding] {
         let len = self.bindings.len();
         if len == 0 || limit == 0 {
             return &[];
         }
-        self.bindings.rotate_left(self.cursor % len);
         let take = limit.min(len);
-        self.cursor = self.cursor.wrapping_add(take);
+        if take == len {
+            return &self.bindings;
+        }
+        self.bindings.rotate_left(self.cursor % len);
+        self.cursor = take;
         self.index.clear();
         for (at, binding) in self.bindings.iter().enumerate() {
             self.index.insert(binding.caller, at);
@@ -1086,4 +1093,71 @@ pub(crate) fn engine_for_test(
     engine.modules = modules;
     engine.pinned = pins;
     engine
+}
+
+#[cfg(test)]
+mod binding_window_tests {
+    use super::*;
+
+    fn windowed_set(count: u32) -> SemanticBindingSet {
+        let domain = NativeDomainId::mint();
+        let pin = Arc::new(PidPin::test_proc_only(1234));
+        let module = ModuleKey::physical(7, 7, 777, None, "/window/provider.so");
+        let mut set = SemanticBindingSet::new();
+        for index in 0..count {
+            set.insert(SemanticCallerBinding::scripted(
+                CallerId(index),
+                module.clone(),
+                domain,
+                ImageIdentity {
+                    task_cookie: u64::from(index),
+                    exec_id: 1,
+                },
+                pin.clone(),
+            ))
+            .unwrap();
+        }
+        set
+    }
+
+    fn window_callers(set: &mut SemanticBindingSet, limit: usize) -> Vec<CallerId> {
+        set.windowed(limit)
+            .iter()
+            .map(|binding| binding.caller())
+            .collect()
+    }
+
+    #[test]
+    fn windowed_rotation_serves_every_binding_within_full_cycle() {
+        // 3:1 population/quantum: three 1024-windows must cover all 3072
+        // bindings, so the last block is served within three windows.
+        let mut set = windowed_set(3072);
+        let mut served = std::collections::BTreeSet::new();
+        for _ in 0..3 {
+            served.extend(window_callers(&mut set, 1024));
+        }
+        assert!(
+            served.contains(&CallerId(2048)),
+            "block 2 starves: only {} of 3072 bindings served in 3 windows",
+            served.len()
+        );
+        assert_eq!(served.len(), 3072);
+    }
+
+    #[test]
+    fn windowed_full_set_is_order_neutral() {
+        let mut set = windowed_set(8);
+        assert_eq!(window_callers(&mut set, 2), vec![CallerId(0), CallerId(1)]);
+        let all = window_callers(&mut set, 8);
+        assert_eq!(
+            all,
+            (0..8).map(CallerId).collect::<Vec<_>>(),
+            "the full window serves insertion order"
+        );
+        assert_eq!(
+            window_callers(&mut set, 2),
+            vec![CallerId(2), CallerId(3)],
+            "rotation continues where it left off: the full window stole no turn"
+        );
+    }
 }

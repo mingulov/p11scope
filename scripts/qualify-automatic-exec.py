@@ -16,7 +16,7 @@ Workloads (all owned, all on disk under the case directory):
   caller.c    SoftHSM interactive caller (leader/reexec/rapid/cgroup legs)
   detailed-nonleader-exec.c  LP64 synthetic provider, exec inside the probed
               frame (cold nonleader / failed / leader-exit legs)
-  inventory-ledger.c (unmodified reuse)  mech/exec-chain/map S1 workloads
+  inventory-ledger.c  opt-in bounded H6 phases, with legacy workloads preserved
 
 Oracle reuse: trace rows and COUNT/EVIDENCE parsing reuse
 scripts/cgroup-trace-oracle.py verbatim (ROW, parse_trace). The H6
@@ -60,6 +60,7 @@ import subprocess
 import sys
 import time
 import uuid
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.dont_write_bytecode = True
@@ -1130,7 +1131,7 @@ def evaluate_metrics_h6(doc, stdout_text, ledger, receipt):
 # H6 oracle: inventory legs (native snapshot + event log vs ledger batches)
 # ---------------------------------------------------------------------------
 
-INV_LINE = re.compile(r"^(IDENT|MAPPED|LEDGER|HELD|RETURNED|ZOMBIE|EXEC|DONE|READY) (.+)$")
+INV_LINE = re.compile(r"^(IDENT|MAPPED|LEDGER|HELD|RETURNED|ZOMBIE|EXEC|DONE|READY|H6_READY|ACK) (.+)$")
 INV_KV = re.compile(r"(\S+?)=(\S+)")
 
 
@@ -1138,7 +1139,7 @@ def parse_inv_ledger(text):
     """Parse inventory-ledger stdout into typed batches. Never raises."""
     out = {"idents": [], "mapped": [], "batches": [], "held": [], "returned": [],
            "zombie": [], "execs": [], "dones": [], "readys": [], "unflushed": 0,
-           "strange": []}
+           "acks": [], "controls": [], "strange": []}
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -1189,6 +1190,16 @@ def parse_inv_ledger(text):
                 out["readys"].append({"cell": fields["cell"], "pid": int(fields["pid"]),
                                       "start": int(fields["start"]), "gen": int(fields["gen"]),
                                       "exe": fields["exe"]})
+            elif kind in ("H6_READY", "ACK"):
+                row = {key: fields[key] for key in ("cell", "exe")}
+                row.update({key: int(fields[key]) for key in ("pid", "start", "gen", "seq", "deadline")})
+                if kind == "H6_READY":
+                    row["t"] = int(fields["t"])
+                    out["controls"].append(row)
+                else:
+                    row.update({key: int(fields[key]) for key in ("attempt", "t0", "t1", "idle")})
+                    row.update(command=fields["command"], rv=int(fields["rv"], 0))
+                    out["acks"].append(row)
         except (KeyError, ValueError):
             out["strange"].append(line[:120])
     return out
@@ -1226,7 +1237,7 @@ def normalize_inv_calls(batches):
     for batch in batches:
         if batch["fn"] == "C_GetFunctionList":
             continue
-        phase = f"{batch['phase']}:gen{batch['gen']}"
+        phase = inventory_phase_name(batch)
         for index in range(batch["n"]):
             calls.append({"kind": "call", "image": batch["gen"], "pid": batch["pid"],
                           "tid": batch["pid"], "fn": batch["fn"],
@@ -1234,6 +1245,11 @@ def normalize_inv_calls(batches):
                           "scope": "selected", "sess": 0,
                           "t0": batch["t0"], "t1": batch["t1"]})
     return calls
+
+
+def inventory_phase_name(batch):
+    prefix = f"{batch['cell']}:" if batch["phase"].startswith("h6-") else ""
+    return f"{prefix}{batch['phase']}:gen{batch['gen']}"
 
 
 def coverage_of(edge):
@@ -1290,7 +1306,8 @@ def mechanism_row_id(row):
 def ledger_s1_totals(batches, started_ns):
     """Per-(pid, gen, module) S1 ledger totals over in-capture phases.
 
-    Gen0 setup precedes the observer (same guard as counted_totals).
+    Legacy gen0 setup precedes the observer (same guard as counted_totals).
+    Opt-in h6-setup is independently ledgered after observer startup.
     Returns (mech_calls, mech_errors, op_completed, op_failed, op_calls,
     entered) keyed by (pid, gen, module[, mech]); op totals assume the
     H6 workload shape (single-shot, Init-before-op, no competing Inits).
@@ -1330,6 +1347,8 @@ def ledger_s1_totals(batches, started_ns):
 
 
 def _evaluate_inventory_h6(doc, ledgers, receipt):
+    if receipt.get("inventory_control"):
+        return evaluate_controlled_inventory_h6(doc, ledgers, receipt)
     errors = stop_errors(receipt)
     if receipt.get("backend_refused"):
         return {"pass": False, "status": "negative", "cell": receipt.get("cell"),
@@ -1498,6 +1517,11 @@ def _evaluate_inventory_h6(doc, ledgers, receipt):
                     measured_gens.add(int(phase.split(":gen")[1]))
                 except ValueError:
                     pass
+        measured_batches = [batch for batch in all_batches
+                            if inventory_phase_name(batch) in
+                            receipt.get("measured", {}).get("phases", [])]
+        measured_s1 = ledger_s1_totals(measured_batches, start)
+        measured_keys = set(measured_s1[5])
         for edge in doc.get("edges", []):
             if edge.get("caller") not in owned_ids:
                 continue
@@ -1561,6 +1585,14 @@ def _evaluate_inventory_h6(doc, ledgers, receipt):
                 s1["failed_total"] += failed
                 if not measured_gens or gen in measured_gens:
                     s1["measured_completed"] += completed
+                if key in measured_keys:
+                    if min(completed, measured_s1[2].get(key, 0)) < 10:
+                        errors.append(f"pid {pid} gen {gen}: S1 measured image completes "
+                                      "fewer than 10 successful operations")
+                    if not any(batch["bad"] > 0 for batch in measured_batches
+                               if (batch["pid"], batch["gen"], batch["module"]) == key):
+                        errors.append(f"pid {pid} gen {gen}: measured image lacks a "
+                                      "separate ledgered failed return")
         if s1["withheld"] and not s1["matched"]:
             errors.append("S1 withheld for every owned edge although a manifest attests the leg")
         if s1["measured_completed"] < 10:
@@ -1663,10 +1695,242 @@ def evaluate_inventory_h6(doc, ledgers, receipt):
     """Judge one H6 inventory leg. Never raises on evidence input."""
     try:
         return _evaluate_inventory_h6(doc, ledgers, receipt)
-    except (KeyError, TypeError, ValueError, IndexError) as error:
+    except (KeyError, TypeError, ValueError, IndexError, SetupError) as error:
         return {"pass": False, "status": "fail", "cell": receipt.get("cell"),
                 "leg": receipt.get("leg"),
                 "errors": [f"invalid independent evidence: {error}"]}
+
+
+def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
+    """Fixed per-birth/caller/incarnation/module/instance measured exactness."""
+    control = receipt["inventory_control"]
+    records = control["final_records"]
+    errors, by_sequence = [], {}
+    last_time = 0
+    emitted = Counter()
+    for seq, record in enumerate(records):
+        if (record.get("schema") != "p11scope/inventory-events/v1" or record.get("seq") != seq
+                or type(record.get("at_ns")) is not int or record["at_ns"] < last_time
+                or record.get("kind") in ("rotated", "retention_evicted")):
+            raise SetupError("Inventory final stream changed schema, sequence or retained history")
+        last_time = record["at_ns"]
+        by_sequence[seq] = record
+        field = {"edge_observed": "edge_events", "instance_observed": "instance_events",
+                 "semantic_edge_observed": "semantic_edge_events"}.get(record["kind"])
+        if field:
+            emitted[field] += 1
+        elif record["kind"] in ("pass_committed", "ended"):
+            for field in ("edge_events", "instance_events", "semantic_edge_events"):
+                if type(record["event"].get(field)) is not int or record["event"][field] != emitted[field]:
+                    errors.append(f"Inventory {field} emitter accounting differs from the actual records")
+            if record["kind"] == "pass_committed":
+                for field in ("edge_events_deferred", "instance_events_deferred", "semantic_edge_events_deferred"):
+                    if type(record["event"].get(field)) is not int or record["event"][field] < 0:
+                        errors.append(f"Inventory {field} accounting is unavailable")
+            emitted.clear()
+    if not records or records[0]["kind"] != "started" or records[-1]["kind"] != "ended":
+        raise SetupError("Inventory final stream lacks its original start or exact end")
+    ending = records[-1]["event"]
+    for key in ("edges_unretained", "instances_unretained", "semantic_edges_unretained"):
+        if type(ending.get(key)) is not int or ending[key] != 0:
+            errors.append(f"Inventory final {key} prevents exact JSON/JSONL parity")
+    latest = {"edge_observed": {}, "instance_observed": {}, "semantic_edge_observed": {}}
+    for record in records:
+        if record["kind"] in latest:
+            row = record["event"]
+            key = (row["caller"], row["module"]) if record["kind"] == "edge_observed" else (
+                row["id"] if record["kind"] == "instance_observed" else row["instance"])
+            latest[record["kind"]][key] = row
+    for kind, field in (("edge_observed", "edges"), ("instance_observed", "instances"),
+                         ("semantic_edge_observed", "semantic_edges")):
+        expected = {}
+        for row in doc.get(field, []):
+            key = (row["caller"], row["module"]) if field == "edges" else (
+                row["id"] if field == "instances" else row["instance"])
+            expected[key] = row
+        if set(expected) != set(latest[kind]) or any(
+                {key: latest[kind][ident].get(key) for key in row} != row
+                for ident, row in expected.items() if ident in latest[kind]):
+            errors.append(f"Inventory exact final JSON/JSONL {field} parity differs")
+    measurements, summaries = control["measurements"], []
+    all_batches = [row for parsed in ledgers.values() for row in parsed["batches"]]
+    if receipt.get("scope_kind") == "cgroup":
+        intervals = receipt.get("scope_intervals", [])
+        for row in all_batches:
+            if (row["fn"] == "C_GetFunctionList" or row["t0"] >= receipt["observer_stopped_ns"]
+                    or row["t1"] < receipt["observer_started_ns"]):
+                continue
+            if not any(interval["pid"] == row["pid"] and interval["membership"] == "selected"
+                       and interval["t0"] <= row["t0"] <= row["t1"] <= interval["t1"]
+                       for interval in intervals):
+                errors.append("Inventory outside-scope ledger work entered the controlled scoped population")
+                break
+    adjusted = {key: dict(value) for key, value in receipt["expected_edges"].items()}
+    expected_tuples, measured_completed, measured_failed = set(), 0, 0
+    for measurement in measurements:
+        proof, marker = measurement["proof"], measurement["marker"]
+        image, provider, admission = proof["image"], proof["provider"], proof["admission"]
+        owner = SimpleNamespace(pid=image["pid"], identity={"start_time": image["start_time"]})
+        gen = admission["incarnation"]
+        label = f"pid {owner.pid} gen {gen}"
+        key = (owner.pid, gen, provider["path"])
+        population = [row for row in all_batches if (row["pid"], row["gen"], row["module"]) == key]
+        ids = [row for parsed in ledgers.values() for row in parsed["idents"]
+               if row["pid"] == owner.pid and row["gen"] == gen]
+        if len(ids) != 1 or ids[0]["start"] != image["start_time"] or ids[0]["exe"] != image["path"]:
+            errors.append(f"{label}: proof differs from original ledger birth/executable")
+        if not (1 <= proof["attempts"] == len(proof["markers"]) <= proof["max_attempts"] == 20
+                and proof["started_ns"] <= proof["observed_ns"] <= proof["deadline_ns"]
+                and 0 < proof["deadline_ns"] - proof["started_ns"] <= 90_000_000_000):
+            errors.append(f"{label}: readiness attempts or original recovery age are invalid")
+        for number, warm in enumerate(proof["markers"], 1):
+            ack = warm["ack"]
+            actual = [row for parsed in ledgers.values() for row in parsed["acks"] if row == ack]
+            if (len(actual) != 1 or ack["attempt"] != number or ack["gen"] != gen
+                    or ack["command"] != "W" or ack["idle"] != 1
+                    or not proof["started_ns"] <= ack["t0"] <= ack["t1"] <= proof["observed_ns"]):
+                errors.append(f"{label}: real warmup attempt/idle acknowledgment differs")
+        warm = proof["markers"][-1]
+        prefix = [row for row in population if row["t1"] <= warm["ack"]["t1"]]
+        baseline_record = proof["baseline"]["pass"]
+        baseline = inventory_boundary([row for row in records if row["seq"] <= baseline_record["seq"]],
+            owner, image, provider, admission, max(proof["cursor"]["seq"], admission["seq"]),
+            warm, prefix)
+        if baseline is None or baseline != proof["baseline"]:
+            errors.append(f"{label}: fresh same-observer physical/instance/S1 baseline is unresolved")
+            continue
+        for field in ("physical", "instance", "semantic", "pass"):
+            raw = baseline[field]
+            if by_sequence.get(raw["seq"]) != raw:
+                errors.append(f"{label}: readiness borrowed another observer's {field} row")
+        matching_provider = next((name for name, pin in receipt["providers"].items() if pin == provider), None)
+        if matching_provider is None:
+            errors.append(f"{label}: provider proof differs from held-FD calibration")
+        else:
+            edge_key = f"{owner.pid}:{gen}:{matching_provider}"
+            if edge_key not in adjusted:
+                errors.append(f"{label}: required physical edge is absent")
+            else:
+                adjusted[edge_key]["count"] -= baseline["early"]["physical_missed"]
+        ack = marker["ack"]
+        matching_ack = [row for parsed in ledgers.values() for row in parsed["acks"] if row == ack]
+        if (len(matching_ack) != 1 or ack["command"] != "M" or ack["gen"] != gen
+                or ack["rv"] != 0xc0 or ack["idle"] != 1
+                or not proof["observed_ns"] <= marker["dispatch_ns"] <= ack["t0"] <= ack["t1"]
+                < ack["deadline"] <= receipt["observer_stopped_ns"] + 180_000_000_000):
+            errors.append(f"{label}: measurement before proof or invalid fixed-phase acknowledgment")
+        fixed = [row for row in population if row["phase"] in ("h6-measured", "h6-failed")]
+        if fixed != marker["batches"] or any(not ack["t0"] <= row["t0"] <= row["t1"] <= ack["t1"]
+                                             for row in fixed):
+            errors.append(f"{label}: fixed measured ledger differs from its actual phase")
+        wanted = ledger_s1_totals(fixed, 0)
+        if wanted[2].get(key, 0) < 10:
+            errors.append(f"{label}: S1 measured image completes fewer than 10 successful operations")
+        if not any(row["fn"] == "C_Verify" and row["bad"] == 1 and row["n"] == 1
+                   and row["phase"] == "h6-failed" for row in fixed):
+            errors.append(f"{label}: separate ledgered CKR_SIGNATURE_INVALID return is missing")
+        end_record = measurement["end"]["pass"]
+        end = inventory_boundary([row for row in records if row["seq"] <= end_record["seq"]],
+            owner, image, provider, admission, baseline_record["seq"], marker,
+            [row for row in population if row["t1"] <= ack["t1"]], prior=baseline)
+        if end is None or end != measurement["end"]:
+            errors.append(f"{label}: measured end lacks a corresponding observed idle boundary")
+            continue
+        stable = (image["start_time"], proof["caller"], gen, proof["module"], proof["instance"])
+        if stable in expected_tuples or end["instance"]["event"]["id"] != proof["instance"]:
+            errors.append(f"{label}: measured instance duplicates or changes authority")
+        expected_tuples.add(stable)
+        before, after = baseline["counts"], end["counts"]
+        delta = {name: after[name] - before[name] for name in
+                 ("physical", "api", "calls", "completed", "failed", "unknown", "orphans", "dropped")}
+        desired = {"physical": wanted[5].get(key, 0), "api": wanted[5].get(key, 0),
+                   "calls": wanted[4].get(key, 0), "completed": wanted[2].get(key, 0),
+                   "failed": wanted[3].get(key, 0), "unknown": 0, "orphans": 0, "dropped": 0}
+        if delta != desired or delta["physical"] != 22:
+            errors.append(f"{label}: fixed physical/API/mechanism/operation delta disagrees with ledger")
+        mechanisms = set(before["mechanisms"]) | set(after["mechanisms"])
+        for mech in mechanisms:
+            prior, final = before["mechanisms"].get(mech, [0, 0]), after["mechanisms"].get(mech, [0, 0])
+            if [final[0] - prior[0], final[1] - prior[1]] != [
+                    wanted[0].get(key + (mech,), 0), wanted[1].get(key + (mech,), 0)]:
+                errors.append(f"{label} {mech}: fixed mechanism calls/errors disagree with ledger")
+        # The final sweep may retire the old instance or freeze the capture;
+        # neither may erase its historical positives or invent post-stop work.
+        tail = [row for row in population if ack["t1"] < row["t0"]
+                and row["t1"] <= receipt["observer_stopped_ns"]]
+        tail_totals = ledger_s1_totals(tail, 0)
+        final = latest["semantic_edge_observed"].get(proof["instance"])
+        final_instance = latest["instance_observed"].get(proof["instance"])
+        if (final is None or final_instance is None or final["caller"] != proof["caller"]
+                or final["module"] != proof["module"]):
+            errors.append(f"{label}: final historical semantic instance is missing")
+        else:
+            final_ops = final.get("operations") or {}
+            desired_final = {"api": after["api"] + tail_totals[5].get(key, 0),
+                "calls": after["calls"] + tail_totals[4].get(key, 0),
+                "completed": after["completed"] + tail_totals[2].get(key, 0),
+                "failed": after["failed"] + tail_totals[3].get(key, 0),
+                "unknown": after["unknown"], "orphans": after["orphans"], "dropped": after["dropped"]}
+            actual_final = {"api": (final.get("api_returns") or {}).get("count"),
+                            **{name: final_ops.get(name) for name in desired_final if name != "api"}}
+            if actual_final != desired_final:
+                errors.append(f"{label}: final historical API/operation totals changed after the measured boundary")
+            final_mechs = {mechanism_row_id(row): [row.get("calls"), row.get("errors")]
+                           for row in final.get("mechanisms") or []}
+            desired_mechs = {mech: [values[0] + tail_totals[0].get(key + (mech,), 0),
+                                    values[1] + tail_totals[1].get(key + (mech,), 0)]
+                             for mech, values in after["mechanisms"].items()}
+            if final_mechs != desired_mechs:
+                errors.append(f"{label}: final historical mechanism totals changed")
+            if final_instance["state"] != "observed" and not (
+                    final_instance["state"] == "retired" and final_instance.get("reason") in
+                    ("image_retired", "instance_retired", "capture_stopped")):
+                errors.append(f"{label}: final instance gained unexplained lost authority")
+        measured_completed += delta["completed"]
+        measured_failed += delta["failed"]
+        summaries.append({"tuple": list(stable), "early": baseline["early"], "measured": delta})
+    if not measurements or {row["proof"]["incarnation"] for row in measurements} != {0, 1}:
+        errors.append("Inventory required original/successor fixed measurements are missing")
+    if control.get("sibling"):
+        sibling = ledgers[control["sibling"]]["batches"]
+        if {stage["label"] for stage in control["stages"]} != {"exec", "recovery", "measurement"}:
+            errors.append("SystemMixed actual target stage population is incomplete")
+        for stage in control["stages"]:
+            for module in control["sibling_providers"]:
+                path = receipt["providers"][module]["path"]
+                if not any(row["module"] == path and row["phase"].startswith("h6-warm")
+                           and row["n"] > 0 and row["t0"] < stage["t1"] and row["t1"] > stage["t0"]
+                           for row in sibling):
+                    errors.append(f"SystemMixed sibling {module} lacks real calls during {stage['label']}")
+    # Reuse the legacy physical/schema/scope/backend/cleanup judge on its
+    # physical projection; the actual S1 facts are independently judged above.
+    physical_doc = {**doc, "instances": [], "semantic_edges": [], "edges": [
+        {**row, "semantics": None, "mechanisms": None, "operations": None} for row in doc.get("edges", [])]}
+    physical_receipt = {**receipt, "s1_expected": False, "expected_edges": adjusted}
+    physical_receipt.pop("inventory_control")
+    physical_receipt["allowed_gap_subjects"] = sorted(set(receipt.get("allowed_gap_subjects", [])) | {
+        gap["event"]["subject"] for summary in summaries for gap in summary["early"]["gaps"]})
+    result = _evaluate_inventory_h6(physical_doc, ledgers, physical_receipt)
+    post_stop = sum(row["n"] for row in all_batches if row["fn"] != "C_GetFunctionList"
+                    and row["t0"] >= receipt["observer_stopped_ns"])
+    if receipt.get("scope_kind") == "cgroup":
+        # Membership sampling ended at stop. Later controlled teardown is a
+        # separately ledgered post-stop population, with no scoped count claim.
+        result["out_of_scope_calls"] -= max(0, post_stop - result["post_stop_calls"])
+        result["post_stop_calls"] = post_stop
+    errors.extend(result["errors"])
+    count_only = {module["id"] for module in doc.get("modules", []) if any(
+        receipt["providers"][name]["path"] in module.get("paths", [])
+        for name in receipt.get("count_only_providers", []))}
+    for row in doc.get("edges", []) + doc.get("semantic_edges", []):
+        if row.get("module") in count_only and (row.get("mechanisms") is not None
+                or row.get("operations") is not None or not str(row.get("semantics", "unknown")).startswith("unknown")):
+            errors.append("SystemMixed count-only provider publishes semantic positives")
+    result.update({"pass": not errors, "status": "pass" if not errors else "fail", "errors": errors,
+        "completed_operations": measured_completed, "s1": {"measured_completed": measured_completed,
+            "measured_failed": measured_failed, "stable_instances": summaries,
+            "instances": len(doc.get("instances", [])), "semantic_edges": len(doc.get("semantic_edges", []))}})
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2670,12 +2934,106 @@ def stop_caller(caller, stdout, image, timeout=10):
 def spawn_ledger(owners, readers, leg_dir, argv, env, uid, gid, tag):
     """Spawn an inventory-ledger cell; returns (owned, stdout, stderr)."""
     owned = spawn_owned(
-        owners, argv, uid, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        owners, argv, uid, stdin=subprocess.PIPE if "--h6-control" in argv else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, env=env, user=uid, group=gid,
         extra_groups=[], start_new_session=True)
     stdout = owned_reader(readers, Reader, owned.popen.stdout, Path(leg_dir) / f"{tag}.out")
     stderr = owned_reader(readers, Reader, owned.popen.stderr, Path(leg_dir) / f"{tag}.err")
     return owned, stdout, stderr
+
+
+def inventory_phase_deadline(phase, image=0):
+    enter_phase(phase, image if phase == "successor-recovery" else 0)
+    if budget := ACTIVE_LEG.get():
+        return min(budget.phase_deadline_ns, budget.deadline_ns)
+    return wait_deadline({"setup": 330, "successor-recovery": 90,
+                          "fixed-measurement": 180, "normal-stop": 30, "cleanup": 5}[phase])
+
+
+def inventory_control_args():
+    setup = inventory_phase_deadline("setup")
+    budget = ACTIVE_LEG.get()
+    leg = budget.deadline_ns if budget else setup + 365_000_000_000
+    return ["--h6-control", "--h6-deadline", str(setup), "--h6-leg-deadline", str(leg)]
+
+
+class InventoryController:
+    """Generation-bound commands to an owned, independently ledgered child."""
+    def __init__(self, owner, reader, executable):
+        self.owner, self.reader, self.executable = owner, reader, executable
+        self.image, self.sequence, self.attempts = 0, 0, 0
+        self.batch_cursor = 0
+
+    def ledger(self):
+        parsed = parse_inv_ledger("".join(self.reader.lines))
+        if parsed["strange"] or parsed["unflushed"] or any(
+                row["status"] != "ok" for row in parsed["dones"]):
+            raise SetupError("H6 controlled child has invalid or failed ledger records")
+        return parsed
+
+    def verify(self):
+        self.executable.verify()
+        return self.executable.image_receipt({"image": self.image}, self.owner)
+
+    def ready(self, deadline, *, image=None, executable=None):
+        if image is not None:
+            self.image, self.sequence, self.attempts = image, 0, 0
+            self.executable = executable
+        self.reader.wait(lambda _r: any(row["gen"] == self.image
+                         for row in self.ledger()["controls"]), remaining_until(deadline))
+        rows = [row for row in self.ledger()["controls"] if row["gen"] == self.image]
+        actual = self.verify()
+        if len(rows) != 1 or any(rows[0][key] != value for key, value in {
+                "pid": self.owner.pid, "start": actual["start_time"], "exe": actual["path"],
+                "seq": 0}.items()) or not 0 < rows[0]["t"] < rows[0]["deadline"]:
+            raise SetupError("H6 ready acknowledgment differs from the owned image")
+        remaining_until(deadline)
+        return rows[0]
+
+    def dispatch(self, command, deadline, attempt=0, *, proof_deadline=None):
+        remaining_until(deadline)
+        actual = self.verify()
+        if proof_deadline is not None:
+            remaining_until(proof_deadline)
+        remaining_until(deadline)
+        lower = monotonic_ns()
+        self.sequence += 1
+        self.owner.popen.stdin.write(
+            f"{command} {self.image} {self.sequence} {lower} {deadline} {attempt}\n")
+        self.owner.popen.stdin.flush()
+        return {"command": command, "deadline": deadline, "attempt": attempt,
+                "lower": lower, "image": actual}
+
+    def complete(self, pending):
+        command, deadline, attempt, lower, actual = (pending[key] for key in
+            ("command", "deadline", "attempt", "lower", "image"))
+        self.reader.wait(lambda _r: any(row["gen"] == self.image and row["seq"] == self.sequence
+                         for row in self.ledger()["acks"]), remaining_until(deadline))
+        parsed = self.ledger()
+        rows = [row for row in parsed["acks"] if row["gen"] == self.image and row["seq"] == self.sequence]
+        want = {"command": command, "pid": self.owner.pid, "start": actual["start_time"],
+                "gen": self.image, "exe": actual["path"], "attempt": attempt,
+                "deadline": deadline, "idle": 1, "rv": 0xc0 if command == "M" else 0}
+        if len(rows) != 1 or any(rows[0][key] != value for key, value in want.items()) or not (
+                lower <= rows[0]["t0"] <= rows[0]["t1"] < deadline):
+            raise SetupError("H6 command acknowledgment differs from its bounded dispatch")
+        batches = parsed["batches"][self.batch_cursor:]
+        self.batch_cursor = len(parsed["batches"])
+        if any(row["gen"] != self.image or row["pid"] != self.owner.pid
+               or row["start"] != actual["start_time"] or row["exe"] != actual["path"]
+               or not rows[0]["t0"] <= row["t0"] <= row["t1"] <= rows[0]["t1"] for row in batches):
+            raise SetupError("H6 phase ledger escaped its command/image bounds")
+        remaining_until(deadline)
+        if command == "W":
+            self.attempts = attempt
+        return {"ack": rows[0], "batches": batches, "dispatch_ns": lower}
+
+    def command(self, command, deadline, attempt=0, *, proof_deadline=None):
+        return self.complete(self.dispatch(command, deadline, attempt, proof_deadline=proof_deadline))
+
+    def warm(self, attempt, deadline):
+        return self.command("W", deadline, attempt)
 
 
 def wait_usage_armed(jsonl_path, wants, timeout=90):
@@ -3928,6 +4286,7 @@ class R5AdmissionCursor:
             self.retired_incarnation = admitted["incarnation"]
             self.retired_subject = admitted["subject"]
             self.original_image, self.completed_pass = image, committed
+            self.saved_gaps = [record for record in records if record["kind"] == "gap_recorded"]
         except BaseException:
             self.close()
             raise
@@ -3943,11 +4302,12 @@ class R5AdmissionCursor:
             raise SetupError("R5 admission stream truncated observed history")
         return held.st_size
 
-    def read(self, deadline=None):
+    def read(self, deadline=None, *, final=False, full=False):
         check_r5_work(deadline)
         size = self.verify_stream()  # before any data allocation
-        parse_start = getattr(self, "saved_bytes", 0)
-        seq, last_time = getattr(self, "seq", -1) + 1, getattr(self, "at_ns", 0)
+        parse_start = 0 if full else getattr(self, "saved_bytes", 0)
+        seq = 0 if full else getattr(self, "seq", -1) + 1
+        last_time = 0 if full else getattr(self, "at_ns", 0)
         records, pending = [], bytearray()
         digest, prefix_digest = hashlib.sha256(), hashlib.sha256()
         offset, complete_bytes = 0, parse_start
@@ -3986,8 +4346,11 @@ class R5AdmissionCursor:
                     raise SetupError("R5 admission stream has unknown schema or invalid sequence/envelope")
                 if (seq == 0 and record["kind"] != "started") or (seq and record["kind"] == "started"):
                     raise SetupError("R5 admission stream is not the original observer run")
-                if record["kind"] in ("rotated", "retention_evicted", "ended"):
+                if record["kind"] in ("rotated", "retention_evicted") or (
+                        record["kind"] == "ended" and not final):
                     raise SetupError("R5 admission stream rotated, evicted history or ended")
+                if records and records[-1]["kind"] == "ended":
+                    raise SetupError("R5 admission stream continued after ended")
                 last_time = record["at_ns"]
                 records.append(record)
                 seq += 1
@@ -4114,6 +4477,251 @@ def wait_r5_successor_admitted(jsonl_path, owner, executable, cursor, *, not_bef
             remaining_until(deadline)
             return {**admitted, "completed_pass": committed}
         pause_until(deadline, 0.2)
+
+
+def inventory_early_gaps(records, owner, caller, module):
+    """Only finite, physically joined evidence can explain an early deficit."""
+    return [record for record in records if record["kind"] == "gap_recorded"
+            and record["event"].get("module") == module
+            and (record["event"].get("caller") == caller
+                 or record["event"].get("pid") == owner.pid)
+            and record["event"].get("reason") in (
+                "use_before_admission", "before_admission", "before_semantic_boundary",
+                "retired_before_coverage", "instance_unproven", "provider_instance_unproven")]
+
+
+def inventory_semantic_totals(row):
+    api, ops = row.get("api_returns") or {}, row.get("operations") or {}
+    fields = {"api": api.get("count"), **{key: ops.get(key) for key in
+              ("calls", "completed", "failed", "unknown", "orphans", "dropped")}}
+    if any(type(value) is not int or value < 0 for value in fields.values()):
+        return None
+    if fields["calls"] > fields["api"] or fields["completed"] + fields["failed"] > fields["api"]:
+        return None
+    if api.get("saturated") or api.get("historical_only_returns", 0) != 0 or (
+            row.get("coverage") or {}).get("lossy") or row.get("semantics") != "observed":
+        return None
+    mechanisms = {}
+    for mech in row.get("mechanisms") or []:
+        key = mechanism_row_id(mech)
+        values = mech.get("calls"), mech.get("errors")
+        if key in mechanisms or any(type(value) is not int or value < 0 for value in values):
+            raise SetupError("Inventory S1 mechanism counters are duplicate or invalid")
+        mechanisms[key] = list(values)
+    if not mechanisms:
+        return None
+    return {**fields, "mechanisms": mechanisms}
+
+
+def inventory_early_phase_populations(batches, expected, physical, api):
+    result = {}
+    for label, predicate in (("setup", lambda phase: phase == "h6-setup"),
+                              ("warmup", lambda phase: phase.startswith("h6-warm"))):
+        population = [row for row in batches if predicate(row["phase"]) and row["fn"] != "C_GetFunctionList"]
+        count = sum(row["n"] for row in population)
+        result[label] = {"phases": sorted({row["phase"] for row in population}), "expected": count,
+            "observed_physical": count if physical == expected else None,
+            "observed_api": count if api == expected else None,
+            "missed_physical": 0 if physical == expected else None,
+            "missed_api": 0 if api == expected else None,
+            "physical_phase_attribution_unknown": 0 if physical == expected else count,
+            "api_phase_attribution_unknown": 0 if api == expected else count}
+    return result
+
+
+def inventory_boundary(records, owner, image, provider, admission, floor, marker, prefix_batches,
+                       *, exact=False, deadline=None, prior=None):
+    """Derive a complete idle boundary from the actual same-observer records.
+
+    Physical and instance rows are cumulative replacements. A pass without a
+    changed physical row cannot refresh a stale bucket. Coalesced rows may
+    complete in later passes; none are accepted until their actual marker and
+    the emitter's deferred accounting settle.
+    """
+    physical, instances, semantics, settled = None, {}, {}, None
+    if prior:
+        row = prior["instance"]
+        instances[row["event"]["id"]] = row
+    ack = marker["ack"]
+    selected = admission["caller"]
+    emitted = Counter()
+    for record in records:
+        check_r5_work(deadline)
+        event, kind = record["event"], record["kind"]
+        if record["seq"] <= floor:
+            continue
+        emission = {"edge_observed": "edge_events", "instance_observed": "instance_events",
+                    "semantic_edge_observed": "semantic_edge_events"}.get(kind)
+        if emission:
+            emitted[emission] += 1
+        if kind == "caller_event" and event.get("event") != "admitted" and (
+                event.get("caller") == selected or event.get("old") == selected):
+            raise SetupError("Inventory selected caller retired before its idle boundary")
+        if kind == "edge_observed" and event.get("caller") == selected:
+            caller = r5_caller_context(event, owner, image)
+            if caller["incarnation"] != admission["incarnation"]:
+                raise SetupError("Inventory physical proof changed caller incarnation")
+            module = r5_admitted_subject(event, "module")
+            mapping = provider["mapping"]
+            if (module.get("status") != "observed" or module.get("id") != event.get("module")
+                    or any(type(module.get(key)) is not int for key in ("device_major", "device_minor", "inode"))
+                    or [module.get("device_major"), module.get("device_minor")] != mapping["dev"]
+                    or module.get("inode") != mapping["ino"]):
+                continue  # a sibling module, pathname or equal digest is no proof
+            if physical and physical["event"]["module"] != event["module"]:
+                raise SetupError("Inventory held provider acquired ambiguous module IDs")
+            physical, settled = record, None
+        elif kind == "instance_observed" and event.get("caller") == selected:
+            instances[event.get("id")] = record
+            settled = None
+        elif kind == "semantic_edge_observed" and event.get("caller") == selected:
+            semantics[event.get("instance")] = record
+            settled = None
+        elif kind == "pass_committed":
+            completion = r5_pass_receipt(record)
+            deferred = [event.get(key) for key in ("edge_events_deferred", "instance_events_deferred",
+                                                   "semantic_edge_events_deferred")]
+            written = [event.get(key) for key in ("edge_events", "instance_events", "semantic_edge_events")]
+            if any(type(value) is not int or value < 0 for value in deferred + written):
+                raise SetupError("Inventory pass lacks explicit bounded emitter accounting")
+            if any(event[key] < emitted[key] for key in (
+                    "edge_events", "instance_events", "semantic_edge_events")):
+                raise SetupError("Inventory pass accounting omits actual emitted proof rows")
+            emitted.clear()
+            if physical is not None and not any(deferred) and completion["pass"] > admission["completed_pass"]["pass"]:
+                settled = record
+    if physical is None or settled is None:
+        return None
+    edge = physical["event"]
+    entries = edge.get("entries") or {}
+    if ((edge.get("mapping") or {}).get("state") != "mapped"
+            or coverage_of(edge).get("state") != "counted" or coverage_of(edge).get("lossy")
+            or type(entries.get("count")) is not int or entries["count"] <= 0
+            or entries.get("saturated")):
+        return None
+    candidates = [row for row in instances.values() if row["event"].get("module") == edge["module"]]
+    if len(candidates) != 1:
+        return None  # physical totals cannot be divided among instance rows
+    instance = candidates[0]
+    if instance["event"].get("state") != "observed" or instance["event"].get("reason") is not None:
+        raise SetupError("Inventory S1 instance is retired or uncertain")
+    semantic = semantics.get(instance["event"]["id"])
+    if semantic is None or semantic["event"].get("module") != edge["module"]:
+        return None
+    counts = inventory_semantic_totals(semantic["event"])
+    if counts is None or counts["api"] <= 0 or counts["completed"] <= 0:
+        return None
+    if any(row["seq"] >= settled["seq"] for row in (physical, instance, semantic)):
+        return None
+    key = (owner.pid, admission["incarnation"], provider["path"])
+    totals = ledger_s1_totals(prefix_batches, 0)
+    expected = totals[5].get(key, 0)
+    warm = [row for row in marker["batches"] if row["fn"] != "C_GetFunctionList"
+            and row["phase"].startswith("h6-warm")]
+    if not warm and ack["command"] == "W":
+        raise SetupError("Inventory warmup acknowledgment lacks independently ledgered real work")
+    finish = [row["t1"] for row in marker["batches"]
+              if row["fn"] in S1_DIRECT_FNS | S1_FINISH_FNS]
+    last_call = max(finish, default=ack["t0"])
+    observed_last = (semantic["event"].get("operations") or {}).get("last_seen_ns")
+    if (physical["at_ns"] < last_call or semantic["at_ns"] < last_call or settled["at_ns"] < ack["t1"]
+            or type(observed_last) is not int or not last_call <= observed_last <= settled["at_ns"]
+            or entries["count"] > expected or counts["api"] > expected
+            or counts["completed"] > totals[2].get(key, 0)
+            or counts["failed"] > totals[3].get(key, 0)):
+        return None
+    for mech, values in counts["mechanisms"].items():
+        if values[0] > totals[0].get(key + (mech,), 0) or values[1] > totals[1].get(key + (mech,), 0):
+            return None
+    if entries["count"] < expected or counts["api"] < expected:
+        gaps = inventory_early_gaps(records, owner, selected, edge["module"])
+        if (exact or not gaps or type(entries.get("last_seen_ns")) is not int
+                or entries["last_seen_ns"] < last_call or entries["count"] < sum(row["n"] for row in warm)):
+            return None
+    else:
+        gaps = []
+    if ack["command"] == "W":
+        marker_totals = ledger_s1_totals(warm, 0)
+        if counts["completed"] < marker_totals[2].get(key, 0):
+            return None
+    return {"physical": physical, "instance": instance, "semantic": semantic, "pass": settled,
+            "counts": {"physical": entries["count"], **counts},
+            "early": {"physical_expected": expected, "physical_observed": entries["count"],
+                      "physical_missed": expected - entries["count"], "api_expected": expected,
+                      "api_observed": counts["api"], "api_missed": expected - counts["api"],
+                      "unknown": counts["unknown"], "gaps": gaps,
+                      "populations": inventory_early_phase_populations(prefix_batches, expected,
+                                                                        entries["count"], counts["api"])}}
+
+
+def wait_inventory_s1_ready(owner, executable, provider_pin, admission, cursor, attempt, deadline,
+                            *, prefix_batches=(), prefix_markers=()):
+    """Release measurement only on fresh held-provider/instance/S1 proof."""
+    if owner is not cursor.owner or owner.identity != cursor.birth_identity:
+        raise SetupError("Inventory readiness changed the original owned birth or observer cursor")
+    remaining_until(deadline)
+    started = prefix_markers[0]["ack"]["t0"] if prefix_markers else monotonic_ns()
+    provider = provider_receipt(provider_pin)
+    prefix, markers = list(prefix_batches), list(prefix_markers)
+    for number in range(len(markers) + 1, 21):
+        remaining_until(deadline)
+        executable.verify()
+        image = executable.image_receipt({"image": admission["incarnation"]}, owner)
+        marker = attempt(number, deadline)
+        ack = marker["ack"]
+        if (ack.get("command") != "W" or ack.get("attempt") != number
+                or ack.get("gen") != admission["incarnation"] or ack.get("idle") != 1
+                or not started <= ack["t0"] <= ack["t1"] < deadline):
+            raise SetupError("Inventory readiness has a stale or unbounded real warmup attempt")
+        markers.append(marker)
+        prefix.extend(marker["batches"])
+        # Observe while this caller is acknowledged idle. A redraw read later
+        # cannot replace a missing count/semantic marker or completing pass.
+        observation_end = min(deadline, monotonic_ns() + 1_000_000_000)
+        while True:
+            records, complete = cursor.read(deadline)
+            boundary = inventory_boundary(cursor.saved_gaps + records, owner, image, provider,
+                admission, max(cursor.seq, admission["seq"]), marker, prefix, deadline=deadline)
+            if complete and boundary is not None:
+                remaining_until(deadline)
+                executable.verify()
+                executable.image_receipt({"image": admission["incarnation"]}, owner)
+                if provider_receipt(provider_pin) != provider:
+                    raise SetupError("Inventory held provider custody changed during readiness")
+                remaining_until(deadline)
+                return {"caller": admission["caller"], "incarnation": admission["incarnation"],
+                    "module": boundary["physical"]["event"]["module"],
+                    "instance": boundary["instance"]["event"]["id"], "image": image,
+                    "provider": provider, "admission": admission, "cursor": cursor.receipt(),
+                    "started_ns": started, "observed_ns": monotonic_ns(), "deadline_ns": deadline,
+                    "attempts": number, "max_attempts": 20, "markers": markers,
+                    "baseline": boundary}
+            if monotonic_ns() >= observation_end:
+                break
+            pause_until(observation_end, 0.05)
+    raise SetupError("Inventory provider/instance/S1 readiness exhausted 20 bounded real attempts")
+
+
+def wait_inventory_measured_boundary(owner, executable, provider_pin, admission, cursor,
+                                     proof, marker, prefix_batches, deadline):
+    provider = proof["provider"]
+    while True:
+        remaining_until(deadline)
+        image = executable.image_receipt({"image": admission["incarnation"]}, owner)
+        records, complete = cursor.read(deadline)
+        boundary = inventory_boundary(cursor.saved_gaps + records, owner, image, provider, admission,
+            proof["baseline"]["pass"]["seq"], marker, prefix_batches, deadline=deadline,
+            prior=proof["baseline"])
+        if complete and boundary is not None:
+            if boundary["instance"]["event"]["id"] != proof["instance"]:
+                raise SetupError("Inventory measured phase changed its authorized instance")
+            remaining_until(deadline)
+            executable.verify()
+            if provider_receipt(provider_pin) != provider:
+                raise SetupError("Inventory measured provider custody changed")
+            remaining_until(deadline)
+            return boundary
+        pause_until(deadline, 0.05)
 
 
 def wait_passes(jsonl_path, count, timeout=120):
@@ -4324,7 +4932,7 @@ def provider_entry(path):
 
 def phase_window(batches, phases):
     """Ledger [t0, t1] span and entered total over named phases."""
-    picked = [batch for batch in batches if f"{batch['phase']}:gen{batch['gen']}"
+    picked = [batch for batch in batches if inventory_phase_name(batch)
               in phases or batch["phase"] in phases]
     total = sum(batch["n"] for batch in picked
                 if batch["fn"] != "C_GetFunctionList")
@@ -4334,18 +4942,20 @@ def phase_window(batches, phases):
             max(batch["t1"] for batch in picked), total)
 
 
-def counted_totals(batches, started_ns):
+def counted_totals(batches, started_ns, stopped_ns=None):
     """Per-(pid, gen, module) entered totals over in-capture phases only.
 
     Generation 0 runs setup before READY, which strictly precedes the
     observer spawn by harness construction; the guard below proves it from
     the ledger clock, so main+teardown is the independent gen0 expectation.
-    Later generations run entirely inside the capture (the exec freeze
-    holds gen1 until its admission is observed), so all their phases count.
+    Opt-in h6-setup is counted after observer startup. Controlled teardown
+    after stopped_ns stays post-stop work; the legacy setup guard is unchanged.
     """
     totals: Counter = Counter()
     for batch in batches:
         if batch["fn"] == "C_GetFunctionList":
+            continue
+        if stopped_ns is not None and batch["t0"] >= stopped_ns:
             continue
         if batch["gen"] == 0 and batch["phase"] == "setup":
             if batch["t1"] >= started_ns:
@@ -4356,9 +4966,118 @@ def counted_totals(batches, started_ns):
     return totals
 
 
+def wait_inventory_original_checkpoint(ctx, path, owner, executable, deadline):
+    while True:
+        remaining_until(deadline)
+        try:
+            return r5_admission_checkpoint(ctx, path, owner, executable)
+        except SetupError as error:
+            if str(error) != "R5 original caller lacks complete same-stream admission/pass":
+                raise
+        pause_until(deadline, 0.05)
+
+
+def release_inventory_measurement(controller, provider, proof, deadline, *, pending=False):
+    remaining_until(proof["deadline_ns"])
+    if provider_receipt(provider) != proof["provider"]:
+        raise SetupError("Inventory held provider custody changed before measurement")
+    remaining_until(proof["deadline_ns"])
+    command = controller.dispatch("M", deadline, proof_deadline=proof["deadline_ns"])
+    return command if pending else controller.complete(command)
+
+
+def inventory_target_phases(ctx, log_path, target, original_executable, successor_executable,
+                            provider, *, outside=None, sub=None, moves=None,
+                            sibling=None):
+    """The shared real R5/SystemMixed gate, with independent sibling batches."""
+    moves = moves if moves is not None else []
+    proofs, measured, stages = [], [], []
+    recovery0 = inventory_phase_deadline("successor-recovery", 0)
+    budget = ACTIVE_LEG.get()
+    sibling_deadline = (budget.deadline_ns if budget else wait_deadline(815)) if sibling else None
+    if sibling:
+        sibling.warm(1, sibling_deadline)
+    first = target.warm(1, recovery0)
+    initial_cursor = wait_inventory_original_checkpoint(ctx, log_path, target.owner,
+                                                        original_executable, recovery0)
+    initial_admission = {"caller": initial_cursor.retired_caller,
+        "incarnation": initial_cursor.retired_incarnation, "seq": initial_cursor.seq,
+        "completed_pass": initial_cursor.completed_pass}
+    initial = wait_inventory_s1_ready(target.owner, original_executable, provider,
+        initial_admission, initial_cursor, target.warm, recovery0,
+        prefix_batches=first["batches"], prefix_markers=[first])
+    proofs.append(initial)
+    fixed_deadline = inventory_phase_deadline("fixed-measurement")
+    first_measurement = release_inventory_measurement(target, provider, initial, fixed_deadline)
+    end0 = wait_inventory_measured_boundary(target.owner, original_executable, provider,
+        initial_admission, initial_cursor, initial, first_measurement,
+        target.ledger()["batches"], fixed_deadline)
+    measured.append({"proof": initial, "marker": first_measurement, "end": end0})
+    # Teardown finishes inside selected membership, while the original image
+    # is still authorized. No provider call may occur in the outside interval.
+    target.command("T", fixed_deadline)
+    checkpoint = r5_admission_checkpoint(ctx, log_path, target.owner, original_executable)
+    checkpoint_receipt = checkpoint.receipt()
+    if outside:
+        move_and_verify(outside, target.owner, moves, "X-exit-for-exec")
+        t_out = moves[-1]["t"]
+    else:
+        t_out = None
+    recovery = inventory_phase_deadline("successor-recovery", 1)
+    exec_start = monotonic_ns()
+    target.command("X", recovery)
+    exec_stop = wait_exec_stop(target.owner.pid)
+    successor_executable.verify()
+    stopped_image = successor_executable.image_receipt({"image": 1}, target.owner)
+    if sub:
+        move_and_verify(sub, target.owner, moves, "X-descendant-reentry")
+        t_in = moves[-1]["t"]
+    else:
+        t_in = exec_stop
+    successor_executable.verify()
+    successor_executable.image_receipt({"image": 1}, target.owner)
+    if sibling:
+        sibling.warm(2, sibling_deadline)
+    ptrace_continue(target.owner.pid)
+    resumed = monotonic_ns()
+    stages.append({"label": "exec", "t0": exec_start, "t1": resumed})
+    if sibling:
+        sibling.warm(3, sibling_deadline)
+    target.ready(recovery, image=1, executable=successor_executable)
+    admission = wait_r5_successor_admitted(log_path, target.owner, successor_executable, checkpoint,
+        not_before_ns=t_in, timeout=remaining_until(recovery))
+    proof = wait_inventory_s1_ready(target.owner, successor_executable, provider, admission,
+        checkpoint, target.warm, recovery)
+    proofs.append(proof)
+    stages.append({"label": "recovery", "t0": resumed, "t1": proof["observed_ns"]})
+    fixed_deadline = inventory_phase_deadline("fixed-measurement")
+    measurement_start = monotonic_ns()
+    pending = release_inventory_measurement(target, provider, proof, fixed_deadline, pending=True)
+    if sibling:
+        sibling.warm(4, sibling_deadline)
+    measurement = target.complete(pending)
+    end1 = wait_inventory_measured_boundary(target.owner, successor_executable, provider,
+        admission, checkpoint, proof, measurement,
+        [row for row in target.ledger()["batches"] if row["gen"] == 1], fixed_deadline)
+    measured.append({"proof": proof, "marker": measurement, "end": end1})
+    stages.append({"label": "measurement", "t0": measurement_start, "t1": monotonic_ns()})
+    return {"proofs": proofs, "measurements": measured, "stages": stages,
+        "cursor": checkpoint, "outside_ns": t_out, "reentry_ns": t_in,
+        "freeze": {"exec_stop_ns": exec_stop, "stopped_image": stopped_image,
+            "checkpoint": checkpoint_receipt, "reentry_ns": t_in, "resumed_ns": resumed,
+            "admitted": admission}}
+
+
+def inventory_final_records(cursor, deadline):
+    records, complete = cursor.read(deadline, full=True, final=True)
+    if not complete or not records or records[-1]["kind"] != "ended":
+        raise SetupError("Inventory stop lacks its complete same-observer ended record")
+    return records
+
+
 @owned_leg(inventory=True)
 def run_cgroup_inventory_r5(ctx, cell_dir, backend):
-    """R5: re-enter while exec-stopped, then prove fresh successor admission."""
+    """R5: stopped re-entry, fresh admission/provider/S1, fixed measurements."""
     leg_dir = Path(cell_dir) / backend / "inventory"
     (leg_dir / "workload").mkdir(mode=0o755, parents=True, exist_ok=True)
     env = init_token(leg_dir / "workload", ctx.args.uid, ctx.args.gid, "h6-r5")
@@ -4378,12 +5097,11 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
     selected, _ = create_tracked(ctx, root.path / "selected")
     outside, _ = create_tracked(ctx, root.path / "outside")
     sub, _ = create_tracked(ctx, selected.path / "sub")
-    gate_x = leg_dir / "gate-X"
     gate_s = leg_dir / "gate-S0"
     owned_x, out_x, err_x = spawn_ledger(
         ctx.owners, ctx.readers, leg_dir,
         [str(ledger_bin), "exec-chain", "--cell", "RX", "--module", str(provider.path),
-         "--iters", "2", "--gate", str(gate_x), "--delay-ms", "2000",
+         "--iters", "2", *inventory_control_args(),
          "--sleep-us", "50000", "--hold", "--chain", f"leader:{ledger2}"],
         env, ctx.args.uid, ctx.args.gid, "RX")
     owned_s, out_s, err_s = spawn_ledger(
@@ -4391,7 +5109,8 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
         [str(ledger_bin), "map", "--cell", "RS0", "--module", str(provider.path),
          "--gate", str(gate_s), "--hold"],
         env, ctx.args.uid, ctx.args.gid, "RS0")
-    wait_ledger_line(out_x, "READY ", timeout=60)
+    control_x = InventoryController(owned_x, out_x, original_executable)
+    control_x.ready(inventory_phase_deadline("setup"))
     wait_ledger_line(out_s, "READY ", timeout=60)
     moves = []
     x_pid = owned_x.pid
@@ -4414,47 +5133,30 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
         write_json(leg_dir / "result.json", result)
         return result
     wait_passes(log_path, 2)
-    enter_phase("fixed-measurement")
-    check_dispatch()
-    gate_x.touch()
     gate_s.touch()
-    out_x.wait(lambda r: any(line.startswith("DONE ") and " gen=0 " in line
-                             for line in r.lines), 120)
-    checkpoint = r5_admission_checkpoint(ctx, log_path, owned_x, original_executable)
-    checkpoint_receipt = checkpoint.receipt()
-    t_out = monotonic_ns()
-    move_and_verify(outside, owned_x, moves, "X-exit-for-exec")
-    exec_stop_ns = wait_exec_stop(x_pid)
-    successor_executable.verify()
-    stopped_image = successor_executable.image_receipt({"image": 1}, owned_x)
-    move_and_verify(sub, owned_x, moves, "X-descendant-reentry")
-    t_in = moves[-1]["t"]
-    successor_executable.verify()
-    successor_executable.image_receipt({"image": 1}, owned_x)
-    ptrace_continue(x_pid)
-    resumed_ns = monotonic_ns()
-    admitted = wait_r5_successor_admitted(log_path, owned_x, successor_executable, checkpoint,
-                                         not_before_ns=t_in)
-    enter_phase("fixed-measurement")
-    out_x.wait(lambda r: any(line.startswith("DONE ") and " gen=1 " in line
-                             for line in r.lines), 180)
+    control = inventory_target_phases(ctx, log_path, control_x, original_executable,
+        successor_executable, provider, outside=outside, sub=sub, moves=moves)
     out_s.wait(lambda r: any(line.startswith("DONE ") for line in r.lines), 60)
-    settled = wait_passes(log_path, wait_passes(log_path, 1) + 2)
     obs_rc, stopped, latency = stop_inventory(owned)
     enter_phase("cleanup")
     ptrace_detach(x_pid, ctx)
-    owned_x.popen.send_signal(signal.SIGINT)
+    cleanup_deadline = inventory_phase_deadline("cleanup")
+    final_records = inventory_final_records(control["cursor"], cleanup_deadline)
+    control_x.command("T", cleanup_deadline)
+    control_x.command("F", cleanup_deadline)
     owned_s.popen.send_signal(signal.SIGINT)
     x_rc = wait_process(owned_x.popen, 15)
     s_rc = wait_process(owned_s.popen, 15)
     finish_readers([out_x, err_x, out_s, err_s, capture, errors])
     ledgers = {"RX": parse_inv_ledger("".join(out_x.lines)),
                "RS0": parse_inv_ledger("".join(out_s.lines))}
-    totals = counted_totals(ledgers["RX"]["batches"], started)
+    totals = counted_totals(ledgers["RX"]["batches"], started, stopped)
     m_t0, m_t1, m_n = phase_window(
-        ledgers["RX"]["batches"], ["setup:gen1", "main:gen1", "teardown:gen1"])
-    w_t0, w_t1, w_n = phase_window(
-        ledgers["RX"]["batches"], ["main:gen0", "teardown:gen0"])
+        ledgers["RX"]["batches"], ["RX:h6-measured:gen1", "RX:h6-failed:gen1"])
+    warm_phases = sorted({inventory_phase_name(row) for row in ledgers["RX"]["batches"]
+        if row["t1"] < m_t0 and row["fn"] != "C_GetFunctionList"})
+    w_t0, w_t1, w_n = phase_window(ledgers["RX"]["batches"], warm_phases)
+    t_out, t_in = control["outside_ns"], control["reentry_ns"]
     key0 = (x_pid, 0, str(provider.path))
     key1 = (x_pid, 1, str(provider.path))
     receipt = {
@@ -4470,7 +5172,7 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
         "observer_stopped_ns": stopped, "observer_rc": obs_rc,
         **stop_receipt(owned, latency, INVENTORY_STOP_SECONDS),
         "manual_rebind": False, "s1_expected": True,
-        "providers": {"A": provider_entry(provider.path)},
+        "providers": {"A": provider_receipt(provider)},
         "expected_incarnations": {
             str(x_pid): {"gens": {
                 "0": {"exe": str(ledger_bin), "retired": True},
@@ -4483,19 +5185,18 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
             f"{s_pid}:0:A": {"zero_ok": True}},
         "measured": {"label": "post-reentry successor", "t0": m_t0, "t1": m_t1,
                      "expected_calls": m_n,
-                     "phases": ["setup:gen1", "main:gen1", "teardown:gen1"]},
+                     "phases": ["RX:h6-measured:gen1", "RX:h6-failed:gen1"]},
         "warmup": {"label": "pre-exec generation", "t0": w_t0, "t1": w_t1,
-                   "expected_calls": w_n, "phases": ["main:gen0", "teardown:gen0"]},
+                   "expected_calls": w_n, "phases": warm_phases},
         "allowed_gap_subjects": ["exact image authority unavailable",
                                  "native capture scope custody unproven",
                                  "used by an unidentified caller image"],
         "cell_endings": {"RX": {"how": "exited" if x_rc == 0 else "signaled", "rc": x_rc},
                          "RS0": {"how": "exited" if s_rc == 0 else "signaled", "rc": s_rc}},
         "requested_backend": backend,
-        "freeze": {"exec_stop_ns": exec_stop_ns, "stopped_image": stopped_image,
-                   "checkpoint": checkpoint_receipt, "reentry_ns": t_in,
-                   "resumed_ns": resumed_ns, "admitted": admitted,
-                   "settled_passes": settled},
+        "freeze": control["freeze"],
+        "inventory_control": {"proofs": control["proofs"], "measurements": control["measurements"],
+            "stages": control["stages"], "final_records": final_records},
     }
     doc = json.loads(doc_path.read_text())
     result = evaluate_inventory_h6(doc, ledgers, receipt)
@@ -4508,11 +5209,10 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
 def run_system_mixed(ctx, cell_dir, backend):
     """system-mixed: execing + sibling same-file callers, attested + count-only.
 
-    XE exec-chains on the attested provider A (frozen until the successor's
-    admission is observed); XS runs continuously on A and on the unattested
-    copy B (count-only: physical counts, no semantic rows); XF's provider
-    file is deleted after READY, so its producer proof is foreign and the
-    host must refuse it while the valid siblings stay exact.
+    MX exec-chains on attested A, idling before provider loading until W.
+    MS performs independently ledgered A/B batches through exec, recovery and
+    measurement; B stays count-only. MF's provider file is deleted after
+    READY, so its producer proof is foreign while valid siblings stay exact.
     """
     leg_dir = Path(cell_dir) / backend / "inventory"
     (leg_dir / "workload").mkdir(mode=0o755, parents=True, exist_ok=True)
@@ -4520,33 +5220,34 @@ def run_system_mixed(ctx, cell_dir, backend):
     ledger_bin = leg_dir / "ledger"
     shutil.copyfile(ctx.pins["ledger"].path, ledger_bin)
     ledger_bin.chmod(0o755)
+    original_executable = leg_pin(ctx, ledger_bin)
     ledger2 = leg_dir / "ledger2"
     shutil.copyfile(ctx.pins["ledger"].path, ledger2)
     ledger2.chmod(0o755)
+    successor_executable = leg_pin(ctx, ledger2)
     provider_a = ctx.provider_pin
     provider_b = leg_dir / "provider-B.so"
     shutil.copyfile(provider_a.path, provider_b)
     provider_b.chmod(0o755)
+    provider_b_pin = leg_pin(ctx, provider_b)
     provider_f = leg_dir / "provider-F.so"
     shutil.copyfile(provider_a.path, provider_f)
     provider_f.chmod(0o755)
     manifest_path = leg_dir / "manifest-A.json"
     build_manifest(ctx.discover_pin, provider_a.path, manifest_path, env,
                    ctx.args.uid, ctx.args.gid)
-    gate_e = leg_dir / "gate-E"
-    gate_s = leg_dir / "gate-S"
     gate_f = leg_dir / "gate-F"
     # XE and XS spawn from the same file: independent same-file callers.
     owned_e, out_e, err_e = spawn_ledger(
         ctx.owners, ctx.readers, leg_dir,
         [str(ledger_bin), "exec-chain", "--cell", "MX", "--module", str(provider_a.path),
-         "--iters", "2", "--gate", str(gate_e), "--delay-ms", "2000",
+         "--iters", "2", *inventory_control_args(),
          "--sleep-us", "50000", "--hold", "--chain", f"leader:{ledger2}"],
         env, ctx.args.uid, ctx.args.gid, "MX")
     owned_s, out_s, err_s = spawn_ledger(
         ctx.owners, ctx.readers, leg_dir,
         [str(ledger_bin), "mech", "--cell", "MS", "--module", str(provider_a.path),
-         "--module", str(provider_b), "--iters", "3", "--gate", str(gate_s),
+         "--module", str(provider_b), "--iters", "3", *inventory_control_args(),
          "--sleep-us", "100000", "--hold"],
         env, ctx.args.uid, ctx.args.gid, "MS")
     owned_f, out_f, err_f = spawn_ledger(
@@ -4554,8 +5255,10 @@ def run_system_mixed(ctx, cell_dir, backend):
         [str(ledger_bin), "mech", "--cell", "MF", "--module", str(provider_f),
          "--iters", "1", "--gate", str(gate_f), "--hold"],
         env, ctx.args.uid, ctx.args.gid, "MF")
-    wait_ledger_line(out_e, "READY ", timeout=60)
-    wait_ledger_line(out_s, "READY ", timeout=60)
+    control_e = InventoryController(owned_e, out_e, original_executable)
+    control_s = InventoryController(owned_s, out_s, original_executable)
+    control_e.ready(inventory_phase_deadline("setup"))
+    control_s.ready(inventory_phase_deadline("setup"))
     wait_ledger_line(out_f, "READY ", timeout=60)
     e_pid, s_pid, f_pid = owned_e.pid, owned_s.pid, owned_f.pid
     provider_f.unlink()
@@ -4575,27 +5278,20 @@ def run_system_mixed(ctx, cell_dir, backend):
         write_json(leg_dir / "result.json", result)
         return result
     wait_passes(log_path, 2)
-    enter_phase("fixed-measurement")
-    check_dispatch()
-    gate_e.touch()
-    gate_s.touch()
     gate_f.touch()
-    out_e.wait(lambda r: any(line.startswith("DONE ") and " gen=0 " in line
-                             for line in r.lines), 120)
-    exec_stop_ns = wait_exec_stop(e_pid)
-    admitted = wait_caller_admitted(log_path, e_pid, str(ledger2))
-    enter_phase("fixed-measurement")
-    ptrace_continue(e_pid)
-    out_e.wait(lambda r: any(line.startswith("DONE ") and " gen=1 " in line
-                             for line in r.lines), 180)
-    out_s.wait(lambda r: any(line.startswith("DONE ") for line in r.lines), 180)
+    control = inventory_target_phases(ctx, log_path, control_e, original_executable,
+        successor_executable, provider_a, sibling=control_s)
     out_f.wait(lambda r: any(line.startswith("DONE ") for line in r.lines), 120)
-    settled = wait_passes(log_path, wait_passes(log_path, 1) + 2)
     obs_rc, stopped, latency = stop_inventory(owned)
     enter_phase("cleanup")
     ptrace_detach(e_pid, ctx)
-    for owned_p in (owned_e, owned_s, owned_f):
-        owned_p.popen.send_signal(signal.SIGINT)
+    cleanup_deadline = inventory_phase_deadline("cleanup")
+    final_records = inventory_final_records(control["cursor"], cleanup_deadline)
+    control_e.command("T", cleanup_deadline)
+    control_e.command("F", cleanup_deadline)
+    control_s.command("T", cleanup_deadline)
+    control_s.command("F", cleanup_deadline)
+    owned_f.popen.send_signal(signal.SIGINT)
     e_rc = wait_process(owned_e.popen, 15)
     s_rc = wait_process(owned_s.popen, 15)
     f_rc = wait_process(owned_f.popen, 15)
@@ -4603,12 +5299,13 @@ def run_system_mixed(ctx, cell_dir, backend):
     ledgers = {"MX": parse_inv_ledger("".join(out_e.lines)),
                "MS": parse_inv_ledger("".join(out_s.lines)),
                "MF": parse_inv_ledger("".join(out_f.lines))}
-    totals_e = counted_totals(ledgers["MX"]["batches"], started)
-    totals_s = counted_totals(ledgers["MS"]["batches"], started)
+    totals_e = counted_totals(ledgers["MX"]["batches"], started, stopped)
+    totals_s = counted_totals(ledgers["MS"]["batches"], started, stopped)
     m_t0, m_t1, m_n = phase_window(
-        ledgers["MX"]["batches"], ["setup:gen1", "main:gen1", "teardown:gen1"])
-    w_t0, w_t1, w_n = phase_window(
-        ledgers["MX"]["batches"], ["main:gen0", "teardown:gen0"])
+        ledgers["MX"]["batches"], ["MX:h6-measured:gen1", "MX:h6-failed:gen1"])
+    warm_phases = sorted({inventory_phase_name(row) for row in ledgers["MX"]["batches"]
+        if row["t1"] < m_t0 and row["fn"] != "C_GetFunctionList"})
+    w_t0, w_t1, w_n = phase_window(ledgers["MX"]["batches"], warm_phases)
     a_path, b_path = str(provider_a.path), str(provider_b)
     receipt = {
         "cell": "system-mixed", "leg": f"inventory/{backend}", "scope_kind": "system",
@@ -4618,8 +5315,8 @@ def run_system_mixed(ctx, cell_dir, backend):
         "observer_stopped_ns": stopped, "observer_rc": obs_rc,
         **stop_receipt(owned, latency, INVENTORY_STOP_SECONDS),
         "manual_rebind": False, "s1_expected": True,
-        "providers": {"A": provider_entry(provider_a.path),
-                      "B": provider_entry(provider_b)},
+        "providers": {"A": provider_receipt(provider_a),
+                      "B": provider_receipt(provider_b_pin)},
         "count_only_providers": ["B"],
         "expected_incarnations": {
             str(e_pid): {"gens": {
@@ -4642,9 +5339,9 @@ def run_system_mixed(ctx, cell_dir, backend):
                              "count": totals_s.get((s_pid, 0, b_path), -1)}},
         "measured": {"label": "exec successor", "t0": m_t0, "t1": m_t1,
                      "expected_calls": m_n,
-                     "phases": ["setup:gen1", "main:gen1", "teardown:gen1"]},
+                     "phases": ["MX:h6-measured:gen1", "MX:h6-failed:gen1"]},
         "warmup": {"label": "pre-exec generation", "t0": w_t0, "t1": w_t1,
-                   "expected_calls": w_n, "phases": ["main:gen0", "teardown:gen0"]},
+                   "expected_calls": w_n, "phases": warm_phases},
         "allow_path_gaps": True,
         "allowed_gap_subjects": ["exact image authority unavailable",
                                  "native capture scope custody unproven",
@@ -4653,8 +5350,10 @@ def run_system_mixed(ctx, cell_dir, backend):
                          "MS": {"how": "exited" if s_rc == 0 else "signaled", "rc": s_rc},
                          "MF": {"how": "exited" if f_rc == 0 else "signaled", "rc": f_rc}},
         "requested_backend": backend,
-        "freeze": {"exec_stop_ns": exec_stop_ns, "admitted": admitted,
-                   "settled_passes": settled},
+        "freeze": control["freeze"],
+        "inventory_control": {"proofs": control["proofs"], "measurements": control["measurements"],
+            "stages": control["stages"], "sibling": "MS", "sibling_providers": ["A", "B"],
+            "final_records": final_records},
     }
     doc = json.loads(doc_path.read_text())
     result = evaluate_inventory_h6(doc, ledgers, receipt)

@@ -513,11 +513,12 @@ class DetailedFixtureTest(unittest.TestCase):
             if result.returncode:
                 raise AssertionError(result.stderr)
 
-    def child(self, after=True, warm=False, failed=False, deadlines=None, short=False, delay_ms=0):
+    def child(self, after=True, warm=False, failed=False, deadlines=None, short=False,
+              delay_ms=0, before_name="before"):
         provider = str(self.directory / "provider.so")
         suffix = "-short" if short else ""
         argv = ([str(self.directory / ("after" + suffix)), provider, str(os.getpid()), "43"] if after
-                else [str(self.directory / ("before" + suffix)), provider, str(self.directory / "after"),
+                else [str(self.directory / (before_name + suffix)), provider, str(self.directory / "after"),
                       str(self.directory / "absent"), str(os.getpid()), "43", "1" if failed else "0"])
         if warm or deadlines:
             argv += ["17", str(delay_ms), "1" if warm else "0"]
@@ -605,10 +606,10 @@ class DetailedFixtureTest(unittest.TestCase):
         send("F")
         self.assertEqual(proc.wait(timeout=2), 0)
 
-    def deadline_args(self, hold_ms=500, recovery_ms=500, setup_ms=500):
+    def deadline_args(self, hold_ms=500, recovery_ms=500, setup_ms=500, measurement_ms=500):
         now = time.monotonic_ns()
         return [now + 2_000_000_000, now + setup_ms * 1_000_000,
-                recovery_ms, 500, hold_ms]
+                recovery_ms, measurement_ms, hold_ms]
 
     def test_opt_in_initial_g_expires_at_absolute_setup_bound(self):
         proc, expect, _send = self.child(after=False, short=True, deadlines=self.deadline_args(setup_ms=150))
@@ -616,6 +617,65 @@ class DetailedFixtureTest(unittest.TestCase):
         time.sleep(0.08)
         self.assertIsNone(proc.poll(), "H6 G wait still used the independent legacy bound")
         self.assertEqual(proc.wait(timeout=1), 92)
+
+    def test_opt_in_pre_exec_x_wait_uses_recovery_phase_bound(self):
+        for failed in (False, True):
+            with self.subTest(failed=failed):
+                proc, expect, send = self.child(after=False, failed=failed,
+                    deadlines=self.deadline_args(recovery_ms=60, measurement_ms=60))
+                expect("READY")
+                send("G")
+                expect("THREAD")
+                expect("WORKER_DONE")
+                expect("EXEC_BODY")
+                try:
+                    status = proc.wait(timeout=0.18)
+                except subprocess.TimeoutExpired:
+                    self.fail("X wait survived 180 ms despite its 60 ms recovery limit (2 s leg)")
+                self.assertEqual(status, 92)
+
+    def test_opt_in_failed_exec_r_wait_uses_fixed_post_phase_bound(self):
+        proc, expect, send = self.child(after=False, failed=True,
+            deadlines=self.deadline_args(recovery_ms=60, measurement_ms=60))
+        expect("READY")
+        send("G")
+        thread = expect("THREAD")
+        expect("WORKER_DONE")
+        expect("EXEC_BODY")
+        send("X")
+        failed = expect("EXEC_FAILED")
+        self.assertEqual(failed[1:3], thread[1:3])
+        try:
+            status = proc.wait(timeout=0.18)
+        except subprocess.TimeoutExpired:
+            self.fail("failed-exec R wait survived 180 ms despite 60 ms recovery and measurement limits (2 s leg)")
+        self.assertEqual(status, 92)
+
+    def test_opt_in_failed_post_deadline_survives_actual_return_before_remaining_calls(self):
+        # Advance only the driver's clock after the real matched RV5. A reset
+        # after return would grant another 60 ms and permit the remaining calls.
+        source = (ROOT / "tests/fixtures/detailed-nonleader-exec.c").read_text()
+        source = source.replace("static unsigned long clock_ns(void) {",
+            "static unsigned long clock_shift_ns;\nstatic unsigned long clock_ns(void) {")
+        source = source.replace("return (unsigned long)now.tv_sec * 1000000000UL",
+            "return clock_shift_ns + (unsigned long)now.tv_sec * 1000000000UL")
+        source = source.replace("    ++errors;\n", "    clock_shift_ns = 200000000UL;\n    ++errors;\n", 1)
+        result = subprocess.run(["cc", *H6["B_CFLAGS"], "-x", "c", "-", "-ldl",
+                                 "-o", str(self.directory / "before-clock")],
+                                input=source, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        proc, expect, send = self.child(after=False, failed=True, before_name="before-clock",
+            deadlines=self.deadline_args(recovery_ms=60, measurement_ms=60))
+        expect("READY")
+        send("G")
+        expect("THREAD")
+        expect("WORKER_DONE")
+        expect("EXEC_BODY")
+        send("X")
+        expect("EXEC_FAILED")
+        send("RF")
+        self.assertEqual(proc.wait(timeout=1), 92,
+            "failed-post measurement renewed after the original matched return")
 
     def test_opt_in_terminal_hold_survives_delayed_stop_then_expires(self):
         for finish in (True, False):

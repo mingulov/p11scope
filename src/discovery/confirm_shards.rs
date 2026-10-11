@@ -13,8 +13,8 @@ use crate::discovery::sweep_attribution::{
     AttributionLoss, ConfirmIo, Confirmation, FD_RESOURCE_REASON, FdLease, IoResources,
     KnownKeyIndex, MappedIdentities, MemberProbe, PreparationKind, PreparedConfirmation,
     ReservationOwner, ReservedPin, SegmentPolicy, SweepAttribution, attribute_one, budget_refusal,
-    confirm_with_resources, finish_confirmation, idle_needs_promotion, lost_with,
-    preparation_kind, prepare_confirmation, proof_ranges, read_ranges_reserved,
+    confirm_with_resources, finish_confirmation, idle_needs_promotion, lost_with, preparation_kind,
+    prepare_confirmation, proof_ranges, read_ranges_reserved,
 };
 use crate::discovery::sweep_shards::{Transcript, record_read, replay_one};
 use p11scope_manifest::maps::{MapEntry, ObjectKey};
@@ -1201,9 +1201,9 @@ where
             let confirmation = match hook.as_deref_mut() {
                 Some(hook) => {
                     match prepare_confirmation(&mut io, *pid, &prove, budget, Some(&immediate)) {
-                        Ok(prepared) => {
-                            prove_and_finish_prepared(&mut io, *pid, prepared, hook, &immediate, budget)
-                        }
+                        Ok(prepared) => prove_and_finish_prepared(
+                            &mut io, *pid, prepared, hook, &immediate, budget,
+                        ),
                         Err(confirmation) => confirmation,
                     }
                 }
@@ -1366,13 +1366,9 @@ mod tests;
 /// the scripted hook and fd-backed pins stay with the driver fix.
 #[cfg(test)]
 mod kernel_promotion_tests {
-    use super::{
-        AcceptedKind, SegmentProof, attribute_unselected_with_segment_proof,
-    };
+    use super::{AcceptedKind, SegmentProof, attribute_unselected_with_segment_proof};
     use crate::discovery::caller_registry::ExeIdentity;
-    use crate::discovery::identity::{
-        ExaminedObject, FileIdentity, MappedFile, PinnedObjectId,
-    };
+    use crate::discovery::identity::{ExaminedObject, FileIdentity, MappedFile, PinnedObjectId};
     use crate::discovery::kernel_identity::{ProofDecision, RunFailure};
     use crate::discovery::scan::CaptureWorkBudget;
     use crate::discovery::sweep_attribution::{
@@ -1396,7 +1392,10 @@ mod kernel_promotion_tests {
     }
 
     fn vm_file(inode: u64) -> FileIdentity {
-        FileIdentity { dev: 37, ino: inode }
+        FileIdentity {
+            dev: 37,
+            ino: inode,
+        }
     }
 
     fn entry(start: u64, perms: &[u8; 4], inode: u64, path: &str) -> MapEntry {
@@ -1485,10 +1484,7 @@ mod kernel_promotion_tests {
     impl ConfirmIo for FakeIo {
         type Pin = Pin;
 
-        fn borrowed_pidfd<'a>(
-            &self,
-            pin: &'a Self::Pin,
-        ) -> Option<std::os::fd::BorrowedFd<'a>> {
+        fn borrowed_pidfd<'a>(&self, pin: &'a Self::Pin) -> Option<std::os::fd::BorrowedFd<'a>> {
             Some(pin.file.as_fd())
         }
 
@@ -1506,10 +1502,7 @@ mod kernel_promotion_tests {
 
         fn open(&mut self, pid: u32) -> Result<Pin, String> {
             let file = std::fs::File::open("/dev/null").map_err(|error| error.to_string())?;
-            self.opens
-                .lock()
-                .unwrap()
-                .push((pid, file.as_raw_fd()));
+            self.opens.lock().unwrap().push((pid, file.as_raw_fd()));
             Ok(Pin { file })
         }
 
@@ -1589,8 +1582,7 @@ mod kernel_promotion_tests {
                 call.pids.push(request.pid());
                 call.confirms
                     .push(matches!(request.kind(), AcceptedKind::Confirm));
-                call.pidfds
-                    .push(request.pidfd().map(|fd| fd.as_raw_fd()));
+                call.pidfds.push(request.pidfd().map(|fd| fd.as_raw_fd()));
             }
             self.calls.lock().unwrap().push(call);
             ProofDecision::Userspace(self.reason)
@@ -1641,7 +1633,11 @@ mod kernel_promotion_tests {
         // The promotion is a single charged Confirm borrowing the one
         // retained pin: exactly one open, and the batch borrows its fd.
         let opens = opens.lock().unwrap();
-        assert_eq!(opens.len(), 1, "the promotion opens one pin, never a reopen");
+        assert_eq!(
+            opens.len(),
+            1,
+            "the promotion opens one pin, never a reopen"
+        );
         assert_eq!(opens[0].0, PROMOTED);
         assert_eq!(calls[1].pids, [PROMOTED]);
         assert_eq!(calls[1].confirms, [true]);
@@ -1655,7 +1651,10 @@ mod kernel_promotion_tests {
         // original pin through the userspace fallback.
         assert!(calls[1].userspace);
         assert_eq!(
-            out.members.iter().map(|member| member.pid).collect::<Vec<_>>(),
+            out.members
+                .iter()
+                .map(|member| member.pid)
+                .collect::<Vec<_>>(),
             [PROMOTED],
             "the promoted member attributes through the disclosed fallback"
         );

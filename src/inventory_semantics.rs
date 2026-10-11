@@ -337,6 +337,18 @@ pub(crate) fn merge_stash_into_report(
     shed.saturating_add(report.merge_stashed_outcomes(stash.take_outcomes()))
 }
 
+/// The custody Arc H0 actually retained for a refresh report: the
+/// minted receipt's pin (adopted across a failed-bind retry), else the
+/// passed pin when the refresh minted nothing. Shared by the live
+/// refresh path and the retry test so both derive it identically.
+pub(crate) fn effective_refresh_custody(report: &TickReport, pin: Arc<PidPin>) -> Arc<PidPin> {
+    report
+        .current()
+        .first()
+        .map(|receipt| receipt.original_pin().clone())
+        .unwrap_or(pin)
+}
+
 /// The live lane: the owned Detailed `Session` (the sole retained EVENTS
 /// cursor, maps and links), its H0 `SemanticCapture` driver, the sealed
 /// attachment receipt, and the terminal ownership state. Counts only;
@@ -521,11 +533,26 @@ impl AttestedSemanticLane {
     /// The images are claims only; custody and attachment re-verify. The
     /// scan's receipts stash for the next tick batch, so a quiet
     /// provider's proof registers instead of dropping.
+    #[cfg(test)]
     pub(crate) fn refresh_candidate(
         &mut self,
         pin: Arc<PidPin>,
         slot: u32,
     ) -> Result<Vec<ImageIdentity>, SemanticRefusal> {
+        self.refresh_candidate_with_custody(pin, slot)
+            .map(|(images, _)| images)
+    }
+
+    /// The custody-preserving refresh behind [`refresh_candidate`](Self::refresh_candidate):
+    /// the same images plus the effective custody Arc H0 retained for
+    /// them. An accepted refresh after a failed bind adopts H0's retained
+    /// Arc instead of the fresh duplicate, so the stored binding must
+    /// share the returned Arc (H0's `ptr_eq` gates refuse any other).
+    pub(crate) fn refresh_candidate_with_custody(
+        &mut self,
+        pin: Arc<PidPin>,
+        slot: u32,
+    ) -> Result<(Vec<ImageIdentity>, Arc<PidPin>), SemanticRefusal> {
         let Some(live) = self.live.as_mut() else {
             return Err(SemanticRefusal::Unavailable);
         };
@@ -534,19 +561,17 @@ impl AttestedSemanticLane {
         }
         let mut report = live
             .capture
-            .refresh(&mut live.session, pin, slot)
+            .refresh(&mut live.session, pin.clone(), slot)
             .map_err(|_| SemanticRefusal::Unavailable)?;
         live.scan_refusals = live
             .scan_refusals
             .saturating_add(report.scan_refusals.len() as u64);
-        let images = report
-            .current()
-            .iter()
-            .map(|receipt| receipt.image())
-            .collect();
-        let shed = live.stashed_refresh.push_all(report.take_current(), report.take_outcomes());
+        // The minted receipt carries the Arc H0 actually retained
+        // (adopted across a failed-bind retry, else the passed pin).
+        let effective = effective_refresh_custody(&report, pin);
+        let (images, shed) = stash_refresh_report(&mut live.stashed_refresh, &mut report);
         live.scan_refusals = live.scan_refusals.saturating_add(shed);
-        Ok(images)
+        Ok((images, effective))
     }
 
     pub(crate) fn apply_physical_gaps(

@@ -1474,37 +1474,71 @@ fn bind_semantic_callers(
     let passes = coordinator.passes() as usize;
     let candidates_len = candidates.len();
     candidates.rotate_left(passes % candidates_len);
-    for (caller, pid) in candidates.into_iter().take(4) {
-        // Each candidate binds against ITS provider's module: a
-        // candidate no provider's module maps stays unbound, honestly
-        // without positives. The image hint is a claim only; the bind
-        // proof re-verifies everything.
-        let Some((slot, module)) = refresh_target_for_candidate(coordinator, lane, caller) else {
-            continue;
-        };
+    // Each candidate binds against ITS provider's module: a
+    // candidate no provider's module maps stays unbound, honestly
+    // without positives. Targets resolve before the refresh closure
+    // borrows the lane, so each pass still spends one of its four
+    // slots on an unresolvable candidate.
+    let targets: Vec<(CallerId, u32, u32, ModuleKey)> = candidates
+        .into_iter()
+        .take(4)
+        .filter_map(|(caller, pid)| {
+            refresh_target_for_candidate(coordinator, lane, caller)
+                .map(|(slot, module)| (caller, pid, slot, module))
+        })
+        .collect();
+    bind_semantic_candidates(coordinator, domain, identity, &targets, |pin, slot| {
+        lane.refresh_candidate_with_custody(pin, slot)
+    });
+}
+
+/// Refresh one pass's precomputed candidates and bind every accepted
+/// image through the coordinator proof. Each candidate duplicates its
+/// live pin fresh, but the stored binding shares the EFFECTIVE custody
+/// Arc the refresh reports: after an accepted-refresh/failed-bind pass,
+/// H0 retains the first pass's Arc and the retry adopts it, so binding
+/// the fresh duplicate would strand the caller behind H0's `ptr_eq`
+/// gate. The refresh seam substitutes only H0's I/O in tests; all
+/// decisions stay in this shared production loop.
+pub(crate) fn bind_semantic_candidates(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    domain: crate::attach::capture::NativeDomainId,
+    identity: &mut dyn NativeIdentity<PidPin>,
+    targets: &[(CallerId, u32, u32, ModuleKey)],
+    mut refresh: impl FnMut(
+        std::sync::Arc<PidPin>,
+        u32,
+    ) -> Result<
+        (Vec<ImageIdentity>, std::sync::Arc<PidPin>),
+        crate::inventory_semantics::SemanticRefusal,
+    >,
+) {
+    for (caller, pid, slot, module) in targets {
         let Some(pin) = coordinator
             .adapter()
-            .live_pin(pid)
+            .live_pin(*pid)
             .and_then(|(_, pin)| pin.try_clone().ok())
             .map(std::sync::Arc::new)
         else {
             continue;
         };
-        // One custody Arc through refresh and binding: H0 retains this
-        // exact Arc, so the stored binding must share it (H0's `ptr_eq`
-        // gates refuse any re-duplication).
-        let images = match lane.refresh_candidate(pin.clone(), slot) {
-            Ok(images) => images,
+        // One custody Arc through refresh and binding: H0 retains the
+        // effective Arc, so the stored binding must share it (H0's
+        // `ptr_eq` gates refuse any re-duplication).
+        let (images, effective) = match refresh(pin, *slot) {
+            Ok(report) => report,
             Err(_) => continue,
         };
         for image in images {
+            // The image hint is a claim only; the bind proof
+            // re-verifies everything.
             let _ = coordinator.bind_semantic_caller_with_pin(
-                caller,
+                *caller,
                 module.clone(),
                 domain,
                 image,
                 identity,
-                pin.clone(),
+                effective.clone(),
             );
         }
     }

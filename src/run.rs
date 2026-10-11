@@ -16768,6 +16768,127 @@ mod tests {
             );
         }
     }
+
+    /// The exact-N/N+1 twins through the production quiescence
+    /// callback: a real discovery drain over scripted records, the
+    /// production dequeue closure, and the production position probe
+    /// (`producer == consumer` proves empty). At the cap over an empty
+    /// drain the probe returns lossless without dequeuing; with one
+    /// record still queued it trips overflow and the record stays
+    /// unread, decoding back intact afterwards.
+    #[test]
+    fn quiescence_exact_n_probes_production_drain_positions() {
+        use crate::discovery::engine::DISCOVERY_HELD_CAP;
+        use crate::events::{
+            DiscoveryDrain, DiscoveryItem, ScriptedRecords, discovery_drain_positions,
+        };
+
+        fn record(pid: u32) -> p11scope_ebpf_common::DiscoveryRecord {
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.pid_tgid = (u64::from(pid)) << 32;
+            record
+        }
+        fn discovery_bytes(record: &p11scope_ebpf_common::DiscoveryRecord) -> Vec<u8> {
+            // SAFETY: the shared repr(C) record is transported as these
+            // exact raw bytes by the kernel ring buffer.
+            unsafe {
+                std::slice::from_raw_parts(
+                    (record as *const p11scope_ebpf_common::DiscoveryRecord).cast::<u8>(),
+                    size_of::<p11scope_ebpf_common::DiscoveryRecord>(),
+                )
+                .to_vec()
+            }
+        }
+        // One production quiescence poll: the overflow guard plus the
+        // shared helper with the production closures, verbatim.
+        fn poll(
+            drain: &mut DiscoveryDrain<ScriptedRecords>,
+            staged_records: &mut Vec<p11scope_ebpf_common::DiscoveryRecord>,
+            staged_malformed: &mut u64,
+            quiesce_cap: usize,
+            quiesce_overflow: &mut bool,
+        ) {
+            if *quiesce_overflow {
+                return;
+            }
+            stage_quiesced_discovery_items(
+                drain,
+                |drain| drain.dequeue(),
+                |drain| {
+                    let positions = discovery_drain_positions(drain);
+                    positions.producer == positions.consumer
+                },
+                staged_records,
+                staged_malformed,
+                quiesce_cap,
+                quiesce_overflow,
+            );
+        }
+
+        let engine = Engine::empty_for_test();
+        let quiesce_cap = DISCOVERY_HELD_CAP.saturating_sub(engine.discovery_held_len());
+        assert_eq!(quiesce_cap, 4_096);
+
+        // Exact-N over a proven-empty drain: lossless, and the probe
+        // dequeues nothing.
+        let (mut staged_records, mut staged_malformed) = split_staged_discovery(
+            (0..4_096u32)
+                .map(|pid| DiscoveryItem::Record(record(pid)))
+                .collect(),
+        );
+        let mut drain = DiscoveryDrain::over(ScriptedRecords::records([], 0));
+        let mut overflow = false;
+        poll(
+            &mut drain,
+            &mut staged_records,
+            &mut staged_malformed,
+            quiesce_cap,
+            &mut overflow,
+        );
+        assert_eq!(staged_records.len(), 4_096);
+        assert!(!overflow, "a proven-empty transport is lossless");
+        let positions = discovery_drain_positions(&drain);
+        assert_eq!(
+            (positions.producer, positions.consumer),
+            (0, 0),
+            "the probe dequeues nothing"
+        );
+
+        // N+1 over a drain with one record still queued: overflow trips
+        // and the record stays unread, decoding back intact afterwards.
+        let (mut staged_records, mut staged_malformed) = split_staged_discovery(
+            (0..4_096u32)
+                .map(|pid| DiscoveryItem::Record(record(pid)))
+                .collect(),
+        );
+        let mut queued = record(4_096);
+        queued.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+        let mut drain =
+            DiscoveryDrain::over(ScriptedRecords::records([discovery_bytes(&queued)], 1));
+        let mut overflow = false;
+        poll(
+            &mut drain,
+            &mut staged_records,
+            &mut staged_malformed,
+            quiesce_cap,
+            &mut overflow,
+        );
+        assert_eq!(staged_records.len(), 4_096);
+        assert!(overflow, "an unread record past the cap trips overflow");
+        let positions = discovery_drain_positions(&drain);
+        assert_eq!(
+            (positions.producer, positions.consumer),
+            (8, 0),
+            "the N+1 record stays unread"
+        );
+        let Some(DiscoveryItem::Record(back)) = drain.dequeue() else {
+            panic!("the queued record reads back as a record");
+        };
+        assert_eq!(
+            back.pid_tgid, queued.pid_tgid,
+            "the unread record decodes back intact"
+        );
+    }
 }
 
 #[cfg(test)]

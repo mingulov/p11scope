@@ -780,8 +780,9 @@ class InitialLoadFixtureTest(unittest.TestCase):
             children.append((owner, reader))
             self.assertFalse(str(self.provider) in Path(f"/proc/{owner.pid}/maps").read_text(),
                              "provider was already mapped before observer startup")
-            self.assertTrue(any(row["kind"] == "ack" and row["phase"] == "load-wait"
-                                for row in reader.records))
+            self.assertTrue(owner.held)
+            self.assertIn(owner, scope.traced)
+            self.assertFalse(reader.records, "the held caller has not entered main")
             self.assertFalse(any(row["kind"] in ("target", "call", "ready") for row in reader.records))
             events.append("observer-start")
             return SimpleNamespace(), SimpleNamespace(lines=[]), SimpleNamespace(lines=[]), time.monotonic_ns()
@@ -813,6 +814,12 @@ class InitialLoadFixtureTest(unittest.TestCase):
             self.assertEqual(options.pop("group"), os.getgid())
             self.assertEqual(options.pop("extra_groups"), [])
             return spawn_owned(owners, argv, uid, **options)
+        def initial_spawn(owners, argv, **options):
+            return H6["INITIAL_EXEC"]["_spawn_initial_exec"](
+                owners, argv, supplementary_groups=tuple(os.getgroups()), **options)
+        def initial_ready(owned, errors, backend, _caller, _proof, _argv):
+            at = ready(owned, errors, backend, allow_empty=True)
+            return {"active_loader_hooks": 1, "hook_ready_ns": at, "loop_ready_ns": at}
         trace_oracle, profile_oracle = H6["evaluate_trace_h6"], H6["evaluate_profile_h6"]
         def judge(*args):
             trace = isinstance(args[0], str)
@@ -823,6 +830,7 @@ class InitialLoadFixtureTest(unittest.TestCase):
             return {"pass": True}  # Controller-only route; no capture acceptance claimed.
         changes = {"init_token": lambda *_args: dict(self.env), "spawn_observer": observer,
                    "spawn_owned": spawn,
+                   "spawn_initial_exec": initial_spawn, "observer_initial_exec_ready": initial_ready,
                    "observer_ready": ready, "warm_caller": warm, "n3_command": calls,
                    "drain_trace_phase": drain, "stop_observer": lambda *_args: (0, time.monotonic_ns(), 0),
                    "finish_readers": lambda *_args: None,

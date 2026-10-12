@@ -1932,7 +1932,7 @@ class RecoveredStaticGapTest(unittest.TestCase):
                     data = self.inputs(mode)
                     change(data)
                     capture = data[0]["capture"] if data[0] is not None else None
-                    self.assertTrue(H6["_early_gap_errors"](data[4], 1, data[3], data[2], capture),
+                    self.assertTrue(H6["_early_gap_errors"](data[4], 1, data[3], data[2], capture, mode=mode),
                                     "recovered category accepted an invalid domain guard")
                     result = self.evaluate(mode, data)
                     self.assertFalse(result["pass"], result)
@@ -1969,6 +1969,34 @@ class RecoveredStaticGapTest(unittest.TestCase):
                 data[4]["skipped"].insert(0, {"name": "discovery subject",
                                              "reason": "static probe coverage gap incomplete"})
                 self.assertTrue(self.evaluate("trace", data)["pass"])
+
+    def test_evaluator_mode_cannot_be_replaced_by_a_different_receipt_route(self):
+        for mode in ("trace", "profile", "metrics"):
+            for receipt_mode in ("trace", "profile", "metrics"):
+                with self.subTest(evaluator=mode, receipt=receipt_mode):
+                    data = self.inputs(mode)
+                    receipt = data[3]
+                    receipt["leg"] = f"{receipt_mode}/singles"
+                    receipt["observer_argv"] = ["/held/p11scope", "trace" if receipt_mode == "trace" else "profile",
+                        "--pid", str(receipt["pid"]), "--module", receipt["provider_before"]["path"],
+                        "--attach-backend", "singles"]
+                    if receipt_mode != "trace":
+                        receipt["observer_argv"] += ["--mode", receipt_mode]
+                    if mode != "trace" and receipt_mode == "trace":
+                        data[0]["capture"]["modules"][0]["dev"] = [999, 999]
+                    result = self.evaluate(mode, data)
+                    self.assertIs(result["pass"], mode == receipt_mode, result)
+
+    def test_capture_presence_must_match_the_evaluator_mode(self):
+        trace = self.inputs("trace")
+        self.assertEqual(H6["_early_gap_errors"](trace[4], 1, trace[3], trace[2], mode="trace"), [])
+        self.assertTrue(H6["_early_gap_errors"](trace[4], 1, trace[3], trace[2], {}, mode="trace"))
+        for mode in ("profile", "metrics"):
+            with self.subTest(mode=mode):
+                data = self.inputs(mode)
+                self.assertTrue(H6["_early_gap_errors"](data[4], 1, data[3], data[2], mode=mode))
+                self.assertEqual(H6["_early_gap_errors"](
+                    data[4], 1, data[3], data[2], data[0]["capture"], mode=mode), [])
 
 
 class SuccessorGateTest(unittest.TestCase):
@@ -2502,7 +2530,7 @@ class BFailureStopTest(unittest.TestCase):
             ev = RecoveredStaticGapTest.inputs(self, "trace")[4]
             identity = {key: pin[key] for key in ("path", "dev", "ino", "sha256")}
             ev["discovery"] = [dict(identity, objects=[dict(identity)])]
-            self.assertEqual(H6["_early_gap_errors"](ev, 1, receipt, ledger), [])
+            self.assertEqual(H6["_early_gap_errors"](ev, 1, receipt, ledger, mode="trace"), [])
             return {"pass": True}
         self.assertTrue(self.route(fault="healthy", domain_provider=True, oracle_override=oracle)["pass"])
         self.assert_released()
@@ -2799,7 +2827,7 @@ class LegCleanupTest(unittest.TestCase):
             ev = RecoveredStaticGapTest.inputs(self, "trace")[4]
             identity = {key: pin[key] for key in ("path", "dev", "ino", "sha256")}
             ev["discovery"] = [dict(identity, objects=[dict(identity)])]
-            self.assertEqual(H6["_early_gap_errors"](ev, 1, receipt, ledger), [])
+            self.assertEqual(H6["_early_gap_errors"](ev, 1, receipt, ledger, mode="trace"), [])
             return {"pass": True}
         patch, _image_patch = self.patches(lambda *_args: time.monotonic_ns())
         directory = self.directory / "pid-domain"

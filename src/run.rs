@@ -4195,6 +4195,10 @@ pub(crate) fn capture_ready_line(attached_probes: usize) -> String {
     format!("p11scope: capturing: {attached_probes} probe(s) attached; stop with Ctrl-C")
 }
 
+fn loader_readiness_line(active_hooks: usize) -> String {
+    format!("p11scope: loader readiness: {active_hooks} active hook(s)")
+}
+
 /// The disclosure line, printed on stderr before the readiness line, when
 /// an `auto` session runs per-offset links instead of uprobe-multi
 /// (DR-CLASSIC-PID0): the reason is also `evidence.attach_backend.fallback`.
@@ -4651,6 +4655,7 @@ fn capture_profile(
         crate::first_use_probe::DiscoveryStage::BeforeLoop,
         session,
     );
+    let active_loader_hooks = engine.active_loader_hook_count(session);
     // Authoritative loop-start stamp (T2, G-14): the last clock read before
     // the first tick.
     scheduling.note_loop_start(crate::attach::monotonic_ns());
@@ -4658,6 +4663,7 @@ fn capture_profile(
     if let Some(line) = attach_fallback_line(session.backend_fallback()) {
         eprintln!("{line}");
     }
+    eprintln!("{}", loader_readiness_line(active_loader_hooks));
     eprintln!("{}", capture_ready_line(session.attached_probes()));
     #[cfg(test)]
     crate::first_use_probe::loop_started(&session.events_domain(), scheduling.loop_start_mono_ns);
@@ -5415,6 +5421,7 @@ fn capture_trace(
         ));
     }
     let clock = Instant::now();
+    let active_loader_hooks = engine.active_loader_hook_count(session);
     // Authoritative loop-start stamp (T2, G-14): the last clock read before
     // the first tick.
     scheduling.note_loop_start(crate::attach::monotonic_ns());
@@ -5422,6 +5429,7 @@ fn capture_trace(
     if let Some(line) = attach_fallback_line(session.backend_fallback()) {
         eprintln!("{line}");
     }
+    eprintln!("{}", loader_readiness_line(active_loader_hooks));
     eprintln!("{}", capture_ready_line(session.attached_probes()));
     #[rustfmt::skip]
     let loop_result = (|| -> Result<CaptureEnd> {
@@ -13498,6 +13506,22 @@ mod tests {
             capture_ready_line(136),
             "p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C"
         );
+        assert_eq!(
+            capture_ready_line(0),
+            "p11scope: capturing: 0 probe(s) attached; stop with Ctrl-C"
+        );
+    }
+
+    #[test]
+    fn loader_readiness_line_exposes_only_the_active_hook_count() {
+        for (count, expected) in [
+            (0, "p11scope: loader readiness: 0 active hook(s)"),
+            (1, "p11scope: loader readiness: 1 active hook(s)"),
+            (2, "p11scope: loader readiness: 2 active hook(s)"),
+            (256, "p11scope: loader readiness: 256 active hook(s)"),
+        ] {
+            assert_eq!(loader_readiness_line(count), expected);
+        }
     }
 
     #[test]

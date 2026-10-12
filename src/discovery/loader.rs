@@ -188,6 +188,20 @@ impl LoaderRegistry {
             .is_some_and(|context| context.state == LoaderContextState::Tombstoned)
     }
 
+    pub(crate) fn attached_contexts(
+        &self,
+    ) -> impl Iterator<Item = (LoaderContextId, &LoaderContext)> {
+        self.contexts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, context)| {
+                context
+                    .as_ref()
+                    .filter(|context| context.state == LoaderContextState::Attached)
+                    .map(|context| (LoaderContextId((index + 1) as u16), context))
+            })
+    }
+
     fn context_mut(&mut self, id: LoaderContextId) -> Result<&mut LoaderContext, String> {
         self.contexts
             .get_mut(usize::from(id.get().saturating_sub(1)))

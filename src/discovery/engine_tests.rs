@@ -4527,6 +4527,12 @@ fn loader_budget_refusals_keep_named_causes_and_fail_closed_cleanup() {
             .unwrap()
             .was_attached
     );
+    assert!(post_engine.views[0].still_the_same());
+    assert_eq!(
+        post_engine.active_loader_hook_count(&post_session),
+        0,
+        "a live view with a failed arm postcheck is not ready"
+    );
     let mut additions_allowed = true;
     let mut collect = Engine::collect_discovery_records;
     let mut closure = PauseClosure::new(true);
@@ -8827,6 +8833,169 @@ fn armed_seed_route(
     record.table_ptr = mapping.start + (spec.hook.file_offset - mapping.file_offset);
     record.hook_ts_ns = engine.views[0].admitted_ns();
     (fixture, engine, context, record, session)
+}
+
+#[test]
+fn loader_readiness_requires_committed_attachment_and_exact_session_link() {
+    let (_fixture, mut engine, context, _record, mut session) = armed_seed_route(0);
+    assert_eq!(engine.active_loader_hook_count(&session), 1);
+    let link = session.dynamic_loader_links[0];
+    for wrong in [
+        (LoaderContextId::from_case_id(200), link.1, link.2, link.3),
+        (link.0, PinnedObjectId(u32::MAX), link.2, link.3),
+        (link.0, link.1, link.2 + 1, link.3),
+        (link.0, link.1, link.2, link.3 ^ 1),
+    ] {
+        session.dynamic_loader_links = vec![wrong];
+        assert_eq!(engine.active_loader_hook_count(&session), 0, "{wrong:?}");
+    }
+    session.dynamic_loader_links.clear();
+    session
+        .attach_dynamic_export(
+            context,
+            engine.views[0].pid(),
+            (link.1, link.2),
+            link.3,
+            HookAbi::FunctionList,
+            &engine.pinned,
+        )
+        .unwrap();
+    assert_eq!(
+        engine.active_loader_hook_count(&session),
+        0,
+        "a different program is not a loader hook"
+    );
+    session.dynamic_loader_links = vec![link];
+    assert_eq!(engine.active_loader_hook_count(&session), 1);
+    engine.loader_registry.tombstone(context).unwrap();
+    assert!(
+        engine
+            .loader_registry
+            .context(context)
+            .unwrap()
+            .was_attached
+    );
+    assert_eq!(engine.active_loader_hook_count(&session), 0);
+}
+
+#[test]
+fn loader_readiness_prepared_context_with_installed_link_is_not_committed() {
+    let (_fixture, mut engine, context, _record, mut session) = armed_seed_route(0);
+    let spec = engine
+        .loader_registry
+        .context(context)
+        .unwrap()
+        .spec
+        .clone();
+    engine.loader_registry.tombstone(context).unwrap();
+    let prepared = engine.loader_registry.preflight(spec.clone()).unwrap();
+    let cookie = prepared.cookie();
+    let pending = engine.loader_registry.prepare(prepared).unwrap();
+    session
+        .attach_dynamic_loader(
+            pending,
+            engine.views[0].pid(),
+            spec.loader,
+            spec.hook.file_offset,
+            cookie,
+            &engine.pinned,
+        )
+        .unwrap();
+    assert_eq!(engine.active_loader_hook_count(&session), 0);
+    engine.loader_registry.mark_attached(pending).unwrap();
+    assert_eq!(engine.active_loader_hook_count(&session), 1);
+}
+
+#[test]
+fn loader_readiness_refuses_retiring_gone_or_unowned_views() {
+    let (mut fixture, mut engine, context, _record, session) = armed_seed_route(0);
+    assert_eq!(engine.active_loader_hook_count(&session), 1);
+    let view = engine.views[0].id();
+    engine.queue_retirement(
+        view,
+        RetirementCause::ExecRefresh,
+        &mut PendingViewRetirements::new(),
+    );
+    let before = engine.budget.attempted_io_bytes();
+    assert_eq!(engine.active_loader_hook_count(&session), 0);
+    assert_eq!(engine.budget.attempted_io_bytes(), before);
+    engine.retirement_intents.clear();
+    assert_eq!(engine.active_loader_hook_count(&session), 1);
+    let pin = engine.pinned.clone();
+    engine.pinned.remove_view(view).unwrap();
+    assert_eq!(engine.active_loader_hook_count(&session), 0);
+    engine.pinned = pin;
+    let owner = engine.views.pop().unwrap();
+    assert_eq!(engine.active_loader_hook_count(&session), 0);
+    engine.views.push(owner);
+    assert_eq!(engine.active_loader_hook_count(&session), 1);
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    assert!(!engine.views[0].still_the_same());
+    assert!(
+        engine
+            .loader_registry
+            .context(context)
+            .unwrap()
+            .was_attached
+    );
+    assert_eq!(engine.active_loader_hook_count(&session), 0);
+}
+
+#[test]
+fn loader_readiness_counts_two_independent_current_contexts() {
+    let (mut fixture, mut engine, first, _record, mut session) = armed_seed_route(0);
+    let pid = fixture.spawn_peer();
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), pid).unwrap());
+    engine.scope = Scope::System;
+    engine
+        .arm_loader_for_view(
+            1,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .unwrap();
+    assert_eq!(session.dynamic_loader_links.len(), 2);
+    assert_eq!(engine.active_loader_hook_count(&session), 2);
+    engine.loader_registry.tombstone(first).unwrap();
+    assert_eq!(engine.active_loader_hook_count(&session), 1);
+}
+
+#[test]
+fn loader_readiness_revalidates_the_current_held_loader_mapping() {
+    let (_fixture, mut engine, original, _record, mut session) = armed_seed_route(0);
+    let original_spec = engine
+        .loader_registry
+        .context(original)
+        .unwrap()
+        .spec
+        .clone();
+    engine.loader_registry.tombstone(original).unwrap();
+    let mut shifted = original_spec.mapping.clone().unwrap();
+    shifted.start += 1;
+    for (mapping, expected) in [(None, 1), (Some(shifted), 0)] {
+        let mut spec = original_spec.clone();
+        spec.mapping = mapping;
+        let prepared = engine.loader_registry.preflight(spec.clone()).unwrap();
+        let cookie = prepared.cookie();
+        let context = engine.loader_registry.prepare(prepared).unwrap();
+        session
+            .attach_dynamic_loader(
+                context,
+                engine.views[0].pid(),
+                spec.loader,
+                spec.hook.file_offset,
+                cookie,
+                &engine.pinned,
+            )
+            .unwrap();
+        engine.loader_registry.mark_attached(context).unwrap();
+        assert_eq!(engine.active_loader_hook_count(&session), expected);
+        engine.loader_registry.tombstone(context).unwrap();
+    }
 }
 
 /// Real direct-ELF child, pre-exec loader pin and post-exec identity check;

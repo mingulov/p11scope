@@ -39,6 +39,7 @@ and cleanup receipts are recorded in summary.json.
 import argparse
 from collections import Counter, defaultdict, deque
 from collections.abc import Mapping
+from contextlib import contextmanager
 from functools import wraps
 from contextvars import ContextVar
 import ctypes
@@ -68,10 +69,13 @@ sys.dont_write_bytecode = True
 
 N3HARNESS = runpy.run_path(str(ROOT / "scripts/qualify-cgroup-trace.py"))
 N3ORACLE = runpy.run_path(str(ROOT / "scripts/cgroup-trace-oracle.py"))
+INITIAL_EXEC = runpy.run_path(str(ROOT / "scripts/h6-initial-exec.py"))
 ROW = N3ORACLE["ROW"]
 N3_PARSE_TRACE = N3ORACLE["parse_trace"]
 IMAGE_FIELDS = ("image", "pid", "start_time", "path", "dev", "ino", "mtime_ns",
                 "pid_namespace", "time_namespace")
+VA_REUSE_TARGETS = ("C_GetFunctionList", "C_Initialize", "C_Finalize", "C_GetInfo", "C_GetSlotList",
+                    "C_OpenSession", "C_CloseSession", "C_GetSessionInfo", "C_GenerateRandom")
 
 CELLS = ("pid-leader", "pid-reexec", "pid-nonleader-cold", "pid-failed-exec",
          "leader-exit-exec", "rapid-chain", "cgroup-reentry", "system-mixed")
@@ -204,7 +208,7 @@ def stop_errors(receipt):
     return errors
 
 
-def expected_reuse_errors(receipt):
+def expected_reuse_errors(receipt, ledger):
     errors = []
     reuse_expected = receipt.get("reuse_expected", {})
     if not isinstance(reuse_expected, Mapping):
@@ -215,7 +219,7 @@ def expected_reuse_errors(receipt):
         info = receipt.get(f"{kind}_reuse", {})
         if not isinstance(info, Mapping):
             raise TypeError(f"{kind}_reuse must be a mapping when reuse is required")
-        if not info.get("observed"):
+        if not info.get("observed") or kind == "va" and not va_reuse_from(ledger)["observed"]:
             errors.append(f"expected {kind} reuse across exec is not demonstrated by the ledger")
     return errors
 
@@ -904,7 +908,7 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
     # H6-DELTA: reuse legs. Expected-but-unobserved reuse fails the cell;
     # observed reuse additionally requires order-attributed non-completion
     # of old operations (post-exec rows match post-exec calls only, above).
-    errors.extend(expected_reuse_errors(receipt))
+    errors.extend(expected_reuse_errors(receipt, ledger))
     if evidence:
         ev = evidence[0]
         if ev.get("privacy_mode") != "allowlisted" or ev.get("trace_truncated") is not False:
@@ -1131,7 +1135,7 @@ def _evaluate_aggregate_h6(doc, stdout_text, ledger, receipt, mode):
         return {"pass": False, "status": "negative", "cell": receipt.get("cell"),
                 "leg": receipt.get("leg"), "negative_reason": receipt["backend_refused"],
                 "errors": ["backend refused: %s" % (receipt["backend_refused"],)]}
-    errors.extend(expected_reuse_errors(receipt))
+    errors.extend(expected_reuse_errors(receipt, ledger))
     want_schema = ("p11scope/observed-profile/v3-metrics" if mode == "metrics"
                    else "p11scope/observed-profile/v3")
     if doc.get("schema") != want_schema or doc.get("lane") != mode:
@@ -2339,6 +2343,8 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
 # ---------------------------------------------------------------------------
 
 OwnedProcess = N3HARNESS["OwnedProcess"]
+InitialExecProcess = INITIAL_EXEC["InitialExecProcess"]
+spawn_initial_exec = INITIAL_EXEC["spawn_initial_exec"]
 FilePin = N3HARNESS["FilePin"]
 cleanup_processes = N3HARNESS["cleanup_processes"]
 cleanup_cgroups = N3HARNESS["cleanup_cgroups"]
@@ -3460,6 +3466,156 @@ def spawn_caller(owners, readers, leg_dir, caller_pin, provider_pin, uid, gid, e
     return owned, stdout, stderr
 
 
+def initial_exec_cleanup_section(ctx):
+    """Charge the primitive's internal mandatory reap to the same five seconds."""
+    setup = True
+    @contextmanager
+    def section():
+        nonlocal setup
+        creating, setup = setup, False
+        with cleanup_section():
+            expired = None
+            if not creating:
+                try:
+                    ctx.budget.enter("cleanup")
+                except TimeoutError as error:
+                    expired = error
+            try:
+                yield  # An expired cleanup budget must still perform its mandatory reap.
+            finally:
+                if not creating:
+                    try:
+                        ctx.budget.remaining()
+                    except TimeoutError as error:
+                        expired = error
+                    if expired is not None:
+                        raise LegCleanupError(f"initial exec cleanup exceeded its unchanged five-second/leg limit: {expired}")
+    return section
+
+
+def spawn_initial_caller(ctx, leg_dir, caller_pin, provider_pin, env, deadline_ns, setarch_pin):
+    """Fork before readers, reserve tracer custody, then hold the real caller exec."""
+    argv = [str(caller_pin.path), str(provider_pin.path), "0", "selected",
+            "--canary", CANARIES[2], "--h6-load-deadline", str(deadline_ns)]
+    with cleanup_section():
+        caller = spawn_initial_exec(ctx.owners, argv, caller_pin=caller_pin, setarch_pin=setarch_pin,
+            uid=ctx.args.uid, gid=ctx.args.gid, env=env, deadline_ns=deadline_ns,
+            cleanup_section=initial_exec_cleanup_section(ctx))
+        try:
+            ctx.traced.append(caller)  # before acquisition or any stopped-image postcheck
+        except BaseException:
+            caller.close()
+            raise
+        held = caller.hold_caller_exec()
+        stopped = monotonic_ns()
+    stdout = owned_reader(ctx.readers, Reader, caller.popen.stdout, Path(leg_dir) / "caller.ledger.jsonl")
+    stderr = owned_reader(ctx.readers, Reader, caller.popen.stderr, Path(leg_dir) / "caller.stderr.txt")
+    return caller, stdout, stderr, {"held": dict(held), "stopped_ns": stopped,
+                                  "deadline_ns": deadline_ns, "control": "kernel-exec-stop"}
+
+
+LOADER_READY_LINE = re.compile(r"p11scope: loader readiness: (0|[1-9][0-9]{0,19}) active hook\(s\)")
+CAPTURE_READY_LINE = re.compile(r"p11scope: capturing: (0|[1-9][0-9]{0,19}) probe\(s\) attached; stop with Ctrl-C")
+
+
+def loader_ready_lines(lines):
+    loader = [(index, LOADER_READY_LINE.fullmatch(line.rstrip("\n")))
+              for index, line in enumerate(lines) if line.startswith("p11scope: loader readiness:")]
+    if len(loader) > 1 or any(match is None or match[1] != "1" for _index, match in loader):
+        raise SetupError("owned initial exec requires exactly one active loader hook readiness line")
+    capturing = [index for index, line in enumerate(lines) if CAPTURE_READY_LINE.fullmatch(line.rstrip("\n"))]
+    if capturing and (len(capturing) != 1 or not loader or capturing[0] != loader[0][0] + 1):
+        raise SetupError("owned initial exec loader readiness must immediately precede loop start")
+    return bool(loader), bool(capturing)
+
+
+def observer_initial_exec_ready(owned, errors, backend, caller, proof, argv):
+    """One actual PID hook plus loop-start text, only while this caller is held."""
+    deadline = proof["deadline_ns"]
+    if not caller.held or not caller.traced or owned.popen.args != argv or argv.count("--pid") != 1 or (
+            argv[argv.index("--pid") + 1] != str(caller.pid)):
+        raise SetupError("loader readiness is not bound to the owned held PID")
+    caller.verify()
+    owned.verify()
+    hook_ready = None
+    def ready():
+        nonlocal hook_ready
+        loader, capturing = loader_ready_lines(errors.lines)
+        if loader and hook_ready is None:
+            hook_ready = monotonic_ns()
+        if capturing:
+            loop_ready = monotonic_ns()
+            if not proof["stopped_ns"] < hook_ready <= loop_ready <= deadline:
+                raise SetupError("initial exec readiness clock order is invalid")
+            return {"active_loader_hooks": 1, "hook_ready_ns": hook_ready, "loop_ready_ns": loop_ready}
+    try:
+        result = _output_wait(errors, ready, deadline)
+    except (EOFError, TimeoutError):
+        rc = owned.popen.poll()  # the normal observer is never the traced caller
+        tail = "".join(errors.lines[-20:])
+        if rc is not None and rc != 0 and REFUSAL_MARKERS.search(tail):
+            raise BackendRefused(f"{backend}: {tail.strip()[-500:]}")
+        raise
+    caller.verify()
+    remaining_until(deadline)
+    return result
+
+
+def release_initial_exec_load(ctx, caller, stdout, caller_pin, provider_pin, proof):
+    """Detach, bind every real image field, then release the existing load0 latch."""
+    deadline = proof["deadline_ns"]
+    remaining_until(deadline)
+    caller_pin.verify()
+    provider_pin.verify()
+    if not 0 < proof["stopped_ns"] < proof["hook_ready_ns"] <= proof["loop_ready_ns"] <= monotonic_ns() <= deadline:
+        raise SetupError("initial exec readiness clock order is invalid before detach")
+    info = os.fstat(caller_pin.fd)
+    file_proof = dict(dev=info.st_dev, ino=info.st_ino, size=info.st_size,
+                      mtime_ns=info.st_mtime_ns, ctime_ns=info.st_ctime_ns)
+    if any(proof["held"].get(field) != value for field, value in file_proof.items()):
+        raise SetupError("held initial exec file metadata differs from the independent pin")
+    with cleanup_section():
+        try:
+            detached = caller.resume_detach()
+        finally:
+            if caller.detached or caller.reaped:
+                ctx.traced.remove(caller)
+    proof.update(detached)
+    ready_ns = proof["loop_ready_ns"]
+    if not (0 < proof["stopped_ns"] < proof["hook_ready_ns"] <= ready_ns <= proof["detach_entry_ns"]
+            <= proof["detach_return_ns"] <= monotonic_ns() <= deadline):
+        raise SetupError("initial exec detach/readiness clock order is invalid")
+    record = stdout.record("image", 0, seconds=min(10, remaining_until(deadline)))
+    image = caller_pin.image_receipt(record, caller)
+    held = {"image": 0, **proof["held"]}
+    if any(type(record.get(field)) is not type(held.get(field))
+           or record.get(field) != held.get(field) or image.get(field) != held.get(field)
+           for field in IMAGE_FIELDS):
+        raise SetupError("real initial image ledger differs from the held exec/file proof")
+    waiting = stdout.record("ack", 0, "load-wait", seconds=min(10, remaining_until(deadline)))
+    now = monotonic_ns()
+    if not proof["detach_entry_ns"] <= record["t"] <= waiting["t"] <= now < deadline:
+        raise SetupError("initial exec load-wait clock order is invalid")
+    caller.verify()
+    caller_pin.verify()
+    provider_pin.verify()
+    remaining_until(deadline)
+    released = monotonic_ns()
+    if not waiting["t"] < released <= deadline:
+        raise SetupError("initial exec load release clock order is invalid")
+    caller.popen.stdin.write("load 0\n")
+    caller.popen.stdin.flush()
+    ready = stdout.record("ready", 0, seconds=min(10, remaining_until(deadline)))
+    if not released <= ready["t"] <= deadline:
+        raise SetupError("initial exec provider-ready clock order is invalid")
+    remaining_until(deadline)
+    if any(value != image[field] for field, value in caller_pin.image_receipt(record, caller).items()
+           if field in IMAGE_FIELDS):
+        raise SetupError("initial image changed across provider load")
+    return image, {"deadline_ns": deadline, "waiting_ns": waiting["t"],
+                   "released_ns": released, "ready_ns": ready["t"]}
+
+
 def release_initial_load(caller, stdout, caller_pin, provider_pin, ready_ns, deadline_ns):
     """Release only an owned initial image after public loop-start evidence."""
     if not isinstance(ready_ns, int) or not 0 < ready_ns <= monotonic_ns():
@@ -3704,19 +3860,29 @@ def session_reuse_from(ledger):
 
 
 def va_reuse_from(ledger):
-    by_image_fn = {}
+    by_image_fn = defaultdict(list)
     for row in ledger:
-        if row.get("kind") == "target" and "vaddr" in row:
-            by_image_fn.setdefault(row["image"], {})[row["fn"]] = row["vaddr"]
-    gens = sorted(by_image_fn)
-    matches = []
-    for index in range(1, len(gens)):
-        before, after = by_image_fn[gens[index - 1]], by_image_fn[gens[index]]
-        for fn in set(before) & set(after):
-            if before[fn] == after[fn]:
-                matches.append({"fn": fn, "from": gens[index - 1], "to": gens[index],
-                                "vaddr": before[fn]})
-    return {"observed": bool(matches), "matches": matches}
+        if row.get("kind") == "target":
+            by_image_fn[row["image"]].append(row)
+    matches, valid = [], set(by_image_fn) == {0, 1}
+    for rows in by_image_fn.values():
+        valid &= len(rows) == 9 and {row["fn"] for row in rows} == set(VA_REUSE_TARGETS)
+    if valid:
+        before = {row["fn"]: row for row in by_image_fn[0]}
+        after = {row["fn"]: row for row in by_image_fn[1]}
+        fields = ("dev", "ino", "file_offset", "vaddr")
+        for fn in VA_REUSE_TARGETS:
+            a, b = before[fn], after[fn]
+            if (all(field in a and field in b and a[field] == b[field] for field in fields)
+                    and all(isinstance(row["dev"], list) and len(row["dev"]) == 2
+                            and all(type(value) is int and value >= 0 for value in row["dev"])
+                            and type(row["ino"]) is int and row["ino"] > 0
+                            and type(row["file_offset"]) is int and row["file_offset"] >= 0
+                            and type(row["vaddr"]) is int and row["vaddr"] > 0 for row in (a, b))):
+                matches.append({"fn": fn, "from": 0, "to": 1, **{field: a[field] for field in fields}})
+    physical = {(tuple(row["dev"]), row["ino"], row["file_offset"], row["vaddr"]) for row in matches}
+    return {"observed": valid and len(matches) == len(physical) == 9,
+            "required_targets": 9, "matches": matches}
 
 
 class Case:
@@ -3743,6 +3909,10 @@ class LegCleanupError(RuntimeError):
 
 def reap_traced_child(owner):
     """Use the held pidfd and a real terminal wait status, never Popen.poll."""
+    if isinstance(owner, InitialExecProcess):
+        owner.kill_and_reap()
+        check_dispatch()
+        return
     # Popen can translate a ptrace stop into a negative return code. SIGKILL
     # releases that stop; waitpid must still prove actual death and reap it.
     try:
@@ -3765,6 +3935,9 @@ def reap_traced_child(owner):
 
 def terminate_owned(owner):
     """Keep the shared custody checks, with this leg's remaining cleanup time."""
+    if isinstance(owner, InitialExecProcess):
+        owner.kill_and_reap()  # includes undetached/raw owners; never ordinary poll
+        return
     if owner.popen.poll() is not None:
         return
     try:
@@ -3792,14 +3965,21 @@ def terminate_owned(owner):
 
 def wait_terminal_child(owner):
     """Confirm/reap after bounded termination, including an exit during send."""
+    if isinstance(owner, InitialExecProcess) and owner.reaped:
+        return
     try:
         pid, status = os.waitpid(owner.pid, os.WNOHANG | 0x40000000)  # __WALL
     except ChildProcessError:
+        if isinstance(owner, InitialExecProcess):
+            raise SetupError("initial exec child lacks a delegated terminal reap proof")
         if owner.popen.returncode is not None and not (Path("/proc") / str(owner.pid)).exists():
             return  # a prior terminal Popen/raw wait already reaped this child
         raise SetupError("owned child lacks a terminal reap proof")
     if pid and (os.WIFEXITED(status) or os.WIFSIGNALED(status)):
-        owner.popen.returncode = os.waitstatus_to_exitcode(status)
+        if isinstance(owner, InitialExecProcess):
+            owner._terminal(status)
+        else:
+            owner.popen.returncode = os.waitstatus_to_exitcode(status)
         return
     raise SetupError("owned child has no terminal status after bounded termination")
 
@@ -3868,7 +4048,8 @@ def _cleanup_leg_resources(ctx, close_pins=True):
                 except Exception as error:
                     failures.append(f"reader stream: {type(error).__name__}: {error}")
         for owner in owners:
-            for stream in (owner.popen.stdin, owner.popen.stdout, owner.popen.stderr):
+            process = owner.popen
+            for stream in (process.stdin, process.stdout, process.stderr) if process is not None else ():
                 if stream is not None and not stream.closed:
                     try:
                         stream.close()
@@ -3903,6 +4084,10 @@ def _cleanup_leg_resources(ctx, close_pins=True):
         ctx.owners[:] = pending
         ctx.readers[:] = [reader for reader in readers
                          if getattr(reader, "thread", None) is not None and reader.thread.is_alive()]
+        try:
+            check_dispatch()  # mandatory kernel reaping never creates a late success
+        except TimeoutError as error:
+            failures.append(f"cleanup budget after resource settlement: {error}")
         if failures:
             case.cleanup_failed = True
             case.cleanup_errors.extend(failures)
@@ -4038,7 +4223,7 @@ def finish_readers(readers):
 
 
 @owned_leg
-def run_pid_caller_leg(ctx, cell, backend, observer_kind, leg_dir, same_path, prefix=()):
+def run_pid_caller_leg(ctx, cell, backend, observer_kind, leg_dir, same_path, prefix=(), setarch_pin=None):
     """One pid-scope caller leg: warm, exec, measured, stop, judge."""
     leg_dir = Path(leg_dir)
     (leg_dir / "workload").mkdir(mode=0o755, parents=True, exist_ok=True)
@@ -4056,17 +4241,24 @@ def run_pid_caller_leg(ctx, cell, backend, observer_kind, leg_dir, same_path, pr
         pin_b = leg_pin(ctx, image_b)
     provider = ctx.provider_pin
     initial_load = cell == "pid-reexec"
-    load_options = {}
+    initial_exec = None
     if initial_load:
         deadline = min(ctx.budget.deadline_ns, ctx.budget.phase_deadline_ns)
-        load_options["load_deadline_ns"] = deadline
-    caller, stdout, _ = spawn_caller(ctx.owners, ctx.readers, leg_dir, pin_a, provider,
-                                     ctx.args.uid, ctx.args.gid, env, prefix=prefix, **load_options)
-    if initial_load:
-        stdout.record("ack", 0, "load-wait")
+        if prefix not in ((), ("setarch", "-R")):
+            raise SetupError("initial exec barrier permits only the pinned setarch -R chain")
+        if setarch_pin is None:
+            path = shutil.which("setarch")
+            if path is None:
+                raise SetupError("setarch is required for the VA-reuse reexec leg")
+            setarch_pin = leg_pin(ctx, Path(path).resolve(strict=True))
+        caller, stdout, _, initial_exec = spawn_initial_caller(ctx, leg_dir, pin_a, provider,
+                                                              env, deadline, setarch_pin)
+        images = []  # real image0 is emitted only after detach/main
     else:
+        caller, stdout, _ = spawn_caller(ctx.owners, ctx.readers, leg_dir, pin_a, provider,
+                                         ctx.args.uid, ctx.args.gid, env, prefix=prefix)
         stdout.record("ready", 0)
-    images = [pin_a.image_receipt(stdout.record("image", 0), caller)]
+        images = [pin_a.image_receipt(stdout.record("image", 0), caller)]
     scope_args = ["--pid", str(caller.pid)]
     module_args = ["--module", str(provider.path)]
     backend_args = ["--attach-backend", backend]
@@ -4082,9 +4274,17 @@ def run_pid_caller_leg(ctx, cell, backend, observer_kind, leg_dir, same_path, pr
     owned, capture, errors, started = spawn_observer(
         ctx.owners, ctx.readers, leg_dir, argv, env, live=observer_kind != "trace")
     try:
-        ready = observer_ready(owned, errors, backend, **({"allow_empty": True} if initial_load else {}))
+        if initial_load:
+            initial_exec.update(observer_initial_exec_ready(owned, errors, backend, caller, initial_exec, argv))
+            ready = initial_exec["loop_ready_ns"]
+        else:
+            ready = observer_ready(owned, errors, backend)
     except BackendRefused as refused:
-        stop_caller(caller, stdout, 0)
+        if initial_load:
+            caller.kill_and_reap()
+            ctx.traced.remove(caller)
+        else:
+            stop_caller(caller, stdout, 0)
         receipt = {"cell": cell, "leg": f"{observer_kind}/{backend}",
                    "backend_refused": str(refused)}
         result = (evaluate_trace_h6("", [], receipt) if observer_kind == "trace"
@@ -4094,7 +4294,8 @@ def run_pid_caller_leg(ctx, cell, backend, observer_kind, leg_dir, same_path, pr
     phases = []
     load_receipt = None
     if initial_load:
-        load_receipt = release_initial_load(caller, stdout, pin_a, provider, ready, deadline)
+        image, load_receipt = release_initial_exec_load(ctx, caller, stdout, pin_a, provider, initial_exec)
+        images.append(image)
         load_receipt["proof"] = warm_caller(capture, caller, stdout, images[0], phases, observer_kind)
     if observer_kind == "trace":
         drain_trace_phase(capture, caller, stdout, "C_GenerateRandom", 3, 100, "warm", 0, phases)
@@ -4138,6 +4339,8 @@ def run_pid_caller_leg(ctx, cell, backend, observer_kind, leg_dir, same_path, pr
     }
     if load_receipt is not None:
         receipt["initial_load"] = load_receipt
+        receipt["initial_exec"] = initial_exec
+        loader_ready_lines(errors.lines)  # also reject a duplicate producer line arriving later
     if observer_kind == "trace":
         trace = "".join(capture.lines)
         file_trace = (leg_dir / "trace.file.txt").read_text()
@@ -4160,12 +4363,18 @@ def run_pid_leader(ctx, cell_dir, backend):
 
 
 def run_pid_reexec(ctx, cell_dir, backend):
-    if not shutil.which("setarch"):
+    path = shutil.which("setarch")
+    if not path:
         raise SetupError("setarch is required for the VA-reuse reexec leg")
-    return [run_pid_caller_leg(ctx, "pid-reexec", backend, kind,
-                               Path(cell_dir) / backend / kind, same_path=True,
-                               prefix=("setarch", "-R"))
-            for kind in ("trace", "profile", "metrics")]
+    pin = leg_pin(ctx, Path(path).resolve(strict=True))
+    try:
+        return [run_pid_caller_leg(ctx, "pid-reexec", backend, kind,
+                                  Path(cell_dir) / backend / kind, same_path=True, setarch_pin=pin)
+                for kind in ("trace", "profile", "metrics")]
+    finally:
+        with cleanup_section():
+            pin.close()
+            ctx.leg_pins.remove(pin)
 
 
 @owned_leg(stop_b=True)

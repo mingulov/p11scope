@@ -24,6 +24,8 @@ H6 = runpy.run_path(str(ROOT / "scripts/qualify-automatic-exec.py"))
 MAPPED = runpy.run_path(str(ROOT / "scripts/mapped-provider-pin.py"))
 BACKENDS = ("singles", "multi")
 FUNCTION, COUNT, RV = "C_GenerateRandom", 5, 0
+INITIAL_FUNCTION = "C_GetInfo"
+INITIAL_ATTEMPTS, INITIAL_TIMEOUT_NS = 20, 15_000_000_000
 
 
 def mapped_provider(owner, pin):
@@ -119,6 +121,95 @@ def group_receipt(ctx, group):
     return {"path": str(group.path), "dev": held.st_dev, "ino": held.st_ino}
 
 
+def check_initial_ready(trace, ledger, receipt):
+    """Prove an initial owned marker independently of the fixed measured calls."""
+    proof = receipt["initial_ready"]
+    image = receipt["replacement"]["replacement_image"]
+    if type(proof["attempts"]) is not int or not 1 <= proof["attempts"] <= INITIAL_ATTEMPTS:
+        raise ValueError("initial readiness attempt count exceeds its fixed bound")
+    phases = [f"initial-{seq}" for seq in range(1, proof["attempts"] + 1)]
+    calls = [row for row in ledger if row.get("kind") == "call" and row.get("phase", "").startswith("initial-")]
+    lines = trace.splitlines()
+    cursor, end = proof["output_cursor"], proof["proof_cursor"]
+    match = H6["ROW"].fullmatch(lines[end - 1]) if 0 <= cursor < end <= len(lines) else None
+    measured_before_proof = any(
+        row and int(row["pid"]) == image["pid"] and row["fn"] == FUNCTION
+        for line in lines[:end] if (row := H6["ROW"].fullmatch(line)))
+    if (proof["proof_kind"] != "trace-row" or proof["image"] != image["image"]
+            or proof["pid"] != image["pid"] or proof["marker_fn"] != INITIAL_FUNCTION
+            or proof["max_attempts"] != INITIAL_ATTEMPTS
+            or proof["phases"] != phases
+            or len(calls) != proof["attempts"] or {row["phase"] for row in calls} != set(phases)
+            or not receipt["observer_ready_ns"] <= proof["started_ns"] <= proof["observed_ns"]
+               <= proof["deadline_ns"] <= min(proof["setup_deadline_ns"], proof["leg_deadline_ns"])
+            or not 0 < proof["deadline_ns"] - proof["started_ns"] <= INITIAL_TIMEOUT_NS
+            or proof["observed_ns"] > receipt["measured"]["t0"]
+            or measured_before_proof
+            or any(row["fn"] != INITIAL_FUNCTION or row["rv"] != RV or row["image"] != image["image"]
+                   or row["pid"] != image["pid"] or row["tid"] != image["pid"] or row["scope"] != "selected"
+                   or not proof["started_ns"] <= row["t0"] <= row["t1"] <= proof["observed_ns"]
+                   for row in calls)
+            or not set(phases).issubset(receipt["warmup"]["phases"])
+            or not match or int(match["pid"]) != image["pid"] or int(match["tid"]) != image["pid"]
+            or match["fn"] != INITIAL_FUNCTION or match["rv"] != "CKR_OK" or not match["path"]
+            or json.loads(match["path"]) != image["path"]
+            or json.loads(match["label"]) != Path(image["path"]).name):
+        raise ValueError("invalid bounded initial owned public readiness proof")
+
+
+def warm_replacement(ctx, io, caller, stdout, capture, group, image, image_pin, provider_mapping, phases):
+    """Drive real initial markers inside setup; never renew a successor/leg budget."""
+    if ctx.budget.phase != "setup":
+        raise ValueError("initial replacement readiness must use the existing setup allowance")
+    started = H6["monotonic_ns"]()
+    deadline = min(started + INITIAL_TIMEOUT_NS, ctx.budget.phase_deadline_ns, ctx.budget.deadline_ns)
+    cursor = len(capture.lines)
+
+    def verify():
+        verify_owner(ctx, caller, caller.identity)
+        actual = image_pin.image_receipt(image, caller)
+        if any(actual[field] != image[field] for field in H6["IMAGE_FIELDS"]):
+            raise ValueError("replacement executable changed during initial readiness")
+        io.membership(group, caller)
+        if mapped_provider(caller, ctx.provider_pin) != provider_mapping:
+            raise ValueError("replacement provider changed during initial readiness")
+
+    def fresh_proof():
+        for index in range(cursor, len(capture.lines)):
+            match = H6["ROW"].fullmatch(capture.lines[index].strip())
+            if (match and int(match["pid"]) == caller.pid and int(match["tid"]) == caller.pid
+                    and match["fn"] == INITIAL_FUNCTION and match["rv"] == "CKR_OK" and match["path"]
+                    and json.loads(match["path"]) == image["path"]
+                    and json.loads(match["label"]) == Path(image["path"]).name):
+                return index + 1
+        return None
+
+    attempts = []
+    for seq in range(1, INITIAL_ATTEMPTS + 1):
+        H6["remaining_until"](deadline)
+        verify()
+        phase = f"initial-{seq}"
+        io.warm_command(caller, stdout, group, phase, phases, H6["remaining_until"](deadline))
+        attempts.append(phase)
+        H6["remaining_until"](deadline)
+        interval_end = min(deadline, H6["monotonic_ns"]() + 500_000_000)
+        try:
+            end = H6["_output_wait"](capture, fresh_proof, interval_end)
+        except TimeoutError:
+            continue
+        verify()
+        H6["remaining_until"](deadline)
+        observed = H6["monotonic_ns"]()
+        if not started <= observed <= deadline:
+            raise TimeoutError("initial replacement proof completed after its absolute deadline")
+        return dict(image=image["image"], pid=caller.pid, proof_kind="trace-row", marker_fn=INITIAL_FUNCTION,
+            started_ns=started, observed_ns=observed, deadline_ns=deadline,
+            setup_deadline_ns=ctx.budget.phase_deadline_ns, leg_deadline_ns=ctx.budget.deadline_ns,
+            attempts=seq, max_attempts=INITIAL_ATTEMPTS, phases=attempts,
+            output_cursor=cursor, proof_cursor=end)
+    raise TimeoutError("initial replacement warm-up attempt budget exhausted")
+
+
 def evaluate_replacement(trace, ledger, receipt, file_trace=None):
     """Add independent death/admission checks to the existing H6 call oracle."""
     result = H6["evaluate_trace_h6"](trace, ledger, receipt, file_trace)
@@ -150,6 +241,7 @@ def evaluate_replacement(trace, ledger, receipt, file_trace=None):
                 errors.append("original/replacement image lacks its own birth and the same held executable")
         if receipt["images"] != [new_image] or receipt["owned_pids"] != [new["pid"]]:
             errors.append("replacement capture reused the original PID/image authority")
+        check_initial_ready(trace, ledger, receipt)
         provider = receipt["provider_before"]
         expected_mapping = {"dev": provider["dev"], "ino": provider["ino"]}
         if any(proof[field] != expected_mapping for field in ("original_mapping", "replacement_mapping")):
@@ -245,6 +337,10 @@ class LiveIO:
         return H6["n3_command"](caller, reader, FUNCTION, COUNT, 100, "measured", "selected",
                                 0, group, phases)
 
+    def warm_command(self, caller, reader, group, phase, phases, remaining):
+        return H6["n3_command"](caller, reader, INITIAL_FUNCTION, 1, 0, phase, "selected",
+                                0, group, phases, acknowledgement_seconds=remaining)
+
 
 @H6["owned_leg"]
 def run_replacement(ctx, directory, backend, env, image_pin, io=None):
@@ -291,6 +387,9 @@ def run_replacement(ctx, directory, backend, env, image_pin, io=None):
         return result
     ctx.binary.image_receipt({"image": 0}, owned)
     phases = []
+    initial_ready = warm_replacement(ctx, io, caller, stdout, capture, descendant, image,
+                                      image_pin, replacement_mapping, phases)
+    check_replacement(ctx, original, proof, proof, caller, image, image_pin)
     io.command(caller, stdout, descendant, phases)
     membership_after = io.membership(descendant, caller)
     if mapped_provider(caller, ctx.provider_pin) != replacement_mapping:
@@ -304,7 +403,7 @@ def run_replacement(ctx, directory, backend, env, image_pin, io=None):
                  descendant_before=descendant_before, descendant_after=descendant_after,
                  membership_before=membership_before, membership_after=membership_after,
                  replacement_spawn_ns=spawned, manufactured_reuse=False, continuous_membership="unknown")
-    measured = phases[0]
+    measured = next(phase for phase in phases if phase["phase"] == "measured")
     receipt = dict(cell="cgroup-process-replacement", leg=f"replacement/{backend}", scope_kind="cgroup",
         owned_pids=[caller.pid], images=[image], replacement=proof, executable_pin=image_pin.metadata(),
         provider_before=provider_before, provider_after=H6["provider_receipt"](ctx.provider_pin),
@@ -315,7 +414,7 @@ def run_replacement(ctx, directory, backend, env, image_pin, io=None):
         scope_intervals=[dict(pid=caller.pid, membership="selected", t0=ready, t1=stopped)],
         measured=dict(label="replacement", t0=measured["t0"], t1=measured["t1"],
                       expected_calls=COUNT, phases=["measured"]),
-        warmup=dict(label="none", t0=measured["t0"], t1=measured["t0"], expected_calls=0, phases=[]),
+        warmup=H6["warmup_receipt"](phases, measured["t0"]), initial_ready=initial_ready,
         phases=phases, exec_transitions=[], require_named=True, require_named_images=[0], first_unknown_images=[],
         successor_policy="no-transition", manual_rebind=False, abandoned_expected=0, abandoned_by_fn={},
         reuse_expected={}, requested_backend=backend, fresh_observer=True, observer_argv=argv,

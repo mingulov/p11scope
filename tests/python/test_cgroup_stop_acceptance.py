@@ -275,6 +275,27 @@ class BaselineWaitTests(unittest.TestCase):
                                                 "baseline", "selected", 0, None, phases)
                 deadline.assert_called_once_with(60)
 
+    def test_same_pid_needs_an_admission_for_the_held_executable(self):
+        mutations = {
+            "same PID wrong executable": lambda event: event["identity_context"]["caller"]["executable"].update(
+                path="/fixture/wrong-caller"),
+            "not admitted": lambda event: event.update(event="retired"),
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                path, owner, executable, provider, rows = self.scene(directory)
+                mutation(rows[0]["event"])
+                self.write_rows(path, rows)
+                reader, phases = object(), []
+                command = Mock(side_effect=lambda *_args: self.publish_counted(path, rows))
+                deadline = Mock(side_effect=lambda seconds: H6["wait_deadline"](min(seconds, 0.02)))
+                with patch.dict(STOP["H6"], n3_command=command, wait_deadline=deadline):
+                    with self.assertRaises(TimeoutError):
+                        STOP["wait_baseline"](path, owner, executable, provider, reader, phases)
+                command.assert_called_once_with(owner, reader, "C_GenerateRandom", 3, 0,
+                                                "baseline", "selected", 0, None, phases)
+                deadline.assert_called_once_with(60)
+
     def test_candidate_move_and_selected_stage_follow_actual_pass_and_counted_baseline(self):
         for sufficient in (True, False):
             with self.subTest(sufficient=sufficient), tempfile.TemporaryDirectory() as directory:

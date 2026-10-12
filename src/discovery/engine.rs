@@ -2670,6 +2670,9 @@ pub(crate) trait EngineSession {
         objects: &PinnedObjects,
     ) -> Result<ReplacementOutcome>;
     fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome>;
+    fn detach_failed_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
+        self.detach_slots(slots)
+    }
     fn detach_ended_pid_slots(
         &mut self,
         slots: &[plan::Slot],
@@ -2852,6 +2855,9 @@ impl EngineSession for Session {
 
     fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
         Session::detach_slots(self, slots)
+    }
+    fn detach_failed_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
+        Session::detach_failed_slots(self, slots)
     }
     fn detach_ended_pid_slots(
         &mut self,
@@ -10062,12 +10068,15 @@ impl Engine {
     }
 
     fn sync_physical_gap(&mut self, session: &dyn EngineSession) {
-        let next = session.physical_gap_summary();
+        self.sync_physical_gap_summary(session.physical_gap_summary());
+    }
+
+    fn sync_physical_gap_summary(&mut self, next: crate::attach::PhysicalGapSummary) {
         if next == self.physical_gap {
             return;
         }
         self.physical_gap = next;
-        if next.episodes != 0 {
+        if next.episodes != 0 || next.open || next.unknown {
             self.mark_partial("physical static probe gap", if next.open || next.unknown {
                 "an actual static detach opened a physical coverage interval whose final exact pairs or clock remain incomplete"
             } else { "static probes detached and final exact pairs reattached; the physical coverage interval remains in history" });
@@ -10084,7 +10093,9 @@ impl Engine {
             .iter()
             .flat_map(|(modules, _)| modules)
             .filter(|module| {
-                self.physical_gap.episodes == 0
+                (self.physical_gap.episodes == 0
+                    && !self.physical_gap.open
+                    && !self.physical_gap.unknown)
                     || self
                         .timings
                         .modules
@@ -11747,7 +11758,8 @@ impl Engine {
                             .cloned()
                             .collect();
                         let detach_failed_slots_start = crate::attach::monotonic_ns();
-                        let detach_failed_slots_outcome = session.detach_slots(&failed_slots);
+                        let detach_failed_slots_outcome =
+                            session.detach_failed_slots(&failed_slots);
                         self.sync_physical_gap(session);
                         self.stage_timings.span(
                             crate::timing::StageKind::Attach,
@@ -12757,7 +12769,7 @@ impl Engine {
                 .cloned()
                 .collect();
             let detach_rollback_start = crate::attach::monotonic_ns();
-            let detach_rollback_outcome = session.detach_slots(&rollback);
+            let detach_rollback_outcome = session.detach_failed_slots(&rollback);
             self.sync_physical_gap(session);
             self.stage_timings.span(
                 crate::timing::StageKind::Attach,

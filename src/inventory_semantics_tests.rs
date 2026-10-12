@@ -6492,6 +6492,7 @@ impl Drop for H6Child {
 /// container length alone.
 #[test]
 fn automatic_exec_recovery_budget_failure_and_stop_are_finite() {
+    use crate::discovery::caller_registry::ProcessSource;
     use crate::discovery::engine::tests::detailed_proof_driver as trace_driver;
 
     // Caller budget N/N+1 at the shared reservation: 2 works, the
@@ -6501,13 +6502,22 @@ fn automatic_exec_recovery_budget_failure_and_stop_are_finite() {
         let pid = std::process::id();
         let detailed = conv.detailed();
         let c1 = conv.caller;
-        let child = H6Child::spawn();
+        let child_started = std::time::Instant::now();
+        let mut child = H6Child::spawn();
         let sibling = conv
             .scene
             .coordinator
             .adapter_mut()
             .admit(child.pid(), ImageAuthority::ScanPinned, 60)
             .unwrap();
+        let retained_sibling_exe = conv
+            .scene
+            .coordinator
+            .adapter()
+            .record(sibling)
+            .unwrap()
+            .exe
+            .clone();
         conv.scene.coordinator.adapter_mut().set_max_callers(2);
         let events = h6_wave(&mut conv, detailed, vec![(7, 2, pid, 1_500)], 2_000);
         let [
@@ -6556,6 +6566,14 @@ fn automatic_exec_recovery_budget_failure_and_stop_are_finite() {
         // release.
         conv.scene.coordinator.adapter_mut().set_max_callers(3);
         let observed: std::collections::BTreeSet<u32> = [pid, child.pid()].into_iter().collect();
+        let current_sibling_exe = OsProcessSource.exe_identity(child.pid());
+        let sibling_pin_same = conv
+            .scene
+            .coordinator
+            .adapter()
+            .live_pin(child.pid())
+            .map(|(_, pin)| pin.still_the_same());
+        let child_elapsed = child_started.elapsed();
         let readmitted = {
             let scene = &mut conv.scene;
             scene.coordinator.adapter_mut().reconcile(
@@ -6564,9 +6582,13 @@ fn automatic_exec_recovery_budget_failure_and_stop_are_finite() {
                 2_500,
             )
         };
+        let child_status = child.0.try_wait();
         assert!(
             matches!(readmitted.as_slice(), [CallerEvent::Admitted { .. }]),
-            "the live pid re-admits fresh: {readmitted:?}"
+            "the live pid re-admits fresh: {readmitted:?}; sibling={sibling:?}, \
+             retained_exe={retained_sibling_exe:?}, current_exe={current_sibling_exe:?}, \
+             pin_same={sibling_pin_same:?}, child_status={child_status:?}, \
+             child_elapsed={child_elapsed:?}"
         );
         let fresh = conv.scene.coordinator.adapter().live_id(pid).unwrap();
         assert_ne!(fresh, c1, "the fresh admission mints a new caller");

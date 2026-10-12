@@ -10,6 +10,7 @@ from what the oracle accepts.
 Run: python3 -I tests/python/test_schema_json.py -v
 """
 
+import copy
 import json
 import runpy
 import unittest
@@ -29,6 +30,59 @@ def evidence_schema():
 
 
 class SchemaOracleAgreement(unittest.TestCase):
+    def metrics_document(self):
+        return CHECKER["document_fixture"](
+            CHECKER["evidence_fixture"]({}), schema=CHECKER["METRICS_SCHEMA"],
+            mode="metrics", privacy="aggregate-only")
+
+    def test_current_metrics_requires_backend_but_historical_shape_excludes_it(self):
+        current = self.metrics_document()
+        self.assertEqual(current["evidence"].get("attach_backend"),
+                         {"selection": "auto", "fallback": None, "scope_filter": "perf-task+bpf"})
+        CHECKER["exact_metrics_schema"](current)
+        missing = copy.deepcopy(current)
+        missing["evidence"].pop("attach_backend")
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_metrics_schema"](missing)
+        historical = CHECKER["document_fixture"](
+            CHECKER["evidence_fixture"]({}), schema=CHECKER["HISTORICAL_METRICS_SCHEMA"],
+            mode="metrics", privacy="aggregate-only")
+        self.assertNotIn("attach_backend", historical["evidence"])
+        CHECKER["exact_historical_metrics_schema"](historical)
+        historical["evidence"]["attach_backend"] = current["evidence"]["attach_backend"]
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_historical_metrics_schema"](historical)
+
+    def test_metrics_backend_shape_and_scope_twins(self):
+        document = self.metrics_document()
+        document["evidence"]["attach_backend"] = {
+            "selection": "multi", "fallback": None, "scope_filter": "kernel-pid+bpf"}
+        for scope in ("pid", "system", "cgroup"):
+            with self.subTest(scope=scope):
+                valid = copy.deepcopy(document)
+                valid["capture"]["scope"] = scope
+                valid["evidence"]["attach_backend"]["scope_filter"] = (
+                    "kernel-pid+bpf" if scope == "pid" else None)
+                CHECKER["exact_metrics_schema"](valid)
+                invalid = copy.deepcopy(valid)
+                invalid["evidence"]["attach_backend"]["scope_filter"] = (
+                    None if scope == "pid" else "kernel-pid+bpf")
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+        for field in ("selection", "fallback", "scope_filter"):
+            with self.subTest(missing=field):
+                invalid = copy.deepcopy(document)
+                del invalid["evidence"]["attach_backend"][field]
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+        for values in ({"extra": 1}, {"selection": "always"}, {"fallback": "failed"},
+                       {"scope_filter": "kernel-pid"}):
+            with self.subTest(values=values):
+                invalid = copy.deepcopy(document)
+                invalid["evidence"]["attach_backend"].update(values)
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+
     def test_evidence_keys_match_oracle_closed_sets(self):
         """Schema evidence properties are exactly the oracle's closed key
         universe: base keys + profile-only keys + run-only child flag."""

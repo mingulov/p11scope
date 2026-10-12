@@ -263,6 +263,10 @@ def judge(report_text, ledger_text, receipt, cell):
             kernel.get("root_affiliation_failures") == [], "kernel capture halted or unknown")
     for key in ("owner_admission_failures", "identity_unavailable"):
         require(type(kernel.get(key)) is int and kernel[key] == 0, "kernel loss or unknown " + key)
+    VERDICT["exact_attach_backend"](
+        evidence.get("attach_backend"),
+        evidence.get("attach_mechanisms") if mode == "profile" else None,
+        report)
     terminal(evidence, profile=mode == "profile")
     provider = identity(receipt["provider_before"])
     admitted = evidence.get("discovery")

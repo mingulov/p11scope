@@ -28,7 +28,7 @@
       "required": [
         "abi_refusals", "active_slots",
         "aliased", "async_duplicates", "async_evictions",
-        "async_orphans", "async_target_failures", "attach_failures",
+        "async_orphans", "async_target_failures", "attach_backend", "attach_failures",
         "attach_gap_ms", "attached_probes", "auth_state_ambiguities",
         "authority", "cgroup_scope_failures", "completeness", "discovery",
         "discovery_conflicts", "discovery_read_failures", "discovery_ring_loss",
@@ -605,7 +605,7 @@
         "properties": {
           "schema": {"const": "p11scope/observed-profile/v3"},
           "evidence": {
-            "required": ["interface_selection", "attach_mechanisms", "attach_backend", "pid_descendant_gaps", "multi_rebuild_gaps"]
+            "required": ["interface_selection", "attach_mechanisms", "pid_descendant_gaps", "multi_rebuild_gaps"]
           }
         },
         "required": ["mechanisms", "sessions", "logins", "templates", "cgroups"]
@@ -621,7 +621,6 @@
               "anyOf": [
                 {"required": ["interface_selection"]},
                 {"required": ["attach_mechanisms"]},
-                {"required": ["attach_backend"]},
                 {"required": ["pid_descendant_gaps"]},
                 {"required": ["multi_rebuild_gaps"]}
               ]

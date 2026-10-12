@@ -80,6 +80,62 @@ class InitialOracleTest(unittest.TestCase):
                 self.assertTrue(result["pass"], result["errors"])
                 self.assertEqual(result["measured_calls"], 2 if rapid else 5)
 
+    def test_reuse_named_initial_marker_cannot_cover_unknown_measured_returns(self):
+        for unknown in (1, 5):
+            with self.subTest(unknown=unknown):
+                text, ledger, receipt = initial_inputs()
+                lines = text.splitlines()
+                changed = 0
+                for index, line in enumerate(lines):
+                    match = H6["ROW"].fullmatch(line)
+                    if match and match["fn"] == "C_GenerateRandom" and changed < unknown:
+                        lines[index] = BASE["unknown_row"](int(match["pid"]), int(match["tid"]), match["fn"])
+                        changed += 1
+                self.assertEqual(changed, unknown)
+                result = self.evaluate("\n".join(lines) + "\n", ledger, receipt)
+                self.assertFalse(result["pass"], result["errors"])
+                self.assertEqual(result["phase_populations"]["initial-0-1"], {"named": 1})
+                self.assertEqual(result["phase_populations"]["measured"].get("unknown", 0), unknown)
+                self.assertTrue(any("reuse measured" in error for error in result["errors"]), result["errors"])
+
+    def test_reuse_requires_five_correct_measured_names_with_valid_initial_readiness(self):
+        result = self.evaluate(*initial_inputs())
+        self.assertTrue(result["pass"], result["errors"])
+        self.assertEqual(result["phase_populations"]["measured"], {"named": 5})
+        for change in ("foreign-pid", "wrong-path", "wrong-label"):
+            text, ledger, receipt = initial_inputs()
+            lines = text.splitlines()
+            index = next(index for index, line in enumerate(lines) if " C_GenerateRandom " in line)
+            if change == "foreign-pid":
+                lines[index] = lines[index].replace("PID 1000", "PID 999")
+            elif change == "wrong-path":
+                lines[index] = lines[index].replace('exe="/w/caller-a"', 'exe="/foreign/caller-a"')
+            else:
+                lines[index] = lines[index].replace('"caller-a"', '"foreign"', 1)
+            with self.subTest(change=change):
+                self.assertFalse(self.evaluate("\n".join(lines) + "\n", ledger, receipt)["pass"])
+
+    def test_reuse_fixed_measured_function_rv_and_population_cannot_change_coherently(self):
+        for change in ("remove", "function", "return"):
+            text, ledger, receipt = initial_inputs()
+            lines = text.splitlines()[3:-2]
+            measured = [row for row in ledger if row.get("phase") == "measured"]
+            if change == "remove":
+                lines.pop()
+                ledger.remove(measured[-1])
+                receipt["measured"]["expected_calls"] = 4
+                receipt["phases"][-1]["count"] = 4
+            elif change == "function":
+                lines[-1] = lines[-1].replace("C_GenerateRandom", "C_GetInfo")
+                measured[-1]["fn"] = "C_GetInfo"
+            else:
+                lines[-1] = lines[-1].replace("CKR_OK", "CKR_GENERAL_ERROR")
+                measured[-1]["rv"] = 5
+            ev = BASE["evidence"](attach_backend=dict(selection="singles", fallback=None, scope_filter=None))
+            with self.subTest(change=change):
+                changed = BASE["trace_text"](lines, len(lines), len(lines), ev)
+                self.assertFalse(self.evaluate(changed, ledger, receipt)["pass"])
+
     def test_named_measured_rows_do_not_replace_a_required_initial_proof(self):
         for rapid in (False, True):
             text, ledger, receipt = initial_inputs(rapid)

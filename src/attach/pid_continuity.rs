@@ -2051,6 +2051,7 @@ pub(crate) mod engine_fixture {
                 comparable_monotonic_ns,
             );
             let mut report = super::super::DetachOutcome {
+                pending: None,
                 recompleted: outcome.completed,
                 rebuild_failures: outcome.failures,
                 rebuilt_groups,

@@ -44,6 +44,7 @@ RUN = [
     ("test_canary_evidence.py", ["--target-bits", "32"]),
     ("test_canary_evidence.py", ["--target-bits", "64"]),
     ("test_ci_dependency_selection.py", []),
+    ("test_cgroup_replacement.py", []),
     ("test_cgroup_trace_harness.py", []),
     ("test_cgroup_trace_oracle.py", []),
     ("test_dashboard_pty_cleanup.py", []),

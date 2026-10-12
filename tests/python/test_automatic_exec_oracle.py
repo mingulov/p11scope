@@ -3390,40 +3390,101 @@ class LegCleanupTest(unittest.TestCase):
                     self.assertEqual(captures[0].errors, [])
         self.assertFalse(self.ctx.cleanup_failed)
 
-    def test_seized_child_is_enrolled_before_options_failure(self):
+    def test_seize_running_owned_child_observes_actual_exec_stop_before_user_code(self):
         original_ptrace = H6["_ptrace"]
-        timer = None
+        acquisition = []
+        def ptrace(request, pid, addr=0, data=0):
+            acquisition.append((request, pid, addr, data))
+            return original_ptrace(request, pid, addr, data)
+        code = ("import os,sys; print('alive',flush=True); "
+                "assert sys.stdin.readline()=='exec\\n'; "
+                "os.execv(sys.executable,[sys.executable,'-I','-c',\"print('after-exec',flush=True)\"])")
         @H6["owned_leg"]
         def leg(ctx):
-            nonlocal timer
-            owner, _, _ = self.child(ctx.owners, ctx.readers, self.directory)
-            def kill_original():
-                try:
-                    owner.send(H6["signal"].SIGKILL)
-                except (OSError, ValueError):
-                    pass
-            timer = threading.Timer(1, kill_original)
-            timer.start()
-            def ptrace(request, pid, *args):
-                if request == H6["_PTRACE_SEIZE"]:
-                    try:
-                        return original_ptrace(request, pid, *args)
-                    except OSError as error:
-                        if error.errno == 1:
-                            self.skipTest("host denies unprivileged seizure of the owned direct child")
-                        raise
-                self.assertEqual(ctx.traced, [owner], "options failed before ptrace ownership enrollment")
-                raise OSError("controlled options acquisition failure")
+            owner, stdout, _ = self.child(ctx.owners, ctx.readers, self.directory, code=code)
+            stdout.wait(lambda reader: "alive\n" in reader.lines, 1)
+            self.assertNotIn("t", H6["proc_task_states"](owner.pid).values())
             with mock.patch.dict(self.globals, {"_ptrace": ptrace}):
                 H6["seize_until_exec"](owner.pid, ctx, owner)
-        try:
-            with self.assertRaisesRegex(OSError, "options acquisition failure"):
-                leg(self.ctx)
-            self.assert_released()
-        finally:
-            if timer is not None:
-                timer.cancel()
-                timer.join(2)
+            self.assertEqual(acquisition, [(H6["_PTRACE_SEIZE"], owner.pid, 0,
+                                           H6["_PTRACE_O_TRACEEXEC"] | (1 << 20))])
+            self.assertEqual(ctx.traced, [owner])
+            owner.verify()
+            owner.popen.stdin.write("exec\n")
+            owner.popen.stdin.flush()
+            begin = time.monotonic_ns()
+            stopped = H6["wait_exec_stop"](owner.pid, deadline=begin + 2_000_000_000)
+            self.assertLessEqual(begin, stopped)
+            self.assertNotIn("after-exec\n", stdout.lines, "new user code ran before its exec stop")
+            self.assertIn("t", H6["proc_task_states"](owner.pid).values())
+            H6["ptrace_detach"](owner.pid, ctx)
+            self.assertFalse(ctx.traced)
+            stdout.wait(lambda reader: "after-exec\n" in reader.lines, 1)
+            self.assertEqual(H6["wait_process"](owner.popen, 1), 0)
+        leg(self.ctx)
+        self.assert_released()
+
+    def test_seize_registration_failure_reaps_the_acquired_owned_trace(self):
+        class RefuseRegistration(list):
+            def append(self, owner):
+                raise MemoryError("controlled trace registration failure")
+        @H6["owned_leg"]
+        def leg(ctx):
+            owner, stdout, _ = self.child(ctx.owners, ctx.readers, self.directory)
+            stdout.wait(lambda reader: "alive\n" in reader.lines, 1)
+            ctx.traced = RefuseRegistration()
+            try:
+                with self.assertRaisesRegex(MemoryError, "trace registration failure"):
+                    H6["seize_until_exec"](owner.pid, ctx, owner)
+                self.assertEqual(owner.popen.returncode, -signal.SIGKILL,
+                                 "successful SEIZE escaped custody when registration failed")
+                self.assertFalse((Path("/proc") / str(owner.pid)).exists())
+            finally:
+                # The RED control also releases its actual acquired trace.
+                if (Path("/proc") / str(owner.pid)).exists():
+                    H6["reap_traced_child"](owner)
+        leg(self.ctx)
+        self.assert_released()
+
+    def test_invalid_seize_options_leave_no_trace_and_owned_cleanup_reaps(self):
+        original_ptrace = H6["_ptrace"]
+        @H6["owned_leg"]
+        def leg(ctx):
+            owner, stdout, _ = self.child(ctx.owners, ctx.readers, self.directory)
+            stdout.wait(lambda reader: "alive\n" in reader.lines, 1)
+            def ptrace(request, pid, addr=0, data=0):
+                self.assertEqual((request, pid, addr, data),
+                    (H6["_PTRACE_SEIZE"], owner.pid, 0, H6["_PTRACE_O_TRACEEXEC"] | (1 << 20)))
+                return original_ptrace(request, pid, addr, data | (1 << 31))
+            with mock.patch.dict(self.globals, {"_ptrace": ptrace}), \
+                    self.assertRaisesRegex(H6["SetupError"], "ptrace 0x4206"):
+                H6["seize_until_exec"](owner.pid, ctx, owner)
+            self.assertFalse(ctx.traced)
+            self.assertIsNone(owner.popen.poll())
+            owner.verify()
+            self.assertIn("TracerPid:\t0\n", (Path("/proc") / str(owner.pid) / "status").read_text())
+        leg(self.ctx)
+        self.assert_released()
+
+    def test_seize_refuses_wrong_or_unregistered_owned_child_before_acquisition(self):
+        @H6["owned_leg"]
+        def leg(ctx):
+            owner, stdout, _ = self.child(ctx.owners, ctx.readers, self.directory)
+            stdout.wait(lambda reader: "alive\n" in reader.lines, 1)
+            with mock.patch.dict(self.globals, {"_ptrace": mock.Mock(
+                    side_effect=AssertionError("unowned ptrace target was dispatched"))}):
+                with self.assertRaisesRegex(H6["SetupError"], "registered owned child"):
+                    H6["seize_until_exec"](owner.pid + 1, ctx, owner)
+                ctx.owners.remove(owner)
+                try:
+                    with self.assertRaisesRegex(H6["SetupError"], "registered owned child"):
+                        H6["seize_until_exec"](owner.pid, ctx, owner)
+                finally:
+                    ctx.owners.append(owner)
+            self.assertFalse(ctx.traced)
+            self.assertIn("TracerPid:\t0\n", (Path("/proc") / str(owner.pid) / "status").read_text())
+        leg(self.ctx)
+        self.assert_released()
 
     def test_later_leg_failure_retains_earlier_completed_result(self):
         @H6["owned_leg"]

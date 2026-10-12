@@ -37405,6 +37405,146 @@ fn automatic_exec_completed_rearm_health_read_follows_held_registry_validation()
 }
 
 #[test]
+fn automatic_exec_completed_rearm_final_clock_producer_advance_refuses_before_mutation() {
+    let (_fixture, mut engine, mut session, _record) = completed_rearm_route();
+    let candidate = carried_completed_rearm(&mut engine, &mut session);
+    let pid = engine.views[0].pid();
+    let view = engine.views[0].id();
+    let request = engine.refresh_requested[&pid].clone();
+    let (identities, calls, frontier) = {
+        let mut pairs = session.pid_continuity.as_ref().unwrap().borrow_mut();
+        let frontier = pairs.completed_frontier();
+        assert_eq!(frontier.0, frontier.1, "production preparation saw empty");
+        pairs.advance_producer_during_completed_clock();
+        (pairs.identities(), pairs.native_attach_calls, frontier)
+    };
+    let detach_calls = session
+        .detached_slot_indices
+        .iter()
+        .filter(|slots| !slots.is_empty())
+        .count();
+    let gap = session.physical_gap_summary();
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut true, false, &[])
+        .unwrap();
+    let pairs = session.pid_continuity.as_ref().unwrap().borrow();
+    let moved = (frontier.0 + 8, frontier.1);
+    assert_eq!(pairs.completed_clock_frontiers, [moved]);
+    assert_eq!(pairs.completed_frontier(), moved);
+    assert_eq!(pairs.completed_health_frontiers.len(), 1);
+    assert_eq!(pairs.native_attach_calls, calls);
+    assert_eq!(pairs.identities(), identities);
+    assert_eq!(
+        session
+            .detached_slot_indices
+            .iter()
+            .filter(|slots| !slots.is_empty())
+            .count(),
+        detach_calls
+    );
+    assert_eq!(session.physical_gap_summary(), gap);
+    assert!(
+        outcome.refused(),
+        "producer movement during final metadata must refuse the stale completed receipt: final metadata {:?}, health/cursor snapshot {:?}",
+        pairs.completed_clock_frontiers,
+        pairs.completed_health_frontiers,
+    );
+    assert_eq!(pairs.completed_health_frontiers, [moved]);
+    assert_eq!(engine.refresh_requested[&pid], request);
+    assert_eq!(engine.exec_rearm_views[&view], Some(request.serial));
+}
+
+#[test]
+fn automatic_exec_completed_rearm_final_clock_unknown_or_incomparable_refuses() {
+    let same = Some("time:[7]");
+    for (active, children, offsets) in [
+        (None, same, Some("monotonic 0 0")),
+        (same, None, Some("monotonic 0 0")),
+        (same, Some("time:[8]"), Some("monotonic 0 0")),
+        (same, same, None),
+        (same, same, Some("monotonic 1 0")),
+        (same, same, Some("monotonic 0 1")),
+        (same, same, Some("monotonic 0 0\nmonotonic 0 0")),
+        (same, same, Some("monotonic 0")),
+        (same, same, Some("monotonic unknown 0")),
+    ] {
+        let (_fixture, mut engine, mut session, _record) = completed_rearm_route();
+        let candidate = carried_completed_rearm(&mut engine, &mut session);
+        let pid = engine.views[0].pid();
+        let view = engine.views[0].id();
+        let request = engine.refresh_requested[&pid].clone();
+        let (identities, calls) = {
+            let mut pairs = session.pid_continuity.as_ref().unwrap().borrow_mut();
+            pairs.script_completed_clock_origins(active, children, offsets);
+            (pairs.identities(), pairs.native_attach_calls)
+        };
+        let detach_calls = session
+            .detached_slot_indices
+            .iter()
+            .filter(|slots| !slots.is_empty())
+            .count();
+        let outcome = engine
+            .apply_candidate(&mut session, candidate, &mut true, false, &[])
+            .unwrap();
+        assert!(outcome.refused(), "{active:?}/{children:?}/{offsets:?}");
+        assert_eq!(engine.refresh_requested[&pid], request);
+        assert_eq!(engine.exec_rearm_views[&view], Some(request.serial));
+        let pairs = session.pid_continuity.as_ref().unwrap().borrow();
+        assert_eq!(pairs.completed_clock_frontiers.len(), 1);
+        assert_eq!(pairs.native_attach_calls, calls);
+        assert_eq!(pairs.identities(), identities);
+        assert_eq!(
+            session
+                .detached_slot_indices
+                .iter()
+                .filter(|slots| !slots.is_empty())
+                .count(),
+            detach_calls
+        );
+    }
+}
+
+#[test]
+fn automatic_exec_completed_rearm_final_clock_healthy_origin_keeps_current_pairs() {
+    let (_fixture, mut engine, mut session, _record) = completed_rearm_route();
+    let candidate = carried_completed_rearm(&mut engine, &mut session);
+    let (identities, calls, frontier) = {
+        let pairs = session.pid_continuity.as_ref().unwrap().borrow();
+        (
+            pairs.identities(),
+            pairs.native_attach_calls,
+            pairs.completed_frontier(),
+        )
+    };
+    let detach_calls = session
+        .detached_slot_indices
+        .iter()
+        .filter(|slots| !slots.is_empty())
+        .count();
+    let gap = session.physical_gap_summary();
+    assert!(
+        engine
+            .apply_candidate(&mut session, candidate, &mut true, false, &[])
+            .unwrap()
+            .accepted()
+    );
+    let pairs = session.pid_continuity.as_ref().unwrap().borrow();
+    assert_eq!(pairs.completed_clock_frontiers, [frontier]);
+    assert_eq!(pairs.completed_health_frontiers, [frontier]);
+    assert_eq!(pairs.native_attach_calls, calls);
+    assert_eq!(pairs.identities(), identities);
+    assert_eq!(
+        session
+            .detached_slot_indices
+            .iter()
+            .filter(|slots| !slots.is_empty())
+            .count(),
+        detach_calls
+    );
+    assert_eq!(session.physical_gap_summary(), gap);
+}
+
+#[test]
 fn automatic_exec_pid_continuity_same_file_keeps_registered_pairs() {
     for policy in [CapturePolicy::Allowlisted, CapturePolicy::AggregateOnly] {
         let (mut fixture, mut engine, mut session) = continuity_route();

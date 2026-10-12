@@ -853,6 +853,16 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
     for image_id in receipt.get("require_named_images", []):
         if not generations[image_id]["named"]:
             errors.append("required image contains no independently correct named event")
+    if receipt.get("cell") == "rapid-chain" and receipt.get("leg", "").startswith("reuse/"):
+        # The separate initial marker proves admission, but cannot provide any
+        # of this fresh host's five required named measured returns.
+        if len(measured_calls) != 5 or any(
+                (call["image"], call["fn"], call["rv"], call["phase"]) !=
+                (0, "C_GenerateRandom", 0, "measured") for call in measured_calls):
+            errors.append("reuse measured phase differs from its fixed five calls/function/RV")
+        measured_names = phase_populations.get("measured", {})
+        if measured_names.get("named", 0) != 5 or measured_names.get("unknown", 0):
+            errors.append("reuse measured returns lack five correct fresh held executable names")
     for image_id in receipt.get("first_unknown_images", []):
         image_calls = [call for call in in_window if call["image"] == image_id]
         if (not image_calls or image_id not in transitions

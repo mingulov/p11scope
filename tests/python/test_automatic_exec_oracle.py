@@ -1992,6 +1992,7 @@ class BFailureStopTest(unittest.TestCase):
         self.ctx.pins = dict.fromkeys(("before", "after", "provider.so"), self.pin)
         self.ctx.b_file_offset = 0
         self.children, self.driver_argv, self.observers = [], [], []
+        self.terminal_budgets, self.oracle_calls = [], 0
         self.primary = TimeoutError("controlled successor warm failure")
         self.addCleanup(self.release_children)
 
@@ -2022,8 +2023,8 @@ class BFailureStopTest(unittest.TestCase):
         # Only replace the native fixture/observer executable at the spawn edge.
         child_code = textwrap.dedent("""
             import json, os, select, signal, sys, time
-            role, events, deadline, delay, initial_output = sys.argv[1:]
-            deadline, delay = int(deadline), float(delay)
+            role, events, deadline, delay, initial_output, stop_exit = sys.argv[1:]
+            deadline, delay, stop_exit = int(deadline), float(delay), int(stop_exit)
             def record(event):
                 with open(events, 'a') as output:
                     output.write(json.dumps({'role': role, 'event': event}) + '\\n')
@@ -2032,7 +2033,7 @@ class BFailureStopTest(unittest.TestCase):
                 if role == 'observer' and signum == signal.SIGINT:
                     time.sleep(delay)
                     record('stopped')
-                    sys.exit(0)
+                    sys.exit(stop_exit)
                 sys.exit(0)
             signal.signal(signal.SIGINT, stop)
             signal.signal(signal.SIGTERM, stop)
@@ -2061,7 +2062,8 @@ class BFailureStopTest(unittest.TestCase):
             options.pop("extra_groups", None)
             command = [sys.executable, "-I", "-c", child_code, role, str(events),
                        str(deadline), str(stop_delay),
-                       live_frame({}) if is_observer and kind != "trace" else "alive\n"]
+                       live_frame({}) if is_observer and kind != "trace" else "alive\n",
+                       "7" if fault == "healthy-nonzero" else "0"]
             if is_observer and fault == "direct-child":
                 def failed_validation(_pid, _parent, _uid, proc):
                     self.assertEqual(proc.stdout.readline(), "alive\n")
@@ -2096,7 +2098,7 @@ class BFailureStopTest(unittest.TestCase):
             budget = H6["ACTIVE_LEG"].get()
             self.work_budget = budget
             self.original_deadline = budget.deadline_ns
-            if fault == "healthy":
+            if fault.startswith("healthy"):
                 return {"attempts": 1}
             budget.enter("successor-recovery", 1)
             budget.phase_deadline_ns = budget.clock() - 1
@@ -2131,7 +2133,7 @@ class BFailureStopTest(unittest.TestCase):
                     capture.finish = failed_finish
             if fault == "unknown-identity":
                 owned.verify = lambda: (_ for _ in ()).throw(ValueError("controlled identity refusal"))
-            if fault == "forced":
+            if fault in ("forced", "healthy-forced"):
                 wait, send = owned.popen.wait, owned.send
                 self.wait_limits, self.sent = [], []
                 def forced_wait(timeout):
@@ -2156,15 +2158,20 @@ class BFailureStopTest(unittest.TestCase):
                 kwargs["leg_seconds"] = leg_seconds
             if clock is not None:
                 kwargs["clock"] = clock
-            return original_budget(**kwargs)
+            value = original_budget(**kwargs)
+            if kwargs.get("leg_seconds") == 65:
+                self.terminal_budgets.append(value)
+            return value
+        def oracle(_text, _ledger, receipt, _file):
+            self.oracle_calls += 1
+            return {"pass": not H6["stop_errors"](receipt), "receipt": receipt}
         patches = {"spawn_owned": spawn, "spawn_observer": observer, "LegBudget": budget,
             "observer_ready": lambda *_args: time.monotonic_ns(), "warm_successor": warm,
             "provider_receipt": lambda *_args: dict(PIN),
-            "evaluate_trace_h6": lambda _text, _ledger, receipt, _file: {
-                "pass": not H6["stop_errors"](receipt), "receipt": receipt}}
+            "evaluate_trace_h6": oracle}
         if clock is not None:
             patches["monotonic_ns"] = clock
-        if fault == "healthy":
+        if fault.startswith("healthy"):
             (self.directory / "leg").mkdir()
             (self.directory / "leg" / "trace.file.txt").write_text("")
         with mock.patch.dict(namespace, patches), \
@@ -2323,6 +2330,73 @@ class BFailureStopTest(unittest.TestCase):
         self.assertLess(events.index({"role": "observer", "event": "stopped"}),
                         events.index({"role": "caller", "event": "F"}))
         self.assert_released()
+
+    def cancel_terminal_transition(self, boundary, signum):
+        active = H6["ACTIVE_LEG"]
+        parent = H6["LegBudget"]()
+        parent_token = active.set(parent)
+        fired = []
+        def cancel():
+            if not fired:
+                fired.append(signum)
+                os.kill(os.getpid(), signum)
+        class ActiveBoundary:
+            get, reset = active.get, active.reset
+            def set(_self, value):
+                token = active.set(value)
+                if boundary == "token" and value in self.terminal_budgets:
+                    cancel()  # The real token has been installed, not yet returned.
+                return token
+        def assignment(scope, name, value):
+            object.__setattr__(scope, name, value)
+            if boundary == "attempt" and name == "observer_stop_attempted" and value is True:
+                cancel()
+        namespace = H6["run_b_leg"].__globals__
+        termination = H6["N3HARNESS"]["TerminationRequested"]
+        try:
+            with H6["signal_cleanup"](), \
+                    mock.patch.dict(namespace, {"ACTIVE_LEG": ActiveBoundary()}), \
+                    mock.patch.object(H6["LegContext"], "__setattr__", assignment), \
+                    self.assertRaises(termination) as caught:
+                self.route(fault="healthy")
+            self.assertEqual(caught.exception.signum, signum)
+            self.assertIs(active.get(), parent, "controller cancellation lost the parent ContextVar")
+        finally:
+            active.reset(parent_token)
+        self.assertEqual(fired, [signum])
+        self.assertEqual(len(self.terminal_budgets), 1, "cancellation renewed the terminal deadline")
+        terminal = self.terminal_budgets[0]
+        self.assertEqual(terminal.deadline_ns - terminal.started_ns, 65_000_000_000)
+        self.assertEqual(self.oracle_calls, 0, "cancelled transition reached the oracle")
+        self.assert_normal_stop()
+
+    def test_controller_sigint_after_terminal_token_keeps_one_normal_stop_and_budget(self):
+        self.cancel_terminal_transition("token", signal.SIGINT)
+
+    def test_controller_sigterm_after_attempt_marker_still_normally_stops_observer(self):
+        self.cancel_terminal_transition("attempt", signal.SIGTERM)
+
+    def test_otherwise_healthy_forced_stop_prevents_finish_and_oracle(self):
+        self.now = [time.monotonic_ns()]
+        with self.assertRaises(H6["LegCleanupError"]) as caught:
+            self.route(fault="healthy-forced", stop_delay=5, clock=lambda: self.now[0])
+        self.assertIn("forced cleanup", str(caught.exception))
+        self.assertEqual(self.sent, [signal.SIGINT, signal.SIGKILL])
+        self.assertEqual(self.wait_limits[:2], [60, 5])
+        self.assertEqual(self.oracle_calls, 0, "failed stop reached the oracle")
+        self.assertNotIn({"role": "caller", "event": "F"}, self.events())
+        self.assertEqual(len(self.terminal_budgets), 1)
+        self.assertEqual(str(caught.exception).count("observer normal stop failed:"), 1)
+        self.assert_released()
+
+    def test_otherwise_healthy_nonzero_stop_prevents_finish_and_oracle(self):
+        with self.assertRaises(H6["LegCleanupError"]) as caught:
+            self.route(fault="healthy-nonzero")
+        self.assertIn("observer normal stop returned 7", str(caught.exception))
+        self.assertEqual(self.observers[0].popen.returncode, 7)
+        self.assertEqual(self.oracle_calls, 0, "failed stop reached the oracle")
+        self.assertEqual(str(caught.exception).count("observer normal stop failed:"), 1)
+        self.assert_normal_stop()
 
     def test_public_cell_result_preserves_primary_after_successful_failure_cleanup(self):
         runner = H6["run_cell_backend"]

@@ -9,6 +9,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/qualify-cgroup-stop.py"
@@ -17,6 +18,35 @@ STOP = runpy.run_path(str(SCRIPT))
 
 
 class StopStageOracleTests(unittest.TestCase):
+    def test_run_leg_uses_compiled_h6_caller_pin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pins = H6["compile_case_fixtures"](Path(directory) / "bin")
+            self.addCleanup(lambda: [pin.close() for pin in pins.values()])
+            self.assertIn("caller", pins)
+            args = SimpleNamespace(uid=1000, gid=1000)
+            ctx = SimpleNamespace(args=args, pins=pins, provider_pin=object(), owners=[], readers=[])
+            created = iter(SimpleNamespace(path=Path(directory) / name)
+                           for name in ("root", "selected", "outside"))
+            observed = {}
+
+            class ReachedCallerSpawn(Exception):
+                pass
+
+            def spawn_caller(_owners, _readers, _directory, caller_pin, *_args, **_kwargs):
+                observed["pin"] = caller_pin
+                raise ReachedCallerSpawn
+
+            patches = {
+                "init_token": lambda *_args: {},
+                "provider_receipt": lambda _pin: {},
+                "create_tracked": lambda *_args: (next(created), None),
+                "spawn_caller": spawn_caller,
+            }
+            with patch.dict(STOP["H6"], patches):
+                with self.assertRaises(ReachedCallerSpawn):
+                    STOP["run_leg"].__wrapped__(ctx, directory, "singles", "traversed", False)
+            self.assertIs(observed["pin"], pins["caller"])
+
     def test_readiness_and_zero_calls_do_not_prove_traversal_cancellation(self):
         receipt = {"cell": "cgroup-reentry", "leg": "stop-before/singles",
                    "expect_empty": True, "observer_rc": 0,

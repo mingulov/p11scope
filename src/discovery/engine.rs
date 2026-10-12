@@ -8793,7 +8793,11 @@ impl Engine {
                             .next()
                             .map(|(id, _)| *id)
                     })
-                    .or_else(|| self.trace_provider_views.first_key_value().map(|(id, _)| *id));
+                    .or_else(|| {
+                        self.trace_provider_views
+                            .first_key_value()
+                            .map(|(id, _)| *id)
+                    });
                 let Some(id) = next else { break };
                 if let Some(position) = self.views.iter().position(|view| view.id() == id)
                     && self.trace_provider_associated(&self.views[position])

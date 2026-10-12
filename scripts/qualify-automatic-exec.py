@@ -203,6 +203,16 @@ def stop_errors(receipt):
     return errors
 
 
+def expected_reuse_errors(receipt):
+    errors = []
+    reuse_expected = receipt.get("reuse_expected", {})
+    for kind in ("session", "va", "token"):
+        info = receipt.get(f"{kind}_reuse", {})
+        if reuse_expected.get(kind) and not info.get("observed"):
+            errors.append(f"expected {kind} reuse across exec is not demonstrated by the ledger")
+    return errors
+
+
 def stop_receipt(owned, latency, limit=OBSERVER_STOP_SECONDS):
     return getattr(owned, "stop_receipt", {
         "stop_latency_seconds": latency, "stop_limit_seconds": limit})
@@ -698,11 +708,7 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
     # H6-DELTA: reuse legs. Expected-but-unobserved reuse fails the cell;
     # observed reuse additionally requires order-attributed non-completion
     # of old operations (post-exec rows match post-exec calls only, above).
-    reuse_expected = receipt.get("reuse_expected", {})
-    for kind in ("session", "va", "token"):
-        info = receipt.get(f"{kind}_reuse", {})
-        if reuse_expected.get(kind) and not info.get("observed"):
-            errors.append(f"expected {kind} reuse across exec is not demonstrated by the ledger")
+    errors.extend(expected_reuse_errors(receipt))
     if evidence:
         ev = evidence[0]
         if ev.get("privacy_mode") != "allowlisted" or ev.get("trace_truncated") is not False:
@@ -921,6 +927,7 @@ def _evaluate_aggregate_h6(doc, stdout_text, ledger, receipt, mode):
         return {"pass": False, "status": "negative", "cell": receipt.get("cell"),
                 "leg": receipt.get("leg"), "negative_reason": receipt["backend_refused"],
                 "errors": ["backend refused: %s" % (receipt["backend_refused"],)]}
+    errors.extend(expected_reuse_errors(receipt))
     want_schema = ("p11scope/observed-profile/v3-metrics" if mode == "metrics"
                    else "p11scope/observed-profile/v3")
     if doc.get("schema") != want_schema or doc.get("lane") != mode:

@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -73,6 +74,18 @@ def synthetic_inputs():
                   for n in range(5))
     rows = ['21:37:58.638119 "caller" (PID 222, TID 222) exe="/w/caller" '
             'C_GenerateRandom [semantics unverified] → CKR_OK 10µs'] * 5
+    ledger.insert(1, dict(kind="target", image=0, fn="C_GetInfo", dev=[8, 1], ino=77, file_offset=5000))
+    ledger.insert(2, dict(kind="call", image=0, pid=222, tid=222, fn="C_GetInfo", rv=0,
+                         phase="initial-1", scope="selected", t0=65, t1=66))
+    rows.insert(0, '21:37:58.638119 "caller" (PID 222, TID 222) exe="/w/caller" '
+                   'C_GetInfo [semantics unverified] → CKR_OK 10µs')
+    receipt["phases"].insert(0, dict(image=0, fn="C_GetInfo", phase="initial-1", scope="selected",
+                                      count=1, t0=65, t1=66))
+    receipt["warmup"] = dict(label="initial public image", t0=65, t1=66,
+                              expected_calls=1, phases=["initial-1"])
+    receipt["initial_ready"] = dict(image=0, pid=222, proof_kind="trace-row", marker_fn="C_GetInfo",
+        started_ns=61, observed_ns=67, deadline_ns=90, setup_deadline_ns=95, leg_deadline_ns=120,
+        attempts=1, max_attempts=20, output_cursor=3, proof_cursor=4, phases=["initial-1"])
     evidence = dict(privacy_mode="allowlisted", trace_truncated=False, event_loss=0,
                     start_insert_failures=0, unmatched_returns=0, rv_update_failures=0,
                     cgroup_scope_failures=0, process_tracking_failures=0,
@@ -105,27 +118,98 @@ class ReplacementOracleTests(unittest.TestCase):
     def test_nonempty_independent_replacement_is_accepted(self):
         result = self.evaluate()
         self.assertTrue(result["pass"], result["errors"])
-        self.assertEqual((result["calls"], result["named"], result["unknown"]), (5, 5, 0))
+        self.assertEqual((result["calls"], result["named"], result["unknown"]), (6, 6, 0))
+
+    def test_initial_public_proof_is_required_and_independent_of_named_measurement(self):
+        receipt = synthetic_inputs()[3]
+        del receipt["initial_ready"]
+        result = self.evaluate(receipt=receipt)
+        self.assertFalse(result["pass"], result["errors"])
+
+    def test_initial_proof_cannot_use_a_foreign_wrong_or_measured_row_or_extend_its_budget(self):
+        mutations = [
+            ("pid", 111), ("image", 1), ("marker_fn", "C_GenerateRandom"),
+            ("proof_cursor", 5), ("output_cursor", 4), ("observed_ns", 71),
+            ("started_ns", 59), ("deadline_ns", 96), ("setup_deadline_ns", 89),
+            ("leg_deadline_ns", 89), ("deadline_ns", 61 + 15_000_000_001),
+            ("attempts", 2), ("max_attempts", 21), ("phases", ["measured"]),
+            ("attempts", True), ("attempts", 21),
+        ]
+        for field, value in mutations:
+            with self.subTest(field=field):
+                receipt = synthetic_inputs()[3]
+                receipt["initial_ready"][field] = value
+                self.assertFalse(self.evaluate(receipt=receipt)["pass"])
+
+    def test_initial_marker_provider_image_and_birth_are_checked_against_independent_ledger(self):
+        for field, value in [("pid", 111), ("tid", 111), ("image", 1), ("rv", 5),
+                             ("scope", "outside"), ("t0", 60), ("t1", 68)]:
+            with self.subTest(field=field):
+                ledger = synthetic_inputs()[2]
+                next(row for row in ledger if row.get("phase") == "initial-1")[field] = value
+                self.assertFalse(self.evaluate(ledger=ledger)["pass"])
+        ledger = synthetic_inputs()[2]
+        next(row for row in ledger if row.get("kind") == "target" and row["fn"] == "C_GetInfo")["ino"] += 1
+        self.assertFalse(self.evaluate(ledger=ledger)["pass"])
+        rows = synthetic_inputs()[0]
+        rows[0] = rows[0].replace('exe="/w/caller"', 'exe="/wrong/caller"')
+        self.assertFalse(self.evaluate(rows=rows)["pass"])
+
+    def test_late_marker_cannot_derive_initial_readiness_from_already_measured_rows(self):
+        rows, evidence, ledger, receipt = synthetic_inputs()
+        rows.append(rows.pop(0))
+        receipt["initial_ready"]["proof_cursor"] = 9
+        result = self.evaluate(rows, evidence, ledger, receipt)
+        self.assertFalse(result["pass"], result["errors"])
+
+    def test_initial_proof_cannot_hide_an_extra_real_warm_attempt(self):
+        rows, evidence, ledger, receipt = synthetic_inputs()
+        ledger.append(dict(kind="call", image=0, pid=222, tid=222, fn="C_GetInfo", rv=0,
+                           phase="initial-2", scope="selected", t0=66, t1=67))
+        rows.insert(1, "21:37:58.638119 Unknown executable (PID 222, TID 222) "
+                       "C_GetInfo [semantics unverified] → CKR_OK 10µs")
+        receipt["phases"].insert(1, dict(image=0, fn="C_GetInfo", phase="initial-2", scope="selected",
+                                      count=1, t0=66, t1=67))
+        receipt["warmup"].update(t1=67, expected_calls=2, phases=["initial-1", "initial-2"])
+        result = self.evaluate(rows, evidence, ledger, receipt)
+        self.assertFalse(result["pass"], result["errors"])
+
+    def test_measured_population_cannot_be_reduced_or_changed_with_coherent_counts(self):
+        for change in ("remove", "function", "return"):
+            with self.subTest(change=change):
+                rows, evidence, ledger, receipt = synthetic_inputs()
+                if change == "remove":
+                    rows.pop()
+                    ledger.pop()
+                    receipt["measured"]["expected_calls"] = 4
+                    receipt["phases"][-1]["count"] = 4
+                elif change == "function":
+                    ledger[-1]["fn"] = "C_GetInfo"
+                    rows[-1] = rows[-1].replace("C_GenerateRandom", "C_GetInfo")
+                else:
+                    ledger[-1]["rv"] = 5
+                    rows[-1] = rows[-1].replace("CKR_OK", "CKR_GENERAL_ERROR")
+                self.assertFalse(self.evaluate(rows, evidence, ledger, receipt)["pass"])
 
     def test_one_unknown_measured_return_rejects_an_otherwise_named_replacement(self):
         rows, evidence, ledger, receipt = synthetic_inputs()
-        rows[0] = rows[0].replace('"caller"', 'Unknown executable').replace(' exe="/w/caller"', '')
+        rows[-1] = rows[-1].replace('"caller"', 'Unknown executable').replace(' exe="/w/caller"', '')
         text = trace_text(rows, evidence)
         # The shared rule intentionally still permits this mixed population.
         shared = H6["evaluate_trace_h6"](text, ledger, receipt, text)
         self.assertTrue(shared["pass"], shared["errors"])
-        self.assertEqual((shared["calls"], shared["named"], shared["unknown"]), (5, 4, 1))
+        self.assertEqual((shared["calls"], shared["named"], shared["unknown"]), (6, 5, 1))
         result = self.evaluate(rows, evidence, ledger, receipt)
         self.assertFalse(result["pass"], result["errors"])
-        self.assertEqual((result["calls"], result["named"], result["unknown"]), (5, 4, 1))
+        self.assertEqual((result["calls"], result["named"], result["unknown"]), (6, 5, 1))
 
     def test_one_wrong_fresh_executable_name_rejects_the_measured_phase(self):
         for replacement in ('"foreign"', '"caller"'):
             with self.subTest(label=replacement):
                 rows = synthetic_inputs()[0]
-                rows[0] = rows[0].replace('"caller"', replacement)
+                rows[-1] = rows[-1].replace('"caller"', replacement)
                 if replacement == '"caller"':
-                    rows[0] = rows[0].replace('exe="/w/caller"', 'exe="/foreign/caller"')
+                    rows[-1] = rows[-1].replace('exe="/w/caller"', 'exe="/foreign/caller"')
                 result = self.evaluate(rows=rows)
                 self.assertFalse(result["pass"], result["errors"])
                 self.assertEqual(result["false_names"], 1)
@@ -133,18 +217,19 @@ class ReplacementOracleTests(unittest.TestCase):
     def test_name_requirement_is_limited_to_measured_returns(self):
         rows, evidence, ledger, receipt = synthetic_inputs()
         ledger.extend([
-            dict(kind="target", image=0, fn="C_GetInfo", dev=[8, 1], ino=77, file_offset=5000),
-            dict(kind="call", image=0, pid=222, tid=222, fn="C_GetInfo", rv=0,
+            dict(kind="target", image=0, fn="C_GetSessionInfo", dev=[8, 1], ino=77, file_offset=6000),
+            dict(kind="call", image=0, pid=222, tid=222, fn="C_GetSessionInfo", rv=0,
                  phase="warm", scope="selected", t0=65, t1=66),
         ])
-        receipt["warmup"] = dict(label="early", t0=64, t1=66, expected_calls=1, phases=["warm"])
-        receipt["phases"].insert(0, dict(image=0, fn="C_GetInfo", phase="warm", scope="selected",
+        receipt["warmup"] = dict(label="early", t0=64, t1=66, expected_calls=2, phases=["warm", "initial-1"])
+        receipt["phases"].insert(0, dict(image=0, fn="C_GetSessionInfo", phase="warm", scope="selected",
                                          count=1, t0=64, t1=66))
         rows.insert(0, "21:37:58.638119 Unknown executable (PID 222, TID 222) "
-                       "C_GetInfo [semantics unverified] → CKR_OK 10µs")
+                       "C_GetSessionInfo [semantics unverified] → CKR_OK 10µs")
+        receipt["initial_ready"].update(output_cursor=4, proof_cursor=5)
         result = self.evaluate(rows, evidence, ledger, receipt)
         self.assertTrue(result["pass"], result["errors"])
-        self.assertEqual((result["measured_calls"], result["named"], result["unknown"]), (5, 5, 1))
+        self.assertEqual((result["measured_calls"], result["named"], result["unknown"]), (5, 6, 1))
 
     def test_invalid_death_custody_and_root_proofs_are_rejected(self):
         mutations = [
@@ -315,6 +400,7 @@ for line in open(proc+'/maps'):
     if len(row)>5 and row[-1]==sys.argv[1]:
         dev=[int(v,16) for v in row[3].split(':')]; ino=int(row[4]); break
 emit(kind='target',image=0,fn='C_GenerateRandom',dev=dev,ino=ino,file_offset=0)
+emit(kind='target',image=0,fn='C_GetInfo',dev=dev,ino=ino,file_offset=1)
 emit(kind='ready',image=0,pid=pid,t=time.monotonic_ns())
 for line in sys.stdin:
     argv=line.split()
@@ -334,26 +420,39 @@ def stop(*_):
     global done
     done=True
 signal.signal(signal.SIGINT,stop)
-print('p11scope: capturing: 1 probe(s) attached; stop with Ctrl-C',file=sys.stderr,flush=True)
-while not done: time.sleep(.005)
-ledger=[json.loads(line[9:]) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()
-        if line.startswith('N3LEDGER ')]
-image=next(row for row in ledger if row['kind']=='image')
-calls=[row for row in ledger if row['kind']=='call']
 lines=['Trace — completed call events in arrival order',
        'Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.',
        'CAPTURE privacy=allowlisted']
-for row in calls:
-    lines.append('21:37:58.638119 '+json.dumps(pathlib.Path(image['path']).name)+
-        ' (PID '+str(row['pid'])+', TID '+str(row['tid'])+') exe='+json.dumps(image['path'])+
-        ' '+row['fn']+' [semantics unverified] → CKR_OK 10µs')
+path=pathlib.Path(sys.argv[2]); path.write_text('\n'.join(lines)+'\n')
+print('\n'.join(lines),flush=True)
+print('p11scope: capturing: 1 probe(s) attached; stop with Ctrl-C',file=sys.stderr,flush=True)
+seen=warm=0
+while True:
+    ledger=[json.loads(line[9:]) for line in pathlib.Path(sys.argv[1]).read_text().splitlines()
+            if line.startswith('N3LEDGER ')]
+    image=next(row for row in ledger if row['kind']=='image')
+    calls=[row for row in ledger if row['kind']=='call']
+    for row in calls[seen:]:
+        warm+=row['phase'].startswith('initial-')
+        prefix=('21:37:58.638119 '+json.dumps(pathlib.Path(image['path']).name)+
+            ' (PID '+str(row['pid'])+', TID '+str(row['tid'])+') exe='+json.dumps(image['path'])) if warm>=3 else (
+            '21:37:58.638119 Unknown executable (PID '+str(row['pid'])+', TID '+str(row['tid'])+')')
+        if len(sys.argv)>4 and sys.argv[4]=='warm-wrong-image' and warm>=3:
+            prefix=prefix.replace(json.dumps(image['path']),json.dumps('/foreign/image'))
+        line=prefix+' '+row['fn']+' [semantics unverified] → CKR_OK 10µs'
+        lines.append(line); print(line,flush=True)
+        with path.open('a') as stream: stream.write(line+'\n')
+    seen=len(calls)
+    if done: break
+    time.sleep(.005)
 lines.append('COUNT_EVIDENCE '+json.dumps(dict(stats_entered=len(calls),stats_returned=len(calls),raw_calls=len(calls))))
 lines.append('EVIDENCE '+json.dumps(dict(privacy_mode='allowlisted',trace_truncated=False,
     event_loss=0,start_insert_failures=0,unmatched_returns=0,rv_update_failures=0,
     cgroup_scope_failures=0,process_tracking_failures=0,process_tracking_evictions=0,
     final_drain=True,completeness='PARTIAL',in_flight_at_end=0,task_uprobe_link_losses=0,
     attach_backend=dict(selection=sys.argv[3],fallback=None,scope_filter=None))))
-text='\n'.join(lines)+'\n'; pathlib.Path(sys.argv[2]).write_text(text)
+text='\n'.join(lines[-2:])+'\n'
+with path.open('a') as stream: stream.write(text)
 print(text,end='',flush=True)
 '''
 
@@ -383,6 +482,7 @@ class StandinIO:
     """Real ordinary children and readers at the controller's live boundary."""
     def __init__(self, failure=None):
         self.failure, self.memberships, self.owners = failure, {}, []
+        self.warm_phases, self.measured_dispatched = [], False
 
     def create_tree(self, ctx):
         disk = Path(ctx.args.out) / "groups"
@@ -429,27 +529,38 @@ class StandinIO:
         elif self.failure == "backend-refused":
             code, extra = "import sys; print('requested backend not supported',file=sys.stderr,flush=True); raise SystemExit(2)", []
         elif self.failure == "nonzero-stop":
-            code, extra = "import signal,time,sys; signal.signal(signal.SIGINT,lambda *_:sys.exit(2)); print('p11scope: capturing: 1 probe(s) attached; stop with Ctrl-C',file=sys.stderr,flush=True); time.sleep(60)", []
+            code, extra = OBSERVER_CODE + "\nraise SystemExit(2)", [str(directory / "replacement.ledger.jsonl"), argv[-1], argv[7]]
         else:
-            code, extra = OBSERVER_CODE, [str(directory / "replacement.ledger.jsonl"), argv[-1], argv[7]]
+            code, extra = OBSERVER_CODE, [str(directory / "replacement.ledger.jsonl"), argv[-1], argv[7], self.failure or ""]
         owner = H6["spawn_owned"](ctx.owners, [sys.executable, "-c", code, *extra], os.geteuid(),
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, start_new_session=True)
         self.owners.append(owner)
         capture = H6["owned_reader"](ctx.readers, H6["Reader"], owner.popen.stdout,
                                       directory / "observer.stdout.txt")
+        self.capture = capture
         errors = H6["owned_reader"](ctx.readers, H6["Reader"], owner.popen.stderr,
                                      directory / "observer.stderr.txt")
         if self.failure == "partial-observer":
             raise ValueError("injected failure after observer ownership acquisition")
+        if self.failure == "setup-near-expiry":
+            ctx.budget.phase_deadline_ns = time.monotonic_ns() + 100_000_000
+            ctx.budget.deadlines[("setup", 0)] = ctx.budget.phase_deadline_ns
         return owner, capture, errors, started
 
     def command(self, caller, reader, group, phases):
+        self.measured_dispatched = True
         self.membership(group, caller)
         H6["n3_command"](caller, reader, "C_GenerateRandom", 5, 0,
                           "measured", "selected", phases=phases)
         if self.failure == "foreign-membership":
             self.memberships[caller.pid] = "/outside"
+
+    def warm_command(self, caller, reader, group, phase, phases, remaining):
+        self.warm_phases.append(phase)
+        self.membership(group, caller)
+        H6["n3_command"](caller, reader, "C_GetInfo", 1, 0, phase, "selected", phases=phases,
+                          acknowledgement_seconds=remaining)
 
 
 class ControllerWiringTests(OwnedFixture, unittest.TestCase):
@@ -457,6 +568,7 @@ class ControllerWiringTests(OwnedFixture, unittest.TestCase):
         self.ctx.binary, self.ctx.provider_pin = self.exe, self.provider
         self.ctx.args.uid, self.ctx.args.gid = os.geteuid(), os.getegid()
         io = StandinIO(failure)
+        self.last_io = io
         directory = self.directory / "cell"
         try:
             result = Q["run_replacement"](self.ctx, directory, "singles", {}, self.exe, io)
@@ -475,6 +587,14 @@ class ControllerWiringTests(OwnedFixture, unittest.TestCase):
         self.assertNotEqual(receipt["replacement"]["original_identity"]["pid"], receipt["owned_pids"][0])
         self.assertLess(receipt["replacement"]["death_ns"], receipt["observer_started_ns"])
         self.assertEqual(result["measured_calls"], 5)
+        self.assertEqual(result["phase_populations"]["measured"], {"named": 5})
+        self.assertEqual(receipt["initial_ready"]["attempts"], 3)
+        self.assertEqual(result["warmup_calls"], 3)
+        self.assertLessEqual(receipt["initial_ready"]["observed_ns"], receipt["measured"]["t0"])
+        self.assertLessEqual(receipt["initial_ready"]["deadline_ns"] - receipt["initial_ready"]["started_ns"],
+                             15_000_000_000)
+        self.assertEqual(set(self.ctx.scopes[0].budget.deadlines),
+                         {("setup", 0), ("fixed-measurement", 0), ("normal-stop", 0), ("cleanup", 0)})
 
     def test_partial_constructor_and_readiness_failures_release_owned_handles(self):
         for failure in ("partial-caller", "partial-observer", "no-readiness", "foreign-membership"):
@@ -494,6 +614,36 @@ class ControllerWiringTests(OwnedFixture, unittest.TestCase):
         with self.assertRaises(H6["LegCleanupError"]):
             self.run_controller("nonzero-stop")
         self.assertTrue(self.ctx.cleanup_failed)
+
+    def test_initial_warm_stays_inside_the_original_setup_deadline(self):
+        with self.assertRaises(TimeoutError):
+            self.run_controller("setup-near-expiry")
+        self.assertFalse(self.last_io.measured_dispatched)
+        self.assertEqual(self.last_io.warm_phases, ["initial-1"])
+        self.assertNotIn(("successor-recovery", 0), self.ctx.scopes[0].budget.deadlines)
+
+    def test_twenty_real_wrong_image_markers_cannot_start_measurement(self):
+        with self.assertRaisesRegex(TimeoutError, "initial replacement warm-up attempt budget exhausted"):
+            self.run_controller("warm-wrong-image")
+        self.assertFalse(self.last_io.measured_dispatched)
+        self.assertEqual(self.last_io.warm_phases, [f"initial-{seq}" for seq in range(1, 21)])
+
+    def test_completed_initial_proof_after_its_deadline_cannot_start_measurement(self):
+        original_clock = H6["monotonic_ns"]
+        globals_ = Q["warm_replacement"].__globals__
+        # Complete the real marker protocol, then expire the clock at its final
+        # receipt stamp. A separate earlier remaining check cannot authorize it.
+        def clock():
+            if (sys._getframe(1).f_code.co_name == "warm_replacement"
+                    and self.last_io.warm_phases == ["initial-1", "initial-2", "initial-3"]):
+                capture = self.last_io.capture
+                if any(' exe=' in line for line in capture.lines):
+                    return self.ctx.scopes[-1].budget.phase_deadline_ns + 1
+            return original_clock()
+        with mock.patch.dict(globals_["H6"], {"monotonic_ns": clock}):
+            with self.assertRaises(TimeoutError):
+                self.run_controller()
+        self.assertFalse(self.last_io.measured_dispatched)
 
     def test_actual_stand_in_refusal_is_negative_and_all_handles_are_released(self):
         result, _ = self.run_controller("backend-refused")

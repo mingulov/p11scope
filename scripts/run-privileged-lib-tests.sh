@@ -79,6 +79,9 @@ attach::identity_iter::tests::anchor_maps_validate_real_handles
 attach::identity_iter::tests::functional_probe_proves_hardlink_match_and_copy_none
 attach::identity_iter::tests::whole_system_run_covers_all_children
 attach::identity_iter::tests::wronly_anchor_fds_refuse_reads_with_eperm
+attach::instance_tests::privileged_full_image_native_multi_query_and_scan_ia32
+attach::instance_tests::privileged_full_image_native_multi_query_and_scan_lp64
+attach::instance_tests::privileged_semantic_capture_multi_reload_and_rebound_successor
 attach::instance_tests::privileged_instance_attach_during_reload_loop_has_zero_false_joins
 attach::instance_tests::privileged_instance_exec_renews_the_instance
 attach::instance_tests::privileged_instance_fork_without_exec_stays_consistent
@@ -227,6 +230,9 @@ process::tests::pidfd_denial::pidfd_denial_helper
 run::root_fence_runtime::actual_original_exit_delayed_first_admission_retires_pending
 inventory::privileged_tests::privileged_identity_kernel_sweep_cell_lp64
 inventory::privileged_tests::privileged_identity_kernel_multipass_reuse_lp64
+s1_tests::resource_probe::native_semantic_resource_final_probe
+s1_tests::resource_probe::native_semantic_resource_registry_probe
+semantics_edge::resource_tests::native_semantic_resource_probe
 )
 SKIP_REASONS=(
 "needs punch-hole support under TMPDIR (btrfs/ext4/xfs; tmpfs refuses); no BPF-independent probe: run by hand as root: TMPDIR=<hole-capable dir> <binary> --exact <path> --ignored"
@@ -244,6 +250,9 @@ SKIP_REASONS=(
 "needs a separately reviewed native stage via P11SCOPE_ROOT_RUNTIME_STAGE (provider.so, driver, provider.json); the test documents no runtime skip"
 "needs TMPDIR on btrfs (it asserts the statfs magic) plus a kernel-identity-capable host (BTF, task_iter pidfd); run by hand as root: TMPDIR=<btrfs dir> <binary> --exact <path> --ignored"
 "needs TMPDIR on btrfs (it asserts the statfs magic) plus a kernel-identity-capable host (BTF, task_iter pidfd); run by hand as root: TMPDIR=<btrfs dir> <binary> --exact <path> --ignored"
+"requires explicit controller-granted host measurement; spawns bounded child probes for the final multi-profile large4096 registry measurement, so schedule under a separate authorized measurement plan"
+"requires explicit controller-granted host measurement; spawns bounded child probes for the multi-profile large4096 registry measurement, so schedule under a separate authorized measurement plan"
+"requires explicit controller-granted host measurement; spawns bounded child probes for the resource semantics multi-profile large4096 registry measurement, so schedule under a separate authorized measurement plan"
 )
 
 usage() {

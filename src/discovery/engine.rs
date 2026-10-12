@@ -22196,6 +22196,10 @@ impl Engine {
 pub(crate) mod tests;
 
 #[cfg(test)]
+#[path = "trace_system_seed_tests.rs"]
+mod trace_system_seed_tests;
+
+#[cfg(test)]
 #[path = "publication_tests.rs"]
 pub(crate) mod publication_tests;
 

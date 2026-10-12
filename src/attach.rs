@@ -52,8 +52,8 @@ pub(crate) use pid_continuity::engine_fixture::{
     AttachmentBoundaryChange, PidSessionFixture, PreflightChange,
 };
 pub(crate) use pid_continuity::{
-    ExecBinding, PhysicalGapSummary, PidContinuityRefusal, PidLifecycleTap, PreservationReceipt,
-    clock_origins_comparable,
+    CompletedRearmReceipt, ExecBinding, PhysicalGapSummary, PidContinuityRefusal, PidLifecycleTap,
+    PreservationReceipt, clock_origins_comparable,
 };
 
 // I3 will consume this preparation capability; I2b installs no callers or links.
@@ -3406,6 +3406,33 @@ fn unsupported_environment_context(error: anyhow::Error) -> anyhow::Error {
     error.context(UNSUPPORTED_ENV_HINT)
 }
 
+fn read_pid_health_with(
+    ebpf: &Ebpf,
+    health: &mut pid_continuity::OwnerHealth,
+    prepared_owner_limit: u64,
+    tap: &PidLifecycleTap,
+) -> std::result::Result<u64, PidContinuityRefusal> {
+    let owner = (|| -> Result<ThreadOwnerControl> {
+        let control: Array<_, ThreadOwnerControl> =
+            Array::try_from(ebpf.map("OWNER_CTL").context("OWNER_CTL map")?)?;
+        Ok(control.get(&0, 0)?)
+    })()
+    .map_err(|_| PidContinuityRefusal::Unavailable);
+    let loss = (|| -> Result<u64> {
+        let counters: PerCpuArray<_, u64> =
+            PerCpuArray::try_from(ebpf.map("COUNTERS").context("COUNTERS map")?)?;
+        pid_continuity::checked_discovery_loss(
+            counters
+                .get(&DISCOVERY_COUNTER_RING_LOSS, 0)?
+                .iter()
+                .copied(),
+        )
+        .map_err(|reason| anyhow!("PID continuity loss: {reason:?}"))
+    })()
+    .map_err(|_| PidContinuityRefusal::Loss);
+    health.check(owner, loss, prepared_owner_limit, tap)
+}
+
 impl Session {
     #[cfg(feature = "h6-reexec-diagnostic")]
     pub(crate) fn reexec_diagnostic(&self) -> Option<reexec_diagnostic::Diagnostic> {
@@ -3955,26 +3982,12 @@ impl Session {
             .pid_lifecycle
             .as_ref()
             .ok_or(PidContinuityRefusal::Unavailable)?;
-        let owner = (|| -> Result<ThreadOwnerControl> {
-            let control: Array<_, ThreadOwnerControl> =
-                Array::try_from(self.ebpf.map("OWNER_CTL").context("OWNER_CTL map")?)?;
-            Ok(control.get(&0, 0)?)
-        })()
-        .map_err(|_| PidContinuityRefusal::Unavailable);
-        let loss = (|| -> Result<u64> {
-            let counters: PerCpuArray<_, u64> =
-                PerCpuArray::try_from(self.ebpf.map("COUNTERS").context("COUNTERS map")?)?;
-            pid_continuity::checked_discovery_loss(
-                counters
-                    .get(&DISCOVERY_COUNTER_RING_LOSS, 0)?
-                    .iter()
-                    .copied(),
-            )
-            .map_err(|reason| anyhow!("PID continuity loss: {reason:?}"))
-        })()
-        .map_err(|_| PidContinuityRefusal::Loss);
-        self.pid_health
-            .check(owner, loss, self.prepared_owner_limit, tap)
+        read_pid_health_with(
+            &self.ebpf,
+            &mut self.pid_health,
+            self.prepared_owner_limit,
+            tap,
+        )
     }
 
     pub(crate) fn mutation_stopped(&self) -> bool {
@@ -4132,6 +4145,104 @@ impl Session {
             );
         });
         valid.then_some(receipt)
+    }
+
+    pub(crate) fn prepare_completed_rearm(
+        &mut self,
+        binding: &ExecBinding,
+        view: &crate::process::ProcessView,
+        serial: u64,
+        slots: &[Slot],
+        ordinary: &[Slot],
+        objects: &PinnedObjects,
+    ) -> Option<CompletedRearmReceipt> {
+        if self.mutation_stopped() {
+            return None;
+        }
+        let loss = self.read_pid_health().ok()?;
+        let tap = self.pid_lifecycle.as_ref()?;
+        let sides = self.current_static_sides();
+        let pairs = pid_continuity::CurrentPairs {
+            book: &self.pid_pairs,
+            links: &self.links,
+            sides: &sides,
+            retained: &self.retained_static,
+        };
+        let receipt = pairs.prepare_completed_rearm(
+            binding,
+            tap,
+            &self.discovery_domain,
+            view,
+            serial,
+            slots,
+            ordinary,
+            objects,
+            loss,
+        )?;
+        let health = &mut self.pid_health;
+        let ebpf = &self.ebpf;
+        let limit = self.prepared_owner_limit;
+        let consumer = &self.discovery_consumer;
+        let valid = pairs.validate_completed_rearm(
+            &receipt,
+            binding,
+            tap,
+            &self.discovery_domain,
+            view,
+            serial,
+            objects,
+            || {
+                let loss = read_pid_health_with(ebpf, health, limit, tap).ok()?;
+                Some((
+                    loss,
+                    consumer.as_ref().map(events::discovery_drain_positions)?,
+                ))
+            },
+        );
+        (valid && !self.mutation_stopped()).then_some(receipt)
+    }
+
+    pub(crate) fn validate_completed_rearm(
+        &mut self,
+        receipt: &CompletedRearmReceipt,
+        binding: &ExecBinding,
+        view: &crate::process::ProcessView,
+        serial: u64,
+        objects: &PinnedObjects,
+    ) -> bool {
+        if self.mutation_stopped() {
+            return false;
+        }
+        let Some(tap) = self.pid_lifecycle.as_ref() else {
+            return false;
+        };
+        let sides = self.current_static_sides();
+        let pairs = pid_continuity::CurrentPairs {
+            book: &self.pid_pairs,
+            links: &self.links,
+            sides: &sides,
+            retained: &self.retained_static,
+        };
+        let health = &mut self.pid_health;
+        let ebpf = &self.ebpf;
+        let limit = self.prepared_owner_limit;
+        let consumer = &self.discovery_consumer;
+        pairs.validate_completed_rearm(
+            receipt,
+            binding,
+            tap,
+            &self.discovery_domain,
+            view,
+            serial,
+            objects,
+            || {
+                let loss = read_pid_health_with(ebpf, health, limit, tap).ok()?;
+                Some((
+                    loss,
+                    consumer.as_ref().map(events::discovery_drain_positions)?,
+                ))
+            },
+        ) && !self.mutation_stopped()
     }
 
     pub(crate) fn validate_preservation(

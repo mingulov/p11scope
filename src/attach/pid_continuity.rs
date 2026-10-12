@@ -989,6 +989,13 @@ pub(crate) struct PreservationReceipt {
     fault: u64,
 }
 
+/// Successful physical recovery after one exact EXEC, not preservation across
+/// that EXEC. Its private payload shares the current-pair/frontier validator;
+/// Engine cannot mint or convert either proof kind.
+pub(crate) struct CompletedRearmReceipt {
+    proof: PreservationReceipt,
+}
+
 pub(super) struct CurrentPairs<'a> {
     pub(super) book: &'a PairBook,
     pub(super) links: &'a [RegisteredLink],
@@ -996,6 +1003,106 @@ pub(super) struct CurrentPairs<'a> {
     pub(super) retained: &'a BTreeMap<u32, RetainedStaticTarget>,
 }
 impl CurrentPairs<'_> {
+    #[allow(clippy::too_many_arguments)] // Exact Session-owned facts for one completed request.
+    pub(super) fn prepare_completed_rearm(
+        &self,
+        binding: &ExecBinding,
+        tap: &PidLifecycleTap,
+        domain: &DiscoveryDomain,
+        view: &crate::process::ProcessView,
+        serial: u64,
+        slots: &[Slot],
+        ordinary: &[Slot],
+        objects: &PinnedObjects,
+        loss: u64,
+    ) -> Option<CompletedRearmReceipt> {
+        if !binding.matches(tap, domain, view, serial)
+            || binding.key.class != ExecClass::SameTaskCandidate
+            || binding.key.hook_ts_ns == 0
+            || slots.is_empty()
+            || !clock_origins_comparable()
+        {
+            return None;
+        }
+        let facts = tap.facts().ok()?;
+        let empty = facts.empty?;
+        if empty.read_started_ns <= binding.key.hook_ts_ns
+            || empty.observation_serial != facts.observation_serial
+        {
+            return None;
+        }
+        let requested: BTreeSet<_> = ordinary.iter().map(|slot| slot.index).collect();
+        let affected = super::plan_group_rebuild(self.links, &requested).unwrap_or(requested);
+        let mut seen = BTreeSet::new();
+        let pairs: Option<Vec<_>> = slots
+            .iter()
+            .map(|slot| {
+                if !seen.insert(slot.index) || affected.contains(&slot.index) {
+                    return None;
+                }
+                let stamp =
+                    self.book
+                        .stamp_for(slot, objects, self.links, self.sides, self.retained)?;
+                if stamp.started_ns <= binding.key.hook_ts_ns
+                    || stamp.completed_ns <= stamp.started_ns
+                    || stamp.completed_ns >= empty.read_started_ns
+                    || facts
+                        .greatest_break_ns
+                        .is_some_and(|time| time >= stamp.started_ns)
+                    || stamp.baseline.loss != loss
+                    || stamp.baseline.fault != facts.fault_serial
+                {
+                    return None;
+                }
+                Some(ReceiptPair {
+                    slot: slot.clone(),
+                    generation: stamp.generation,
+                    entry: stamp.entry,
+                    return_: stamp.return_,
+                })
+            })
+            .collect();
+        Some(CompletedRearmReceipt {
+            proof: PreservationReceipt {
+                binding: binding.clone(),
+                empty,
+                pairs: pairs?,
+                loss,
+                fault: facts.fault_serial,
+            },
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)] // Reuse exact registrations, held files, and the sole frontier.
+    pub(super) fn validate_completed_rearm(
+        &self,
+        receipt: &CompletedRearmReceipt,
+        binding: &ExecBinding,
+        tap: &PidLifecycleTap,
+        domain: &DiscoveryDomain,
+        view: &crate::process::ProcessView,
+        serial: u64,
+        objects: &PinnedObjects,
+        health_and_positions: impl FnOnce() -> Option<(u64, aya::maps::ring_buf::RingBufPositions)>,
+    ) -> bool {
+        let proof = &receipt.proof;
+        if proof.binding != *binding
+            || !binding.matches(tap, domain, view, serial)
+            || !clock_origins_comparable()
+            || !self.receipt_pairs_current(proof, objects)
+        {
+            return false;
+        }
+        // Native registry and held-file checks can perform I/O. Read both
+        // direct owner health and the sole frontier only after they finish.
+        let Some((loss, positions)) = health_and_positions() else {
+            return false;
+        };
+        loss == proof.loss
+            && clock_origins_comparable()
+            && Self::receipt_frontier_current(proof, tap, positions)
+    }
+
     #[allow(clippy::too_many_arguments)] // One Session-owned fact set and its exact request.
     pub(super) fn prepare(
         &self,
@@ -1081,15 +1188,7 @@ impl CurrentPairs<'_> {
         {
             return false;
         }
-        if !receipt.pairs.iter().all(|pair| {
-            self.book
-                .stamp_for(&pair.slot, objects, self.links, self.sides, self.retained)
-                .is_some_and(|stamp| {
-                    stamp.generation == pair.generation
-                        && stamp.entry == pair.entry
-                        && stamp.return_ == pair.return_
-                })
-        }) {
+        if !self.receipt_pairs_current(receipt, objects) {
             return false;
         }
         // Held-file and registry checks can perform I/O. Sample the retained
@@ -1097,6 +1196,30 @@ impl CurrentPairs<'_> {
         let Some(positions) = positions() else {
             return false;
         };
+        Self::receipt_frontier_current(receipt, tap, positions)
+    }
+
+    fn receipt_pairs_current(
+        &self,
+        receipt: &PreservationReceipt,
+        objects: &PinnedObjects,
+    ) -> bool {
+        receipt.pairs.iter().all(|pair| {
+            self.book
+                .stamp_for(&pair.slot, objects, self.links, self.sides, self.retained)
+                .is_some_and(|stamp| {
+                    stamp.generation == pair.generation
+                        && stamp.entry == pair.entry
+                        && stamp.return_ == pair.return_
+                })
+        })
+    }
+
+    fn receipt_frontier_current(
+        receipt: &PreservationReceipt,
+        tap: &PidLifecycleTap,
+        positions: aya::maps::ring_buf::RingBufPositions,
+    ) -> bool {
         let Ok(facts) = tap.facts() else {
             return false;
         };
@@ -1454,6 +1577,8 @@ pub(crate) mod engine_fixture {
         Registration,
         Stop,
         Clock,
+        Terminal,
+        ProducersDetached,
         Exit(u32),
         Cancel(Arc<std::sync::atomic::AtomicBool>),
     }
@@ -1869,6 +1994,26 @@ pub(crate) mod engine_fixture {
             let stamp = &self.book.stamps[&slot];
             (stamp.started_ns, stamp.completed_ns)
         }
+        pub(crate) fn current_pair_times(
+            &self,
+            slots: &[Slot],
+            objects: &PinnedObjects,
+        ) -> Vec<(u32, u64, u64)> {
+            let sides = self.sides();
+            slots
+                .iter()
+                .filter_map(|slot| {
+                    let stamp =
+                        self.book
+                            .stamp_for(slot, objects, &self.links, &sides, &self.retained)?;
+                    Some((slot.index, stamp.started_ns, stamp.completed_ns))
+                })
+                .collect()
+        }
+        pub(crate) fn fresh_empty_started_ns(&mut self) -> u64 {
+            assert!(self.drain.dequeue().is_none());
+            self.tap.facts().unwrap().empty.unwrap().read_started_ns
+        }
         pub(crate) fn scripted_read_clocks(&self, values: impl IntoIterator<Item = Option<u64>>) {
             *self.tap.0.read_clocks.lock().unwrap() = values.into_iter().collect();
         }
@@ -1924,14 +2069,36 @@ pub(crate) mod engine_fixture {
             clock_origins_comparable_with(Some(&ns), Some(&ns), self.clock_offsets.as_deref())
         }
         fn read_health(&mut self) -> Result<u64, PidContinuityRefusal> {
-            self.health_reads += 1;
-            if let Some((owner, loss)) = self.health_script.pop_front() {
-                self.owner = owner;
-                self.loss = loss;
+            Self::read_health_with(
+                &mut self.health,
+                &mut self.owner,
+                &mut self.loss,
+                &mut self.health_script,
+                &mut self.health_reads,
+                self.prepared_limit,
+                &self.tap,
+            )
+        }
+        fn read_health_with(
+            health: &mut OwnerHealth,
+            owner: &mut Result<ThreadOwnerControl, PidContinuityRefusal>,
+            loss: &mut Result<Vec<u64>, PidContinuityRefusal>,
+            script: &mut VecDeque<RawHealthRead>,
+            reads: &mut usize,
+            limit: u64,
+            tap: &PidLifecycleTap,
+        ) -> Result<u64, PidContinuityRefusal> {
+            *reads += 1;
+            if let Some((next_owner, next_loss)) = script.pop_front() {
+                *owner = next_owner;
+                *loss = next_loss;
             }
-            let loss = self.loss.clone().and_then(checked_discovery_loss);
-            self.health
-                .check(self.owner, loss, self.prepared_limit, &self.tap)
+            health.check(
+                *owner,
+                loss.clone().and_then(checked_discovery_loss),
+                limit,
+                tap,
+            )
         }
         pub(crate) fn bind(
             &self,
@@ -1994,6 +2161,108 @@ pub(crate) mod engine_fixture {
             }
             self.prepared_count += 1;
             Some(receipt)
+        }
+        pub(crate) fn prepare_completed_rearm(
+            &mut self,
+            binding: &ExecBinding,
+            view: &ProcessView,
+            serial: u64,
+            slots: &[Slot],
+            ordinary: &[Slot],
+            objects: &PinnedObjects,
+        ) -> Option<CompletedRearmReceipt> {
+            if self.stopped() || !self.origin() {
+                return None;
+            }
+            self.health_phases.push("prepare_completed");
+            let loss = self.read_health().ok()?;
+            let sides = self.sides();
+            let pairs = CurrentPairs {
+                book: &self.book,
+                links: &self.links,
+                sides: &sides,
+                retained: &self.retained,
+            };
+            let receipt = pairs.prepare_completed_rearm(
+                binding,
+                &self.tap,
+                &self.tap.0.domain,
+                view,
+                serial,
+                slots,
+                ordinary,
+                objects,
+                loss,
+            )?;
+            if !pairs.validate_completed_rearm(
+                &receipt,
+                binding,
+                &self.tap,
+                &self.tap.0.domain,
+                view,
+                serial,
+                objects,
+                || {
+                    let loss = Self::read_health_with(
+                        &mut self.health,
+                        &mut self.owner,
+                        &mut self.loss,
+                        &mut self.health_script,
+                        &mut self.health_reads,
+                        self.prepared_limit,
+                        &self.tap,
+                    )
+                    .ok()?;
+                    Some((loss, crate::events::discovery_drain_positions(&self.drain)))
+                },
+            ) || self.stopped()
+            {
+                return None;
+            }
+            self.prepared_count += 1;
+            Some(receipt)
+        }
+        pub(crate) fn validate_completed_rearm(
+            &mut self,
+            receipt: &CompletedRearmReceipt,
+            binding: &ExecBinding,
+            view: &ProcessView,
+            serial: u64,
+            objects: &PinnedObjects,
+        ) -> bool {
+            if self.stopped() || !self.origin() {
+                return false;
+            }
+            self.health_phases.push("apply_completed");
+            let sides = self.sides();
+            let pairs = CurrentPairs {
+                book: &self.book,
+                links: &self.links,
+                sides: &sides,
+                retained: &self.retained,
+            };
+            pairs.validate_completed_rearm(
+                receipt,
+                binding,
+                &self.tap,
+                &self.tap.0.domain,
+                view,
+                serial,
+                objects,
+                || {
+                    let loss = Self::read_health_with(
+                        &mut self.health,
+                        &mut self.owner,
+                        &mut self.loss,
+                        &mut self.health_script,
+                        &mut self.health_reads,
+                        self.prepared_limit,
+                        &self.tap,
+                    )
+                    .ok()?;
+                    Some((loss, crate::events::discovery_drain_positions(&self.drain)))
+                },
+            ) && !self.stopped()
         }
         pub(crate) fn validate(
             &mut self,
@@ -2065,6 +2334,8 @@ pub(crate) mod engine_fixture {
                     self.stop_word = p11scope_ebpf_common::STOP_GATE_STOP | 3
                 }
                 Some(PreflightChange::Clock) => self.clock_offsets = Some("monotonic 1 0".into()),
+                Some(PreflightChange::Terminal) => self.tap.invalidate_terminal(),
+                Some(PreflightChange::ProducersDetached) => self.producers_detached = true,
                 Some(PreflightChange::Exit(pid)) => {
                     let pid = pid as libc::pid_t;
                     assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);

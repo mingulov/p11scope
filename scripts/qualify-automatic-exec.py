@@ -4981,8 +4981,8 @@ _LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
 _PTRACE_SEIZE = 0x4206
 _PTRACE_CONT = 7
 _PTRACE_DETACH = 17
-_PTRACE_SETOPTIONS = 0x4200
 _PTRACE_O_TRACEEXEC = 0x10
+_PTRACE_O_EXITKILL = 1 << 20
 _PTRACE_EVENT_EXEC = 4
 
 
@@ -5002,9 +5002,13 @@ def seize_until_exec(pid, ctx, owner):
         raise SetupError("ptrace target is not the leg's registered owned child")
     with cleanup_section():
         owner.verify()
-        _ptrace(_PTRACE_SEIZE, pid)
-        ctx.traced.append(owner)  # before options acquisition can fail
-        _ptrace(_PTRACE_SETOPTIONS, pid, 0, _PTRACE_O_TRACEEXEC)
+        # SEIZE installs options while running; SETOPTIONS requires a stop.
+        _ptrace(_PTRACE_SEIZE, pid, 0, _PTRACE_O_TRACEEXEC | _PTRACE_O_EXITKILL)
+        try:
+            ctx.traced.append(owner)
+        except BaseException:
+            reap_traced_child(owner)  # acquired tracing must never escape custody
+            raise
 
 
 def wait_exec_stop(pid, timeout=120, *, deadline=None):

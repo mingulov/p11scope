@@ -1,19 +1,182 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Package G (SYSPLAN): capacity and long-lived capture architecture.
 //!
-//! RED suite: every test names one Package G checkbox. The `capacity` module
-//! does not exist yet, so this file fails to compile until the GREEN
-//! implementation lands.
+//! Capacity contracts and checked Detailed component accounting.
 
 use p11scope::capacity::{
-    AttachCost, FirstTouchLedger, ReclamationPolicy, SlotIdentityAllocator, SlotIdentityError,
-    StorageModel, admission_envelope, broader_admission_qualified, experimental_candidate_slots,
-    inventory, native_slot_bound, production_slots, reclamation_policy,
+    AttachCost, DetailedResources, FirstTouchLedger, ReclamationPolicy, SlotIdentityAllocator,
+    SlotIdentityError, StorageModel, admission_envelope, broader_admission_qualified,
+    experimental_candidate_slots, inventory, native_slot_bound, production_slots,
+    reclamation_policy,
 };
 use p11scope_ebpf_common::{
-    IMAGE_IDENTITY_TICKET_LIMIT, MAX_DESCRIPTORS, MAX_SLOTS, RING_BYTES, ROOT_AFFILIATION_LIMIT,
-    RV_ENTRIES, START_ENTRIES, THREAD_OWNER_LIMIT,
+    CallStart, IMAGE_IDENTITY_TICKET_LIMIT, MAX_DESCRIPTORS, MAX_SLOTS, RING_BYTES,
+    ROOT_AFFILIATION_LIMIT, RV_ENTRIES, RvKey, START_ENTRIES, SlotSemantics, SlotStats, StartKey,
+    THREAD_OWNER_LIMIT,
 };
+use std::mem::size_of;
+
+#[test]
+fn detailed_resources_profiles_use_possible_cpu_allocation() {
+    for (n, rv, stats, rv_values) in [
+        (
+            512,
+            4096,
+            [303104, 1818624, 9699328],
+            [65536, 393216, 2097152],
+        ),
+        (
+            2112,
+            8192,
+            [1250304, 7501824, 40009728],
+            [131072, 786432, 4194304],
+        ),
+    ] {
+        for (index, cpus) in [2, 12, 64].into_iter().enumerate() {
+            let facts = DetailedResources::new(n, rv, cpus).unwrap();
+            assert_eq!(facts.resources.stats_values_bytes, stats[index]);
+            assert_eq!(facts.resources.rv_values_bytes, rv_values[index]);
+            assert_eq!(facts.resources.rv_keys_bytes, rv * 16);
+            assert_eq!(facts.resources.static_singles_links, n * 2);
+        }
+    }
+}
+
+#[test]
+fn detailed_resources_idle_keeps_full_stats_allocation() {
+    let resources = DetailedResources::compiled(12).unwrap();
+    let rows = StorageModel::compare();
+    for residency in ["idle", "sparse", "full"] {
+        let row = rows
+            .iter()
+            .find(|row| row.cpus == 12 && row.residency == residency)
+            .unwrap();
+        assert_eq!(resources.resources.stats_values_bytes, row.dense_bytes);
+    }
+}
+
+#[test]
+fn detailed_resources_rv_capacity_is_independent_of_slots() {
+    let small = DetailedResources::new(512, 8192, 12).unwrap();
+    let wide = DetailedResources::new(2112, 8192, 12).unwrap();
+    assert_eq!(small.resources.rv_values_bytes, 786432);
+    assert_eq!(small.resources.rv_keys_bytes, 131072);
+    assert_eq!(
+        small.resources.rv_values_bytes,
+        wide.resources.rv_values_bytes
+    );
+    assert_eq!(small.resources.rv_keys_bytes, wide.resources.rv_keys_bytes);
+    let rv_changed = DetailedResources::new(2112, 4096, 12).unwrap();
+    assert_eq!(
+        rv_changed.resources.stats_values_bytes,
+        wide.resources.stats_values_bytes
+    );
+    assert_eq!(rv_changed.resources.rv_values_bytes, 393216);
+}
+
+#[test]
+fn detailed_resources_fixed_maps_do_not_scale_with_slots_or_cpus() {
+    let small = DetailedResources::new(512, 4096, 2).unwrap();
+    let wide = DetailedResources::new(2112, 8192, 64).unwrap();
+    for facts in [small, wide] {
+        assert_eq!(
+            facts.resources.start_keys_bytes,
+            u64::from(START_ENTRIES) * size_of::<StartKey>() as u64
+        );
+        assert_eq!(
+            facts.resources.start_values_bytes,
+            u64::from(START_ENTRIES) * size_of::<CallStart>() as u64
+        );
+        assert_eq!(facts.resources.descriptor_declared_values_bytes, 1890);
+        assert_eq!(facts.resources.descriptor_aligned_values_bytes, 2520);
+    }
+    assert_eq!(
+        small.resources.start_values_bytes,
+        wide.resources.start_values_bytes
+    );
+}
+
+#[test]
+fn detailed_resources_declared_and_aligned_arrays_are_distinct() {
+    for (n, declared, aligned) in [(512, 2048, 4096), (2112, 8448, 16896)] {
+        let facts = DetailedResources::new(n, 4096, 12).unwrap();
+        assert_eq!(facts.resources.slot_file_declared_values_bytes, declared);
+        assert_eq!(facts.resources.slot_file_aligned_values_bytes, aligned);
+    }
+}
+
+#[test]
+fn detailed_resources_compiled_constructor_uses_current_abi() {
+    let compiled = DetailedResources::compiled(12).unwrap();
+    assert_eq!(
+        compiled,
+        DetailedResources::new(u64::from(MAX_SLOTS), u64::from(RV_ENTRIES), 12).unwrap()
+    );
+    assert_eq!(compiled.inputs.start_capacity, u64::from(START_ENTRIES));
+    assert_eq!(
+        compiled.inputs.descriptor_capacity,
+        u64::from(MAX_DESCRIPTORS)
+    );
+    assert_eq!(
+        compiled.abi_sizes.stats_value_bytes,
+        size_of::<SlotStats>() as u64
+    );
+    assert_eq!(compiled.abi_sizes.rv_key_bytes, size_of::<RvKey>() as u64);
+    assert_eq!(compiled.abi_sizes.rv_value_bytes, size_of::<u64>() as u64);
+    assert_eq!(
+        compiled.abi_sizes.start_key_bytes,
+        size_of::<StartKey>() as u64
+    );
+    assert_eq!(
+        compiled.abi_sizes.start_value_bytes,
+        size_of::<CallStart>() as u64
+    );
+    assert_eq!(
+        compiled.abi_sizes.descriptor_value_bytes,
+        size_of::<SlotSemantics>() as u64
+    );
+    assert_eq!(
+        compiled.abi_sizes.slot_file_value_bytes,
+        size_of::<u32>() as u64
+    );
+}
+
+#[test]
+fn detailed_resources_reject_zero_conversion_and_overflow() {
+    for (n, rv, cpus) in [
+        (0, 4096, 12),
+        (512, 0, 12),
+        (512, 4096, 0),
+        (u64::MAX, 4096, 12),
+        (512, u64::MAX, 12),
+        (512, 4096, u64::MAX),
+        (
+            u64::from(u32::MAX),
+            u64::from(u32::MAX),
+            u64::from(u32::MAX),
+        ),
+    ] {
+        assert!(
+            DetailedResources::new(n, rv, cpus).is_err(),
+            "must refuse {n}/{rv}/{cpus}"
+        );
+    }
+}
+
+#[test]
+fn detailed_resources_component_sum_excludes_links_and_declared_duplicates() {
+    let facts = DetailedResources::new(512, 4096, 12).unwrap();
+    assert_eq!(
+        facts.resources.component_payload_bytes,
+        2546136 + u64::from(START_ENTRIES) * size_of::<CallStart>() as u64
+    );
+    // Each variable component fits u64 here, but their combined sum does not.
+    assert!(
+        DetailedResources::new(20_000_000, 2_000_000_000, 1_000_000_000)
+            .unwrap_err()
+            .contains("sum overflowed")
+    );
+}
 
 // Checkbox 1: inventory capacity/occupancy for every G resource.
 #[test]

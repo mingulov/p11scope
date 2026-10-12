@@ -1836,6 +1836,141 @@ class EarlyCoverageTest(unittest.TestCase):
                 self.assertFalse(result["pass"], result)
 
 
+class RecoveredStaticGapTest(unittest.TestCase):
+    def inputs(self, mode):
+        if mode == "trace":
+            text, ledger, receipt = EarlyCoverageTest.deficit(self, gap=False)
+            _rows, counts, evs, _errors = H6["N3_PARSE_TRACE"](text)
+            payload, stdout, ev = None, text, evs[0]
+        else:
+            payload, stdout, ledger, receipt = AggregateReadinessTest.early_population(self, 2, 0)
+            payload = profile_doc(payload["functions"], mode=mode)
+            ev = payload["evidence"]
+            counts = None
+        pin = copy.deepcopy(PIN)
+        pin["mapping"].update(file_offset=0, length=4096, permissions="r--p")
+        pin["file_identity"] = {"dev": [0, 37], "ino": pin["ino"]}  # Btrfs fstat is a different domain.
+        receipt.update(provider_before=copy.deepcopy(pin), provider_after=copy.deepcopy(pin),
+            leg=f"{mode}/singles", observer_argv=["/held/p11scope", "trace" if mode == "trace" else "profile",
+                "--pid", str(receipt["pid"]), "--module", pin["path"], "--attach-backend", "singles"])
+        if mode != "trace":
+            receipt["observer_argv"] += ["--mode", mode]
+            payload["capture"]["modules"] = [{key: pin[key] for key in ("path", "dev", "ino", "sha256")}]
+        identity = {key: pin[key] for key in ("path", "dev", "ino", "sha256")}
+        ev.update(completeness="PARTIAL", verdict_detail="concrete_gap", authority="hash-pinned",
+            unprotected_live_windows=0,
+            skipped=[{"name": "discovery subject", "reason": "static probes detached and exact pairs reattached"}],
+            discovery=[dict(identity, objects=[dict(identity)])],
+            gap_classes={"observation": {"status": "lossy", "causes": ["skipped"]}})
+        ev["attach_backend"].update(scope_filter="perf-task+bpf")
+        return payload, stdout, ledger, receipt, ev, counts
+
+    def evaluate(self, mode, inputs):
+        payload, stdout, ledger, receipt, ev, counts = inputs
+        if mode == "trace":
+            text = trace_text(stdout.splitlines()[3:-2], counts[0]["stats_entered"], counts[0]["stats_returned"], ev)
+            return H6["evaluate_trace_h6"](text, ledger, receipt, text)
+        return H6[f"evaluate_{mode}_h6"](payload, stdout, ledger, receipt)
+
+    def test_recovered_gap_accepts_only_early_deficit_and_keeps_population_totals(self):
+        for mode in ("trace", "profile", "metrics"):
+            with self.subTest(mode=mode):
+                result = self.evaluate(mode, self.inputs(mode))
+                self.assertTrue(result["pass"], result["errors"])
+                self.assertEqual(result["early_coverage"]["deficit"], 1)
+                self.assertEqual(result["measured_calls"], 3 if mode == "trace" else 2)
+
+    def test_duplicate_retained_objects_with_one_physical_identity_are_not_extra_providers(self):
+        data = self.inputs("trace")
+        data[4]["discovery"][0]["objects"] *= 2
+        result = self.evaluate("trace", data)
+        self.assertTrue(result["pass"], result["errors"])
+
+    def test_recovered_category_requires_all_scope_provider_and_verdict_guards(self):
+        def missing_image_field(data):
+            data[3]["images"][0].pop("mtime_ns")
+            next(row for row in data[2] if row["kind"] == "image" and row["image"] == 0).pop("mtime_ns")
+        changes = {
+            "absent": lambda d: d[4].update(skipped=[]),
+            "incomplete": lambda d: d[4]["skipped"][0].update(reason="static probe coverage gap incomplete"),
+            "generic": lambda d: d[4]["skipped"][0].update(reason="discovery unavailable"),
+            "near-match": lambda d: d[4]["skipped"][0].update(reason="static probes detached and exact pairs reattached "),
+            "wrong-subject": lambda d: d[4]["skipped"][0].update(name="provider"),
+            "missing-cause": lambda d: d[4]["gap_classes"]["observation"].update(causes=[]),
+            "status": lambda d: d[4]["gap_classes"]["observation"].update(status="lossless"),
+            "verdict": lambda d: d[4].update(verdict_detail="attribution_only"),
+            "complete": lambda d: d[4].update(completeness="COMPLETE"),
+            "authority": lambda d: d[4].pop("authority"),
+            "filter": lambda d: d[4]["attach_backend"].pop("scope_filter"),
+            "unbound-filter": lambda d: d[4]["attach_backend"].update(scope_filter="kernel-pid"),
+            "system": lambda d: d[3].update(scope_kind="system"),
+            "cgroup": lambda d: d[3].update(scope_kind="cgroup"),
+            "other-cell": lambda d: d[3].update(cell="system-mixed"),
+            "extra-pid": lambda d: d[3]["owned_pids"].append(2000),
+            "missing-invocation": lambda d: d[3].pop("observer_argv"),
+            "wrong-pid": lambda d: d[3]["observer_argv"].__setitem__(3, "2000"),
+            "wrong-module": lambda d: d[3]["observer_argv"].__setitem__(5, "/foreign"),
+            "extra-module": lambda d: d[3]["observer_argv"].extend(["--module", "/foreign"]),
+            "foreign-image": lambda d: d[3]["images"][-1].update(pid=2000),
+            "wrong-birth": lambda d: d[3]["images"][-1].update(start_time=1),
+            "missing-image-field": missing_image_field,
+            "missing-map": lambda d: d[3]["provider_before"].pop("mapping"),
+            "changed-pin": lambda d: d[3]["provider_after"].update(ino=999),
+            "missing-provider": lambda d: d[4].update(discovery=[]),
+            "extra-provider": lambda d: d[4]["discovery"].append(copy.deepcopy(d[4]["discovery"][0])),
+            "foreign-provider": lambda d: d[4]["discovery"][0].update(path="/foreign"),
+            "bad-device": lambda d: d[4]["discovery"][0].update(dev=[0, 37]),
+            "bad-digest": lambda d: d[4]["discovery"][0].update(sha256="f" * 64),
+            "missing-object": lambda d: d[4]["discovery"][0].update(objects=[]),
+            "foreign-object": lambda d: d[4]["discovery"][0]["objects"][0].update(ino=999),
+            "extra-object": lambda d: d[4]["discovery"][0]["objects"].append(dict(PIN, ino=999)),
+            "foreign-target": lambda d: next(row for row in d[2] if row["kind"] == "target").update(dev=[0, 37]),
+        }
+        for mode in ("trace", "profile", "metrics"):
+            for name, change in changes.items():
+                with self.subTest(mode=mode, guard=name):
+                    data = self.inputs(mode)
+                    change(data)
+                    capture = data[0]["capture"] if data[0] is not None else None
+                    self.assertTrue(H6["_early_gap_errors"](data[4], 1, data[3], data[2], capture),
+                                    "recovered category accepted an invalid domain guard")
+                    result = self.evaluate(mode, data)
+                    self.assertFalse(result["pass"], result)
+                    if result.get("early_coverage", {}).get("deficit"):
+                        self.assertTrue(any("early deficit lacks" in error for error in result["errors"]), result)
+            if mode != "trace":
+                for field in ("scope", "modules"):
+                    with self.subTest(mode=mode, capture=field):
+                        data = self.inputs(mode)
+                        data[0]["capture"].pop(field)
+                        self.assertFalse(self.evaluate(mode, data)["pass"])
+
+    def test_recovered_gap_does_not_excuse_stable_return_or_readiness_failure(self):
+        for change in ("stable", "readiness"):
+            with self.subTest(change=change):
+                data = self.inputs("trace")
+                if change == "stable":
+                    data = (data[0], "\n".join(data[1].splitlines()[:-3] + data[1].splitlines()[-2:]) + "\n", *data[2:])
+                else:
+                    data[3]["successor_ready"][0]["attempts"] = 21
+                self.assertFalse(self.evaluate("trace", data)["pass"])
+
+    def test_existing_loader_and_zero_deficit_do_not_require_recovered_domain(self):
+        self.assertEqual(H6["_early_gap_errors"](real_early_gap(), 1), [])
+        recovered = self.inputs("trace")[4]
+        self.assertEqual(H6["_early_gap_errors"](recovered, 0), [])
+        self.assertTrue(H6["_early_gap_errors"](recovered, 1))
+
+    def test_recovered_with_incomplete_history_and_either_pid_filter_is_eligible(self):
+        for binding in ("perf-task+bpf", "kernel-pid+bpf"):
+            with self.subTest(binding=binding):
+                data = self.inputs("trace")
+                data[4]["attach_backend"]["scope_filter"] = binding
+                data[4]["skipped"].insert(0, {"name": "discovery subject",
+                                             "reason": "static probe coverage gap incomplete"})
+                self.assertTrue(self.evaluate("trace", data)["pass"])
+
+
 class SuccessorGateTest(unittest.TestCase):
     def test_rejects_missing_successor_proof_despite_initial_ready(self):
         text, ledger, receipt = caller_inputs(raw=True)
@@ -2010,7 +2145,8 @@ class BFailureStopTest(unittest.TestCase):
                 reader.stop.set()
                 reader.thread.join(1)
 
-    def route(self, *, kind="trace", fault="warm", stop_delay=0, leg_seconds=None, clock=None):
+    def route(self, *, kind="trace", fault="warm", stop_delay=0, leg_seconds=None, clock=None,
+              domain_provider=False, oracle_override=None):
         namespace = H6["run_b_leg"].__globals__
         original_spawn = H6["spawn_owned"]
         original_observer = H6["spawn_observer"]
@@ -2022,9 +2158,12 @@ class BFailureStopTest(unittest.TestCase):
         # Keep the production BDriver constructor and its actual deadline argv.
         # Only replace the native fixture/observer executable at the spawn edge.
         child_code = textwrap.dedent("""
-            import json, os, select, signal, sys, time
-            role, events, deadline, delay, initial_output, stop_exit = sys.argv[1:]
+            import json, mmap, os, select, signal, sys, time
+            role, events, deadline, delay, initial_output, stop_exit, provider = sys.argv[1:]
             deadline, delay, stop_exit = int(deadline), float(delay), int(stop_exit)
+            if role == 'caller' and provider:
+                fd = os.open(provider, os.O_RDONLY)
+                held = mmap.mmap(fd, 0, flags=mmap.MAP_PRIVATE, prot=mmap.PROT_READ | mmap.PROT_EXEC)
             def record(event):
                 with open(events, 'a') as output:
                     output.write(json.dumps({'role': role, 'event': event}) + '\\n')
@@ -2063,7 +2202,8 @@ class BFailureStopTest(unittest.TestCase):
             command = [sys.executable, "-I", "-c", child_code, role, str(events),
                        str(deadline), str(stop_delay),
                        live_frame({}) if is_observer and kind != "trace" else "alive\n",
-                       "7" if fault == "healthy-nonzero" else "0"]
+                       "7" if fault == "healthy-nonzero" else "0",
+                       str(self.pin.path) if domain_provider else ""]
             if is_observer and fault == "direct-child":
                 def failed_validation(_pid, _parent, _uid, proc):
                     self.assertEqual(proc.stdout.readline(), "alive\n")
@@ -2084,6 +2224,8 @@ class BFailureStopTest(unittest.TestCase):
         def ready(driver):
             H6["expect_line"](driver.stdout, 0, "alive", 2)
             driver.exe0 = str(self.pin.path)
+            if domain_provider:
+                self.caller_mapping = H6["proc_provider_mapping"](driver.pid, str(self.pin.path))
             if fault == "no-observer":
                 raise self.primary
         def pre(driver):
@@ -2106,6 +2248,7 @@ class BFailureStopTest(unittest.TestCase):
                 self.children[0].popen.wait(2)
             raise self.primary
         def observer(*args, **kwargs):
+            self.submitted_observer_argv = list(args[3])
             owned, capture, errors, started = original_observer(*args, **kwargs)
             if kind == "trace":
                 H6["expect_line"](capture, 0, "alive", 2)
@@ -2169,6 +2312,23 @@ class BFailureStopTest(unittest.TestCase):
             "observer_ready": lambda *_args: time.monotonic_ns(), "warm_successor": warm,
             "provider_receipt": lambda *_args: dict(PIN),
             "evaluate_trace_h6": oracle}
+        if domain_provider:
+            patches.pop("provider_receipt")
+        if oracle_override is not None:
+            patches["evaluate_trace_h6"] = oracle_override
+        def normalized(driver, _offset):
+            if not domain_provider:
+                return [{"kind": "exec"}]
+            rows = [{"kind": "exec"}]
+            for image in (0, 1):
+                rows.extend(({"kind": "image", "image": image, "pid": driver.pid,
+                    "start_time": driver.birth, "path": str(self.pin.path), "dev": self.pin.initial.st_dev,
+                    "ino": self.pin.initial.st_ino, "mtime_ns": self.pin.initial.st_mtime_ns,
+                    "pid_namespace": driver.owned.identity["pid_namespace"],
+                    "time_namespace": driver.owned.identity["time_namespace"]},
+                    {"kind": "target", "image": image, "fn": "C_Initialize",
+                     "dev": self.caller_mapping[2], "ino": self.caller_mapping[3], "file_offset": 0}))
+            return rows
         if clock is not None:
             patches["monotonic_ns"] = clock
         if fault.startswith("healthy"):
@@ -2180,7 +2340,7 @@ class BFailureStopTest(unittest.TestCase):
                 mock.patch.object(driver_class, "pre_exec", pre), \
                 mock.patch.object(driver_class, "do_exec", execute), \
                 mock.patch.object(driver_class, "post_exec", post), \
-                mock.patch.object(driver_class, "normalize", return_value=[{"kind": "exec"}]):
+                mock.patch.object(driver_class, "normalize", normalized):
             return H6["run_b_leg"](self.ctx, "pid-nonleader-cold", "singles", kind,
                                   self.directory / "leg", "0")
 
@@ -2329,6 +2489,22 @@ class BFailureStopTest(unittest.TestCase):
         self.assertEqual(events.count({"role": "observer", "event": "SIGINT"}), 1)
         self.assertLess(events.index({"role": "observer", "event": "stopped"}),
                         events.index({"role": "caller", "event": "F"}))
+        self.assert_released()
+
+    def test_b_controller_feeds_actual_invocation_and_held_mapping_to_gap_gate(self):
+        def oracle(_text, ledger, receipt, _file):
+            self.assertIn("observer_argv", receipt)
+            self.assertEqual(receipt["observer_argv"], self.submitted_observer_argv)
+            pin = H6["provider_receipt"](self.pin)
+            self.assertEqual(receipt["provider_before"], pin)
+            self.assertEqual(pin["dev"], self.caller_mapping[2])
+            self.assertEqual(pin["ino"], self.caller_mapping[3])
+            ev = RecoveredStaticGapTest.inputs(self, "trace")[4]
+            identity = {key: pin[key] for key in ("path", "dev", "ino", "sha256")}
+            ev["discovery"] = [dict(identity, objects=[dict(identity)])]
+            self.assertEqual(H6["_early_gap_errors"](ev, 1, receipt, ledger), [])
+            return {"pass": True}
+        self.assertTrue(self.route(fault="healthy", domain_provider=True, oracle_override=oracle)["pass"])
         self.assert_released()
 
     def cancel_terminal_transition(self, boundary, signum):
@@ -2586,6 +2762,59 @@ class LegCleanupTest(unittest.TestCase):
         for scope in self.ctx.scopes:
             H6["cleanup_leg_resources"](scope)
         self.assertEqual(self.ctx.cleanup_totals, totals)
+
+    def test_pid_controller_feeds_actual_invocation_and_held_mapping_to_gap_gate(self):
+        pin_class = H6["FilePin"]
+        submitted = []
+        def image(pin, record, owner):
+            pin.verify()
+            return {"kind": "image", "image": record["image"], "pid": owner.pid,
+                "start_time": owner.identity["start_time"], "path": str(pin.path),
+                "dev": pin.initial.st_dev, "ino": pin.initial.st_ino,
+                "mtime_ns": pin.initial.st_mtime_ns,
+                "pid_namespace": owner.identity["pid_namespace"], "time_namespace": owner.identity["time_namespace"]}
+        def target(owner, generation):
+            mapped = H6["proc_provider_mapping"](owner.pid, str(self.case_pin.path))
+            return {"kind": "target", "image": generation, "fn": "C_GetInfo",
+                    "dev": mapped[2], "ino": mapped[3], "file_offset": 0}
+        def caller(owners, readers, directory, executable, *_args, **_kwargs):
+            code = ("import mmap,os,sys; "
+                    f"fd=os.open({str(self.case_pin.path)!r},os.O_RDONLY); "
+                    "held=mmap.mmap(fd,0,flags=mmap.MAP_PRIVATE,prot=mmap.PROT_READ|mmap.PROT_EXEC); "
+                    "print('alive',flush=True); sys.stdin.read()")
+            owned, stdout, stderr = self.child(owners, readers, directory, code=code)
+            H6["expect_line"](stdout, 0, "alive", 2)
+            stdout.records.extend((image(executable, {"image": 0}, owned), target(owned, 0)))
+            return owned, stdout, stderr
+        def execute(owner, stdout, images, _method, executable):
+            successor = image(executable, {"image": 1}, owner)
+            images.append(successor)
+            stdout.records.extend((successor, target(owner, 1)))
+            return {}, {}, time.monotonic_ns(), time.monotonic_ns()
+        def oracle(_text, ledger, receipt, _file):
+            self.assertIn("observer_argv", receipt)
+            self.assertEqual(receipt["observer_argv"], submitted[0])
+            pin = H6["provider_receipt"](self.case_pin)
+            self.assertEqual(receipt["provider_before"], pin)
+            ev = RecoveredStaticGapTest.inputs(self, "trace")[4]
+            identity = {key: pin[key] for key in ("path", "dev", "ino", "sha256")}
+            ev["discovery"] = [dict(identity, objects=[dict(identity)])]
+            self.assertEqual(H6["_early_gap_errors"](ev, 1, receipt, ledger), [])
+            return {"pass": True}
+        patch, _image_patch = self.patches(lambda *_args: time.monotonic_ns())
+        directory = self.directory / "pid-domain"
+        directory.mkdir()
+        (directory / "trace.file.txt").write_text("")
+        with patch, self.driven_patches(oracle), mock.patch.object(pin_class, "image_receipt", image):
+            observer = self.globals["spawn_observer"]
+            def observe(*args, **kwargs):
+                submitted.append(list(args[3]))
+                return observer(*args, **kwargs)
+            with mock.patch.dict(self.globals, {"spawn_caller": caller, "caller_exec": execute,
+                    "spawn_observer": observe, "provider_receipt": H6["provider_receipt"]}):
+                result = H6["run_pid_caller_leg"](self.ctx, "pid-leader", "singles", "trace", directory, False)
+        self.assertTrue(result["pass"])
+        self.assert_released()
 
     def test_interrupted_leg_cleans_before_propagating(self):
         def interrupt(*_args):

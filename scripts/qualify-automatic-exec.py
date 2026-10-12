@@ -257,7 +257,100 @@ def _without_sink(value):
     return value
 
 
-def _early_gap_errors(ev, missing):
+def _single_pid_provider_domain(ev, receipt, ledger, capture):
+    """Bind the recovered category to controlled H6 invocation/held-object facts.
+
+    The trace footer has no structured scope. Its binding comes from the actual
+    submitted argv, held-FD calibration, owned image births and independent target
+    mappings. These unsigned records do not authenticate a rewritten document or
+    identify which missing return crossed the categorical coverage episode.
+    """
+    try:
+        if receipt["scope_kind"] != "pid" or receipt["cell"] not in (
+                "pid-leader", "pid-reexec", "pid-nonleader-cold", "pid-failed-exec", "leader-exit-exec"):
+            return False
+        pid = receipt["pid"]
+        if type(pid) is not int or pid <= 0 or receipt["owned_pids"] != [pid]:
+            return False
+        pin = receipt["provider_before"]
+        mapping = pin["mapping"]
+        if (pin != receipt["provider_after"] or not pin["path"].startswith("/")
+                or not isinstance(pin["dev"], list) or len(pin["dev"]) != 2
+                or any(type(value) is not int or value < 0 for value in pin["dev"])
+                or type(pin["ino"]) is not int or pin["ino"] <= 0
+                or not re.fullmatch(r"[0-9a-f]{64}", pin["sha256"])
+                or mapping["dev"] != pin["dev"] or mapping["ino"] != pin["ino"]
+                or mapping["file_offset"] != 0 or mapping["permissions"] != "r--p"
+                or type(mapping["length"]) is not int or mapping["length"] <= 0):
+            return False
+        # fstat's file_identity.dev deliberately is not the /proc/maps domain.
+        identity = {key: pin[key] for key in ("path", "dev", "ino", "sha256")}
+        def matches(record):
+            return isinstance(record, dict) and all(record.get(key) == value for key, value in identity.items())
+        argv = receipt["observer_argv"]
+        mode = receipt["leg"].split("/")[0]
+        if (not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv)
+                or mode not in ("trace", "profile", "metrics")
+                or mode not in REQUIRED_LEGS[receipt["cell"]] or receipt["requested_backend"] not in BACKENDS
+                or receipt["leg"] != f"{mode}/{receipt['requested_backend']}"
+                or argv[1] != ("trace" if mode == "trace" else "profile")
+                or not argv[0].startswith("/")
+                or any(flag in argv for flag in ("--system", "--cgroup"))
+                or any(arg.startswith(("--pid=", "--cgroup=", "--module=")) for arg in argv)
+                or any(argv.count(flag) != 1 for flag in ("--pid", "--module", "--attach-backend"))
+                or argv[argv.index("--pid") + 1] != str(pid)
+                or argv[argv.index("--module") + 1] != pin["path"]
+                or argv[argv.index("--attach-backend") + 1] != receipt["requested_backend"]
+                or (mode != "trace" and (argv.count("--mode") != 1
+                    or argv[argv.index("--mode") + 1] != mode))):
+            return False
+        images = receipt["images"]
+        ledger_images = [row for row in ledger if row["kind"] == "image"]
+        by_image = {row["image"]: row for row in images}
+        if (not images or len(by_image) != len(images) or len(ledger_images) != len(images)
+                or any(any(field not in row for field in IMAGE_FIELDS) for row in images + ledger_images)
+                or {row["image"] for row in ledger_images} != set(by_image)
+                or len({row["start_time"] for row in images}) != 1
+                or any(row["pid"] != pid or type(row["start_time"]) is not int or row["start_time"] <= 0
+                    or not row["path"].startswith("/")
+                    or any(type(row[field]) is not int or row[field] <= 0
+                           for field in ("ino", "mtime_ns", "pid_namespace", "time_namespace"))
+                    or row["pid_namespace"] != receipt["pid_namespace"]
+                    or row["time_namespace"] != receipt["time_namespace"] for row in images)
+                or any(any(row.get(field) != by_image[row["image"]].get(field) for field in IMAGE_FIELDS)
+                    for row in ledger_images)):
+            return False
+        targets = [row for row in ledger if row["kind"] == "target"]
+        if (not targets or {row["image"] for row in targets} != set(by_image)
+                or any(row["dev"] != pin["dev"] or row["ino"] != pin["ino"]
+                    or type(row["file_offset"]) is not int or row["file_offset"] < 0 for row in targets)):
+            return False
+        target_keys = {(row["image"], row["fn"]) for row in targets}
+        if any((row["image"], row["fn"]) not in target_keys for row in ledger if row["kind"] == "call"):
+            return False
+        backend = ev["attach_backend"]
+        if (ev["authority"] != "hash-pinned" or backend["fallback"] is not None
+                or backend["selection"] != receipt["requested_backend"]
+                or backend["scope_filter"] not in ("perf-task+bpf", "kernel-pid+bpf")):
+            return False
+        providers = ev["discovery"]
+        if not isinstance(providers, list) or len(providers) != 1 or not matches(providers[0]):
+            return False
+        objects = providers[0]["objects"]
+        if not isinstance(objects, list) or not objects or any(not matches(item) for item in objects):
+            return False
+        physical = {(tuple(item["dev"]), item["ino"], item["sha256"]) for item in objects}
+        if len(physical) != 1:
+            return False
+        if mode != "trace" and (capture["scope"] != "pid" or capture["mode"] != mode
+                or len(capture["modules"]) != 1 or not matches(capture["modules"][0])):
+            return False
+        return True
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+        return False
+
+
+def _early_gap_errors(ev, missing, receipt=None, ledger=None, capture=None):
     if not missing:
         return []
     observation = ev.get("gap_classes", {}).get("observation", {})
@@ -266,6 +359,10 @@ def _early_gap_errors(ev, missing):
     # or broaden a count-only attribution verdict into an observation gap.
     relevant = (ev.get("unprotected_live_windows", 0) > 0
                 and "unprotected_live_windows" in observation.get("causes", []))
+    if not relevant and "skipped" in observation.get("causes", []):
+        recovered = {"name": "discovery subject", "reason": "static probes detached and exact pairs reattached"}
+        relevant = (recovered in ev.get("skipped", [])
+                    and _single_pid_provider_domain(ev, receipt, ledger, capture))
     if (ev.get("completeness") != "PARTIAL" or ev.get("verdict_detail") != "concrete_gap"
             or observation.get("status") != "lossy" or not relevant):
         return ["early deficit lacks relevant real product concrete-gap/PARTIAL evidence"]
@@ -589,7 +686,7 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
         order_match, row_image_hints, early_coverage, population_errors = _trace_successor_populations(
             trace, rows, in_window, receipt, images)
         errors.extend(population_errors)
-        errors.extend(_early_gap_errors(evidence[0] if evidence else {}, early_coverage["deficit"]))
+        errors.extend(_early_gap_errors(evidence[0] if evidence else {}, early_coverage["deficit"], receipt, ledger))
         ambiguous_keys = []  # Independently guarded by public stream cursors.
     else:
         for key in sorted(actual.keys() | mandatory.keys()):
@@ -1050,7 +1147,7 @@ def _evaluate_aggregate_h6(doc, stdout_text, ledger, receipt, mode):
         early_coverage = {"expected": sum(early_expected.values()),
                           "observed_named": sum(early_observed.values()), "observed_unknown": 0,
                           "deficit": missing}
-        errors.extend(_early_gap_errors(doc.get("evidence", {}), missing))
+        errors.extend(_early_gap_errors(doc.get("evidence", {}), missing, receipt, ledger, capture))
     else:
         for fn in sorted(set(expect_completed) | set(got_completed)):
             if got_completed[fn] > expect_completed[fn]:
@@ -3718,6 +3815,7 @@ def run_pid_caller_leg(ctx, cell, backend, observer_kind, leg_dir, same_path, pr
     scope_args = ["--pid", str(caller.pid)]
     module_args = ["--module", str(provider.path)]
     backend_args = ["--attach-backend", backend]
+    provider_before = provider_receipt(provider)
     if observer_kind == "trace":
         argv = [str(ctx.binary.path), "trace", *scope_args, *module_args, *backend_args,
                "--duration", "120s", "-o", str(leg_dir / "trace.file.txt")]
@@ -3763,7 +3861,7 @@ def run_pid_caller_leg(ctx, cell, backend, observer_kind, leg_dir, same_path, pr
     receipt = {
         "cell": cell, "leg": f"{observer_kind}/{backend}", "scope_kind": "pid",
         "pid": caller.pid, "known_tids": [caller.pid], "owned_pids": [caller.pid],
-        "images": images, "provider_before": provider_receipt(provider),
+        "images": images, "observer_argv": list(argv), "provider_before": provider_before,
         "provider_after": provider_receipt(provider),
         "privacy_canaries": list(CANARIES), "observer_stderr": "".join(errors.lines),
         "observer_rc": obs_rc, "caller_rc": caller_rc,
@@ -3829,6 +3927,7 @@ def run_b_leg(ctx, cell, backend, observer_kind, leg_dir, mode, measured=25, del
     scope_args = ["--pid", str(driver.pid)]
     module_args = ["--module", str(provider.path)]
     backend_args = ["--attach-backend", backend]
+    provider_before = provider_receipt(provider)
     if observer_kind == "trace":
         argv = [str(ctx.binary.path), "trace", *scope_args, *module_args, *backend_args,
                "--duration", "180s", "-o", str(leg_dir / "trace.file.txt")]
@@ -3914,7 +4013,7 @@ def run_b_leg(ctx, cell, backend, observer_kind, leg_dir, mode, measured=25, del
         "cell": cell, "leg": f"{observer_kind}/{backend}", "scope_kind": "pid",
         "pid": driver.pid, "known_tids": [driver.pid, driver.worker_tid],
         "owned_pids": [driver.pid], "images": images,
-        "provider_before": provider_receipt(provider),
+        "observer_argv": list(argv), "provider_before": provider_before,
         "provider_after": provider_receipt(provider),
         "privacy_canaries": list(CANARIES), "observer_stderr": "".join(errors.lines),
         "observer_rc": obs_rc, "caller_rc": caller_rc,

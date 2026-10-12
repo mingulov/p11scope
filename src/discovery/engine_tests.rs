@@ -9329,6 +9329,8 @@ __attribute__((visibility("default")))
 int P11S_fn_b(void) { return 22; }
 __attribute__((visibility("default")))
 int P11S_fn_c(void) { return 33; }
+__attribute__((visibility("default")))
+int P11S_fn_d(void) { return 44; }
 struct p11s_function_list {
     unsigned char major;
     unsigned char minor;
@@ -9370,6 +9372,7 @@ int main(int argc, char **argv) {
     }
     void *handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (handle == NULL) return 3;
+    void *additional = NULL;
     char command;
     while (read(0, &command, 1) == 1) {
         if (command == 's' || command == 'd') {
@@ -9382,12 +9385,27 @@ int main(int argc, char **argv) {
             execl(command == 'd' ? alternate : argv[0], argv[0], argv[1], argv[2], (char *)NULL);
             return 8;
         }
+        if (command == 'a') {
+            additional = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
+            if (additional == NULL) return 11;
+            if (write(1, "A", 1) != 1) return 12;
+            continue;
+        }
+        if (command == 't') {
+            char *table = dlsym(handle, "P11S_function_list");
+            void *function = dlsym(handle, "P11S_fn_d");
+            if (table == NULL || function == NULL) return 13;
+            ((void **)(table + 8))[3] = function;
+            if (write(1, "T", 1) != 1) return 14;
+            continue;
+        }
         if (command != 'c') return 5;
         dlclose(handle);
         handle = dlopen(argv[2], RTLD_NOW | RTLD_LOCAL);
         if (handle == NULL) return 4;
         if (write(1, "C", 1) != 1) return 6;
     }
+    if (additional != NULL) dlclose(additional);
     dlclose(handle);
     return 0;
 }
@@ -9424,6 +9442,19 @@ fn wait_tabled_mapping(pid: u32, library: &std::path::Path) {
 }
 
 impl TabledSeedProvider {
+    fn grow_function_table(&mut self) {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        self.child.stdin.as_mut().unwrap().write_all(b"t").unwrap();
+        let output = self.child.stdout.as_mut().unwrap();
+        assert!(
+            system_scope_poll_fd(output.as_raw_fd(), std::time::Duration::from_secs(5)).unwrap()
+        );
+        let mut ack = [0];
+        output.read_exact(&mut ack).unwrap();
+        assert_eq!(ack, *b"T");
+    }
+
     fn reexec(&mut self, different: bool) {
         use std::io::Read as _;
         use std::os::fd::AsRawFd as _;
@@ -27040,7 +27071,8 @@ fn e07_rescan(
         .process_validated_loader_scan(
             0,
             context,
-            1_000_000,
+            Some(1_000_000),
+            None,
             None,
             &[],
             LoaderScanMode::Memory,
@@ -27525,7 +27557,8 @@ fn loader_rescan_with_a_stale_generation_refuses_without_mutation() {
         .process_validated_loader_scan(
             0,
             context,
-            1_000_000,
+            Some(1_000_000),
+            None,
             None,
             &[],
             LoaderScanMode::Memory,
@@ -37682,6 +37715,457 @@ fn observed_candidate_exec(engine: &Engine, session: &mut ScriptedSession) -> Di
         .borrow_mut()
         .observe(record);
     record
+}
+
+#[test]
+fn automatic_exec_provider_mapped_before_loader_rearm_is_caught_without_loader_hit() {
+    use std::cell::RefCell;
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+    use std::rc::Rc;
+
+    let (mut fixture, mut engine, mut session) = continuity_route();
+    let pid = engine.views[0].pid();
+    let view = engine.views[0].id();
+    let original_admission = engine.views[0].view_admission();
+    let additional = compile_tabled_provider(fixture.dir.path(), "tabled-replacement");
+    engine.module_hints.push(additional.clone());
+    fixture.reexec(false);
+    let exec = observed_candidate_exec(&engine, &mut session);
+    assert!(
+        engine
+            .modules
+            .iter()
+            .all(|module| module.scanned.path != additional)
+    );
+
+    // Keep the child's pipe ends alive outside the one-shot callback. The
+    // additional provider maps after the full rescan and before the loader's
+    // first link is installed, so no observed loader event can request it.
+    let input = Rc::new(RefCell::new(fixture.child.stdin.take().unwrap()));
+    let output = Rc::new(RefCell::new(fixture.child.stdout.take().unwrap()));
+    let load_input = Rc::clone(&input);
+    let load_output = Rc::clone(&output);
+    let mapped_provider = additional.clone();
+    session.before_dynamic_loader_attach = Some(Box::new(move || {
+        load_input.borrow_mut().write_all(b"a").unwrap();
+        let mut output = load_output.borrow_mut();
+        assert!(
+            system_scope_poll_fd(output.as_raw_fd(), std::time::Duration::from_secs(5)).unwrap()
+        );
+        let mut ack = [0];
+        output.read_exact(&mut ack).unwrap();
+        assert_eq!(ack, *b"A");
+        wait_tabled_mapping(pid, &mapped_provider);
+    }));
+
+    let refreshed = engine
+        .with_live_frame(|engine| apply_ordinary_batch(engine, &mut session, vec![exec]))
+        .unwrap();
+    assert!(refreshed.required_complete);
+    assert!(session.before_dynamic_loader_attach.is_none());
+    let armed = engine.loader_registry.ids_for_view(view);
+    assert_eq!(armed.len(), 1);
+    assert_eq!(engine.capture_facts().loader_discovery.hits, 0);
+    assert!(engine.refresh_requested.is_empty());
+    assert!(
+        engine
+            .modules
+            .iter()
+            .all(|module| module.scanned.path != additional)
+    );
+    let loader_attaches = session.dynamic_loader_attach_calls;
+    let retired_contexts = session.detached.clone();
+
+    engine
+        .with_live_frame(|engine| apply_ordinary_batch(engine, &mut session, Vec::new()))
+        .unwrap();
+    let provider = engine
+        .modules
+        .iter()
+        .find(|module| module.scanned.view == view && module.scanned.path == additional)
+        .expect(
+            "the first eligible empty frame must catch the provider mapped during loader rearm",
+        );
+    assert!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| { slot.object == provider.object && engine.plan.is_active(slot.index) })
+    );
+    assert_eq!(engine.loader_registry.ids_for_view(view), armed);
+    assert_eq!(session.dynamic_loader_attach_calls, loader_attaches);
+    assert_eq!(session.detached, retired_contexts);
+    assert_eq!(engine.capture_facts().loader_discovery.hits, 0);
+    assert!(
+        engine.views[0]
+            .view_admission()
+            .same_allocation(&original_admission)
+    );
+    assert!(engine.views[0].still_the_same());
+    assert_eq!(engine.capture_facts().attach_gap_ms, None);
+    assert_eq!(engine.counters.object_skips.iter().filter(|skip| skip.reason == "a provider was first observed after loader rearm; calls across the unarmed window and before attachment are unknown").count(), 1);
+    let scans = engine.loader_memory_scan_attempts;
+    engine
+        .with_live_frame(|engine| apply_ordinary_batch(engine, &mut session, Vec::new()))
+        .unwrap();
+    assert_eq!(engine.loader_memory_scan_attempts, scans);
+    assert_eq!(engine.capture_facts().loader_discovery.hits, 0);
+}
+
+fn loader_arm_catchup_route() -> (
+    TabledSeedProvider,
+    Engine,
+    ScriptedSession,
+    PendingLoaderScanKey,
+) {
+    let (mut fixture, mut engine, mut session) = continuity_route();
+    fixture.reexec(false);
+    let exec = observed_candidate_exec(&engine, &mut session);
+    engine
+        .with_live_frame(|engine| apply_ordinary_batch(engine, &mut session, vec![exec]))
+        .unwrap();
+    assert_eq!(engine.pending_loader_arm_scans.len(), 1);
+    let key = *engine.pending_loader_arm_scans.iter().next().unwrap();
+    (fixture, engine, session, key)
+}
+
+fn service_arm_catchup_only(
+    engine: &mut Engine,
+    session: &mut ScriptedSession,
+    additions: bool,
+    records_pending: bool,
+) -> DiscoveryRecordOutcome {
+    engine
+        .with_live_frame(|engine| {
+            engine.service_loader_arm_scans(
+                engine.pending_loader_arm_scans.clone(),
+                session,
+                &mut { additions },
+                &mut PendingViewRetirements::new(),
+                records_pending,
+            )
+        })
+        .unwrap()
+}
+
+#[test]
+fn automatic_exec_loader_arm_catchup_empty_scan_preserves_timing_and_never_churns() {
+    let (_fixture, mut engine, mut session, key) = loader_arm_catchup_route();
+    let timing = engine.timings.clone();
+    let gap = engine.capture_facts().attach_gap_ms;
+    let native_calls = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .native_attach_calls;
+    let dynamic_calls = session.dynamic_attach_calls.clone();
+    let retired = session.detached.clone();
+    let before = engine.loader_memory_scan_attempts;
+    let outcome = service_arm_catchup_only(&mut engine, &mut session, true, false);
+    assert!(outcome.required_complete());
+    assert_eq!(engine.loader_memory_scan_attempts, before + 1);
+    assert!(engine.pending_loader_arm_scans.is_empty());
+    assert_eq!(engine.timings, timing);
+    assert_eq!(engine.capture_facts().attach_gap_ms, gap);
+    assert_eq!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .native_attach_calls,
+        native_calls
+    );
+    assert_eq!(session.dynamic_attach_calls, dynamic_calls);
+    assert_eq!(session.detached, retired);
+    assert_eq!(engine.loader_registry.ids_for_view(key.view), [key.context]);
+    service_arm_catchup_only(&mut engine, &mut session, true, false);
+    assert_eq!(engine.loader_memory_scan_attempts, before + 1);
+    assert_eq!(engine.capture_facts().loader_discovery.hits, 0);
+}
+
+#[test]
+fn automatic_exec_loader_arm_catchup_changed_provider_keeps_scan_and_export_work() {
+    let (mut fixture, mut engine, mut session, key) = loader_arm_catchup_route();
+    let object = engine.modules[0].object;
+    let before = engine.plan.active_slot_count();
+    assert_eq!(before, 3);
+    assert!(
+        !engine
+            .plan
+            .provisional_objects()
+            .any(|candidate| candidate == object)
+    );
+    fixture.grow_function_table();
+    let retired = session.detached.clone();
+    let outcome = service_arm_catchup_only(&mut engine, &mut session, true, false);
+    assert!(outcome.required_complete());
+    assert!(engine.plan.active_slot_count() >= 4);
+    assert!(engine.modules.iter().any(|module| module.object == object));
+    assert!(
+        engine
+            .plan
+            .provisional_objects()
+            .any(|candidate| candidate == object)
+    );
+    assert_eq!(engine.loader_registry.ids_for_view(key.view), [key.context]);
+    assert_eq!(session.detached, retired);
+    assert_eq!(engine.capture_facts().loader_discovery.hits, 0);
+    assert!(engine.pending_loader_arm_scans.is_empty());
+}
+
+#[test]
+fn automatic_exec_loader_arm_catchup_discards_obsolete_identity_without_scanning() {
+    for condition in [
+        "absent",
+        "tombstoned",
+        "mismatched",
+        "mapping",
+        "ended",
+        "refresh",
+    ] {
+        let (mut fixture, mut engine, mut session, key) = loader_arm_catchup_route();
+        let before = engine.loader_memory_scan_attempts;
+        let losses = engine.discovery_truncated;
+        let retired = session.detached.clone();
+        match condition {
+            "absent" => engine.views.clear(),
+            "tombstoned" => engine.loader_registry.tombstone(key.context).unwrap(),
+            "mismatched" => {
+                engine.pending_loader_arm_scans.clear();
+                engine
+                    .pending_loader_arm_scans
+                    .insert(PendingLoaderScanKey {
+                        view: key.view,
+                        context: LoaderContextId::from_case_id(255),
+                    });
+            }
+            "mapping" => {
+                let mut spec = engine
+                    .loader_registry
+                    .context(key.context)
+                    .unwrap()
+                    .spec
+                    .clone();
+                spec.mapping.as_mut().unwrap().start += 4096;
+                engine.loader_registry.tombstone(key.context).unwrap();
+                engine.loader_registry.remove(key.context).unwrap();
+                let prepared = engine.loader_registry.preflight(spec).unwrap();
+                let context = engine.loader_registry.prepare(prepared).unwrap();
+                engine.loader_registry.mark_attached(context).unwrap();
+                engine.pending_loader_arm_scans.clear();
+                engine
+                    .pending_loader_arm_scans
+                    .insert(PendingLoaderScanKey {
+                        view: key.view,
+                        context,
+                    });
+            }
+            "ended" => {
+                fixture.child.kill().unwrap();
+                fixture.child.wait().unwrap();
+            }
+            _ => {
+                assert!(
+                    engine.request_refresh(engine.views[0].pid(), crate::attach::monotonic_ns())
+                );
+            }
+        }
+        let outcome = service_arm_catchup_only(&mut engine, &mut session, true, false);
+        assert!(outcome.required_complete(), "{condition}");
+        assert!(engine.pending_loader_arm_scans.is_empty(), "{condition}");
+        assert_eq!(engine.loader_memory_scan_attempts, before, "{condition}");
+        assert_eq!(engine.discovery_truncated, losses, "{condition}");
+        assert_eq!(session.detached, retired, "{condition}");
+    }
+}
+
+#[test]
+fn automatic_exec_loader_arm_catchup_defers_without_renewing_or_losing_work() {
+    for condition in [
+        "closed",
+        "frame",
+        "budget",
+        "queued",
+        "protected",
+        "terminal",
+        "stop",
+        "cancel",
+    ] {
+        let (_fixture, mut engine, mut session, key) = loader_arm_catchup_route();
+        let before = engine.loader_memory_scan_attempts;
+        let losses = engine.discovery_truncated;
+        match condition {
+            "frame" => engine.frame_work_budget_ns = 0,
+            "budget" => {
+                engine.budget.charge(u64::MAX);
+            }
+            "protected" => engine.pressure_protection.block_all = true,
+            "terminal" => engine.start_cleanup_only_terminal_journal_for_test(key.context),
+            "stop" => {
+                session
+                    .pid_continuity
+                    .as_mut()
+                    .unwrap()
+                    .borrow_mut()
+                    .stop_word = p11scope_ebpf_common::STOP_GATE_STOP
+            }
+            "cancel" => engine.set_cancel_flag(std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(true),
+            )),
+            _ => {}
+        }
+        let used = engine.budget.work_units_count();
+        let outcome = service_arm_catchup_only(
+            &mut engine,
+            &mut session,
+            condition != "closed",
+            condition == "queued",
+        );
+        assert!(!outcome.required_complete(), "{condition}");
+        assert_eq!(
+            engine
+                .pending_loader_arm_scans
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            [key],
+            "{condition}"
+        );
+        assert_eq!(engine.loader_memory_scan_attempts, before, "{condition}");
+        assert_eq!(engine.budget.work_units_count(), used, "{condition}");
+        assert_eq!(engine.discovery_truncated, losses, "{condition}");
+        engine.settle_terminal_drain();
+        assert!(engine.pending_loader_arm_scans.is_empty(), "{condition}");
+        assert_eq!(engine.discovery_truncated, losses, "{condition}");
+    }
+}
+
+#[test]
+fn automatic_exec_loader_arm_catchup_is_not_backlog_or_terminal_work() {
+    let (_fixture, mut engine, mut session, key) = loader_arm_catchup_route();
+    let before = engine.loader_memory_scan_attempts;
+    engine.service_backlog_quantum(&mut session).unwrap();
+    let mut collect = Engine::collect_discovery_records;
+    engine
+        .with_live_frame(|engine| {
+            engine.apply_discovery_batch_with(
+                &mut session,
+                Vec::new(),
+                0,
+                true,
+                true,
+                &mut collect,
+                None,
+            )
+        })
+        .unwrap();
+    assert!(engine.pending_loader_arm_scans.contains(&key));
+    assert_eq!(engine.loader_memory_scan_attempts, before);
+    engine.settle_frame_deferrals_at_capture_end();
+    assert!(engine.pending_loader_arm_scans.is_empty());
+}
+
+#[test]
+fn automatic_exec_loader_arm_catchup_started_scan_is_consumed_with_one_partial() {
+    let (_fixture, mut engine, mut session, _key) = loader_arm_catchup_route();
+    let before = engine.loader_memory_scan_attempts;
+    let losses = engine.discovery_truncated;
+    engine.loader_arm_scan_after_scan = Some(|engine| {
+        engine.budget.charge(u64::MAX);
+    });
+    let outcome = service_arm_catchup_only(&mut engine, &mut session, true, false);
+    assert!(!outcome.required_complete());
+    assert_eq!(engine.loader_memory_scan_attempts, before + 1);
+    assert!(engine.pending_loader_arm_scans.is_empty());
+    assert_eq!(engine.discovery_truncated, losses);
+    assert_eq!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .filter(|skip| skip.reason == "the one-shot loader-arm catch-up scan did not complete")
+            .count(),
+        1
+    );
+    service_arm_catchup_only(&mut engine, &mut session, true, false);
+    assert_eq!(engine.loader_memory_scan_attempts, before + 1);
+}
+
+#[test]
+fn automatic_exec_loader_arm_catchup_revalidates_after_fallible_scan() {
+    let (mut fixture, mut engine, mut session, key) = loader_arm_catchup_route();
+    let replacement = fixture.replace_mapped_provider();
+    engine.module_hints.push(replacement.clone());
+    let native_before = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .native_attach_calls;
+    engine.loader_arm_scan_after_scan = Some(|engine| {
+        let context = engine.loader_registry.ids_for_view(engine.views[0].id())[0];
+        engine.loader_registry.tombstone(context).unwrap();
+    });
+    let outcome = service_arm_catchup_only(&mut engine, &mut session, true, false);
+    assert!(outcome.required_complete());
+    assert!(engine.loader_registry.is_tombstoned(key.context));
+    assert!(
+        engine
+            .modules
+            .iter()
+            .all(|module| module.scanned.path != replacement)
+    );
+    assert_eq!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .native_attach_calls,
+        native_before
+    );
+    assert!(engine.pending_loader_arm_scans.is_empty());
+}
+
+#[test]
+fn automatic_exec_loader_arm_catchup_real_rt_add_owns_the_single_memory_scan() {
+    let (_fixture, mut engine, mut session, key) = loader_arm_catchup_route();
+    let mut add = mapped_loader_record(&mut engine, key.context);
+    add.announced_count = 1;
+    session.counters.loader_hits = 1;
+    let before = engine.loader_memory_scan_attempts;
+    engine
+        .with_live_frame(|engine| apply_ordinary_batch(engine, &mut session, vec![add]))
+        .unwrap();
+    assert!(engine.pending_loader_arm_scans.is_empty());
+    assert_eq!(engine.pending_loader_scans.len(), 1);
+    assert_eq!(engine.loader_memory_scan_attempts, before);
+    engine
+        .with_live_frame(|engine| apply_ordinary_batch(engine, &mut session, Vec::new()))
+        .unwrap();
+    assert!(engine.pending_loader_scans.is_empty());
+    assert_eq!(engine.loader_memory_scan_attempts, before + 1);
+    assert_eq!(engine.loader_records_accepted, 1);
+    assert_eq!(engine.capture_facts().loader_discovery.hits, 1);
+}
+
+#[test]
+fn automatic_exec_loader_arm_catchup_does_not_mint_for_global_or_prearm_contexts() {
+    for system in [true, false] {
+        let (_fixture, mut engine, mut session, _scope) =
+            exec_rearm_global_twin_route(system, false);
+        let exec = exec_record_for(engine.views[0].pid());
+        engine
+            .with_live_frame(|engine| apply_ordinary_batch(engine, &mut session, vec![exec]))
+            .unwrap();
+        assert!(engine.pending_loader_arm_scans.is_empty());
+    }
+    let (_fixture, _child, engine, _context, _exec, _session) = owned_prearmed_seed_route(true);
+    assert!(engine.pending_loader_arm_scans.is_empty());
 }
 
 /// The loader route can replace all static pairs while the matched EXEC's

@@ -44,6 +44,7 @@ use std::sync::Arc;
 
 pub(crate) mod detailed_identity;
 mod ended_pid_retirement;
+mod global_retirement;
 #[allow(dead_code)] // B2 records private facts; B3 supplies request-bound validation.
 mod pid_continuity;
 pub(crate) use ended_pid_retirement::EndedPidRetirement;
@@ -1284,6 +1285,7 @@ pub struct Session {
     /// slot's last link detaches (see [`RetainedStaticTarget`]).
     retained_static: BTreeMap<u32, RetainedStaticTarget>,
     pid_pairs: pid_continuity::PairBook,
+    global_retirements: global_retirement::Retirements,
     pid_health: pid_continuity::OwnerHealth,
     prepared_owner_limit: u64,
     pid_lifecycle: Option<PidLifecycleTap>,
@@ -3947,6 +3949,7 @@ impl Session {
             process_creation_tracking_unavailable: None,
             retained_static: BTreeMap::new(),
             pid_pairs: pid_continuity::PairBook::default(),
+            global_retirements: global_retirement::Retirements::default(),
             pid_health: pid_continuity::OwnerHealth::default(),
             prepared_owner_limit: prepared_owner_limit
                 .expect("identity preparation retained exact owner limit"),
@@ -4023,7 +4026,10 @@ impl Session {
     }
 
     pub(crate) fn physical_gap_summary(&self) -> PhysicalGapSummary {
-        self.pid_pairs.gap_summary()
+        global_retirement::merge_summaries(
+            self.pid_pairs.gap_summary(),
+            self.global_retirements.summary(),
+        )
     }
 
     pub(crate) fn prepare_ended_pid_retirement(
@@ -4622,6 +4628,7 @@ impl Session {
             bail!("static attachment refused while Session is stopping or detached");
         }
         self.pid_pairs.retarget_gap(targets, objects);
+        self.global_retirements.select(targets, objects);
         attachment_admission(&self.detach_failures, !targets.is_empty())?;
         if targets.is_empty() {
             return Ok((Vec::new(), Vec::new()));
@@ -4782,6 +4789,13 @@ impl Session {
             &self.retained_static,
             pid_continuity::comparable_monotonic_ns,
         );
+        self.global_retirements.seal(
+            &continuity_rounds,
+            &self.links,
+            &current_sides,
+            &self.retained_static,
+            pid_continuity::comparable_monotonic_ns,
+        );
         self.successful_static.extend(successful);
         let failed: Vec<_> = failures.iter().map(|(slot, _)| *slot).collect();
         self.attach_failures.extend(failures);
@@ -4899,7 +4913,7 @@ impl Session {
             .collect();
         // An entry failure still leaves a successful return link behind. Remove
         // it before retiring the slot so failed replacement evidence is exact.
-        let detach = self.detach_slots(&failed_slots);
+        let detach = self.detach_failed_slots(&failed_slots);
         for slot in &failed_slots {
             plan.deactivate(slot.index);
         }
@@ -4919,7 +4933,14 @@ impl Session {
     /// is made even if an earlier one failed; the report carries per-member
     /// rebuild evidence for the caller to apply.
     pub fn detach_slots(&mut self, slots: &[Slot]) -> Result<DetachOutcome> {
-        self.detach_slots_with_ended(slots, None)
+        self.detach_slots_with_ended(slots, None, false)
+    }
+
+    /// Cleanup of an uncompleted new attachment is not coverage retirement.
+    /// Healthy siblings actually detached by a partial Multi rebuild still
+    /// retain their own physical retirement and reselection evidence.
+    pub(crate) fn detach_failed_slots(&mut self, slots: &[Slot]) -> Result<DetachOutcome> {
+        self.detach_slots_with_ended(slots, None, true)
     }
 
     pub(crate) fn detach_ended_pid_slots(
@@ -4928,15 +4949,21 @@ impl Session {
         owner: &crate::process::ProcessView,
         ended: &EndedPidRetirement,
     ) -> Result<DetachOutcome> {
-        self.detach_slots_with_ended(slots, Some((owner, ended)))
+        self.detach_slots_with_ended(slots, Some((owner, ended)), false)
     }
 
     fn detach_slots_with_ended(
         &mut self,
         slots: &[Slot],
         ended: Option<(&crate::process::ProcessView, &EndedPidRetirement)>,
+        failed_cleanup: bool,
     ) -> Result<DetachOutcome> {
         let requested: BTreeSet<_> = slots.iter().map(|slot| slot.index).collect();
+        let excluded = if failed_cleanup {
+            requested.clone()
+        } else {
+            BTreeSet::new()
+        };
         let Some(affected) = plan_group_rebuild(&self.links, &requested) else {
             self.pid_pairs.invalidate(&requested);
             let detached = self.detach_links_with_ended(
@@ -4948,11 +4975,12 @@ impl Session {
                     _ => link.slots().iter().any(|slot| requested.contains(slot)),
                 },
                 ended.map(|(owner, proof)| (owner, proof, slots)),
+                &excluded,
             );
             prune_linkless_retained(&mut self.retained_static, &self.links);
             return detached.map(|()| DetachOutcome::default());
         };
-        self.rebuild_affected_groups(&requested, &affected)
+        self.rebuild_affected_groups(&requested, &affected, &excluded)
     }
 
     /// Explicit multi-group rebuild for a partially covered retirement:
@@ -4967,6 +4995,7 @@ impl Session {
         &mut self,
         requested: &BTreeSet<u32>,
         affected: &BTreeSet<u32>,
+        excluded: &BTreeSet<u32>,
     ) -> Result<DetachOutcome> {
         let mut survivors = Vec::new();
         let mut missing = Vec::new();
@@ -5002,12 +5031,18 @@ impl Session {
             prog_fds.insert(program, multi_prog_fd(&mut self.ebpf, program)?);
         }
         self.pid_pairs.invalidate(affected);
-        self.detach_links(|link| match link {
-            RegisteredLink::MultiUProbe { slots, .. } => {
-                slots.iter().any(|slot| affected.contains(slot))
-            }
-            _ => link.slots().iter().any(|slot| requested.contains(slot)),
-        })?;
+        let detached = self.detach_links_with_ended(
+            |link| match link {
+                RegisteredLink::MultiUProbe { slots, .. } => {
+                    slots.iter().any(|slot| affected.contains(slot))
+                }
+                _ => link.slots().iter().any(|slot| requested.contains(slot)),
+            },
+            None,
+            excluded,
+        );
+        self.global_retirements.select_retained(&survivors);
+        detached?;
         prune_linkless_retained(&mut self.retained_static, &self.links);
         let continuity_baseline = match static_attachment_baseline_with(
             self,
@@ -5065,6 +5100,13 @@ impl Session {
                 .as_ref()
                 .and_then(|tap| tap.facts().ok())
                 .map(|facts| facts.fault_serial),
+            &self.links,
+            &current_sides,
+            &self.retained_static,
+            pid_continuity::comparable_monotonic_ns,
+        );
+        self.global_retirements.seal(
+            &continuity_rounds,
             &self.links,
             &current_sides,
             &self.retained_static,
@@ -5195,13 +5237,14 @@ impl Session {
     }
 
     fn detach_links(&mut self, mut select: impl FnMut(&RegisteredLink) -> bool) -> Result<()> {
-        self.detach_links_with_ended(&mut select, None)
+        self.detach_links_with_ended(&mut select, None, &BTreeSet::new())
     }
 
     fn detach_links_with_ended(
         &mut self,
         mut select: impl FnMut(&RegisteredLink) -> bool,
         ended: Option<(&crate::process::ProcessView, &EndedPidRetirement, &[Slot])>,
+        excluded: &BTreeSet<u32>,
     ) -> Result<()> {
         // Resolve singles' fallible program lookup before extracting any
         // ownership. A refused lookup keeps all native handles untouched and
@@ -5231,6 +5274,19 @@ impl Session {
                     &self.retained_static,
                 )
             });
+        // Program/group preflight has succeeded. Preserve the held physical
+        // points immediately before these exact owned links enter retirement,
+        // while the old complete entry/return pair can still be verified.
+        let stopped = self.mutation_stopped();
+        self.global_retirements.retire_selected(
+            self.uprobe_scope,
+            stopped,
+            &self.links,
+            &choices,
+            excluded,
+            &self.retained_static,
+            pid_continuity::comparable_monotonic_ns,
+        );
         let mut choices = choices.into_iter();
         let selected = extract_selected_links(&mut self.links, &mut self.pid_pairs, |_| {
             choices.next().expect("one choice per original link")

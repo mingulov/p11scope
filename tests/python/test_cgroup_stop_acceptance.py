@@ -9,7 +9,7 @@ import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/qualify-cgroup-stop.py"
@@ -198,6 +198,159 @@ class StopStageOracleTests(unittest.TestCase):
             with self.subTest(healthy=healthy):
                 result = self.verdict(inputs)
                 self.assertTrue(result["pass"], result)
+
+
+class BaselineWaitTests(unittest.TestCase):
+    def scene(self, directory):
+        path = Path(directory) / "inventory.jsonl"
+        owner = SimpleNamespace(pid=300)
+        executable = SimpleNamespace(path=Path("/fixture/caller"))
+        provider = {"mapping": {"dev": [0, 35], "ino": 111}}
+        rows = [
+            {"seq": 0, "kind": "caller_event", "event": {
+                "event": "admitted", "caller": "c0", "identity_context": {
+                    "caller": {"pid": owner.pid, "executable": {"path": str(executable.path)}}}}},
+            {"seq": 1, "kind": "edge_observed", "event": {
+                "caller": "c0", "module": "m0", "entries": {"count": 0,
+                    "coverage": {"state": "unknown", "reason": "scope_membership_unproven"}},
+                "identity_context": {"version": 1, "module": {"id": "m0", "status": "observed",
+                    "device_major": 0, "device_minor": 35, "inode": 111}}}},
+        ]
+        self.write_rows(path, rows)
+        return path, owner, executable, provider, rows
+
+    def write_rows(self, path, rows):
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    def publish_counted(self, path, rows, mutation=None):
+        row = json.loads(json.dumps(next(row for row in rows if row["kind"] == "edge_observed")))
+        row["seq"] = len(rows)
+        row["event"]["entries"] = {"count": 3, "coverage": {"state": "counted", "lossy": False}}
+        if mutation:
+            mutation(row["event"])
+        rows.append(row)
+        self.write_rows(path, rows)
+
+    def test_quiet_cgroup_issues_fixed_calls_before_waiting_for_counted_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path, owner, executable, provider, rows = self.scene(directory)
+            reader, phases = object(), []
+            command = Mock(side_effect=lambda *_args: self.publish_counted(path, rows))
+            # Exercise the existing quiet-coverage wait under a short host-test
+            # cap. Only the command above can publish the counted JSONL control.
+            quiet_wait = lambda *args: H6["wait_usage_armed"](*args, timeout=0.02)
+            with patch.dict(STOP["H6"], n3_command=command, wait_usage_armed=quiet_wait):
+                try:
+                    result = STOP["wait_baseline"](path, owner, executable, provider, reader, phases)
+                except TimeoutError:
+                    self.fail("quiet cgroup readiness timed out before the fixed baseline calls")
+            command.assert_called_once_with(owner, reader, "C_GenerateRandom", 3, 0,
+                                            "baseline", "selected", 0, None, phases)
+            self.assertEqual(result, {"caller": "c0", "module": "m0", "count": 3, "seq": 2})
+
+    def test_fixed_calls_cannot_release_a_missing_or_unproven_baseline(self):
+        def wrong_module(event):
+            event["module"] = "m1"
+            event["identity_context"]["module"].update(id="m1", inode=112)
+
+        mutations = {
+            "wrong module identity": wrong_module,
+            "wrong caller": lambda event: event.update(caller="c1"),
+            "lossy": lambda event: event["entries"]["coverage"].update(lossy=True),
+            "all unknown": lambda event: event["entries"]["coverage"].update(state="unknown"),
+            "insufficient": lambda event: event["entries"].update(count=2),
+            "missing": None,
+        }
+        for label, mutation in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                path, owner, executable, provider, rows = self.scene(directory)
+                reader, phases = object(), []
+                command = Mock(side_effect=(lambda *_args: None) if mutation is None else
+                    lambda *_args: self.publish_counted(path, rows, mutation))
+                deadline = Mock(side_effect=lambda seconds: H6["wait_deadline"](min(seconds, 0.02)))
+                with patch.dict(STOP["H6"], n3_command=command, wait_deadline=deadline):
+                    with self.assertRaises(TimeoutError):
+                        STOP["wait_baseline"](path, owner, executable, provider, reader, phases)
+                command.assert_called_once_with(owner, reader, "C_GenerateRandom", 3, 0,
+                                                "baseline", "selected", 0, None, phases)
+                deadline.assert_called_once_with(60)
+
+    def test_candidate_move_and_selected_stage_follow_actual_pass_and_counted_baseline(self):
+        for sufficient in (True, False):
+            with self.subTest(sufficient=sufficient), tempfile.TemporaryDirectory() as directory:
+                path, owner, executable, provider, rows = self.scene(directory)
+                owner.identity = {"start_time": 800}
+                candidate = SimpleNamespace(pid=321, identity={"start_time": 876})
+                executable.image_receipt = Mock()
+                reader = SimpleNamespace(record=Mock(return_value={}))
+                callers = iter(((owner, reader, None), (candidate, reader, None)))
+                groups = iter(SimpleNamespace(path=Path(directory) / name)
+                              for name in ("root", "selected", "outside"))
+                ctx = SimpleNamespace(args=SimpleNamespace(uid=1000, gid=1000),
+                    pins={"caller": executable}, provider_pin=SimpleNamespace(path=Path("/fixture/provider.so")),
+                    owners=[], readers=[],
+                    binary=SimpleNamespace(path=Path("/fixture/p11scope")))
+                observer = SimpleNamespace(popen=SimpleNamespace(stdout=object(), stderr=object()))
+                order = []
+
+                class ReachedSelectedStage(Exception):
+                    pass
+
+                def spawn_observer(_owners, argv, _uid, **kwargs):
+                    nonlocal path
+                    path = Path(argv[argv.index("--event-log") + 1])
+                    rows.append({"seq": len(rows), "kind": "pass_committed", "event": {"pass": 0}})
+                    self.write_rows(path, rows)
+                    # Service the actual StageController socket; this host test
+                    # controls transport and ordering, not native stage facts.
+                    frames = [{"version": 1, "sequence": 0, "transaction": 0, "event": "armed"},
+                              {"version": 1, "sequence": 1, "transaction": 2,
+                               "event": "final_pre_read", "pid": 321, "start_time": 876}]
+                    os.write(kwargs["pass_fds"][0], "".join(json.dumps(frame) + "\n"
+                             for frame in frames).encode())
+                    return observer
+
+                def ready(*args):
+                    result = H6["wait_inventory_ready"](*args)
+                    order.append("first committed pass")
+                    return result
+
+                def command(*args):
+                    self.assertEqual(order, ["first committed pass"])
+                    self.assertEqual(args[:8], (owner, reader, "C_GenerateRandom", 3, 0,
+                                                "baseline", "selected", 0))
+                    order.append("fixed baseline calls")
+                    mutation = None if sufficient else lambda event: event["entries"].update(count=2)
+                    self.publish_counted(path, rows, mutation)
+
+                def move(_group, moved, _moves, label):
+                    if label == "fresh-mapped-candidate":
+                        self.assertIs(moved, candidate)
+                        self.assertTrue(sufficient)
+                        self.assertEqual(order, ["first committed pass", "fixed baseline calls"])
+                        order.append("candidate moved")
+
+                def stop(_ctx, stopped):
+                    self.assertIs(stopped, observer)
+                    self.assertEqual(order, ["first committed pass", "fixed baseline calls", "candidate moved"])
+                    order.append("selected stage")
+                    raise ReachedSelectedStage
+
+                command_spy, move_spy, stop_spy = Mock(side_effect=command), Mock(side_effect=move), Mock(side_effect=stop)
+                patches = {"init_token": lambda *_args: {}, "provider_receipt": lambda _pin: provider,
+                    "create_tracked": lambda *_args: (next(groups), None),
+                    "spawn_caller": lambda *_args, **_kwargs: next(callers),
+                    "spawn_owned": spawn_observer, "owned_reader": lambda *_args: reader,
+                    "wait_inventory_ready": ready, "n3_command": command_spy,
+                    "move_and_verify": move_spy, "stop_b_observer": stop_spy,
+                    "wait_deadline": lambda seconds: H6["wait_deadline"](min(seconds, 0.02))}
+                with patch.dict(STOP["H6"], patches):
+                    with self.assertRaises(ReachedSelectedStage if sufficient else TimeoutError):
+                        STOP["run_leg"].__wrapped__(ctx, directory, "singles", "final_pre_read", False)
+                self.assertEqual(command_spy.call_count, 1)
+                self.assertEqual(move_spy.call_count, 3 if sufficient else 2)
+                self.assertEqual(stop_spy.call_count, int(sufficient))
+                self.assertEqual(order[-1], "selected stage" if sufficient else "fixed baseline calls")
 
 
 class StageControllerTests(unittest.TestCase):

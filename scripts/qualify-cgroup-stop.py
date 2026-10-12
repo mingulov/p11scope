@@ -13,7 +13,6 @@ from pathlib import Path
 import re
 import runpy
 import select
-import signal
 import socket
 import subprocess
 import time

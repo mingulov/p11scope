@@ -32988,14 +32988,54 @@ fn refresh_retry_preserves_newer_serial_and_first_seen() {
         1
     );
     assert_eq!(engine.discovery_truncated, 0);
+    let armed = engine.loader_registry.ids_for_view(view);
+    assert_eq!(armed.len(), 1);
+    assert_ne!(armed[0], context);
+    assert_eq!(
+        engine.pending_loader_arm_scans,
+        BTreeSet::from([PendingLoaderScanKey {
+            view,
+            context: armed[0],
+        }]),
+        "the completed retry owes one catch-up for its newly armed context"
+    );
+    assert!(!engine.refresh_requested.contains_key(&pid));
     let scans = engine.deep_scans;
-    let detached = session.detached.len();
+    let memory_scans = engine.loader_memory_scan_attempts;
+    let detached = session.detached.clone();
+    let attached = session.attached_slots.iter().sum::<usize>();
+    let exports = session.dynamic_attach_calls.clone();
+    let loader_attaches = session.dynamic_loader_attach_calls;
+    engine.drain_discovery_from(&mut session).unwrap();
+    assert_eq!(engine.deep_scans, scans + 1);
+    assert_eq!(engine.loader_memory_scan_attempts, memory_scans + 1);
+    assert!(engine.pending_loader_arm_scans.is_empty());
+    assert_eq!(engine.loader_registry.ids_for_view(view), armed);
+    assert_eq!(session.detached, detached);
+    assert_eq!(session.attached_slots.iter().sum::<usize>(), attached);
+    assert_eq!(session.dynamic_attach_calls, exports);
+    assert_eq!(session.dynamic_loader_attach_calls, loader_attaches);
+    assert!(!engine.refresh_requested.contains_key(&pid));
+    assert!(!engine.retirement_intents.contains_key(&view));
+    assert_eq!(engine.loader_records_accepted, 1);
+    assert_eq!(engine.discovery_truncated, 0);
+
+    let settled_scans = engine.deep_scans;
+    let settled_memory_scans = engine.loader_memory_scan_attempts;
     engine.drain_discovery_from(&mut session).unwrap();
     assert_eq!(
-        engine.deep_scans, scans,
+        engine.deep_scans, settled_scans,
         "completed retry does not perpetuate itself"
     );
-    assert_eq!(session.detached.len(), detached);
+    assert_eq!(engine.loader_memory_scan_attempts, settled_memory_scans);
+    assert!(engine.pending_loader_arm_scans.is_empty());
+    assert_eq!(engine.loader_registry.ids_for_view(view), armed);
+    assert_eq!(session.detached, detached);
+    assert_eq!(session.attached_slots.iter().sum::<usize>(), attached);
+    assert_eq!(session.dynamic_attach_calls, exports);
+    assert_eq!(session.dynamic_loader_attach_calls, loader_attaches);
+    assert!(!engine.refresh_requested.contains_key(&pid));
+    assert!(!engine.retirement_intents.contains_key(&view));
 
     // A normal shallow cgroup frame frees the absent requests while the
     // retained owner's retry is still waiting. That intent must itself

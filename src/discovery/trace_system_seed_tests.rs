@@ -5,6 +5,8 @@
 //! Only native CALL production,
 //! cookie-map reads, loss-map reads and the clock are scripted. No receipt is
 //! constructed by the fixture and no native counter or map is populated.
+//! The time-overrun refusal control uses the existing sealed fixture sampler;
+//! positive readiness and exploratory progress use actual OS samples.
 
 use super::*;
 use crate::attach::detailed_identity::{CgroupCandidate, TraceSeed};
@@ -35,27 +37,44 @@ impl ProviderFixture {
         let directory = tempfile::tempdir().unwrap();
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let library = directory.path().join("trace-provider.so");
-        assert!(Command::new("gcc")
-            .args(["-shared", "-fPIC", "-DMATRIX_INTERFACES=0", "-o"])
-            .arg(&library)
-            .arg(root.join("crates/discover/tests/fixture/version_matrix.c"))
-            .status().unwrap().success());
+        assert!(
+            Command::new("gcc")
+                .args(["-shared", "-fPIC", "-DMATRIX_INTERFACES=0", "-o"])
+                .arg(&library)
+                .arg(root.join("crates/discover/tests/fixture/version_matrix.c"))
+                .status()
+                .unwrap()
+                .success()
+        );
         let driver = directory.path().join("trace-caller");
-        assert!(Command::new("gcc")
-            .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-o"])
-            .arg(&driver)
-            .arg(root.join("tests/fixtures/live-discovery-driver.c"))
-            .args(["-ldl", "-pthread"])
-            .status().unwrap().success());
-        Self { _directory: directory, library, driver }
+        assert!(
+            Command::new("gcc")
+                .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-o"])
+                .arg(&driver)
+                .arg(root.join("tests/fixtures/live-discovery-driver.c"))
+                .args(["-ldl", "-pthread"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        Self {
+            _directory: directory,
+            library,
+            driver,
+        }
     }
 
     fn command(&self) -> Command {
         let mut command = Command::new(&self.driver);
-        command.arg("dlopen").arg(&self.library).env_clear()
+        command
+            .arg("dlopen")
+            .arg(&self.library)
+            .env_clear()
             .env("P11SCOPE_FIXTURE_INTERFACES", "0")
             .env("P11SCOPE_FIXTURE_POST_GATE", "1")
-            .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
         command
     }
 
@@ -68,7 +87,9 @@ impl ProviderFixture {
         while !bytes.ends_with(b"P11SCOPE_FIXTURE driver done\n") {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             assert!(!remaining.is_zero() && bytes.len() < 4096);
-            assert!(crate::discovery::test_subject::poll_fd(output.as_raw_fd(), remaining).unwrap());
+            assert!(
+                crate::discovery::test_subject::poll_fd(output.as_raw_fd(), remaining).unwrap()
+            );
             let mut byte = [0];
             output.read_exact(&mut byte).unwrap();
             bytes.extend_from_slice(&byte);
@@ -90,6 +111,7 @@ struct Io {
     proof: ProofSession,
     target: u32,
     cookie: Cell<Option<u64>>,
+    overrun_target: bool,
     boundaries: RefCell<Vec<String>>,
 }
 impl Io {
@@ -145,7 +167,7 @@ impl TraceIo for Io {
                 .flatten(),
         );
         if pin.pid() == self.target {
-            self.boundary("original-pin cookie read", &result);
+            self.boundary("original-pin cookie read", result);
         }
         result
     }
@@ -159,7 +181,27 @@ impl TraceIo for Io {
         view: &ProcessView,
         work: &mut TraceWorkTicket,
     ) -> Result<TraceSeed, TraceWorkError> {
-        let result = self.proof.test_sample_os_view(view, work);
+        let overran = Cell::new(false);
+        let result = if view.pid() == self.target && self.overrun_target {
+            // This refusal control uses the existing sealed fixture sampler to
+            // expire the actual ticket inside the link bracket. Positive and
+            // exploratory samples continue to use the real OS sampler.
+            self.proof.test_sample_view_after_link(view, work, &mut || {
+                overran.set(true);
+                self.proof.test_set_time(self.proof.test_time() + 5_000_000);
+            })
+        } else {
+            self.proof.test_sample_os_view(view, work)
+        };
+        if overran.get() {
+            let state = work.state.as_ref().unwrap().lock().unwrap();
+            assert!(
+                state.reads > 0,
+                "this refusal is time, not read-credit exhaustion"
+            );
+            assert_eq!(state.closed, Some(CgroupWorkRefusal::BudgetDeferred));
+            self.boundary("sample time overrun", state.reads);
+        }
         if view.pid() == self.target {
             let allowance = work.state.as_ref().map(|state| {
                 let state = state.lock().unwrap();
@@ -171,7 +213,11 @@ impl TraceIo for Io {
                 )
             });
             self.boundary(
-                "original-view OS sample",
+                if self.overrun_target {
+                    "original-view after-link refusal sample"
+                } else {
+                    "original-view OS sample"
+                },
                 (result.as_ref().map(|_| ()), allowance),
             );
         }
@@ -219,7 +265,9 @@ impl Capture {
     fn build(unrelated: usize, system: bool, mapped: bool) -> Self {
         // The fixture owns up to 132 processes and their original pidfds. Keep
         // these controls serial even when the unit-test harness is parallel.
-        let serial = CAPTURE_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let serial = CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let provider = mapped.then(ProviderFixture::new);
         let mut children = Children(Vec::new());
         let mut views = Vec::new();
@@ -261,16 +309,32 @@ impl Capture {
                 let id = view.id();
                 let mut counters = DiscoveryCounters::default();
                 let (modules, pins) = scan_and_pin(
-                    view, &engine.module_hints, &engine.hooks, &mut engine.budget,
-                    &mut counters, false, &mut engine.stage_timings,
-                ).unwrap();
-                assert_eq!(modules.is_empty(), position != unrelated,
-                    "only the actual mapped PKCS#11 caller contributes a module");
+                    view,
+                    &engine.module_hints,
+                    &engine.hooks,
+                    &mut engine.budget,
+                    &mut counters,
+                    false,
+                    &mut engine.stage_timings,
+                )
+                .unwrap();
+                assert_eq!(
+                    modules.is_empty(),
+                    position != unrelated,
+                    "only the actual mapped PKCS#11 caller contributes a module"
+                );
                 assert!(modules.iter().all(|module| module.view == id));
                 // This is the discover_plan ingress. Scheduling metadata is
                 // produced by the real scanner, separately from trace proof.
                 engine.note_scan_observed(id, &modules);
-                engine.scan_inputs.insert(id, ScanInput { modules, pins, counters });
+                engine.scan_inputs.insert(
+                    id,
+                    ScanInput {
+                        modules,
+                        pins,
+                        counters,
+                    },
+                );
             }
         }
         let proof = ProofSession::test_scope(&engine.scope, true);
@@ -288,6 +352,7 @@ impl Capture {
                 proof,
                 target,
                 cookie: Cell::new(None),
+                overrun_target: false,
                 boundaries: RefCell::new(Vec::new()),
             },
             key,
@@ -309,10 +374,10 @@ impl Capture {
                         (receipt.key(), receipt.eligible_after_ns()),
                     );
                     let result = store.admit(receipt);
-                    io.boundary("store admission", &result);
+                    io.boundary("store admission", result);
                     result.unwrap();
                 };
-                engine.service_trace_images(io, work, accept);
+                let mut visits = engine.service_trace_images(io, work, accept).visited;
                 io.pending(engine, "before discovery drain");
                 // This is the same retained lifecycle transport used by the
                 // production proof tap. An empty read must follow confirmation.
@@ -324,16 +389,22 @@ impl Capture {
                     .attach_trace_tap(io.proof.test_discovery_tap())
                     .unwrap();
                 assert!(drain.dequeue().is_none());
-                engine.service_trace_images(io, work, |receipt| {
-                    io.boundary(
-                        "verified transfer",
-                        (receipt.key(), receipt.eligible_after_ns()),
-                    );
-                    let result = store.admit(receipt);
-                    io.boundary("store admission", &result);
-                    result.unwrap();
-                });
+                visits += engine
+                    .service_trace_images(io, work, |receipt| {
+                        io.boundary(
+                            "verified transfer",
+                            (receipt.key(), receipt.eligible_after_ns()),
+                        );
+                        let result = store.admit(receipt);
+                        io.boundary("store admission", result);
+                        result.unwrap();
+                    })
+                    .visited;
                 io.pending(engine, "after discovery drain");
+                assert!(visits <= 32 && engine.trace_phase_visits <= 8);
+                let state = work.state.as_ref().unwrap().lock().unwrap();
+                assert!(state.reads <= 32 && state.visits <= 32);
+                assert!(state.deadline - state.last_clock.min(state.deadline) <= 5_000_000);
                 Ok(())
             })
             .unwrap();
@@ -381,6 +452,21 @@ impl Capture {
                 next_frame += FRAME_NS;
             }
             if self.marker(marker) {
+                eprintln!(
+                    "trace readiness: {} views, {:?}, marker {attempt}, at {marker}ns",
+                    self.engine.views.len(),
+                    self.engine.scope,
+                );
+                for boundary in self.io.boundaries.borrow().iter().filter(|boundary| {
+                    boundary.starts_with("original-view OS sample")
+                        || boundary.starts_with("original-pin cookie read")
+                        || boundary.starts_with("verified transfer")
+                        || boundary.starts_with("store admission")
+                        || (boundary.starts_with("CALL witness ingress")
+                            && !boundary.contains("no pending target sample"))
+                }) {
+                    eprintln!("{boundary}");
+                }
                 return Some(attempt);
             }
         }
@@ -418,9 +504,18 @@ fn fresh_system_trace_provider_target_survives_dead_unreadable_exploratory_first
     dead.kill().unwrap();
     dead.wait().unwrap();
     assert_eq!(capture.engine.views[0].pid(), pid);
-    assert!(capture.engine.views[0].retained_pin().original_exited().unwrap());
+    assert!(
+        capture.engine.views[0]
+            .retained_pin()
+            .original_exited()
+            .unwrap()
+    );
     assert!(std::fs::read_link(format!("/proc/{pid}/exe")).is_err());
-    assert!(capture.readiness().is_some(), "{}", capture.io.boundaries.borrow().join("\n"));
+    assert!(
+        capture.readiness().is_some(),
+        "{}",
+        capture.io.boundaries.borrow().join("\n")
+    );
 }
 
 #[test]
@@ -438,28 +533,88 @@ fn fresh_system_trace_exploratory_sampling_progresses_under_provider_calls() {
         named |= capture.marker(marker);
     }
     assert!(named, "{}", capture.io.boundaries.borrow().join("\n"));
-    let (_, start, completed, witness) = capture.io.proof.test_pending_times(exploratory)
+    let (_, start, completed, witness) = capture
+        .io
+        .proof
+        .test_pending_times(exploratory)
         .expect("the original exploratory view must obtain a real completed OS sample");
     assert!(start < completed && completed < START_NS + READINESS_NS);
-    assert!(witness.is_none(), "provider CALLs cannot witness the exploratory process");
+    assert!(
+        witness.is_none(),
+        "provider CALLs cannot witness the exploratory process"
+    );
+}
+
+#[test]
+fn fresh_system_trace_provider_time_overrun_preserves_exploratory_progress() {
+    let mut capture = Capture::mapped(1);
+    let exploratory = capture.engine.views[0].pid();
+    capture.io.overrun_target = true;
+    for frame in 0..16 {
+        capture.frame(frame * FRAME_NS);
+        assert!(
+            capture
+                .io
+                .proof
+                .test_pending_times(capture.io.target)
+                .is_none()
+        );
+        assert!(
+            capture
+                .store
+                .lookup(capture.key, START_NS + frame * FRAME_NS)
+                .path()
+                .is_none()
+        );
+    }
+    assert!(
+        capture
+            .io
+            .boundaries
+            .borrow()
+            .iter()
+            .any(|boundary| boundary.starts_with("sample time overrun")),
+        "the provider-associated view must hit the real ticket time refusal"
+    );
+    let (_, start, completed, witness) = capture
+        .io
+        .proof
+        .test_pending_times(exploratory)
+        .expect("provider time overruns must advance to the original exploratory view");
+    assert!(start < completed && completed < START_NS + READINESS_NS);
+    assert!(witness.is_none());
 }
 
 #[test]
 fn fresh_system_trace_provider_association_alone_cannot_grant_a_name() {
-    for association in ["current", "missing", "stale", "foreign"] {
+    for association in ["current", "missing", "stale", "foreign", "reused"] {
         let mut capture = Capture::mapped(1);
         let id = capture.engine.views.last().unwrap().id();
+        assert!(capture.engine.trace_provider_views.contains(&id));
         match association {
             "missing" => {
                 capture.engine.scan_inputs.remove(&id);
                 capture.engine.note_scan_observed(id, &[]);
             }
-            "stale" => capture.engine.scan_inputs.get_mut(&id).unwrap().modules.clear(),
+            "stale" => capture
+                .engine
+                .scan_inputs
+                .get_mut(&id)
+                .unwrap()
+                .modules
+                .clear(),
             "foreign" => {
                 let foreign = capture.engine.views[0].id();
                 for module in &mut capture.engine.scan_inputs.get_mut(&id).unwrap().modules {
                     module.view = foreign;
                 }
+            }
+            "reused" => {
+                capture.engine.release_view_id(id);
+                assert!(!capture.engine.trace_provider_views.contains(&id));
+                let position = capture.engine.views.len() - 1;
+                let unrelated_pid = capture.engine.views[0].pid();
+                capture.engine.views[position] = ProcessView::open(id, unrelated_pid).unwrap();
             }
             "current" => {}
             _ => unreachable!(),
@@ -468,8 +623,18 @@ fn fresh_system_trace_provider_association_alone_cannot_grant_a_name() {
         // only a scheduling hint. No native CALL is supplied in this control.
         for at in (0..READINESS_NS).step_by(FRAME_NS as usize) {
             capture.frame(at);
-            assert!(capture.store.lookup(capture.key, START_NS + at).path().is_none(),
-                "{association} provider association must not construct naming proof");
+            assert!(
+                capture
+                    .store
+                    .lookup(capture.key, START_NS + at)
+                    .path()
+                    .is_none(),
+                "{association} provider association must not construct naming proof"
+            );
         }
+        assert_eq!(
+            capture.engine.trace_provider_views.contains(&id),
+            association == "current"
+        );
     }
 }

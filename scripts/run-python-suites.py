@@ -51,6 +51,7 @@ RUN = [
     ("test_cgroup_trace_oracle.py", []),
     ("test_dashboard_pty_cleanup.py", []),
     ("test_detailed_leader_held_entry.py", []),
+    ("test_h6_initial_exec_process.py", []),
     ("test_help_usage_drift.py", []),
     ("test_ia32_automatic_exec.py", []),
     ("test_inventory_capacity_oracle.py", []),

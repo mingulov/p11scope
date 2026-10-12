@@ -11,6 +11,8 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -157,6 +159,33 @@ static void wait_gate(const char *gate, unsigned long long limit_ns) {
   unsigned long long end = now_ns() + limit_ns;
   while (access(gate, F_OK)) { if (now_ns() >= end) exit(1); delay_ms(1); }
 }
+static int initial_load(unsigned long long deadline) {
+  if (now_ns() >= deadline) exit(1);
+  ack("load-wait");
+  char command[16]; size_t length = 0;
+  for (;;) {
+    unsigned long long now = now_ns();
+    if (now >= deadline) exit(1);
+    unsigned long long milliseconds = (deadline - now) / 1000000ULL + 1;
+    struct pollfd input = {STDIN_FILENO, POLLIN, 0};
+    int result = poll(&input, 1, milliseconds > INT_MAX ? INT_MAX : (int)milliseconds);
+    if (result < 0) { if (errno == EINTR) continue; exit(1); }
+    if (!result) continue;
+    if (input.revents & (POLLERR | POLLNVAL)) exit(1);
+    if (!(input.revents & (POLLIN | POLLHUP))) exit(1);
+    char byte;
+    ssize_t n = read(STDIN_FILENO, &byte, 1);
+    if (n < 0) { if (errno == EINTR) continue; exit(1); }
+    if (!n || now_ns() >= deadline) exit(1);
+    if (!byte || length == sizeof command - 1) exit(2);
+    command[length++] = byte;
+    if (byte != '\n') continue;
+    command[length] = 0;
+    if (!strcmp(command, "load 0\n")) return 1;
+    if (!strcmp(command, "stop\n")) { ack("done"); return 0; }
+    exit(2);
+  }
+}
 static void exec_image(const char *path, const char *mode) {
   header("exec"); printf(",\"pid\":%d,\"tid\":%ld,\"start_time\":%llu,\"mode\":",
                         getpid(), syscall(SYS_gettid), birth()); quoted(mode);
@@ -181,6 +210,7 @@ int main(int argc, char **argv) {
   if (sizeof(void *) != 8 || sizeof(unsigned long) != 8 || argc < 4) return 2;
   module = argv[1]; image = strtoul(argv[2], NULL, 10); scope = argv[3];
   const char *gate = NULL, *start_gate = NULL;
+  unsigned long long load_deadline = 0;
   unsigned long auto_count = 20, auto_delay = 200;
   for (int i = 4; i < argc; i += 2) {
     if (i + 1 >= argc) return 2;
@@ -188,14 +218,24 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--start-gate")) start_gate = argv[i + 1];
     else if (!strcmp(argv[i], "--auto-count")) auto_count = strtoul(argv[i + 1], NULL, 10);
     else if (!strcmp(argv[i], "--auto-delay-ms")) auto_delay = strtoul(argv[i + 1], NULL, 10);
+    else if (!strcmp(argv[i], "--h6-load-deadline")) {
+      if (load_deadline || !argv[i + 1][0]) return 2;
+      for (const unsigned char *p = (const unsigned char *)argv[i + 1]; *p; p++)
+        if (!isdigit(*p)) return 2;
+      char *end; errno = 0;
+      load_deadline = strtoull(argv[i + 1], &end, 10);
+      if (errno || *end || !load_deadline || load_deadline <= now_ns()) return 2;
+    }
     else if (!strcmp(argv[i], "--canary")) { private_buffer[63] ^= (unsigned char)argv[i + 1][0]; }
     else return 2;
   }
   const char *env = getenv("N3_PRIVATE_ENV");
   if (env) private_buffer[62] ^= (unsigned char)env[0];
   if (!auto_count || auto_count > 10000 || auto_delay > 10000 || auto_count * auto_delay > 125000UL) return 2;
+  if (load_deadline && (image || gate || start_gate)) return 2;
   observed_image();
   if (start_gate) wait_gate(start_gate, 5000000000ULL);
+  if (load_deadline && !initial_load(load_deadline)) return 0;
   setup();
   if (gate) {
     wait_gate(gate, 30000000000ULL);

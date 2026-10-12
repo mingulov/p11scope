@@ -3050,10 +3050,10 @@ REFUSAL_MARKERS = re.compile(
     r"backend .* unavailable|no .* backend", re.IGNORECASE)
 
 
-def observer_ready(owned, errors, backend, timeout=20):
+def observer_ready(owned, errors, backend, timeout=20, allow_empty=False):
     """Wait for capturing; raises BackendRefused or SetupError."""
     try:
-        wait_capture_started(errors, seconds=timeout)
+        wait_capture_started(errors, allow_empty=allow_empty, seconds=timeout)
         return monotonic_ns()
     except (TimeoutError, ValueError):
         pass
@@ -3094,17 +3094,42 @@ def stop_observer(owned, limit_seconds=OBSERVER_STOP_SECONDS):
 
 
 def spawn_caller(owners, readers, leg_dir, caller_pin, provider_pin, uid, gid, env,
-                 tag="caller", prefix=()):
+                 tag="caller", prefix=(), load_deadline_ns=None):
     """Spawn the interactive SoftHSM caller; returns (owned, stdout, stderr)."""
+    argv = [*prefix, str(caller_pin.path), str(provider_pin.path), "0", "selected",
+            "--canary", CANARIES[2]]
+    if load_deadline_ns is not None:
+        argv += ["--h6-load-deadline", str(load_deadline_ns)]
     owned = spawn_owned(
-        owners, [*prefix, str(caller_pin.path), str(provider_pin.path), "0", "selected",
-                 "--canary", CANARIES[2]], uid,
+        owners, argv, uid,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, env=env, user=uid, group=gid, extra_groups=[],
         start_new_session=True)
     stdout = owned_reader(readers, Reader, owned.popen.stdout, Path(leg_dir) / f"{tag}.ledger.jsonl")
     stderr = owned_reader(readers, Reader, owned.popen.stderr, Path(leg_dir) / f"{tag}.stderr.txt")
     return owned, stdout, stderr
+
+
+def release_initial_load(caller, stdout, caller_pin, provider_pin, ready_ns, deadline_ns):
+    """Release only an owned initial image after public loop-start evidence."""
+    if not isinstance(ready_ns, int) or not 0 < ready_ns <= monotonic_ns():
+        raise SetupError("initial provider load lacks observer loop-start readiness")
+    remaining_until(deadline_ns)
+    caller_pin.verify()
+    provider_pin.verify()
+    caller_pin.image_receipt(stdout.record("image", 0), caller)
+    waiting = stdout.record("ack", 0, "load-wait")
+    if not waiting["t"] <= ready_ns:
+        raise SetupError("initial provider load wait did not precede observer readiness")
+    caller.verify()
+    remaining_until(deadline_ns)
+    released_ns = monotonic_ns()
+    caller.popen.stdin.write("load 0\n")
+    caller.popen.stdin.flush()
+    ready = stdout.record("ready", 0, seconds=min(10, remaining_until(deadline_ns)))
+    remaining_until(deadline_ns)
+    caller_pin.image_receipt(stdout.record("image", 0), caller)
+    return {"deadline_ns": deadline_ns, "released_ns": released_ns, "ready_ns": ready["t"]}
 
 
 def caller_exec(caller, stdout, images, method, target_pin):
@@ -3605,9 +3630,17 @@ def run_pid_caller_leg(ctx, cell, backend, observer_kind, leg_dir, same_path, pr
         image_b.chmod(0o755)
         pin_b = leg_pin(ctx, image_b)
     provider = ctx.provider_pin
+    initial_load = cell == "pid-reexec"
+    load_options = {}
+    if initial_load:
+        deadline = min(ctx.budget.deadline_ns, ctx.budget.phase_deadline_ns)
+        load_options["load_deadline_ns"] = deadline
     caller, stdout, _ = spawn_caller(ctx.owners, ctx.readers, leg_dir, pin_a, provider,
-                                     ctx.args.uid, ctx.args.gid, env, prefix=prefix)
-    stdout.record("ready", 0)
+                                     ctx.args.uid, ctx.args.gid, env, prefix=prefix, **load_options)
+    if initial_load:
+        stdout.record("ack", 0, "load-wait")
+    else:
+        stdout.record("ready", 0)
     images = [pin_a.image_receipt(stdout.record("image", 0), caller)]
     scope_args = ["--pid", str(caller.pid)]
     module_args = ["--module", str(provider.path)]
@@ -3623,7 +3656,7 @@ def run_pid_caller_leg(ctx, cell, backend, observer_kind, leg_dir, same_path, pr
     owned, capture, errors, started = spawn_observer(
         ctx.owners, ctx.readers, leg_dir, argv, env, live=observer_kind != "trace")
     try:
-        ready = observer_ready(owned, errors, backend)
+        ready = observer_ready(owned, errors, backend, **({"allow_empty": True} if initial_load else {}))
     except BackendRefused as refused:
         stop_caller(caller, stdout, 0)
         receipt = {"cell": cell, "leg": f"{observer_kind}/{backend}",
@@ -3633,6 +3666,10 @@ def run_pid_caller_leg(ctx, cell, backend, observer_kind, leg_dir, same_path, pr
         write_json(leg_dir / "result.json", result)
         return result
     phases = []
+    load_receipt = None
+    if initial_load:
+        load_receipt = release_initial_load(caller, stdout, pin_a, provider, ready, deadline)
+        load_receipt["proof"] = warm_caller(capture, caller, stdout, images[0], phases, observer_kind)
     if observer_kind == "trace":
         drain_trace_phase(capture, caller, stdout, "C_GenerateRandom", 3, 100, "warm", 0, phases)
     else:
@@ -3673,6 +3710,8 @@ def run_pid_caller_leg(ctx, cell, backend, observer_kind, leg_dir, same_path, pr
         "session_reuse": session_reuse_from(ledger), "va_reuse": va_reuse_from(ledger),
         "requested_backend": backend,
     }
+    if load_receipt is not None:
+        receipt["initial_load"] = load_receipt
     if observer_kind == "trace":
         trace = "".join(capture.lines)
         file_trace = (leg_dir / "trace.file.txt").read_text()

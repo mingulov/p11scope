@@ -13953,6 +13953,12 @@ impl Engine {
         let mut changed = false;
         let mut required_complete = true;
         for key in due {
+            // An earlier fallback can hand off native ownership. The remaining
+            // keys keep their original timestamps for the fresh scoped frame.
+            if self.pending_global_retirement.is_some() || self.global_retirement_frame_owed {
+                required_complete = false;
+                break;
+            }
             // H-1: a spent live frame leaves the rest pending; the next
             // frame's fallback pass serves them.
             if self.pending_loader_scans.contains_key(&key) && self.frame_work_exhausted() {
@@ -20855,16 +20861,18 @@ impl Engine {
         &mut self,
         session: &mut dyn EngineSession,
     ) -> Result<BacklogOutcome> {
-        if let Some(outcome) = self.poll_global_retirement_barrier(session) {
+        if self.pending_global_retirement.is_some() || self.global_retirement_frame_owed {
+            // Deferring mutation does not defer absolute producer-loss reads.
+            self.update_counter_snapshot(session)?;
+            let outcome = self
+                .poll_global_retirement_barrier(session)
+                .unwrap_or(BacklogOutcome {
+                    changed: false,
+                    progressed: false,
+                    pending: true,
+                });
             self.publish_batch_tail(false)?;
             return Ok(outcome);
-        }
-        if self.global_retirement_frame_owed {
-            return Ok(BacklogOutcome {
-                changed: false,
-                progressed: false,
-                pending: true,
-            });
         }
         let passes_before = self.pressure_service_passes;
         let staged_before = session.staged_discovery_len();
@@ -21019,7 +21027,10 @@ impl Engine {
         }
         // A re-park or a frame deferral appended behind the rest of the
         // queue; restore FIFO order with the held prefix first.
-        if self.pressure_rotation_pending || self.frame_deferred {
+        if self.pressure_rotation_pending
+            || self.frame_deferred
+            || self.pending_global_retirement.is_some()
+        {
             let mut held = self
                 .pending_discovery_records
                 .split_off(rest_len.saturating_add(front_inserted));
@@ -21126,18 +21137,6 @@ impl Engine {
             terminal_exports: Vec::new(),
         }));
         self.record_malformed_discovery(malformed);
-        if self.poll_global_retirement_barrier(session).is_some() {
-            self.pending_discovery_records = queued;
-            self.held_records.clear();
-            self.publish_batch_tail(false)?;
-            return Ok(DiscoveryBatchOutcome {
-                changed: false,
-                required_complete: false,
-            });
-        }
-        // Only an actual ordinary frame can discharge the owed frame; a
-        // backlog poll and consuming the run hint cannot make it disappear.
-        self.global_retirement_frame_owed = false;
         let queued = match begin_discovery_batch(queued, self.update_counter_snapshot(session)) {
             Ok(records) => records,
             Err((error, records)) => {
@@ -21153,6 +21152,18 @@ impl Engine {
                 return Err(error);
             }
         };
+        if self.poll_global_retirement_barrier(session).is_some() {
+            self.pending_discovery_records = queued;
+            self.held_records.clear();
+            self.publish_batch_tail(false)?;
+            return Ok(DiscoveryBatchOutcome {
+                changed: false,
+                required_complete: false,
+            });
+        }
+        // Only an actual ordinary frame can discharge the owed frame; a
+        // backlog poll and consuming the run hint cannot make it disappear.
+        self.global_retirement_frame_owed = false;
         let fallback_due: BTreeSet<_> = self.pending_loader_scans.keys().copied().collect();
         let loader_arm_due = self.pending_loader_arm_scans.clone();
         let mut records = queued;

@@ -4019,7 +4019,7 @@ class InventoryFixtureTest(unittest.TestCase):
         self.assertEqual(sum(row["n"] for row in ledger["batches"]
             if row["module"] == str(second) and row["phase"] == "main"), 20)
 
-    def run_inventory_route(self, cell="system-mixed", fault=None):
+    def run_inventory_route(self, cell="system-mixed", fault=None, exec_poll_delay=0):
         owners, readers, pins = [], [], []
         provider_pin = H6["FilePin"](self.provider)
         self.addCleanup(provider_pin.close)
@@ -4071,17 +4071,16 @@ class InventoryFixtureTest(unittest.TestCase):
             observers.append(injected)
             return injected, None, None, injected.started, doc, log
         def exec_stop(pid, **kwargs):
-            deadline = time.monotonic() + 2
-            while not os.readlink(f"/proc/{pid}/exe").endswith("/ledger2"):
-                if time.monotonic() >= deadline:
-                    self.fail("actual child did not exec its held successor")
-                time.sleep(0.001)
+            time.sleep(exec_poll_delay)
+            stopped = H6["wait_exec_stop"](pid, **kwargs)
             owner = next(owner for owner in owners if owner.pid == pid)
-            owner.send(signal.SIGSTOP)
+            ledger = H6["parse_inv_ledger"]("".join(owner.h6_test_reader.lines))
+            self.assertFalse([row for row in ledger["controls"] if row["gen"] == 1],
+                             "successor main entered before the kernel exec stop")
             exec_deadline.append(kwargs["deadline"])
             if fault == "late-stop":
                 time.sleep(max(0, (exec_deadline[0] - time.monotonic_ns()) / 1e9) + 0.005)
-            return time.monotonic_ns()
+            return stopped
         def group(_ctx, path):
             path = Path(path)
             def move(owner):
@@ -4094,16 +4093,19 @@ class InventoryFixtureTest(unittest.TestCase):
             if cell != "system-mixed":
                 self.assertTrue(membership[pid].endswith("/selected/sub"))
             events.append("resume")
-            next(owner for owner in owners if owner.pid == pid).send(signal.SIGCONT)
+            # These one-exec fixture routes release at the known kernel stop,
+            # settling tracer custody before ordinary child cleanup.
+            H6["ptrace_detach"](pid, ctx.scopes[-1])
+        def detach(pid, scope):
+            if any(owner.pid == pid for owner in scope.traced):
+                H6["ptrace_detach"](pid, scope)
         patches = {"init_token": lambda *_args: self.env, "build_manifest": lambda *_args: None, "leg_pin": pinned,
             "spawn_owned": ordinary, "spawn_ledger": ledger, "spawn_inventory": observer,
             "wait_inventory_ready": lambda *_args: time.monotonic_ns(),
             "wait_passes": lambda *_args: 2,
-            "seize_until_exec": lambda _pid, scope, owner: scope.traced.append(owner),
             "wait_exec_stop": exec_stop,
             "ptrace_continue": resume, "create_tracked": group, "cgroup_of": lambda pid: membership[pid],
-            "ptrace_detach": lambda pid, scope: scope.traced.remove(
-                next(owner for owner in scope.traced if owner.pid == pid)),
+            "ptrace_detach": detach,
             "stop_inventory": lambda injected: injected.finish(),
             "stop_receipt": lambda *_args: {},
             "finish_readers": lambda rows: [row.finish() for row in rows if row is not None],
@@ -4158,6 +4160,16 @@ class InventoryFixtureTest(unittest.TestCase):
         sibling = result["s1"]["sibling_instances"][0]
         self.assertEqual((sibling["api_returns"], sibling["ledger_api_returns"]), (47, 47))
         self.assertEqual(sibling["operations"]["completed"], 22)
+
+    def test_system_mixed_delayed_exec_wait_still_stops_before_successor_main(self):
+        doc, ledgers, receipt = self.run_inventory_route(exec_poll_delay=0.05)
+        freeze = receipt["freeze"]
+        ready = next(row for row in ledgers["MX"]["controls"] if row["gen"] == 1)
+        self.assertGreaterEqual(ready["t"], freeze["exec_stop_ns"])
+        self.assertLess(freeze["exec_stop_ns"], freeze["admitted"]["at_ns"])
+        result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+        self.assertTrue(result["pass"], result["errors"])
+        self.assertFalse(self.route_case.scopes[-1].traced)
 
     def test_r5_real_owned_target_reenters_before_resuming_and_measuring(self):
         doc, ledgers, receipt = self.run_inventory_route(cell="cgroup-reentry")

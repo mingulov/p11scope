@@ -3453,11 +3453,15 @@ def wait_terminal_child(owner):
 
 
 def cleanup_leg_resources(ctx, close_pins=True):
+    if not any((ctx.owners, ctx.readers, ctx.groups, ctx.leg_pins, ctx.traced)):
+        return  # Completed scopes need no new budget, including the backstop.
     # The final case backstop has no live leg context. It still gets one
     # finite cleanup allowance, shared by every remaining child and reader.
+    # A workload-B terminal scope retains its already-started allowance.
     token = None
     if ACTIVE_LEG.get() is None:
-        token = ACTIVE_LEG.set(LegBudget())
+        retained = getattr(ctx, "terminal_budget", None)
+        token = ACTIVE_LEG.set(retained if retained is not None else LegBudget())
     try:
         return _cleanup_leg_resources(ctx, close_pins)
     finally:
@@ -3564,14 +3568,55 @@ class LegContext:
         return getattr(self.parent, name)
 
 
-def owned_leg(function=None, *, inventory=False):
+def stop_b_observer(ctx, owned):
+    """Retire B work once; normal stop and cleanup share one terminal cap."""
+    if ctx.observer_stop_attempted:
+        raise SetupError("workload-B observer normal stop already attempted")
+    ctx.terminal_budget = LegBudget(clock=ctx.budget.clock,
+        leg_seconds=OBSERVER_STOP_SECONDS + CLEANUP_SECONDS)
+    ctx.terminal_token = ACTIVE_LEG.set(ctx.terminal_budget)
+    ctx.observer_stop_attempted = True
+    with cleanup_section():
+        ctx.observer_stop_result = stop_observer(owned)
+    return ctx.observer_stop_result
+
+
+def finalize_b_observer(ctx):
+    """Recover only the observer enrolled by this scope's spawn operation."""
+    owned = ctx.observer_owned
+    if owned is None and ctx.observer_start is not None:
+        enrolled = ctx.owners[ctx.observer_start:]
+        if len(enrolled) > 1:
+            raise SetupError("workload-B observer enrollment is ambiguous")
+        owned = enrolled[0] if enrolled else None
+    if owned is None:
+        return
+    if owned not in ctx.owners or not isinstance(owned, (OwnedProcess, N3HARNESS["DirectChild"])):
+        raise SetupError("workload-B observer lacks enrolled direct-child ownership")
+    if not ctx.observer_stop_attempted and owned.popen.poll() is None:
+        stop_b_observer(ctx, owned)
+    if ctx.observer_stop_result is not None:
+        rc, _stopped, latency = ctx.observer_stop_result
+        failures = stop_errors(stop_receipt(owned, latency))
+        if rc != 0:
+            failures.append(f"observer normal stop returned {rc}")
+        if failures:
+            raise LegCleanupError("observer normal stop failed: " + "; ".join(failures))
+
+
+def owned_leg(function=None, *, inventory=False, stop_b=False):
     if function is None:
-        return lambda target: owned_leg(target, inventory=inventory)
+        return lambda target: owned_leg(target, inventory=inventory, stop_b=stop_b)
     @wraps(function)
     def run(ctx, *args, **kwargs):
         with cleanup_section():
             scope = LegContext(ctx)
             scope.budget = LegBudget(inventory=inventory)
+            if stop_b:
+                scope.observer_start = scope.observer_owned = None
+                scope.observer_stop_attempted = False
+                scope.observer_stop_result = scope.terminal_token = None
+                scope.terminal_budget = scope.budget  # No-observer cleanup also cannot renew.
         token = ACTIVE_LEG.set(scope.budget)
         primary = None
         try:
@@ -3582,15 +3627,37 @@ def owned_leg(function=None, *, inventory=False):
             raise
         finally:
             try:
-                try:
-                    cleanup_leg_resources(scope)
-                except LegCleanupError as error:
-                    if primary is not None:
-                        raise LegCleanupError(f"{error}; primary {type(primary).__name__}: {primary}") from primary
-                    raise
+                with cleanup_section():
+                    stop_error = None
+                    if stop_b:
+                        try:
+                            finalize_b_observer(scope)
+                        except BaseException as error:
+                            stop_error = error
+                            scope.case.cleanup_failed = True
+                            scope.case.cleanup_errors.append(
+                                f"observer normal stop: {type(error).__name__}: {error}")
+                    try:
+                        cleanup_leg_resources(scope)
+                    except LegCleanupError as error:
+                        if stop_error is not None:
+                            detail = f"observer normal stop {type(stop_error).__name__}: {stop_error}; {error}"
+                            if primary is not None:
+                                detail += f"; primary {type(primary).__name__}: {primary}"
+                            raise LegCleanupError(detail) from (primary or stop_error)
+                        if primary is not None:
+                            raise LegCleanupError(f"{error}; primary {type(primary).__name__}: {primary}") from primary
+                        raise
+                    if stop_error is not None:
+                        detail = f"observer normal stop {type(stop_error).__name__}: {stop_error}"
+                        if primary is not None:
+                            detail += f"; primary {type(primary).__name__}: {primary}"
+                        raise LegCleanupError(detail) from (primary or stop_error)
                 if primary is None and isinstance(result, dict):
                     scope.case.completed_results.append(result)
             finally:
+                if stop_b and scope.terminal_token is not None:
+                    ACTIVE_LEG.reset(scope.terminal_token)
                 ACTIVE_LEG.reset(token)
     return run
 
@@ -3741,7 +3808,7 @@ def run_pid_reexec(ctx, cell_dir, backend):
             for kind in ("trace", "profile", "metrics")]
 
 
-@owned_leg
+@owned_leg(stop_b=True)
 def run_b_leg(ctx, cell, backend, observer_kind, leg_dir, mode, measured=25, delay_ms=300):
     """One workload-B leg: cold/failed/leader-exit exec under an observer."""
     leg_dir = Path(leg_dir)
@@ -3763,8 +3830,10 @@ def run_b_leg(ctx, cell, backend, observer_kind, leg_dir, mode, measured=25, del
         argv = [str(ctx.binary.path), "profile", *scope_args, *module_args,
                "--mode", agg, *backend_args, "--duration", "180s",
                "-o", str(leg_dir / f"{observer_kind}.json")]
+    ctx.observer_start = len(ctx.owners)
     owned, capture, errors, started = spawn_observer(
         ctx.owners, ctx.readers, leg_dir, argv, env, live=observer_kind != "trace")
+    ctx.observer_owned = owned
     try:
         ready = observer_ready(owned, errors, backend)
     except BackendRefused as refused:
@@ -3787,7 +3856,7 @@ def run_b_leg(ctx, cell, backend, observer_kind, leg_dir, mode, measured=25, del
         proof = warm_successor(capture, {"image": 1, "pid": driver.pid, "path": driver.exe1},
                                driver.warm_attempt, observer_kind, output_cursor=output_cursor)
         driver.post_exec()
-    obs_rc, stopped, latency = stop_observer(owned)
+    obs_rc, stopped, latency = stop_b_observer(ctx, owned)
     caller_rc = driver.finish()
     finish_readers([driver.stdout, driver.stderr, capture, errors])
     ledger = driver.normalize(ctx.b_file_offset)

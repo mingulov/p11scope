@@ -343,6 +343,9 @@ pub struct Engine {
     trace_arm_cursor: Option<SeedId>,
     trace_settle_cursor: Option<SeedId>,
     trace_view_cursor: usize,
+    trace_provider_views: BTreeSet<ProcessViewId>,
+    trace_provider_cursor: Option<ProcessViewId>,
+    trace_provider_turn: bool,
     trace_needs_health: bool,
     trace_health_seed: Option<SeedId>,
     modules: Vec<ReconciledModule>,
@@ -8397,6 +8400,9 @@ impl Engine {
             trace_arm_cursor: None,
             trace_settle_cursor: None,
             trace_view_cursor: 0,
+            trace_provider_views: BTreeSet::new(),
+            trace_provider_cursor: None,
+            trace_provider_turn: true,
             trace_needs_health: false,
             trace_health_seed: None,
             modules: Vec::new(),
@@ -8724,6 +8730,58 @@ impl Engine {
             None => self.trace_seeds.keys().next().copied(),
         }
     }
+    fn trace_provider_associated(&self, id: ProcessViewId) -> bool {
+        self.scan_inputs
+            .get(&id)
+            .is_some_and(|input| input.modules.iter().any(|module| module.view == id))
+    }
+
+    /// A provider association selects work, never executable proof. The ordinary
+    /// cursor still visits every retained view; the two classes alternate turns.
+    /// Health peeks the same selection without advancing either class.
+    fn next_trace_view(
+        &mut self,
+        proof: &ProofSession,
+        work: &TraceWorkTicket,
+    ) -> std::result::Result<Option<(usize, bool)>, TraceWorkError> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        if self.views.is_empty() {
+            return Ok(None);
+        }
+        if !matches!(self.scope, Scope::System) || proof.is_cgroup() {
+            return Ok(Some((self.trace_view_cursor % self.views.len(), false)));
+        }
+        if self.trace_provider_turn {
+            let mut cursor = self.trace_provider_cursor;
+            let mut remaining = self.trace_provider_views.len();
+            while remaining != 0 {
+                work.check(proof)?;
+                let next = cursor
+                    .and_then(|id| {
+                        self.trace_provider_views
+                            .range((Excluded(id), Unbounded))
+                            .next()
+                            .copied()
+                    })
+                    .or_else(|| self.trace_provider_views.first().copied());
+                let Some(id) = next else { break };
+                if self.trace_provider_associated(id)
+                    && let Some(position) = self.views.iter().position(|view| view.id() == id)
+                {
+                    work.check(proof)?;
+                    return Ok(Some((position, true)));
+                }
+                // A stale/reused ID or vanished association is only a discarded
+                // hint. Pruning progresses even if this ticket later expires.
+                self.trace_provider_views.remove(&id);
+                cursor = Some(id);
+                remaining -= 1;
+            }
+        }
+        work.check(proof)?;
+        Ok(Some((self.trace_view_cursor % self.views.len(), false)))
+    }
+
     fn advance_trace_phase(&mut self) {
         self.trace_phase = match self.trace_phase {
             TracePhase::Arming => TracePhase::Health,
@@ -8932,9 +8990,17 @@ impl Engine {
                             break;
                         }
                         progress.visited += 1;
-                        self.trace_view_cursor %= self.views.len();
-                        baseline_needed =
-                            proof.can_seed(&self.views[self.trace_view_cursor]).is_ok();
+                        let selection = self.next_trace_view(proof, work);
+                        match selection {
+                            Ok(Some((position, _))) => {
+                                baseline_needed = proof.can_seed(&self.views[position]).is_ok();
+                            }
+                            Err(_) => {
+                                progress.deferred += 1;
+                                break;
+                            }
+                            Ok(None) => {}
+                        }
                     }
                     if (self.trace_needs_health || baseline_needed) && !work.health_attempted() {
                         let result = if proof.is_cgroup() {
@@ -9092,8 +9158,17 @@ impl Engine {
                         break;
                     }
                     progress.visited += 1;
-                    self.trace_view_cursor %= self.views.len();
-                    let position = self.trace_view_cursor;
+                    let (position, provider) = match self.next_trace_view(proof, work) {
+                        Ok(Some(selection)) => selection,
+                        Err(_) => {
+                            progress.deferred += 1;
+                            break;
+                        }
+                        Ok(None) => {
+                            self.advance_trace_phase();
+                            break;
+                        }
+                    };
                     let view = &self.views[position];
                     let eligible = if proof.is_cgroup() {
                         self.trace_by_view
@@ -9118,7 +9193,13 @@ impl Engine {
                     }
                     // Charge the fair slot before a sample can overrun. Partial
                     // samples roll back; this view is retried on a later pass.
-                    self.trace_view_cursor = (position + 1) % self.views.len();
+                    let prior_provider_cursor = self.trace_provider_cursor;
+                    if provider {
+                        self.trace_provider_cursor = Some(view.id());
+                    } else {
+                        self.trace_view_cursor = (position + 1) % self.views.len();
+                    }
+                    self.trace_provider_turn = !provider;
                     self.trace_phase_visits += 1;
                     if eligible {
                         let result = if proof.is_cgroup() {
@@ -9139,6 +9220,25 @@ impl Engine {
                                 progress.seeded += 1;
                             }
                             Err(TraceWorkError::Deferred) => {
+                                if matches!(self.scope, Scope::System)
+                                    && !proof.is_cgroup()
+                                    && work.check(proof).is_ok()
+                                    && work
+                                        .state
+                                        .as_ref()
+                                        .and_then(|state| state.lock().ok())
+                                        .is_some_and(|state| state.reads == 0)
+                                {
+                                    // Retry only read-credit shortfalls with a
+                                    // fresh ordinary ticket. Time/stop/unknown
+                                    // failures keep their fair advancement.
+                                    if provider {
+                                        self.trace_provider_cursor = prior_provider_cursor;
+                                    } else {
+                                        self.trace_view_cursor = position;
+                                    }
+                                    self.trace_provider_turn = provider;
+                                }
                                 if self.trace_phase_visits as usize >= self.views.len()
                                     || self.trace_phase_visits >= 8
                                 {
@@ -9746,6 +9846,7 @@ impl Engine {
     }
 
     fn release_view_id(&mut self, id: ProcessViewId) {
+        self.trace_provider_views.remove(&id);
         self.pending_loader_arm_scans.retain(|key| key.view != id);
         self.exec_rearm_views.remove(&id);
         self.pending_leader_exit_order.remove(&id);
@@ -18430,6 +18531,11 @@ impl Engine {
     fn note_scan_observed(&mut self, view: ProcessViewId, modules: &[ScannedModule]) {
         if !modules.is_empty() {
             self.exploratory_dirty.insert(view);
+        }
+        if modules.iter().any(|module| module.view == view) {
+            self.trace_provider_views.insert(view);
+        } else {
+            self.trace_provider_views.remove(&view);
         }
     }
 

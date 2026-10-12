@@ -113,7 +113,19 @@ run_lane() {
     wait_for_capture_ready "$WORK/$lane.log" aggregate-only metrics
     touch "$WORK/$lane-go"
     if wait "$WPID"; then WPID=; else status=$?; WPID=; echo "workload failed: $status"; cat "$WORK/$lane-workload.log"; exit "$status"; fi
-    if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "profiler failed: $status"; tail -n 20 "$WORK/$lane.log" || true; exit "$status"; fi
+    if wait "$SPID"; then
+        SPID=
+    else
+        status=$?
+        SPID=
+        echo "profiler failed: $status"
+        if [ "$diagnose_skips" -eq 1 ]; then
+            tail -n 20 "$WORK/$lane.log" | sed '/^p11scope: skip-attribution: /d' || :
+        else
+            tail -n 20 "$WORK/$lane.log" || true
+        fi
+        exit "$status"
+    fi
     if [ "$diagnose_skips" -eq 1 ]; then
         # Attribution belongs only in the bounded checker-failure dump below.
         tail -n 3 "$WORK/$lane.log" | sed '/^p11scope: skip-attribution: /d'

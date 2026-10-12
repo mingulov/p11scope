@@ -34,6 +34,8 @@ PRODUCER_CONSTANTS = (
     "PHYSICAL_IDENTITY_AMBIGUITY",
     # SYSPLAN residual F-14: refused future-minor table at the scan gate.
     "UNSUPPORTED_TABLE_VERSION",
+    "STATIC_GAP_INCOMPLETE",
+    "STATIC_GAP_RECOVERED",
 )
 
 
@@ -53,7 +55,7 @@ def producer_reasons():
 
     Entry granularity (function subjects and the one gated null) renders
     "null pointer" or ENTRY_UNAVAILABLE; everything else renders one of the
-    five discovery reasons. The split mirrors `capture_skipped_out`'s
+    seven discovery reasons. The split mirrors `capture_skipped_out`'s
     branches; the strings themselves come from the source, never from a
     copy pasted into this test.
     """
@@ -67,8 +69,10 @@ def producer_reasons():
         const["SHARED_OVERLAY_UNCERTAINTY"],
         const["PHYSICAL_IDENTITY_AMBIGUITY"],
         const["UNSUPPORTED_TABLE_VERSION"],
+        const["STATIC_GAP_INCOMPLETE"],
+        const["STATIC_GAP_RECOVERED"],
     }
-    assert len(entry) == 2 and len(discovery) == 5, const
+    assert len(entry) == 2 and len(discovery) == 7, const
     return entry, discovery
 
 

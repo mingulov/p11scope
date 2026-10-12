@@ -139,6 +139,34 @@ def add_trace_successor_control(text, ledger, receipt):
     return trace_text(lines, counts[0]["stats_entered"] + 1, counts[0]["stats_returned"] + 1, evs[0]), ledger, receipt
 
 
+def add_trace_initial_control(text, ledger, receipt):
+    image = next(row for row in receipt["images"] if row["image"] == 0)
+    first = min(phase["t0"] for phase in receipt["phases"] if phase["phase"] in ("warm", "measured"))
+    t0 = first - 50_000_000
+    phase = "initial-0-1"
+    ledger.extend((target_record(0, "C_GetInfo"), call_record(0, "C_GetInfo", 0, phase, "selected", t0, t0 + 10)))
+    receipt["phases"].insert(0, dict(image=0, fn="C_GetInfo", phase=phase, scope="selected",
+                                   count=1, t0=t0, t1=t0 + 10))
+    receipt["warmup"].update(t0=t0, expected_calls=receipt["warmup"]["expected_calls"] + 1,
+                              phases=[phase, *receipt["warmup"]["phases"]])
+    for proof in receipt.get("successor_ready", []):
+        proof["output_cursor"] += 1
+        proof["proof_cursor"] += 1
+    for item in receipt["phases"]:
+        for field in ("output_cursor", "output_end"):
+            if field in item:
+                item[field] += 1
+    receipt["initial_ready"] = dict(image=0, pid=image["pid"], proof_kind="trace-row", marker_fn="C_GetInfo",
+        budget_phase="setup", started_ns=t0 - 10, observed_ns=t0 + 20, deadline_ns=t0 + 1_000_000_000,
+        setup_deadline_ns=START + 330_000_000_000, leg_deadline_ns=START + 485_000_000_000,
+        attempts=1, max_attempts=20, output_cursor=3, proof_cursor=4, phases=[phase],
+        provider={key: receipt["provider_before"][key] for key in ("path", "dev", "ino", "sha256")})
+    _, counts, evs, _ = H6["N3_PARSE_TRACE"](text)
+    lines = text.splitlines()[3:-2]
+    lines.insert(0, named_row(image["pid"], image["pid"], image["path"], "C_GetInfo"))
+    return trace_text(lines, counts[0]["stats_entered"] + 1, counts[0]["stats_returned"] + 1, evs[0]), ledger, receipt
+
+
 def caller_inputs(raw=False):
     """Leader exec A->B, pid scope: the nonempty ledger-matched control."""
     warm0 = READY + 100_000_000
@@ -2776,9 +2804,13 @@ class LegCleanupTest(unittest.TestCase):
         def warm(capture, caller, stdout, image, phases, *_args, **_kwargs):
             phase(caller, stdout, "C_GetInfo", 1, 0, "successor", "selected", 1, None, phases)
             return {}
+        def initial(ctx, capture, caller, stdout, image, image_pin, provider_pin, phases):
+            phase(caller, stdout, "C_GetInfo", 1, 0, "initial-0-1", "selected", 0, None, phases)
+            return {}
         return mock.patch.dict(self.globals, {
             "drain_trace_phase": drain, "n3_command": phase, "caller_exec": execute,
-            "warm_caller": warm, "stop_observer": lambda *_args: (0, time.monotonic_ns(), 0),
+            "warm_caller": warm, "warm_initial_caller": initial,
+            "stop_observer": lambda *_args: (0, time.monotonic_ns(), 0),
             "finish_readers": lambda *_args: None, "provider_receipt": lambda *_args: dict(PIN),
             "evaluate_trace_h6": oracle})
 
@@ -5670,9 +5702,10 @@ class TraceTest(unittest.TestCase):
         ]
         text = trace_text(rows, 3, 3, evidence())
         text, ledger, receipt = add_trace_successor_control(text, ledger, receipt)
+        text, ledger, receipt = add_trace_initial_control(text, ledger, receipt)
         result = H6["evaluate_trace_h6"](text, ledger, receipt)
         self.assertTrue(result["pass"], result["errors"])
-        self.assertEqual(result["order_matched"], 4)
+        self.assertEqual(result["order_matched"], 5)
         self.assertEqual(result["image_generation_populations"][1], {"named": 3, "unknown": 0})
 
     def test_reject_ambiguous_reused_key_under_loss(self):

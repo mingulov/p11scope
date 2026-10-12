@@ -170,9 +170,12 @@ class _Process:
         self._ordinary()
         started = time.monotonic()
         while self.poll() is None:
-            remaining = _remaining(self.owner.deadline_ns)
-            if timeout is not None:
-                remaining = min(remaining, timeout - (time.monotonic() - started))
+            if timeout is None:
+                remaining = _remaining(self.owner.deadline_ns)
+            else:
+                # After detach, the caller supplies its current bounded phase
+                # timeout. The original setup deadline still gates exec/load.
+                remaining = timeout - (time.monotonic() - started)
                 if remaining <= 0:
                     raise subprocess.TimeoutExpired("owned initial-exec caller", timeout)
             select.select([self.owner.pidfd], [], [], min(remaining, 0.01))

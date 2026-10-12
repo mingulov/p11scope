@@ -2142,7 +2142,6 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
 # ---------------------------------------------------------------------------
 
 OwnedProcess = N3HARNESS["OwnedProcess"]
-Reader = N3HARNESS["Reader"]
 FilePin = N3HARNESS["FilePin"]
 cleanup_processes = N3HARNESS["cleanup_processes"]
 cleanup_cgroups = N3HARNESS["cleanup_cgroups"]

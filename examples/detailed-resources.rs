@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
+//! SPDX-License-Identifier: GPL-3.0-or-later
 //! Unprivileged JSON adapter for system-scope-measure.sh's opt-in component model.
 //! Build this example with the same feature profile as the measured observer.
 

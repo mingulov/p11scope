@@ -489,6 +489,8 @@ def worker_early_population(rows, receipt, images, hints):
 def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
     rows, counts, evidence, errors = N3_PARSE_TRACE(trace)
     errors.extend(stop_errors(receipt))
+    if (receipt.get("b_setup") or {}).get("mode") == "3":
+        errors.extend(held_entry_errors(trace, ledger, receipt))
     if receipt.get("expect_empty"):
         if rows:
             errors.append("stop-before-collection leg captured rows")
@@ -2503,6 +2505,7 @@ class BDriver:
         self.tasks: dict = {}
         self.index = 0
         self.warm_calls = []
+        self.initial_calls = []
         token = int.from_bytes(os.urandom(8), "little") | 1
         absent = self.leg_dir / "must-not-exist"
         argv = [str(before_pin.path), str(provider_pin.path), str(after_pin.path),
@@ -2537,9 +2540,9 @@ class BDriver:
             self.owned.verify()
         except FileNotFoundError:
             # Linux removes the zombie leader's namespace links while its
-            # exact clone worker survives. Only mode2 may use this local
+            # exact clone worker survives. Only the leader-exit modes use this
             # fallback; the held group pidfd and original birth stay owned.
-            if getattr(self, "mode", None) != "2" or not hasattr(self, "worker_identity"):
+            if getattr(self, "mode", None) not in ("2", "3") or not hasattr(self, "worker_identity"):
                 raise
             self.verify_zombie_worker()
         self.stamps[name] = monotonic_ns()  # lower bound before a fast child can read
@@ -2568,12 +2571,19 @@ class BDriver:
         return line
 
     def start_worker(self):
+        if self.mode == "3" and not getattr(self, "initial_ready", None):
+            raise SetupError("held-entry worker lacks its original-image public provider proof")
         deadline = wait_deadline(10) if self.mode == "2" else None
         self.send("G", "G")
         thread = self.expect("THREAD", timeout=remaining_until(deadline) if deadline else 10)
         fields = thread.split()
         self.worker_tid = int(fields[2])
         assert self.worker_tid != self.pid
+        if self.mode == "3":
+            if len(fields) != 5 or [int(value) for value in fields[1:4]] != [self.pid, self.worker_tid, self.worker_tid]:
+                raise SetupError("THREAD does not identify the exact held-entry worker")
+            self.worker_identity = proc_worker_identity(self.pid, self.worker_tid)
+            self.owned.zombie_worker_verify = self.verify_zombie_worker
         if self.mode == "2":
             if len(fields) != 5 or [int(value) for value in fields[1:4]] != [self.pid, self.worker_tid, self.worker_tid]:
                 raise SetupError("THREAD does not identify the exact owned worker")
@@ -2643,6 +2653,75 @@ class BDriver:
     def verify_zombie_worker(self):
         if self.verify_worker_group().get(self.pid) != "Z":
             raise SetupError("worker custody lacks the original zombie leader")
+
+    def initial_warm_attempt(self, sequence, remaining):
+        phase = f"initial-0-{sequence}"
+        self.send("W", phase)
+        done = self.expect("INITIAL_WARM_DONE", timeout=remaining)
+        fields = [int(field) for field in done.split()[1:]]
+        if (fields[:4] != [self.pid, self.pid, sequence, 0]
+                or not self.stamps[phase] <= fields[4] <= fields[5] <= self.stamps["INITIAL_WARM_DONE"]):
+            raise SetupError("initial marker does not match its independently issued real call")
+        self.initial_calls.append({"kind": "call", "image": 0, "pid": self.pid, "tid": self.pid,
+            "fn": "C_GetInfo", "rv": 0, "phase": phase, "scope": "selected", "sess": 0,
+            "seq": sequence, "t0": fields[4], "t1": fields[5]})
+        return phase
+
+    def accept_initial_proof(self, capture, proof, ready):
+        self.owned.verify()
+        self.before_pin.verify()
+        self.provider_pin.verify()
+        index = proof["proof_cursor"] - 1
+        row = ROW.fullmatch(capture.lines[index].strip()) if 0 <= index < len(capture.lines) else None
+        if (proof["image"] != 0 or proof["proof_kind"] != "trace-row"
+                or proof["marker_fn"] != "C_GetInfo" or not row
+                or (int(row["pid"]), int(row["tid"]), row["fn"], row["rv"]) !=
+                   (self.pid, self.pid, "C_GetInfo", "CKR_OK")
+                or not row["path"] or json.loads(row["path"]) != self.exe0
+                or json.loads(row["label"]) != Path(self.exe0).name
+                or not ready <= proof["started_ns"] <= proof["observed_ns"] <= proof["deadline_ns"]
+                or not 1 <= proof["attempts"] == len(self.initial_calls) <= proof["max_attempts"] == 20
+                or not 0 < proof["deadline_ns"] - proof["started_ns"] <= 15_000_000_000):
+            raise SetupError("held-entry initial proof is not this observer's bounded original provider row")
+        self.initial_ready = proof
+
+    def release_held_leader(self):
+        """Permit exit only after the exact worker entered under a live leader."""
+        deadline = wait_deadline(10)
+        self.owned.verify()
+        self.before_pin.verify()
+        self.provider_pin.verify()
+        leader = proc_leader_identity(self.pid)
+        states = self.verify_worker_group()
+        body = [int(value) for value in self.lines["EXEC_BODY"].split()[1:]]
+        observed = monotonic_ns()
+        if (self.mode != "3" or states.get(self.pid) not in ("R", "S", "D")
+                or leader["state"] not in ("R", "S", "D")
+                or body[:3] != [self.pid, self.worker_tid, self.token]
+                or not self.initial_ready["observed_ns"] <= self.stamps["G"]
+                    <= int(self.lines["WORKER_DONE"].split()[-1]) <= body[-1] <= observed):
+            raise SetupError("held provider entry lacks a live original leader/current public readiness")
+        self.held_entry = {"proof_kind": "live-leader-held-provider-entry",
+            "leader": dict(self.owned.identity), "worker": dict(self.worker_identity),
+            "leader_before": leader, "tasks_before": states, "pidfd_live": True,
+            "entered_ns": body[-1], "observed_live_ns": observed, "deadline_ns": deadline,
+            "initial_ready": self.initial_ready, "provider": provider_receipt(self.provider_pin)}
+        self.send("E", "E")
+        released = self.expect("HELD_LEADER_RELEASE", timeout=remaining_until(deadline))
+        fields = [int(value) for value in released.split()[1:]]
+        if fields[:3] != body[:3] or not self.stamps["E"] <= fields[-1] <= self.stamps["HELD_LEADER_RELEASE"]:
+            raise SetupError("held-frame leader release ack differs from its independent E dispatch")
+        self.expect("LEADER_EXIT", timeout=remaining_until(deadline))
+        while True:
+            remaining_until(deadline)
+            states = self.verify_worker_group()
+            observed = monotonic_ns()
+            remaining_until(deadline)
+            if states.get(self.pid) == "Z":
+                break
+            pause_until(deadline, 0.005)
+        self.held_entry.update(released_ns=fields[-1], observed_zombie_ns=observed, tasks_after=states)
+        return self.held_entry
 
     def pre_exec(self):
         done = self.expect("WORKER_DONE", timeout=10)
@@ -2719,7 +2798,8 @@ class BDriver:
         return {"token": self.token, "mode": self.mode, "measured": self.measured,
                 "delay_ms": self.delay_ms, "tasks": self.tasks, "lines": self.lines,
                 "stamps": self.stamps, "worker_identity": getattr(self, "worker_identity", None),
-                "worker_barrier": getattr(self, "worker_barrier", None)}
+                "worker_barrier": getattr(self, "worker_barrier", None),
+                "held_entry": getattr(self, "held_entry", None)}
 
     def normalize(self, file_offset):
         """Translate receipts to N3LEDGER-schema records."""
@@ -2741,6 +2821,11 @@ class BDriver:
                            "fn": "C_Initialize", "rv": rv, "phase": "pre", "scope": "selected",
                            "sess": 0, "t0": self.stamps.get("B", self.stamps["G"]), "t1": self.stamps["WORKER_DONE"],
                            "seq": seq})
+        if self.initial_calls:
+            ledger.append({"kind": "target", "image": 0, "fn": "C_GetInfo",
+                "dev": self.maps0[2], "ino": self.maps0[3],
+                "file_offset": symbol_file_offset(self.provider_pin.path, "C_GetInfo")})
+            ledger.extend(self.initial_calls)
         failed = self.mode == "1"
         if failed:
             post_rvs = [5] + [0 if i % 2 == 0 else 5 for i in range(17)]
@@ -3042,7 +3127,7 @@ def warm_successor(capture, image, attempt, mode="trace", marker_fn="C_GetInfo",
         raise ValueError("invalid successor warm-up budget")
     started = monotonic_ns()
     enter_phase("successor-recovery", key=image["image"])
-    deadline = wait_deadline(timeout)
+    deadline = min(wait_deadline(timeout), started + int(timeout * 1_000_000_000))
     baseline = None
     if mode == "trace":
         cursor = len(capture.lines) if output_cursor is None else output_cursor
@@ -3952,8 +4037,16 @@ def run_b_leg(ctx, cell, backend, observer_kind, leg_dir, mode, measured=25, del
                   else evaluate_profile_h6({}, "", [], receipt))
         write_json(leg_dir / "result.json", result)
         return result
+    if mode == "3":
+        if observer_kind != "trace":
+            raise SetupError("held-entry recovery requires its public trace readiness proof")
+        initial = warm_successor(capture, {"image": 0, "pid": driver.pid, "path": driver.exe0},
+                                 driver.initial_warm_attempt, output_cursor=len(capture.lines))
+        driver.accept_initial_proof(capture, initial, ready)
     driver.start_worker()
     driver.pre_exec()
+    if mode == "3":
+        driver.release_held_leader()
     output_cursor = len(capture.lines) if observer_kind == "trace" else None
     driver.do_exec()
     failed = mode == "1"
@@ -4009,7 +4102,10 @@ def run_b_leg(ctx, cell, backend, observer_kind, leg_dir, mode, measured=25, del
     warm_phases = [{"image": 1, "fn": "C_GetInfo", "phase": call["phase"],
                     "scope": "selected", "count": 1, "t0": call["t0"], "t1": call["t1"]}
                    for call in driver.warm_calls]
-    phases = [pre_phase, *warm_phases, post_phase]
+    initial_phases = [{"image": 0, "fn": "C_GetInfo", "phase": call["phase"],
+                       "scope": "selected", "count": 1, "t0": call["t0"], "t1": call["t1"]}
+                      for call in driver.initial_calls] if mode == "3" else []
+    phases = [*initial_phases, pre_phase, *warm_phases, post_phase]
     receipt = {
         "cell": cell, "leg": f"{observer_kind}/{backend}", "scope_kind": "pid",
         "pid": driver.pid, "known_tids": [driver.pid, driver.worker_tid],
@@ -4060,6 +4156,130 @@ def run_pid_nonleader_cold(ctx, cell_dir, backend):
 def run_pid_failed_exec(ctx, cell_dir, backend):
     return [run_b_leg(ctx, "pid-failed-exec", backend, "trace",
                       Path(cell_dir) / backend / "trace", "1")]
+
+
+def held_entry_errors(trace, ledger, receipt):
+    """Check the physical held entry without deriving it from native counters."""
+    try:
+        setup = receipt["b_setup"]
+        held = setup["held_entry"]
+        leader, worker = held["leader"], held["worker"]
+        pid, tid = receipt["pid"], worker["tid"]
+        image = next(row for row in receipt["images"] if row["image"] == 0)
+        before = {int(key): value for key, value in held["tasks_before"].items()}
+        after = {int(key): value for key, value in held["tasks_after"].items()}
+        current = held["leader_before"]
+        proof = held["initial_ready"]
+        lines, stamps = setup["lines"], setup["stamps"]
+        body, released, exited = (lines[key].split() for key in
+                                  ("EXEC_BODY", "HELD_LEADER_RELEASE", "LEADER_EXIT"))
+        if (setup["mode"] != "3" or held["proof_kind"] != "live-leader-held-provider-entry"
+                or leader["pid"] != pid or leader["start_time"] != image["start_time"]
+                or any(leader[key] != image[key] for key in ("pid_namespace", "time_namespace"))
+                or tid == pid or worker != setup["worker_identity"] or worker["tgid"] != pid
+                or worker["start_time"] <= 0 or set(receipt["known_tids"]) != {pid, tid}
+                or any(worker[key] != leader[key] for key in ("ppid", "uid", "pid_namespace", "time_namespace"))
+                or any(current[key] != leader[key] for key in ("pid", "ppid", "uid", "start_time"))
+                or current["state"] not in ("R", "S", "D") or held["pidfd_live"] is not True
+                or set(before) != {pid, tid} or set(after) != {pid, tid}
+                or before[pid] not in ("R", "S", "D") or before[tid] not in ("R", "S", "D")
+                or after[pid] != "Z" or after[tid] not in ("R", "S", "D")
+                or held["provider"] != receipt["provider_before"]
+                or receipt["provider_before"] != receipt["provider_after"]
+                or receipt["abandoned_expected"] != 1 or receipt["abandoned_by_fn"] != {"C_Initialize": 1}
+                or receipt["measured"]["expected_calls"] != 25):
+            raise ValueError("original live leader/exact held worker/provider identity disagrees")
+        if (body[0] != "EXEC_BODY" or released[0] != "HELD_LEADER_RELEASE" or exited[0] != "LEADER_EXIT"
+                or [int(value) for value in body[1:4]] != [pid, tid, setup["token"]]
+                or released[1:4] != body[1:4] or [int(value) for value in exited[1:3]] != [pid, tid]
+                or int(body[-1]) != held["entered_ns"] or int(released[-1]) != held["released_ns"]):
+            raise ValueError("held frame and leader release acknowledgements disagree")
+        times = [receipt["observer_ready_ns"], proof["started_ns"], proof["observed_ns"], stamps["G"],
+                 int(lines["THREAD"].split()[-1]), int(lines["WORKER_DONE"].split()[-1]),
+                 held["entered_ns"], held["observed_live_ns"], stamps["E"], held["released_ns"],
+                 int(exited[-1]), held["observed_zombie_ns"], stamps["X"],
+                 int(lines["NEW_READY"].split()[-1]), receipt["observer_stopped_ns"]]
+        if (any(type(value) is not int for value in times) or times != sorted(times)
+                or not held["observed_zombie_ns"] <= held["deadline_ns"]
+                or not 0 < held["deadline_ns"] - held["observed_live_ns"] <= 10_000_000_000):
+            raise ValueError("held entry/live-leader release/zombie/exec chronology disagrees")
+        initial_calls = [row for row in ledger if row["kind"] == "call" and row["phase"] in proof["phases"]]
+        if (proof["image"] != 0 or proof["proof_kind"] != "trace-row" or proof["marker_fn"] != "C_GetInfo"
+                or not 1 <= proof["attempts"] == len(initial_calls) <= proof["max_attempts"] == 20
+                or not proof["observed_ns"] <= proof["deadline_ns"]
+                or not 0 < proof["deadline_ns"] - proof["started_ns"] <= 15_000_000_000
+                or not 0 <= proof["output_cursor"] < proof["proof_cursor"]
+                or any((row["image"], row["pid"], row["tid"], row["fn"], row["rv"], row["scope"]) !=
+                       (0, pid, pid, "C_GetInfo", 0, "selected") or not
+                       proof["started_ns"] <= row["t0"] <= row["t1"] <= proof["observed_ns"]
+                       for row in initial_calls)):
+            raise ValueError("initial proof disagrees with its fixed real marker ledger")
+        stream = trace.splitlines()
+        index = proof["proof_cursor"] - 1
+        row = ROW.fullmatch(stream[index]) if 0 <= index < len(stream) else None
+        if (not row or (int(row["pid"]), int(row["tid"]), row["fn"], row["rv"]) !=
+                (pid, pid, "C_GetInfo", "CKR_OK") or not row["path"]
+                or json.loads(row["path"]) != image["path"] or json.loads(row["label"]) != Path(image["path"]).name):
+            raise ValueError("initial proof lacks this observer's correctly named original marker row")
+        return []
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError, StopIteration) as error:
+        return [f"held-entry recovery lacks independent live-entry/zombie proof: {error}"]
+
+
+def worker_perf_prefix_gap(ev, receipt):
+    """Exact mode2 prefix only: an exited perf target no longer covers its worker.
+
+    The caller first validates the original-Z/exact-worker release proof. A
+    generic link-loss count, requested backend or later static detach cannot
+    supply this proof; the real Session filter and held provider must agree.
+    """
+    try:
+        observation = ev["gap_classes"]["observation"]
+        if (receipt["cell"] != "leader-exit-exec" or receipt["scope_kind"] != "pid"
+                or receipt["requested_backend"] != "singles"
+                or receipt["b_setup"]["mode"] != "2" or receipt["owned_pids"] != [receipt["pid"]]
+                or ev["attach_backend"] != {"selection": "singles", "fallback": None,
+                                           "scope_filter": "perf-task+bpf"}
+                or ev["completeness"] != "PARTIAL" or ev["verdict_detail"] != "concrete_gap"
+                or observation["status"] != "lossy" or "task_uprobe_link_losses" not in observation["causes"]
+                or type(ev["task_uprobe_link_losses"]) is not int or ev["task_uprobe_link_losses"] <= 0
+                or ev["authority"] != "hash-pinned"):
+            return False
+        pin = receipt["provider_before"]
+        mapping, physical = pin["mapping"], pin["file_identity"]
+        if (pin != receipt["provider_after"] or not pin["path"].startswith("/")
+                or not re.fullmatch(r"[0-9a-f]{64}", pin["sha256"])
+                or not isinstance(pin["dev"], list) or len(pin["dev"]) != 2
+                or any(type(value) is not int or value < 0 for value in pin["dev"])
+                or type(pin["ino"]) is not int or pin["ino"] <= 0
+                or mapping["dev"] != pin["dev"] or mapping["ino"] != pin["ino"]
+                or mapping["file_offset"] != 0 or mapping["permissions"] != "r--p"
+                or type(mapping["length"]) is not int or mapping["length"] <= 0
+                or physical["ino"] != pin["ino"]
+                or not isinstance(physical["dev"], list) or len(physical["dev"]) != 2
+                or any(type(value) is not int or value < 0 for value in physical["dev"])
+                or any(type(physical[key]) is not int or physical[key] <= 0
+                       for key in ("size", "mtime_ns", "ctime_ns"))):
+            return False
+        argv = receipt["observer_argv"]
+        if (not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv)
+                or not argv[0].startswith("/") or argv[1] != "trace"
+                or any(flag in argv for flag in ("--system", "--cgroup"))
+                or any(arg.startswith(("--pid=", "--cgroup=", "--module=")) for arg in argv)
+                or any(argv.count(flag) != 1 for flag in ("--pid", "--module", "--attach-backend"))
+                or argv[argv.index("--pid") + 1] != str(receipt["pid"])
+                or argv[argv.index("--module") + 1] != pin["path"]
+                or argv[argv.index("--attach-backend") + 1] != "singles"):
+            return False
+        identity = {key: pin[key] for key in ("path", "dev", "ino", "sha256")}
+        def matches(record):
+            return isinstance(record, dict) and all(record.get(key) == value for key, value in identity.items())
+        discovered = ev["discovery"]
+        return (isinstance(discovered, list) and len(discovered) == 1 and matches(discovered[0])
+                and isinstance(discovered[0]["objects"], list) and bool(discovered[0]["objects"])
+                and all(matches(record) for record in discovered[0]["objects"]))
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+        return False
 
 
 def evaluate_worker_capability(result, receipt, backend):
@@ -4131,7 +4351,6 @@ def evaluate_worker_capability(result, receipt, backend):
             errors.append("capability lacks terminal capture evidence")
         else:
             ev = terminal[0]
-            errors.extend(_early_gap_errors(ev, early["deficit"]))
             attach = ev.get("attach_backend")
             if not isinstance(attach, dict) or attach.get("selection") != backend:
                 errors.append("capability capture backend differs from the requested backend")
@@ -4141,6 +4360,10 @@ def evaluate_worker_capability(result, receipt, backend):
                     or any(ev.get(key, 0) for key in ("event_loss", "start_insert_failures", "unmatched_returns",
                         "rv_update_failures", "process_tracking_failures", "process_tracking_evictions"))):
                 errors.append("capability capture reports truncation/policy or native event loss")
+            gap_errors = _early_gap_errors(ev, early["deficit"])
+            if gap_errors and not errors and worker_perf_prefix_gap(ev, receipt):
+                gap_errors = []
+            errors.extend(gap_errors)
     except (KeyError, TypeError, ValueError, IndexError, StopIteration) as error:
         errors.append(f"missing/invalid worker barrier evidence: {error}")
     if not errors:
@@ -4152,12 +4375,18 @@ def evaluate_worker_capability(result, receipt, backend):
 
 def run_leader_exit_exec(ctx, cell_dir, backend):
     leg_dir = Path(cell_dir) / backend / "trace"
-    result = run_b_leg(ctx, "leader-exit-exec", backend, "trace", leg_dir, "2")
+    result = run_b_leg(ctx, "leader-exit-exec", backend, "trace", leg_dir, "3")
     if result.get("pass") is False and result.get("status") == "negative":
         return [result]  # observer refused before a worker/barrier receipt existed
-    receipt = json.loads((leg_dir / "receipt.json").read_text())
-    capability = evaluate_worker_capability(result, receipt, backend)
-    write_json(leg_dir / "capability.json", capability)
+    capability_dir = Path(cell_dir) / backend / "capability-preexec"
+    source = run_b_leg(ctx, "leader-exit-exec", backend, "trace", capability_dir, "2")
+    if source.get("status") == "negative":
+        capability = {"cell": "leader-exit-exec", "leg": f"capability-preexec/{backend}",
+                      "pass": False, "status": "negative", "errors": source["errors"]}
+    else:
+        receipt = json.loads((capability_dir / "receipt.json").read_text())
+        capability = evaluate_worker_capability(source, receipt, backend)
+    write_json(capability_dir / "capability.json", capability)
     return [result, capability]
 
 

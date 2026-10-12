@@ -5,7 +5,12 @@
  * the failed-exec worker's final kernel clear_child_tid. No uretprobe unwinding.
  * Mode argv[6]: '0' nonleader exec, '1' failed exec, '2' leader thread-exit then
  * nonleader exec (the leader emits LEADER_EXIT, then exits; the worker owns
- * everything after THREAD). The provider additionally
+ * everything after THREAD). H6-only mode '3' enters the held provider frame
+ * while the original leader is live; E permits that leader's exit, then X
+ * permits exec after the controller proves the original zombie/exact worker.
+ * Its initial W markers permit a real public readiness proof before G.
+ * Mode '2' remains the separate post-zombie worker capability protocol.
+ * The provider additionally
  * exports a v2.40 C_GetFunctionList table (slot 0 is the real C_Initialize, the
  * C_GetInfo is the zero-return warm-up marker, the rest distinct stubs) so public scan-only discovery can attach;
  * the driver calls the getter once before READY. The getter itself is never a
@@ -144,6 +149,9 @@ struct request {
     unsigned long leg_deadline_ns;
     unsigned long measurement_ms;
     unsigned long post_deadline_ns;
+    int release_leader;
+    int leader_exit_fd;
+    unsigned long leader_exit_deadline_ns;
 };
 
 #ifdef DETAILED_EXEC_PROVIDER
@@ -158,6 +166,14 @@ unsigned long C_Initialize(void *argument) {
             (unsigned long)raw6(SYS_gettid, 0, 0, 0, 0, 0, 0), request->token
         };
         emit("EXEC_BODY", fields, 3);
+        if (request->release_leader) {
+            /* The controller saw this physical entry while the original
+             * leader was live. Only this held frame consumes E; the leader
+             * waits on its private pipe, so no thread races for stdin. */
+            receive_until(0, 'E', request->leader_exit_deadline_ns);
+            emit("HELD_LEADER_RELEASE", fields, 3);
+            write_all(request->leader_exit_fd, "E", 1);
+        }
         receive_until(0, 'X', request->deadline_ns);
         /* exec consumes the prepared argv/envp while this probed frame is live. */
         long result = raw6(SYS_execve, (long)request->exec_path,
@@ -394,7 +410,8 @@ int main(int argc, char **argv) {
     int opt_in = argc == 15;
     unsigned long parent = positive(argv[4]), token = positive(argv[5]);
     if (argv[2][0] != '/' || argv[3][0] != '/'
-        || (argv[6][0] != '0' && argv[6][0] != '1' && argv[6][0] != '2') || argv[6][1]) return 3;
+        || (argv[6][0] != '0' && argv[6][0] != '1' && argv[6][0] != '2'
+            && !(opt_in && argv[6][0] == '3')) || argv[6][1]) return 3;
     /* Validate the after-image pacing passthrough before the worker exists. */
     unsigned long passthrough_measured = argc > 7 ? positive(argv[7]) : 17;
     unsigned long passthrough_delay = argc > 8 ? nonnegative(argv[8]) : 0;
@@ -466,7 +483,27 @@ int main(int argc, char **argv) {
     receive_until(0, 'F', phase_deadline(h6_hold_ms));
 #else
     emit("READY", ready, 5);
-    receive_until(0, 'G', h6_setup);
+    if (argv[6][0] == '3') {
+        call_fn initial_call = (call_fn)dlsym(provider, "C_GetInfo");
+        if (!initial_call) return 16;
+        unsigned long sequence = 0;
+        for (;;) {
+            char command = receive_command_until(0, h6_setup);
+            if (command == 'G') {
+                if (!sequence) fail(110);
+                break;
+            }
+            if (command != 'W' || ++sequence > 20) fail(111);
+            unsigned long t0 = clock_ns();
+            unsigned long initial_rv = initial_call(NULL);
+            unsigned long t1 = clock_ns();
+            if (initial_rv != 0) fail(107);
+            unsigned long initial[] = { pid, pid, sequence, initial_rv, t0, t1 };
+            emit("INITIAL_WARM_DONE", initial, 6);
+        }
+    } else {
+        receive_until(0, 'G', h6_setup);
+    }
     long page = sysconf(_SC_PAGESIZE);
     if (page <= 0) return 9;
     size_t stack_size = 1024 * 1024, allocation = stack_size + 2 * (size_t)page;
@@ -474,6 +511,8 @@ int main(int argc, char **argv) {
     if (stack == MAP_FAILED || mprotect(stack + page, stack_size, PROT_READ | PROT_WRITE)) return 10;
     int go[2];
     if (pipe2(go, O_CLOEXEC)) return 11;
+    int leader_exit[2] = { -1, -1 };
+    if (argv[6][0] == '3' && pipe2(leader_exit, O_CLOEXEC)) return 11;
     /* Everything the execing frame dereferences is prepared before clone,
      * including the optional measured-phase pacing passthrough. */
     char *next_argv[13];
@@ -497,7 +536,9 @@ int main(int argc, char **argv) {
                   .expect_failure = argv[6][0] == '1',
                   .exec_path = argv[6][0] == '1' ? argv[3] : argv[2],
                   .exec_argv = next_argv, .exec_envp = next_envp,
-                  .leg_deadline_ns = h6_leg, .measurement_ms = h6_measurement_ms }
+                  .leg_deadline_ns = h6_leg, .measurement_ms = h6_measurement_ms,
+                  .release_leader = argv[6][0] == '3',
+                  .leader_exit_fd = leader_exit[1], .leader_exit_deadline_ns = h6_setup }
     };
     _Alignas(4) int child_tid = -1;
     int flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD
@@ -507,7 +548,8 @@ int main(int argc, char **argv) {
     unsigned long started[] = { pid, (unsigned long)tid, (unsigned long)child_tid };
     emit("THREAD", started, 3);
     if (!args.controller_gate) write_all(go[1], "W", 1);
-    if (argv[6][0] == '2') {
+    if (argv[6][0] == '2' || argv[6][0] == '3') {
+        if (argv[6][0] == '3') receive_until(leader_exit[0], 'E', h6_setup);
         /* Leader thread-exit: the worker owns the rest of the protocol. */
         unsigned long gone[] = { pid, (unsigned long)tid };
         emit("LEADER_EXIT", gone, 2);

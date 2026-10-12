@@ -3730,7 +3730,7 @@ fn profile_frame_decisions(
     }
 }
 
-/// Request one ordinary frame after the closed loss-settlement tick. Preserve
+/// Request one ordinary frame after loss or native-retirement settlement. Preserve
 /// the render's clock and avoid another clock read on the ordinary cadence.
 fn request_profile_recovery_frame(
     frame_clock: &mut Instant,
@@ -5591,7 +5591,12 @@ fn capture_trace(
             CaptureTick::Continue { paused, snapshot: () } => paused,
             CaptureTick::End(end) => break Ok(end),
         };
-        let _ = engine.take_immediate_exec_recovery_frame();
+        request_profile_recovery_frame(
+            &mut last_frame,
+            drain,
+            engine.take_immediate_exec_recovery_frame(),
+            Instant::now,
+        );
         flush_stdout(stdout, &mut stdout_open)?;
         if let Some(f) = out_file.as_mut() {
             f.flush().context("flushing trace output file")?;

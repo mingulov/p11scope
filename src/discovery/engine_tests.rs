@@ -1,6 +1,8 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 use super::session_fixture::ScriptedSession;
 use super::*;
+#[path = "async_global_tests.rs"]
+mod async_global;
 use crate::discovery::test_subject::{OwnedMapper, poll_fd as system_scope_poll_fd};
 
 #[path = "inventory_claims_tests.rs"]
@@ -10346,6 +10348,7 @@ fn automatic_exec_unchanged_plan_rearms_pid_targets() {
         .map(|index| (*index, Some(7)))
         .collect();
     session.report_slot_rebuilds([DetachOutcome {
+        pending: None,
         recompleted: survivors,
         rebuild_failures: vec![(failed_slot, "scripted multi survivor lost".into())],
         rebuilt_groups: 1,
@@ -15158,6 +15161,7 @@ fn rebuild_report_recompletions_record_reactivation_for_siblings() {
         &mut plan,
         &owners,
         DetachOutcome {
+            pending: None,
             recompleted: vec![(1, Some(50))],
             rebuild_failures: Vec::new(),
             rebuilt_groups: 1,
@@ -15196,6 +15200,7 @@ fn rebuild_report_failures_deactivate_and_record_loss() {
         &mut plan,
         &owners,
         DetachOutcome {
+            pending: None,
             recompleted: Vec::new(),
             rebuild_failures: vec![(1, "p11_return refused".into())],
             rebuilt_groups: 1,
@@ -15228,6 +15233,7 @@ fn rebuild_report_for_unknown_slot_publishes_defensive_partial() {
         &mut plan,
         &owners,
         DetachOutcome {
+            pending: None,
             recompleted: vec![(99, Some(7))],
             rebuild_failures: vec![(98, "gone".into())],
             rebuilt_groups: 1,
@@ -15278,6 +15284,7 @@ fn failed_attach_rebuild_report_reactivates_surviving_sibling() {
     session.report_slot_rebuilds([
         DetachOutcome::default(),
         DetachOutcome {
+            pending: None,
             recompleted: vec![(sibling, Some(77))],
             rebuild_failures: Vec::new(),
             rebuilt_groups: 1,
@@ -15322,6 +15329,7 @@ fn retired_slot_rebuild_report_reactivates_surviving_sibling() {
     assert_eq!(candidate.delta.retire.len(), 1);
     let mut session = ScriptedSession::default();
     session.report_slot_rebuilds([DetachOutcome {
+        pending: None,
         recompleted: vec![(0, Some(88))],
         rebuild_failures: Vec::new(),
         rebuilt_groups: 1,

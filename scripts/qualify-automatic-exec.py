@@ -3570,15 +3570,25 @@ class LegContext:
 
 def stop_b_observer(ctx, owned):
     """Retire B work once; normal stop and cleanup share one terminal cap."""
-    if ctx.observer_stop_attempted:
-        raise SetupError("workload-B observer normal stop already attempted")
-    ctx.terminal_budget = LegBudget(clock=ctx.budget.clock,
-        leg_seconds=OBSERVER_STOP_SECONDS + CLEANUP_SECONDS)
-    ctx.terminal_token = ACTIVE_LEG.set(ctx.terminal_budget)
-    ctx.observer_stop_attempted = True
     with cleanup_section():
-        ctx.observer_stop_result = stop_observer(owned)
-    return ctx.observer_stop_result
+        if ctx.observer_stop_attempted:
+            raise SetupError("workload-B observer normal stop already attempted")
+        ctx.terminal_budget = LegBudget(clock=ctx.budget.clock,
+            leg_seconds=OBSERVER_STOP_SECONDS + CLEANUP_SECONDS)
+        ctx.terminal_token = ACTIVE_LEG.set(ctx.terminal_budget)
+        ctx.observer_stop_attempted = True
+        try:
+            ctx.observer_stop_result = stop_observer(owned)
+            rc, _stopped, latency = ctx.observer_stop_result
+            failures = stop_errors(stop_receipt(owned, latency))
+            if rc != 0:
+                failures.append(f"observer normal stop returned {rc}")
+            if failures:
+                raise LegCleanupError("observer normal stop failed: " + "; ".join(failures))
+        except BaseException as error:
+            ctx.observer_stop_error = error
+            raise
+        return ctx.observer_stop_result
 
 
 def finalize_b_observer(ctx):
@@ -3595,13 +3605,8 @@ def finalize_b_observer(ctx):
         raise SetupError("workload-B observer lacks enrolled direct-child ownership")
     if not ctx.observer_stop_attempted and owned.popen.poll() is None:
         stop_b_observer(ctx, owned)
-    if ctx.observer_stop_result is not None:
-        rc, _stopped, latency = ctx.observer_stop_result
-        failures = stop_errors(stop_receipt(owned, latency))
-        if rc != 0:
-            failures.append(f"observer normal stop returned {rc}")
-        if failures:
-            raise LegCleanupError("observer normal stop failed: " + "; ".join(failures))
+    if ctx.observer_stop_error is not None:
+        raise ctx.observer_stop_error
 
 
 def owned_leg(function=None, *, inventory=False, stop_b=False):
@@ -3616,6 +3621,7 @@ def owned_leg(function=None, *, inventory=False, stop_b=False):
                 scope.observer_start = scope.observer_owned = None
                 scope.observer_stop_attempted = False
                 scope.observer_stop_result = scope.terminal_token = None
+                scope.observer_stop_error = None
                 scope.terminal_budget = scope.budget  # No-observer cleanup also cannot renew.
         token = ACTIVE_LEG.set(scope.budget)
         primary = None
@@ -3633,7 +3639,8 @@ def owned_leg(function=None, *, inventory=False, stop_b=False):
                         try:
                             finalize_b_observer(scope)
                         except BaseException as error:
-                            stop_error = error
+                            if error is not primary:
+                                stop_error = error  # An already-primary stop error is not a second failure.
                             scope.case.cleanup_failed = True
                             scope.case.cleanup_errors.append(
                                 f"observer normal stop: {type(error).__name__}: {error}")

@@ -175,6 +175,12 @@ def evaluate_replacement(trace, ledger, receipt, file_trace=None):
                                       or row["pid"] != new["pid"] or row["scope"] != "selected"
                                       for row in calls):
             errors.append("replacement measured phase differs from the fixed independent function/RV/population")
+        # H6 already parses, ledger-matches and checks each published name.
+        # This gate additionally requires names for every measured return;
+        # unknown warm/early returns keep the shared H6 policy.
+        measured_names = result.get("phase_populations", {}).get("measured", {})
+        if measured_names.get("named", 0) != COUNT or measured_names.get("unknown", 0):
+            errors.append("replacement measured returns lack the correct fresh held executable name")
         for ev in result.get("evidence", []):
             backend = ev.get("attach_backend", {})
             # Classic trace publishes a PID-link filter only for PID scope.

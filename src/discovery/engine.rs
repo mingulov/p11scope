@@ -34,7 +34,7 @@ use crate::discovery::scheduler::{
 };
 use crate::discovery::sweep_shards;
 use crate::manifest_input::{read_manifest, selection_surface_usable, validate_structure};
-use crate::process::{self, OriginalGenerationState, ProcessView, ProcessViewId};
+use crate::process::{self, OriginalGenerationState, ProcessView, ProcessViewId, ViewAdmission};
 use crate::run::OwnedChild;
 use crate::{plan, render};
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -344,7 +344,7 @@ pub struct Engine {
     trace_arm_cursor: Option<SeedId>,
     trace_settle_cursor: Option<SeedId>,
     trace_view_cursor: usize,
-    trace_provider_views: BTreeSet<ProcessViewId>,
+    trace_provider_views: BTreeMap<ProcessViewId, ViewAdmission>,
     trace_provider_cursor: Option<ProcessViewId>,
     trace_provider_turn: bool,
     trace_needs_health: bool,
@@ -5351,7 +5351,7 @@ fn discover_plan(
         discovered.deep_scans = discovered.deep_scans.saturating_add(1);
         match scan_result {
             Ok((found, pins)) => {
-                discovered.note_scan_observed(view.id(), &found);
+                discovered.note_scan_observed(view.id(), view.view_admission(), &found);
                 discovered.scan_inputs.insert(
                     view.id(),
                     ScanInput {
@@ -8428,7 +8428,7 @@ impl Engine {
             trace_arm_cursor: None,
             trace_settle_cursor: None,
             trace_view_cursor: 0,
-            trace_provider_views: BTreeSet::new(),
+            trace_provider_views: BTreeMap::new(),
             trace_provider_cursor: None,
             trace_provider_turn: true,
             trace_needs_health: false,
@@ -8760,10 +8760,10 @@ impl Engine {
             None => self.trace_seeds.keys().next().copied(),
         }
     }
-    fn trace_provider_associated(&self, id: ProcessViewId) -> bool {
-        self.scan_inputs
-            .get(&id)
-            .is_some_and(|input| input.modules.iter().any(|module| module.view == id))
+    fn trace_provider_associated(&self, view: &ProcessView) -> bool {
+        self.trace_provider_views
+            .get(&view.id())
+            .is_some_and(|admission| admission.same_allocation(&view.view_admission()))
     }
 
     /// A provider association selects work, never executable proof. The ordinary
@@ -8791,12 +8791,12 @@ impl Engine {
                         self.trace_provider_views
                             .range((Excluded(id), Unbounded))
                             .next()
-                            .copied()
+                            .map(|(id, _)| *id)
                     })
-                    .or_else(|| self.trace_provider_views.first().copied());
+                    .or_else(|| self.trace_provider_views.first_key_value().map(|(id, _)| *id));
                 let Some(id) = next else { break };
-                if self.trace_provider_associated(id)
-                    && let Some(position) = self.views.iter().position(|view| view.id() == id)
+                if let Some(position) = self.views.iter().position(|view| view.id() == id)
+                    && self.trace_provider_associated(&self.views[position])
                 {
                     work.check(proof)?;
                     return Ok(Some((position, true)));
@@ -13399,7 +13399,11 @@ impl Engine {
             .map(|module| module.scanned.clone())
             .collect();
         let observed_module = lowered.clone();
-        self.note_scan_observed(lowered.view, std::slice::from_ref(&lowered));
+        self.note_scan_observed(
+            lowered.view,
+            self.views[position].view_admission(),
+            std::slice::from_ref(&lowered),
+        );
         merge_scanned_module(&mut raw_modules, lowered);
         let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
         candidate.views.insert(self.views[position].id());
@@ -13722,7 +13726,11 @@ impl Engine {
                 return Err(error);
             }
         };
-        self.note_scan_observed(self.views[position].id(), &found);
+        self.note_scan_observed(
+            self.views[position].id(),
+            self.views[position].view_admission(),
+            &found,
+        );
         if mode == LoaderScanMode::MetadataOnly {
             for module in &mut found {
                 let Some(current) = self.modules.iter().find(|current| {
@@ -18606,7 +18614,11 @@ impl Engine {
                 // re-reads the outcome — a refreshed view with modules is
                 // owned, an empty never-dirty one stays exploratory.
                 Ok((modules, pins, _complete)) => {
-                    self.note_scan_observed(*view_id, &modules);
+                    self.note_scan_observed(
+                        *view_id,
+                        self.views[position].view_admission(),
+                        &modules,
+                    );
                     scans.push((*view_id, modules, pins));
                 }
                 Err(error) => {
@@ -18715,12 +18727,19 @@ impl Engine {
     /// loader rescans, live lowering — so the dirty set is complete by
     /// construction within this file, and eviction never needs `scan.rs`
     /// internals to prove an ID evidence-free.
-    fn note_scan_observed(&mut self, view: ProcessViewId, modules: &[ScannedModule]) {
+    fn note_scan_observed(
+        &mut self,
+        view: ProcessViewId,
+        admission: ViewAdmission,
+        modules: &[ScannedModule],
+    ) {
         if !modules.is_empty() {
             self.exploratory_dirty.insert(view);
         }
         if modules.iter().any(|module| module.view == view) {
-            self.trace_provider_views.insert(view);
+            // Current, unmerged discovery association for this allocation.
+            // The token holds no descriptor and confers no executable proof.
+            self.trace_provider_views.insert(view, admission);
         } else {
             self.trace_provider_views.remove(&view);
         }
@@ -19276,7 +19295,7 @@ impl Engine {
                 // no retained modules, so a partial first scan simply
                 // attaches what it verified with the skips as evidence.
                 Ok((modules, pins, _complete)) => {
-                    self.note_scan_observed(view.id(), &modules);
+                    self.note_scan_observed(view.id(), view.view_admission(), &modules);
                     self.scheduler.note_admitted(pid);
                     new_views.push((view, modules, pins));
                 }

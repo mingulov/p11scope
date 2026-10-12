@@ -324,6 +324,7 @@ impl Capture {
             for position in 0..engine.views.len() {
                 let view = &engine.views[position];
                 let id = view.id();
+                let admission = view.view_admission();
                 let mut counters = DiscoveryCounters::default();
                 let (modules, pins) = scan_and_pin(
                     view,
@@ -344,7 +345,7 @@ impl Capture {
                 assert!(modules.iter().all(|module| module.view == id));
                 // This is the discover_plan ingress. Scheduling metadata is
                 // produced by the real scanner, separately from trace proof.
-                engine.note_scan_observed(id, &modules);
+                engine.note_scan_observed(id, admission, &modules);
                 engine.scan_inputs.insert(
                     id,
                     ScanInput {
@@ -562,7 +563,7 @@ fn fresh_system_trace_names_provider_found_after_initial_scan() {
     assert_eq!(late_scans[0].0, id);
     assert!(!late_scans[0].1.is_empty());
     assert!(late_scans[0].1.iter().all(|module| module.view == id));
-    assert!(capture.engine.trace_provider_views.contains(&id));
+    assert!(capture.engine.trace_provider_views.contains_key(&id));
     capture.io.boundary(
         "late mapped provider scan association",
         (
@@ -572,7 +573,7 @@ fn fresh_system_trace_names_provider_found_after_initial_scan() {
                 .scan_inputs
                 .get(&id)
                 .map(|input| input.modules.len()),
-            capture.engine.trace_provider_associated(id),
+            capture.engine.trace_provider_associated(capture.engine.views.last().unwrap()),
         ),
     );
 
@@ -676,34 +677,71 @@ fn fresh_system_trace_provider_time_overrun_preserves_exploratory_progress() {
 
 #[test]
 fn fresh_system_trace_provider_association_alone_cannot_grant_a_name() {
-    for association in ["current", "missing", "stale", "foreign", "reused"] {
-        let mut capture = Capture::mapped(1);
+    for association in ["current", "missing", "stale", "foreign", "reused", "replaced"] {
+        let mut capture = if association == "missing" {
+            Capture::late_mapped(1)
+        } else {
+            Capture::mapped(1)
+        };
         let id = capture.engine.views.last().unwrap().id();
-        assert!(capture.engine.trace_provider_views.contains(&id));
+        assert_eq!(capture.engine.trace_provider_views.contains_key(&id), association != "missing");
         match association {
-            "missing" => {
-                capture.engine.scan_inputs.remove(&id);
-                capture.engine.note_scan_observed(id, &[]);
-            }
-            "stale" => capture
-                .engine
-                .scan_inputs
-                .get_mut(&id)
-                .unwrap()
-                .modules
-                .clear(),
-            "foreign" => {
-                let foreign = capture.engine.views[0].id();
-                for module in &mut capture.engine.scan_inputs.get_mut(&id).unwrap().modules {
-                    module.view = foreign;
-                }
-            }
-            "reused" => {
-                capture.engine.release_view_id(id);
-                assert!(!capture.engine.trace_provider_views.contains(&id));
+            "missing" => {}
+            "stale" => {
                 let position = capture.engine.views.len() - 1;
                 let unrelated_pid = capture.engine.views[0].pid();
                 capture.engine.views[position] = ProcessView::open(id, unrelated_pid).unwrap();
+                // A real empty refresh on the replacement allocation must
+                // clear the formerly observed provider association at ingress.
+                let (scans, failed, deferred, _) = capture.engine.scan_inventory_views(
+                    &BTreeSet::from([id]),
+                    "empty replacement association",
+                    &mut crate::attach::monotonic_ns,
+                );
+                assert!(failed.is_empty() && deferred.is_empty());
+                assert_eq!(scans.len(), 1);
+                assert!(scans[0].1.is_empty());
+                assert!(!capture.engine.trace_provider_views.contains_key(&id));
+            }
+            "foreign" => {
+                // Supply actual discovery data from a different held caller;
+                // no ScannedModule is constructed or its origin rewritten.
+                let child = capture._provider.as_ref().unwrap().command().spawn().unwrap();
+                let pid = child.id();
+                capture._children.0.push(child);
+                ProviderFixture::ready(capture._children.0.last_mut().unwrap());
+                let foreign = ProcessView::open(ProcessViewId(id.0 + 1), pid).unwrap();
+                let (scan, _) = Engine::scan_retained_view(
+                    &foreign,
+                    &capture.engine.module_hints,
+                    &capture.engine.hooks,
+                    &mut capture.engine.budget,
+                    false,
+                    &mut capture.engine.stage_timings,
+                );
+                let (modules, _pins, _) = scan.unwrap();
+                assert!(!modules.is_empty());
+                assert!(modules.iter().all(|module| module.view == foreign.id()));
+                let admission = capture.engine.views.last().unwrap().view_admission();
+                capture.engine.note_scan_observed(id, admission, &modules);
+                assert!(!capture.engine.trace_provider_views.contains_key(&id));
+            }
+            "reused" => {
+                capture.engine.release_view_id(id);
+                assert!(!capture.engine.trace_provider_views.contains_key(&id));
+                let position = capture.engine.views.len() - 1;
+                let unrelated_pid = capture.engine.views[0].pid();
+                capture.engine.views[position] = ProcessView::open(id, unrelated_pid).unwrap();
+            }
+            "replaced" => {
+                let position = capture.engine.views.len() - 1;
+                let pid = capture.engine.views[position].pid();
+                let old = capture.engine.views[position].view_admission();
+                capture.engine.views[position] = ProcessView::open(id, pid).unwrap();
+                let new = capture.engine.views[position].view_admission();
+                assert!(!old.same_allocation(&new));
+                assert!(!capture.engine.trace_provider_associated(&capture.engine.views[position]));
+                assert!(capture.engine.trace_provider_views.contains_key(&id));
             }
             "current" => {}
             _ => unreachable!(),
@@ -722,7 +760,7 @@ fn fresh_system_trace_provider_association_alone_cannot_grant_a_name() {
             );
         }
         assert_eq!(
-            capture.engine.trace_provider_views.contains(&id),
+            capture.engine.trace_provider_views.contains_key(&id),
             association == "current"
         );
     }

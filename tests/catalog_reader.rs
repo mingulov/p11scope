@@ -4,9 +4,10 @@
 //! Reads ONLY the `inspect --system` output document (via CLI invocation
 //! on owned fixture processes — no private-harness shortcuts) and asserts
 //! every expected catalog object is present with the right
-//! identity/state/reason, including the refused NSS/closure cases, the
-//! same-path dance pair, and the hardlink alias pair. Also pins the
-//! negative contracts: no record reports a mapping as an observed call,
+//! identity/state/reason, including default-profile NSS/closure refusals
+//! and wide-profile whole admissions, the same-path dance pair, and the
+//! hardlink alias pair. Also pins the negative contracts: no record
+//! reports a mapping as an observed call,
 //! and inspection executes no provider code (E3 marker).
 
 use serde_json::Value;
@@ -214,7 +215,7 @@ impl Drop for FixtureGuard {
 /// Strict-admission asserts (B/MW admitted) hold only when ambient
 /// processes stay memory-unreadable: ptrace_scope >= 1 and unprivileged.
 /// Any other machine shape relaxes admission *state* only — identity,
-/// tables, classes, and the always-over-capacity N/C refusals stay
+/// tables, classes, and profile-specific N/C admission controls stay
 /// strict everywhere.
 fn strict_admission() -> bool {
     if unsafe { libc::getuid() } == 0 {
@@ -264,14 +265,24 @@ fn dance(fixtures: &FixtureSet, json_out: bool) -> Dance {
         .join(if json_out { "out.json" } else { "out.txt" });
     let _ = std::fs::remove_file(&out);
     let script = fixture_source("catalog-observe.sh");
+    let binary = env!("CARGO_BIN_EXE_p11scope");
+    let inspect_args: &[&str] = if json_out {
+        &["--system", "--json", "--max-scan-pids", "4096"]
+    } else {
+        &["--system", "--max-scan-pids", "4096"]
+    };
+    eprintln!(
+        "catalog reader: profile={} binary={binary} inspect {}",
+        if cfg!(feature = "wide-detailed-2112") {
+            "wide-detailed-2112"
+        } else {
+            "default-512"
+        },
+        inspect_args.join(" ")
+    );
     let child = Command::new("sh")
         .arg(&script)
-        .arg("--system")
-        .args(if json_out {
-            vec!["--json", "--max-scan-pids", "4096"]
-        } else {
-            vec!["--max-scan-pids", "4096"]
-        })
+        .args(inspect_args)
         .env("CATALOG_DRIVER", &fixtures.driver)
         .env("CATALOG_V1", &fixtures.v1)
         .env("CATALOG_V2", &fixtures.v2)
@@ -285,7 +296,7 @@ fn dance(fixtures: &FixtureSet, json_out: bool) -> Dance {
         .env("CATALOG_READY", &fixtures.ready)
         .env("CATALOG_MARKER", &fixtures.marker)
         .env("CATALOG_OUT", &out)
-        .env("P11SCOPE_BIN", env!("CARGO_BIN_EXE_p11scope"))
+        .env("P11SCOPE_BIN", binary)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -496,12 +507,15 @@ fn catalog_reader_finds_every_fixture_object() {
     let dir = tmp("catalog-reader");
     let fixtures = build_fixtures(&dir);
     let strict = strict_admission();
+    let wide = cfg!(feature = "wide-detailed-2112");
 
     // ---- JSON dance: the full strict read. ----
     let mut run = dance(&fixtures, true);
     let doc = run.json.as_ref().unwrap();
     assert_eq!(doc["schema"], "p11scope/inspect-system/v1");
     assert_eq!(doc["scope"], "system");
+    assert_eq!(doc["admission"]["policy"], "detailed");
+    assert_eq!(doc["admission"]["scope"], "shared");
     assert!(
         run.script_stdout_empty,
         "progress must never pollute stdout"
@@ -567,8 +581,9 @@ fn catalog_reader_finds_every_fixture_object() {
     );
     assert_eq!(a_note["reason"], "deleted mapping");
 
-    // N: refused NSS shape. Eight interface-linked tables (publication
-    // evidence) whose 544 endpoints exceed the 512-slot ceiling alone.
+    // N: eight interface-linked tables (publication evidence), with 544
+    // distinct physical endpoints. Default refuses the whole object;
+    // wide must admit the complete union, never a strongest-table prefix.
     let n = object_for(doc, &run.pids, "nss.so");
     let n_tables = tables_of(n);
     assert_eq!(n_tables.len(), 8);
@@ -586,16 +601,22 @@ fn catalog_reader_finds_every_fixture_object() {
         assert_eq!(iface["flags"], 0);
         assert_eq!(iface["table"], index as u64);
     }
-    assert_eq!(n["admission"]["state"], "refused");
     assert_eq!(n["admission"]["class"], "corroborated");
-    let n_reason = n["admission"]["reason"].as_str().unwrap();
-    assert!(
-        n_reason.contains("544") && n_reason.contains("512"),
-        "NSS refusal must be the 544-over-512 capacity whole-refusal: {n_reason}"
-    );
+    if wide {
+        assert_eq!(n["admission"]["state"], "admitted");
+        assert_eq!(n["admission"]["endpoints"], 544);
+    } else {
+        assert_eq!(n["admission"]["state"], "refused");
+        let n_reason = n["admission"]["reason"].as_str().unwrap();
+        assert!(
+            n_reason.contains("544") && n_reason.contains("512"),
+            "NSS refusal must be the 544-over-512 capacity whole-refusal: {n_reason}"
+        );
+    }
 
-    // C: refused p11-kit closure shape. 65 bare heuristic tables, no
-    // triples, 532 endpoints that cannot fit the remaining slots.
+    // C: 65 bare heuristic tables, no triples, 532 distinct endpoints.
+    // Closure classification survives the wider budget: default refuses
+    // whole; wide admits whole under the same shared-scope policy.
     let c = object_for(doc, &run.pids, "closure.so");
     let c_tables = tables_of(c);
     assert_eq!(c_tables.len(), 65);
@@ -609,13 +630,18 @@ fn catalog_reader_finds_every_fixture_object() {
         c["observations"][0]["interfaces"].as_array().unwrap().len(),
         0
     );
-    assert_eq!(c["admission"]["state"], "refused");
     assert_eq!(c["admission"]["class"], "closure_array");
-    let c_reason = c["admission"]["reason"].as_str().unwrap();
-    assert!(
-        c_reason.contains("65") && c_reason.contains("lookalike"),
-        "closure refusal must name the 65 lookalike tables: {c_reason}"
-    );
+    if wide {
+        assert_eq!(c["admission"]["state"], "admitted");
+        assert_eq!(c["admission"]["endpoints"], 532);
+    } else {
+        assert_eq!(c["admission"]["state"], "refused");
+        let c_reason = c["admission"]["reason"].as_str().unwrap();
+        assert!(
+            c_reason.contains("65") && c_reason.contains("lookalike"),
+            "closure refusal must name the 65 lookalike tables: {c_reason}"
+        );
+    }
 
     // M: admitted multi-table shape. Four file-backed templates; any
     // interface triple here is spurious data, never standard linkage.
@@ -717,7 +743,7 @@ fn catalog_reader_finds_every_fixture_object() {
     }
 
     // Catalog/admission separation: every admission is scan-only, every
-    // object carries a state and a class, both refusals are counted.
+    // object carries a state and a class, default refusals are counted.
     assert_eq!(doc["admission"]["scan_only"], true);
     assert!(
         doc["admission"]["note"]
@@ -738,23 +764,31 @@ fn catalog_reader_finds_every_fixture_object() {
     };
     assert_eq!(doc["admission"]["admitted"], in_state("admitted"));
     assert_eq!(doc["admission"]["refused"], in_state("refused"));
-    assert!(doc["admission"]["refused"].as_u64().unwrap() >= 2);
+    if !wide {
+        assert!(doc["admission"]["refused"].as_u64().unwrap() >= 2);
+    }
     // Fixture-owned admissions only: an ambient same-uid process keeps its
     // maps readable under ptrace_scope=1, so a desktop's libp11-kit is
     // cataloged and admitted at 0 endpoints, while a hosted runner maps
-    // none. N/C are refused on every machine (their endpoints exceed the
-    // whole 512-slot budget alone); T/H are admitted on every machine
-    // (zero endpoints always fit). B/M admission is ambient-sensitive,
-    // hence the strict gate.
+    // none. N/C are default whole-refusals and wide whole-admissions;
+    // T/H have zero endpoints and always fit. B/M admission remains
+    // ambient-sensitive, hence the strict gate.
     assert_eq!(h["admission"]["state"], "admitted");
-    let fixture_admitted = [b, m, t, h]
+    let fixture_admitted = [b, m, t, h, n, c]
         .iter()
         .filter(|object| object["admission"]["state"] == "admitted")
         .count();
     if strict {
-        assert_eq!(fixture_admitted, 4, "B, M, T and H must all be admitted");
+        assert_eq!(
+            fixture_admitted,
+            if wide { 6 } else { 4 },
+            "B, M, T and H must be admitted, plus N/C in the wide profile"
+        );
     } else {
-        assert!(fixture_admitted >= 2, "T and H must be admitted");
+        assert!(
+            fixture_admitted >= if wide { 4 } else { 2 },
+            "T/H must be admitted, plus N/C in the wide profile"
+        );
     }
     for object in objects {
         assert_eq!(object["admission"]["scan_only"], true);
@@ -789,8 +823,6 @@ fn catalog_reader_finds_every_fixture_object() {
         "tless.so",
         "h1.so",
         "h2.so",
-        "refused (closure_array)",
-        "refused (corroborated)",
         "admitted",
         "alias object",
         "(deleted)",
@@ -799,6 +831,40 @@ fn catalog_reader_finds_every_fixture_object() {
         assert!(
             text.contains(fragment),
             "text rendering must carry {fragment:?}"
+        );
+    }
+    // Read each fixture's own object block: ambient objects must never
+    // satisfy the NSS/closure text admission checks.
+    for (name, admitted_fragment, refused_fragment) in [
+        (
+            "nss.so",
+            "admitted (corroborated, 544 endpoints;",
+            "refused (corroborated)",
+        ),
+        (
+            "closure.so",
+            "admitted (closure_array, 532 endpoints;",
+            "refused (closure_array)",
+        ),
+    ] {
+        let path = fixtures.dir.join(name);
+        let block = text
+            .split("object[")
+            .find(|block| {
+                block
+                    .lines()
+                    .next()
+                    .is_some_and(|header| header.ends_with(path.to_str().unwrap()))
+            })
+            .unwrap_or_else(|| panic!("text must contain the {name} object block: {text}"));
+        let fragment = if wide {
+            admitted_fragment
+        } else {
+            refused_fragment
+        };
+        assert!(
+            block.contains(fragment),
+            "{name} text admission must carry {fragment:?}: {block}"
         );
     }
     for phase in ["enumerating", "deep-scanning", "rendering"] {

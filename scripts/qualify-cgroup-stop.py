@@ -292,7 +292,10 @@ def wait_baseline(path, owner, executable, provider, reader, phases):
         modules = provider_modules(records, provider)
         ids = {row["event"].get("caller") for row in records
                if row.get("kind") == "caller_event"
-               and caller_subject(row.get("event") or {}).get("pid") == owner.pid}
+               and (row.get("event") or {}).get("event") == "admitted"
+               and caller_subject(row.get("event") or {}).get("pid") == owner.pid
+               and (caller_subject(row.get("event") or {}).get("executable") or {}).get("path")
+                   == str(executable.path)}
         for record in reversed(records):
             event = record.get("event") or {}
             count = (event.get("entries") or {}).get("count", 0)

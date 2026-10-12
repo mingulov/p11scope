@@ -4717,6 +4717,32 @@ class TraceTest(unittest.TestCase):
                         f"expected {kind} reuse across exec is not demonstrated by the ledger",
                         result["errors"])
 
+    def test_reject_malformed_reuse_containers(self):
+        for field in ("reuse_expected", "session_reuse", "va_reuse", "token_reuse"):
+            for value in (None, []):
+                with self.subTest(field=field, value=value):
+                    text, ledger, receipt = b_style_inputs()
+                    control = H6["evaluate_trace_h6"](text, ledger, receipt)
+                    self.assertTrue(control["pass"], control["errors"])
+                    if field != "reuse_expected":
+                        receipt["reuse_expected"][field.removesuffix("_reuse")] = True
+                    receipt[field] = value
+                    result = H6["evaluate_trace_h6"](text, ledger, receipt)
+                    self.assertFalse(result["pass"], result)
+                    self.assertEqual(result["status"], "fail")
+                    self.assertTrue(any("invalid independent evidence" in error
+                                        and field in error for error in result["errors"]), result)
+
+    def test_ignore_unrequested_reuse_containers(self):
+        for kind in ("session", "va", "token"):
+            for value in (None, []):
+                with self.subTest(kind=kind, value=value):
+                    text, ledger, receipt = b_style_inputs()
+                    receipt["reuse_expected"].pop(kind, None)
+                    receipt[f"{kind}_reuse"] = value
+                    result = H6["evaluate_trace_h6"](text, ledger, receipt)
+                    self.assertTrue(result["pass"], result["errors"])
+
     def test_accept_empty_stop_leg(self):
         text = trace_text([], 0, 0, evidence())
         receipt = {"cell": "cgroup-reentry", "leg": "stop/singles",
@@ -5237,6 +5263,41 @@ class AggregateTest(unittest.TestCase):
                     self.assertIn(
                         f"expected {kind} reuse across exec is not demonstrated by the ledger",
                         result["errors"])
+
+    def test_reject_malformed_reuse_containers(self):
+        for mode in ("profile", "metrics"):
+            for field in ("reuse_expected", "session_reuse", "va_reuse", "token_reuse"):
+                for value in (None, []):
+                    with self.subTest(mode=mode, field=field, value=value):
+                        doc, stdout_text, ledger, receipt = profile_inputs()
+                        if mode == "metrics":
+                            doc = profile_doc(doc["functions"], mode=mode)
+                            receipt["leg"] = "metrics/singles"
+                        evaluate = H6[f"evaluate_{mode}_h6"]
+                        control = evaluate(doc, stdout_text, ledger, receipt)
+                        self.assertTrue(control["pass"], control["errors"])
+                        if field != "reuse_expected":
+                            receipt["reuse_expected"][field.removesuffix("_reuse")] = True
+                        receipt[field] = value
+                        result = evaluate(doc, stdout_text, ledger, receipt)
+                        self.assertFalse(result["pass"], result)
+                        self.assertEqual(result["status"], "fail")
+                        self.assertTrue(any("invalid independent evidence" in error
+                                            and field in error for error in result["errors"]), result)
+
+    def test_ignore_unrequested_reuse_containers(self):
+        for mode in ("profile", "metrics"):
+            for kind in ("session", "va", "token"):
+                for value in (None, []):
+                    with self.subTest(mode=mode, kind=kind, value=value):
+                        doc, stdout_text, ledger, receipt = profile_inputs()
+                        if mode == "metrics":
+                            doc = profile_doc(doc["functions"], mode=mode)
+                            receipt["leg"] = "metrics/singles"
+                        receipt["reuse_expected"].pop(kind, None)
+                        receipt[f"{kind}_reuse"] = value
+                        result = H6[f"evaluate_{mode}_h6"](doc, stdout_text, ledger, receipt)
+                        self.assertTrue(result["pass"], result["errors"])
 
     def test_reject_profile_outside_count(self):
         doc, stdout_text, ledger, receipt = profile_inputs()

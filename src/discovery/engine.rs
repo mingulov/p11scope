@@ -12633,7 +12633,7 @@ impl Engine {
                     .cloned()
                     .collect();
                 let detach_selection_start = crate::attach::monotonic_ns();
-                let detach_selection_outcome = session.detach_slots(&detach);
+                let detach_selection_outcome = session.detach_failed_slots(&detach);
                 self.sync_physical_gap(session);
                 self.stage_timings.span(
                     crate::timing::StageKind::Attach,
@@ -21330,6 +21330,9 @@ pub(crate) mod session_fixture {
         pub(crate) detached_slots: Vec<usize>,
         /// Exact slot identities of every `detach_slots` call, in order.
         pub(crate) detached_slot_indices: Vec<Vec<u32>>,
+        /// Exact targets requested through failed-attachment/selection cleanup,
+        /// distinct from retirement of accepted coverage.
+        pub(crate) failed_cleanup_slot_indices: Vec<Vec<u32>>,
         /// Exact slot identities of every `replace_targets` call, in order.
         pub(crate) replaced_slot_indices: Vec<Vec<u32>>,
         /// One entry per upcoming `detach_slots` call; `true` fails it.
@@ -21862,6 +21865,12 @@ pub(crate) mod session_fixture {
         }
 
         fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
+            self.detach_slots_with_ended(slots, None)
+        }
+
+        fn detach_failed_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
+            self.failed_cleanup_slot_indices
+                .push(slots.iter().map(|slot| slot.index).collect());
             self.detach_slots_with_ended(slots, None)
         }
 

@@ -282,7 +282,8 @@ def read_records(path, final=False):
 
 
 def wait_baseline(path, owner, executable, provider, reader, phases):
-    H6["wait_usage_armed"](path, [(owner.pid, str(executable.path), 1)])
+    # Quiet cgroup coverage stays unknown. After run_leg's first committed
+    # pass, issue the fixed calls before requiring their counted proof.
     H6["n3_command"](owner, reader, "C_GenerateRandom", 3, 0, "baseline", "selected",
                       0, None, phases)
     deadline = H6["wait_deadline"](60)

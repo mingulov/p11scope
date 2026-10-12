@@ -209,7 +209,7 @@ STANDARD_EXPORT_STATUS = {
 }
 ATTACH_MECHANISMS = {"per-offset", "uprobe-multi"}
 PROFILE_V3_FIELDS = {
-    "interface_selection", "attach_mechanisms", "attach_backend",
+    "interface_selection", "attach_mechanisms",
     "pid_descendant_gaps", "multi_rebuild_gaps",
 }
 ATTACH_BACKEND_KEYS = {"selection", "fallback", "scope_filter"}
@@ -255,7 +255,7 @@ ROOT_FAILURE_REASONS = {
 # C_GetInterface result flags publish only this finite class, never the word.
 SELECTION_RESULT_FLAG_CLASSES = {"zero", "fork_safe", "other"}
 BASE_EVIDENCE_KEYS = set(COUNTERS) | {
-    "kernel_control",
+    "kernel_control", "attach_backend",
     "authority", "discovery", "manifest_object_fallbacks", "modules_skipped",
     "scan_unavailable", "scan_ms", "table_entries", "slots", "active_slots",
     "attached_probes",
@@ -575,7 +575,7 @@ def exact_attach_backend(backend, mechanisms, document, *, terminal=False):
     )
     require(fallback is None or backend["selection"] == "auto",
             f"only auto falls back: {backend!r}")
-    require(fallback is None or "uprobe-multi" not in mechanisms,
+    require(fallback is None or mechanisms is None or "uprobe-multi" not in mechanisms,
             f"a fallback session attached uprobe-multi: {backend!r} {mechanisms!r}")
     scope_filter = backend["scope_filter"]
     require(scope_filter in SCOPE_FILTERS, f"invalid scope filter: {backend!r}")
@@ -773,6 +773,7 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
         wanted -= RESIDUAL_EVIDENCE_KEYS
         wanted -= VERDICT_CLASS_KEYS
         wanted.discard("kernel_control")
+        wanted.discard("attach_backend")
     wanted |= PROFILE_V3_FIELDS if profile else set()
     if terminal:
         wanted |= TRACE_TERMINAL_KEYS
@@ -852,6 +853,9 @@ def exact_metrics_schema(document, *, run=False):
     require(document["capture"]["privacy_mode"] == "aggregate-only", document["capture"])
     exact_capture_scope(document)
     exact_evidence_keys(document["evidence"], profile=False, child=run)
+    # Metrics exposes the actual Session backend/filter without publishing
+    # profile-only successful-link mechanisms or selection verdict authority.
+    exact_attach_backend(document["evidence"]["attach_backend"], None, document)
     exact_scheduling_evidence(document["evidence"])
     exact_kernel_control(document["evidence"])
     exact_task_uprobe_link_losses(document["evidence"])
@@ -3159,22 +3163,24 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
 
 def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy="allowlisted"):
     evidence = copy.deepcopy(evidence)
+    if schema in (PROFILE_SCHEMA, METRICS_SCHEMA):
+        # The fixture's capture scope is `pid` (below), behind per-offset links.
+        evidence.setdefault("attach_backend", {
+            "selection": "auto", "fallback": None, "scope_filter": "perf-task+bpf",
+        })
     if schema == PROFILE_SCHEMA:
         evidence.setdefault("interface_selection", {
             "providers": [], "standard_exports": [], "inventory_surfaces": [],
             "tuples": [], "selection_truncated": False,
         })
         evidence.setdefault("attach_mechanisms", [] if evidence["attached_probes"] == 0 else ["per-offset"])
-        # The fixture's capture scope is `pid` (below), behind per-offset links.
-        evidence.setdefault("attach_backend", {
-            "selection": "auto", "fallback": None, "scope_filter": "perf-task+bpf",
-        })
         evidence.setdefault("pid_descendant_gaps", 0)
         evidence.setdefault("multi_rebuild_gaps", 0)
     elif schema in (METRICS_SCHEMA, HISTORICAL_METRICS_SCHEMA):
         for field in PROFILE_V3_FIELDS:
             evidence.pop(field, None)
         if schema == HISTORICAL_METRICS_SCHEMA:
+            evidence.pop("attach_backend", None)
             evidence.pop("task_uprobe_link_losses", None)
             evidence.pop("abi_refusals", None)
             evidence.pop("semantic_history_drops", None)

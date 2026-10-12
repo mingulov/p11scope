@@ -39,7 +39,7 @@ VERDICT_COUNTERS = (
     "shape_decode_failures", "shape_decode_total_failures", "discovery_conflicts",
     "discovery_uncorroborated", "module_ambiguous", "semantic_unverified_slots",
     "module_unresolved_slots", "unprotected_live_windows", "pause_partial", "vendor_interfaces")
-PROFILE_FIELDS = ("interface_selection", "attach_mechanisms", "attach_backend",
+PROFILE_FIELDS = ("interface_selection", "attach_mechanisms",
                   "pid_descendant_gaps", "multi_rebuild_gaps")
 
 
@@ -486,6 +486,32 @@ class ProfileVerdictModeTests(unittest.TestCase):
             self.assertEqual(d["capture"]["mode"], "metrics")
             self.assertTrue(set(PROFILE_FIELDS).isdisjoint(d["evidence"]))
         self.run_case(check, cell="metrics-pid")
+
+    def test_metrics_accepts_actual_backend_metadata(self):
+        for backend in (
+                {"selection": "singles", "fallback": None, "scope_filter": "perf-task+bpf"},
+                {"selection": "multi", "fallback": None, "scope_filter": "kernel-pid+bpf"},
+                {"selection": "auto", "fallback": "uprobe-multi functional probe failed",
+                 "scope_filter": "perf-task+bpf"}):
+            with self.subTest(backend=backend):
+                self.run_case(lambda d, l, r: d["evidence"].update(attach_backend=backend),
+                              cell="metrics-pid")
+
+    def test_metrics_requires_closed_valid_backend_metadata(self):
+        changes = {
+            "missing": lambda ev: ev.pop("attach_backend"),
+            "missing-filter": lambda ev: ev["attach_backend"].pop("scope_filter"),
+            "extra": lambda ev: ev["attach_backend"].update(pid=123),
+            "wrong-selection": lambda ev: ev["attach_backend"].update(selection="always"),
+            "wrong-filter": lambda ev: ev["attach_backend"].update(scope_filter="kernel-pid"),
+            "global-filter": lambda ev: ev["attach_backend"].update(scope_filter=None),
+            "wrong-fallback": lambda ev: ev["attach_backend"].update(fallback="probe failed"),
+            "private-fallback": lambda ev: ev["attach_backend"].update(
+                selection="auto", fallback="attach /owned.so failed"),
+        }
+        for name, change in changes.items():
+            with self.subTest(change=name):
+                self.run_case(lambda d, l, r: change(d["evidence"]), cell="metrics-pid", want=1)
 
     def test_metrics_profile_only_inputs_fail(self):
         profile, _, _ = inputs()

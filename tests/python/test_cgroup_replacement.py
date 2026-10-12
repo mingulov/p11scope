@@ -107,6 +107,45 @@ class ReplacementOracleTests(unittest.TestCase):
         self.assertTrue(result["pass"], result["errors"])
         self.assertEqual((result["calls"], result["named"], result["unknown"]), (5, 5, 0))
 
+    def test_one_unknown_measured_return_rejects_an_otherwise_named_replacement(self):
+        rows, evidence, ledger, receipt = synthetic_inputs()
+        rows[0] = rows[0].replace('"caller"', 'Unknown executable').replace(' exe="/w/caller"', '')
+        text = trace_text(rows, evidence)
+        # The shared rule intentionally still permits this mixed population.
+        shared = H6["evaluate_trace_h6"](text, ledger, receipt, text)
+        self.assertTrue(shared["pass"], shared["errors"])
+        self.assertEqual((shared["calls"], shared["named"], shared["unknown"]), (5, 4, 1))
+        result = self.evaluate(rows, evidence, ledger, receipt)
+        self.assertFalse(result["pass"], result["errors"])
+        self.assertEqual((result["calls"], result["named"], result["unknown"]), (5, 4, 1))
+
+    def test_one_wrong_fresh_executable_name_rejects_the_measured_phase(self):
+        for replacement in ('"foreign"', '"caller"'):
+            with self.subTest(label=replacement):
+                rows = synthetic_inputs()[0]
+                rows[0] = rows[0].replace('"caller"', replacement)
+                if replacement == '"caller"':
+                    rows[0] = rows[0].replace('exe="/w/caller"', 'exe="/foreign/caller"')
+                result = self.evaluate(rows=rows)
+                self.assertFalse(result["pass"], result["errors"])
+                self.assertEqual(result["false_names"], 1)
+
+    def test_name_requirement_is_limited_to_measured_returns(self):
+        rows, evidence, ledger, receipt = synthetic_inputs()
+        ledger.extend([
+            dict(kind="target", image=0, fn="C_GetInfo", dev=[8, 1], ino=77, file_offset=5000),
+            dict(kind="call", image=0, pid=222, tid=222, fn="C_GetInfo", rv=0,
+                 phase="warm", scope="selected", t0=65, t1=66),
+        ])
+        receipt["warmup"] = dict(label="early", t0=64, t1=66, expected_calls=1, phases=["warm"])
+        receipt["phases"].insert(0, dict(image=0, fn="C_GetInfo", phase="warm", scope="selected",
+                                         count=1, t0=64, t1=66))
+        rows.insert(0, "21:37:58.638119 Unknown executable (PID 222, TID 222) "
+                       "C_GetInfo [semantics unverified] → CKR_OK 10µs")
+        result = self.evaluate(rows, evidence, ledger, receipt)
+        self.assertTrue(result["pass"], result["errors"])
+        self.assertEqual((result["measured_calls"], result["named"], result["unknown"]), (5, 5, 1))
+
     def test_invalid_death_custody_and_root_proofs_are_rejected(self):
         mutations = [
             ("original_reaped", False), ("original_proc_gone", False),

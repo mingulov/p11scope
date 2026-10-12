@@ -375,7 +375,9 @@
                   "discovery unavailable",
                   "shared-overlay physical identity is uncertain; a distinct byte-identical instance may be unobserved",
                   "physical identity is ambiguous; the collision group was not attached",
-                  "unsupported function-table version; the scanner does not walk this layout"
+                  "unsupported function-table version; the scanner does not walk this layout",
+                  "static probe coverage gap incomplete",
+                  "static probes detached and exact pairs reattached"
                 ]
               }
             }

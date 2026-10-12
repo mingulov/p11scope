@@ -21,6 +21,10 @@
 #   [--pace-us US] [--seed N] [--ring-bytes B] [--drain-interval-ms MS]
 #   [--sink file|discard|slow-pipe] [--sink-rate-kbps KBPS]
 #   [--work DIR] [--profile release|debug] [--binary PATH] [--no-build]
+#   [--detailed-profile default|wide-detailed-2112]
+#   [--detailed-resources-calculator PATH]
+# The optional calculator is the matching compiled detailed-resources example.
+# Its component payload model is recorded separately from sampled RSS/fds.
 #
 # both = metrics+profile (Task 1.4 shape); all adds trace. The sink selects
 # the observer's stdout destination: file (default), discard (/dev/null: no
@@ -50,6 +54,8 @@ BINARY=
 NO_BUILD=0
 SOURCE_MODULE=/usr/lib/softhsm/libsofthsm2.so
 MODULE=
+DETAILED_PROFILE=
+DETAILED_CALCULATOR=
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -67,7 +73,9 @@ while [ "$#" -gt 0 ]; do
         --profile) PROFILE=$2; shift 2 ;;
         --binary) BINARY=$2; shift 2 ;;
         --no-build) NO_BUILD=1; shift ;;
-        -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+        --detailed-profile) DETAILED_PROFILE=$2; shift 2 ;;
+        --detailed-resources-calculator) DETAILED_CALCULATOR=$2; shift 2 ;;
+        -h|--help) sed -n '2,34p' "$0"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
@@ -76,6 +84,21 @@ case "$MODE" in metrics|profile|trace|both|all) ;; *) echo "bad --mode: $MODE" >
 case "$SINK" in file|discard|slow-pipe) ;; *) echo "bad --sink: $SINK" >&2; exit 2 ;; esac
 case "$PROFILE" in release|debug) ;; *) echo "bad --profile: $PROFILE" >&2; exit 2 ;; esac
 case "$WORK" in /*) ;; *) WORK="$PWD/$WORK" ;; esac
+case "$DETAILED_PROFILE" in ''|default|wide-detailed-2112) ;; *) echo "bad --detailed-profile: $DETAILED_PROFILE" >&2; exit 2 ;; esac
+if { [ -n "$DETAILED_PROFILE" ] && [ -z "$DETAILED_CALCULATOR" ]; } ||
+   { [ -z "$DETAILED_PROFILE" ] && [ -n "$DETAILED_CALCULATOR" ]; }; then
+    echo "--detailed-profile and --detailed-resources-calculator must be supplied together" >&2
+    exit 2
+fi
+
+# This preflight runs before any owned workload or privileged observer launch.
+# It performs no builds and refuses absent/mismatched/malformed compiled facts.
+if [ -n "$DETAILED_PROFILE" ]; then
+    python3 -I scripts/system-scope-measure.py --prepare-detailed-resources \
+        --detailed-profile "$DETAILED_PROFILE" \
+        --detailed-resources-calculator "$DETAILED_CALCULATOR" \
+        --out "$WORK/detailed-resources.json"
+fi
 
 WPID=
 WPID_STARTTIME=
@@ -222,6 +245,7 @@ mono_ns() {
 KERNEL=$(uname -r)
 CPU=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')
 NCPU=$(nproc)
+POSSIBLE_CPUS=$(python3 -I scripts/system-scope-measure.py --possible-cpu-count 2>/dev/null) || POSSIBLE_CPUS=null
 
 # wait_file <path> <timeout_s> — poll for a file to appear.
 wait_file() {
@@ -759,7 +783,7 @@ out.close()
   "observer_source_revision": null,
   "observer_argv": $OBS_ARGV_JSON, "workload_argv": $WORKLOAD_ARGV_JSON,
   "mapping_gate": "$([ "$MAP_EARLY" -eq 1 ] && echo pre-observer || echo post-attach)"},
- "host": {"kernel": "$KERNEL", "cpu": "$CPU", "ncpu": $NCPU, "loadavg": "$LOADAVG"},
+ "host": {"kernel": "$KERNEL", "cpu": "$CPU", "ncpu": $NCPU, "possible_cpus": $POSSIBLE_CPUS, "loadavg": "$LOADAVG"},
  "timing": {"t_spawn_mono_ns": $T_SPAWN, "t_initial_go_mono_ns": $T_INITIAL_GO,
   "t_mapping_ready_mono_ns": $T_MAPPING_READY, "t_receipt_ready_mono_ns": $T_RECEIPT_READY,
   "t_go_mono_ns": $T_GO, "t_exit_mono_ns": $T_EXIT},
@@ -767,7 +791,7 @@ out.close()
   "stderr_ts": "$dir/stderr-ts.jsonl", "stderr": "$dir/stderr.txt",
   "workload_log": "$dir/workload.log", "mapping_receipt": "$dir/workload-mapping-receipt.json"}}
 EOF
-    python3 -I - "$dir/meta.json" "$dir/receipt-metadata.json" <<'PY'
+    python3 -I - "$dir/meta.json" "$dir/receipt-metadata.json" "$DETAILED_PROFILE" "$WORK/detailed-resources.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -777,6 +801,13 @@ receipt_path = Path(sys.argv[2])
 meta = json.loads(meta_path.read_text(encoding="utf-8"))
 receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
 meta["condition"].update(receipt)
+if sys.argv[3]:
+    prepared = json.loads(Path(sys.argv[4]).read_text(encoding="utf-8"))
+    if prepared["possible_cpus"] != meta["host"]["possible_cpus"]:
+        raise ValueError("detailed resources: possible CPU metadata changed")
+    meta["condition"]["detailed_profile"] = sys.argv[3]
+    meta["condition"]["detailed_resource_calculator"] = prepared["calculator"]
+    meta["detailed_resources"] = prepared["detailed_resources"]
 meta_path.write_text(json.dumps(meta, sort_keys=True) + "\n", encoding="utf-8")
 PY
     python3 -I scripts/system-scope-measure.py --meta "$dir/meta.json" \

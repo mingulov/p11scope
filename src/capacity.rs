@@ -8,15 +8,206 @@
 //! refusal names the exhausted resource.
 
 use p11scope_ebpf_common::{
-    EXPERIMENTAL_SLOT_CANDIDATE, IMAGE_IDENTITY_TICKET_LIMIT, MAX_DESCRIPTORS, MAX_SLOTS,
-    RING_BYTES, ROOT_AFFILIATION_LIMIT, RV_ENTRIES, START_ENTRIES, THREAD_OWNER_LIMIT,
+    CallStart, EXPERIMENTAL_SLOT_CANDIDATE, IMAGE_IDENTITY_TICKET_LIMIT, MAX_DESCRIPTORS,
+    MAX_SLOTS, RING_BYTES, ROOT_AFFILIATION_LIMIT, RV_ENTRIES, RvKey, START_ENTRIES, SlotSemantics,
+    SlotStats, StartKey, THREAD_OWNER_LIMIT,
 };
+use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::mem::size_of;
 use std::sync::{
     Mutex, RwLock, RwLockReadGuard,
     atomic::{AtomicU64, Ordering},
 };
+
+/// Immutable map capacities, independent of live endpoint or RV activity.
+/// `possible_cpus` must count Linux possible CPUs, not online CPUs or affinity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DetailedResourceInputs {
+    pub slots: u64,
+    pub rv_capacity: u64,
+    pub possible_cpus: u64,
+    pub start_capacity: u64,
+    pub descriptor_capacity: u64,
+}
+
+/// Declared sizes from the common ABI compiled into this observer build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DetailedAbiSizes {
+    pub stats_value_bytes: u64,
+    pub rv_key_bytes: u64,
+    pub rv_value_bytes: u64,
+    pub start_key_bytes: u64,
+    pub start_value_bytes: u64,
+    pub descriptor_value_bytes: u64,
+    pub slot_file_value_bytes: u64,
+}
+
+impl DetailedAbiSizes {
+    fn compiled() -> Result<Self, String> {
+        fn bytes<T>() -> Result<u64, String> {
+            u64::try_from(size_of::<T>()).map_err(|_| "Detailed ABI size does not fit u64".into())
+        }
+        Ok(Self {
+            stats_value_bytes: bytes::<SlotStats>()?,
+            rv_key_bytes: bytes::<RvKey>()?,
+            rv_value_bytes: bytes::<u64>()?,
+            start_key_bytes: bytes::<StartKey>()?,
+            start_value_bytes: bytes::<CallStart>()?,
+            descriptor_value_bytes: bytes::<SlotSemantics>()?,
+            slot_file_value_bytes: bytes::<u32>()?,
+        })
+    }
+}
+
+/// Selected logical payloads. Array/per-CPU values include eight-byte rounding;
+/// declared array values remain separate. Hash keys are counted once per key.
+/// This excludes map overhead, identity/task storage, other maps/rings,
+/// programs/dynamic attachments and userspace/transient allocations. The sum
+/// is neither RSS nor exact kernel allocation. Static Singles links are not
+/// an FD budget: attachments and other resources retain additional FDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DetailedResourcePayloads {
+    pub stats_values_bytes: u64,
+    pub rv_keys_bytes: u64,
+    pub rv_values_bytes: u64,
+    pub start_keys_bytes: u64,
+    pub start_values_bytes: u64,
+    pub descriptor_declared_values_bytes: u64,
+    pub descriptor_aligned_values_bytes: u64,
+    pub slot_file_declared_values_bytes: u64,
+    pub slot_file_aligned_values_bytes: u64,
+    /// Paired static links required at full slot capacity with Singles.
+    pub static_singles_links: u64,
+    /// Includes aligned array values once; excludes links and other costs.
+    pub component_payload_bytes: u64,
+}
+
+/// Checked component accounting for Detailed's dense, preallocated maps.
+/// This calculator selects no production capacity, changes no admission policy
+/// and guarantees no successful map allocation or attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DetailedResources {
+    pub inputs: DetailedResourceInputs,
+    pub abi_sizes: DetailedAbiSizes,
+    pub resources: DetailedResourcePayloads,
+}
+
+impl DetailedResources {
+    /// Calculate using independent slot/RV capacities and possible CPUs.
+    pub fn new(slots: u64, rv_capacity: u64, possible_cpus: u64) -> Result<Self, String> {
+        fn capacity(name: &str, value: u64) -> Result<(), String> {
+            if value == 0 {
+                return Err(format!("Detailed {name} must be non-zero"));
+            }
+            u32::try_from(value)
+                .map_err(|_| format!("Detailed {name} does not fit the u32 map bound"))?;
+            usize::try_from(value)
+                .map_err(|_| format!("Detailed {name} does not fit this platform"))?;
+            Ok(())
+        }
+        fn aligned(value: u64) -> Result<u64, String> {
+            value
+                .checked_add(7)
+                .map(|rounded| rounded / 8 * 8)
+                .ok_or_else(|| "Detailed value alignment overflowed".into())
+        }
+        fn payload(name: &str, factors: &[u64]) -> Result<u64, String> {
+            factors.iter().try_fold(1u64, |total, factor| {
+                total
+                    .checked_mul(*factor)
+                    .ok_or_else(|| format!("Detailed {name} payload overflowed"))
+            })
+        }
+
+        let inputs = DetailedResourceInputs {
+            slots,
+            rv_capacity,
+            possible_cpus,
+            start_capacity: u64::from(START_ENTRIES),
+            descriptor_capacity: u64::from(MAX_DESCRIPTORS),
+        };
+        for (name, value) in [
+            ("slots", slots),
+            ("RV capacity", rv_capacity),
+            ("possible CPUs", possible_cpus),
+            ("START capacity", inputs.start_capacity),
+            ("descriptor capacity", inputs.descriptor_capacity),
+        ] {
+            capacity(name, value)?;
+        }
+        let abi_sizes = DetailedAbiSizes::compiled()?;
+        let mut resources = DetailedResourcePayloads {
+            stats_values_bytes: payload(
+                "STATS values",
+                &[slots, aligned(abi_sizes.stats_value_bytes)?, possible_cpus],
+            )?,
+            rv_keys_bytes: payload("RV keys", &[rv_capacity, abi_sizes.rv_key_bytes])?,
+            rv_values_bytes: payload(
+                "RV values",
+                &[
+                    rv_capacity,
+                    aligned(abi_sizes.rv_value_bytes)?,
+                    possible_cpus,
+                ],
+            )?,
+            start_keys_bytes: payload(
+                "START keys",
+                &[inputs.start_capacity, abi_sizes.start_key_bytes],
+            )?,
+            start_values_bytes: payload(
+                "START values",
+                &[inputs.start_capacity, abi_sizes.start_value_bytes],
+            )?,
+            descriptor_declared_values_bytes: payload(
+                "descriptor declared values",
+                &[inputs.descriptor_capacity, abi_sizes.descriptor_value_bytes],
+            )?,
+            descriptor_aligned_values_bytes: payload(
+                "descriptor aligned values",
+                &[
+                    inputs.descriptor_capacity,
+                    aligned(abi_sizes.descriptor_value_bytes)?,
+                ],
+            )?,
+            slot_file_declared_values_bytes: payload(
+                "SLOT_FILE declared values",
+                &[slots, abi_sizes.slot_file_value_bytes],
+            )?,
+            slot_file_aligned_values_bytes: payload(
+                "SLOT_FILE aligned values",
+                &[slots, aligned(abi_sizes.slot_file_value_bytes)?],
+            )?,
+            static_singles_links: payload("static Singles links", &[slots, 2])?,
+            component_payload_bytes: 0,
+        };
+        resources.component_payload_bytes = [
+            resources.stats_values_bytes,
+            resources.rv_keys_bytes,
+            resources.rv_values_bytes,
+            resources.start_keys_bytes,
+            resources.start_values_bytes,
+            resources.descriptor_aligned_values_bytes,
+            resources.slot_file_aligned_values_bytes,
+        ]
+        .into_iter()
+        .try_fold(0u64, |total, bytes| {
+            total
+                .checked_add(bytes)
+                .ok_or_else(|| "Detailed component payload sum overflowed".to_string())
+        })?;
+        Ok(Self {
+            inputs,
+            abi_sizes,
+            resources,
+        })
+    }
+
+    /// Account for the capacities and ABI of the current compiled build.
+    pub fn compiled(possible_cpus: u64) -> Result<Self, String> {
+        Self::new(u64::from(MAX_SLOTS), u64::from(RV_ENTRIES), possible_cpus)
+    }
+}
 
 /// One compact inventory value is one atomic `u64` constrained to 0/1.
 pub const INVENTORY_ENDPOINT_BYTES: u64 = size_of::<u64>() as u64;

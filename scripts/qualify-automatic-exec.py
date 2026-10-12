@@ -369,7 +369,7 @@ def _early_gap_errors(ev, missing, receipt=None, ledger=None, capture=None, *, m
     return []
 
 
-def _trace_successor_populations(trace, rows, in_window, receipt, images):
+def _trace_successor_populations(trace, rows, in_window, receipt, images, recovery_indices=None):
     """Match exact stable groups; never kth-match an early missing prefix.
 
     Saved public stream cursors partition sequential owned image generations.
@@ -441,8 +441,12 @@ def _trace_successor_populations(trace, rows, in_window, receipt, images):
             errors.append("duplicate return or outside-scope or foreign count in guarded public population")
         if key[-1] == "measured":
             if len(observed) != len(expected):
+                if recovery_indices is not None:
+                    recovery_indices.add(len(errors))
                 errors.append("stable measured population disagrees with its fixed ledger")
             if any(row["path"] is None for _, row in observed):
+                if recovery_indices is not None:
+                    recovery_indices.add(len(errors))
                 errors.append("stable measured positive contains unknown executable rows")
             # Only an exact group permits order-matching provider return codes.
             if len(expected) == len(observed):
@@ -488,6 +492,15 @@ def worker_early_population(rows, receipt, images, hints):
 
 def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
     rows, counts, evidence, errors = N3_PARSE_TRACE(trace)
+    # Default every finding to capture integrity. Only the specific recovery
+    # and unobserved-mode2-entry checks below classify their own findings.
+    non_integrity_indices = set()
+    successor_recovery_errors, expected_mode2_abandonment_errors = [], []
+    def recovery_errors(values, *, abandonment=False):
+        for error in values:
+            non_integrity_indices.add(len(errors))
+            errors.append(error)
+            (expected_mode2_abandonment_errors if abandonment else successor_recovery_errors).append(error)
     errors.extend(stop_errors(receipt))
     if (receipt.get("b_setup") or {}).get("mode") == "3":
         errors.extend(held_entry_errors(trace, ledger, receipt))
@@ -517,7 +530,8 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
                 "cell": receipt.get("cell"), "leg": receipt.get("leg"),
                 "calls": len(rows), "named": 0, "unknown": 0, "false_names": 0,
                 "physical_entered": 0, "api_returned": 0, "completed_operations": 0,
-                "errors": errors}
+                "errors": errors, "capture_integrity_errors": list(errors),
+                "successor_recovery_errors": [], "expected_mode2_abandonment_errors": []}
     if file_trace is not None:
         other_rows, other_counts, other_evidence, other_errors = N3_PARSE_TRACE(file_trace)
         errors.extend(other_errors)
@@ -685,11 +699,18 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
     ambiguous_keys = [key for key, ids in expected_images.items() if len(ids) != 1]
     order_match = {}
     if receipt.get("successor_ready"):
+        population_recovery_indices = set()
         order_match, row_image_hints, early_coverage, population_errors = _trace_successor_populations(
-            trace, rows, in_window, receipt, images)
-        errors.extend(population_errors)
-        errors.extend(_early_gap_errors(evidence[0] if evidence else {}, early_coverage["deficit"],
-                                       receipt, ledger, mode="trace"))
+            trace, rows, in_window, receipt, images, population_recovery_indices)
+        for index, error in enumerate(population_errors):
+            if index in population_recovery_indices:
+                recovery_errors([error])
+            else:
+                errors.append(error)
+        # The combined early population includes successor attempts. The
+        # capability independently judges its original worker prefix gap.
+        recovery_errors(_early_gap_errors(evidence[0] if evidence else {}, early_coverage["deficit"],
+                                         receipt, ledger, mode="trace"))
         ambiguous_keys = []  # Independently guarded by public stream cursors.
     else:
         for key in sorted(actual.keys() | mandatory.keys()):
@@ -805,11 +826,23 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
     # units: entries minus returns must equal the ledgered abandoned count.
     abandoned = receipt.get("abandoned_expected", 0)
     entered = len(rows) + abandoned
+    capability_early = (worker_early_population(rows, receipt, images, row_image_hints)
+                        if receipt.get("cell") == "leader-exit-exec" else None)
+    unobserved_mode2_entry = bool(
+        abandoned == 1 and (receipt.get("b_setup") or {}).get("mode") == "2"
+        and capability_early and capability_early["observed_named"] == capability_early["observed_unknown"] == 0
+        and len(counts) == len(evidence) == 1 and evidence[0].get("in_flight_at_end") == 0
+        and all(type(counts[0].get(field)) is int and counts[0][field] == len(rows)
+                for field in ("stats_entered", "stats_returned", "raw_calls"))
+        and worker_perf_prefix_gap(evidence[0], receipt))
     if counts and any([counts[0].get("stats_entered") != entered,
                        counts[0].get("stats_returned") != len(rows),
                        counts[0].get("raw_calls") != len(rows)]):
-        errors.append("terminal counts disagree with independently accounted physical entries/"
-                      "returns/completions")
+        error = "terminal counts disagree with independently accounted physical entries/returns/completions"
+        if unobserved_mode2_entry:
+            recovery_errors([error], abandonment=True)
+        else:
+            errors.append(error)
     elif counts and (counts[0].get("stats_entered", 0) - counts[0].get("stats_returned", 0)) != abandoned:
         errors.append("terminal entry/return gap disagrees with the ledgered abandoned in-flight count")
     # H6-DELTA: reuse legs. Expected-but-unobserved reuse fails the cell;
@@ -827,7 +860,11 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
         if ev.get("final_drain") is False and ev.get("completeness") == "COMPLETE":
             errors.append("capture claims complete without its final drain proof")
         if ev.get("in_flight_at_end", 0) != abandoned:
-            errors.append("terminal in-flight disagrees with the ledgered abandoned in-flight count")
+            error = "terminal in-flight disagrees with the ledgered abandoned in-flight count"
+            if unobserved_mode2_entry:
+                recovery_errors([error], abandonment=True)
+            else:
+                errors.append(error)
         backend = ev.get("attach_backend", {})
         if backend.get("fallback") is not None:
             errors.append("capture installed a fallback link: no global fallback allowed")
@@ -850,10 +887,12 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
             "link_losses": evidence[0].get("task_uprobe_link_losses") if evidence else None,
             "image_populations": populations, "image_generation_populations": generations,
             "phase_populations": {key: dict(value) for key, value in phase_populations.items()},
-            "capability_early_coverage": (worker_early_population(rows, receipt, images, row_image_hints)
-                                          if receipt.get("cell") == "leader-exit-exec" else None),
+            "capability_early_coverage": capability_early,
             "mandatory_calls": sum(mandatory.values()), "counts": counts,
-            "evidence": evidence, "errors": errors}
+            "evidence": evidence, "errors": errors,
+            "capture_integrity_errors": [error for index, error in enumerate(errors) if index not in non_integrity_indices],
+            "successor_recovery_errors": successor_recovery_errors,
+            "expected_mode2_abandonment_errors": expected_mode2_abandonment_errors}
 
 
 def _check_group_death_proof(death, receipt):
@@ -1019,9 +1058,11 @@ def evaluate_trace_h6(trace, ledger, receipt, file_trace=None):
     try:
         return _evaluate_trace_h6(trace, ledger, receipt, file_trace)
     except (KeyError, TypeError, ValueError, IndexError) as error:
+        errors = [f"invalid independent evidence: {error}"]
         return {"pass": False, "status": "fail", "cell": receipt.get("cell"),
                 "leg": receipt.get("leg"), "named": 0, "unknown": 0, "false_names": 0,
-                "errors": [f"invalid independent evidence: {error}"]}
+                "errors": errors, "capture_integrity_errors": list(errors),
+                "successor_recovery_errors": [], "expected_mode2_abandonment_errors": []}
 
 
 # ---------------------------------------------------------------------------
@@ -4229,9 +4270,10 @@ def held_entry_errors(trace, ledger, receipt):
 def worker_perf_prefix_gap(ev, receipt):
     """Exact mode2 prefix only: an exited perf target no longer covers its worker.
 
-    The caller first validates the original-Z/exact-worker release proof. A
-    generic link-loss count, requested backend or later static detach cannot
-    supply this proof; the real Session filter and held provider must agree.
+    An informative capability additionally requires its independently
+    validated original-Z/exact-worker release proof. A generic link-loss
+    count, requested backend or later static detach cannot supply this proof;
+    the real Session filter and held provider must agree.
     """
     try:
         observation = ev["gap_classes"]["observation"]
@@ -4292,6 +4334,14 @@ def evaluate_worker_capability(result, receipt, backend):
         if (result.get("status") not in ("pass", "fail")
                 or result.get("pass") is not (result.get("status") == "pass")):
             errors.append("failed/untested setup cannot demonstrate worker capability")
+        classified = [result[key] for key in ("capture_integrity_errors", "successor_recovery_errors",
+                                             "expected_mode2_abandonment_errors")]
+        if (any(not isinstance(group, list) or any(not isinstance(error, str) for error in group)
+                for group in [result["errors"], *classified])
+                or Counter(result["errors"]) != sum((Counter(group) for group in classified), Counter())):
+            errors.append("capability source trace findings lack complete integrity classification")
+        else:
+            errors.extend(classified[0])
         if receipt["requested_backend"] != backend:
             errors.append("capability receipt backend differs from the requested backend")
         setup = receipt["b_setup"]
@@ -4361,9 +4411,12 @@ def evaluate_worker_capability(result, receipt, backend):
                         "rv_update_failures", "process_tracking_failures", "process_tracking_evictions"))):
                 errors.append("capability capture reports truncation/policy or native event loss")
             gap_errors = _early_gap_errors(ev, early["deficit"])
-            if gap_errors and not errors and worker_perf_prefix_gap(ev, receipt):
+            prefix_loss_proven = not errors and worker_perf_prefix_gap(ev, receipt)
+            if gap_errors and prefix_loss_proven:
                 gap_errors = []
             errors.extend(gap_errors)
+            if classified[2] and not (captured == 0 and prefix_loss_proven):
+                errors.extend(classified[2])
     except (KeyError, TypeError, ValueError, IndexError, StopIteration) as error:
         errors.append(f"missing/invalid worker barrier evidence: {error}")
     if not errors:

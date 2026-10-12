@@ -8,6 +8,7 @@ prove physical call ordering and finite waits, not native capture acceptance.
 
 import os
 import copy
+from collections import Counter
 from pathlib import Path
 import runpy
 import subprocess
@@ -395,6 +396,146 @@ class LeaderProtocolRoutingTest(unittest.TestCase):
                 coverage = H6["required_recovery_coverage"](
                     [("leader-exit-exec", "singles", rows)], ["leader-exit-exec"], ["singles"])
                 self.assertEqual(coverage["complete"], required_pass)
+
+
+class CapabilityIntegrityTest(unittest.TestCase):
+    """Actual oracle/routing negatives with independently specified stream data."""
+
+    def inputs(self):
+        _source, receipt = WorkerPerfPrefixGapTest().inputs()
+        ready = CONTROL["READY"]
+        image0 = receipt["images"][0]
+        image1 = CONTROL["image_record"](1, "/w/after", ready + 200)
+        targets = [CONTROL["target_record"](0, "C_Initialize"),
+                   CONTROL["target_record"](1, "C_Initialize"),
+                   CONTROL["target_record"](1, "C_GetInfo")]
+        calls = [CONTROL["call_record"](0, "C_Initialize", 0 if seq % 2 == 0 else 5,
+                 "pre", "selected", ready + 60, ready + 80, tid=1001) for seq in range(11)]
+        request = {"kind": "exec", "image": 0, "pid": 1000, "tid": 1001,
+                   "start_time": 7777, "mode": "nonleader", "path": "/w/after",
+                   "scope": "selected", "t": ready + 100}
+        for sequence, start in ((1, 300), (2, 400)):
+            calls.append(CONTROL["call_record"](1, "C_GetInfo", 0, f"successor-1-{sequence}",
+                         "selected", ready + start, ready + start + 10))
+        calls.extend(CONTROL["call_record"](1, "C_Initialize", 0 if seq % 2 == 0 else 5,
+                     "post", "selected", ready + 1000, ready + 2000) for seq in range(25))
+        ledger = [image0, targets[0], *calls[:11], request, image1, *targets[1:], *calls[11:]]
+        proof = {"image": 1, "proof_kind": "trace-row", "marker_fn": "C_GetInfo",
+                 "started_ns": ready + 290, "observed_ns": ready + 500,
+                 "deadline_ns": ready + 15_000_000_290, "attempts": 2, "max_attempts": 20,
+                 "output_cursor": 3, "proof_cursor": 5,
+                 "phases": ["successor-1-1", "successor-1-2"]}
+        receipt.update(images=[image0, image1], successor_policy="public-successor", successor_ready=[proof],
+                       exec_transitions=[{"from_image": 0, "to_image": 1, "mode": "nonleader",
+                                          "same_path": False, "t0": ready + 100, "t1": ready + 250,
+                                          "request": request}],
+                       measured={"label": "stable", "expected_calls": 25, "phases": ["post"],
+                                 "t0": ready + 1000, "t1": ready + 2000},
+                       warmup={"label": "early", "expected_calls": 13,
+                               "phases": ["pre", "successor-1-1", "successor-1-2"],
+                               "t0": ready + 60, "t1": ready + 410},
+                       phases=[{"image": 0, "fn": "C_Initialize", "phase": "pre", "scope": "selected",
+                                "count": 11, "t0": ready + 60, "t1": ready + 90},
+                               {"image": 1, "fn": "C_GetInfo", "phase": "successor-1-1", "scope": "selected",
+                                "count": 1, "t0": ready + 300, "t1": ready + 310},
+                               {"image": 1, "fn": "C_GetInfo", "phase": "successor-1-2", "scope": "selected",
+                                "count": 1, "t0": ready + 400, "t1": ready + 410},
+                               {"image": 1, "fn": "C_Initialize", "phase": "post", "scope": "selected",
+                                "count": 25, "t0": ready + 1000, "t1": ready + 2000}],
+                       abandoned_expected=1, abandoned_by_fn={"C_Initialize": 1},
+                       require_named=True, require_named_images=[1], first_unknown_images=[])
+        ev = _source["evidence"][0]
+        rows = [CONTROL["unknown_row"](1000, 1000, "C_GetInfo"),
+                CONTROL["named_row"](1000, 1000, "/w/after", "C_GetInfo")]
+        rows.extend(CONTROL["named_row"](1000, 1000, "/w/after", "C_Initialize",
+                    "CKR_OK" if seq % 2 == 0 else "CKR_GENERAL_ERROR") for seq in range(25))
+        return rows, ev, ledger, receipt
+
+    def source(self, change=None):
+        rows, ev, ledger, receipt = self.inputs()
+        if change == "foreign-pid":
+            rows.append(CONTROL["unknown_row"](4242, 4242, "C_Initialize"))
+        elif change == "sink-loss":
+            ev["scheduling"] = {"sink_dropped_bytes": 100}
+        elif change == "wrong-open-count":
+            ev["in_flight_at_end"] = 2
+        elif change == "missing-successor":
+            rows.pop()
+        entered = len(rows) + 2 if change == "wrong-native-counts" else len(rows)
+        trace = CONTROL["trace_text"](rows, entered, len(rows), ev)
+        if change == "malformed-record":
+            trace = trace.replace("COUNT_EVIDENCE ", "BROKEN\nCOUNT_EVIDENCE ")
+        file_trace = trace
+        if change == "file-disagreement":
+            file_trace = trace.replace("→ CKR_OK", "→ CKR_GENERAL_ERROR", 1)
+        source = H6["evaluate_trace_h6"](trace, ledger, receipt, file_trace)
+        return source, receipt
+
+    def route(self, source, receipt):
+        with tempfile.TemporaryDirectory(prefix="h6-cap-integrity-") as directory:
+            required = {"cell": "leader-exit-exec", "leg": "trace/singles", "status": "pass", "pass": True}
+            def leg(_ctx, _cell, _backend, _kind, leg_dir, mode):
+                Path(leg_dir).mkdir(parents=True)
+                if mode == "2":
+                    H6["write_json"](Path(leg_dir) / "receipt.json", receipt)
+                    return source
+                return required
+            runner = H6["run_leader_exit_exec"]
+            with mock.patch.dict(runner.__globals__, {"run_b_leg": leg}):
+                rows = runner(None, directory, "singles")
+            self.assertIs(rows[0], required)
+            return rows[1]
+
+    def test_expected_missing_mode2_entry_remains_informational(self):
+        source, receipt = self.source()
+        self.assertFalse(source["pass"], source)
+        self.assertEqual(source["capture_integrity_errors"], [])
+        self.assertEqual(len(source["expected_mode2_abandonment_errors"]), 2)
+        self.assertEqual(Counter(source["errors"]), Counter(source["successor_recovery_errors"])
+                         + Counter(source["expected_mode2_abandonment_errors"]))
+        self.assertEqual(source["capability_early_coverage"]["deficit"], 11)
+        capability = self.route(source, receipt)
+        self.assertEqual((capability["status"], capability["pass"]), ("limitation", None), capability["errors"])
+
+    def integrity_negative(self, change, expected):
+        source, receipt = self.source(change)
+        self.assertFalse(source["pass"], source)
+        self.assertTrue(any(expected in error for error in source["errors"]), source["errors"])
+        capability = self.route(source, receipt)
+        self.assertEqual((capability["status"], capability["pass"]), ("error", False), capability)
+        self.assertTrue(any(expected in error for error in capability["errors"]), capability["errors"])
+
+    def test_foreign_pid_with_consistent_native_totals_is_not_hidden(self):
+        self.integrity_negative("foreign-pid", "foreign pid")
+
+    def test_malformed_record_with_preserved_terminals_is_not_hidden(self):
+        self.integrity_negative("malformed-record", "unexpected trace record")
+
+    def test_stdout_file_disagreement_is_not_hidden(self):
+        self.integrity_negative("file-disagreement", "stdout/file event or count disagreement")
+
+    def test_sink_dropped_bytes_is_not_hidden(self):
+        self.integrity_negative("sink-loss", "capture lost output")
+
+    def test_other_native_count_mismatch_is_not_the_expected_unobserved_entry(self):
+        self.integrity_negative("wrong-native-counts", "terminal counts disagree")
+
+    def test_other_open_count_mismatch_is_not_the_expected_unobserved_entry(self):
+        self.integrity_negative("wrong-open-count", "terminal in-flight disagrees")
+
+    def test_separate_successor_deficit_does_not_change_the_exact_worker_capability(self):
+        source, receipt = self.source("missing-successor")
+        self.assertFalse(source["pass"])
+        self.assertIn("stable measured population disagrees with its fixed ledger", source["successor_recovery_errors"])
+        self.assertEqual(source["capture_integrity_errors"], [])
+        capability = self.route(source, receipt)
+        self.assertEqual((capability["status"], capability["pass"]), ("limitation", None), capability["errors"])
+
+    def test_unclassified_source_error_cannot_be_silently_ignored(self):
+        source, receipt = self.source()
+        source["errors"].append("unclassified source contract failure")
+        capability = self.route(source, receipt)
+        self.assertEqual((capability["status"], capability["pass"]), ("error", False))
 
 
 if __name__ == "__main__":

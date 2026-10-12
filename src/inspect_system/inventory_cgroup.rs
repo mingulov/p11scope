@@ -242,6 +242,7 @@ pub(crate) struct CgroupCollectRequest {
     pub(crate) control: CollectionControl,
     pub(crate) max_scan_pids: Option<usize>,
     pub(crate) scan_budget: CaptureWorkBudget,
+    pub(crate) observer: Option<crate::cgroup_stop_acceptance::Observer>,
 }
 
 pub(crate) struct CgroupCollection {
@@ -260,8 +261,29 @@ pub(crate) struct CgroupCollection {
     invalidated: BTreeSet<u32>,
     eligible: BTreeSet<u32>,
     timings: StageTimings,
+    observer: Option<crate::cgroup_stop_acceptance::Transaction>,
 }
 impl CgroupCollection {
+    pub(crate) fn observe_worker_joined(&self) {
+        if let Some(observer) = &self.observer {
+            observer.joined();
+        }
+    }
+    pub(crate) fn observe_worker_returned(&self) {
+        if let Some(observer) = &self.observer {
+            observer.returned(self.outcome());
+        }
+    }
+    pub(crate) fn observe_allowed(&mut self, allowed: &BTreeSet<u32>) {
+        if let Some(observer) = &mut self.observer {
+            observer.allowed(allowed);
+        }
+    }
+    pub(crate) fn observe_publication(&self, admitted: usize, callers: usize, endpoints: usize) {
+        if let Some(observer) = &self.observer {
+            observer.published(self.outcome(), admitted, callers, endpoints);
+        }
+    }
     pub(crate) fn root(&self) -> &Arc<File> {
         &self.root
     }
@@ -358,7 +380,28 @@ impl CgroupCollection {
         // Move the walker-owned locator allocation through the transaction;
         // no extra path copies escape the walker path budget.
         self.locators.retain(|pid, _| self.ready.contains(pid));
+        if let Some(observer) = &self.observer {
+            observer.final_pre_read(
+                |pid, start_time| {
+                    self.locators.contains_key(&pid)
+                        && self
+                            .originals
+                            .get(&pid)
+                            .is_some_and(|member| member.generation.start_time == Some(start_time))
+                },
+                &self.work.control,
+            );
+        }
         let end = self.work.sample(&self.root, &self.locators);
+        if let Some(observer) = &self.observer {
+            let present = self
+                .locators
+                .keys()
+                .copied()
+                .filter(|pid| end.answer(*pid) == MembershipOutcome::Present)
+                .collect();
+            observer.sampled(end.outcome.into(), &present);
+        }
         self.note(end.outcome.into());
         if self
             .locators
@@ -615,12 +658,14 @@ fn collect_with(
     checkpoint: &mut dyn FnMut(CollectionStage),
 ) -> CgroupCollection {
     let started = monotonic_ns();
+    let observer = request.observer.as_ref().map(|observer| observer.launch());
     let work = SharedCollectionWork::new(request.limits.clone(), request.control, request.fence);
     let quota = CandidateQuota {
         candidates: PROCESS_PIN_LIMIT,
         work_units: request.limits.work_units.min(1 << 16),
     };
-    let candidates = if work.charge(1) {
+    let traversal_started = work.charge(1);
+    let candidates = if traversal_started {
         next_candidates(
             &request.root,
             &mut request.state,
@@ -637,6 +682,9 @@ fn collect_with(
     };
     let mut outcome = ScopedCollectionOutcome::from(candidates.outcome);
     checkpoint(CollectionStage::Traversed);
+    if traversal_started && let Some(observer) = &observer {
+        observer.traversed(&work.control);
+    }
     let mut pinned = BTreeMap::new();
     let mut requests = BTreeMap::new();
     for (index, (pid, locator)) in candidates.candidates.into_iter().enumerate() {
@@ -884,12 +932,264 @@ fn collect_with(
         invalidated: BTreeSet::new(),
         eligible,
         timings,
+        observer,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cgroup_stop_acceptance_stage_child() {
+        let Ok(stage) = std::env::var("P11SCOPE_CGROUP_STAGE_TEST") else {
+            return;
+        };
+        let pid = std::env::var("P11SCOPE_CGROUP_MEMBER_TEST")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let healthy = std::env::var_os("P11SCOPE_CGROUP_RELEASE_TEST").is_some();
+        let (_fixture, root) = fixture(pid);
+        let stop = crate::inventory_dashboard::StopFlag::install();
+        let mut request = request(root);
+        request.control =
+            CollectionControl::new(None).with_operator_stop_source(stop.signal_source());
+        if std::env::var_os("P11SCOPE_CGROUP_PRE_CANCEL_TEST").is_some() {
+            request.control.cancel();
+        }
+        request.observer = crate::cgroup_stop_acceptance::Observer::from_environment().unwrap();
+        let control = request.control.clone();
+        // The accepted inherited descriptor must not escape a subsequent exec.
+        let fd = std::env::var("P11SCOPE_CGROUP_STOP_FD").unwrap();
+        assert!(
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &format!("test ! -e /proc/self/fd/{fd}")])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut collection = crate::inventory_capture::collect_cgroup_off_thread(
+            Box::new(move || collect(request, &[], &HookRegistry::default(), policy())),
+            std::time::Duration::from_millis(2),
+            &mut || {},
+        )
+        .unwrap();
+        if stage == "final_pre_read" {
+            let before = collection.work.budget.lock().unwrap().used.membership_bytes;
+            collection.sample_end(&BTreeSet::from([pid]));
+            let end = collection
+                .end
+                .as_ref()
+                .expect("actual final membership sample ran");
+            if healthy {
+                assert!(
+                    end.work.membership_bytes > before,
+                    "healthy twin actually read membership"
+                );
+                assert!(collection.permit(pid).is_some());
+            } else {
+                assert_eq!(
+                    end.work.membership_bytes, before,
+                    "cancelled sampler performed no membership read"
+                );
+                assert!(collection.permit(pid).is_none());
+            }
+        } else if !healthy {
+            assert_eq!(
+                collection
+                    .collection
+                    .as_ref()
+                    .unwrap()
+                    .budget
+                    .attempted_io_bytes(),
+                0
+            );
+            assert!(collection.member_pids().next().is_none());
+        }
+        if healthy {
+            assert!(matches!(
+                collection.outcome(),
+                ScopedCollectionOutcome::Complete
+                    | ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::ScanIncomplete)
+            ));
+        } else {
+            assert_eq!(
+                collection.outcome(),
+                ScopedCollectionOutcome::Cancelled(CollectionStop::OperatorStop)
+            );
+        }
+        assert_eq!(control.check().is_ok(), healthy);
+    }
+
+    fn installed_stage_host_control(
+        stage: &str,
+        healthy: bool,
+        pre_cancel: bool,
+        invalid_release: bool,
+    ) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::os::unix::process::CommandExt;
+        let member =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let birth = ProcessView::open(ProcessViewId(0), member.id())
+            .unwrap()
+            .start_time()
+            .unwrap();
+        let (mut controller, inherited) = UnixStream::pair().unwrap();
+        controller
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let fd = inherited.as_raw_fd();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "inspect_system::inventory_cgroup::tests::cgroup_stop_acceptance_stage_child",
+            ])
+            .env("P11SCOPE_CGROUP_STOP_FD", fd.to_string())
+            .env("P11SCOPE_CGROUP_STAGE_TEST", stage)
+            .env("P11SCOPE_CGROUP_MEMBER_TEST", member.id().to_string());
+        if healthy {
+            command.env("P11SCOPE_CGROUP_RELEASE_TEST", "1");
+        }
+        if pre_cancel {
+            command.env("P11SCOPE_CGROUP_PRE_CANCEL_TEST", "1");
+        }
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop(inherited);
+        let (pid, start_time) = if stage == "traversed" {
+            (0, 0)
+        } else {
+            (member.id(), birth)
+        };
+        writeln!(
+            controller,
+            "{}",
+            serde_json::json!({"version": 1, "stage": stage,
+            "timeout_ms": 4000, "pid": pid, "start_time": start_time})
+        )
+        .unwrap();
+        let mut input = BufReader::new(controller.try_clone().unwrap());
+        let mut events = Vec::new();
+        loop {
+            let mut line = String::new();
+            let read = input.read_line(&mut line);
+            if !matches!(read, Ok(count) if count > 0) {
+                break;
+            }
+            let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(frame["sequence"], events.len());
+            if frame["event"] == stage {
+                if healthy {
+                    let release = if invalid_release {
+                        serde_json::json!({"version": 1, "cancel": frame["transaction"]})
+                    } else {
+                        serde_json::json!({"version": 1, "release": frame["transaction"]})
+                    };
+                    writeln!(controller, "{release}").unwrap();
+                } else if !pre_cancel {
+                    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+                }
+            }
+            events.push(frame);
+        }
+        let status = child.wait().unwrap();
+        assert!(
+            status.success(),
+            "actual scoped stage child failed: {status}"
+        );
+        let names = events
+            .iter()
+            .map(|event| event["event"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        if invalid_release {
+            assert_eq!(names, vec!["armed", "launch", "traversed"]);
+            return;
+        }
+        if pre_cancel {
+            assert_eq!(
+                names,
+                vec!["armed", "launch", "worker_returned", "worker_joined"]
+            );
+            return;
+        }
+        let want = if stage == "traversed" {
+            vec![
+                "armed",
+                "launch",
+                "traversed",
+                "worker_returned",
+                "worker_joined",
+            ]
+        } else {
+            vec![
+                "armed",
+                "launch",
+                "worker_returned",
+                "worker_joined",
+                "final_pre_read",
+                "end_sampled",
+            ]
+        };
+        assert_eq!(names, want);
+        if stage == "final_pre_read" {
+            let gate = &events[4];
+            assert_eq!(gate["requested"], true);
+            assert_eq!(gate["pid"], member.id());
+            assert_eq!(gate["start_time"], birth);
+            assert_eq!(
+                events[5]["outcome"],
+                if healthy { "complete" } else { "operator_stop" }
+            );
+            assert_eq!(events[5]["present"], healthy);
+        } else {
+            if healthy {
+                assert!(matches!(
+                    events[3]["outcome"].as_str(),
+                    Some("complete" | "incomplete")
+                ));
+            } else {
+                assert_eq!(events[3]["outcome"], "operator_stop");
+            }
+        }
+    }
+
+    #[test]
+    fn cgroup_stop_acceptance_real_sigint_at_traversed_returns_then_joins() {
+        installed_stage_host_control("traversed", false, false, false);
+    }
+    #[test]
+    fn cgroup_stop_acceptance_healthy_traversed_release() {
+        installed_stage_host_control("traversed", true, false, false);
+    }
+    #[test]
+    fn cgroup_stop_acceptance_real_sigint_at_final_pre_read_performs_no_membership_read() {
+        installed_stage_host_control("final_pre_read", false, false, false);
+    }
+    #[test]
+    fn cgroup_stop_acceptance_healthy_final_release_reads_and_authorizes_same_member() {
+        installed_stage_host_control("final_pre_read", true, false, false);
+    }
+    #[test]
+    fn cgroup_stop_acceptance_before_walk_does_not_claim_traversal() {
+        installed_stage_host_control("traversed", false, true, false);
+    }
+    #[test]
+    fn cgroup_stop_acceptance_cancel_command_never_cancels_collection_control() {
+        installed_stage_host_control("traversed", true, false, true);
+    }
+
     fn request(root: Arc<File>) -> CgroupCollectRequest {
         CgroupCollectRequest {
             root,
@@ -902,6 +1202,7 @@ mod tests {
                 per_object_bytes: 8 << 20,
                 total_bytes: 16 << 20,
             }),
+            observer: None,
         }
     }
     fn fixture(pid: u32) -> (tempfile::TempDir, Arc<File>) {

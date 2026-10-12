@@ -6005,7 +6005,7 @@ fn capture_trace(
                         context.6,
                         context.7,
                     )?;
-                    crate::attach::reexec_diagnostic::observe!(context.1, |diag| {
+                    crate::attach::reexec_diagnostic::terminal!(context.1, |diag| {
                         let gap = context.1.physical_gap_summary();
                         diag.finish(
                             crate::attach::reexec_diagnostic::canary_counts(&reports),

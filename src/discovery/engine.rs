@@ -3336,6 +3336,71 @@ impl CandidateAdmission {
     }
 }
 
+#[derive(Clone, Copy)]
+enum InventoryDiagnosticPass {
+    First,
+    Final,
+}
+
+#[cfg(feature = "h6-reexec-diagnostic")]
+impl InventoryDiagnosticPass {
+    fn candidate_phase(self) -> DiagnosticPhase {
+        match self {
+            Self::First => DiagnosticPhase::CandidateFirst,
+            Self::Final => DiagnosticPhase::CandidateFinal,
+        }
+    }
+
+    fn admission_phase(self) -> DiagnosticPhase {
+        match self {
+            Self::First => DiagnosticPhase::AdmissionFirst,
+            Self::Final => DiagnosticPhase::AdmissionFinal,
+        }
+    }
+}
+
+fn inventory_candidate_observed<T>(
+    _session: &dyn EngineSession,
+    _pass: InventoryDiagnosticPass,
+    _counts: impl FnOnce() -> [Option<u64>; 4],
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    crate::attach::reexec_diagnostic::evaluate!(
+        _session,
+        _pass.candidate_phase(),
+        _counts(),
+        operation,
+        |result: &Result<T>| {
+            if result.is_ok() {
+                DiagnosticOutcome::Ok
+            } else {
+                DiagnosticOutcome::Error
+            }
+        }
+    )
+}
+
+fn inventory_admission_observed(
+    _session: &dyn EngineSession,
+    _pass: InventoryDiagnosticPass,
+    _counts: impl FnOnce() -> [Option<u64>; 4],
+    operation: impl FnOnce() -> CandidateAdmission,
+) -> CandidateAdmission {
+    crate::attach::reexec_diagnostic::evaluate!(
+        _session,
+        _pass.admission_phase(),
+        _counts(),
+        operation,
+        |result: &CandidateAdmission| {
+            if result.refuses_candidate() {
+                DiagnosticOutcome::Refused
+            } else {
+                DiagnosticOutcome::Ok
+            }
+        }
+    )
+}
+
 #[derive(Clone)]
 struct DynamicExportWork {
     context: LoaderContextId,
@@ -18755,11 +18820,33 @@ impl Engine {
         let mut deferred_new_view_records = Vec::new();
         let mut refreshed_ok: BTreeSet<_> =
             refreshed_scans.iter().map(|(view, _, _)| *view).collect();
-        let candidate =
-            self.inventory_candidate(&removed, &refreshed_scans, new_views, skipped.clone())?;
+        let candidate = inventory_candidate_observed(
+            session,
+            InventoryDiagnosticPass::First,
+            || {
+                [
+                    Some(removed.len() as u64),
+                    Some(refreshed_scans.len() as u64),
+                    Some(new_views.len() as u64),
+                    None,
+                ]
+            },
+            || self.inventory_candidate(&removed, &refreshed_scans, new_views, skipped.clone()),
+        )?;
         let admission_start = crate::attach::monotonic_ns();
-        let admission =
-            self.inventory_candidate_admission(session, &candidate, &removed, new_views);
+        let admission = inventory_admission_observed(
+            session,
+            InventoryDiagnosticPass::First,
+            || {
+                [
+                    Some(candidate.delta.new.len() as u64),
+                    Some(candidate.delta.replace.len() as u64),
+                    Some(candidate.views.len() as u64),
+                    None,
+                ]
+            },
+            || self.inventory_candidate_admission(session, &candidate, &removed, new_views),
+        );
         self.stage_timings.span(
             crate::timing::StageKind::Attach,
             "candidate_admission",
@@ -18964,8 +19051,19 @@ impl Engine {
         refreshed_ok = refreshed_scans.iter().map(|(view, _, _)| *view).collect();
         refreshed_ok.retain(|view| !failed_retirements.contains(view));
         refreshed_scans.retain(|(view, _, _)| refreshed_ok.contains(view));
-        let mut candidate =
-            self.inventory_candidate(&removed, &refreshed_scans, new_views, skipped)?;
+        let mut candidate = inventory_candidate_observed(
+            session,
+            InventoryDiagnosticPass::Final,
+            || {
+                [
+                    Some(removed.len() as u64),
+                    Some(refreshed_scans.len() as u64),
+                    Some(new_views.len() as u64),
+                    None,
+                ]
+            },
+            || self.inventory_candidate(&removed, &refreshed_scans, new_views, skipped),
+        )?;
         // Exec-refreshed views whose rescan re-accepted the same static
         // PID targets force them through detach/replace: PID-bound links may
         // be dead while still recorded as attached. Global file links remain
@@ -18975,8 +19073,19 @@ impl Engine {
         let lowered_exec_rearms =
             self.lower_exec_rearms(session, &mut candidate, &refreshed_ok, &serviced_requests);
         let admission_start = crate::attach::monotonic_ns();
-        let admission =
-            self.inventory_candidate_admission(session, &candidate, &removed, new_views);
+        let admission = inventory_admission_observed(
+            session,
+            InventoryDiagnosticPass::Final,
+            || {
+                [
+                    Some(candidate.delta.new.len() as u64),
+                    Some(candidate.delta.replace.len() as u64),
+                    Some(candidate.views.len() as u64),
+                    None,
+                ]
+            },
+            || self.inventory_candidate_admission(session, &candidate, &removed, new_views),
+        );
         self.stage_timings.span(
             crate::timing::StageKind::Attach,
             "candidate_admission",
@@ -20614,6 +20723,10 @@ pub(crate) mod session_fixture {
 
     #[derive(Default)]
     pub(crate) struct ScriptedSession {
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        pub(crate) reexec_diagnostic: Option<crate::attach::reexec_diagnostic::Diagnostic>,
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        pub(crate) diagnostic_at_preflight: Cell<Option<crate::attach::reexec_diagnostic::Record>>,
         pub(crate) capture_policy: Option<CapturePolicy>,
         pub(crate) pid_continuity: Option<RefCell<crate::attach::PidSessionFixture>>,
         pub(crate) dequeues: VecDeque<Result<Option<crate::events::DiscoveryItem>>>,
@@ -20827,6 +20940,10 @@ pub(crate) mod session_fixture {
     }
 
     impl EngineSession for ScriptedSession {
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        fn reexec_diagnostic(&self) -> Option<crate::attach::reexec_diagnostic::Diagnostic> {
+            self.reexec_diagnostic.clone()
+        }
         fn has_slot_link(&self, slot: u32) -> bool {
             self.pid_continuity
                 .as_ref()
@@ -20977,6 +21094,12 @@ pub(crate) mod session_fixture {
         }
 
         fn preflight_targets(&self, targets: &[plan::Slot], _: &PinnedObjects) -> Result<()> {
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            self.diagnostic_at_preflight.set(
+                self.reexec_diagnostic
+                    .as_ref()
+                    .and_then(crate::attach::reexec_diagnostic::Diagnostic::last_record),
+            );
             self.preflight_targets.borrow_mut().push(
                 targets
                     .iter()
@@ -21322,6 +21445,261 @@ pub(crate) mod tests;
 #[cfg(test)]
 #[path = "publication_tests.rs"]
 pub(crate) mod publication_tests;
+
+#[cfg(test)]
+mod reexec_diagnostic_evaluation_tests {
+    use super::session_fixture::ScriptedSession;
+    use super::*;
+    use std::cell::Cell;
+
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    use crate::attach::reexec_diagnostic::{Diagnostic, Outcome};
+
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    fn active_session(diag: &Diagnostic, refused: bool) -> ScriptedSession {
+        let mut session = if refused {
+            ScriptedSession::refusing_preflight()
+        } else {
+            ScriptedSession::default()
+        };
+        session.reexec_diagnostic = Some(diag.clone());
+        session
+    }
+
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    #[test]
+    fn reexec_diagnostic_first_final_candidate_surround_actual_assembly() {
+        let mut observed = Vec::new();
+        let mut expected = Vec::new();
+        for pass in [
+            InventoryDiagnosticPass::First,
+            InventoryDiagnosticPass::Final,
+        ] {
+            let diag = Diagnostic::selected(true, true).unwrap();
+            diag.matched_exec();
+            let session = active_session(&diag, false);
+            let calls = Cell::new(0);
+            let before_operation = Cell::new(None);
+            let removed = BTreeSet::new();
+            let mut engine = Engine::empty();
+            let candidate = inventory_candidate_observed(
+                &session,
+                pass,
+                || [Some(0); 4],
+                || {
+                    calls.set(calls.get() + 1);
+                    before_operation.set(diag.last_record());
+                    engine.inventory_candidate(&removed, &[], &[], vec![])
+                },
+            )
+            .unwrap();
+            let control = Engine::empty()
+                .inventory_candidate(&removed, &[], &[], vec![])
+                .unwrap();
+            assert_eq!(calls.get(), 1, "the real assembly must execute once");
+            assert_eq!(
+                (
+                    candidate.plan.slots.len(),
+                    candidate.delta.new.len(),
+                    candidate.delta.replace.len(),
+                    candidate.delta.retire.len(),
+                    candidate.views.clone()
+                ),
+                (
+                    control.plan.slots.len(),
+                    control.delta.new.len(),
+                    control.delta.replace.len(),
+                    control.delta.retire.len(),
+                    control.views.clone()
+                ),
+                "the actual candidate result must remain unchanged"
+            );
+            observed.push((
+                before_operation
+                    .get()
+                    .map(|record| (record.phase, record.outcome)),
+                diag.last_record()
+                    .map(|record| (record.phase, record.outcome)),
+            ));
+            expected.push((
+                Some((pass.candidate_phase(), Outcome::Begin)),
+                Some((pass.candidate_phase(), Outcome::Ok)),
+            ));
+        }
+        assert_eq!(
+            observed, expected,
+            "first/final boundaries must surround actual assembly"
+        );
+    }
+
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    #[test]
+    fn reexec_diagnostic_first_final_candidate_errors_propagate_once() {
+        let mut observed = Vec::new();
+        let mut expected = Vec::new();
+        for pass in [
+            InventoryDiagnosticPass::First,
+            InventoryDiagnosticPass::Final,
+        ] {
+            let diag = Diagnostic::selected(true, true).unwrap();
+            diag.matched_exec();
+            let session = active_session(&diag, false);
+            let calls = Cell::new(0);
+            let before_operation = Cell::new(None);
+            let result: Result<()> = inventory_candidate_observed(
+                &session,
+                pass,
+                || [Some(0); 4],
+                || {
+                    calls.set(calls.get() + 1);
+                    before_operation.set(diag.last_record());
+                    Err(anyhow!("scripted assembly failure"))
+                },
+            );
+            assert_eq!(calls.get(), 1, "the fallible operation must execute once");
+            assert_eq!(result.unwrap_err().to_string(), "scripted assembly failure");
+            observed.push((
+                before_operation
+                    .get()
+                    .map(|record| (record.phase, record.outcome)),
+                diag.last_record()
+                    .map(|record| (record.phase, record.outcome)),
+            ));
+            expected.push((
+                Some((pass.candidate_phase(), Outcome::Begin)),
+                Some((pass.candidate_phase(), Outcome::Error)),
+            ));
+        }
+        assert_eq!(
+            observed, expected,
+            "first/final error results require their own boundaries"
+        );
+    }
+
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    #[test]
+    fn reexec_diagnostic_first_final_admission_surround_actual_preflight_refusals() {
+        let mut observed = Vec::new();
+        let mut expected = Vec::new();
+        for pass in [
+            InventoryDiagnosticPass::First,
+            InventoryDiagnosticPass::Final,
+        ] {
+            for (refused, stale) in [(false, false), (true, false), (false, true)] {
+                let diag = Diagnostic::selected(true, true).unwrap();
+                diag.matched_exec();
+                let session = active_session(&diag, refused);
+                let control_session = if refused {
+                    ScriptedSession::refusing_preflight()
+                } else {
+                    ScriptedSession::default()
+                };
+                let removed = BTreeSet::new();
+                let mut engine = Engine::empty();
+                let mut candidate = engine
+                    .inventory_candidate(&removed, &[], &[], vec![])
+                    .unwrap();
+                if stale {
+                    candidate.views.insert(ProcessViewId(77));
+                }
+                let control = engine.inventory_candidate_admission(
+                    &control_session,
+                    &candidate,
+                    &removed,
+                    &[],
+                );
+                let calls = Cell::new(0);
+                let admission = inventory_admission_observed(
+                    &session,
+                    pass,
+                    || [Some(0); 4],
+                    || {
+                        calls.set(calls.get() + 1);
+                        engine.inventory_candidate_admission(&session, &candidate, &removed, &[])
+                    },
+                );
+                assert_eq!(calls.get(), 1);
+                assert_eq!(
+                    session.preflight_targets.borrow().len(),
+                    1,
+                    "the real preflight must execute once"
+                );
+                assert_eq!(control_session.preflight_targets.borrow().len(), 1);
+                assert_eq!(admission.targets_ok, control.targets_ok);
+                assert!(admission.stale_views == control.stale_views);
+                assert!(admission.missing_contexts == control.missing_contexts);
+                assert!(admission.newly_rejected_keys == control.newly_rejected_keys);
+                assert_eq!(
+                    admission.refuses_candidate(),
+                    refused || stale,
+                    "the fixture must reach its intended actual admission branch"
+                );
+                observed.push((
+                    session
+                        .diagnostic_at_preflight
+                        .get()
+                        .map(|record| (record.phase, record.outcome)),
+                    diag.last_record()
+                        .map(|record| (record.phase, record.outcome)),
+                ));
+                expected.push((
+                    Some((pass.admission_phase(), Outcome::Begin)),
+                    Some((
+                        pass.admission_phase(),
+                        if refused || stale {
+                            Outcome::Refused
+                        } else {
+                            Outcome::Ok
+                        },
+                    )),
+                ));
+            }
+        }
+        assert_eq!(
+            observed, expected,
+            "first/final actual admission refusals require boundaries"
+        );
+    }
+
+    #[cfg(not(feature = "h6-reexec-diagnostic"))]
+    #[test]
+    fn reexec_diagnostic_off_candidate_admission_do_work_once_without_metadata() {
+        let session = ScriptedSession::default();
+        let removed = BTreeSet::new();
+        let metadata = Cell::new(0);
+        let calls = Cell::new(0);
+        let mut engine = Engine::empty();
+        let candidate = inventory_candidate_observed(
+            &session,
+            InventoryDiagnosticPass::First,
+            || {
+                metadata.set(metadata.get() + 1);
+                panic!("disabled candidate metadata evaluated")
+            },
+            || {
+                calls.set(calls.get() + 1);
+                engine.inventory_candidate(&removed, &[], &[], vec![])
+            },
+        )
+        .unwrap();
+        let admission = inventory_admission_observed(
+            &session,
+            InventoryDiagnosticPass::Final,
+            || {
+                metadata.set(metadata.get() + 1);
+                panic!("disabled admission metadata evaluated")
+            },
+            || {
+                calls.set(calls.get() + 1);
+                engine.inventory_candidate_admission(&session, &candidate, &removed, &[])
+            },
+        );
+        assert_eq!(calls.get(), 2);
+        assert!(admission.targets_ok && !admission.refuses_candidate());
+        assert_eq!(session.preflight_targets.borrow().len(), 1);
+        assert_eq!(metadata.get(), 0);
+    }
+}
 
 #[cfg(test)]
 mod backlog_transfer_tests {

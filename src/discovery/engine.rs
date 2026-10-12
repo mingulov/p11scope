@@ -534,6 +534,9 @@ pub struct Engine {
     /// that can be rendered.
     loader_contexts: BTreeMap<(ProcessViewId, LoaderAggregateKey, bool), LoaderContextClass>,
     pending_loader_scans: BTreeMap<PendingLoaderScanKey, u64>,
+    /// One noncausal catch-up owed by each newly armed live PID context.
+    /// Context retirement bounds and prunes this independently of RT_ADD work.
+    pending_loader_arm_scans: BTreeSet<PendingLoaderScanKey>,
     selection_claims: BTreeMap<SelectionClaimKey, SelectionClaim>,
     selection_tables: BTreeMap<SelectionTableKey, SelectionTableFact>,
     /// Task 1.6 experiment: broad admission. Set once from
@@ -562,6 +565,8 @@ pub struct Engine {
     exploratory_evictions: u64,
     #[cfg(test)]
     loader_memory_scan_attempts: usize,
+    #[cfg(test)]
+    loader_arm_scan_after_scan: Option<fn(&mut Engine)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8465,6 +8470,7 @@ impl Engine {
             selection_tables: BTreeMap::new(),
             loader_contexts: BTreeMap::new(),
             pending_loader_scans: BTreeMap::new(),
+            pending_loader_arm_scans: BTreeSet::new(),
             broad_admit: false,
             exploratory_dirty: BTreeSet::new(),
             deep_scans: 0,
@@ -8472,6 +8478,8 @@ impl Engine {
             exploratory_evictions: 0,
             #[cfg(test)]
             loader_memory_scan_attempts: 0,
+            #[cfg(test)]
+            loader_arm_scan_after_scan: None,
         }
     }
 
@@ -9234,6 +9242,7 @@ impl Engine {
     /// Called when the terminal drain is done: deferred records it still
     /// left undispatched are the one deferral that is a loss (F4).
     pub(crate) fn settle_frame_deferrals_at_capture_end(&mut self) {
+        self.pending_loader_arm_scans.clear();
         if self.pending_discovery_records.is_empty() {
             return;
         }
@@ -9714,6 +9723,7 @@ impl Engine {
     }
 
     fn release_view_id(&mut self, id: ProcessViewId) {
+        self.pending_loader_arm_scans.retain(|key| key.view != id);
         self.exec_rearm_views.remove(&id);
         self.pending_leader_exit_order.remove(&id);
         if let Some(seed) = self.trace_by_view.get(&id).copied() {
@@ -13254,11 +13264,129 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn service_loader_arm_scans(
+        &mut self,
+        due: BTreeSet<PendingLoaderScanKey>,
+        session: &mut dyn EngineSession,
+        additions_allowed: &mut bool,
+        pending_views: &mut PendingViewRetirements,
+        records_pending: bool,
+    ) -> Result<DiscoveryRecordOutcome> {
+        let mut changed = false;
+        let mut complete = true;
+        for key in due {
+            if !self.pending_loader_arm_scans.contains(&key) {
+                continue;
+            }
+            if !*additions_allowed
+                || self.cancellation_requested()
+                || session.mutation_stopped()
+                || self.frame_work_exhausted()
+                || self.budget.stopped_now().is_some()
+                || records_pending
+                || self.discovery_backlog_pending(session.staged_discovery_len())
+                || self.pressure_service_active
+                || self.pressure_rotation_pending
+                || self.pressure_episode.is_some()
+                || self.pressure_protection.block_all
+                || !self.pressure_protection.pids.is_empty()
+                || self.terminal_journal.is_some()
+                || self.terminal_batch.is_some()
+                || !pending_views.is_empty()
+                || !self.pending_retirements.is_empty()
+            {
+                complete = false;
+                break;
+            }
+            let position = self.views.iter().position(|view| view.id() == key.view);
+            let Some(position) = position.filter(|position| {
+                self.views[*position].still_the_same()
+                    && !self
+                        .refresh_requested
+                        .contains_key(&self.views[*position].pid())
+            }) else {
+                self.pending_loader_arm_scans.remove(&key);
+                continue;
+            };
+            let authority = self.loader_arm_scan_authority(position, key);
+            // No memory scan started: keep the exact key when preparation
+            // alone spent this opportunity, without renewing its budget.
+            if self.frame_work_exhausted()
+                || self.budget.stopped_now().is_some()
+                || self.cancellation_requested()
+                || session.mutation_stopped()
+            {
+                complete = false;
+                break;
+            }
+            let Ok(Some(authority)) = authority else {
+                self.pending_loader_arm_scans.remove(&key);
+                continue;
+            };
+            self.pending_loader_arm_scans.remove(&key);
+            self.unpaused_loader_views.insert(key.view);
+            let outcome = self.process_validated_loader_scan(
+                position,
+                key.context,
+                None,
+                Some(authority),
+                None,
+                &[],
+                LoaderScanMode::Memory,
+                session,
+                additions_allowed,
+                pending_views,
+            )?;
+            changed |= outcome.changed();
+            complete &= outcome.required_complete();
+        }
+        Ok(DiscoveryRecordOutcome::applied(changed, complete))
+    }
+
+    /// A catch-up is a scheduling hint, so re-prove the actual armed loader
+    /// against the current original process, held file and exact mapping.
+    fn loader_arm_scan_authority(
+        &mut self,
+        position: usize,
+        key: PendingLoaderScanKey,
+    ) -> Result<Option<LoaderAuthority>> {
+        let Some(context) = self.loader_registry.context(key.context) else {
+            return Ok(None);
+        };
+        if context.spec.view != key.view
+            || self.views[position].id() != key.view
+            || !context.was_attached
+            || self.loader_registry.is_tombstoned(key.context)
+            || !self.views[position].still_the_same()
+            || !self.pinned.check_unchanged().unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        let spec = context.spec.clone();
+        let Some(mapping) = spec.mapping.as_ref() else {
+            return Ok(None);
+        };
+        let Some(locator) = Self::loader_locator(&self.views[position], &mut self.budget)? else {
+            return Ok(None);
+        };
+        let loader_file = self.pinned.file_for(spec.loader);
+        let valid =
+            self.pinned.summary(spec.loader).is_some_and(|loader| {
+                loader.key == ObjectKey::of(mapping) && loader.key == locator.authority.loader_key
+            }) && loader_file.is_some_and(|file| {
+                FileSnapshot::read(file).ok().as_ref() == Some(&locator.authority.interpreter_file)
+            }) && unique_mapping_for_offset(&locator.authority.loader_maps, spec.hook.file_offset)
+                .is_ok_and(|current| current == *mapping);
+        Ok(valid.then_some(locator.authority))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn process_validated_loader_scan(
         &mut self,
         position: usize,
         context_id: LoaderContextId,
-        hook_ts_ns: u64,
+        hook_ts_ns: Option<u64>,
+        catchup_authority: Option<LoaderAuthority>,
         terminal_owner: Option<LoaderContextId>,
         terminal_exports: &[DynamicExportIdentity],
         mode: LoaderScanMode,
@@ -13289,8 +13417,50 @@ impl Engine {
                 &mut self.stage_timings,
             ),
         };
-        let mut skipped = self.absorb_scan_counters(scan_counters);
         self.deep_scans = self.deep_scans.saturating_add(1);
+        #[cfg(test)]
+        if catchup_authority.is_some()
+            && let Some(after_scan) = self.loader_arm_scan_after_scan.take()
+        {
+            after_scan(self);
+        }
+        if let Some(expected) = catchup_authority {
+            if self.original_exited(self.views[position].id()) {
+                return Ok(DiscoveryRecordOutcome::applied(false, true));
+            }
+            if scan_result.is_err()
+                || scan_result.as_ref().is_ok_and(|(_, _, complete)| !complete)
+                || self.budget.stopped_now().is_some()
+                || self.frame_work_exhausted()
+                || self.cancellation_requested()
+                || session.mutation_stopped()
+            {
+                self.mark_partial(
+                    "post-arm provider discovery",
+                    "the one-shot loader-arm catch-up scan did not complete",
+                );
+                return Ok(DiscoveryRecordOutcome::applied(false, false));
+            }
+            let key = PendingLoaderScanKey {
+                view: self.views[position].id(),
+                context: context_id,
+            };
+            let current = self.loader_arm_scan_authority(position, key);
+            if self.original_exited(self.views[position].id()) {
+                return Ok(DiscoveryRecordOutcome::applied(false, true));
+            }
+            if self.budget.stopped_now().is_some() || self.frame_work_exhausted() {
+                self.mark_partial(
+                    "post-arm provider discovery",
+                    "the one-shot loader-arm catch-up scan did not complete",
+                );
+                return Ok(DiscoveryRecordOutcome::applied(false, false));
+            }
+            if !current.is_ok_and(|current| current.as_ref() == Some(&expected)) {
+                return Ok(DiscoveryRecordOutcome::applied(false, true));
+            }
+        }
+        let mut skipped = self.absorb_scan_counters(scan_counters);
         let (mut found, fresh_pins, found_complete) = match scan_result {
             Ok(value) => value,
             Err(error) => {
@@ -13316,7 +13486,35 @@ impl Engine {
                 module.interfaces = current.scanned.interfaces.clone();
             }
         }
-        let export_modules = found.clone();
+        // A catch-up has no loader occurrence to seed an already published
+        // provider again. Keep the full candidate scan, but request export
+        // work only for provider facts this scan actually added or changed.
+        let export_modules: Vec<_> = found
+            .iter()
+            .filter(|module| {
+                hook_ts_ns.is_some()
+                    || !self
+                        .modules
+                        .iter()
+                        .any(|current| current.scanned == **module)
+            })
+            .cloned()
+            .collect();
+        let late_modules: Vec<_> = if hook_ts_ns.is_none() {
+            let retained: Vec<_> = self
+                .modules
+                .iter()
+                .filter(|module| module.scanned.view == self.views[position].id())
+                .map(|module| module.scanned.clone())
+                .collect();
+            export_modules
+                .iter()
+                .filter(|module| is_newly_observed_module(&retained, module))
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         let loader = self
             .loader_registry
             .context(context_id)
@@ -13393,7 +13591,10 @@ impl Engine {
         let mut candidate = self.live_candidate(candidate_pins, raw_modules, skipped)?;
         candidate.views.insert(self.views[position].id());
         let observed = candidate_timing_keys(&candidate, &export_modules);
-        self.observe_causal_timing(&observed, hook_ts_ns);
+        if let Some(hook_ts_ns) = hook_ts_ns {
+            self.observe_causal_timing(&observed, hook_ts_ns);
+        }
+        let late_observed = candidate_timing_keys(&candidate, &late_modules);
         let collected = self.collect_dynamic_export_work(
             context_id,
             &export_modules,
@@ -13449,6 +13650,16 @@ impl Engine {
         self.queue_apply_outcome(&outcome, pending_views);
         let changed = outcome.changed;
         let mut required_complete = required_seed_complete && outcome.required_complete();
+        if outcome.accepted() && !late_observed.is_empty() {
+            for module in late_observed {
+                self.timings.lose(&module);
+            }
+            self.mark_live_loss(
+                "post-arm provider discovery",
+                "a provider was first observed after loader rearm; calls across the unarmed window and before attachment are unknown",
+            );
+            required_complete = false;
+        }
         if terminal_owner.is_none() && outcome.accepted() {
             let (retire, dynamic_complete, _) = self.attach_export_work(
                 self.views[position].id(),
@@ -13525,7 +13736,8 @@ impl Engine {
             match self.process_validated_loader_scan(
                 position,
                 key.context,
-                hook_ts_ns,
+                Some(hook_ts_ns),
+                None,
                 None,
                 &[],
                 LoaderScanMode::Memory,
@@ -13698,12 +13910,16 @@ impl Engine {
             view: view_id,
             context: context_id,
         };
+        // Actual validated loader work owns the scan now, including the
+        // RT_ADD path's existing deferred memory scan. No duplicate catch-up.
+        self.pending_loader_arm_scans.remove(&key);
         if matches!(record.announced_count, 1 | 2) {
             self.defer_loader_memory_scan(key, record.hook_ts_ns);
             let result = self.process_validated_loader_scan(
                 position,
                 context_id,
-                record.hook_ts_ns,
+                Some(record.hook_ts_ns),
+                None,
                 terminal_owner,
                 &terminal_exports,
                 LoaderScanMode::MetadataOnly,
@@ -13735,7 +13951,8 @@ impl Engine {
             let result = self.process_validated_loader_scan(
                 position,
                 context_id,
-                record.hook_ts_ns,
+                Some(record.hook_ts_ns),
+                None,
                 terminal_owner,
                 &terminal_exports,
                 LoaderScanMode::Memory,
@@ -15222,6 +15439,26 @@ impl Engine {
                 self.loader_registry
                     .mark_attached(context)
                     .map_err(|error| LoaderArmFailure::invariant(anyhow!(error)))?;
+                if matches!(self.scope, Scope::Pid(_))
+                    && self.frame_deadline_ns.is_some()
+                    && !self.pause_owned_batch
+                    && self.capture_facts.staged.is_none()
+                {
+                    let key = PendingLoaderScanKey {
+                        view: view_id,
+                        context,
+                    };
+                    if self.pending_loader_arm_scans.len()
+                        < crate::discovery::loader::MAX_LOADER_CONTEXTS
+                    {
+                        self.pending_loader_arm_scans.insert(key);
+                    } else {
+                        self.mark_partial(
+                            "post-arm provider discovery",
+                            "the bounded loader-arm catch-up ledger was full",
+                        );
+                    }
+                }
                 false
             }
             GenerationMutation::PostcheckFailed(Ok(_)) => {
@@ -15744,6 +15981,7 @@ impl Engine {
     /// and the empty-scan rule; a journal still pending keeps the record, and
     /// the timing proof this loss already invalidated is not given back.
     pub(crate) fn settle_terminal_drain(&mut self) {
+        self.pending_loader_arm_scans.clear();
         self.settle_all_pending_loader_scans(
             "a deferred loader memory scan was unresolved at capture cancellation or shutdown",
         );
@@ -16193,6 +16431,10 @@ impl Engine {
             }
         }
         for context_id in self.loader_registry.ids_for_view(view) {
+            self.pending_loader_arm_scans.remove(&PendingLoaderScanKey {
+                view,
+                context: context_id,
+            });
             let Some(context) = self.loader_registry.context(context_id).cloned() else {
                 continue;
             };
@@ -20557,6 +20799,7 @@ impl Engine {
             }
         };
         let fallback_due: BTreeSet<_> = self.pending_loader_scans.keys().copied().collect();
+        let loader_arm_due = self.pending_loader_arm_scans.clone();
         let mut records = queued;
 
         let retained_pids: BTreeSet<_> = self.views.iter().map(ProcessView::pid).collect();
@@ -20620,6 +20863,23 @@ impl Engine {
                 collect,
                 &mut closure,
             )?;
+        }
+        if self.frame_deadline_ns.is_some()
+            && !terminal_dispatch
+            && !self.pause_owned_batch
+            && matches!(self.scope, Scope::Pid(_))
+        {
+            let catchup = self.service_loader_arm_scans(
+                loader_arm_due,
+                session,
+                &mut additions_allowed,
+                &mut pending_views,
+                !records.is_empty(),
+            )?;
+            changed |= catchup.changed();
+            if !catchup.required_complete() {
+                closure.fail();
+            }
         }
         // A frame that deferred records runs no inventory pass: the next
         // frame dispatches them first, then refreshes (H-1). A head
@@ -21080,6 +21340,9 @@ pub(crate) mod session_fixture {
         pub(crate) dynamic_loader_attach_calls: usize,
         pub(crate) dynamic_loader_reports_added: bool,
         pub(crate) dynamic_loader_links: Vec<(LoaderContextId, PinnedObjectId, u64, u64)>,
+        /// Runs once before the next loader link is installed. Tests use
+        /// actual child I/O here to map a provider after inventory's rescan.
+        pub(crate) before_dynamic_loader_attach: Option<Box<dyn FnOnce()>>,
         pub(crate) selection_table_read: Option<(MapEntry, ScannedTable)>,
         /// Killed and reaped from inside `attach_targets`, i.e. exactly between
         /// a generation precheck and its postcheck.
@@ -21652,6 +21915,9 @@ pub(crate) mod session_fixture {
             let identity = (context, object, file_offset, cookie);
             if self.dynamic_loader_links.contains(&identity) {
                 return Ok(false);
+            }
+            if let Some(before_attach) = self.before_dynamic_loader_attach.take() {
+                before_attach();
             }
             attachment_admission(&self.detach_failures, true)
                 .map_err(DynamicLoaderAttachFailure::Registry)?;

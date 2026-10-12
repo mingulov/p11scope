@@ -43,8 +43,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub(crate) mod detailed_identity;
+mod ended_pid_retirement;
 #[allow(dead_code)] // B2 records private facts; B3 supplies request-bound validation.
 mod pid_continuity;
+pub(crate) use ended_pid_retirement::EndedPidRetirement;
 #[cfg(test)]
 pub(crate) use pid_continuity::clock_origins_comparable_with;
 #[cfg(test)]
@@ -4024,6 +4026,24 @@ impl Session {
         self.pid_pairs.gap_summary()
     }
 
+    pub(crate) fn prepare_ended_pid_retirement(
+        &self,
+        view: &crate::process::ProcessView,
+        slots: &[Slot],
+    ) -> Option<EndedPidRetirement> {
+        if self.mutation_stopped() {
+            return None;
+        }
+        EndedPidRetirement::prepare(
+            &self.discovery_domain,
+            self.uprobe_scope,
+            view,
+            slots,
+            &self.links,
+            &self.retained_static,
+        )
+    }
+
     pub(crate) fn bind_exec(
         &self,
         view: &crate::process::ProcessView,
@@ -4899,16 +4919,36 @@ impl Session {
     /// is made even if an earlier one failed; the report carries per-member
     /// rebuild evidence for the caller to apply.
     pub fn detach_slots(&mut self, slots: &[Slot]) -> Result<DetachOutcome> {
+        self.detach_slots_with_ended(slots, None)
+    }
+
+    pub(crate) fn detach_ended_pid_slots(
+        &mut self,
+        slots: &[Slot],
+        owner: &crate::process::ProcessView,
+        ended: &EndedPidRetirement,
+    ) -> Result<DetachOutcome> {
+        self.detach_slots_with_ended(slots, Some((owner, ended)))
+    }
+
+    fn detach_slots_with_ended(
+        &mut self,
+        slots: &[Slot],
+        ended: Option<(&crate::process::ProcessView, &EndedPidRetirement)>,
+    ) -> Result<DetachOutcome> {
         let requested: BTreeSet<_> = slots.iter().map(|slot| slot.index).collect();
         let Some(affected) = plan_group_rebuild(&self.links, &requested) else {
             self.pid_pairs.invalidate(&requested);
-            let detached = self.detach_links(|link| match link {
-                // A group link drops only with all its members.
-                RegisteredLink::MultiUProbe { slots, .. } => {
-                    !slots.is_empty() && slots.iter().all(|slot| requested.contains(slot))
-                }
-                _ => link.slots().iter().any(|slot| requested.contains(slot)),
-            });
+            let detached = self.detach_links_with_ended(
+                |link| match link {
+                    // A group link drops only with all its members.
+                    RegisteredLink::MultiUProbe { slots, .. } => {
+                        !slots.is_empty() && slots.iter().all(|slot| requested.contains(slot))
+                    }
+                    _ => link.slots().iter().any(|slot| requested.contains(slot)),
+                },
+                ended.map(|(owner, proof)| (owner, proof, slots)),
+            );
             prune_linkless_retained(&mut self.retained_static, &self.links);
             return detached.map(|()| DetachOutcome::default());
         };
@@ -5155,6 +5195,14 @@ impl Session {
     }
 
     fn detach_links(&mut self, mut select: impl FnMut(&RegisteredLink) -> bool) -> Result<()> {
+        self.detach_links_with_ended(&mut select, None)
+    }
+
+    fn detach_links_with_ended(
+        &mut self,
+        mut select: impl FnMut(&RegisteredLink) -> bool,
+        ended: Option<(&crate::process::ProcessView, &EndedPidRetirement, &[Slot])>,
+    ) -> Result<()> {
         // Resolve singles' fallible program lookup before extracting any
         // ownership. A refused lookup keeps all native handles untouched and
         // therefore opens no physical detach episode.
@@ -5171,6 +5219,18 @@ impl Session {
                     .try_into()?;
             }
         }
+        let ended = ended
+            .filter(|_| !self.mutation_stopped())
+            .and_then(|(owner, proof, slots)| {
+                proof.check(
+                    &self.discovery_domain,
+                    self.uprobe_scope,
+                    owner,
+                    slots,
+                    &self.links,
+                    &self.retained_static,
+                )
+            });
         let mut choices = choices.into_iter();
         let selected = extract_selected_links(&mut self.links, &mut self.pid_pairs, |_| {
             choices.next().expect("one choice per original link")
@@ -5188,10 +5248,12 @@ impl Session {
         // All fallible group/program preparation has finished; these exact
         // owned handles are about to enter the first actual detach attempt.
         if matches!(self.uprobe_scope, UProbeScope::OneProcess(_)) {
-            self.pid_pairs.begin_gap(
+            ended_pid_retirement::begin_detach_gap(
+                &mut self.pid_pairs,
                 &affected,
                 pid_continuity::comparable_monotonic_ns(),
                 &self.retained_static,
+                ended,
             );
         }
         let mut first_error = None;

@@ -410,6 +410,9 @@ pub struct Engine {
     /// queue not observed empty. Sticky until the scheduler takes it: a
     /// set flag schedules backlog service instead of a full sleep.
     frame_fresh_blocked: bool,
+    /// One-shot scheduling hint after an older leader loss settles with an
+    /// exact newer bound PID EXEC still owed. It grants no admission authority.
+    immediate_exec_recovery_frame: bool,
     /// Terminal-drain quanta that stopped at the shared allowance with
     /// terminal work unfinished. Sticky evidence, like quiescence
     /// overflow: a terminal drain that ends here never claims complete.
@@ -8396,6 +8399,7 @@ impl Engine {
             pressure_service_passes: 0,
             pressure_attempts: 0,
             frame_fresh_blocked: false,
+            immediate_exec_recovery_frame: false,
             terminal_capacity_backlog: 0,
             discovery_held_high_water: 0,
             held_records: BTreeSet::new(),
@@ -17196,6 +17200,11 @@ impl Engine {
         };
     }
 
+    /// Consume only the next-frame scheduling hint, never admission authority.
+    pub(crate) fn take_immediate_exec_recovery_frame(&mut self) -> bool {
+        std::mem::take(&mut self.immediate_exec_recovery_frame)
+    }
+
     /// Keep recovery work owed by a later matched EXEC. This only retains an
     /// existing request; it grants no continuity or attachment authority. The
     /// ordinary next tick still scans, admits and validates every mutation.
@@ -17264,7 +17273,12 @@ impl Engine {
                         .find(|candidate| candidate.id() == *view)
                         .map(ProcessView::pid)
                     {
-                        if !self.pid_exec_after_leader_exit(*view, pid, exit_hook_ts_ns) {
+                        if self.pid_exec_after_leader_exit(*view, pid, exit_hook_ts_ns) {
+                            // Keep this batch closed: protected old-context
+                            // records still use its admission flag. Only the
+                            // next ordinary frame may service the exact EXEC.
+                            self.immediate_exec_recovery_frame = true;
+                        } else {
                             self.clear_refresh_for_view(*view, pid);
                         }
                         // No rescan will settle this view's pending poll, and

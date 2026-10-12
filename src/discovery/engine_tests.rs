@@ -36799,6 +36799,135 @@ fn cold_leader_exit_bound_route() -> (TabledSeedProvider, Engine, ScriptedSessio
 }
 
 #[test]
+fn automatic_exec_cold_leader_exit_bound_exec_requests_one_immediate_next_frame() {
+    let (_fixture, mut engine, mut session, _exec) = cold_leader_exit_bound_route();
+    let pid = engine.views[0].pid();
+    let view = engine.views[0].id();
+    let original_admission = engine.views[0].view_admission();
+    let request = engine.refresh_requested[&pid].clone();
+    let entries_before = engine.plan.entries_seen;
+    let early_unknown_before = engine.newcomer_ages.dropped_unknown;
+    let native_before = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .native_attach_calls;
+    assert!(!engine.take_immediate_exec_recovery_frame());
+
+    let outcome = apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+    assert!(!outcome.required_complete, "the loss remains explicit");
+    assert_eq!(engine.task_uprobe_link_losses, 1);
+    assert!(engine.pending_leader_exit_views.is_empty());
+    assert!(engine.views[0].still_the_same());
+    assert!(
+        engine.views[0]
+            .view_admission()
+            .same_allocation(&original_admission)
+    );
+    assert_eq!(engine.plan.entries_seen, entries_before);
+    assert_eq!(engine.newcomer_ages.dropped_unknown, early_unknown_before);
+    assert_eq!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .native_attach_calls,
+        native_before,
+        "settlement cannot reopen the closed attachment opportunity"
+    );
+    assert!(engine.loader_registry.ids_for_view(view).is_empty());
+    assert_eq!(engine.refresh_requested[&pid], request);
+    assert!(session.physical_gap_summary().open);
+    assert_physical_gap_public_categories(&engine, &["static probe coverage gap incomplete"]);
+    assert!(
+        engine.take_immediate_exec_recovery_frame(),
+        "the exact newer bound EXEC schedules the next eligible frame immediately"
+    );
+    assert!(
+        !engine.take_immediate_exec_recovery_frame(),
+        "one shot only"
+    );
+
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+    assert!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .native_attach_calls
+            > native_before
+    );
+    assert!(!session.physical_gap_summary().open);
+    assert!(!engine.take_immediate_exec_recovery_frame());
+}
+
+#[test]
+fn automatic_exec_cold_leader_exit_immediate_frame_keeps_refusals_closed() {
+    for refusal in ["absent", "unbound", "older", "equal", "foreign", "closed"] {
+        let (_fixture, mut engine, mut session, exec) = cold_leader_exit_bound_route();
+        let pid = engine.views[0].pid();
+        let view = engine.views[0].id();
+        match refusal {
+            "absent" => {
+                engine.refresh_requested.remove(&pid);
+            }
+            "unbound" => engine.refresh_requested.get_mut(&pid).unwrap().exec_binding = None,
+            "older" => {
+                engine.queue_leader_exit_assessment(view, Some(exec.hook_ts_ns + 1));
+            }
+            "equal" => {
+                engine.queue_leader_exit_assessment(view, Some(exec.hook_ts_ns));
+            }
+            "foreign" => {
+                engine.refresh_requested.get_mut(&pid).unwrap().owner =
+                    Some(ProcessViewId(view.0 + 1));
+            }
+            _ => {}
+        }
+        let before = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .native_attach_calls;
+        let mut collect = Engine::collect_discovery_records;
+        let outcome = engine
+            .apply_discovery_batch_with(
+                &mut session,
+                Vec::new(),
+                0,
+                refusal != "closed",
+                false,
+                &mut collect,
+                None,
+            )
+            .unwrap();
+        assert!(!outcome.required_complete, "{refusal}");
+        assert_eq!(engine.task_uprobe_link_losses, 1, "{refusal}");
+        assert_eq!(
+            session
+                .pid_continuity
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .native_attach_calls,
+            before,
+            "{refusal} cannot open a new attachment opportunity"
+        );
+        assert!(
+            engine.loader_registry.ids_for_view(view).is_empty(),
+            "{refusal}"
+        );
+        if refusal != "closed" {
+            assert!(!engine.take_immediate_exec_recovery_frame(), "{refusal}");
+        }
+    }
+}
+
+#[test]
 fn automatic_exec_cold_leader_exit_later_bound_exec_recovers() {
     let (_fixture, mut engine, mut session, _exec) = cold_leader_exit_bound_route();
     let pid = engine.views[0].pid();

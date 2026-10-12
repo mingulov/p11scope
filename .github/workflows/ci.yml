@@ -353,15 +353,15 @@ jobs:
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc libseccomp-dev llvm python3
       - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
-      # Reviewed full-image continuity and fault exhaustion change Detailed;
-      # both Inventory objects remain byte-identical to v0.3.
+      # Reviewed exec task candidacy and dumpability checks change all three
+      # default objects. Use the latest intended BPF-source revision as baseline.
       # The checker reconstructs and explicitly fetches each immutable snapshot,
       # then builds it offline (including nested nightly Cargo). No target cache.
       - name: Compare complete default objects
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=ca3a1814201e2fbc4d3dd747b577fde849320041
+          BASELINE=e2961e08d6760bf617259e3461dc64c37ed4fa24
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \
@@ -1064,7 +1064,18 @@ jobs:
         run: python3 -I scripts/prepare-dependencies.py
       - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
       - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - name: Prepare host coverage linker
+        shell: bash
+        run: |
+          umask 077
+          cat > "$RUNNER_TEMP/coverage-linker" <<'SH'
+          #!/bin/sh
+          exec cc -Wl,--compress-debug-sections=zlib "$@"
+          SH
+          chmod 0700 "$RUNNER_TEMP/coverage-linker"
       - run: python3 -I scripts/ci-test-partition.py run --partition "${{ matrix.partition }}" -- cargo +"$(cat .release-rust-version)" llvm-cov --locked --offline --workspace --all-targets --no-report
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: ${{ runner.temp }}/coverage-linker
       # The scanner rejects objects at or above 256 MiB; fail here after the
       # instrumented build rather than mid-merge when an executable outgrows
       # it. cargo-llvm-cov builds under target/llvm-cov-target (see the pack

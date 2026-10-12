@@ -183,10 +183,14 @@ echo "=== build ==="
 gcc -O0 -o "$WORK/workload" scripts/system-scope-workload.c -ldl
 if [ -z "$BINARY" ]; then
     if [ "$NO_BUILD" -eq 0 ]; then
+        set --
+        if [ "$DETAILED_PROFILE" = wide-detailed-2112 ]; then
+            set -- --features wide-detailed-2112
+        fi
         if [ "$PROFILE" = release ]; then
-            scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --offline --release -p p11scope -p p11scope-discover
+            scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --offline --release -p p11scope -p p11scope-discover "$@"
         else
-            scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --offline -p p11scope -p p11scope-discover
+            scripts/cargo.sh "+$(cat .release-rust-version)" build --locked --offline -p p11scope -p p11scope-discover "$@"
         fi
     fi
     BINARY="$PWD/target/$PROFILE/p11scope"

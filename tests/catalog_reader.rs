@@ -212,11 +212,10 @@ impl Drop for FixtureGuard {
     }
 }
 
-/// Strict-admission asserts (B/MW admitted) hold only when ambient
+/// Strict positive assertions hold only when ambient
 /// processes stay memory-unreadable: ptrace_scope >= 1 and unprivileged.
-/// Any other machine shape relaxes admission *state* only — identity,
-/// tables, classes, and profile-specific N/C admission controls stay
-/// strict everywhere.
+/// Other machines may refuse wide N/C whole for capacity; their admitted
+/// endpoint totals, tables, classes and identities remain exact.
 fn strict_admission() -> bool {
     if unsafe { libc::getuid() } == 0 {
         return false;
@@ -501,6 +500,220 @@ fn assert_no_call_fields(value: &Value) {
     walk(value, &mut String::new());
 }
 
+#[derive(Clone, Copy)]
+struct WholeFixture {
+    class: &'static str,
+    demand: u64,
+    lookalikes: Option<u64>,
+}
+
+const NSS: WholeFixture = WholeFixture {
+    class: "corroborated",
+    demand: 544,
+    lookalikes: None,
+};
+const CLOSURE: WholeFixture = WholeFixture {
+    class: "closure_array",
+    demand: 532,
+    lookalikes: Some(65),
+};
+
+struct WholeAdmission<'a> {
+    state: &'a str,
+    class: &'a str,
+    endpoints: Option<u64>,
+    reason: Option<&'a str>,
+}
+
+fn json_whole_admission(admission: &Value) -> Result<WholeAdmission<'_>, String> {
+    Ok(WholeAdmission {
+        state: admission["state"]
+            .as_str()
+            .ok_or("admission state is missing")?,
+        class: admission["class"]
+            .as_str()
+            .ok_or("admission class is missing")?,
+        endpoints: admission["endpoints"].as_u64(),
+        reason: admission["reason"].as_str(),
+    })
+}
+
+fn text_whole_admission(block: &str) -> Result<WholeAdmission<'_>, String> {
+    let mut lines = block
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with("admission  "));
+    let line = lines.next().ok_or("text admission is missing")?;
+    if lines.next().is_some() {
+        return Err("text object must have exactly one admission".into());
+    }
+    if let Some(admitted) = line.strip_prefix("admission  admitted (") {
+        let (class, rest) = admitted
+            .split_once(", ")
+            .ok_or("text admitted class is missing")?;
+        let (endpoints, _) = rest
+            .split_once(" endpoints;")
+            .ok_or("text admitted endpoint count is missing")?;
+        Ok(WholeAdmission {
+            state: "admitted",
+            class,
+            endpoints: Some(endpoints.parse().map_err(|_| "invalid text endpoints")?),
+            reason: None,
+        })
+    } else if let Some(refused) = line.strip_prefix("admission  refused (") {
+        let (class, reason) = refused
+            .split_once("): ")
+            .ok_or("text refusal reason is missing")?;
+        Ok(WholeAdmission {
+            state: "refused",
+            class,
+            endpoints: None,
+            reason: Some(reason),
+        })
+    } else {
+        Err(format!("unexpected text admission: {line}"))
+    }
+}
+
+fn validate_whole_admission(
+    admission: WholeAdmission<'_>,
+    fixture: WholeFixture,
+    wide: bool,
+    strict: bool,
+) -> Result<(), String> {
+    if admission.class != fixture.class {
+        return Err(format!("expected {} admission class", fixture.class));
+    }
+    match admission.state {
+        "admitted" if wide => {
+            if admission.endpoints != Some(fixture.demand) {
+                return Err(format!(
+                    "expected the whole {}-endpoint admission, got {:?}",
+                    fixture.demand, admission.endpoints
+                ));
+            }
+            Ok(())
+        }
+        "refused" if !wide || !strict => {
+            let reason = admission.reason.ok_or("whole refusal reason is missing")?;
+            let capacity = if wide { 2112 } else { 512 };
+            if admission.endpoints.is_some()
+                || !reason.contains(&format!("module needs {} more", fixture.demand))
+                || !reason.contains(&format!("only {capacity} attach slots"))
+                || !reason.contains("refusing to attach a prefix")
+                || fixture.lookalikes.is_some_and(|tables| {
+                    !reason.contains(&format!("prefix of its {tables} lookalike"))
+                })
+            {
+                return Err(format!(
+                    "expected a capacity-shaped whole refusal: {reason}"
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(format!(
+            "unexpected {} admission for wide={wide}, strict={strict}",
+            admission.state
+        )),
+    }
+}
+
+// Literal public refusal shapes; no planner or provider-demand computation.
+const NSS_WIDE_REFUSAL: &str = "module needs 544 more; only 2112 attach slots are available; 1700 are in use (1700 active, 0 retired) — refusing to attach a prefix";
+const CLOSURE_WIDE_REFUSAL: &str = "module needs 532 more; only 2112 attach slots are available; 1207 are in use (1207 active, 0 retired); 528 are reserved for providers with a corroborated function table — refusing to attach a prefix of its 65 lookalike function tables";
+
+#[test]
+fn catalog_admission_oracle_accepts_relaxed_wide_whole_refusals() {
+    for (fixture, class, reason) in [
+        (NSS, "corroborated", NSS_WIDE_REFUSAL),
+        (CLOSURE, "closure_array", CLOSURE_WIDE_REFUSAL),
+    ] {
+        let json = serde_json::json!({ "state": "refused", "class": class, "reason": reason });
+        let text = format!("  admission  refused ({class}): {reason} [scan-only admission]");
+        validate_whole_admission(json_whole_admission(&json).unwrap(), fixture, true, false)
+            .unwrap();
+        validate_whole_admission(text_whole_admission(&text).unwrap(), fixture, true, false)
+            .unwrap();
+        for invalid_reason in [
+            "provider metadata unavailable",
+            "module needs 68 more; only 2112 attach slots are available — refusing to attach a prefix",
+        ] {
+            let json = serde_json::json!({
+                "state": "refused", "class": class, "reason": invalid_reason,
+            });
+            let text =
+                format!("  admission  refused ({class}): {invalid_reason} [scan-only admission]");
+            assert!(
+                validate_whole_admission(
+                    json_whole_admission(&json).unwrap(),
+                    fixture,
+                    true,
+                    false,
+                )
+                .is_err()
+            );
+            assert!(
+                validate_whole_admission(
+                    text_whole_admission(&text).unwrap(),
+                    fixture,
+                    true,
+                    false,
+                )
+                .is_err()
+            );
+        }
+    }
+}
+
+#[test]
+fn catalog_admission_oracle_rejects_strict_wide_refusals() {
+    for (fixture, class, reason) in [
+        (NSS, "corroborated", NSS_WIDE_REFUSAL),
+        (CLOSURE, "closure_array", CLOSURE_WIDE_REFUSAL),
+    ] {
+        let json = serde_json::json!({ "state": "refused", "class": class, "reason": reason });
+        let text = format!("  admission  refused ({class}): {reason} [scan-only admission]");
+        assert!(
+            validate_whole_admission(json_whole_admission(&json).unwrap(), fixture, true, true)
+                .is_err()
+        );
+        assert!(
+            validate_whole_admission(text_whole_admission(&text).unwrap(), fixture, true, true)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn catalog_admission_oracle_rejects_admitted_prefixes() {
+    for (fixture, class, endpoints) in [(NSS, "corroborated", 68), (CLOSURE, "closure_array", 20)] {
+        let json =
+            serde_json::json!({ "state": "admitted", "class": class, "endpoints": endpoints });
+        let text =
+            format!("  admission  admitted ({class}, {endpoints} endpoints; scan-only admission)");
+        for strict in [false, true] {
+            assert!(
+                validate_whole_admission(
+                    json_whole_admission(&json).unwrap(),
+                    fixture,
+                    true,
+                    strict,
+                )
+                .is_err()
+            );
+            assert!(
+                validate_whole_admission(
+                    text_whole_admission(&text).unwrap(),
+                    fixture,
+                    true,
+                    strict,
+                )
+                .is_err()
+            );
+        }
+    }
+}
+
 #[test]
 fn catalog_reader_finds_every_fixture_object() {
     let _guard = serial_guard();
@@ -583,7 +796,8 @@ fn catalog_reader_finds_every_fixture_object() {
 
     // N: eight interface-linked tables (publication evidence), with 544
     // distinct physical endpoints. Default refuses the whole object;
-    // wide must admit the complete union, never a strongest-table prefix.
+    // strict wide must admit the complete union, never a strongest-table
+    // prefix; relaxed wide may instead report a whole capacity refusal.
     let n = object_for(doc, &run.pids, "nss.so");
     let n_tables = tables_of(n);
     assert_eq!(n_tables.len(), 8);
@@ -602,21 +816,17 @@ fn catalog_reader_finds_every_fixture_object() {
         assert_eq!(iface["table"], index as u64);
     }
     assert_eq!(n["admission"]["class"], "corroborated");
-    if wide {
-        assert_eq!(n["admission"]["state"], "admitted");
-        assert_eq!(n["admission"]["endpoints"], 544);
-    } else {
-        assert_eq!(n["admission"]["state"], "refused");
-        let n_reason = n["admission"]["reason"].as_str().unwrap();
-        assert!(
-            n_reason.contains("544") && n_reason.contains("512"),
-            "NSS refusal must be the 544-over-512 capacity whole-refusal: {n_reason}"
-        );
-    }
+    validate_whole_admission(
+        json_whole_admission(&n["admission"]).unwrap(),
+        NSS,
+        wide,
+        strict,
+    )
+    .unwrap();
 
     // C: 65 bare heuristic tables, no triples, 532 distinct endpoints.
     // Closure classification survives the wider budget: default refuses
-    // whole; wide admits whole under the same shared-scope policy.
+    // whole; wide admits whole when cumulative shared capacity permits.
     let c = object_for(doc, &run.pids, "closure.so");
     let c_tables = tables_of(c);
     assert_eq!(c_tables.len(), 65);
@@ -631,17 +841,13 @@ fn catalog_reader_finds_every_fixture_object() {
         0
     );
     assert_eq!(c["admission"]["class"], "closure_array");
-    if wide {
-        assert_eq!(c["admission"]["state"], "admitted");
-        assert_eq!(c["admission"]["endpoints"], 532);
-    } else {
-        assert_eq!(c["admission"]["state"], "refused");
-        let c_reason = c["admission"]["reason"].as_str().unwrap();
-        assert!(
-            c_reason.contains("65") && c_reason.contains("lookalike"),
-            "closure refusal must name the 65 lookalike tables: {c_reason}"
-        );
-    }
+    validate_whole_admission(
+        json_whole_admission(&c["admission"]).unwrap(),
+        CLOSURE,
+        wide,
+        strict,
+    )
+    .unwrap();
 
     // M: admitted multi-table shape. Four file-backed templates; any
     // interface triple here is spurious data, never standard linkage.
@@ -770,9 +976,9 @@ fn catalog_reader_finds_every_fixture_object() {
     // Fixture-owned admissions only: an ambient same-uid process keeps its
     // maps readable under ptrace_scope=1, so a desktop's libp11-kit is
     // cataloged and admitted at 0 endpoints, while a hosted runner maps
-    // none. N/C are default whole-refusals and wide whole-admissions;
-    // T/H have zero endpoints and always fit. B/M admission remains
-    // ambient-sensitive, hence the strict gate.
+    // none. N/C are default whole-refusals and strict wide whole-admissions;
+    // T/H have zero endpoints and always fit. Wide N/C, like B/M, may be
+    // refused after readable ambient occupancy, hence the strict gate.
     assert_eq!(h["admission"]["state"], "admitted");
     let fixture_admitted = [b, m, t, h, n, c]
         .iter()
@@ -785,10 +991,7 @@ fn catalog_reader_finds_every_fixture_object() {
             "B, M, T and H must be admitted, plus N/C in the wide profile"
         );
     } else {
-        assert!(
-            fixture_admitted >= if wide { 4 } else { 2 },
-            "T/H must be admitted, plus N/C in the wide profile"
-        );
+        assert!(fixture_admitted >= 2, "T/H must be admitted");
     }
     for object in objects {
         assert_eq!(object["admission"]["scan_only"], true);
@@ -835,18 +1038,7 @@ fn catalog_reader_finds_every_fixture_object() {
     }
     // Read each fixture's own object block: ambient objects must never
     // satisfy the NSS/closure text admission checks.
-    for (name, admitted_fragment, refused_fragment) in [
-        (
-            "nss.so",
-            "admitted (corroborated, 544 endpoints;",
-            "refused (corroborated)",
-        ),
-        (
-            "closure.so",
-            "admitted (closure_array, 532 endpoints;",
-            "refused (closure_array)",
-        ),
-    ] {
+    for (name, fixture) in [("nss.so", NSS), ("closure.so", CLOSURE)] {
         let path = fixtures.dir.join(name);
         let block = text
             .split("object[")
@@ -857,15 +1049,8 @@ fn catalog_reader_finds_every_fixture_object() {
                     .is_some_and(|header| header.ends_with(path.to_str().unwrap()))
             })
             .unwrap_or_else(|| panic!("text must contain the {name} object block: {text}"));
-        let fragment = if wide {
-            admitted_fragment
-        } else {
-            refused_fragment
-        };
-        assert!(
-            block.contains(fragment),
-            "{name} text admission must carry {fragment:?}: {block}"
-        );
+        validate_whole_admission(text_whole_admission(block).unwrap(), fixture, wide, strict)
+            .unwrap_or_else(|error| panic!("{name} text admission: {error}: {block}"));
     }
     for phase in ["enumerating", "deep-scanning", "rendering"] {
         assert!(

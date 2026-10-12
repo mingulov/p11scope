@@ -4527,7 +4527,7 @@ impl Session {
         self.has_dynamic_link(context, return_program, target.0, target.1, cookie)
     }
 
-    fn has_dynamic_link(
+    pub(crate) fn has_dynamic_link(
         &self,
         context: LoaderContextId,
         program: &'static str,

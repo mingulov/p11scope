@@ -108,6 +108,34 @@ impl Case {
         }
         assert_eq!(self.engine.refresh_requested.len(), MAX_PENDING_REFRESH);
     }
+
+    fn scan_context(
+        &mut self,
+        view: ProcessViewId,
+        mapping: Option<MapEntry>,
+    ) -> PendingLoaderScanKey {
+        let object = self.engine.plan.slots[0].object;
+        let offset = mapping
+            .as_ref()
+            .map_or(0x1000, |mapping| mapping.file_offset + 1);
+        let prepared = self
+            .engine
+            .loader_registry
+            .preflight(LoaderContextSpec {
+                view,
+                loader: object,
+                mapping,
+                hook: p11scope_manifest::elf::SymbolFact {
+                    virtual_address: offset,
+                    file_offset: offset,
+                },
+                state_address: None,
+            })
+            .unwrap();
+        let context = self.engine.loader_registry.prepare(prepared).unwrap();
+        self.engine.loader_registry.mark_attached(context).unwrap();
+        PendingLoaderScanKey { view, context }
+    }
 }
 
 impl Drop for Case {
@@ -246,7 +274,11 @@ fn async_global_empty_queue_poll_keeps_pending_without_progress_or_scan() {
         .unwrap();
     assert!(outcome.pending && !outcome.progressed && !outcome.changed);
     assert_eq!(case.engine.deep_scans, scans);
-    assert_eq!(case.session.counter_reads(), counters);
+    assert_eq!(
+        case.session.counter_reads(),
+        counters + 1,
+        "read-only loss evidence remains fresh while mutation waits"
+    );
     assert!(
         case.session
             .global_retirement
@@ -611,4 +643,185 @@ fn async_global_quiet_handoff_still_runs_one_fresh_scoped_scan_after_hint_consum
     assert!(case.session.attached_slots.iter().all(|count| *count == 0));
     assert!(!case.engine.global_retirement_frame_owed);
     assert!(!case.engine.take_immediate_exec_recovery_frame());
+}
+
+#[test]
+fn async_global_fix_round_fallback_first_scan_parks_other_held_view() {
+    let mut case = Case::new();
+    let _scope = case.bounded_scope();
+    let peers = e06_spawn_sleeps(1);
+    let other = ProcessView::open(ProcessViewId(4), peers[0].pid()).unwrap();
+    let other_id = other.id();
+    case.engine.views.push(other);
+    let first = case.scan_context(case.engine.views[0].id(), None);
+    let second = case.scan_context(other_id, None);
+    case.engine.pending_loader_scans.insert(first, 11);
+    case.engine.pending_loader_scans.insert(second, 22);
+    let scans = case.engine.deep_scans;
+    let outcome = case
+        .engine
+        .service_pending_loader_scans(
+            BTreeSet::from([first, second]),
+            &mut case.session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .unwrap();
+    assert!(
+        case.engine.pending_global_retirement.is_some(),
+        "the first real scan handed off its original owned static pair"
+    );
+    case.entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(!outcome.required_complete());
+    assert_eq!(
+        case.engine.deep_scans,
+        scans + 1,
+        "the later held view must not be scanned behind the ticket"
+    );
+    assert_eq!(case.engine.pending_loader_scans.get(&second), Some(&22));
+    assert!(case.session.attached_slots.is_empty());
+}
+
+#[test]
+fn async_global_fix_round_nonpressure_backlog_handoff_keeps_fifo_over_one_quantum() {
+    let mut case = Case::new();
+    let _scope = case.bounded_scope();
+    let object = case.engine.plan.slots[0].object;
+    let key = case.engine.pinned.summary(object).unwrap().key;
+    let maps = Engine::read_maps(&case.engine.views[0], &mut case.engine.budget).unwrap();
+    let mapping = maps
+        .iter()
+        .find(|mapping| mapping.permissions[2] == b'x' && ObjectKey::of(mapping) == key)
+        .unwrap()
+        .clone();
+    let address = mapping.start + 1;
+    let context = case.scan_context(case.engine.views[0].id(), Some(mapping));
+    let mut loader = loader_record_for(context.context, case.child.id());
+    loader.table_ptr = address;
+    loader.hook_ts_ns = case.engine.views[0].admitted_ns() + 1;
+    case.session.counters.loader_hits = 1;
+    let mut records = vec![QueuedDiscoveryRecord {
+        record: loader,
+        terminal_owner: None,
+        terminal_exports: Vec::new(),
+    }];
+    for index in 1..300 {
+        let mut queued = refresh_exec(9_000_000);
+        queued.record.hook_ts_ns = index;
+        records.push(queued);
+    }
+    case.engine.pending_discovery_records = records;
+    let outcome = case
+        .engine
+        .service_backlog_quantum(&mut case.session)
+        .unwrap();
+    assert!(outcome.pending && outcome.changed);
+    assert!(case.engine.pending_global_retirement.is_some());
+    case.entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        case.engine.pressure_service_passes, 0,
+        "this is an ordinary loader handoff"
+    );
+    assert!(!case.engine.pressure_rotation_pending && !case.engine.frame_deferred);
+    let actual: Vec<_> = case
+        .engine
+        .pending_discovery_records
+        .iter()
+        .map(|queued| queued.record.hook_ts_ns)
+        .collect();
+    assert_eq!(
+        actual,
+        (1..300).collect::<Vec<_>>(),
+        "older unserviced head suffix must precede the newer queue rest"
+    );
+}
+
+#[test]
+fn async_global_fix_round_deferred_pending_refused_and_terminal_publish_fresh_counters() {
+    for (refused, terminal, backlog) in [
+        (false, false, false),
+        (false, true, false),
+        (true, false, false),
+        (true, true, false),
+        (false, false, true),
+        (true, false, true),
+    ] {
+        let mut case = Case::with_close_failure(refused);
+        case.hold_pending();
+        if refused {
+            case.release();
+            wait_for(|| {
+                case.session
+                    .global_retirement
+                    .as_ref()
+                    .unwrap()
+                    .borrow_mut()
+                    .poll(case.engine.pending_global_retirement.as_ref().unwrap())
+                    == crate::attach::RetirementPoll::Refused
+            });
+        }
+        case.session.counters.ring_loss = 3;
+        case.session.counters.export_state_failures = 4;
+        case.session.counters.export_bounded_read_failures = 5;
+        case.session.counters.loader_state_read_failures = 7;
+        if backlog {
+            let outcome = case
+                .engine
+                .service_backlog_quantum(&mut case.session)
+                .unwrap();
+            assert!(outcome.pending && !outcome.progressed);
+        } else {
+            let mut collect = |_: &mut dyn EngineSession| Ok((Vec::new(), 0));
+            let outcome = case
+                .engine
+                .apply_discovery_batch_with(
+                    &mut case.session,
+                    Vec::new(),
+                    0,
+                    !terminal,
+                    terminal,
+                    &mut collect,
+                    None,
+                )
+                .unwrap();
+            assert!(!outcome.required_complete);
+        }
+        assert_eq!(
+            case.engine.capture_facts().discovery_losses(),
+            [3, 4, 5, 0],
+            "fresh absolute producer loss stays visible while ownership is deferred"
+        );
+        assert_eq!(case.engine.counter_snapshot.loader_state_read_failures, 7);
+        assert!(
+            case.engine
+                .plan
+                .skipped
+                .iter()
+                .any(|skip| skip.reason.contains("loader-state read failures"))
+        );
+        assert!(
+            case.engine
+                .plan
+                .skipped
+                .iter()
+                .any(|skip| skip.reason.contains("could not reserve"))
+        );
+        assert!(case.engine.pending_global_retirement.is_some());
+        assert!(case.session.attached_slots.is_empty());
+    }
+    let mut case = Case::new();
+    case.hold_pending();
+    case.session.fail_counter_reads([true]);
+    let record = refresh_exec(9_000_000).record;
+    assert!(
+        case.engine
+            .apply_discovery_batch(&mut case.session, vec![record], 0)
+            .is_err()
+    );
+    assert_eq!(
+        case.engine.pending_discovery_records.len(),
+        1,
+        "failed loss reads must retain the undispatched prefix"
+    );
+    assert!(case.engine.pending_global_retirement.is_some());
 }

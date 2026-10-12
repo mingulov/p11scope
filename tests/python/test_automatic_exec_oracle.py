@@ -14,6 +14,7 @@ Python subprocesses; no privileged observer capture or cgroups are run.
 """
 
 import copy
+import contextlib
 from collections import Counter
 import inspect
 import io
@@ -560,6 +561,342 @@ class RapidSuccessorTest(unittest.TestCase):
             else: receipt["successor_ready"][1]["marker_fn"] = "C_GetInfo"
             result = H6["evaluate_trace_h6"](text, ledger, receipt)
             self.assertFalse(result["pass"], result)
+
+
+class InitialLoadFixtureTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.provider = Path("/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so")
+        if not cls.provider.is_file() or not shutil.which("softhsm2-util") or not shutil.which("cc"):
+            raise unittest.SkipTest("requires existing SoftHSM/cc; installs nothing")
+        cls.temporary = tempfile.TemporaryDirectory(prefix="h6-initial-load-")
+        cls.addClassCleanup(cls.temporary.cleanup)
+        cls.directory = Path(cls.temporary.name)
+        cls.executable = cls.directory / "caller with spaces"
+        compiled = subprocess.run(
+            ["cc", "-std=c11", *H6["CALLER_CFLAGS"], str(ROOT / "tests/fixtures/cgroup-trace/caller.c"),
+             "-ldl", "-lpthread", "-o", str(cls.executable)],
+            capture_output=True, text=True, timeout=20)
+        if compiled.returncode:
+            raise AssertionError(compiled.stderr)
+        tokens = cls.directory / "tokens"
+        tokens.mkdir(mode=0o700)
+        config = cls.directory / "softhsm2.conf"
+        config.write_text(f"directories.tokendir = {tokens}\nobjectstore.backend = file\nlog.level = ERROR\n")
+        cls.env = dict(os.environ, SOFTHSM2_CONF=str(config), N3_PRIVATE_ENV=H6["CANARIES"][1])
+        subprocess.run(["softhsm2-util", "--init-token", "--free", "--label", "h6-initial-load",
+                        "--so-pin", "5678", "--pin", "1234"], env=cls.env,
+                       check=True, capture_output=True, timeout=30)
+        cls.pin = H6["FilePin"](cls.executable)
+        cls.addClassCleanup(cls.pin.close)
+
+    def setUp(self):
+        self.ctx = H6["Case"](SimpleNamespace(out=self.directory, uid=os.getuid(), gid=os.getgid()))
+        self.addCleanup(H6["cleanup_leg_resources"], self.ctx)
+
+    def start(self, deadline=None, extra=(), image=0, prefix=()):
+        argv = [*prefix, str(self.executable), str(self.provider), str(image), "selected",
+                "--canary", H6["CANARIES"][2]]
+        if deadline is not None:
+            argv += ["--h6-load-deadline", str(deadline)]
+        owner = H6["spawn_owned"](
+            self.ctx.owners, [*argv, *extra], os.getuid(), env=self.env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True)
+        reader = H6["owned_reader"](self.ctx.readers, H6["Reader"], owner.popen.stdout,
+                                    self.directory / f"load-{owner.pid}.out")
+        H6["owned_reader"](self.ctx.readers, H6["Reader"], owner.popen.stderr,
+                           self.directory / f"load-{owner.pid}.err")
+        return owner, reader
+
+    def send(self, owner, command):
+        owner.verify()
+        owner.popen.stdin.write(command)
+        owner.popen.stdin.flush()
+
+    def unloaded(self, owner, reader):
+        try:
+            reader.record("ack", 0, "load-wait", seconds=1)
+        except TimeoutError:
+            if owner.popen.poll() is not None:
+                self.fail(f"caller exited rc={owner.popen.returncode} before required load-wait acknowledgement")
+            raise
+        image = self.pin.image_receipt(reader.record("image", 0), owner)
+        self.assertNotIn(str(self.provider), Path(f"/proc/{owner.pid}/maps").read_text())
+        self.assertFalse(any(row["kind"] in ("target", "call", "ready") for row in reader.records))
+        return image
+
+    def targets(self, owner, reader, image):
+        rows = [row for row in reader.records if row["kind"] == "target" and row["image"] == image]
+        self.assertEqual({row["fn"] for row in rows}, {
+            "C_GetFunctionList", "C_Initialize", "C_Finalize", "C_GetInfo", "C_GetSlotList",
+            "C_OpenSession", "C_CloseSession", "C_GetSessionInfo", "C_GenerateRandom"})
+        self.assertEqual(len(rows), 9)
+        maps = [line.split(maxsplit=5) for line in Path(f"/proc/{owner.pid}/maps").read_text().splitlines()]
+        for row in rows:
+            self.assertGreater(row["vaddr"], 0)
+            mapping = next(cols for cols in maps if "x" in cols[1]
+                           and int(cols[0].split("-")[0], 16) <= row["vaddr"]
+                           < int(cols[0].split("-")[1], 16))
+            self.assertEqual(row["dev"], [int(value, 16) for value in mapping[3].split(":")])
+            self.assertEqual(row["ino"], int(mapping[4]))
+            self.assertEqual(row["file_offset"], row["vaddr"] - int(mapping[0].split("-")[0], 16)
+                             + int(mapping[2], 16))
+        return {row["fn"]: row for row in rows}
+
+    def retired(self, owner, reader, rc=0, unloaded=False):
+        self.assertEqual(owner.popen.wait(timeout=2), rc)
+        H6["cleanup_leg_resources"](self.ctx)
+        self.assertIsNone(owner.pidfd)
+        self.assertFalse(Path(f"/proc/{owner.pid}").exists())
+        self.assertTrue(all(stream.closed for stream in
+                            (owner.popen.stdin, owner.popen.stdout, owner.popen.stderr)))
+        self.assertFalse(self.ctx.readers)
+        if unloaded:
+            self.assertFalse(any(row["kind"] in ("target", "call", "ready") for row in reader.records))
+
+    def test_initial_latch_keeps_provider_absent_until_load_and_preserves_exec(self):
+        owner, reader = self.start(time.monotonic_ns() + 3_000_000_000, prefix=("setarch", "-R"))
+        images = [self.unloaded(owner, reader)]
+        self.send(owner, "load 0\ncalls C_GetInfo 1 0 initial selected\n")
+        reader.record("ready", 0, seconds=1)
+        reader.record("ack", 0, "initial", seconds=1)
+        before = self.targets(owner, reader, 0)
+        H6["caller_exec"](owner, reader, images, "exec", self.pin)
+        after = self.targets(owner, reader, 1)
+        self.assertEqual(images[0]["pid"], images[1]["pid"])
+        self.assertEqual(images[0]["start_time"], images[1]["start_time"])
+        for fn in before:
+            for field in ("dev", "ino", "file_offset"):
+                self.assertEqual(before[fn][field], after[fn][field])
+        self.assertTrue(H6["session_reuse_from"](reader.records)["observed"])
+        self.assertEqual(sum(row["kind"] == "exec" for row in reader.records), 1)
+        self.assertEqual(sum(row["kind"] == "ack" and row["phase"] == "load-wait"
+                             for row in reader.records), 1)
+        self.send(owner, "stop\n")
+        reader.record("ack", 1, "done", seconds=1)
+        self.retired(owner, reader)
+
+    def test_preload_stop_and_eof_never_load_provider(self):
+        for eof in (False, True):
+            with self.subTest(eof=eof):
+                owner, reader = self.start(time.monotonic_ns() + 2_000_000_000)
+                self.unloaded(owner, reader)
+                if eof:
+                    owner.popen.stdin.close()
+                else:
+                    self.send(owner, "stop\n")
+                    reader.record("ack", 0, "done", seconds=1)
+                self.retired(owner, reader, rc=1 if eof else 0, unloaded=True)
+
+    def test_invalid_or_partial_load_is_bounded_before_provider(self):
+        for command in ("load 1\n", " load 0\n", "load 0\r\n", "x" * 32 + "\n", "load 0\0\n", "load "):
+            with self.subTest(command=command):
+                owner, reader = self.start(time.monotonic_ns() + 200_000_000)
+                self.unloaded(owner, reader)
+                self.send(owner, command)
+                self.retired(owner, reader, rc=1 if command == "load " else 2, unloaded=True)
+
+    def test_invalid_deadlines_images_and_gate_combinations_fail_before_provider(self):
+        cases = [(value, (), 0) for value in ("", "0", "-1", "12x", "18446744073709551616",
+                                              str(time.monotonic_ns() - 1))]
+        future = time.monotonic_ns() + 3_000_000_000
+        cases += [(future, (), 1), (future, ("--start-gate", "/unused"), 0),
+                  (future, ("--auto-gate", "/unused"), 0),
+                  (future, ("--h6-load-deadline", str(future)), 0)]
+        for deadline, extra, image in cases:
+            with self.subTest(deadline=deadline, extra=extra, image=image):
+                # These reject before the image protocol starts. subprocess.run
+                # owns/reaps a fast exit without racing /proc namespace reads.
+                completed = subprocess.run(
+                    [str(self.executable), str(self.provider), str(image), "selected",
+                     "--canary", H6["CANARIES"][2], "--h6-load-deadline", str(deadline), *extra],
+                    env=self.env, input="", capture_output=True, text=True, timeout=2)
+                self.assertEqual(completed.returncode, 2)
+                self.assertEqual(completed.stdout, "")
+
+    def test_duplicate_load_cannot_reload_provider(self):
+        owner, reader = self.start(time.monotonic_ns() + 2_000_000_000)
+        self.unloaded(owner, reader)
+        self.send(owner, "load 0\n")
+        reader.record("ready", 0, seconds=1)
+        self.targets(owner, reader, 0)
+        self.send(owner, "load 0\n")
+        self.retired(owner, reader, rc=2)
+        self.assertEqual(sum(row["kind"] == "target" for row in reader.records), 9)
+        self.assertEqual(sum(row["kind"] == "ready" for row in reader.records), 1)
+
+    def test_default_launch_still_loads_without_latch(self):
+        owner, reader = self.start()
+        reader.record("ready", 0, seconds=1)
+        self.targets(owner, reader, 0)
+        self.assertFalse(any(row["kind"] == "ack" and row["phase"] == "load-wait" for row in reader.records))
+        self.send(owner, "stop\n")
+        reader.record("ack", 0, "done", seconds=1)
+        self.retired(owner, reader)
+
+    def drive_initial(self, mode="trace", ready_error=None, warm_error=None):
+        provider_pin = H6["FilePin"](self.provider)
+        self.addCleanup(provider_pin.close)
+        self.ctx.provider_pin, self.ctx.binary = provider_pin, self.pin
+        self.ctx.pins = {"caller": self.pin}
+        events, children = [], []
+        self.driven_events, self.driven_children = events, children
+        leg_dir = self.directory / f"driven-{time.monotonic_ns()}"
+        leg_dir.mkdir()
+        (leg_dir / "trace.file.txt").write_text("")
+        (leg_dir / f"{mode}.json").write_text("{}")
+        def observer(*_args, **_kwargs):
+            scope = self.ctx.scopes[-1]
+            owner, reader = scope.owners[0], scope.readers[0]
+            children.append((owner, reader))
+            self.assertFalse(str(self.provider) in Path(f"/proc/{owner.pid}/maps").read_text(),
+                             "provider was already mapped before observer startup")
+            self.assertTrue(any(row["kind"] == "ack" and row["phase"] == "load-wait"
+                                for row in reader.records))
+            self.assertFalse(any(row["kind"] in ("target", "call", "ready") for row in reader.records))
+            events.append("observer-start")
+            return SimpleNamespace(), SimpleNamespace(lines=[]), SimpleNamespace(lines=[]), time.monotonic_ns()
+        def ready(*_args, **kwargs):
+            self.assertTrue(kwargs["allow_empty"])
+            events.append("observer-ready")
+            if ready_error:
+                raise ready_error
+            return time.monotonic_ns()
+        command = H6["n3_command"]
+        def calls(caller, reader, fn, count, delay, phase, scope, image=0, group=None, phases=None, **kwargs):
+            events.append(f"{phase}:{image}:{count}")
+            # Preserve real call populations; this unprivileged controller
+            # test needs no measurement delay or observer process.
+            return command(caller, reader, fn, count, 0, phase, scope, image, group, phases, **kwargs)
+        def drain(_capture, caller, reader, fn, count, delay, phase, image, phases):
+            return calls(caller, reader, fn, count, delay, phase, "selected", image, None, phases)
+        def warm(_capture, caller, reader, image, phases, *_args, **_kwargs):
+            phase = f"successor-{image['image']}-1"
+            calls(caller, reader, "C_GetInfo", 1, 0, phase, "selected", image["image"], None, phases)
+            if warm_error:
+                raise warm_error
+            return {"image": image["image"], "phases": [phase]}
+        spawn_owned = H6["spawn_owned"]
+        def spawn(owners, argv, uid, **options):
+            # Production runs as root and drops credentials. This control
+            # already runs as the exact owned uid/gid, without setgroups.
+            self.assertEqual(options.pop("user"), os.getuid())
+            self.assertEqual(options.pop("group"), os.getgid())
+            self.assertEqual(options.pop("extra_groups"), [])
+            return spawn_owned(owners, argv, uid, **options)
+        trace_oracle, profile_oracle = H6["evaluate_trace_h6"], H6["evaluate_profile_h6"]
+        def judge(*args):
+            trace = isinstance(args[0], str)
+            receipt = args[2] if trace else args[3]
+            if receipt.get("backend_refused"):
+                evaluate = trace_oracle if trace else profile_oracle
+                return evaluate(*args)
+            return {"pass": True}  # Controller-only route; no capture acceptance claimed.
+        changes = {"init_token": lambda *_args: dict(self.env), "spawn_observer": observer,
+                   "spawn_owned": spawn,
+                   "observer_ready": ready, "warm_caller": warm, "n3_command": calls,
+                   "drain_trace_phase": drain, "stop_observer": lambda *_args: (0, time.monotonic_ns(), 0),
+                   "finish_readers": lambda *_args: None,
+                   "evaluate_trace_h6": judge, "evaluate_profile_h6": judge,
+                   "evaluate_metrics_h6": judge}
+        with mock.patch.dict(H6["run_pid_caller_leg"].__globals__, changes):
+            result = H6["run_pid_caller_leg"](
+                self.ctx, "pid-reexec", "singles", mode, leg_dir, True, prefix=("setarch", "-R"))
+        return result, events, children, leg_dir
+
+    def test_reexec_controller_starts_observer_before_load_and_proves_both_images(self):
+        for mode in ("trace", "profile", "metrics"):
+            with self.subTest(mode=mode):
+                result, events, children, leg_dir = self.drive_initial(mode)
+                self.assertTrue(result["pass"])
+                self.assertEqual(events, ["observer-start", "observer-ready", "successor-0-1:0:1",
+                                          "warm:0:3", "successor-1-1:1:1", "measured:1:10"])
+                receipt = json.loads((leg_dir / "receipt.json").read_text())
+                load = receipt["initial_load"]
+                self.assertLessEqual(receipt["observer_ready_ns"], load["released_ns"])
+                self.assertLessEqual(load["released_ns"], load["ready_ns"])
+                self.assertLessEqual(load["ready_ns"], load["deadline_ns"])
+                self.assertEqual(load["proof"]["image"], 0)
+                self.assertEqual([proof["image"] for proof in receipt["successor_ready"]], [1])
+                owner, reader = children[0]
+                self.assertEqual(sum(row["kind"] == "target" for row in reader.records), 18)
+                self.assertIsNone(owner.pidfd)
+                self.assertFalse(Path(f"/proc/{owner.pid}").exists())
+
+    def test_observer_refusal_or_error_retires_unloaded_caller(self):
+        for error in (H6["BackendRefused"]("controlled refusal"), H6["SetupError"]("controlled startup failure")):
+            with self.subTest(error=type(error).__name__):
+                if isinstance(error, H6["BackendRefused"]):
+                    result, _events, _children, _directory = self.drive_initial(ready_error=error)
+                    self.assertFalse(result["pass"])
+                else:
+                    with self.assertRaisesRegex(H6["SetupError"], "controlled startup failure"):
+                        self.drive_initial(ready_error=error)
+                scope = self.ctx.scopes[-1]
+                self.assertFalse(scope.owners)
+                self.assertFalse(scope.readers)
+                self.assertFalse(scope.leg_pins)
+                ledgers = list(self.directory.glob("driven-*/caller.ledger.jsonl"))
+                ledger = [json.loads(line[9:]) for line in max(ledgers, key=lambda path: path.stat().st_mtime_ns)
+                          .read_text().splitlines()]
+                self.assertFalse(any(row["kind"] in ("target", "call", "ready") for row in ledger))
+
+    def test_release_rejects_expiry_or_identity_failure_without_loading(self):
+        for failure in ("expired", "ownership", "file", "not-ready"):
+            with self.subTest(failure=failure):
+                deadline = time.monotonic_ns() + 2_000_000_000
+                owner, reader = self.start(deadline)
+                self.unloaded(owner, reader)
+                provider = H6["FilePin"](self.provider)
+                try:
+                    ready = time.monotonic_ns()
+                    if failure == "expired": deadline = ready - 1
+                    if failure == "not-ready": ready = None
+                    verify = mock.patch.object(owner, "verify", side_effect=ValueError("controlled ownership mismatch"))
+                    pin = mock.patch.object(self.pin, "image_receipt", side_effect=ValueError("controlled file mismatch"))
+                    with (verify if failure == "ownership" else contextlib.nullcontext()), \
+                            (pin if failure == "file" else contextlib.nullcontext()), \
+                            self.assertRaises((TimeoutError, ValueError, H6["SetupError"])):
+                        H6["release_initial_load"](owner, reader, self.pin, provider, ready, deadline)
+                    self.assertNotIn(str(self.provider), Path(f"/proc/{owner.pid}/maps").read_text())
+                    self.send(owner, "stop\n")
+                    reader.record("ack", 0, "done", seconds=1)
+                    self.retired(owner, reader, unloaded=True)
+                finally:
+                    provider.close()
+
+    def test_initial_public_proof_failure_prevents_original_warm_and_exec(self):
+        with self.assertRaisesRegex(TimeoutError, "controlled initial public proof missing"):
+            self.drive_initial(warm_error=TimeoutError("controlled initial public proof missing"))
+        self.assertEqual(self.driven_events, ["observer-start", "observer-ready", "successor-0-1:0:1"])
+        owner, reader = self.driven_children[0]
+        self.assertFalse(any(row["kind"] == "exec" for row in reader.records))
+        self.assertFalse(any(row["kind"] == "call" and row["phase"] == "warm" for row in reader.records))
+        self.assertEqual(sum(row["kind"] == "target" for row in reader.records), 9)
+        self.assertIsNone(owner.pidfd)
+        self.assertFalse(Path(f"/proc/{owner.pid}").exists())
+
+
+class InitialLoopStartTest(unittest.TestCase):
+    def test_zero_probe_loop_start_requires_explicit_opt_in_and_is_not_public_provider_proof(self):
+        with tempfile.TemporaryDirectory(prefix="h6-loop-start-") as directory:
+            stream = io.StringIO("p11scope: capturing: 0 probe(s) attached; stop with Ctrl-C\n")
+            reader = H6["Reader"](stream, Path(directory) / "observer.err")
+            reader.thread.join(1)
+            owned = SimpleNamespace(popen=SimpleNamespace(poll=lambda: None))
+            with self.assertRaises(H6["SetupError"]):
+                H6["observer_ready"](owned, reader, "singles", timeout=0.1)
+            ready = H6["observer_ready"](owned, reader, "singles", timeout=0.1, allow_empty=True)
+            self.assertGreater(ready, 0)
+            attempted = []
+            capture = SimpleNamespace(lines=[], errors=[], thread=SimpleNamespace(is_alive=lambda: False))
+            with self.assertRaises(EOFError):
+                H6["warm_successor"](capture, {"image": 0},
+                    lambda seq, _left: attempted.append(seq) or f"initial-{seq}", max_attempts=1, timeout=0.1)
+            self.assertEqual(attempted, [1])
+            reader.finish()
+            stream.close()
 
 
 class DetailedFixtureTest(unittest.TestCase):

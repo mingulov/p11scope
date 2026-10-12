@@ -1,10 +1,10 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! Background link cleanup after publication (stop-gate Task 5).
+//! Background link retirement and terminal cleanup (stop-gate Task 5).
 //!
-//! After the report is published, the session moves its links out of Aya
-//! by ownership transfer and submits them here. The worker closes them in
-//! [`DetachOrder`] on its own thread while the foreground prints progress
-//! to stderr; a second signal interrupts the wait (the kernel finishes the
+//! The session moves owned links out of Aya and submits tagged live batches
+//! or terminal cleanup to its single prestarted worker. The worker closes them
+//! in [`DetachOrder`]. Only terminal cleanup drives/join waits and prints
+//! progress; a second signal interrupts that wait (the kernel finishes the
 //! remaining closes at process exit).
 
 use std::io::Write;
@@ -13,17 +13,21 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use aya::programs::links::FdLink;
+use aya::programs::uprobe::UProbeLink;
 
 use super::ProducerProgram;
 
 /// A link value moved out of Aya by ownership transfer (`take_link` plus
-/// `into_fd_links()` for singles; the existing fds for multi group links).
+/// `into_fd_links()` where supported, or the intact legacy owning probe;
+/// the existing fds for multi group links).
 /// Detach is drop: closing the last fd detaches the kernel link. The
 /// payloads are never inspected, only closed.
 #[allow(dead_code)]
 pub(crate) enum OwnedLink {
     Fd(FdLink),
     Multi(Vec<OwnedFd>),
+    /// Aya's owning legacy perf representation; moved intact, never reopened.
+    Probe(UProbeLink),
 }
 
 /// The existing producer detach order from `detach_selected_with` as data:
@@ -95,8 +99,70 @@ pub(crate) struct CleanupReceipt {
 type BoxCloser = Box<dyn FnMut(OwnedLink, ProducerProgram) -> Result<(), String> + Send>;
 type BoxClock = Arc<dyn Fn() -> Duration + Send + Sync>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchStatus {
+    Pending,
+    Released,
+    Failed,
+}
+
+#[derive(Clone)]
+pub(crate) struct BatchTicket {
+    owner: Arc<Mutex<WorkerState>>,
+    state: Arc<Mutex<BatchState>>,
+}
+
+struct BatchState {
+    total: usize,
+    released: usize,
+    failed: bool,
+}
+
+impl std::fmt::Debug for BatchTicket {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("BatchTicket(<owned cleanup>)")
+    }
+}
+
+impl BatchTicket {
+    pub(crate) fn status(&self) -> BatchStatus {
+        let Ok(state) = self.state.lock() else {
+            return BatchStatus::Failed;
+        };
+        if state.failed {
+            BatchStatus::Failed
+        } else if state.released == state.total {
+            BatchStatus::Released
+        } else {
+            BatchStatus::Pending
+        }
+    }
+
+    pub(crate) fn belongs_to(&self, worker: &CleanupWorker) -> bool {
+        Arc::ptr_eq(&self.owner, &worker.state)
+    }
+}
+
+pub(crate) struct SubmissionFailure {
+    pub(crate) message: String,
+    pub(crate) links: Vec<(OwnedLink, ProducerProgram)>,
+}
+
+impl std::fmt::Debug for SubmissionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SubmissionFailure")
+            .field("message", &self.message)
+            .field("owned_links", &self.links.len())
+            .finish()
+    }
+}
+
 enum Command {
-    Submit(Vec<(OwnedLink, ProducerProgram)>),
+    Submit {
+        links: Vec<(OwnedLink, ProducerProgram)>,
+        batch: Arc<Mutex<BatchState>>,
+    },
     Shutdown,
 }
 
@@ -108,7 +174,8 @@ struct WorkerState {
     uncertain: usize,
     transfer_failed: usize,
     failures: Vec<String>,
-    started_at: Option<Duration>,
+    terminal_started_at: Option<Duration>,
+    counts_invalid: bool,
     done: bool,
 }
 
@@ -123,6 +190,9 @@ pub(crate) struct CleanupWorker {
     clock: BoxClock,
     handle: Option<std::thread::JoinHandle<()>>,
     start_error: Option<String>,
+    // A failed submission remains owned. Never close its potentially blocking
+    // native handles on the foreground thread, including on second SIGINT.
+    unsubmitted: Mutex<Vec<(OwnedLink, ProducerProgram)>>,
 }
 
 impl CleanupWorker {
@@ -142,39 +212,161 @@ impl CleanupWorker {
     /// [`CleanupWorker::pre_start`].
     #[allow(dead_code)]
     pub(crate) fn pre_start_with(closer: BoxCloser, clock: BoxClock) -> Self {
+        Self::pre_start_with_spawn(closer, clock, |task| {
+            std::thread::Builder::new()
+                .name("p11scope-cleanup".to_string())
+                .spawn(task)
+        })
+    }
+
+    pub(crate) fn pre_start_with_spawn(
+        closer: BoxCloser,
+        clock: BoxClock,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>>,
+    ) -> Self {
         let state = Arc::new(Mutex::new(WorkerState::default()));
         let (tx, rx) = mpsc::channel::<Command>();
         let thread_state = Arc::clone(&state);
-        let handle = std::thread::Builder::new()
-            .name("p11scope-cleanup".to_string())
-            .spawn(move || run_cleanup(rx, thread_state, closer))
-            .ok();
-        let start_error = if handle.is_none() {
-            Some("cleanup worker thread failed to start".to_string())
-        } else {
-            None
-        };
+        let (handle, start_error) =
+            match spawn(Box::new(move || run_cleanup(rx, thread_state, closer))) {
+                Ok(handle) => (Some(handle), None),
+                Err(error) => (
+                    None,
+                    Some(format!("cleanup worker thread failed to start: {error}")),
+                ),
+            };
         Self {
             tx,
             state,
             clock,
             handle,
             start_error,
+            unsubmitted: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn live_admission(&self) -> Result<(), String> {
+        if let Some(error) = &self.start_error {
+            return Err(error.clone());
+        }
+        if self
+            .handle
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
+        {
+            return Err("cleanup worker is unavailable for live retirement".into());
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "cleanup worker state is poisoned")?;
+        if state.counts_invalid {
+            return Err("cleanup worker accounting is uncertain".into());
+        }
+        if state.terminal_started_at.is_some() {
+            return Err("terminal cleanup has already begun".into());
+        }
+        Ok(())
+    }
+
+    /// Queue one tagged live batch without joining or stopping the worker.
+    /// Only this batch's successful closes can settle its ticket.
+    pub(crate) fn submit_live(
+        &self,
+        links: Vec<(OwnedLink, ProducerProgram)>,
+        order: DetachOrder,
+    ) -> Result<BatchTicket, SubmissionFailure> {
+        if let Err(message) = self.live_admission() {
+            self.note_transfer_failed(links.len());
+            self.note_failure(message.clone());
+            return Err(SubmissionFailure { message, links });
+        }
+        self.submit_batch(links, order)
+    }
+
+    fn submit_batch(
+        &self,
+        mut links: Vec<(OwnedLink, ProducerProgram)>,
+        order: DetachOrder,
+    ) -> Result<BatchTicket, SubmissionFailure> {
+        links.sort_by_key(|(_, producer)| order.rank(producer));
+        let mut state = self.state.lock().unwrap();
+        if let Some(total) = state.total.checked_add(links.len()) {
+            state.total = total;
+        } else {
+            state.counts_invalid = true;
+            let message = "cleanup submitted-link count overflow".to_string();
+            state.failures.push(message.clone());
+            return Err(SubmissionFailure { message, links });
+        }
+        drop(state);
+        let batch = Arc::new(Mutex::new(BatchState {
+            total: links.len(),
+            released: 0,
+            failed: false,
+        }));
+        match self.tx.send(Command::Submit {
+            links,
+            batch: Arc::clone(&batch),
+        }) {
+            Ok(()) => Ok(BatchTicket {
+                owner: Arc::clone(&self.state),
+                state: batch,
+            }),
+            Err(mpsc::SendError(Command::Submit { links, batch })) => {
+                batch.lock().unwrap().failed = true;
+                let message =
+                    "cleanup submission failed; owned native links remain quarantined".to_string();
+                let mut state = self.state.lock().unwrap();
+                if let Some(uncertain) = state.uncertain.checked_add(links.len()) {
+                    state.uncertain = uncertain;
+                } else {
+                    state.counts_invalid = true;
+                }
+                state.failures.push(message.clone());
+                Err(SubmissionFailure { message, links })
+            }
+            Err(mpsc::SendError(Command::Shutdown)) => unreachable!("submitted a link batch"),
         }
     }
 
     /// Submit links for background closing, lowest [`DetachOrder`] rank
-    /// first (stable within a rank). Single-submit discipline: the session
-    /// submits once per detach, then drives this worker to completion.
-    pub(crate) fn submit(&self, mut links: Vec<(OwnedLink, ProducerProgram)>, order: DetachOrder) {
-        links.sort_by_key(|(_, producer)| order.rank(producer));
-        let mut state = self.state.lock().unwrap();
-        state.total += links.len();
-        if state.started_at.is_none() {
-            state.started_at = Some((self.clock)());
+    /// first (stable within a rank). All earlier live submissions remain in
+    /// the cumulative receipt, while elapsed time starts at terminal cleanup.
+    pub(crate) fn submit(&self, links: Vec<(OwnedLink, ProducerProgram)>, order: DetachOrder) {
+        self.begin_terminal();
+        if let Err(failure) = self.submit_batch(links, order) {
+            self.retain_unsubmitted(failure);
         }
-        drop(state);
-        let _ = self.tx.send(Command::Submit(links));
+    }
+
+    pub(crate) fn begin_terminal(&self) {
+        self.state
+            .lock()
+            .unwrap()
+            .terminal_started_at
+            .get_or_insert_with(|| (self.clock)());
+    }
+
+    pub(crate) fn has_submissions(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.total != 0 || state.transfer_failed != 0 || !state.failures.is_empty()
+    }
+
+    pub(crate) fn running(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+    }
+
+    /// Preserve ownership after a refused channel handoff. The failure was
+    /// already accounted by submission; retaining it cannot credit a close.
+    pub(crate) fn retain_unsubmitted(&self, failure: SubmissionFailure) {
+        self.unsubmitted.lock().unwrap().extend(failure.links);
+    }
+
+    pub(crate) fn note_failure(&self, message: String) {
+        self.state.lock().unwrap().failures.push(message);
     }
 
     /// Record links that never reached the worker because the
@@ -184,7 +376,15 @@ impl CleanupWorker {
     /// worker closes only, and folding early would let a transfer
     /// failure mask an in-flight close.
     pub(crate) fn note_transfer_failed(&self, count: usize) {
-        self.state.lock().unwrap().transfer_failed += count;
+        let mut state = self.state.lock().unwrap();
+        if let Some(total) = state.transfer_failed.checked_add(count) {
+            state.transfer_failed = total;
+        } else {
+            state.counts_invalid = true;
+            state
+                .failures
+                .push("cleanup transfer-failure count overflow".into());
+        }
     }
 
     pub(crate) fn progress(&self) -> CleanupProgress {
@@ -198,7 +398,7 @@ impl CleanupWorker {
             CleanupPhase::Draining
         };
         let elapsed = state
-            .started_at
+            .terminal_started_at
             .map(|started| (self.clock)().saturating_sub(started))
             .unwrap_or(Duration::ZERO);
         CleanupProgress {
@@ -218,7 +418,11 @@ impl CleanupWorker {
     /// last attempt lands, and the drive must stay signal-responsive until
     /// it settles.
     fn is_done(&self) -> bool {
-        if self.handle.is_none() {
+        if self
+            .handle
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished)
+        {
             return true;
         }
         let state = self.state.lock().unwrap();
@@ -230,30 +434,72 @@ impl CleanupWorker {
     /// from it instead of a progress snapshot. The start-error path
     /// settles otherwise-unstarted links here.
     pub(crate) fn join(&mut self) -> CleanupReceipt {
+        self.begin_terminal();
         let _ = self.tx.send(Command::Shutdown);
+        let mut thread_failed = false;
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            thread_failed = handle.join().is_err();
         }
         let mut state = self.state.lock().unwrap();
         if let Some(error) = &self.start_error {
-            state.uncertain = state
-                .uncertain
-                .saturating_add(state.total - state.attempted);
-            state.attempted = state.total;
             state.failures.push(error.clone());
+        }
+        if thread_failed {
+            state
+                .failures
+                .push("cleanup worker terminated before successful settlement".into());
+        }
+        let settled = state.released.checked_add(state.uncertain);
+        let missing = settled.and_then(|settled| state.total.checked_sub(settled));
+        if let Some(missing) = missing {
+            state.uncertain += missing;
+            if missing != 0 {
+                state
+                    .failures
+                    .push("cleanup worker ended with unsettled native ownership".into());
+            }
+        } else {
+            state.counts_invalid = true;
+        }
+        let uncertain = state.uncertain.checked_add(state.transfer_failed);
+        state.counts_invalid |= uncertain.is_none();
+        if state.counts_invalid {
+            state
+                .failures
+                .push("cleanup link accounting is uncertain".into());
         }
         state.done = true;
         let elapsed = state
-            .started_at
+            .terminal_started_at
             .map(|started| (self.clock)().saturating_sub(started))
             .unwrap_or(Duration::ZERO);
         CleanupReceipt {
-            completed: state.failures.is_empty() && state.transfer_failed == 0,
+            completed: state.failures.is_empty()
+                && state.transfer_failed == 0
+                && !state.counts_invalid
+                && state.released == state.total,
             released: state.released,
             total: state.total,
-            uncertain: state.uncertain.saturating_add(state.transfer_failed),
+            uncertain: uncertain.unwrap_or(usize::MAX),
             elapsed,
             failures: std::mem::take(&mut state.failures),
+        }
+    }
+}
+
+impl Drop for CleanupWorker {
+    fn drop(&mut self) {
+        // The channel has refused these already-transferred handles. Its
+        // receipt reports them uncertain, and no replacement can pass their
+        // Session quarantine. Abandon only at worker destruction: closing here
+        // could block stop/second SIGINT. The kernel closes them at process exit.
+        let links = std::mem::take(
+            self.unsubmitted
+                .get_mut()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+        if !links.is_empty() {
+            std::mem::forget(links);
         }
     }
 }
@@ -261,19 +507,42 @@ impl CleanupWorker {
 fn run_cleanup(rx: mpsc::Receiver<Command>, state: Arc<Mutex<WorkerState>>, mut closer: BoxCloser) {
     for command in rx {
         match command {
-            Command::Submit(links) => {
+            Command::Submit { links, batch } => {
                 for (link, producer) in links {
                     // Started, not settled: completion counts the release
                     // or failure below, never this increment.
-                    state.lock().unwrap().attempted += 1;
+                    let mut counts = state.lock().unwrap();
+                    if let Some(attempted) = counts.attempted.checked_add(1) {
+                        counts.attempted = attempted;
+                    } else {
+                        counts.counts_invalid = true;
+                    }
+                    drop(counts);
                     match closer(link, producer) {
                         Ok(()) => {
-                            state.lock().unwrap().released += 1;
+                            let mut counts = state.lock().unwrap();
+                            if let Some(released) = counts.released.checked_add(1) {
+                                counts.released = released;
+                            } else {
+                                counts.counts_invalid = true;
+                            }
+                            drop(counts);
+                            let mut batch = batch.lock().unwrap();
+                            if let Some(released) = batch.released.checked_add(1) {
+                                batch.released = released;
+                            } else {
+                                batch.failed = true;
+                            }
                         }
                         Err(error) => {
                             let mut state = state.lock().unwrap();
-                            state.uncertain += 1;
+                            if let Some(uncertain) = state.uncertain.checked_add(1) {
+                                state.uncertain = uncertain;
+                            } else {
+                                state.counts_invalid = true;
+                            }
                             state.failures.push(error);
+                            batch.lock().unwrap().failed = true;
                         }
                     }
                 }
@@ -351,6 +620,7 @@ pub(crate) fn drive_cleanup(
     out: &mut dyn Write,
     poll_interval: Duration,
 ) -> CleanupExit {
+    worker.begin_terminal();
     let mut first_poll = true;
     loop {
         if worker.is_done() {
@@ -885,3 +1155,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "cleanup_worker_live_tests.rs"]
+mod live_tests;

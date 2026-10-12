@@ -45,6 +45,9 @@ use std::sync::Arc;
 pub(crate) mod detailed_identity;
 mod ended_pid_retirement;
 mod global_retirement;
+#[allow(dead_code)] // Phase B connects the reviewed pending-ticket consumer.
+mod native_retirement;
+pub(crate) use native_retirement::{RetirementPoll, RetirementTicket};
 #[allow(dead_code)] // B2 records private facts; B3 supplies request-bound validation.
 mod pid_continuity;
 pub(crate) use ended_pid_retirement::EndedPidRetirement;
@@ -1286,6 +1289,7 @@ pub struct Session {
     retained_static: BTreeMap<u32, RetainedStaticTarget>,
     pid_pairs: pid_continuity::PairBook,
     global_retirements: global_retirement::Retirements,
+    native_retirement: native_retirement::NativeRetirement,
     pid_health: pid_continuity::OwnerHealth,
     prepared_owner_limit: u64,
     pid_lifecycle: Option<PidLifecycleTap>,
@@ -3950,6 +3954,7 @@ impl Session {
             retained_static: BTreeMap::new(),
             pid_pairs: pid_continuity::PairBook::default(),
             global_retirements: global_retirement::Retirements::default(),
+            native_retirement: native_retirement::NativeRetirement::default(),
             pid_health: pid_continuity::OwnerHealth::default(),
             prepared_owner_limit: prepared_owner_limit
                 .expect("identity preparation retained exact owner limit"),
@@ -4627,6 +4632,11 @@ impl Session {
         if !targets.is_empty() && self.mutation_stopped() {
             bail!("static attachment refused while Session is stopping or detached");
         }
+        if !targets.is_empty() && self.native_retirement.blocking() {
+            bail!(
+                "static attachment refused while old global native ownership is pending or uncertain"
+            );
+        }
         self.pid_pairs.retarget_gap(targets, objects);
         self.global_retirements.select(targets, objects);
         attachment_admission(&self.detach_failures, !targets.is_empty())?;
@@ -4888,6 +4898,9 @@ impl Session {
         replace: &[Slot],
         objects: &PinnedObjects,
     ) -> Result<ReplacementOutcome> {
+        if !replace.is_empty() && self.native_retirement.blocking() {
+            bail!("replacement refused while old global native ownership is pending or uncertain");
+        }
         if let Some(slot) = replace.iter().find(|slot| self.has_slot_link(slot.index)) {
             bail!(
                 "replacement slot {} still has an old link; detach and synchronize it before reattach",
@@ -4934,6 +4947,65 @@ impl Session {
     /// rebuild evidence for the caller to apply.
     pub fn detach_slots(&mut self, slots: &[Slot]) -> Result<DetachOutcome> {
         self.detach_slots_with_ended(slots, None, false)
+    }
+
+    /// Phase B supplies the whole-candidate consumer before the existing
+    /// synchronous detach route calls this opt-in ownership handoff.
+    #[allow(dead_code)]
+    pub(crate) fn begin_global_static_retirement(
+        &mut self,
+        slots: &[Slot],
+    ) -> Result<Option<RetirementTicket>> {
+        let stopped = self.mutation_stopped();
+        if !matches!(self.uprobe_scope, UProbeScope::AllProcesses) || stopped {
+            return Ok(None);
+        }
+        if self.native_retirement.blocking() {
+            bail!("an earlier global native retirement is pending or uncertain");
+        }
+        let requested: BTreeSet<_> = slots.iter().map(|slot| slot.index).collect();
+        if plan_group_rebuild(&self.links, &requested).is_some() {
+            return Ok(None);
+        }
+        // Resolve every fallible singles program/type lookup before the gap
+        // ledger or live registry can change, as the synchronous path does.
+        for link in &self.links {
+            if let RegisteredLink::UProbe { program, slot, .. } = link
+                && requested.contains(slot)
+            {
+                let _: &mut UProbe = self
+                    .ebpf
+                    .program_mut(program)
+                    .with_context(|| format!("program {program} missing before static retirement"))?
+                    .try_into()?;
+            }
+        }
+        let Some(worker) = self.cleanup_worker.as_ref() else {
+            return Ok(None);
+        };
+        let ebpf = &mut self.ebpf;
+        self.native_retirement.begin_with(
+            self.uprobe_scope,
+            stopped,
+            false,
+            false,
+            slots,
+            &mut self.links,
+            &mut self.retained_static,
+            &mut self.pid_pairs,
+            &mut self.global_retirements,
+            worker,
+            |link| take_owned_links(ebpf, link),
+            pid_continuity::comparable_monotonic_ns,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn poll_global_retirement(&mut self, ticket: &RetirementTicket) -> RetirementPoll {
+        let Some(worker) = &self.cleanup_worker else {
+            return RetirementPoll::Refused;
+        };
+        self.native_retirement.poll(ticket, worker)
     }
 
     /// Cleanup of an uncompleted new attachment is not coverage retirement.
@@ -5154,9 +5226,17 @@ impl Session {
     ) -> Result<()> {
         invalidate_pid_session(&mut self.pid_pairs, self.pid_lifecycle.as_ref());
         let start = std::time::Instant::now();
-        let had_links = !self.links.is_empty();
+        let had_links = !self.links.is_empty()
+            || self
+                .cleanup_worker
+                .as_ref()
+                .is_some_and(CleanupWorker::has_submissions);
         let mut first_error = None;
         if had_links {
+            let worker = self.take_cleanup_worker()?;
+            // Start terminal elapsed time before transfers, even when all
+            // producer links already belong to earlier live batches.
+            worker.begin_terminal();
             let mut owned = Vec::new();
             let mut transfer_failed = 0;
             for link in std::mem::take(&mut self.links) {
@@ -5173,7 +5253,6 @@ impl Session {
                     }
                 }
             }
-            let worker = self.take_cleanup_worker();
             worker.note_transfer_failed(transfer_failed);
             worker.submit(owned, DetachOrder);
             // A second SIGINT abandons the wait: the worker keeps closing
@@ -5203,10 +5282,10 @@ impl Session {
         )
     }
 
-    fn take_cleanup_worker(&mut self) -> CleanupWorker {
+    fn take_cleanup_worker(&mut self) -> Result<CleanupWorker> {
         self.cleanup_worker
             .take()
-            .unwrap_or_else(CleanupWorker::pre_start)
+            .context("the prestarted cleanup worker has already been consumed")
     }
 
     /// Wall time the producer detach took, in whole milliseconds; zero
@@ -5875,10 +5954,7 @@ fn take_owned_links(ebpf: &mut Ebpf, link: RegisteredLink) -> Result<Vec<OwnedLi
                 .with_context(|| format!("detaching {program}"))?;
             match taken.into_fd_links() {
                 Ok(links) => Ok(links.into_iter().map(OwnedLink::Fd).collect()),
-                Err(link) => {
-                    drop(link);
-                    Ok(Vec::new())
-                }
+                Err(link) => Ok(vec![OwnedLink::Probe(link)]),
             }
         })(),
         RegisteredLink::RawTracePoint { program, id } => (|| {
@@ -5911,10 +5987,7 @@ fn take_owned_links(ebpf: &mut Ebpf, link: RegisteredLink) -> Result<Vec<OwnedLi
                 .with_context(|| format!("detaching {program}"))?;
             match taken.into_fd_links() {
                 Ok(links) => Ok(links.into_iter().map(OwnedLink::Fd).collect()),
-                Err(link) => {
-                    drop(link);
-                    Ok(Vec::new())
-                }
+                Err(link) => Ok(vec![OwnedLink::Probe(link)]),
             }
         })(),
     }
@@ -6016,9 +6089,15 @@ impl Drop for Session {
                 owned.extend(links.into_iter().map(|link| (link, producer)));
             }
         }
-        let worker = self.take_cleanup_worker();
-        worker.submit(owned, DetachOrder);
-        drop(worker);
+        if let Some(worker) = self.cleanup_worker.take() {
+            worker.submit(owned, DetachOrder);
+            drop(worker);
+        } else if !owned.is_empty() {
+            // A terminal/second-signal path already owns the sole worker.
+            // Never introduce another thread or block this destructor on
+            // native closes; process exit releases this explicit abandon.
+            std::mem::forget(owned);
+        }
     }
 }
 

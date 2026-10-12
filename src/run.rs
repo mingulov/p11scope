@@ -3730,6 +3730,19 @@ fn profile_frame_decisions(
     }
 }
 
+/// Request one ordinary frame after the closed loss-settlement tick. Preserve
+/// the render's clock and avoid another clock read on the ordinary cadence.
+fn request_profile_recovery_frame(
+    frame_clock: &mut Instant,
+    drain: Duration,
+    immediate: bool,
+    now: impl FnOnce() -> Instant,
+) {
+    if immediate {
+        *frame_clock = now() - drain;
+    }
+}
+
 /// One profile tick's aggregate-map snapshot: a frame tick reads the maps
 /// fresh; any other tick reuses the cached snapshot (reading fresh when no
 /// snapshot was cached yet). Shared by the profile loop and the cadence
@@ -4844,6 +4857,12 @@ fn capture_profile(
                 break Ok(CaptureEnd::Error);
             }
         }
+        request_profile_recovery_frame(
+            &mut last_frame,
+            drain,
+            engine.take_immediate_exec_recovery_frame(),
+            Instant::now,
+        );
         collect_sink_drops(
             stdout,
             &mut scheduling,
@@ -5564,6 +5583,7 @@ fn capture_trace(
             CaptureTick::Continue { paused, snapshot: () } => paused,
             CaptureTick::End(end) => break Ok(end),
         };
+        let _ = engine.take_immediate_exec_recovery_frame();
         flush_stdout(stdout, &mut stdout_open)?;
         if let Some(f) = out_file.as_mut() {
             f.flush().context("flushing trace output file")?;
@@ -12610,6 +12630,67 @@ mod tests {
             (true, true, true),
             "the next tick does all of it"
         );
+    }
+
+    #[test]
+    fn immediate_exec_recovery_request_schedules_a_whole_profile_frame_once() {
+        let drain = PROFILE_CADENCE;
+        let rendered = Instant::now();
+        let mut last_frame = rendered;
+        let after_long_tick = rendered + Duration::from_millis(500);
+        request_profile_recovery_frame(&mut last_frame, drain, true, || after_long_tick);
+        let mut reads = 0;
+        let frame = profile_frame_decisions(
+            || {
+                reads += 1;
+                after_long_tick.duration_since(last_frame)
+            },
+            drain,
+        );
+        assert_eq!(reads, 1);
+        assert_eq!(
+            discovery_due(frame.since_frame, drain, || false, || false),
+            Some(DiscoveryPass::Frame)
+        );
+        assert!(frame.fresh_snapshot && frame.render);
+        let mut cache = Some(7);
+        assert_eq!(
+            profile_tick_snapshot(frame, &mut cache, || Ok(11)).unwrap(),
+            11
+        );
+
+        // The next completed render takes over the ordinary cadence. A
+        // consumed signal cannot keep requesting frames or read another clock.
+        last_frame = after_long_tick;
+        request_profile_recovery_frame(&mut last_frame, drain, false, || {
+            panic!("ordinary cadence needs no recovery clock read")
+        });
+        let next = profile_frame_decisions(
+            || (after_long_tick + Duration::from_millis(1)).duration_since(last_frame),
+            drain,
+        );
+        assert_eq!(
+            discovery_due(next.since_frame, drain, || false, || false),
+            None
+        );
+        assert!(!next.fresh_snapshot && !next.render);
+    }
+
+    #[test]
+    fn no_exec_recovery_request_preserves_profile_cadence_and_pending_stop() {
+        let drain = PROFILE_CADENCE;
+        let rendered = Instant::now();
+        let mut last_frame = rendered;
+        request_profile_recovery_frame(&mut last_frame, drain, false, || {
+            panic!("ordinary cadence reads no recovery clock")
+        });
+        assert_eq!(last_frame, rendered);
+        let frame = profile_frame_decisions(|| Duration::from_millis(1), drain);
+        assert_eq!(
+            discovery_due(frame.since_frame, drain, || true, || false),
+            Some(DiscoveryPass::PendingStop)
+        );
+        assert!(!frame.fresh_snapshot && !frame.render);
     }
 
     /// One scripted profile tick, offset from the loop's first tick.

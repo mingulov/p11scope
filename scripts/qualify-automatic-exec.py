@@ -257,7 +257,7 @@ def _without_sink(value):
     return value
 
 
-def _single_pid_provider_domain(ev, receipt, ledger, capture):
+def _single_pid_provider_domain(ev, receipt, ledger, capture, mode):
     """Bind the recovered category to controlled H6 invocation/held-object facts.
 
     The trace footer has no structured scope. Its binding comes from the actual
@@ -288,9 +288,9 @@ def _single_pid_provider_domain(ev, receipt, ledger, capture):
         def matches(record):
             return isinstance(record, dict) and all(record.get(key) == value for key, value in identity.items())
         argv = receipt["observer_argv"]
-        mode = receipt["leg"].split("/")[0]
         if (not isinstance(argv, list) or not all(isinstance(arg, str) for arg in argv)
                 or mode not in ("trace", "profile", "metrics")
+                or (capture is None) != (mode == "trace")
                 or mode not in REQUIRED_LEGS[receipt["cell"]] or receipt["requested_backend"] not in BACKENDS
                 or receipt["leg"] != f"{mode}/{receipt['requested_backend']}"
                 or argv[1] != ("trace" if mode == "trace" else "profile")
@@ -350,7 +350,7 @@ def _single_pid_provider_domain(ev, receipt, ledger, capture):
         return False
 
 
-def _early_gap_errors(ev, missing, receipt=None, ledger=None, capture=None):
+def _early_gap_errors(ev, missing, receipt=None, ledger=None, capture=None, *, mode=None):
     if not missing:
         return []
     observation = ev.get("gap_classes", {}).get("observation", {})
@@ -362,7 +362,7 @@ def _early_gap_errors(ev, missing, receipt=None, ledger=None, capture=None):
     if not relevant and "skipped" in observation.get("causes", []):
         recovered = {"name": "discovery subject", "reason": "static probes detached and exact pairs reattached"}
         relevant = (recovered in ev.get("skipped", [])
-                    and _single_pid_provider_domain(ev, receipt, ledger, capture))
+                    and _single_pid_provider_domain(ev, receipt, ledger, capture, mode))
     if (ev.get("completeness") != "PARTIAL" or ev.get("verdict_detail") != "concrete_gap"
             or observation.get("status") != "lossy" or not relevant):
         return ["early deficit lacks relevant real product concrete-gap/PARTIAL evidence"]
@@ -686,7 +686,8 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
         order_match, row_image_hints, early_coverage, population_errors = _trace_successor_populations(
             trace, rows, in_window, receipt, images)
         errors.extend(population_errors)
-        errors.extend(_early_gap_errors(evidence[0] if evidence else {}, early_coverage["deficit"], receipt, ledger))
+        errors.extend(_early_gap_errors(evidence[0] if evidence else {}, early_coverage["deficit"],
+                                       receipt, ledger, mode="trace"))
         ambiguous_keys = []  # Independently guarded by public stream cursors.
     else:
         for key in sorted(actual.keys() | mandatory.keys()):
@@ -1147,7 +1148,7 @@ def _evaluate_aggregate_h6(doc, stdout_text, ledger, receipt, mode):
         early_coverage = {"expected": sum(early_expected.values()),
                           "observed_named": sum(early_observed.values()), "observed_unknown": 0,
                           "deficit": missing}
-        errors.extend(_early_gap_errors(doc.get("evidence", {}), missing, receipt, ledger, capture))
+        errors.extend(_early_gap_errors(doc.get("evidence", {}), missing, receipt, ledger, capture, mode=mode))
     else:
         for fn in sorted(set(expect_completed) | set(got_completed)):
             if got_completed[fn] > expect_completed[fn]:

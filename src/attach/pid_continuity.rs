@@ -1085,22 +1085,48 @@ impl CurrentPairs<'_> {
         objects: &PinnedObjects,
         health_and_positions: impl FnOnce() -> Option<(u64, aya::maps::ring_buf::RingBufPositions)>,
     ) -> bool {
+        self.validate_completed_rearm_with(
+            receipt,
+            binding,
+            tap,
+            domain,
+            view,
+            serial,
+            objects,
+            health_and_positions,
+            clock_origins_comparable,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)] // The metadata seam keeps the production validation order.
+    fn validate_completed_rearm_with(
+        &self,
+        receipt: &CompletedRearmReceipt,
+        binding: &ExecBinding,
+        tap: &PidLifecycleTap,
+        domain: &DiscoveryDomain,
+        view: &crate::process::ProcessView,
+        serial: u64,
+        objects: &PinnedObjects,
+        health_and_positions: impl FnOnce() -> Option<(u64, aya::maps::ring_buf::RingBufPositions)>,
+        mut clock_origin: impl FnMut() -> bool,
+    ) -> bool {
         let proof = &receipt.proof;
         if proof.binding != *binding
             || !binding.matches(tap, domain, view, serial)
-            || !clock_origins_comparable()
+            || !clock_origin()
             || !self.receipt_pairs_current(proof, objects)
+            || !clock_origin()
         {
             return false;
         }
-        // Native registry and held-file checks can perform I/O. Read both
-        // direct owner health and the sole frontier only after they finish.
+        // Native registry, held-file and clock-origin checks can perform I/O.
+        // Read direct health and the sole frontier after all of them finish;
+        // only compare retained memory after this final snapshot.
         let Some((loss, positions)) = health_and_positions() else {
             return false;
         };
-        loss == proof.loss
-            && clock_origins_comparable()
-            && Self::receipt_frontier_current(proof, tap, positions)
+        loss == proof.loss && Self::receipt_frontier_current(proof, tap, positions)
     }
 
     #[allow(clippy::too_many_arguments)] // One Session-owned fact set and its exact request.
@@ -1591,6 +1617,15 @@ pub(crate) mod engine_fixture {
         DetachFailure,
     }
 
+    enum CompletedClockChange {
+        Producer,
+        Origins {
+            active: Option<std::path::PathBuf>,
+            children: Option<std::path::PathBuf>,
+            offsets: Option<String>,
+        },
+    }
+
     struct Cursor {
         records: std::cell::RefCell<VecDeque<Vec<u8>>>,
         producer: std::cell::Cell<usize>,
@@ -1640,6 +1675,9 @@ pub(crate) mod engine_fixture {
         pub(crate) health_script: VecDeque<RawHealthRead>,
         pub(crate) preflight_change: Option<PreflightChange>,
         pub(crate) clock_offsets: Option<String>,
+        completed_clock_change: Option<CompletedClockChange>,
+        pub(crate) completed_clock_frontiers: Vec<(usize, usize)>,
+        pub(crate) completed_health_frontiers: Vec<(usize, usize)>,
         pub(crate) stop_word: u64,
         pub(crate) uprobe_scope: aya::programs::uprobe::UProbeScope,
         pub(crate) producers_detached: bool,
@@ -1686,6 +1724,9 @@ pub(crate) mod engine_fixture {
                 health_script: VecDeque::new(),
                 preflight_change: None,
                 clock_offsets: Some("monotonic 0 0".into()),
+                completed_clock_change: None,
+                completed_clock_frontiers: Vec::new(),
+                completed_health_frontiers: Vec::new(),
                 stop_word: 0,
                 uprobe_scope: aya::programs::uprobe::UProbeScope::OneProcess(
                     NonZeroU32::new(view.pid()).unwrap(),
@@ -1964,6 +2005,25 @@ pub(crate) mod engine_fixture {
             let ns = std::path::PathBuf::from("time:[7]");
             (Some(ns.clone()), Some(ns), self.clock_offsets.clone())
         }
+        pub(crate) fn advance_producer_during_completed_clock(&mut self) {
+            self.completed_clock_change = Some(CompletedClockChange::Producer);
+        }
+        pub(crate) fn script_completed_clock_origins(
+            &mut self,
+            active: Option<&str>,
+            children: Option<&str>,
+            offsets: Option<&str>,
+        ) {
+            self.completed_clock_change = Some(CompletedClockChange::Origins {
+                active: active.map(std::path::PathBuf::from),
+                children: children.map(std::path::PathBuf::from),
+                offsets: offsets.map(str::to_owned),
+            });
+        }
+        pub(crate) fn completed_frontier(&self) -> (usize, usize) {
+            let positions = crate::events::discovery_drain_positions(&self.drain);
+            (positions.producer, positions.consumer)
+        }
         fn sample(
             origin: &(
                 Option<std::path::PathBuf>,
@@ -2241,7 +2301,8 @@ pub(crate) mod engine_fixture {
                 sides: &sides,
                 retained: &self.retained,
             };
-            pairs.validate_completed_rearm(
+            let mut clock_reads = 0;
+            pairs.validate_completed_rearm_with(
                 receipt,
                 binding,
                 &self.tap,
@@ -2260,7 +2321,37 @@ pub(crate) mod engine_fixture {
                         &self.tap,
                     )
                     .ok()?;
-                    Some((loss, crate::events::discovery_drain_positions(&self.drain)))
+                    let positions = crate::events::discovery_drain_positions(&self.drain);
+                    self.completed_health_frontiers
+                        .push((positions.producer, positions.consumer));
+                    Some((loss, positions))
+                },
+                || {
+                    clock_reads += 1;
+                    let comparable = clock_origins_comparable();
+                    if clock_reads != 2 {
+                        return comparable;
+                    }
+                    let cursor = self.drain.source();
+                    let metadata = match self.completed_clock_change.take() {
+                        Some(CompletedClockChange::Producer) => {
+                            cursor.producer.set(cursor.producer.get() + 8);
+                            true
+                        }
+                        Some(CompletedClockChange::Origins {
+                            active,
+                            children,
+                            offsets,
+                        }) => clock_origins_comparable_with(
+                            active.as_ref(),
+                            children.as_ref(),
+                            offsets.as_deref(),
+                        ),
+                        None => true,
+                    };
+                    self.completed_clock_frontiers
+                        .push((cursor.producer.get(), cursor.consumer.get()));
+                    comparable && metadata
                 },
             ) && !self.stopped()
         }

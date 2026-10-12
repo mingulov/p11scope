@@ -19,6 +19,8 @@ wide-detailed-2112 = ["p11scope-ebpf-common/wide-detailed-2112"]
 # site that raised it. Stderr only; the capture document is byte-identical
 # either way (src/discovery/attribution.rs).
 skip-attribution = []
+# Internal, bounded stderr metadata for one PID/Singles exec diagnostic.
+h6-reexec-diagnostic = []
 
 [dependencies]
 anyhow = "1"

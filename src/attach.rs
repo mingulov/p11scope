@@ -30,6 +30,10 @@ use p11scope_ebpf_common::{
 use p11scope_manifest::elf::ElfAbi;
 use pkcs11_types::mechanism_registry::MechanismRegistry;
 use std::collections::{BTreeMap, BTreeSet};
+
+pub(crate) mod reexec_diagnostic;
+#[cfg(feature = "h6-reexec-diagnostic")]
+use reexec_diagnostic::{Outcome as DiagnosticOutcome, Phase as DiagnosticPhase};
 use std::fs::File;
 use std::io;
 use std::mem::size_of_val;
@@ -1290,6 +1294,8 @@ pub struct Session {
     /// driven it to completion; a fresh worker is created if links ever
     /// need closing afterwards.
     cleanup_worker: Option<CleanupWorker>,
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    reexec_diagnostic: Option<reexec_diagnostic::Diagnostic>,
 }
 
 /// A detach error leaves this Session's ownership bookkeeping inconsistent.
@@ -3401,6 +3407,11 @@ fn unsupported_environment_context(error: anyhow::Error) -> anyhow::Error {
 }
 
 impl Session {
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    pub(crate) fn reexec_diagnostic(&self) -> Option<reexec_diagnostic::Diagnostic> {
+        self.reexec_diagnostic.clone()
+    }
+
     pub(crate) const fn capture_policy(&self) -> CapturePolicy {
         self.policy
     }
@@ -3488,6 +3499,13 @@ impl Session {
         let (mut session, fallback) = started?;
         session.selection = selection;
         session.backend_fallback = fallback;
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        {
+            session.reexec_diagnostic = reexec_diagnostic::Diagnostic::selected(
+                matches!(scope, Scope::Pid(_)),
+                selection == BackendSelection::Singles,
+            );
+        }
         Ok(session)
     }
 
@@ -3907,6 +3925,8 @@ impl Session {
             links,
             instance,
             cleanup_worker: Some(CleanupWorker::pre_start()),
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            reexec_diagnostic: None,
         })
     }
 
@@ -4021,9 +4041,28 @@ impl Session {
         objects: &PinnedObjects,
     ) -> Option<PreservationReceipt> {
         if self.mutation_stopped() {
+            reexec_diagnostic::observe!(self, |diag| {
+                diag.note(
+                    DiagnosticPhase::Rearm,
+                    DiagnosticOutcome::Stopped,
+                    [None; 4],
+                );
+            });
             return None;
         }
-        let loss = self.read_pid_health().ok()?;
+        let loss = match self.read_pid_health() {
+            Ok(loss) => loss,
+            Err(_) => {
+                reexec_diagnostic::observe!(self, |diag| {
+                    diag.note(
+                        DiagnosticPhase::Rearm,
+                        DiagnosticOutcome::NoHealth,
+                        [None; 4],
+                    );
+                });
+                return None;
+            }
+        };
         let sides = self.current_static_sides();
         let pairs = pid_continuity::CurrentPairs {
             book: &self.pid_pairs,
@@ -4031,8 +4070,17 @@ impl Session {
             sides: &sides,
             retained: &self.retained_static,
         };
-        let tap = self.pid_lifecycle.as_ref()?;
-        let receipt = pairs.prepare(
+        let Some(tap) = self.pid_lifecycle.as_ref() else {
+            reexec_diagnostic::observe!(self, |diag| {
+                diag.note(
+                    DiagnosticPhase::Rearm,
+                    DiagnosticOutcome::Unavailable,
+                    [None; 4],
+                );
+            });
+            return None;
+        };
+        let Some(receipt) = pairs.prepare(
             binding,
             tap,
             &self.discovery_domain,
@@ -4042,24 +4090,48 @@ impl Session {
             ordinary,
             objects,
             loss,
-        )?;
-        pairs
-            .validate(
-                &receipt,
-                binding,
-                tap,
-                &self.discovery_domain,
-                view,
-                serial,
-                objects,
-                loss,
-                || {
-                    self.discovery_consumer
-                        .as_ref()
-                        .map(events::discovery_drain_positions)
+        ) else {
+            reexec_diagnostic::observe!(self, |diag| {
+                diag.note(
+                    DiagnosticPhase::Rearm,
+                    DiagnosticOutcome::NoPairs,
+                    [
+                        Some(slots.len() as u64),
+                        Some(ordinary.len() as u64),
+                        None,
+                        None,
+                    ],
+                );
+            });
+            return None;
+        };
+        let valid = pairs.validate(
+            &receipt,
+            binding,
+            tap,
+            &self.discovery_domain,
+            view,
+            serial,
+            objects,
+            loss,
+            || {
+                self.discovery_consumer
+                    .as_ref()
+                    .map(events::discovery_drain_positions)
+            },
+        );
+        reexec_diagnostic::observe!(self, |diag| {
+            diag.note(
+                DiagnosticPhase::Rearm,
+                if valid {
+                    DiagnosticOutcome::Preserved
+                } else {
+                    DiagnosticOutcome::NoValidation
                 },
-            )
-            .then_some(receipt)
+                [Some(slots.len() as u64), None, None, None],
+            );
+        });
+        valid.then_some(receipt)
     }
 
     pub(crate) fn validate_preservation(
@@ -4071,12 +4143,33 @@ impl Session {
         objects: &PinnedObjects,
     ) -> bool {
         if self.mutation_stopped() {
+            reexec_diagnostic::observe!(self, |diag| {
+                diag.note(
+                    DiagnosticPhase::Preflight,
+                    DiagnosticOutcome::Stopped,
+                    [None; 4],
+                );
+            });
             return false;
         }
         let Ok(loss) = self.read_pid_health() else {
+            reexec_diagnostic::observe!(self, |diag| {
+                diag.note(
+                    DiagnosticPhase::Preflight,
+                    DiagnosticOutcome::NoHealth,
+                    [None; 4],
+                );
+            });
             return false;
         };
         let Some(tap) = self.pid_lifecycle.as_ref() else {
+            reexec_diagnostic::observe!(self, |diag| {
+                diag.note(
+                    DiagnosticPhase::Preflight,
+                    DiagnosticOutcome::Unavailable,
+                    [None; 4],
+                );
+            });
             return false;
         };
         let sides = self.current_static_sides();
@@ -4086,7 +4179,7 @@ impl Session {
             sides: &sides,
             retained: &self.retained_static,
         };
-        pairs.validate(
+        let valid = pairs.validate(
             receipt,
             binding,
             tap,
@@ -4100,7 +4193,19 @@ impl Session {
                     .as_ref()
                     .map(events::discovery_drain_positions)
             },
-        )
+        );
+        reexec_diagnostic::observe!(self, |diag| {
+            diag.note(
+                DiagnosticPhase::Preflight,
+                if valid {
+                    DiagnosticOutcome::Preserved
+                } else {
+                    DiagnosticOutcome::NoValidation
+                },
+                [None; 4],
+            );
+        });
+        valid
     }
 
     pub(crate) fn preflight_targets(
@@ -4435,6 +4540,8 @@ impl Session {
         self.instance
             .prepare_targets(&mut self.ebpf, targets, objects);
         let scope = self.uprobe_scope;
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        let diagnostic = self.reexec_diagnostic();
         let outcome = if self.backend == AttachBackend::Multi {
             self.attach_targets_multi(targets, &attach_targets)?
         } else {
@@ -4462,10 +4569,35 @@ impl Session {
                                 .program_mut(program)
                                 .with_context(|| format!("program {program} missing from object"))?
                                 .try_into()?;
+                            #[cfg(feature = "h6-reexec-diagnostic")]
+                            let diagnostic_span = diagnostic
+                                .as_ref()
+                                .filter(|diag| diag.active())
+                                .map(|diag| {
+                                    diag.begin(
+                                        if program == "p11_return" {
+                                            DiagnosticPhase::NativeReturn
+                                        } else {
+                                            DiagnosticPhase::NativeEntry
+                                        },
+                                        [
+                                            Some(1),
+                                            Some(u64::from(
+                                                slot.names.iter().any(|name| name == "C_GetInfo"),
+                                            )),
+                                            None,
+                                            None,
+                                        ],
+                                    )
+                                });
                             let attempt = pid_continuity::NativeAttempt::run(
                                 pid_continuity::comparable_monotonic_ns,
                                 || prog.attach([point], path, scope),
                             );
+                            #[cfg(feature = "h6-reexec-diagnostic")]
+                            if let Some(span) = diagnostic_span {
+                                span.finish_result(&attempt.result);
+                            }
                             let result = match attempt.result {
                                 Ok(id) => {
                                     links.push(RegisteredLink::UProbe {
@@ -4522,6 +4654,27 @@ impl Session {
         self.successful_static.extend(successful);
         let failed: Vec<_> = failures.iter().map(|(slot, _)| *slot).collect();
         self.attach_failures.extend(failures);
+        reexec_diagnostic::observe!(self, |diag| {
+            let sides = self.current_static_sides();
+            let paired = self
+                .retained_static
+                .keys()
+                .filter(|slot| {
+                    sides.contains(&(**slot, ProbeSide::Entry))
+                        && sides.contains(&(**slot, ProbeSide::Return))
+                })
+                .count();
+            diag.note(
+                DiagnosticPhase::AttachState,
+                DiagnosticOutcome::Ok,
+                [
+                    Some(targets.len() as u64),
+                    Some(failed.len() as u64),
+                    Some(completed.len() as u64),
+                    Some(paired as u64),
+                ],
+            );
+        });
         #[cfg(test)]
         crate::first_use_probe::attached(&self.events_domain, targets, objects, &completed);
         Ok((failed, completed))
@@ -4948,7 +5101,27 @@ impl Session {
     }
 
     fn detach_link(&mut self, link: RegisteredLink) -> Result<()> {
-        detach_registered_link(&mut self.ebpf, link)
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        let diagnostic_span = self
+            .reexec_diagnostic()
+            .filter(|diag| diag.active())
+            .map(|diag| {
+                let phase = match &link {
+                    RegisteredLink::UProbe {
+                        program: "p11_return",
+                        ..
+                    } => DiagnosticPhase::NativeReturn,
+                    RegisteredLink::UProbe { .. } => DiagnosticPhase::NativeEntry,
+                    _ => DiagnosticPhase::NativeOther,
+                };
+                diag.begin(phase, [Some(0), None, None, None])
+            });
+        let result = detach_registered_link(&mut self.ebpf, link);
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        if let Some(span) = diagnostic_span {
+            span.finish_result(&result);
+        }
+        result
     }
 
     pub(crate) fn diagnostic() -> Result<Self> {

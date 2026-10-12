@@ -1701,8 +1701,27 @@ def evaluate_inventory_h6(doc, ledgers, receipt):
                 "errors": [f"invalid independent evidence: {error}"]}
 
 
-def inventory_instance_history_errors(records, instance_id, caller, module, receipt, *, after_seq=-1):
-    """Accept stop loss only in the public final-commit/sweep interval."""
+def inventory_semantic_authority_errors(row, *, final=False):
+    """Initial API materialization and retained positive S1 have distinct public shapes."""
+    api, errors = row.get("api_returns") or {}, []
+    if (api.get("saturated") is not False or type(api.get("historical_only_returns")) is not int
+            or api["historical_only_returns"] != 0):
+        errors.append("Inventory semantic history has saturated or historical-only API authority")
+    count, label = api.get("count"), row.get("semantics")
+    details = row.get("mechanisms") is not None or row.get("operations") is not None
+    if final or details:
+        if type(count) is not int or count <= 0 or label != "observed":
+            errors.append("Inventory semantic history lacks retained positive S1 authority")
+    elif count is None:
+        if label != "unknown (no calls observed)":
+            errors.append("Inventory initial no-call API authority is inconsistent")
+    elif type(count) is not int or count <= 0 or label != "unknown (no operation evidence)":
+        errors.append("Inventory early API authority is inconsistent with its absent S1 details")
+    return errors
+
+
+def inventory_instance_history_errors(records, instance_id, caller, module, receipt):
+    """Replay complete retained history; stop loss belongs only to the terminal interval."""
     errors = []
     passes = [row for row in records if row["kind"] == "pass_committed"]
     finals = [row for row in passes if row["event"].get("final") is True]
@@ -1716,6 +1735,7 @@ def inventory_instance_history_errors(records, instance_id, caller, module, rece
     retired_at = next((row["seq"] for row in records if row["kind"] == "caller_event"
         and row["event"].get("event") == "exec_retired" and row["event"].get("old") == caller), None)
     instances, semantics, previous = [], [], {}
+    authority_ended, loss_seen, loss_reasons = False, False, set()
     for record in records:
         row, kind = record["event"], record["kind"]
         if not ((kind == "instance_observed" and row.get("id") == instance_id)
@@ -1724,19 +1744,21 @@ def inventory_instance_history_errors(records, instance_id, caller, module, rece
         if row.get("caller") != caller or row.get("module") != module:
             errors.append("Inventory semantic history changes instance/caller/module identity")
         (instances if kind == "instance_observed" else semantics).append(record)
-        if record["seq"] <= after_seq:
-            continue
         terminal = terminal_floor < record["seq"] and record["at_ns"] <= records[-1]["at_ns"]
         retired = retired_at is not None and retired_at < record["seq"]
         if kind == "instance_observed":
             state, reason = row.get("state"), row.get("reason")
             if (state, reason) == ("observed", None):
+                if authority_ended:
+                    errors.append("Inventory instance history revived lost authority")
                 continue
+            authority_ended = True
             if (state == "retired" and reason == "instance_retired" and retired
                     or state == "uncertain" and reason == "semantic_loss" and terminal and not retired):
                 continue
             errors.append("Inventory instance history gained earlier or unexplained lost authority")
         else:
+            errors.extend(inventory_semantic_authority_errors(row))
             api, ops = row.get("api_returns") or {}, row.get("operations")
             counters = {"api": api.get("count"), "historical": api.get("historical_only_returns")}
             if ops is not None:
@@ -1764,6 +1786,11 @@ def inventory_instance_history_errors(records, instance_id, caller, module, rece
             if not isinstance(reasons, list) or reasons != sorted(set(reasons)):
                 errors.append("Inventory semantic history has invalid loss reasons")
                 continue
+            if (loss_seen and coverage.get("lossy") is not True) or loss_reasons - set(reasons):
+                errors.append("Inventory semantic history erased sticky loss disclosure")
+            if coverage.get("lossy") is True:
+                loss_seen = True
+                loss_reasons.update(set(reasons) - {"no_calls"})
             if coverage.get("lossy") is False and not reasons:
                 continue
             if (coverage.get("lossy") is False and reasons == ["no_calls"] and not had_returns
@@ -2023,6 +2050,7 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
                 or final["module"] != proof["module"]):
             errors.append(f"{label}: final historical semantic instance is missing")
         else:
+            errors.extend(f"{label}: final {error}" for error in inventory_semantic_authority_errors(final, final=True))
             final_ops = final.get("operations") or {}
             desired_final = {"api": after["api"] + tail_totals[5].get(key, 0),
                 "calls": after["calls"] + tail_totals[4].get(key, 0),
@@ -2041,8 +2069,7 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
             if final_mechs != desired_mechs:
                 errors.append(f"{label}: final historical mechanism totals changed")
             errors.extend(f"{label}: {error}" for error in inventory_instance_history_errors(
-                records, proof["instance"], proof["caller"], proof["module"], receipt,
-                after_seq=end_record["seq"]))
+                records, proof["instance"], proof["caller"], proof["module"], receipt))
         measured_completed += delta["completed"]
         measured_failed += delta["failed"]
         summaries.append({"tuple": list(stable), "early": baseline["early"], "measured": delta})

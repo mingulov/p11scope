@@ -111,6 +111,38 @@ class SystemScopeMeasureLaunchTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         load_measure().possible_cpu_count(path)
 
+    def test_auto_build_selects_requested_detailed_feature_profile(self):
+        ensure_test_tmp()
+        source = MEASURE.read_text(encoding="utf-8")
+        start = source.index('if [ -z "$BINARY" ]; then')
+        end = source.index('\ntest -x "$BINARY"', start)
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as raw:
+            base = Path(raw)
+            (base / "scripts").mkdir()
+            (base / ".release-rust-version").write_text("1.98.1\n")
+            wrapper = base / "scripts/cargo.sh"
+            wrapper.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$BUILD_ARGV\"\n")
+            wrapper.chmod(0o700)
+            for build_profile in ("debug", "release"):
+                for detailed_profile in ("", "default", "wide-detailed-2112"):
+                    with self.subTest(build=build_profile, detailed=detailed_profile):
+                        argv_path = base / "argv"
+                        harness = ("set -eu\nBINARY=\nNO_BUILD=0\n" +
+                                   f"PROFILE={shlex.quote(build_profile)}\n" +
+                                   f"DETAILED_PROFILE={shlex.quote(detailed_profile)}\n" +
+                                   f"BUILD_ARGV={shlex.quote(str(argv_path))}\nexport BUILD_ARGV\n" +
+                                   source[start:end])
+                        result = subprocess.run(["sh", "-c", harness], cwd=base,
+                                                capture_output=True, text=True, timeout=5)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        expected = ["+1.98.1", "build", "--locked", "--offline"]
+                        if build_profile == "release":
+                            expected.append("--release")
+                        expected += ["-p", "p11scope", "-p", "p11scope-discover"]
+                        if detailed_profile == "wide-detailed-2112":
+                            expected += ["--features", "wide-detailed-2112"]
+                        self.assertEqual(argv_path.read_text().splitlines(), expected)
+
     def test_detailed_preflight_consumes_unprivileged_calculator_before_launch(self):
         ensure_test_tmp()
         with tempfile.TemporaryDirectory(dir=TEST_TMP) as raw:

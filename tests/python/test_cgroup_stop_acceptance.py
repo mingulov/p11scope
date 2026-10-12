@@ -35,6 +35,9 @@ class StopStageOracleTests(unittest.TestCase):
                    "baseline": {"caller": "c0", "module": "m0", "count": 3, "seq": 0},
                    "observer_rc": 0, "workload_rc": 0, "stop_latency_seconds": 0.1,
                    "stop_limit_seconds": 60, "forced_cleanup": False}
+        provider = {"path": "/w/lib.so", "dev": [0, 35], "ino": 111,
+                    "mapping": {"dev": [0, 35], "ino": 111}, "sha256": "0" * 64}
+        receipt.update(provider_before=provider, provider_after=dict(provider))
         tx = 1 if stage == "traversed" else 2
         frames = [{"event": "armed", "transaction": 0},
                   {"event": "launch", "transaction": tx}]
@@ -58,7 +61,13 @@ class StopStageOracleTests(unittest.TestCase):
         if stage == "final_pre_read":
             doc["callers"].append({"id": "c0", "pid": 300, "start_time": 800})
             doc["modules"].append({"id": "m0"})
-            doc["edges"].append({"caller": "c0", "module": "m0", "entries": {"count": 3}})
+            doc["edges"].append({"caller": "c0", "module": "m0", "entries": {"count": 3,
+                "coverage": {"state": "counted", "lossy": False}}})
+        if stage == "final_pre_read" or healthy:
+            records.append({"kind": "edge_observed", "seq": 0,
+                "event": {"caller": "c0", "module": "m0", "identity_context": {
+                    "version": 1, "module": {"id": "m0", "status": "observed",
+                        "device_major": 0, "device_minor": 35, "inode": 111}}}})
         if healthy:
             doc["callers"].append({"id": "c1", **candidate})
             doc["edges"].append({"caller": "c1", "module": "m0"})
@@ -134,6 +143,21 @@ class StopStageOracleTests(unittest.TestCase):
             inputs[0][field] = value
             with self.subTest(field=field):
                 self.assertFalse(self.verdict(inputs)["pass"])
+
+    def test_positive_requires_independent_held_provider_mapping_domain(self):
+        for mutation in ("mapping", "module"):
+            inputs = self.inputs(healthy=True)
+            if mutation == "mapping":
+                inputs[0]["provider_after"]["ino"] = 112
+            else:
+                inputs[3][0]["event"]["identity_context"]["module"]["device_minor"] = 36
+            with self.subTest(mutation=mutation):
+                self.assertFalse(self.verdict(inputs)["pass"])
+
+    def test_all_unknown_baseline_is_not_a_useful_capture(self):
+        inputs = self.inputs()
+        inputs[2]["edges"][0]["entries"]["coverage"]["state"] = "unknown"
+        self.assertFalse(self.verdict(inputs)["pass"])
 
 
 class StageControllerTests(unittest.TestCase):

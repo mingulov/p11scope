@@ -127,11 +127,35 @@ def caller_subject(event):
     return context.get("caller") or {}
 
 
+def provider_modules(records, provider):
+    mapping = provider.get("mapping") or {}
+    selected = set()
+    for record in records:
+        event = record.get("event") or {}
+        context = event.get("identity_context") or {}
+        module = context.get("module") or {}
+        if (record.get("kind") == "edge_observed" and type(context.get("version")) is int
+                and context["version"] == 1 and isinstance(event.get("module"), str)
+                and re.fullmatch(r"m[0-9]+", event["module"])
+                and module.get("status") == "observed" and module.get("id") == event.get("module")
+                and all(type(module.get(key)) is int for key in ("device_major", "device_minor", "inode"))
+                and [module["device_major"], module["device_minor"]] == mapping.get("dev")
+                and module["inode"] == mapping.get("ino")):
+            selected.add(event["module"])
+    return selected
+
+
 def evaluate_stop_stage(receipt, frames, document, records):
     """Require actual stage/lifecycle metadata plus independent admission facts."""
     errors = H6["stop_errors"](receipt)
     if receipt.get("observer_rc") != 0 or receipt.get("workload_rc") != 0:
         errors.append("observer or workload failed its normal stop")
+    before, after = receipt.get("provider_before") or {}, receipt.get("provider_after") or {}
+    mapping = before.get("mapping") or {}
+    if (not before or before != after or before.get("dev") != mapping.get("dev")
+            or before.get("ino") != mapping.get("ino")
+            or not re.fullmatch(r"[0-9a-f]{64}", before.get("sha256", ""))):
+        errors.append("held provider changed or lacks its independent mapping-domain anchor")
     if not frames or len(frames) > MAX_EVENTS or any(
             type(frame.get("version")) is not int or frame["version"] != 1
             or type(frame.get("sequence")) is not int or frame["sequence"] != index
@@ -179,6 +203,7 @@ def evaluate_stop_stage(receipt, frames, document, records):
     admissions = [caller_subject(row.get("event") or {}) for row in admission_records]
     callers = document.get("callers", [])
     edges = document.get("edges", [])
+    modules = provider_modules(records, before)
     if stage == "traversed":
         if tx != 1 or not gate.get("sequence", MAX_EVENTS) < returned.get("sequence", -1):
             errors.append("gate was not inside the first actual worker traversal")
@@ -190,7 +215,8 @@ def evaluate_stop_stage(receipt, frames, document, records):
                 or any(frame.get("event") == "published" and frame.get("outcome") == "complete"
                        for frame in frames)):
             errors.append("first cancelled transaction published caller/endpoint authority")
-        if healthy and (published.get("admitted", 0) < 1 or not admissions or not edges):
+        if healthy and (published.get("admitted", 0) < 1 or not admissions
+                        or not any(edge.get("module") in modules for edge in edges)):
             errors.append("healthy traversal twin did not actually admit its held member")
     else:
         candidate = receipt.get("candidate") or {}
@@ -213,7 +239,8 @@ def evaluate_stop_stage(receipt, frames, document, records):
         if healthy:
             if (sampled.get("present") is not True or published.get("candidate_admitted") is not True
                     or len(candidate_admissions) != 1 or len(candidate_rows) != 1
-                    or not any(row.get("caller") == candidate_rows[0].get("id") for row in edges)):
+                    or not any(row.get("caller") == candidate_rows[0].get("id")
+                               and row.get("module") in modules for row in edges)):
                 errors.append("healthy final twin did not sample and actually admit the same candidate")
         elif (candidate_admissions or candidate_rows or published.get("candidate_admitted") is not False
               or sampled.get("present") is not False):
@@ -231,7 +258,10 @@ def evaluate_stop_stage(receipt, frames, document, records):
         histories = [row for row in edges if row.get("caller") == baseline.get("caller")
                      and row.get("module") == baseline.get("module")]
         if (baseline.get("count", 0) < 1 or len(histories) != 1
-                or (histories[0].get("entries") or {}).get("count", -1) < baseline["count"]):
+                or baseline.get("module") not in modules
+                or (histories[0].get("entries") or {}).get("count", -1) < baseline["count"]
+                or ((histories[0].get("entries") or {}).get("coverage") or {}).get("state") != "counted"
+                or ((histories[0].get("entries") or {}).get("coverage") or {}).get("lossy") is not False):
             errors.append("useful baseline capture/history was not preserved")
     return {"pass": not errors, "stage": stage, "healthy": healthy,
             "transaction": tx, "errors": errors}
@@ -251,20 +281,24 @@ def read_records(path, final=False):
     return rows
 
 
-def wait_baseline(ctx, path, owner, executable, provider, reader, phases):
+def wait_baseline(path, owner, executable, provider, reader, phases):
     H6["wait_usage_armed"](path, [(owner.pid, str(executable.path), 1)])
     H6["n3_command"](owner, reader, "C_GenerateRandom", 3, 0, "baseline", "selected",
                       0, None, phases)
     deadline = H6["wait_deadline"](60)
     while True:
         records = read_records(path)
+        modules = provider_modules(records, provider)
         ids = {row["event"].get("caller") for row in records
                if row.get("kind") == "caller_event"
                and caller_subject(row.get("event") or {}).get("pid") == owner.pid}
         for record in reversed(records):
             event = record.get("event") or {}
             count = (event.get("entries") or {}).get("count", 0)
-            if record.get("kind") == "edge_observed" and event.get("caller") in ids and count >= 3:
+            coverage = (event.get("entries") or {}).get("coverage") or {}
+            if (record.get("kind") == "edge_observed" and event.get("caller") in ids
+                    and event.get("module") in modules and count >= 3
+                    and coverage.get("state") == "counted" and coverage.get("lossy") is False):
                 return {"caller": event["caller"], "module": event["module"], "count": count,
                         "seq": records[-1]["seq"]}
         H6["pause_until"](deadline, 0.05)
@@ -275,6 +309,7 @@ def run_leg(ctx, directory, backend, stage, healthy):
     directory = Path(directory) / backend / f"{stage}-{'release' if healthy else 'sigint'}"
     (directory / "workload").mkdir(mode=0o755, parents=True)
     env = H6["init_token"](directory / "workload", ctx.args.uid, ctx.args.gid, "h6-stage")
+    provider_before = H6["provider_receipt"](ctx.provider_pin)
     root, _ = H6["create_tracked"](ctx, Path("/sys/fs/cgroup") / f"p11scope-h6-stop-{os.getpid()}-{time.monotonic_ns()}")
     selected, _ = H6["create_tracked"](ctx, root.path / "selected")
     outside, _ = H6["create_tracked"](ctx, root.path / "outside")
@@ -308,8 +343,8 @@ def run_leg(ctx, directory, backend, stage, healthy):
         baseline = None
         if stage == "final_pre_read":
             H6["wait_inventory_ready"](owned, errors, log_path, backend)
-            baseline = wait_baseline(ctx, log_path, workloads[0][0], ctx.pins["caller-a"],
-                                     ctx.provider_pin, workloads[0][1], phases)
+            baseline = wait_baseline(log_path, workloads[0][0], ctx.pins["caller-a"],
+                                     provider_before, workloads[0][1], phases)
             H6["move_and_verify"](selected, candidate, moves, "fresh-mapped-candidate")
         gate = channel.wait(stage)
         if healthy:
@@ -325,6 +360,8 @@ def run_leg(ctx, directory, backend, stage, healthy):
         ctx.binary.verify()
         ctx.provider_pin.verify()
         receipt = {"stage": stage, "healthy": healthy, "candidate": identity, "baseline": baseline,
+                   "provider_before": provider_before,
+                   "provider_after": H6["provider_receipt"](ctx.provider_pin),
                    "observer_rc": rc, "workload_rc": workload_rc,
                    **H6["stop_receipt"](owned, latency)}
         result = evaluate_stop_stage(receipt, frames, document, records)

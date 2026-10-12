@@ -320,6 +320,97 @@ fn fd_open(fd: FdToken) -> bool {
     stat.st_dev == fd.dev && stat.st_ino == fd.ino
 }
 
+pub(super) struct ClosedFdEvidence {
+    _original: FdToken,
+    _path: tempfile::TempPath,
+    closed: bool,
+}
+impl ClosedFdEvidence {
+    pub(super) fn capture(original: FdToken, path: tempfile::TempPath) -> Self {
+        // The named entry keeps this inode allocated while we check the
+        // original descriptor. It retains no additional descriptor.
+        let closed = !fd_open(original);
+        assert!(closed, "original fixture FD remains open after consumption");
+        Self {
+            _original: original,
+            _path: path,
+            closed,
+        }
+    }
+
+    pub(super) fn was_closed(&self) -> bool {
+        // A later descriptor can reuse this number, including another OFD
+        // of the same inode. Preserve the physical check made at consumption.
+        self.closed
+    }
+}
+
+#[test]
+fn d3c_fd_close_snapshot_survives_rebound_same_inode() {
+    const CHILD: &str = "P11SCOPE_D3C_FD_CLOSE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Isolate dup2 from other tests' descriptor allocation. The child
+        // runs this exact cell with one harness thread and owns its FDs.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "discovery::kernel_identity::tests::d3c_fd_close_snapshot_survives_rebound_same_inode",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "FD close child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    use std::io::{Seek as _, SeekFrom};
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+
+    let (mut original, path) = tempfile::NamedTempFile::new().unwrap().into_parts();
+    let mut independent = File::open(&path).unwrap();
+    original.seek(SeekFrom::Start(13)).unwrap();
+    independent.seek(SeekFrom::Start(29)).unwrap();
+    assert_eq!(original.stream_position().unwrap(), 13);
+    assert_eq!(independent.stream_position().unwrap(), 29);
+    let token = FdToken::of(&original);
+    let other = FdToken::of(&independent);
+    assert_ne!(token.raw, other.raw);
+    assert_eq!((token.dev, token.ino), (other.dev, other.ino));
+    drop(original);
+    let closed = ClosedFdEvidence::capture(token, path);
+    assert!(closed.was_closed());
+
+    // SAFETY: this single-test child has closed token.raw and owns the
+    // independent source FD. dup2 installs a newly owned destination FD.
+    let rebound = unsafe { libc::dup2(independent.as_raw_fd(), token.raw) };
+    assert_eq!(rebound, token.raw);
+    // SAFETY: successful dup2 returned this unique owned destination FD.
+    let mut rebound = File::from(unsafe { OwnedFd::from_raw_fd(rebound) });
+    assert_eq!(rebound.stream_position().unwrap(), 29);
+    assert!(
+        fd_open(token),
+        "rebind did not reproduce the old oracle match"
+    );
+    assert!(
+        closed.was_closed(),
+        "late FD reuse erased the original close observation"
+    );
+}
+
+#[test]
+#[should_panic(expected = "original fixture FD remains open after consumption")]
+fn d3c_fd_close_snapshot_rejects_live_original() {
+    let (original, path) = tempfile::NamedTempFile::new().unwrap().into_parts();
+    ClosedFdEvidence::capture(FdToken::of(&original), path);
+}
+
 fn anchor_stream(outcomes: &[(u32, u32, u64)]) -> Vec<u8> {
     let mut bytes = Vec::new();
     for &(slot, outcome, root) in outcomes {
@@ -767,16 +858,25 @@ struct AdapterTrace {
     reads: Vec<(u32, u64, u64)>,
     events: Vec<&'static str>,
     pin: Option<FdToken>,
+    pin_closed: Option<ClosedFdEvidence>,
 }
 
 struct AdapterPin {
-    file: File,
+    file: Option<(File, tempfile::TempPath)>,
     trace: Rc<RefCell<AdapterTrace>>,
 }
 impl Drop for AdapterPin {
     fn drop(&mut self) {
-        assert!(fd_open(FdToken::of(&self.file)));
+        let (file, path) = self
+            .file
+            .take()
+            .expect("fixture pin owns its original File");
+        let token = FdToken::of(&file);
+        assert!(fd_open(token));
+        drop(file);
+        let closed = ClosedFdEvidence::capture(token, path);
         let mut trace = self.trace.borrow_mut();
+        trace.pin_closed = Some(closed);
         trace.closes += 1;
         trace.events.push("close-pin");
     }
@@ -794,14 +894,14 @@ impl ConfirmIo for AdapterIo {
     type Pin = AdapterPin;
     fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
         assert_eq!(pid, ADAPTER_PID);
-        let file = tempfile::tempfile().unwrap();
+        let (file, path) = tempfile::NamedTempFile::new().unwrap().into_parts();
         let mut trace = self.trace.borrow_mut();
         trace.opens += 1;
         trace.events.push("pin");
         trace.pin = Some(FdToken::of(&file));
         drop(trace);
         Ok(AdapterPin {
-            file,
+            file: Some((file, path)),
             trace: self.trace.clone(),
         })
     }
@@ -816,12 +916,12 @@ impl ConfirmIo for AdapterIo {
         Ok(self.identity)
     }
     fn start_time(&self, pin: &Self::Pin) -> Option<u64> {
-        assert!(fd_open(FdToken::of(&pin.file)));
+        assert!(fd_open(FdToken::of(&pin.file.as_ref().unwrap().0)));
         self.trace.borrow_mut().events.push("start-time");
         Some(42)
     }
     fn still_the_same(&self, pin: &Self::Pin) -> bool {
-        assert!(fd_open(FdToken::of(&pin.file)));
+        assert!(fd_open(FdToken::of(&pin.file.as_ref().unwrap().0)));
         self.trace.borrow_mut().events.push("generation");
         !self.pid_changed
     }
@@ -970,7 +1070,7 @@ fn adapter_cell(cell: AdapterCell) -> AdapterObservation {
     assert_eq!(owner.state_for_test().0, [0; 4]);
     let trace_state = trace.borrow();
     assert_eq!((trace_state.opens, trace_state.closes), (1, 1));
-    assert!(!fd_open(trace_state.pin.unwrap()));
+    assert!(trace_state.pin_closed.as_ref().unwrap().was_closed());
     assert_eq!(&trace_state.events[..3], &["pin", "exe-before", "maps"]);
     drop(trace_state);
     drop(installed);
@@ -1543,9 +1643,7 @@ impl ConfirmIo for SegmentIo<'_> {
     fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
         let runs = self.runs.lock().unwrap();
         assert!(
-            runs.closed
-                .iter()
-                .all(|&(iterator, link)| !fd_open(iterator) && !fd_open(link)),
+            runs.all_concrete_runs_closed(),
             "userspace worker started before an iterator/link closed"
         );
         assert_eq!(
@@ -1617,6 +1715,30 @@ impl super::super::confirm_shards::ShardableIo for SegmentIo<'_> {
     fn maps_now(&self) -> Option<u64> {
         crate::attach::monotonic_ns()
     }
+}
+
+#[test]
+#[should_panic(expected = "userspace worker started before an iterator/link closed")]
+fn d3c_fallback_rejects_unclosed_concrete_run() {
+    let (iterator, _iterator_path) = tempfile::NamedTempFile::new().unwrap().into_parts();
+    let (link, _link_path) = tempfile::NamedTempFile::new().unwrap().into_parts();
+    assert!(fd_open(FdToken::of(&iterator)));
+    assert!(fd_open(FdToken::of(&link)));
+    let world = BTreeMap::new();
+    let identities = BTreeMap::new();
+    let mut io = SegmentIo {
+        world: &world,
+        identities: &identities,
+        events: Arc::new(std::sync::Mutex::new(SegmentEvents::default())),
+        runs: Arc::new(std::sync::Mutex::new(FixtureRunTrace {
+            concrete_runs: 1,
+            ..Default::default()
+        })),
+        owner: ReservationOwner::for_examined(SegmentPolicy::from_headroom(16, 0, 0), 0),
+        exe_reads: Cell::new(0),
+        imm_base: 0,
+    };
+    io.mapped_file(1, 0x1000, 0x2000).unwrap();
 }
 
 fn segment_range(key_number: usize) -> (u64, u64) {
@@ -1987,12 +2109,7 @@ fn d3c_segments_iterator_fds_close_before_fallback_workers() {
         1,
         "no concrete iterator/link was consumed before fallback"
     );
-    assert!(
-        trace
-            .closed
-            .iter()
-            .all(|&(iterator, link)| !fd_open(iterator) && !fd_open(link))
-    );
+    assert!(trace.all_concrete_runs_closed());
     assert_eq!(
         observation.events.lock().unwrap().fallback_after_runs,
         [1, 1]

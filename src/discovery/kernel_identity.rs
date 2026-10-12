@@ -1345,9 +1345,21 @@ enum FixtureTarget {
 #[derive(Default)]
 struct FixtureRunTrace {
     scopes: Vec<BTreeSet<u32>>,
-    closed: Vec<(tests::FdToken, tests::FdToken)>,
+    concrete_runs: usize,
+    closed: Vec<(tests::ClosedFdEvidence, tests::ClosedFdEvidence)>,
     outcomes: Vec<Result<(), RunFailure>>,
     pidfds: Vec<Option<i32>>,
+}
+
+#[cfg(test)]
+impl FixtureRunTrace {
+    fn all_concrete_runs_closed(&self) -> bool {
+        self.concrete_runs == self.closed.len()
+            && self
+                .closed
+                .iter()
+                .all(|(iterator, link)| iterator.was_closed() && link.was_closed())
+    }
 }
 
 fn probe_succeeded(report: &crate::attach::identity_iter::FunctionalProbeReport) -> bool {
@@ -1511,10 +1523,13 @@ impl IdentitySession {
                         RunKind::Target => target,
                     },
                 };
-                let file = tempfile::tempfile().unwrap();
+                let (file, file_path) = tempfile::NamedTempFile::new().unwrap().into_parts();
                 file.write_at(bytes, 0).unwrap();
-                let link = tempfile::tempfile().unwrap();
+                let (link, link_path) = tempfile::NamedTempFile::new().unwrap().into_parts();
                 let tokens = (tests::FdToken::of(&file), tests::FdToken::of(&link));
+                if run == RunKind::Target {
+                    target_trace.lock().unwrap().concrete_runs += 1;
+                }
                 let read_deadline = if matches!(step, Some(FixtureTarget::Deadline(_))) {
                     std::time::Instant::now() - std::time::Duration::from_millis(1)
                 } else {
@@ -1527,9 +1542,13 @@ impl IdentitySession {
                     max_bytes,
                 )
                 .map_err(RunFailure::from);
+                let closed = (
+                    tests::ClosedFdEvidence::capture(tokens.0, file_path),
+                    tests::ClosedFdEvidence::capture(tokens.1, link_path),
+                );
                 if run == RunKind::Target {
                     let mut trace = target_trace.lock().unwrap();
-                    trace.closed.push(tokens);
+                    trace.closed.push(closed);
                     trace
                         .outcomes
                         .push(result.as_ref().map(|_| ()).map_err(|reason| *reason));

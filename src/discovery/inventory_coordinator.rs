@@ -1861,6 +1861,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         control: CollectionControl,
         max_scan_pids: Option<usize>,
     ) -> Result<impl FnOnce() -> CgroupCollection + Send + 'static> {
+        self.cgroup_collector_observed(state, limits, control, max_scan_pids, None)
+    }
+
+    pub(crate) fn cgroup_collector_observed(
+        &self,
+        state: CgroupWalkState,
+        limits: CgroupWalkLimits,
+        control: CollectionControl,
+        max_scan_pids: Option<usize>,
+        observer: Option<crate::cgroup_stop_acceptance::Observer>,
+    ) -> Result<impl FnOnce() -> CgroupCollection + Send + 'static> {
         let Scope::Cgroup { dir, .. } = &self.engine.scope else {
             bail!("scoped cgroup collection requires a retained cgroup root");
         };
@@ -1876,6 +1887,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             control,
             max_scan_pids,
             scan_budget: crate::discovery::scan::CaptureWorkBudget::for_inventory(work),
+            observer,
         };
         let hints = self.engine.module_hints.clone();
         let hooks = self.engine.hooks.clone();
@@ -5350,6 +5362,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 self.exit_clocks_comparable = false;
             }
             scoped_scan_callers = allowed.len();
+            collection.observe_allowed(&allowed);
             let mut catalog = collection.catalog(&allowed);
             let absorbed = match (provider, catalog.lowering.take()) {
                 (Some(provider), Some(lowering)) => {
@@ -5431,6 +5444,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         };
         self.finalize_pending_counts();
         if let Some((collection, _)) = publishing_cgroup {
+            collection.observe_publication(
+                scoped_admitted,
+                scoped_scan_callers,
+                self.attach_set.len(),
+            );
             let (state, outcome) = collection.finish();
             self.completed_cgroup = Some(CgroupCompletion {
                 state,

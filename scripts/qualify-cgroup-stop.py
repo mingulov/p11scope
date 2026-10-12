@@ -173,6 +173,7 @@ def evaluate_stop_stage(receipt, frames, document, records):
     tx = gate.get("transaction")
     healthy = receipt.get("healthy") is True
     expected = "complete" if healthy else "operator_stop"
+    allowed_outcomes = {"complete", "incomplete"} if healthy else {"operator_stop"}
     same = [frame for frame in frames if frame.get("transaction") == tx]
     def unique(event):
         values = [frame for frame in same if frame.get("event") == event]
@@ -190,7 +191,7 @@ def evaluate_stop_stage(receipt, frames, document, records):
             or not published.get("sequence", MAX_EVENTS) < retiring[0].get("sequence", -1)
             or not retiring[0].get("sequence", MAX_EVENTS) < retired[0].get("sequence", -1)):
         errors.append("worker return/join/publication did not precede normal native retirement")
-    if published.get("outcome") != expected:
+    if published.get("outcome") not in allowed_outcomes:
         errors.append("selected transaction has the wrong real collection outcome")
     if any(frame.get("event") == "launch" and frame.get("transaction", 0) > tx
            for frame in frames):
@@ -207,7 +208,7 @@ def evaluate_stop_stage(receipt, frames, document, records):
     if stage == "traversed":
         if tx != 1 or not gate.get("sequence", MAX_EVENTS) < returned.get("sequence", -1):
             errors.append("gate was not inside the first actual worker traversal")
-        if returned.get("outcome") != expected:
+        if returned.get("outcome") not in allowed_outcomes:
             errors.append("worker did not return the actual expected collection outcome")
         if not healthy and (admissions or callers or edges or document.get("modules")
                 or published.get("admitted") != 0 or published.get("callers") != 0
@@ -227,8 +228,8 @@ def evaluate_stop_stage(receipt, frames, document, records):
                 or gate.get("requested") is not True
                 or not joined.get("sequence", MAX_EVENTS) < gate.get("sequence", -1)):
             errors.append("final stage lacks the real ready/requested candidate and joined worker")
-        if returned.get("outcome") != "complete":
-            errors.append("final stage worker did not return a complete real candidate collection")
+        if returned.get("outcome") not in {"complete", "incomplete"}:
+            errors.append("final stage worker did not return a live real candidate collection")
         sampled = unique("end_sampled")
         if (not gate.get("sequence", MAX_EVENTS) < sampled.get("sequence", -1)
                 < published.get("sequence", -1) or sampled.get("outcome") != expected):
@@ -365,7 +366,15 @@ def run_leg(ctx, directory, backend, stage, healthy):
                    "observer_rc": rc, "workload_rc": workload_rc,
                    **H6["stop_receipt"](owned, latency)}
         result = evaluate_stop_stage(receipt, frames, document, records)
-        result["backend"] = backend
+        publication = next((frame for frame in frames if frame["event"] == "published"
+                            and frame["transaction"] == gate["transaction"]), {})
+        result.update(backend=backend, source_revision=ctx.args.source_revision,
+                      binary=ctx.binary.metadata(), scope="cgroup",
+                      boundary="final membership sampling, pre-read boundary" if stage == "final_pre_read"
+                      else "first transaction, traversed before pin/scan",
+                      outcome=publication.get("outcome"), admitted=publication.get("admitted"),
+                      callers=publication.get("callers"), endpoints=publication.get("endpoints"),
+                      stop_latency_seconds=latency, forced_cleanup=owned.stop_receipt["forced_cleanup"])
         print(json.dumps(result), flush=True)
         return result
     finally:

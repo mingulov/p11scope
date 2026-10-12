@@ -853,7 +853,8 @@ fn run_with_terminal_budget(
         diagnostics.enable(&mut coordinator, capture, scope, request.pid_filter);
     }
     let cgroup = matches!(scope, InventoryRunScope::Cgroup)
-        .then(|| CgroupDriverState::new(deadline_for_duration(duration), operator_stop_source));
+        .then(|| CgroupDriverState::new(deadline_for_duration(duration), operator_stop_source))
+        .transpose()?;
     let lane = match open_native_lane(
         capture,
         attach_backend,
@@ -1260,24 +1261,26 @@ struct CgroupDriverState {
     limits: crate::scope::inventory_cgroup::CgroupWalkLimits,
     control: crate::scope::inventory_cgroup::CollectionControl,
     deadline: Option<Instant>,
+    observer: Option<crate::cgroup_stop_acceptance::Observer>,
 }
 
 impl CgroupDriverState {
     fn new(
         deadline: Option<Instant>,
         source: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
-    ) -> Self {
+    ) -> Result<Self> {
         let control = crate::scope::inventory_cgroup::CollectionControl::new(deadline);
         let control = match source {
             Some(source) => control.with_operator_stop_source(source),
             None => control,
         };
-        Self {
+        Ok(Self {
             continuation: Some(crate::scope::inventory_cgroup::CgroupWalkState::default()),
             limits: crate::scope::inventory_cgroup::CgroupWalkLimits::default(),
             control,
             deadline,
-        }
+            observer: crate::cgroup_stop_acceptance::Observer::from_environment()?,
+        })
     }
 }
 
@@ -1653,11 +1656,12 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                 .ok_or(CgroupJobFailure::Preparation)
                 .and_then(|state| {
                     self.coordinator
-                        .cgroup_collector(
+                        .cgroup_collector_observed(
                             state,
                             cgroup.limits.clone(),
                             cgroup.control.clone(),
                             self.max_scan_pids,
+                            cgroup.observer.clone(),
                         )
                         .map(|job| Box::new(job) as crate::inventory_capture::CgroupCollectJob)
                         .map_err(|_| CgroupJobFailure::Preparation)
@@ -1836,6 +1840,13 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
     }
 
     fn on_stop_requested(&mut self) {
+        if let Some(observer) = self
+            .cgroup
+            .as_ref()
+            .and_then(|cgroup| cgroup.observer.as_ref())
+        {
+            observer.retiring();
+        }
         // Gate Detailed immediately, before the (possibly slow) native
         // retirement: one producer's stop never certifies the other.
         if let Some(lane) = self.semantic.as_mut() {
@@ -1849,6 +1860,13 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
     }
 
     fn on_lane_stopped(&mut self) {
+        if let Some(observer) = self
+            .cgroup
+            .as_ref()
+            .and_then(|cgroup| cgroup.observer.as_ref())
+        {
+            observer.retired();
+        }
         // Safety net for the same terminal sequence (a no-op once the
         // stop request above already ran it before native retirement).
         self.run_semantic_terminal_sequence();
@@ -3571,6 +3589,135 @@ pub(crate) fn render_text<Source: ProcessSource>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cgroup_stop_acceptance_inherited_fd_child() {
+        if std::env::var_os("P11SCOPE_CGROUP_STOP_TEST_CHILD").is_none() {
+            return;
+        }
+        let _state = super::CgroupDriverState::new(None, None).unwrap();
+    }
+
+    #[test]
+    fn cgroup_stop_acceptance_inherited_controller_fd_is_armed() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::os::unix::process::CommandExt;
+        let (mut controller, observer) = UnixStream::pair().unwrap();
+        controller
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        controller
+            .write_all(b"{\"version\":1,\"stage\":\"traversed\",\"timeout_ms\":2000,\"pid\":0,\"start_time\":0}\n")
+            .unwrap();
+        let fd = observer.as_raw_fd();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "inventory::tests::cgroup_stop_acceptance_inherited_fd_child",
+            ])
+            .env("P11SCOPE_CGROUP_STOP_TEST_CHILD", "1")
+            .env("P11SCOPE_CGROUP_STOP_FD", fd.to_string());
+        // Only the selected socket is inherited by this isolated test child.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        drop(observer);
+        let mut first = [0_u8; 1];
+        let observed = controller.read(&mut first);
+        let status = child.wait().unwrap();
+        assert!(status.success(), "observer setup child failed");
+        assert!(
+            matches!(observed, Ok(1)) && first[0] == b'{',
+            "inherited controller socket must receive an armed stage observer, got {observed:?}"
+        );
+    }
+
+    #[test]
+    fn cgroup_stop_acceptance_absent_selector_performs_no_socket_io() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::os::unix::process::CommandExt;
+        let (mut controller, mut unselected) = UnixStream::pair().unwrap();
+        controller.write_all(b"untouched").unwrap();
+        unselected
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let fd = unselected.as_raw_fd();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "inventory::tests::cgroup_stop_acceptance_inherited_fd_child",
+            ])
+            .env("P11SCOPE_CGROUP_STOP_TEST_CHILD", "1")
+            .env_remove("P11SCOPE_CGROUP_STOP_FD");
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        assert!(command.status().unwrap().success());
+        let mut bytes = [0; 9];
+        unselected.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"untouched");
+    }
+
+    #[test]
+    fn cgroup_stop_acceptance_malformed_or_unavailable_descriptor_refuses() {
+        for value in ["1", "-1", "not-a-descriptor", "2147483647"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "inventory::tests::cgroup_stop_acceptance_inherited_fd_child",
+                ])
+                .env("P11SCOPE_CGROUP_STOP_TEST_CHILD", "1")
+                .env("P11SCOPE_CGROUP_STOP_FD", value)
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "invalid descriptor {value} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn cgroup_stop_acceptance_regular_file_descriptor_refuses() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let file = tempfile::tempfile().unwrap();
+        let fd = file.as_raw_fd();
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "inventory::tests::cgroup_stop_acceptance_inherited_fd_child",
+            ])
+            .env("P11SCOPE_CGROUP_STOP_TEST_CHILD", "1")
+            .env("P11SCOPE_CGROUP_STOP_FD", fd.to_string());
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        assert!(!command.output().unwrap().status.success());
+    }
+
     use super::*;
     use crate::discovery::caller_registry::{
         AdmissionState, ImageAuthority, ModuleInfo, ModuleKey,

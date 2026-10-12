@@ -35,6 +35,7 @@ impl<'a> ObservedDriver<'a> {
                 inventory_scope: None,
                 scope: InventoryRunScope::Cgroup,
                 cgroup: Some(CgroupDriverState {
+                    observer: None,
                     continuation: Some(CgroupWalkState::default()),
                     limits: CgroupWalkLimits::default(),
                     control,

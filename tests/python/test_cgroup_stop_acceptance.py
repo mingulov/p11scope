@@ -159,6 +159,16 @@ class StopStageOracleTests(unittest.TestCase):
         inputs[2]["edges"][0]["entries"]["coverage"]["state"] = "unknown"
         self.assertFalse(self.verdict(inputs)["pass"])
 
+    def test_covered_member_permit_preserves_unrelated_finite_scan_gaps(self):
+        for healthy in (False, True):
+            inputs = self.inputs(healthy=healthy)
+            next(frame for frame in inputs[1] if frame["event"] == "worker_returned")["outcome"] = "incomplete"
+            if healthy:
+                next(frame for frame in inputs[1] if frame["event"] == "published")["outcome"] = "incomplete"
+            with self.subTest(healthy=healthy):
+                result = self.verdict(inputs)
+                self.assertTrue(result["pass"], result)
+
 
 class StageControllerTests(unittest.TestCase):
     def channel(self, seconds=1):

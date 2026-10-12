@@ -5,6 +5,7 @@
 import json
 import os
 from pathlib import Path
+import runpy
 import shutil
 import subprocess
 import tempfile
@@ -84,14 +85,14 @@ class DualBuildCallerTests(unittest.TestCase):
     def rows(self):
         return [json.loads(row) for row in self.events.read_text().splitlines()]
 
-    def run_child(self, child, bits=64, prepared=False):
+    def run_child(self, child, bits=64, prepared=False, arguments=()):
         self.events.unlink(missing_ok=True)
         environment = self.environment.copy()
         environment["P11SCOPE_CANARY_TARGET_BITS"] = str(bits)
         if prepared:
             environment["P11SCOPE_PRODUCT_BUILD_MODE"] = "prepared"
             environment.update({name: str(value) for name, value in zip(PREPARED, self.selected)})
-        return subprocess.run(["sh", str(self.repo / "scripts" / child.name)], cwd=self.base,
+        return subprocess.run(["sh", str(self.repo / "scripts" / child.name), *arguments], cwd=self.base,
                               env=environment, text=True, stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, timeout=10)
 
@@ -110,10 +111,13 @@ class DualBuildCallerTests(unittest.TestCase):
                                    str(self.work / "helper-build")])
         return rows
 
-    def assert_builds(self, child, bits, prepared):
+    def assert_builds(self, child, bits, prepared, diagnose=False):
         expected = self.expected(child, bits, prepared)
+        if diagnose:
+            expected[0].extend(["--features", "skip-attribution"])
         self.configure([0] * (len(expected) - 1) + [83])
-        result = self.run_child(child, bits, prepared)
+        result = self.run_child(child, bits, prepared,
+                                ("--diagnose-skips",) if diagnose else ())
         self.assertEqual(result.returncode, 83, result.stderr)
         rows = self.rows()
         builds = [row for row in rows if row["kind"] == "cargo"]
@@ -153,11 +157,199 @@ class DualBuildCallerTests(unittest.TestCase):
         self.assert_builds(CHILDREN[1], 64, True)
         self.assert_builds(CHILDREN[1], 32, True)
 
+    def test_attach_diagnostic_adds_only_fixed_feature_in_both_build_modes(self):
+        for prepared in (False, True):
+            with self.subTest(prepared=prepared):
+                self.assert_builds(CHILDREN[0], 64, prepared, diagnose=True)
+
+    def test_attach_rejects_unknown_or_combined_arguments_before_resources(self):
+        self.configure([83])
+        for arguments in (("unknown",), ("",), ("--diagnose-skips", "extra"),
+                          ("--diagnose-skips", "--diagnose-skips"),
+                          ("--self-test", "--diagnose-skips"),
+                          ("--diagnose-skips", "--self-test")):
+            with self.subTest(arguments=arguments):
+                shutil.rmtree(self.work, ignore_errors=True)
+                result = self.run_child(CHILDREN[0], arguments=arguments)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("usage:", result.stderr)
+                self.assertFalse(self.events.exists())
+                self.assertFalse(self.work.exists())
+
+    def configure_attach_observer(self, *, skipped=1, log_lines=(), checker_status=None,
+                                  log_fault=None, terminal_attribution=False):
+        """Keep the actual gate, waits and checker; fake only external commands."""
+        for name in ("check-capture-evidence.py", "lane-attach-e2e-oracle.py"):
+            shutil.copy2(ROOT / "scripts" / name, self.repo / "scripts" / name)
+        (self.repo / "spike").mkdir()
+        shutil.copy2(ROOT / "spike/expected.txt", self.repo / "spike/expected.txt")
+        checker = runpy.run_path(str(ROOT / "scripts/check-capture-evidence.py"))
+        counts = {"C_CloseSession": 10, "C_Digest": 50, "C_DigestInit": 50,
+                  "C_Finalize": 1, "C_GenerateRandom": 100, "C_GetInfo": 3,
+                  "C_GetSlotList": 1, "C_Initialize": 1, "C_OpenSession": 10,
+                  "C_GetFunctionList": 1}
+        documents = []
+        for sources in (("scan",), ("scan", "manifest")):
+            surfaces = checker["LEGACY_SURFACES"].copy()
+            if len(sources) == 2:
+                surfaces += checker["LEGACY_SURFACES"]
+            evidence = checker["evidence_fixture"](surfaces, sources, discovery_skipped=skipped)
+            evidence.update(table_entries=68, slots=68, active_slots=68, attached_probes=136)
+            evidence["discovery"][0]["path"] = "/opt/libsofthsm2.so"
+            evidence["discovery"][0]["objects"][0]["path"] = "/opt/libsofthsm2.so"
+            if len(sources) == 2:
+                evidence["surfaces"][0]["source"] = (
+                    f"{evidence['discovery'][0]['path']} table 2.40")
+            document = checker["document_fixture"](
+                evidence, schema=checker["METRICS_SCHEMA"], mode="metrics",
+                privacy="aggregate-only")
+            document["functions"] = checker["function_items"](
+                [([name], calls) for name, calls in counts.items()])
+            documents.append(document)
+        self.module = self.base / "libsofthsm2.so"
+        self.module.write_bytes(b"fixture mapping")
+        self.environment["P11SCOPE_PKCS11_MODULE"] = str(self.module)
+        self.config.write_text(json.dumps({"events": str(self.events),
+                                           "documents": documents, "log_lines": log_lines,
+                                           "terminal_attribution": terminal_attribution}),
+                               encoding="utf-8")
+        dispatcher = '''#!/usr/bin/python3
+import json, mmap, os, shutil, sys, time
+from pathlib import Path
+config = json.loads(Path(os.environ["P11SCOPE_DUAL_BUILD_CONFIG"]).read_text())
+kind = "cargo" if Path(sys.argv[0]).name in ("cargo", "stable cargo") else Path(sys.argv[0]).name
+with Path(config["events"]).open("a") as stream:
+    stream.write(json.dumps({"kind": kind, "argv": sys.argv[1:]}) + "\\n")
+if kind == "cargo":
+    release = Path(sys.argv[sys.argv.index("--target-dir") + 1]) / "release"
+    release.mkdir(parents=True)
+    for name in ("p11scope", "p11scope-discover"):
+        shutil.copy2(Path(sys.argv[0]).resolve(), release / name)
+elif kind == "gcc":
+    shutil.copy2(Path(sys.argv[0]).resolve(), sys.argv[sys.argv.index("-o") + 1])
+elif kind == "harness":
+    with open(sys.argv[1], "rb") as provider, mmap.mmap(provider.fileno(), 0, access=mmap.ACCESS_READ):
+        deadline = time.monotonic() + 8
+        while not Path(sys.argv[2]).exists():
+            if time.monotonic() > deadline:
+                raise SystemExit(98)
+            time.sleep(0.01)
+elif kind == "p11scope":
+    output = Path(sys.argv[sys.argv.index("-o") + 1])
+    output.write_text(json.dumps(config["documents"][int("--manifest" in sys.argv)]))
+    print("p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C", flush=True)
+    print("PRIVATE UNRELATED LOG SENTINEL")
+    if not config["terminal_attribution"]:
+        for line in config["log_lines"]:
+            print(line)
+    for index in range(3):
+        print(f"ordinary terminal line {index}")
+    if config["terminal_attribution"]:
+        for line in config["log_lines"]:
+            print(line)
+elif kind == "p11scope-discover":
+    Path(sys.argv[sys.argv.index("-o") + 1]).write_text("{}")
+elif kind == "sudo":
+    arguments = sys.argv[1:]
+    while arguments and arguments[0].startswith("-"):
+        arguments.pop(0)
+    os.execvp(arguments[0], arguments)
+elif kind != "softhsm2-util":
+    raise SystemExit(97)
+'''
+        (self.bin / "dispatch.py").write_text(dispatcher, encoding="utf-8")
+        shutil.copy2(self.bin / "dispatch.py", self.stable_cargo)
+        if checker_status is not None:
+            shutil.copy2(self.repo / "scripts/check-capture-evidence.py",
+                         self.repo / "scripts/real-check-capture-evidence.py")
+            wrapper = f'''import subprocess, sys
+from pathlib import Path
+subprocess.run([sys.executable, "-I", "scripts/real-check-capture-evidence.py", *sys.argv[1:]], check=False)
+log = Path(sys.argv[2]).with_suffix(".log")
+fault = {log_fault!r}
+if fault in ("missing", "directory"):
+    log.unlink()
+if fault == "directory":
+    log.mkdir()
+raise SystemExit({checker_status})
+'''
+            (self.repo / "scripts/check-capture-evidence.py").write_text(wrapper, encoding="utf-8")
+
+    def assert_first_lane_failed(self, result, status=1):
+        self.assertEqual(result.returncode, status, result.stderr)
+        self.assertIn("discovery skips: want 0, got", result.stderr)
+        self.assertNotIn("=== discover", result.stdout)
+        self.assertNotIn("manifest corroborated against the scan", result.stdout)
+        self.assertNotIn("ALL OK", result.stdout)
+        self.assertEqual(sum(row["kind"] == "p11scope" for row in self.rows()), 1)
+        self.assertFalse(any(row["kind"] == "p11scope-discover" for row in self.rows()))
+
+    def test_attach_real_checker_failure_exposes_only_opted_in_attribution(self):
+        attribution = 'p11scope: skip-attribution: [0] site.rs:7 x2 :: subject="internal" reason="racing exit"'
+        unanchored = "PRIVATE PREFIX SENTINEL p11scope: skip-attribution: unrelated"
+        self.configure_attach_observer(log_lines=(unanchored, attribution))
+        for diagnose in (False, True):
+            with self.subTest(diagnose=diagnose):
+                result = self.run_child(CHILDREN[0],
+                                        arguments=("--diagnose-skips",) if diagnose else ())
+                self.assert_first_lane_failed(result)
+                self.assertNotIn("PRIVATE UNRELATED LOG SENTINEL", result.stdout + result.stderr)
+                self.assertNotIn(unanchored, result.stdout + result.stderr)
+                self.assertEqual(attribution in result.stderr, diagnose)
+                self.assertNotIn(attribution, result.stdout)
+
+    def test_attach_diagnostic_output_clips_lines_and_record_count(self):
+        prefix = "p11scope: skip-attribution: "
+        self.configure_attach_observer(log_lines=[prefix + "x" * 3000] +
+                                       [prefix + f"record {index}" for index in range(80)],
+                                       terminal_attribution=True)
+        result = self.run_child(CHILDREN[0], arguments=("--diagnose-skips",))
+        self.assert_first_lane_failed(result)
+        lines = [line for line in result.stderr.splitlines() if line.startswith(prefix)]
+        self.assertEqual(len(lines), 65)
+        self.assertTrue(all(len(line) <= 2048 for line in lines))
+        self.assertIn("[line clipped]", lines[0])
+        self.assertIn("[additional lines clipped]", lines[-1])
+        self.assertNotIn(prefix + "record 63", lines)
+        self.assertNotIn(prefix, result.stdout)
+
+    def test_attach_diagnostic_keeps_checker_status_with_unusable_log(self):
+        self.configure_attach_observer(checker_status=37)
+        for fault in (None, "missing", "directory"):
+            with self.subTest(fault=fault):
+                wrapper = self.repo / "scripts/check-capture-evidence.py"
+                text = wrapper.read_text()
+                start = text.index("fault = ")
+                end = text.index("\n", start)
+                wrapper.write_text(text[:start] + f"fault = {fault!r}" + text[end:])
+                result = self.run_child(CHILDREN[0], arguments=("--diagnose-skips",))
+                self.assert_first_lane_failed(result, 37)
+
+    def test_attach_success_keeps_both_oracles_without_dumping_diagnostics(self):
+        attribution = "p11scope: skip-attribution: 0 published record(s)"
+        self.configure_attach_observer(skipped=0, log_lines=(attribution,),
+                                       terminal_attribution=True)
+        result = self.run_child(CHILDREN[0], arguments=("--diagnose-skips",))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("=== e2e: ALL OK ===", result.stdout)
+        self.assertNotIn(attribution, result.stdout + result.stderr)
+        self.assertEqual(sum(row["kind"] == "p11scope" for row in self.rows()), 2)
+
+    def test_attach_self_test_returns_before_build_or_resources(self):
+        self.configure([83])
+        result = subprocess.run(["sh", str(CHILDREN[0]), "--self-test"], cwd=ROOT,
+                                env=self.environment, text=True, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.events.exists())
+        self.assertFalse(self.work.exists())
+
     def test_every_partial_prepared_context_refuses_before_build_and_resources(self):
         self.configure([83])
-        for child in CHILDREN:
+        for child, arguments in ((CHILDREN[0], ()), (CHILDREN[0], ("--diagnose-skips",)),
+                                 (CHILDREN[1], ())):
             for mask in range(15):
-                with self.subTest(child=child.name, mask=mask):
+                with self.subTest(child=child.name, arguments=arguments, mask=mask):
                     self.events.unlink(missing_ok=True)
                     environment = self.environment.copy()
                     environment["P11SCOPE_PRODUCT_BUILD_MODE"] = "prepared"
@@ -165,7 +357,7 @@ class DualBuildCallerTests(unittest.TestCase):
                         if mask & (1 << index):
                             environment[name] = str(value)
                     result = subprocess.run(
-                        ["sh", str(self.repo / "scripts" / child.name)], cwd=self.base,
+                        ["sh", str(self.repo / "scripts" / child.name), *arguments], cwd=self.base,
                         env=environment, text=True, stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE, timeout=10)
                     self.assertNotEqual(result.returncode, 0)

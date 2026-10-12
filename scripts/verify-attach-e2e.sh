@@ -17,12 +17,17 @@ assert_lane_evidence() {
     python3 -I scripts/lane-attach-e2e-oracle.py "$@"
 }
 
-if [ "${1-}" = "--self-test" ]; then
-    [ "$#" -eq 1 ] || { echo "usage: $0 [--self-test]" >&2; exit 2; }
-    assert_lane_evidence --self-test
-    echo "verify-attach-e2e self-test: OK"
-    exit 0
-fi
+diagnose_skips=0
+case "$#:${1-}" in
+    0:) ;;
+    1:--self-test)
+        assert_lane_evidence --self-test
+        echo "verify-attach-e2e self-test: OK"
+        exit 0
+        ;;
+    1:--diagnose-skips) diagnose_skips=1 ;;
+    *) echo "usage: $0 [--self-test | --diagnose-skips]" >&2; exit 2 ;;
+esac
 
 P11SCOPE_PRODUCT_BUILD_MODE=${P11SCOPE_PRODUCT_BUILD_MODE:-ordinary}
 . scripts/product-build.sh
@@ -62,8 +67,11 @@ test -f "$MODULE" || { echo "SoftHSM2 not installed at $MODULE"; exit 1; }
 
 echo "=== build ==="
 rm -rf "$WORK/build"
-p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" \
-    --release --workspace --target-dir "$WORK/build"
+set -- --release --workspace --target-dir "$WORK/build"
+if [ "$diagnose_skips" -eq 1 ]; then
+    set -- "$@" --features skip-attribution
+fi
+p11scope_product_build "$P11SCOPE_PRODUCT_BUILD_MODE" "$@"
 gcc -O0 -o "$WORK/harness" spike/harness.c -ldl
 
 echo "=== softhsm token ==="
@@ -106,10 +114,37 @@ run_lane() {
     touch "$WORK/$lane-go"
     if wait "$WPID"; then WPID=; else status=$?; WPID=; echo "workload failed: $status"; cat "$WORK/$lane-workload.log"; exit "$status"; fi
     if wait "$SPID"; then SPID=; else status=$?; SPID=; echo "profiler failed: $status"; tail -n 20 "$WORK/$lane.log" || true; exit "$status"; fi
-    tail -n 3 "$WORK/$lane.log"
+    if [ "$diagnose_skips" -eq 1 ]; then
+        # Attribution belongs only in the bounded checker-failure dump below.
+        tail -n 3 "$WORK/$lane.log" | sed '/^p11scope: skip-attribution: /d'
+    else
+        tail -n 3 "$WORK/$lane.log"
+    fi
     reclaim_root_output "$WORK/$lane.json"
-    python3 -I scripts/check-capture-evidence.py "$mode" \
-        "$WORK/$lane.json" spike/expected.txt
+    if python3 -I scripts/check-capture-evidence.py "$mode" \
+        "$WORK/$lane.json" spike/expected.txt; then
+        :
+    else
+        checker_status=$?
+        if [ "$diagnose_skips" -eq 1 ]; then
+            # Existing internal stderr only, bounded independently of the log.
+            # Diagnostic I/O must never replace the checker failure.
+            LC_ALL=C awk '
+                index($0, "p11scope: skip-attribution: ") == 1 {
+                    if (++records > 64) {
+                        print "p11scope: skip-attribution: [additional lines clipped]"
+                        exit
+                    }
+                    marker = " [line clipped]"
+                    if (length($0) > 2048)
+                        print substr($0, 1, 2048 - length(marker)) marker
+                    else
+                        print
+                }
+            ' "$WORK/$lane.log" >&2 2>/dev/null || :
+        fi
+        exit "$checker_status"
+    fi
 }
 
 echo "=== observe (manifest-free: memory scan only) ==="

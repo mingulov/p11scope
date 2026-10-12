@@ -1,6 +1,8 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Initial and incremental provider discovery ownership.
 
+#[cfg(feature = "h6-reexec-diagnostic")]
+use crate::attach::reexec_diagnostic::{Outcome as DiagnosticOutcome, Phase as DiagnosticPhase};
 use crate::attach::{
     BackendSelection, CapturePolicy, CounterSnapshot, DetachOutcome, DynamicExportIdentity,
     DynamicLoaderAttachFailure, OwnedPauseGeneration, ReplacementOutcome, Scope, Session,
@@ -2540,6 +2542,10 @@ type TargetAttachResult = (Vec<u32>, Vec<SlotCompletion>);
 /// BPF object; `Session` is the only production implementation and every method
 /// is a plain delegation to the existing inherent one.
 pub(crate) trait EngineSession {
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    fn reexec_diagnostic(&self) -> Option<crate::attach::reexec_diagnostic::Diagnostic> {
+        None
+    }
     fn has_slot_link(&self, _: u32) -> bool {
         false
     }
@@ -2651,6 +2657,10 @@ pub(crate) trait EngineSession {
 }
 
 impl EngineSession for Session {
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    fn reexec_diagnostic(&self) -> Option<crate::attach::reexec_diagnostic::Diagnostic> {
+        Session::reexec_diagnostic(self)
+    }
     fn has_slot_link(&self, slot: u32) -> bool {
         Session::has_slot_link(self, slot)
     }
@@ -11239,6 +11249,18 @@ impl Engine {
         preflighted: bool,
         extra_views: &[&ProcessView],
     ) -> Result<ApplyOutcome> {
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        let diagnostic_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
+            d.begin(
+                DiagnosticPhase::Apply,
+                [
+                    Some(candidate.delta.new.len() as u64),
+                    Some(candidate.delta.replace.len() as u64),
+                    Some(candidate.delta.retire.len() as u64),
+                    Some(candidate.exec_preservations.len() as u64),
+                ],
+            )
+        });
         let mut outcome = ApplyOutcome::default();
         if self.continuity_deferred || self.cancellation_requested() || session.mutation_stopped() {
             *additions_allowed = false;
@@ -11256,11 +11278,31 @@ impl Engine {
             .collect();
         let timing_owners = candidate_timing_owners(&candidate);
         let target_modules = delta_timing_keys(&candidate.delta, &timing_owners);
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        let preflight_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
+            d.begin(
+                DiagnosticPhase::Preflight,
+                [
+                    Some(targets.len() as u64),
+                    Some(u64::from(preflighted)),
+                    None,
+                    None,
+                ],
+            )
+        });
         let preflight_start = crate::attach::monotonic_ns();
         let targets_ok = preflighted
             || session
                 .preflight_targets(&targets, &candidate.pinned)
                 .is_ok();
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        if let Some(span) = preflight_span {
+            span.finish(if targets_ok {
+                DiagnosticOutcome::Ok
+            } else {
+                DiagnosticOutcome::Refused
+            });
+        }
         // A preflighted candidate paid nothing here: the span still records
         // (usually zero) so invocations count applications, not syscalls.
         self.stage_timings.span(
@@ -11357,7 +11399,18 @@ impl Engine {
             .cloned()
             .collect();
         let detach_slots_start = crate::attach::monotonic_ns();
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        let detach_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
+            d.begin(
+                DiagnosticPhase::DetachSlots,
+                [Some(selected.len() as u64), None, None, None],
+            )
+        });
         let detach_slots_outcome = session.detach_slots(&selected);
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        if let Some(span) = detach_span {
+            span.finish_result(&detach_slots_outcome);
+        }
         self.sync_physical_gap(session);
         self.stage_timings.span(
             crate::timing::StageKind::Attach,
@@ -11399,6 +11452,13 @@ impl Engine {
         } else {
             let candidate_views = candidate.views.clone();
             let mut generation_lost = false;
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            let new_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
+                d.begin(
+                    DiagnosticPhase::NewAttach,
+                    [Some(candidate.delta.new.len() as u64), None, None, None],
+                )
+            });
             let attach_targets_start = crate::attach::monotonic_ns();
             let attach = generation_checked_mutation(
                 || process_views_are_current(&self.views, extra_views, &candidate_views),
@@ -11410,6 +11470,20 @@ impl Engine {
                 attach_targets_start,
                 crate::attach::monotonic_ns(),
             );
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            if let Some(span) = new_span {
+                span.finish(match &attach {
+                    GenerationMutation::PrecheckFailed => DiagnosticOutcome::SerialChanged,
+                    GenerationMutation::PostcheckFailed(_) => DiagnosticOutcome::SerialChanged,
+                    GenerationMutation::Committed(result) => {
+                        if result.is_ok() {
+                            DiagnosticOutcome::Ok
+                        } else {
+                            DiagnosticOutcome::Error
+                        }
+                    }
+                });
+            }
             let (attach, attach_stale) = match attach {
                 GenerationMutation::PrecheckFailed => (None, true),
                 GenerationMutation::Committed(result) => (Some(result), false),
@@ -11475,6 +11549,13 @@ impl Engine {
             }
             if *additions_allowed && !generation_lost {
                 let detach_failures = session.detach_failures().len();
+                #[cfg(feature = "h6-reexec-diagnostic")]
+                let replace_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
+                    d.begin(
+                        DiagnosticPhase::ReplaceAttach,
+                        [Some(candidate.delta.replace.len() as u64), None, None, None],
+                    )
+                });
                 let replace_targets_start = crate::attach::monotonic_ns();
                 let replacement = generation_checked_mutation(
                     || process_views_are_current(&self.views, extra_views, &candidate_views),
@@ -11492,6 +11573,20 @@ impl Engine {
                     replace_targets_start,
                     crate::attach::monotonic_ns(),
                 );
+                #[cfg(feature = "h6-reexec-diagnostic")]
+                if let Some(span) = replace_span {
+                    span.finish(match &replacement {
+                        GenerationMutation::PrecheckFailed => DiagnosticOutcome::SerialChanged,
+                        GenerationMutation::PostcheckFailed(_) => DiagnosticOutcome::SerialChanged,
+                        GenerationMutation::Committed(result) => {
+                            if result.is_ok() {
+                                DiagnosticOutcome::Ok
+                            } else {
+                                DiagnosticOutcome::Error
+                            }
+                        }
+                    });
+                }
                 let (replacement, replacement_stale) = match replacement {
                     GenerationMutation::PrecheckFailed => (None, true),
                     GenerationMutation::Committed(result) => (Some(result), false),
@@ -11631,6 +11726,36 @@ impl Engine {
             &mut outcome,
         );
         self.sync_physical_gap(session);
+        crate::attach::reexec_diagnostic::observe!(session, |diag| {
+            diag.note(
+                DiagnosticPhase::Apply,
+                if outcome.accepted() {
+                    DiagnosticOutcome::Accepted
+                } else {
+                    DiagnosticOutcome::Rejected
+                },
+                [
+                    Some(
+                        self.plan
+                            .slots
+                            .iter()
+                            .filter(|s| self.plan.is_active(s.index))
+                            .count() as u64,
+                    ),
+                    Some(self.plan.slots.len() as u64),
+                    Some(outcome.static_failures.len() as u64),
+                    Some(u64::from(outcome.detach_failed)),
+                ],
+            );
+        });
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        if let Some(span) = diagnostic_span {
+            span.finish(if outcome.accepted() {
+                DiagnosticOutcome::Accepted
+            } else {
+                DiagnosticOutcome::Rejected
+            });
+        }
         Ok(outcome)
     }
 
@@ -11732,17 +11857,73 @@ impl Engine {
         serial: u64,
         candidate: &LiveCandidate,
     ) -> Option<PreparedExecRearm> {
-        let retained = self.views.iter().find(|old| old.id() == view)?;
+        let Some(retained) = self.views.iter().find(|old| old.id() == view) else {
+            crate::attach::reexec_diagnostic::observe!(session, |diag| {
+                diag.note(
+                    DiagnosticPhase::Rearm,
+                    DiagnosticOutcome::NoOwner,
+                    [None; 4],
+                );
+            });
+            return None;
+        };
         if !retained.still_the_same() {
+            crate::attach::reexec_diagnostic::observe!(session, |diag| {
+                diag.note(
+                    DiagnosticPhase::Rearm,
+                    DiagnosticOutcome::NoOwner,
+                    [None; 4],
+                );
+            });
             return None;
         }
-        let request = self.refresh_requested.get(&retained.pid())?;
+        let Some(request) = self.refresh_requested.get(&retained.pid()) else {
+            crate::attach::reexec_diagnostic::observe!(session, |diag| {
+                diag.note(
+                    DiagnosticPhase::Rearm,
+                    DiagnosticOutcome::NoOwner,
+                    [None; 4],
+                );
+            });
+            return None;
+        };
         if request.owner != Some(view) || request.serial != serial {
+            crate::attach::reexec_diagnostic::observe!(session, |diag| {
+                diag.note(
+                    DiagnosticPhase::Rearm,
+                    DiagnosticOutcome::SerialChanged,
+                    [None; 4],
+                );
+            });
             return None;
         }
+        crate::attach::reexec_diagnostic::observe!(session, |diag| {
+            let renewed = diag.serial(Some(serial));
+            diag.note(
+                DiagnosticPhase::Request,
+                if renewed {
+                    DiagnosticOutcome::Renewed
+                } else {
+                    DiagnosticOutcome::Queued
+                },
+                [
+                    Some(self.refresh_requested.len() as u64),
+                    Some(self.exec_rearm_views.len() as u64),
+                    None,
+                    None,
+                ],
+            );
+        });
         let slots = if matches!(self.scope, Scope::Pid(_)) {
             let slots = Self::unchanged_exec_targets(view, candidate);
             if slots.is_empty() {
+                crate::attach::reexec_diagnostic::observe!(session, |diag| {
+                    diag.note(
+                        DiagnosticPhase::Rearm,
+                        DiagnosticOutcome::NoTargets,
+                        [Some(0), None, None, None],
+                    );
+                });
                 return None;
             }
             slots
@@ -11756,6 +11937,15 @@ impl Engine {
             .chain(&candidate.delta.replace)
             .cloned()
             .collect();
+        crate::attach::reexec_diagnostic::observe!(session, |diag| {
+            if request.exec_binding.is_none() {
+                diag.note(
+                    DiagnosticPhase::Rearm,
+                    DiagnosticOutcome::NoBinding,
+                    [Some(slots.len() as u64), None, None, None],
+                );
+            }
+        });
         let preservation = request.exec_binding.as_ref().and_then(|binding| {
             session.prepare_preservation(
                 binding,
@@ -11765,6 +11955,22 @@ impl Engine {
                 &ordinary,
                 &candidate.pinned,
             )
+        });
+        crate::attach::reexec_diagnostic::observe!(session, |diag| {
+            diag.note(
+                DiagnosticPhase::Rearm,
+                if preservation.is_some() {
+                    DiagnosticOutcome::Preserved
+                } else {
+                    DiagnosticOutcome::Forced
+                },
+                [
+                    Some(slots.len() as u64),
+                    Some(ordinary.len() as u64),
+                    Some(u64::from(request.exec_binding.is_some())),
+                    None,
+                ],
+            );
         });
         Some(PreparedExecRearm {
             view,
@@ -11828,6 +12034,62 @@ impl Engine {
         refreshed: &BTreeSet<ProcessViewId>,
         serviced: &BTreeMap<u32, u64>,
     ) -> Vec<(ProcessViewId, u64)> {
+        crate::attach::reexec_diagnostic::observe!(session, |diag| {
+            diag.note(
+                DiagnosticPhase::Candidate,
+                DiagnosticOutcome::Ok,
+                [
+                    Some(candidate.delta.new.len() as u64),
+                    Some(candidate.delta.replace.len() as u64),
+                    Some(candidate.delta.retire.len() as u64),
+                    Some(candidate.exec_preservations.len() as u64),
+                ],
+            );
+            let old: Vec<_> = self
+                .plan
+                .slots
+                .iter()
+                .take(136)
+                .filter(|slot| self.plan.is_active(slot.index))
+                .collect();
+            let current: Vec<_> = candidate
+                .plan
+                .slots
+                .iter()
+                .take(136)
+                .filter(|slot| candidate.plan.is_active(slot.index))
+                .collect();
+            let mut same_id = 0u64;
+            let mut same_file = 0u64;
+            let mut unknown = 0u64;
+            for before in &old {
+                same_id += u64::from(current.iter().any(|after| {
+                    before.object == after.object && before.file_offset == after.file_offset
+                }));
+                if let Some(identity) = self.plan.target_object_of(before) {
+                    same_file += u64::from(current.iter().any(|after| {
+                        before.file_offset == after.file_offset
+                            && candidate.plan.target_object_of(after).as_ref() == Some(&identity)
+                    }));
+                } else {
+                    unknown += 1;
+                }
+            }
+            diag.note(
+                DiagnosticPhase::Identity,
+                if self.plan.slots.len() > 136 || candidate.plan.slots.len() > 136 {
+                    DiagnosticOutcome::Incomplete
+                } else {
+                    DiagnosticOutcome::Ok
+                },
+                [
+                    Some(same_id),
+                    Some(same_file),
+                    Some(unknown),
+                    Some(old.len() as u64),
+                ],
+            );
+        });
         let marked: Vec<ProcessViewId> = refreshed
             .iter()
             .copied()
@@ -11860,6 +12122,13 @@ impl Engine {
                 && self.exec_rearm_views.get(&view) == Some(&Some(serial))
                 && Self::exec_rearm_moot(view, candidate)
             {
+                crate::attach::reexec_diagnostic::observe!(session, |diag| {
+                    diag.note(
+                        DiagnosticPhase::Rearm,
+                        DiagnosticOutcome::Moot,
+                        [Some(0), None, None, None],
+                    );
+                });
                 lowered.push((view, serial));
             }
         }
@@ -16486,6 +16755,14 @@ impl Engine {
                 // a mismatched loader record elsewhere in this batch.
                 return None;
             }
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            if record.kind == DISCOVERY_KIND_EXEC
+                && cause == RetirementCause::ExecRefresh
+                && let Some(diag) = session.reexec_diagnostic()
+            {
+                diag.matched_exec();
+                diag.note(DiagnosticPhase::Exec, DiagnosticOutcome::Begin, [None; 4]);
+            }
             if record.kind == DISCOVERY_KIND_LEADER_EXIT {
                 self.close_cgroup_admission(view, record.hook_ts_ns);
                 if !self.admitted_cgroup_views.contains_key(&view) {
@@ -16529,6 +16806,24 @@ impl Engine {
                 // links. The refresh rearms them even when the rescan
                 // re-accepts the same targets; removal prunes the marker.
                 self.exec_rearm_views.insert(view, refreshed_serial);
+                crate::attach::reexec_diagnostic::observe!(session, |diag| {
+                    diag.serial(refreshed_serial);
+                    let request = self.refresh_requested.get(&pid);
+                    diag.note(
+                        DiagnosticPhase::Request,
+                        if refreshed_serial.is_some() {
+                            DiagnosticOutcome::Queued
+                        } else {
+                            DiagnosticOutcome::Refused
+                        },
+                        [
+                            Some(self.refresh_requested.len() as u64),
+                            Some(u64::from(request.is_some_and(|r| r.owner == Some(view)))),
+                            Some(u64::from(request.is_some_and(|r| r.exec_binding.is_some()))),
+                            None,
+                        ],
+                    );
+                });
             }
             (cause == RetirementCause::ExecRefresh).then_some(view)
         } else if record.kind == DISCOVERY_KIND_EXEC
@@ -18085,6 +18380,18 @@ impl Engine {
         closure: &mut PauseClosure,
         tick_now: &mut TickClock<'_>,
     ) -> Result<bool> {
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        let diagnostic_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
+            d.begin(
+                DiagnosticPhase::Refresh,
+                [
+                    Some(self.refresh_requested.len() as u64),
+                    Some(self.exec_rearm_views.len() as u64),
+                    None,
+                    None,
+                ],
+            )
+        });
         let mut new_views = Vec::new();
         self.in_refresh_tick = true;
         let result = self.refresh_inventory_inner(
@@ -18099,6 +18406,10 @@ impl Engine {
         );
         self.in_refresh_tick = false;
         self.release_unadmitted_views(new_views);
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        if let Some(span) = diagnostic_span {
+            span.finish_result(&result);
+        }
         result
     }
 
@@ -18328,6 +18639,18 @@ impl Engine {
         );
         if removed.is_empty() && refreshed.is_empty() && new_pids.is_empty() {
             self.complete_refresh_requests(&serviced_requests, &failed_refresh_pids);
+            crate::attach::reexec_diagnostic::observe!(session, |diag| {
+                diag.note(
+                    DiagnosticPhase::SettleRequest,
+                    DiagnosticOutcome::Ok,
+                    [
+                        Some(serviced_requests.len() as u64),
+                        Some(failed_refresh_pids.len() as u64),
+                        Some(self.refresh_requested.len() as u64),
+                        Some(self.exec_rearm_views.len() as u64),
+                    ],
+                );
+            });
             // No tick queued anything (a queued poll would have made a
             // retirement cause), so any pending poll is stale: forget it
             // with the requests rather than leaking it into a later tick.
@@ -18375,6 +18698,13 @@ impl Engine {
         let newcomers_first = self
             .scheduler
             .newcomers_first(!refreshed.is_empty(), !admitted.is_empty());
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        let initial_scan_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
+            d.begin(
+                DiagnosticPhase::Scan,
+                [Some(refreshed.len() as u64), None, None, None],
+            )
+        });
         let (refresh_outcome, admission_outcome) = if newcomers_first {
             let admission = self.admit_inventory_new_views(admitted, max_scan_pids, &mut *tick_now);
             let refresh = self.scan_inventory_views(
@@ -18394,6 +18724,16 @@ impl Engine {
         };
         let (mut refreshed_scans, failed_scan_pids, deferred_scan_pids, refresh_skips) =
             refresh_outcome;
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        if let Some(span) = initial_scan_span {
+            span.finish(
+                if failed_scan_pids.is_empty() && deferred_scan_pids.is_empty() {
+                    DiagnosticOutcome::Ok
+                } else {
+                    DiagnosticOutcome::Incomplete
+                },
+            );
+        }
         failed_refresh_pids.extend(failed_scan_pids.iter().copied());
         failed_refresh_pids.extend(deferred_scan_pids);
         skipped.extend(refresh_skips);
@@ -18528,7 +18868,12 @@ impl Engine {
                 mutation_started = true;
                 context_retirements.insert(*view);
             }
-            let (retirement_changed, complete) = self.retire_loader_contexts(
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            let retirement_span = session
+                .reexec_diagnostic()
+                .filter(|d| d.active())
+                .map(|d| d.begin(DiagnosticPhase::ContextRetire, [Some(1), None, None, None]));
+            let retirement_result = self.retire_loader_contexts(
                 *view,
                 &mut no_terminal_selection_handoffs,
                 session,
@@ -18536,7 +18881,12 @@ impl Engine {
                 pending_views,
                 collect,
                 closure,
-            )?;
+            );
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            if let Some(span) = retirement_span {
+                span.finish_result(&retirement_result);
+            }
+            let (retirement_changed, complete) = retirement_result?;
             changed |= retirement_changed;
             mutation_started |= retirement_changed;
             if !complete {
@@ -18584,12 +18934,29 @@ impl Engine {
             );
             return Ok(changed);
         }
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        let rescan_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
+            d.begin(
+                DiagnosticPhase::Scan,
+                [Some(refreshed_ok.len() as u64), None, None, None],
+            )
+        });
         let (rescanned, failed_rescan_pids, deferred_rescan_pids, rescan_skips) = self
             .scan_inventory_views(
                 &refreshed_ok,
                 "a post-retirement inventory refresh failed",
                 &mut *tick_now,
             );
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        if let Some(span) = rescan_span {
+            span.finish(
+                if failed_rescan_pids.is_empty() && deferred_rescan_pids.is_empty() {
+                    DiagnosticOutcome::Ok
+                } else {
+                    DiagnosticOutcome::Incomplete
+                },
+            );
+        }
         failed_refresh_pids.extend(failed_rescan_pids);
         failed_refresh_pids.extend(deferred_rescan_pids);
         skipped.extend(rescan_skips);
@@ -18715,7 +19082,31 @@ impl Engine {
             // consumed. A refusal mutated nothing — like the stale-view and
             // preflight exits above — and keeps every marker for the retry
             // the retained request owns.
+            crate::attach::reexec_diagnostic::observe!(session, |diag| {
+                diag.note(
+                    DiagnosticPhase::SettleMarker,
+                    DiagnosticOutcome::Begin,
+                    [
+                        Some(lowered_exec_rearms.len() as u64),
+                        Some(self.exec_rearm_views.len() as u64),
+                        None,
+                        None,
+                    ],
+                );
+            });
             self.settle_exec_rearms(lowered_exec_rearms);
+            crate::attach::reexec_diagnostic::observe!(session, |diag| {
+                diag.note(
+                    DiagnosticPhase::SettleMarker,
+                    DiagnosticOutcome::Ok,
+                    [
+                        Some(self.exec_rearm_views.len() as u64),
+                        Some(self.refresh_requested.len() as u64),
+                        None,
+                        None,
+                    ],
+                );
+            });
         }
         // Only a published newcomer is retained and armed. An unpublished one
         // committed nothing, so it stays in `new_views` for release and is
@@ -18816,6 +19207,18 @@ impl Engine {
         for view in removed.iter().chain(&refreshed_ok) {
             self.scan_inputs.remove(view);
         }
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        let setup_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
+            d.begin(
+                DiagnosticPhase::Setup,
+                [
+                    Some(refreshed_ok.len() as u64),
+                    Some(new_view_ids.len() as u64),
+                    None,
+                    None,
+                ],
+            )
+        });
         let arm_result = if *additions_allowed {
             let arm: Vec<_> = self
                 .views
@@ -18916,7 +19319,23 @@ impl Engine {
             return Err(error);
         }
         changed |= cleanup?;
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        if let Some(span) = setup_span {
+            span.finish(DiagnosticOutcome::Ok);
+        }
         self.complete_refresh_requests(&serviced_requests, &failed_refresh_pids);
+        crate::attach::reexec_diagnostic::observe!(session, |diag| {
+            diag.note(
+                DiagnosticPhase::SettleRequest,
+                DiagnosticOutcome::Ok,
+                [
+                    Some(serviced_requests.len() as u64),
+                    Some(failed_refresh_pids.len() as u64),
+                    Some(self.refresh_requested.len() as u64),
+                    Some(self.exec_rearm_views.len() as u64),
+                ],
+            );
+        });
         Ok(changed)
     }
 

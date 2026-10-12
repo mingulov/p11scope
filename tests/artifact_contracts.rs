@@ -8930,8 +8930,10 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
                 })
         })
     };
-    // Fail closed. This reads two forms only — `- run: <script>` is a full lane
-    // run, `- run: <script> --self-test` is not — and every other way of invoking
+    // Fail closed. `- run: <script>` is a full lane run and
+    // `- run: <script> --self-test` is not. The attach lane's exact
+    // `--diagnose-skips` call still runs both full lanes and their oracles;
+    // it only adds bounded failure attribution. Every other way of invoking
     // a lane (`bash scripts/x.sh`, `./scripts/x.sh`, a call inside a `run: |`
     // block, an extra argument) is refused rather than quietly treated as "did
     // not run in full", which would leave this job printing `UNRUN:` for a lane
@@ -8941,9 +8943,81 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // inverse of a path character rather than a list of separators: enumerating
     // separators is what let `scripts/x.sh;` through, and the list was still
     // missing backtick, brackets and comma one round later.
-    let is_lane = |token: &str| {
+    fn is_lane(token: &str) -> bool {
         token.contains("scripts/") && (token.ends_with(".sh") || token.ends_with(".py"))
-    };
+    }
+    fn lane_call(line: &str) -> Option<(&str, bool)> {
+        // `- name:` above a step is an ordinary edit, so accept bare `run:` too.
+        let call = line
+            .strip_prefix("- run: ")
+            .or_else(|| line.strip_prefix("run: "))?;
+        if call == "scripts/verify-attach-e2e.sh --diagnose-skips" {
+            return Some(("scripts/verify-attach-e2e.sh", true));
+        }
+        let call = call.strip_prefix("python3 -I ").unwrap_or(call);
+        let (command, tail) = call.split_once(' ').unwrap_or((call, ""));
+        match (command.starts_with("scripts/") && is_lane(command), tail) {
+            (true, "") => Some((command, true)),
+            (true, "--self-test") => Some((command, false)),
+            _ => None,
+        }
+    }
+    // Exercise the same classifier that derives hosted_full below. Broader
+    // flag or path matching would silently change the UNRUN/scope claims.
+    for (line, command, full) in [
+        (
+            "- run: scripts/verify-attach-e2e.sh --diagnose-skips",
+            "scripts/verify-attach-e2e.sh",
+            true,
+        ),
+        (
+            "run: scripts/verify-attach-e2e.sh --diagnose-skips",
+            "scripts/verify-attach-e2e.sh",
+            true,
+        ),
+        (
+            "run: scripts/verify-attach-e2e.sh",
+            "scripts/verify-attach-e2e.sh",
+            true,
+        ),
+        (
+            "run: scripts/verify-attach-e2e.sh --self-test",
+            "scripts/verify-attach-e2e.sh",
+            false,
+        ),
+        (
+            "run: python3 -I scripts/run-python-suites.py",
+            "scripts/run-python-suites.py",
+            true,
+        ),
+        (
+            "run: python3 -I scripts/run-python-suites.py --self-test",
+            "scripts/run-python-suites.py",
+            false,
+        ),
+    ] {
+        assert_eq!(lane_call(line), Some((command, full)), "{line:?}");
+    }
+    for line in [
+        "run: scripts/verify-attach-e2e.sh --unknown",
+        "run: scripts/verify-attach-e2e.sh --diagnose-skips --unknown",
+        "run: scripts/verify-attach-e2e.sh --diagnose-skips --self-test",
+        "run: scripts/verify-attach-e2e.sh --self-test --diagnose-skips",
+        "run: scripts/verify-attach-e2e.sh --diagnose-skips --diagnose-skips",
+        "run: scripts/verify-attach-e2e.sh --diagnose-skips && scripts/verify-inspect-doctor.sh",
+        "run: echo scripts/verify-attach-e2e.sh --diagnose-skips",
+        "name: scripts/verify-attach-e2e.sh --diagnose-skips",
+        "scripts/verify-attach-e2e.sh --diagnose-skips",
+        "run: ./scripts/verify-attach-e2e.sh --diagnose-skips",
+        "run: /elsewhere/scripts/verify-attach-e2e.sh --diagnose-skips",
+        "run: scripts/fixtures/verify-attach-e2e.sh --diagnose-skips",
+        "run: bash scripts/verify-attach-e2e.sh --diagnose-skips",
+        "run: scripts/verify-inspect-doctor.sh --diagnose-skips",
+        "run: python3 -I scripts/run-python-suites.py --diagnose-skips",
+        "run: python3 -I scripts/verify-attach-e2e.sh --diagnose-skips",
+    ] {
+        assert_eq!(lane_call(line), None, "unreviewed invocation {line:?}");
+    }
     let names_lane = |line: &str| {
         line.split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '.' | '/' | '_' | '-'))
             .any(is_lane)
@@ -9123,22 +9197,17 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
             );
             continue;
         }
-        // `- name:` above a step is an ordinary edit, so accept the bare `run:` form.
-        let call = line
-            .strip_prefix("- run: ")
-            .or_else(|| line.strip_prefix("run: "))
-            .unwrap_or_default();
-        let call = call.strip_prefix("python3 -I ").unwrap_or(call);
-        let (command, tail) = call.split_once(' ').unwrap_or((call, ""));
-        match (command.starts_with("scripts/") && is_lane(command), tail) {
-            (true, "") => {
+        match lane_call(line) {
+            Some((command, true)) => {
                 hosted_full.insert(command);
             }
-            (true, "--self-test") => {}
-            _ => panic!(
+            Some((_, false)) => {}
+            None => panic!(
                 "unreadable lane invocation {line:?}: the UNRUN derivation reads only \
                  `run: <script>` and `run: <script> --self-test`, optionally via \
-                 `python3 -I`. If this line does not invoke a lane, keep the script path \
+                 `python3 -I`, plus the exact direct call \
+                 `run: scripts/verify-attach-e2e.sh --diagnose-skips`. \
+                 If this line does not invoke a lane, keep the script path \
                  out of it; if it does, the derivation cannot tell, and the block would \
                  be wrong about what ran"
             ),

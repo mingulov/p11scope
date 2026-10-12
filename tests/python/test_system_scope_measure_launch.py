@@ -9,6 +9,7 @@ from pathlib import Path
 import shlex
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -62,6 +63,14 @@ def load_lane_a():
     return module
 
 
+def load_measure():
+    spec = importlib.util.spec_from_file_location(
+        "system_scope_measure", ROOT / "scripts/system-scope-measure.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class FakeObserverProc:
     """Minimal stand-in for the Popen object wait_attach polls."""
 
@@ -89,6 +98,78 @@ def live_sleep():
 
 class SystemScopeMeasureLaunchTests(unittest.TestCase):
     maxDiff = None
+
+    def test_possible_cpu_count_uses_full_possible_list_with_gaps(self):
+        ensure_test_tmp()
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as raw:
+            path = Path(raw) / "possible"
+            path.write_text("0-1,4-13\n", encoding="ascii")
+            self.assertEqual(load_measure().possible_cpu_count(path), 12)
+            for invalid in ("", "1-0", "0-2,2-4", "0-1,0", "0,", "-1", "0-4294967295"):
+                with self.subTest(invalid=invalid):
+                    path.write_text(invalid, encoding="ascii")
+                    with self.assertRaises(ValueError):
+                        load_measure().possible_cpu_count(path)
+
+    def test_detailed_preflight_consumes_unprivileged_calculator_before_launch(self):
+        ensure_test_tmp()
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as raw:
+            base = Path(raw)
+            fixture = ROOT / "tests/python/test_measure_e03.py"
+            facts = subprocess.run(
+                [sys.executable, "-I", "-c",
+                 "import json, runpy; print(json.dumps(runpy.run_path(" +
+                 repr(str(fixture)) + ")[\"detailed_resource_facts\"]()))"],
+                check=True, capture_output=True, text=True).stdout
+            calculator = base / "calculator"
+            invocation = base / "invocation"
+            calculator.write_text(
+                f"#!{sys.executable}\n"
+                "import json, pathlib, sys\n"
+                f"facts = json.loads({facts!r})\n"
+                f"pathlib.Path({str(invocation)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+                "cpus = int(sys.argv[sys.argv.index('--possible-cpus') + 1])\n"
+                "facts['inputs']['possible_cpus'] = cpus\n"
+                "facts['resources']['stats_values_bytes'] = 151552 * cpus\n"
+                "facts['resources']['rv_values_bytes'] = 32768 * cpus\n"
+                "facts['resources']['component_payload_bytes'] = 5052888 + 184320 * cpus\n"
+                "print(json.dumps(facts))\n", encoding="utf-8")
+            calculator.chmod(0o700)
+            # Execute the real shell argument/preflight prefix. Stop before
+            # the existing owned workload/observer launch code can run.
+            prefix = MEASURE.read_text(encoding="utf-8").split("\nWPID=", 1)[0]
+            result = subprocess.run(
+                ["sh", "-c", prefix, str(MEASURE),
+                 "--work", str(base / "work"), "--no-build",
+                 "--detailed-profile", "default",
+                 "--detailed-resources-calculator", str(calculator)],
+                cwd=ROOT, capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            prepared = json.loads((base / "work/detailed-resources.json").read_text())
+            cpus = prepared["possible_cpus"]
+            self.assertEqual(json.loads(invocation.read_text()),
+                             ["--possible-cpus", str(cpus), "--profile", "default"])
+            self.assertEqual(prepared["detailed_resources"]["inputs"]["possible_cpus"], cpus)
+            self.assertEqual(prepared["detailed_resources"]["resources"]["stats_values_bytes"],
+                             151552 * cpus)
+
+    def test_detailed_preflight_refuses_absent_or_malformed_calculator(self):
+        ensure_test_tmp()
+        with tempfile.TemporaryDirectory(dir=TEST_TMP) as raw:
+            base = Path(raw)
+            calculator = base / "bad-calculator"
+            calculator.write_text("#!/bin/sh\nprintf 'not JSON\\n'\n", encoding="utf-8")
+            calculator.chmod(0o700)
+            for path in (calculator, base / "missing"):
+                with self.subTest(path=path):
+                    result = subprocess.run(
+                        [sys.executable, "-I", str(ROOT / "scripts/system-scope-measure.py"),
+                         "--prepare-detailed-resources", "--detailed-profile", "default",
+                         "--detailed-resources-calculator", str(path),
+                         "--out", str(base / "prepared.json")],
+                        cwd=ROOT, capture_output=True, text=True, timeout=5)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse((base / "prepared.json").exists())
 
     def test_temp_root_is_created_private_without_changing_existing_mode(self):
         ensure_test_tmp()

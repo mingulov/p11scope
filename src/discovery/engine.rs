@@ -2584,6 +2584,27 @@ pub(crate) trait EngineSession {
     ) -> bool {
         false
     }
+    fn prepare_completed_rearm(
+        &mut self,
+        _: &crate::attach::ExecBinding,
+        _: &ProcessView,
+        _: u64,
+        _: &[plan::Slot],
+        _: &[plan::Slot],
+        _: &PinnedObjects,
+    ) -> Option<crate::attach::CompletedRearmReceipt> {
+        None
+    }
+    fn validate_completed_rearm(
+        &mut self,
+        _: &crate::attach::CompletedRearmReceipt,
+        _: &crate::attach::ExecBinding,
+        _: &ProcessView,
+        _: u64,
+        _: &PinnedObjects,
+    ) -> bool {
+        false
+    }
     fn capture_policy(&self) -> CapturePolicy;
     fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>>;
     /// Moves up to `quantum` DISCOVERY items off the kernel ring into the
@@ -2698,6 +2719,27 @@ impl EngineSession for Session {
         objects: &PinnedObjects,
     ) -> bool {
         Session::validate_preservation(self, receipt, binding, view, serial, objects)
+    }
+    fn prepare_completed_rearm(
+        &mut self,
+        binding: &crate::attach::ExecBinding,
+        view: &ProcessView,
+        serial: u64,
+        slots: &[plan::Slot],
+        ordinary: &[plan::Slot],
+        objects: &PinnedObjects,
+    ) -> Option<crate::attach::CompletedRearmReceipt> {
+        Session::prepare_completed_rearm(self, binding, view, serial, slots, ordinary, objects)
+    }
+    fn validate_completed_rearm(
+        &mut self,
+        receipt: &crate::attach::CompletedRearmReceipt,
+        binding: &crate::attach::ExecBinding,
+        view: &ProcessView,
+        serial: u64,
+        objects: &PinnedObjects,
+    ) -> bool {
+        Session::validate_completed_rearm(self, receipt, binding, view, serial, objects)
     }
     fn capture_policy(&self) -> CapturePolicy {
         Session::capture_policy(self)
@@ -3077,6 +3119,13 @@ struct LiveCandidate {
     manifest_inventory_slots: BTreeMap<plan::AttachKey, plan::Slot>,
     loader_plan_proof: Option<LoaderPlanProof>,
     exec_preservations: Vec<PreparedPreservation>,
+    exec_completions: Vec<PreparedCompletedRearm>,
+}
+
+impl LiveCandidate {
+    fn has_exec_receipts(&self) -> bool {
+        !self.exec_preservations.is_empty() || !self.exec_completions.is_empty()
+    }
 }
 
 struct LoaderPlanCache {
@@ -3099,12 +3148,19 @@ struct PreparedExecRearm {
     serial: u64,
     slots: Vec<plan::Slot>,
     preservation: Option<crate::attach::PreservationReceipt>,
+    completed: Option<crate::attach::CompletedRearmReceipt>,
 }
 
 struct PreparedPreservation {
     view: ProcessViewId,
     serial: u64,
     receipt: crate::attach::PreservationReceipt,
+}
+
+struct PreparedCompletedRearm {
+    view: ProcessViewId,
+    serial: u64,
+    receipt: crate::attach::CompletedRearmReceipt,
 }
 
 /// Transient baseline for one loader transaction, never a second retained
@@ -3145,6 +3201,14 @@ enum ApplyDisposition {
     /// authorize positive provider/history facts, pause completeness, dynamic
     /// export work, and loader follow-up.
     Accepted,
+}
+
+fn candidate_publication_disposition(retired: bool, publication: &Result<()>) -> ApplyDisposition {
+    if retired || publication.is_err() {
+        ApplyDisposition::ConservativeRetirement
+    } else {
+        ApplyDisposition::Accepted
+    }
 }
 
 #[derive(Default)]
@@ -11081,6 +11145,7 @@ impl Engine {
             manifest_inventory_slots,
             loader_plan_proof: None,
             exec_preservations: Vec::new(),
+            exec_completions: Vec::new(),
         })
     }
 
@@ -11196,6 +11261,7 @@ impl Engine {
                 manifest_inventory_slots: BTreeMap::new(),
                 loader_plan_proof: None,
                 exec_preservations: Vec::new(),
+                exec_completions: Vec::new(),
             }
         } else {
             self.loader_plan_cache = None;
@@ -11322,7 +11388,10 @@ impl Engine {
                     Some(candidate.delta.new.len() as u64),
                     Some(candidate.delta.replace.len() as u64),
                     Some(candidate.delta.retire.len() as u64),
-                    Some(candidate.exec_preservations.len() as u64),
+                    Some(
+                        (candidate.exec_preservations.len() + candidate.exec_completions.len())
+                            as u64,
+                    ),
                 ],
             )
         });
@@ -11385,7 +11454,7 @@ impl Engine {
             &self.pinned,
             targets_ok,
         );
-        if candidate.exec_preservations.is_empty() {
+        if !candidate.has_exec_receipts() {
             outcome.changed |= self.latch_candidate_ambiguity(&candidate.plan);
         }
         let generation_stale = !admission.stale_views.is_empty();
@@ -11445,14 +11514,38 @@ impl Engine {
                                     })
                             })
                     })
-            });
+            })
+            && candidate.exec_completions.iter().all(|prepared| {
+                self.views
+                    .iter()
+                    .find(|view| view.id() == prepared.view)
+                    .is_some_and(|view| {
+                        self.refresh_requested
+                            .get(&view.pid())
+                            .is_some_and(|request| {
+                                request.owner == Some(prepared.view)
+                                    && request.serial == prepared.serial
+                                    && request.exec_binding.as_ref().is_some_and(|binding| {
+                                        session.validate_completed_rearm(
+                                            &prepared.receipt,
+                                            binding,
+                                            view,
+                                            prepared.serial,
+                                            &candidate.pinned,
+                                        )
+                                    })
+                            })
+                    })
+            })
+            && !self.cancellation_requested()
+            && !session.mutation_stopped();
         if !preservation_ok {
             self.continuity_deferred = true;
             *additions_allowed = false;
             self.mark_partial("live exec continuity", "current Session/request/target/health/frontier refused preservation before mutation; refresh remains pending");
             return Ok(outcome);
         }
-        if !candidate.exec_preservations.is_empty() {
+        if candidate.has_exec_receipts() {
             outcome.changed |= self.latch_candidate_ambiguity(&candidate.plan);
         }
 
@@ -12021,11 +12114,27 @@ impl Engine {
                 &candidate.pinned,
             )
         });
+        let completed = if preservation.is_none() {
+            request.exec_binding.as_ref().and_then(|binding| {
+                session.prepare_completed_rearm(
+                    binding,
+                    retained,
+                    serial,
+                    &slots,
+                    &ordinary,
+                    &candidate.pinned,
+                )
+            })
+        } else {
+            None
+        };
         crate::attach::reexec_diagnostic::observe!(session, |diag| {
             diag.note(
                 DiagnosticPhase::Rearm,
                 if preservation.is_some() {
                     DiagnosticOutcome::Preserved
+                } else if completed.is_some() {
+                    DiagnosticOutcome::Accepted
                 } else {
                     DiagnosticOutcome::Forced
                 },
@@ -12042,6 +12151,7 @@ impl Engine {
             serial,
             slots,
             preservation,
+            completed,
         })
     }
 
@@ -12069,6 +12179,12 @@ impl Engine {
         }
         if let Some(receipt) = prepared.preservation {
             candidate.exec_preservations.push(PreparedPreservation {
+                view: prepared.view,
+                serial: prepared.serial,
+                receipt,
+            });
+        } else if let Some(receipt) = prepared.completed {
+            candidate.exec_completions.push(PreparedCompletedRearm {
                 view: prepared.view,
                 serial: prepared.serial,
                 receipt,
@@ -12205,6 +12321,23 @@ impl Engine {
             if self.exec_rearm_views.get(&view) == Some(&Some(serial)) {
                 self.exec_rearm_views.remove(&view);
             }
+        }
+    }
+
+    /// Completed-pair acknowledgement is positive publication authority.
+    /// Existing destructive/conservative recovery retains its settlement rule.
+    fn settle_applied_exec_rearms(
+        &mut self,
+        serviced: impl IntoIterator<Item = (ProcessViewId, u64)>,
+        completed: &BTreeSet<(ProcessViewId, u64)>,
+        outcome: &ApplyOutcome,
+    ) {
+        if !outcome.refused() {
+            self.settle_exec_rearms(
+                serviced
+                    .into_iter()
+                    .filter(|key| outcome.accepted() || !completed.contains(key)),
+            );
         }
     }
 
@@ -12600,16 +12733,12 @@ impl Engine {
         self.counters.manifest_fallbacks = candidate.manifest_fallbacks;
         self.selection_claims = candidate.selection_claims;
         self.selection_tables = candidate.selection_tables;
-        outcome.disposition = if retired {
-            ApplyDisposition::ConservativeRetirement
-        } else {
-            ApplyDisposition::Accepted
-        };
-        if self.publish_current_capture_facts().is_err() {
+        let publication = self.publish_current_capture_facts();
+        outcome.disposition = candidate_publication_disposition(retired, &publication);
+        if publication.is_err() {
             // The preflight proved this for the whole candidate, so only the
             // cleaned subset can still refuse. Keep the committed state and
             // drop to conservative authority rather than unwinding.
-            outcome.disposition = ApplyDisposition::ConservativeRetirement;
             self.mark_partial(
                 "live discovery evidence",
                 "the retired candidate's provider history could not be published",
@@ -19092,7 +19221,7 @@ impl Engine {
             admission_start,
             crate::attach::monotonic_ns(),
         );
-        if !candidate.exec_preservations.is_empty()
+        if candidate.has_exec_receipts()
             && (!admission.targets_ok
                 || !admission.stale_views.is_empty()
                 || !admission.missing_contexts.is_empty())
@@ -19102,7 +19231,7 @@ impl Engine {
             self.mark_partial("live exec continuity", "preservation candidate lost its preflight or original custody; refresh remains pending before static mutation");
             return Ok(changed);
         }
-        if candidate.exec_preservations.is_empty() {
+        if !candidate.has_exec_receipts() {
             changed |= self.latch_candidate_ambiguity(&candidate.plan);
         }
         self.pending_rejected_keys
@@ -19181,6 +19310,11 @@ impl Engine {
         }
 
         let extra_views: Vec<_> = new_views.iter().map(|(view, _, _)| view).collect();
+        let completed_rearms = candidate
+            .exec_completions
+            .iter()
+            .map(|prepared| (prepared.view, prepared.serial))
+            .collect();
         let outcome =
             self.apply_candidate(session, candidate, additions_allowed, true, &extra_views)?;
         self.record_apply_timing(&outcome);
@@ -19203,7 +19337,7 @@ impl Engine {
                     ],
                 );
             });
-            self.settle_exec_rearms(lowered_exec_rearms);
+            self.settle_applied_exec_rearms(lowered_exec_rearms, &completed_rearms, &outcome);
             crate::attach::reexec_diagnostic::observe!(session, |diag| {
                 diag.note(
                     DiagnosticPhase::SettleMarker,
@@ -21010,6 +21144,42 @@ pub(crate) mod session_fixture {
         }
         fn capture_policy(&self) -> CapturePolicy {
             self.capture_policy.unwrap_or(CapturePolicy::Allowlisted)
+        }
+
+        fn prepare_completed_rearm(
+            &mut self,
+            binding: &crate::attach::ExecBinding,
+            view: &ProcessView,
+            serial: u64,
+            slots: &[plan::Slot],
+            ordinary: &[plan::Slot],
+            objects: &PinnedObjects,
+        ) -> Option<crate::attach::CompletedRearmReceipt> {
+            if self.mutation_stopped() {
+                return None;
+            }
+            self.pid_continuity
+                .as_mut()?
+                .borrow_mut()
+                .prepare_completed_rearm(binding, view, serial, slots, ordinary, objects)
+        }
+
+        fn validate_completed_rearm(
+            &mut self,
+            receipt: &crate::attach::CompletedRearmReceipt,
+            binding: &crate::attach::ExecBinding,
+            view: &ProcessView,
+            serial: u64,
+            objects: &PinnedObjects,
+        ) -> bool {
+            if self.mutation_stopped() {
+                return false;
+            }
+            self.pid_continuity.as_mut().is_some_and(|state| {
+                state
+                    .borrow_mut()
+                    .validate_completed_rearm(receipt, binding, view, serial, objects)
+            })
         }
 
         fn discovery_dequeue(&mut self) -> Result<Option<crate::events::DiscoveryItem>> {

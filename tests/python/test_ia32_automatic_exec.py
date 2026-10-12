@@ -66,7 +66,7 @@ class Ia32GateTests(unittest.TestCase):
         if os.geteuid() == 0:
             self.skipTest("ordinary uid refusal control")
         with tempfile.TemporaryDirectory(prefix="ia32-cli-root-") as tmp:
-            out = Path(tmp) / "uncreated"
+            out = Path("/var/tmp/p11scope-ws-tmp") / f"{Path(tmp).name}-uncreated"
             result = subprocess.run([sys.executable, "-I", str(SCRIPT), "--binary", sys.executable,
                 "--source-revision", "1" * 40, "--uid", str(os.getuid()), "--gid", str(os.getgid()),
                 "--out", str(out)], capture_output=True, text=True, timeout=10)

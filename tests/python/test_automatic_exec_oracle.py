@@ -1977,6 +1977,365 @@ class ReaderReadinessTest(unittest.TestCase):
             reader.finish()
 
 
+class BFailureStopTest(unittest.TestCase):
+    """Real child signals/reaps through the decorated workload-B route."""
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="h6-b-stop-")
+        self.addCleanup(self.temporary.cleanup)
+        self.directory = Path(self.temporary.name)
+        path = self.directory / "input"
+        path.write_text("inert input\n")
+        self.pin = H6["FilePin"](path)
+        self.addCleanup(self.pin.close)
+        self.ctx = H6["Case"](SimpleNamespace(out=self.directory, uid=os.getuid(), gid=os.getgid()))
+        self.ctx.binary = self.pin
+        self.ctx.pins = dict.fromkeys(("before", "after", "provider.so"), self.pin)
+        self.ctx.b_file_offset = 0
+        self.children, self.driver_argv, self.observers = [], [], []
+        self.primary = TimeoutError("controlled successor warm failure")
+        self.addCleanup(self.release_children)
+
+    def release_children(self):
+        for owner in self.children:
+            if owner.popen.poll() is None:
+                owner.popen.kill()
+            owner.popen.wait(2)
+            for stream in (owner.popen.stdin, owner.popen.stdout, owner.popen.stderr):
+                if stream is not None and not stream.closed:
+                    stream.close()
+            owner.close()
+        for scope in self.ctx.scopes:
+            for reader in scope.readers:
+                reader.stop.set()
+                reader.thread.join(1)
+
+    def route(self, *, kind="trace", fault="warm", stop_delay=0, leg_seconds=None, clock=None):
+        namespace = H6["run_b_leg"].__globals__
+        original_spawn = H6["spawn_owned"]
+        original_observer = H6["spawn_observer"]
+        original_budget = H6["LegBudget"]
+        driver_class = H6["BDriver"]
+        events = self.directory / "events.jsonl"
+        events.write_text("")
+        self.events_path = events
+        # Keep the production BDriver constructor and its actual deadline argv.
+        # Only replace the native fixture/observer executable at the spawn edge.
+        child_code = textwrap.dedent("""
+            import json, os, select, signal, sys, time
+            role, events, deadline, delay, initial_output = sys.argv[1:]
+            deadline, delay = int(deadline), float(delay)
+            def record(event):
+                with open(events, 'a') as output:
+                    output.write(json.dumps({'role': role, 'event': event}) + '\\n')
+            def stop(signum, _frame):
+                record(signal.Signals(signum).name)
+                if role == 'observer' and signum == signal.SIGINT:
+                    time.sleep(delay)
+                    record('stopped')
+                    sys.exit(0)
+                sys.exit(0)
+            signal.signal(signal.SIGINT, stop)
+            signal.signal(signal.SIGTERM, stop)
+            print(initial_output, end='', flush=True)
+            while True:
+                if role == 'caller' and time.monotonic_ns() >= deadline:
+                    record('deadline-92')
+                    sys.exit(92)
+                if role == 'caller' and select.select([sys.stdin], [], [], .01)[0]:
+                    command = os.read(sys.stdin.fileno(), 1)
+                    record(command.decode() if command else 'eof')
+                    if command == b'F':
+                        sys.exit(0)
+                else:
+                    time.sleep(.01)
+        """)
+        def spawn(owners, argv, uid, **options):
+            is_observer = "trace" in argv or "profile" in argv
+            if is_observer:
+                role, deadline = "observer", 0
+            else:
+                self.driver_argv.append(list(argv))
+                role, deadline = "caller", int(argv[-5])
+            options.pop("user", None)
+            options.pop("group", None)
+            options.pop("extra_groups", None)
+            command = [sys.executable, "-I", "-c", child_code, role, str(events),
+                       str(deadline), str(stop_delay),
+                       live_frame({}) if is_observer and kind != "trace" else "alive\n"]
+            if is_observer and fault == "direct-child":
+                def failed_validation(_pid, _parent, _uid, proc):
+                    self.assertEqual(proc.stdout.readline(), "alive\n")
+                    raise self.primary
+                with mock.patch.dict(H6["N3HARNESS"]["spawn_owned"].__globals__,
+                                     {"OwnedProcess": failed_validation}):
+                    try:
+                        original_spawn(owners, command, os.getuid(), **options)
+                    except TimeoutError:
+                        self.children.append(owners[-1])
+                        self.observers.append(owners[-1])
+                        raise
+            owner = original_spawn(owners, command, os.getuid(), **options)
+            self.children.append(owner)
+            if is_observer:
+                self.observers.append(owner)
+            return owner
+        def ready(driver):
+            H6["expect_line"](driver.stdout, 0, "alive", 2)
+            driver.exe0 = str(self.pin.path)
+            if fault == "no-observer":
+                raise self.primary
+        def pre(driver):
+            driver.worker_tid = driver.pid
+            driver.stamps.update(G=1, WORKER_DONE=2)
+        def execute(driver):
+            driver.exe1 = str(self.pin.path)
+            driver.stamps.update(EXEC_BODY=3, NEW_READY=4)
+        def post(driver):
+            driver.stamps.update(R=5, NEW_DONE=6)
+        def warm(*_args, **_kwargs):
+            budget = H6["ACTIVE_LEG"].get()
+            self.work_budget = budget
+            self.original_deadline = budget.deadline_ns
+            if fault == "healthy":
+                return {"attempts": 1}
+            budget.enter("successor-recovery", 1)
+            budget.phase_deadline_ns = budget.clock() - 1
+            if fault == "natural-before":
+                self.children[0].popen.wait(2)
+            raise self.primary
+        def observer(*args, **kwargs):
+            owned, capture, errors, started = original_observer(*args, **kwargs)
+            if kind == "trace":
+                H6["expect_line"](capture, 0, "alive", 2)
+            else:
+                deadline = time.monotonic() + 2
+                while not capture.lines and time.monotonic() < deadline:
+                    time.sleep(.01)
+                self.assertTrue(capture.lines, "inert PTY observer never started")
+            if fault == "partial-observer":
+                raise self.primary
+            if fault in ("stop-error", "stop-and-cleanup-error"):
+                send = owned.send
+                self.stop_attempts = 0
+                def refused_send(signum):
+                    if signum == signal.SIGINT:
+                        self.stop_attempts += 1
+                        raise OSError("controlled stop failure")
+                    return send(signum)
+                owned.send = refused_send
+                if fault == "stop-and-cleanup-error":
+                    finish = capture.finish
+                    def failed_finish():
+                        finish()
+                        raise ValueError("controlled reader cleanup failure")
+                    capture.finish = failed_finish
+            if fault == "unknown-identity":
+                owned.verify = lambda: (_ for _ in ()).throw(ValueError("controlled identity refusal"))
+            if fault == "forced":
+                wait, send = owned.popen.wait, owned.send
+                self.wait_limits, self.sent = [], []
+                def forced_wait(timeout):
+                    self.wait_limits.append(timeout)
+                    if len(self.wait_limits) == 1:
+                        deadline = time.monotonic() + 2
+                        while {"role": "observer", "event": "SIGINT"} not in self.events():
+                            self.assertLess(time.monotonic(), deadline)
+                            time.sleep(.01)
+                        self.now[0] += 60_000_000_000
+                        raise subprocess.TimeoutExpired("inert observer", timeout)
+                    rc = wait(2)
+                    self.now[0] += 4_000_000_000
+                    return rc
+                def sent(signum):
+                    self.sent.append(signum)
+                    return send(signum)
+                owned.popen.wait, owned.send = forced_wait, sent
+            return owned, capture, errors, started
+        def budget(**kwargs):
+            if leg_seconds is not None and "leg_seconds" not in kwargs:
+                kwargs["leg_seconds"] = leg_seconds
+            if clock is not None:
+                kwargs["clock"] = clock
+            return original_budget(**kwargs)
+        patches = {"spawn_owned": spawn, "spawn_observer": observer, "LegBudget": budget,
+            "observer_ready": lambda *_args: time.monotonic_ns(), "warm_successor": warm,
+            "provider_receipt": lambda *_args: dict(PIN),
+            "evaluate_trace_h6": lambda _text, _ledger, receipt, _file: {
+                "pass": not H6["stop_errors"](receipt), "receipt": receipt}}
+        if clock is not None:
+            patches["monotonic_ns"] = clock
+        if fault == "healthy":
+            (self.directory / "leg").mkdir()
+            (self.directory / "leg" / "trace.file.txt").write_text("")
+        with mock.patch.dict(namespace, patches), \
+                mock.patch.object(driver_class, "ready", ready), \
+                mock.patch.object(driver_class, "start_worker", lambda _driver: None), \
+                mock.patch.object(driver_class, "pre_exec", pre), \
+                mock.patch.object(driver_class, "do_exec", execute), \
+                mock.patch.object(driver_class, "post_exec", post), \
+                mock.patch.object(driver_class, "normalize", return_value=[{"kind": "exec"}]):
+            return H6["run_b_leg"](self.ctx, "pid-nonleader-cold", "singles", kind,
+                                  self.directory / "leg", "0")
+
+    def events(self):
+        return [json.loads(line) for line in self.events_path.read_text().splitlines()]
+
+    def assert_released(self):
+        for owner in self.children:
+            self.assertIsNotNone(owner.popen.poll())
+            self.assertFalse((Path("/proc") / str(owner.pid)).exists())
+            self.assertIsNone(getattr(owner, "pidfd", None))
+            self.assertTrue(all(stream.closed for stream in
+                (owner.popen.stdin, owner.popen.stdout, owner.popen.stderr) if stream is not None))
+        self.assertTrue(all(not scope.owners and not scope.readers for scope in self.ctx.scopes))
+        os.fstat(self.pin.fd)
+        self.assertIsNone(H6["ACTIVE_LEG"].get())
+
+    def assert_normal_stop(self):
+        events = self.events()
+        self.assertEqual(events.count({"role": "observer", "event": "SIGINT"}), 1,
+                         "workload-B failure skipped its observer's normal SIGINT stop")
+        self.assertNotIn({"role": "observer", "event": "SIGTERM"}, events)
+        self.assertNotIn({"role": "caller", "event": "F"}, events)
+        self.assert_released()
+
+    def test_expired_warm_failure_normally_stops_real_trace_observer(self):
+        with self.assertRaises(TimeoutError) as caught:
+            self.route()
+        self.assertIs(caught.exception, self.primary)
+        self.assert_normal_stop()
+        self.assertEqual(self.work_budget.deadline_ns, self.original_deadline)
+        self.assertEqual([int(value) for value in self.driver_argv[0][-3:]], [15000, 60000, 65000])
+        stop_index = self.events().index({"role": "observer", "event": "stopped"})
+        caller_index = self.events().index({"role": "caller", "event": "SIGTERM"})
+        self.assertLess(stop_index, caller_index)
+
+    def test_expired_warm_failure_normally_stops_real_pty_observer(self):
+        with self.assertRaises(TimeoutError) as caught:
+            self.route(kind="profile")
+        self.assertIs(caught.exception, self.primary)
+        self.assert_normal_stop()
+
+    def test_partial_observer_enrollment_is_normally_stopped(self):
+        with self.assertRaises(TimeoutError) as caught:
+            self.route(fault="partial-observer")
+        self.assertIs(caught.exception, self.primary)
+        self.assert_normal_stop()
+
+    def test_failed_process_validation_stops_only_enrolled_direct_child(self):
+        with self.assertRaises(TimeoutError) as caught:
+            self.route(fault="direct-child")
+        self.assertIs(caught.exception, self.primary)
+        self.assertIsInstance(self.observers[0], H6["N3HARNESS"]["DirectChild"])
+        self.assert_normal_stop()
+
+    def test_no_observer_failure_preserves_primary_and_reaps_caller(self):
+        with self.assertRaises(TimeoutError) as caught:
+            self.route(fault="no-observer")
+        self.assertIs(caught.exception, self.primary)
+        self.assertEqual(self.observers, [])
+        self.assert_released()
+
+    def test_natural_caller_deadline_during_normal_stop_is_not_renewed(self):
+        with self.assertRaises((TimeoutError, H6["LegCleanupError"])) as caught:
+            self.route(fault="natural-during", leg_seconds=.3, stop_delay=.5)
+        self.assertIn(str(self.primary), str(caught.exception))
+        self.assert_normal_stop()
+        self.assertEqual(self.children[0].popen.returncode, 92)
+        self.assertIn({"role": "caller", "event": "deadline-92"}, self.events())
+        self.assertEqual(int(self.driver_argv[0][-5]), self.original_deadline)
+
+    def test_natural_caller_deadline_before_stop_is_not_renewed(self):
+        with self.assertRaises((TimeoutError, H6["LegCleanupError"])) as caught:
+            self.route(fault="natural-before", leg_seconds=.3)
+        self.assertIn(str(self.primary), str(caught.exception))
+        self.assert_normal_stop()
+        self.assertEqual(self.children[0].popen.returncode, 92)
+        events = self.events()
+        self.assertLess(events.index({"role": "caller", "event": "deadline-92"}),
+                        events.index({"role": "observer", "event": "SIGINT"}))
+
+    def test_primary_is_chained_with_stop_and_cleanup_failures(self):
+        with self.assertRaises(H6["LegCleanupError"]) as caught:
+            self.route(fault="stop-and-cleanup-error")
+        self.assertIs(caught.exception.__cause__, self.primary)
+        for detail in (str(self.primary), "controlled stop failure", "controlled reader cleanup failure"):
+            self.assertIn(detail, str(caught.exception))
+        self.assertEqual(self.stop_attempts, 1)
+        self.assert_released()
+
+    def test_stop_failure_still_cleans_without_repeating_normal_stop(self):
+        with self.assertRaises(H6["LegCleanupError"]) as caught:
+            self.route(fault="stop-error")
+        self.assertIs(caught.exception.__cause__, self.primary)
+        self.assertIn("controlled stop failure", str(caught.exception))
+        self.assertEqual(self.stop_attempts, 1)
+        self.assert_released()
+
+    def test_unknown_owned_identity_is_refused_without_signalling_a_guessed_pid(self):
+        with self.assertRaises(H6["LegCleanupError"]) as caught:
+            self.route(fault="unknown-identity")
+        self.assertIs(caught.exception.__cause__, self.primary)
+        self.assertIn("controlled identity refusal", str(caught.exception))
+        self.assertIsNone(self.observers[0].popen.poll())
+        self.assertFalse(any(row["role"] == "observer" for row in self.events()))
+
+    def test_forced_stop_and_final_backstop_share_the_original_cleanup_deadline(self):
+        self.now = [time.monotonic_ns()]
+        with self.assertRaises(H6["LegCleanupError"]) as caught:
+            self.route(fault="forced", stop_delay=5, clock=lambda: self.now[0])
+        self.assertIs(caught.exception.__cause__, self.primary)
+        self.assertIn("forced cleanup", str(caught.exception))
+        self.assertEqual(self.sent, [signal.SIGINT, signal.SIGKILL])
+        self.assertEqual(self.wait_limits[:2], [60, 5])
+        self.assertEqual(self.observers[0].popen.returncode, -signal.SIGKILL)
+        self.assert_released()
+        scope = self.ctx.scopes[0]
+        terminal = scope.terminal_budget
+        self.assertEqual(terminal.deadlines["cleanup", 0], terminal.started_ns + 65_000_000_000)
+        errors = list(self.ctx.cleanup_errors)
+        self.now[0] += 10_000_000_000
+        H6["cleanup_leg_resources"](scope)
+        self.assertEqual(self.ctx.cleanup_errors, errors, "empty backstop invented a new failure")
+        with self.assertRaises(TimeoutError):
+            terminal.enter("cleanup")
+        self.assertEqual(terminal.deadlines["cleanup", 0], terminal.started_ns + 65_000_000_000)
+        # The final backstop may still own an unreaped child. It must reuse the
+        # expired interval rather than grant that pending child five more seconds.
+        pending = H6["spawn_owned"](scope.owners,
+            [sys.executable, "-I", "-c", "import time; time.sleep(30)"], os.getuid(),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        self.children.append(pending)
+        namespace = H6["cleanup_leg_resources"].__globals__
+        with mock.patch.dict(namespace, {"LegBudget": lambda **_kwargs: self.fail("cleanup budget renewed")}), \
+                self.assertRaisesRegex(H6["LegCleanupError"], "deadline exhausted"):
+            H6["cleanup_leg_resources"](scope)
+        self.assertIsNone(H6["ACTIVE_LEG"].get())
+        self.assertEqual(terminal.deadlines["cleanup", 0], terminal.started_ns + 65_000_000_000)
+
+    def test_healthy_route_stops_once_before_finish_and_keeps_terminal_receipt(self):
+        result = self.route(fault="healthy")
+        self.assertTrue(result["pass"], result)
+        self.assertFalse(result["receipt"]["forced_cleanup"])
+        events = self.events()
+        self.assertEqual(events.count({"role": "observer", "event": "SIGINT"}), 1)
+        self.assertLess(events.index({"role": "observer", "event": "stopped"}),
+                        events.index({"role": "caller", "event": "F"}))
+        self.assert_released()
+
+    def test_public_cell_result_preserves_primary_after_successful_failure_cleanup(self):
+        runner = H6["run_cell_backend"]
+        with mock.patch.dict(H6["CELL_RUNNERS"], {"pid-nonleader-cold": lambda *_args: [self.route()]}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            results = runner(self.ctx, "pid-nonleader-cold", "singles")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["status"], "error")
+        self.assertFalse(results[0]["pass"])
+        self.assertEqual(results[0]["errors"], ["TimeoutError: controlled successor warm failure"])
+        self.assert_normal_stop()
+
+
 class LegCleanupTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="h6-leg-cleanup-")

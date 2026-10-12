@@ -383,7 +383,7 @@ impl CaptureFacts {
 
 /// How the classic session attached its static probes (DR-CLASSIC-PID0),
 /// as the native inventory lane's `observation.attach` spells it.
-/// Profile lane only (`evidence.attach_backend`).
+/// Profile and metrics lanes (`evidence.attach_backend`).
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct AttachBackendEvidence {
     /// The operator's `--attach-backend`: `auto`, `multi` or `singles`.
@@ -826,7 +826,6 @@ pub struct Evidence {
     pub interface_selection: InterfaceSelection,
     #[serde(skip)]
     pub attach_mechanisms: Vec<&'static str>,
-    #[serde(skip)]
     pub attach_backend: AttachBackendEvidence,
     #[serde(skip)]
     pub pid_descendant_gaps: u64,
@@ -2794,14 +2793,79 @@ pub(crate) mod tests {
 
         let metrics = json(&reports_fixture(), &ev, &capture_fixture());
         assert_eq!(metrics["schema"], "p11scope/observed-profile/v3-metrics");
+        assert_eq!(
+            metrics["evidence"]["attach_backend"],
+            profile["evidence"]["attach_backend"]
+        );
         for field in [
             "interface_selection",
             "attach_mechanisms",
-            "attach_backend",
             "pid_descendant_gaps",
             "multi_rebuild_gaps",
         ] {
             assert!(metrics["evidence"].get(field).is_none(), "{field}");
+        }
+    }
+
+    #[test]
+    fn metrics_serializes_actual_attach_backend_metadata() {
+        let pid_fallback = crate::attach::select_session_backend(
+            crate::attach::BackendSelection::Auto,
+            true,
+            || panic!("PID scope must use the PID-filter probe"),
+            || Err("not supported".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(pid_fallback.backend, crate::attach::AttachBackend::Singles);
+        for (scope, selection, fallback, scope_filter, expected) in [
+            (
+                "pid",
+                "singles",
+                None,
+                Some("perf-task+bpf"),
+                serde_json::json!({"selection": "singles", "fallback": null, "scope_filter": "perf-task+bpf"}),
+            ),
+            (
+                "pid",
+                "multi",
+                None,
+                Some("kernel-pid+bpf"),
+                serde_json::json!({"selection": "multi", "fallback": null, "scope_filter": "kernel-pid+bpf"}),
+            ),
+            (
+                "pid",
+                "auto",
+                pid_fallback.fallback.as_deref(),
+                Some("perf-task+bpf"),
+                serde_json::json!({"selection": "auto", "fallback": "uprobe-multi under --pid needs a proven kernel pid filter: not supported", "scope_filter": "perf-task+bpf"}),
+            ),
+            (
+                "system",
+                "multi",
+                None,
+                None,
+                serde_json::json!({"selection": "multi", "fallback": null, "scope_filter": null}),
+            ),
+            (
+                "cgroup",
+                "singles",
+                None,
+                None,
+                serde_json::json!({"selection": "singles", "fallback": null, "scope_filter": null}),
+            ),
+        ] {
+            let mut ev = evidence();
+            ev.attach_backend = AttachBackendEvidence {
+                selection,
+                fallback: fallback.map(str::to_owned),
+                scope_filter,
+            };
+            let capture = CaptureMeta {
+                scope,
+                ..capture_fixture()
+            };
+            let document = json(&reports_fixture(), &ev, &capture);
+            assert_eq!(document["evidence"]["attach_backend"], expected);
         }
     }
 
@@ -3074,6 +3138,7 @@ pub(crate) mod tests {
         let mut baseline = evidence();
         baseline.verdict_with_selection(false);
         let expected = baseline.completeness;
+        let expected_json = json(&reports_fixture(), &baseline, &capture_fixture());
 
         baseline.interface_selection.selection_truncated = true;
         baseline
@@ -3085,6 +3150,11 @@ pub(crate) mod tests {
             });
         baseline.verdict_with_selection(false);
         assert_eq!(baseline.completeness, expected);
+        assert_eq!(
+            json(&reports_fixture(), &baseline, &capture_fixture()),
+            expected_json,
+            "selection-only state must not change metrics output or verdict"
+        );
         assert!(
             json(&reports_fixture(), &baseline, &capture_fixture())["evidence"]
                 .get("interface_selection")

@@ -64,7 +64,7 @@ def evidence(backend="singles", in_flight=0, losses=0, **over):
           "final_drain": True, "completeness": "PARTIAL",
           "in_flight_at_end": in_flight, "task_uprobe_link_losses": losses,
           "attach_backend": {"selection": backend, "fallback": None,
-                             "mechanisms": ["uprobe"]}}
+                             "scope_filter": "kernel-pid+bpf" if backend == "multi" else "perf-task+bpf"}}
     ev.update(over)
     return ev
 
@@ -1885,6 +1885,20 @@ class RecoveredStaticGapTest(unittest.TestCase):
         data[4]["discovery"][0]["objects"] *= 2
         result = self.evaluate("trace", data)
         self.assertTrue(result["pass"], result["errors"])
+
+    def test_metrics_recovered_gap_requires_actual_metadata_despite_matching_argv(self):
+        for field in ("attach_backend", "selection", "fallback", "scope_filter"):
+            with self.subTest(missing=field):
+                data = self.inputs("metrics")
+                self.assertTrue(self.evaluate("metrics", data)["pass"])
+                if field == "attach_backend":
+                    del data[4][field]
+                else:
+                    del data[4]["attach_backend"][field]
+                result = self.evaluate("metrics", data)
+                self.assertFalse(result["pass"], result)
+                self.assertIn("early deficit lacks relevant real product concrete-gap/PARTIAL evidence",
+                              result["errors"])
 
     def test_recovered_category_requires_all_scope_provider_and_verdict_guards(self):
         def missing_image_field(data):
@@ -6037,7 +6051,8 @@ def profile_doc(functions, mode="profile", scope="pid"):
                        "modules": [{"path": "/w/lib.so", "ino": 111, "sha256": "0" * 64}]},
            "functions": functions,
            "evidence": {"attach_failures": [],
-                        "attach_backend": {"selection": "singles", "fallback": None}}}
+                        "attach_backend": {"selection": "singles", "fallback": None,
+                                           "scope_filter": "perf-task+bpf" if scope == "pid" else None}}}
     if mode == "profile":
         doc.update({"cgroups": [], "sessions": {}, "mechanisms": [],
                     "templates": {}, "logins": {}})
@@ -6352,16 +6367,6 @@ class AggregateTest(unittest.TestCase):
         result = H6["evaluate_profile_h6"](doc, stdout_text, ledger, receipt)
         self.assertFalse(result["pass"])
         self.assertTrue(any("missing measured phase" in error for error in result["errors"]),
-                        result["errors"])
-
-    def test_metrics_lane_omits_backend_selection(self):
-        doc, stdout_text, ledger, receipt = profile_inputs()
-        doc = copy.deepcopy(doc)
-        doc["evidence"].pop("attach_backend", None)
-        receipt = copy.deepcopy(receipt)
-        receipt["requested_backend"] = "singles"
-        result = H6["evaluate_metrics_h6"](doc, stdout_text, ledger, receipt)
-        self.assertTrue(all("backend differs" not in error for error in result["errors"]),
                         result["errors"])
 
     def test_reject_metrics_identity_leak(self):

@@ -41,17 +41,22 @@ capture, and a consumer must dispatch on the top-level `lane` field
 
 - The **profile** lane (`render::profile_json`, verdict
   `verdict_with_selection(true)`) embeds `versioned_evidence`: the full base
-  set plus the five profile-only fields `interface_selection`,
-  `attach_mechanisms`, `attach_backend`, `pid_descendant_gaps`, and
+  set plus the four profile-only fields `interface_selection`,
+  `attach_mechanisms`, `pid_descendant_gaps`, and
   `multi_rebuild_gaps`. Its
   verdict is selection-aware: a descendant gap, a rebuild gap, or any
   selection loss forces `PARTIAL`.
 - The **metrics** lane (`render::json`, verdict
-  `verdict_with_selection(false)`) embeds `Evidence` directly, so the five
+  `verdict_with_selection(false)`) embeds `Evidence` directly, so the four
   `#[serde(skip)]` profile-only fields above are absent. Its verdict is
   selection-blind by construction: the same capture that reads `PARTIAL` as
   profile over a descendant gap reads `COMPLETE`-eligible as metrics, with no
   contradiction — the metrics verdict never saw the selection state.
+
+Both current v3 lanes include `attach_backend`: the existing Session's
+`selection`, `fallback`, and `scope_filter` metadata. This disclosure does not
+add selection verdict authority to metrics. Historical v2-metrics documents
+retain their old shape without `attach_backend`.
 
 The terminal trace `EVIDENCE` object follows the profile lane: it carries the
 four versioned-only fields and no `lane` key (it is an evidence object, not a
@@ -116,7 +121,8 @@ result (a null table output) is handled uniformly with nonzero `rv`: null
 `uprobe-multi`, derived only from successfully owned links. Before the
 uprobe-multi attachment slice, a nonempty array can contain only `per-offset`.
 
-`attach_backend` says how the session chose its static attach backend, as
+`attach_backend` is always present in both v3 lanes and says how the session
+chose its static attach backend, as
 the inventory document's `observation.attach` does. The backend is chosen by
 functional probes, never by the kernel version:
 - `selection`: the operator's `--attach-backend` (`auto`, `multi` or

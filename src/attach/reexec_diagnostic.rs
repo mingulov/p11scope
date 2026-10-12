@@ -17,6 +17,44 @@ macro_rules! observe {
 }
 pub(crate) use observe;
 
+// Terminal snapshots remain eligible after the first observation window closes.
+#[cfg(not(feature = "h6-reexec-diagnostic"))]
+macro_rules! terminal {
+    ($receiver:expr, |$observer:ident| $body:block) => {{}};
+}
+#[cfg(feature = "h6-reexec-diagnostic")]
+macro_rules! terminal {
+    ($receiver:expr, |$observer:ident| $body:block) => {{
+        if let Some($observer) = $receiver.reexec_diagnostic()
+            && $observer.terminal_pending()
+        {
+            $body
+        }
+    }};
+}
+pub(crate) use terminal;
+
+#[cfg(not(feature = "h6-reexec-diagnostic"))]
+macro_rules! evaluate {
+    ($receiver:expr, $phase:expr, $counts:expr, $operation:expr, $classify:expr) => {{ ($operation)() }};
+}
+#[cfg(feature = "h6-reexec-diagnostic")]
+macro_rules! evaluate {
+    ($receiver:expr, $phase:expr, $counts:expr, $operation:expr, $classify:expr) => {{
+        if let Some(diag) = $receiver.reexec_diagnostic()
+            && diag.active()
+        {
+            let span = diag.begin($phase, $counts);
+            let result = ($operation)();
+            span.finish(($classify)(&result));
+            result
+        } else {
+            ($operation)()
+        }
+    }};
+}
+pub(crate) use evaluate;
+
 #[cfg(feature = "h6-reexec-diagnostic")]
 mod enabled {
     use crate::{metrics::SlotReport, sink::SinkDrops};
@@ -27,10 +65,11 @@ mod enabled {
 
     pub(crate) const RECORD_CAP: u64 = 1024;
     pub(crate) const LINE_CAP: usize = 192;
-    // One clipping record, eight terminal data records and the final summary.
-    const RESERVED: u64 = 10;
+    // One clipping and one closing record, eight terminal data records,
+    // and the final summary share the hard 1,024-attempt budget.
+    const RESERVED: u64 = 11;
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum Phase {
         Exec,
         Request,
@@ -38,6 +77,10 @@ mod enabled {
         Scan,
         ContextRetire,
         Candidate,
+        CandidateFirst,
+        CandidateFinal,
+        AdmissionFirst,
+        AdmissionFinal,
         Identity,
         Rearm,
         Preflight,
@@ -72,6 +115,10 @@ mod enabled {
                 Self::Scan => "scan",
                 Self::ContextRetire => "context_retire",
                 Self::Candidate => "candidate",
+                Self::CandidateFirst => "candidate_first",
+                Self::CandidateFinal => "candidate_final",
+                Self::AdmissionFirst => "admission_first",
+                Self::AdmissionFinal => "admission_final",
                 Self::Identity => "identity",
                 Self::Rearm => "rearm",
                 Self::Preflight => "preflight",
@@ -99,7 +146,7 @@ mod enabled {
             }
         }
     }
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum Outcome {
         Begin,
         Ok,
@@ -160,7 +207,7 @@ mod enabled {
             }
         }
     }
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) struct Record {
         pub(crate) phase: Phase,
         pub(crate) outcome: Outcome,
@@ -231,6 +278,8 @@ mod enabled {
         cap_noted: bool,
         summary: Summary,
         trace: TraceCounts,
+        #[cfg(test)]
+        last_record: Option<Record>,
     }
     #[derive(Clone, Default)]
     pub(crate) struct Diagnostic(Arc<Mutex<State>>);
@@ -273,7 +322,7 @@ mod enabled {
             let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
             state.execs = state.execs.saturating_add(1);
             state.active = state.execs == 1 && !state.finished;
-            let overtaken = state.execs > 1 && !state.finished;
+            let overtaken = state.execs == 2 && !state.finished;
             let serial = state.serial;
             let execs = state.execs;
             drop(state);
@@ -294,6 +343,10 @@ mod enabled {
         pub(crate) fn active(&self) -> bool {
             self.0.lock().unwrap_or_else(|e| e.into_inner()).active
         }
+        pub(crate) fn terminal_pending(&self) -> bool {
+            let state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            state.execs != 0 && !state.finished
+        }
         pub(crate) fn serial(&self, serial: Option<u64>) -> bool {
             let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
             let renewed = state.serial.is_some() && state.serial != serial;
@@ -306,6 +359,10 @@ mod enabled {
         #[cfg(test)]
         pub(crate) fn trace_counts(&self) -> TraceCounts {
             self.0.lock().unwrap_or_else(|e| e.into_inner()).trace
+        }
+        #[cfg(test)]
+        pub(crate) fn last_record(&self) -> Option<Record> {
+            self.0.lock().unwrap_or_else(|e| e.into_inner()).last_record
         }
         pub(crate) fn trace_observation(
             &self,
@@ -449,6 +506,10 @@ mod enabled {
                     return;
                 }
                 state.summary.attempts += 1;
+                #[cfg(test)]
+                {
+                    state.last_record = Some(record);
+                }
                 if record.time_ms.is_none() {
                     state.summary.unknown_times = state.summary.unknown_times.saturating_add(1);
                 }
@@ -658,6 +719,40 @@ mod tests {
         assert_eq!(touched.get(), 0);
     }
 
+    #[cfg(not(feature = "h6-reexec-diagnostic"))]
+    #[test]
+    fn reexec_diagnostic_off_terminal_and_evaluation_skip_metadata() {
+        let touched = std::cell::Cell::new(0);
+        let calls = std::cell::Cell::new(0);
+        super::terminal!(
+            {
+                touched.set(1);
+                panic!("terminal receiver evaluated")
+            },
+            |diag| {
+                touched.set(2);
+                let _clock = crate::attach::monotonic_ns();
+                panic!("terminal metadata evaluated");
+            }
+        );
+        let result = super::evaluate!(
+            {
+                touched.set(3);
+                panic!("evaluation receiver evaluated")
+            },
+            panic!("phase evaluated"),
+            panic!("counts evaluated"),
+            || {
+                calls.set(calls.get() + 1);
+                17
+            },
+            |_| panic!("classifier evaluated")
+        );
+        assert_eq!(result, 17);
+        assert_eq!(calls.get(), 1);
+        assert_eq!(touched.get(), 0);
+    }
+
     #[cfg(feature = "h6-reexec-diagnostic")]
     mod on {
         use super::super::*;
@@ -709,7 +804,7 @@ mod tests {
                     Err(std::io::ErrorKind::BrokenPipe.into())
                 });
             }
-            assert_eq!(attempted, 1014);
+            assert_eq!(attempted, 1013);
             for _ in 0..12 {
                 diag.record_with(event(Some(2)), true, |_| {
                     attempted += 1;
@@ -835,6 +930,128 @@ mod tests {
                 let _ = diag.summary();
             });
             assert_eq!(count.get(), 1);
+        }
+
+        struct Receiver(Option<Diagnostic>);
+        impl Receiver {
+            fn reexec_diagnostic(&self) -> Option<Diagnostic> {
+                self.0.clone()
+            }
+        }
+
+        #[test]
+        fn reexec_diagnostic_production_terminal_after_overtaking_is_once_and_closed() {
+            let diag = Diagnostic::selected(true, true).unwrap();
+            let receiver = Receiver(Some(diag.clone()));
+            let metadata = std::cell::Cell::new(0);
+            let reports = [report(&["C_GetInfo", "alias"], 20, 3)];
+            super::super::terminal!(receiver, |d| {
+                metadata.set(metadata.get() + 1);
+                d.finish(canary_counts(&reports), 29, [0, 0, 0, 1], [Some(0); 4]);
+            });
+            assert_eq!(metadata.get(), 0, "no EXEC means no terminal metadata");
+            diag.matched_exec();
+            diag.matched_exec();
+            assert!(!diag.active(), "the first observation window stays closed");
+            super::super::observe!(receiver, |d| {
+                let _ = d.summary();
+                panic!("ordinary observation resumed after overtaking");
+            });
+            let before = diag.summary().attempts;
+            super::super::terminal!(receiver, |d| {
+                metadata.set(metadata.get() + 1);
+                d.finish(canary_counts(&reports), 29, [0, 0, 0, 1], [Some(0); 4]);
+            });
+            assert_eq!(
+                metadata.get(),
+                1,
+                "production terminal must run after two EXECs"
+            );
+            assert_eq!(diag.summary().attempts, before + 9);
+            let last = diag.last_record().unwrap();
+            assert_eq!((last.phase, last.outcome), (Phase::Terminal, Outcome::Ok));
+            super::super::terminal!(receiver, |d| {
+                metadata.set(metadata.get() + 1);
+                d.finish(canary_counts(&reports), 29, [0, 0, 0, 1], [Some(0); 4]);
+            });
+            assert_eq!(
+                metadata.get(),
+                1,
+                "finished terminal must not repeat metadata"
+            );
+            assert_eq!(diag.summary().attempts, before + 9);
+            assert!(!diag.active());
+        }
+
+        #[test]
+        fn reexec_diagnostic_production_terminal_overtaking_keeps_clipped_summary() {
+            let diag = Diagnostic::selected(true, true).unwrap();
+            let receiver = Receiver(Some(diag.clone()));
+            diag.matched_exec();
+            for _ in 0..2000 {
+                diag.record_with(event(Some(1)), false, |_| {
+                    Err(std::io::ErrorKind::BrokenPipe.into())
+                });
+            }
+            // Exercise the real cap notification before the closing EXEC.
+            diag.note(Phase::Refresh, Outcome::Ok, [None; 4]);
+            diag.matched_exec();
+            diag.matched_exec(); // Further EXECs must not spend the terminal reserve.
+            let metadata = std::cell::Cell::new(0);
+            super::super::terminal!(receiver, |d| {
+                metadata.set(metadata.get() + 1);
+                d.finish(
+                    canary_counts(&[report(&["C_GetInfo"], 20, 3)]),
+                    29,
+                    [0, 0, 0, 1],
+                    [Some(0); 4],
+                );
+            });
+            assert_eq!(
+                metadata.get(),
+                1,
+                "clipping cannot suppress production terminal"
+            );
+            let summary = diag.summary();
+            assert_eq!(summary.attempts, RECORD_CAP);
+            assert!(summary.failures > 0 && summary.clipped > 0);
+            let last = diag.last_record().unwrap();
+            assert_eq!(
+                (last.phase, last.outcome),
+                (Phase::Terminal, Outcome::Incomplete),
+                "the reserved final summary must be attempted after cap and overtaking"
+            );
+            assert_eq!(last.counts[0], Some(RECORD_CAP));
+            let before = summary.attempts;
+            super::super::terminal!(receiver, |d| {
+                metadata.set(metadata.get() + 1);
+                d.finish(canary_counts(&[]), 0, [0; 4], [None; 4]);
+            });
+            assert_eq!(metadata.get(), 1);
+            assert_eq!(diag.summary().attempts, before);
+        }
+
+        #[test]
+        fn reexec_diagnostic_inactive_evaluation_preserves_operation_without_metadata() {
+            for recorder in [None, Diagnostic::selected(true, true)] {
+                let receiver = Receiver(recorder);
+                let calls = std::cell::Cell::new(0);
+                let phase = || -> Phase { panic!("inactive phase evaluated") };
+                let counts = || -> [Option<u64>; 4] { panic!("inactive counts evaluated") };
+                let classify = |_: &i32| -> Outcome { panic!("inactive classifier evaluated") };
+                let result = super::super::evaluate!(
+                    receiver,
+                    phase(),
+                    counts(),
+                    || {
+                        calls.set(calls.get() + 1);
+                        23
+                    },
+                    classify
+                );
+                assert_eq!(result, 23);
+                assert_eq!(calls.get(), 1);
+            }
         }
     }
 }

@@ -1406,7 +1406,9 @@ class WorkerCapabilityTest(unittest.TestCase):
                   "capability_early_coverage": {"expected": 11, "observed_named": captured, "observed_unknown": 0,
                                                 "deficit": 11 - captured, "errors": []},
                   "early_coverage": {"expected": 12, "observed_named": captured + 1, "observed_unknown": 0,
-                                     "deficit": 11 - captured}, "evidence": [ev], "errors": []}
+                                     "deficit": 11 - captured}, "evidence": [ev], "errors": [],
+                  "capture_integrity_errors": [], "successor_recovery_errors": [],
+                  "expected_mode2_abandonment_errors": []}
         return result, receipt
 
     def test_capability_counts_only_exact_worker_rows_and_rejects_false_names(self):
@@ -1477,7 +1479,7 @@ class WorkerCapabilityTest(unittest.TestCase):
                 receipt["requested_backend"] = backend
                 result["evidence"][0]["attach_backend"]["selection"] = backend
                 result.update(leg=f"trace/{backend}", status="fail", errors=["post-exec successor rows missing"],
-                              **{"pass": False})
+                              successor_recovery_errors=["post-exec successor rows missing"], **{"pass": False})
                 rows = self.run_capability(result, receipt, backend)
                 self.assertIs(rows[0], result)
                 self.assertIs(rows[0]["pass"], False)

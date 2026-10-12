@@ -369,6 +369,8 @@ DISCOVERY_REASONS = {
     SHARED_OVERLAY_UNCERTAINTY,
     PHYSICAL_IDENTITY_AMBIGUITY,
     UNSUPPORTED_TABLE_VERSION,
+    "static probe coverage gap incomplete",
+    "static probes detached and exact pairs reattached",
 }
 ENTRY_REASONS = {"null pointer", ENTRY_UNAVAILABLE}
 # The one gated entry-like skip whose subject is not a standard function: a
@@ -3749,6 +3751,33 @@ def self_test():
         unreadable["evidence"]["gap_classes"]["observation"]["causes"] == ["skipped"],
         unreadable["evidence"]["gap_classes"],
     )
+    for reason in (
+        "static probe coverage gap incomplete",
+        "static probes detached and exact pairs reattached",
+    ):
+        physical_gap = verdict_doc(skipped=[{"name": DISCOVERY_SUBJECT, "reason": reason}])
+        exact_metrics_schema(physical_gap)
+        require(discovery_skips(physical_gap["evidence"]) == physical_gap["evidence"]["skipped"],
+                "the static category is a finite discovery-level skip")
+        require(
+            physical_gap["evidence"]["completeness"] == "PARTIAL"
+            and physical_gap["evidence"]["verdict_detail"] == "concrete_gap"
+            and physical_gap["evidence"]["gap_classes"]["observation"]
+            == {"status": "lossy", "causes": ["skipped"]}
+            and physical_gap["evidence"]["unprotected_live_windows"] == 0
+            and physical_gap["evidence"]["attach_gap_ms"] is None,
+            "a fixed physical category retains loss without inventing a loader window or duration",
+        )
+        for name, invalid_reason in (
+            ("C_Initialize", reason),
+            ("unknown", reason),
+            ("physical static probe gap", reason),
+            (DISCOVERY_SUBJECT, reason + " private sentinel"),
+            (DISCOVERY_SUBJECT, reason.upper()),
+        ):
+            invalid = verdict_doc(skipped=[{"name": name, "reason": invalid_reason}])
+            rejected(lambda invalid=invalid: bounded_skip(invalid["evidence"]["skipped"][0]))
+    print("fixed static-gap categories retain observation loss and finite privacy: OK")
     open_calls = verdict_doc(in_flight_at_end=2)
     require(
         open_calls["evidence"]["gap_classes"]["observation"]["causes"] == ["in_flight_at_end"]

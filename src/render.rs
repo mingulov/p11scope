@@ -1201,6 +1201,8 @@ const PHYSICAL_IDENTITY_AMBIGUITY: &str =
     "physical identity is ambiguous; the collision group was not attached";
 const UNSUPPORTED_TABLE_VERSION: &str =
     "unsupported function-table version; the scanner does not walk this layout";
+const STATIC_GAP_INCOMPLETE: &str = "static probe coverage gap incomplete";
+const STATIC_GAP_RECOVERED: &str = "static probes detached and exact pairs reattached";
 
 /// Convert an untyped internal discovery loss into the finite public capture
 /// record. Detailed paths, process identities, and error chains remain in
@@ -1220,6 +1222,16 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
         }
     } else if gated_null {
         "null pointer"
+    } else if s.subject == "physical static probe gap"
+        && s.reason
+            == "an actual static detach opened a physical coverage interval whose final exact pairs or clock remain incomplete"
+    {
+        STATIC_GAP_INCOMPLETE
+    } else if s.subject == "physical static probe gap"
+        && s.reason
+            == "static probes detached and final exact pairs reattached; the physical coverage interval remains in history"
+    {
+        STATIC_GAP_RECOVERED
     } else if s
         .reason
         .contains("cannot prove physical identity across overlay instances")
@@ -1246,6 +1258,48 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
             DISCOVERY_SUBJECT.into()
         },
         reason: reason.into(),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn physical_gap_category_requires_exact_internal_subject_and_description() {
+    for description in [
+        "an actual static detach opened a physical coverage interval whose final exact pairs or clock remain incomplete",
+        "static probes detached and final exact pairs reattached; the physical coverage interval remains in history",
+    ] {
+        for (subject, reason) in [
+            ("discovery subject".to_string(), description.to_string()),
+            (
+                "physical static probe gap PRIVATE_SUBJECT_SENTINEL".to_string(),
+                description.to_string(),
+            ),
+            (
+                "physical static probe gap".to_string(),
+                format!("{description} PRIVATE_REASON_SENTINEL"),
+            ),
+            (
+                "physical static probe gap".to_string(),
+                description.to_uppercase(),
+            ),
+            (
+                "physical static probe gap".to_string(),
+                format!(" {description}"),
+            ),
+            (
+                "physical static probe gap".to_string(),
+                "static probes detached and exact pairs reattached".to_string(),
+            ),
+        ] {
+            let projected = capture_skipped_out(&Skipped { subject, reason });
+            assert_eq!(projected.name, "discovery subject");
+            assert_eq!(projected.reason, "discovery unavailable");
+            assert!(
+                !serde_json::to_string(&projected)
+                    .unwrap()
+                    .contains("PRIVATE_")
+            );
+        }
     }
 }
 

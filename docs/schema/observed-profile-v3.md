@@ -260,6 +260,14 @@ trace evidence object. Historical documents predate them (see Migration).
   `loader_discovery.hits > 0` and `pause` other than `sigstop`), and
   `module_unresolved_slots` (the number of `functions[].module_unresolved`
   rows) are the three verdict inputs that were previously unpublished.
+- Static detach history uses the existing `skipped` record with name
+  `discovery subject` and one of two fixed reasons: `static probe coverage gap
+  incomplete` or `static probes detached and exact pairs reattached`. The first
+  includes open or clock-unknown intervals; the second requires all affected
+  exact pairs and comparable clocks to have completed. Both retain observation
+  loss through the `skipped` cause after recovery. They carry no missing-call
+  count or per-provider/per-call interval and do not change
+  `unprotected_live_windows` or define a previously unknown `attach_gap_ms`.
 - `uretprobe_override` is `null` when the hazard preflight proceeded clean,
   else `{flag, reason}`: the exact `--allow-uretprobe-on-confined-target`
   flag plus the preflight's reason for requiring it. Disclosed, never a

@@ -145,7 +145,7 @@ Discovery and attachment:
 | `attached_probes` | Successful probe attachments; two per fully attached slot. |
 | `attach_failures` | Per-slot attachment errors. |
 | `aliased` | Name groups that share one address and therefore one count. |
-| `skipped` | Everything discovery could not use, at every granularity it works at. **Entries**: a NULL table slot, an entry whose object could not be pinned, an unresolvable manifest record. **Objects**: a mapping with no usable pathname, exports that could not be read, an object over the byte caps, an incomplete snapshot, or a provider with no decoded file-backed table. **Processes and scope**: a process or cgroup subtree that could not be scanned, and the `MAX_SCAN_PIDS` cap. Such a skip may be the only record of a provider that was never decoded. Identical internal losses are deduplicated before rendering; two different losses remain two records even if sanitization gives them the same public pair. The public `{name, reason}` is finite: `name` is an exact standard function, the gated `unknown` of a null slot in an unlinked table, or `discovery subject`; `reason` is exactly `null pointer`, `function entry unavailable`, `function table unavailable in file-backed data`, `shared-overlay physical identity is uncertain; a distinct byte-identical instance may be unobserved`, `physical identity is ambiguous; the collision group was not attached`, `unsupported function-table version; the scanner does not walk this layout`, or the fail-closed `discovery unavailable`. Arbitrary mapped paths, numeric PIDs, `/proc/<pid>` paths, cgroup paths, and raw error chains remain diagnostic-only. Every record still forces `PARTIAL`. |
+| `skipped` | Everything discovery could not use, at every granularity it works at. **Entries**: a NULL table slot, an entry whose object could not be pinned, an unresolvable manifest record. **Objects**: a mapping with no usable pathname, exports that could not be read, an object over the byte caps, an incomplete snapshot, or a provider with no decoded file-backed table. **Processes and scope**: a process or cgroup subtree that could not be scanned, and the `MAX_SCAN_PIDS` cap. Such a skip may be the only record of a provider that was never decoded. Identical internal losses are deduplicated before rendering; two different losses remain two records even if sanitization gives them the same public pair. The public `{name, reason}` is finite: `name` is an exact standard function, the gated `unknown` of a null slot in an unlinked table, or `discovery subject`; `reason` is exactly `null pointer`, `function entry unavailable`, `function table unavailable in file-backed data`, `shared-overlay physical identity is uncertain; a distinct byte-identical instance may be unobserved`, `physical identity is ambiguous; the collision group was not attached`, `unsupported function-table version; the scanner does not walk this layout`, `static probe coverage gap incomplete`, `static probes detached and exact pairs reattached`, or the fail-closed `discovery unavailable`. Arbitrary mapped paths, numeric PIDs, `/proc/<pid>` paths, cgroup paths, and raw error chains remain diagnostic-only. Every record still forces `PARTIAL`. |
 | `surfaces` | Source, acquisition status, walk outcome, and function count for every surface. |
 | `vendor_interfaces` | Present but undecoded interfaces. |
 | `interface_list` | `C_GetInterfaceList` acquisition outcome. |
@@ -283,6 +283,18 @@ record, interface name, marker, or process identity is published beside the
 counts (`docs/privacy/allowlist-v1.md`).
 
 #### The unprotected live window
+
+Current captures preserve two static probe transition categories under the
+`discovery subject` skip name. `static probe coverage gap incomplete` means
+an actual detach occurred and the final exact pairs or comparable clock remain
+incomplete. It can also describe recovered pairs whose interval is still
+clock-unknown. `static probes detached and exact pairs reattached` means all
+affected final pairs completed with known comparable clocks; the earlier
+coverage gap remains in capture history. Neither category assigns a missing
+call count, names an individual provider or supplies a per-call interval.
+Both are observation loss through `skipped`; recovery cannot erase the loss.
+They do not change the loader-window inference below or make an unknown
+`attach_gap_ms` defined.
 
 The completeness verdict consumes one more live-discovery fact: whether any
 module's first required attach key was learned from a live loader or export

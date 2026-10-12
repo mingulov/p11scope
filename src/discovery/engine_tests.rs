@@ -12752,7 +12752,10 @@ fn selection_table_partial_attach_rolls_back_the_successful_prefix() {
         .live_candidate_with_selection(engine.pinned.clone(), raw_modules, claims, tables, pending)
         .unwrap();
     assert_eq!(candidate.delta.new.len(), 2);
-    session.fail_target_slots([candidate.delta.new[1].index]);
+    let successful_prefix = candidate.delta.new[0].index;
+    let failed = candidate.delta.new[1].index;
+    session.fail_target_slots([failed]);
+    session.failed_cleanup_slot_indices.clear();
 
     let outcome = engine
         .apply_candidate(&mut session, candidate, &mut true, false, &[])
@@ -12773,6 +12776,11 @@ fn selection_table_partial_attach_rolls_back_the_successful_prefix() {
     assert_eq!(
         session.detached_slots.iter().rev().take(2).sum::<usize>(),
         2
+    );
+    assert_eq!(
+        session.failed_cleanup_slot_indices,
+        vec![vec![failed], vec![successful_prefix]],
+        "both the failed target and the successful unaccepted prefix are cleanup, not retirement of accepted coverage"
     );
 }
 
@@ -40902,11 +40910,20 @@ fn global_retirement_unknown_without_count_remains_concrete_partial_in_public_ou
 }
 
 #[test]
-fn global_retirement_failed_cleanup_default_preserves_detach_error_and_exact_slots() {
+fn global_retirement_failed_cleanup_preserves_detach_error_and_exact_slots() {
     let slots = plan_with(2, 0).slots;
     let mut session = ScriptedSession::default();
     session.fail_slot_detaches([true, false]);
     assert!(session.detach_failed_slots(&slots).is_err());
     assert!(session.detach_failed_slots(&slots).is_ok());
     assert_eq!(session.detached_slot_indices, vec![vec![0, 1], vec![0, 1]]);
+    assert_eq!(
+        session.failed_cleanup_slot_indices,
+        session.detached_slot_indices
+    );
+    assert!(session.detach_slots(&slots).is_ok());
+    assert_eq!(
+        session.failed_cleanup_slot_indices,
+        vec![vec![0, 1], vec![0, 1]]
+    );
 }

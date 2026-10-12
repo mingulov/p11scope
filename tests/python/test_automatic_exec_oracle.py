@@ -2520,6 +2520,7 @@ class ControlledInventoryObserver:
         self.stop = threading.Event()
         self.records, self.callers, self.last, self.instances, self.semantic = [], {}, {}, {}, {}
         self.passed, self.previous_counts = -1, {}
+        self.last_acks = {}
         self.module_ids = {value["path"]: f"m{index}" for index, value in enumerate(providers.values())}
         self.started = time.monotonic_ns()
         self.emit("started", {"scope": "system" if membership is None else "cgroup",
@@ -2584,6 +2585,11 @@ class ControlledInventoryObserver:
                 context = self.callers[caller_key]
                 ack = max((row for row in parsed["acks"] if row["gen"] == ident["gen"]),
                           key=lambda row: row["t1"], default=None)
+                if self.fault in ("initial-no-calls", "history-prefix") and not final:
+                    ack = min((row for row in parsed["acks"] if row["gen"] == ident["gen"]
+                               and row["seq"] > self.last_acks.get(caller_key, 0)),
+                              key=lambda row: row["seq"], default=ack)
+                pending_no_calls = False
                 batches = [row for row in parsed["batches"] if row["gen"] == ident["gen"]
                            and ack is not None and row["t1"] <= ack["t1"]]
                 for module_path, module_id in self.module_ids.items():
@@ -2620,6 +2626,13 @@ class ControlledInventoryObserver:
                             "api_returns": {"count": count, "saturated": False, "historical_only_returns": 0},
                             "semantics": "observed", "mechanisms": mechanisms, "operations": ops,
                             "coverage": {"lossy": False, "reasons": []}}
+                        if self.fault == "initial-no-calls" and instance_id not in self.instances and not final:
+                            # Registration can publish before admitted returns.
+                            # Serve this same independently ledgered ACK next pass.
+                            semantic.update(semantics="unknown (no calls observed)", mechanisms=None,
+                                            operations=None, coverage={"lossy": False, "reasons": ["no_calls"]})
+                            semantic["api_returns"]["count"] = None
+                            pending_no_calls = True
                         retired = context["lifecycle"] == "exec_retired"
                         if retired:
                             instance.update(state="retired", reason="instance_retired")
@@ -2650,6 +2663,8 @@ class ControlledInventoryObserver:
                         self.emit("edge_observed", edge)
                         written["edge_events"] += 1
                         self.last[pair] = edge
+                if ack is not None and not pending_no_calls:
+                    self.last_acks[caller_key] = ack["seq"]
         if not final:
             self.passed += 1
         self.emit("pass_committed", {"pass": self.passed, "final": final,
@@ -2915,7 +2930,7 @@ class InventoryFixtureTest(unittest.TestCase):
             "evaluate_inventory_h6": lambda doc, ledgers, receipt: (doc, ledgers, receipt)}
         actual_budget = H6["LegBudget"]
         patches["LegBudget"] = lambda **_kwargs: actual_budget(inventory=True, budgets={"setup": 3,
-            "successor-recovery": 0.4 if fault not in (None, "failed-move") else 3,
+            "successor-recovery": 0.4 if fault not in (None, "failed-move", "initial-no-calls", "history-prefix") else 3,
             "fixed-measurement": 8, "normal-stop": 2, "cleanup": 2}, leg_seconds=15)
         self.route_events, self.route_owners, self.route_case = events, owners, ctx
         try:
@@ -3039,6 +3054,110 @@ class InventoryFixtureTest(unittest.TestCase):
         result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
         self.assertFalse(result["pass"], result)
         self.assertTrue(any("historical" in error for error in result["errors"]), result["errors"])
+
+    def test_target_history_cannot_rewind_or_erase_loss_across_measured_end(self):
+        for cell in ("cgroup-reentry", "system-mixed"):
+            original = self.run_inventory_route(cell=cell, fault="history-prefix")
+            for fault in ("rewind-after-end", "pre-baseline-loss", "retirement-reason-erasure"):
+                with self.subTest(cell=cell, fault=fault):
+                    doc, ledgers, receipt = copy.deepcopy(original)
+                    phase = receipt["inventory_control"]["measurements"][0]
+                    proof = phase["proof"]
+                    rows = [row for row in receipt["inventory_control"]["final_records"]
+                            if row["kind"] == "semantic_edge_observed"
+                            and row["event"]["instance"] == proof["instance"]]
+                    early = next(row for row in rows if row["event"]["api_returns"]["count"] == 17
+                                 and row["seq"] < proof["baseline"]["semantic"]["seq"])
+                    final = next(row for row in doc["semantic_edges"] if row["instance"] == proof["instance"])
+                    self.assertEqual((early["event"]["api_returns"]["count"],
+                        phase["end"]["counts"]["api"], final["api_returns"]["count"]), (17, 49, 53))
+                    if fault == "rewind-after-end":
+                        later = [row for row in rows if row["seq"] > phase["end"]["pass"]["seq"]]
+                        self.assertGreaterEqual(len(later), 2)
+                        later[0]["event"] = copy.deepcopy(early["event"])
+                    elif fault == "pre-baseline-loss":
+                        early["event"]["coverage"] = {"lossy": True, "reasons": ["semantic_loss"]}
+                    else:
+                        for row in (final, rows[-1]["event"]):
+                            self.assertIn("instance_retired", row["coverage"]["reasons"])
+                            row["coverage"]["reasons"].remove("instance_retired")
+                    result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+                    self.assertFalse(result["pass"], (cell, fault, result["errors"]))
+
+    def test_target_initial_no_calls_remains_valid_through_measurement_and_stop(self):
+        for cell in ("cgroup-reentry", "system-mixed"):
+            with self.subTest(cell=cell):
+                doc, ledgers, receipt = self.run_inventory_route(cell=cell, fault="initial-no-calls")
+                for phase in receipt["inventory_control"]["measurements"]:
+                    proof = phase["proof"]
+                    rows = [row for row in receipt["inventory_control"]["final_records"]
+                        if row["kind"] == "semantic_edge_observed" and row["event"]["instance"] == proof["instance"]]
+                    self.assertIsNone(rows[0]["event"]["api_returns"]["count"])
+                    self.assertLess(rows[0]["seq"], proof["baseline"]["semantic"]["seq"])
+                    self.assertEqual(rows[0]["event"]["coverage"], {"lossy": False, "reasons": ["no_calls"]})
+                result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+                self.assertTrue(result["pass"], (cell, result["errors"]))
+
+                # The public serializer also supports admitted API returns
+                # before operation evidence; this prefix claims no completions.
+                for phase in receipt["inventory_control"]["measurements"]:
+                    instance = phase["proof"]["instance"]
+                    row = next(row["event"] for row in receipt["inventory_control"]["final_records"]
+                        if row["kind"] == "semantic_edge_observed" and row["event"]["instance"] == instance)
+                    row.update(semantics="unknown (no operation evidence)", coverage={"lossy": False, "reasons": []})
+                    row["api_returns"]["count"] = 4  # Initialize, GetSlotList, OpenSession, Login
+                result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+                self.assertTrue(result["pass"], (cell, "API-only prefix", result["errors"]))
+
+    def test_target_api_and_s1_authority_survive_history_and_final_stop(self):
+        for cell in ("cgroup-reentry", "system-mixed"):
+            original = self.run_inventory_route(cell=cell, fault="history-prefix")
+            for position in ("prefix", "final"):
+                for fault in ("historical", "saturation", "label"):
+                    with self.subTest(cell=cell, position=position, fault=fault):
+                        doc, ledgers, receipt = copy.deepcopy(original)
+                        phase = receipt["inventory_control"]["measurements"][0 if position == "prefix" else -1]
+                        instance = phase["proof"]["instance"]
+                        matching = [row["event"] for row in receipt["inventory_control"]["final_records"]
+                            if row["kind"] == "semantic_edge_observed" and row["event"]["instance"] == instance]
+                        rows = [matching[0]] if position == "prefix" else [matching[-1],
+                            next(row for row in doc["semantic_edges"] if row["instance"] == instance)]
+                        for row in rows:
+                            if fault == "historical":
+                                row["api_returns"]["historical_only_returns"] = 1
+                            elif fault == "saturation":
+                                row["api_returns"]["saturated"] = True
+                            else:
+                                row["semantics"] = "unknown (no operation evidence)"
+                        result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+                        self.assertFalse(result["pass"], (cell, position, fault, result["errors"]))
+
+    def test_target_counter_fields_cannot_disappear_before_during_or_after_measurement(self):
+        for cell in ("cgroup-reentry", "system-mixed"):
+            original = self.run_inventory_route(cell=cell, fault="history-prefix")
+            for position in ("prefix", "measured", "post-measured"):
+                for field in ("operation", "mechanism"):
+                    with self.subTest(cell=cell, position=position, field=field):
+                        doc, ledgers, receipt = copy.deepcopy(original)
+                        phase = receipt["inventory_control"]["measurements"][0]
+                        rows = [row for row in receipt["inventory_control"]["final_records"]
+                            if row["kind"] == "semantic_edge_observed"
+                            and row["event"]["instance"] == phase["proof"]["instance"]]
+                        if position == "prefix":
+                            changed = rows[0]["event"]
+                        elif position == "measured":
+                            changed = next(row["event"] for row in rows
+                                           if row["seq"] == phase["end"]["semantic"]["seq"])
+                        else:
+                            later = [row for row in rows if row["seq"] > phase["end"]["pass"]["seq"]]
+                            self.assertGreaterEqual(len(later), 2)
+                            changed = later[0]["event"]
+                        if field == "operation":
+                            del changed["operations"]["completed"]
+                        else:
+                            del changed["mechanisms"][0]["calls"]
+                        result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+                        self.assertFalse(result["pass"], (cell, position, field, result["errors"]))
 
     def test_sibling_duplicate_api_returns_cannot_borrow_target_s1_proof(self):
         doc, ledgers, receipt = self.run_inventory_route()

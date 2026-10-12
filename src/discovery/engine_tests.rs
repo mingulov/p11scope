@@ -7865,6 +7865,17 @@ fn loaded_seed_provider() -> (
     ScannedModule,
     PinnedObjects,
 ) {
+    loaded_seed_provider_with_owned_loader(false)
+}
+
+fn loaded_seed_provider_with_owned_loader(
+    owned_loader: bool,
+) -> (
+    LoadedSeedProvider,
+    ProcessView,
+    ScannedModule,
+    PinnedObjects,
+) {
     let dir = tempfile::tempdir().unwrap();
     let library = dir.path().join("seed-provider.so");
     let source = dir.path().join("seed-provider.c");
@@ -7921,16 +7932,21 @@ int main(int argc, char **argv) {
 "#,
     )
     .unwrap();
-    assert!(
-        std::process::Command::new("gcc")
-            .args(["-o"])
-            .arg(&runner)
-            .arg(&runner_source)
-            .arg("-ldl")
-            .status()
-            .unwrap()
-            .success()
-    );
+    let mut link = std::process::Command::new("gcc");
+    link.arg("-o").arg(&runner).arg(&runner_source).arg("-ldl");
+    if owned_loader {
+        let executable = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        let (interpreter, _) =
+            read_bounded_interpreter(&executable, executable.metadata().unwrap().len()).unwrap();
+        let loader = dir.path().join("seed-loader.so");
+        std::fs::copy(
+            interpreter.expect("the dynamic test executable has PT_INTERP"),
+            &loader,
+        )
+        .unwrap();
+        link.arg(format!("-Wl,--dynamic-linker={}", loader.display()));
+    }
+    assert!(link.status().unwrap().success());
     let child = std::process::Command::new(&runner)
         .arg(&library)
         .spawn()
@@ -8996,6 +9012,52 @@ fn loader_readiness_revalidates_the_current_held_loader_mapping() {
         assert_eq!(engine.active_loader_hook_count(&session), expected);
         engine.loader_registry.tombstone(context).unwrap();
     }
+}
+
+#[test]
+fn loader_readiness_rechecks_original_pin_after_current_locator() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::rc::Rc;
+    let (_fixture, view, _module, _pins) = loaded_seed_provider_with_owned_loader(true);
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Pid(view.pid());
+    engine.views.push(view);
+    let mut session = ScriptedSession::default();
+    engine
+        .arm_loader_or_partial(
+            0,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .unwrap();
+    assert_eq!(engine.active_loader_hook_count(&session), 1);
+    let link = session.dynamic_loader_links[0];
+    let loader = link.1;
+    let file = engine.pinned.file_for(loader).unwrap().try_clone().unwrap();
+    let before = FileSnapshot::read(&file).unwrap();
+    assert!(engine.pinned.object_unchanged(loader).unwrap());
+    let mode = file.metadata().unwrap().permissions().mode();
+    let queried = Rc::new(Cell::new(false));
+    let changed = queried.clone();
+    *session.before_dynamic_loader_query.borrow_mut() = Some(Box::new(move || {
+        file.set_permissions(std::fs::Permissions::from_mode(mode ^ 0o010))
+            .unwrap();
+        assert_ne!(FileSnapshot::read(&file).unwrap(), before);
+        changed.set(true);
+    }));
+    let count = engine.active_loader_hook_count(&session);
+    assert!(
+        queried.get(),
+        "the metadata change must follow the first original-pin check"
+    );
+    assert_eq!(session.dynamic_loader_links, [link]);
+    assert!(engine.views[0].still_the_same());
+    assert!(!engine.pinned.object_unchanged(loader).unwrap());
+    assert_eq!(
+        count, 0,
+        "matching new locator snapshots cannot replace the original pin"
+    );
 }
 
 /// Real direct-ELF child, pre-exec loader pin and post-exec identity check;

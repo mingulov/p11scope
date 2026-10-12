@@ -21068,7 +21068,11 @@ impl Engine {
                             .as_ref()
                             .is_none_or(|expected| current == *expected)
                     });
-            if valid && self.views[position].still_the_same() {
+            // Agreeing current snapshots cannot replace the original retained pin.
+            if valid
+                && self.views[position].still_the_same()
+                && self.pinned.object_unchanged(spec.loader).unwrap_or(false)
+            {
                 count += 1;
             }
         }
@@ -21427,6 +21431,8 @@ pub(crate) mod session_fixture {
         pub(crate) dynamic_loader_attach_calls: usize,
         pub(crate) dynamic_loader_reports_added: bool,
         pub(crate) dynamic_loader_links: Vec<(LoaderContextId, PinnedObjectId, u64, u64)>,
+        /// Runs once during the loader-link query, after the engine's first pin check.
+        pub(crate) before_dynamic_loader_query: RefCell<Option<Box<dyn FnOnce()>>>,
         /// Runs once before the next loader link is installed. Tests use
         /// actual child I/O here to map a provider after inventory's rescan.
         pub(crate) before_dynamic_loader_attach: Option<Box<dyn FnOnce()>>,
@@ -21962,6 +21968,9 @@ pub(crate) mod session_fixture {
             file_offset: u64,
             cookie: u64,
         ) -> bool {
+            if let Some(before_query) = self.before_dynamic_loader_query.borrow_mut().take() {
+                before_query();
+            }
             self.dynamic_loader_links
                 .contains(&(context, object, file_offset, cookie))
         }

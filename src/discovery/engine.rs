@@ -497,6 +497,9 @@ pub struct Engine {
     expected_target_exit_pending: Option<ProcessViewId>,
     expected_target_exit: bool,
     pending_leader_exit_views: BTreeSet<ProcessViewId>,
+    // Kernel lifecycle timestamps only, bounded by pending retained views.
+    // None means at least one pending EXIT has unknown ordering.
+    pending_leader_exit_order: BTreeMap<ProcessViewId, Option<u64>>,
     counted_leader_exit_views: BTreeSet<ProcessViewId>,
     /// Views with a matched EXEC whose PID-bound static links may be dead
     /// while still recorded as attached. At most one marker per retained
@@ -2533,6 +2536,8 @@ struct RefreshRequest {
     serial: u64,
     owner: Option<ProcessViewId>,
     exec_binding: Option<crate::attach::ExecBinding>,
+    // The matched, bound EXEC's kernel hook clock, never its arrival clock.
+    exec_hook_ts_ns: Option<u64>,
 }
 type SlotCompletion = (u32, Option<u64>);
 type TargetAttachResult = (Vec<u32>, Vec<SlotCompletion>);
@@ -8403,6 +8408,7 @@ impl Engine {
             expected_target_exit_pending: None,
             expected_target_exit: false,
             pending_leader_exit_views: BTreeSet::new(),
+            pending_leader_exit_order: BTreeMap::new(),
             counted_leader_exit_views: BTreeSet::new(),
             exec_rearm_views: BTreeMap::new(),
             pid_descendant_gaps: 0,
@@ -9667,6 +9673,7 @@ impl Engine {
 
     fn release_view_id(&mut self, id: ProcessViewId) {
         self.exec_rearm_views.remove(&id);
+        self.pending_leader_exit_order.remove(&id);
         if let Some(seed) = self.trace_by_view.get(&id).copied() {
             if let Some(proof) = &self.trace_owner
                 && let Some(candidate) = self.trace_seeds.get(&seed)
@@ -10498,6 +10505,7 @@ impl Engine {
                 serial,
                 owner,
                 exec_binding: None,
+                exec_hook_ts_ns: None,
             },
         );
         if let Some(owner) = owner
@@ -15678,6 +15686,7 @@ impl Engine {
             &mut self.counted_leader_exit_views,
             &mut self.task_uprobe_link_losses,
         );
+        self.pending_leader_exit_order.clear();
         for view in pending_views {
             self.close_owned_selection_for_view(view);
         }
@@ -16965,7 +16974,7 @@ impl Engine {
             }
             let mut refreshed_serial = None;
             if cause == RetirementCause::ExpectedRemoval {
-                self.queue_leader_exit_assessment(view);
+                self.queue_leader_exit_assessment(view, Some(record.hook_ts_ns));
             } else {
                 if let Some(admission) = self.admitted_cgroup_views.get_mut(&view) {
                     admission.closed_ns = None;
@@ -16989,8 +16998,14 @@ impl Engine {
                             .and_then(|retained| {
                                 session.bind_exec(retained, request.serial, record)
                             });
+                        request.exec_hook_ts_ns = request
+                            .exec_binding
+                            .as_ref()
+                            .map(|_| record.hook_ts_ns)
+                            .filter(|timestamp| *timestamp != 0);
                     } else if let Some(request) = self.refresh_requested.get_mut(&pid) {
                         request.exec_binding = None;
+                        request.exec_hook_ts_ns = None;
                     }
                 }
                 self.queue_retirement(view, cause, pending_views);
@@ -17076,11 +17091,44 @@ impl Engine {
                 view,
                 original_exited,
             );
+            if !self.pending_leader_exit_views.contains(&view) {
+                self.pending_leader_exit_order.remove(&view);
+            }
         }
     }
 
-    fn queue_leader_exit_assessment(&mut self, view: ProcessViewId) {
-        self.pending_leader_exit_views.insert(view);
+    fn queue_leader_exit_assessment(&mut self, view: ProcessViewId, hook_ts_ns: Option<u64>) {
+        let known = hook_ts_ns.filter(|timestamp| *timestamp != 0);
+        let newly_pending = self.pending_leader_exit_views.insert(view);
+        let order = self
+            .pending_leader_exit_order
+            .entry(view)
+            .or_insert(if newly_pending { known } else { None });
+        *order = match (*order, known) {
+            (Some(previous), Some(next)) => Some(previous.max(next)),
+            _ => None,
+        };
+    }
+
+    /// Keep recovery work owed by a later matched EXEC. This only retains an
+    /// existing request; it grants no continuity or attachment authority. The
+    /// ordinary next tick still scans, admits and validates every mutation.
+    fn pid_exec_after_leader_exit(
+        &self,
+        view: ProcessViewId,
+        pid: u32,
+        exit_hook_ts_ns: Option<u64>,
+    ) -> bool {
+        matches!(self.scope, Scope::Pid(named) if named == pid)
+            && self.refresh_requested.get(&pid).is_some_and(|request| {
+                request.owner == Some(view)
+                    && self.exec_rearm_views.get(&view) == Some(&Some(request.serial))
+                    && request.exec_binding.is_some()
+                    && request
+                        .exec_hook_ts_ns
+                        .zip(exit_hook_ts_ns)
+                        .is_some_and(|(exec, exit)| exit != 0 && exit < exec)
+            })
     }
 
     fn settle_leader_exit_assessments(
@@ -17091,6 +17139,7 @@ impl Engine {
         closure: &mut PauseClosure,
     ) {
         for view in assessments {
+            let exit_hook_ts_ns = self.pending_leader_exit_order.get(view).copied().flatten();
             let result = self
                 .views
                 .iter()
@@ -17099,13 +17148,17 @@ impl Engine {
                     || Err("retained process view is no longer available".to_string()),
                     ProcessView::original_exited,
                 );
-            match settle_leader_exit_view(
+            let assessment = settle_leader_exit_view(
                 &mut self.pending_leader_exit_views,
                 &mut self.counted_leader_exit_views,
                 &mut self.task_uprobe_link_losses,
                 *view,
                 result,
-            ) {
+            );
+            if !self.pending_leader_exit_views.contains(view) {
+                self.pending_leader_exit_order.remove(view);
+            }
+            match assessment {
                 LeaderExitAssessment::AlreadySettled => {}
                 LeaderExitAssessment::Pending => {
                     *additions_allowed = false;
@@ -17125,7 +17178,9 @@ impl Engine {
                         .find(|candidate| candidate.id() == *view)
                         .map(ProcessView::pid)
                     {
-                        self.clear_refresh_for_view(*view, pid);
+                        if !self.pid_exec_after_leader_exit(*view, pid, exit_hook_ts_ns) {
+                            self.clear_refresh_for_view(*view, pid);
+                        }
                         // No rescan will settle this view's pending poll, and
                         // the link loss is counted separately — forget the
                         // poll rather than publishing it twice (F1).

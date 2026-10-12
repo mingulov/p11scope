@@ -36633,6 +36633,272 @@ fn automatic_exec_cold_leader_exit_later_bound_exec_recovers() {
     assert!(engine.pending_leader_exit_order.is_empty());
 }
 
+fn assert_physical_gap_public_categories(engine: &Engine, expected: &[&str]) {
+    for document in crate::run::physical_gap_public_evidence_for_test(engine) {
+        let categories: Vec<_> = document["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|skip| {
+                matches!(
+                    skip["reason"].as_str(),
+                    Some("static probe coverage gap incomplete")
+                        | Some("static probes detached and exact pairs reattached")
+                )
+            })
+            .map(|skip| {
+                assert_eq!(skip["name"], "discovery subject");
+                skip["reason"].as_str().unwrap()
+            })
+            .collect();
+        assert_eq!(
+            categories, expected,
+            "real gap history must survive public projection"
+        );
+        assert_eq!(document["loader_discovery"]["hits"], 0);
+        assert_eq!(document["unprotected_live_windows"], 0);
+        assert_eq!(
+            document["attach_gap_ms"],
+            serde_json::json!(engine.capture_facts().attach_gap_ms())
+        );
+        if !expected.is_empty() {
+            assert_eq!(document["completeness"], "PARTIAL");
+            assert_eq!(document["verdict_detail"], "concrete_gap");
+            assert_eq!(document["gap_classes"]["observation"]["status"], "lossy");
+            assert!(
+                document["gap_classes"]["observation"]["causes"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!("skipped"))
+            );
+        }
+    }
+}
+
+#[test]
+fn automatic_exec_physical_gap_public_recovery_retains_both_categories() {
+    let (_fixture, mut engine, mut session, _exec) = cold_leader_exit_bound_route();
+    assert_physical_gap_public_categories(&engine, &[]);
+    assert!(
+        !apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+            .unwrap()
+            .required_complete
+    );
+    assert!(session.physical_gap_summary().open);
+    assert_physical_gap_public_categories(&engine, &["static probe coverage gap incomplete"]);
+
+    assert!(
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+            .unwrap()
+            .required_complete
+    );
+    let gap = session.physical_gap_summary();
+    assert!(gap.episodes > 0 && !gap.open && !gap.unknown);
+    assert!(
+        !session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities()
+            .is_empty()
+    );
+    assert_physical_gap_public_categories(
+        &engine,
+        &[
+            "static probe coverage gap incomplete",
+            "static probes detached and exact pairs reattached",
+        ],
+    );
+
+    let record = observed_candidate_exec(&engine, &mut session);
+    assert!(
+        apply_ordinary_batch(&mut engine, &mut session, vec![record])
+            .unwrap()
+            .required_complete
+    );
+    assert_eq!(session.physical_gap_summary(), gap);
+    assert_physical_gap_public_categories(
+        &engine,
+        &[
+            "static probe coverage gap incomplete",
+            "static probes detached and exact pairs reattached",
+        ],
+    );
+}
+
+#[test]
+fn automatic_exec_physical_gap_public_untouched_pairs_have_no_category() {
+    for case in ["preserved", "empty", "preflight", "detach preparation"] {
+        let (_fixture, mut engine, mut session) = continuity_route();
+        let before = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities();
+        let records = if case == "empty" {
+            Vec::new()
+        } else if case == "preserved" {
+            vec![observed_candidate_exec(&engine, &mut session)]
+        } else {
+            let record = continuity_exec_class(&engine, &mut session, 2);
+            if case == "preflight" {
+                session.refuse_preflights([true; 16]);
+            } else {
+                session.fail_slot_detaches_before_mutation([true]);
+            }
+            vec![record]
+        };
+        apply_ordinary_batch(&mut engine, &mut session, records).unwrap();
+        assert_eq!(session.physical_gap_summary().episodes, 0, "{case}");
+        assert_eq!(
+            session
+                .pid_continuity
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .identities(),
+            before,
+            "{case}"
+        );
+        assert_physical_gap_public_categories(&engine, &[]);
+    }
+}
+
+#[test]
+fn automatic_exec_physical_gap_public_partial_pairs_stay_incomplete() {
+    let (_fixture, mut engine, mut session) = continuity_route();
+    let native_before = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .native_attach_calls;
+    session
+        .pid_continuity
+        .as_mut()
+        .unwrap()
+        .borrow_mut()
+        .native_failures
+        .insert((u32::MAX, "p11_entry"));
+    let record = continuity_exec_class(&engine, &mut session, 2);
+    assert!(
+        !apply_ordinary_batch(&mut engine, &mut session, vec![record])
+            .unwrap()
+            .required_complete
+    );
+    assert!(session.physical_gap_summary().open);
+    {
+        let state = session.pid_continuity.as_ref().unwrap().borrow();
+        assert!(state.native_attach_calls > native_before);
+        assert!(
+            state.identities().is_empty(),
+            "no replacement entry/return pair completed"
+        );
+    }
+    assert_physical_gap_public_categories(&engine, &["static probe coverage gap incomplete"]);
+}
+
+#[test]
+fn automatic_exec_physical_gap_public_unknown_clocks_never_claim_recovered_history() {
+    for missing_detach in [true, false] {
+        let (_fixture, mut engine, mut session) = continuity_route();
+        {
+            let mut state = session.pid_continuity.as_mut().unwrap().borrow_mut();
+            if missing_detach {
+                state.detach_clocks.push_back(None);
+            } else {
+                state.completion_clocks = std::collections::VecDeque::from([None; 16]);
+            }
+        }
+        let record = continuity_exec_class(&engine, &mut session, 2);
+        apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+        assert!(session.physical_gap_summary().unknown);
+        assert_physical_gap_public_categories(&engine, &["static probe coverage gap incomplete"]);
+
+        session
+            .pid_continuity
+            .as_mut()
+            .unwrap()
+            .borrow_mut()
+            .completion_clocks
+            .clear();
+        let record = observed_candidate_exec(&engine, &mut session);
+        apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+        assert!(
+            session.physical_gap_summary().unknown,
+            "a later healthy opportunity cannot erase unknown history"
+        );
+        assert_physical_gap_public_categories(&engine, &["static probe coverage gap incomplete"]);
+    }
+}
+
+#[test]
+fn automatic_exec_physical_gap_public_terminal_only_cannot_publish_recovered_history() {
+    let (_fixture, mut engine, mut session) = continuity_route();
+    let record = continuity_exec_class(&engine, &mut session, 2);
+    let native_before = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .native_attach_calls;
+    session
+        .pid_continuity
+        .as_mut()
+        .unwrap()
+        .borrow_mut()
+        .stop_word = p11scope_ebpf_common::STOP_GATE_STOP;
+    session.pid_continuity.as_ref().unwrap().borrow().terminal();
+    let mut collect = |_: &mut dyn EngineSession| Ok((Vec::new(), 0));
+    engine
+        .apply_discovery_batch_with(
+            &mut session,
+            vec![record],
+            0,
+            false,
+            true,
+            &mut collect,
+            None,
+        )
+        .unwrap();
+    assert_eq!(session.physical_gap_summary().episodes, 0);
+    assert_physical_gap_public_categories(&engine, &[]);
+
+    // Cleanup can detach original registered pairs, but cannot attach/seal
+    // fresh pairs. Even projecting that real cleanup summary cannot claim recovery.
+    let slots = engine.plan.slots.clone();
+    session
+        .pid_continuity
+        .as_mut()
+        .unwrap()
+        .borrow_mut()
+        .detach(&slots);
+    assert!(session.physical_gap_summary().open);
+    assert_eq!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .native_attach_calls,
+        native_before
+    );
+    assert!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities()
+            .is_empty()
+    );
+    engine.sync_physical_gap(&session);
+    record_object_skips(&mut engine.plan, &engine.counters.object_skips);
+    assert_physical_gap_public_categories(&engine, &["static probe coverage gap incomplete"]);
+}
+
 fn settle_cold_leader_exit(engine: &mut Engine) {
     let mut additions = true;
     let mut closure = PauseClosure::new(true);

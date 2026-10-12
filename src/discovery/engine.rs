@@ -5,7 +5,8 @@
 use crate::attach::reexec_diagnostic::{Outcome as DiagnosticOutcome, Phase as DiagnosticPhase};
 use crate::attach::{
     BackendSelection, CapturePolicy, CounterSnapshot, DetachOutcome, DynamicExportIdentity,
-    DynamicLoaderAttachFailure, OwnedPauseGeneration, ReplacementOutcome, Scope, Session,
+    DynamicLoaderAttachFailure, OwnedPauseGeneration, ReplacementOutcome, RetirementPoll,
+    RetirementTicket, Scope, Session,
 };
 use crate::cli::CaptureArgs;
 use crate::discovery::attribution;
@@ -413,9 +414,11 @@ pub struct Engine {
     /// queue not observed empty. Sticky until the scheduler takes it: a
     /// set flag schedules backlog service instead of a full sleep.
     frame_fresh_blocked: bool,
-    /// One-shot scheduling hint after an older leader loss settles with an
-    /// exact newer bound PID EXEC still owed. It grants no admission authority.
+    /// One-shot scheduling hint after an older leader loss or actual global
+    /// native retirement settles. It grants no admission authority.
     immediate_exec_recovery_frame: bool,
+    pending_global_retirement: Option<RetirementTicket>,
+    global_retirement_frame_owed: bool,
     /// Terminal-drain quanta that stopped at the shared allowance with
     /// terminal work unfinished. Sticky evidence, like quiescence
     /// overflow: a terminal drain that ends here never claims complete.
@@ -2673,6 +2676,15 @@ pub(crate) trait EngineSession {
         objects: &PinnedObjects,
     ) -> Result<ReplacementOutcome>;
     fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome>;
+    fn begin_global_static_retirement(
+        &mut self,
+        _: &[plan::Slot],
+    ) -> Result<Option<RetirementTicket>> {
+        Ok(None)
+    }
+    fn poll_global_retirement(&mut self, _: &RetirementTicket) -> RetirementPoll {
+        RetirementPoll::Refused
+    }
     fn detach_failed_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
         self.detach_slots(slots)
     }
@@ -2865,6 +2877,15 @@ impl EngineSession for Session {
 
     fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
         Session::detach_slots(self, slots)
+    }
+    fn begin_global_static_retirement(
+        &mut self,
+        slots: &[plan::Slot],
+    ) -> Result<Option<RetirementTicket>> {
+        Session::begin_global_static_retirement(self, slots)
+    }
+    fn poll_global_retirement(&mut self, ticket: &RetirementTicket) -> RetirementPoll {
+        Session::poll_global_retirement(self, ticket)
     }
     fn detach_failed_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
         Session::detach_failed_slots(self, slots)
@@ -3270,6 +3291,9 @@ enum ApplyDisposition {
     /// and every retry intent the candidate would have consumed is retained.
     #[default]
     Refused,
+    /// The original static ownership is retiring on the Session worker. Only
+    /// its historical inactive prefix is published; all retry intent survives.
+    Deferred,
     /// Links were mutated and the Engine kept a cleaned, conservatively retired
     /// state. It consumed its retry intent but owns no positive follow-up.
     ConservativeRetirement,
@@ -3429,6 +3453,10 @@ impl ApplyOutcome {
 
     fn refused(&self) -> bool {
         self.disposition == ApplyDisposition::Refused
+    }
+
+    fn retains_intent(&self) -> bool {
+        self.refused() || self.disposition == ApplyDisposition::Deferred
     }
 
     fn required_complete(&self) -> bool {
@@ -8434,6 +8462,8 @@ impl Engine {
             pressure_attempts: 0,
             frame_fresh_blocked: false,
             immediate_exec_recovery_frame: false,
+            pending_global_retirement: None,
+            global_retirement_frame_owed: false,
             terminal_capacity_backlog: 0,
             discovery_held_high_water: 0,
             held_records: BTreeSet::new(),
@@ -10252,6 +10282,7 @@ impl Engine {
             recompleted,
             rebuild_failures,
             rebuilt_groups,
+            pending: _,
         } = report;
         if rebuilt_groups == 0 && recompleted.is_empty() && rebuild_failures.is_empty() {
             return;
@@ -11608,6 +11639,15 @@ impl Engine {
             *additions_allowed = false;
             return Ok(outcome);
         }
+        // A pending batch owns the whole global candidate boundary, including
+        // replacement-only candidates. Never replay this candidate after close.
+        if self.pending_global_retirement.is_some() {
+            outcome.disposition = ApplyDisposition::Deferred;
+            outcome
+                .unpublished_views
+                .extend(extra_views.iter().map(|view| view.id()));
+            return Ok(outcome);
+        }
         if !preflighted {
             self.lower_registered_retries(session, &mut candidate);
         }
@@ -11778,6 +11818,16 @@ impl Engine {
                 && candidate.views.is_empty()
         }) {
             Some(ended) => session.detach_ended_pid_slots(&selected, &ended.owner, &ended.proof),
+            None if ended.is_none() && *additions_allowed => {
+                match session.begin_global_static_retirement(&selected) {
+                    Ok(Some(ticket)) => Ok(crate::attach::DetachOutcome {
+                        pending: Some(ticket),
+                        ..Default::default()
+                    }),
+                    Ok(None) => session.detach_slots(&selected),
+                    Err(error) => Err(error),
+                }
+            }
             None => session.detach_slots(&selected),
         };
         #[cfg(feature = "h6-reexec-diagnostic")]
@@ -11791,6 +11841,78 @@ impl Engine {
             detach_slots_start,
             crate::attach::monotonic_ns(),
         );
+        if let Ok(report) = &detach_slots_outcome
+            && let Some(ticket) = &report.pending
+        {
+            // Authority comes from the Session's actual extracted original
+            // registrations, never from updated replacement descriptors or
+            // unaccepted candidate additions. Retain pins/modules/history.
+            for index in ticket.retired_slots() {
+                if !self.plan.slots.iter().any(|slot| slot.index == *index) {
+                    self.mark_partial("global native retirement", "a retired original registration has no historical plan slot; its ownership cannot grant replacement authority");
+                }
+                if self.plan.is_active(*index) {
+                    self.plan.deactivate(*index);
+                    outcome.changed = true;
+                }
+            }
+            // Only historical providers that owned actual retired slots, and
+            // unpublished newcomers, need fresh ordinary discovery. Existing
+            // requests keep their exact owner, serial and first arrival time.
+            let owners: BTreeSet<_> = self
+                .plan
+                .slots
+                .iter()
+                .filter(|slot| ticket.retired_slots().contains(&slot.index))
+                .flat_map(|slot| slot.module_ids.iter().copied())
+                .collect();
+            let objects: BTreeSet<_> = self
+                .plan
+                .modules
+                .iter()
+                .filter(|module| owners.contains(&module.id))
+                .map(|module| module.object)
+                .collect();
+            let views: BTreeSet<_> = self
+                .modules
+                .iter()
+                .filter(|module| objects.contains(&module.object))
+                .map(|module| module.scanned.view)
+                .collect();
+            let pids: BTreeSet<_> = self
+                .views
+                .iter()
+                .filter(|view| views.contains(&view.id()))
+                .map(ProcessView::pid)
+                .chain(extra_views.iter().map(|view| view.pid()))
+                .collect();
+            let arrival = crate::attach::monotonic_ns();
+            for pid in pids {
+                self.request_refresh(pid, arrival);
+            }
+            let unlinked: Vec<_> = candidate
+                .plan
+                .slots
+                .iter()
+                .skip(self.plan.slots.len())
+                .map(|slot| slot.index)
+                .collect();
+            for index in unlinked {
+                candidate.plan.deactivate(index);
+            }
+            candidate
+                .plan
+                .withdraw_unlinked_additions(self.plan.slots.len());
+            if outcome.changed {
+                self.note_facts_mutated();
+            }
+            self.pending_global_retirement = Some(ticket.clone());
+            outcome.disposition = ApplyDisposition::Deferred;
+            outcome
+                .unpublished_views
+                .extend(extra_views.iter().map(|view| view.id()));
+            return Ok(outcome);
+        }
         let detach_failed = match detach_slots_outcome {
             Ok(report) => {
                 self.apply_group_rebuild(&mut candidate.plan, &timing_owners, report, &mut outcome);
@@ -12548,7 +12670,7 @@ impl Engine {
         completed: &BTreeSet<(ProcessViewId, u64)>,
         outcome: &ApplyOutcome,
     ) {
-        if !outcome.refused() {
+        if !outcome.retains_intent() {
             self.settle_exec_rearms(
                 serviced
                     .into_iter()
@@ -16882,8 +17004,8 @@ impl Engine {
         pending_views: &mut PendingViewRetirements,
     ) {
         // Both an accepted candidate and a conservative cleanup consumed the
-        // retry intent they were built from; only a refusal retains it.
-        if outcome.refused() {
+        // retry intent they were built from. Refusal and worker deferral retain it.
+        if outcome.retains_intent() {
             self.pending_rejected_keys
                 .extend(outcome.newly_rejected_keys.iter().copied());
         } else {
@@ -16936,7 +17058,7 @@ impl Engine {
         pending_views: &mut PendingViewRetirements,
     ) -> bool {
         self.queue_apply_outcome(outcome, pending_views);
-        if !outcome.refused() {
+        if !outcome.retains_intent() {
             self.pending_retirements
                 .retain(|view| !retirements.contains(view));
             self.pending_rejected_keys
@@ -17003,7 +17125,7 @@ impl Engine {
         if !outcome.accepted() || outcome.detach_failed {
             *additions_allowed = false;
         }
-        if outcome.refused() {
+        if outcome.retains_intent() {
             self.ended_pid_retirement = ended;
         }
         self.record_apply_timing(&outcome);
@@ -17577,6 +17699,41 @@ impl Engine {
         std::mem::take(&mut self.immediate_exec_recovery_frame)
     }
 
+    /// Poll only the current Session allocation's ticket. A pending or refused
+    /// close is a readiness wait; successful settlement requests one ordinary
+    /// scoped frame, without replaying the candidate or crediting discovery.
+    fn poll_global_retirement_barrier(
+        &mut self,
+        session: &mut dyn EngineSession,
+    ) -> Option<BacklogOutcome> {
+        let ticket = self.pending_global_retirement.as_ref()?;
+        let settled = match session.poll_global_retirement(ticket) {
+            RetirementPoll::Pending => false,
+            RetirementPoll::Refused => {
+                if !self.counters.object_skips.iter().any(|skip| skip.subject == "global native retirement" && skip.reason == "original static ownership remains uncertain; replacement admission is blocked") {
+                    self.mark_partial(
+                    "global native retirement",
+                    "original static ownership remains uncertain; replacement admission is blocked",
+                    );
+                }
+                false
+            }
+            RetirementPoll::Settled => {
+                self.pending_global_retirement = None;
+                if !self.cancellation_requested() && !session.mutation_stopped() {
+                    self.immediate_exec_recovery_frame = true;
+                    self.global_retirement_frame_owed = true;
+                }
+                true
+            }
+        };
+        Some(BacklogOutcome {
+            changed: false,
+            progressed: settled,
+            pending: self.discovery_backlog_pending(session.staged_discovery_len()),
+        })
+    }
+
     /// Keep recovery work owed by a later matched EXEC. This only retains an
     /// existing request; it grants no continuity or attachment authority. The
     /// ordinary next tick still scans, admits and validates every mutation.
@@ -17971,6 +18128,12 @@ impl Engine {
         closure: &mut PauseClosure,
     ) -> Result<bool> {
         self.note_discovery_held_high_water(records.len());
+        if self.pending_global_retirement.is_some() {
+            // Re-park before H5 selects or rules out any pressure request.
+            self.pending_discovery_records.append(records);
+            closure.fail();
+            return Ok(false);
+        }
         // A re-parked rotation never leaks across record passes: this pass
         // sets it again only if it re-parks a head itself.
         self.pressure_rotation_pending = false;
@@ -17996,6 +18159,12 @@ impl Engine {
             let mut deferred_mismatches = Vec::new();
             let mut batch = std::mem::take(records).into_iter();
             while let Some(queued) = batch.next() {
+                if self.pending_global_retirement.is_some() {
+                    self.pending_discovery_records
+                        .extend(std::iter::once(queued).chain(batch));
+                    closure.fail();
+                    break;
+                }
                 // H-1: a spent live frame dispatches nothing more. The rest
                 // waits, in ring order, at the head of the next batch. Only
                 // where that cannot change a verdict: no loader mismatch
@@ -18055,7 +18224,9 @@ impl Engine {
                         ) {
                             Ok(outcome) => {
                                 changed |= outcome.changed;
-                                if let Some(episode) = self.pressure_episode.as_mut() {
+                                if self.pending_global_retirement.is_none()
+                                    && let Some(episode) = self.pressure_episode.as_mut()
+                                {
                                     episode.ruled_out.insert(selection.pid);
                                 }
                                 if outcome.attempted {
@@ -18081,6 +18252,12 @@ impl Engine {
                     self.note_discovery_held_high_water(
                         parked.len().saturating_add(diverted_fresh.len()),
                     );
+                    if self.pending_global_retirement.is_some() {
+                        self.pending_discovery_records.extend(parked);
+                        self.pressure_rotation_pending = true;
+                        closure.fail();
+                        break;
+                    }
                     // A service pass may have spent the frame: defer the
                     // parked prefix untouched rather than refusing work the
                     // next frame can still service.
@@ -18145,6 +18322,10 @@ impl Engine {
             // the frame deferred: they are newer than every parked record.
             self.pending_discovery_records.append(&mut diverted_fresh);
             self.settle_deferred_loader_mismatches(deferred_mismatches, &exec_refresh_views);
+            if self.pending_global_retirement.is_some() {
+                closure.fail();
+                break;
+            }
             self.promote_stale_execs(pending_views);
             if pending_views.is_empty() {
                 if (self.pending_rejected_keys.is_empty() && self.pending_retirements.is_empty())
@@ -18162,7 +18343,7 @@ impl Engine {
                 // generations (U-07).
                 closure.fail();
                 changed |= outcome.changed;
-                if outcome.refused() && pending_views.is_empty() {
+                if outcome.retains_intent() && pending_views.is_empty() {
                     break;
                 }
             }
@@ -19192,6 +19373,10 @@ impl Engine {
         new_views: &mut Vec<InventoryNewView>,
         tick_now: &mut TickClock<'_>,
     ) -> Result<bool> {
+        if self.poll_global_retirement_barrier(session).is_some() {
+            closure.fail();
+            return Ok(false);
+        }
         if matches!(self.scope, Scope::Pid(_)) {
             let mut stale: BTreeSet<_> = self
                 .views
@@ -19871,7 +20056,15 @@ impl Engine {
         let outcome =
             self.apply_candidate(session, candidate, additions_allowed, true, &extra_views)?;
         self.record_apply_timing(&outcome);
-        if !outcome.refused() {
+        if outcome.disposition == ApplyDisposition::Deferred {
+            // Retain exact original request serials, ages, newcomers and exec
+            // markers. The fresh frame will reopen and rescan these views.
+            self.queue_apply_outcome(&outcome, pending_views);
+            closure.fail();
+            self.pending_discovery_records.append(records);
+            return Ok(changed || outcome.changed);
+        }
+        if !outcome.retains_intent() {
             // The apply completed: forced PID slots detached/replaced, or were
             // deactivated for a `delta.new` retry, and global markers settled
             // with the context/ordinary-delta refresh, so their markers are
@@ -20151,6 +20344,8 @@ impl Engine {
     /// by the run loop's periodic forced full frame.
     fn discovery_shallow_idle(&self) -> bool {
         !matches!(self.scope, Scope::Pid(_))
+            && self.pending_global_retirement.is_none()
+            && !self.global_retirement_frame_owed
             && self.pending_discovery_records.is_empty()
             && self.pending_loader_scans.is_empty()
             && self.retirement_intents.is_empty()
@@ -20583,7 +20778,9 @@ impl Engine {
     /// that stopped at the shared allowance. Schedules backlog service
     /// instead of a full sleep.
     pub(crate) fn discovery_backlog_pending(&self, staged_len: usize) -> bool {
-        self.frame_fresh_blocked
+        self.pending_global_retirement.is_some()
+            || self.global_retirement_frame_owed
+            || self.frame_fresh_blocked
             || self.pressure_rotation_pending
             || !self.pending_discovery_records.is_empty()
             || staged_len > 0
@@ -20658,6 +20855,17 @@ impl Engine {
         &mut self,
         session: &mut dyn EngineSession,
     ) -> Result<BacklogOutcome> {
+        if let Some(outcome) = self.poll_global_retirement_barrier(session) {
+            self.publish_batch_tail(false)?;
+            return Ok(outcome);
+        }
+        if self.global_retirement_frame_owed {
+            return Ok(BacklogOutcome {
+                changed: false,
+                progressed: false,
+                pending: true,
+            });
+        }
         let passes_before = self.pressure_service_passes;
         let staged_before = session.staged_discovery_len();
         let retained_before = self
@@ -20918,6 +21126,18 @@ impl Engine {
             terminal_exports: Vec::new(),
         }));
         self.record_malformed_discovery(malformed);
+        if self.poll_global_retirement_barrier(session).is_some() {
+            self.pending_discovery_records = queued;
+            self.held_records.clear();
+            self.publish_batch_tail(false)?;
+            return Ok(DiscoveryBatchOutcome {
+                changed: false,
+                required_complete: false,
+            });
+        }
+        // Only an actual ordinary frame can discharge the owed frame; a
+        // backlog poll and consuming the run hint cannot make it disappear.
+        self.global_retirement_frame_owed = false;
         let queued = match begin_discovery_batch(queued, self.update_counter_snapshot(session)) {
             Ok(records) => records,
             Err((error, records)) => {
@@ -20968,6 +21188,14 @@ impl Engine {
             &mut closure,
         )?;
         records.extend(deferred_exits);
+        if self.pending_global_retirement.is_some() {
+            self.pending_discovery_records.append(&mut records);
+            self.publish_batch_tail(changed)?;
+            return Ok(DiscoveryBatchOutcome {
+                changed,
+                required_complete: false,
+            });
+        }
         if terminal_dispatch
             && let Some(terminal_changed) = self.continue_terminal_batch(
                 session,
@@ -21493,6 +21721,7 @@ pub(crate) mod session_fixture {
         pub(crate) diagnostic_at_preflight: Cell<Option<crate::attach::reexec_diagnostic::Record>>,
         pub(crate) capture_policy: Option<CapturePolicy>,
         pub(crate) pid_continuity: Option<RefCell<crate::attach::PidSessionFixture>>,
+        pub(crate) global_retirement: Option<RefCell<crate::attach::RetirementFixture>>,
         pub(crate) dequeues: VecDeque<Result<Option<crate::events::DiscoveryItem>>>,
         /// The staged FIFO, mirroring production: `stage_discovery` moves
         /// scripted ring outcomes here, `discovery_dequeue` serves it
@@ -21758,9 +21987,13 @@ pub(crate) mod session_fixture {
             self.reexec_diagnostic.clone()
         }
         fn has_slot_link(&self, slot: u32) -> bool {
-            self.pid_continuity
+            self.global_retirement
                 .as_ref()
                 .is_some_and(|state| state.borrow().has_slot_link(slot))
+                || self
+                    .pid_continuity
+                    .as_ref()
+                    .is_some_and(|state| state.borrow().has_slot_link(slot))
         }
         fn physical_gap_summary(&self) -> crate::attach::PhysicalGapSummary {
             self.pid_continuity
@@ -21988,6 +22221,14 @@ pub(crate) mod session_fixture {
             slots: &[plan::Slot],
             objects: &PinnedObjects,
         ) -> Result<TargetAttachResult> {
+            if !slots.is_empty()
+                && self
+                    .global_retirement
+                    .as_ref()
+                    .is_some_and(|state| state.borrow().blocking())
+            {
+                bail!("actual global retirement quarantine blocks attachment");
+            }
             attachment_admission(&self.detach_failures, !slots.is_empty())?;
             self.attached_slots.push(slots.len());
             let physical = self
@@ -22050,6 +22291,21 @@ pub(crate) mod session_fixture {
 
         fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
             self.detach_slots_with_ended(slots, None)
+        }
+        fn begin_global_static_retirement(
+            &mut self,
+            slots: &[plan::Slot],
+        ) -> Result<Option<RetirementTicket>> {
+            self.global_retirement
+                .as_ref()
+                .map_or(Ok(None), |state| state.borrow_mut().begin(slots))
+        }
+        fn poll_global_retirement(&mut self, ticket: &RetirementTicket) -> RetirementPoll {
+            self.global_retirement
+                .as_ref()
+                .map_or(RetirementPoll::Refused, |state| {
+                    state.borrow_mut().poll(ticket)
+                })
         }
 
         fn detach_failed_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {

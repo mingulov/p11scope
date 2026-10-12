@@ -256,5 +256,9 @@ impl NativeRetirement {
 }
 
 #[cfg(test)]
+#[path = "native_retirement_fixture.rs"]
+pub(crate) mod fixture;
+
+#[cfg(test)]
 #[path = "native_retirement_tests.rs"]
 mod tests;

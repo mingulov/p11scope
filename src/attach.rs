@@ -45,8 +45,9 @@ use std::sync::Arc;
 pub(crate) mod detailed_identity;
 mod ended_pid_retirement;
 mod global_retirement;
-#[allow(dead_code)] // Phase B connects the reviewed pending-ticket consumer.
 mod native_retirement;
+#[cfg(test)]
+pub(crate) use native_retirement::fixture::RetirementFixture;
 pub(crate) use native_retirement::{RetirementPoll, RetirementTicket};
 #[allow(dead_code)] // B2 records private facts; B3 supplies request-bound validation.
 mod pid_continuity;
@@ -1343,6 +1344,7 @@ fn refused_group_rebuild(
     reason: &str,
 ) -> DetachOutcome {
     DetachOutcome {
+        pending: None,
         recompleted: Vec::new(),
         rebuild_failures: members
             .into_iter()
@@ -1786,6 +1788,8 @@ pub struct ReplacementOutcome {
 /// group needed a rebuild (singles detach, whole-bundle detach).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DetachOutcome {
+    /// Only the ordinary global candidate consumer may defer publication.
+    pub(crate) pending: Option<RetirementTicket>,
     /// (slot, reactivation timestamp) for every survivor fully reattached,
     /// including unchanged siblings.
     pub recompleted: Vec<(u32, Option<u64>)>,
@@ -4949,9 +4953,8 @@ impl Session {
         self.detach_slots_with_ended(slots, None, false)
     }
 
-    /// Phase B supplies the whole-candidate consumer before the existing
-    /// synchronous detach route calls this opt-in ownership handoff.
-    #[allow(dead_code)]
+    /// Opt-in ownership handoff for the ordinary whole-candidate consumer.
+    /// Generic selective detach remains synchronous.
     pub(crate) fn begin_global_static_retirement(
         &mut self,
         slots: &[Slot],
@@ -5000,7 +5003,6 @@ impl Session {
         )
     }
 
-    #[allow(dead_code)]
     pub(crate) fn poll_global_retirement(&mut self, ticket: &RetirementTicket) -> RetirementPoll {
         let Some(worker) = &self.cleanup_worker else {
             return RetirementPoll::Refused;
@@ -5198,6 +5200,7 @@ impl Session {
             .extend(rebuild_failures.iter().cloned());
         prune_linkless_retained(&mut self.retained_static, &self.links);
         Ok(DetachOutcome {
+            pending: None,
             recompleted,
             rebuild_failures,
             rebuilt_groups,

@@ -40883,3 +40883,30 @@ fn automatic_exec_pid_continuity_completed_owner_keeps_initial_gap_across_later_
         Some(70_000_000)
     );
 }
+
+#[test]
+fn global_retirement_unknown_without_count_remains_concrete_partial_in_public_output() {
+    for (open, unknown) in [(false, true), (true, false)] {
+        let mut engine = Engine::empty();
+        engine.scope = Scope::System;
+        engine.sync_physical_gap_summary(crate::attach::PhysicalGapSummary {
+            episodes: 0,
+            max_gap_ns: None,
+            open,
+            unknown,
+        });
+        record_object_skips(&mut engine.plan, &engine.counters.object_skips);
+        assert_eq!(engine.capture_facts().attach_gap_ms(), None);
+        assert_physical_gap_public_categories(&engine, &["static probe coverage gap incomplete"]);
+    }
+}
+
+#[test]
+fn global_retirement_failed_cleanup_default_preserves_detach_error_and_exact_slots() {
+    let slots = plan_with(2, 0).slots;
+    let mut session = ScriptedSession::default();
+    session.fail_slot_detaches([true, false]);
+    assert!(session.detach_failed_slots(&slots).is_err());
+    assert!(session.detach_failed_slots(&slots).is_ok());
+    assert_eq!(session.detached_slot_indices, vec![vec![0, 1], vec![0, 1]]);
+}

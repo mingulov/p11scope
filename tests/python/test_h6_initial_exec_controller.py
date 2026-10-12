@@ -167,6 +167,21 @@ class InitialExecControllerTests(unittest.TestCase):
         self.assertFalse(Path(f"/proc/{caller.pid}").exists())
         self.assertFalse(self.ctx.cleanup_failed, self.ctx.cleanup_errors)
 
+    def test_short_setup_can_finish_warmup_and_measurement_within_the_leg_budget(self):
+        result, receipt, directory = self.drive(short_setup=True)
+        self.assertTrue(result["pass"])
+        caller = self.callers[0]
+        self.assertEqual(caller.deadline_ns, receipt["initial_load"]["deadline_ns"])
+        self.assertLess(receipt["initial_load"]["ready_ns"], caller.deadline_ns)
+        ledger = [json.loads(line[9:]) for line in (directory / "caller.ledger.jsonl").read_text().splitlines()]
+        done = next(row for row in ledger if row["kind"] == "ack" and row["phase"] == "done")
+        self.assertGreater(done["t"], caller.deadline_ns)
+        self.assertEqual(sum(row["kind"] == "exec" for row in ledger), 1)
+        self.assertEqual(sum(row["kind"] == "call" and row["phase"] == "warm" for row in ledger), 3)
+        self.assertEqual(sum(row["kind"] == "call" and row["phase"] == "measured" for row in ledger), 10)
+        self.assertTrue(caller.reaped)
+        self.assertFalse(self.ctx.cleanup_failed, self.ctx.cleanup_errors)
+
     def test_zero_missing_duplicate_or_malformed_hook_count_never_releases_main(self):
         capturing = "p11scope: capturing: 0 probe(s) attached; stop with Ctrl-C"
         for lines in (["p11scope: loader readiness: 0 active hook(s)", capturing], [capturing],
@@ -273,7 +288,7 @@ class InitialExecControllerTests(unittest.TestCase):
         self.assertTrue(result["pass"])
         self.assertLess(receipt["initial_load"]["waiting_ns"], receipt["initial_exec"]["detach_return_ns"])
 
-    def held_raw_caller(self):
+    def held_raw_caller(self, seconds=2):
         initial = H6["INITIAL_EXEC"]
         setarch = H6["FilePin"](Path(shutil.which("setarch")).resolve(strict=True))
         self.addCleanup(setarch.close)
@@ -281,10 +296,31 @@ class InitialExecControllerTests(unittest.TestCase):
             self.ctx.owners, [str(self.pin.path), str(self.provider), "0", "selected"],
             caller_pin=self.pin, setarch_pin=setarch, uid=os.getuid(), gid=os.getgid(),
             supplementary_groups=tuple(os.getgroups()), env=self.env,
-            deadline_ns=time.monotonic_ns() + 2_000_000_000, cleanup_section=nullcontext)
+            deadline_ns=time.monotonic_ns() + int(seconds * 1e9), cleanup_section=nullcontext)
         self.ctx.traced.append(caller)
         caller.hold_caller_exec()
         return caller
+
+    def test_detached_live_wait_honors_its_explicit_timeout_after_setup_expires(self):
+        caller = self.held_raw_caller(seconds=0.4)
+        deadline = caller.deadline_ns
+        caller.resume_detach()
+        time.sleep(max(0, (deadline - time.monotonic_ns()) / 1e9) + 0.02)
+        self.assertIsNone(caller.popen.poll())
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            caller.popen.wait(timeout=0.04)
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 0.03)
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(caller.deadline_ns, deadline)
+        self.assertIsNone(caller.popen.poll())
+        self.assertFalse(caller.reaped)
+        self.assertIsNotNone(caller.pidfd)
+        caller.popen.stdin.write("stop\n")
+        caller.popen.stdin.flush()
+        self.assertEqual(caller.popen.wait(timeout=1), 0)
+        self.assertTrue(caller.reaped)
 
     def test_raw_terminal_wait_sets_primitive_reaped_state_before_close(self):
         caller = self.held_raw_caller()

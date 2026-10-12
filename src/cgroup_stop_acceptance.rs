@@ -74,60 +74,56 @@ fn outcome(value: ScopedCollectionOutcome) -> &'static str {
 }
 
 fn poll(stream: &UnixStream, events: i16, deadline: Instant) -> Result<()> {
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            bail!("cgroup stop observer deadline exhausted");
-        }
-        let mut descriptor = libc::pollfd {
-            fd: stream.as_raw_fd(),
-            events,
-            revents: 0,
-        };
-        // A fixed service quantum lets a gated wait inspect the real control.
-        let milliseconds = remaining.as_millis().clamp(1, 10) as i32;
-        let ready = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
-        if ready < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error.into());
-        }
-        if ready == 0 {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        bail!("cgroup stop observer deadline exhausted");
+    }
+    let mut descriptor = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events,
+        revents: 0,
+    };
+    // A fixed service quantum lets a gated wait inspect the real control.
+    let milliseconds = remaining.as_millis().clamp(1, 10) as i32;
+    let ready = unsafe { libc::poll(&mut descriptor, 1, milliseconds) };
+    if ready < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == ErrorKind::Interrupted {
             return Ok(());
         }
-        if descriptor.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
-            bail!("cgroup stop observer socket failed");
-        }
-        return Ok(()); // HUP is settled by the bounded read/write itself.
+        return Err(error.into());
     }
+    if descriptor.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+        bail!("cgroup stop observer socket failed");
+    }
+    Ok(()) // HUP is settled by the bounded read/write itself.
 }
 
-fn read_frame(stream: &mut UnixStream, deadline: Instant) -> Result<Option<Vec<u8>>> {
-    let mut frame = Vec::with_capacity(MAX_FRAME);
+fn read_frame(
+    stream: &mut UnixStream,
+    frame: &mut Vec<u8>,
+    deadline: Instant,
+) -> Result<Option<Vec<u8>>> {
     loop {
+        if Instant::now() >= deadline {
+            bail!("cgroup stop observer deadline exhausted");
+        }
         let mut byte = [0];
         match stream.read(&mut byte) {
             Ok(0) => bail!("cgroup stop observer socket closed"),
-            Ok(_) if byte[0] == b'\n' => return Ok(Some(frame)),
+            Ok(_) if byte[0] == b'\n' => return Ok(Some(std::mem::take(frame))),
             Ok(_) => {
                 if frame.len() == MAX_FRAME {
                     bail!("cgroup stop observer frame too large");
                 }
                 frame.push(byte[0]);
             }
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                if frame.is_empty() {
-                    return Ok(None);
-                }
-                poll(stream, libc::POLLIN, deadline)?;
+            Err(error)
+                if matches!(error.kind(), ErrorKind::Interrupted | ErrorKind::WouldBlock) =>
+            {
+                return Ok(None);
             }
             Err(error) => return Err(error.into()),
-        }
-        if Instant::now() >= deadline {
-            bail!("cgroup stop observer deadline exhausted");
         }
     }
 }
@@ -188,8 +184,9 @@ impl State {
         );
         // No collection budget mutex is held here. Failure only retires the
         // observer; it never supplies a cancellation/admission decision.
+        let mut pending = Vec::with_capacity(MAX_FRAME);
         while !self.failed && control.check().is_ok() {
-            match read_frame(&mut self.stream, self.deadline) {
+            match read_frame(&mut self.stream, &mut pending, self.deadline) {
                 Ok(Some(frame)) => {
                     let release = serde_json::from_slice::<Release>(&frame);
                     if !matches!(release, Ok(Release { version: 1, release }) if release == id) {
@@ -204,6 +201,11 @@ impl State {
                 }
                 Err(_) => self.failed = true,
             }
+        }
+        // A real stop must not wait for a partial frame, and the unfinished
+        // exchange must not acquire positive completion metadata afterward.
+        if !pending.is_empty() {
+            self.failed = true;
         }
     }
 }
@@ -265,8 +267,9 @@ impl Observer {
         stream.set_nonblocking(true)?;
         let started = Instant::now();
         let mut deadline = started + MAX_WAIT;
+        let mut pending = Vec::with_capacity(MAX_FRAME);
         let frame = loop {
-            if let Some(frame) = read_frame(&mut stream, deadline)? {
+            if let Some(frame) = read_frame(&mut stream, &mut pending, deadline)? {
                 break frame;
             }
             poll(&stream, libc::POLLIN, deadline)?;

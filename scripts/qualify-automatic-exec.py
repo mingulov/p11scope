@@ -2813,10 +2813,17 @@ def parse_live_frames(text, final=True):
             if line.startswith("(~ = "):
                 break
             match = LIVE_ROW.fullmatch(line.strip())
-            if not match or match[1] in functions:
-                raise ValueError("malformed or duplicate public live function row")
-            functions[match[1]] = dict(zip(("calls", "errors", "in_flight"),
-                                          (int(match[2]), int(match[3]), int(match[4]))))
+            if not match:
+                raise ValueError("malformed public live function row")
+            row = dict(zip(("calls", "errors", "in_flight"),
+                           (int(match[2]), int(match[3]), int(match[4]))))
+            if row["errors"] > row["calls"]:
+                raise ValueError("public live slot errors exceed its completed calls")
+            # The producer emits active and retained SlotReports separately.
+            # Match the JSON judge's function-key sums within this frame only.
+            function = functions.setdefault(match[1], {key: 0 for key in row})
+            for key, value in row.items():
+                function[key] += value
         total = [int(value) for value in totals[0].groups()]
         if total != [sum(row[field] for row in functions.values())
                      for field in ("calls", "errors", "in_flight")]:

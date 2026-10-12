@@ -1196,18 +1196,54 @@ class LiveFrameTest(unittest.TestCase):
         self.assertEqual(frames[-1]["functions"]["C_GetInfo"]["calls"], 2)
         self.assertEqual(frames[-1]["totals"], [2, 0, 0])
 
+    def test_captured_multi_retained_current_slot_rows_aggregate_within_frame(self):
+        # Second complete frame from installed836b Multi/profile: SlotReports
+        # retain two C_GetInfo rows with different latency buckets.
+        captured = "\x1b[2J\x1b[H" + textwrap.dedent("""\
+            p11scope — PID scope — up 00:00:01 — mode profile — privacy=allowlisted — /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
+            Scope: PID scope
+            Aggregate across the selected scope; counts are not per application.
+            8 completed calls; 0 returned errors; 0 entries without an observed return.
+            Coverage PARTIAL: observation lossy (3 entries skipped, unprotected live window, live loader timing unproven); attribution withheld (136 semantics-unverified/count-only slots)
+            CALLS = completed calls; ERR = returned errors; IN-FLIGHT = entries without an observed return.
+            Latency units: ns/us/ms/s (us displayed as µs); ~ = log2-bucket approximation, lower bound.
+            FUNCTION                        CALLS    ERR      p50~      p95~      p99~ IN-FLIGHT
+            C_GenerateRandom                    3      0    32.8µs    65.5µs    65.5µs         0
+            C_GetFunctionList                   1      0    16.4µs    16.4µs    16.4µs         0
+            C_GetInfo                           1      0     8.2µs     8.2µs     8.2µs         0
+            C_GetInfo                           1      0    16.4µs    16.4µs    16.4µs         0
+            C_GetSlotList                       1      0     8.2µs     8.2µs     8.2µs         0
+            C_OpenSession                       1      0     4.1µs     4.1µs     4.1µs         0
+            (~ = log2-bucket approximation, lower bound)
+            Evidence: 272/272 probes attached · 136 slots (68 active) · 0 aliased · 3 skipped · 0 in-flight → PARTIAL: observation lossy (3 entries skipped, unprotected live window, live loader timing unproven); attribution withheld (136 semantics-unverified/count-only slots)
+            """)
+        frames = self.parse(live_frame([("C_GenerateRandom", 1, 0, 0)]) + captured)
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(frames[-1]["functions"]["C_GetInfo"], {"calls": 2, "errors": 0, "in_flight": 0})
+        self.assertEqual(frames[-1]["functions"]["C_GenerateRandom"]["calls"], 3)
+        self.assertEqual(frames[-1]["totals"], [8, 0, 0])
+
     def test_incomplete_frame_waits_until_evidence_terminates(self):
         text = live_frame([("C_GetInfo", 1, 0, 0)])
         self.assertEqual(self.parse(text[:-1], final=False), [])
         with self.assertRaisesRegex(ValueError, "incomplete"):
             self.parse(text[:-1])
 
-    def test_malformed_duplicate_and_overflow_frames_fail(self):
-        for text in (live_frame([("C_GetInfo", 1, 0, 0), ("C_GetInfo", 1, 0, 0)]),
+    def test_malformed_totals_rv_subset_and_overflow_frames_fail(self):
+        for text in (live_frame([("C_GetInfo", 0, 1, 0), ("C_GetInfo", 1, 0, 0)]),
+                     live_frame([("C_GetInfo", 1, 0, 0), ("C_GetInfo", 1, 0, 0)]).replace(
+                         "2 completed calls", "1 completed calls"),
                      live_frame([("C_GetInfo", 1, 0, 0)]).replace("1 completed calls", "3 completed calls"),
                      "\x1b[2J\x1b[H" + "x" * 65537):
             with self.subTest(text=text[:70]), self.assertRaises(ValueError):
                 self.parse(text)
+
+    def test_slot_row_errors_and_in_flight_sum_within_each_redraw(self):
+        text = live_frame([("C_GetInfo", 1, 0, 1), ("C_GetInfo", 2, 1, 0)])
+        frames = self.parse(text + text)
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(frames[-1]["functions"]["C_GetInfo"], {"calls": 3, "errors": 1, "in_flight": 1})
+        self.assertEqual(frames[-1]["totals"], [3, 1, 1])
 
     def test_empty_eof_has_no_proof(self):
         self.assertEqual(self.parse(""), [])
@@ -4967,6 +5003,28 @@ def profile_inputs():
 
 
 class AggregateReadinessTest(unittest.TestCase):
+    def test_split_slot_functions_match_json_and_keep_independent_measured_limits(self):
+        doc, _stdout, ledger, receipt = profile_inputs()
+        doc["functions"] = [profile_function("C_Initialize", 3, 1, 1),
+                            profile_function("C_Initialize", 2, 1, 0), profile_function("C_GetInfo", 1)]
+        before = [("C_Initialize", 1, 0, 1), ("C_Initialize", 2, 1, 0)]
+        stdout = (live_frame(before) + live_frame(before + [("C_GetInfo", 1, 0, 0)])
+                  + live_frame([("C_Initialize", 3, 1, 1), ("C_Initialize", 2, 1, 0), ("C_GetInfo", 1, 0, 0)]))
+        frames = H6["parse_live_frames"](stdout)
+        receipt["successor_ready"][0].update(baseline=frames[0], snapshot=frames[1],
+            output_cursor=frames[0]["cursor"], proof_cursor=frames[1]["cursor"])
+        for mode in ("profile", "metrics"):
+            with self.subTest(mode=mode):
+                target = profile_doc(doc["functions"], mode=mode)
+                result = H6[f"evaluate_{mode}_h6"](target, stdout, ledger, receipt)
+                self.assertTrue(result["pass"], result["errors"])
+                self.assertEqual(result["completed_calls"], 6)
+                duplicate = copy.deepcopy(target)
+                duplicate["functions"][1]["calls"] += 1
+                forged = stdout[:frames[-1]["start_cursor"]] + live_frame([
+                    ("C_Initialize", 3, 1, 1), ("C_Initialize", 3, 1, 0), ("C_GetInfo", 1, 0, 0)])
+                self.assertFalse(H6[f"evaluate_{mode}_h6"](duplicate, forged, ledger, receipt)["pass"])
+
     def early_population(self, observed_calls, observed_errors, expected_errors=1):
         doc, _, ledger, receipt = profile_inputs()
         early = [row for row in ledger if row["kind"] == "call" and row.get("phase") == "pre"]

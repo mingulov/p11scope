@@ -490,6 +490,51 @@ def worker_early_population(rows, receipt, images, hints):
             "deficit": max(0, 11 - len(observed)), "errors": errors}
 
 
+def initial_ready_errors(trace, ledger, receipt):
+    """Initial rapid/reuse admission is separate from every successor proof."""
+    if receipt.get("cell") != "rapid-chain" or not receipt.get("leg", "").startswith(("trace/", "reuse/")):
+        return []
+    try:
+        proof = receipt["initial_ready"]
+        image = next(row for row in receipt["images"] if row["image"] == 0)
+        attempts = proof["attempts"]
+        if type(attempts) is not int or not 1 <= attempts <= 20:
+            raise ValueError("initial attempt count exceeds its fixed bound")
+        phases = [f"initial-0-{seq}" for seq in range(1, attempts + 1)]
+        calls = [row for row in ledger if row.get("kind") == "call"
+                 and row.get("phase", "").startswith("initial-0-")]
+        fixed = [phase for phase in receipt["phases"] if phase["phase"] in ("warm", "measured")]
+        first_fixed = min(phase["t0"] for phase in fixed)
+        lines = trace.splitlines()
+        cursor, end = proof["output_cursor"], proof["proof_cursor"]
+        marker = ROW.fullmatch(lines[end - 1]) if 0 <= cursor < end <= len(lines) else None
+        provider = {key: receipt["provider_before"][key] for key in ("path", "dev", "ino", "sha256")}
+        if (proof["image"] != 0 or proof["pid"] != image["pid"] or proof["proof_kind"] != "trace-row"
+                or proof["marker_fn"] != "C_GetInfo" or proof["budget_phase"] != "setup"
+                or proof["provider"] != provider or proof["max_attempts"] != 20 or proof["phases"] != phases
+                or len(calls) != attempts or {row["phase"] for row in calls} != set(phases)
+                or not set(phases).issubset(receipt["warmup"]["phases"])
+                or not receipt["observer_ready_ns"] <= proof["started_ns"] <= proof["observed_ns"]
+                   <= first_fixed <= receipt["observer_stopped_ns"]
+                or not proof["observed_ns"] <= proof["deadline_ns"]
+                   <= min(proof["setup_deadline_ns"], proof["leg_deadline_ns"])
+                or not 0 < proof["deadline_ns"] - proof["started_ns"] <= 15_000_000_000
+                or any((row["image"], row["pid"], row["tid"], row["fn"], row["rv"], row["scope"]) !=
+                       (0, image["pid"], image["pid"], "C_GetInfo", 0, "selected") or not
+                       proof["started_ns"] <= row["t0"] <= row["t1"] <= proof["observed_ns"] for row in calls)
+                or not marker or (int(marker["pid"]), int(marker["tid"]), marker["fn"], marker["rv"]) !=
+                   (image["pid"], image["pid"], "C_GetInfo", "CKR_OK") or not marker["path"]
+                or json.loads(marker["path"]) != image["path"]
+                or json.loads(marker["label"]) != Path(image["path"]).name
+                or any(row and int(row["pid"]) == image["pid"] and row["fn"] == "C_GenerateRandom"
+                       for line in lines[:end] if (row := ROW.fullmatch(line)))
+                or any(end > successor["output_cursor"] for successor in receipt.get("successor_ready", []))):
+            raise ValueError("initial public marker/time/owned subject/provider disagrees")
+        return []
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError, StopIteration) as error:
+        return [f"invalid bounded initial public readiness proof: {error}"]
+
+
 def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
     rows, counts, evidence, errors = N3_PARSE_TRACE(trace)
     # Default every finding to capture integrity. Only the specific recovery
@@ -655,6 +700,7 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
     measured_calls, warmup_calls, gate_errors = _check_measured_warmup(
         calls, receipt, ready, stop, start)
     errors.extend(gate_errors)
+    errors.extend(initial_ready_errors(trace, ledger, receipt))
     for call in calls:
         image = images[call["image"]]
         target = targets.get((call["image"], call["fn"]))
@@ -3158,16 +3204,24 @@ def _output_wait(capture, predicate, deadline_ns):
 
 
 def warm_successor(capture, image, attempt, mode="trace", marker_fn="C_GetInfo",
-                   max_attempts=20, timeout=15, output_cursor=None):
+                   max_attempts=20, timeout=15, output_cursor=None, initial=False):
     """Bound real single-call attempts and require this observer's fresh proof.
 
     attempt(seq, remaining_seconds) returns a distinct independently ledgered
     phase. All calls/attempts remain in that ledger, including dark attempts.
+    Initial setup attempts also receive the absolute deadline, so held-object
+    preparation cannot authorize a later dispatch with an old relative wait.
     """
     if mode not in ("trace", "profile", "metrics") or not 1 <= max_attempts <= 40 or not 0 < timeout <= 20:
         raise ValueError("invalid successor warm-up budget")
     started = monotonic_ns()
-    enter_phase("successor-recovery", key=image["image"])
+    initial_budget = ACTIVE_LEG.get() if initial else None
+    if initial:
+        if (initial_budget is None or initial_budget.phase != "setup" or image["image"] != 0
+                or mode != "trace" or max_attempts != 20 or timeout != 15):
+            raise ValueError("initial readiness requires the existing setup and fixed 20/15 bound")
+    else:
+        enter_phase("successor-recovery", key=image["image"])
     deadline = min(wait_deadline(timeout), started + int(timeout * 1_000_000_000))
     baseline = None
     if mode == "trace":
@@ -3178,7 +3232,7 @@ def warm_successor(capture, image, attempt, mode="trace", marker_fn="C_GetInfo",
     phases = []
     for seq in range(1, max_attempts + 1):
         remaining = remaining_until(deadline)
-        phases.append(attempt(seq, remaining))
+        phases.append(attempt(seq, remaining, deadline) if initial else attempt(seq, remaining))
         remaining_until(deadline)
         # A bounded observation interval permits another real attempt when
         # discovery is still cold; it never substitutes a sleep for proof.
@@ -3188,6 +3242,7 @@ def warm_successor(capture, image, attempt, mode="trace", marker_fn="C_GetInfo",
                 for index in range(cursor, len(capture.lines)):
                     match = ROW.fullmatch(capture.lines[index].strip())
                     if (match and int(match["pid"]) == image["pid"]
+                            and (not initial or int(match["tid"]) == image["pid"])
                             and match["fn"] == marker_fn and match["rv"] == "CKR_OK" and match["path"]
                             and json.loads(match["path"]) == image["path"]
                             and json.loads(match["label"]) == Path(image["path"]).name):
@@ -3207,7 +3262,9 @@ def warm_successor(capture, image, attempt, mode="trace", marker_fn="C_GetInfo",
         return {"image": image["image"], "started_ns": started, "observed_ns": monotonic_ns(),
                 "deadline_ns": deadline, "attempts": seq, "max_attempts": max_attempts,
                 "output_cursor": cursor, "proof_kind": "trace-row" if mode == "trace" else "live-counter",
-                "marker_fn": marker_fn, "phases": phases, **proof}
+                "marker_fn": marker_fn, "phases": phases, **proof,
+                **({"budget_phase": "setup", "setup_deadline_ns": initial_budget.phase_deadline_ns,
+                    "leg_deadline_ns": initial_budget.deadline_ns} if initial else {})}
     raise TimeoutError("successor warm-up attempt budget exhausted")
 
 
@@ -3219,6 +3276,66 @@ def warm_caller(capture, caller, stdout, image, phases, mode="trace", group=None
                    image["image"], group, phases, acknowledgement_seconds=remaining)
         return phase
     return warm_successor(capture, image, attempt, mode, marker_fn=marker_fn, output_cursor=output_cursor)
+
+
+def warm_initial_caller(ctx, capture, caller, stdout, image, image_pin, provider_pin, phases):
+    """One independently held image/provider; no successor budget or old context."""
+    provider = None
+
+    def verify():
+        nonlocal provider
+        if (caller not in ctx.owners or caller.pidfd is None or caller.popen is None
+                or caller.popen.pid != caller.pid):
+            raise SetupError("initial caller lacks its enrolled original owner")
+        caller.verify()
+        image_pin.verify()
+        actual = image_pin.image_receipt(image, caller)
+        if any(actual[field] != image[field] for field in IMAGE_FIELDS):
+            raise SetupError("initial caller image changed from its independently held receipt")
+        current = provider_receipt(provider_pin)
+        if provider is not None and provider != current:
+            raise SetupError("initial held provider changed during readiness")
+        provider = current
+        targets = [row for row in stdout.records if row.get("kind") == "target"
+                   and row.get("image") == 0 and row.get("fn") == "C_GetInfo"]
+        if (len(targets) != 1 or targets[0]["dev"] != provider["dev"] or targets[0]["ino"] != provider["ino"]
+                or targets[0]["file_offset"] < 0 or targets[0].get("vaddr", 0) <= 0):
+            raise SetupError("initial marker lacks its independent held provider target")
+        with open(f"/proc/{caller.pid}/maps", encoding="utf-8") as stream:
+            text = stream.read(MAPPED_PROVIDER["MAX_MAPS_BYTES"] + 1)
+        if len(text) > MAPPED_PROVIDER["MAX_MAPS_BYTES"]:
+            raise SetupError("initial provider maps exceed the bounded limit")
+        mapped = False
+        for line in text.splitlines():
+            row = MAPPED_PROVIDER["MAPS_LINE"].fullmatch(line)
+            if row is None:
+                raise SetupError("malformed initial caller maps")
+            low, high = int(row[1], 16), int(row[2], 16)
+            target = targets[0]
+            if ("x" in row[3] and low <= target["vaddr"] < high
+                    and [int(row[5], 16), int(row[6], 16)] == provider["dev"]
+                    and int(row[7]) == provider["ino"]
+                    and target["vaddr"] - low + int(row[4], 16) == target["file_offset"]):
+                mapped = True
+        if not mapped:
+            raise SetupError("initial marker is not mapped from the independently held provider")
+        caller.verify()
+
+    def attempt(seq, _remaining, deadline):
+        verify()
+        phase = f"initial-0-{seq}"
+        n3_command(caller, stdout, "C_GetInfo", 1, 0, phase, "selected", 0, None, phases,
+                   acknowledgement_seconds=remaining_until(deadline))
+        verify()
+        return phase
+
+    proof = warm_successor(capture, image, attempt, initial=True)
+    verify()
+    remaining_until(proof["deadline_ns"])
+    if proof["observed_ns"] > proof["deadline_ns"]:
+        raise TimeoutError("initial public proof completed after its absolute deadline")
+    proof.update(pid=caller.pid, provider={key: provider[key] for key in ("path", "dev", "ino", "sha256")})
+    return proof
 
 
 def drain_trace_phase(capture, caller, stdout, fn, count, delay, phase, image, phases, group=None):
@@ -3553,7 +3670,8 @@ def wait_usage_armed(jsonl_path, wants, timeout=90):
 # H6 harness: cells
 # ---------------------------------------------------------------------------
 
-PIN_FD = runpy.run_path(str(ROOT / "scripts/mapped-provider-pin.py"))["pin_fd"]
+MAPPED_PROVIDER = runpy.run_path(str(ROOT / "scripts/mapped-provider-pin.py"))
+PIN_FD = MAPPED_PROVIDER["pin_fd"]
 
 
 def provider_receipt(pin):
@@ -4476,6 +4594,7 @@ def run_rapid_chain(ctx, cell_dir, backend):
         return [result]
     phases = []
     # Sequential public stream boundaries distinguish reused function keys.
+    initial_ready = warm_initial_caller(ctx, capture, caller, stdout, images[0], pins["caller-a"], provider, phases)
     drain_trace_phase(capture, caller, stdout, "C_GenerateRandom", 2, 50, "warm", 0, phases)
     order = [("caller-b", 1, "gen1"), ("caller-a", 2, "gen2"), ("caller-b", 3, "measured")]
     transitions, proofs = [], []
@@ -4514,6 +4633,7 @@ def run_rapid_chain(ctx, cell_dir, backend):
                      "expected_calls": 10, "phases": ["measured"]},
         "warmup": warmup_receipt(phases, measured["t0"]),
         "successor_policy": "public-successor", "successor_ready": proofs, "trace_generation_guards": True,
+        "initial_ready": initial_ready,
         "exec_transitions": transitions, "phases": phases,
         "require_named": True, "require_named_images": [3],
         "first_unknown_images": [],
@@ -4564,13 +4684,14 @@ def run_reuse_control(ctx, leg_dir, backend, env, dead_pid, image_pin):
         write_json(leg_dir / "result.json", result)
         return result
     phases = []
+    initial_ready = warm_initial_caller(ctx, capture, caller, stdout, images[0], image_pin, provider, phases)
     n3_command(caller, stdout, "C_GenerateRandom", 5, 100, "measured", "selected",
                0, None, phases)
     obs_rc, stopped, latency = stop_observer(owned)
     caller_rc = stop_caller(caller, stdout, 0)
     finish_readers([stdout, capture, errors])
     ledger = list(stdout.records)
-    measured = phases[0]
+    measured = next(phase for phase in phases if phase["phase"] == "measured")
     receipt = {
         "cell": "rapid-chain", "leg": f"reuse/{backend}", "scope_kind": "system",
         "owned_pids": [caller.pid], "dead_pid": dead_pid,
@@ -4585,8 +4706,7 @@ def run_reuse_control(ctx, leg_dir, backend, env, dead_pid, image_pin):
         "time_namespace": caller.identity["time_namespace"],
         "measured": {"label": "host", "t0": measured["t0"], "t1": measured["t1"],
                      "expected_calls": 5, "phases": ["measured"]},
-        "warmup": {"label": "none", "t0": measured["t0"], "t1": measured["t0"],
-                   "expected_calls": 0, "phases": []},
+        "warmup": warmup_receipt(phases, measured["t0"]), "initial_ready": initial_ready,
         "exec_transitions": [], "phases": phases,
         "require_named": True, "require_named_images": [0], "first_unknown_images": [],
         "successor_policy": "no-transition", "manual_rebind": False, "abandoned_expected": 0, "abandoned_by_fn": {},

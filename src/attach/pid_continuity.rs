@@ -414,7 +414,7 @@ impl PairBook {
     }
 }
 
-fn current_pair(
+pub(super) fn current_pair(
     slot: u32,
     links: &[RegisteredLink],
     sides: &BTreeSet<StaticEndpoint>,
@@ -1689,6 +1689,8 @@ pub(crate) mod engine_fixture {
         pub(crate) native_clocks: std::collections::VecDeque<Option<u64>>,
         pub(crate) completion_clocks: std::collections::VecDeque<Option<u64>>,
         pub(crate) detach_clocks: std::collections::VecDeque<Option<u64>>,
+        pub(crate) ended_original_state:
+            Option<Result<crate::process::OriginalGenerationState, String>>,
         pub(crate) detach_delay: std::time::Duration,
         pub(crate) completion_delay: std::time::Duration,
     }
@@ -1740,6 +1742,7 @@ pub(crate) mod engine_fixture {
                 native_clocks: VecDeque::new(),
                 completion_clocks: VecDeque::new(),
                 detach_clocks: VecDeque::new(),
+                ended_original_state: None,
                 detach_delay: std::time::Duration::ZERO,
                 completion_delay: std::time::Duration::ZERO,
             }
@@ -1877,7 +1880,42 @@ pub(crate) mod engine_fixture {
                 comparable_monotonic_ns,
             );
         }
+        pub(crate) fn prepare_ended_pid_retirement(
+            &self,
+            view: &ProcessView,
+            slots: &[Slot],
+        ) -> Option<super::super::EndedPidRetirement> {
+            if self.stopped() {
+                return None;
+            }
+            super::super::EndedPidRetirement::prepare(
+                &self.tap.0.domain,
+                self.uprobe_scope,
+                view,
+                slots,
+                &self.links,
+                &self.retained,
+            )
+        }
+
         pub(crate) fn detach(&mut self, slots: &[Slot]) -> super::super::DetachOutcome {
+            self.detach_with_ended(slots, None)
+        }
+
+        pub(crate) fn detach_ended_pid_slots(
+            &mut self,
+            slots: &[Slot],
+            owner: &ProcessView,
+            proof: &super::super::EndedPidRetirement,
+        ) -> super::super::DetachOutcome {
+            self.detach_with_ended(slots, Some((owner, proof)))
+        }
+
+        fn detach_with_ended(
+            &mut self,
+            slots: &[Slot],
+            ended: Option<(&ProcessView, &super::super::EndedPidRetirement)>,
+        ) -> super::super::DetachOutcome {
             let requested: BTreeSet<_> = slots.iter().map(|slot| slot.index).collect();
             let affected = super::super::plan_group_rebuild(&self.links, &requested);
             let survivors: Vec<_> = affected
@@ -1913,6 +1951,27 @@ pub(crate) mod engine_fixture {
             let rebuilt_groups = affected.as_ref().map_or(0, |affected| {
                 super::super::affected_group_count(&self.links, affected)
             });
+            let ended = ended
+                .filter(|_| !self.stopped())
+                .and_then(|(owner, proof)| match &self.ended_original_state {
+                    Some(state) => proof.check_with_original_state(
+                        &self.tap.0.domain,
+                        self.uprobe_scope,
+                        owner,
+                        slots,
+                        &self.links,
+                        &self.retained,
+                        || state.clone(),
+                    ),
+                    None => proof.check(
+                        &self.tap.0.domain,
+                        self.uprobe_scope,
+                        owner,
+                        slots,
+                        &self.links,
+                        &self.retained,
+                    ),
+                });
             let selected =
                 super::super::extract_selected_links(&mut self.links, &mut self.book, |link| {
                     link.slots()
@@ -1927,7 +1986,13 @@ pub(crate) mod engine_fixture {
                 .detach_clocks
                 .pop_front()
                 .unwrap_or_else(|| Self::sample(&self.origin_inputs()));
-            self.book.begin_gap(&actual, start, &self.retained);
+            super::super::ended_pid_retirement::begin_detach_gap(
+                &mut self.book,
+                &actual,
+                start,
+                &self.retained,
+                ended,
+            );
             // The gap has already begun before the native close/detach work.
             std::thread::sleep(self.detach_delay);
             drop(selected);

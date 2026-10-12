@@ -36457,6 +36457,290 @@ fn continuity_route() -> (TabledSeedProvider, Engine, ScriptedSession) {
     (fixture, engine, session)
 }
 
+fn assert_proven_named_exit_has_no_new_physical_gap(queued_exit: bool) {
+    let (mut fixture, mut engine, mut session) = continuity_route();
+    let pid = engine.views[0].pid();
+    let historical_slots = engine.plan.slots.len();
+    let historical_entries = engine.plan.entries_seen;
+    assert!(historical_slots > 0);
+    assert_eq!(engine.plan.active_slot_count(), historical_slots);
+    assert_eq!(session.physical_gap_summary().episodes, 0);
+
+    let mut leader: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    leader.kind = DISCOVERY_KIND_LEADER_EXIT;
+    leader.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+    leader.hook_ts_ns = crate::attach::monotonic_ns().unwrap();
+    assert!(valid_discovery_record(&leader));
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    assert_eq!(
+        engine.views[0].original_generation_state().unwrap(),
+        crate::process::OriginalGenerationState::Exited,
+        "the retained original group ended before the retirement"
+    );
+
+    let records = if queued_exit {
+        session
+            .pid_continuity
+            .as_mut()
+            .unwrap()
+            .borrow_mut()
+            .observe(leader);
+        vec![leader]
+    } else {
+        Vec::new()
+    };
+    apply_ordinary_batch(&mut engine, &mut session, records).unwrap();
+    assert!(engine.expected_target_exit());
+    assert!(engine.views.is_empty());
+    assert!(engine.pending_retirements.is_empty());
+    assert!(engine.retirement_intents.is_empty());
+    assert_eq!(engine.plan.active_slot_count(), 0);
+    assert_eq!(engine.plan.slots.len(), historical_slots);
+    assert_eq!(engine.plan.entries_seen, historical_entries);
+    assert!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities()
+            .is_empty(),
+        "static handles are eagerly retired after proved original-group exit"
+    );
+    assert_eq!(
+        session.physical_gap_summary().episodes,
+        0,
+        "retiring a proved ended original group cannot open a new live coverage interval"
+    );
+    assert_physical_gap_public_categories(&engine, &[]);
+}
+
+#[test]
+fn automatic_exec_named_pid_original_pin_exit_does_not_create_physical_gap() {
+    assert_proven_named_exit_has_no_new_physical_gap(false);
+}
+
+#[test]
+fn automatic_exec_named_pid_matched_exit_does_not_create_physical_gap() {
+    assert_proven_named_exit_has_no_new_physical_gap(true);
+}
+
+#[test]
+fn automatic_exec_named_pid_proven_exit_preserves_earlier_physical_gap_history() {
+    for history in ["recovered", "open", "unknown", "unknown recovered"] {
+        let (mut fixture, mut engine, mut session) = continuity_route();
+        let slots = engine.plan.slots.clone();
+        {
+            let mut continuity = session.pid_continuity.as_mut().unwrap().borrow_mut();
+            if history.starts_with("unknown") {
+                continuity.detach_clocks.push_back(None);
+            }
+            continuity.detach(if history.ends_with("recovered") {
+                &slots
+            } else {
+                &slots[..1]
+            });
+        }
+        engine.sync_physical_gap(&session);
+        if history.ends_with("recovered") {
+            session
+                .pid_continuity
+                .as_mut()
+                .unwrap()
+                .borrow_mut()
+                .attach(&slots, &engine.pinned)
+                .unwrap();
+            engine.sync_physical_gap(&session);
+        }
+        let previous = session.physical_gap_summary();
+        assert_eq!(previous.episodes, 1);
+        assert_eq!(previous.open, !history.ends_with("recovered"));
+        assert_eq!(previous.unknown, history.starts_with("unknown"));
+
+        fixture.child.kill().unwrap();
+        fixture.child.wait().unwrap();
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+        assert!(engine.expected_target_exit());
+        assert!(engine.ended_pid_retirement.is_none());
+        assert_eq!(engine.plan.active_slot_count(), 0);
+        assert_eq!(engine.plan.slots.len(), slots.len());
+        assert_eq!(session.physical_gap_summary(), previous, "{history}");
+        if history == "recovered" {
+            assert_physical_gap_public_categories(
+                &engine,
+                &[
+                    "static probe coverage gap incomplete",
+                    "static probes detached and exact pairs reattached",
+                ],
+            );
+        } else {
+            assert_physical_gap_public_categories(
+                &engine,
+                &["static probe coverage gap incomplete"],
+            );
+        }
+    }
+}
+
+#[test]
+fn automatic_exec_named_pid_end_receipt_refuses_foreign_stale_or_stopped_detach() {
+    for refusal in [
+        "foreign owner",
+        "foreign domain",
+        "changed registrations",
+        "stop",
+        "partial pair",
+    ] {
+        let (mut fixture, mut engine, mut session) = continuity_route();
+        let slots = engine.plan.slots.clone();
+        let foreign_owner = ProcessView::open(engine.views[0].id(), fixture.child.id()).unwrap();
+        let mut foreign_session = if refusal == "foreign domain" {
+            let mut other = crate::attach::PidSessionFixture::new(&engine.views[0]);
+            other.attach(&slots, &engine.pinned).unwrap();
+            Some(other)
+        } else {
+            None
+        };
+        assert!(
+            session
+                .prepare_ended_pid_retirement(&engine.views[0], &slots)
+                .is_none(),
+            "a current original group cannot mint terminal retirement authority"
+        );
+        fixture.child.kill().unwrap();
+        fixture.child.wait().unwrap();
+        let proof = session
+            .prepare_ended_pid_retirement(&engine.views[0], &slots)
+            .unwrap();
+        let owner = engine.views.remove(0);
+        let mut expected_episodes = 1;
+        match refusal {
+            "foreign domain" => {
+                session.pid_continuity =
+                    Some(std::cell::RefCell::new(foreign_session.take().unwrap()))
+            }
+            "changed registrations" | "partial pair" => {
+                let mut continuity = session.pid_continuity.as_mut().unwrap().borrow_mut();
+                continuity.detach(&slots);
+                if refusal == "partial pair" {
+                    continuity
+                        .native_failures
+                        .insert((slots[0].index, "p11_return"));
+                }
+                continuity.attach(&slots, &engine.pinned).unwrap();
+                if refusal == "changed registrations" {
+                    assert!(!continuity.gap_summary().open);
+                    expected_episodes = 2;
+                } else {
+                    assert!(continuity.gap_summary().open);
+                }
+            }
+            "stop" => {
+                session
+                    .pid_continuity
+                    .as_mut()
+                    .unwrap()
+                    .borrow_mut()
+                    .stop_word = p11scope_ebpf_common::STOP_GATE_STOP
+            }
+            _ => {}
+        }
+        let supplied_owner = if refusal == "foreign owner" {
+            &foreign_owner
+        } else {
+            &owner
+        };
+        session
+            .detach_ended_pid_slots(&slots, supplied_owner, &proof)
+            .unwrap();
+        let gap = session.physical_gap_summary();
+        assert_eq!(gap.episodes, expected_episodes, "{refusal}");
+        assert!(
+            gap.open,
+            "{refusal}: invalid proof retains ordinary gap accounting"
+        );
+        assert!(
+            session
+                .pid_continuity
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .identities()
+                .is_empty()
+        );
+        engine.sync_physical_gap(&session);
+        record_object_skips(&mut engine.plan, &engine.counters.object_skips);
+        assert_physical_gap_public_categories(&engine, &["static probe coverage gap incomplete"]);
+    }
+}
+
+#[test]
+fn automatic_exec_named_pid_end_receipt_rechecks_original_pin_current_reused_or_error() {
+    for state in [
+        Ok(crate::process::OriginalGenerationState::Current),
+        Ok(crate::process::OriginalGenerationState::Reused),
+        Err("original pidfd poll failed".to_string()),
+    ] {
+        let (mut fixture, engine, mut session) = continuity_route();
+        let slots = engine.plan.slots.clone();
+        fixture.child.kill().unwrap();
+        fixture.child.wait().unwrap();
+        let owner = &engine.views[0];
+        let proof = session.prepare_ended_pid_retirement(owner, &slots).unwrap();
+        session
+            .pid_continuity
+            .as_mut()
+            .unwrap()
+            .borrow_mut()
+            .ended_original_state = Some(state.clone());
+        session
+            .detach_ended_pid_slots(&slots, owner, &proof)
+            .unwrap();
+        assert_eq!(session.physical_gap_summary().episodes, 1, "{state:?}");
+        assert!(session.physical_gap_summary().open, "{state:?}");
+    }
+}
+
+#[test]
+fn automatic_exec_named_pid_end_receipt_refuses_replacement_endpoint_selection() {
+    let (mut fixture, mut engine, mut session) = continuity_route();
+    let mut replacement = engine.plan.slots.clone();
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    let proof = session
+        .prepare_ended_pid_retirement(&engine.views[0], &replacement)
+        .unwrap();
+    // A replacement target cannot borrow the retired original endpoint's proof,
+    // even when it keeps that slot's cookie and the caller's original custody.
+    replacement[0].file_offset += 8;
+    session
+        .detach_ended_pid_slots(&replacement, &engine.views[0], &proof)
+        .unwrap();
+    assert_eq!(session.physical_gap_summary().episodes, 1);
+    assert!(session.physical_gap_summary().open);
+    engine.sync_physical_gap(&session);
+    record_object_skips(&mut engine.plan, &engine.counters.object_skips);
+    assert_physical_gap_public_categories(&engine, &["static probe coverage gap incomplete"]);
+}
+
+#[test]
+fn automatic_exec_named_pid_proven_exit_keeps_sticky_generation_loss() {
+    let (mut fixture, mut engine, mut session) = continuity_route();
+    let view = engine.views[0].id();
+    let mut pending = PendingViewRetirements::new();
+    engine.queue_retirement(view, RetirementCause::GenerationLost, &mut pending);
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    assert!(apply_ordinary_batch(&mut engine, &mut session, Vec::new()).is_err());
+    assert!(engine.ended_pid_retirement.is_none());
+    assert!(!engine.expected_target_exit());
+    assert_eq!(session.physical_gap_summary().episodes, 1);
+    assert!(session.physical_gap_summary().open);
+    record_object_skips(&mut engine.plan, &engine.counters.object_skips);
+    assert_physical_gap_public_categories(&engine, &["static probe coverage gap incomplete"]);
+}
+
 fn cold_leader_exit_bound_route() -> (TabledSeedProvider, Engine, ScriptedSession, DiscoveryRecord)
 {
     let (mut fixture, mut engine, mut session) = continuity_route();

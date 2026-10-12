@@ -494,6 +494,9 @@ pub struct Engine {
     pending_retirements: BTreeSet<ProcessViewId>,
     retirement_intents: PendingViewRetirements,
     ready_expected_removals: BTreeSet<ProcessViewId>,
+    // Original custody and exact Session endpoint proof survive only the
+    // existing bounded conservative retirement/replay transaction.
+    ended_pid_retirement: Option<PendingEndedPidRetirement>,
     expected_target_exit_pending: Option<ProcessViewId>,
     expected_target_exit: bool,
     pending_leader_exit_views: BTreeSet<ProcessViewId>,
@@ -2519,6 +2522,10 @@ type InventoryScanOutcome = (
     Vec<Skipped>,
 );
 type PendingViewRetirements = BTreeMap<ProcessViewId, RetirementCause>;
+struct PendingEndedPidRetirement {
+    owner: ProcessView,
+    proof: crate::attach::EndedPidRetirement,
+}
 type TerminalSelectionHandoffs = BTreeMap<u16, Vec<DiscoveryRecord>>;
 type DiscoveryCollector<'a> =
     dyn FnMut(&mut dyn EngineSession) -> Result<(Vec<DiscoveryRecord>, u64)> + 'a;
@@ -2556,6 +2563,13 @@ pub(crate) trait EngineSession {
     }
     fn physical_gap_summary(&self) -> crate::attach::PhysicalGapSummary {
         crate::attach::PhysicalGapSummary::default()
+    }
+    fn prepare_ended_pid_retirement(
+        &self,
+        _: &ProcessView,
+        _: &[plan::Slot],
+    ) -> Option<crate::attach::EndedPidRetirement> {
+        None
     }
     fn mutation_stopped(&self) -> bool {
         false
@@ -2648,6 +2662,14 @@ pub(crate) trait EngineSession {
         objects: &PinnedObjects,
     ) -> Result<ReplacementOutcome>;
     fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome>;
+    fn detach_ended_pid_slots(
+        &mut self,
+        slots: &[plan::Slot],
+        _: &ProcessView,
+        _: &crate::attach::EndedPidRetirement,
+    ) -> Result<DetachOutcome> {
+        self.detach_slots(slots)
+    }
     fn has_dynamic_export(
         &self,
         context: LoaderContextId,
@@ -2692,6 +2714,13 @@ impl EngineSession for Session {
     }
     fn physical_gap_summary(&self) -> crate::attach::PhysicalGapSummary {
         Session::physical_gap_summary(self)
+    }
+    fn prepare_ended_pid_retirement(
+        &self,
+        view: &ProcessView,
+        slots: &[plan::Slot],
+    ) -> Option<crate::attach::EndedPidRetirement> {
+        Session::prepare_ended_pid_retirement(self, view, slots)
     }
     fn mutation_stopped(&self) -> bool {
         Session::mutation_stopped(self)
@@ -2815,6 +2844,14 @@ impl EngineSession for Session {
 
     fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
         Session::detach_slots(self, slots)
+    }
+    fn detach_ended_pid_slots(
+        &mut self,
+        slots: &[plan::Slot],
+        owner: &ProcessView,
+        ended: &crate::attach::EndedPidRetirement,
+    ) -> Result<DetachOutcome> {
+        Session::detach_ended_pid_slots(self, slots, owner, ended)
     }
 
     fn has_dynamic_export(
@@ -8405,6 +8442,7 @@ impl Engine {
             pending_retirements: BTreeSet::new(),
             retirement_intents: PendingViewRetirements::new(),
             ready_expected_removals: BTreeSet::new(),
+            ended_pid_retirement: None,
             expected_target_exit_pending: None,
             expected_target_exit: false,
             pending_leader_exit_views: BTreeSet::new(),
@@ -11383,10 +11421,29 @@ impl Engine {
     fn apply_candidate(
         &mut self,
         session: &mut dyn EngineSession,
+        candidate: LiveCandidate,
+        additions_allowed: &mut bool,
+        preflighted: bool,
+        extra_views: &[&ProcessView],
+    ) -> Result<ApplyOutcome> {
+        self.apply_candidate_with_ended(
+            session,
+            candidate,
+            additions_allowed,
+            preflighted,
+            extra_views,
+            None,
+        )
+    }
+
+    fn apply_candidate_with_ended(
+        &mut self,
+        session: &mut dyn EngineSession,
         mut candidate: LiveCandidate,
         additions_allowed: &mut bool,
         preflighted: bool,
         extra_views: &[&ProcessView],
+        ended: Option<&PendingEndedPidRetirement>,
     ) -> Result<ApplyOutcome> {
         #[cfg(feature = "h6-reexec-diagnostic")]
         let diagnostic_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
@@ -11572,7 +11629,14 @@ impl Engine {
                 [Some(selected.len() as u64), None, None, None],
             )
         });
-        let detach_slots_outcome = session.detach_slots(&selected);
+        let detach_slots_outcome = match ended.filter(|_| {
+            candidate.delta.new.is_empty()
+                && candidate.delta.replace.is_empty()
+                && candidate.views.is_empty()
+        }) {
+            Some(ended) => session.detach_ended_pid_slots(&selected, &ended.owner, &ended.proof),
+            None => session.detach_slots(&selected),
+        };
         #[cfg(feature = "h6-reexec-diagnostic")]
         if let Some(span) = detach_span {
             span.finish_result(&detach_slots_outcome);
@@ -16354,6 +16418,14 @@ impl Engine {
             cause
         };
         let cause = previous.map_or(cause, |current| current.merge(cause));
+        if cause != RetirementCause::ExpectedRemoval
+            && self
+                .ended_pid_retirement
+                .as_ref()
+                .is_some_and(|ended| ended.owner.id() == view)
+        {
+            self.ended_pid_retirement = None;
+        }
         let pending_reason = match cause {
             RetirementCause::ExpectedRemoval => {
                 "a deferred loader memory scan was unresolved at expected process exit"
@@ -16468,6 +16540,7 @@ impl Engine {
         if self.views.is_empty()
             && self.retirement_intents.is_empty()
             && self.pending_retirements.is_empty()
+            && self.ended_pid_retirement.is_none()
             && self.pending_rejected_keys.is_empty()
             && self.loader_registry.ids_for_view(view).is_empty()
             && self.terminal_journal.is_none()
@@ -16526,10 +16599,20 @@ impl Engine {
             }
         };
         let mut no_additions = false;
-        let outcome = match self.apply_candidate(session, candidate, &mut no_additions, false, &[])
-        {
+        let ended = self.ended_pid_retirement.take();
+        let outcome = match self.apply_candidate_with_ended(
+            session,
+            candidate,
+            &mut no_additions,
+            false,
+            &[],
+            ended
+                .as_ref()
+                .filter(|ended| retirements.contains(&ended.owner.id())),
+        ) {
             Ok(outcome) => outcome,
             Err(_) => {
+                self.ended_pid_retirement = ended;
                 *additions_allowed = false;
                 self.mark_partial(
                     "live discovery transaction",
@@ -16543,6 +16626,9 @@ impl Engine {
         // failure there but still blocked additions (PD-T3-1).
         if !outcome.accepted() || outcome.detach_failed {
             *additions_allowed = false;
+        }
+        if outcome.refused() {
+            self.ended_pid_retirement = ended;
         }
         self.record_apply_timing(&outcome);
         self.queue_conservative_outcome(&outcome, &retirements, &keys, pending_views);
@@ -17820,6 +17906,24 @@ impl Engine {
                 // same live generation: dropping its pins re-pins the same
                 // provider under a fresh ID, so a second full slot set is
                 // allocated for targets that already have one.
+                let ended = if cause == RetirementCause::ExpectedRemoval
+                    && matches!(self.scope, Scope::Pid(pid) if pid == retained_pid)
+                    && self.ended_pid_retirement.is_none()
+                {
+                    let slots: Vec<_> = self
+                        .plan
+                        .slots
+                        .iter()
+                        .filter(|slot| session.has_slot_link(slot.index))
+                        .cloned()
+                        .collect();
+                    self.views
+                        .iter()
+                        .find(|owner| owner.id() == view)
+                        .and_then(|owner| session.prepare_ended_pid_retirement(owner, &slots))
+                } else {
+                    None
+                };
                 if cause != RetirementCause::ExecRefresh {
                     self.pending_retirements.insert(view);
                 }
@@ -17828,9 +17932,12 @@ impl Engine {
                 if cause == RetirementCause::ExpectedRemoval {
                     self.close_cgroup_admission_at_removal(view);
                     self.settle_leader_exits_at_removal([view]);
-                    let retained = self.views.len();
-                    self.views.retain(|candidate| candidate.id() != view);
-                    if self.views.len() != retained {
+                    if let Some(index) = self.views.iter().position(|owner| owner.id() == view) {
+                        let owner = self.views.remove(index);
+                        if let Some(proof) = ended {
+                            self.ended_pid_retirement =
+                                Some(PendingEndedPidRetirement { owner, proof });
+                        }
                         self.release_view_id(view);
                     }
                     self.scan_inputs.remove(&view);
@@ -21002,6 +21109,47 @@ pub(crate) mod session_fixture {
     }
 
     impl ScriptedSession {
+        fn detach_slots_with_ended(
+            &mut self,
+            slots: &[plan::Slot],
+            ended: Option<(&ProcessView, &crate::attach::EndedPidRetirement)>,
+        ) -> Result<DetachOutcome> {
+            self.detached_slots.push(slots.len());
+            self.detached_slot_indices
+                .push(slots.iter().map(|slot| slot.index).collect());
+            if let Some(Some(pid)) = self.detach_losses.pop_front() {
+                kill_and_reap(pid);
+            }
+            let untouched_refusal = if slots.is_empty() && self.pid_continuity.is_some() {
+                false
+            } else {
+                self.detach_slot_premutation_script
+                    .pop_front()
+                    .unwrap_or(false)
+            };
+            if untouched_refusal {
+                bail!("scripted program fd resolution failed before any link mutation");
+            }
+            let native_failure = if slots.is_empty() && self.pid_continuity.is_some() {
+                false
+            } else {
+                self.detach_slot_script.pop_front().unwrap_or(false)
+            };
+            let rebuild = self.pid_continuity.as_mut().map(|continuity| match ended {
+                Some((owner, proof)) => continuity
+                    .borrow_mut()
+                    .detach_ended_pid_slots(slots, owner, proof),
+                None => continuity.borrow_mut().detach(slots),
+            });
+            if native_failure {
+                self.detach_failures
+                    .push("scripted one-shot slot detach failed".into());
+                bail!("scripted one-shot slot detach failed");
+            }
+            Ok(rebuild
+                .unwrap_or_else(|| self.detach_rebuild_script.pop_front().unwrap_or_default()))
+        }
+
         /// A session whose ring holds exactly these records and whose producer
         /// counters authorize `loader_hits` loader records.
         pub(crate) fn with_records(
@@ -21143,6 +21291,16 @@ pub(crate) mod session_fixture {
                 .as_ref()
                 .map(|state| state.borrow().gap_summary())
                 .unwrap_or_default()
+        }
+        fn prepare_ended_pid_retirement(
+            &self,
+            view: &ProcessView,
+            slots: &[plan::Slot],
+        ) -> Option<crate::attach::EndedPidRetirement> {
+            self.pid_continuity
+                .as_ref()?
+                .borrow()
+                .prepare_ended_pid_retirement(view, slots)
         }
         fn mutation_stopped(&self) -> bool {
             self.pid_continuity
@@ -21415,39 +21573,16 @@ pub(crate) mod session_fixture {
         }
 
         fn detach_slots(&mut self, slots: &[plan::Slot]) -> Result<DetachOutcome> {
-            self.detached_slots.push(slots.len());
-            self.detached_slot_indices
-                .push(slots.iter().map(|slot| slot.index).collect());
-            if let Some(Some(pid)) = self.detach_losses.pop_front() {
-                kill_and_reap(pid);
-            }
-            let untouched_refusal = if slots.is_empty() && self.pid_continuity.is_some() {
-                false
-            } else {
-                self.detach_slot_premutation_script
-                    .pop_front()
-                    .unwrap_or(false)
-            };
-            if untouched_refusal {
-                bail!("scripted program fd resolution failed before any link mutation");
-            }
-            let native_failure = if slots.is_empty() && self.pid_continuity.is_some() {
-                false
-            } else {
-                self.detach_slot_script.pop_front().unwrap_or(false)
-            };
-            if native_failure {
-                if let Some(continuity) = &mut self.pid_continuity {
-                    continuity.borrow_mut().detach(slots);
-                }
-                self.detach_failures
-                    .push("scripted one-shot slot detach failed".into());
-                bail!("scripted one-shot slot detach failed");
-            }
-            if let Some(continuity) = &mut self.pid_continuity {
-                return Ok(continuity.borrow_mut().detach(slots));
-            }
-            Ok(self.detach_rebuild_script.pop_front().unwrap_or_default())
+            self.detach_slots_with_ended(slots, None)
+        }
+
+        fn detach_ended_pid_slots(
+            &mut self,
+            slots: &[plan::Slot],
+            owner: &ProcessView,
+            proof: &crate::attach::EndedPidRetirement,
+        ) -> Result<DetachOutcome> {
+            self.detach_slots_with_ended(slots, Some((owner, proof)))
         }
 
         fn has_dynamic_export(

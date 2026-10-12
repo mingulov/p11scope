@@ -314,11 +314,12 @@ def run_leg(ctx, directory, backend, stage, healthy):
     selected, _ = H6["create_tracked"](ctx, root.path / "selected")
     outside, _ = H6["create_tracked"](ctx, root.path / "outside")
     workloads, moves, phases = [], [], []
+    caller_pin = ctx.pins["caller"]
     for tag in (("baseline", "candidate") if stage == "final_pre_read" else ("candidate",)):
         owner, reader, stderr = H6["spawn_caller"](ctx.owners, ctx.readers, directory,
-            ctx.pins["caller-a"], ctx.provider_pin, ctx.args.uid, ctx.args.gid, env, tag=tag)
+            caller_pin, ctx.provider_pin, ctx.args.uid, ctx.args.gid, env, tag=tag)
         reader.record("ready", 0, seconds=30)
-        ctx.pins["caller-a"].image_receipt(reader.record("image", 0), owner)
+        caller_pin.image_receipt(reader.record("image", 0), owner)
         H6["move_and_verify"](outside if tag == "candidate" and stage == "final_pre_read" else selected,
                               owner, moves, tag)
         workloads.append((owner, reader, stderr))
@@ -343,7 +344,7 @@ def run_leg(ctx, directory, backend, stage, healthy):
         baseline = None
         if stage == "final_pre_read":
             H6["wait_inventory_ready"](owned, errors, log_path, backend)
-            baseline = wait_baseline(log_path, workloads[0][0], ctx.pins["caller-a"],
+            baseline = wait_baseline(log_path, workloads[0][0], caller_pin,
                                      provider_before, workloads[0][1], phases)
             H6["move_and_verify"](selected, candidate, moves, "fresh-mapped-candidate")
         gate = channel.wait(stage)

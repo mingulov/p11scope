@@ -545,9 +545,7 @@ fn fresh_system_trace_names_provider_found_after_initial_scan() {
     assert_eq!(child.id(), capture.io.target);
     child.stdin.as_mut().unwrap().write_all(b"!").unwrap();
     ProviderFixture::ready(child);
-    assert!(
-        original.same_allocation(&capture.engine.views.last().unwrap().view_admission())
-    );
+    assert!(original.same_allocation(&capture.engine.views.last().unwrap().view_admission()));
     assert!(capture.engine.views.last().unwrap().still_the_same());
 
     // Use the actual refresh-scan ingress, which performs scan_and_pin and
@@ -573,7 +571,9 @@ fn fresh_system_trace_names_provider_found_after_initial_scan() {
                 .scan_inputs
                 .get(&id)
                 .map(|input| input.modules.len()),
-            capture.engine.trace_provider_associated(capture.engine.views.last().unwrap()),
+            capture
+                .engine
+                .trace_provider_associated(capture.engine.views.last().unwrap()),
         ),
     );
 
@@ -677,14 +677,19 @@ fn fresh_system_trace_provider_time_overrun_preserves_exploratory_progress() {
 
 #[test]
 fn fresh_system_trace_provider_association_alone_cannot_grant_a_name() {
-    for association in ["current", "missing", "stale", "foreign", "reused", "replaced"] {
+    for association in [
+        "current", "missing", "stale", "foreign", "reused", "replaced",
+    ] {
         let mut capture = if association == "missing" {
             Capture::late_mapped(1)
         } else {
             Capture::mapped(1)
         };
         let id = capture.engine.views.last().unwrap().id();
-        assert_eq!(capture.engine.trace_provider_views.contains_key(&id), association != "missing");
+        assert_eq!(
+            capture.engine.trace_provider_views.contains_key(&id),
+            association != "missing"
+        );
         match association {
             "missing" => {}
             "stale" => {
@@ -706,7 +711,13 @@ fn fresh_system_trace_provider_association_alone_cannot_grant_a_name() {
             "foreign" => {
                 // Supply actual discovery data from a different held caller;
                 // no ScannedModule is constructed or its origin rewritten.
-                let child = capture._provider.as_ref().unwrap().command().spawn().unwrap();
+                let child = capture
+                    ._provider
+                    .as_ref()
+                    .unwrap()
+                    .command()
+                    .spawn()
+                    .unwrap();
                 let pid = child.id();
                 capture._children.0.push(child);
                 ProviderFixture::ready(capture._children.0.last_mut().unwrap());
@@ -740,7 +751,11 @@ fn fresh_system_trace_provider_association_alone_cannot_grant_a_name() {
                 capture.engine.views[position] = ProcessView::open(id, pid).unwrap();
                 let new = capture.engine.views[position].view_admission();
                 assert!(!old.same_allocation(&new));
-                assert!(!capture.engine.trace_provider_associated(&capture.engine.views[position]));
+                assert!(
+                    !capture
+                        .engine
+                        .trace_provider_associated(&capture.engine.views[position])
+                );
                 assert!(capture.engine.trace_provider_views.contains_key(&id));
             }
             "current" => {}

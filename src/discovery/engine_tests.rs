@@ -18951,6 +18951,7 @@ fn post_attach_generation_loss_detaches_and_cannot_commit_stale_candidate() {
         manifest_inventory_slots: BTreeMap::new(),
         loader_plan_proof: None,
         exec_preservations: Vec::new(),
+        exec_completions: Vec::new(),
     };
     commit_cleaned_candidate_identity(
         &mut candidate,
@@ -36468,6 +36469,939 @@ fn observed_candidate_exec(engine: &Engine, session: &mut ScriptedSession) -> Di
         .borrow_mut()
         .observe(record);
     record
+}
+
+/// The loader route can replace all static pairs while the matched EXEC's
+/// inventory request is still pending. Exercise that same ordinary apply
+/// transaction, using production sealing and retained files, before the final
+/// ordinary-batch refresh: no test receipt or recovery flag is installed.
+fn completed_rearm_route() -> (TabledSeedProvider, Engine, ScriptedSession, DiscoveryRecord) {
+    let (mut fixture, mut engine, mut session) = continuity_route();
+    fixture.reexec(false);
+    let record = observed_candidate_exec(&engine, &mut session);
+    let view = engine.views[0].id();
+    let pid = engine.views[0].pid();
+    engine.dispatch_lifecycle_record(&mut session, &record, &mut PendingViewRetirements::new());
+    let bound = engine.refresh_requested[&pid].clone();
+    assert!(bound.exec_binding.is_some());
+    assert_eq!(bound.owner, Some(view));
+    assert_eq!(engine.exec_rearm_views[&view], Some(bound.serial));
+    let mut recovery = engine
+        .live_candidate(
+            engine.pinned.clone(),
+            engine
+                .modules
+                .iter()
+                .map(|module| module.scanned.clone())
+                .collect(),
+            Vec::new(),
+        )
+        .unwrap();
+    assert!(recovery.delta.new.is_empty());
+    assert!(recovery.delta.retire.is_empty());
+    assert!(recovery.delta.replace.is_empty());
+    recovery.delta.replace = recovery.plan.slots.clone();
+    let outcome = engine
+        .apply_candidate(&mut session, recovery, &mut true, false, &[])
+        .unwrap();
+    assert!(
+        outcome.accepted(),
+        "ordinary recovery must publish successfully"
+    );
+    assert!(outcome.static_failures.is_empty());
+    assert_eq!(engine.refresh_requested[&pid], bound);
+    assert_eq!(engine.exec_rearm_views[&view], Some(bound.serial));
+    assert!(engine.views[0].still_the_same());
+    let mut pairs = session.pid_continuity.as_ref().unwrap().borrow_mut();
+    let times = pairs.current_pair_times(&engine.plan.slots, &engine.pinned);
+    assert_eq!(times.len(), engine.plan.active_slot_count());
+    assert!(!times.is_empty());
+    let empty_start = pairs.fresh_empty_started_ns();
+    assert!(times.iter().all(|(_, start, end)| {
+        record.hook_ts_ns < *start && *start < *end && *end < empty_start
+    }));
+    drop(pairs);
+    (fixture, engine, session, record)
+}
+
+#[test]
+fn automatic_exec_completed_rearm_same_request_keeps_fresh_pairs() {
+    let (_fixture, mut engine, mut session, _record) = completed_rearm_route();
+    let pid = engine.views[0].pid();
+    let view = engine.views[0].id();
+    let bound = engine.refresh_requested[&pid].clone();
+    let candidate = engine
+        .live_candidate(
+            engine.pinned.clone(),
+            engine
+                .modules
+                .iter()
+                .map(|module| module.scanned.clone())
+                .collect(),
+            Vec::new(),
+        )
+        .unwrap();
+    assert!(candidate.delta.new.is_empty());
+    assert!(candidate.delta.replace.is_empty());
+    assert!(candidate.delta.retire.is_empty());
+    assert!(
+        session
+            .prepare_preservation(
+                bound.exec_binding.as_ref().unwrap(),
+                &engine.views[0],
+                bound.serial,
+                &candidate.plan.slots,
+                &[],
+                &candidate.pinned,
+            )
+            .is_none(),
+        "a completed post-EXEC recovery is not a pre-EXEC preservation"
+    );
+    let before = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .identities();
+    let native_before = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .native_attach_calls;
+    let detach_before = session
+        .detached_slot_indices
+        .iter()
+        .filter(|slots| !slots.is_empty())
+        .count();
+    let history = engine.capture_facts.history.clone();
+    let gap_before = session.physical_gap_summary();
+    assert!(gap_before.episodes > 0 && !gap_before.open);
+    let outcome = apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+    assert!(outcome.required_complete);
+    assert!(!engine.refresh_requested.contains_key(&pid));
+    assert!(!engine.exec_rearm_views.contains_key(&view));
+    assert_eq!(engine.capture_facts.history.modules, history.modules);
+    assert_eq!(engine.capture_facts.history.decoded, history.decoded);
+    assert_eq!(
+        session
+            .detached_slot_indices
+            .iter()
+            .filter(|slots| !slots.is_empty())
+            .count(),
+        detach_before,
+        "the same request must not detach pairs already recovered after its EXEC",
+    );
+    let pairs = session.pid_continuity.as_ref().unwrap().borrow();
+    assert_eq!(pairs.native_attach_calls, native_before);
+    assert_eq!(pairs.identities(), before);
+    assert_eq!(pairs.gap_summary(), gap_before);
+}
+
+fn carried_completed_rearm(engine: &mut Engine, session: &mut ScriptedSession) -> LiveCandidate {
+    let mut candidate = engine
+        .live_candidate(
+            engine.pinned.clone(),
+            engine
+                .modules
+                .iter()
+                .map(|module| module.scanned.clone())
+                .collect(),
+            Vec::new(),
+        )
+        .unwrap();
+    let view = engine.views[0].id();
+    let serial = engine.refresh_requested[&engine.views[0].pid()].serial;
+    let prepared = engine
+        .prepare_exec_rearm(session, view, serial, &candidate)
+        .unwrap();
+    assert!(prepared.preservation.is_none());
+    assert!(
+        prepared.completed.is_some(),
+        "proof must come from production pair preparation"
+    );
+    assert!(engine.consume_exec_rearm(&mut candidate, prepared));
+    assert_eq!(candidate.exec_completions.len(), 1);
+    assert!(candidate.delta.new.is_empty());
+    assert!(candidate.delta.replace.is_empty());
+    assert!(candidate.delta.retire.is_empty());
+    candidate
+}
+
+#[test]
+fn automatic_exec_completed_rearm_revalidates_after_fallible_preflight() {
+    for case in 0..10 {
+        let (_fixture, mut engine, mut session, _record) = completed_rearm_route();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        engine.set_cancel_flag(cancel.clone());
+        let candidate = carried_completed_rearm(&mut engine, &mut session);
+        let before = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities();
+        let calls = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .native_attach_calls;
+        let request = engine.refresh_requested[&engine.views[0].pid()].clone();
+        let change = match case {
+            0 => crate::attach::PreflightChange::Producer,
+            1 => crate::attach::PreflightChange::Observation,
+            2 => crate::attach::PreflightChange::Health,
+            3 => crate::attach::PreflightChange::Registration,
+            4 => crate::attach::PreflightChange::Stop,
+            5 => crate::attach::PreflightChange::Clock,
+            6 => crate::attach::PreflightChange::Terminal,
+            7 => crate::attach::PreflightChange::Cancel(cancel),
+            8 => crate::attach::PreflightChange::ProducersDetached,
+            _ => crate::attach::PreflightChange::Exit(engine.views[0].pid()),
+        };
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .preflight_change = Some(change);
+        let outcome = engine
+            .apply_candidate(&mut session, candidate, &mut true, false, &[])
+            .unwrap();
+        assert!(outcome.refused(), "case {case}");
+        assert_eq!(
+            engine.refresh_requested[&engine.views[0].pid()],
+            request,
+            "case {case}"
+        );
+        assert_eq!(
+            engine.exec_rearm_views[&engine.views[0].id()],
+            Some(request.serial)
+        );
+        let pairs = session.pid_continuity.as_ref().unwrap().borrow();
+        assert_eq!(pairs.native_attach_calls, calls, "case {case}");
+        assert_eq!(pairs.identities(), before, "case {case}");
+    }
+}
+
+#[test]
+fn automatic_exec_completed_rearm_health_fault_and_missing_identity_refuse() {
+    for case in 0..8 {
+        let (_fixture, engine, mut session, _record) = completed_rearm_route();
+        let request = &engine.refresh_requested[&engine.views[0].pid()];
+        {
+            let mut pairs = session.pid_continuity.as_ref().unwrap().borrow_mut();
+            match case {
+                0 => pairs.forget_retained_target(engine.plan.slots[0].index),
+                1 => pairs.invalidate_generations(),
+                2 => pairs.owner = Err(crate::attach::PidContinuityRefusal::Unavailable),
+                3 => pairs.loss = Err(crate::attach::PidContinuityRefusal::Loss),
+                4 => pairs.loss = Ok(vec![1]),
+                5 => pairs.raw_fault(),
+                6 => pairs.stop_word = p11scope_ebpf_common::STOP_GATE_STOP | 2,
+                _ => pairs.producers_detached = true,
+            }
+        }
+        assert!(
+            session
+                .prepare_completed_rearm(
+                    request.exec_binding.as_ref().unwrap(),
+                    &engine.views[0],
+                    request.serial,
+                    &engine.plan.slots,
+                    &[],
+                    &engine.pinned,
+                )
+                .is_none(),
+            "case {case}"
+        );
+    }
+}
+
+#[test]
+fn automatic_exec_completed_rearm_rejects_foreign_owner_and_renewal() {
+    let (_fixture, mut engine, mut session, record) = completed_rearm_route();
+    let view = engine.views[0].id();
+    let pid = engine.views[0].pid();
+    let request = engine.refresh_requested[&pid].clone();
+    let candidate = carried_completed_rearm(&mut engine, &mut session);
+    let fresh_view = ProcessView::open(view, pid).unwrap();
+    assert!(
+        session
+            .prepare_completed_rearm(
+                request.exec_binding.as_ref().unwrap(),
+                &fresh_view,
+                request.serial,
+                &engine.plan.slots,
+                &[],
+                &engine.pinned,
+            )
+            .is_none()
+    );
+    assert!(
+        session
+            .prepare_completed_rearm(
+                request.exec_binding.as_ref().unwrap(),
+                &engine.views[0],
+                request.serial + 1,
+                &engine.plan.slots,
+                &[],
+                &engine.pinned,
+            )
+            .is_none()
+    );
+    let mut wrong = crate::attach::PidSessionFixture::new(&engine.views[0]);
+    wrong.observe(record);
+    wrong.attach(&engine.plan.slots, &engine.pinned).unwrap();
+    wrong.fresh_empty_started_ns();
+    assert!(
+        wrong
+            .bind(&engine.views[0], request.serial, &record)
+            .is_some()
+    );
+    assert!(
+        wrong
+            .prepare_completed_rearm(
+                request.exec_binding.as_ref().unwrap(),
+                &engine.views[0],
+                request.serial,
+                &engine.plan.slots,
+                &[],
+                &engine.pinned,
+            )
+            .is_none(),
+        "matching numeric domain, key and pairs cannot borrow a Session allocation"
+    );
+    assert!(engine.request_refresh_consumed(pid, Some(u64::MAX)));
+    let renewed = engine.refresh_requested[&pid].clone();
+    let before = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .identities();
+    let outcome = engine
+        .apply_candidate(&mut session, candidate, &mut true, false, &[])
+        .unwrap();
+    assert!(outcome.refused());
+    assert_eq!(engine.refresh_requested[&pid], renewed);
+    assert_eq!(engine.exec_rearm_views[&view], Some(renewed.serial));
+    assert_eq!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities(),
+        before
+    );
+}
+
+#[test]
+fn automatic_exec_completed_rearm_new_exec_cannot_borrow_previous_recovery() {
+    for class in [
+        p11scope_ebpf_common::DISCOVERY_EXEC_SAME_TASK_CANDIDATE,
+        p11scope_ebpf_common::DISCOVERY_EXEC_TASK_REPLACED,
+    ] {
+        let (_fixture, mut engine, mut session, _record) = completed_rearm_route();
+        let candidate = carried_completed_rearm(&mut engine, &mut session);
+        // Encode this class before the production decoder/observer and binding.
+        let newer = continuity_exec_class(&engine, &mut session, class);
+        engine.dispatch_lifecycle_record(&mut session, &newer, &mut PendingViewRetirements::new());
+        let pid = engine.views[0].pid();
+        let request = engine.refresh_requested[&pid].clone();
+        let before = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities();
+        assert!(
+            engine
+                .apply_candidate(&mut session, candidate, &mut true, false, &[])
+                .unwrap()
+                .refused()
+        );
+        assert_eq!(engine.refresh_requested[&pid], request);
+        assert_eq!(
+            engine.exec_rearm_views[&engine.views[0].id()],
+            Some(request.serial)
+        );
+        assert!(
+            apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+                .unwrap()
+                .required_complete
+        );
+        let current = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities();
+        if class == p11scope_ebpf_common::DISCOVERY_EXEC_SAME_TASK_CANDIDATE {
+            assert_eq!(
+                current, before,
+                "strict pre-EXEC proof remains valid for this newer same-task EXEC"
+            );
+        } else {
+            assert_ne!(
+                current, before,
+                "task replacement needs physical recovery for its new bound EXEC"
+            );
+        }
+    }
+}
+
+#[test]
+fn automatic_exec_completed_rearm_requires_accepted_publication_for_acknowledgement() {
+    let failed_publication: Result<()> = Err(anyhow!("scripted publication failure"));
+    assert_eq!(
+        candidate_publication_disposition(false, &failed_publication),
+        ApplyDisposition::ConservativeRetirement
+    );
+    for disposition in [
+        ApplyDisposition::Refused,
+        candidate_publication_disposition(false, &failed_publication),
+        candidate_publication_disposition(false, &Ok(())),
+    ] {
+        let (_fixture, mut engine, mut session, _record) = completed_rearm_route();
+        let candidate = carried_completed_rearm(&mut engine, &mut session);
+        let view = engine.views[0].id();
+        let pid = engine.views[0].pid();
+        let request = engine.refresh_requested[&pid].clone();
+        let completed = BTreeSet::from([(view, request.serial)]);
+        let before = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities();
+        // The shared production settlement helper sees ConservativeRetirement
+        // for a publication failure as well as destructive cleanup. A real
+        // completed receipt does not authorize that positive acknowledgement.
+        let outcome = ApplyOutcome {
+            disposition,
+            ..Default::default()
+        };
+        engine.settle_applied_exec_rearms([(view, request.serial)], &completed, &outcome);
+        assert_eq!(
+            !engine.exec_rearm_views.contains_key(&view),
+            disposition == ApplyDisposition::Accepted
+        );
+        assert_eq!(engine.refresh_requested[&pid], request);
+        assert_eq!(
+            session
+                .pid_continuity
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .identities(),
+            before
+        );
+        drop(candidate);
+    }
+    let (_fixture, mut engine, _session, _record) = completed_rearm_route();
+    let view = engine.views[0].id();
+    let serial = engine.refresh_requested[&engine.views[0].pid()].serial;
+    engine.settle_applied_exec_rearms(
+        [(view, serial)],
+        &BTreeSet::new(),
+        &ApplyOutcome {
+            disposition: ApplyDisposition::ConservativeRetirement,
+            ..Default::default()
+        },
+    );
+    assert!(
+        !engine.exec_rearm_views.contains_key(&view),
+        "existing destructive conservative settlement remains intact"
+    );
+}
+
+#[test]
+fn automatic_exec_completed_rearm_requires_every_requested_unique_pair() {
+    let (_fixture, engine, mut session, _record) = completed_rearm_route();
+    let request = &engine.refresh_requested[&engine.views[0].pid()];
+    for slots in [
+        Vec::new(),
+        vec![engine.plan.slots[0].clone(), engine.plan.slots[0].clone()],
+    ] {
+        assert!(
+            session
+                .prepare_completed_rearm(
+                    request.exec_binding.as_ref().unwrap(),
+                    &engine.views[0],
+                    request.serial,
+                    &slots,
+                    &[],
+                    &engine.pinned,
+                )
+                .is_none()
+        );
+    }
+    assert!(engine.plan.slots.len() > 1);
+    session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow_mut()
+        .forget_retained_target(engine.plan.slots.last().unwrap().index);
+    assert!(
+        session
+            .prepare_completed_rearm(
+                request.exec_binding.as_ref().unwrap(),
+                &engine.views[0],
+                request.serial,
+                &engine.plan.slots,
+                &[],
+                &engine.pinned,
+            )
+            .is_none(),
+        "the valid prefix cannot mint a successful subset receipt"
+    );
+}
+
+#[test]
+fn automatic_exec_completed_rearm_excludes_ordinary_targets_and_multi_siblings() {
+    for grouped in [false, true] {
+        let (_fixture, engine, mut session, _record) = completed_rearm_route();
+        let request = &engine.refresh_requested[&engine.views[0].pid()];
+        let selected = engine.plan.slots.last().unwrap().clone();
+        let spared = &engine.plan.slots[..engine.plan.slots.len() - 1];
+        if grouped {
+            let mut state = session.pid_continuity.as_ref().unwrap().borrow_mut();
+            state.group_all();
+            state.fresh_empty_started_ns();
+        }
+        assert!(
+            session
+                .prepare_completed_rearm(
+                    request.exec_binding.as_ref().unwrap(),
+                    &engine.views[0],
+                    request.serial,
+                    &engine.plan.slots,
+                    std::slice::from_ref(&selected),
+                    &engine.pinned,
+                )
+                .is_none()
+        );
+        let proof = session.prepare_completed_rearm(
+            request.exec_binding.as_ref().unwrap(),
+            &engine.views[0],
+            request.serial,
+            spared,
+            std::slice::from_ref(&selected),
+            &engine.pinned,
+        );
+        assert_eq!(
+            proof.is_none(),
+            grouped,
+            "a connected sibling must not be spared during rebuild"
+        );
+    }
+}
+
+#[test]
+fn automatic_exec_completed_rearm_clock_boundaries_and_unavailability_refuse() {
+    for case in 0..7 {
+        let (_fixture, mut engine, mut session, record) = completed_rearm_route();
+        let request = engine.refresh_requested[&engine.views[0].pid()].clone();
+        let mut recovery = engine
+            .live_candidate(
+                engine.pinned.clone(),
+                engine
+                    .modules
+                    .iter()
+                    .map(|module| module.scanned.clone())
+                    .collect(),
+                Vec::new(),
+            )
+            .unwrap();
+        recovery.delta.replace = recovery.plan.slots.clone();
+        {
+            let mut state = session.pid_continuity.as_ref().unwrap().borrow_mut();
+            match case {
+                0 => state.native_clocks.push_back(Some(record.hook_ts_ns)),
+                1 => state.native_clocks.push_back(Some(0)),
+                2 => state.native_clocks.push_back(None),
+                3 => state.completion_clocks.push_back(Some(record.hook_ts_ns)),
+                4 => state.completion_clocks.push_back(None),
+                _ => (),
+            }
+        }
+        assert!(
+            engine
+                .apply_candidate(&mut session, recovery, &mut true, false, &[])
+                .unwrap()
+                .accepted()
+        );
+        {
+            let mut state = session.pid_continuity.as_ref().unwrap().borrow_mut();
+            if case == 5 {
+                let latest = state
+                    .current_pair_times(&engine.plan.slots, &engine.pinned)
+                    .into_iter()
+                    .map(|(_, _, end)| end)
+                    .max()
+                    .unwrap();
+                state.scripted_read_clocks([Some(latest), Some(latest)]);
+                assert_eq!(state.fresh_empty_started_ns(), latest);
+            } else {
+                state.fresh_empty_started_ns();
+            }
+            if case == 6 {
+                state.clock_offsets = None;
+            }
+        }
+        assert!(
+            session
+                .prepare_completed_rearm(
+                    request.exec_binding.as_ref().unwrap(),
+                    &engine.views[0],
+                    request.serial,
+                    &engine.plan.slots,
+                    &[],
+                    &engine.pinned,
+                )
+                .is_none(),
+            "case {case}"
+        );
+    }
+}
+
+#[test]
+fn automatic_exec_completed_rearm_mixed_pre_and_post_exec_pairs_refuse() {
+    let (_fixture, mut engine, mut session, record) = completed_rearm_route();
+    let mut recovery = engine
+        .live_candidate(
+            engine.pinned.clone(),
+            engine
+                .modules
+                .iter()
+                .map(|module| module.scanned.clone())
+                .collect(),
+            Vec::new(),
+        )
+        .unwrap();
+    recovery.delta.replace = recovery.plan.slots[..1].to_vec();
+    // This side's actual scripted-native timestamp is before the bound EXEC;
+    // the other fully registered targets retain their post-EXEC stamps.
+    session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow_mut()
+        .native_clocks
+        .push_back(Some(record.hook_ts_ns - 1));
+    assert!(
+        engine
+            .apply_candidate(&mut session, recovery, &mut true, false, &[])
+            .unwrap()
+            .accepted()
+    );
+    session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow_mut()
+        .fresh_empty_started_ns();
+    let serial = engine.refresh_requested[&engine.views[0].pid()].serial;
+    let candidate = engine
+        .live_candidate(
+            engine.pinned.clone(),
+            engine
+                .modules
+                .iter()
+                .map(|module| module.scanned.clone())
+                .collect(),
+            Vec::new(),
+        )
+        .unwrap();
+    let prepared = engine
+        .prepare_exec_rearm(&mut session, engine.views[0].id(), serial, &candidate)
+        .unwrap();
+    assert!(prepared.preservation.is_none());
+    assert!(prepared.completed.is_none());
+}
+
+#[test]
+fn automatic_exec_completed_rearm_unclassified_recovery_stays_conservative() {
+    for class in [
+        p11scope_ebpf_common::DISCOVERY_EXEC_UNKNOWN,
+        p11scope_ebpf_common::DISCOVERY_EXEC_TASK_REPLACED,
+    ] {
+        let (_fixture, mut engine, mut session, _record) = completed_rearm_route();
+        let mut record = exec_record_for(engine.views[0].pid());
+        record.pid_tgid |= u64::from(engine.views[0].pid());
+        record.case_id = class;
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .observe(record);
+        engine.dispatch_lifecycle_record(&mut session, &record, &mut PendingViewRetirements::new());
+        let mut recovery = engine
+            .live_candidate(
+                engine.pinned.clone(),
+                engine
+                    .modules
+                    .iter()
+                    .map(|module| module.scanned.clone())
+                    .collect(),
+                Vec::new(),
+            )
+            .unwrap();
+        recovery.delta.replace = recovery.plan.slots.clone();
+        assert!(
+            engine
+                .apply_candidate(&mut session, recovery, &mut true, false, &[])
+                .unwrap()
+                .accepted()
+        );
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow_mut()
+            .fresh_empty_started_ns();
+        let request = &engine.refresh_requested[&engine.views[0].pid()];
+        assert!(
+            session
+                .prepare_completed_rearm(
+                    request.exec_binding.as_ref().unwrap(),
+                    &engine.views[0],
+                    request.serial,
+                    &engine.plan.slots,
+                    &[],
+                    &engine.pinned
+                )
+                .is_none()
+        );
+        let before = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities();
+        assert!(
+            apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+                .unwrap()
+                .required_complete
+        );
+        assert_ne!(
+            session
+                .pid_continuity
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .identities(),
+            before
+        );
+    }
+}
+
+#[test]
+fn automatic_exec_completed_rearm_partial_native_success_cannot_mint_subset() {
+    let (_fixture, mut engine, mut session, _record) = completed_rearm_route();
+    let failed = engine.plan.slots.last().unwrap().index;
+    session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow_mut()
+        .native_failures
+        .insert((failed, "p11_entry"));
+    let mut recovery = engine
+        .live_candidate(
+            engine.pinned.clone(),
+            engine
+                .modules
+                .iter()
+                .map(|module| module.scanned.clone())
+                .collect(),
+            Vec::new(),
+        )
+        .unwrap();
+    recovery.delta.replace = recovery.plan.slots.clone();
+    let outcome = engine
+        .apply_candidate(&mut session, recovery, &mut true, false, &[])
+        .unwrap();
+    assert!(outcome.accepted());
+    assert!(!outcome.static_failures.is_empty());
+    assert!(!engine.plan.is_active(failed));
+    let state = session.pid_continuity.as_ref().unwrap().borrow();
+    assert!(
+        !state
+            .identities()
+            .iter()
+            .any(|(slot, _, _)| *slot == failed)
+    );
+    assert!(
+        state.gap_summary().open,
+        "failed recovery retains its physical gap"
+    );
+    drop(state);
+    session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow_mut()
+        .fresh_empty_started_ns();
+    let request = &engine.refresh_requested[&engine.views[0].pid()];
+    assert!(
+        session
+            .prepare_completed_rearm(
+                request.exec_binding.as_ref().unwrap(),
+                &engine.views[0],
+                request.serial,
+                &engine.plan.slots,
+                &[],
+                &engine.pinned
+            )
+            .is_none()
+    );
+    assert_eq!(
+        engine.exec_rearm_views[&engine.views[0].id()],
+        Some(request.serial)
+    );
+}
+
+#[test]
+fn automatic_exec_completed_rearm_held_identity_changes_refuse_prepare_and_apply() {
+    let (fixture, mut engine, mut session, _record) = completed_rearm_route();
+    let candidate = carried_completed_rearm(&mut engine, &mut session);
+    let request = &engine.refresh_requested[&engine.views[0].pid()];
+    for field in 0..2 {
+        let mut slots = engine.plan.slots.clone();
+        if field == 0 {
+            slots[0].file_offset += 1;
+        } else {
+            slots[0].descriptor_index += 1;
+        }
+        assert!(
+            session
+                .prepare_completed_rearm(
+                    request.exec_binding.as_ref().unwrap(),
+                    &engine.views[0],
+                    request.serial,
+                    &slots,
+                    &[],
+                    &engine.pinned
+                )
+                .is_none()
+        );
+    }
+    let path = fixture.dir.path().join("tabled-provider.so");
+    let file = std::fs::File::open(&path).unwrap();
+    let changed = file.metadata().unwrap().modified().unwrap() + std::time::Duration::from_secs(1);
+    file.set_times(std::fs::FileTimes::new().set_modified(changed))
+        .unwrap();
+    assert!(engine.views[0].still_the_same());
+    assert!(
+        session
+            .prepare_completed_rearm(
+                request.exec_binding.as_ref().unwrap(),
+                &engine.views[0],
+                request.serial,
+                &engine.plan.slots,
+                &[],
+                &engine.pinned
+            )
+            .is_none()
+    );
+    assert!(!session.validate_completed_rearm(
+        &candidate.exec_completions[0].receipt,
+        request.exec_binding.as_ref().unwrap(),
+        &engine.views[0],
+        request.serial,
+        &engine.pinned
+    ));
+}
+
+#[test]
+fn automatic_exec_completed_rearm_changed_provider_keeps_ordinary_delta_authority() {
+    let (mut fixture, mut engine, mut session, _record) = completed_rearm_route();
+    let replacement = fixture.replace_mapped_provider();
+    engine.module_hints.push(replacement);
+    let before = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .identities();
+    let calls = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .native_attach_calls;
+    assert!(
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+            .unwrap()
+            .required_complete
+    );
+    let state = session.pid_continuity.as_ref().unwrap().borrow();
+    assert!(state.native_attach_calls > calls);
+    assert!(before.iter().all(|(slot, _, _)| {
+        !state
+            .identities()
+            .iter()
+            .any(|(current, _, _)| slot == current)
+    }));
+    assert_eq!(state.identities().len(), engine.plan.active_slot_count());
+}
+
+#[test]
+fn automatic_exec_completed_rearm_health_read_follows_held_registry_validation() {
+    let (_fixture, mut engine, mut session, _record) = completed_rearm_route();
+    let candidate = carried_completed_rearm(&mut engine, &mut session);
+    let request = &engine.refresh_requested[&engine.views[0].pid()];
+    let reads = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .health_reads;
+    assert!(session.validate_completed_rearm(
+        &candidate.exec_completions[0].receipt,
+        request.exec_binding.as_ref().unwrap(),
+        &engine.views[0],
+        request.serial,
+        &engine.pinned
+    ));
+    assert_eq!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .health_reads,
+        reads + 1
+    );
+    session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow_mut()
+        .forget_retained_target(engine.plan.slots[0].index);
+    assert!(!session.validate_completed_rearm(
+        &candidate.exec_completions[0].receipt,
+        request.exec_binding.as_ref().unwrap(),
+        &engine.views[0],
+        request.serial,
+        &engine.pinned
+    ));
+    assert_eq!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .health_reads,
+        reads + 1,
+        "held-registry refusal must precede the direct health/cursor callback"
+    );
 }
 
 #[test]

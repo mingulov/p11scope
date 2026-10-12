@@ -1214,7 +1214,7 @@ fn collect_job_off_thread(
 
 /// Scoped jobs never run inline. Join the owned worker on every outcome;
 /// a returning filesystem operation still determines the next checkpoint.
-fn collect_cgroup_off_thread(
+pub(crate) fn collect_cgroup_off_thread(
     job: CgroupCollectJob,
     tick: Duration,
     service: &mut dyn FnMut(),
@@ -1236,7 +1236,9 @@ fn collect_cgroup_off_thread(
         loop {
             match results.recv_timeout(schedule.wait(Instant::now())) {
                 Ok(value) => {
+                    value.observe_worker_returned();
                     worker.join().map_err(|_| CgroupJobFailure::Panic)?;
+                    value.observe_worker_joined();
                     return Ok(value);
                 }
                 Err(RecvTimeoutError::Timeout) => {

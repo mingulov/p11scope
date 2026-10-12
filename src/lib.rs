@@ -30,6 +30,7 @@ macro_rules! eprint {
 
 pub mod attach;
 pub mod capacity;
+pub(crate) mod cgroup_stop_acceptance;
 pub mod cli;
 pub mod discovery;
 pub mod doctor;

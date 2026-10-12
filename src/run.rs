@@ -7579,6 +7579,60 @@ fn evidence_for(
     ev
 }
 
+/// Exercise the real capture projection from a retained Engine test route.
+/// The route owns discovery, links and gap history; this adapter adds no gap fact.
+#[cfg(test)]
+pub(crate) fn physical_gap_public_evidence_for_test(engine: &Engine) -> [serde_json::Value; 3] {
+    let state = semantics::State::new(engine.plan());
+    let evidence = evidence_for(
+        engine,
+        engine.capture_facts(),
+        0,
+        false,
+        false,
+        Default::default(),
+        &[],
+        &[],
+        metrics::KernelEvidence::default(),
+        process::TrackingEvidence::default(),
+        0,
+        &state,
+        false,
+        true,
+        Default::default(),
+        None,
+        false,
+        render::SchedulingEvidence::default(),
+        None,
+        None,
+    );
+    let mut capture = render::CaptureMeta {
+        started: "t0",
+        ended: "t1",
+        kernel: "test",
+        policy: CapturePolicy::Allowlisted,
+        scope: "pid",
+        ring_bytes: p11scope_ebpf_common::RING_BYTES,
+        drain_interval_ms: 1000,
+    };
+    let profile = render::profile_json(
+        &[],
+        render::VersionedEvidence::wrap(&evidence),
+        &state,
+        &capture,
+    )["evidence"]
+        .clone();
+    capture.policy = CapturePolicy::AggregateOnly;
+    let metrics = render::json(&[], &evidence, &capture)["evidence"].clone();
+    let trace = serde_json::from_str(
+        trace::evidence_line(&evidence, CapturePolicy::Allowlisted)
+            .strip_prefix("EVIDENCE ")
+            .expect("public terminal evidence"),
+    )
+    .expect("valid public terminal evidence");
+    [profile, metrics, trace]
+}
+
 fn attach_mechanisms(
     attached_probes: usize,
     dynamic_per_offset_attached: bool,

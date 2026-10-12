@@ -177,7 +177,7 @@ class DualBuildCallerTests(unittest.TestCase):
                 self.assertFalse(self.work.exists())
 
     def configure_attach_observer(self, *, skipped=1, log_lines=(), checker_status=None,
-                                  log_fault=None, terminal_attribution=False):
+                                  log_fault=None, terminal_attribution=False, profiler_status=0):
         """Keep the actual gate, waits and checker; fake only external commands."""
         for name in ("check-capture-evidence.py", "lane-attach-e2e-oracle.py"):
             shutil.copy2(ROOT / "scripts" / name, self.repo / "scripts" / name)
@@ -211,7 +211,8 @@ class DualBuildCallerTests(unittest.TestCase):
         self.environment["P11SCOPE_PKCS11_MODULE"] = str(self.module)
         self.config.write_text(json.dumps({"events": str(self.events),
                                            "documents": documents, "log_lines": log_lines,
-                                           "terminal_attribution": terminal_attribution}),
+                                           "terminal_attribution": terminal_attribution,
+                                           "profiler_status": profiler_status}),
                                encoding="utf-8")
         dispatcher = '''#!/usr/bin/python3
 import json, mmap, os, shutil, sys, time
@@ -247,6 +248,7 @@ elif kind == "p11scope":
     if config["terminal_attribution"]:
         for line in config["log_lines"]:
             print(line)
+    raise SystemExit(config["profiler_status"])
 elif kind == "p11scope-discover":
     Path(sys.argv[sys.argv.index("-o") + 1]).write_text("{}")
 elif kind == "sudo":
@@ -334,6 +336,28 @@ raise SystemExit({checker_status})
         self.assertIn("=== e2e: ALL OK ===", result.stdout)
         self.assertNotIn(attribution, result.stdout + result.stderr)
         self.assertEqual(sum(row["kind"] == "p11scope" for row in self.rows()), 2)
+
+    def test_attach_failed_profiler_preserves_status_and_filters_private_attribution(self):
+        attribution = "p11scope: skip-attribution: PRIVATE ATTRIBUTION " + "x" * 5000
+        self.configure_attach_observer(log_lines=(attribution,), terminal_attribution=True,
+                                       profiler_status=37)
+        for diagnose in (False, True):
+            with self.subTest(diagnose=diagnose):
+                result = self.run_child(CHILDREN[0],
+                                        arguments=("--diagnose-skips",) if diagnose else ())
+                self.assertEqual(result.returncode, 37, result.stderr)
+                self.assertIn("profiler failed: 37", result.stdout)
+                self.assertIn("ordinary terminal line 2", result.stdout)
+                self.assertEqual(attribution in result.stdout, not diagnose)
+                self.assertNotIn("PRIVATE ATTRIBUTION", result.stderr)
+                if diagnose:
+                    self.assertNotIn("p11scope: skip-attribution:", result.stdout + result.stderr)
+                self.assertNotIn("capture evidence rejected:", result.stderr)
+                self.assertNotIn("=== discover", result.stdout)
+                self.assertNotIn("manifest corroborated against the scan", result.stdout)
+                self.assertNotIn("ALL OK", result.stdout)
+                self.assertEqual(sum(row["kind"] == "p11scope" for row in self.rows()), 1)
+                self.assertFalse(any(row["kind"] == "p11scope-discover" for row in self.rows()))
 
     def test_attach_self_test_returns_before_build_or_resources(self):
         self.configure([83])

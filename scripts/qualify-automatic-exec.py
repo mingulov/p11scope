@@ -38,6 +38,7 @@ and cleanup receipts are recorded in summary.json.
 
 import argparse
 from collections import Counter, defaultdict, deque
+from collections.abc import Mapping
 from functools import wraps
 from contextvars import ContextVar
 import ctypes
@@ -206,9 +207,15 @@ def stop_errors(receipt):
 def expected_reuse_errors(receipt):
     errors = []
     reuse_expected = receipt.get("reuse_expected", {})
+    if not isinstance(reuse_expected, Mapping):
+        raise TypeError("reuse_expected must be a mapping")
     for kind in ("session", "va", "token"):
+        if not reuse_expected.get(kind):
+            continue
         info = receipt.get(f"{kind}_reuse", {})
-        if reuse_expected.get(kind) and not info.get("observed"):
+        if not isinstance(info, Mapping):
+            raise TypeError(f"{kind}_reuse must be a mapping when reuse is required")
+        if not info.get("observed"):
             errors.append(f"expected {kind} reuse across exec is not demonstrated by the ledger")
     return errors
 

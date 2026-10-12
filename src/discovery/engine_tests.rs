@@ -3315,7 +3315,7 @@ fn a_view_retired_after_its_group_exited_is_not_a_link_loss() {
     let view = ProcessView::open(ProcessViewId(40), child.id()).unwrap();
     let mut engine = Engine::empty();
     engine.views.push(view);
-    engine.queue_leader_exit_assessment(ProcessViewId(40));
+    engine.queue_leader_exit_assessment(ProcessViewId(40), None);
     child.kill().unwrap();
     child.wait().unwrap();
 
@@ -3332,7 +3332,7 @@ fn a_view_retired_after_its_group_exited_is_not_a_link_loss() {
 
     // The fail-closed path is untouched: an assessment that never became
     // answerable is still counted at capture end.
-    engine.queue_leader_exit_assessment(ProcessViewId(41));
+    engine.queue_leader_exit_assessment(ProcessViewId(41), None);
     finalize_pending_leader_exit_views(
         &mut engine.pending_leader_exit_views,
         &mut engine.counted_leader_exit_views,
@@ -3353,7 +3353,7 @@ fn a_view_retired_while_its_group_lives_is_still_a_link_loss() {
     let view = ProcessView::open(ProcessViewId(42), child.id()).unwrap();
     let mut engine = Engine::empty();
     engine.views.push(view);
-    engine.queue_leader_exit_assessment(ProcessViewId(42));
+    engine.queue_leader_exit_assessment(ProcessViewId(42), None);
 
     engine.settle_leader_exits_at_removal([ProcessViewId(42)]);
 
@@ -36455,6 +36455,540 @@ fn continuity_route() -> (TabledSeedProvider, Engine, ScriptedSession) {
     assert_eq!(continuity.identities().len(), engine.plan.slots.len());
     session.pid_continuity = Some(std::cell::RefCell::new(continuity));
     (fixture, engine, session)
+}
+
+fn cold_leader_exit_bound_route() -> (TabledSeedProvider, Engine, ScriptedSession, DiscoveryRecord)
+{
+    let (mut fixture, mut engine, mut session) = continuity_route();
+    let view = engine.views[0].id();
+    let pid = engine.views[0].pid();
+    let mut leader: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    leader.kind = DISCOVERY_KIND_LEADER_EXIT;
+    leader.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+    leader.hook_ts_ns = crate::attach::monotonic_ns().unwrap();
+    assert!(valid_discovery_record(&leader));
+    session
+        .pid_continuity
+        .as_mut()
+        .unwrap()
+        .borrow_mut()
+        .observe(leader);
+    fixture.reexec(false);
+    let mut exec = exec_record_for(pid);
+    exec.pid_tgid |= u64::from(pid);
+    exec.case_id = p11scope_ebpf_common::DISCOVERY_EXEC_TASK_REPLACED;
+    assert!(valid_discovery_record(&exec));
+    assert!(leader.hook_ts_ns < exec.hook_ts_ns);
+    session
+        .pid_continuity
+        .as_mut()
+        .unwrap()
+        .borrow_mut()
+        .observe(exec);
+
+    // These genuine decoded records transfer through the ordinary retained
+    // FIFO. The backlog route retires the old loader but deliberately yields
+    // inventory to the next full opportunity, as in the installed capture.
+    session.dequeues.extend(
+        [leader, exec]
+            .into_iter()
+            .map(|record| Ok(Some(crate::events::DiscoveryItem::Record(record)))),
+    );
+    session
+        .stage_discovery(2, engine.discovery_held_len())
+        .unwrap();
+    let outcome = engine.service_backlog_quantum(&mut session).unwrap();
+    assert!(outcome.progressed);
+    assert!(engine.pending_leader_exit_views.contains(&view));
+    assert_eq!(engine.views[0].original_exited(), Ok(false));
+    assert!(engine.views[0].still_the_same());
+    let request = &engine.refresh_requested[&pid];
+    assert_eq!(request.owner, Some(view));
+    assert!(request.serial > 0);
+    assert!(request.exec_binding.is_some());
+    assert_eq!(engine.exec_rearm_views[&view], Some(request.serial));
+    assert_eq!(
+        exec.case_id,
+        p11scope_ebpf_common::DISCOVERY_EXEC_TASK_REPLACED
+    );
+    (fixture, engine, session, exec)
+}
+
+#[test]
+fn automatic_exec_cold_leader_exit_later_bound_exec_recovers() {
+    let (_fixture, mut engine, mut session, _exec) = cold_leader_exit_bound_route();
+    let pid = engine.views[0].pid();
+    let view = engine.views[0].id();
+    let request = engine.refresh_requested[&pid].clone();
+    let registrations = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .identities();
+    let native_before = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .native_attach_calls;
+    let maps_before = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .target_map_prepares;
+    let detaches_before = session
+        .detached_slot_indices
+        .iter()
+        .filter(|s| !s.is_empty())
+        .count();
+    assert!(engine.loader_registry.ids_for_view(view).is_empty());
+    let retired_loaders = session.detached.clone();
+    assert!(!retired_loaders.is_empty());
+
+    let settled = apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+    assert!(
+        !settled.required_complete,
+        "the loss opportunity stays incomplete"
+    );
+    assert_eq!(engine.task_uprobe_link_losses, 1);
+    assert!(engine.pending_leader_exit_views.is_empty());
+    assert!(engine.views[0].still_the_same());
+    assert_eq!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .native_attach_calls,
+        native_before
+    );
+    assert_eq!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .target_map_prepares,
+        maps_before
+    );
+    let pending_after_loss = engine.refresh_requested.get(&pid).cloned();
+    assert_eq!(
+        pending_after_loss,
+        Some(request),
+        "the exact owed request survives without renewal"
+    );
+    assert!(
+        session.physical_gap_summary().open,
+        "conservative retirement leaves the physical gap open"
+    );
+
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+    let detaches_after = session
+        .detached_slot_indices
+        .iter()
+        .filter(|s| !s.is_empty())
+        .count();
+    assert!(
+        detaches_after > detaches_before,
+        "later bound EXEC must physically rearm after older leader EXIT settlement: before={detaches_before}, after={detaches_after}, request_after_loss={pending_after_loss:?}"
+    );
+    assert!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .native_attach_calls
+            > native_before
+    );
+    assert_ne!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities(),
+        registrations
+    );
+    assert!(
+        !session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities()
+            .is_empty()
+    );
+    assert_eq!(engine.loader_registry.ids_for_view(view).len(), 1);
+    assert!(!retired_loaders.contains(&engine.loader_registry.ids_for_view(view)[0]));
+    assert!(
+        !session.physical_gap_summary().open,
+        "actual complete new pairs close the physical gap"
+    );
+    assert!(!engine.refresh_requested.contains_key(&pid));
+    assert!(!engine.exec_rearm_views.contains_key(&view));
+    assert_eq!(engine.task_uprobe_link_losses, 1);
+    assert!(engine.pending_leader_exit_order.is_empty());
+}
+
+fn settle_cold_leader_exit(engine: &mut Engine) {
+    let mut additions = true;
+    let mut closure = PauseClosure::new(true);
+    engine.settle_leader_exit_assessments(
+        &engine.pending_leader_exit_views.clone(),
+        &mut PendingViewRetirements::new(),
+        &mut additions,
+        &mut closure,
+    );
+    assert!(
+        !additions,
+        "loss or unresolved identity closes this opportunity"
+    );
+    assert!(!closure.required_complete());
+}
+
+#[test]
+fn automatic_exec_cold_leader_exit_unknown_equal_later_order_refuses() {
+    for condition in 0..5 {
+        let (_fixture, mut engine, session, exec) = cold_leader_exit_bound_route();
+        let pid = engine.views[0].pid();
+        let view = engine.views[0].id();
+        let extra = match condition {
+            0 => None,
+            1 => Some(0),
+            2 => Some(exec.hook_ts_ns),
+            3 => Some(exec.hook_ts_ns + 1),
+            _ => Some(exec.hook_ts_ns - 1),
+        };
+        if condition == 4 {
+            engine.queue_leader_exit_assessment(view, None);
+        }
+        engine.queue_leader_exit_assessment(view, extra);
+        let order = engine.pending_leader_exit_order[&view];
+        assert!(!engine.pid_exec_after_leader_exit(view, pid, order));
+        let before = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities();
+        settle_cold_leader_exit(&mut engine);
+        assert!(
+            !engine.refresh_requested.contains_key(&pid),
+            "ordering case {condition}"
+        );
+        assert_eq!(engine.task_uprobe_link_losses, 1);
+        assert!(engine.pending_leader_exit_order.is_empty());
+        assert_eq!(
+            session
+                .pid_continuity
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .identities(),
+            before
+        );
+    }
+}
+
+#[test]
+fn automatic_exec_cold_leader_exit_changed_request_refuses() {
+    for condition in 0..9 {
+        let (_fixture, mut engine, mut session, exec) = cold_leader_exit_bound_route();
+        let pid = engine.views[0].pid();
+        let view = engine.views[0].id();
+        let original = engine.refresh_requested[&pid].clone();
+        match condition {
+            0 => engine.refresh_requested.get_mut(&pid).unwrap().exec_binding = None,
+            1 => {
+                engine
+                    .refresh_requested
+                    .get_mut(&pid)
+                    .unwrap()
+                    .exec_hook_ts_ns = None
+            }
+            2 => engine.refresh_requested.get_mut(&pid).unwrap().serial += 1,
+            3 => {
+                engine.refresh_requested.get_mut(&pid).unwrap().owner =
+                    Some(ProcessViewId(view.0 + 1))
+            }
+            4 => {
+                engine.exec_rearm_views.remove(&view);
+            }
+            5 => {
+                engine.exec_rearm_views.insert(view, None);
+            }
+            6 => {
+                assert!(engine.request_refresh_consumed(pid, Some(u64::MAX)));
+            }
+            7 => {
+                engine.refresh_requested.remove(&pid);
+                assert!(engine.request_refresh(pid, None));
+            }
+            _ => {
+                // Actual unclassified adapter: the next consumed record cannot
+                // bind to a PID Session, and carries no positive clock proof.
+                session.pid_continuity = None;
+                let mut unknown = exec;
+                unknown.case_id = p11scope_ebpf_common::DISCOVERY_EXEC_UNKNOWN;
+                unknown.hook_ts_ns = crate::attach::monotonic_ns().unwrap();
+                assert!(valid_discovery_record(&unknown));
+                engine.dispatch_lifecycle_record(
+                    &mut session,
+                    &unknown,
+                    &mut PendingViewRetirements::new(),
+                );
+                assert!(engine.refresh_requested[&pid].exec_binding.is_none());
+                assert!(engine.refresh_requested[&pid].exec_hook_ts_ns.is_none());
+            }
+        }
+        let changed = engine.refresh_requested[&pid].clone();
+        assert!(!engine.pid_exec_after_leader_exit(
+            view,
+            pid,
+            engine.pending_leader_exit_order[&view]
+        ));
+        let native_before = session
+            .pid_continuity
+            .as_ref()
+            .map(|s| s.borrow().native_attach_calls);
+        settle_cold_leader_exit(&mut engine);
+        if condition == 3 {
+            assert_eq!(
+                engine.refresh_requested[&pid], changed,
+                "another owner's request is never removed"
+            );
+        } else {
+            assert!(
+                !engine.refresh_requested.contains_key(&pid),
+                "request case {condition}"
+            );
+        }
+        if condition == 6 {
+            assert!(changed.serial > original.serial);
+            assert_eq!(changed.first_seen_ns, original.first_seen_ns);
+        }
+        assert_eq!(
+            session
+                .pid_continuity
+                .as_ref()
+                .map(|s| s.borrow().native_attach_calls),
+            native_before
+        );
+        assert_eq!(engine.task_uprobe_link_losses, 1);
+        assert!(engine.pending_leader_exit_order.is_empty());
+    }
+}
+
+#[test]
+fn automatic_exec_cold_leader_exit_all_older_exits_recover_once() {
+    let (_fixture, mut engine, mut session, exec) = cold_leader_exit_bound_route();
+    let pid = engine.views[0].pid();
+    let view = engine.views[0].id();
+    let original = engine.refresh_requested[&pid].clone();
+    let first_exit = engine.pending_leader_exit_order[&view].unwrap();
+    assert!(first_exit < exec.hook_ts_ns - 1);
+    engine.queue_leader_exit_assessment(view, Some(exec.hook_ts_ns - 1));
+    engine.queue_leader_exit_assessment(view, Some(first_exit));
+    assert_eq!(
+        engine.pending_leader_exit_order[&view],
+        Some(exec.hook_ts_ns - 1)
+    );
+    settle_cold_leader_exit(&mut engine);
+    assert_eq!(engine.refresh_requested[&pid], original);
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+    let detaches = session
+        .detached_slot_indices
+        .iter()
+        .filter(|s| !s.is_empty())
+        .count();
+    assert_eq!(
+        detaches, 1,
+        "all older EXITs still owe one physical recovery"
+    );
+    assert!(!engine.refresh_requested.contains_key(&pid));
+    assert!(!engine.exec_rearm_views.contains_key(&view));
+    engine.queue_leader_exit_assessment(view, Some(first_exit));
+    settle_cold_leader_exit(&mut engine);
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+    assert_eq!(
+        session
+            .detached_slot_indices
+            .iter()
+            .filter(|s| !s.is_empty())
+            .count(),
+        detaches
+    );
+    assert_eq!(
+        engine.task_uprobe_link_losses, 1,
+        "the same view's loss is counted once"
+    );
+}
+
+#[test]
+fn automatic_exec_cold_leader_exit_stop_terminal_cancel_never_mutates() {
+    for condition in 0..4 {
+        let (_fixture, mut engine, mut session, _exec) = cold_leader_exit_bound_route();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        match condition {
+            0 => {
+                session
+                    .pid_continuity
+                    .as_mut()
+                    .unwrap()
+                    .borrow_mut()
+                    .stop_word = p11scope_ebpf_common::STOP_GATE_STOP
+            }
+            1 => session
+                .pid_continuity
+                .as_mut()
+                .unwrap()
+                .borrow_mut()
+                .terminal(),
+            2 => {
+                session
+                    .pid_continuity
+                    .as_mut()
+                    .unwrap()
+                    .borrow_mut()
+                    .producers_detached = true
+            }
+            _ => {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+                engine.set_cancel_flag(cancel);
+            }
+        }
+        let before = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .identities();
+        let native_before = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .native_attach_calls;
+        let maps_before = session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .target_map_prepares;
+        for _ in 0..2 {
+            let outcome = apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+            assert!(!outcome.required_complete, "stopped case {condition}");
+        }
+        assert_eq!(
+            session
+                .pid_continuity
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .identities(),
+            before
+        );
+        assert_eq!(
+            session
+                .pid_continuity
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .native_attach_calls,
+            native_before
+        );
+        assert_eq!(
+            session
+                .pid_continuity
+                .as_ref()
+                .unwrap()
+                .borrow()
+                .target_map_prepares,
+            maps_before
+        );
+        assert!(!session.detached_slot_indices.iter().any(|s| !s.is_empty()));
+    }
+}
+
+#[test]
+fn automatic_exec_cold_leader_exit_ended_original_prunes_order() {
+    let (mut fixture, mut engine, mut session, _exec) = cold_leader_exit_bound_route();
+    let pid = engine.views[0].pid();
+    let view = engine.views[0].id();
+    let native_before = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .native_attach_calls;
+    fixture.child.kill().unwrap();
+    fixture.child.wait().unwrap();
+    assert_eq!(engine.views[0].original_exited(), Ok(true));
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+    assert!(engine.views.is_empty());
+    assert!(!engine.refresh_requested.contains_key(&pid));
+    assert!(!engine.exec_rearm_views.contains_key(&view));
+    assert!(engine.pending_leader_exit_order.is_empty());
+    assert_eq!(
+        engine.task_uprobe_link_losses, 0,
+        "proven whole-group exit stays expected"
+    );
+    assert_eq!(
+        session
+            .pid_continuity
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .native_attach_calls,
+        native_before
+    );
+}
+
+#[test]
+fn automatic_exec_cold_leader_exit_unavailable_view_defers_and_terminal_prunes() {
+    let (_fixture, mut engine, session, _exec) = cold_leader_exit_bound_route();
+    let pid = engine.views[0].pid();
+    let view = engine.views[0].id();
+    let request = engine.refresh_requested[&pid].clone();
+    let order = engine.pending_leader_exit_order[&view];
+    let retained = std::mem::take(&mut engine.views);
+    settle_cold_leader_exit(&mut engine);
+    assert_eq!(engine.refresh_requested[&pid], request);
+    assert!(engine.pending_leader_exit_views.contains(&view));
+    assert_eq!(engine.pending_leader_exit_order[&view], order);
+    assert_eq!(engine.task_uprobe_link_losses, 0);
+    engine.views = retained;
+    assert!(engine.views[0].still_the_same());
+    engine.settle_terminal_drain();
+    assert!(engine.pending_leader_exit_views.is_empty());
+    assert!(engine.pending_leader_exit_order.is_empty());
+    assert_eq!(engine.task_uprobe_link_losses, 1);
+    engine.settle_terminal_drain();
+    assert_eq!(engine.task_uprobe_link_losses, 1);
+    assert!(!session.detached_slot_indices.iter().any(|s| !s.is_empty()));
+}
+
+#[test]
+fn automatic_exec_cold_leader_exit_system_cgroup_keep_prior_policy() {
+    for system in [true, false] {
+        let (_fixture, mut engine, session, _exec) = cold_leader_exit_bound_route();
+        let pid = engine.views[0].pid();
+        let view = engine.views[0].id();
+        let (cgroup, _dir) = engine_over_cgroup_naming(&[pid]);
+        engine.scope = if system { Scope::System } else { cgroup.scope };
+        assert!(!engine.pid_exec_after_leader_exit(
+            view,
+            pid,
+            engine.pending_leader_exit_order[&view]
+        ));
+        settle_cold_leader_exit(&mut engine);
+        assert!(!engine.refresh_requested.contains_key(&pid));
+        assert_eq!(engine.task_uprobe_link_losses, 1);
+        assert!(!session.detached_slot_indices.iter().any(|s| !s.is_empty()));
+    }
 }
 
 fn observed_candidate_exec(engine: &Engine, session: &mut ScriptedSession) -> DiscoveryRecord {

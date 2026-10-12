@@ -2681,6 +2681,13 @@ pub(crate) trait EngineSession {
     ) -> Result<DetachOutcome> {
         self.detach_slots(slots)
     }
+    fn has_dynamic_loader(
+        &self,
+        context: LoaderContextId,
+        object: PinnedObjectId,
+        file_offset: u64,
+        cookie: u64,
+    ) -> bool;
     fn has_dynamic_export(
         &self,
         context: LoaderContextId,
@@ -2866,6 +2873,16 @@ impl EngineSession for Session {
         ended: &crate::attach::EndedPidRetirement,
     ) -> Result<DetachOutcome> {
         Session::detach_ended_pid_slots(self, slots, owner, ended)
+    }
+
+    fn has_dynamic_loader(
+        &self,
+        context: LoaderContextId,
+        object: PinnedObjectId,
+        file_offset: u64,
+        cookie: u64,
+    ) -> bool {
+        Session::has_dynamic_link(self, context, "dl_debug_state", object, file_offset, cookie)
     }
 
     fn has_dynamic_export(
@@ -21003,6 +21020,61 @@ impl Engine {
         self.loader_arms
     }
 
+    /// A bounded snapshot of committed hooks backed by this Session's exact
+    /// link and the current retained loader. It proves no loader-hit timing.
+    pub(crate) fn active_loader_hook_count(&mut self, session: &dyn EngineSession) -> usize {
+        let contexts: Vec<_> = self
+            .loader_registry
+            .attached_contexts()
+            .map(|(id, _)| id)
+            .collect();
+        let mut count = 0;
+        for id in contexts {
+            let context = self
+                .loader_registry
+                .context(id)
+                .expect("a retained attached context");
+            let spec = context.spec.clone();
+            let cookie = context.cookie;
+            let Some(position) = self.views.iter().position(|view| view.id() == spec.view) else {
+                continue;
+            };
+            if self.retirement_intents.contains_key(&spec.view)
+                || !self.views[position].still_the_same()
+                || !self
+                    .pinned
+                    .view_claims(spec.view)
+                    .is_some_and(|claims| claims.pins.contains(&spec.loader))
+                || !self.pinned.object_unchanged(spec.loader).unwrap_or(false)
+                || !session.has_dynamic_loader(id, spec.loader, spec.hook.file_offset, cookie)
+            {
+                continue;
+            }
+            let Ok(Some(locator)) = Self::loader_locator(&self.views[position], &mut self.budget)
+            else {
+                continue;
+            };
+            let valid = self
+                .pinned
+                .summary(spec.loader)
+                .is_some_and(|loader| loader.key == locator.authority.loader_key)
+                && self.pinned.file_for(spec.loader).is_some_and(|file| {
+                    FileSnapshot::read(file).ok().as_ref()
+                        == Some(&locator.authority.interpreter_file)
+                })
+                && unique_mapping_for_offset(&locator.authority.loader_maps, spec.hook.file_offset)
+                    .is_ok_and(|current| {
+                        spec.mapping
+                            .as_ref()
+                            .is_none_or(|expected| current == *expected)
+                    });
+            if valid && self.views[position].still_the_same() {
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// Batch-tail publications executed vs skipped as provably redundant.
     pub(crate) fn tail_stats(&self) -> (u64, u64) {
         (self.tail_publishes, self.tail_skips)
@@ -21881,6 +21953,17 @@ pub(crate) mod session_fixture {
             proof: &crate::attach::EndedPidRetirement,
         ) -> Result<DetachOutcome> {
             self.detach_slots_with_ended(slots, Some((owner, proof)))
+        }
+
+        fn has_dynamic_loader(
+            &self,
+            context: LoaderContextId,
+            object: PinnedObjectId,
+            file_offset: u64,
+            cookie: u64,
+        ) -> bool {
+            self.dynamic_loader_links
+                .contains(&(context, object, file_offset, cookie))
         }
 
         fn has_dynamic_export(

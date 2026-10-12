@@ -253,28 +253,45 @@ struct Capture {
     _provider: Option<ProviderFixture>,
     _serial: MutexGuard<'static, ()>,
 }
+
+#[derive(Clone, Copy)]
+enum ProviderStage {
+    Absent,
+    InitiallyMapped,
+    AfterInitialScan,
+}
+
 impl Capture {
     fn fresh(unrelated: usize, system: bool) -> Self {
-        Self::build(unrelated, system, false)
+        Self::build(unrelated, system, ProviderStage::Absent)
     }
 
     fn mapped(unrelated: usize) -> Self {
-        Self::build(unrelated, true, true)
+        Self::build(unrelated, true, ProviderStage::InitiallyMapped)
     }
 
-    fn build(unrelated: usize, system: bool, mapped: bool) -> Self {
+    fn late_mapped(unrelated: usize) -> Self {
+        Self::build(unrelated, true, ProviderStage::AfterInitialScan)
+    }
+
+    fn build(unrelated: usize, system: bool, provider_stage: ProviderStage) -> Self {
         // The fixture owns up to 132 processes and their original pidfds. Keep
         // these controls serial even when the unit-test harness is parallel.
         let serial = CAPTURE_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let provider = mapped.then(ProviderFixture::new);
+        let provider =
+            (!matches!(provider_stage, ProviderStage::Absent)).then(ProviderFixture::new);
         let mut children = Children(Vec::new());
         let mut views = Vec::new();
         for index in 0..=unrelated {
             let child = if index == unrelated {
                 if let Some(provider) = &provider {
-                    provider.command().spawn().unwrap()
+                    let mut command = provider.command();
+                    if matches!(provider_stage, ProviderStage::AfterInitialScan) {
+                        command.env("P11SCOPE_FIXTURE_GATE", "1");
+                    }
+                    command.spawn().unwrap()
                 } else {
                     Command::new("/bin/sleep").arg("30").spawn().unwrap()
                 }
@@ -283,7 +300,7 @@ impl Capture {
             };
             let pid = child.id();
             children.0.push(child);
-            if index == unrelated && provider.is_some() {
+            if index == unrelated && matches!(provider_stage, ProviderStage::InitiallyMapped) {
                 ProviderFixture::ready(children.0.last_mut().unwrap());
             }
             views.push(ProcessView::open(ProcessViewId(index as u32), pid).unwrap());
@@ -320,8 +337,9 @@ impl Capture {
                 .unwrap();
                 assert_eq!(
                     modules.is_empty(),
-                    position != unrelated,
-                    "only the actual mapped PKCS#11 caller contributes a module"
+                    position != unrelated
+                        || !matches!(provider_stage, ProviderStage::InitiallyMapped),
+                    "only an actually mapped PKCS#11 caller contributes a module"
                 );
                 assert!(modules.iter().all(|module| module.view == id));
                 // This is the discover_plan ingress. Scheduling metadata is
@@ -443,9 +461,13 @@ impl Capture {
     }
 
     fn readiness(&mut self) -> Option<usize> {
-        let mut next_frame = 0;
+        self.readiness_from(0)
+    }
+
+    fn readiness_from(&mut self, start: u64) -> Option<usize> {
+        let mut next_frame = start;
         for attempt in 1..=MAX_ATTEMPTS {
-            let marker = FIRST_MARKER_NS + (attempt - 1) as u64 * ATTEMPT_WAIT_NS;
+            let marker = start + FIRST_MARKER_NS + (attempt - 1) as u64 * ATTEMPT_WAIT_NS;
             assert!(marker < READINESS_NS);
             while next_frame <= marker {
                 self.frame(next_frame);
@@ -491,6 +513,73 @@ fn fresh_system_trace_names_original_last_view_within_readiness_bounds() {
     let mut capture = Capture::mapped(131);
     assert!(
         capture.readiness().is_some(),
+        "{}",
+        capture.io.boundaries.borrow().join("\n")
+    );
+}
+
+#[test]
+fn fresh_system_trace_names_provider_found_after_initial_scan() {
+    use std::io::Write as _;
+
+    let mut capture = Capture::late_mapped(131);
+    let view = capture.engine.views.last().unwrap();
+    let id = view.id();
+    let original = view.view_admission();
+    assert_eq!(capture.engine.scan_inputs.len(), 132);
+    assert!(
+        capture
+            .engine
+            .scan_inputs
+            .values()
+            .all(|input| input.modules.is_empty())
+    );
+    assert!(capture.engine.trace_provider_views.is_empty());
+
+    // Naming service has started while the original caller remains at its
+    // pre-dlopen gate. Releasing stdin changes mappings, never the process or
+    // its executable. The post-call gate then retains the mapped provider.
+    capture.frame(0);
+    let child = capture._children.0.last_mut().unwrap();
+    assert_eq!(child.id(), capture.io.target);
+    child.stdin.as_mut().unwrap().write_all(b"!").unwrap();
+    ProviderFixture::ready(child);
+    assert!(
+        original.same_allocation(&capture.engine.views.last().unwrap().view_admission())
+    );
+    assert!(capture.engine.views.last().unwrap().still_the_same());
+
+    // Use the actual refresh-scan ingress, which performs scan_and_pin and
+    // note_scan_observed itself. Keep its real modules and pins held through
+    // readiness; do not fill or alter the initial per-view scan input.
+    let (late_scans, failed, deferred, _) = capture.engine.scan_inventory_views(
+        &BTreeSet::from([id]),
+        "late mapped provider refresh",
+        &mut crate::attach::monotonic_ns,
+    );
+    assert!(failed.is_empty() && deferred.is_empty());
+    assert_eq!(late_scans.len(), 1);
+    assert_eq!(late_scans[0].0, id);
+    assert!(!late_scans[0].1.is_empty());
+    assert!(late_scans[0].1.iter().all(|module| module.view == id));
+    assert!(capture.engine.trace_provider_views.contains(&id));
+    capture.io.boundary(
+        "late mapped provider scan association",
+        (
+            late_scans[0].1.len(),
+            capture
+                .engine
+                .scan_inputs
+                .get(&id)
+                .map(|input| input.modules.len()),
+            capture.engine.trace_provider_associated(id),
+        ),
+    );
+
+    // Start at the next ordinary frame, preserving monotonic proof time and
+    // the same twenty markers, 500ms cadence, 15s bound and 8/32/5ms tickets.
+    assert!(
+        capture.readiness_from(FRAME_NS).is_some(),
         "{}",
         capture.io.boundaries.borrow().join("\n")
     );

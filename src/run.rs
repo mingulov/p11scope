@@ -5358,6 +5358,8 @@ fn capture_trace(
         ));
     }
     let mut tracer = trace::Tracer::new(engine.plan());
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    let reexec_diagnostic = session.reexec_diagnostic();
 
     let mut stdout_open = true;
     let mut malformed_records: u64 = 0;
@@ -5676,6 +5678,8 @@ fn capture_trace(
                         &mut tracer,
                     ),
                     identities.as_ref(),
+                    #[cfg(feature = "h6-reexec-diagnostic")]
+                    reexec_diagnostic.as_ref(),
                     (&mut *(stdout), &mut stdout_open, &mut *(out_file)),
                     Some(crate::events::LIVE_POLL_QUANTUM),
                 ) {
@@ -5845,6 +5849,8 @@ fn capture_trace(
                                         .expect("trace consumer")),
                                 ),
                                 context.8.as_ref(),
+                                #[cfg(feature = "h6-reexec-diagnostic")]
+                                reexec_diagnostic.as_ref(),
                                 (&mut *(context.5), &mut *(context.6), &mut *(context.7)),
                                 &mut root_write_error,
                                 event,
@@ -5999,6 +6005,29 @@ fn capture_trace(
                         context.6,
                         context.7,
                     )?;
+                    crate::attach::reexec_diagnostic::observe!(context.1, |diag| {
+                        let gap = context.1.physical_gap_summary();
+                        diag.finish(
+                            crate::attach::reexec_diagnostic::canary_counts(&reports),
+                            consumers
+                                .tracer
+                                .as_deref()
+                                .expect("trace consumer")
+                                .raw_calls(),
+                            [
+                                evidence.scheduling.sink_dropped_bytes,
+                                evidence.scheduling.sink_timeouts,
+                                evidence.scheduling.sink_stall_ms,
+                                u64::from(*context.6),
+                            ],
+                            [
+                                Some(gap.episodes),
+                                Some(u64::from(gap.open)),
+                                Some(u64::from(gap.unknown)),
+                                gap.max_gap_ns.map(|n| n / 1_000_000),
+                            ],
+                        );
+                    });
                     let summary = timing_summary_line(&evidence.scheduling);
                     eprintln!("{summary}");
                     Ok(evidence)
@@ -6978,6 +7007,9 @@ fn drain_trace_events_to_position<S: crate::events::BoundedRecordSource, W: Writ
     scope: &Scope,
     tracer: &mut trace::Tracer,
     identities: Option<&crate::trace_identity::TraceIdentityStore>,
+    #[cfg(feature = "h6-reexec-diagnostic")] diagnostic: Option<
+        &crate::attach::reexec_diagnostic::Diagnostic,
+    >,
     stdout: &mut dyn Write,
     stdout_open: &mut bool,
     out_file: &mut Option<W>,
@@ -7002,6 +7034,8 @@ fn drain_trace_events_to_position<S: crate::events::BoundedRecordSource, W: Writ
                         &mut *(tracer),
                     ),
                     identities,
+                    #[cfg(feature = "h6-reexec-diagnostic")]
+                    diagnostic,
                     (&mut *(stdout), &mut *(stdout_open), &mut *(out_file)),
                     &mut write_error,
                     ev,
@@ -7049,6 +7083,8 @@ fn drain_trace_events<W: Write>(
             post_q_record,
         } => (true, Some((events_q, post_q_record))),
     };
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    let reexec_diagnostic = session.reexec_diagnostic();
     let drain = session.event_drain()?;
     if let Some((events_q, post_q_record)) = quiesced {
         let phase_start = Instant::now();
@@ -7062,6 +7098,8 @@ fn drain_trace_events<W: Write>(
             scope,
             tracer,
             identities,
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            reexec_diagnostic.as_ref(),
             stdout,
             stdout_open,
             out_file,
@@ -7102,6 +7140,8 @@ fn drain_trace_events<W: Write>(
                             &mut *(tracer),
                         ),
                         identities,
+                        #[cfg(feature = "h6-reexec-diagnostic")]
+                        reexec_diagnostic.as_ref(),
                         (&mut *(stdout), &mut *(stdout_open), &mut *(out_file)),
                         quantum,
                     )
@@ -7180,6 +7220,8 @@ fn reduce_trace_event<W: Write>(
             &mut *(tracer),
         ),
         None,
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        None,
         (&mut *(stdout), &mut *(stdout_open), &mut *(out_file)),
         write_error,
         ev,
@@ -7210,6 +7252,8 @@ fn drain_trace_events_from<S: crate::events::RecordSource, W: Write>(
             &mut *(tracer),
         ),
         None,
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        None,
         (&mut *(stdout), &mut *(stdout_open), &mut *(out_file)),
         quantum,
     )
@@ -7219,6 +7263,9 @@ fn reduce_trace_event_with_identities<W: Write>(
     domain: u64,
     (remaining, state, tracker, scope, tracer): TraceEventConsumers<'_, '_, '_, '_, '_>,
     identities: Option<&crate::trace_identity::TraceIdentityStore>,
+    #[cfg(feature = "h6-reexec-diagnostic")] diagnostic: Option<
+        &crate::attach::reexec_diagnostic::Diagnostic,
+    >,
     (stdout, stdout_open, out_file): TraceEventOutputs<'_, '_, '_, W>,
     write_error: &mut Option<anyhow::Error>,
     ev: p11scope_ebpf_common::Event,
@@ -7230,11 +7277,17 @@ fn reduce_trace_event_with_identities<W: Write>(
     }
     let process = identify_tracked(domain, tracker, state, &ev);
     if write_error.is_some() {
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        if ev.event_type == p11scope_ebpf_common::event_type::CALL
+            && let Some(diag) = diagnostic
+        {
+            diag.trace_observation(process.is_some(), false, true, false, *stdout_open);
+        }
         if let Some(process) = process {
             state.observe_process(process, &ev);
         }
     } else {
-        let (emitted, error) = emit_bounded_trace_event(
+        let (attempted, error) = emit_bounded_trace_event(
             remaining,
             || match process {
                 Some(process) => {
@@ -7253,8 +7306,20 @@ fn reduce_trace_event_with_identities<W: Write>(
             stdout_open,
             out_file,
         );
+        #[cfg(feature = "h6-reexec-diagnostic")]
+        if ev.event_type == p11scope_ebpf_common::event_type::CALL
+            && let Some(diag) = diagnostic
+        {
+            diag.trace_observation(
+                process.is_some(),
+                attempted,
+                false,
+                error.is_some(),
+                *stdout_open,
+            );
+        }
         *write_error = error;
-        if !emitted && let Some(process) = process {
+        if !attempted && let Some(process) = process {
             state.observe_process(process, &ev);
         }
     }
@@ -7265,6 +7330,9 @@ fn drain_trace_events_from_with_identities<S: crate::events::RecordSource, W: Wr
     drain: &mut crate::events::EventDrain<S>,
     (remaining, state, tracker, scope, tracer): TraceEventConsumers<'_, '_, '_, '_, '_>,
     identities: Option<&crate::trace_identity::TraceIdentityStore>,
+    #[cfg(feature = "h6-reexec-diagnostic")] diagnostic: Option<
+        &crate::attach::reexec_diagnostic::Diagnostic,
+    >,
     (stdout, stdout_open, out_file): TraceEventOutputs<'_, '_, '_, W>,
     quantum: Option<usize>,
 ) -> Result<(u64, bool)> {
@@ -7282,6 +7350,8 @@ fn drain_trace_events_from_with_identities<S: crate::events::RecordSource, W: Wr
                 &mut *(tracer),
             ),
             identities,
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            diagnostic,
             (&mut *(stdout), &mut *(stdout_open), &mut *(out_file)),
             &mut write_error,
             ev,
@@ -11791,6 +11861,8 @@ mod tests {
                 &mut tracer,
             ),
             None,
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            None,
             (&mut stdout, &mut stdout_open, &mut out_file),
             Some(LIVE_POLL_QUANTUM),
         )
@@ -11832,6 +11904,8 @@ mod tests {
                 &Scope::Pid(std::process::id()),
                 &mut tracer,
             ),
+            None,
+            #[cfg(feature = "h6-reexec-diagnostic")]
             None,
             (&mut stdout, &mut stdout_open, &mut out_file),
             Some(LIVE_POLL_QUANTUM),
@@ -13367,6 +13441,8 @@ mod tests {
                     &mut tracer,
                 ),
                 None,
+                #[cfg(feature = "h6-reexec-diagnostic")]
+                None,
                 (&mut stdout, &mut stdout_open, &mut out_file),
                 Some(LIVE_POLL_QUANTUM),
             )
@@ -13401,6 +13477,8 @@ mod tests {
                 &Scope::Pid(std::process::id()),
                 &mut tracer,
             ),
+            None,
+            #[cfg(feature = "h6-reexec-diagnostic")]
             None,
             (&mut stdout, &mut stdout_open, &mut out_file),
             None,
@@ -13468,6 +13546,8 @@ mod tests {
                 &mut tracer,
             ),
             None,
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            None,
             (&mut stdout, &mut stdout_open, &mut out_file),
             None,
         )
@@ -13530,6 +13610,8 @@ mod tests {
                 &Scope::Pid(std::process::id()),
                 &mut tracer,
             ),
+            None,
+            #[cfg(feature = "h6-reexec-diagnostic")]
             None,
             (&mut Vec::new(), &mut true, &mut None::<Vec<u8>>),
             None,
@@ -13999,6 +14081,8 @@ mod tests {
                                     &Scope::Pid(7),
                                     &mut tracer,
                                 ),
+                                None,
+                                #[cfg(feature = "h6-reexec-diagnostic")]
                                 None,
                                 (&mut Vec::new(), &mut true, &mut None::<Vec<u8>>),
                                 quantum,
@@ -16889,6 +16973,147 @@ mod tests {
             "the unread record decodes back intact"
         );
     }
+    #[cfg(feature = "h6-reexec-diagnostic")]
+    #[test]
+    fn reexec_diagnostic_actual_trace_branches_preserve_results() {
+        use crate::attach::reexec_diagnostic::{Diagnostic, TraceCounts};
+        struct Writer {
+            error: Option<std::io::ErrorKind>,
+            writes: usize,
+        }
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.writes += 1;
+                match self.error {
+                    Some(kind) => Err(kind.into()),
+                    None => Ok(bytes.len()),
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let expected = [
+            TraceCounts {
+                calls: 1,
+                accepted: 1,
+                attempted: 1,
+                ..Default::default()
+            },
+            TraceCounts {
+                calls: 1,
+                rejected: 1,
+                attempted: 1,
+                ..Default::default()
+            },
+            TraceCounts {
+                calls: 1,
+                accepted: 1,
+                limit_skipped: 1,
+                ..Default::default()
+            },
+            TraceCounts {
+                calls: 1,
+                accepted: 1,
+                prior_error_skipped: 1,
+                ..Default::default()
+            },
+            TraceCounts {
+                calls: 1,
+                accepted: 1,
+                attempted: 1,
+                write_errors: 1,
+                ..Default::default()
+            },
+            TraceCounts {
+                calls: 1,
+                accepted: 1,
+                attempted: 1,
+                stdout_closed: 1,
+                ..Default::default()
+            },
+            TraceCounts {
+                calls: 1,
+                accepted: 1,
+                attempted: 1,
+                stdout_closed: 1,
+                ..Default::default()
+            },
+        ];
+        for (mode, want) in expected.into_iter().enumerate() {
+            let diag = Diagnostic::selected(true, true).unwrap();
+            diag.matched_exec();
+            let run = |diagnostic: Option<&Diagnostic>| {
+                let plan = crate::plan::AttachPlan::from_slots(vec![]);
+                let anchor = crate::events::EventsDomain::test_standin(901);
+                let mut state = semantics::State::for_capture(
+                    &plan,
+                    CapturePolicy::Allowlisted,
+                    anchor.clone(),
+                );
+                let mut tracker = process::Tracker::for_producer(anchor, 16);
+                let mut tracer = trace::Tracer::new(&plan);
+                let mut event = call_event();
+                event.image.task_cookie = if mode == 1 { 0 } else { 37 };
+                let pid = u64::from(std::process::id());
+                event.pid_tgid = (pid << 32) | pid;
+                let domain = tracker.producer_domain();
+                let mut remaining = Some(if mode == 2 { 0 } else { 2 });
+                let mut writer = Writer {
+                    error: match mode {
+                        4 => Some(std::io::ErrorKind::Other),
+                        6 => Some(std::io::ErrorKind::BrokenPipe),
+                        _ => None,
+                    },
+                    writes: 0,
+                };
+                let mut open = mode != 5;
+                let mut file: Option<Vec<u8>> = None;
+                let mut error = if mode == 3 {
+                    Some(anyhow::anyhow!("prior error"))
+                } else {
+                    None
+                };
+                let result = reduce_trace_event_with_identities(
+                    domain,
+                    (
+                        &mut remaining,
+                        &mut state,
+                        &mut tracker,
+                        &Scope::Pid(std::process::id()),
+                        &mut tracer,
+                    ),
+                    None,
+                    diagnostic,
+                    (&mut writer, &mut open, &mut file),
+                    &mut error,
+                    event,
+                );
+                (
+                    result.is_ok(),
+                    remaining,
+                    open,
+                    error.is_some(),
+                    writer.writes,
+                    tracer.raw_calls(),
+                    state.semantic_evidence(),
+                    tracker.evidence(),
+                )
+            };
+            let control = run(None);
+            let observed = run(Some(&diag));
+            assert_eq!(
+                control.6.semantic_history_drops,
+                u64::from(mode == 1),
+                "fixture must reach the intended history branch {mode}"
+            );
+            assert_eq!(
+                observed, control,
+                "diagnostics changed actual branch {mode}"
+            );
+            assert_eq!(diag.trace_counts(), want, "actual reducer branch {mode}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -17285,6 +17510,8 @@ mod trace_identity_consumer_tests {
                     &mut self.tracer,
                 ),
                 Some(identities),
+                #[cfg(feature = "h6-reexec-diagnostic")]
+                None,
                 (&mut self.stdout, &mut self.stdout_open, &mut self.file),
                 quantum,
             )
@@ -17840,6 +18067,8 @@ int main(int argc, char **argv) {
                             &c.scope,
                             &mut c.tracer,
                             Some(&identities),
+                            #[cfg(feature = "h6-reexec-diagnostic")]
+                            None,
                             &mut c.stdout,
                             &mut c.stdout_open,
                             &mut c.file
@@ -17873,6 +18102,8 @@ int main(int argc, char **argv) {
                                     &mut c.tracer,
                                 ),
                                 Some(&identities),
+                                #[cfg(feature = "h6-reexec-diagnostic")]
+                                None,
                                 (&mut c.stdout, &mut c.stdout_open, &mut c.file),
                                 &mut write_error,
                                 ev,
@@ -18066,6 +18297,8 @@ int main(int argc, char **argv) {
                 &mut c.tracer,
             ),
             Some(&identities),
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            None,
             (
                 &mut BrokenWriter(io::ErrorKind::BrokenPipe),
                 &mut c.stdout_open,
@@ -18099,6 +18332,8 @@ int main(int argc, char **argv) {
                 &mut c.tracer,
             ),
             Some(&identities),
+            #[cfg(feature = "h6-reexec-diagnostic")]
+            None,
             (
                 &mut c.stdout,
                 &mut c.stdout_open,
@@ -18244,6 +18479,8 @@ mod correction1_tests {
                         &scope,
                         &mut self.tracer,
                     ),
+                    None,
+                    #[cfg(feature = "h6-reexec-diagnostic")]
                     None,
                     (&mut self.output, &mut true, &mut None::<Vec<u8>>),
                     Some(crate::events::LIVE_POLL_QUANTUM),

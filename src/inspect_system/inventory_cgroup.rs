@@ -1028,6 +1028,30 @@ mod tests {
         pre_cancel: bool,
         invalid_release: bool,
     ) {
+        stage_host_transport(
+            stage,
+            healthy,
+            pre_cancel,
+            invalid_release,
+            TestFrame::Whole,
+        );
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum TestFrame {
+        Whole,
+        Fragmented,
+        PartialEof,
+        PartialDeadline,
+    }
+
+    fn stage_host_transport(
+        stage: &str,
+        healthy: bool,
+        pre_cancel: bool,
+        invalid_release: bool,
+        transport: TestFrame,
+    ) {
         use std::io::{BufRead, BufReader, Write};
         use std::os::fd::AsRawFd;
         use std::os::unix::net::UnixStream;
@@ -1073,15 +1097,21 @@ mod tests {
         } else {
             (member.id(), birth)
         };
+        let timeout_ms = if transport == TestFrame::Whole {
+            4000
+        } else {
+            1500
+        };
         writeln!(
             controller,
             "{}",
             serde_json::json!({"version": 1, "stage": stage,
-            "timeout_ms": 4000, "pid": pid, "start_time": start_time})
+            "timeout_ms": timeout_ms, "pid": pid, "start_time": start_time})
         )
         .unwrap();
         let mut input = BufReader::new(controller.try_clone().unwrap());
         let mut events = Vec::new();
+        let mut interrupted = None;
         loop {
             let mut line = String::new();
             let read = input.read_line(&mut line);
@@ -1091,14 +1121,49 @@ mod tests {
             let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
             assert_eq!(frame["sequence"], events.len());
             if frame["event"] == stage {
-                if healthy {
+                if transport != TestFrame::Whole {
+                    controller.write_all(b"{").unwrap();
+                    // Observe actual peer consumption before SIGINT or the
+                    // rest of a valid frame; a timer alone would miss the bug.
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                    loop {
+                        let mut queued = 0_i32;
+                        assert_eq!(
+                            unsafe {
+                                libc::ioctl(controller.as_raw_fd(), libc::TIOCOUTQ, &mut queued)
+                            },
+                            0
+                        );
+                        if queued == 0 {
+                            break;
+                        }
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "observer did not consume partial frame"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                if transport == TestFrame::PartialEof {
+                    controller.shutdown(std::net::Shutdown::Write).unwrap();
+                } else if transport == TestFrame::PartialDeadline {
+                    // Leave the partial frame open: the original deadline
+                    // must expire without a cancellation or a renewed wait.
+                } else if healthy {
                     let release = if invalid_release {
                         serde_json::json!({"version": 1, "cancel": frame["transaction"]})
                     } else {
                         serde_json::json!({"version": 1, "release": frame["transaction"]})
                     };
-                    writeln!(controller, "{release}").unwrap();
+                    let release = release.to_string();
+                    if transport == TestFrame::Fragmented {
+                        controller.write_all(&release.as_bytes()[1..]).unwrap();
+                        controller.write_all(b"\n").unwrap();
+                    } else {
+                        writeln!(controller, "{release}").unwrap();
+                    }
                 } else if !pre_cancel {
+                    interrupted = Some(std::time::Instant::now());
                     assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
                 }
             }
@@ -1109,12 +1174,32 @@ mod tests {
             status.success(),
             "actual scoped stage child failed: {status}"
         );
+        if transport == TestFrame::Fragmented && !healthy {
+            assert!(
+                interrupted.unwrap().elapsed() < std::time::Duration::from_millis(500),
+                "partial adapter frame deferred real SIGINT until its deadline"
+            );
+        }
         let names = events
             .iter()
             .map(|event| event["event"].as_str().unwrap())
             .collect::<Vec<_>>();
         if invalid_release {
             assert_eq!(names, vec!["armed", "launch", "traversed"]);
+            return;
+        }
+        if matches!(
+            transport,
+            TestFrame::PartialEof | TestFrame::PartialDeadline
+        ) || (transport == TestFrame::Fragmented && !healthy)
+        {
+            let prefix = if stage == "traversed" { 3 } else { 5 };
+            assert_eq!(
+                names.len(),
+                prefix,
+                "failed partial exchange fabricated a completion"
+            );
+            assert_eq!(names.last().copied(), Some(stage));
             return;
         }
         if pre_cancel {
@@ -1188,6 +1273,27 @@ mod tests {
     #[test]
     fn cgroup_stop_acceptance_cancel_command_never_cancels_collection_control() {
         installed_stage_host_control("traversed", true, false, true);
+    }
+
+    #[test]
+    fn cgroup_stop_acceptance_partial_release_real_sigint_checks_between_polls() {
+        for stage in ["traversed", "final_pre_read"] {
+            stage_host_transport(stage, false, false, false, TestFrame::Fragmented);
+        }
+    }
+    #[test]
+    fn cgroup_stop_acceptance_fragmented_healthy_release_preserves_frame() {
+        for stage in ["traversed", "final_pre_read"] {
+            stage_host_transport(stage, true, false, false, TestFrame::Fragmented);
+        }
+    }
+    #[test]
+    fn cgroup_stop_acceptance_partial_eof_and_deadline_cannot_complete_exchange() {
+        for stage in ["traversed", "final_pre_read"] {
+            for frame in [TestFrame::PartialEof, TestFrame::PartialDeadline] {
+                stage_host_transport(stage, true, false, false, frame);
+            }
+        }
     }
 
     fn request(root: Arc<File>) -> CgroupCollectRequest {

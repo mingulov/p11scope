@@ -7851,14 +7851,74 @@ impl Drop for LoadedSeedProvider {
 
 impl LoadedSeedProvider {
     fn spawn_peer(&mut self) -> u32 {
-        let child = std::process::Command::new(self._dir.path().join("seed-runner"))
-            .arg(self._dir.path().join("seed-provider.so"))
+        let runner = self._dir.path().join("seed-runner");
+        let library = self._dir.path().join("seed-provider.so");
+        let child = std::process::Command::new(&runner)
+            .arg(&library)
             .spawn()
             .unwrap();
         let pid = child.id();
         self.peers.push(child);
+        wait_loaded_seed_peer(self.peers.last_mut().unwrap(), &runner, &library, |_| {});
         pid
     }
+}
+
+fn wait_loaded_seed_peer(
+    child: &mut std::process::Child,
+    _runner: &Path,
+    _library: &Path,
+    mut after_probe: impl FnMut(&mut std::process::Child),
+) {
+    after_probe(child);
+}
+
+#[test]
+fn loaded_seed_peer_waits_for_exact_runner_and_provider_mapping() {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let (fixture, _primary, _module, _pins) = loaded_seed_provider();
+    let runner = fixture._dir.path().join("seed-runner");
+    let library = fixture._dir.path().join("seed-provider.so");
+    let child = Command::new("sh")
+        .args([
+            "-c",
+            "printf 'ready\\n'; read -r ignored; exec \"$@\"",
+            "seed-pre-exec",
+        ])
+        .arg(&runner)
+        .arg(&library)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut held = crate::discovery::test_subject::OwnedMapper::from_child(
+        child,
+        std::time::Duration::from_secs(10),
+    )
+    .unwrap();
+    let pid = held.pid();
+    let before = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+    assert_ne!(before, runner, "launcher exec'd before release");
+    let mut probes = 0;
+    wait_loaded_seed_peer(&mut held.0, &runner, &library, |child| {
+        probes += 1;
+        if probes == 2 {
+            // The first real probe must keep the peer held. Release only on
+            // a later readiness opportunity, independent of host scheduling.
+            child.stdin.as_mut().unwrap().write_all(b"!\n").unwrap();
+            // SAFETY: OwnedMapper acknowledged and stopped this unreaped child.
+            assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGCONT) }, 0);
+        }
+    });
+    let image = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+    assert_eq!(image, runner, "peer readiness accepted launcher {before:?}");
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+    assert!(maps_have_executable_image(&maps, &runner));
+    assert!(maps_have_executable_image(&maps, &library));
+    let view = ProcessView::open(ProcessViewId(1), pid).unwrap();
+    assert!(view.still_the_same());
 }
 
 fn loaded_seed_provider() -> (

@@ -168,14 +168,37 @@ where
     Ok((abi, exports))
 }
 
-/// Demand-paged export facts for the scan path. Detailed mode preserves its
-/// sparse structural post-read charge. Inventory pre-debits a conservative
-/// logical mapped-byte reservation and fixes the dependency mapping to it.
+/// A previously retained file may already be watched by the instance hooks.
+/// Read its exports without mapping it in the observer's shared mm. The
+/// ordinary byte/deadline limits and the caller's post-read pin check remain.
+fn read_retained_export_facts_budgeted(
+    file: &File,
+    wanted: &[&str],
+    budget: &mut CaptureWorkBudget,
+) -> Result<(ElfAbi, Vec<(String, u64)>), String> {
+    if matches!(budget.policy(), DiscoveryPolicy::Inventory(_)) && budget.active_scan.is_none() {
+        return Err("read failed: inventory discovery requires an active scan".into());
+    }
+    let facts = read_elf_snapshot(file, budget)
+        .and_then(|snapshot| Ok((snapshot.abi(), snapshot.exports_matching(wanted)?)));
+    if let Some(reason) = budget.check_deadline_now() {
+        return Err(format!("read failed: {reason}"));
+    }
+    facts
+}
+
+/// Demand-paged export facts for unretained files; retained files use bounded
+/// reads to avoid invalidating the very instances the observer is watching.
+/// Detailed mode otherwise preserves its sparse structural post-read charge.
+/// Inventory pre-debits the unretained file's conservative mapped-byte bound.
 fn read_export_facts_budgeted(
     file: &File,
     wanted: &[&str],
     budget: &mut CaptureWorkBudget,
 ) -> Result<(ElfAbi, Vec<(String, u64)>), String> {
+    if budget.retained_mapped_identity(file).is_some() {
+        return read_retained_export_facts_budgeted(file, wanted, budget);
+    }
     if matches!(budget.policy(), DiscoveryPolicy::Inventory(_)) {
         return read_inventory_export_facts_budgeted_with(
             file,
@@ -7593,6 +7616,57 @@ mod tests {
             "first scan must charge ELF tables, not the 2 MiB file: {}",
             budget.attempted_io_bytes()
         );
+    }
+
+    #[test]
+    fn retained_export_reads_preserve_getter_facts_and_refuse_exhausted_budgets() {
+        let fixture = ElfExportFactsFixture::new_provider();
+        let file = File::open(&fixture.path).unwrap();
+        let size = file.metadata().unwrap().len();
+        let wanted = ["C_GetFunctionList", "NSC_GetFunctionList", "not_exported"];
+        let (abi, exports, _) = p11scope_manifest::elf::read_export_facts(&file, &wanted).unwrap();
+        assert_eq!(exports.len(), 2, "standard and vendor getter controls");
+
+        let mut budget = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: size,
+            total_bytes: size,
+        });
+        assert_eq!(
+            read_retained_export_facts_budgeted(&file, &wanted, &mut budget).unwrap(),
+            (abi, exports.clone())
+        );
+        assert_eq!(budget.attempted_io_bytes(), size);
+
+        let mut bounded = CaptureWorkBudget::new(ScanLimits {
+            per_object_bytes: size,
+            total_bytes: size - 1,
+        });
+        let error = read_retained_export_facts_budgeted(&file, &wanted, &mut bounded).unwrap_err();
+        assert!(error.contains(IO_CEILING_REASON), "{error}");
+        assert_eq!(bounded.attempted_io_bytes(), size - 1);
+
+        let mut expired = CaptureWorkBudget::default();
+        expired.set_deadline(Some(0));
+        let error = read_retained_export_facts_budgeted(&file, &wanted, &mut expired).unwrap_err();
+        assert!(error.contains(SCAN_DEADLINE_REASON), "{error}");
+        assert_eq!(expired.attempted_io_bytes(), 0);
+
+        let mut inventory = CaptureWorkBudget::for_inventory(inventory_limits(size, 2, 1, 1, 1, 1));
+        assert!(read_retained_export_facts_budgeted(&file, &wanted, &mut inventory).is_err());
+        assert_eq!(inventory.attempted_io_bytes(), 0, "no active scan");
+        let window = inventory.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = inventory.checkpoint(window.clone()).unwrap();
+        assert_eq!(
+            read_retained_export_facts_budgeted(&file, &wanted, &mut inventory).unwrap(),
+            (abi, exports)
+        );
+        assert_eq!(inventory.attempted_io_bytes(), size);
+        let error =
+            read_retained_export_facts_budgeted(&file, &wanted, &mut inventory).unwrap_err();
+        assert!(error.contains(IO_CEILING_REASON), "{error}");
+        assert_eq!(inventory.attempted_io_bytes(), size);
+        inventory.finish_scan(scan).unwrap();
+        inventory.finish_window(window).unwrap();
     }
 
     #[test]

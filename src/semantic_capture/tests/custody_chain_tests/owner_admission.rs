@@ -773,7 +773,10 @@ fn owner_admission_system_late_attested_caller_survives_unrelated_provider_catal
             |pid| {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while !ready.exists() {
-                    assert!(Instant::now() < deadline, "unrelated provider child did not load");
+                    assert!(
+                        Instant::now() < deadline,
+                        "unrelated provider child did not load"
+                    );
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 // SAFETY: this pid names only the retained owned child.
@@ -788,14 +791,19 @@ fn owner_admission_system_late_attested_caller_survives_unrelated_provider_catal
         hints,
         OsProcessSource,
         RegistryLimits::default_limits(),
-    ).unwrap();
+    )
+    .unwrap();
     // Populate real catalogs without servicing H0 yet, so the first semantic
     // quantum faces four earlier unrelated callers and one late attested pair.
-    for pid in children.iter().map(OwnedStoppedChild::id).chain([scene.child.id()]) {
+    for pid in children
+        .iter()
+        .map(OwnedStoppedChild::id)
+        .chain([scene.child.id()])
+    {
         let catalog = scene.coordinator.collector(InventoryScope::Pid(pid), None)().unwrap();
         scene.coordinator.apply_catalog(
             catalog,
-            &mut crate::discovery::inventory::UnavailableImageGuard,
+            &mut crate::discovery::engine::inventory::UnavailableImageGuard,
             &mut scene.identity,
             u64::MAX,
             now_ns(),
@@ -805,7 +813,10 @@ fn owner_admission_system_late_attested_caller_survives_unrelated_provider_catal
     let caller = scene.caller();
     for child in &children {
         let other = scene.coordinator.adapter().live_id(child.id()).unwrap();
-        assert!(other < caller, "the attested caller must be late in the real catalog");
+        assert!(
+            other < caller,
+            "the attested caller must be late in the real catalog"
+        );
         assert!(scene.coordinator.registry().edges_of(other).any(|edge| {
             edge.mapping == crate::discovery::caller_registry::MappingState::Mapped
         }));
@@ -824,10 +835,22 @@ fn owner_admission_system_late_attested_caller_survives_unrelated_provider_catal
         let other = scene.coordinator.adapter().live_id(child.id()).unwrap();
         assert!(scene.coordinator.semantic_bindings().get(other).is_none());
     }
-    let rows: Vec<_> = scene.coordinator.registry().instance_semantic_edges().map(|row| {
-        (row.caller, row.api_returns, row.lossy,
-         row.semantics.as_ref().map(|value| value.completed()).unwrap_or(0))
-    }).collect();
+    let rows: Vec<_> = scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .map(|row| {
+            (
+                row.caller,
+                row.api_returns,
+                row.lossy,
+                row.semantics
+                    .as_ref()
+                    .map(|value| value.completed())
+                    .unwrap_or(0),
+            )
+        })
+        .collect();
     assert_eq!(rows, vec![(caller, Some(2), false, 1)]);
 }
 

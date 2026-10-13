@@ -3877,6 +3877,120 @@ class LegCleanupTest(unittest.TestCase):
         leg(self.ctx)
         self.assert_released()
 
+    def test_running_detach_interrupts_and_observes_stop_before_releasing_custody(self):
+        actual_ptrace, actual_wait = H6["_ptrace"], os.waitpid
+        events = []
+        @H6["owned_leg"]
+        def leg(ctx):
+            owner, stdout, _ = self.child(ctx.owners, ctx.readers, self.directory)
+            stdout.wait(lambda reader: "alive\n" in reader.lines, 1)
+            H6["seize_until_exec"](owner.pid, ctx, owner)
+            def ptrace(request, pid, addr=0, data=0):
+                if request == H6["_PTRACE_DETACH"]:
+                    self.assertEqual(events[-1], "stop")
+                    self.assertIn(owner, ctx.traced)
+                events.append(request)
+                return actual_ptrace(request, pid, addr, data)
+            def wait(pid, options):
+                result = actual_wait(pid, options)
+                if result[0]:
+                    self.assertEqual(result[0], owner.pid)
+                    self.assertTrue(os.WIFSTOPPED(result[1]))
+                    self.assertEqual((result[1] >> 16, os.WSTOPSIG(result[1])),
+                                     (H6["_PTRACE_EVENT_STOP"], signal.SIGTRAP))
+                    events.append("stop")
+                return result
+            with mock.patch.dict(self.globals, {"_ptrace": ptrace}), mock.patch.object(os, "waitpid", wait):
+                H6["ptrace_detach_running"](owner.pid, ctx)
+            self.assertEqual(events, [H6["_PTRACE_INTERRUPT"], "stop", H6["_PTRACE_DETACH"]])
+            self.assertFalse(ctx.traced)
+            owner.verify()
+            self.assertIn("TracerPid:\t0\n", (Path("/proc") / str(owner.pid) / "status").read_text())
+            owner.popen.stdin.close()
+            self.assertEqual(H6["wait_process"](owner.popen, 1), 0)
+        leg(self.ctx)
+        self.assert_released()
+
+    def test_running_detach_failures_retain_tracing_custody_for_owned_cleanup(self):
+        actual_ptrace, actual_wait = H6["_ptrace"], os.waitpid
+        for failure in ("interrupt", "detach", "timeout", "unexpected-stop", "terminal"):
+            with self.subTest(failure=failure):
+                @H6["owned_leg"]
+                def leg(ctx):
+                    owner, stdout, _ = self.child(ctx.owners, ctx.readers, self.directory)
+                    stdout.wait(lambda reader: "alive\n" in reader.lines, 1)
+                    H6["seize_until_exec"](owner.pid, ctx, owner)
+                    def ptrace(request, pid, addr=0, data=0):
+                        if ((failure == "interrupt" and request == H6["_PTRACE_INTERRUPT"])
+                                or failure == "detach" and request == H6["_PTRACE_DETACH"]):
+                            raise H6["SetupError"]("controlled ptrace failure")
+                        result = actual_ptrace(request, pid, addr, data)
+                        if failure == "terminal" and request == H6["_PTRACE_INTERRUPT"]:
+                            signal.pidfd_send_signal(owner.pidfd, signal.SIGKILL)
+                        return result
+                    def wait(pid, options):
+                        if failure == "timeout":
+                            return 0, 0
+                        result = actual_wait(pid, options)
+                        if failure == "unexpected-stop" and result[0]:
+                            return pid, (signal.SIGUSR1 << 8) | 0x7f
+                        return result
+                    patches = {"_ptrace": ptrace}
+                    if failure == "timeout":
+                        patches["wait_deadline"] = lambda _seconds: time.monotonic_ns() + 1_000_000
+                    with mock.patch.dict(self.globals, patches), mock.patch.object(os, "waitpid", wait), \
+                            self.assertRaises((H6["SetupError"], TimeoutError)):
+                        H6["ptrace_detach_running"](owner.pid, ctx)
+                    self.assertEqual(ctx.traced, [owner])
+                    if failure == "terminal":
+                        self.assertEqual(owner.popen.returncode, -signal.SIGKILL)
+                leg(self.ctx)
+                self.assert_released()
+
+    def test_running_detach_rejects_unregistered_or_changed_owned_birth(self):
+        @H6["owned_leg"]
+        def leg(ctx):
+            owner, stdout, _ = self.child(ctx.owners, ctx.readers, self.directory)
+            stdout.wait(lambda reader: "alive\n" in reader.lines, 1)
+            H6["seize_until_exec"](owner.pid, ctx, owner)
+            for failure in ("wrong-pid", "unenrolled", "foreign-birth"):
+                original = dict(owner.identity)
+                if failure == "unenrolled":
+                    ctx.owners.remove(owner)
+                elif failure == "foreign-birth":
+                    owner.identity["start_time"] += 1
+                try:
+                    with mock.patch.dict(self.globals, {"_ptrace": mock.Mock(
+                            side_effect=AssertionError("unproved target reached ptrace"))}), \
+                            self.assertRaises((H6["SetupError"], ValueError)):
+                        H6["ptrace_detach_running"](owner.pid + (failure == "wrong-pid"), ctx)
+                finally:
+                    owner.identity = original
+                    if failure == "unenrolled":
+                        ctx.owners.append(owner)
+                self.assertEqual(ctx.traced, [owner])
+        leg(self.ctx)
+        self.assert_released()
+
+    def test_running_detach_does_not_renew_expired_cleanup_or_interrupt(self):
+        @H6["owned_leg"]
+        def leg(ctx):
+            owner, stdout, _ = self.child(ctx.owners, ctx.readers, self.directory)
+            stdout.wait(lambda reader: "alive\n" in reader.lines, 1)
+            H6["seize_until_exec"](owner.pid, ctx, owner)
+            H6["enter_phase"]("cleanup")
+            deadlines = dict(ctx.budget.deadlines)
+            expired = deadlines["cleanup", 0] + 1
+            with mock.patch.object(ctx.budget, "clock", lambda: expired), \
+                    mock.patch.dict(self.globals, {"monotonic_ns": lambda: expired,
+                        "_ptrace": mock.Mock(side_effect=AssertionError("expired detach dispatched ptrace"))}), \
+                    self.assertRaises(TimeoutError):
+                H6["ptrace_detach_running"](owner.pid, ctx)
+            self.assertEqual(ctx.budget.deadlines, deadlines)
+            self.assertEqual(ctx.traced, [owner])
+        leg(self.ctx)
+        self.assert_released()
+
     def test_seize_registration_failure_reaps_the_acquired_owned_trace(self):
         class RefuseRegistration(list):
             def append(self, owner):

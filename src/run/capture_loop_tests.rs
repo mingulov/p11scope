@@ -2768,6 +2768,26 @@ fn assert_must_detect(canary: &ContinuityCanary, surfaces: &[(String, Vec<u8>)])
     }
 }
 
+#[test]
+fn continuity_canary_public_metadata_is_deterministic() {
+    let record = canary_record();
+    assert_eq!(
+        record.event.pid_tgid,
+        4242u64 << 32,
+        "a canary fixture must not depend on the ambient observer PID"
+    );
+    assert_eq!(record.event.ts_ns, 1100);
+    let driven = drive_trace_capture(&crate::events::record_bytes(&record));
+    assert!(
+        driven.stdout.starts_with(
+            b"00:00:00.000000 Unknown executable (PID 4242, TID 0) sess#1 C_OpenSession "
+        ),
+        "the actual capture/render path must use fixed canary clock and PID metadata: {}",
+        String::from_utf8_lossy(&driven.stdout),
+    );
+    assert_eq!(driven.stdout, driven.out_file);
+}
+
 /// R1+R2, EVENTS-tail layout: the scanner covers every needle form, and
 /// every planted control flags on every public surface.
 #[test]

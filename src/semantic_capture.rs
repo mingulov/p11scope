@@ -1584,6 +1584,7 @@ mod tests {
                 Ok(())
             );
 
+            io.fail_file = Some(0);
             io.semantic_call("C_Sign", 0, 0);
             let cached = capture.tick_with(&mut io).unwrap();
             assert_eq!(
@@ -1592,11 +1593,13 @@ mod tests {
             );
             assert!(
                 cached.current().is_empty(),
-                "historical cached Joined is not a scan receipt"
+                "a refused fresh scan cannot grant a cached Joined call currency"
             );
+            assert_eq!(cached.scan_refusals, vec![ImageQueryRefusal::Unstable]);
             let (owned_cached, no_receipts) = cached.into_parts();
             assert_eq!(owned_cached.len(), 1);
             assert!(no_receipts.is_empty());
+            io.fail_file = None;
             let refresh = capture
                 .refresh_with(&mut io, receipt.pin.clone(), 0)
                 .unwrap();
@@ -1635,6 +1638,109 @@ mod tests {
             assert_eq!(
                 capture.validate_current_with(&mut io, &receipt, &mut report),
                 Err(CurrentReceiptRefusal::Stopped)
+            );
+        }
+
+        #[test]
+        fn joined_refresh_rotates_after_refusal_with_one_shared_scan_slot() {
+            let mut io = ScriptIo::new(NativeDomainId::mint());
+            let mut capture = super::capture(&io);
+            for file in [0, 1] {
+                io.semantic_call("C_SignInit", file, 0);
+                io.semantic_call("C_Sign", file, 0);
+            }
+            let initial = capture.tick_with(&mut io).unwrap();
+            assert_eq!(initial.current().len(), 2);
+            let original = [0, 1].map(|file| {
+                id(initial
+                    .calls()
+                    .find(|call| call.endpoint().unwrap().file_slot == file)
+                    .unwrap()
+                    .route())
+            });
+            assert_ne!(original[0], original[1]);
+            assert_eq!(capture.router.instances_minted(), 2);
+            capture.limits.scans = 1;
+
+            for (refused_file, selected_file) in [(Some(0), 0), (None, 1), (None, 0)] {
+                io.fail_file = refused_file;
+                let prior_attempts = io.attempted_files.len();
+                let next_token = capture.next_token;
+                for file in [0, 1] {
+                    io.semantic_call("C_SignInit", file, 0);
+                    io.semantic_call("C_Sign", file, 0);
+                }
+                let mut report = capture.tick_with(&mut io).unwrap();
+                assert_eq!(report.scans, 1, "Pending and Joined share the scan cap");
+                assert_eq!(&io.attempted_files[prior_attempts..], &[selected_file]);
+                assert_eq!(report.calls().count(), 4);
+                for call in report.calls() {
+                    let file = call.endpoint().unwrap().file_slot as usize;
+                    assert_eq!(call.route(), Route::Joined(original[file]));
+                }
+                assert_eq!(capture.next_token, next_token + 4);
+                assert!(capture.awaiting.is_empty());
+                assert!(capture.jobs.is_empty());
+                assert_eq!(capture.router.pending_len(), 0);
+                assert_eq!(capture.router.instances_minted(), 2);
+                if refused_file.is_some() {
+                    assert_eq!(report.scan_refusals, vec![ImageQueryRefusal::Unstable]);
+                    assert!(report.current().is_empty());
+                } else {
+                    assert!(report.scan_refusals.is_empty());
+                    assert_eq!(report.current().len(), 1);
+                    let receipt = report.current.pop().unwrap();
+                    assert_eq!(receipt.endpoint().file_slot, selected_file);
+                    assert_eq!(receipt.instances(), &[original[selected_file as usize]]);
+                    assert_eq!(
+                        capture.validate_current_with(&mut io, &receipt, &mut report),
+                        Ok(())
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn pending_scan_keeps_its_deadline_and_precedes_joined_refresh() {
+            let mut io = ScriptIo::new(NativeDomainId::mint());
+            let mut capture = super::capture(&io);
+            let initial = initial_pair(&mut capture, &mut io);
+            let joined = id(initial.calls().next().unwrap().route());
+
+            capture.limits.scans = 1;
+            io.fail_file = Some(1);
+            io.semantic_call("C_SignInit", 1, 0);
+            let pending = capture.tick_with(&mut io).unwrap();
+            assert_eq!(pending.scans, 1);
+            assert!(pending.calls().next().is_none());
+            assert_eq!(capture.awaiting.len(), 1);
+            let original_deadline = capture.jobs[0].deadline;
+            let original_token = *capture.awaiting.keys().next().unwrap();
+
+            capture.limits.scans = 2;
+            let prior_attempts = io.attempted_files.len();
+            io.semantic_call("C_Sign", 0, 0);
+            let mut later = capture.tick_with(&mut io).unwrap();
+            assert_eq!(
+                later.scans, 2,
+                "one Pending and one Joined scan share the cap"
+            );
+            assert_eq!(&io.attempted_files[prior_attempts..], &[1, 0]);
+            assert_eq!(later.scan_refusals, vec![ImageQueryRefusal::Unstable]);
+            assert_eq!(later.calls().count(), 1);
+            assert_eq!(later.calls().next().unwrap().route(), Route::Joined(joined));
+            assert_eq!(later.current().len(), 1);
+            let receipt = later.current.pop().unwrap();
+            assert_eq!(receipt.endpoint().file_slot, 0);
+            assert_eq!(
+                capture.validate_current_with(&mut io, &receipt, &mut later),
+                Ok(())
+            );
+            assert_eq!(capture.jobs.len(), 1);
+            assert_eq!(capture.jobs[0].deadline, original_deadline);
+            assert_eq!(
+                capture.awaiting.keys().copied().collect::<Vec<_>>(),
+                vec![original_token]
             );
         }
 
@@ -2338,7 +2444,9 @@ mod tests {
         last_health: Health,
         pin: Arc<PidPin>,
         fail_cookie: Option<u64>,
+        fail_file: Option<u32>,
         attempts: Vec<(u64, Instant)>,
+        attempted_files: Vec<u32>,
         raises: usize,
         raise_fails: bool,
         local: u32,
@@ -2389,7 +2497,9 @@ mod tests {
                 },
                 pin: Arc::new(PidPin::open(std::process::id()).unwrap()),
                 fail_cookie: None,
+                fail_file: None,
                 attempts: Vec::new(),
+                attempted_files: Vec::new(),
                 raises: 0,
                 raise_fails: false,
                 local: 0,
@@ -2549,8 +2659,11 @@ mod tests {
             _: &dyn Fn() -> u64,
         ) -> Result<ImageScanProof, ImageQueryRefusal> {
             self.attempts.push((job.image.task_cookie, deadline));
+            self.attempted_files.push(job.endpoint.file_slot);
             self.now += self.scan_advance;
-            if self.fail_cookie == Some(job.image.task_cookie) {
+            if self.fail_cookie == Some(job.image.task_cookie)
+                || self.fail_file == Some(job.endpoint.file_slot)
+            {
                 return Err(ImageQueryRefusal::Unstable);
             }
             let base = u64::from(job.endpoint.file_slot) * 0x4000;

@@ -10309,6 +10309,8 @@ fn owned_retirement_barrier_checks_nonce_and_bounds_unreleased_wait() -> Result<
 #[test]
 #[ignore = "root-owned BPF lane and external lifecycle ledger; explicit controlled worker/synchronous comparison"]
 fn privileged_inventory_retirement_controlled_churn() -> Result<()> {
+    use aya::programs::links::Link as _;
+
     let mode = std::env::var("P11SCOPE_I3A_RETIREMENT_MODE")?;
     ensure!(
         mode == "worker" || mode == "synchronous",
@@ -10344,14 +10346,24 @@ fn privileged_inventory_retirement_controlled_churn() -> Result<()> {
         "I3A_CONTROLLED_BEFORE mode={mode} counters={:?}",
         before.health.discovery_counters
     );
-    // The immutable static order establishes that the first real successful
-    // close is entry575; both roots remain in the work while the barrier waits.
+    // Gate the actual entry575 fd after its close returns. Other entry closes
+    // may overlap, while both roots remain behind the ordinary-link barrier.
     ensure!(active.state.links.last().unwrap().target == InventoryLinkIdentity::Entry(575));
-    let mut first = true;
+    let KernelInventoryLink::Fds(controlled_fds) = &active.state.links.last().unwrap().handle
+    else {
+        anyhow::bail!("controlled entry575 does not own fd links");
+    };
+    ensure!(controlled_fds.len() == 1);
+    let controlled_fd = controlled_fds[0]
+        .as_aya()
+        .context("controlled Singles entry575 does not own an Aya fd link")?
+        .id();
     let mut close = move |fds: &mut Vec<InventoryFd>| {
+        let controlled = fds
+            .iter()
+            .any(|fd| fd.as_aya().is_some_and(|link| link.id().eq(&controlled_fd)));
         close_inventory_fds(fds)?;
-        if first {
-            first = false;
+        if controlled {
             barrier.wait(Duration::from_secs(30))?;
         }
         Ok(())

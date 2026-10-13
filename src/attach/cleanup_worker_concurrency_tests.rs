@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::fd::AsRawFd as _;
 use std::sync::Condvar;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 #[derive(Clone, Debug, Default)]
@@ -135,18 +136,20 @@ fn bounded_cleanup_detailed_closes_four_same_rank_payloads_before_advancing_rank
     let closer_gate = Arc::clone(&gate);
     let mut worker = CleanupWorker::pre_start_with(
         Box::new(move |owned, _| {
-            let OwnedLink::Multi(fds) = &owned else {
+            let Some(OwnedLink::Multi(fds)) = owned.as_ref() else {
                 return Err("unexpected test payload".into());
             };
             let id = identities[&fds[0].as_raw_fd()];
             closer_gate.before_close(id);
-            drop(owned);
+            drop(owned.take());
             closer_gate.after_close(id);
             Ok(())
         }),
         Arc::new(|| Duration::ZERO),
     );
-    let ticket = worker.submit_live(links, DetachOrder).unwrap();
+    let ticket = worker
+        .submit_live(links, Arc::default(), DetachOrder)
+        .unwrap();
     let release_guard = ReleaseGuard(Arc::clone(&gate));
     let concurrent = gate.wait_for(Duration::from_secs(2), |state| {
         state
@@ -216,4 +219,118 @@ fn bounded_cleanup_detailed_closes_four_same_rank_payloads_before_advancing_rank
     );
     assert_eq!(ticket.status(), BatchStatus::Released);
     assert!(settled.failures.is_empty(), "{settled:?}");
+}
+
+struct GuardedPoolPayload {
+    fd: Option<OwnedFd>,
+    fail: bool,
+    _leases: FileLeases,
+}
+
+fn pool_payload(fail: bool, leases: &FileLeases) -> CloseSlot<GuardedPoolPayload> {
+    Arc::new(Mutex::new(GuardedPoolPayload {
+        fd: Some(File::open("/dev/null").unwrap().into()),
+        fail,
+        _leases: Arc::clone(leases),
+    }))
+}
+
+#[test]
+fn bounded_cleanup_partial_helper_startup_joins_started_empty_helpers() {
+    let reaped = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&reaped);
+    let mut starts = 0;
+    let result = ClosePool::<GuardedPoolPayload>::start_with(Arc::new(|_| Ok(())), move |task| {
+        starts += 1;
+        if starts == 2 {
+            return Err(std::io::Error::other("injected second helper refusal"));
+        }
+        let observed = Arc::clone(&observed);
+        std::thread::Builder::new().spawn(move || {
+            task();
+            observed.fetch_add(1, Ordering::SeqCst);
+        })
+    });
+    assert!(
+        result.is_err(),
+        "partial helper startup cannot report ready"
+    );
+    assert_eq!(
+        reaped.load(Ordering::SeqCst),
+        1,
+        "started helper actually joined"
+    );
+}
+
+#[test]
+fn bounded_cleanup_helper_panic_keeps_residual_fd_and_original_file_guard() {
+    let file = Arc::new(tempfile::tempfile().unwrap());
+    let weak = Arc::downgrade(&file);
+    let leases = Arc::new(vec![file]);
+    let slots = [pool_payload(true, &leases), pool_payload(false, &leases)];
+    let raw = slots[0].lock().unwrap().fd.as_ref().unwrap().as_raw_fd();
+    drop(leases);
+    let mut pool = ClosePool::start(Arc::new(|item: &mut GuardedPoolPayload| {
+        if item.fail {
+            panic!("injected helper close panic before ownership release");
+        }
+        drop(item.fd.take());
+        Ok(())
+    }))
+    .unwrap();
+    let results = pool.close_chunk(&slots);
+    drop(pool);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| result.result.is_ok())
+            .count(),
+        1
+    );
+    assert!(results.iter().any(|result| {
+        result
+            .result
+            .as_ref()
+            .is_err_and(|error| error.contains("injected helper close panic"))
+    }));
+    assert!(slots[0].lock().unwrap().fd.is_some());
+    // SAFETY: this control inspects its still-owned harmless descriptor only.
+    assert!(unsafe { libc::fcntl(raw, libc::F_GETFD) } >= 0);
+    assert!(
+        weak.upgrade().is_some(),
+        "failed residual retains original file"
+    );
+    drop(results);
+    drop(slots);
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn bounded_cleanup_failed_dispatch_keeps_all_unstarted_payloads_and_files() {
+    let file = Arc::new(tempfile::tempfile().unwrap());
+    let weak = Arc::downgrade(&file);
+    let leases = Arc::new(vec![file]);
+    let slots = [pool_payload(false, &leases), pool_payload(false, &leases)];
+    drop(leases);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    let mut pool = ClosePool::start(Arc::new(move |item: &mut GuardedPoolPayload| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        drop(item.fd.take());
+        Ok(())
+    }))
+    .unwrap();
+    let (closed, receiver) = mpsc::sync_channel(1);
+    drop(receiver);
+    drop(std::mem::replace(&mut pool.senders[0], closed));
+    let results = pool.close_chunk(&slots);
+    drop(pool);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|result| result.result.is_err()));
+    assert!(slots.iter().all(|slot| slot.lock().unwrap().fd.is_some()));
+    assert!(weak.upgrade().is_some());
+    drop(results);
+    drop(slots);
+    assert!(weak.upgrade().is_none());
 }

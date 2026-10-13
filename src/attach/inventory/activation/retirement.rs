@@ -2,6 +2,7 @@
 //! Owned blocking retirement work. Discovery stays with the main owner.
 
 use super::{InventoryCleanupReceipt, InventoryDetachFailure, InventoryLinkIdentity};
+use crate::attach::cleanup_worker::{ClosePool, CloseSlot, FileLeases};
 use crate::events::DiscoveryItem;
 use anyhow::{Result, anyhow};
 use std::fs::File;
@@ -15,6 +16,7 @@ pub(super) struct RetirementLink<L> {
     pub(super) target: InventoryLinkIdentity,
     pub(super) handle: Option<L>,
     pub(super) quarantine: Option<String>,
+    pub(super) _leases: FileLeases,
 }
 
 pub(super) struct RetirementWork<L> {
@@ -22,11 +24,15 @@ pub(super) struct RetirementWork<L> {
     pub(super) receipt: InventoryCleanupReceipt,
     // These are the existing opened physical files, not reopened pathnames.
     // Keep them after links so every explicit/implicit close retains its pins.
-    _leases: Vec<Arc<File>>,
+    _leases: FileLeases,
 }
 
 impl<L> RetirementWork<L> {
-    pub(super) fn new(links: Vec<RetirementLink<L>>, leases: Vec<Arc<File>>) -> Self {
+    pub(super) fn new(mut links: Vec<RetirementLink<L>>, leases: Vec<Arc<File>>) -> Self {
+        let leases = Arc::new(leases);
+        for link in &mut links {
+            link._leases = Arc::clone(&leases);
+        }
         Self {
             links,
             receipt: InventoryCleanupReceipt::default(),
@@ -82,6 +88,122 @@ impl<L> RetirementWork<L> {
     }
 }
 
+struct InventoryClose<L> {
+    handle: Option<L>,
+    target: InventoryLinkIdentity,
+    quarantine: Option<String>,
+    attempted: bool,
+    // Inner vector/legacy destructors run before this actual file guard.
+    _leases: FileLeases,
+}
+
+struct InventoryCloseBatch<L> {
+    slots: Vec<CloseSlot<InventoryClose<L>>>,
+    _leases: FileLeases,
+}
+
+impl<L> Drop for InventoryCloseBatch<L> {
+    fn drop(&mut self) {
+        // The pool is declared after this owner and therefore joins its
+        // helpers first on unwind. Reclaim residual ordinary handles before
+        // roots; this fallback cannot manufacture successful receipts.
+        for lifecycle in [false, true] {
+            for slot in self.slots.iter().rev() {
+                let mut item = slot.lock().unwrap_or_else(|error| error.into_inner());
+                if matches!(item.target, InventoryLinkIdentity::Lifecycle(_)) == lifecycle {
+                    drop(item.handle.take());
+                }
+            }
+        }
+    }
+}
+
+impl<L: Send + 'static> RetirementWork<L> {
+    fn run_concurrent(&mut self, close: Arc<dyn Fn(&mut L) -> Result<()> + Send + Sync>) {
+        let mut batch = InventoryCloseBatch {
+            slots: Vec::new(),
+            _leases: Arc::clone(&self._leases),
+        };
+        let operation = Arc::new(move |item: &mut InventoryClose<L>| {
+            item.attempted = true;
+            let handle = item.handle.as_mut().ok_or_else(|| {
+                item.quarantine
+                    .clone()
+                    .unwrap_or_else(|| "Inventory handle missing before retirement".into())
+            })?;
+            close(handle).map_err(|error| format!("{error:#}"))?;
+            // Success is credited only after the payload's own destructor,
+            // including every inner FD, has returned while files stay held.
+            drop(item.handle.take());
+            Ok(())
+        });
+        let mut pool = match ClosePool::start(operation) {
+            Ok(pool) => pool,
+            Err(error) => {
+                // Empty helper startup leaves every original handle with the
+                // work. Refuse every target without claiming a close attempt.
+                self.receipt.failures.extend(self.links.iter().map(|link| {
+                    InventoryDetachFailure {
+                        target: link.target,
+                        error: anyhow!(error.clone()),
+                    }
+                }));
+                return;
+            }
+        };
+        batch.slots = self
+            .links
+            .iter_mut()
+            .map(|link| {
+                Arc::new(std::sync::Mutex::new(InventoryClose {
+                    handle: link.handle.take(),
+                    target: link.target,
+                    quarantine: link.quarantine.take(),
+                    attempted: false,
+                    _leases: Arc::clone(&self._leases),
+                }))
+            })
+            .collect();
+        for lifecycle in [false, true] {
+            let phase: Vec<_> = batch
+                .slots
+                .iter()
+                .rev()
+                .filter(|slot| {
+                    matches!(
+                        slot.lock().unwrap().target,
+                        InventoryLinkIdentity::Lifecycle(_)
+                    ) == lifecycle
+                })
+                .cloned()
+                .collect();
+            for chunk in phase.chunks(4) {
+                for result in pool.close_chunk(chunk) {
+                    let item = result
+                        .slot
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    self.receipt.attempted += usize::from(item.attempted);
+                    match result.result {
+                        Ok(()) => self.receipt.closed += 1,
+                        Err(error) => self.receipt.failures.push(InventoryDetachFailure {
+                            target: item.target,
+                            error: anyhow!(error),
+                        }),
+                    }
+                }
+            }
+        }
+        // Restore each failed residual to its original target. Returning the
+        // owned work never strips uncertain native handles or original pins.
+        for (link, slot) in self.links.iter_mut().zip(&batch.slots) {
+            let mut item = slot.lock().unwrap_or_else(|error| error.into_inner());
+            link.handle = item.handle.take();
+            link.quarantine = item.quarantine.take();
+        }
+    }
+}
+
 impl<L> Drop for RetirementWork<L> {
     fn drop(&mut self) {
         // Last-resort resource guard, including unwind outside the per-close
@@ -114,7 +236,7 @@ pub(super) struct RetirementJob<L> {
 impl<L: Send + 'static> RetirementJob<L> {
     pub(super) fn start(
         work: RetirementWork<L>,
-        close: impl FnMut(&mut L) -> Result<()> + Send + 'static,
+        close: impl Fn(&mut L) -> Result<()> + Send + Sync + 'static,
     ) -> std::result::Result<Self, Box<RetirementStartFailure<L>>> {
         Self::start_with(work, close, |task| {
             std::thread::Builder::new()
@@ -125,7 +247,7 @@ impl<L: Send + 'static> RetirementJob<L> {
 
     pub(super) fn start_with(
         work: RetirementWork<L>,
-        mut close: impl FnMut(&mut L) -> Result<()> + Send + 'static,
+        close: impl Fn(&mut L) -> Result<()> + Send + Sync + 'static,
         spawn: impl FnOnce(RetirementTask<L>) -> std::io::Result<JoinHandle<Option<RetirementWork<L>>>>,
     ) -> std::result::Result<Self, Box<RetirementStartFailure<L>>> {
         let (sender, receiver) = mpsc::sync_channel::<RetirementWork<L>>(1);
@@ -135,7 +257,7 @@ impl<L: Send + 'static> RetirementJob<L> {
             let Ok(mut work) = receiver.recv() else {
                 return None;
             };
-            work.run(&mut close);
+            work.run_concurrent(Arc::new(close));
             Some(work)
         });
         let worker = match spawn(task) {

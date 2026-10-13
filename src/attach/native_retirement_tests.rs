@@ -23,6 +23,16 @@ impl NativeSession {
             dyn FnMut(OwnedLink, ProducerProgram) -> std::result::Result<(), String> + Send,
         >,
     ) -> Self {
+        Self::new_concurrent(
+            target,
+            super::super::cleanup_worker::legacy_test_closer(closer),
+        )
+    }
+
+    fn new_concurrent(
+        target: RetainedStaticTarget,
+        closer: super::super::cleanup_worker::BoxCloser,
+    ) -> Self {
         let mut pairs = PairBook::default();
         let links = ["p11_return", "p11_entry"]
             .into_iter()
@@ -97,7 +107,7 @@ fn bounded_cleanup_detailed_batch_keeps_original_pin_after_session_owner_drops()
     let gate = Arc::new(CloseGate::default());
     let closer_gate = Arc::clone(&gate);
     let closer_pin = weak.clone();
-    let mut session = NativeSession::new(
+    let mut session = NativeSession::new_concurrent(
         target,
         Box::new(move |owned, producer| {
             let id = usize::from(producer == ProducerProgram::UProbe("p11_return"));
@@ -105,7 +115,7 @@ fn bounded_cleanup_detailed_batch_keeps_original_pin_after_session_owner_drops()
                 closer_gate.missing_pin();
             }
             closer_gate.before_close(id);
-            drop(owned);
+            drop(owned.take());
             if closer_pin.upgrade().is_none() {
                 closer_gate.missing_pin();
             }
@@ -287,10 +297,10 @@ fn native_retirement_foreign_or_old_ticket_cannot_clear_current_quarantine() {
         RetirementPoll::Refused
     );
     let mut other_worker = CleanupWorker::pre_start_with(
-        Box::new(|owned, _| {
+        super::super::cleanup_worker::legacy_test_closer(Box::new(|owned, _| {
             drop(owned);
             Ok(())
-        }),
+        })),
         Arc::new(|| Duration::ZERO),
     );
     assert_eq!(
@@ -358,7 +368,9 @@ fn native_retirement_unavailable_worker_preserves_untouched_synchronous_fallback
     let (_dir, _pins, target) = fixture();
     let mut session = NativeSession::new(target, Box::new(|_, _| panic!("unavailable worker")));
     session.worker = CleanupWorker::pre_start_with_spawn(
-        Box::new(|_, _| panic!("failed startup must never close")),
+        super::super::cleanup_worker::legacy_test_closer(Box::new(|_, _| {
+            panic!("failed startup must never close")
+        })),
         Arc::new(|| Duration::ZERO),
         |_| Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
     );

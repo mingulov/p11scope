@@ -2,13 +2,16 @@
 //! Background link retirement and terminal cleanup (stop-gate Task 5).
 //!
 //! The session moves owned links out of Aya and submits tagged live batches
-//! or terminal cleanup to its single prestarted worker. The worker closes them
-//! in [`DetachOrder`]. Only terminal cleanup drives/join waits and prints
+//! or terminal cleanup to its prestarted coordinator and three helpers. At
+//! most four payloads close together within one [`DetachOrder`] rank; every
+//! close returns before the next rank starts. Terminal cleanup drives/join waits and prints
 //! progress; a second signal interrupts that wait (the kernel finishes the
 //! remaining closes at process exit).
 
+use std::fs::File;
 use std::io::Write;
 use std::os::fd::OwnedFd;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -96,8 +99,200 @@ pub(crate) struct CleanupReceipt {
     pub failures: Vec<String>,
 }
 
-type BoxCloser = Box<dyn FnMut(OwnedLink, ProducerProgram) -> Result<(), String> + Send>;
+pub(crate) type BoxCloser =
+    Box<dyn Fn(&mut Option<OwnedLink>, ProducerProgram) -> Result<(), String> + Send + Sync>;
 type BoxClock = Arc<dyn Fn() -> Duration + Send + Sync>;
+
+/// Legacy functional fixtures intentionally serialize their mutable leaf.
+/// Production and concurrency/lifetime controls use BoxCloser directly.
+#[cfg(test)]
+pub(crate) fn legacy_test_closer(
+    closer: Box<dyn FnMut(OwnedLink, ProducerProgram) -> Result<(), String> + Send>,
+) -> BoxCloser {
+    let closer = Mutex::new(closer);
+    Box::new(move |payload, producer| {
+        let owned = payload.take().ok_or("legacy fixture payload missing")?;
+        closer.lock().unwrap_or_else(|error| error.into_inner())(owned, producer)
+    })
+}
+
+pub(crate) type FileLeases = Arc<Vec<Arc<File>>>;
+pub(crate) type CloseSlot<T> = Arc<Mutex<T>>;
+type CloseOperation<T> = Arc<dyn Fn(&mut T) -> Result<(), String> + Send + Sync>;
+type CloseTask = Box<dyn FnOnce() + Send>;
+
+pub(crate) struct CloseResult<T> {
+    pub(crate) slot: CloseSlot<T>,
+    pub(crate) result: Result<(), String>,
+}
+
+/// Three empty helpers plus their owning coordinator close at most four
+/// payloads. The coordinator retains every slot until actual results return.
+/// A slot owns its original file leases through panic and inner destruction.
+pub(crate) struct ClosePool<T> {
+    senders: Vec<mpsc::SyncSender<CloseSlot<T>>>,
+    results: mpsc::Receiver<CloseResult<T>>,
+    helpers: Vec<std::thread::JoinHandle<()>>,
+    operation: CloseOperation<T>,
+    broken: Option<String>,
+}
+
+impl<T: Send + 'static> ClosePool<T> {
+    pub(crate) fn start(operation: CloseOperation<T>) -> Result<Self, String> {
+        Self::start_with(operation, |task| {
+            std::thread::Builder::new()
+                .name("p11scope-close".into())
+                .spawn(task)
+        })
+    }
+
+    pub(crate) fn start_with(
+        operation: CloseOperation<T>,
+        mut spawn: impl FnMut(CloseTask) -> std::io::Result<std::thread::JoinHandle<()>>,
+    ) -> Result<Self, String> {
+        let (results_tx, results) = mpsc::channel();
+        let mut pool = Self {
+            senders: Vec::new(),
+            results,
+            helpers: Vec::new(),
+            operation,
+            broken: None,
+        };
+        for _ in 0..3 {
+            let (sender, receiver) = mpsc::sync_channel(1);
+            let operation = Arc::clone(&pool.operation);
+            let results = results_tx.clone();
+            let task = Box::new(move || {
+                while let Ok(slot) = receiver.recv() {
+                    let result = invoke_close(&slot, &operation);
+                    if results.send(CloseResult { slot, result }).is_err() {
+                        break;
+                    }
+                }
+            });
+            match spawn(task) {
+                Ok(helper) => {
+                    pool.senders.push(sender);
+                    pool.helpers.push(helper);
+                }
+                Err(error) => {
+                    // No payload has entered any helper. Drop joins only the
+                    // already-started empty helpers, leaving owner custody.
+                    return Err(format!("owned closer helper failed to start: {error}"));
+                }
+            }
+        }
+        Ok(pool)
+    }
+
+    pub(crate) fn close_chunk(&mut self, slots: &[CloseSlot<T>]) -> Vec<CloseResult<T>> {
+        assert!(!slots.is_empty() && slots.len() <= 4);
+        if let Some(error) = &self.broken {
+            return slots
+                .iter()
+                .map(|slot| CloseResult {
+                    slot: Arc::clone(slot),
+                    result: Err(error.clone()),
+                })
+                .collect();
+        }
+        let mut waiting = Vec::new();
+        let mut returned = Vec::new();
+        for (sender, slot) in self.senders.iter().zip(&slots[..slots.len() - 1]) {
+            if sender.send(Arc::clone(slot)).is_err() {
+                self.broken = Some("owned closer dispatch failed; payload remains retained".into());
+                break;
+            }
+            waiting.push(Arc::clone(slot));
+        }
+        if self.broken.is_none() {
+            let slot = slots.last().unwrap();
+            returned.push(CloseResult {
+                slot: Arc::clone(slot),
+                result: invoke_close(slot, &self.operation),
+            });
+        }
+        while !waiting.is_empty() && self.broken.is_none() {
+            match self.results.recv_timeout(Duration::from_millis(50)) {
+                Ok(result) => {
+                    if let Some(index) = waiting
+                        .iter()
+                        .position(|slot| Arc::ptr_eq(slot, &result.slot))
+                    {
+                        waiting.swap_remove(index);
+                        returned.push(result);
+                    } else {
+                        self.broken = Some("owned closer returned a foreign result".into());
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout)
+                    if self.helpers.iter().all(|helper| !helper.is_finished()) => {}
+                Err(_) => self.broken = Some("owned closer ended without a returned result".into()),
+            }
+        }
+        if self.broken.is_some() {
+            self.finish_helpers();
+            // Join first: a dispatch/worker failure cannot leave an in-flight
+            // destructor behind while a later detach rank starts.
+            while let Ok(result) = self.results.try_recv() {
+                if slots.iter().any(|slot| Arc::ptr_eq(slot, &result.slot))
+                    && !returned
+                        .iter()
+                        .any(|prior| Arc::ptr_eq(&prior.slot, &result.slot))
+                {
+                    returned.push(result);
+                }
+            }
+            for slot in slots {
+                if !returned
+                    .iter()
+                    .any(|result| Arc::ptr_eq(slot, &result.slot))
+                {
+                    returned.push(CloseResult {
+                        slot: Arc::clone(slot),
+                        result: Err(self.broken.as_ref().unwrap().clone()),
+                    });
+                }
+            }
+        }
+        returned
+    }
+}
+
+impl<T> ClosePool<T> {
+    fn finish_helpers(&mut self) {
+        self.senders.clear();
+        for helper in self.helpers.drain(..) {
+            if helper.join().is_err() {
+                self.broken
+                    .get_or_insert_with(|| "owned closer helper panicked".into());
+            }
+        }
+    }
+}
+
+impl<T> Drop for ClosePool<T> {
+    fn drop(&mut self) {
+        self.finish_helpers();
+    }
+}
+
+fn invoke_close<T>(slot: &CloseSlot<T>, operation: &CloseOperation<T>) -> Result<(), String> {
+    let mut item = slot
+        .lock()
+        .map_err(|_| "owned close slot is poisoned".to_string())?;
+    match catch_unwind(AssertUnwindSafe(|| operation(&mut item))) {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("non-string panic");
+            Err(format!("owned detach panicked: {message}"))
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BatchStatus {
@@ -116,6 +311,7 @@ struct BatchState {
     total: usize,
     released: usize,
     failed: bool,
+    _leases: FileLeases,
 }
 
 impl std::fmt::Debug for BatchTicket {
@@ -146,6 +342,8 @@ impl BatchTicket {
 pub(crate) struct SubmissionFailure {
     pub(crate) message: String,
     pub(crate) links: Vec<(OwnedLink, ProducerProgram)>,
+    // Payloads drop before this guard, including returned transfer failures.
+    _leases: FileLeases,
 }
 
 impl std::fmt::Debug for SubmissionFailure {
@@ -162,6 +360,7 @@ enum Command {
     Submit {
         links: Vec<(OwnedLink, ProducerProgram)>,
         batch: Arc<Mutex<BatchState>>,
+        leases: FileLeases,
     },
     Shutdown,
 }
@@ -177,6 +376,34 @@ struct WorkerState {
     terminal_started_at: Option<Duration>,
     counts_invalid: bool,
     done: bool,
+    quarantined: Vec<CloseSlot<DetailedClose>>,
+}
+
+struct DetailedClose {
+    payload: Option<OwnedLink>,
+    producer: ProducerProgram,
+    batch: Arc<Mutex<BatchState>>,
+    // Always after payload: inner Multi/Probe destructors retain actual files.
+    _leases: FileLeases,
+}
+
+impl Drop for DetailedClose {
+    fn drop(&mut self) {
+        if let Some(payload) = self.payload.take() {
+            // An uncertain slot is not a foreground close opportunity. Keep
+            // its entire remaining Multi/legacy payload and original files
+            // for process exit, also if the coordinator unexpectedly unwinds.
+            std::mem::forget((payload, Arc::clone(&self._leases)));
+        }
+    }
+}
+
+impl Drop for WorkerState {
+    fn drop(&mut self) {
+        // Failed residual native handles cannot close on a foreground ticket
+        // drop. Their complete owning slots, including files, await exit.
+        std::mem::forget(std::mem::take(&mut self.quarantined));
+    }
 }
 
 /// Pre-started background worker that closes submitted links in
@@ -192,7 +419,7 @@ pub(crate) struct CleanupWorker {
     start_error: Option<String>,
     // A failed submission remains owned. Never close its potentially blocking
     // native handles on the foreground thread, including on second SIGINT.
-    unsubmitted: Mutex<Vec<(OwnedLink, ProducerProgram)>>,
+    unsubmitted: Mutex<Vec<SubmissionFailure>>,
 }
 
 impl CleanupWorker {
@@ -201,7 +428,7 @@ impl CleanupWorker {
         let epoch = std::time::Instant::now();
         Self::pre_start_with(
             Box::new(|link, _| {
-                drop(link);
+                drop(link.take());
                 Ok(())
             }),
             Arc::new(move || epoch.elapsed()),
@@ -226,15 +453,24 @@ impl CleanupWorker {
     ) -> Self {
         let state = Arc::new(Mutex::new(WorkerState::default()));
         let (tx, rx) = mpsc::channel::<Command>();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread_state = Arc::clone(&state);
-        let (handle, start_error) =
-            match spawn(Box::new(move || run_cleanup(rx, thread_state, closer))) {
-                Ok(handle) => (Some(handle), None),
-                Err(error) => (
-                    None,
-                    Some(format!("cleanup worker thread failed to start: {error}")),
-                ),
-            };
+        let (handle, start_error) = match spawn(Box::new(move || {
+            run_cleanup(rx, thread_state, Arc::from(closer), ready_tx)
+        })) {
+            Ok(handle) => {
+                let error = match ready_rx.recv() {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error),
+                    Err(_) => Some("cleanup worker ended before closer readiness".into()),
+                };
+                (Some(handle), error)
+            }
+            Err(error) => (
+                None,
+                Some(format!("cleanup worker thread failed to start: {error}")),
+            ),
+        };
         Self {
             tx,
             state,
@@ -274,19 +510,25 @@ impl CleanupWorker {
     pub(crate) fn submit_live(
         &self,
         links: Vec<(OwnedLink, ProducerProgram)>,
+        leases: FileLeases,
         order: DetachOrder,
     ) -> Result<BatchTicket, SubmissionFailure> {
         if let Err(message) = self.live_admission() {
             self.note_transfer_failed(links.len());
             self.note_failure(message.clone());
-            return Err(SubmissionFailure { message, links });
+            return Err(SubmissionFailure {
+                message,
+                links,
+                _leases: leases,
+            });
         }
-        self.submit_batch(links, order)
+        self.submit_batch(links, leases, order)
     }
 
     fn submit_batch(
         &self,
         mut links: Vec<(OwnedLink, ProducerProgram)>,
+        leases: FileLeases,
         order: DetachOrder,
     ) -> Result<BatchTicket, SubmissionFailure> {
         links.sort_by_key(|(_, producer)| order.rank(producer));
@@ -297,23 +539,33 @@ impl CleanupWorker {
             state.counts_invalid = true;
             let message = "cleanup submitted-link count overflow".to_string();
             state.failures.push(message.clone());
-            return Err(SubmissionFailure { message, links });
+            return Err(SubmissionFailure {
+                message,
+                links,
+                _leases: leases,
+            });
         }
         drop(state);
         let batch = Arc::new(Mutex::new(BatchState {
             total: links.len(),
             released: 0,
             failed: false,
+            _leases: Arc::clone(&leases),
         }));
         match self.tx.send(Command::Submit {
             links,
             batch: Arc::clone(&batch),
+            leases,
         }) {
             Ok(()) => Ok(BatchTicket {
                 owner: Arc::clone(&self.state),
                 state: batch,
             }),
-            Err(mpsc::SendError(Command::Submit { links, batch })) => {
+            Err(mpsc::SendError(Command::Submit {
+                links,
+                batch,
+                leases,
+            })) => {
                 batch.lock().unwrap().failed = true;
                 let message =
                     "cleanup submission failed; owned native links remain quarantined".to_string();
@@ -324,18 +576,27 @@ impl CleanupWorker {
                     state.counts_invalid = true;
                 }
                 state.failures.push(message.clone());
-                Err(SubmissionFailure { message, links })
+                Err(SubmissionFailure {
+                    message,
+                    links,
+                    _leases: leases,
+                })
             }
             Err(mpsc::SendError(Command::Shutdown)) => unreachable!("submitted a link batch"),
         }
     }
 
     /// Submit links for background closing, lowest [`DetachOrder`] rank
-    /// first (stable within a rank). All earlier live submissions remain in
+    /// first, with up to four closes in flight within one rank. All earlier live submissions remain in
     /// the cumulative receipt, while elapsed time starts at terminal cleanup.
-    pub(crate) fn submit(&self, links: Vec<(OwnedLink, ProducerProgram)>, order: DetachOrder) {
+    pub(crate) fn submit(
+        &self,
+        links: Vec<(OwnedLink, ProducerProgram)>,
+        leases: FileLeases,
+        order: DetachOrder,
+    ) {
         self.begin_terminal();
-        if let Err(failure) = self.submit_batch(links, order) {
+        if let Err(failure) = self.submit_batch(links, leases, order) {
             self.retain_unsubmitted(failure);
         }
     }
@@ -362,7 +623,7 @@ impl CleanupWorker {
     /// Preserve ownership after a refused channel handoff. The failure was
     /// already accounted by submission; retaining it cannot credit a close.
     pub(crate) fn retain_unsubmitted(&self, failure: SubmissionFailure) {
-        self.unsubmitted.lock().unwrap().extend(failure.links);
+        self.unsubmitted.lock().unwrap().push(failure);
     }
 
     pub(crate) fn note_failure(&self, message: String) {
@@ -504,52 +765,115 @@ impl Drop for CleanupWorker {
     }
 }
 
-fn run_cleanup(rx: mpsc::Receiver<Command>, state: Arc<Mutex<WorkerState>>, mut closer: BoxCloser) {
+fn run_cleanup(
+    rx: mpsc::Receiver<Command>,
+    state: Arc<Mutex<WorkerState>>,
+    closer: Arc<
+        dyn Fn(&mut Option<OwnedLink>, ProducerProgram) -> Result<(), String> + Send + Sync,
+    >,
+    ready: mpsc::SyncSender<Result<(), String>>,
+) {
+    let close_state = Arc::clone(&state);
+    let operation: CloseOperation<DetailedClose> = Arc::new(move |item| {
+        // Started, not settled. No shared counter lock spans native close.
+        let mut counts = close_state.lock().unwrap();
+        if let Some(attempted) = counts.attempted.checked_add(1) {
+            counts.attempted = attempted;
+        } else {
+            counts.counts_invalid = true;
+        }
+        drop(counts);
+        closer(&mut item.payload, item.producer)?;
+        if item.payload.is_some() {
+            return Err("closer returned success with native ownership still retained".into());
+        }
+        Ok(())
+    });
+    let mut pool = ClosePool::start(operation);
+    let _ = ready.send(pool.as_ref().map(|_| ()).map_err(Clone::clone));
+    if let Err(error) = &pool {
+        let mut counts = state.lock().unwrap();
+        counts.counts_invalid = true;
+        counts.failures.push(error.clone());
+    }
     for command in rx {
         match command {
-            Command::Submit { links, batch } => {
-                for (link, producer) in links {
-                    // Started, not settled: completion counts the release
-                    // or failure below, never this increment.
-                    let mut counts = state.lock().unwrap();
-                    if let Some(attempted) = counts.attempted.checked_add(1) {
-                        counts.attempted = attempted;
-                    } else {
-                        counts.counts_invalid = true;
-                    }
-                    drop(counts);
-                    match closer(link, producer) {
-                        Ok(()) => {
+            Command::Submit {
+                links,
+                batch,
+                leases,
+            } => {
+                let items: Vec<_> = links
+                    .into_iter()
+                    .map(|(payload, producer)| {
+                        Arc::new(Mutex::new(DetailedClose {
+                            payload: Some(payload),
+                            producer,
+                            batch: Arc::clone(&batch),
+                            _leases: Arc::clone(&leases),
+                        }))
+                    })
+                    .collect();
+                let mut first = 0;
+                while first < items.len() {
+                    let rank = DetachOrder.rank(&items[first].lock().unwrap().producer);
+                    let end = (first + 1..items.len())
+                        .find(|index| {
+                            DetachOrder.rank(&items[*index].lock().unwrap().producer) != rank
+                        })
+                        .unwrap_or(items.len());
+                    for chunk in items[first..end].chunks(4) {
+                        let results = match &mut pool {
+                            Ok(pool) => pool.close_chunk(chunk),
+                            Err(error) => chunk
+                                .iter()
+                                .map(|slot| CloseResult {
+                                    slot: Arc::clone(slot),
+                                    result: Err(error.clone()),
+                                })
+                                .collect(),
+                        };
+                        for result in results {
+                            let item = result
+                                .slot
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
                             let mut counts = state.lock().unwrap();
-                            if let Some(released) = counts.released.checked_add(1) {
-                                counts.released = released;
-                            } else {
-                                counts.counts_invalid = true;
+                            let mut batch = item.batch.lock().unwrap();
+                            match result.result {
+                                Ok(()) => {
+                                    if let Some(released) = counts.released.checked_add(1) {
+                                        counts.released = released;
+                                    } else {
+                                        counts.counts_invalid = true;
+                                    }
+                                    if let Some(released) = batch.released.checked_add(1) {
+                                        batch.released = released;
+                                    } else {
+                                        batch.failed = true;
+                                    }
+                                }
+                                Err(error) => {
+                                    if let Some(uncertain) = counts.uncertain.checked_add(1) {
+                                        counts.uncertain = uncertain;
+                                    } else {
+                                        counts.counts_invalid = true;
+                                    }
+                                    counts.failures.push(error);
+                                    counts.quarantined.push(Arc::clone(&result.slot));
+                                    batch.failed = true;
+                                }
                             }
-                            drop(counts);
-                            let mut batch = batch.lock().unwrap();
-                            if let Some(released) = batch.released.checked_add(1) {
-                                batch.released = released;
-                            } else {
-                                batch.failed = true;
-                            }
-                        }
-                        Err(error) => {
-                            let mut state = state.lock().unwrap();
-                            if let Some(uncertain) = state.uncertain.checked_add(1) {
-                                state.uncertain = uncertain;
-                            } else {
-                                state.counts_invalid = true;
-                            }
-                            state.failures.push(error);
-                            batch.lock().unwrap().failed = true;
                         }
                     }
+                    // Every close in this rank returned before the next rank.
+                    first = end;
                 }
             }
             Command::Shutdown => break,
         }
     }
+    drop(pool);
     state.lock().unwrap().done = true;
 }
 
@@ -684,14 +1008,14 @@ mod tests {
         let gate = Mutex::new(Some(gate_rx));
         let now = Arc::new(Mutex::new(Duration::ZERO));
         let mut worker = CleanupWorker::pre_start_with(
-            Box::new(move |_link, role| {
+            legacy_test_closer(Box::new(move |_link, role| {
                 recorder.lock().unwrap().push(role);
                 if recorder.lock().unwrap().len() == 1 {
                     let gate = gate.lock().unwrap().take().unwrap();
                     let _ = gate.recv();
                 }
                 Ok(())
-            }),
+            })),
             scripted_clock(Arc::clone(&now)),
         );
         worker.submit(
@@ -700,6 +1024,7 @@ mod tests {
                 multi(ProducerProgram::UProbe("p11_return")),
                 multi(ProducerProgram::UProbe("p11_entry")),
             ],
+            Arc::default(),
             DetachOrder,
         );
         let mut progress = worker.progress();
@@ -734,13 +1059,13 @@ mod tests {
     #[test]
     fn cleanup_failure_is_reported_not_swallowed() {
         let mut worker = CleanupWorker::pre_start_with(
-            Box::new(|_link, role| {
+            legacy_test_closer(Box::new(|_link, role| {
                 if role == ProducerProgram::UProbe("p11_return") {
                     Err("close p11_return: bad fd".to_string())
                 } else {
                     Ok(())
                 }
-            }),
+            })),
             scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
         );
         worker.submit(
@@ -748,6 +1073,7 @@ mod tests {
                 multi(ProducerProgram::UProbe("p11_entry")),
                 multi(ProducerProgram::UProbe("p11_return")),
             ],
+            Arc::default(),
             DetachOrder,
         );
         // `attempted` is published before the closer runs. Wait for its
@@ -785,10 +1111,10 @@ mod tests {
     fn second_signal_during_cleanup_reports_incomplete_and_exits() {
         let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
         let worker = CleanupWorker::pre_start_with(
-            Box::new(move |_link, _| {
+            legacy_test_closer(Box::new(move |_link, _| {
                 let _ = gate_rx.recv();
                 Ok(())
-            }),
+            })),
             scripted_clock(Arc::new(Mutex::new(Duration::from_secs(38)))),
         );
         worker.submit(
@@ -796,6 +1122,7 @@ mod tests {
                 multi(ProducerProgram::UProbe("p11_entry")),
                 multi(ProducerProgram::UProbe("p11_return")),
             ],
+            Arc::default(),
             DetachOrder,
         );
         let mut out = Vec::new();
@@ -827,14 +1154,15 @@ mod tests {
     fn a_second_signal_abandons_cleanup_as_a_typed_outcome_not_a_process_exit() {
         let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
         let worker = CleanupWorker::pre_start_with(
-            Box::new(move |_link, _| {
+            legacy_test_closer(Box::new(move |_link, _| {
                 let _ = gate_rx.recv();
                 Ok(())
-            }),
+            })),
             scripted_clock(Arc::new(Mutex::new(Duration::from_secs(3)))),
         );
         worker.submit(
             vec![multi(ProducerProgram::UProbe("p11_entry"))],
+            Arc::default(),
             DetachOrder,
         );
         let mut out = Vec::new();
@@ -849,11 +1177,14 @@ mod tests {
     #[test]
     fn a_completed_cleanup_settles_to_its_close_failures() {
         let worker = CleanupWorker::pre_start_with(
-            Box::new(|_link, _| Err("close p11_entry: bad fd".to_string())),
+            legacy_test_closer(Box::new(|_link, _| {
+                Err("close p11_entry: bad fd".to_string())
+            })),
             scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
         );
         worker.submit(
             vec![multi(ProducerProgram::UProbe("p11_entry"))],
+            Arc::default(),
             DetachOrder,
         );
         let mut out = Vec::new();
@@ -870,12 +1201,12 @@ mod tests {
     fn cleanup_completion_counts_settled_closes_not_started_ones() {
         let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
         let mut worker = CleanupWorker::pre_start_with(
-            Box::new(move |_link, role| {
+            legacy_test_closer(Box::new(move |_link, role| {
                 if role == ProducerProgram::UProbe("p11_return") {
                     let _ = gate_rx.recv();
                 }
                 Ok(())
-            }),
+            })),
             scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
         );
         worker.submit(
@@ -883,6 +1214,7 @@ mod tests {
                 multi(ProducerProgram::UProbe("p11_entry")),
                 multi(ProducerProgram::UProbe("p11_return")),
             ],
+            Arc::default(),
             DetachOrder,
         );
         for _ in 0..1000 {
@@ -908,12 +1240,12 @@ mod tests {
     #[test]
     fn completed_cleanup_prints_n_over_n() {
         let worker = CleanupWorker::pre_start_with(
-            Box::new(|_link, role| {
+            legacy_test_closer(Box::new(|_link, role| {
                 if role == ProducerProgram::UProbe("p11_return") {
                     std::thread::sleep(Duration::from_millis(200));
                 }
                 Ok(())
-            }),
+            })),
             scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
         );
         worker.submit(
@@ -921,6 +1253,7 @@ mod tests {
                 multi(ProducerProgram::UProbe("p11_entry")),
                 multi(ProducerProgram::UProbe("p11_return")),
             ],
+            Arc::default(),
             DetachOrder,
         );
         let mut out = Vec::new();
@@ -951,12 +1284,13 @@ mod tests {
     #[test]
     fn transfer_failure_qualifies_the_completed_line() {
         let worker = CleanupWorker::pre_start_with(
-            Box::new(|_link, _| Ok(())),
+            legacy_test_closer(Box::new(|_link, _| Ok(()))),
             scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
         );
         worker.note_transfer_failed(1);
         worker.submit(
             vec![multi(ProducerProgram::UProbe("p11_entry"))],
+            Arc::default(),
             DetachOrder,
         );
         let mut out = Vec::new();
@@ -994,7 +1328,7 @@ mod tests {
     #[test]
     fn signal_after_last_close_still_reports_completed() {
         let worker = CleanupWorker::pre_start_with(
-            Box::new(|_link, _| Ok(())),
+            legacy_test_closer(Box::new(|_link, _| Ok(()))),
             scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
         );
         worker.submit(
@@ -1002,6 +1336,7 @@ mod tests {
                 multi(ProducerProgram::UProbe("p11_entry")),
                 multi(ProducerProgram::UProbe("p11_return")),
             ],
+            Arc::default(),
             DetachOrder,
         );
         for _ in 0..1000 {
@@ -1036,12 +1371,12 @@ mod tests {
     fn second_signal_during_final_close_reports_incomplete() {
         let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
         let worker = CleanupWorker::pre_start_with(
-            Box::new(move |_link, role| {
+            legacy_test_closer(Box::new(move |_link, role| {
                 if role == ProducerProgram::UProbe("p11_return") {
                     let _ = gate_rx.recv_timeout(Duration::from_secs(5));
                 }
                 Ok(())
-            }),
+            })),
             scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
         );
         worker.submit(
@@ -1049,6 +1384,7 @@ mod tests {
                 multi(ProducerProgram::UProbe("p11_entry")),
                 multi(ProducerProgram::UProbe("p11_return")),
             ],
+            Arc::default(),
             DetachOrder,
         );
         let start = std::time::Instant::now();
@@ -1084,12 +1420,12 @@ mod tests {
     #[test]
     fn fast_session_detaches_well_under_one_second() {
         let worker = CleanupWorker::pre_start_with(
-            Box::new(|_link, role| {
+            legacy_test_closer(Box::new(|_link, role| {
                 if role == ProducerProgram::UProbe("p11_entry") {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Ok(())
-            }),
+            })),
             scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
         );
         worker.submit(
@@ -1097,6 +1433,7 @@ mod tests {
                 multi(ProducerProgram::UProbe("p11_entry")),
                 multi(ProducerProgram::UProbe("p11_return")),
             ],
+            Arc::default(),
             DetachOrder,
         );
         let mut out = Vec::new();
@@ -1123,10 +1460,10 @@ mod tests {
     #[test]
     fn slow_session_keeps_about_one_line_per_poll_interval() {
         let worker = CleanupWorker::pre_start_with(
-            Box::new(|_link, _| {
+            legacy_test_closer(Box::new(|_link, _| {
                 std::thread::sleep(Duration::from_millis(150));
                 Ok(())
-            }),
+            })),
             scripted_clock(Arc::new(Mutex::new(Duration::ZERO))),
         );
         worker.submit(
@@ -1135,6 +1472,7 @@ mod tests {
                 multi(ProducerProgram::UProbe("p11_return")),
                 multi(ProducerProgram::RawTracePoint("sched_process_exit")),
             ],
+            Arc::default(),
             DetachOrder,
         );
         let mut out = Vec::new();

@@ -56,7 +56,10 @@ impl RetirementFixture {
             retained,
             pairs,
             gaps: Retirements::default(),
-            worker: CleanupWorker::pre_start_with(closer, Arc::new(|| std::time::Duration::ZERO)),
+            worker: CleanupWorker::pre_start_with(
+                super::super::cleanup_worker::legacy_test_closer(closer),
+                Arc::new(|| std::time::Duration::ZERO),
+            ),
             begins: 0,
             polls: 0,
         }

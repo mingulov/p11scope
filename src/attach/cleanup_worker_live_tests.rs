@@ -29,19 +29,20 @@ fn live_retirement_batch_returns_before_close_and_reuses_one_running_worker() {
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let mut worker = CleanupWorker::pre_start_with(
-        Box::new(move |owned, _| {
+        legacy_test_closer(Box::new(move |owned, _| {
             entered_tx.send(std::thread::current().id()).unwrap();
             release_rx
                 .recv_timeout(Duration::from_secs(2))
                 .map_err(|error| error.to_string())?;
             drop(owned);
             Ok(())
-        }),
+        })),
         Arc::new(|| Duration::ZERO),
     );
     let first = worker
         .submit_live(
             vec![link(ProducerProgram::UProbe("p11_entry"))],
+            Arc::default(),
             DetachOrder,
         )
         .expect("prestarted worker accepts the first live batch");
@@ -56,6 +57,7 @@ fn live_retirement_batch_returns_before_close_and_reuses_one_running_worker() {
     let second = worker
         .submit_live(
             vec![link(ProducerProgram::UProbe("p11_return"))],
+            Arc::default(),
             DetachOrder,
         )
         .expect("same running worker accepts a later live batch");
@@ -76,7 +78,7 @@ fn live_retirement_final_inflight_close_has_zero_remaining_but_ticket_stays_pend
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let mut worker = CleanupWorker::pre_start_with(
-        Box::new(move |owned, producer| {
+        legacy_test_closer(Box::new(move |owned, producer| {
             if producer == ProducerProgram::UProbe("p11_return") {
                 entered_tx.send(()).unwrap();
                 release_rx
@@ -85,7 +87,7 @@ fn live_retirement_final_inflight_close_has_zero_remaining_but_ticket_stays_pend
             }
             drop(owned);
             Ok(())
-        }),
+        })),
         Arc::new(|| Duration::ZERO),
     );
     let ticket = worker
@@ -94,6 +96,7 @@ fn live_retirement_final_inflight_close_has_zero_remaining_but_ticket_stays_pend
                 link(ProducerProgram::UProbe("p11_return")),
                 link(ProducerProgram::UProbe("p11_entry")),
             ],
+            Arc::default(),
             DetachOrder,
         )
         .unwrap();
@@ -113,25 +116,27 @@ fn live_retirement_final_inflight_close_has_zero_remaining_but_ticket_stays_pend
 #[test]
 fn live_retirement_ticket_cannot_borrow_another_batch_success() {
     let mut worker = CleanupWorker::pre_start_with(
-        Box::new(|owned, producer| {
+        legacy_test_closer(Box::new(|owned, producer| {
             drop(owned);
             if producer == ProducerProgram::UProbe("p11_entry") {
                 Err("actual closer failure".into())
             } else {
                 Ok(())
             }
-        }),
+        })),
         Arc::new(|| Duration::ZERO),
     );
     let failed = worker
         .submit_live(
             vec![link(ProducerProgram::UProbe("p11_entry"))],
+            Arc::default(),
             DetachOrder,
         )
         .unwrap();
     let released = worker
         .submit_live(
             vec![link(ProducerProgram::UProbe("p11_return"))],
+            Arc::default(),
             DetachOrder,
         )
         .unwrap();
@@ -148,10 +153,10 @@ fn live_retirement_ticket_cannot_borrow_another_batch_success() {
 #[test]
 fn live_retirement_submission_failure_returns_still_owned_payload() {
     let mut worker = CleanupWorker::pre_start_with(
-        Box::new(|owned, _| {
+        legacy_test_closer(Box::new(|owned, _| {
             drop(owned);
             Ok(())
-        }),
+        })),
         Arc::new(|| Duration::ZERO),
     );
     // Keep the actual worker channel alive, but close the receiver selected for
@@ -167,6 +172,7 @@ fn live_retirement_submission_failure_returns_still_owned_payload() {
                 OwnedLink::Multi(vec![fd.into()]),
                 ProducerProgram::UProbe("p11_entry"),
             )],
+            Arc::default(),
             DetachOrder,
         )
         .unwrap_err();
@@ -197,10 +203,10 @@ fn live_retirement_submission_failure_returns_still_owned_payload() {
 #[test]
 fn live_retirement_worker_start_failure_preserves_payload_and_refuses_readiness() {
     let mut worker = CleanupWorker::pre_start_with_spawn(
-        Box::new(|owned, _| {
+        legacy_test_closer(Box::new(|owned, _| {
             drop(owned);
             Ok(())
-        }),
+        })),
         Arc::new(|| Duration::ZERO),
         |_| Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
     );
@@ -208,6 +214,7 @@ fn live_retirement_worker_start_failure_preserves_payload_and_refuses_readiness(
     let failure = worker
         .submit_live(
             vec![link(ProducerProgram::UProbe("p11_entry"))],
+            Arc::default(),
             DetachOrder,
         )
         .unwrap_err();
@@ -223,7 +230,7 @@ fn live_retirement_terminal_receipt_is_cumulative_and_excludes_capture_idle() {
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let worker = CleanupWorker::pre_start_with(
-        Box::new(move |owned, producer| {
+        legacy_test_closer(Box::new(move |owned, producer| {
             if producer == ProducerProgram::UProbe("p11_return") {
                 entered_tx.send(()).unwrap();
                 release_rx
@@ -232,12 +239,13 @@ fn live_retirement_terminal_receipt_is_cumulative_and_excludes_capture_idle() {
             }
             drop(owned);
             Ok(())
-        }),
+        })),
         Arc::new(move || *clock.lock().unwrap()),
     );
     let live = worker
         .submit_live(
             vec![link(ProducerProgram::UProbe("p11_entry"))],
+            Arc::default(),
             DetachOrder,
         )
         .unwrap();
@@ -245,6 +253,7 @@ fn live_retirement_terminal_receipt_is_cumulative_and_excludes_capture_idle() {
     *now.lock().unwrap() = Duration::from_secs(60);
     worker.submit(
         vec![link(ProducerProgram::UProbe("p11_return"))],
+        Arc::default(),
         DetachOrder,
     );
     entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -272,19 +281,20 @@ fn live_retirement_only_pending_batch_remains_second_signal_responsive_at_stop()
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let worker = CleanupWorker::pre_start_with(
-        Box::new(move |owned, _| {
+        legacy_test_closer(Box::new(move |owned, _| {
             entered_tx.send(()).unwrap();
             release_rx
                 .recv_timeout(Duration::from_secs(2))
                 .map_err(|error| error.to_string())?;
             drop(owned);
             Ok(())
-        }),
+        })),
         Arc::new(|| Duration::ZERO),
     );
     let ticket = worker
         .submit_live(
             vec![link(ProducerProgram::UProbe("p11_entry"))],
+            Arc::default(),
             DetachOrder,
         )
         .unwrap();

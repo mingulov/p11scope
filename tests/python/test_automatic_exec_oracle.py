@@ -5970,6 +5970,52 @@ class InventoryReadinessTest(unittest.TestCase):
         self.assertEqual(result["baseline"]["physical"]["event"]["entries"]["count"], 10)
         self.assertGreater(result["baseline"]["pass"]["seq"], result["baseline"]["semantic"]["seq"])
 
+    def measured_marker(self, proof):
+        t = time.monotonic_ns()
+        warm = proof["markers"][-1]
+        batches = [{**warm["batches"][0], "fn": fn, "mech": mech, "n": count, "bad": bad,
+                    "phase": phase, "t0": t - 50, "t1": t - 10}
+                   for fn, mech, count, bad, phase in (
+                       ("C_DigestInit", "0x250", 2, 0, "h6-measured"),
+                       ("C_Digest", "0x250", 2, 0, "h6-measured"),
+                       ("C_GenerateKey", "0x1080", 2, 0, "h6-measured"),
+                       ("C_EncryptInit", "0x1087", 2, 0, "h6-measured"),
+                       ("C_Encrypt", "0x1087", 2, 0, "h6-measured"),
+                       ("C_GenerateKey", "0x350", 2, 0, "h6-measured"),
+                       ("C_SignInit", "0x251", 2, 0, "h6-measured"),
+                       ("C_Sign", "0x251", 2, 0, "h6-measured"),
+                       ("C_DestroyObject", "-", 4, 0, "h6-measured"),
+                       ("C_VerifyInit", "0x251", 1, 0, "h6-failed"),
+                       ("C_Verify", "0x251", 1, 1, "h6-failed"))]
+        return {"ack": {**warm["ack"], "command": "M", "seq": 2, "attempt": 0,
+                        "t0": t - 100, "t1": t, "rv": 0xc0}, "batches": batches}
+
+    def instance_update(self, proof, **changes):
+        row = self.record(self.sequence, "instance_observed",
+                          {**proof["baseline"]["instance"]["event"], **changes})
+        row["at_ns"] = time.monotonic_ns()
+        self.sequence += 1
+        return row
+
+    def measured_boundary(self, proof, marker):
+        return H6["wait_inventory_measured_boundary"](self.owner, self.pin, self.pin,
+            self.accepted, self.cursor, proof, marker,
+            [*proof["markers"][-1]["batches"], *marker["batches"]], time.monotonic_ns() + 1_000_000_000)
+
+    def test_measured_retired_replaced_instance_refuses_before_another_poll(self):
+        proof = self.gate(self.prepare())
+        marker = self.measured_marker(proof)
+        # Native failure shape: retire the accepted instance and publish its
+        # replacement, before any fresh physical row or completing pass.
+        rows = [self.instance_update(proof, state="retired", reason="instance_retired"),
+                self.instance_update(proof, id="i2")]
+        with self.log.open("ab") as stream:
+            stream.write(b"".join(json.dumps(row).encode() + b"\n" for row in rows))
+        with mock.patch.dict(H6["wait_inventory_measured_boundary"].__globals__,
+                pause_until=lambda *_: self.fail("known retired measured instance waited again")), \
+                self.assertRaisesRegex(H6["SetupError"], "instance"):
+            self.measured_boundary(proof, marker)
+
     def test_unmapped_unattached_unknown_and_wrong_subjects_cannot_release(self):
         def wrong_birth(p, _i, _s): p["identity_context"]["caller"]["start_time"] += 1
         def wrong_incarnation(p, _i, _s): p["identity_context"]["caller"]["incarnation"] = 0

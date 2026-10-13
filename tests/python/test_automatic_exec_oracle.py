@@ -4784,6 +4784,9 @@ class InventoryFixtureTest(unittest.TestCase):
             if edge["caller"] == caller["id"]:
                 edge["entries"].update(count=0, saturated=False, in_flight=False,
                     coverage={"state": "unknown", "reason": "scope_membership_unproven", "lossy": None})
+        first_edge = next(row["event"] for row in records if row["kind"] == "edge_observed"
+                          and row["event"]["caller"] == caller["id"])
+        first_edge["entries"]["coverage"]["reason"] = "not_attached"
         doc["gaps"] = [
             {"subject": "scoped native owner admission deferred", "caller": None,
              "module": None, "pid": None, "budget": None, "repeats": 4,
@@ -4795,6 +4798,11 @@ class InventoryFixtureTest(unittest.TestCase):
         # immediately before the terminal commit, with normal stream indexing.
         position = next(i for i, row in enumerate(records)
                         if row["kind"] == "pass_committed" and row["event"].get("final"))
+        records[position]["event"]["edge_events"] += 1
+        records.insert(position, {"schema": "p11scope/inventory-events/v1", "kind": "edge_observed",
+            "at_ns": records[position]["at_ns"], "event": copy.deepcopy(next(
+                row for row in doc["edges"] if row["caller"] == caller["id"]))})
+        position += 1
         for index, gap in enumerate(doc["gaps"]):
             records.insert(position + index, {"schema": "p11scope/inventory-events/v1",
                 "kind": "gap_recorded", "at_ns": records[position]["at_ns"],
@@ -4810,6 +4818,7 @@ class InventoryFixtureTest(unittest.TestCase):
         self.assertEqual(result["completed_operations"], 20)
         self.assertEqual(result["physical_counted"], result["physical_entered"])
         self.assertEqual(result["gaps"], [(row["subject"], None) for row in doc["gaps"]])
+        self.assertEqual(result["expected_disclosures"], doc["gaps"])
 
     def test_cgroup_disclosures_reject_wrong_scope_caller_reason_budget_and_authority(self):
         original = self.cgroup_disclosure_inputs()
@@ -4818,11 +4827,22 @@ class InventoryFixtureTest(unittest.TestCase):
             for row in data[2]["inventory_control"]["final_records"]:
                 if row["kind"] == "gap_recorded" and row["event"]["index"] == index:
                     row["event"][field] = value
+        def quiet_edge(data, field, value):
+            caller = data[0]["gaps"][1]["caller"]
+            for row in data[0]["edges"] + [record["event"] for record in
+                    data[2]["inventory_control"]["final_records"] if record["kind"] == "edge_observed"]:
+                if row["caller"] == caller:
+                    row["entries"][field] = value
+        def allowlist_bypass(data):
+            gap_change(data, 1, "reason", "provider_instance_unproven")
+            data[2]["allowed_gap_subjects"].append("semantic admission refused")
         cases = {
             "scope": lambda d: d[2].update(scope_kind="system"),
             "stream-scope": lambda d: d[2]["inventory_control"]["final_records"][0]["event"].update(scope="system"),
             "lane": lambda d: d[0]["observation"].update(lane="scan"),
             "filter": lambda d: d[0]["observation"]["attach"].update(scope_filter="bpf-pid"),
+            "suppressed": lambda d: d[0].update(gaps_suppressed=1),
+            "repeats": lambda d: d[0]["gaps"][1].update(repeats=101),
             "global-caller": lambda d: gap_change(d, 0, "caller", d[0]["callers"][0]["id"]),
             "global-reason": lambda d: gap_change(d, 0, "reason", "different limitation"),
             "global-budget": lambda d: gap_change(d, 0, "budget", "callers"),
@@ -4833,6 +4853,15 @@ class InventoryFixtureTest(unittest.TestCase):
             "semantic-module": lambda d: gap_change(d, 1, "module", "m0"),
             "semantic-pid": lambda d: gap_change(d, 1, "pid", d[1]["RS0"]["idents"][0]["pid"]),
             "birth": lambda d: d[1]["RS0"]["idents"][0].update(start=1),
+            "provider": lambda d: d[1]["RS0"]["mapped"][0].update(ino=1),
+            "scope-interval": lambda d: next(row for row in d[2]["scope_intervals"]
+                if row["pid"] == d[1]["RS0"]["idents"][0]["pid"]).update(membership="outside"),
+            "failed-ledger": lambda d: d[1]["RS0"]["dones"][0].update(status="failed"),
+            "count": lambda d: quiet_edge(d, "count", 1),
+            "saturated": lambda d: quiet_edge(d, "saturated", True),
+            "in-flight": lambda d: quiet_edge(d, "in_flight", True),
+            "regressed-not-attached": lambda d: quiet_edge(d, "coverage", {
+                "state": "unknown", "reason": "not_attached", "lossy": None}),
             "ledger-call": lambda d: d[1]["RS0"]["batches"].append({**d[1]["RX"]["batches"][0],
                 "pid": d[1]["RS0"]["idents"][0]["pid"]}),
             "unowned": lambda d: d[2]["owned_pids"].remove(d[1]["RS0"]["idents"][0]["pid"]),
@@ -4840,6 +4869,7 @@ class InventoryFixtureTest(unittest.TestCase):
                 "caller": d[0]["gaps"][1]["caller"], "module": "m0", "state": "observed"}),
             "stream-gap": lambda d: next(row for row in d[2]["inventory_control"]["final_records"]
                 if row["kind"] == "gap_recorded" and row["event"]["index"] == 1)["event"].update(reason="other"),
+            "allowlist-bypass": allowlist_bypass,
         }
         for name, mutate in cases.items():
             with self.subTest(name=name):

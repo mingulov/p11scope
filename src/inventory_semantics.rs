@@ -305,6 +305,13 @@ pub(crate) trait LaneTestIo {
     fn begin_terminal_cleanup(&mut self) -> anyhow::Result<()> {
         Ok(())
     }
+    fn finish_terminal_cleanup(
+        &mut self,
+        _second_signal: &dyn Fn() -> bool,
+        _out: &mut dyn std::io::Write,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// The exact targets the production driver selected for this tick.
     fn tick_targets(&mut self, _pins: &[Arc<PidPin>]) {}
     /// Substitute Session attachment I/O, retaining the production subset
@@ -745,6 +752,59 @@ impl AttestedSemanticLane {
         self.live.as_ref().is_some_and(|live| live.finished)
     }
 
+    /// Begin native closes only after the driver's H0 Finish publication.
+    /// No wait, success receipt or owner release occurs at this boundary.
+    pub(crate) fn begin_owned_terminal_cleanup(&mut self) -> anyhow::Result<()> {
+        if !self.is_live() {
+            return Ok(());
+        }
+        anyhow::ensure!(self.is_finished(), "Detailed cleanup preceded H0 Finish");
+        #[cfg(test)]
+        if let Some(io) = self.test_io.as_mut() {
+            return io.begin_terminal_cleanup();
+        }
+        self.live
+            .as_mut()
+            .unwrap()
+            .session
+            .begin_owned_producer_detach()
+    }
+
+    /// Consume the complete Detailed owner after Inventory's output/retirement
+    /// boundary. Only a real joined successful receipt releases its maps,
+    /// readers, H0 state, retained targets and residual Aya registry normally.
+    /// Failure/second signal retains the whole owner for process exit, so an
+    /// implicit Session/Ebpf destructor cannot introduce foreground blocking.
+    pub(crate) fn finish_owned_terminal_cleanup(
+        mut self,
+        second_signal: &dyn Fn() -> bool,
+        out: &mut dyn std::io::Write,
+    ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(mut io) = self.test_io.take() {
+            let result = if self.test_finished {
+                io.finish_terminal_cleanup(second_signal, out)
+            } else {
+                Err(anyhow::anyhow!("Detailed cleanup preceded H0 Finish"))
+            };
+            return release_terminal_owner(io, result);
+        }
+        let Some(mut live) = self.live.take() else {
+            return Ok(());
+        };
+        let result = if live.finished {
+            // A failed Finish publication withheld early start; after the
+            // output boundary, negative cleanup can still retire ownership.
+            live.session.begin_owned_producer_detach().and_then(|()| {
+                live.session
+                    .finish_owned_producer_detach_driven(second_signal, out)
+            })
+        } else {
+            Err(anyhow::anyhow!("Detailed cleanup preceded H0 Finish"))
+        };
+        release_terminal_owner(live, result)
+    }
+
     /// One H0 collect→audit→route quantum over the bound callers' stable
     /// custody Arcs. The only producer of lane call batches; a gated,
     /// finished or shell lane refuses instead of inventing calls.
@@ -1093,6 +1153,17 @@ impl AttestedSemanticLane {
 /// poll bound) and records per quantum (one H0 collection quantum).
 pub(crate) const TERMINAL_DRAIN_QUANTA: usize = 16;
 pub(crate) const TERMINAL_DRAIN_QUANTUM: usize = 1024;
+
+/// Keep the complete original envelope on any unproved terminal result. This
+/// is process-exit retention, never a fabricated native settlement receipt.
+fn release_terminal_owner<T>(owner: T, result: anyhow::Result<()>) -> anyhow::Result<()> {
+    if result.is_ok() {
+        drop(owner);
+    } else {
+        std::mem::forget(owner);
+    }
+    result
+}
 
 /// Bound on terminal batches staged ahead of commit: one
 /// [`TERMINAL_DRAIN_QUANTA`] window each for the quiesce wait and the
@@ -2285,6 +2356,32 @@ mod terminal_drain_tests {
     use crate::semantic_capture::RoutedCall;
     use p11scope_ebpf_common::instance::STAMP_VALID;
     use p11scope_ebpf_common::{Event, InstanceStamp};
+
+    #[test]
+    fn owner_terminal_unproved_result_retains_the_complete_owner() {
+        struct Owner(Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        release_terminal_owner(Box::new(Owner(Arc::clone(&drops))), Ok(())).unwrap();
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let original = Arc::downgrade(&drops);
+        let error = release_terminal_owner(
+            Box::new(Owner(Arc::clone(&drops))),
+            Err(crate::attach::CleanupInterrupted.into()),
+        )
+        .unwrap_err();
+        assert!(error.is::<crate::attach::CleanupInterrupted>());
+        assert_eq!(drops.load(std::sync::atomic::Ordering::SeqCst), 1);
+        drop(drops);
+        assert!(
+            original.upgrade().is_some(),
+            "the original complete owner remains retained for exit"
+        );
+    }
 
     fn router_ids(domain: NativeDomainId, count: usize) -> Vec<InstanceId> {
         let mut router = InstanceRouter::new(domain, RouterLimits::default());

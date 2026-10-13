@@ -45,6 +45,7 @@ from contextvars import ContextVar
 import ctypes
 import errno
 import codecs
+import copy
 import pty
 import threading
 import hashlib
@@ -4076,11 +4077,28 @@ def wait_usage_armed(jsonl_path, wants, timeout=90):
 
 MAPPED_PROVIDER = runpy.run_path(str(ROOT / "scripts/mapped-provider-pin.py"))
 PIN_FD = MAPPED_PROVIDER["pin_fd"]
+FILE_IDENTITY = MAPPED_PROVIDER["file_identity"]
 
 
 def provider_receipt(pin):
     pin.verify()
-    return dict(PIN_FD(pin.fd), path=str(pin.path))
+    cached = getattr(pin, "_h6_provider_receipt", None)
+    if cached is None:
+        # The helper independently obtains the maps-domain device by mapping
+        # this original held FD. Callers calibrate before starting the observer
+        # where possible; later receipts must not remap its watched provider.
+        mapped = PIN_FD(pin.fd)
+        pin.verify()
+        if (mapped["sha256"] != pin.digest
+                or mapped["file_identity"] != FILE_IDENTITY(pin.initial)):
+            raise ValueError("held provider mapping calibration changed")
+        cached = (pin.fd, dict(mapped, path=str(pin.path)))
+        pin._h6_provider_receipt = cached
+    elif pin.fd != cached[0]:
+        raise ValueError("held provider descriptor changed")
+    # FilePin.verify rechecks the original FD metadata and complete hash on
+    # every call. The nested mapping arrays must not escape cache ownership.
+    return copy.deepcopy(cached[1])
 
 
 def inventory_manifest_hooks(manifest, pin):

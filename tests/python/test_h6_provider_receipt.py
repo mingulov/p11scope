@@ -98,6 +98,22 @@ class HeldProviderReceiptTests(unittest.TestCase):
             original.close()
             replacement.close()
 
+    def test_cached_mapping_refuses_a_different_descriptor_on_same_owner(self):
+        pin = H6["FilePin"](self.provider)
+        try:
+            RECEIPT(pin)
+            original_fd = pin.fd
+            alias = os.dup(original_fd)
+            try:
+                pin.fd = alias
+                with self.assertRaisesRegex(ValueError, "descriptor changed"):
+                    RECEIPT(pin)
+            finally:
+                pin.fd = original_fd
+                os.close(alias)
+        finally:
+            pin.close()
+
 
 if __name__ == "__main__":
     unittest.main()

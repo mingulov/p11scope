@@ -4260,7 +4260,8 @@ class ControlledInventoryObserver:
                         ops = {"calls": totals[4].get(key, 0), "completed": totals[2].get(key, 0),
                             "failed": totals[3].get(key, 0), "unknown": 0, "orphans": 0, "dropped": 0,
                             "last_seen_ns": last_seen}
-                        edge.update(semantics="observed", mechanisms=mechanisms, operations=ops)
+                        # Native per-instance S1 publication leaves the legacy
+                        # physical edge's semantic fields withheld.
                         instance = {"id": instance_id, "caller": context["id"], "module": module_id,
                             "state": "observed", "reason": None,
                             "first_seen_ns": self.instances.get(instance_id, {}).get("first_seen_ns", last_seen),
@@ -4867,6 +4868,62 @@ class InventoryFixtureTest(unittest.TestCase):
         sibling = result["s1"]["sibling_instances"][0]
         self.assertEqual((sibling["api_returns"], sibling["ledger_api_returns"]), (47, 47))
         self.assertEqual(sibling["operations"]["completed"], 22)
+
+    def test_system_mixed_sibling_physical_counts_and_instance_s1_use_separate_channels(self):
+        doc, ledgers, receipt = self.run_inventory_route()
+        pid = ledgers["MS"]["idents"][0]["pid"]
+        caller = next(row["id"] for row in doc["callers"] if row["pid"] == pid)
+        module = next(row["id"] for row in doc["modules"]
+                      if receipt["providers"]["A"]["path"] in row["paths"])
+        physical = next(row for row in doc["edges"] if (row["caller"], row["module"]) == (caller, module))
+        semantic = next(row for row in doc["semantic_edges"] if (row["caller"], row["module"]) == (caller, module))
+        self.assertEqual(physical["semantics"], "unknown (semantic capture withheld)")
+        self.assertIsNone(physical["mechanisms"])
+        self.assertIsNone(physical["operations"])
+        self.assertEqual(physical["entries"]["count"], 48)
+        self.assertEqual(semantic["api_returns"]["count"], 47)
+        self.assertEqual(semantic["operations"]["completed"], 22)
+        result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+        self.assertTrue(result["pass"], result["errors"])
+
+    def test_separate_sibling_channels_still_require_exact_physical_and_semantic_evidence(self):
+        original = self.run_inventory_route()
+        for fault in ("physical-count", "physical-identity", "missing-physical", "duplicate-physical",
+                      "cross-caller-physical", "missing-semantic", "cross-caller-semantic"):
+            with self.subTest(fault=fault):
+                doc, ledgers, receipt = copy.deepcopy(original)
+                pid = ledgers["MS"]["idents"][0]["pid"]
+                caller = next(row["id"] for row in doc["callers"] if row["pid"] == pid)
+                module = next(row for row in doc["modules"] if receipt["providers"]["A"]["path"] in row["paths"])
+                physical = next(row for row in doc["edges"]
+                                if (row["caller"], row["module"]) == (caller, module["id"]))
+                semantic = next(row for row in doc["semantic_edges"]
+                                if (row["caller"], row["module"]) == (caller, module["id"]))
+                records = receipt["inventory_control"]["final_records"]
+                if fault == "physical-count":
+                    physical["entries"]["count"] += 1
+                    for record in records:
+                        row = record["event"]
+                        if record["kind"] == "edge_observed" and (row["caller"], row["module"]) == (caller, module["id"]):
+                            row["entries"]["count"] += 1
+                elif fault == "physical-identity":
+                    module["identity"]["inode"] += 1
+                elif fault == "missing-physical":
+                    doc["edges"].remove(physical)
+                elif fault == "duplicate-physical":
+                    doc["edges"].append(copy.deepcopy(physical))
+                elif fault == "cross-caller-physical":
+                    physical["caller"] = next(row["id"] for row in doc["callers"] if row["pid"] != pid)
+                elif fault == "missing-semantic":
+                    doc["semantic_edges"].remove(semantic)
+                else:
+                    semantic["caller"] = next(row["id"] for row in doc["callers"] if row["pid"] != pid)
+                result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+                self.assertFalse(result["pass"], (fault, result))
+                if fault == "physical-count":
+                    self.assertTrue(any("counted entries disagree" in error for error in result["errors"]), result)
+                elif fault == "physical-identity":
+                    self.assertTrue(any("module identity" in error for error in result["errors"]), result)
 
     def test_system_mixed_delayed_exec_wait_still_stops_before_successor_main(self):
         doc, ledgers, receipt = self.run_inventory_route(exec_poll_delay=0.05)

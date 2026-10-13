@@ -177,7 +177,8 @@ class DualBuildCallerTests(unittest.TestCase):
                 self.assertFalse(self.work.exists())
 
     def configure_attach_observer(self, *, skipped=1, log_lines=(), checker_status=None,
-                                  log_fault=None, terminal_attribution=False, profiler_status=0):
+                                  log_fault=None, terminal_attribution=False, profiler_status=0,
+                                  require_completed_live=False):
         """Keep the actual gate, waits and checker; fake only external commands."""
         for name in ("check-capture-evidence.py", "lane-attach-e2e-oracle.py"):
             shutil.copy2(ROOT / "scripts" / name, self.repo / "scripts" / name)
@@ -212,10 +213,11 @@ class DualBuildCallerTests(unittest.TestCase):
         self.config.write_text(json.dumps({"events": str(self.events),
                                            "documents": documents, "log_lines": log_lines,
                                            "terminal_attribution": terminal_attribution,
-                                           "profiler_status": profiler_status}),
+                                           "profiler_status": profiler_status,
+                                           "require_completed_live": require_completed_live}),
                                encoding="utf-8")
         dispatcher = '''#!/usr/bin/python3
-import json, mmap, os, shutil, sys, time
+import json, mmap, os, select, shutil, sys, time
 from pathlib import Path
 config = json.loads(Path(os.environ["P11SCOPE_DUAL_BUILD_CONFIG"]).read_text())
 kind = "cargo" if Path(sys.argv[0]).name in ("cargo", "stable cargo") else Path(sys.argv[0]).name
@@ -235,10 +237,37 @@ elif kind == "harness":
             if time.monotonic() > deadline:
                 raise SystemExit(98)
             time.sleep(0.01)
+        print("harness OK", flush=True)
+        phase = Path(sys.argv[2] + ".phase")
+        phase.write_text("held" if len(sys.argv) == 4 else "exiting")
+        if len(sys.argv) == 4:
+            while not Path(sys.argv[3]).exists():
+                if time.monotonic() > deadline:
+                    raise SystemExit(98)
+                time.sleep(0.01)
 elif kind == "p11scope":
     output = Path(sys.argv[sys.argv.index("-o") + 1])
-    output.write_text(json.dumps(config["documents"][int("--manifest" in sys.argv)]))
+    target = int(sys.argv[sys.argv.index("--pid") + 1])
+    pin = os.pidfd_open(target)
     print("p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C", flush=True)
+    if config["require_completed_live"]:
+        phase = output.with_name(output.stem + "-go.phase")
+        deadline = time.monotonic() + 3
+        while not phase.exists():
+            if time.monotonic() > deadline:
+                raise SystemExit("workload never completed")
+            time.sleep(0.01)
+        if phase.read_text() == "exiting":
+            if not select.select([pin], [], [], 3)[0]:
+                raise SystemExit("unheld workload never exited")
+        if select.select([pin], [], [], 0)[0]:
+            raise SystemExit("completed workload exited before observer terminal collection")
+        if "libsofthsm2.so" not in Path(f"/proc/{target}/maps").read_text():
+            raise SystemExit("completed workload lost its provider mapping")
+        with Path(config["events"]).open("a") as stream:
+            stream.write(json.dumps({"kind": "completed-live", "pid": target}) + "\\n")
+    os.close(pin)
+    output.write_text(json.dumps(config["documents"][int("--manifest" in sys.argv)]))
     print("PRIVATE UNRELATED LOG SENTINEL")
     if not config["terminal_attribution"]:
         for line in config["log_lines"]:
@@ -336,6 +365,13 @@ raise SystemExit({checker_status})
         self.assertIn("=== e2e: ALL OK ===", result.stdout)
         self.assertNotIn(attribution, result.stdout + result.stderr)
         self.assertEqual(sum(row["kind"] == "p11scope" for row in self.rows()), 2)
+
+    def test_attach_keeps_completed_workload_mapped_through_observer_terminal(self):
+        self.configure_attach_observer(skipped=0, require_completed_live=True)
+        result = self.run_child(CHILDREN[0], arguments=("--diagnose-skips",))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("=== e2e: ALL OK ===", result.stdout)
+        self.assertEqual(sum(row["kind"] == "completed-live" for row in self.rows()), 2)
 
     def test_attach_failed_profiler_preserves_status_and_filters_private_attribution(self):
         attribution = "p11scope: skip-attribution: PRIVATE ATTRIBUTION " + "x" * 5000

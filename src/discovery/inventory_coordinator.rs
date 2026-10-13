@@ -1794,6 +1794,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     fn collector_budget(
         &self,
         budget: crate::discovery::scan::CaptureWorkBudget,
+        _semantic_capture_live: bool,
     ) -> crate::discovery::scan::CaptureWorkBudget {
         let objects: BTreeSet<_> = self
             .attach_set
@@ -1827,7 +1828,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let policy = crate::plan::AdmissionPolicy::Inventory(self.attach_set.budget());
         let hints = self.engine.module_hints.clone();
         let hooks = self.engine.hooks.clone();
-        let budget = self.collector_budget(crate::discovery::scan::CaptureWorkBudget::default());
+        let budget =
+            self.collector_budget(crate::discovery::scan::CaptureWorkBudget::default(), false);
         move || {
             if cgroup_requires_transaction {
                 bail!("cgroup inventory requires the bounded scoped collection job");
@@ -1856,12 +1858,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         scope: InventoryScope,
         max_scan_pids: Option<usize>,
         shared: crate::inspect_system::IdentityShared,
+        semantic_capture_live: bool,
     ) -> impl FnOnce() -> Result<crate::inspect_system::Catalog> + Send + 'static {
         let cgroup_requires_transaction = matches!(self.engine.scope, Scope::Cgroup { .. });
         let policy = crate::plan::AdmissionPolicy::Inventory(self.attach_set.budget());
         let hints = self.engine.module_hints.clone();
         let hooks = self.engine.hooks.clone();
-        let budget = self.collector_budget(crate::discovery::scan::CaptureWorkBudget::default());
+        let budget = self.collector_budget(
+            crate::discovery::scan::CaptureWorkBudget::default(),
+            semantic_capture_live,
+        );
         move || {
             if cgroup_requires_transaction {
                 bail!("cgroup inventory requires the bounded scoped collection job");
@@ -1919,6 +1925,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             max_scan_pids,
             scan_budget: self.collector_budget(
                 crate::discovery::scan::CaptureWorkBudget::for_inventory(work),
+                false,
             ),
             observer,
         };
@@ -8006,6 +8013,34 @@ pub(crate) mod tests {
     }
 
     // ---- C3 review fixes: incarnation-scoped, demotable capture coverage ----
+
+    #[test]
+    fn collector_budget_excludes_all_retained_provider_anchors() {
+        let mut scene = CaptureScene::new(3);
+        let id = scene.pins.pinned().next().unwrap().id;
+        let file = scene.pins.file_for(id).unwrap();
+        let target = scene.pins.retain_inventory_target(id).unwrap();
+        for physical_live in [false, true] {
+            if physical_live {
+                scene
+                    .coordinator
+                    .begin_capture_coverage(CaptureScopeCoverage::System);
+            }
+            for semantic_live in [false, true] {
+                let budget = scene.coordinator.collector_budget(
+                    crate::discovery::scan::CaptureWorkBudget::default(),
+                    semantic_live,
+                );
+                assert_eq!(
+                    budget
+                        .kernel_anchor_exclusions()
+                        .excludes(&BTreeSet::from([target.object_key()]), file,),
+                    physical_live || semantic_live,
+                    "physical={physical_live}, semantic={semantic_live}"
+                );
+            }
+        }
+    }
 
     /// A coordinator over a scripted process source, its attach set holding
     /// one provider with `endpoints` entries, and that provider's catalog

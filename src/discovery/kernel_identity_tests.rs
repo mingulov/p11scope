@@ -194,6 +194,118 @@ fn mapped(address: u64) -> bool {
 }
 
 #[test]
+fn capture_watched_admitted_aliases_never_reserve_an_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (file, examined) = opened(dir.path(), "watched.so");
+    drop(file);
+    let pins = super::super::identity::test_fixture::real_scan_pin(
+        &dir.path().join("watched.so"),
+        None,
+        1,
+        "watched",
+    );
+    let id = pins.pinned().next().unwrap().id;
+    let target = pins.retain_inventory_target(id).unwrap();
+    let exclusions = KernelAnchorExclusions::from_targets([&target, &target]);
+    assert_eq!(exclusions.files.len(), 1);
+    assert!(Arc::ptr_eq(
+        exclusions.files.values().next().unwrap(),
+        &target.retirement_lease()
+    ));
+    let alias = ObjectKey {
+        inode: examined.key.inode + 1,
+        ..examined.key
+    };
+    let pass = AnchorPass::prepare_excluding(
+        &pins,
+        [(examined.key, id), (alias, id)],
+        custody(0, BTreeMap::new()),
+        &exclusions,
+    );
+    assert!(
+        pass.arena.is_none(),
+        "watched aliases created an observer mmap"
+    );
+    assert!(pass.candidates.is_empty());
+    assert!(pass.expected_matches.is_empty());
+}
+
+#[test]
+fn capture_watched_examined_file_alias_never_reserves_an_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let (file, mut examined) = opened(dir.path(), "watched.so");
+    let pins = super::super::identity::test_fixture::real_scan_pin(
+        &dir.path().join("watched.so"),
+        None,
+        1,
+        "watched",
+    );
+    let id = pins.pinned().next().unwrap().id;
+    let target = pins.retain_inventory_target(id).unwrap();
+    let exclusions = KernelAnchorExclusions::from_targets([&target]);
+    // Script only a differently exposed maps key. The actual opened file
+    // remains the same retained inode, including when its metadata changes.
+    examined.key.inode += 1;
+    file.set_len(8192).unwrap();
+    assert!(!target.check_unchanged().unwrap());
+    let exclusions_after_change = KernelAnchorExclusions::from_targets([&target]);
+    for exclusions in [&exclusions, &exclusions_after_change] {
+        let mut held = custody(1, BTreeMap::new());
+        let scan = held.begin_scan();
+        assert!(held.offer_for_test(scan, examined, file.try_clone().unwrap()));
+        let pass = AnchorPass::prepare_excluding(&pins, [], held, exclusions);
+        assert!(
+            pass.arena.is_none(),
+            "examined alias mapped a watched inode"
+        );
+        assert!(pass.candidates.is_empty());
+        assert!(pass.expected_examined.is_empty());
+    }
+}
+
+#[test]
+fn capture_watched_key_collision_only_excludes_acceleration() {
+    let dir = tempfile::tempdir().unwrap();
+    let (watched_file, watched) = opened(dir.path(), "watched.so");
+    drop(watched_file);
+    let pins = super::super::identity::test_fixture::real_scan_pin(
+        &dir.path().join("watched.so"),
+        None,
+        1,
+        "watched",
+    );
+    let target = pins
+        .retain_inventory_target(pins.pinned().next().unwrap().id)
+        .unwrap();
+    let exclusions = KernelAnchorExclusions::from_targets([&target]);
+    let (foreign_file, mut foreign) = opened(dir.path(), "foreign.so");
+    assert_ne!(foreign.identity, watched.identity);
+    foreign.key = watched.key;
+    let (unrelated_file, unrelated) = opened(dir.path(), "unrelated.so");
+    let mut held = custody(2, BTreeMap::new());
+    let scan = held.begin_scan();
+    assert!(held.offer_for_test(scan, foreign, foreign_file));
+    assert!(held.offer_for_test(scan, unrelated, unrelated_file));
+    let pass = AnchorPass::prepare_excluding(&pins, [], held, &exclusions);
+    assert_eq!(pass.candidates.len(), 1);
+    assert_eq!(pass.candidates[0].keys, BTreeSet::from([unrelated.key]));
+    let mut session = fixture_session();
+    let installed = session
+        .install_anchors(
+            pass,
+            1,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+    let pass = installed.pass.as_ref().unwrap();
+    assert_eq!(
+        pass.expected_examined[&unrelated.key],
+        BTreeSet::from([Slot(0)])
+    );
+    assert!(!pass.expected_examined.contains_key(&watched.key));
+}
+
+#[test]
 fn d3b_pinned_files_precede_examined_and_are_borrowed_without_reopening() {
     let dir = tempfile::tempdir().unwrap();
     let (file, admitted) = opened(dir.path(), "admitted.so");
@@ -849,6 +961,7 @@ struct AdapterCell {
     page_offset: bool,
     exec_changed: bool,
     pid_changed: bool,
+    capture_watched: bool,
 }
 
 #[derive(Default)]
@@ -978,6 +1091,7 @@ struct AdapterObservation {
     trace: Rc<RefCell<AdapterTrace>>,
     target_reads: usize,
     charges: u64,
+    fallback_reason: Option<KernelFallbackReason>,
 }
 
 fn adapter_cell(cell: AdapterCell) -> AdapterObservation {
@@ -1007,7 +1121,16 @@ fn adapter_cell(cell: AdapterCell) -> AdapterObservation {
         let scan = custody.begin_scan();
         assert!(custody.offer_for_test(scan, distinct, file));
     }
-    let pass = AnchorPass::prepare(&pins, [(examined.key, id)], custody);
+    let exclusions = if cell.capture_watched {
+        let target = pins.retain_inventory_target(id).unwrap();
+        let (file, unrelated) = opened(dir.path(), "unrelated-anchor.so");
+        let scan = custody.begin_scan();
+        assert!(custody.offer_for_test(scan, unrelated, file));
+        KernelAnchorExclusions::from_targets([&target])
+    } else {
+        KernelAnchorExclusions::default()
+    };
+    let pass = AnchorPass::prepare_excluding(&pins, [(examined.key, id)], custody, &exclusions);
     let mut session = fixture_session();
     if let SessionObject::Fixture { anchor, target, .. } = &mut session.object {
         *target = cell.target;
@@ -1019,7 +1142,9 @@ fn adapter_cell(cell: AdapterCell) -> AdapterObservation {
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut installed = session.install_anchors(pass, 1, deadline).unwrap();
-    assert!(installed.pass.as_ref().unwrap().expected[&examined.key].contains(&Slot(0)));
+    if !cell.capture_watched {
+        assert!(installed.pass.as_ref().unwrap().expected[&examined.key].contains(&Slot(0)));
+    }
     let entries: Vec<_> = cell
         .ranges
         .unwrap_or_else(|| ADAPTER_RANGES.to_vec())
@@ -1074,11 +1199,39 @@ fn adapter_cell(cell: AdapterCell) -> AdapterObservation {
     assert_eq!(&trace_state.events[..3], &["pin", "exe-before", "maps"]);
     drop(trace_state);
     drop(installed);
+    let fallback_reason = session.fallback_totals().first_reason;
     AdapterObservation {
         out,
         trace,
         target_reads,
         charges,
+        fallback_reason,
+    }
+}
+
+#[test]
+fn capture_watched_anchor_fallback_keeps_same_pin_and_userspace_truth() {
+    for exec_changed in [false, true] {
+        let observation = adapter_cell(AdapterCell {
+            capture_watched: true,
+            exec_changed,
+            target: complete_target(),
+            ..Default::default()
+        });
+        assert_eq!(
+            observation.target_reads, 0,
+            "watched request reached a kernel target run"
+        );
+        assert_eq!(observation.charges, 2);
+        assert_eq!(
+            observation.trace.borrow().reads,
+            ADAPTER_RANGES.map(|(start, end)| (ADAPTER_PID, start, end))
+        );
+        assert_eq!(observation.out.members.len(), usize::from(!exec_changed));
+        assert_eq!(
+            observation.fallback_reason,
+            Some(KernelFallbackReason::AnchorNotInstalled)
+        );
     }
 }
 

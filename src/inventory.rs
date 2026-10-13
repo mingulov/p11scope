@@ -1751,11 +1751,14 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                 let job = match (&scope, self.identity.clone()) {
                     // D3d: `--system` collections share the capture-owned
                     // identity state; `--pid` stays on the plain path.
-                    (InventoryScope::System, Some(shared)) => Box::new(
-                        self.coordinator
-                            .collector_with_identity(scope, self.max_scan_pids, shared),
-                    )
-                        as crate::inventory_capture::LegacyCollectJob,
+                    (InventoryScope::System, Some(shared)) => {
+                        Box::new(self.coordinator.collector_with_identity(
+                            scope,
+                            self.max_scan_pids,
+                            shared,
+                            self.semantic.as_ref().is_some_and(|lane| lane.is_live()),
+                        )) as crate::inventory_capture::LegacyCollectJob
+                    }
                     _ => Box::new(self.coordinator.collector(scope, self.max_scan_pids))
                         as crate::inventory_capture::LegacyCollectJob,
                 };

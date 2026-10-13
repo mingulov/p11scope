@@ -3629,6 +3629,15 @@ fn apply_kernel_fallback(
     }
 }
 
+fn note_anchor_setup_fallback(shared: &mut IdentityRunShared, _capture_excluded: bool) {
+    if shared.selection == crate::cli::IdentityBackendSelection::Auto
+        && shared.backend == IdentityBackend::Userspace
+    {
+        shared.auto_ineligible = true;
+    }
+    shared.note_fallback("anchor_not_installed");
+}
+
 /// Run this pass's sweep attribution on the capture-owned kernel session,
 /// falling back to userspace within the same pins on any setup failure.
 /// The pass installs fresh anchors under its takeout generation and always
@@ -3765,12 +3774,7 @@ fn attribute_pass_with_kernel(
             // for later passes with the finite reason recorded.
             {
                 let mut shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
-                if shared.selection == crate::cli::IdentityBackendSelection::Auto
-                    && shared.backend == IdentityBackend::Userspace
-                {
-                    shared.auto_ineligible = true;
-                }
-                shared.note_fallback("anchor_not_installed");
+                note_anchor_setup_fallback(&mut shared, false);
                 shared.session = Some(session);
             }
             attribute_sweep_with(
@@ -4259,6 +4263,53 @@ mod tests {
             super::map_live_load_error(denied),
             IdentityUnavailable::PermissionDenied
         );
+    }
+
+    #[test]
+    fn capture_watched_all_excluded_pass_keeps_later_auto_kernel_eligible() {
+        use crate::discovery::kernel_identity::{
+            AnchorPass, ExaminedCustody, KernelAnchorExclusions,
+        };
+        use crate::discovery::sweep_attribution::{ReservationOwner, SegmentPolicy};
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("watched.so");
+        std::fs::write(&path, [0u8; 4096]).unwrap();
+        let pins =
+            crate::discovery::identity::test_fixture::real_scan_pin(&path, None, 1, "watched");
+        let id = pins.pinned().next().unwrap().id;
+        let target = pins.retain_inventory_target(id).unwrap();
+        for excluded in [false, true] {
+            let (shared, _) = shared_with(
+                IdentityBackendSelection::Auto,
+                ScriptedIdentityChecks::must_not_load(),
+            );
+            let custody = ExaminedCustody::new(
+                ReservationOwner::for_examined(SegmentPolicy::from_headroom(16, 0, 0), 0),
+                BTreeMap::new(),
+            );
+            let exclusions = KernelAnchorExclusions::from_targets([&target]);
+            let admitted = excluded.then_some((target.object_key(), id));
+            let pass = AnchorPass::prepare_excluding(&pins, admitted, custody, &exclusions);
+            assert_eq!(pass.only_capture_excluded(), excluded);
+            super::note_anchor_setup_fallback(
+                &mut shared.lock().unwrap(),
+                pass.only_capture_excluded(),
+            );
+            assert_eq!(
+                matches!(
+                    decide_pass_attempt(&shared, true),
+                    super::PassAttempt::Kernel { .. }
+                ),
+                excluded,
+                "intentional exclusion disabled future unrelated kernel proof"
+            );
+            assert_eq!(
+                shared.lock().unwrap().summary().fallback.as_deref(),
+                Some("anchor_not_installed")
+            );
+        }
     }
 
     /// D3d: runtime fallback rendering — label alone, except the fixed

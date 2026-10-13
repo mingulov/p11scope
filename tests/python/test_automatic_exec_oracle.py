@@ -4296,7 +4296,9 @@ class ControlledInventoryObserver:
             for value in self.callers.values()]
         doc = {"schema": "p11scope/inventory/v1", "scope": "system" if self.membership is None else "cgroup",
             "callers": rows, "modules": [{"id": self.module_ids[pin["path"]], "paths": [pin["path"]],
-                "identity": {"inode": pin["ino"], "sha256": pin["sha256"]}} for pin in self.providers.values()],
+                "identity": {"inode": pin["ino"], "sha256": pin["sha256"], "device": {
+                    "major": pin["mapping"]["dev"][0], "minor": pin["mapping"]["dev"][1]}}}
+                for pin in self.providers.values()],
             "edges": [{key: value for key, value in row.items() if key != "identity_context"}
                       for row in self.last.values()], "instances": list(self.instances.values()),
             "semantic_edges": list(self.semantic.values()), "gaps": list(self.gaps),
@@ -8149,7 +8151,8 @@ def inventory_inputs(s1_expected=True):
              "image": {"exe": {"path": "/w/ledger2"}}},
         ],
         "modules": [{"id": "m0", "paths": ["/w/libA.so"],
-                     "identity": {"inode": 201, "sha256": "a" * 64}}],
+                     "identity": {"inode": 201, "sha256": "a" * 64,
+                                  "device": {"major": 8, "minor": 1}}}],
         "edges": [
             {"caller": "c0", "module": "m0",
              "entries": {"count": 8, "coverage": {"state": "counted",
@@ -8222,7 +8225,8 @@ def inventory_inputs(s1_expected=True):
                "observer_started_ns": START, "observer_ready_ns": READY,
                "observer_stopped_ns": STOP, "observer_rc": 0,
                "manual_rebind": False, "s1_expected": s1_expected,
-               "providers": {"A": {"path": "/w/libA.so", "ino": 201, "sha256": "a" * 64}},
+               "providers": {"A": {"path": "/w/libA.so", "dev": [8, 1], "ino": 201,
+                   "mapping": {"dev": [8, 1], "ino": 201}, "sha256": "a" * 64}},
                "expected_incarnations": {"1000": {"gens": {
                    "0": {"exe": "/w/ledger", "retired": True},
                    "1": {"exe": "/w/ledger2", "retired": False}}}},

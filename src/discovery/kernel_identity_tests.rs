@@ -206,7 +206,20 @@ fn anchor_mapping(address: u64) -> MapEntry {
 }
 
 fn anchor_mapping_held(mapping: &MapEntry) -> bool {
-    mapped(mapping.start)
+    // The unique fixture remains named, so its inode cannot be recycled while
+    // this observation runs. Compare its actual maps key and path; unrelated
+    // tests may already have reused the numeric address after arena drop.
+    // This is teardown evidence only, never physical-identity or pass authority.
+    let maps = std::fs::read("/proc/self/maps").unwrap();
+    p11scope_manifest::maps::parse_maps(&maps)
+        .unwrap()
+        .iter()
+        .any(|entry| {
+            entry.start < mapping.end
+                && mapping.start < entry.end
+                && ObjectKey::of(entry) == ObjectKey::of(mapping)
+                && entry.raw_path == mapping.raw_path
+        })
 }
 
 #[test]

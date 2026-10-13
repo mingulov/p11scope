@@ -132,6 +132,49 @@ impl LaneTestIo for AdmissionLane {
     fn tick_targets(&mut self, pins: &[Arc<PidPin>]) {
         self.0.borrow_mut().io.tick_pins = pins.to_vec();
     }
+    fn validate_attachment(&mut self, subset: &AttestedSubset) -> Result<(), SemanticRefusal> {
+        let owned = self.0.borrow();
+        for (object, slots) in subset.required() {
+            for slot in slots {
+                let expected = subset
+                    .plan()
+                    .slots
+                    .iter()
+                    .find(|candidate| candidate.index == *slot)
+                    .ok_or(SemanticRefusal::Attachment)?;
+                let endpoint = owned
+                    .io
+                    .endpoint(*slot)
+                    .ok_or(SemanticRefusal::Attachment)?;
+                let target = owned
+                    .io
+                    .retained_attachment(*slot)
+                    .map_err(|_| SemanticRefusal::Attachment)?;
+                if endpoint.object != *object
+                    || endpoint.offset != expected.file_offset
+                    || !target.same_object_as(subset.pins(), *object)
+                    || target.check_unchanged() != Ok(true)
+                {
+                    return Err(SemanticRefusal::Attachment);
+                }
+            }
+        }
+        Ok(())
+    }
+    fn take_refresh_receipt(
+        &mut self,
+        pin: &Arc<PidPin>,
+        slot: u32,
+    ) -> Option<CurrentPartitionReceipt> {
+        self.0.borrow_mut().stash.take_for_admission(pin, slot)
+    }
+    fn stash_admission_evidence(
+        &mut self,
+        receipts: Vec<CurrentPartitionReceipt>,
+        outcomes: Vec<TickOutcome>,
+    ) {
+        assert_eq!(self.0.borrow_mut().stash.push_all(receipts, outcomes), 0);
+    }
     fn physical_gaps(
         &mut self,
         domain: NativeDomainId,
@@ -504,6 +547,13 @@ fn admission_positive(selection: Selection) {
     let mut scene = AdmissionScene::new(selection);
     scene.prepare_without_cookie();
     scene.observe_entry();
+    let pid = scene.child.id();
+    scene.h0.0.borrow_mut().after_refresh = Some(Box::new(move |owned| {
+        // First real calls arrive while this same accepted owner receipt is
+        // still awaiting the driver's first tick/publication.
+        owned.io.held.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+        owned.io.held.enqueue(pid, 0, "C_Sign", 0, 0);
+    }));
     for _ in 0..3 {
         scene.pass();
     }
@@ -513,22 +563,6 @@ fn admission_positive(selection: Selection) {
         0,
         "healthy complete scope proof cannot manufacture a cut"
     );
-    let pid = scene.child.id();
-    scene
-        .h0
-        .0
-        .borrow_mut()
-        .io
-        .held
-        .enqueue(pid, 0, "C_SignInit", 0x000d, 0);
-    scene
-        .h0
-        .0
-        .borrow_mut()
-        .io
-        .held
-        .enqueue(pid, 0, "C_Sign", 0, 0);
-    scene.pass();
     let rows: Vec<_> = scene
         .coordinator
         .registry()
@@ -568,6 +602,48 @@ fn owner_admission_pid_uses_detailed_owner_receipt() {
 #[test]
 fn owner_admission_system_uses_detailed_owner_receipt() {
     admission_positive(Selection::System);
+}
+
+#[test]
+fn owner_admission_quiet_cached_returns_keep_historical_standing() {
+    let mut scene = AdmissionScene::new(Selection::Pid);
+    scene.prepare_without_cookie();
+    scene.observe_entry();
+    for _ in 0..3 {
+        scene.pass();
+    }
+    scene.assert_admitted();
+    let pid = scene.child.id();
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .held
+        .enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .held
+        .enqueue(pid, 0, "C_Sign", 0, 0);
+    scene.pass();
+    let row = scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .next()
+        .unwrap();
+    assert_eq!(row.api_returns, Some(2));
+    assert!(row.lossy);
+    assert_eq!(
+        row.semantics
+            .as_ref()
+            .map_or(0, |reducer| reducer.completed()),
+        0,
+        "cached Joined calls without same-publication owner coverage stay historical"
+    );
 }
 #[test]
 fn owner_admission_cgroup_uses_current_member_permit() {
@@ -784,19 +860,14 @@ fn owner_admission_cgroup_final_sample_cuts_old_operation_before_queued_return()
     let mut scene = AdmissionScene::new(Selection::Cgroup);
     scene.prepare_without_cookie();
     scene.observe_entry();
+    let pid = scene.child.id();
+    scene.h0.0.borrow_mut().after_refresh = Some(Box::new(move |owned| {
+        owned.io.held.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+    }));
     for _ in 0..3 {
         scene.pass();
     }
     scene.assert_admitted();
-    let pid = scene.child.id();
-    scene
-        .h0
-        .0
-        .borrow_mut()
-        .io
-        .held
-        .enqueue(pid, 0, "C_SignInit", 0x000d, 0);
-    scene.pass();
     let row = scene
         .coordinator
         .registry()
@@ -808,6 +879,7 @@ fn owner_admission_cgroup_final_sample_cuts_old_operation_before_queued_return()
 
     // The eligible return is already resolved and staged before the real
     // collection's final membership sample rejects this formerly bound caller.
+    assert_eq!(scene.refresh_direct().0, vec![image(7)]);
     scene
         .h0
         .0
@@ -853,4 +925,114 @@ fn owner_admission_cgroup_final_sample_cuts_old_operation_before_queued_return()
         "the queued pre-cut return cannot complete after scope refusal"
     );
     assert_eq!(reducer.unknown(), 1);
+
+    // Owner-valid evidence outside the selected scope must remain unable to
+    // register current coverage on a later tick, even without a collection.
+    assert_eq!(scene.refresh_direct().0, vec![image(7)]);
+    let batch = scene
+        .lane
+        .as_mut()
+        .unwrap()
+        .tick(
+            scene
+                .coordinator
+                .semantic_bindings_mut()
+                .bindings_for_tick(),
+        )
+        .unwrap();
+    assert!(scene.h0.0.borrow().io.tick_pins.is_empty());
+    scene.coordinator.stage_semantic_batch(batch);
+    scene
+        .coordinator
+        .commit_batch_with_semantics(false, scene.lane.as_mut())
+        .unwrap();
+    assert!(
+        !scene
+            .coordinator
+            .semantic_bindings()
+            .get(scene.caller())
+            .unwrap()
+            .scope_current()
+    );
+    assert!(
+        scene
+            .coordinator
+            .registry()
+            .instances()
+            .all(|instance| instance.state
+                != crate::discovery::caller_registry::instance_input::InstanceLifecycle::Observed)
+    );
+    scene.pass();
+    assert_eq!(
+        scene.h0.0.borrow().capture.continuity_cuts(),
+        1,
+        "continued absence cannot mint another cut for the suspended episode"
+    );
+
+    let original = scene
+        .coordinator
+        .semantic_bindings()
+        .get(scene.caller())
+        .unwrap()
+        .pin();
+    std::fs::write(scene.dir.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+    scene.h0.0.borrow_mut().after_refresh = Some(Box::new(move |owned| {
+        owned.io.held.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+        owned.io.held.enqueue(pid, 0, "C_Sign", 0, 0);
+    }));
+    for _ in 0..3 {
+        scene.pass();
+    }
+    let restored = scene
+        .coordinator
+        .semantic_bindings()
+        .get(scene.caller())
+        .unwrap();
+    assert!(restored.scope_current());
+    assert!(Arc::ptr_eq(&original, &restored.pin()));
+    assert_eq!(scene.h0.0.borrow().capture.continuity_cuts(), 1);
+    assert_eq!(
+        scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|row| row.semantics.as_ref())
+            .map(|reducer| reducer.completed())
+            .sum::<u64>(),
+        1,
+        "only a fresh same-incarnation permit and owner receipt recover useful operations"
+    );
+}
+
+#[test]
+fn owner_admission_failed_scope_then_same_executable_new_image_refuses_old_caller() {
+    let mut scene = AdmissionScene::new(Selection::Cgroup);
+    scene.prepare_without_cookie();
+    scene.observe_entry();
+    let old = scene.caller();
+    let membership = scene.dir.path().join("cgroup.procs");
+    let path = membership.clone();
+    scene.h0.0.borrow_mut().after_refresh = Some(Box::new(move |_| {
+        std::fs::write(path, "").unwrap();
+    }));
+    scene.pass();
+    assert_eq!(scene.h0.0.borrow().accepted, 1);
+    assert_eq!(scene.coordinator.semantic_bindings().len(), 0);
+    std::fs::write(&membership, format!("{}\n", scene.child.id())).unwrap();
+    // Same real executable and birth; only actual Detailed full-image I/O
+    // reports the exec change. It must not overwrite the old incarnation.
+    scene.h0.0.borrow_mut().io.current = Some(ImageIdentity {
+        task_cookie: 7,
+        exec_id: 2,
+    });
+    for _ in 0..3 {
+        scene.pass();
+    }
+    assert_eq!(scene.caller(), old);
+    assert_eq!(
+        scene.coordinator.semantic_bindings().len(),
+        0,
+        "a later Detailed exec cannot attach to the old scan-pinned CallerId"
+    );
+    assert_eq!(scene.coordinator.registry().instances().count(), 0);
 }

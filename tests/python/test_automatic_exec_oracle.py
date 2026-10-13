@@ -2288,6 +2288,53 @@ class ReaderReadinessTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "decode"):
             H6["expect_line"](reader, 0, "NEW_READY", 2)
 
+    def test_wait_accepts_terminal_ack_published_as_reader_exits(self):
+        reader, writer = self.pipe_reader()
+        first = True
+
+        def acknowledged(row):
+            nonlocal first
+            if first:
+                first = False
+                writer.write("ACK seq=1\nDONE status=ok\n")
+                writer.close()
+                reader.thread.join(2)
+                self.assertFalse(reader.thread.is_alive())
+                return False  # The first check preceded the terminal output.
+            return "ACK seq=1\n" in row.lines
+
+        self.assertTrue(reader.wait(acknowledged, 2))
+
+    def test_wait_rejects_terminal_eof_without_ack(self):
+        reader, writer = self.pipe_reader()
+        writer.close()
+        reader.thread.join(2)
+        self.assertFalse(reader.thread.is_alive())
+        with self.assertRaisesRegex(TimeoutError, "acknowledgement missing"):
+            reader.wait(lambda row: "ACK seq=1\n" in row.lines, 2)
+
+    def test_wait_preserves_terminal_decode_error_even_with_ack(self):
+        reader, writer = self.pipe_reader()
+        first = True
+
+        def acknowledged(row):
+            nonlocal first
+            if first:
+                first = False
+                writer.write("ACK seq=1\n")
+                writer.flush()
+                reader.updates.get(timeout=2)
+                self.assertIn("ACK seq=1\n", reader.lines)
+                os.write(writer.fileno(), b"\xff")
+                writer.close()
+                reader.thread.join(2)
+                self.assertFalse(reader.thread.is_alive())
+                return False
+            return "ACK seq=1\n" in row.lines
+
+        with self.assertRaisesRegex(ValueError, "decode"):
+            reader.wait(acknowledged, 2)
+
     def test_real_pipe_preserves_split_utf8_ledgers_and_final_unterminated_line(self):
         reader, writer = self.pipe_reader()
         text = 'N3LEDGER {"kind":"first","text":"€"}\r\nN3LEDGER {"kind":"last"}'

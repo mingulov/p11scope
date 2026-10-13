@@ -2665,6 +2665,13 @@ class Reader(N3HARNESS["Reader"]):
                 remaining_until(deadline)
                 return result
             if not self.thread.is_alive():
+                # The terminal ACK can arrive between the predicate and EOF check.
+                if self.errors:
+                    raise ValueError("; ".join(self.errors))
+                result = predicate(self)
+                if result:
+                    remaining_until(deadline)
+                    return result
                 raise TimeoutError("owned fixture/capture readiness acknowledgement missing")
             try:
                 self.updates.get(timeout=min(remaining, 0.2))

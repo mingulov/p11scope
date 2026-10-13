@@ -4204,7 +4204,7 @@ class ControlledInventoryObserver:
                     self.callers[caller_key] = context
                     if old:
                         old["lifecycle"] = "exec_retired"
-                        if self.fault in ("recovered-history", "split-retirement", "historical-tail"):
+                        if self.fault in ("recovered-history", "recovered-no-calls", "split-retirement"):
                             self.emit("caller_event", {"event": "retired", "caller": old["id"],
                                 "identity_context": {"version": 1, "caller": dict(old)}})
                             self.emit("caller_event", {"event": "admitted", "caller": caller_id,
@@ -4218,7 +4218,7 @@ class ControlledInventoryObserver:
                 context = self.callers[caller_key]
                 ack = max((row for row in parsed["acks"] if row["gen"] == ident["gen"]),
                           key=lambda row: row["t1"], default=None)
-                if self.fault in ("initial-no-calls", "history-prefix") and not final:
+                if self.fault in ("initial-no-calls", "recovered-no-calls", "history-prefix") and not final:
                     ack = min((row for row in parsed["acks"] if row["gen"] == ident["gen"]
                                and row["seq"] > self.last_acks.get(caller_key, 0)),
                               key=lambda row: row["seq"], default=ack)
@@ -4269,7 +4269,7 @@ class ControlledInventoryObserver:
                             "api_returns": {"count": api_count, "saturated": False, "historical_only_returns": 0},
                             "semantics": "observed", "mechanisms": mechanisms, "operations": ops,
                             "coverage": {"lossy": False, "reasons": []}}
-                        if self.fault == "initial-no-calls" and instance_id not in self.instances and not final:
+                        if self.fault in ("initial-no-calls", "recovered-no-calls") and instance_id not in self.instances and not final:
                             # Registration can publish before admitted returns.
                             # Serve this same independently ledgered ACK next pass.
                             semantic.update(semantics="unknown (no calls observed)", mechanisms=None,
@@ -4280,10 +4280,13 @@ class ControlledInventoryObserver:
                         if retired:
                             instance.update(state="retired", reason="instance_retired")
                             semantic["coverage"] = {"lossy": True, "reasons": ["instance_retired"]}
-                            if self.fault == "recovered-history":
+                            if self.fault in ("recovered-history", "recovered-no-calls"):
                                 semantic["coverage"]["reasons"].append("semantic_loss")
-                        if ident["gen"] == 1 and self.fault == "recovered-history":
-                            semantic["coverage"] = {"lossy": True, "reasons": ["semantic_loss"]}
+                        if ident["gen"] == 1 and self.fault in ("recovered-history", "recovered-no-calls"):
+                            semantic["coverage"] = {"lossy": True, "reasons": (
+                                ["no_calls", "semantic_loss"] if pending_no_calls else ["semantic_loss"])}
+                            if pending_no_calls:
+                                instance.update(state="uncertain", reason="semantic_loss")
                         if final:
                             if not retired:
                                 instance.update(state="uncertain", reason="semantic_loss")
@@ -4608,8 +4611,9 @@ class InventoryFixtureTest(unittest.TestCase):
         actual_budget = H6["LegBudget"]
         patches["LegBudget"] = lambda **_kwargs: actual_budget(inventory=True, budgets={"setup": 3,
             "successor-recovery": 0.4 if fault not in (None, "failed-move", "initial-no-calls", "history-prefix",
-                "recovered-history", "split-retirement", "historical-tail", "delayed-teardown") else 3,
-            "fixed-measurement": 8, "normal-stop": 2, "cleanup": 2}, leg_seconds=15)
+                "recovered-history", "recovered-no-calls", "split-retirement", "delayed-teardown", "withheld-teardown") else 3,
+            "fixed-measurement": 2 if fault == "withheld-teardown" else 8,
+            "normal-stop": 2, "cleanup": 2}, leg_seconds=15)
         self.route_events, self.route_owners, self.route_case = events, owners, ctx
         try:
             budget = H6["LegBudget"](inventory=True, budgets={"setup": 3,
@@ -4650,6 +4654,173 @@ class InventoryFixtureTest(unittest.TestCase):
         self.assertTrue(result["pass"], result["errors"])
         self.assertEqual(result["s1"]["measured_completed"], 20)
         self.assertEqual(result["s1"]["measured_failed"], 2)
+
+    def test_recovered_no_call_prefix_waits_for_current_positive_baseline(self):
+        doc, ledgers, receipt = self.run_inventory_route(cell="cgroup-reentry", fault="recovered-no-calls")
+        proof = receipt["inventory_control"]["measurements"][1]["proof"]
+        first = proof["baseline"]["recovery"]["successor_semantic"]["event"]
+        self.assertIsNone(first["api_returns"]["count"])
+        self.assertEqual((proof["baseline"]["recovery"]["successor_instance"]["event"]["state"],
+                          proof["baseline"]["recovery"]["successor_instance"]["event"]["reason"]),
+                         ("uncertain", "semantic_loss"))
+        self.assertEqual(first["coverage"], {"lossy": True, "reasons": ["no_calls", "semantic_loss"]})
+        self.assertGreater(proof["baseline"]["counts"]["completed"], 0)
+        result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+        self.assertTrue(result["pass"], result["errors"])
+        for fault in ("false-positive", "historical", "other-uncertainty"):
+            changed = copy.deepcopy(receipt)
+            recovery = changed["inventory_control"]["measurements"][1]["proof"]["baseline"]["recovery"]
+            records = changed["inventory_control"]["final_records"]
+            if fault == "other-uncertainty":
+                records[recovery["successor_instance"]["seq"]]["event"]["reason"] = "task_retired"
+            else:
+                row = records[recovery["successor_semantic"]["seq"]]["event"]
+                row["api_returns"]["count" if fault == "false-positive" else "historical_only_returns"] = 1
+            self.assertFalse(H6["evaluate_inventory_h6"](doc, ledgers, changed)["pass"], fault)
+
+    def test_recovered_history_receipt_requires_prior_same_stream_exec_loss(self):
+        original = self.run_inventory_route(cell="cgroup-reentry", fault="recovered-history")
+        for fault in ("missing-retirement", "foreign-birth", "other-retirement", "other-admission",
+                      "late-old-loss", "dirty-original", "changed-instance", "changed-provider"):
+            with self.subTest(fault=fault):
+                _doc, _ledgers, receipt = copy.deepcopy(original)
+                records = receipt["inventory_control"]["final_records"]
+                previous, current = receipt["inventory_control"]["measurements"]
+                proof = current["proof"]
+                recovery = proof["baseline"]["recovery"]
+                retirement = records[recovery["retirement"]["seq"]]
+                if fault == "missing-retirement":
+                    records.remove(retirement)
+                elif fault == "foreign-birth":
+                    retirement["event"]["identity_context"]["caller"]["start_time"] += 1
+                elif fault == "other-retirement":
+                    retirement["event"]["identity_context"]["caller"]["lifecycle"] = "exited"
+                elif fault == "other-admission":
+                    records[proof["admission"]["seq"]]["event"]["event"] = "retired"
+                elif fault == "late-old-loss":
+                    for row in records:
+                        if (row["kind"] == "semantic_edge_observed"
+                                and row["event"]["instance"] == previous["proof"]["instance"]
+                                and row["seq"] < recovery["successor_semantic"]["seq"]):
+                            row["event"]["coverage"]["reasons"] = [reason for reason in
+                                row["event"]["coverage"]["reasons"] if reason != "semantic_loss"]
+                    late = copy.deepcopy(recovery["old_semantic"])
+                    late["seq"] = recovery["successor_semantic"]["seq"] + 1
+                    records.append(late)
+                elif fault == "dirty-original":
+                    previous["end"]["semantic"]["event"]["coverage"] = {"lossy": True, "reasons": ["semantic_loss"]}
+                elif fault == "changed-instance":
+                    previous["proof"]["instance"] = proof["instance"]
+                else:
+                    previous["proof"]["provider"]["ino"] += 1
+                owner = SimpleNamespace(pid=proof["image"]["pid"],
+                    identity={"start_time": proof["image"]["start_time"]})
+                with self.assertRaises(H6["SetupError"]):
+                    H6["inventory_recovered_history"](records, previous, owner, proof["image"],
+                        proof["provider"], proof["admission"], current["end"]["semantic"])
+
+    def test_recovered_measurement_rejects_new_loss_history_and_wrong_outcomes(self):
+        original = self.run_inventory_route(cell="cgroup-reentry", fault="recovered-history")
+        for fault in ("new-reason", "history", "uncertain", "completed", "failed", "mechanism",
+                      "unknown", "orphans", "dropped", "receipt-erasure", "loss-erasure"):
+            with self.subTest(fault=fault):
+                doc, ledgers, receipt = copy.deepcopy(original)
+                phase = receipt["inventory_control"]["measurements"][1]
+                proof = phase["proof"]
+                records = receipt["inventory_control"]["final_records"]
+                row = records[phase["end"]["semantic"]["seq"]]["event"]
+                if fault == "new-reason":
+                    row["coverage"]["reasons"].append("task_retired")
+                elif fault == "history":
+                    row["api_returns"]["historical_only_returns"] = 1
+                elif fault == "uncertain":
+                    records[phase["end"]["instance"]["seq"]]["event"].update(state="uncertain", reason="semantic_loss")
+                elif fault == "receipt-erasure":
+                    proof["baseline"]["recovery"] = None
+                elif fault == "loss-erasure":
+                    row["coverage"] = {"lossy": False, "reasons": []}
+                else:
+                    # Keep source rows, saved endpoint and final JSON coherent:
+                    # these controls must fail the independent ledger delta,
+                    # rather than merely a copied-receipt/parity mismatch.
+                    changed = [record["event"] for record in records
+                        if record["seq"] >= phase["end"]["semantic"]["seq"]
+                        and record["kind"] == "semantic_edge_observed"
+                        and record["event"]["instance"] == proof["instance"]]
+                    changed += [next(value for value in doc["semantic_edges"] if value["instance"] == proof["instance"])]
+                    amount = -1 if fault in ("completed", "failed", "mechanism") else 1
+                    for value in changed:
+                        if fault == "mechanism":
+                            value["mechanisms"][0]["calls"] += amount
+                        else:
+                            value["operations"][fault] += amount
+                    phase["end"]["semantic"] = copy.deepcopy(records[phase["end"]["semantic"]["seq"]])
+                    if fault == "mechanism":
+                        ident = H6["mechanism_row_id"](row["mechanisms"][0])
+                        phase["end"]["counts"]["mechanisms"][ident][0] += amount
+                    else:
+                        phase["end"]["counts"][fault] += amount
+                        if fault == "unknown":
+                            phase["end"]["early"]["unknown"] += amount
+                result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+                self.assertFalse(result["pass"], (fault, result))
+                if fault in ("completed", "failed", "mechanism", "unknown", "orphans", "dropped"):
+                    self.assertTrue(any("fixed" in error and ("delta" in error or "mechanism" in error)
+                                        for error in result["errors"]), result["errors"])
+
+    def test_old_teardown_history_retains_api_without_reducer_credit(self):
+        _doc, _ledgers, receipt = self.run_inventory_route(cell="cgroup-reentry", fault="split-retirement")
+        phase = receipt["inventory_control"]["measurements"][0]
+        proof, end = phase["proof"], phase["end"]
+        original = receipt["inventory_control"]["final_records"]
+        retired = next(row["seq"] for row in original if H6["inventory_exec_retirement"](row, proof["caller"]))
+        # Alternate contract shape: all four exact ledgered teardown returns
+        # publish only after old-image retirement. Keep the measured endpoint.
+        records = [row for row in copy.deepcopy(original) if not (end["pass"]["seq"] < row["seq"] < retired
+            and row["kind"] == "semantic_edge_observed" and row["event"]["instance"] == proof["instance"])]
+        for row in records:
+            if row["seq"] > retired and row["kind"] == "semantic_edge_observed" and row["event"]["instance"] == proof["instance"]:
+                row["event"]["api_returns"]["historical_only_returns"] = 4
+                row["event"]["operations"]["calls"] = end["counts"]["calls"]
+        errors = H6["inventory_instance_history_errors"](records, proof["instance"], proof["caller"],
+            proof["module"], receipt, historical_limit=4, historical_after=end["pass"]["seq"])
+        self.assertEqual(errors, [])
+        for fault in ("extra", "before-cut", "saturated"):
+            bad = copy.deepcopy(records)
+            row = next(row["event"] for row in (bad if fault == "before-cut" else reversed(bad))
+                if row["kind"] == "semantic_edge_observed" and row["event"]["instance"] == proof["instance"])
+            row["api_returns"]["saturated" if fault == "saturated" else "historical_only_returns"] = (
+                True if fault == "saturated" else 5 if fault == "extra" else 1)
+            self.assertTrue(H6["inventory_instance_history_errors"](bad, proof["instance"], proof["caller"],
+                proof["module"], receipt, historical_limit=4, historical_after=end["pass"]["seq"]), fault)
+
+    def test_teardown_receipt_cannot_borrow_counts_or_a_later_exec_window(self):
+        original = self.run_inventory_route(cell="cgroup-reentry", fault="delayed-teardown")
+        for fault in ("missing-api", "extra-physical", "wrong-function", "bad-rv", "late-checkpoint", "extended-deadline"):
+            with self.subTest(fault=fault):
+                doc, ledgers, receipt = copy.deepcopy(original)
+                tail = receipt["inventory_control"]["teardown"]
+                if fault == "missing-api":
+                    tail["end"]["counts"]["api"] -= 1
+                elif fault == "extra-physical":
+                    tail["end"]["counts"]["physical"] += 1
+                elif fault == "wrong-function":
+                    tail["marker"]["batches"][0]["fn"] = "C_Sign"
+                elif fault == "bad-rv":
+                    tail["marker"]["batches"][0]["bad"] = 1
+                elif fault == "late-checkpoint":
+                    receipt["freeze"]["checkpoint"]["at_ns"] = tail["marker"]["ack"]["t1"] - 1
+                else:
+                    tail["marker"]["ack"]["deadline"] += 1
+                result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+                self.assertFalse(result["pass"], (fault, result))
+
+    def test_withheld_teardown_publication_cannot_move_or_exec(self):
+        with self.assertRaises(TimeoutError):
+            self.run_inventory_route(cell="cgroup-reentry", fault="withheld-teardown")
+        self.assertNotIn("outside", self.route_events)
+        self.assertNotIn("resume", self.route_events)
+        self.assertTrue(all(owner.popen.poll() is not None for owner in self.route_owners))
 
     def test_actual_split_exec_retirement_replays_to_normal_stop(self):
         doc, ledgers, receipt = self.run_inventory_route(cell="cgroup-reentry", fault="split-retirement")
@@ -5995,7 +6166,7 @@ class InventoryPhysicalLedgerTest(unittest.TestCase):
             "api_returns": {"count": 10, "saturated": False, "historical_only_returns": 0},
             "mechanisms": [{"mechanism_hex": "0x250", "calls": 10, "errors": 0}],
             "operations": {"calls": 10, "completed": 5, "failed": 0, "unknown": 0,
-                "orphans": 0, "dropped": 0, "last_seen_ns": t - 100}, "coverage": {"lossy": False}}
+                "orphans": 0, "dropped": 0, "last_seen_ns": t - 100}, "coverage": {"lossy": False, "reasons": []}}
         records = [self.record(seq, kind, event) for seq, kind, event in (
             (5, "edge_observed", edge), (6, "instance_observed", instance),
             (7, "semantic_edge_observed", semantic), (8, "pass_committed", {"pass": 2,

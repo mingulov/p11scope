@@ -5137,15 +5137,23 @@ class InventoryFixtureTest(unittest.TestCase):
         result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
         self.assertTrue(result["pass"], result["errors"])
 
-    def test_system_mixed_real_sibling_calls_overlap_target_measurement(self):
+    def test_system_mixed_real_sibling_calls_run_during_target_measurement_stage(self):
         doc, ledgers, receipt = self.run_inventory_route()
-        measured = receipt["measured"]
+        control = receipt["inventory_control"]
+        stage = next(row for row in control["stages"] if row["label"] == "measurement")
+        measurement = control["measurements"][-1]
+        self.assertLessEqual(stage["t0"], measurement["marker"]["dispatch_ns"])
+        self.assertLessEqual(measurement["end"]["pass"]["at_ns"], stage["t1"])
+        # Dispatch does not acknowledge the child's first API entry. W4 is
+        # guaranteed inside the measurement stage, independent of scheduling.
+        sibling_work = {}
         for module in ("A", "B"):
             path = receipt["providers"][module]["path"]
-            overlap = [row for row in ledgers["MS"]["batches"]
-                if row["module"] == path and row["fn"] != "C_GetFunctionList"
-                and row["t0"] <= measured["t1"] and row["t1"] >= measured["t0"]]
-            self.assertTrue(overlap, f"no real MS {module} calls overlap target fixed measurement")
+            sibling_work[module] = [row for row in ledgers["MS"]["batches"]
+                if row["module"] == path and row["phase"] == "h6-warm4"]
+            self.assertEqual(sum(row["n"] for row in sibling_work[module]), 10)
+            self.assertTrue(all(row["bad"] == 0 and stage["t0"] <= row["t0"] <= row["t1"] <= stage["t1"]
+                                for row in sibling_work[module]))
         result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
         self.assertTrue(result["pass"], result["errors"])
         self.assertEqual(result["s1"]["measured_completed"], 20)
@@ -5153,6 +5161,20 @@ class InventoryFixtureTest(unittest.TestCase):
         sibling = result["s1"]["sibling_instances"][0]
         self.assertEqual((sibling["api_returns"], sibling["ledger_api_returns"]), (47, 47))
         self.assertEqual(sibling["operations"]["completed"], 22)
+        for module, rows in sibling_work.items():
+            for outside in ("before", "after"):
+                with self.subTest(module=module, outside=outside):
+                    changed = copy.deepcopy(receipt)
+                    window = next(row for row in changed["inventory_control"]["stages"]
+                                  if row["label"] == "measurement")
+                    if outside == "before":
+                        window["t0"] = max(row["t1"] for row in rows)
+                    else:
+                        window["t1"] = min(row["t0"] for row in rows)
+                    refused = H6["evaluate_inventory_h6"](doc, ledgers, changed)
+                    self.assertFalse(refused["pass"], refused)
+                    self.assertIn(f"SystemMixed sibling {module} lacks real calls during measurement",
+                                  refused["errors"])
 
     def test_system_first_provider_calls_wait_for_each_deferred_owned_admission(self):
         for fault in ("deferred-target-admission", "deferred-sibling-admission"):

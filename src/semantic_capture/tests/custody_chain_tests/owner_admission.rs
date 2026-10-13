@@ -123,6 +123,7 @@ struct AdmissionH0 {
     validations: usize,
     fault_on_validation: bool,
     validation_negatives: usize,
+    last_validation_refusal: Option<CurrentReceiptRefusal>,
     last_effective: Option<Arc<PidPin>>,
     after_refresh: Option<AfterAdmissionRefresh>,
 }
@@ -227,6 +228,7 @@ impl LaneTestIo for AdmissionLane {
         let before = report.outcomes().len();
         let AdmissionH0 { capture, io, .. } = &mut *owned;
         let result = capture.validate_current_with(io, receipt, report);
+        owned.last_validation_refusal = result.err();
         owned.validation_negatives += report.outcomes()[before..]
             .iter()
             .filter(|outcome| matches!(outcome, TickOutcome::Invalidation(_)))
@@ -347,6 +349,7 @@ impl AdmissionScene {
             validations: 0,
             fault_on_validation: false,
             validation_negatives: 0,
+            last_validation_refusal: None,
             last_effective: None,
             after_refresh: None,
         })));
@@ -1144,4 +1147,133 @@ fn owner_admission_rejected_first_scope_cuts_unread_pre_refusal_calls() {
         1,
         "a real fresh receipt and fault-1 pair recover useful same-custody work"
     );
+}
+
+#[test]
+fn owner_admission_fresh_scope_after_expiry_separates_loss_episodes() {
+    let mut scene = AdmissionScene::new(Selection::Cgroup);
+    scene.prepare_without_cookie();
+    scene.observe_entry();
+    let pid = scene.child.id();
+    let membership = scene.dir.path().join("cgroup.procs");
+    let leave = membership.clone();
+    scene.h0.0.borrow_mut().after_refresh =
+        Some(Box::new(move |_| std::fs::write(leave, "").unwrap()));
+    scene.pass();
+    assert_eq!(scene.h0.0.borrow().accepted, 1);
+    assert_eq!(scene.h0.0.borrow().capture.continuity_cuts(), 1);
+    assert_eq!(scene.coordinator.semantic_bindings().len(), 0);
+    let original = scene.h0.0.borrow().last_effective.clone().unwrap();
+    for _ in 0..2 {
+        scene.pass();
+    }
+    assert_eq!(scene.h0.0.borrow().capture.continuity_cuts(), 1);
+    assert_eq!(scene.h0.0.borrow().accepted, 1);
+
+    std::fs::write(&membership, format!("{pid}\n")).unwrap();
+    scene.h0.0.borrow_mut().after_refresh = Some(Box::new(|owned| {
+        // Time advances only forward. Expiry refuses this receipt without
+        // ending H0; a later actual refresh has its own newly minted deadline.
+        owned.io.held.script.now += Duration::from_secs(3);
+    }));
+    for _ in 0..3 {
+        scene.pass();
+        if scene.h0.0.borrow().accepted > 1 {
+            break;
+        }
+    }
+    assert_eq!(scene.h0.0.borrow().accepted, 2);
+    assert_eq!(
+        scene.h0.0.borrow().last_validation_refusal,
+        Some(CurrentReceiptRefusal::Deadline)
+    );
+    assert_eq!(scene.coordinator.semantic_bindings().len(), 0);
+    assert_eq!(scene.coordinator.registry().instances().count(), 0);
+    assert!(
+        scene.coordinator.registry().gaps().iter().any(|gap| {
+            gap.subject == "semantic admission refused"
+                && gap.reason == "provider_instance_unproven"
+        }),
+        "owner refusal is reached only after the exact scope/custody guard passed"
+    );
+    assert_eq!(scene.h0.0.borrow().capture.continuity_cuts(), 1);
+    assert!(Arc::ptr_eq(
+        &original,
+        scene.h0.0.borrow().last_effective.as_ref().unwrap()
+    ));
+
+    let unread = Rc::new(RefCell::new(None));
+    let delayed = unread.clone();
+    let leave = membership.clone();
+    scene.h0.0.borrow_mut().after_refresh = Some(Box::new(move |owned| {
+        assert_eq!(owned.io.held.script.last_health.fault, 1);
+        owned.io.held.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+        owned.io.held.enqueue(pid, 0, "C_Sign", 0, 0);
+        *delayed.borrow_mut() = Some(std::mem::take(&mut owned.io.held.script.records));
+        std::fs::write(leave, "").unwrap();
+    }));
+    scene.pass();
+    assert_eq!(scene.h0.0.borrow().accepted, 3);
+    assert_eq!(scene.coordinator.semantic_bindings().len(), 0);
+    assert_eq!(unread.borrow().as_ref().unwrap().len(), 2);
+    let after_second_loss = scene.h0.0.borrow().capture.continuity_cuts();
+    for _ in 0..2 {
+        scene.pass();
+    }
+    assert_eq!(
+        scene.h0.0.borrow().capture.continuity_cuts(),
+        after_second_loss,
+        "repeated absence must not invent another loss episode"
+    );
+
+    std::fs::write(&membership, format!("{pid}\n")).unwrap();
+    scene.h0.0.borrow_mut().after_refresh = Some(Box::new(move |owned| {
+        owned.io.held.script.records = unread.borrow_mut().take().unwrap();
+    }));
+    for _ in 0..3 {
+        scene.pass();
+    }
+    scene.assert_admitted();
+    assert_eq!(
+        scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|row| row.semantics.as_ref())
+            .map(|reducer| reducer.completed())
+            .sum::<u64>(),
+        0,
+        "the second genuine scope loss must fence unchanged unread fault-1 calls"
+    );
+    assert_eq!(scene.h0.0.borrow().capture.continuity_cuts(), 2);
+
+    assert_eq!(scene.refresh_direct().0, vec![image(7)]);
+    {
+        let mut owned = scene.h0.0.borrow_mut();
+        assert_eq!(owned.io.held.script.last_health.fault, 2);
+        owned.io.held.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+        owned.io.held.enqueue(pid, 0, "C_Sign", 0, 0);
+    }
+    scene.pass();
+    assert_eq!(
+        scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|row| row.semantics.as_ref())
+            .map(|reducer| reducer.completed())
+            .sum::<u64>(),
+        1,
+        "a fresh real fault-2 receipt recovers useful work"
+    );
+    assert!(Arc::ptr_eq(
+        &original,
+        &scene
+            .coordinator
+            .semantic_bindings()
+            .get(scene.caller())
+            .unwrap()
+            .pin()
+    ));
+    assert_eq!(scene.h0.0.borrow().capture.continuity_cuts(), 2);
 }

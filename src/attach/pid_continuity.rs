@@ -2136,6 +2136,9 @@ pub(crate) mod engine_fixture {
                 })
                 .collect()
         }
+        pub(crate) fn greatest_break_ns(&self) -> Option<u64> {
+            self.tap.facts().unwrap().greatest_break_ns
+        }
         pub(crate) fn fresh_empty_started_ns(&mut self) -> u64 {
             assert!(self.drain.dequeue().is_none());
             self.tap.facts().unwrap().empty.unwrap().read_started_ns

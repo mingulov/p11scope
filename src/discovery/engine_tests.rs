@@ -9701,6 +9701,10 @@ int main(int argc, char **argv) {
     void *additional = NULL;
     char command;
     while (read(0, &command, 1) == 1) {
+        if (command == 'r') {
+            if (write(1, "R", 1) != 1) return 15;
+            continue;
+        }
         if (command == 's' || command == 'd') {
             setenv("P11S_REEXEC", "1", 1);
             char alternate[4096];
@@ -9771,6 +9775,25 @@ fn wait_tabled_ready(
     child: &mut std::process::Child,
     library: &std::path::Path,
 ) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Read as _};
+    use std::os::fd::AsRawFd as _;
+
+    // The mapping can become visible while dlopen still runs constructors.
+    // This pure command is answered only after dlopen returns; it invokes no
+    // provider getter or API and leaves the table unchanged.
+    child.stdin.as_mut().unwrap().write_all(b"r")?;
+    let output = child.stdout.as_mut().unwrap();
+    if !system_scope_poll_fd(output.as_raw_fd(), std::time::Duration::from_secs(5))? {
+        return Err(Error::new(ErrorKind::TimedOut, "tabled readiness expired"));
+    }
+    let mut ack = [0];
+    output.read_exact(&mut ack)?;
+    if ack != *b"R" {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "unexpected tabled readiness acknowledgement",
+        ));
+    }
     wait_tabled_mapping(child.id(), library);
     Ok(())
 }
@@ -9829,7 +9852,7 @@ impl TabledSeedProvider {
         let mut ack = [0];
         output.read_exact(&mut ack).unwrap();
         assert_eq!(ack, *b"E");
-        wait_tabled_mapping(self.child.id(), &self.dir.path().join("tabled-provider.so"));
+        wait_tabled_ready(&mut self.child, &self.dir.path().join("tabled-provider.so")).unwrap();
     }
 
     fn spawn_peer(&mut self, stem: &str) -> (u32, PathBuf) {
@@ -9847,7 +9870,7 @@ impl TabledSeedProvider {
             .unwrap();
         let pid = child.id();
         self.peers.push(child);
-        wait_tabled_mapping(pid, library);
+        wait_tabled_ready(self.peers.last_mut().unwrap(), library).unwrap();
         pid
     }
 
@@ -9879,12 +9902,12 @@ fn loaded_tabled_provider() -> (TabledSeedProvider, ProcessView, PathBuf) {
         .spawn()
         .unwrap();
     let pid = child.id();
-    wait_tabled_mapping(pid, &library);
-    let fixture = TabledSeedProvider {
+    let mut fixture = TabledSeedProvider {
         child,
         peers: Vec::new(),
         dir,
     };
+    wait_tabled_ready(&mut fixture.child, &library).unwrap();
     let view = ProcessView::open(ProcessViewId(0), pid).unwrap();
     let library = fixture.dir.path().join("tabled-provider.so");
     (fixture, view, library)

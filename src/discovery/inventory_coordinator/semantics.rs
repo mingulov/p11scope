@@ -804,7 +804,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }
                 return Err(Refusal::NoLiveCaller);
             }
-            let provider = provider.map_err(Refusal::OwnerRefused)?;
             let record = self.adapter.record(caller).ok_or(Refusal::NoLiveCaller)?;
             if record.retired
                 || record.incarnation != candidate.incarnation
@@ -817,6 +816,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             {
                 return Err(Refusal::NoLiveCaller);
             }
+            // Proven current membership ends the previous scope-loss episode
+            // independently of provider permission. An expired owner receipt
+            // still grants no positive authority, but a later genuine leave
+            // must mint its own cut instead of reusing the old episode latch.
+            if candidate.scope == AdmissionScope::Cgroup {
+                self.semantic_bindings
+                    .admission_images
+                    .get_mut(&caller)
+                    .expect("the scope proof retained its accepted owner scan")
+                    .initial_scope_cut = false;
+            }
+            let provider = provider.map_err(Refusal::OwnerRefused)?;
             if let Some(at) = self.semantic_bindings.index.get(&caller).copied() {
                 let existing = &mut self.semantic_bindings.bindings[at];
                 if existing.domain != receipt.domain() {
@@ -846,15 +857,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 provider: Some(provider),
             })
         })();
-        match result {
-            Err(reason) => self.semantic_admission_refused(caller, reason.code()),
-            Ok(()) => {
-                self.semantic_bindings
-                    .admission_images
-                    .get_mut(&caller)
-                    .expect("successful admission retained its accepted scan")
-                    .initial_scope_cut = false;
-            }
+        if let Err(reason) = result {
+            self.semantic_admission_refused(caller, reason.code());
         }
         (receipt, result)
     }

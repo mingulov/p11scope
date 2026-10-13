@@ -354,6 +354,81 @@ def _single_pid_provider_domain(ev, receipt, ledger, capture, mode):
         return False
 
 
+def _single_cgroup_provider_domain(ev, receipt, ledger, capture, mode):
+    """Bind only R1's recovered global category to its held root and provider.
+
+    The categorical footer does not locate individual missed calls. The owned
+    invocation, two original images, held provider calibration and target ledger
+    restrict which controlled domain it can explain; deficits remain explicit.
+    """
+    try:
+        if (mode != "trace" or capture is not None or receipt["scope_kind"] != "cgroup"
+                or receipt["cell"] != "cgroup-reentry" or cgroup_operator_path_errors(receipt)
+                or receipt["requested_backend"] not in BACKENDS
+                or receipt["leg"] != f"trace/{receipt['requested_backend']}"):
+            return False
+        images = receipt["images"]
+        by_image = {row["image"]: row for row in images}
+        actual_images = [row for row in ledger if row["kind"] == "image"]
+        if len(images) != 2 or set(by_image) != {0, 1} or len(actual_images) != 2:
+            return False
+        pid = images[0]["pid"]
+        if (type(pid) is not int or pid <= 0 or receipt["owned_pids"] != [pid]
+                or {row["image"] for row in actual_images} != {0, 1}
+                or len({row["start_time"] for row in images}) != 1
+                or any(any(field not in row for field in IMAGE_FIELDS) for row in images + actual_images)
+                or any(row["pid"] != pid or not row["path"].startswith("/")
+                    or any(type(row[field]) is not int or row[field] <= 0
+                           for field in ("start_time", "ino", "mtime_ns", "pid_namespace", "time_namespace"))
+                    or row["pid_namespace"] != receipt["pid_namespace"]
+                    or row["time_namespace"] != receipt["time_namespace"] for row in images)
+                or any(any(row[field] != by_image[row["image"]][field] for field in IMAGE_FIELDS)
+                       for row in actual_images)):
+            return False
+        pin = receipt["provider_before"]
+        mapping = pin["mapping"]
+        if (pin != receipt["provider_after"] or not pin["path"].startswith("/")
+                or not isinstance(pin["dev"], list) or len(pin["dev"]) != 2
+                or any(type(value) is not int or value < 0 for value in pin["dev"])
+                or type(pin["ino"]) is not int or pin["ino"] <= 0
+                or not re.fullmatch(r"[0-9a-f]{64}", pin["sha256"])
+                or mapping["dev"] != pin["dev"] or mapping["ino"] != pin["ino"]
+                or mapping["file_offset"] != 0 or mapping["permissions"] != "r--p"
+                or type(mapping["length"]) is not int or mapping["length"] <= 0):
+            return False
+        argv = receipt["observer_argv"]
+        if (not isinstance(argv, list) or len(argv) != 12 or not all(isinstance(arg, str) for arg in argv)
+                or not argv[0].startswith("/") or not argv[-1].startswith("/")
+                or argv != [argv[0], "trace", "--cgroup", receipt["operator_path"]["initial"]["path"],
+                    "--module", pin["path"], "--attach-backend", receipt["requested_backend"],
+                    "--duration", "240s", "-o", argv[-1]]):
+            return False
+        backend = ev["attach_backend"]
+        if (ev["authority"] != "hash-pinned" or backend["fallback"] is not None
+                or backend["scope_filter"] is not None or backend["selection"] != receipt["requested_backend"]
+                or type(ev["attach_gap_ms"]) is not int or ev["attach_gap_ms"] <= 0):
+            return False
+        identity = {key: pin[key] for key in ("path", "dev", "ino", "sha256")}
+        def matches(row):
+            return isinstance(row, dict) and all(row.get(key) == value for key, value in identity.items())
+        providers = ev["discovery"]
+        if not isinstance(providers, list) or len(providers) != 1 or not matches(providers[0]):
+            return False
+        objects = providers[0]["objects"]
+        if not isinstance(objects, list) or not objects or any(not matches(row) for row in objects):
+            return False
+        targets = [row for row in ledger if row["kind"] == "target"]
+        if (not targets or {row["image"] for row in targets} != {0, 1}
+                or any(row["dev"] != pin["dev"] or row["ino"] != pin["ino"]
+                    or type(row["file_offset"]) is not int or row["file_offset"] < 0 for row in targets)):
+            return False
+        keys = {(row["image"], row["fn"]) for row in targets}
+        return all(row["pid"] == pid and (row["image"], row["fn"]) in keys
+                   for row in ledger if row["kind"] == "call")
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+        return False
+
+
 def _early_gap_errors(ev, missing, receipt=None, ledger=None, capture=None, *, mode=None):
     if not missing:
         return []
@@ -366,7 +441,8 @@ def _early_gap_errors(ev, missing, receipt=None, ledger=None, capture=None, *, m
     if not relevant and "skipped" in observation.get("causes", []):
         recovered = {"name": "discovery subject", "reason": "static probes detached and exact pairs reattached"}
         relevant = (recovered in ev.get("skipped", [])
-                    and _single_pid_provider_domain(ev, receipt, ledger, capture, mode))
+                    and (_single_pid_provider_domain(ev, receipt, ledger, capture, mode)
+                         or _single_cgroup_provider_domain(ev, receipt, ledger, capture, mode)))
     if (ev.get("completeness") != "PARTIAL" or ev.get("verdict_detail") != "concrete_gap"
             or observation.get("status") != "lossy" or not relevant):
         return ["early deficit lacks relevant real product concrete-gap/PARTIAL evidence"]
@@ -619,9 +695,54 @@ def cgroup_operator_path_errors(receipt):
         intervals = receipt["scope_intervals"]
         if len(intervals) != 2 or intervals[-1]["t1"] != proof["outside_move_ns"]:
             raise ValueError("selected scope interval extends past the actual outside move")
+        successor, = receipt["successor_ready"]
+        if (successor["image"] != 1 or successor["marker_fn"] != "C_GenerateRandom"
+                or successor["max_attempts"] != 20 or not 1 <= successor["attempts"] <= 20
+                or not 0 < successor["deadline_ns"] - successor["started_ns"] <= 15_000_000_000):
+            raise ValueError("R1 needs its disjoint real successor marker inside the original 20/15 bound")
+        # No selected C_GetInfo population may absorb an outside negative.
+        adaptive = [phase for phase in phases if phase["phase"] not in controlled]
+        if (len(adaptive) != successor["attempts"]
+                or [phase["phase"] for phase in adaptive] != successor["phases"]
+                or any((phase["image"], phase["fn"], phase["count"], phase["scope"]) !=
+                       (1, "C_GenerateRandom", 1, "selected") for phase in adaptive)):
+            raise ValueError("R1 adaptive population differs from its independently ledgered marker attempts")
         return []
     except (KeyError, TypeError, ValueError, AttributeError, IndexError) as error:
         return [f"invalid held-root operator-path control: {error}"]
+
+
+def cgroup_trace_boundary_errors(trace, receipt):
+    """Keep same-function generations and the final negative independently bounded."""
+    if receipt.get("cell") != "cgroup-reentry" or not receipt.get("leg", "").startswith("trace/"):
+        return []
+    try:
+        lines = trace.splitlines()
+        images = {image["image"]: image for image in receipt["images"]}
+        phases = {phase["phase"]: phase for phase in receipt["phases"]}
+        successor, = receipt["successor_ready"]
+        warm, tail = phases["warm"], receipt["cgroup_positive_tail"]
+        for boundary, image, fn, count, named in ((warm, images[0], "C_GenerateRandom", 5, False),
+                                                 (tail, images[1], "C_GetSessionInfo", 16, True)):
+            start, end = boundary["output_cursor"], boundary["output_end"]
+            if type(start) is not int or type(end) is not int or not 0 <= start < end <= len(lines):
+                raise ValueError("invalid public population cursor")
+            rows = [match for line in lines[start:end] if (match := ROW.fullmatch(line))
+                    and int(match["pid"]) == image["pid"] and match["fn"] == fn]
+            if len(rows) != count or any(int(row["tid"]) != image["pid"] or row["rv"] != "CKR_OK"
+                    or (not row["path"] and named) or row["path"] and
+                    (json.loads(row["path"]) != image["path"]
+                     or json.loads(row["label"]) != Path(image["path"]).name) for row in rows):
+                raise ValueError("public fixed population was not completely drained with its original image")
+        if (warm["output_end"] > successor["output_cursor"]
+                or not warm["t1"] <= warm["output_observed_ns"] <= phases["aside"]["t0"]
+                or tail["output_cursor"] != successor["proof_cursor"]
+                or not phases["renamed"]["t1"] <= tail["observed_ns"] <= receipt["operator_path"]["outside_move_ns"]
+                or any(ROW.fullmatch(line) for line in lines[tail["output_end"]:])):
+            raise ValueError("outside control crossed an undrained public population boundary")
+        return []
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError) as error:
+        return [f"invalid cgroup public population boundary: {error}"]
 
 
 def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
@@ -637,6 +758,7 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
             (expected_mode2_abandonment_errors if abandonment else successor_recovery_errors).append(error)
     errors.extend(stop_errors(receipt))
     errors.extend(cgroup_operator_path_errors(receipt))
+    errors.extend(cgroup_trace_boundary_errors(trace, receipt))
     if (receipt.get("b_setup") or {}).get("mode") == "3":
         errors.extend(held_entry_errors(trace, ledger, receipt))
     if receipt.get("expect_empty"):
@@ -3452,6 +3574,23 @@ def drain_trace_phase(capture, caller, stdout, fn, count, delay, phase, image, p
         return len(matched) if len(matched) >= count else None
     _output_wait(capture, population, deadline)
     phases[-1].update(output_cursor=cursor, output_end=len(capture.lines))
+
+
+def wait_cgroup_trace_population(capture, image, fn, count, cursor, *, named):
+    """Drain an existing fixed population, without adding a call or phase budget."""
+    deadline = wait_deadline(10)
+    def population():
+        rows = [match for line in capture.lines[cursor:] if (match := ROW.fullmatch(line.strip()))
+                and int(match["pid"]) == image["pid"] and match["fn"] == fn]
+        if len(rows) < count:
+            return None
+        if len(rows) != count or any(int(row["tid"]) != image["pid"] or row["rv"] != "CKR_OK"
+                or (not row["path"] and named) or row["path"] and
+                (json.loads(row["path"]) != image["path"]
+                 or json.loads(row["label"]) != Path(image["path"]).name) for row in rows):
+            raise SetupError("cgroup fixed public population disagrees with its owned image/count")
+        return {"output_cursor": cursor, "output_end": len(capture.lines), "observed_ns": monotonic_ns()}
+    return _output_wait(capture, population, deadline)
 
 
 def warmup_receipt(phases, measured_t0):
@@ -6341,8 +6480,13 @@ def run_cgroup_r1(ctx, cell_dir, backend):
         write_json(leg_dir / "result.json", result)
         return result
     phases = []
+    warm_cursor = len(capture.lines)
     n3_command(caller, stdout, "C_GenerateRandom", 5, 100, "warm", "selected",
                0, selected, phases)
+    warm_boundary = wait_cgroup_trace_population(capture, images[0], "C_GenerateRandom", 5, warm_cursor,
+                                                 named=False)
+    phases[-1].update(output_cursor=warm_boundary["output_cursor"], output_end=warm_boundary["output_end"],
+                      output_observed_ns=warm_boundary["observed_ns"])
     t_out = monotonic_ns()
     move_and_verify(outside, caller, moves, "exit")
     n3_command(caller, stdout, "C_GetInfo", 3, 50, "aside", "outside",
@@ -6357,7 +6501,7 @@ def run_cgroup_r1(ctx, cell_dir, backend):
     t_in = monotonic_ns()
     move_and_verify(sub, caller, moves, "descendant-reentry")
     proof = warm_caller(capture, caller, stdout, images[-1], phases, group=sub,
-                        output_cursor=output_cursor)
+                        output_cursor=output_cursor, marker_fn="C_GenerateRandom")
     n3_command(caller, stdout, "C_GetSessionInfo", 10, 200, "measured", "selected",
                1, sub, phases)
     move_and_verify(selected, caller, moves, "same-image-move")
@@ -6367,6 +6511,8 @@ def run_cgroup_r1(ctx, cell_dir, backend):
     operator.replace_original()
     n3_command(caller, stdout, "C_GetSessionInfo", 3, 100, "renamed", "selected",
                1, selected, phases)
+    positive_tail = wait_cgroup_trace_population(capture, images[-1], "C_GetSessionInfo", 16,
+                                                proof["proof_cursor"], named=True)
     move_and_verify(outside, caller, moves, "operator-path-replacement-negative")
     operator.proof["outside_move_ns"] = moves[-1]["t"]
     n3_command(caller, stdout, "C_GetInfo", 3, 100, "operator-outside", "outside",
@@ -6384,6 +6530,8 @@ def run_cgroup_r1(ctx, cell_dir, backend):
             {"pid": caller.pid, "membership": "selected", "t0": t_in, "t1": operator.proof["outside_move_ns"]},
         ],
         "operator_path": operator.proof,
+        "observer_argv": argv,
+        "cgroup_positive_tail": positive_tail,
         "moves": moves,
         "images": images, "provider_before": provider_receipt(provider),
         "provider_after": provider_receipt(provider),

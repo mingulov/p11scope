@@ -5,7 +5,7 @@
 //! this is no kernel attach, nonleader-exec or teardown timing qualification.
 
 use super::*;
-use crate::discovery::caller_registry::CallerEvent;
+use crate::discovery::caller_registry::{CallerEvent, ModuleId};
 use crate::events::{EventDrain, ScriptedRecords, record_bytes};
 use std::ops::ControlFlow;
 
@@ -208,6 +208,20 @@ fn completed(scene: &AdmissionScene, caller: CallerId) -> u64 {
         .sum()
 }
 
+fn physical_counts(scene: &AdmissionScene) -> Vec<(CallerId, ModuleId, u64)> {
+    let mut counts: Vec<_> = scene
+        .coordinator
+        .registry()
+        .edges()
+        .filter(|edge| edge.entry_count != 0)
+        .map(|edge| (edge.caller, edge.module, edge.entry_count))
+        .collect();
+    // Catalog reconciliation may add mapped rows with zero observed entries.
+    // Compare every nonzero old/successor count across semantic delivery.
+    counts.sort_unstable();
+    counts
+}
+
 fn run_successor_replay(
     selection: Selection,
     shape: ExecShape,
@@ -340,12 +354,18 @@ fn run_successor_replay(
             exec_id: 0,
         },
     };
+    let physical_before = physical_counts(&scene);
     scene.h0.0.borrow_mut().io.current = Some(successor_image);
     scene.h0.0.borrow_mut().after_refresh =
         Some(Box::new(move |owned| calls.replay(owned, quantum)));
     for _ in 0..3 {
         pass_with_inventory(&mut scene, &mut inventory);
     }
+    assert_eq!(
+        physical_counts(&scene),
+        physical_before,
+        "deferred semantic replay cannot invent old or successor physical entry counts"
+    );
     let binding = scene
         .coordinator
         .semantic_bindings()
@@ -386,12 +406,6 @@ fn run_successor_replay(
             .any(|instance| { instance.caller == successor && instance.id != original_instance })
     );
 
-    let physical_before: Vec<_> = scene
-        .coordinator
-        .registry()
-        .edges_of(successor)
-        .map(|edge| (edge.module, edge.entry_count))
-        .collect();
     let slot = scene.h0.0.borrow().io.held.slot(0, "C_SignInit");
     scene
         .lane
@@ -426,14 +440,9 @@ fn run_successor_replay(
         0,
         "an image retirement alone does not invent a physical-gap episode"
     );
-    let physical_after: Vec<_> = scene
-        .coordinator
-        .registry()
-        .edges_of(successor)
-        .map(|edge| (edge.module, edge.entry_count))
-        .collect();
     assert_eq!(
-        physical_after, physical_before,
+        physical_counts(&scene),
+        physical_before,
         "semantic replay cannot invent physical entry counts"
     );
     assert!(!inventory.queried.is_empty());

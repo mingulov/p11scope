@@ -1366,6 +1366,31 @@ pub(crate) fn classic_semantic_pass_for_test(
     driver.semantic.take().unwrap()
 }
 
+/// Drive the production stop hook over real H0 with substituted native I/O.
+#[cfg(test)]
+pub(crate) fn classic_semantic_stop_for_test(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    lane: crate::inventory_semantics::AttestedSemanticLane,
+) -> crate::inventory_semantics::AttestedSemanticLane {
+    let mut driver = ClassicDriver {
+        coordinator,
+        inventory_scope: None,
+        scope: InventoryRunScope::Pid(std::process::id()),
+        cgroup: None,
+        max_scan_pids: None,
+        guard: UnavailableImageGuard,
+        deadline: None,
+        identity: None,
+        display: None,
+        semantic: Some(lane),
+        semantic_staged: false,
+    };
+    driver.on_stop_requested();
+    // Repeated stop hooks cannot submit the same native owners again.
+    driver.on_lane_stopped();
+    driver.semantic.take().unwrap()
+}
+
 impl ClassicDriver<'_> {
     /// A pass warning: stderr on the classic path; under the dashboard
     /// (which must never scribble beside its screen) the log tail, kept

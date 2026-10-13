@@ -13,7 +13,7 @@ use crate::discovery::instances::{
 };
 use crate::process::PidPin;
 use p11scope_ebpf_common::{EventRecord, ImageIdentity, event_type};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -664,6 +664,9 @@ pub(crate) struct SemanticCapture {
     jobs: VecDeque<ScanJob>,
     bindings: BTreeMap<u64, TaskBinding>,
     terminal_cursor: u64,
+    /// Fairness among tick-local Joined partitions when Pending scans leave
+    /// fewer scan slots than the later calls need. This carries no authority.
+    joined_refresh_cursor: Option<(u64, u64, u32)>,
     fault: u64,
     sticky: u64,
     image_failed: bool,
@@ -700,6 +703,7 @@ impl SemanticCapture {
             jobs: VecDeque::new(),
             bindings: BTreeMap::new(),
             terminal_cursor: 0,
+            joined_refresh_cursor: None,
             fault: 0,
             sticky: 0,
             image_failed: false,
@@ -1346,6 +1350,10 @@ impl SemanticCapture {
                 (position, record)
             })
             .collect();
+        // Joined calls already have a route, but later publications need a
+        // fresh owner proof. These interests are bounded by this collection
+        // and never enter the Pending queue or renew its original deadlines.
+        let mut joined_interests = BTreeMap::new();
         // A malformed/read-error prefix still contains genuine consumed
         // records. Keep their positions, then forbid every positive route.
         if collection_failed {
@@ -1398,6 +1406,17 @@ impl SemanticCapture {
             };
             let route = self.router.route(facts);
             if route != Route::Pending {
+                if matches!(route, Route::Joined(_)) {
+                    let endpoint = endpoint.expect("checked owned endpoint");
+                    let image = record.event.image;
+                    let key = (image.task_cookie, image.exec_id, endpoint.file_slot);
+                    joined_interests.entry(key).or_insert((
+                        image,
+                        endpoint,
+                        record.event.slot,
+                        (record.event.pid_tgid >> 32) as u32,
+                    ));
+                }
                 self.emit(Some(token), record, endpoint, route, &mut report);
                 continue;
             }
@@ -1442,6 +1461,7 @@ impl SemanticCapture {
         self.prune_jobs();
         // Visit each initial queued job at most once. Refused peers rotate.
         let attempts = self.limits.scans.min(self.jobs.len());
+        let mut attempted_keys = BTreeSet::new();
         for _ in 0..attempts {
             let Some(job) = self.jobs.pop_front() else {
                 break;
@@ -1451,6 +1471,7 @@ impl SemanticCapture {
                 continue;
             }
             report.scans += 1;
+            attempted_keys.insert(job.key());
             let fence = self.router.fence();
             let Some(slice_end) = io.now().checked_add(self.limits.scan_slice) else {
                 self.exhaust(&mut report);
@@ -1475,6 +1496,72 @@ impl SemanticCapture {
                 .any(|waiting| Self::pending_key(waiting) == job.key())
             {
                 self.jobs.push_back(job);
+            }
+        }
+        // Pending keeps its existing queue, deadlines, and first claim on
+        // the shared scan cap. Sweep only this tick's Joined interests in a
+        // separate cyclic order; a refusal advances the cursor as well.
+        let mut joined_keys: Vec<_> = joined_interests
+            .keys()
+            .filter(|key| !attempted_keys.contains(*key))
+            .copied()
+            .collect();
+        let split = self.joined_refresh_cursor.map_or(0, |cursor| {
+            joined_keys.partition_point(|key| *key <= cursor)
+        });
+        joined_keys.rotate_left(split);
+        for key in joined_keys {
+            if report.scans >= self.limits.scans
+                || self.image_failed
+                || self.exhausted
+                || self.sticky != 0
+            {
+                break;
+            }
+            let (image, endpoint, slot, pid) = joined_interests[&key];
+            let Some(pin) = io.target(pid) else {
+                continue;
+            };
+            let Some(binding) = self.bindings.get(&image.task_cookie) else {
+                continue;
+            };
+            if binding.domain != self.router.domain()
+                || !binding.current
+                || binding.image != image
+                || pin.pid() != pid
+                || !Arc::ptr_eq(&pin, &binding.pin)
+                || !pin.still_the_same()
+            {
+                continue;
+            }
+            let now = io.now();
+            let (Some(proof_deadline), Some(slice_end)) = (
+                now.checked_add(self.limits.pending_for),
+                now.checked_add(self.limits.scan_slice),
+            ) else {
+                self.exhaust(&mut report);
+                break;
+            };
+            let job = ScanJob {
+                image,
+                endpoint,
+                slot,
+                pin,
+                deadline: proof_deadline,
+            };
+            report.scans += 1;
+            self.joined_refresh_cursor = Some(key);
+            let fence = self.router.fence();
+            let attempt_deadline = slice_end.min(proof_deadline);
+            let result = io.scan(&job, attempt_deadline, fence, &|| self.router.fence());
+            let healthy = self.audit(io, &mut report);
+            if io.now() >= attempt_deadline {
+                report.scan_refusals.push(ImageQueryRefusal::Deadline);
+            } else if healthy {
+                match result {
+                    Ok(proof) => self.accept_scan(io, proof, &job, fence, &mut report),
+                    Err(refusal) => report.scan_refusals.push(refusal),
+                }
             }
         }
         Ok(report)

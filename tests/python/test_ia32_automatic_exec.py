@@ -414,6 +414,15 @@ int main(int argc, char **argv) {
                 'C_GetInfo [semantics unverified] → CKR_OK 10µs\n')
 
     def test_trace_exec_waits_for_old_shared_return_after_held_ack(self):
+        self.trace_exec_boundary()
+
+    def test_trace_exec_refuses_missing_duplicate_foreign_or_failed_shared_return(self):
+        for change in ("missing", "duplicate", "pid", "tid", "path", "label", "rv",
+                       "stdout-eof", "stderr-eof", "transport"):
+            with self.subTest(change=change):
+                self.trace_exec_boundary(change)
+
+    def trace_exec_boundary(self, change=None):
         gate = self.load()
         with tempfile.TemporaryDirectory(prefix="ia32-shared-return-") as tmp:
             directory = Path(tmp)
@@ -440,11 +449,27 @@ int main(int argc, char **argv) {
                     self.assertIn("held-ack", driver.stamps)
                     self.assertNotIn("exec-start", driver.stamps)
                     if not state.get("published"):
-                        row = next(r for r in driver.stdout.records if r.get("fn") == "C_OpenSession")
+                        row = next(r for r in driver.stdout.records
+                                   if r["kind"] == "call" and r["fn"] == "C_OpenSession")
                         self.assertEqual((row["image"], row["phase"], row["rv"]), (0, "setup", 0))
                         text = (f'21:37:58.638119 Unknown executable (PID {row["pid"]}, TID {row["tid"]}) '
                                 'C_OpenSession [semantics unverified] → CKR_OK 10µs\n')
-                        os.write(writers[0], text.encode())
+                        if change == "duplicate": text += text
+                        elif change == "pid": text = text.replace(f'PID {row["pid"]}', f'PID {row["pid"] + 1}')
+                        elif change == "tid": text = text.replace(f'TID {row["tid"]}', f'TID {row["tid"] + 1}')
+                        elif change == "rv": text = text.replace("CKR_OK", "CKR_GENERAL_ERROR")
+                        elif change in ("path", "label"):
+                            path = "/wrong" if change == "path" else driver.images[0]["path"]
+                            label = "wrong" if change == "label" else Path(path).name
+                            text = text.replace("Unknown executable", json.dumps(label)).replace(
+                                ") C_OpenSession", f") exe={json.dumps(path)} C_OpenSession")
+                        if change in ("stdout-eof", "stderr-eof"):
+                            fd = writers.pop(0 if change == "stdout-eof" else 1)
+                            os.close(fd)
+                        elif change == "transport":
+                            capture.errors.append("controlled observer transport failure")
+                        elif change != "missing":
+                            os.write(writers[0], text.encode())
                         state["published"] = True
                     return original_get(*args, **kwargs)
 
@@ -456,21 +481,39 @@ int main(int argc, char **argv) {
 
             original_start = gate["Ia32Driver"].start_held
             original_exec = gate["Ia32Driver"].do_exec
+            original_deadline = gate["H6"]["wait_deadline"]
             def held(driver):
                 state["driver"] = driver
-                return original_start(driver)
+                original_start(driver)
+                state["held"] = True
             def execute(driver):
+                self.assertIsNone(change, "invalid old public return released X")
                 self.assertEqual(len(state["capture"].lines), 1,
                                  "X released before the delayed old shared-key return was drained")
                 original_exec(driver)
                 self.assertEqual([r["image"] for r in driver.images], [0, 1])
+                snapshot = driver.snapshot()
+                snapshot.update(observer_ready_ns=state["ready"], successor_ready=[{
+                    "output_cursor": driver.trace_shared_key_guard["output_end"]}])
+                self.assertEqual(gate["shared_key_guard_errors"](
+                    "".join(state["capture"].lines), snapshot["ledger"], snapshot), [])
                 raise RuntimeError("controlled stop after guarded exec")
+
+            def deadline(seconds):
+                # Shorten only this missing-output control's already finite wait;
+                # caller setup/ACK budgets and all production budgets stay intact.
+                return original_deadline(min(seconds, 0.05) if change == "missing"
+                                         and state.get("held") else seconds)
+
+            def ready(*_):
+                state["ready"] = gate["H6"]["monotonic_ns"]()
+                return state["ready"]
 
             @gate["H6"]["owned_leg"]
             def exercise(ctx):
                 try:
                     with mock.patch.dict(gate["H6"], spawn_observer=observer,
-                            observer_ready=lambda *_: gate["H6"]["monotonic_ns"]()), \
+                            wait_deadline=deadline, observer_ready=ready), \
                             mock.patch.object(gate["Ia32Driver"], "start_held", held), \
                             mock.patch.object(gate["Ia32Driver"], "do_exec", execute):
                         gate["run_leg"].__wrapped__(ctx, "pid-leader", "singles", "trace", directory / "leg")
@@ -478,10 +521,15 @@ int main(int argc, char **argv) {
                     for fd in writers:
                         os.close(fd)
 
-            with self.assertRaisesRegex(RuntimeError, "controlled stop after guarded exec"):
+            failure = (ValueError, TimeoutError, EOFError, gate["H6"]["SetupError"], gate["H6"]["LegCleanupError"])
+            expected = self.assertRaises(failure) if change else self.assertRaisesRegex(
+                RuntimeError, "controlled stop after guarded exec")
+            with expected:
                 exercise(case)
             self.assertTrue(state["published"])
-            self.assertFalse(case.cleanup_failed, case.cleanup_errors)
+            if change:
+                self.assertNotIn("exec-start", state["driver"].stamps)
+            self.assertEqual(case.cleanup_failed, change == "transport", case.cleanup_errors)
             self.assertIsNone(state["driver"].owned.pidfd)
             self.assertTrue(all(not scope.owners and not scope.readers and not scope.leg_pins
                                 for scope in case.scopes))
@@ -723,7 +771,7 @@ int main(int argc, char **argv) {
                 "--module", pin["path"], "--attach-backend", backend]
         if kind != "trace": argv += ["--mode", kind]
         observer = {"argv": argv, "started_ns": snapshot["spawned_ns"],
-                    "ready_ns": calls[0]["t0"] - 1, "stopped_ns": snapshot["finished_ns"],
+                    "ready_ns": snapshot["command_stamps"]["pre-start"] - 1, "stopped_ns": snapshot["finished_ns"],
                     "rc": 0, "caller_rc": 0, "stderr": "", "stop": {
                         "stop_limit_seconds": 60, "stop_latency_seconds": 0.1, "forced_cleanup": False}}
         proof = None
@@ -733,6 +781,13 @@ int main(int argc, char **argv) {
                      "deadline_ns": warm["t0"] - 1 + 15_000_000_000, "attempts": 1, "max_attempts": 20,
                      "output_cursor": 15, "proof_cursor": 17, "marker_fn": "C_GetInfo",
                      "phases": ["successor-1-1"], "proof_kind": "trace-row"}
+            if kind == "trace":
+                old_setup = next(r for r in calls if r["image"] == 0 and r["fn"] == "C_OpenSession")
+                snapshot["trace_shared_key_guard"] = {
+                    "image": 0, "ledger_seq": old_setup["seq"], "output_cursor": 3, "output_end": 15,
+                    "started_ns": snapshot["command_stamps"]["pre-start"],
+                    "observed_ns": snapshot["command_stamps"]["exec-start"],
+                    "deadline_ns": snapshot["held"]["t0"] + 15_000_000_000}
         doc = None
         if kind != "trace":
             def live(functions):
@@ -794,6 +849,52 @@ int main(int argc, char **argv) {
                 output = "\n".join(lines) + "\n"
                 result = gate["evaluate_ia32"](output, doc, ledger, bad, "trace", output)
                 self.assertFalse(result["pass"], change)
+
+    def test_trace_gate_rejects_corrupted_shared_key_cursor_authority(self):
+        gate, text, doc, ledger, receipt = self.capture()
+        self.assertTrue(gate["evaluate_ia32"](text, doc, ledger, receipt, "trace", text)["pass"])
+        for change in ("absent", "image", "ledger", "cursor", "end", "started", "observed", "deadline",
+                       "old-row-missing", "old-row-duplicate", "old-row-name", "old-row-rv"):
+            with self.subTest(change=change):
+                bad, lines = copy.deepcopy(receipt), text.splitlines()
+                guard = bad["trace_shared_key_guard"]
+                if change == "absent": bad.pop("trace_shared_key_guard")
+                elif change == "image": guard["image"] = 1
+                elif change == "ledger": guard["ledger_seq"] += 1
+                elif change == "cursor": guard["output_cursor"] = 4
+                elif change == "end": guard["output_end"] += 1
+                elif change == "started": guard["started_ns"] = bad["command_stamps"]["pre-start"] + 1
+                elif change == "observed": guard["observed_ns"] = bad["command_stamps"]["exec-start"] + 1
+                elif change == "deadline": guard["deadline_ns"] = guard["observed_ns"]
+                elif change == "old-row-missing": lines[3] = "missing shared row"
+                elif change == "old-row-duplicate": lines[4] = lines[3]
+                elif change == "old-row-name": lines[3] = lines[3].replace(bad["images"][0]["path"], "/wrong")
+                elif change == "old-row-rv": lines[3] = lines[3].replace("CKR_OK", "CKR_GENERAL_ERROR")
+                output = "\n".join(lines) + "\n"
+                result = gate["evaluate_ia32"](output, doc, ledger, bad, "trace", output)
+                self.assertFalse(result["pass"], change)
+                self.assertTrue(any("shared-key guard" in error for error in result["errors"]), result["errors"])
+
+    def test_shared_key_boundary_allows_unknown_and_missing_unique_prefix(self):
+        gate, text, _doc, ledger, receipt = self.capture()
+        lines = text.splitlines()
+        pid = receipt["pid"]
+        lines[3] = (f"21:37:58.638119 Unknown executable (PID {pid}, TID {pid}) "
+                    "C_OpenSession [semantics unverified] → CKR_OK 10µs")
+        # Only the shared row is drained. Six old unique-key returns arrive after
+        # the cursor; the first five are absent. Never assign a missing kth call.
+        del lines[4:9]
+        receipt["trace_shared_key_guard"]["output_end"] = 4
+        receipt["successor_ready"][0].update(output_cursor=4, proof_cursor=12)
+        output = "\n".join(lines) + "\n"
+        self.assertEqual(gate["shared_key_guard_errors"](output, ledger, receipt), [])
+        rows, _, _, _ = gate["H6"]["N3_PARSE_TRACE"](output)
+        calls = [r for r in ledger if r["kind"] == "call"]
+        _, _, early, errors = gate["H6"]["_trace_successor_populations"](
+            output, rows, calls, receipt, {r["image"]: r for r in receipt["images"]})
+        self.assertEqual(errors, [])
+        self.assertEqual(early["deficit"], 5)
+        self.assertEqual(early["observed_unknown"], 1)
 
     def test_failed_exec_gate_rejects_successor_changed_image_lost_return_and_link_loss(self):
         gate, text, doc, ledger, receipt = self.capture("failed")

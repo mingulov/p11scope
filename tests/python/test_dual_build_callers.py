@@ -4,11 +4,13 @@
 
 import json
 import os
+from collections import Counter
 from pathlib import Path
 import runpy
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -18,6 +20,146 @@ FIXTURES = ROOT / "tests/fixtures/dual-build-callers"
 CHILDREN = (ROOT / "scripts/verify-attach-e2e.sh", ROOT / "scripts/verify-canaries.sh")
 PREPARED = ("P11SCOPE_PREPARED_STABLE_CARGO", "P11SCOPE_PREPARED_STABLE_RUSTC",
             "P11SCOPE_PREPARED_BPF_CARGO", "P11SCOPE_PREPARED_BPF_RUSTC")
+
+SPIKE_RECORDER = r"""
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+typedef unsigned long U;
+static U record(const char *name) {
+    FILE *stream = fopen(getenv("P11SCOPE_SPIKE_CALL_LEDGER"), "a");
+    if (!stream) return 5;
+    fprintf(stream, "%s\n", name);
+    return fclose(stream) == 0 ? 0 : 5;
+}
+static U initialize(void *arg) { (void)arg; return record("C_Initialize"); }
+static U finalize(void *arg) {
+    (void)arg;
+    U rv = record("C_Finalize");
+    return getenv("P11SCOPE_SPIKE_FAIL_FINALIZE") ? 5 : rv;
+}
+static U info(void *arg) { (void)arg; return record("C_GetInfo"); }
+static U slots(unsigned char present, U *out, U *count) {
+    (void)present; out[0] = 7; *count = 1; return record("C_GetSlotList");
+}
+static U open_session(U slot, U flags, void *app, void *notify, U *out) {
+    (void)slot; (void)flags; (void)app; (void)notify;
+    static U next = 1; *out = next++; return record("C_OpenSession");
+}
+static U close_session(U session) { (void)session; return record("C_CloseSession"); }
+static U digest_init(U session, void *mechanism) {
+    (void)session; (void)mechanism; return record("C_DigestInit");
+}
+static U digest(U session, unsigned char *data, U size, unsigned char *out, U *length) {
+    (void)session; (void)data; (void)size;
+    memset(out, 0, 32); *length = 32; return record("C_Digest");
+}
+static U random_bytes(U session, unsigned char *out, U length) {
+    (void)session; memset(out, 0, length); return record("C_GenerateRandom");
+}
+static struct { unsigned char version[2]; void *functions[68]; } table = {
+    {2, 40}, {[0] = initialize, [1] = finalize, [2] = info, [4] = slots,
+              [12] = open_session, [13] = close_session, [37] = digest_init,
+              [38] = digest, [64] = random_bytes}
+};
+U C_GetFunctionList(void **out) { *out = &table; return record("C_GetFunctionList"); }
+"""
+
+
+class SpikeHarnessLifetimeTests(unittest.TestCase):
+    """Run the actual C harness, with independent provider call receipts."""
+
+    @classmethod
+    def setUpClass(cls):
+        temporary = tempfile.TemporaryDirectory(prefix="p11scope spike lifetime build ")
+        cls.addClassCleanup(temporary.cleanup)
+        cls.build = Path(temporary.name)
+        cls.harness = cls.build / "harness"
+        cls.provider = cls.build / "recorder.so"
+        source = cls.build / "recorder.c"
+        source.write_text(SPIKE_RECORDER, encoding="utf-8")
+        flags = ["gcc", "-O0", "-Wall", "-Wextra", "-Werror"]
+        subprocess.run([*flags, str(ROOT / "spike/harness.c"), "-ldl", "-o",
+                        str(cls.harness)], check=True)
+        subprocess.run([*flags, "-shared", "-fPIC", str(source), "-o",
+                        str(cls.provider)], check=True)
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="p11scope spike lifetime case ")
+        self.addCleanup(temporary.cleanup)
+        self.work = Path(temporary.name)
+        self.ledger = self.work / "calls"
+        self.environment = dict(os.environ, P11SCOPE_SPIKE_CALL_LEDGER=str(self.ledger))
+        self.environment.pop("P11SCOPE_SPIKE_FAIL_FINALIZE", None)
+
+    def assert_calls_complete(self):
+        calls = self.ledger.read_text().splitlines()
+        self.assertEqual(Counter(calls), {
+            "C_GetFunctionList": 1, "C_Initialize": 1, "C_GetInfo": 3,
+            "C_GetSlotList": 1, "C_OpenSession": 10, "C_DigestInit": 50,
+            "C_Digest": 50, "C_GenerateRandom": 100, "C_CloseSession": 10,
+            "C_Finalize": 1,
+        })
+        self.assertEqual(calls[-1], "C_Finalize")
+
+    def test_optional_finish_holds_completed_calls_and_provider_mapping(self):
+        go, finish = self.work / "go", self.work / "finish"
+        log_path = self.work / "workload.log"
+        log = log_path.open("w")
+        self.addCleanup(log.close)
+        child = subprocess.Popen([str(self.harness), str(self.provider), str(go), str(finish)],
+                                 env=self.environment, stdout=log, stderr=log)
+
+        def settle():
+            if child.poll() is None:
+                child.terminate()
+            child.wait(timeout=3)
+        self.addCleanup(settle)
+        deadline = time.monotonic() + 3
+        while "HARNESS_PROVIDER_MAPPED\n" not in log_path.read_text():
+            self.assertIsNone(child.poll(), log_path.read_text())
+            self.assertLess(time.monotonic(), deadline, "provider did not map before go")
+            time.sleep(0.005)
+        self.assertFalse(self.ledger.exists(), "the go latch must precede every fixed call")
+        go.touch()
+        deadline = time.monotonic() + 3
+        while "harness OK\n" not in log_path.read_text():
+            self.assertIsNone(child.poll(), log_path.read_text())
+            self.assertLess(time.monotonic(), deadline, "completion acknowledgement was not flushed")
+            time.sleep(0.005)
+        self.assertIsNone(child.poll(), "completed workload must stay alive until finish")
+        self.assertIn(str(self.provider), Path(f"/proc/{child.pid}/maps").read_text())
+        self.assert_calls_complete()
+        finish.touch()
+        self.assertEqual(child.wait(timeout=3), 0, log_path.read_text())
+        self.assert_calls_complete()
+
+    def test_original_ungated_and_go_only_forms_exit_with_exact_counts(self):
+        for gated in (False, True):
+            with self.subTest(gated=gated):
+                self.ledger.unlink(missing_ok=True)
+                argv = [str(self.harness), str(self.provider)]
+                if gated:
+                    go = self.work / "go"
+                    go.touch()
+                    argv.append(str(go))
+                result = subprocess.run(argv, env=self.environment, capture_output=True,
+                                        text=True, timeout=3)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, "harness OK\n")
+                self.assert_calls_complete()
+
+    def test_failed_finalize_exits_without_completion_or_finish(self):
+        go = self.work / "go"
+        go.touch()
+        result = subprocess.run([str(self.harness), str(self.provider), str(go),
+                                 str(self.work / "absent finish")],
+                                env=dict(self.environment, P11SCOPE_SPIKE_FAIL_FINALIZE="1"),
+                                capture_output=True, text=True, timeout=3)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotIn("harness OK", result.stdout)
+        self.assertIn("C_Finalize failed", result.stderr)
+        self.assert_calls_complete()
 
 
 def logical_commands(path):
@@ -178,7 +320,8 @@ class DualBuildCallerTests(unittest.TestCase):
 
     def configure_attach_observer(self, *, skipped=1, log_lines=(), checker_status=None,
                                   log_fault=None, terminal_attribution=False, profiler_status=0,
-                                  require_completed_live=False):
+                                  require_completed_live=False, workload_status=0,
+                                  omit_completion=False):
         """Keep the actual gate, waits and checker; fake only external commands."""
         for name in ("check-capture-evidence.py", "lane-attach-e2e-oracle.py"):
             shutil.copy2(ROOT / "scripts" / name, self.repo / "scripts" / name)
@@ -214,7 +357,9 @@ class DualBuildCallerTests(unittest.TestCase):
                                            "documents": documents, "log_lines": log_lines,
                                            "terminal_attribution": terminal_attribution,
                                            "profiler_status": profiler_status,
-                                           "require_completed_live": require_completed_live}),
+                                           "require_completed_live": require_completed_live,
+                                           "workload_status": workload_status,
+                                           "omit_completion": omit_completion}),
                                encoding="utf-8")
         dispatcher = '''#!/usr/bin/python3
 import json, mmap, os, select, shutil, sys, time
@@ -237,6 +382,8 @@ elif kind == "harness":
             if time.monotonic() > deadline:
                 raise SystemExit(98)
             time.sleep(0.01)
+        if config["workload_status"] or config["omit_completion"]:
+            raise SystemExit(config["workload_status"])
         print("harness OK", flush=True)
         phase = Path(sys.argv[2] + ".phase")
         phase.write_text("held" if len(sys.argv) == 4 else "exiting")
@@ -245,6 +392,8 @@ elif kind == "harness":
                 if time.monotonic() > deadline:
                     raise SystemExit(98)
                 time.sleep(0.01)
+            with Path(config["events"]).open("a") as stream:
+                stream.write(json.dumps({"kind": "workload-released"}) + "\\n")
 elif kind == "p11scope":
     output = Path(sys.argv[sys.argv.index("-o") + 1])
     target = int(sys.argv[sys.argv.index("--pid") + 1])
@@ -372,6 +521,21 @@ raise SystemExit({checker_status})
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("=== e2e: ALL OK ===", result.stdout)
         self.assertEqual(sum(row["kind"] == "completed-live" for row in self.rows()), 2)
+        self.assertEqual(sum(row["kind"] == "workload-released" for row in self.rows()), 2)
+
+    def test_attach_preserves_failed_workload_status_before_completion(self):
+        self.configure_attach_observer(skipped=0, workload_status=43)
+        result = self.run_child(CHILDREN[0])
+        self.assertEqual(result.returncode, 43, result.stdout + result.stderr)
+        self.assertIn("workload failed before completion: 43", result.stdout)
+        self.assertNotIn("=== discover", result.stdout)
+
+    def test_attach_refuses_successful_exit_without_completion(self):
+        self.configure_attach_observer(skipped=0, omit_completion=True)
+        result = self.run_child(CHILDREN[0])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("workload failed before completion: 1", result.stdout)
+        self.assertNotIn("=== discover", result.stdout)
 
     def test_attach_failed_profiler_preserves_status_and_filters_private_attribution(self):
         attribution = "p11scope: skip-attribution: PRIVATE ATTRIBUTION " + "x" * 5000
@@ -393,6 +557,7 @@ raise SystemExit({checker_status})
                 self.assertNotIn("manifest corroborated against the scan", result.stdout)
                 self.assertNotIn("ALL OK", result.stdout)
                 self.assertEqual(sum(row["kind"] == "p11scope" for row in self.rows()), 1)
+                self.assertEqual(sum(row["kind"] == "workload-released" for row in self.rows()), 1)
                 self.assertFalse(any(row["kind"] == "p11scope-discover" for row in self.rows()))
 
     def test_attach_self_test_returns_before_build_or_resources(self):

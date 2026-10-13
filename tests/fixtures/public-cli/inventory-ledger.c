@@ -30,8 +30,9 @@
  *   --sleep-us N     sleep N us after every iteration (stretches a short CLI)
  *   --chain SPEC     (exec-chain) comma list of HOW:EXE steps, HOW = leader|thread
  *   --gen K          (internal) exec generation, set by the chain itself
- *   --h6-control     opt-in mech/exec-chain stdin controller; every image waits
- *                    before dlopen. Commands: W/M/T/X/F GEN SEQ LOWER DEADLINE
+ *   --h6-control     opt-in mech/exec-chain stdin controller; every image maps
+ *                    providers without API calls before READY, then waits.
+ *                    Commands: W/M/T/X/F GEN SEQ LOWER DEADLINE
  *                    ATTEMPT; W's attempt is 1..20, other commands use 0.
  *                    Every command has a flushed ACK; M always runs two
  *                    iterations and one actual corrupted-HMAC verification.
@@ -588,6 +589,12 @@ static void h6_generation(void) {
     CK_MECHANISM hmac = {CKM_SHA256_HMAC, NULL, 0};
     unsigned long seq = 0, recovery_deadline = 0;
     int attempts = 0, measured = 0, torn_down = 0;
+    h6_work_deadline = opt.h6_deadline;
+    for (int m = 0; m < module_count; m++) {
+        check_h6_work();
+        load_module(m);
+        check_h6_work();
+    }
     printf("H6_READY " HEAD " seq=0 t=%lu deadline=%lu\n", HEAD_ARGS, now_ns(), opt.h6_deadline);
     fflush(stdout);
     for (;;) {
@@ -630,7 +637,6 @@ static void h6_generation(void) {
             if (!attempts) {
                 for (int m = 0; m < module_count; m++) {
                     check_h6_work();
-                    load_module(m);
                     bind_module(m, PH_H6_SETUP);
                     sessions[m] = setup(m, PH_H6_SETUP);
                     keys[m] = keygen(m, sessions[m], CKM_GENERIC_SECRET_KEY_GEN,

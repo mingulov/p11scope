@@ -295,6 +295,19 @@ fn admit_fresh_pair(scene: &mut AdmissionScene) {
     scene.h0.0.borrow_mut().after_refresh = Some(Box::new(move |owned| {
         owned.io.held.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
         owned.io.held.enqueue(pid, 0, "C_Sign", 0, 0);
+        // Two genuine receipts for the same unchanged partition reach this
+        // bounded publication. Their first-proof disclosure must be emitted
+        // once, independently of the number of accepted registrations.
+        let pin = owned.last_effective.as_ref().unwrap().clone();
+        let slot = owned.io.held.slot(0, "C_SignInit");
+        let AdmissionH0 {
+            capture, io, stash, ..
+        } = owned;
+        let mut report = capture.refresh_with(io, pin, slot).unwrap();
+        assert_eq!(report.current().len(), 1);
+        let (images, shed) = stash_refresh_report(stash, &mut report);
+        assert_eq!(images, vec![image(7)]);
+        assert_eq!(shed, 0);
     }));
     scene.pass();
     scene.assert_admitted();
@@ -430,6 +443,18 @@ fn initial_coverage_discloses_prior_committed_use_without_reducing_early_unknown
     assert_eq!(gaps[0].module, Some(module));
     assert!(gaps[0].subject.contains("earlier physical provider use"));
     assert!(gaps[0].budget.is_none());
+    let gap_index = scene
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .position(|gap| gap == &gaps[0])
+        .unwrap();
+    assert_eq!(
+        scene.coordinator.registry().gap_repeats()[gap_index],
+        1,
+        "multiple genuine receipts in one registration batch disclose once"
+    );
     assert_eq!(physical_snapshot(&scene), physical);
 
     scene.pass();
@@ -459,10 +484,10 @@ fn initial_coverage_discloses_prior_committed_use_without_reducing_early_unknown
 fn initial_coverage_same_publication_physical_use_stays_clean() {
     let mut scene = Box::new(AdmissionScene::new(Selection::Cgroup));
     scene.prepare_without_cookie();
-    prepare_scoped_first_receipt(&mut scene);
     let endpoint = provider_endpoint(&scene, scene.lane.as_ref().unwrap().subset());
     let pid = scene.child.id();
     stage_physical_use(&mut scene, pid, endpoint);
+    prepare_scoped_first_receipt(&mut scene);
     assert!(
         physical_snapshot(&scene).is_empty(),
         "physical use is only staged"

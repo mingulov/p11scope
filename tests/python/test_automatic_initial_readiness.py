@@ -258,6 +258,7 @@ class InitialProducerTest(unittest.TestCase):
         self.ctx.leg_pins.extend((self.ctx.provider_pin, self.ctx.binary))
         self.ctx.pins = {"caller": self.pin}
         self.addCleanup(H6["cleanup_leg_resources"], self.ctx)
+        self.launches = {}
         self.spawned = []
 
     def spawn(self, owners, argv, uid, **options):

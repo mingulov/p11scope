@@ -311,6 +311,16 @@ fn run_successor_replay(
             .adapter()
             .record(successor)
             .unwrap()
+            .authority,
+        ImageAuthority::ScanPinned,
+        "an Inventory replay handoff must not promote scan custody to native authority"
+    );
+    assert_eq!(
+        scene
+            .coordinator
+            .adapter()
+            .record(successor)
+            .unwrap()
             .start_time,
         old_start
     );
@@ -399,6 +409,16 @@ fn run_successor_replay(
         completed(&scene, successor),
         1,
         "fresh successor Init/Sign must remain useful"
+    );
+    assert_eq!(
+        scene
+            .coordinator
+            .adapter()
+            .record(successor)
+            .unwrap()
+            .authority,
+        ImageAuthority::ScanPinned,
+        "useful H0 semantic receipt coverage leaves caller image authority scan-pinned"
     );
     assert_eq!(completed(&scene, old), 0);
     assert_eq!(

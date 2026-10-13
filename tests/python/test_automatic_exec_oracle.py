@@ -6847,6 +6847,11 @@ class InventoryReadinessTest(unittest.TestCase):
                     "edge_events": 1, "instance_events": 1, "semantic_edge_events": 1,
                     "semantic_edge_events_deferred": 1 if deferred else 0}))
                 self.next_pass += 1
+                if delayed and number == 1:
+                    # An idle observer pass is independent of fixture calls.
+                    # It still has no fresh physical marker; W2 remains needed.
+                    payloads.append(("pass_committed", {"pass": self.next_pass}))
+                    self.next_pass += 1
             records = []
             for kind, event in payloads:
                 row = self.record(self.sequence, kind, event)

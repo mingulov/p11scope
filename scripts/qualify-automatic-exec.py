@@ -6697,6 +6697,28 @@ def inventory_boundary(records, owner, image, provider, admission, floor, marker
                           physical_hooks=physical_hooks, started_ns=started_ns)}}
 
 
+def inventory_readiness_retry_ready(records, admission, floor, ack, deadline):
+    """Pace priming work after publication opportunities, never confer readiness.
+
+    inventory_boundary has already validated these passes' emitter accounting.
+    The first post-ACK pass can publish an already staged semantic batch; hold
+    the caller idle for a second settled pass before advancing its work marker.
+    """
+    opportunities, deferred = set(), False
+    for record in records:
+        check_r5_work(deadline)
+        if record["seq"] <= floor or record["kind"] != "pass_committed":
+            continue
+        completion = r5_pass_receipt(record)
+        if completion["at_ns"] <= ack["t1"] or completion["pass"] <= admission["completed_pass"]["pass"]:
+            continue
+        deferred = any(record["event"][key] for key in (
+            "edge_events_deferred", "instance_events_deferred", "semantic_edge_events_deferred"))
+        if not deferred:
+            opportunities.add(completion["pass"])
+    return len(opportunities) >= 2 and not deferred
+
+
 def wait_inventory_s1_ready(owner, executable, provider_pin, admission, cursor, attempt, deadline,
                             *, prefix_batches=(), prefix_markers=(), physical_hooks=None, recovery_from=None):
     """Release measurement only on fresh held-provider/instance/S1 proof."""
@@ -6706,21 +6728,24 @@ def wait_inventory_s1_ready(owner, executable, provider_pin, admission, cursor, 
     started = prefix_markers[0]["ack"]["t0"] if prefix_markers else monotonic_ns()
     provider = provider_receipt(provider_pin)
     prefix, markers = list(prefix_batches), list(prefix_markers)
-    for number in range(len(markers) + 1, 21):
+    for number in range(max(1, len(markers)), 21):
         remaining_until(deadline)
         executable.verify()
         image = executable.image_receipt({"image": admission["incarnation"]}, owner)
-        marker = attempt(number, deadline)
+        # Initial readiness already owns ACKed W1. Observe it before deciding
+        # whether another real entry is needed to prime native admission.
+        fresh = number > len(markers)
+        marker = attempt(number, deadline) if fresh else markers[-1]
         ack = marker["ack"]
         if (ack.get("command") != "W" or ack.get("attempt") != number
                 or ack.get("gen") != admission["incarnation"] or ack.get("idle") != 1
                 or not started <= ack["t0"] <= ack["t1"] < deadline):
             raise SetupError("Inventory readiness has a stale or unbounded real warmup attempt")
-        markers.append(marker)
-        prefix.extend(marker["batches"])
+        if fresh:
+            markers.append(marker)
+            prefix.extend(marker["batches"])
         # Observe while this caller is acknowledged idle. A redraw read later
         # cannot replace a missing count/semantic marker or completing pass.
-        observation_end = min(deadline, monotonic_ns() + 1_000_000_000)
         while True:
             records, complete = cursor.read(deadline, full=recovery_from is not None)
             boundary = inventory_boundary(records if recovery_from is not None else cursor.saved_gaps + records,
@@ -6742,9 +6767,10 @@ def wait_inventory_s1_ready(owner, executable, provider_pin, admission, cursor, 
                     "started_ns": started, "observed_ns": monotonic_ns(), "deadline_ns": deadline,
                     "attempts": number, "max_attempts": 20, "markers": markers,
                     "baseline": boundary}
-            if monotonic_ns() >= observation_end:
+            if complete and inventory_readiness_retry_ready(records, admission,
+                    max(cursor.seq, admission["seq"]), ack, deadline):
                 break
-            pause_until(observation_end, 0.05)
+            pause_until(deadline, 0.05)
     raise SetupError("Inventory provider/instance/S1 readiness exhausted 20 bounded real attempts")
 
 

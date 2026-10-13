@@ -5604,7 +5604,7 @@ class R5OrderingTest(unittest.TestCase):
             "wait_ledger_line": lambda *_args, **_kwargs: None,
             "wait_inventory_ready": lambda *_args: 20, "wait_passes": lambda *_args: 2,
             "seize_until_exec": lambda *_args: None, "wait_exec_stop": stop,
-            "ptrace_continue": resume, "ptrace_detach": lambda *_args: None,
+            "ptrace_continue": resume, "ptrace_detach_running": lambda *_args: None,
             "wait_caller_admitted": admission, "wait_r5_successor_admitted": admission,
             "r5_admission_checkpoint": checkpoint,
             "wait_inventory_original_checkpoint": checkpoint,

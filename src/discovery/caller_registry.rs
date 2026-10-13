@@ -170,6 +170,12 @@ pub(crate) trait ProcessSource {
     fn semantic_custody(&self, _pin: &Self::Pin) -> Option<PidPin> {
         None
     }
+    /// Inspect held process custody without duplicating its pidfd. A known
+    /// Detailed Arc can be reused after this check; only first admission
+    /// needs `semantic_custody` to acquire an independent owner handle.
+    fn semantic_custody_ref<'pin>(&self, _pin: &'pin Self::Pin) -> Option<&'pin PidPin> {
+        None
+    }
 }
 
 /// The exe identity of `pid` (`/proc/<pid>/exe` metadata plus its link

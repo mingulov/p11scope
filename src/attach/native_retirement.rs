@@ -191,7 +191,13 @@ impl NativeRetirement {
         let batch = if owned.is_empty() {
             None
         } else {
-            match worker.submit_live(owned, DetachOrder) {
+            let leases = Arc::new(
+                points
+                    .values()
+                    .filter_map(RetainedStaticTarget::retirement_lease)
+                    .collect(),
+            );
+            match worker.submit_live(owned, leases, DetachOrder) {
                 Ok(batch) => Some(batch),
                 Err(failure) => {
                     refused = true;

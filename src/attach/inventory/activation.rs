@@ -810,6 +810,7 @@ impl InventoryState {
                     target,
                     handle: Some(fds),
                     quarantine: None,
+                    _leases: std::sync::Arc::default(),
                 }),
                 handle => {
                     let error = match &handle {
@@ -825,6 +826,7 @@ impl InventoryState {
                         target,
                         handle: None,
                         quarantine: Some(error),
+                        _leases: std::sync::Arc::default(),
                     });
                     // Opaque custody stays with its owning prepared object.
                     self.links.push(InventoryLinked { target, handle });
@@ -1100,7 +1102,7 @@ impl RetiringInventory {
 
     fn begin_with_close(
         mut state: InventoryState,
-        close: impl FnMut(&mut Vec<InventoryFd>) -> Result<()> + Send + 'static,
+        close: impl Fn(&mut Vec<InventoryFd>) -> Result<()> + Send + Sync + 'static,
     ) -> Self {
         let work = state.take_retirement_work();
         let mut retiring = Self {

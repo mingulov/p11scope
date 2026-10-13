@@ -298,6 +298,13 @@ impl LaneCoverage {
 /// production stash/merge/batch/finalize/commit path.
 #[cfg(test)]
 pub(crate) trait LaneTestIo {
+    /// Observe the real driver publication notification; grants no permission.
+    fn semantic_published(&mut self) {}
+    /// Substitute native terminal ownership I/O beneath the real driver/H0
+    /// ordering. A real cleanup worker may own the injected close leaf.
+    fn begin_terminal_cleanup(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
     /// The exact targets the production driver selected for this tick.
     fn tick_targets(&mut self, _pins: &[Arc<PidPin>]) {}
     /// Substitute Session attachment I/O, retaining the production subset
@@ -691,6 +698,10 @@ impl AttestedSemanticLane {
     /// publishes the staged quantum.
     pub(crate) fn note_semantic_published(&mut self) {
         self.staged_at = None;
+        #[cfg(test)]
+        if let Some(io) = self.test_io.as_mut() {
+            io.semantic_published();
+        }
     }
 
     /// How long the staged quantum has awaited publication, if one is

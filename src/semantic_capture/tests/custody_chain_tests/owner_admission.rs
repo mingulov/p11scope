@@ -126,12 +126,129 @@ struct AdmissionH0 {
     last_validation_refusal: Option<CurrentReceiptRefusal>,
     last_effective: Option<Arc<PidPin>>,
     after_refresh: Option<AfterAdmissionRefresh>,
+    terminal: Option<TerminalCloseFixture>,
+    terminal_published: bool,
 }
 
 #[derive(Clone)]
 struct AdmissionLane(Rc<RefCell<AdmissionH0>>);
 
+/// Real ownership transfer and worker settlement, with only the kernel close
+/// leaf held behind a channel. No receipt or completion is scripted.
+struct TerminalCloseFixture {
+    worker: Option<crate::attach::CleanupWorker>,
+    leases: Arc<Vec<Arc<std::fs::File>>>,
+    payload: Option<crate::attach::OwnedLink>,
+    release_on_drop: std::sync::mpsc::Sender<()>,
+    begins: usize,
+}
+
+struct TerminalCloseControl {
+    entered: std::sync::mpsc::Receiver<()>,
+    release: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl Drop for TerminalCloseControl {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+impl TerminalCloseFixture {
+    fn new(lease: Arc<std::fs::File>) -> (Self, TerminalCloseControl) {
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let original = Arc::downgrade(&lease);
+        let start = Instant::now();
+        let worker = crate::attach::CleanupWorker::pre_start_with(
+            Box::new(move |payload, _| {
+                entered.send(()).unwrap();
+                let _ = release_rx.lock().unwrap().recv();
+                assert!(original.upgrade().unwrap().metadata().is_ok());
+                drop(payload.take());
+                Ok(())
+            }),
+            Arc::new(move || start.elapsed()),
+        );
+        (
+            Self {
+                worker: Some(worker),
+                // An ordinary duplicate FD substitutes for the native link;
+                // the worker really owns/closes it without loading BPF.
+                payload: Some(crate::attach::OwnedLink::Multi(vec![
+                    lease.try_clone().unwrap().into(),
+                ])),
+                release_on_drop: release.clone(),
+                leases: Arc::new(vec![lease]),
+                begins: 0,
+            },
+            TerminalCloseControl {
+                entered: entered_rx,
+                release: Some(release),
+            },
+        )
+    }
+
+    fn begin(&mut self) {
+        self.begins += 1;
+        if self.begins != 1 {
+            return;
+        }
+        self.worker.as_ref().unwrap().submit(
+            vec![(
+                self.payload.take().unwrap(),
+                crate::attach::ProducerProgram::UProbe("p11_entry"),
+            )],
+            Arc::clone(&self.leases),
+            crate::attach::DetachOrder,
+        );
+        // The calibration's only remaining original-file lease is now owned
+        // by the submitted job, including while its close leaf is blocked.
+        self.leases = Arc::default();
+    }
+
+    fn settle(&mut self, control: &mut TerminalCloseControl) {
+        control.release.take().unwrap().send(()).unwrap();
+        let receipt = self.worker.take().unwrap().join();
+        assert!(receipt.completed, "actual worker settlement: {receipt:?}");
+        assert_eq!((receipt.released, receipt.uncertain), (1, 0));
+    }
+}
+
+impl Drop for TerminalCloseFixture {
+    fn drop(&mut self) {
+        if let Some(mut worker) = self.worker.take() {
+            let _ = self.release_on_drop.send(());
+            let _ = worker.join();
+        }
+    }
+}
+
 impl LaneTestIo for AdmissionLane {
+    fn semantic_published(&mut self) {
+        let mut owned = self.0.borrow_mut();
+        if owned.capture.stopped {
+            owned.terminal_published = true;
+        }
+    }
+    fn begin_terminal_cleanup(&mut self) -> anyhow::Result<()> {
+        let mut owned = self.0.borrow_mut();
+        assert!(
+            owned.capture.stopped,
+            "native detach cannot precede real H0 Finish"
+        );
+        assert!(
+            owned.terminal_published,
+            "native detach cannot precede the terminal publication notification"
+        );
+        if let Some(terminal) = owned.terminal.as_mut() {
+            terminal.begin();
+        }
+        Ok(())
+    }
     fn tick_targets(&mut self, pins: &[Arc<PidPin>]) {
         self.0.borrow_mut().io.tick_pins = pins.to_vec();
     }
@@ -352,6 +469,8 @@ impl AdmissionScene {
             last_validation_refusal: None,
             last_effective: None,
             after_refresh: None,
+            terminal: None,
+            terminal_published: false,
         })));
         lane.install_test_io(Box::new(h0.clone()));
         Self {
@@ -1443,4 +1562,128 @@ fn owner_admission_bound_scope_after_expiry_separates_loss_episodes() {
             .pin()
     ));
     assert_eq!(scene.h0.0.borrow().capture.continuity_cuts(), 2);
+}
+
+#[test]
+fn owner_terminal_real_worker_control_waits_for_the_original_close() {
+    let file = Arc::new(tempfile::tempfile().unwrap());
+    let (mut terminal, mut control) = TerminalCloseFixture::new(file);
+    terminal.begin();
+    control
+        .entered
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+    let progress = terminal.worker.as_ref().unwrap().progress();
+    assert_eq!(
+        (progress.attempted, progress.released, progress.remaining),
+        (1, 0, 0)
+    );
+    terminal.settle(&mut control);
+}
+
+#[test]
+fn owner_terminal_driver_begins_detailed_closes_before_native_retirement() {
+    let mut scene = AdmissionScene::new(Selection::Pid);
+    scene.prepare_without_cookie();
+    scene.observe_entry();
+    let pid = scene.child.id();
+    scene.h0.0.borrow_mut().after_refresh = Some(Box::new(move |owned| {
+        owned.io.held.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+    }));
+    for _ in 0..3 {
+        scene.pass();
+    }
+    scene.assert_admitted();
+    assert!(
+        scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .any(|row| {
+                row.semantics
+                    .as_ref()
+                    .is_some_and(|semantics| semantics.has_live_operations())
+            })
+    );
+    let original = scene
+        .h0
+        .0
+        .borrow()
+        .io
+        .retained_attachment(0)
+        .unwrap()
+        .retirement_lease();
+    let (terminal, mut control) = TerminalCloseFixture::new(original);
+    scene.h0.0.borrow_mut().terminal = Some(terminal);
+    assert_eq!(scene.refresh_direct().0, vec![image(7)]);
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .held
+        .enqueue(pid, 0, "C_Sign", 0, 0);
+    scene.lane = Some(crate::inventory::classic_semantic_stop_for_test(
+        &mut scene.coordinator,
+        scene.lane.take().unwrap(),
+    ));
+    assert!(scene.h0.0.borrow().capture.stopped);
+    assert_eq!(scene.coordinator.registry().instances().count(), 1);
+    assert_eq!(
+        scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|row| row.semantics.as_ref())
+            .map(|reducer| reducer.completed())
+            .sum::<u64>(),
+        1,
+        "the real terminal drain publishes the queued last return before H0 Finish"
+    );
+    assert!(
+        scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .all(|row| row.reasons.contains(&InstanceReason::CaptureStopped))
+    );
+    assert!(
+        scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .all(|row| {
+                row.semantics
+                    .as_ref()
+                    .is_none_or(|semantics| !semantics.has_live_operations())
+            })
+    );
+    assert!(scene.lane.as_ref().unwrap().staged_semantic_age().is_none());
+
+    // This hook returns before the real caller starts NativeLane::stop. The
+    // Detailed kernel close must already be running, with its owner retained.
+    let entered_before_native = control
+        .entered
+        .recv_timeout(Duration::from_millis(500))
+        .is_ok();
+    let mut owned = scene.h0.0.borrow_mut();
+    let terminal = owned.terminal.as_mut().unwrap();
+    let begins_before_native = terminal.begins;
+    if !entered_before_native {
+        // Calibrate and reap the actual worker even on the expected RED path.
+        terminal.begin();
+        control
+            .entered
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+    }
+    terminal.settle(&mut control);
+    assert!(
+        entered_before_native,
+        "Detailed close must begin after real H0 Finish publication, before Inventory retirement"
+    );
+    assert_eq!(
+        begins_before_native, 1,
+        "the post-retirement safety hook must not resubmit"
+    );
 }

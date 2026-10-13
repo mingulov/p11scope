@@ -12792,13 +12792,30 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
         // H0's retained evidence adapter owns private CALL routing/continuity;
         // this grants no renderer or public projection a raw-field consumer.
         "src/semantic_capture.rs",
+        // Exact fixtures under its cfg(test) ancestry, guarded below. This
+        // grants no sibling directory or production consumer an exemption.
+        SEMANTIC_VALIDATION_TEST_CHILD,
+        OWNER_ADMISSION_TEST_CHILD,
         // Test-only assertions that the public projection omits private fields.
         "src/s1_tests.rs",
     ];
     let refuses = |path: &str, source: &str| {
         !allowed.contains(&path) && source_uses_private_record_fields(source)
     };
-    for path in ["src/render.rs", "src/output.rs"] {
+    for path in [SEMANTIC_VALIDATION_TEST_CHILD, OWNER_ADMISSION_TEST_CHILD] {
+        assert!(
+            !refuses(path, "record.entry_ip"),
+            "the exact isolated test fixture must be accepted: {path}"
+        );
+    }
+    for path in [
+        "src/render.rs",
+        "src/output.rs",
+        "src/semantic_capture/tests/custody_chain_tests/render.rs",
+        "src/semantic_capture/tests/custody_chain_tests/owner_admission_helpers.rs",
+        "src/semantic_capture/semantic_validation.rs",
+        "src/semantic_capture/owner_admission.rs",
+    ] {
         for source in [
             "record.continuity",
             "let data = record.continuity;",
@@ -12825,6 +12842,14 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
     assert!(
         read("src/lib.rs").contains("#[cfg(test)]\nmod s1_tests;"),
         "the public projection privacy sentinel must remain test-only"
+    );
+    assert!(
+        semantic_capture_private_test_children_are_isolated(
+            &read("src/semantic_capture.rs"),
+            &read(SEMANTIC_VALIDATION_TEST_CHILD),
+            std::path::Path::new(OWNER_ADMISSION_TEST_CHILD).is_file(),
+        ),
+        "the exact semantic fixture exemptions require their cfg(test) ancestry"
     );
     // `decode_record`/`poll_records` hand the whole record only to the
     // router; every other consumer gets the bare `Event` from `decode`.

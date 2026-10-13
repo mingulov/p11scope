@@ -87,6 +87,83 @@ fn wait_for(mut predicate: impl FnMut() -> bool) {
 }
 
 #[test]
+fn bounded_cleanup_detailed_batch_keeps_original_pin_after_session_owner_drops() {
+    use crate::attach::cleanup_worker::concurrency_tests::{CloseGate, ReleaseGuard};
+
+    let (directory, pins, target) = fixture();
+    let lease = target.held.as_ref().unwrap().retirement_lease();
+    let weak = Arc::downgrade(&lease);
+    drop(lease);
+    let gate = Arc::new(CloseGate::default());
+    let closer_gate = Arc::clone(&gate);
+    let closer_pin = weak.clone();
+    let mut session = NativeSession::new(
+        target,
+        Box::new(move |owned, producer| {
+            let id = usize::from(producer == ProducerProgram::UProbe("p11_return"));
+            if closer_pin.upgrade().is_none() {
+                closer_gate.missing_pin();
+            }
+            closer_gate.before_close(id);
+            drop(owned);
+            if closer_pin.upgrade().is_none() {
+                closer_gate.missing_pin();
+            }
+            closer_gate.after_close(id);
+            Ok(())
+        }),
+    );
+    let ticket = session
+        .begin(UProbeScope::AllProcesses, false, false, false)
+        .unwrap()
+        .expect("real held target is selected for owned retirement");
+    let release_guard = ReleaseGuard(Arc::clone(&gate));
+    let entry_blocked = gate.wait_for(Duration::from_secs(2), |state| state.started.contains(&0));
+    let pinned_before_owner_drop = weak.upgrade().is_some();
+    let NativeSession {
+        retirement,
+        links,
+        retained,
+        pairs,
+        gaps,
+        mut worker,
+    } = session;
+    // Keep the actual running worker and original ticket, while removing
+    // every session-side file owner. The worker has one in-flight entry and
+    // one queued return from the same real physical target.
+    drop(retirement);
+    drop(links);
+    drop(retained);
+    drop(pairs);
+    drop(gaps);
+    drop(pins);
+    drop(directory);
+    let pinned_while_worker_owns_batch = weak.upgrade().is_some();
+    let still_pending = ticket
+        .identity
+        .batch
+        .as_ref()
+        .is_some_and(|batch| batch.status() == BatchStatus::Pending);
+    gate.release_all();
+    let receipt = worker.join();
+    drop(release_guard);
+    let settled = gate.snapshot();
+    drop(ticket);
+    assert!(entry_blocked && pinned_before_owner_drop && still_pending);
+    assert!(
+        pinned_while_worker_owns_batch,
+        "queued/in-flight native ownership outlived its original physical file lease: {settled:?}"
+    );
+    assert!(receipt.completed, "{receipt:?}");
+    assert_eq!((receipt.released, receipt.total), (2, 2));
+    assert!(settled.failures.is_empty(), "{settled:?}");
+    assert!(
+        weak.upgrade().is_none(),
+        "completed batch has no remaining file owner"
+    );
+}
+
+#[test]
 fn native_retirement_session_handoff_returns_with_final_kernel_close_pending() {
     let (_dir, _pins, target) = fixture();
     let (entered_tx, entered_rx) = mpsc::channel();

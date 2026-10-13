@@ -11822,16 +11822,18 @@ impl Engine {
                 && candidate.views.is_empty()
         }) {
             Some(ended) => session.detach_ended_pid_slots(&selected, &ended.owner, &ended.proof),
-            None if ended.is_none() && *additions_allowed => {
-                match session.begin_global_static_retirement(&selected) {
-                    Ok(Some(ticket)) => Ok(crate::attach::DetachOutcome {
-                        pending: Some(ticket),
-                        ..Default::default()
-                    }),
-                    Ok(None) => session.detach_slots(&selected),
-                    Err(error) => Err(error),
-                }
-            }
+            // Live/stop and publication checks already passed above. A
+            // removal-only conservative candidate closes additions without
+            // changing eligibility to retire its actually owned global links.
+            // Session still rejects PID, stopped or ineligible ownership.
+            None if ended.is_none() => match session.begin_global_static_retirement(&selected) {
+                Ok(Some(ticket)) => Ok(crate::attach::DetachOutcome {
+                    pending: Some(ticket),
+                    ..Default::default()
+                }),
+                Ok(None) => session.detach_slots(&selected),
+                Err(error) => Err(error),
+            },
             None => session.detach_slots(&selected),
         };
         #[cfg(feature = "h6-reexec-diagnostic")]

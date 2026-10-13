@@ -2125,11 +2125,11 @@ def evaluate_inventory_h6(doc, ledgers, receipt):
                 "errors": [f"invalid independent evidence: {error}"]}
 
 
-def inventory_semantic_authority_errors(row, *, final=False):
+def inventory_semantic_authority_errors(row, *, final=False, historical_limit=0):
     """Initial API materialization and retained positive S1 have distinct public shapes."""
     api, errors = row.get("api_returns") or {}, []
     if (api.get("saturated") is not False or type(api.get("historical_only_returns")) is not int
-            or api["historical_only_returns"] != 0):
+            or not 0 <= api["historical_only_returns"] <= historical_limit):
         errors.append("Inventory semantic history has saturated or historical-only API authority")
     count, label = api.get("count"), row.get("semantics")
     details = row.get("mechanisms") is not None or row.get("operations") is not None
@@ -2144,7 +2144,23 @@ def inventory_semantic_authority_errors(row, *, final=False):
     return errors
 
 
-def inventory_instance_history_errors(records, instance_id, caller, module, receipt):
+def inventory_exec_retirement(record, caller):
+    """Recognize both producer shapes, with explicit retired identity context."""
+    event = record["event"]
+    if record["kind"] != "caller_event":
+        return None
+    subject = ("old" if event.get("event") == "exec_retired" else
+               "caller" if event.get("event") == "retired" else None)
+    if subject is None or event.get(subject) != caller:
+        return None
+    context = r5_admitted_subject(event, subject)
+    if context.get("id") != caller or context.get("lifecycle") != "exec_retired":
+        raise SetupError("Inventory old caller lacks explicit exec retirement identity")
+    return subject
+
+
+def inventory_instance_history_errors(records, instance_id, caller, module, receipt,
+                                      *, recovery=None, historical_limit=0, historical_after=None):
     """Replay complete retained history; stop loss belongs only to the terminal interval."""
     errors = []
     passes = [row for row in records if row["kind"] == "pass_committed"]
@@ -2156,8 +2172,7 @@ def inventory_instance_history_errors(records, instance_id, caller, module, rece
             <= receipt["observer_stopped_ns"]):
         return ["Inventory normal stop lacks its exact terminal commit position"]
     terminal_floor = ordinary[-1]["seq"]
-    retired_at = next((row["seq"] for row in records if row["kind"] == "caller_event"
-        and row["event"].get("event") == "exec_retired" and row["event"].get("old") == caller), None)
+    retired_at = next((row["seq"] for row in records if inventory_exec_retirement(row, caller)), None)
     instances, semantics, previous = [], [], {}
     authority_ended, loss_seen, loss_reasons = False, False, set()
     for record in records:
@@ -2172,6 +2187,10 @@ def inventory_instance_history_errors(records, instance_id, caller, module, rece
         retired = retired_at is not None and retired_at < record["seq"]
         if kind == "instance_observed":
             state, reason = row.get("state"), row.get("reason")
+            if (recovery is not None and record == recovery["successor_instance"]
+                    and (state, reason) == ("uncertain", "semantic_loss")
+                    and inventory_inherited_no_calls(recovery["successor_semantic"]["event"])):
+                continue  # First registration inherited a cut, before any reducer-positive call.
             if (state, reason) == ("observed", None):
                 if authority_ended:
                     errors.append("Inventory instance history revived lost authority")
@@ -2182,7 +2201,8 @@ def inventory_instance_history_errors(records, instance_id, caller, module, rece
                 continue
             errors.append("Inventory instance history gained earlier or unexplained lost authority")
         else:
-            errors.extend(inventory_semantic_authority_errors(row))
+            limit = historical_limit if retired and historical_after is not None and record["seq"] > historical_after else 0
+            errors.extend(inventory_semantic_authority_errors(row, historical_limit=limit))
             api, ops = row.get("api_returns") or {}, row.get("operations")
             counters = {"api": api.get("count"), "historical": api.get("historical_only_returns")}
             if ops is not None:
@@ -2223,13 +2243,18 @@ def inventory_instance_history_errors(records, instance_id, caller, module, rece
                     and row.get("semantics") == "unknown (no calls observed)"
                     and row.get("mechanisms") is None and ops is None):
                 continue
-            allowed = {"instance_retired", "image_retired", "semantic_loss"} if retired else set()
+            inherited = (recovery is not None and record["seq"] >= recovery["successor_semantic"]["seq"])
+            if inherited and not had_returns and inventory_inherited_no_calls(row):
+                continue
+            allowed = {"instance_retired", "image_retired", "semantic_loss"} if retired else (
+                {"semantic_loss"} if inherited else set())
             stop = "capture_stopped" in reasons
             if stop and terminal:
                 allowed |= {"capture_stopped", "semantic_loss"}
             retirement_loss = retired and bool(set(reasons) & {"instance_retired", "image_retired"})
             if (coverage.get("lossy") is not True or set(reasons) - allowed
-                    or not (stop and terminal and "semantic_loss" in reasons or retirement_loss)):
+                    or not (stop and terminal and "semantic_loss" in reasons or retirement_loss
+                            or inherited and reasons == ["semantic_loss"])):
                 errors.append("Inventory semantic history gained earlier or unexplained loss")
     if not instances or not semantics:
         return errors + ["Inventory final semantic instance history is absent"]
@@ -2377,7 +2402,7 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
                 break
     adjusted = {key: dict(value) for key, value in receipt["expected_edges"].items()}
     expected_tuples, measured_completed, measured_failed = set(), 0, 0
-    for measurement in measurements:
+    for measurement_index, measurement in enumerate(measurements):
         proof, marker = measurement["proof"], measurement["marker"]
         image, provider, admission = proof["image"], proof["provider"], proof["admission"]
         owner = SimpleNamespace(pid=image["pid"], identity={"start_time": image["start_time"]})
@@ -2406,7 +2431,8 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
         baseline = inventory_boundary([row for row in records if row["seq"] <= baseline_record["seq"]],
             owner, image, provider, admission, max(proof["cursor"]["seq"], admission["seq"]),
             warm, prefix, physical_hooks=proof["physical_hooks"],
-            started_ns=proof["observer_started_ns"])
+            started_ns=proof["observer_started_ns"],
+            recovery_from=measurements[measurement_index - 1] if measurement_index else None)
         if baseline is None or baseline != proof["baseline"]:
             errors.append(f"{label}: fresh same-observer physical/instance/S1 baseline is unresolved")
             continue
@@ -2473,16 +2499,52 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
         tail = [row for row in population if ack["t1"] < row["t0"]
                 and row["t1"] <= receipt["observer_stopped_ns"]]
         tail_totals = ledger_s1_totals(tail, 0)
+        historical_limit = 0
+        if gen == 0:
+            teardown = control["teardown"]
+            tmarker, tend = teardown["marker"], teardown["end"]
+            tack = tmarker["ack"]
+            actual_acks = [row for parsed in ledgers.values() for row in parsed["acks"] if row == tack]
+            functions = Counter(row["fn"] for row in tail)
+            if (functions != Counter({name: 1 for name in
+                    ("C_DestroyObject", "C_Logout", "C_CloseSession", "C_Finalize")})
+                    or tail != tmarker["batches"] or any(row["n"] != 1 or row["bad"] != 0
+                        or row["mech"] != "-" or row["phase"] != "h6-teardown"
+                        or not tack["t0"] <= row["t0"] <= row["t1"] <= tack["t1"] for row in tail)
+                    or len(actual_acks) != 1 or tack["command"] != "T" or tack["gen"] != gen
+                    or tack["rv"] != 0 or tack["idle"] != 1 or tack["deadline"] != ack["deadline"]
+                    or not end["pass"]["at_ns"] <= tmarker["dispatch_ns"] <= tack["t0"] <= tack["t1"] < tack["deadline"]):
+                errors.append(f"{label}: old teardown differs from its exact bounded four-call ledger")
+            else:
+                historical_limit = 4
+            replay = inventory_boundary([row for row in records if row["seq"] <= tend["pass"]["seq"]],
+                owner, image, provider, admission, end["pass"]["seq"], tmarker,
+                [row for row in population if row["t1"] <= tack["t1"]], prior=end,
+                physical_hooks=proof["physical_hooks"], started_ns=proof["observer_started_ns"])
+            checkpoint = receipt["freeze"]["checkpoint"]
+            xacks = [row for parsed in ledgers.values() for row in parsed["acks"]
+                if row["command"] == "X" and row["pid"] == owner.pid and row["gen"] == gen]
+            if (checkpoint != measurements[1]["proof"]["cursor"]
+                    or by_sequence.get(checkpoint["seq"], {}).get("at_ns") != checkpoint["at_ns"]
+                    or replay is None or replay != tend or not inventory_exact_idle_delta(end, replay,
+                    tail, owner.pid, gen, provider, proof["physical_hooks"], proof["observer_started_ns"])
+                    or len(xacks) != 1 or not tack["t1"] <= tend["pass"]["at_ns"] <= checkpoint["at_ns"]
+                    <= xacks[0]["t0"] or tend["pass"]["seq"] > checkpoint["seq"]
+                    or receipt.get("scope_kind") == "cgroup" and tend["pass"]["at_ns"] > receipt["scope_intervals"][0]["t1"]):
+                errors.append(f"{label}: original teardown was not published before checkpoint/move/exec")
         final = latest["semantic_edge_observed"].get(proof["instance"])
         final_instance = latest["instance_observed"].get(proof["instance"])
         if (final is None or final_instance is None or final["caller"] != proof["caller"]
                 or final["module"] != proof["module"]):
             errors.append(f"{label}: final historical semantic instance is missing")
         else:
-            errors.extend(f"{label}: final {error}" for error in inventory_semantic_authority_errors(final, final=True))
+            errors.extend(f"{label}: final {error}" for error in inventory_semantic_authority_errors(
+                final, final=True, historical_limit=historical_limit))
             final_ops = final.get("operations") or {}
+            historical = (final.get("api_returns") or {}).get("historical_only_returns")
+            historical = historical if type(historical) is int and 0 <= historical <= historical_limit else 0
             desired_final = {"api": after["api"] + tail_totals[5].get(key, 0),
-                "calls": after["calls"] + tail_totals[4].get(key, 0),
+                "calls": after["calls"] + tail_totals[4].get(key, 0) - historical,
                 "completed": after["completed"] + tail_totals[2].get(key, 0),
                 "failed": after["failed"] + tail_totals[3].get(key, 0),
                 "unknown": after["unknown"], "orphans": after["orphans"], "dropped": after["dropped"]}
@@ -2498,10 +2560,13 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
             if final_mechs != desired_mechs:
                 errors.append(f"{label}: final historical mechanism totals changed")
             errors.extend(f"{label}: {error}" for error in inventory_instance_history_errors(
-                records, proof["instance"], proof["caller"], proof["module"], receipt))
+                records, proof["instance"], proof["caller"], proof["module"], receipt,
+                recovery=baseline.get("recovery"), historical_limit=historical_limit,
+                historical_after=end["pass"]["seq"]))
         measured_completed += delta["completed"]
         measured_failed += delta["failed"]
-        summaries.append({"tuple": list(stable), "early": baseline["early"], "measured": delta})
+        summaries.append({"tuple": list(stable), "early": baseline["early"], "measured": delta,
+                          "recovered_history": baseline.get("recovery")})
     if not measurements or {row["proof"]["incarnation"] for row in measurements} != {0, 1}:
         errors.append("Inventory required original/successor fixed measurements are missing")
     sibling_s1 = []
@@ -2548,6 +2613,7 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
         "completed_operations": measured_completed, "s1": {"measured_completed": measured_completed,
             "measured_failed": measured_failed, "stable_instances": summaries,
             "sibling_instances": sibling_s1,
+            "limitation": RECOVERED_HISTORY_LIMITATION,
             "instances": len(doc.get("instances", [])), "semantic_edges": len(doc.get("semantic_edges", []))}})
     return result
 
@@ -5910,7 +5976,92 @@ def inventory_early_gaps(records, owner, admission, module, lower, upper):
                 "retired_before_coverage", "instance_unproven", "provider_instance_unproven")]
 
 
-def inventory_semantic_totals(row):
+RECOVERED_HISTORY_LIMITATION = (
+    "Exact independently ledgered fixed-workload outcomes with retained partial history; "
+    "sticky public loss reasons cannot count repeated same-reason idle cuts.")
+
+
+def inventory_inherited_no_calls(row):
+    api = row.get("api_returns") or {}
+    return (api.get("count") is None and api.get("saturated") is False
+        and api.get("historical_only_returns") == 0 and row.get("mechanisms") is None
+        and row.get("operations") is None and row.get("semantics") == "unknown (no calls observed)"
+        and row.get("coverage") == {"lossy": True, "reasons": ["no_calls", "semantic_loss"]})
+
+
+def inventory_recovered_history(records, previous, owner, image, provider, admission, semantic):
+    """Bind the one supported inherited-loss shape to this observer's exec history.
+
+    This is an outcome receipt, not proof of uninterrupted capture. H2 keeps
+    domain loss disclosure on a separately proven H6 successor indefinitely.
+    """
+    if previous is None:
+        return None
+    proof, end = previous["proof"], previous["end"]
+    old_image = proof["image"]
+    if (proof["incarnation"] != 0 or admission["incarnation"] != 1
+            or old_image["pid"] != owner.pid or old_image["start_time"] != image["start_time"]
+            or proof["provider"] != provider or proof["caller"] == admission["caller"]
+            or proof["instance"] == semantic["event"]["instance"]
+            or proof["module"] != semantic["event"]["module"]
+            or inventory_semantic_totals(end["semantic"]["event"]) is None
+            or (end["instance"]["event"].get("state"), end["instance"]["event"].get("reason"))
+               != ("observed", None)):
+        raise SetupError("Inventory recovered history lacks its clean original measured endpoint")
+    by_seq = {row["seq"]: row for row in records}
+    if any(by_seq.get(end[field]["seq"]) != end[field] for field in ("physical", "instance", "semantic", "pass")):
+        raise SetupError("Inventory recovered history borrowed another stream's original endpoint")
+    admitted = by_seq.get(admission["seq"])
+    if (admitted is None or admitted["kind"] != "caller_event"
+            or admitted["event"].get("event") not in ("admitted", "exec_retired")):
+        raise SetupError("Inventory recovered history lacks its actual successor admission")
+    subject = "new" if admitted["event"].get("event") == "exec_retired" else "caller"
+    current = r5_caller_context(admitted["event"], owner, image, subject=subject)
+    if (current["id"], current["incarnation"]) != (admission["caller"], admission["incarnation"]):
+        raise SetupError("Inventory recovered history changed successor admission identity")
+    retirements = [row for row in records if end["pass"]["seq"] < row["seq"] <= admission["seq"]
+                   and inventory_exec_retirement(row, proof["caller"])]
+    if len(retirements) != 1:
+        raise SetupError("Inventory recovered history lacks one original exec retirement")
+    retirement = retirements[0]
+    old = r5_caller_context(retirement["event"], owner, old_image,
+        subject=inventory_exec_retirement(retirement, proof["caller"]), lifecycle="exec_retired")
+    if old["incarnation"] != proof["incarnation"]:
+        raise SetupError("Inventory recovered history changed the retired incarnation")
+    first = next((row for row in records if row["kind"] == "semantic_edge_observed"
+                  and row["event"].get("instance") == semantic["event"]["instance"]), None)
+    if first is None or first["seq"] <= admission["seq"]:
+        raise SetupError("Inventory recovered history lacks its first successor semantic publication")
+    old_instances = [row for row in records if retirement["seq"] < row["seq"] < first["seq"]
+        and row["kind"] == "instance_observed" and row["event"].get("id") == proof["instance"]
+        and (row["event"].get("caller"), row["event"].get("module"), row["event"].get("state"),
+             row["event"].get("reason")) == (proof["caller"], proof["module"], "retired", "instance_retired")]
+    old_loss = [row for row in records if retirement["seq"] < row["seq"] < first["seq"]
+        and row["kind"] == "semantic_edge_observed" and row["event"].get("instance") == proof["instance"]
+        and (row["event"].get("caller"), row["event"].get("module")) == (proof["caller"], proof["module"])
+        and (row["event"].get("coverage") or {}).get("lossy") is True
+        and {"instance_retired", "semantic_loss"} <= set(row["event"]["coverage"].get("reasons", []))
+        <= {"instance_retired", "image_retired", "semantic_loss"}]
+    if (not old_instances or not old_loss
+            or not (first["event"].get("coverage") == {"lossy": True, "reasons": ["semantic_loss"]}
+                    or inventory_inherited_no_calls(first["event"]))):
+        raise SetupError("Inventory recovered history lacks retained old loss before the successor boundary")
+    first_instance = next((row for row in records if row["kind"] == "instance_observed"
+        and row["event"].get("id") == semantic["event"]["instance"]), None)
+    if (first_instance is None or not admission["seq"] < first_instance["seq"] < first["seq"]
+            or (first_instance["event"].get("caller"), first_instance["event"].get("module"))
+                != (admission["caller"], proof["module"])
+            or not ((first_instance["event"].get("state"), first_instance["event"].get("reason")) == ("observed", None)
+                or (first_instance["event"].get("state"), first_instance["event"].get("reason")) == ("uncertain", "semantic_loss")
+                    and inventory_inherited_no_calls(first["event"]))):
+        raise SetupError("Inventory recovered history lacks its supported initial successor registration")
+    return {"previous_end_seq": end["pass"]["seq"], "retirement": retirement,
+        "old_instance": old_instances[0], "old_semantic": old_loss[0],
+        "successor_admission": admitted, "successor_instance": first_instance, "successor_semantic": first,
+        "limitation": RECOVERED_HISTORY_LIMITATION}
+
+
+def inventory_semantic_totals(row, *, recovered=False):
     api, ops = row.get("api_returns") or {}, row.get("operations") or {}
     fields = {"api": api.get("count"), **{key: ops.get(key) for key in
               ("calls", "completed", "failed", "unknown", "orphans", "dropped")}}
@@ -5918,8 +6069,10 @@ def inventory_semantic_totals(row):
         return None
     if fields["calls"] > fields["api"] or fields["completed"] + fields["failed"] > fields["api"]:
         return None
-    if api.get("saturated") or api.get("historical_only_returns", 0) != 0 or (
-            row.get("coverage") or {}).get("lossy") or row.get("semantics") != "observed":
+    coverage = row.get("coverage") or {}
+    allowed_coverage = {"lossy": True, "reasons": ["semantic_loss"]} if recovered else {"lossy": False, "reasons": []}
+    if (api.get("saturated") is not False or api.get("historical_only_returns") != 0
+            or coverage != allowed_coverage or row.get("semantics") != "observed"):
         return None
     mechanisms = {}
     for mech in row.get("mechanisms") or []:
@@ -5954,7 +6107,8 @@ def inventory_early_phase_populations(batches, expected, physical, api, *, api_e
 
 
 def inventory_boundary(records, owner, image, provider, admission, floor, marker, prefix_batches,
-                       *, exact=False, deadline=None, prior=None, physical_hooks=None, started_ns=0):
+                       *, exact=False, deadline=None, prior=None, physical_hooks=None, started_ns=0,
+                       recovery_from=None):
     """Derive a complete idle boundary from the actual same-observer records.
 
     Physical and instance rows are cumulative replacements. A pass without a
@@ -6007,6 +6161,10 @@ def inventory_boundary(records, owner, image, provider, admission, floor, marker
             instances[event.get("id")] = record
             settled = None
         elif kind == "semantic_edge_observed" and event.get("caller") == selected:
+            if prior and event.get("instance") == prior["instance"]["event"]["id"] and (
+                    event.get("coverage") != prior["semantic"]["event"].get("coverage")
+                    or (event.get("api_returns") or {}).get("historical_only_returns") != 0):
+                raise SetupError("Inventory measured semantic authority gained loss or historical returns")
             semantics[event.get("instance")] = record
             settled = None
         elif kind == "pass_committed":
@@ -6035,12 +6193,18 @@ def inventory_boundary(records, owner, image, provider, admission, floor, marker
     if len(candidates) != 1:
         return None  # physical totals cannot be divided among instance rows
     instance = candidates[0]
-    if instance["event"].get("state") != "observed" or instance["event"].get("reason") is not None:
-        raise SetupError("Inventory S1 instance is retired or uncertain")
     semantic = semantics.get(instance["event"]["id"])
     if semantic is None or semantic["event"].get("module") != edge["module"]:
         return None
-    counts = inventory_semantic_totals(semantic["event"])
+    recovery = prior.get("recovery") if prior else None
+    if prior is None and (semantic["event"].get("coverage") or {}).get("lossy"):
+        recovery = inventory_recovered_history(records, recovery_from, owner, image, provider, admission, semantic)
+    if instance["event"].get("state") != "observed" or instance["event"].get("reason") is not None:
+        if (prior is None and recovery is not None and instance == recovery["successor_instance"]
+                and inventory_inherited_no_calls(semantic["event"])):
+            return None
+        raise SetupError("Inventory S1 instance is retired or uncertain")
+    counts = inventory_semantic_totals(semantic["event"], recovered=recovery is not None)
     if counts is None or counts["api"] <= 0 or counts["completed"] <= 0:
         return None
     if any(row["seq"] >= settled["seq"] for row in (physical, instance, semantic)):
@@ -6083,6 +6247,7 @@ def inventory_boundary(records, owner, image, provider, admission, floor, marker
         if counts["completed"] < marker_totals[2].get(key, 0):
             return None
     return {"physical": physical, "instance": instance, "semantic": semantic, "pass": settled,
+            "recovery": recovery,
             "counts": {"physical": entries["count"], **counts},
             "early": {"physical_expected": expected, "physical_observed": entries["count"],
                       "physical_missed": expected - entries["count"], "api_expected": api_expected,
@@ -6095,7 +6260,7 @@ def inventory_boundary(records, owner, image, provider, admission, floor, marker
 
 
 def wait_inventory_s1_ready(owner, executable, provider_pin, admission, cursor, attempt, deadline,
-                            *, prefix_batches=(), prefix_markers=(), physical_hooks=None):
+                            *, prefix_batches=(), prefix_markers=(), physical_hooks=None, recovery_from=None):
     """Release measurement only on fresh held-provider/instance/S1 proof."""
     if owner is not cursor.owner or owner.identity != cursor.birth_identity:
         raise SetupError("Inventory readiness changed the original owned birth or observer cursor")
@@ -6119,10 +6284,11 @@ def wait_inventory_s1_ready(owner, executable, provider_pin, admission, cursor, 
         # cannot replace a missing count/semantic marker or completing pass.
         observation_end = min(deadline, monotonic_ns() + 1_000_000_000)
         while True:
-            records, complete = cursor.read(deadline)
-            boundary = inventory_boundary(cursor.saved_gaps + records, owner, image, provider,
+            records, complete = cursor.read(deadline, full=recovery_from is not None)
+            boundary = inventory_boundary(records if recovery_from is not None else cursor.saved_gaps + records,
+                owner, image, provider,
                 admission, max(cursor.seq, admission["seq"]), marker, prefix, deadline=deadline,
-                physical_hooks=physical_hooks, started_ns=cursor.started_ns)
+                physical_hooks=physical_hooks, started_ns=cursor.started_ns, recovery_from=recovery_from)
             if complete and boundary is not None:
                 remaining_until(deadline)
                 executable.verify()
@@ -6145,7 +6311,7 @@ def wait_inventory_s1_ready(owner, executable, provider_pin, admission, cursor, 
 
 
 def wait_inventory_measured_boundary(owner, executable, provider_pin, admission, cursor,
-                                     proof, marker, prefix_batches, deadline):
+                                     proof, marker, prefix_batches, deadline, *, exact_delta=False):
     provider = proof["provider"]
     while True:
         remaining_until(deadline)
@@ -6158,6 +6324,11 @@ def wait_inventory_measured_boundary(owner, executable, provider_pin, admission,
         if complete and boundary is not None:
             if boundary["instance"]["event"]["id"] != proof["instance"]:
                 raise SetupError("Inventory measured phase changed its authorized instance")
+            if exact_delta and not inventory_exact_idle_delta(proof["baseline"], boundary,
+                    marker["batches"], owner.pid, admission["incarnation"], provider,
+                    proof["physical_hooks"], proof["observer_started_ns"]):
+                pause_until(deadline, 0.05)
+                continue
             remaining_until(deadline)
             executable.verify()
             if provider_receipt(provider_pin) != provider:
@@ -6165,6 +6336,27 @@ def wait_inventory_measured_boundary(owner, executable, provider_pin, admission,
             remaining_until(deadline)
             return boundary
         pause_until(deadline, 0.05)
+
+
+def inventory_exact_idle_delta(before, after, batches, pid, gen, provider, physical_hooks, started_ns):
+    """Wait for the actual ledgered idle tail; excess counters can never settle."""
+    key = pid, gen, provider["path"]
+    totals = ledger_s1_totals(batches, 0)
+    desired = {"physical": counted_totals(batches, started_ns, physical_hooks=physical_hooks).get(key, 0),
+        "api": totals[5].get(key, 0), "calls": totals[4].get(key, 0),
+        "completed": totals[2].get(key, 0), "failed": totals[3].get(key, 0),
+        "unknown": 0, "orphans": 0, "dropped": 0}
+    delta = {name: after["counts"][name] - before["counts"][name] for name in desired}
+    mechanisms = set(before["counts"]["mechanisms"]) | set(after["counts"]["mechanisms"])
+    for mech in mechanisms:
+        old, new = before["counts"]["mechanisms"].get(mech, [0, 0]), after["counts"]["mechanisms"].get(mech, [0, 0])
+        for index in (0, 1):
+            name = f"mechanism:{mech}:{index}"
+            delta[name] = new[index] - old[index]
+            desired[name] = totals[index].get(key + (mech,), 0)
+    if any(value < 0 or value > desired[name] for name, value in delta.items()):
+        raise SetupError("Inventory idle publication exceeds or regresses its exact ledgered delta")
+    return delta == desired
 
 
 def wait_passes(jsonl_path, count, timeout=120):
@@ -6776,7 +6968,10 @@ def inventory_target_phases(ctx, log_path, target, original_executable, successo
     measured.append({"proof": initial, "marker": first_measurement, "end": end0})
     # Teardown finishes inside selected membership, while the original image
     # is still authorized. No provider call may occur in the outside interval.
-    target.command("T", fixed_deadline)
+    teardown = target.command("T", fixed_deadline)
+    tail_end = wait_inventory_measured_boundary(target.owner, original_executable, provider,
+        initial_admission, initial_cursor, {**initial, "baseline": end0}, teardown,
+        target.ledger()["batches"], fixed_deadline, exact_delta=True)
     checkpoint = r5_admission_checkpoint(ctx, log_path, target.owner, original_executable)
     checkpoint_receipt = checkpoint.receipt()
     if outside:
@@ -6814,7 +7009,7 @@ def inventory_target_phases(ctx, log_path, target, original_executable, successo
     admission = wait_r5_successor_admitted(log_path, target.owner, successor_executable, checkpoint,
         not_before_ns=t_in, timeout=remaining_until(recovery))
     proof = wait_inventory_s1_ready(target.owner, successor_executable, provider, admission,
-        checkpoint, target.warm, recovery, physical_hooks=physical_hooks)
+        checkpoint, target.warm, recovery, physical_hooks=physical_hooks, recovery_from=measured[0])
     proofs.append(proof)
     stages.append({"label": "recovery", "t0": resumed, "t1": proof["observed_ns"]})
     fixed_deadline = inventory_phase_deadline("fixed-measurement")
@@ -6829,6 +7024,7 @@ def inventory_target_phases(ctx, log_path, target, original_executable, successo
     measured.append({"proof": proof, "marker": measurement, "end": end1})
     stages.append({"label": "measurement", "t0": measurement_start, "t1": monotonic_ns()})
     return {"proofs": proofs, "measurements": measured, "stages": stages,
+        "teardown": {"marker": teardown, "end": tail_end},
         "cursor": checkpoint, "outside_ns": t_out, "reentry_ns": t_in,
         "freeze": {"exec_stop_ns": exec_stop, "stopped_image": stopped_image,
             "checkpoint": checkpoint_receipt, "reentry_ns": t_in, "resumed_ns": resumed,
@@ -6968,7 +7164,7 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
         "requested_backend": backend,
         "freeze": control["freeze"],
         "inventory_control": {"proofs": control["proofs"], "measurements": control["measurements"],
-            "stages": control["stages"], "final_records": final_records},
+            "stages": control["stages"], "teardown": control["teardown"], "final_records": final_records},
     }
     doc = json.loads(doc_path.read_text())
     result = evaluate_inventory_h6(doc, ledgers, receipt)
@@ -7126,7 +7322,7 @@ def run_system_mixed(ctx, cell_dir, backend):
         "requested_backend": backend,
         "freeze": control["freeze"],
         "inventory_control": {"proofs": control["proofs"], "measurements": control["measurements"],
-            "stages": control["stages"], "sibling": "MS", "sibling_providers": ["A", "B"],
+            "stages": control["stages"], "teardown": control["teardown"], "sibling": "MS", "sibling_providers": ["A", "B"],
             "final_records": final_records},
     }
     doc = json.loads(doc_path.read_text())

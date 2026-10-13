@@ -12665,9 +12665,11 @@ const SEMANTIC_VALIDATION_TEST_CHILD: &str =
     "src/semantic_capture/tests/custody_chain_tests/semantic_validation.rs";
 const OWNER_ADMISSION_TEST_CHILD: &str =
     "src/semantic_capture/tests/custody_chain_tests/owner_admission.rs";
+const SUCCESSOR_REPLAY_TEST_CHILD: &str =
+    "src/semantic_capture/tests/custody_chain_tests/owner_admission/successor_replay.rs";
 
 fn semantic_capture_private_test_child_references_are_canonical(path: &str, source: &str) -> bool {
-    // Strip only the two approved source sites. Concrete filename references
+    // Strip only the approved source sites. Concrete filename references
     // elsewhere also catch differently named #[path] aliases and include!.
     let remainder = match path {
         "src/semantic_capture.rs" => source.replacen("\n        mod semantic_validation;\n", "", 1),
@@ -12676,13 +12678,20 @@ fn semantic_capture_private_test_child_references_are_canonical(path: &str, sour
             "",
             1,
         ),
+        OWNER_ADMISSION_TEST_CHILD => source.replacen(
+            "\n#[path = \"owner_admission/successor_replay.rs\"]\nmod successor_replay;\n",
+            "",
+            1,
+        ),
         _ => source.to_owned(),
     };
     ![
         "semantic_validation.rs",
         "owner_admission.rs",
+        "successor_replay.rs",
         "mod semantic_validation;",
         "mod owner_admission;",
+        "mod successor_replay;",
     ]
     .iter()
     .any(|reference| remainder.contains(reference))
@@ -12724,6 +12733,83 @@ fn semantic_capture_private_test_children_are_isolated(
     !owner_admission_present
         || (validation.contains("\n#[path = \"owner_admission.rs\"]\nmod owner_admission;\n")
             && validation.matches("mod owner_admission;").count() == 1)
+}
+
+fn successor_replay_test_child_is_isolated(capture: &str, validation: &str, owner: &str) -> bool {
+    semantic_capture_private_test_children_are_isolated(capture, validation, true)
+        && semantic_capture_private_test_child_references_are_canonical(
+            OWNER_ADMISSION_TEST_CHILD,
+            owner,
+        )
+        && owner.contains(
+            "\n#[path = \"owner_admission/successor_replay.rs\"]\nmod successor_replay;\n",
+        )
+        && owner.matches("mod successor_replay;").count() == 1
+}
+
+#[test]
+fn successor_replay_record_consumer_requires_exact_test_ancestry() {
+    let capture = read("src/semantic_capture.rs");
+    let validation = read(SEMANTIC_VALIDATION_TEST_CHILD);
+    let owner = read(OWNER_ADMISSION_TEST_CHILD);
+    assert!(successor_replay_test_child_is_isolated(
+        &capture,
+        &validation,
+        &owner,
+    ));
+    for (capture, validation, owner) in [
+        (
+            capture.replacen("#[cfg(test)]\nmod tests {", "mod tests {", 1),
+            validation.clone(),
+            owner.clone(),
+        ),
+        (
+            capture.clone(),
+            validation.replace("mod owner_admission;", ""),
+            owner.clone(),
+        ),
+        (
+            capture.clone(),
+            validation.clone(),
+            owner.replace("mod successor_replay;", ""),
+        ),
+        (
+            capture.clone(),
+            validation.clone(),
+            owner.replace("owner_admission/successor_replay.rs", "other.rs"),
+        ),
+        (
+            capture.clone(),
+            validation.clone(),
+            format!("{owner}\n#[path = \"owner_admission/successor_replay.rs\"]\nmod alias;\n"),
+        ),
+        (
+            capture.clone(),
+            validation.clone(),
+            format!("{owner}\ninclude!(\"owner_admission/successor_replay.rs\");\n"),
+        ),
+    ] {
+        assert!(
+            !successor_replay_test_child_is_isolated(&capture, &validation, &owner),
+            "an alternate inclusion must not license private-record consumption",
+        );
+    }
+    for path in [
+        "src/lib.rs",
+        "src/render.rs",
+        "src/semantic_capture/tests/custody_chain_tests/owner_admission/other.rs",
+    ] {
+        for reference in [
+            "#[path = \"owner_admission/successor_replay.rs\"]\nmod alias;",
+            "include!(\"successor_replay.rs\");",
+            "mod successor_replay;",
+        ] {
+            assert!(
+                !semantic_capture_private_test_child_references_are_canonical(path, reference),
+                "{path} must refuse alternate replay inclusion {reference:?}",
+            );
+        }
+    }
 }
 
 #[test]
@@ -12787,6 +12873,7 @@ fn semantic_capture_private_record_test_children_remain_test_only() {
         "src/semantic_capture.rs",
         SEMANTIC_VALIDATION_TEST_CHILD,
         OWNER_ADMISSION_TEST_CHILD,
+        SUCCESSOR_REPLAY_TEST_CHILD,
     ] {
         for inclusion in [
             "#[path = \"semantic_validation.rs\"]\nmod alias_validation;",
@@ -12870,13 +12957,18 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
         // grants no sibling directory or production consumer an exemption.
         SEMANTIC_VALIDATION_TEST_CHILD,
         OWNER_ADMISSION_TEST_CHILD,
+        SUCCESSOR_REPLAY_TEST_CHILD,
         // Test-only assertions that the public projection omits private fields.
         "src/s1_tests.rs",
     ];
     let refuses = |path: &str, source: &str| {
         !allowed.contains(&path) && source_uses_private_record_fields(source)
     };
-    for path in [SEMANTIC_VALIDATION_TEST_CHILD, OWNER_ADMISSION_TEST_CHILD] {
+    for path in [
+        SEMANTIC_VALIDATION_TEST_CHILD,
+        OWNER_ADMISSION_TEST_CHILD,
+        SUCCESSOR_REPLAY_TEST_CHILD,
+    ] {
         assert!(
             !refuses(path, "record.entry_ip"),
             "the exact isolated test fixture must be accepted: {path}"
@@ -12887,6 +12979,7 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
         "src/output.rs",
         "src/semantic_capture/tests/custody_chain_tests/render.rs",
         "src/semantic_capture/tests/custody_chain_tests/owner_admission_helpers.rs",
+        "src/semantic_capture/tests/custody_chain_tests/owner_admission/other.rs",
         "src/semantic_capture/semantic_validation.rs",
         "src/semantic_capture/owner_admission.rs",
     ] {
@@ -12924,6 +13017,14 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
             std::path::Path::new(OWNER_ADMISSION_TEST_CHILD).is_file(),
         ),
         "the exact semantic fixture exemptions require their cfg(test) ancestry"
+    );
+    assert!(
+        successor_replay_test_child_is_isolated(
+            &read("src/semantic_capture.rs"),
+            &read(SEMANTIC_VALIDATION_TEST_CHILD),
+            &read(OWNER_ADMISSION_TEST_CHILD),
+        ),
+        "the exact replay consumer requires its whole cfg(test) ancestry",
     );
     // `decode_record`/`poll_records` hand the whole record only to the
     // router; every other consumer gets the bare `Event` from `decode`.

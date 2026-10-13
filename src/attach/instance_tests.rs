@@ -1097,6 +1097,102 @@ fn dir_is_btrfs(dir: &Path) -> Result<bool> {
 
 #[test]
 #[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_system_identity_anchor_preserves_watched_instance() -> Result<()> {
+    use crate::discovery::kernel_identity::{AnchorPass, ExaminedCustody};
+    use crate::discovery::sweep_attribution::{ReservationOwner, SegmentPolicy};
+
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let (_view, pins, plan, key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let object = plan.slots[0].object;
+    let mut harness = Harness::start(&plan, target.pid(), &pins)?;
+    target.command(b'c')?;
+    let first = single_join(&pump_until(&mut harness, &target, 1)?)?;
+
+    // A real external shared-mm mutation must still renew the instance.
+    // Establish this before the preservation assertion, including on RED.
+    let mutation_before = harness.session.instance_maps().counters()?;
+    ensure!(target.command(b'v')? == "SHARER");
+    let mutation_after = harness.session.instance_maps().counters()?;
+    target.command(b'c')?;
+    let original = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(
+        mutation_after.global_bumps > mutation_before.global_bumps
+            && mutation_after.shared > mutation_before.shared
+            && original != first,
+        "real shared-mm mutation did not renew the watched instance: \
+         {mutation_before:?} -> {mutation_after:?}"
+    );
+
+    let main_thread = std::thread::current().id();
+    let mut preserved = true;
+    for pass in 0..2 {
+        let before_maps = std::fs::read(format!("/proc/{}/maps", target.pid()))?;
+        let before = harness.session.instance_maps().complete_epochs(
+            target.pin.pidfd().map_err(anyhow::Error::msg)?,
+            harness.file_slot,
+        )?;
+        let counters_before = harness.session.instance_maps().counters()?;
+        // System identity anchors are mapped during prepare, before an
+        // IdentitySession installs its iterator. Clone the original held
+        // files, never a pathname; map and release on the observer worker
+        // while the owned target remains idle and unchanged.
+        let worker_pins = pins.clone();
+        let worker = crate::inventory_capture::collect_off_thread(
+            move || {
+                let custody = ExaminedCustody::new(
+                    ReservationOwner::for_examined(SegmentPolicy::from_headroom(128, 0, 0), 0),
+                    BTreeMap::new(),
+                );
+                let anchors = AnchorPass::prepare(&worker_pins, [(key, object)], custody);
+                drop(anchors);
+                std::thread::current().id()
+            },
+            Duration::from_millis(20),
+            &mut || {},
+        );
+        ensure!(
+            worker != main_thread,
+            "identity anchors did not use the worker"
+        );
+        let after = harness.session.instance_maps().complete_epochs(
+            target.pin.pidfd().map_err(anyhow::Error::msg)?,
+            harness.file_slot,
+        )?;
+        let counters_after = harness.session.instance_maps().counters()?;
+        ensure!(
+            before_maps == std::fs::read(format!("/proc/{}/maps", target.pid()))?
+                && target.pin.still_the_same(),
+            "the idle target changed during identity anchor preparation"
+        );
+        let observation = harness.scan(&target, false)?;
+        target.command(b'c')?;
+        let joined = single_join(&pump_until(&mut harness, &target, 1)?)?;
+        let continued = observation == Some(ObserveOutcome::Continued) && joined == original;
+        eprintln!(
+            "H6_SYSTEM_IDENTITY_ANCHOR pass={pass} epochs_equal={} continued={continued} \
+             local_delta={} global_delta={} fault_delta={} \
+             counters_before={counters_before:?} counters_after={counters_after:?}",
+            before == after,
+            after.local.saturating_sub(before.local),
+            after.global.saturating_sub(before.global),
+            after.fault.saturating_sub(before.fault),
+        );
+        preserved &= before == after && continued;
+    }
+    ensure!(
+        preserved,
+        "System identity anchors changed the idle target's watched instance; \
+         inspect actual H6_SYSTEM_IDENTITY_ANCHOR epoch/counter deltas"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
 fn privileged_inventory_worker_scan_preserves_watched_instance() -> Result<()> {
     use crate::discovery::hooks::HookRegistry;
     use crate::discovery::identity::RetainedMappedIdentities;

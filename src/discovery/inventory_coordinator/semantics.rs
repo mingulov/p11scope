@@ -816,6 +816,24 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             {
                 return Err(Refusal::NoLiveCaller);
             }
+            let existing_at = self.semantic_bindings.index.get(&caller).copied();
+            if let Some(at) = existing_at {
+                let existing = &mut self.semantic_bindings.bindings[at];
+                if existing.domain != receipt.domain() {
+                    return Err(Refusal::DomainConflict);
+                }
+                if existing.image != receipt.image()
+                    || !Arc::ptr_eq(&existing.pin, receipt.original_pin())
+                {
+                    return Err(Refusal::ImageUnproven(UnboundReason::ExecAmbiguous));
+                }
+                if candidate.scope == AdmissionScope::Cgroup {
+                    // Re-arm negative loss tracking under this exact binding's
+                    // fresh scope proof. Provider refusal below must keep its
+                    // positive scope eligibility suspended.
+                    existing.suspension_cut = false;
+                }
+            }
             // Proven current membership ends the previous scope-loss episode
             // independently of provider permission. An expired owner receipt
             // still grants no positive authority, but a later genuine leave
@@ -828,16 +846,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .initial_scope_cut = false;
             }
             let provider = provider.map_err(Refusal::OwnerRefused)?;
-            if let Some(at) = self.semantic_bindings.index.get(&caller).copied() {
+            if let Some(at) = existing_at {
                 let existing = &mut self.semantic_bindings.bindings[at];
-                if existing.domain != receipt.domain() {
-                    return Err(Refusal::DomainConflict);
-                }
-                if existing.image != receipt.image()
-                    || !Arc::ptr_eq(&existing.pin, receipt.original_pin())
-                {
-                    return Err(Refusal::ImageUnproven(UnboundReason::ExecAmbiguous));
-                }
                 if existing.module != *provider.module() {
                     return Err(Refusal::ModuleConflict);
                 }
@@ -878,7 +888,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// a one-publication loss marker. History retains its original custody.
     pub(crate) fn suspend_semantic_scope_except(&mut self, allowed: &BTreeSet<CallerId>) {
         for binding in &mut self.semantic_bindings.bindings {
-            if binding.scope_current && !allowed.contains(&binding.caller) {
+            if (binding.scope_current || !binding.suspension_cut)
+                && !allowed.contains(&binding.caller)
+            {
                 binding.scope_current = false;
                 binding.suspension_cut = false;
                 self.registry.note_member_unscanned(binding.caller);

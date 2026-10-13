@@ -4146,6 +4146,8 @@ class ControlledInventoryObserver:
         self.records, self.callers, self.last, self.instances, self.semantic = [], {}, {}, {}, {}
         self.passed, self.previous_counts = -1, {}
         self.last_acks = {}
+        self.release_teardown = fault not in ("delayed-teardown", "withheld-teardown")
+        self.teardown_published = False
         self.module_ids = {value["path"]: f"m{index}" for index, value in enumerate(providers.values())}
         self.started = time.monotonic_ns()
         self.emit("started", {"scope": "system" if membership is None else "cgroup",
@@ -4202,8 +4204,14 @@ class ControlledInventoryObserver:
                     self.callers[caller_key] = context
                     if old:
                         old["lifecycle"] = "exec_retired"
-                        self.emit("caller_event", {"event": "exec_retired", "old": old["id"], "new": caller_id,
-                            "identity_context": {"version": 1, "old": dict(old), "new": context}})
+                        if self.fault in ("recovered-history", "split-retirement", "historical-tail"):
+                            self.emit("caller_event", {"event": "retired", "caller": old["id"],
+                                "identity_context": {"version": 1, "caller": dict(old)}})
+                            self.emit("caller_event", {"event": "admitted", "caller": caller_id,
+                                "identity_context": {"version": 1, "caller": context}})
+                        else:
+                            self.emit("caller_event", {"event": "exec_retired", "old": old["id"], "new": caller_id,
+                                "identity_context": {"version": 1, "old": dict(old), "new": context}})
                     else:
                         self.emit("caller_event", {"event": "admitted", "caller": caller_id,
                             "identity_context": {"version": 1, "caller": context}})
@@ -4214,6 +4222,10 @@ class ControlledInventoryObserver:
                     ack = min((row for row in parsed["acks"] if row["gen"] == ident["gen"]
                                and row["seq"] > self.last_acks.get(caller_key, 0)),
                               key=lambda row: row["seq"], default=ack)
+                if (ack is not None and ack["command"] == "T" and ident["gen"] == 0
+                        and not self.release_teardown):
+                    ack = max((row for row in parsed["acks"] if row["gen"] == 0 and row["command"] == "M"),
+                              key=lambda row: row["t1"], default=None)
                 pending_no_calls = False
                 batches = [row for row in parsed["batches"] if row["gen"] == ident["gen"]
                            and ack is not None and row["t1"] <= ack["t1"]]
@@ -4268,6 +4280,10 @@ class ControlledInventoryObserver:
                         if retired:
                             instance.update(state="retired", reason="instance_retired")
                             semantic["coverage"] = {"lossy": True, "reasons": ["instance_retired"]}
+                            if self.fault == "recovered-history":
+                                semantic["coverage"]["reasons"].append("semantic_loss")
+                        if ident["gen"] == 1 and self.fault == "recovered-history":
+                            semantic["coverage"] = {"lossy": True, "reasons": ["semantic_loss"]}
                         if final:
                             if not retired:
                                 instance.update(state="uncertain", reason="semantic_loss")
@@ -4296,6 +4312,8 @@ class ControlledInventoryObserver:
                         self.last[pair] = edge
                 if ack is not None and not pending_no_calls:
                     self.last_acks[caller_key] = ack["seq"]
+                    if ack["command"] == "T" and ident["gen"] == 0:
+                        self.teardown_published = True
         if not final:
             self.passed += 1
         self.emit("pass_committed", {"pass": self.passed, "final": final,
@@ -4551,6 +4569,9 @@ class InventoryFixtureTest(unittest.TestCase):
         def group(_ctx, path):
             path = Path(path)
             def move(owner):
+                if path.name == "outside" and fault == "delayed-teardown":
+                    self.assertTrue(observers[-1].teardown_published,
+                                    "outside move preceded actual T publication")
                 if path.name == "sub" and fault == "failed-move":
                     raise H6["SetupError"]("controlled failed descendant verification")
                 membership[owner.pid] = str(path)
@@ -4566,6 +4587,13 @@ class InventoryFixtureTest(unittest.TestCase):
         def detach(pid, scope):
             if any(owner.pid == pid for owner in scope.traced):
                 H6["ptrace_detach"](pid, scope)
+        cursor_read = H6["R5AdmissionCursor"].read
+        def read_cursor(cursor, deadline=None, **kwargs):
+            if fault == "delayed-teardown" and deadline is not None and observers:
+                parsed = H6["parse_inv_ledger"]("".join(cursor.owner.h6_test_reader.lines))
+                if any(row["command"] == "T" and row["gen"] == 0 for row in parsed["acks"]):
+                    observers[-1].release_teardown = True
+            return cursor_read(cursor, deadline, **kwargs)
         patches = {"init_token": lambda *_args: self.env, "build_manifest": manifest, "leg_pin": pinned,
             "spawn_owned": ordinary, "spawn_ledger": ledger, "spawn_inventory": observer,
             "wait_inventory_ready": lambda *_args: time.monotonic_ns(),
@@ -4579,7 +4607,8 @@ class InventoryFixtureTest(unittest.TestCase):
             "evaluate_inventory_h6": lambda doc, ledgers, receipt: (doc, ledgers, receipt)}
         actual_budget = H6["LegBudget"]
         patches["LegBudget"] = lambda **_kwargs: actual_budget(inventory=True, budgets={"setup": 3,
-            "successor-recovery": 0.4 if fault not in (None, "failed-move", "initial-no-calls", "history-prefix") else 3,
+            "successor-recovery": 0.4 if fault not in (None, "failed-move", "initial-no-calls", "history-prefix",
+                "recovered-history", "split-retirement", "historical-tail", "delayed-teardown") else 3,
             "fixed-measurement": 8, "normal-stop": 2, "cleanup": 2}, leg_seconds=15)
         self.route_events, self.route_owners, self.route_case = events, owners, ctx
         try:
@@ -4588,7 +4617,8 @@ class InventoryFixtureTest(unittest.TestCase):
                 leg_seconds=15)
             token = H6["ACTIVE_LEG"].set(budget)
             function = H6["run_system_mixed" if cell == "system-mixed" else "run_cgroup_inventory_r5"]
-            with mock.patch.dict(function.__globals__, patches):
+            with mock.patch.dict(function.__globals__, patches), \
+                    mock.patch.object(H6["R5AdmissionCursor"], "read", read_cursor):
                 doc, ledgers, receipt = function(ctx,
                     self.directory / f"mixed-{time.monotonic_ns()}", "singles")
             self.route_events, self.route_owners = events, owners
@@ -4610,6 +4640,29 @@ class InventoryFixtureTest(unittest.TestCase):
                 reader.thread.join(2)
             for pin in pins:
                 pin.close()
+
+    def test_recovered_successor_keeps_inherited_loss_and_exact_fixed_outcomes(self):
+        doc, ledgers, receipt = self.run_inventory_route(cell="cgroup-reentry", fault="recovered-history")
+        phase = receipt["inventory_control"]["measurements"][1]
+        self.assertEqual(phase["proof"]["baseline"]["semantic"]["event"]["coverage"],
+                         {"lossy": True, "reasons": ["semantic_loss"]})
+        result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+        self.assertTrue(result["pass"], result["errors"])
+        self.assertEqual(result["s1"]["measured_completed"], 20)
+        self.assertEqual(result["s1"]["measured_failed"], 2)
+
+    def test_actual_split_exec_retirement_replays_to_normal_stop(self):
+        doc, ledgers, receipt = self.run_inventory_route(cell="cgroup-reentry", fault="split-retirement")
+        result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+        self.assertTrue(result["pass"], result["errors"])
+
+    def test_original_teardown_publication_precedes_outside_move_and_exec(self):
+        doc, ledgers, receipt = self.run_inventory_route(cell="cgroup-reentry", fault="delayed-teardown")
+        result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+        self.assertTrue(result["pass"], result["errors"])
+        tail = receipt["inventory_control"]["teardown"]
+        self.assertEqual(sum(row["n"] for row in tail["marker"]["batches"]), 4)
+        self.assertLess(tail["end"]["pass"]["at_ns"], receipt["freeze"]["checkpoint"]["at_ns"] + 1)
 
     def test_system_mixed_real_sibling_calls_overlap_target_measurement(self):
         doc, ledgers, receipt = self.run_inventory_route()

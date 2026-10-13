@@ -1739,6 +1739,176 @@ class LiveFrameTest(unittest.TestCase):
         self.assertEqual(self.parse(""), [])
 
 
+class WarmupPacingTest(unittest.TestCase):
+    """Drive the real proof waiter without real sleeps or observer privileges."""
+    def setUp(self):
+        self.token = H6["ACTIVE_LEG"].set(None)
+        self.addCleanup(H6["ACTIVE_LEG"].reset, self.token)
+        patch = mock.patch.dict(H6["warm_successor"].__globals__,
+                                monotonic_ns=lambda: self.now)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.reset_capture()
+
+    def reset_capture(self, initial=False):
+        self.now = START
+        self.events, self.calls, self.public_text = [], [], ""
+        self.image = {"image": 0 if initial else 1, "pid": 1000, "path": "/w/after"}
+        test = self
+        class Updates:
+            def get(self, timeout):
+                end = test.now + max(1, round(timeout * 1e9))
+                if test.events and test.events[0][0] <= end:
+                    test.now, emit = test.events.pop(0)
+                    emit()
+                    return None
+                test.now = end
+                raise H6["queue"].Empty
+        self.capture = SimpleNamespace(lines=[], frames=[], errors=[], updates=Updates(),
+                                       thread=SimpleNamespace(is_alive=lambda: True))
+        self.budget = H6["LegBudget"](clock=lambda: self.now) if initial else None
+        H6["ACTIVE_LEG"].set(self.budget)
+
+    def append_live(self, text):
+        self.public_text += text
+        self.capture.frames = H6["parse_live_frames"](self.public_text, final=False)
+
+    def marker(self, seq, remaining, *deadline, mode="trace", recovered=False):
+        phase = f"warm-{seq}"
+        self.calls.append((seq, phase, self.now, remaining, deadline))
+        if mode == "trace":
+            self.capture.lines.append(named_row(1000, 1000, "/w/after", "C_GetInfo") if recovered else
+                                      unknown_row(1000, 1000, "C_GetInfo"))
+        else:
+            self.append_live(live_frame([("C_GetInfo", 8 if recovered else 7, 0, 0)]))
+        return phase
+
+    def test_real_marker_after_eleven_seconds_can_prove_recovery_within_original_budget(self):
+        for mode, initial in (("trace", False), ("trace", True), ("profile", False), ("metrics", False)):
+            with self.subTest(mode=mode, initial=initial):
+                self.reset_capture(initial)
+                if mode != "trace":
+                    self.append_live(live_frame([("C_GetInfo", 7, 0, 0)]))
+                def attempt(seq, remaining, *deadline):
+                    return self.marker(seq, remaining, *deadline, mode=mode,
+                                       recovered=self.now >= START + 11_000_000_000)
+                try:
+                    proof = H6["warm_successor"](self.capture, self.image, attempt, mode=mode, initial=initial)
+                except TimeoutError as error:
+                    self.fail(f"recovery was available at 11s but {len(self.calls)} real calls exhausted at "
+                              f"{(self.now - START) / 1e9}s: {error}")
+                self.assertGreaterEqual(proof["observed_ns"], START + 11_000_000_000)
+                self.assertLess(proof["observed_ns"], START + 15_000_000_000)
+                self.assertEqual(proof["deadline_ns"], START + 15_000_000_000)
+                self.assertEqual([row[0] for row in self.calls], list(range(1, proof["attempts"] + 1)))
+                self.assertEqual(proof["phases"], [row[1] for row in self.calls])
+                self.assertLessEqual(len(self.calls), 20)
+                if initial:
+                    self.assertEqual(self.budget.phase, "setup")
+                    self.assertFalse(any(phase == "successor-recovery" for phase, _ in self.budget.deadlines))
+                    self.assertTrue(all(row[4] == (START + 15_000_000_000,) for row in self.calls))
+                    self.assertEqual(proof["budget_phase"], "setup")
+                elif mode != "trace":
+                    self.assertEqual(proof["baseline"]["functions"]["C_GetInfo"]["calls"], 7)
+                    self.assertEqual(proof["snapshot"]["functions"]["C_GetInfo"]["calls"], 8)
+
+    def test_unrecovered_calls_use_the_allowed_time_without_exceeding_attempt_cap(self):
+        for max_attempts, timeout in ((20, 15), (4, 3)):
+            with self.subTest(max_attempts=max_attempts, timeout=timeout):
+                self.reset_capture()
+                with self.assertRaisesRegex(TimeoutError, "budget exhausted"):
+                    H6["warm_successor"](self.capture, self.image, self.marker,
+                                         max_attempts=max_attempts, timeout=timeout)
+                self.assertEqual(len(self.calls), max_attempts)
+                self.assertEqual(self.now, START + timeout * 1_000_000_000)
+
+    def test_fresh_proof_returns_immediately_after_ack(self):
+        for mode in ("trace", "profile", "metrics"):
+            with self.subTest(mode=mode):
+                self.reset_capture()
+                if mode != "trace":
+                    self.append_live(live_frame([("C_GetInfo", 7, 0, 0)]))
+                def attempt(seq, remaining):
+                    self.now += 123
+                    return self.marker(seq, remaining, mode=mode, recovered=True)
+                proof = H6["warm_successor"](self.capture, self.image, attempt, mode=mode,
+                                            max_attempts=3, timeout=0.3)
+                self.assertEqual(proof["observed_ns"], START + 123)
+                self.assertEqual(proof["attempts"], 1)
+
+    def test_stale_unknown_wrong_image_and_wrong_marker_cannot_prove_recovery(self):
+        for initial in (False, True):
+            with self.subTest(initial=initial):
+                self.reset_capture(initial)
+                self.capture.lines.append(named_row(1000, 1000, "/w/after", "C_GetInfo"))
+                def attempt(seq, remaining, *deadline):
+                    phase = self.marker(seq, remaining, *deadline)
+                    self.capture.lines.extend((named_row(999, 999, "/w/after", "C_GetInfo"),
+                        named_row(1000, 1000, "/w/before", "C_GetInfo"),
+                        named_row(1000, 1000, "/w/after", "C_GenerateRandom"),
+                        named_row(1000, 1000, "/w/after", "C_GetInfo", rv="CKR_GENERAL_ERROR")))
+                    if initial:
+                        self.capture.lines.append(named_row(1000, 999, "/w/after", "C_GetInfo"))
+                    return phase
+                with self.assertRaises(TimeoutError):
+                    H6["warm_successor"](self.capture, self.image, attempt, initial=initial)
+                self.assertEqual(len(self.calls), 20)
+                self.assertLessEqual(self.now, START + 15_000_000_000)
+
+    def test_slow_ack_cannot_renew_deadline_or_authorize_late_proof(self):
+        for initial in (False, True):
+            with self.subTest(initial=initial):
+                self.reset_capture(initial)
+                def attempt(seq, remaining, *deadline):
+                    self.now += 11_000_000_000 if seq == 1 else 4_100_000_000
+                    return self.marker(seq, remaining, *deadline, recovered=seq > 1)
+                with self.assertRaises(TimeoutError):
+                    H6["warm_successor"](self.capture, self.image, attempt, initial=initial)
+                self.assertEqual([row[0] for row in self.calls], [1, 2])
+                self.assertLessEqual(self.calls[1][3], 4)
+                self.assertGreater(self.now, START + 15_000_000_000)
+
+    def test_counter_proof_requires_a_complete_frame_before_deadline(self):
+        for mode in ("profile", "metrics"):
+            for completion in (START + 100_000_000, START + 15_000_000_001):
+                with self.subTest(mode=mode, completion=completion):
+                    self.reset_capture()
+                    self.append_live(live_frame([("C_GetInfo", 7, 0, 0)]))
+                    self.events.append((completion, lambda: self.append_live("\n")))
+                    def attempt(seq, remaining):
+                        self.calls.append((seq, f"warm-{seq}", self.now, remaining, ()))
+                        if seq == 1:
+                            self.append_live(live_frame([("C_GetInfo", 8, 0, 0)])[:-1])
+                        return f"warm-{seq}"
+                    if completion < START + 15_000_000_000:
+                        proof = H6["warm_successor"](self.capture, self.image, attempt, mode=mode)
+                        self.assertEqual(proof["attempts"], 1)
+                        self.assertEqual(proof["observed_ns"], completion)
+                        self.assertEqual(proof["snapshot"]["functions"]["C_GetInfo"]["calls"], 8)
+                    else:
+                        with self.assertRaises(TimeoutError):
+                            H6["warm_successor"](self.capture, self.image, attempt, mode=mode)
+                        self.assertEqual(len(self.capture.frames), 1)
+                        self.assertLessEqual(self.now, START + 15_000_000_000)
+
+    def test_counter_baseline_and_ack_waits_consume_the_original_deadline(self):
+        for mode in ("profile", "metrics"):
+            with self.subTest(mode=mode):
+                self.reset_capture()
+                self.events.append((START + 8_000_000_000,
+                                    lambda: self.append_live(live_frame([("C_GetInfo", 7, 0, 0)]))))
+                def attempt(seq, remaining):
+                    self.now += 1_000_000_000
+                    return self.marker(seq, remaining, mode=mode,
+                                       recovered=self.now > START + 15_000_000_000)
+                with self.assertRaises(TimeoutError):
+                    H6["warm_successor"](self.capture, self.image, attempt, mode=mode)
+                self.assertEqual(self.calls[0][2], START + 9_000_000_000)
+                self.assertEqual(self.calls[0][3], 7)
+                self.assertLess(len(self.calls), 20)
+                self.assertGreaterEqual(self.now, START + 15_000_000_000)
+
+
 class WarmSuccessorTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="h6-warm-")

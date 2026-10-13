@@ -303,8 +303,9 @@ class InitialProducerTest(unittest.TestCase):
         self.assertEqual(results[0]["phase_populations"]["warm"], {"named": 2})
         self.assertEqual(results[0]["phase_populations"]["measured"], {"named": 10})
         self.assertEqual([proof["image"] for proof in receipt["successor_ready"]], [1, 2, 3])
-        keys = {key for phase, key in self.ctx.scopes[0].budget.deadlines if phase == "successor-recovery"}
-        self.assertEqual(keys, {1, 2, 3})
+        keys = [{key for phase, key in scope.budget.deadlines if phase == "successor-recovery"}
+                for scope in self.ctx.scopes]
+        self.assertEqual([group for group in keys if group], [{1, 2, 3}])
         self.assert_released()
 
     def test_reuse_real_new_child_initial_proof_precedes_the_fixed_five_calls(self):

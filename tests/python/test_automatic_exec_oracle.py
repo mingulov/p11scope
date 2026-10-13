@@ -4417,7 +4417,8 @@ class ControlledInventoryObserver:
                             "last_seen_ns": last_seen}
                         semantic = {"caller": context["id"], "module": module_id, "instance": instance_id,
                             "entries": {"unit": "api_entries", "count": None, "observation": "unavailable"},
-                            "api_returns": {"count": api_count, "saturated": False, "historical_only_returns": 0},
+                            "api_returns": {"unit": "api_returns", "count": api_count,
+                                            "saturated": False, "historical_only_returns": 0},
                             "semantics": "observed", "mechanisms": mechanisms, "operations": ops,
                             "coverage": {"lossy": False, "reasons": []}}
                         quiet_prefix = (instance_id not in self.instances or self.fault == "recovered-no-calls"
@@ -5623,7 +5624,7 @@ class InventoryFixtureTest(unittest.TestCase):
                                     for error in result["errors"]), (fault, result["errors"]))
 
     def test_sibling_no_call_prefix_is_supported_but_positive_history_cannot_regress(self):
-        original = self.run_inventory_route()
+        original = self.run_inventory_route(fault="initial-no-calls")
         for fault in ("initial-no-calls", "later-no-calls", "duplicate-prefix"):
             with self.subTest(fault=fault):
                 doc, ledgers, receipt = copy.deepcopy(original)
@@ -5632,7 +5633,7 @@ class InventoryFixtureTest(unittest.TestCase):
                 rows = [row["event"] for row in receipt["inventory_control"]["final_records"]
                         if row["kind"] == "semantic_edge_observed" and row["event"]["caller"] == caller]
                 if fault == "duplicate-prefix":
-                    rows[0]["api_returns"]["count"] += 100
+                    next(row for row in rows if type(row["api_returns"]["count"]) is int)["api_returns"]["count"] += 100
                 else:
                     row = rows[0 if fault == "initial-no-calls" else 1]
                     row.update(semantics="unknown (no calls observed)", mechanisms=None, operations=None,

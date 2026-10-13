@@ -15,7 +15,7 @@ H6 = BASE["H6"]
 START, STOP = BASE["START"], BASE["STOP"]
 
 
-def sibling_inputs():
+def sibling_inputs(no_calls=True):
     doc, _, receipt = BASE["inventory_inputs"]()
     provider = {**BASE["PIN"], "path": "/w/libA.so", "mapping": {"dev": [8, 1], "ino": 111}}
     image = {"image": 0, "pid": 2000, "start_time": 8888, "path": "/w/ledger",
@@ -123,10 +123,26 @@ def sibling_inputs():
                        "stages": [{"label": label, "t0": START + n * 1000,
                                    "t1": START + n * 1000 + 4} for n, label in
                                   ((2, "exec"), (3, "recovery"), (4, "measurement"))]})
+    if not no_calls:
+        expected = {"0x350": [1, 0], "0x251": [2, 0], "0x250": [10, 0]}
+        quiet.update(semantics="observed", coverage={"lossy": False, "reasons": []},
+            mechanisms=[{"mechanism_hex": key, "calls": values[0], "errors": values[1]}
+                        for key, values in expected.items()],
+            operations={"calls": 15, "completed": 7, "failed": 0, "unknown": 0,
+                        "orphans": 0, "dropped": 0, "cancelled": 0, "active": []})
+        quiet["api_returns"]["count"] = 17
+        combined = [{"mechanism_hex": key, "calls": values[0] + (30 if key == "0x250" else 0),
+                     "errors": values[1]} for key, values in expected.items()]
+        for row in records:
+            if row["kind"] == "semantic_edge_observed" and row["seq"] > semantic["seq"]:
+                row["event"]["api_returns"]["count"] = 47
+                row["event"]["operations"].update(calls=45, completed=22)
+                row["event"]["mechanisms"] = copy.deepcopy(combined)
+        doc["semantic_edges"][0]["mechanisms"] = copy.deepcopy(combined)
     return doc, ledger, receipt, records
 
 
-def controlled_inputs():
+def controlled_inputs(*, missing_target=True, target_gap=None):
     """Replay the existing observer seam with literal ledgers, without children."""
     pins = {name: {**BASE["PIN"], "path": f"/w/lib{name}.so", "ino": 111 + i,
                   "mapping": {"dev": [8, 1], "ino": 111 + i}} for i, name in enumerate(("A", "B"))}
@@ -167,6 +183,8 @@ def controlled_inputs():
     observer.context = context
     def emit(kind, event):
         event = copy.deepcopy(event)
+        if kind == "pass_committed":
+            event["gaps_suppressed"] = 0
         if kind == "edge_observed" and not event["entries"]["count"]:
             event["entries"].update(in_flight=False, first_seen_ns=None, last_seen_ns=None,
                 coverage={"state": "watched_no_use", "lossy": None, "reason": None})
@@ -178,7 +196,7 @@ def controlled_inputs():
                 event.update(semantics="unknown (no calls observed)", mechanisms=None, operations=None,
                              coverage={"lossy": False, "reasons": ["no_calls"]})
                 event["api_returns"]["count"] = None
-            elif name == "MS" or old:
+            elif name == "MS" or old and missing_target:
                 api, calls, completed = (17, 15, 7) if name == "MS" else (87, 85, 42)
                 event["api_returns"]["count"] -= api
                 for key, deficit in (("calls", calls), ("completed", completed)):
@@ -255,6 +273,8 @@ def controlled_inputs():
         gap = {"caller": caller, "module": "m0", "pid": None, "budget": None,
                "subject": "physical provider use preceded first observed semantic registration",
                "reason": "before_semantic_boundary"}
+        if caller == "c0" and target_gap:
+            gap.update(target_gap)
         observer.gaps.append({**gap, "repeats": 1})
         emit("gap_recorded", {**gap, "index": len(observer.gaps) - 1})
     observer.sweep()
@@ -362,7 +382,11 @@ def controlled_inputs():
             "stages": [{"label": "exec", "t0": exec_start, "t1": resumed},
                 {"label": "recovery", "t0": resumed, "t1": proof1["observed_ns"]},
                 {"label": "measurement", "t0": measurement_start, "t1": clock[0]}]}}
-    return doc, ledgers, receipt
+    # The final full read is a separate decode from the retained baseline.
+    # Copies keep corruption controls from mutating both pieces together.
+    control = receipt["inventory_control"]
+    receipt["inventory_control"] = {key: copy.deepcopy(value) for key, value in control.items()}
+    return copy.deepcopy(doc), copy.deepcopy(ledgers), receipt
 
 
 class SystemSiblingTest(unittest.TestCase):
@@ -379,8 +403,12 @@ class SystemSiblingTest(unittest.TestCase):
         self.assertEqual(early["unobserved"]["completed"], 7)
         self.assertEqual(early["mechanisms_expected"], {"0x350": [1, 0], "0x251": [2, 0], "0x250": [10, 0]})
         self.assertEqual(early["mechanisms_observed"], {})
-        self.assertEqual(summaries[0]["delta"]["api"], 30)
-        self.assertEqual(summaries[0]["delta"]["completed"], 15)
+        self.assertEqual((summaries[0]["api_returns"], summaries[0]["ledger_api_returns"]), (30, 47))
+        self.assertEqual(summaries[0]["operations_observed"]["completed"], 15)
+        self.assertEqual(summaries[0]["operations"]["completed"], 22)
+        self.assertEqual(summaries[0]["delta"]["observed"], summaries[0]["delta"]["expected"])
+        self.assertEqual(summaries[0]["delta"]["observed"]["api"], 30)
+        self.assertEqual(summaries[0]["delta"]["observed"]["completed"], 15)
 
     def test_native_no_calls_baseline_requires_both_public_units(self):
         original = sibling_inputs()
@@ -400,6 +428,59 @@ class SystemSiblingTest(unittest.TestCase):
         self.assertEqual(result["s1"]["sibling_instances"][0]["early"]["unobserved"]["api"], 17)
         self.assertEqual(len(result["expected_disclosures"]), 4)
         self.assertEqual(len(result["gaps"]), 4)
+
+    def test_full_count_target_cannot_license_unrelated_boundary_subject_or_reason(self):
+        for gap in ({"subject": "future gap", "reason": "before_admission"},
+                    {"reason": "before_admission"}):
+            with self.subTest(gap=gap):
+                data = controlled_inputs(missing_target=False, target_gap=gap)
+                result = H6["evaluate_inventory_h6"](*data)
+                self.assertFalse(result["pass"], result)
+
+    def test_full_count_target_retains_conservative_boundary_gap_without_claiming_loss(self):
+        doc, ledgers, receipt = controlled_inputs(missing_target=False)
+        result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+        self.assertTrue(result["pass"], result["errors"])
+        early = result["s1"]["stable_instances"][0]["early"]
+        self.assertEqual(early["api_missed"], 0)
+        self.assertEqual(len(early["gaps"]), 1)
+        self.assertEqual(len(result["expected_disclosures"]), 4)
+        self.assertEqual(len(result["gaps"]), 4)
+
+    def test_owned_preuse_requires_armed_provider_progression_and_complete_prefix(self):
+        original = controlled_inputs()
+        def accepted(data):
+            doc, ledgers, receipt = data
+            records = receipt["inventory_control"]["final_records"]
+            publication = next(row for row in records if row["kind"] == "gap_recorded"
+                               and row["event"]["index"] == 1)
+            return H6["inventory_system_preuse_disclosure"](doc, ledgers, receipt, doc["gaps"][1], publication)
+        self.assertTrue(accepted(original))
+        for fault in ("not-armed", "regression", "uncommitted-prefix"):
+            with self.subTest(fault=fault):
+                data = copy.deepcopy(original)
+                records = data[2]["inventory_control"]["final_records"]
+                dispatch = data[2]["inventory_control"]["sibling_baseline"]["marker"]["dispatch_ns"]
+                edges = [row for row in records if row["kind"] == "edge_observed"
+                         and row["event"]["caller"] == "c1" and row["at_ns"] < dispatch]
+                if fault == "not-armed":
+                    edges[-1]["event"]["entries"]["coverage"] = {
+                        "state": "unknown", "reason": "not_attached", "lossy": None}
+                else:
+                    pending = copy.deepcopy(edges[-1])
+                    if fault == "regression":
+                        pending["event"]["entries"]["coverage"] = {
+                            "state": "unknown", "reason": "not_attached", "lossy": None}
+                        where = max(i for i, row in enumerate(records) if row["kind"] == "pass_committed"
+                                    and row["at_ns"] < dispatch)
+                        records[where:where] = [pending, copy.deepcopy(edges[-1])]
+                    else:
+                        pending["at_ns"] = dispatch - 1
+                        where = next(i for i, row in enumerate(records) if row["at_ns"] >= dispatch)
+                        records.insert(where, pending)
+                    for seq, row in enumerate(records):
+                        row["seq"] = seq
+                self.assertFalse(accepted(data), fault)
 
     def test_composed_baseline_and_early_disclosures_reject_authority_or_later_loss_mutations(self):
         original = controlled_inputs()
@@ -447,6 +528,11 @@ class SystemSiblingTest(unittest.TestCase):
             "hidden-later-loss": hidden_loss,
             "count-only-positive": lambda d: next(row for row in d[0]["edges"]
                 if (row["caller"], row["module"]) == ("c1", "m1")).update(operations={"completed": 1}),
+            "baseline-wrong-admission-kind": lambda d: next(row for row in
+                d[2]["inventory_control"]["final_records"]
+                if row["seq"] == baseline(d)["admission"]["completed_pass"]["seq"]).update(kind="gap_repeated"),
+            "baseline-missing-written": lambda d: baseline(d)["pass"]["event"].pop("semantic_edge_events"),
+            "baseline-deferred": lambda d: baseline(d)["pass"]["event"].update(semantic_edge_events_deferred=1),
         }
         for name, mutate in cases.items():
             with self.subTest(name=name):
@@ -454,6 +540,43 @@ class SystemSiblingTest(unittest.TestCase):
                 mutate(data)
                 result = H6["evaluate_inventory_h6"](*data)
                 self.assertFalse(result["pass"], result)
+
+    def test_early_current_mechanism_overcount_or_unreported_deficit_is_rejected(self):
+        original = sibling_inputs(no_calls=False)
+        errors, _ = H6["inventory_sibling_s1_errors"](*original)
+        self.assertEqual(errors, [])
+        for fault in ("mechanism-overcount", "mechanism-deficit-without-gap", "cancelled-later", "active-later"):
+            with self.subTest(fault=fault):
+                doc, ledger, receipt, records = copy.deepcopy(original)
+                baseline = receipt["inventory_control"]["sibling_baseline"]
+                row = baseline["semantic"]["event"]
+                expected = {"0x350": [1, 0], "0x251": [2, 0], "0x250": [10, 0]}
+                row.update(semantics="observed", coverage={"lossy": False, "reasons": []},
+                    mechanisms=[{"mechanism_hex": key, "calls": values[0], "errors": values[1]}
+                                for key, values in expected.items()],
+                    operations={"calls": 15, "completed": 7, "failed": 0, "unknown": 0,
+                                "orphans": 0, "dropped": 0, "cancelled": 0, "active": []})
+                row["api_returns"]["count"] = 17
+                final = doc["semantic_edges"][0]
+                final["api_returns"]["count"] = 47
+                final["operations"].update(calls=45, completed=22)
+                final["mechanisms"] = [{"mechanism_hex": key, "calls": values[0] + (30 if key == "0x250" else 0),
+                                        "errors": values[1]} for key, values in expected.items()]
+                if fault == "mechanism-overcount":
+                    row["mechanisms"][0]["calls"] = 2
+                elif fault == "mechanism-deficit-without-gap":
+                    row["mechanisms"][0]["calls"] = 0
+                    final["mechanisms"][0]["calls"] = 0
+                    for record in records:
+                        if record["kind"] == "semantic_edge_observed" and record["seq"] > baseline["pass"]["seq"]:
+                            record["event"]["mechanisms"][0]["calls"] = 0
+                    records[3]["event"]["reason"] = "different"
+                elif fault == "cancelled-later":
+                    final["operations"]["cancelled"] = 1
+                else:
+                    final["operations"]["active"] = [{"count": 1}]
+                errors, _ = H6["inventory_sibling_s1_errors"](doc, ledger, receipt, records)
+                self.assertTrue(errors)
 
 
 if __name__ == "__main__":

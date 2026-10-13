@@ -1786,6 +1786,26 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         Ok(self.apply_catalog(catalog, guard, identity, deadline_ns, now_ns))
     }
 
+    /// Share only the attach set's bounded, original held-file proofs with
+    /// the next collection. Scan-pinned callers need not own an Engine view.
+    fn collector_budget(
+        &self,
+        budget: crate::discovery::scan::CaptureWorkBudget,
+    ) -> crate::discovery::scan::CaptureWorkBudget {
+        let objects: BTreeSet<_> = self
+            .attach_set
+            .endpoints()
+            .map(|entry| entry.object)
+            .collect();
+        budget.with_retained_mapped_identities(
+            crate::discovery::identity::RetainedMappedIdentities::from_targets(
+                objects
+                    .into_iter()
+                    .filter_map(|object| self.attach_set.target(object)),
+            ),
+        )
+    }
+
     /// The pass's collection as an owned job (Task 6 C5.7): it reads
     /// `/proc` only, over its own copies of the run's fixed hints and hooks,
     /// and hands back its catalog. It borrows nothing of the coordinator, so
@@ -1804,17 +1824,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let policy = crate::plan::AdmissionPolicy::Inventory(self.attach_set.budget());
         let hints = self.engine.module_hints.clone();
         let hooks = self.engine.hooks.clone();
+        let budget = self.collector_budget(crate::discovery::scan::CaptureWorkBudget::default());
         move || {
             if cgroup_requires_transaction {
                 bail!("cgroup inventory requires the bounded scoped collection job");
             }
             match scope {
-                InventoryScope::Pid(pid) => {
-                    crate::inspect_system::collect_pid(pid, &hints, &hooks, policy)
-                }
-                InventoryScope::System => {
-                    crate::inspect_system::collect(&hints, &hooks, max_scan_pids, policy)
-                }
+                InventoryScope::Pid(pid) => crate::inspect_system::collect_pid_with_budget(
+                    pid, &hints, &hooks, policy, budget,
+                ),
+                InventoryScope::System => crate::inspect_system::collect_with_budget(
+                    &hints,
+                    &hooks,
+                    max_scan_pids,
+                    policy,
+                    budget,
+                ),
             }
         }
     }
@@ -1833,20 +1858,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let policy = crate::plan::AdmissionPolicy::Inventory(self.attach_set.budget());
         let hints = self.engine.module_hints.clone();
         let hooks = self.engine.hooks.clone();
+        let budget = self.collector_budget(crate::discovery::scan::CaptureWorkBudget::default());
         move || {
             if cgroup_requires_transaction {
                 bail!("cgroup inventory requires the bounded scoped collection job");
             }
             match scope {
-                InventoryScope::Pid(pid) => {
-                    crate::inspect_system::collect_pid(pid, &hints, &hooks, policy)
-                }
+                InventoryScope::Pid(pid) => crate::inspect_system::collect_pid_with_budget(
+                    pid, &hints, &hooks, policy, budget,
+                ),
                 InventoryScope::System => crate::inspect_system::collect_system_with_identity(
                     &hints,
                     &hooks,
                     max_scan_pids,
                     policy,
                     shared,
+                    budget,
                 ),
             }
         }
@@ -1887,7 +1914,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             limits,
             control,
             max_scan_pids,
-            scan_budget: crate::discovery::scan::CaptureWorkBudget::for_inventory(work),
+            scan_budget: self.collector_budget(
+                crate::discovery::scan::CaptureWorkBudget::for_inventory(work),
+            ),
             observer,
         };
         let hints = self.engine.module_hints.clone();

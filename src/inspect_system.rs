@@ -357,8 +357,9 @@ fn collect_members(
     hooks: &HookRegistry,
     max_scan_pids: Option<usize>,
     timings: &mut StageTimings,
+    budget: CaptureWorkBudget,
 ) -> Collection {
-    collect_members_identity(hints, hooks, max_scan_pids, timings, false).0
+    collect_members_identity(hints, hooks, max_scan_pids, timings, false, budget).0
 }
 
 fn collect_members_identity(
@@ -367,6 +368,7 @@ fn collect_members_identity(
     max_scan_pids: Option<usize>,
     timings: &mut StageTimings,
     identity: bool,
+    mut budget: CaptureWorkBudget,
 ) -> (Collection, Option<ExaminedCustody>) {
     progress!("p11scope: enumerating processes...");
     let scope = Scope::System;
@@ -376,7 +378,6 @@ fn collect_members_identity(
         .any(|skip| skip.reason.contains("no process was discovered"));
     let mut scope_gaps: Vec<PidGap> = unlisted.into_iter().map(PidGap::scope).collect();
     let cap = max_scan_pids.unwrap_or(MAX_SCAN_PIDS);
-    let mut budget = CaptureWorkBudget::default();
     let mut noise = DiscoveryNoiseAggregator::default();
 
     // Phase 1+2, exactly like capture discovery: the sweep and the
@@ -1073,7 +1074,23 @@ pub(crate) fn collect(
     max_scan_pids: Option<usize>,
     policy: AdmissionPolicy,
 ) -> Result<Catalog> {
-    collect_identity(hints, hooks, max_scan_pids, policy, false).map(|(catalog, _)| catalog)
+    collect_with_budget(
+        hints,
+        hooks,
+        max_scan_pids,
+        policy,
+        CaptureWorkBudget::default(),
+    )
+}
+
+pub(crate) fn collect_with_budget(
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
+    max_scan_pids: Option<usize>,
+    policy: AdmissionPolicy,
+    budget: CaptureWorkBudget,
+) -> Result<Catalog> {
+    collect_identity(hints, hooks, max_scan_pids, policy, false, budget).map(|(catalog, _)| catalog)
 }
 
 /// Dormant opt-in collection seam for the inventory identity backend. The
@@ -1090,7 +1107,14 @@ pub(crate) fn collect_inventory_identity(
             "physical identity collection requires inventory policy"
         ));
     }
-    let (catalog, custody) = collect_identity(hints, hooks, max_scan_pids, policy, true)?;
+    let (catalog, custody) = collect_identity(
+        hints,
+        hooks,
+        max_scan_pids,
+        policy,
+        true,
+        CaptureWorkBudget::default(),
+    )?;
     Ok((catalog, custody.expect("opt-in collection owns custody")))
 }
 
@@ -1100,13 +1124,14 @@ fn collect_identity(
     max_scan_pids: Option<usize>,
     policy: AdmissionPolicy,
     identity: bool,
+    budget: CaptureWorkBudget,
 ) -> Result<(Catalog, Option<ExaminedCustody>)> {
     let mut timings = StageTimings::new();
     let (mut collection, mut custody) = if identity {
-        collect_members_identity(hints, hooks, max_scan_pids, &mut timings, true)
+        collect_members_identity(hints, hooks, max_scan_pids, &mut timings, true, budget)
     } else {
         (
-            collect_members(hints, hooks, max_scan_pids, &mut timings),
+            collect_members(hints, hooks, max_scan_pids, &mut timings, budget),
             None,
         )
     };
@@ -1225,14 +1250,24 @@ fn with_confirmation_pools<R>(
 /// Collect one pid through the same member scan and the same assembly:
 /// the inventory scan lane's `--pid` pass. The only `Err` is a target no
 /// scan inventoried — pid-inspect's hard failure, kept honest.
+#[cfg(test)]
 pub(crate) fn collect_pid(
     pid: u32,
     hints: &[PathBuf],
     hooks: &HookRegistry,
     policy: AdmissionPolicy,
 ) -> Result<Catalog> {
+    collect_pid_with_budget(pid, hints, hooks, policy, CaptureWorkBudget::default())
+}
+
+pub(crate) fn collect_pid_with_budget(
+    pid: u32,
+    hints: &[PathBuf],
+    hooks: &HookRegistry,
+    policy: AdmissionPolicy,
+    mut budget: CaptureWorkBudget,
+) -> Result<Catalog> {
     progress!("p11scope: deep-scanning pid {pid}...");
-    let mut budget = CaptureWorkBudget::default();
     let mut noise = DiscoveryNoiseAggregator::default();
     let member = scan_member(pid, ProcessViewId(0), hints, hooks, &mut budget, &mut noise);
     noise.report();
@@ -3317,6 +3352,7 @@ pub(crate) fn collect_system_with_identity(
     max_scan_pids: Option<usize>,
     policy: AdmissionPolicy,
     shared: IdentityShared,
+    budget: CaptureWorkBudget,
 ) -> Result<Catalog> {
     if !matches!(policy, AdmissionPolicy::Inventory(_)) {
         return Err(anyhow::anyhow!(
@@ -3325,7 +3361,7 @@ pub(crate) fn collect_system_with_identity(
     }
     let mut timings = StageTimings::new();
     let (mut collection, mut custody) =
-        collect_members_identity(hints, hooks, max_scan_pids, &mut timings, true);
+        collect_members_identity(hints, hooks, max_scan_pids, &mut timings, true, budget);
     let stats = OutcomeStats {
         enumerated: collection.enumerated.len(),
         scanned: collection.scanned(),

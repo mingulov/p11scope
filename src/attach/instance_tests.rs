@@ -1099,6 +1099,7 @@ fn dir_is_btrfs(dir: &Path) -> Result<bool> {
 #[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
 fn privileged_inventory_worker_scan_preserves_watched_instance() -> Result<()> {
     use crate::discovery::hooks::HookRegistry;
+    use crate::discovery::identity::RetainedMappedIdentities;
 
     let CmdSetup {
         _directory,
@@ -1106,6 +1107,9 @@ fn privileged_inventory_worker_scan_preserves_watched_instance() -> Result<()> {
         mut target,
     } = spawn_cmd_target()?;
     let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let retained = pins
+        .retain_inventory_target(pins.pinned().next().context("owned pin")?.id)
+        .map_err(anyhow::Error::msg)?;
     let mut harness = Harness::start(&plan, target.pid(), &pins)?;
     target.command(b'c')?;
     let first = single_join(&pump_until(&mut harness, &target, 1)?)?;
@@ -1156,17 +1160,22 @@ fn privileged_inventory_worker_scan_preserves_watched_instance() -> Result<()> {
             harness.file_slot,
         )?;
         let counters_before = harness.session.instance_maps().counters()?;
+        // The same snapshot constructor used by the coordinator's collector:
+        // the original target/file proof, calibrated before it was watched.
+        let budget = CaptureWorkBudget::default()
+            .with_retained_mapped_identities(RetainedMappedIdentities::from_targets([&retained]));
         // The same production scan/pinning path used by Inventory's collector,
         // on its real worker. No target command runs during this collection.
         let (worker, catalog) = crate::inventory_capture::collect_off_thread(
             || {
                 (
                     std::thread::current().id(),
-                    crate::inspect_system::collect_pid(
+                    crate::inspect_system::collect_pid_with_budget(
                         pid,
                         std::slice::from_ref(&provider),
                         &HookRegistry::default(),
                         policy,
+                        budget,
                     ),
                 )
             },

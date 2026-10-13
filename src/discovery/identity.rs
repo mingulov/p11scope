@@ -45,11 +45,15 @@ pub(crate) fn pin_of(file: &std::fs::File) -> Result<Pin, String> {
     let md = file
         .metadata()
         .map_err(|error| format!("fstat failed: {error}"))?;
-    Ok(Pin {
+    Ok(pin_from_metadata(&md))
+}
+
+fn pin_from_metadata(md: &std::fs::Metadata) -> Pin {
+    Pin {
         ino: md.ino(),
         size: md.len(),
         ctime: (md.ctime(), md.ctime_nsec()),
-    })
+    }
 }
 
 /// Capture-local opened-object identity. It has no stable or serialized meaning.
@@ -115,6 +119,9 @@ struct Entry {
     mapping: MappingFileKey,
     file: Arc<std::fs::File>,
     pin: Pin,
+    /// Calibrated through this opened file, while its pin was unchanged.
+    /// Keeping the proof avoids mapping a watched file in the observer again.
+    mapped: Option<MappedFile>,
     path: String,
     sha256: String,
     build_id: Option<String>,
@@ -142,6 +149,61 @@ struct Entry {
 pub(crate) struct RetainedInventoryTarget {
     entry: Entry,
     changed: std::cell::Cell<bool>,
+}
+
+/// A collection's finite snapshot of already-retained attach targets. Every
+/// proof owns the original file Arc; it neither reopens nor duplicates an fd.
+/// The key is fstat-to-fstat only, never a maps device or pathname.
+#[derive(Debug, Default)]
+pub(crate) struct RetainedMappedIdentities {
+    files: BTreeMap<FileIdentity, RetainedMappedIdentity>,
+}
+
+#[derive(Debug)]
+struct RetainedMappedIdentity {
+    file: Arc<std::fs::File>,
+    pin: Pin,
+    mapped: MappedFile,
+}
+
+impl RetainedMappedIdentities {
+    pub(crate) fn from_targets<'a>(
+        targets: impl IntoIterator<Item = &'a RetainedInventoryTarget>,
+    ) -> Self {
+        let mut result = Self::default();
+        for target in targets {
+            let entry = &target.entry;
+            if target.changed.get() {
+                continue;
+            }
+            let Some(mapped) = entry.reusable_mapped_file() else {
+                continue;
+            };
+            let Ok(metadata) = entry.file.metadata() else {
+                continue;
+            };
+            result
+                .files
+                .entry(FileIdentity::of(&metadata))
+                .or_insert_with(|| RetainedMappedIdentity {
+                    file: Arc::clone(&entry.file),
+                    pin: entry.pin,
+                    mapped,
+                });
+        }
+        result
+    }
+
+    pub(crate) fn identity_for(&self, file: &std::fs::File) -> Option<MappedFile> {
+        let metadata = file.metadata().ok()?;
+        let held = self.files.get(&FileIdentity::of(&metadata))?;
+        // The held fd prevents inode/device reuse; both it and the freshly
+        // opened file must still match the calibrated metadata. Changed or
+        // unmatched files go through the normal probe and hash checks.
+        (pin_from_metadata(&metadata) == held.pin
+            && pin_of(&held.file).is_ok_and(|current| current == held.pin))
+        .then_some(held.mapped)
+    }
 }
 
 impl RetainedInventoryTarget {
@@ -347,6 +409,15 @@ pub struct FileIdentity {
     pub ino: u64,
 }
 
+impl FileIdentity {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        }
+    }
+}
+
 /// A provider-candidate object a complete deep scan opened, identified,
 /// and found to export no wanted symbol: examined, not a provider. Carries
 /// the held fd's `vm_file` identity (see [`FileIdentity`]); an object
@@ -417,6 +488,20 @@ pub struct MappedFile {
 }
 
 impl MappedFile {
+    /// These filesystems preserve the mapping behind a held, unchanged file.
+    /// Btrfs is included here because fstat-to-fstat includes the subvolume
+    /// device; it still requires every target range's map_files proof below.
+    /// Overlay backing switches, wrapping tmpfs inode numbers and unknown
+    /// filesystems keep the ordinary fresh self-mapping probe.
+    fn may_retain(&self) -> bool {
+        self.fs_magic.is_some_and(|magic| {
+            magic == 0x9123_683e
+                || KEY_IS_IDENTITY_FILESYSTEMS
+                    .iter()
+                    .any(|(allowed, _)| *allowed == magic)
+        })
+    }
+
     /// Whether the maps key `key` is this file's identity, so a range
     /// rendered under it in any process is this file: the identity equals
     /// `(makedev(key.device), key.inode)` AND the filesystem is on
@@ -562,16 +647,16 @@ fn map_files_entry_file(entry: &str) -> std::io::Result<MappedFile> {
     Ok(MappedFile { identity, fs_magic })
 }
 
-/// The `vm_file` identity of a held fd: mmap one page (`PROT_READ`,
-/// `MAP_PRIVATE`, never `PROT_EXEC`, unmapped on every path) and stat this
-/// process's own `map_files` entry for it. Like-for-like with
-/// [`map_files_identity`] of a target that maps the same file.
+#[cfg(test)]
 pub(crate) fn self_mapped_identity(file: &std::fs::File) -> Result<FileIdentity, String> {
     self_mapped_file(file).map(|mapped| mapped.identity)
 }
 
-/// [`self_mapped_identity`] plus the filesystem magic of the same
-/// `/proc/self/map_files` entry, read while the self-mapping exists.
+/// The `vm_file` identity of a held fd: mmap one page (`PROT_READ`,
+/// `MAP_PRIVATE`, never `PROT_EXEC`, unmapped on every path) and stat this
+/// process's own `map_files` entry for it. Like-for-like with
+/// [`map_files_identity`] of a target that maps the same file. Includes the
+/// filesystem magic of that same entry, read while the self-mapping exists.
 pub(crate) fn self_mapped_file(file: &std::fs::File) -> Result<MappedFile, String> {
     if file.metadata().map_err(|e| e.to_string())?.len() == 0 {
         return Err("an empty file cannot be mapped".into());
@@ -659,6 +744,15 @@ impl Drop for SelfMapping {
 }
 
 impl Entry {
+    fn reusable_mapped_file(&self) -> Option<MappedFile> {
+        self.mapped.filter(|mapped| {
+            !self.overlay
+                && !self.collapsed
+                && mapped.may_retain()
+                && pin_of(&self.file).is_ok_and(|current| current == self.pin)
+        })
+    }
+
     fn new(
         file: std::fs::File,
         pin: Pin,
@@ -666,6 +760,7 @@ impl Entry {
         inspected: &InspectedObject,
         raw: RawObjectInstance,
         mapping: MappingFileKey,
+        mapped: Option<MappedFile>,
     ) -> Result<Self, String> {
         Ok(Self {
             overlay: on_overlayfs(file.as_raw_fd())?,
@@ -674,6 +769,7 @@ impl Entry {
             mapping,
             file: Arc::new(file),
             pin,
+            mapped,
             path,
             // `inspect_file` always records a whole-file digest.
             sha256: inspected.identity.sha256.clone().unwrap_or_default(),
@@ -1251,7 +1347,7 @@ impl PinnedObjects {
         filesystem_without_unique_inodes(entry.file.as_raw_fd())
     }
 
-    /// The held object's `vm_file` identity ([`self_mapped_identity`]):
+    /// The held object's `vm_file` identity ([`self_mapped_file`]):
     /// what another process's `map_files` range must equal before a maps
     /// key may stand for this object there (C1b sweep matching).
     pub(crate) fn object_mapped_identity(&self, id: PinnedObjectId) -> Result<MappedFile, String> {
@@ -1259,7 +1355,10 @@ impl PinnedObjects {
             .by_id
             .get(&id)
             .ok_or_else(|| format!("object {id:?} was not pinned"))?;
-        self_mapped_file(&entry.file)
+        match entry.reusable_mapped_file() {
+            Some(mapped) => Ok(mapped),
+            None => self_mapped_file(&entry.file),
+        }
     }
 
     /// Every pinned object, for `discovery[]`.
@@ -2367,7 +2466,15 @@ pub fn pin_manifest_objects_deferred_in_views_with_budget(
             problems.push(format!("{}: object path cannot be normalized", object.path));
             continue;
         };
-        let entry = match Entry::new(file, pin, object.path.clone(), &inspected, raw, mapping) {
+        let entry = match Entry::new(
+            file,
+            pin,
+            object.path.clone(),
+            &inspected,
+            raw,
+            mapping,
+            None,
+        ) {
             Ok(entry) => entry,
             Err(error) => {
                 problems.push(format!("{}: {error}", object.path));
@@ -2465,11 +2572,11 @@ pub fn pin_scanned_view_objects(
     modules: &[ScannedModule],
     budget: &mut CaptureWorkBudget,
 ) -> Result<(PinnedObjects, Vec<Skipped>), String> {
-    pin_scanned_view_objects_with(view, modules, budget, &self_mapped_identity)
+    pin_scanned_view_objects_with(view, modules, budget, &self_mapped_file)
 }
 
-/// Reads a pinned fd's `vm_file` identity ([`self_mapped_identity`]).
-type ReadPinnedIdentity<'a> = &'a dyn Fn(&std::fs::File) -> Result<FileIdentity, String>;
+/// Reads a pinned fd's `vm_file` identity ([`self_mapped_file`]).
+type ReadPinnedIdentity<'a> = &'a dyn Fn(&std::fs::File) -> Result<MappedFile, String>;
 
 /// [`pin_scanned_view_objects`] with the pinned fd's `vm_file` identity
 /// read through `pinned_identity` (a seam: following `map_files` needs
@@ -2535,7 +2642,8 @@ fn pin_scanned_view_objects_with(
         let candidate = pin_scanned_object(
             view,
             raw.clone(),
-            scanned.map(|scanned| (scanned, pinned_identity)),
+            scanned,
+            pinned_identity,
             &mut mounts,
             budget,
         );
@@ -2723,7 +2831,8 @@ pub fn reconcile_scanned_modules(
 fn pin_scanned_object(
     view: &ProcessView,
     raw: RawObjectInstance,
-    scanned: Option<(FileIdentity, ReadPinnedIdentity<'_>)>,
+    scanned: Option<FileIdentity>,
+    pinned_identity: ReadPinnedIdentity<'_>,
     mounts: &mut MountTableCache,
     budget: &mut CaptureWorkBudget,
 ) -> Result<Entry, String> {
@@ -2753,10 +2862,15 @@ fn pin_scanned_object(
             object_key(found),
         ));
     }
-    if let Some((scanned, pinned_identity)) = scanned {
-        check_same_scanned_file(scanned, pinned_identity(&file))?;
-    }
     let before = pin_of(&file)?;
+    let mapped = budget
+        .retained_mapped_identity(&file)
+        .map(Ok)
+        .unwrap_or_else(|| pinned_identity(&file));
+    if let Some(scanned) = scanned {
+        check_same_scanned_file(scanned, mapped.clone().map(|mapped| mapped.identity))?;
+    }
+    let mapped = mapped.ok();
     // The per-file rule can be decided from metadata. Aggregate admission happens
     // incrementally at the reader below, and a partial digest is never trusted.
     if before.size > budget.limits().per_object_bytes {
@@ -2780,7 +2894,15 @@ fn pin_scanned_object(
         // Nothing was read for this hit, but the file may have changed since
         // `before`; only the still-unchanged file may reuse the cached value.
         if pin_of(&file)? == before {
-            return Entry::new(file, before, raw.path.clone(), &inspected, raw, found);
+            return Entry::new(
+                file,
+                before,
+                raw.path.clone(),
+                &inspected,
+                raw,
+                found,
+                mapped,
+            );
         }
     }
     let mut operation_bytes = 0u64;
@@ -2808,7 +2930,15 @@ fn pin_scanned_object(
     }
     // Only the stable read lands here: a file that changed mid-read is never cached.
     budget.note_inspected_file(cache_key, inspected.clone());
-    Entry::new(file, before, raw.path.clone(), &inspected, raw, found)
+    Entry::new(
+        file,
+        before,
+        raw.path.clone(),
+        &inspected,
+        raw,
+        found,
+        mapped,
+    )
 }
 
 #[cfg(test)]
@@ -2909,6 +3039,7 @@ pub(crate) mod test_fixture {
             raw,
             pin: pin_of(&file).unwrap(),
             file: Arc::new(file),
+            mapped: None,
             path: path.into(),
             sha256: sha256.into(),
             build_id: None,
@@ -2944,6 +3075,7 @@ pub(crate) mod test_fixture {
             },
             raw,
             file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+            mapped: None,
             pin: Pin {
                 ino: module.key.inode,
                 size: 4096,
@@ -3006,6 +3138,7 @@ pub(crate) mod test_fixture {
             },
             raw,
             file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+            mapped: None,
             pin: Pin {
                 ino: INODE,
                 size: 4096,
@@ -3037,6 +3170,7 @@ pub(crate) mod test_fixture {
             },
             raw,
             file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+            mapped: None,
             pin: Pin {
                 ino: INODE,
                 size: 4096,
@@ -5059,6 +5193,161 @@ mod tests {
     }
 
     #[test]
+    fn retained_mapped_identity_keeps_the_original_file_and_rejects_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held.so");
+        let other = dir.path().join("other.so");
+        std::fs::write(&path, "same bytes").unwrap();
+        std::fs::copy(&path, &other).unwrap();
+        let mut pins = test_fixture::real_scan_pin(&path, None, 1, "digest");
+        let entry = pins.by_id.values_mut().next().unwrap();
+        // Script only the privileged calibration result. Its device differs
+        // from fstat, ensuring reuse returns that proof, not a new identity
+        // invented from a path, raw maps key or the lookup metadata.
+        let calibrated = MappedFile {
+            identity: FileIdentity { dev: 37, ino: 9 },
+            fs_magic: Some(0x9123_683e),
+        };
+        entry.mapped = Some(calibrated);
+        let original = Arc::downgrade(&entry.file);
+        let id = pins.by_id.keys().next().copied().unwrap();
+        let target = pins.retain_inventory_target(id).unwrap();
+        let snapshot = RetainedMappedIdentities::from_targets([&target, &target]);
+        assert_eq!(snapshot.files.len(), 1, "aliases share one retained proof");
+        drop(target);
+        drop(pins);
+        assert!(original.upgrade().is_some(), "the original Arc stays held");
+
+        let reopened = std::fs::File::open(&path).unwrap();
+        assert_eq!(snapshot.identity_for(&reopened), Some(calibrated));
+        assert_eq!(
+            snapshot.identity_for(&std::fs::File::open(&other).unwrap()),
+            None
+        );
+        // The held inode changes through a second open descriptor.
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("/proc/self/fd/{}", reopened.as_raw_fd()))
+            .unwrap();
+        writer.set_len(32).unwrap();
+        assert_eq!(snapshot.identity_for(&reopened), None);
+        std::fs::rename(&other, &path).unwrap();
+        assert_eq!(
+            snapshot.identity_for(&std::fs::File::open(&path).unwrap()),
+            None
+        );
+        drop(snapshot);
+        assert!(original.upgrade().is_none());
+    }
+
+    #[test]
+    fn retained_mapped_identity_refuses_overlay_unknown_and_unproved_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("held.so");
+        std::fs::write(&path, "provider").unwrap();
+        let mut pins = test_fixture::real_scan_pin(&path, None, 1, "digest");
+        let id = pins.by_id.keys().next().copied().unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        for (magic, overlay, collapsed, expected) in [
+            (Some(0xef53), false, false, true),
+            (Some(0x9123_683e), false, false, true),
+            (Some(0xef53), true, false, false),
+            (Some(0xef53), false, true, false),
+            (Some(0x794c_7630), false, false, false),
+            (Some(0x0102_1994), false, false, false),
+            (Some(0x6573_5546), false, false, false),
+            (Some(0x1234_5678), false, false, false),
+            (None, false, false, false),
+        ] {
+            let entry = pins.by_id.get_mut(&id).unwrap();
+            entry.mapped = Some(MappedFile {
+                identity: FileIdentity { dev: 37, ino: 9 },
+                fs_magic: magic,
+            });
+            entry.overlay = overlay;
+            entry.collapsed = collapsed;
+            let target = pins.retain_inventory_target(id).unwrap();
+            let snapshot = RetainedMappedIdentities::from_targets([&target]);
+            assert_eq!(
+                snapshot.identity_for(&file).is_some(),
+                expected,
+                "{magic:?}, overlay={overlay}, collapsed={collapsed}"
+            );
+        }
+        pins.by_id.get_mut(&id).unwrap().mapped = None;
+        let target = pins.retain_inventory_target(id).unwrap();
+        assert!(
+            RetainedMappedIdentities::from_targets([&target])
+                .files
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_retained_pin_reuses_calibration_but_still_checks_the_scanned_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("libpinned.so");
+        std::fs::copy("/bin/sh", &path).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let mapping = mapping_file_key(&file).unwrap();
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let calibrated = MappedFile {
+            identity: FileIdentity { dev: 37, ino: 9 },
+            fs_magic: Some(0x9123_683e),
+        };
+        let mut module = test_fixture::module(object_key(mapping));
+        module.view = view.id();
+        module.mount_namespace = view.mount_namespace();
+        module.path = path.display().to_string();
+        module.tables.clear();
+        module.mapped_identity = Some(calibrated.identity);
+        let (pins, skipped) = pin_scanned_view_objects_with(
+            &view,
+            std::slice::from_ref(&module),
+            &mut CaptureWorkBudget::default(),
+            &|_| Ok(calibrated),
+        )
+        .unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let id = pins.pinned().next().unwrap().id;
+        let target = pins.retain_inventory_target(id).unwrap();
+        let reusable = pins.by_id[&id].reusable_mapped_file().is_some();
+        let probes = std::cell::Cell::new(0);
+        let probe = |_: &std::fs::File| {
+            probes.set(probes.get() + 1);
+            Ok(calibrated)
+        };
+        let mut budget = CaptureWorkBudget::default()
+            .with_retained_mapped_identities(RetainedMappedIdentities::from_targets([&target]));
+        let (reused, skipped) = pin_scanned_view_objects_with(
+            &view,
+            std::slice::from_ref(&module),
+            &mut budget,
+            &probe,
+        )
+        .unwrap();
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(probes.get(), usize::from(!reusable));
+        // Sweep matching uses the same retained proof, without a third probe.
+        if reusable {
+            assert_eq!(
+                reused.object_mapped_identity(reused.pinned().next().unwrap().id),
+                Ok(calibrated)
+            );
+        }
+        module.mapped_identity = Some(FileIdentity { dev: 47, ino: 9 });
+        let (refused, skipped) =
+            pin_scanned_view_objects_with(&view, &[module], &mut budget, &probe).unwrap();
+        assert_eq!(probes.get(), 2 * usize::from(!reusable));
+        assert_eq!(refused.pinned().count(), 0);
+        assert!(
+            skipped
+                .iter()
+                .any(|skip| skip.reason.contains("identity_mismatch"))
+        );
+    }
+
+    #[test]
     fn the_pin_refuses_a_reopened_file_that_is_not_the_one_the_scan_read() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("libpinned.so");
@@ -5091,7 +5380,12 @@ mod tests {
                 &view,
                 std::slice::from_ref(&module),
                 &mut budget,
-                &|_| pinned.clone(),
+                &|_| {
+                    pinned.clone().map(|identity| MappedFile {
+                        identity,
+                        fs_magic: None,
+                    })
+                },
             )
             .unwrap();
             (objects.pinned().count(), skipped)

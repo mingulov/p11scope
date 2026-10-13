@@ -5545,29 +5545,98 @@ fn native_semantic_multiprovider_candidates_bind_per_provider() {
 }
 
 #[test]
+fn native_semantic_refresh_unattested_mappings_do_not_consume_attempts() {
+    let fixture = ProviderFixture::new();
+    let mut scene = BindingScene::new();
+    let children: Vec<_> = (0..5).map(|_| OwnedStoppedChild::new()).collect();
+    for (index, child) in children.iter().enumerate() {
+        let caller = scene.admit(child.id(), 100 + index as u64);
+        scene.map(caller, child.id(), 200 + index as u64);
+    }
+    let lane =
+        AttestedSemanticLane::start(fixture.subset(), &Scope::System, BackendSelection::Auto)
+            .unwrap();
+    assert!(
+        scene
+            .coordinator
+            .semantic_refresh_attempts(&lane, None, |_| true)
+            .is_empty(),
+        "mapped providers outside the attested subset are not refresh candidates"
+    );
+}
+
+#[test]
+fn native_semantic_refresh_late_attested_caller_is_not_starved_by_unrelated_mappings() {
+    let fixture = ProviderFixture::new();
+    let mut scene = BindingScene::new();
+    let children: Vec<_> = (0..6).map(|_| OwnedStoppedChild::new()).collect();
+    for (index, child) in children[..5].iter().enumerate() {
+        let caller = scene.admit(child.id(), 100 + index as u64);
+        scene.map(caller, child.id(), 200 + index as u64);
+    }
+    let lane =
+        AttestedSemanticLane::start(fixture.subset(), &Scope::System, BackendSelection::Auto)
+            .unwrap();
+    let pin = lane.subset().pins().pinned().next().unwrap();
+    let module = ModuleKey::physical(
+        pin.key.device.major,
+        pin.key.device.minor,
+        pin.key.inode,
+        Some(pin.sha256.to_owned()),
+        pin.path,
+    );
+    let caller = scene.admit(children[5].id(), 105);
+    scene.map_module(caller, children[5].id(), &module, pin.path, 205);
+    let attempts = scene
+        .coordinator
+        .semantic_refresh_attempts(&lane, None, |_| true);
+    assert_eq!(
+        attempts
+            .iter()
+            .map(|attempt| attempt.caller)
+            .collect::<Vec<_>>(),
+        vec![caller],
+        "the actual attested pair must reach the unchanged four-attempt service"
+    );
+    assert_eq!(attempts[0].module.as_ref(), Some(&module));
+}
+
+#[test]
 fn native_semantic_failed_refresh_attempts_remain_bounded_and_fair() {
     let fixture = ProviderFixture::new();
     let mut scene = BindingScene::new();
+    let mut lane =
+        AttestedSemanticLane::start(fixture.subset(), &Scope::System, BackendSelection::Auto)
+            .unwrap();
+    let pin = lane.subset().pins().pinned().next().unwrap();
+    let module = ModuleKey::physical(
+        pin.key.device.major,
+        pin.key.device.minor,
+        pin.key.inode,
+        Some(pin.sha256.to_owned()),
+        pin.path,
+    );
     let children: Vec<_> = (0..5).map(|_| OwnedStoppedChild::new()).collect();
     let callers: Vec<_> = children
         .iter()
         .enumerate()
         .map(|(index, child)| {
             let caller = scene.admit(child.id(), 100 + index as u64);
-            // A mapped but unattested provider is still a failed attempt; it
-            // cannot cause more than four scans or strand the next caller.
-            scene.map(caller, child.id(), 200 + index as u64);
+            // Genuine exact mapped candidates still consume one slot when
+            // their owner/H0 refresh refuses to establish current authority.
+            scene.map_module(caller, child.id(), &module, pin.path, 200 + index as u64);
             caller
         })
         .collect();
-    let lane =
-        AttestedSemanticLane::start(fixture.subset(), &Scope::System, BackendSelection::Auto)
-            .unwrap();
     let first = scene
         .coordinator
         .semantic_refresh_attempts(&lane, None, |_| true);
     assert_eq!(first.len(), 4);
-    assert!(first.iter().all(|attempt| attempt.module.is_none()));
+    assert!(
+        first
+            .iter()
+            .all(|attempt| attempt.module.as_ref() == Some(&module))
+    );
     assert_eq!(
         first
             .iter()
@@ -5575,6 +5644,28 @@ fn native_semantic_failed_refresh_attempts_remain_bounded_and_fair() {
             .collect::<Vec<_>>(),
         callers[..4]
     );
+    for attempt in &first {
+        let pid = scene
+            .coordinator
+            .adapter()
+            .record(attempt.caller)
+            .unwrap()
+            .pid;
+        let pin = scene
+            .coordinator
+            .adapter()
+            .live_pin(pid)
+            .unwrap()
+            .1
+            .try_clone()
+            .unwrap();
+        assert!(
+            lane.prepare_caller_admission(Arc::new(pin), attempt.slot, &module)
+                .is_err(),
+            "a shell lane without H0 I/O cannot mint current owner proof"
+        );
+    }
+    assert_eq!(scene.coordinator.semantic_bindings().len(), 0);
     let second = scene
         .coordinator
         .semantic_refresh_attempts(&lane, None, |_| true);
@@ -5585,6 +5676,17 @@ fn native_semantic_failed_refresh_attempts_remain_bounded_and_fair() {
             .coordinator
             .semantic_refresh_attempts(&lane, None, |_| false)
             .is_empty()
+    );
+    let mut charged = 0;
+    assert!(
+        scene
+            .coordinator
+            .semantic_refresh_attempts(&lane, None, |units| {
+                charged += units;
+                charged <= 6
+            })
+            .is_empty(),
+        "partial traversal charge exhaustion cannot dispatch a refresh"
     );
 }
 

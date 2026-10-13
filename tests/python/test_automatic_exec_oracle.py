@@ -5439,6 +5439,14 @@ class InventoryFixtureTest(unittest.TestCase):
     def test_target_history_cannot_rewind_or_erase_loss_across_measured_end(self):
         for cell in ("cgroup-reentry", "system-mixed"):
             original = self.run_inventory_route(cell=cell, fault="history-prefix")
+            clean = H6["evaluate_inventory_h6"](*original)
+            self.assertTrue(clean["pass"], (cell, clean["errors"]))
+            target = original[1]["RX" if cell == "cgroup-reentry" else "MX"]
+            self.assertEqual([row["seq"] for row in target["acks"]
+                if row["gen"] == 0 and row["command"] == "W"], [1, 2],
+                "history fixture needs a real first warm publication before a distinct ready baseline")
+            baseline = original[2]["inventory_control"]["measurements"][0]["proof"]["baseline"]
+            self.assertEqual(baseline["counts"]["api"], 27)
             for fault in ("rewind-after-end", "pre-baseline-loss", "retirement-reason-erasure"):
                 with self.subTest(cell=cell, fault=fault):
                     doc, ledgers, receipt = copy.deepcopy(original)

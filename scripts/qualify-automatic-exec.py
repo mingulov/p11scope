@@ -5995,6 +5995,14 @@ def inventory_boundary(records, owner, image, provider, admission, floor, marker
                 raise SetupError("Inventory held provider acquired ambiguous module IDs")
             physical, settled = record, None
         elif kind == "instance_observed" and event.get("caller") == selected:
+            # Measurement already authorized one instance. Its retirement or
+            # replacement cannot recover while waiting for coalesced counts.
+            # Readiness has no prior instance and keeps its discovery waits.
+            if prior and event.get("module") == prior["instance"]["event"]["module"]:
+                if event.get("id") != prior["instance"]["event"]["id"]:
+                    raise SetupError("Inventory measured phase changed its authorized instance")
+                if event.get("state") != "observed" or event.get("reason") is not None:
+                    raise SetupError("Inventory measured instance is retired or uncertain")
             instances[event.get("id")] = record
             settled = None
         elif kind == "semantic_edge_observed" and event.get("caller") == selected:

@@ -2083,7 +2083,8 @@ def _evaluate_inventory_h6(doc, ledgers, receipt):
                 errors.append(f"count-only provider {module_key} publishes semantic rows")
     # These disclosures need their full controlled scope/ledger proof below;
     # a subject-only allowlist can never authorize them.
-    allowed_gaps = set(receipt.get("allowed_gap_subjects", [])) - CGROUP_DISCLOSURE_SUBJECTS
+    allowed_gaps = (set(receipt.get("allowed_gap_subjects", []))
+                    - CGROUP_DISCLOSURE_SUBJECTS - SYSTEM_DISCLOSURE_SUBJECTS)
     allow_path_gaps = receipt.get("allow_path_gaps", False)
     gaps = [(gap.get("subject"), gap.get("detail")) for gap in doc.get("gaps", [])]
     for subject, _ in gaps:
@@ -2336,6 +2337,14 @@ def inventory_sibling_s1_errors(doc, ledger, receipt, records):
 
 
 CGROUP_DISCLOSURE_SUBJECTS = {"scoped native owner admission deferred", "semantic admission refused"}
+SYSTEM_DISCLOSURE_SUBJECTS = {"discovery capped", "capture discovery", "semantic admission refused"}
+SYSTEM_SCAN_LIMIT = 256
+SYSTEM_EMPTY_MAPS_REFUSAL = (
+    "memory scan refused: initial mapping validation unavailable: empty or truncated /proc maps snapshot")
+SYSTEM_H6_LIMITATION = (
+    "System H6 qualifies only independently ledgered owned callers. Global discovery remains partial "
+    "and ambient usage remains unqualified; recognized disclosures are retained unresolved. "
+    "This does not prove a complete host census.")
 SCOPED_OWNER_DEFERRAL = (
     "native owner activation and refresh cannot yet be enclosed by the final cgroup membership bracket; "
     "sampled scan-pinned callers and retained native totals remain available")
@@ -2424,6 +2433,166 @@ def inventory_target_preuse_disclosure(doc, ledgers, receipt, gap, publication, 
     return scoped and any(row["kind"] == "pass_committed" and not row["event"].get("final")
         and row["seq"] > max(edges[-1]["seq"], last_publication["seq"])
         and row["at_ns"] < dispatch for row in records)
+
+
+def inventory_system_owned_births(ledgers, receipt):
+    """The complete independent MX/MS/MF population, including the foreign control."""
+    if set(ledgers) != {"MX", "MS", "MF"}:
+        return None
+    births = set()
+    for name, generations in (("MX", {0, 1}), ("MS", {0}), ("MF", {0})):
+        ids = ledgers[name]["idents"]
+        if (len(ids) != len(generations) or {row["gen"] for row in ids} != generations
+                or any(row["cell"] != name or type(row["gen"]) is not int
+                       or type(row["pid"]) is not int or row["pid"] <= 0
+                       or type(row["start"]) is not int or row["start"] < 0 for row in ids)
+                or len({(row["pid"], row["start"]) for row in ids}) != 1):
+            return None
+        births.add((ids[0]["pid"], ids[0]["start"]))
+    owned = receipt.get("owned_pids", [])
+    if (len(births) != 3 or len({pid for pid, _ in births}) != 3
+            or len(owned) != 3 or len(set(owned)) != 3 or any(type(pid) is not int for pid in owned)
+            or set(owned) != {pid for pid, _ in births}):
+        return None
+    return births
+
+
+def inventory_system_ambient_caller(doc, records, gap, publication, owned_births):
+    """Public admission proves an unowned birth; it proves no absence of calls."""
+    callers = [row for row in doc.get("callers", []) if row["id"] == gap["caller"]]
+    if len(callers) != 1:
+        return None
+    caller = callers[0]
+    birth = caller["pid"], caller["start_time"]
+    if (type(birth[0]) is not int or birth[0] <= 0 or type(birth[1]) is not int or birth[1] < 0
+            or type(caller["incarnation"]) is not int or caller["incarnation"] < 0
+            or birth in owned_births or birth[0] in {pid for pid, _ in owned_births}):
+        return None
+    admissions = [row for row in records if row["kind"] == "caller_event"
+                  and row["event"].get("event") == "admitted"
+                  and row["event"].get("caller") == caller["id"]]
+    if len(admissions) != 1 or admissions[0]["seq"] >= publication["seq"]:
+        return None
+    context = admissions[0]["event"].get("identity_context") or {}
+    subject = context.get("caller") or {}
+    identity = {key: caller[key] for key in ("id", "pid", "start_time", "incarnation")}
+    if (context.get("version") != 1 or any(type(subject.get(key)) is not int
+            for key in ("pid", "start_time", "incarnation"))
+            or any(subject.get(key) != value for key, value in identity.items())
+            or subject.get("authority") != "scan_pinned"
+            or subject.get("status") not in ("observed", "unavailable")
+            or (caller.get("image") or {}).get("exe") != subject.get("executable")):
+        return None
+    # A later row cannot relabel this caller as another birth/incarnation.
+    for row in records:
+        current = ((row["event"].get("identity_context") or {}).get("caller") or {})
+        if current.get("id") == caller["id"] and any(
+                current.get(key) != value for key, value in identity.items()):
+            return None
+    return caller, identity
+
+
+def inventory_system_disclosure(doc, ledgers, receipt, index):
+    """Recognize exact bounded/ambient limitations without granting owned authority."""
+    gap = doc["gaps"][index]
+    records = receipt["inventory_control"]["final_records"]
+    observation = doc.get("observation") or {}
+    attach = observation.get("attach") or {}
+    if (receipt.get("cell") != "system-mixed" or receipt.get("scope_kind") != "system"
+            or receipt.get("scope_label") != "system" or doc.get("scope") != "system"
+            or records[0]["kind"] != "started" or records[0]["event"].get("scope") != "system"
+            or records[-1]["kind"] != "ended" or observation.get("lane") != "native"
+            or "scope_filter" not in attach or attach["scope_filter"] is not None
+            or doc.get("gaps_suppressed") != 0
+            or set(gap) != {"subject", "reason", "caller", "module", "pid", "budget", "repeats"}
+            or gap["module"] is not None or gap["budget"] is not None
+            or type(gap["repeats"]) is not int or type(observation.get("passes")) is not int
+            or not 1 <= gap["repeats"] <= observation["passes"]):
+        return False
+    births = inventory_system_owned_births(ledgers, receipt)
+    if births is None:
+        return False
+    publications = [row for row in records if row["kind"] == "gap_recorded"
+                    and row["event"].get("index") == index]
+    expected = {**{key: value for key, value in gap.items() if key != "repeats"}, "index": index}
+    if (len(publications) != 1 or publications[0]["event"] != expected
+            or type(publications[0]["event"]["index"]) is not int):
+        return False
+    publication = publications[0]
+    repeats = 1
+    for row in records:
+        if row["kind"] == "gap_repeated" and row["event"].get("index") == index:
+            count = row["event"].get("repeats")
+            if (row["seq"] <= publication["seq"] or type(row["event"]["index"]) is not int
+                    or type(count) is not int or not repeats < count <= gap["repeats"]):
+                return False
+            repeats = count
+    if repeats != gap["repeats"]:
+        return False
+    completing = next((row for row in records if row["kind"] == "pass_committed"
+                       and row["seq"] > publication["seq"]), None)
+    if (completing is None or completing["event"].get("final")
+            or type(completing["event"].get("pass")) is not int
+            or not 0 <= completing["event"]["pass"] < observation["passes"]
+            or completing["event"].get("gaps_suppressed") != 0):
+        return False
+    if gap["subject"] == "discovery capped":
+        if gap["caller"] is not None or gap["pid"] is not None:
+            return False
+        matched = re.fullmatch(
+            r"([0-9]+) processes in scope; ([0-9]+) deep-scanned by provider rarity \(limit ([0-9]+)\); "
+            r"([0-9]+) attributed to pinned provider objects by exact maps identity; "
+            r"([0-9]+) processes map ([0-9]+) shared objects no deep scan examined and may use undiscovered providers"
+            r"(?:; ([0-9]+) processes past the cap had no maps snapshot)?", gap["reason"])
+        if matched is None:
+            return False
+        total, deep, limit, mapped, unseen, objects, unavailable = (
+            int(value or 0) for value in matched.groups())
+        return (all(0 <= value <= 18446744073709551615 for value in
+                    (total, deep, limit, mapped, unseen, objects, unavailable))
+            and type(receipt.get("system_scan_limit")) is int
+            and limit == receipt["system_scan_limit"] == SYSTEM_SCAN_LIMIT
+            and total > limit and deep <= limit and deep + mapped <= total
+            # A maps-matched member may also map unexamined shared objects.
+            and 0 < unseen + unavailable <= total - deep
+            and mapped + unavailable <= total - deep
+            and (objects > 0 if unseen > 0 else objects == 0)
+            and type(completing["event"].get("scanned")) is int
+            and type(completing["event"].get("maps_matched")) is int
+            and completing["event"].get("scanned") == deep + mapped
+            and completing["event"].get("maps_matched") == mapped)
+    ambient = inventory_system_ambient_caller(doc, records, gap, publication, births)
+    if ambient is None:
+        return False
+    caller, identity = ambient
+    if gap["subject"] == "capture discovery":
+        return (gap["reason"] == SYSTEM_EMPTY_MAPS_REFUSAL and type(gap["pid"]) is int
+                and gap["pid"] == caller["pid"])
+    if (gap["subject"] != "semantic admission refused" or gap["pid"] is not None
+            or gap["reason"] not in ("semantic_unavailable", "provider_mapping_unproven")):
+        return False
+    for row in records:
+        if (row["kind"] != "edge_observed" or row["seq"] >= publication["seq"]
+                or row["event"].get("caller") != caller["id"]):
+            continue
+        edge = row["event"]
+        context = edge.get("identity_context") or {}
+        module = context.get("module") or {}
+        modules = [item for item in doc["modules"] if item["id"] == edge["module"]]
+        if len(modules) != 1:
+            continue
+        physical = modules[0].get("identity") or {}
+        device = physical.get("device") or {}
+        if (context.get("version") == 1 and module.get("id") == edge["module"]
+                and module.get("status") == "observed"
+                and module.get("inode") == physical.get("inode")
+                and module.get("device_major") == device.get("major")
+                and module.get("device_minor") == device.get("minor")
+                and module.get("path") in modules[0].get("paths", [])
+                and all((context.get("caller") or {}).get(key) == value for key, value in identity.items())
+                and (edge.get("mapping") or {}).get("state") == "mapped"):
+            return True
+    return False
 
 
 def inventory_cgroup_disclosure(doc, ledgers, receipt, index):
@@ -2788,8 +2957,10 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
     # removes S1. Keep every disclosure in the reported result.
     physical_doc["gaps"], disclosures = [], []
     for index, gap in enumerate(doc.get("gaps", [])):
-        if gap.get("subject") in CGROUP_DISCLOSURE_SUBJECTS and inventory_cgroup_disclosure(
-                doc, ledgers, receipt, index):
+        if (gap.get("subject") in CGROUP_DISCLOSURE_SUBJECTS and inventory_cgroup_disclosure(
+                doc, ledgers, receipt, index)
+                or gap.get("subject") in SYSTEM_DISCLOSURE_SUBJECTS and inventory_system_disclosure(
+                    doc, ledgers, receipt, index)):
             disclosures.append(gap)
         else:
             physical_doc["gaps"].append(gap)
@@ -2820,7 +2991,8 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
         "completed_operations": measured_completed, "s1": {"measured_completed": measured_completed,
             "measured_failed": measured_failed, "stable_instances": summaries,
             "sibling_instances": sibling_s1,
-            "limitation": RECOVERED_HISTORY_LIMITATION,
+            "limitation": RECOVERED_HISTORY_LIMITATION + (
+                " " + SYSTEM_H6_LIMITATION if receipt.get("scope_kind") == "system" else ""),
             "instances": len(doc.get("instances", [])), "semantic_edges": len(doc.get("semantic_edges", []))}})
     return result
 
@@ -7504,7 +7676,7 @@ def run_system_mixed(ctx, cell_dir, backend):
     provider_f.unlink()
     seize_until_exec(e_pid, ctx, owned_e)
     owned, capture, errors, started, doc_path, log_path = spawn_inventory(
-        ctx, leg_dir, ["--system"], [], ["--manifest", str(manifest_path)],
+        ctx, leg_dir, ["--system", "--max-scan-pids", str(SYSTEM_SCAN_LIMIT)], [], ["--manifest", str(manifest_path)],
         backend, 300)
     try:
         ready = wait_inventory_ready(owned, errors, log_path, backend)
@@ -7550,6 +7722,7 @@ def run_system_mixed(ctx, cell_dir, backend):
     receipt = {
         "cell": "system-mixed", "leg": f"inventory/{backend}", "scope_kind": "system",
         "scope_label": "system",
+        "system_scan_limit": SYSTEM_SCAN_LIMIT,
         "owned_pids": [e_pid, s_pid, f_pid], "foreign_pids": [f_pid],
         "observer_started_ns": started, "observer_ready_ns": ready,
         "observer_stopped_ns": stopped, "observer_rc": obs_rc,

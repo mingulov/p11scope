@@ -24,6 +24,7 @@ import runpy
 import signal
 import shutil
 import subprocess
+import struct
 import sys
 import tempfile
 import textwrap
@@ -3987,7 +3988,13 @@ class ControlledInventoryObserver:
                     pin = next(pin for pin in self.providers.values() if pin["path"] == module_path)
                     key = owner.pid, ident["gen"], module_path
                     totals = H6["ledger_s1_totals"](batches, 0)
-                    count = totals[5].get(key, 0)
+                    # Physical publication is independently fed by actual
+                    # in-window calls. Provider A's exported getter is among
+                    # its selected physical hooks; S1 remains a separate row.
+                    count = sum(row["n"] for row in batches if row["module"] == module_path
+                        and row["t0"] >= self.started
+                        and (row["fn"] != "C_GetFunctionList" or module_path == self.provider["path"]))
+                    api_count = totals[5].get(key, 0)
                     last_seen = max((row["t1"] for row in batches if row["module"] == module_path), default=None)
                     edge = {"caller": context["id"], "module": module_id, "mapping": {"state": "mapped"},
                         "entries": {"count": count, "last_seen_ns": last_seen, "saturated": False,
@@ -4012,7 +4019,7 @@ class ControlledInventoryObserver:
                             "last_seen_ns": last_seen}
                         semantic = {"caller": context["id"], "module": module_id, "instance": instance_id,
                             "entries": {"unit": "api_entries", "count": None, "observation": "unavailable"},
-                            "api_returns": {"count": count, "saturated": False, "historical_only_returns": 0},
+                            "api_returns": {"count": api_count, "saturated": False, "historical_only_returns": 0},
                             "semantics": "observed", "mechanisms": mechanisms, "operations": ops,
                             "coverage": {"lossy": False, "reasons": []}}
                         if self.fault == "initial-no-calls" and instance_id not in self.instances and not final:
@@ -5603,6 +5610,164 @@ class R5FreshAdmissionTest(unittest.TestCase):
                 self.wait()
         finally:
             H6["ACTIVE_LEG"].reset(token)
+
+
+class InventoryPhysicalLedgerTest(unittest.TestCase):
+    """One held ELF and literal endpoint/count fixtures, independent of S1."""
+    record = R5FreshAdmissionTest.record
+    admission = R5FreshAdmissionTest.admission
+    release = R5FreshAdmissionTest.release
+    write = R5FreshAdmissionTest.write
+
+    def setUp(self):
+        R5FreshAdmissionTest.setUp(self)
+        # A real held/mapped file with hand-positioned ELF64 exported functions.
+        # No provider code is loaded or executed to establish these offsets.
+        blob = bytearray(0x500)
+        blob[:16] = b"\x7fELF\x02\x01\x01" + bytes(9)
+        struct.pack_into("<HHIQQQIHHHHHH", blob, 16,
+            3, 62, 1, 0, 64, 0x300, 0, 64, 56, 1, 64, 3, 2)
+        struct.pack_into("<IIQQQQQQ", blob, 64, 1, 5, 0x200, 0x1200, 0x1200, 0x80, 0x80, 0x1000)
+        names = b"\0C_GetFunctionList\0C_DigestInit\0C_Digest\0"
+        blob[0x400:0x400 + len(names)] = names
+        struct.pack_into("<IIQQQQIIQQ", blob, 0x340, 0, 11, 0, 0, 0x280, 96, 2, 0, 8, 24)
+        struct.pack_into("<IIQQQQIIQQ", blob, 0x380, 0, 3, 0, 0, 0x400, len(names), 0, 0, 1, 0)
+        offsets = {"C_GetFunctionList": 0x220, "C_DigestInit": 0x240, "C_Digest": 0x250}
+        for index, (name, offset) in enumerate(offsets.items(), 1):
+            struct.pack_into("<IBBHQQ", blob, 0x280 + index * 24,
+                names.index(name.encode()), 0x12, 0, 1, offset + 0x1000, 1)
+        self.provider_path = self.directory / "physical-provider.so"
+        self.provider_path.write_bytes(blob)
+        self.provider_pin = H6["FilePin"](self.provider_path)
+        self.addCleanup(self.provider_pin.close)
+        self.provider = H6["provider_receipt"](self.provider_pin)
+        self.hooks = {str(self.provider_path): {"provider": self.provider,
+            "functions": offsets, "getter_export_offset": 0x220}}
+        self.manifest = {"schema": "p11scope-manifest/5", "module_path": str(self.provider_path),
+            "objects": [{"id": 0, "path": str(self.provider_path),
+                         "identity": {"sha256": self.provider["sha256"]}}],
+            "provenance_objects": [{"path": str(self.provider_path),
+                "device_major": self.provider["dev"][0], "device_minor": self.provider["dev"][1],
+                "inode": self.provider["ino"], "identity": {"sha256": self.provider["sha256"]}}],
+            "surfaces": [{"source": {"kind": "legacy_function_list"}, "acquisition": {"status": "ok"},
+                "walk": {"status": "full"}, "functions": [{"name": name,
+                    "resolution": {"status": "resolved", "object": 0, "file_offset": offset}}
+                    for name, offset in offsets.items()]}]}
+        self.started = time.monotonic_ns()
+
+    def boundary_inputs(self, getter_n=1):
+        t = self.started + 1000
+        def batch(fn, n, phase, lower, upper):
+            return {"cell": "RX", "pid": self.owner.pid, "start": self.owner.identity["start_time"],
+                "gen": 1, "exe": str(self.pin.path), "module": str(self.provider_path),
+                "fn": fn, "mech": "-" if fn == "C_GetFunctionList" else "0x250", "n": n,
+                "bad": 0, "phase": phase, "t0": lower, "t1": upper}
+        batches = [batch("C_GetFunctionList", getter_n, "h6-setup", t - 900, t - 800),
+            batch("C_DigestInit", 5, "h6-warm1", t - 500, t - 400),
+            batch("C_Digest", 5, "h6-warm1", t - 300, t - 100)]
+        ack = {"command": "W", "gen": 1, "attempt": 1, "t0": t - 950, "t1": t}
+        marker = {"ack": ack, "batches": batches}
+        caller = self.admission(3, "c1", 1)["event"]["identity_context"]["caller"]
+        edge = {"caller": "c1", "module": "m0", "mapping": {"state": "mapped"},
+            "entries": {"count": 10 + getter_n, "last_seen_ns": t, "saturated": False,
+                        "coverage": {"state": "counted", "lossy": False}},
+            "identity_context": {"version": 1, "caller": caller, "module": {"id": "m0",
+                "device_major": self.provider["dev"][0], "device_minor": self.provider["dev"][1],
+                "inode": self.provider["ino"], "path": str(self.provider_path), "status": "observed"}}}
+        instance = {"id": "i1", "caller": "c1", "module": "m0", "state": "observed", "reason": None}
+        semantic = {"caller": "c1", "module": "m0", "instance": "i1", "semantics": "observed",
+            "api_returns": {"count": 10, "saturated": False, "historical_only_returns": 0},
+            "mechanisms": [{"mechanism_hex": "0x250", "calls": 10, "errors": 0}],
+            "operations": {"calls": 10, "completed": 5, "failed": 0, "unknown": 0,
+                "orphans": 0, "dropped": 0, "last_seen_ns": t - 100}, "coverage": {"lossy": False}}
+        records = [self.record(seq, kind, event) for seq, kind, event in (
+            (5, "edge_observed", edge), (6, "instance_observed", instance),
+            (7, "semantic_edge_observed", semantic), (8, "pass_committed", {"pass": 2,
+                "edge_events": 1, "instance_events": 1, "semantic_edge_events": 1}))]
+        for row in records:
+            row["at_ns"] = t + row["seq"]
+        image = self.pin.image_receipt({"image": 1}, self.owner)
+        admission = {"caller": "c1", "incarnation": 1, "seq": 3, "completed_pass": {"pass": 1}}
+        return records, image, admission, marker, batches
+
+    def boundary(self, data, hooks=None):
+        records, image, admission, marker, batches = data
+        function = H6["inventory_boundary"]
+        # The legacy API reaches its real count rejection before the new
+        # independently calibrated hook input is implemented.
+        kwargs = {"physical_hooks": self.hooks if hooks is None else hooks,
+                  "started_ns": self.started} if "physical_hooks" in inspect.signature(function).parameters else {}
+        return function(records, self.owner, image, self.provider, admission, 4, marker, batches, **kwargs)
+
+    def totals(self, batches, **kwargs):
+        function = H6["counted_totals"]
+        if "physical_hooks" in inspect.signature(function).parameters:
+            kwargs["physical_hooks"] = self.hooks
+        else:
+            kwargs.pop("scope_intervals", None)
+        return function(batches, self.started, **kwargs)
+
+    def test_captured_getter_is_physical_work_without_fabricating_s1_returns(self):
+        for n, physical in ((1, 11), (3, 13)):
+            with self.subTest(getter_calls=n):
+                data = self.boundary_inputs(n)
+                result = self.boundary(data)
+                self.assertIsNotNone(result, "proved physical getter was rejected using the S1 denominator")
+                self.assertEqual((result["counts"]["physical"], result["counts"]["api"]), (physical, 10))
+                early = result["early"]
+                self.assertEqual((early["physical_expected"], early["api_expected"]), (physical, 10))
+                self.assertEqual((early["physical_missed"], early["api_missed"]), (0, 0))
+                self.assertEqual((early["populations"]["setup"]["observed_physical"],
+                                  early["populations"]["setup"]["observed_api"]), (n, 0))
+                self.assertEqual(self.totals(data[-1])[(self.owner.pid, 1, str(self.provider_path))], physical)
+
+    def test_unproved_getter_cannot_excuse_an_excess_physical_count(self):
+        self.assertIsNone(self.boundary(self.boundary_inputs(), hooks={}))
+
+    def test_getter_outside_the_observer_or_selected_interval_is_not_counted(self):
+        key = self.owner.pid, 1, str(self.provider_path)
+        for lower, upper, intervals in ((self.started - 10, self.started - 1, None),
+                (self.started + 1, self.started + 2, [{"pid": self.owner.pid,
+                    "membership": "outside", "t0": self.started, "t1": self.started + 1000}])):
+            with self.subTest(window=(lower, upper), intervals=intervals):
+                rows = self.boundary_inputs()[-1]
+                rows[0].update(t0=lower, t1=upper)
+                kwargs = {} if intervals is None else {"scope_intervals": intervals + [{"pid": self.owner.pid,
+                    "membership": "selected", "t0": self.started + 400, "t1": self.started + 1000}]}
+                self.assertEqual(self.totals(rows, **kwargs).get(key, 0), 10)
+
+    def test_manifest_hooks_bind_the_export_to_the_same_held_physical_object(self):
+        function = H6.get("inventory_manifest_hooks")
+        self.assertTrue(callable(function), "qualification lacks held-provider physical hook calibration")
+        self.assertEqual(function(self.manifest, self.provider_pin), self.hooks)
+
+    def test_manifest_getter_unresolved_foreign_or_wrong_offset_never_grants_membership(self):
+        function = H6.get("inventory_manifest_hooks")
+        self.assertTrue(callable(function), "qualification lacks held-provider physical hook calibration")
+        for fault in ("unresolved", "foreign-object", "wrong-offset", "wrong-inode", "wrong-device", "wrong-digest"):
+            with self.subTest(fault=fault):
+                manifest = copy.deepcopy(self.manifest)
+                resolution = manifest["surfaces"][0]["functions"][0]["resolution"]
+                if fault == "unresolved":
+                    resolution["status"] = "unresolved"
+                elif fault == "foreign-object":
+                    resolution["object"] = 1
+                elif fault == "wrong-offset":
+                    resolution["file_offset"] = 0x240
+                elif fault == "wrong-inode":
+                    manifest["provenance_objects"][0]["inode"] += 1
+                elif fault == "wrong-device":
+                    manifest["provenance_objects"][0]["device_minor"] += 1
+                else:
+                    manifest["objects"][0]["identity"]["sha256"] = "f" * 64
+                with self.assertRaises(H6["SetupError"]):
+                    function(manifest, self.provider_pin)
+
+    def test_unhooked_function_cannot_enter_the_proved_physical_total(self):
+        rows = self.boundary_inputs()[-1]
+        rows.append({**rows[-1], "fn": "C_ForeignFunction", "n": 1})
+        with self.assertRaises(H6["SetupError"]):
+            self.totals(rows)
 
 
 class InventoryReadinessTest(unittest.TestCase):

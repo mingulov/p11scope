@@ -14,6 +14,9 @@ use crate::inventory_semantics::{
 use p11scope_manifest::identity::{inspect_file, mapping_file_key, open_object};
 use p11scope_manifest::manifest::*;
 
+#[path = "inventory_semantics_tests/initial_coverage.rs"]
+mod initial_coverage;
+
 struct ProviderFixture {
     dir: tempfile::TempDir,
     manifest: Manifest,

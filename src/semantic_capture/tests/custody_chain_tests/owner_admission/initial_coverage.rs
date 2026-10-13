@@ -1,5 +1,5 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! First semantic proof after committed physical use, through the real Cgroup
+//! First observed semantic registration after physical use, through the real Cgroup
 //! driver/H0 and registry publication. Only native transport is substituted;
 //! these controls do not qualify kernel attachment or count missing API calls.
 
@@ -191,17 +191,30 @@ fn provider_endpoint(scene: &AdmissionScene, subset: &AttestedSubset) -> AttachE
 /// process pin and publishes a count row for its actual retained provider.
 /// The caller chooses the publication boundary, never registry mutations.
 fn stage_physical_use(scene: &mut AdmissionScene, pid: u32, endpoint: AttachEndpoint) {
+    stage_physical_use_from(scene, pid, endpoint, None);
+}
+
+fn stage_physical_use_from(
+    scene: &mut AdmissionScene,
+    pid: u32,
+    endpoint: AttachEndpoint,
+    first_ns: Option<u64>,
+) {
     assert!(matches!(scene.scope, Scope::Cgroup { .. }));
     let domain = scene.identity.0;
     assert_ne!(domain, scene.lane.as_ref().unwrap().domain());
     let at_ns = now_ns();
+    let first_ns = first_ns.unwrap_or(at_ns + 3);
+    // A retained first-use row may arrive after semantic registration. Its
+    // binding sight and attachment precede that use; read anchors remain late.
+    assert!(first_ns > 3 && first_ns <= at_ns + 3);
     scene.coordinator.set_semantic_binding_clock(sight_clock);
-    SIGHT_NS.with(|clock| clock.set(at_ns + 2));
+    SIGHT_NS.with(|clock| clock.set(first_ns - 1));
     scene.coordinator.note_extend_receipt(&ExtendReceipt {
         attached: vec![AttachedEndpoint {
             id: endpoint.id,
             object: endpoint.object,
-            at_ns,
+            at_ns: first_ns - 3,
         }],
         custody: Some(ScopeCustody::CgroupHeld),
         activated_roots: true,
@@ -224,7 +237,7 @@ fn stage_physical_use(scene: &mut AdmissionScene, pid: u32, endpoint: AttachEndp
         endpoint.object,
         endpoint.id,
         pid,
-        at_ns + 3,
+        first_ns,
     );
     for batch in [
         NativeBatch::Witness(Box::new(physical_read(
@@ -369,31 +382,8 @@ fn prepare_scoped_first_receipt(scene: &mut AdmissionScene) {
     assert_eq!(scene.caller(), caller);
 }
 
-#[test]
-fn initial_coverage_discloses_prior_committed_use_without_reducing_early_unknowns() {
-    let mut scene = Box::new(AdmissionScene::new(Selection::Cgroup));
-    scene.prepare_without_cookie();
-    let caller = scene.caller();
-    let module = provider_module(&scene);
-    let endpoint = provider_endpoint(&scene, scene.lane.as_ref().unwrap().subset());
+fn route_early_unknown_pair(scene: &mut AdmissionScene) {
     let pid = scene.child.id();
-    stage_physical_use(&mut scene, pid, endpoint);
-    scene.coordinator.commit_batch(false).unwrap();
-    let physical = physical_snapshot(&scene);
-    assert_eq!(physical.len(), 1);
-    assert_eq!(
-        (physical[0].0, physical[0].1, physical[0].2),
-        (caller, module, 7)
-    );
-    assert!(matches!(
-        physical[0].3,
-        UseCoverage::Counted { lossy: false, .. }
-    ));
-    assert!(
-        coverage_gaps(&scene).is_empty(),
-        "no semantic authority yet"
-    );
-
     scene.observe_entry();
     // HeldIo uses this map only to encode genuine deterministic CALL bytes.
     // H0 receives no selected tick pins until the coordinator admits custody.
@@ -431,17 +421,44 @@ fn initial_coverage_discloses_prior_committed_use_without_reducing_early_unknown
         .as_mut()
         .unwrap()
         .install_test_io(Box::new(scene.h0.clone()));
+}
+
+#[test]
+fn initial_coverage_discloses_prior_committed_use_without_reducing_early_unknowns() {
+    let mut scene = Box::new(AdmissionScene::new(Selection::Cgroup));
+    scene.prepare_without_cookie();
+    let caller = scene.caller();
+    let module = provider_module(&scene);
+    let endpoint = provider_endpoint(&scene, scene.lane.as_ref().unwrap().subset());
+    let pid = scene.child.id();
+    stage_physical_use(&mut scene, pid, endpoint);
+    scene.coordinator.commit_batch(false).unwrap();
+    let physical = physical_snapshot(&scene);
+    assert_eq!(physical.len(), 1);
+    assert_eq!(
+        (physical[0].0, physical[0].1, physical[0].2),
+        (caller, module, 7)
+    );
+    assert!(matches!(
+        physical[0].3,
+        UseCoverage::Counted { lossy: false, .. }
+    ));
+    assert!(coverage_gaps(&scene).is_empty(), "no registration yet");
+    route_early_unknown_pair(&mut scene);
 
     admit_fresh_pair(&mut scene);
     let gaps = coverage_gaps(&scene);
     assert_eq!(
         gaps.len(),
         1,
-        "first successful proof must disclose the earlier physical-use interval"
+        "first observed registration must disclose the earlier physical-use interval"
     );
     assert_eq!(gaps[0].caller, Some(caller));
     assert_eq!(gaps[0].module, Some(module));
-    assert!(gaps[0].subject.contains("earlier physical provider use"));
+    assert_eq!(
+        gaps[0].subject,
+        "physical provider use preceded first observed semantic registration"
+    );
     assert!(gaps[0].budget.is_none());
     let gap_index = scene
         .coordinator
@@ -481,7 +498,7 @@ fn initial_coverage_discloses_prior_committed_use_without_reducing_early_unknown
 }
 
 #[test]
-fn initial_coverage_same_publication_physical_use_stays_clean() {
+fn initial_coverage_same_publication_discloses_physical_use_before_registration() {
     let mut scene = Box::new(AdmissionScene::new(Selection::Cgroup));
     scene.prepare_without_cookie();
     let endpoint = provider_endpoint(&scene, scene.lane.as_ref().unwrap().subset());
@@ -513,10 +530,118 @@ fn initial_coverage_same_publication_physical_use_stays_clean() {
     assert!(!row.lossy);
     assert_eq!(row.semantics.as_ref().unwrap().completed(), 1);
     assert_eq!(physical_snapshot(&scene)[0].2, 7);
+    let registry = scene.coordinator.registry();
     assert!(
-        coverage_gaps(&scene).is_empty(),
-        "same publication starts both coverages"
+        registry
+            .edge(scene.caller(), provider_module(&scene))
+            .unwrap()
+            .entry_first_seen_ns
+            .unwrap()
+            < registry.instances().next().unwrap().first_seen_ns
     );
+    let gaps = coverage_gaps(&scene);
+    assert_eq!(
+        gaps.len(),
+        1,
+        "physical use precedes the first registration even within one publication"
+    );
+    assert_eq!(
+        (gaps[0].caller, gaps[0].module),
+        (Some(scene.caller()), Some(provider_module(&scene)))
+    );
+    let index = scene
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .position(|gap| gap == &gaps[0])
+        .unwrap();
+    scene.pass();
+    assert_eq!(scene.coordinator.registry().gap_repeats()[index], 1);
+}
+
+#[test]
+fn initial_coverage_physical_use_after_first_registration_stays_clean() {
+    let mut scene = Box::new(AdmissionScene::new(Selection::Cgroup));
+    scene.prepare_without_cookie();
+    admit_fresh_pair(&mut scene);
+    let endpoint = provider_endpoint(&scene, scene.lane.as_ref().unwrap().subset());
+    let pid = scene.child.id();
+    stage_physical_use(&mut scene, pid, endpoint);
+    scene.coordinator.commit_batch(false).unwrap();
+    assert_eq!(physical_snapshot(&scene)[0].2, 7);
+    assert!(coverage_gaps(&scene).is_empty());
+    let row = scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .next()
+        .unwrap();
+    assert_eq!(row.api_returns, Some(2));
+    assert_eq!(row.historical_only_returns, 0);
+    assert!(!row.lossy);
+    assert_eq!(row.semantics.as_ref().unwrap().completed(), 1);
+}
+
+#[test]
+fn initial_coverage_delayed_physical_reveal_preserves_early_unknowns_and_current_calls() {
+    let mut scene = Box::new(AdmissionScene::new(Selection::Cgroup));
+    scene.prepare_without_cookie();
+    route_early_unknown_pair(&mut scene);
+    let first_ns = now_ns();
+    admit_fresh_pair(&mut scene);
+    assert!(physical_snapshot(&scene).is_empty());
+    assert!(coverage_gaps(&scene).is_empty());
+    assert!(
+        first_ns
+            < scene
+                .coordinator
+                .registry()
+                .instances()
+                .next()
+                .unwrap()
+                .first_seen_ns
+    );
+    let endpoint = provider_endpoint(&scene, scene.lane.as_ref().unwrap().subset());
+    let pid = scene.child.id();
+    stage_physical_use_from(&mut scene, pid, endpoint, Some(first_ns));
+    scene.coordinator.commit_batch(false).unwrap();
+    let physical = physical_snapshot(&scene);
+    assert_eq!(physical[0].2, 7);
+    let gaps = coverage_gaps(&scene);
+    assert_eq!(
+        gaps.len(),
+        1,
+        "late count reveal must not hide earlier physical use"
+    );
+    assert_eq!(
+        (gaps[0].caller, gaps[0].module),
+        (Some(scene.caller()), Some(provider_module(&scene)))
+    );
+    let index = scene
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .position(|gap| gap == &gaps[0])
+        .unwrap();
+    scene.pass();
+    assert_eq!(scene.coordinator.registry().gap_repeats()[index], 1);
+    assert_eq!(physical_snapshot(&scene), physical);
+    let row = scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .next()
+        .unwrap();
+    assert_eq!(
+        row.api_returns,
+        Some(2),
+        "earlier Unknown returns do not reappear"
+    );
+    assert_eq!(row.historical_only_returns, 0);
+    assert!(!row.lossy);
+    assert_eq!(row.semantics.as_ref().unwrap().completed(), 1);
 }
 
 #[test]

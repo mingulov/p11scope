@@ -99,8 +99,9 @@ pub(crate) struct CleanupReceipt {
     pub failures: Vec<String>,
 }
 
-pub(crate) type BoxCloser =
-    Box<dyn Fn(&mut Option<OwnedLink>, ProducerProgram) -> Result<(), String> + Send + Sync>;
+type LinkCloser =
+    dyn Fn(&mut Option<OwnedLink>, ProducerProgram) -> Result<(), String> + Send + Sync;
+pub(crate) type BoxCloser = Box<LinkCloser>;
 type BoxClock = Arc<dyn Fn() -> Duration + Send + Sync>;
 
 /// Legacy functional fixtures intentionally serialize their mutable leaf.
@@ -768,9 +769,7 @@ impl Drop for CleanupWorker {
 fn run_cleanup(
     rx: mpsc::Receiver<Command>,
     state: Arc<Mutex<WorkerState>>,
-    closer: Arc<
-        dyn Fn(&mut Option<OwnedLink>, ProducerProgram) -> Result<(), String> + Send + Sync,
-    >,
+    closer: Arc<LinkCloser>,
     ready: mpsc::SyncSender<Result<(), String>>,
 ) {
     let close_state = Arc::clone(&state);

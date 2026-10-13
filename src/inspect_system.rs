@@ -3629,8 +3629,9 @@ fn apply_kernel_fallback(
     }
 }
 
-fn note_anchor_setup_fallback(shared: &mut IdentityRunShared, _capture_excluded: bool) {
-    if shared.selection == crate::cli::IdentityBackendSelection::Auto
+fn note_anchor_setup_fallback(shared: &mut IdentityRunShared, capture_excluded: bool) {
+    if !capture_excluded
+        && shared.selection == crate::cli::IdentityBackendSelection::Auto
         && shared.backend == IdentityBackend::Userspace
     {
         shared.auto_ineligible = true;
@@ -3685,8 +3686,13 @@ fn attribute_pass_with_kernel(
     // anchors ride in custody. Held files only, never a pathname.
     let admitted: Vec<(ObjectKey, PinnedObjectId)> =
         bound.aggregate.sweep_match_keys().into_iter().collect();
-    let pass =
-        crate::discovery::kernel_identity::AnchorPass::prepare(&bound.aggregate, admitted, custody);
+    let pass = crate::discovery::kernel_identity::AnchorPass::prepare_excluding(
+        &bound.aggregate,
+        admitted,
+        custody,
+        collection.budget.kernel_anchor_exclusions(),
+    );
+    let capture_excluded = pass.only_capture_excluded();
     let install_deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
     // The install borrows the session exclusively; its scope ends before
     // the common tail below touches the session again. `Some` carries the
@@ -3774,7 +3780,7 @@ fn attribute_pass_with_kernel(
             // for later passes with the finite reason recorded.
             {
                 let mut shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
-                note_anchor_setup_fallback(&mut shared, false);
+                note_anchor_setup_fallback(&mut shared, capture_excluded);
                 shared.session = Some(session);
             }
             attribute_sweep_with(
@@ -4267,6 +4273,15 @@ mod tests {
 
     #[test]
     fn capture_watched_all_excluded_pass_keeps_later_auto_kernel_eligible() {
+        assert_capture_exclusion_selection(false);
+    }
+
+    #[test]
+    fn capture_watched_mixed_setup_failure_keeps_auto_failure_sticky() {
+        assert_capture_exclusion_selection(true);
+    }
+
+    fn assert_capture_exclusion_selection(missing_anchor: bool) {
         use crate::discovery::kernel_identity::{
             AnchorPass, ExaminedCustody, KernelAnchorExclusions,
         };
@@ -4290,9 +4305,17 @@ mod tests {
                 BTreeMap::new(),
             );
             let exclusions = KernelAnchorExclusions::from_targets([&target]);
-            let admitted = excluded.then_some((target.object_key(), id));
+            let mut admitted: Vec<_> = excluded
+                .then_some((target.object_key(), id))
+                .into_iter()
+                .collect();
+            if missing_anchor {
+                let mut absent = target.object_key();
+                absent.inode += 1;
+                admitted.push((absent, crate::discovery::identity::PinnedObjectId(u32::MAX)));
+            }
             let pass = AnchorPass::prepare_excluding(&pins, admitted, custody, &exclusions);
-            assert_eq!(pass.only_capture_excluded(), excluded);
+            assert_eq!(pass.only_capture_excluded(), excluded && !missing_anchor);
             super::note_anchor_setup_fallback(
                 &mut shared.lock().unwrap(),
                 pass.only_capture_excluded(),
@@ -4302,7 +4325,7 @@ mod tests {
                     decide_pass_attempt(&shared, true),
                     super::PassAttempt::Kernel { .. }
                 ),
-                excluded,
+                excluded && !missing_anchor,
                 "intentional exclusion disabled future unrelated kernel proof"
             );
             assert_eq!(

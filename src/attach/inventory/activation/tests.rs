@@ -17,6 +17,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[path = "retirement_concurrency_tests.rs"]
+mod bounded_concurrency;
+
 fn budget(n: u32) -> InventoryBudget {
     InventoryBudget::new(u64::from(n), u64::from(n) * 8).unwrap()
 }

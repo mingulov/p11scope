@@ -1108,4 +1108,40 @@ fn owner_admission_rejected_first_scope_cuts_unread_pre_refusal_calls() {
         "a rejected first scope admission must fence unread old operations"
     );
     assert_eq!(scene.h0.0.borrow().capture.continuity_cuts(), 1);
+
+    let original = scene
+        .coordinator
+        .semantic_bindings()
+        .get(scene.caller())
+        .unwrap()
+        .pin();
+    assert_eq!(scene.refresh_direct().0, vec![image(7)]);
+    {
+        let mut owned = scene.h0.0.borrow_mut();
+        assert_eq!(owned.io.held.script.last_health.fault, 1);
+        owned.io.held.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+        owned.io.held.enqueue(pid, 0, "C_Sign", 0, 0);
+    }
+    scene.pass();
+    assert!(Arc::ptr_eq(
+        &original,
+        &scene
+            .coordinator
+            .semantic_bindings()
+            .get(scene.caller())
+            .unwrap()
+            .pin()
+    ));
+    assert_eq!(scene.h0.0.borrow().capture.continuity_cuts(), 1);
+    assert_eq!(
+        scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|row| row.semantics.as_ref())
+            .map(|reducer| reducer.completed())
+            .sum::<u64>(),
+        1,
+        "a real fresh receipt and fault-1 pair recover useful same-custody work"
+    );
 }

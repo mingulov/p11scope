@@ -828,6 +828,7 @@ impl CollectionWork {
 pub struct CaptureWorkBudget {
     collection_work: Option<CollectionWork>,
     retained_mapped: crate::discovery::identity::RetainedMappedIdentities,
+    kernel_anchor_exclusions: crate::discovery::kernel_identity::KernelAnchorExclusions,
     limits: ScanLimits,
     policy: DiscoveryPolicy,
     domain: Option<Arc<BudgetDomain>>,
@@ -872,6 +873,8 @@ impl CaptureWorkBudget {
         Self {
             collection_work: None,
             retained_mapped: crate::discovery::identity::RetainedMappedIdentities::default(),
+            kernel_anchor_exclusions:
+                crate::discovery::kernel_identity::KernelAnchorExclusions::default(),
             limits,
             policy: DiscoveryPolicy::DetailedLegacy,
             domain: None,
@@ -921,6 +924,20 @@ impl CaptureWorkBudget {
         file: &File,
     ) -> Option<crate::discovery::identity::MappedFile> {
         self.retained_mapped.identity_for(file)
+    }
+
+    pub(crate) fn with_kernel_anchor_exclusions(
+        mut self,
+        exclusions: crate::discovery::kernel_identity::KernelAnchorExclusions,
+    ) -> Self {
+        self.kernel_anchor_exclusions = exclusions;
+        self
+    }
+
+    pub(crate) fn kernel_anchor_exclusions(
+        &self,
+    ) -> &crate::discovery::kernel_identity::KernelAnchorExclusions {
+        &self.kernel_anchor_exclusions
     }
 
     pub(crate) fn has_collection_work(&self) -> bool {

@@ -5,7 +5,10 @@
 use super::confirm_shards::{
     AcceptedBatch, AcceptedKind, AcceptedRequest, SegmentProof, prove_and_finish_prepared,
 };
-use super::identity::{ExaminedObject, HeldExaminedObject, PinnedObjectId, PinnedObjects};
+use super::identity::{
+    ExaminedObject, FileIdentity, HeldExaminedObject, PinnedObjectId, PinnedObjects,
+    RetainedInventoryTarget,
+};
 use super::scan::CaptureWorkBudget;
 use super::sweep_attribution::{
     ConfirmIo, Confirmation, IoResources, KnownKeyIndex, MappedIdentities, MemberProbe,
@@ -20,7 +23,55 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::fd::AsFd;
+use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
+
+/// A bounded snapshot of capture-retained files that must not be mapped by
+/// identity acceleration. These keys only exclude work: collisions can lose
+/// acceleration, never establish file identity or admission authority.
+#[derive(Debug, Default)]
+pub(crate) struct KernelAnchorExclusions {
+    keys: BTreeSet<ObjectKey>,
+    files: BTreeMap<FileIdentity, Arc<File>>,
+    unavailable: bool,
+}
+
+impl KernelAnchorExclusions {
+    pub(crate) fn from_targets<'a>(
+        targets: impl IntoIterator<Item = &'a RetainedInventoryTarget>,
+    ) -> Self {
+        let mut result = Self::default();
+        for target in targets {
+            result.keys.insert(target.object_key());
+            let file = target.retirement_lease();
+            match file.metadata() {
+                Ok(metadata) => {
+                    result
+                        .files
+                        .entry(FileIdentity {
+                            dev: metadata.dev(),
+                            ino: metadata.ino(),
+                        })
+                        .or_insert(file);
+                }
+                Err(_) => result.unavailable = true,
+            }
+        }
+        result
+    }
+
+    pub(crate) fn excludes(&self, keys: &BTreeSet<ObjectKey>, file: &File) -> bool {
+        !self.keys.is_empty()
+            && (self.unavailable
+                || keys.iter().any(|key| self.keys.contains(key))
+                || file.metadata().map_or(true, |metadata| {
+                    self.files.contains_key(&FileIdentity {
+                        dev: metadata.dev(),
+                        ino: metadata.ino(),
+                    })
+                }))
+    }
+}
 
 pub(crate) const EXAMINED_ANCHOR_CAP: usize = 512;
 pub(crate) const TOTAL_ANCHOR_CAP: usize = 1024;
@@ -1070,6 +1121,19 @@ impl Drop for DropObserver {
 }
 
 impl<'p> AnchorPass<'p> {
+    pub(crate) fn only_capture_excluded(&self) -> bool {
+        false
+    }
+
+    pub(crate) fn prepare_excluding(
+        pins: &'p PinnedObjects,
+        admitted: impl IntoIterator<Item = (ObjectKey, PinnedObjectId)>,
+        custody: ExaminedCustody,
+        _exclusions: &KernelAnchorExclusions,
+    ) -> Self {
+        Self::prepare(pins, admitted, custody)
+    }
+
     pub(crate) fn prepare(
         pins: &'p PinnedObjects,
         admitted: impl IntoIterator<Item = (ObjectKey, PinnedObjectId)>,

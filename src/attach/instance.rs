@@ -227,6 +227,39 @@ impl InstanceTracking {
         self.links.len()
     }
 
+    /// Transfer every original hook owner out of this Session's Aya registry.
+    /// FEntry/FExit wrappers are exactly FdLink-backed; conversion is infallible
+    /// and does not close/reopen the link. A failed take leaves the residual
+    /// owner in Aya, and terminal cleanup must retain the complete Session.
+    pub(super) fn take_owned_hooks(
+        &mut self,
+        ebpf: &mut Ebpf,
+    ) -> Vec<Result<(super::OwnedLink, super::ProducerProgram)>> {
+        std::mem::take(&mut self.links)
+            .into_iter()
+            .map(|(program, link)| {
+                let hook = ebpf.program_mut(program).with_context(|| {
+                    format!("program {program} missing during instance hook retirement")
+                })?;
+                let owned = match link {
+                    HookLink::Entry(id) => super::OwnedLink::Fd(
+                        <&mut FEntry>::try_from(hook)?
+                            .take_link(id)
+                            .with_context(|| format!("taking original fentry {program}"))?
+                            .into(),
+                    ),
+                    HookLink::Exit(id) => super::OwnedLink::Fd(
+                        <&mut FExit>::try_from(hook)?
+                            .take_link(id)
+                            .with_context(|| format!("taking original fexit {program}"))?
+                            .into(),
+                    ),
+                };
+                Ok((owned, super::ProducerProgram::InstanceHook(program)))
+            })
+            .collect()
+    }
+
     /// Loads hooks only. Never fails ordinary capture: the retained result
     /// names the first refusal and cannot authorize attachment or coverage.
     /// Refusal order is measurement toggle, then policy (Task 1d: metrics

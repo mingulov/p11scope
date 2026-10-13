@@ -748,8 +748,88 @@ fn owner_admission_system_uses_detailed_owner_receipt() {
     admission_positive(Selection::System);
 }
 
+fn later_cached_calls_refresh_current_owner_proof(selection: Selection) {
+    let mut scene = AdmissionScene::new(selection);
+    scene.prepare_without_cookie();
+    scene.observe_entry();
+    for _ in 0..3 {
+        scene.pass();
+    }
+    scene.assert_admitted();
+    let original = scene.coordinator.registry().instances().next().unwrap().id;
+    let validations = scene.h0.0.borrow().validations;
+    let pid = scene.child.id();
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .held
+        .enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .held
+        .enqueue(pid, 0, "C_Sign", 0, 0);
+    scene.pass();
+
+    scene.assert_admitted();
+    assert_eq!(
+        scene
+            .coordinator
+            .registry()
+            .instances()
+            .map(|record| record.id)
+            .collect::<Vec<_>>(),
+        vec![original],
+        "later calls must retain the same admitted instance"
+    );
+    let rows: Vec<_> = scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .map(|row| {
+            (
+                row.api_returns,
+                row.historical_only_returns,
+                row.lossy,
+                row.semantics.as_ref().map_or(0, |s| s.completed()),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![(Some(2), 0, false, 1)],
+        "an unchanged live owner needs a fresh same-publication receipt"
+    );
+    assert!(
+        scene.h0.0.borrow().validations > validations,
+        "the finalizer must validate the new H0 receipt"
+    );
+    assert!(
+        scene
+            .coordinator
+            .registry()
+            .edges_of(scene.caller())
+            .all(|edge| edge.entry_count == 0),
+        "semantic calls must not invent Inventory physical counts"
+    );
+}
+
 #[test]
-fn owner_admission_quiet_cached_returns_keep_historical_standing() {
+fn owner_admission_pid_later_cached_calls_refresh_current_owner_proof() {
+    later_cached_calls_refresh_current_owner_proof(Selection::Pid);
+}
+
+#[test]
+fn owner_admission_cgroup_later_cached_calls_refresh_current_owner_proof() {
+    later_cached_calls_refresh_current_owner_proof(Selection::Cgroup);
+}
+
+#[test]
+fn owner_admission_cached_returns_without_current_proof_keep_historical_standing() {
     let mut scene = AdmissionScene::new(Selection::Pid);
     scene.prepare_without_cookie();
     scene.observe_entry();
@@ -757,6 +837,9 @@ fn owner_admission_quiet_cached_returns_keep_historical_standing() {
         scene.pass();
     }
     scene.assert_admitted();
+    // The real H0 scan now has no current Detailed image to prove. A cached
+    // Joined route still counts the calls, but cannot mint current coverage.
+    scene.h0.0.borrow_mut().io.current = None;
     let pid = scene.child.id();
     scene
         .h0

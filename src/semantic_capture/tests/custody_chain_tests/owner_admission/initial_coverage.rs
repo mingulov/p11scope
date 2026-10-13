@@ -415,7 +415,7 @@ fn route_early_unknown_pair(scene: &mut AdmissionScene) {
     assert!(scene.h0.0.borrow().io.tick_pins.is_empty());
     assert_eq!(scene.coordinator.semantic_bindings().len(), 0);
     assert_eq!(scene.coordinator.registry().instances().count(), 0);
-    assert!(coverage_gaps(&scene).is_empty());
+    assert!(coverage_gaps(scene).is_empty());
     scene
         .lane
         .as_mut()

@@ -2084,7 +2084,7 @@ def _evaluate_inventory_h6(doc, ledgers, receipt):
     # These disclosures need their full controlled scope/ledger proof below;
     # a subject-only allowlist can never authorize them.
     allowed_gaps = (set(receipt.get("allowed_gap_subjects", []))
-                    - CGROUP_DISCLOSURE_SUBJECTS - SYSTEM_DISCLOSURE_SUBJECTS)
+                    - CGROUP_DISCLOSURE_SUBJECTS - SYSTEM_DISCLOSURE_SUBJECTS - SEMANTIC_EARLY_SUBJECTS)
     allow_path_gaps = receipt.get("allow_path_gaps", False)
     gaps = [(gap.get("subject"), gap.get("detail")) for gap in doc.get("gaps", [])]
     for subject, _ in gaps:
@@ -2271,6 +2271,109 @@ def inventory_instance_history_errors(records, instance_id, caller, module, rece
     return errors
 
 
+def inventory_sibling_current_totals(row):
+    """An observed quiet registration has zero materialized counters, not zero use."""
+    if row.get("api_returns") == {"unit": "api_returns", "count": None,
+                "saturated": False, "historical_only_returns": 0}:
+        if (row.get("coverage") == {"lossy": False, "reasons": ["no_calls"]}
+                and row.get("entries") == {"unit": "api_entries", "count": None, "observation": "unavailable"}
+                and row.get("semantics") == "unknown (no calls observed)"
+                and row.get("mechanisms") is None and row.get("operations") is None):
+            return {**{key: 0 for key in ("api", "calls", "completed", "failed", "unknown", "orphans", "dropped")},
+                    "mechanisms": {}}
+    totals = inventory_semantic_totals(row)
+    ops = row.get("operations") or {}
+    return totals if totals is not None and not ops.get("active") and ops.get("cancelled", 0) == 0 else None
+
+
+def inventory_sibling_boundary(records, image, provider, admission, marker, *, physical_hooks=None, started_ns=0):
+    """Retain actual completed MS/A rows while W1 is acknowledged idle."""
+    owner = SimpleNamespace(pid=image["pid"], identity={"start_time": image["start_time"]})
+    by_seq = {row["seq"]: row for row in records}
+    admitted = by_seq.get(admission["seq"])
+    first_pass = by_seq.get(admission["completed_pass"]["seq"])
+    if (admitted is None or first_pass is None or first_pass["kind"] != "pass_committed"
+            or not admitted["seq"] < first_pass["seq"] or r5_pass_receipt(first_pass) != admission["completed_pass"]
+            or admitted["kind"] != "caller_event" or admitted["event"].get("event") != "admitted"
+            or r5_caller_context(admitted["event"], owner, image)["id"] != admission["caller"]
+            or r5_caller_context(admitted["event"], owner, image)["incarnation"] != 0
+            or image["image"] != 0 or admission["incarnation"] != 0):
+        raise SetupError("System sibling baseline lacks its original admission/image")
+    ack = marker["ack"]
+    if (ack["command"] != "W" or ack["attempt"] != 1 or ack["seq"] != 1 or ack["gen"] != 0
+            or ack["pid"] != owner.pid or ack["start"] != image["start_time"] or ack["exe"] != image["path"]
+            or ack["idle"] != 1 or ack["rv"] != 0
+            or not first_pass["at_ns"] < marker["dispatch_ns"] <= ack["t0"] <= ack["t1"] < ack["deadline"]
+            or not marker["batches"] or any(row["pid"] != owner.pid or row["start"] != image["start_time"]
+                or row["gen"] != 0 or row["exe"] != image["path"]
+                or row["phase"] not in ("h6-setup", "h6-warm1")
+                or not ack["t0"] <= row["t0"] <= row["t1"] <= ack["t1"] for row in marker["batches"])):
+        raise SetupError("System sibling baseline lacks its exact W1 ledger/idle acknowledgment")
+    physical, instances, semantics, settled, emitted = None, {}, {}, None, Counter()
+    for row in records:
+        event, kind = row["event"], row["kind"]
+        if row["seq"] <= first_pass["seq"]:
+            continue
+        emission = {"edge_observed": "edge_events", "instance_observed": "instance_events",
+                    "semantic_edge_observed": "semantic_edge_events"}.get(kind)
+        if emission:
+            emitted[emission] += 1
+        if kind == "caller_event" and event.get("event") != "admitted" and (
+                event.get("caller") == admission["caller"] or event.get("old") == admission["caller"]):
+            raise SetupError("System sibling baseline crossed an image transition")
+        if kind == "edge_observed" and event.get("caller") == admission["caller"]:
+            if r5_caller_context(event, owner, image)["incarnation"] != 0:
+                raise SetupError("System sibling baseline changed incarnation")
+            module = r5_admitted_subject(event, "module")
+            if (module.get("status") == "observed" and module.get("id") == event["module"]
+                    and [module.get("device_major"), module.get("device_minor")] == provider["mapping"]["dev"]
+                    and module.get("inode") == provider["mapping"]["ino"]):
+                if physical is not None and physical["event"]["module"] != event["module"]:
+                    raise SetupError("System sibling baseline has ambiguous provider modules")
+                physical, settled = row, None
+        elif kind == "instance_observed" and event.get("caller") == admission["caller"]:
+            instances[event["id"]], settled = row, None
+        elif kind == "semantic_edge_observed" and event.get("caller") == admission["caller"]:
+            semantics[event["instance"]], settled = row, None
+        elif kind == "pass_committed" and not event.get("final"):
+            r5_pass_receipt(row)
+            deferred = [event.get(key) for key in
+                ("edge_events_deferred", "instance_events_deferred", "semantic_edge_events_deferred")]
+            written = [event.get(key) for key in ("edge_events", "instance_events", "semantic_edge_events")]
+            if (any(type(value) is not int or value < 0 for value in deferred + written)
+                    or any(event[key] < emitted[key] for key in emitted)
+                    or event["pass"] <= first_pass["event"]["pass"]):
+                raise SetupError("System sibling baseline lacks settled emitter accounting")
+            emitted.clear()
+            if not any(deferred) and row["at_ns"] >= ack["t1"]:
+                settled = row
+    if physical is None or settled is None:
+        return None
+    edge = physical["event"]
+    candidates = [row for row in instances.values() if row["event"].get("module") == edge["module"]]
+    if len(candidates) != 1:
+        return None
+    instance = candidates[0]
+    semantic = semantics.get(instance["event"]["id"])
+    if (semantic is None or semantic["event"].get("module") != edge["module"]
+            or (instance["event"].get("state"), instance["event"].get("reason")) != ("observed", None)
+            or any(row["seq"] >= settled["seq"] for row in (physical, instance, semantic))
+            or (edge.get("mapping") or {}).get("state") != "mapped"
+            or coverage_of(edge).get("state") != "counted" or coverage_of(edge).get("lossy")
+            or (edge.get("entries") or {}).get("saturated") is not False):
+        return None
+    key = owner.pid, 0, provider["path"]
+    expected = counted_totals(marker["batches"], started_ns, physical_hooks=physical_hooks).get(key, 0)
+    if type(edge["entries"].get("count")) is not int or edge["entries"]["count"] != expected:
+        return None
+    counts = inventory_sibling_current_totals(semantic["event"])
+    if counts is None or any(counts[name] != 0 for name in ("unknown", "orphans", "dropped")):
+        return None
+    return {"image": image, "provider": provider, "admission": admission, "marker": marker,
+        "physical": physical, "instance": instance, "semantic": semantic, "pass": settled,
+        "tuple": [image["start_time"], admission["caller"], 0, edge["module"], instance["event"]["id"]]}
+
+
 def inventory_sibling_s1_errors(doc, ledger, receipt, records):
     """Judge attested MS history against MS's own in-capture ledger."""
     errors, summaries = [], []
@@ -2302,7 +2405,53 @@ def inventory_sibling_s1_errors(doc, ledger, receipt, records):
                 continue
             population = [row for row in ledger["batches"] if row["pid"] == pid and row["gen"] == gen
                 and row["t0"] >= receipt["observer_started_ns"] and row["t1"] <= receipt["observer_stopped_ns"]]
-            totals, key = ledger_s1_totals(population, 0), (pid, gen, path)
+            saved = control.get("sibling_baseline")
+            if saved is None:
+                errors.append(f"{label}: original same-stream sibling baseline is absent")
+                continue
+            by_seq = {row["seq"]: row for row in records}
+            before = [row for row in records if row["seq"] <= saved["pass"]["seq"]]
+            baseline = inventory_sibling_boundary(before, saved["image"], saved["provider"],
+                saved["admission"], saved["marker"], physical_hooks=receipt.get("physical_hooks"),
+                started_ns=receipt["observer_started_ns"])
+            if (baseline is None or any(saved.get(key) != value for key, value in baseline.items())
+                    or any(by_seq.get(saved[field]["seq"]) != saved[field]
+                           for field in ("physical", "instance", "semantic", "pass"))
+                    or saved["provider"] != receipt["providers"][name]
+                    or saved["tuple"] != [ident["start"], caller, gen, module, instances[0]["id"]]
+                    or saved["image"]["pid"] != pid or saved["image"]["path"] != ident["exe"]
+                    or not saved["pass"]["at_ns"] <= saved["observed_ns"] < control["stages"][0]["t0"]
+                    or sum(row == saved["marker"]["ack"] for row in ledger["acks"]) != 1):
+                errors.append(f"{label}: original sibling baseline borrowed identity, stream or later work")
+                continue
+            early_batches = [row for row in population if row["phase"] in ("h6-setup", "h6-warm1")]
+            later = [row for row in population if row["phase"] not in ("h6-setup", "h6-warm1")]
+            if (early_batches != saved["marker"]["batches"] or any(row["t0"] <= saved["observed_ns"]
+                or row["phase"] not in ("h6-warm2", "h6-warm3", "h6-warm4") for row in later)):
+                errors.append(f"{label}: sibling population crossed its W1 baseline")
+                continue
+            prefix, key = ledger_s1_totals(early_batches, 0), (pid, gen, path)
+            observed = inventory_sibling_current_totals(saved["semantic"]["event"])
+            wanted_prefix = {"api": prefix[5].get(key, 0), "calls": prefix[4].get(key, 0),
+                "completed": prefix[2].get(key, 0), "failed": prefix[3].get(key, 0),
+                "unknown": 0, "orphans": 0, "dropped": 0}
+            if any(observed[field] > value for field, value in wanted_prefix.items()):
+                errors.append(f"{label}: sibling baseline exceeds its independent early ledger")
+            gaps = inventory_early_gaps(before, SimpleNamespace(pid=pid), saved["admission"], module,
+                min(row["t0"] for row in early_batches), saved["pass"]["at_ns"])
+            gaps = [row for row in gaps if row["event"].get("reason") == "before_semantic_boundary"
+                    and row["event"].get("subject") in SEMANTIC_EARLY_SUBJECTS]
+            if any(observed[field] < value for field, value in wanted_prefix.items()) and not gaps:
+                errors.append(f"{label}: sibling early deficit lacks an actual caller/module semantic boundary gap")
+            prefix_mechs = {mech: [value, prefix[1].get(key + (mech,), 0)] for (*group, mech), value
+                            in prefix[0].items() if tuple(group) == key}
+            if (any(observed["mechanisms"].get(mech, [0, 0])[i] < values[i]
+                    for mech, values in prefix_mechs.items() for i in (0, 1)) and not gaps):
+                errors.append(f"{label}: sibling early mechanism deficit lacks an actual semantic boundary gap")
+            for mech, values in observed["mechanisms"].items():
+                if any(value > want for value, want in zip(values, prefix_mechs.get(mech, [0, 0]))):
+                    errors.append(f"{label}: sibling baseline mechanism exceeds its early ledger")
+            totals = ledger_s1_totals(later, 0)
             expected = {"calls": totals[4].get(key, 0), "completed": totals[2].get(key, 0),
                 "failed": totals[3].get(key, 0), "unknown": 0, "orphans": 0, "dropped": 0}
             desired_mechs = {mech: [count, totals[1].get(key + (mech,), 0)]
@@ -2311,26 +2460,41 @@ def inventory_sibling_s1_errors(doc, ledger, receipt, records):
             # attested S1 history belongs only to the instance semantic edge.
             for row in semantic:
                 ops = row.get("operations") or {}
-                actual = {name: ops.get(name) for name in expected}
+                actual = {name: ops.get(name) - observed[name] if type(ops.get(name)) is int else None
+                          for name in expected}
                 if (row.get("semantics") != "observed" or actual != expected
                         or any(type(value) is not int for value in actual.values())
                         or ops.get("cancelled", 0) != 0 or ops.get("active", [])):
                     errors.append(f"{label}: S1 operation history disagrees with the sibling ledger")
                 mechs = row.get("mechanisms") or []
-                observed = {mechanism_row_id(mech): [mech.get("calls"), mech.get("errors")] for mech in mechs}
-                if (len(observed) != len(mechs) or observed != desired_mechs
+                final_mechs = {mechanism_row_id(mech): [mech.get("calls"), mech.get("errors")] for mech in mechs}
+                wanted_mechs = {mech: [values[i] + observed["mechanisms"].get(mech, [0, 0])[i] for i in (0, 1)]
+                                for mech, values in desired_mechs.items()}
+                for mech, values in observed["mechanisms"].items():
+                    wanted_mechs.setdefault(mech, values)
+                if (len(final_mechs) != len(mechs) or final_mechs != wanted_mechs
                         or any(type(value) is not int or value < 0
-                               for values in observed.values() for value in values)):
+                               for values in final_mechs.values() for value in values)):
                     errors.append(f"{label}: S1 mechanism history disagrees with the sibling ledger")
             api = semantic[0].get("api_returns") or {}
-            if (type(api.get("count")) is not int or api["count"] != totals[5].get(key, 0)
+            if (type(api.get("count")) is not int or api["count"] - observed["api"] != totals[5].get(key, 0)
                     or api.get("saturated") is not False or api.get("historical_only_returns") != 0):
                 errors.append(f"{label}: S1 API returns disagree with the sibling ledger")
             errors.extend(f"{label}: {error}" for error in inventory_instance_history_errors(
                 records, instances[0]["id"], caller, module, receipt))
             summaries.append({"tuple": [ident["start"], caller, gen, module, instances[0]["id"]],
-                "api_returns": api.get("count"), "ledger_api_returns": totals[5].get(key, 0),
-                "operations": expected})
+                "api_returns": api.get("count"),
+                "ledger_api_returns": wanted_prefix["api"] + totals[5].get(key, 0),
+                "operations": {name: wanted_prefix[name] + value for name, value in expected.items()},
+                "operations_observed": {name: ops.get(name) for name in expected},
+                "delta": {"expected": {"api": totals[5].get(key, 0), **expected},
+                          "observed": {"api": api.get("count", 0) - observed["api"], **actual}},
+                "early": {"expected": wanted_prefix, "observed": {key: observed[key] for key in wanted_prefix},
+                    "unobserved": {key: max(0, wanted_prefix[key] - observed[key]) for key in wanted_prefix},
+                    "mechanisms_expected": prefix_mechs, "mechanisms_observed": observed["mechanisms"],
+                    "mechanisms_unobserved": {mech: [max(0, values[i] - observed["mechanisms"].get(mech, [0, 0])[i])
+                        for i in (0, 1)] for mech, values in prefix_mechs.items()},
+                    "gaps": gaps}})
     if not summaries:
         errors.append("SystemMixed sibling attested semantic history is absent")
     return errors, summaries
@@ -2338,6 +2502,8 @@ def inventory_sibling_s1_errors(doc, ledger, receipt, records):
 
 CGROUP_DISCLOSURE_SUBJECTS = {"scoped native owner admission deferred", "semantic admission refused"}
 SYSTEM_DISCLOSURE_SUBJECTS = {"discovery capped", "capture discovery", "semantic admission refused"}
+SEMANTIC_EARLY_SUBJECTS = {"physical provider use preceded first observed semantic registration",
+                         "initial semantic proof followed earlier physical provider use"}
 SYSTEM_SCAN_LIMIT = 256
 SYSTEM_EMPTY_MAPS_REFUSAL = (
     "memory scan refused: initial mapping validation unavailable: empty or truncated /proc maps snapshot")
@@ -2492,6 +2658,102 @@ def inventory_system_ambient_caller(doc, records, gap, publication, owned_births
     return caller, identity
 
 
+def inventory_system_preuse_disclosure(doc, ledgers, receipt, gap, publication):
+    """A strictly pre-W owned refusal is retained, separate from later early loss."""
+    if gap["subject"] != "semantic admission refused" or gap["reason"] != "semantic_unavailable" or gap["pid"] is not None:
+        return False
+    records = receipt["inventory_control"]["final_records"]
+    callers = [row for row in doc["callers"] if row["id"] == gap["caller"]]
+    if len(callers) != 1 or callers[0]["incarnation"] != 0:
+        return False
+    caller = callers[0]
+    name = next((name for name in ("MX", "MS")
+                 if ledgers[name]["idents"][0]["pid"] == caller["pid"]), None)
+    if name is None:
+        return False  # MF never belongs to the controlled pre-use positive.
+    control = receipt["inventory_control"]
+    if name == "MX":
+        phases = [row for row in control["measurements"] if row["proof"]["caller"] == caller["id"]
+                  and row["proof"]["incarnation"] == 0]
+        if len(phases) != 1:
+            return False
+        proof = phases[0]["proof"]
+        image, admission, marker = proof["image"], proof["admission"], proof["markers"][0]
+        providers = [proof["provider"]]
+    else:
+        proof = control["sibling_baseline"]
+        image, admission, marker = proof["image"], proof["admission"], proof["marker"]
+        providers = [receipt["providers"][key] for key in control["sibling_providers"]]
+    owner = SimpleNamespace(pid=caller["pid"], identity={"start_time": caller["start_time"]})
+    by_seq = {row["seq"]: row for row in records}
+    admitted, completed = by_seq.get(admission["seq"]), by_seq.get(admission["completed_pass"]["seq"])
+    if (admitted is None or completed is None or admitted["kind"] != "caller_event"
+            or admitted["event"].get("event") != "admitted" or completed["kind"] != "pass_committed"
+            or r5_pass_receipt(completed) != admission["completed_pass"]
+            or image["pid"] != caller["pid"] or image["start_time"] != caller["start_time"]
+            or image["image"] != 0 or admission["caller"] != caller["id"] or admission["incarnation"] != 0):
+        return False
+    context = r5_caller_context(admitted["event"], owner, image)
+    if (context["incarnation"] != 0 or context["authority"] != "scan_pinned"
+            or caller["image"].get("authority") != "scan_pinned" or caller["image"].get("exe") != context["executable"]):
+        return False
+    ident = ledgers[name]["idents"][0]
+    mapped = [row for row in ledgers[name]["mapped"] if row["gen"] == 0]
+    expected = [{**ident, "module": pin["path"], "ino": pin["ino"]} for pin in providers]
+    if (ident["start"] != image["start_time"] or ident["gen"] != 0 or ident["exe"] != image["path"]
+            or sorted(mapped, key=lambda row: row["module"]) != sorted(expected, key=lambda row: row["module"])
+            or any(pin not in receipt["providers"].values() for pin in providers)):
+        return False
+    ack, dispatch = marker["ack"], marker["dispatch_ns"]
+    calls = [row for row in ledgers[name]["batches"] if row["gen"] == 0]
+    if (not calls or ack["command"] != "W" or ack["seq"] != 1 or ack["attempt"] != 1
+            or sum(row == ack for row in ledgers[name]["acks"]) != 1
+            or not admitted["seq"] < publication["seq"]
+            or not completed["at_ns"] < dispatch <= ack["t0"] <= min(row["t0"] for row in calls)
+            or not admitted["at_ns"] <= publication["at_ns"] < dispatch):
+        return False
+    repeat, previous = 1, publication["seq"]
+    for row in records:
+        if row["kind"] == "gap_repeated" and row["event"].get("index") == publication["event"]["index"]:
+            if (set(row["event"]) != {"index", "repeats"} or type(row["event"]["repeats"]) is not int
+                    or row["event"]["repeats"] <= repeat or row["seq"] <= previous or row["at_ns"] >= dispatch):
+                return False
+            repeat, previous = row["event"]["repeats"], row["seq"]
+    if repeat != gap["repeats"]:
+        return False
+    prefix = [row for row in records if row["at_ns"] < dispatch and row["event"].get("caller") == caller["id"]]
+    if any(row["kind"] in ("instance_observed", "semantic_edge_observed") for row in prefix):
+        return False
+    proved, last_prefix = {}, previous
+    for row in prefix:
+        if row["kind"] != "edge_observed":
+            continue
+        event, entries = row["event"], row["event"].get("entries") or {}
+        module = r5_admitted_subject(event, "module")
+        pins = [pin for pin in providers if module.get("path") == pin["path"]
+                and module.get("inode") == pin["mapping"]["ino"]
+                and [module.get("device_major"), module.get("device_minor")] == pin["mapping"]["dev"]]
+        coverage = coverage_of(event)
+        if (len(pins) != 1 or r5_caller_context(event, owner, image) != context
+                or module.get("id") != event.get("module") or module.get("status") != "observed"
+                or event.get("mapping", {}).get("state") != "mapped"
+                or type(entries.get("count")) is not int or entries["count"] != 0
+                or entries.get("saturated") is not False or entries.get("in_flight") is not False
+                or entries.get("first_seen_ns") is not None or entries.get("last_seen_ns") is not None
+                or event.get("mechanisms") is not None or event.get("operations") is not None
+                or event.get("semantics") != "unknown (semantic capture withheld)"
+                or (coverage.get("state"), coverage.get("reason"), coverage.get("lossy"))
+                    not in (("unknown", "not_attached", None), ("watched_no_use", None, None))):
+            return False
+        path, state = pins[0]["path"], coverage["state"]
+        if proved.get(path) == "watched_no_use" and state != "watched_no_use":
+            return False
+        proved[path], last_prefix = state, max(last_prefix, row["seq"])
+    return (proved == {pin["path"]: "watched_no_use" for pin in providers}
+        and any(row["kind"] == "pass_committed" and not row["event"].get("final")
+                and row["seq"] > last_prefix and row["at_ns"] < dispatch for row in records))
+
+
 def inventory_system_disclosure(doc, ledgers, receipt, index):
     """Recognize exact bounded/ambient limitations without granting owned authority."""
     gap = doc["gaps"][index]
@@ -2561,6 +2823,8 @@ def inventory_system_disclosure(doc, ledgers, receipt, index):
             and type(completing["event"].get("maps_matched")) is int
             and completing["event"].get("scanned") == deep + mapped
             and completing["event"].get("maps_matched") == mapped)
+    if inventory_system_preuse_disclosure(doc, ledgers, receipt, gap, publication):
+        return True
     ambient = inventory_system_ambient_caller(doc, records, gap, publication, births)
     if ambient is None:
         return False
@@ -2593,6 +2857,20 @@ def inventory_system_disclosure(doc, ledgers, receipt, index):
                 and (edge.get("mapping") or {}).get("state") == "mapped"):
             return True
     return False
+
+
+def inventory_semantic_early_disclosure(doc, records, index, validated):
+    """Only the exact gap used by a verified early boundary is recognized."""
+    gap = doc["gaps"][index]
+    if (set(gap) != {"caller", "module", "pid", "budget", "subject", "reason", "repeats"}
+            or gap["subject"] not in SEMANTIC_EARLY_SUBJECTS or gap["reason"] != "before_semantic_boundary"
+            or gap["caller"] is None or gap["module"] is None or gap["pid"] is not None
+            or gap["budget"] is not None or type(gap["repeats"]) is not int or gap["repeats"] != 1):
+        return False
+    expected = {**{key: value for key, value in gap.items() if key != "repeats"}, "index": index}
+    published = [row for row in records if row["kind"] == "gap_recorded" and row["event"].get("index") == index]
+    return (len(published) == 1 and published[0]["event"] == expected and published[0] in validated
+            and not any(row["kind"] == "gap_repeated" and row["event"].get("index") == index for row in records))
 
 
 def inventory_cgroup_disclosure(doc, ledgers, receipt, index):
@@ -2956,11 +3234,13 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
     # Validate against the original rows, before the physical-only projection
     # removes S1. Keep every disclosure in the reported result.
     physical_doc["gaps"], disclosures = [], []
+    early = [row for summary in summaries + sibling_s1 for row in summary["early"]["gaps"]]
     for index, gap in enumerate(doc.get("gaps", [])):
         if (gap.get("subject") in CGROUP_DISCLOSURE_SUBJECTS and inventory_cgroup_disclosure(
                 doc, ledgers, receipt, index)
                 or gap.get("subject") in SYSTEM_DISCLOSURE_SUBJECTS and inventory_system_disclosure(
-                    doc, ledgers, receipt, index)):
+                    doc, ledgers, receipt, index)
+                or inventory_semantic_early_disclosure(doc, records, index, early)):
             disclosures.append(gap)
         else:
             physical_doc["gaps"].append(gap)
@@ -6671,15 +6951,16 @@ def inventory_boundary(records, owner, image, provider, admission, floor, marker
     for mech, values in counts["mechanisms"].items():
         if values[0] > totals[0].get(key + (mech,), 0) or values[1] > totals[1].get(key + (mech,), 0):
             return None
+    lower = min(row["t0"] for row in prefix_batches
+                if (row["pid"], row["gen"], row["module"]) == key)
+    gaps = inventory_early_gaps(records, owner, admission, edge["module"], lower, settled["at_ns"])
     if entries["count"] < expected or counts["api"] < api_expected:
-        lower = min(row["t0"] for row in prefix_batches
-                    if (row["pid"], row["gen"], row["module"]) == key)
-        gaps = inventory_early_gaps(records, owner, admission, edge["module"], lower, settled["at_ns"])
         if (exact or not gaps or type(entries.get("last_seen_ns")) is not int
                 or entries["last_seen_ns"] < last_call or entries["count"] < sum(row["n"] for row in warm)):
             return None
     else:
-        gaps = []
+        gaps = [row for row in gaps if row["event"].get("reason") == "before_semantic_boundary"
+                and row["event"].get("subject") in SEMANTIC_EARLY_SUBJECTS]
     if ack["command"] == "W":
         marker_totals = ledger_s1_totals(warm, 0)
         if counts["completed"] < marker_totals[2].get(key, 0):
@@ -7406,6 +7687,31 @@ def release_inventory_measurement(controller, provider, proof, deadline, *, pend
     return command if pending else controller.complete(command)
 
 
+def wait_inventory_sibling_baseline(sibling, executable, provider_pin, cursor, marker, deadline, *, physical_hooks=None):
+    """Read the original owned MS cursor while W1 stays idle; dispatch no work."""
+    if sibling.owner is not cursor.owner or sibling.owner.identity != cursor.birth_identity:
+        raise SetupError("System sibling baseline changed original owner/observer custody")
+    admission = {"caller": cursor.retired_caller, "incarnation": cursor.retired_incarnation,
+        "seq": cursor.retired_admission_seq, "completed_pass": cursor.completed_pass}
+    provider = provider_receipt(provider_pin)
+    while True:
+        remaining_until(deadline)
+        executable.verify()
+        image = executable.image_receipt({"image": 0}, sibling.owner)
+        records, complete = cursor.read(deadline, full=True)
+        baseline = inventory_sibling_boundary(records, image, provider, admission, marker,
+            physical_hooks=physical_hooks, started_ns=cursor.started_ns)
+        if complete and baseline is not None:
+            remaining_until(deadline)
+            executable.verify()
+            executable.image_receipt({"image": 0}, sibling.owner)
+            if provider_receipt(provider_pin) != provider:
+                raise SetupError("System sibling baseline changed its held provider")
+            remaining_until(deadline)
+            return {**baseline, "observed_ns": monotonic_ns()}
+        pause_until(deadline, 0.05)
+
+
 def inventory_target_phases(ctx, log_path, target, original_executable, successor_executable,
                             provider, *, outside=None, sub=None, moves=None,
                             sibling=None, physical_hooks=None):
@@ -7417,9 +7723,10 @@ def inventory_target_phases(ctx, log_path, target, original_executable, successo
     sibling_deadline = (budget.deadline_ns if budget else wait_deadline(815)) if sibling else None
     initial_cursor = wait_inventory_original_checkpoint(ctx, log_path, target.owner,
                                                         original_executable, recovery0)
+    sibling_baseline = None
     if sibling:
-        wait_inventory_original_checkpoint(ctx, log_path, sibling.owner, original_executable, recovery0)
-        sibling.warm(1, sibling_deadline)
+        sibling_cursor = wait_inventory_original_checkpoint(ctx, log_path, sibling.owner, original_executable, recovery0)
+        sibling_first = sibling.warm(1, sibling_deadline)
     first = target.warm(1, recovery0)
     initial_admission = {"caller": initial_cursor.retired_caller,
         "incarnation": initial_cursor.retired_incarnation,
@@ -7443,6 +7750,9 @@ def inventory_target_phases(ctx, log_path, target, original_executable, successo
         target.ledger()["batches"], fixed_deadline, exact_delta=True)
     checkpoint = r5_admission_checkpoint(ctx, log_path, target.owner, original_executable)
     checkpoint_receipt = checkpoint.receipt()
+    if sibling:
+        sibling_baseline = wait_inventory_sibling_baseline(sibling, original_executable, provider,
+            sibling_cursor, sibling_first, fixed_deadline, physical_hooks=physical_hooks)
     if outside:
         move_and_verify(outside, target.owner, moves, "X-exit-for-exec")
         t_out = moves[-1]["t"]
@@ -7493,6 +7803,7 @@ def inventory_target_phases(ctx, log_path, target, original_executable, successo
     measured.append({"proof": proof, "marker": measurement, "end": end1})
     stages.append({"label": "measurement", "t0": measurement_start, "t1": monotonic_ns()})
     return {"proofs": proofs, "measurements": measured, "stages": stages,
+        "sibling_baseline": sibling_baseline,
         "teardown": {"marker": teardown, "end": tail_end},
         "cursor": checkpoint, "outside_ns": t_out, "reentry_ns": t_in,
         "freeze": {"exec_stop_ns": exec_stop, "stopped_image": stopped_image,
@@ -7793,6 +8104,7 @@ def run_system_mixed(ctx, cell_dir, backend):
         "freeze": control["freeze"],
         "inventory_control": {"proofs": control["proofs"], "measurements": control["measurements"],
             "stages": control["stages"], "teardown": control["teardown"], "sibling": "MS", "sibling_providers": ["A", "B"],
+            "sibling_baseline": control["sibling_baseline"],
             "final_records": final_records},
     }
     doc = json.loads(doc_path.read_text())

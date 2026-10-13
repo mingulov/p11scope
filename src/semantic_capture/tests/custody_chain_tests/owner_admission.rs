@@ -1038,3 +1038,74 @@ fn owner_admission_failed_scope_then_same_executable_new_image_refuses_old_calle
     );
     assert_eq!(scene.coordinator.registry().instances().count(), 0);
 }
+
+#[test]
+fn owner_admission_rejected_validation_remembers_first_accepted_image() {
+    let mut scene = AdmissionScene::new(Selection::Pid);
+    scene.prepare_without_cookie();
+    scene.observe_entry();
+    let old = scene.caller();
+    let _other = install_owner_refusal(&mut scene, OwnerRefusal::Image);
+    scene.pass();
+    assert_eq!(scene.h0.0.borrow().accepted, 1);
+    assert_eq!(scene.coordinator.semantic_bindings().len(), 0);
+    assert_eq!(scene.coordinator.registry().instances().count(), 0);
+    // H0 accepted exec 1 before owner validation observed exec 2. A later
+    // successful refresh must not silently join exec 2 to the old CallerId.
+    for _ in 0..3 {
+        scene.pass();
+    }
+    assert_eq!(scene.caller(), old);
+    assert_eq!(
+        scene.coordinator.semantic_bindings().len(),
+        0,
+        "post-scan refusal must retain accepted full-image history"
+    );
+    assert_eq!(scene.coordinator.registry().instances().count(), 0);
+}
+
+#[test]
+fn owner_admission_rejected_first_scope_cuts_unread_pre_refusal_calls() {
+    let mut scene = AdmissionScene::new(Selection::Cgroup);
+    scene.prepare_without_cookie();
+    scene.observe_entry();
+    let pid = scene.child.id();
+    let unread = Rc::new(RefCell::new(None));
+    let delayed = unread.clone();
+    let membership = scene.dir.path().join("cgroup.procs");
+    scene.h0.0.borrow_mut().after_refresh = Some(Box::new(move |owned| {
+        // Actual return records from the accepted image remain unread by H0,
+        // as a ring reader may deliver old records in a later quantum.
+        owned.io.held.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+        owned.io.held.enqueue(pid, 0, "C_Sign", 0, 0);
+        *delayed.borrow_mut() = Some(std::mem::take(&mut owned.io.held.script.records));
+        std::fs::write(membership, "").unwrap();
+    }));
+    scene.pass();
+    assert_eq!(scene.h0.0.borrow().accepted, 1);
+    assert_eq!(scene.coordinator.semantic_bindings().len(), 0);
+    assert_eq!(scene.coordinator.registry().instances().count(), 0);
+    assert_eq!(unread.borrow().as_ref().unwrap().len(), 2);
+
+    std::fs::write(scene.dir.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+    scene.h0.0.borrow_mut().after_refresh = Some(Box::new(move |owned| {
+        // New owner coverage must not make the old fault-era pair current.
+        owned.io.held.script.records = unread.borrow_mut().take().unwrap();
+    }));
+    for _ in 0..3 {
+        scene.pass();
+    }
+    scene.assert_admitted();
+    assert_eq!(
+        scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|row| row.semantics.as_ref())
+            .map(|reducer| reducer.completed())
+            .sum::<u64>(),
+        0,
+        "a rejected first scope admission must fence unread old operations"
+    );
+    assert_eq!(scene.h0.0.borrow().capture.continuity_cuts(), 1);
+}

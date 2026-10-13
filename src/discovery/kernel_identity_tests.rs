@@ -6,6 +6,7 @@ use super::*;
 use crate::attach::identity_iter::{
     ANCHOR_DUP, ANCHOR_OK, KIND_ANCHOR, KIND_END, RECORD_MAGIC, RECORD_VERSION,
 };
+use p11scope_manifest::maps::MapEntry;
 use std::cell::{Cell, RefCell};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, MetadataExt};
@@ -108,9 +109,9 @@ fn owner_counterexample(case: usize) {
         }
         3 => {
             let installed = session.install_unowned_for_test(pass, 1, deadline).unwrap();
-            let address = installed.arena.as_ref().unwrap().base();
+            let mapping = anchor_mapping(installed.arena.as_ref().unwrap().base());
             drop(installed);
-            assert!(!mapped(address));
+            assert!(!anchor_mapping_held(&mapping));
             pass = prepare("second.so");
         }
         _ => {
@@ -191,6 +192,124 @@ fn mapped(address: u64) -> bool {
     let mut residency = 0u8;
     // SAFETY: mincore observes one aligned page and does not dereference it.
     unsafe { libc::mincore(address as *mut libc::c_void, 4096, &mut residency) == 0 }
+}
+
+fn anchor_mapping(address: u64) -> MapEntry {
+    let maps = std::fs::read("/proc/self/maps").unwrap();
+    let entry = p11scope_manifest::maps::parse_maps(&maps)
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.start <= address && address < entry.end)
+        .expect("the live anchor has a mapping");
+    assert_ne!(entry.inode, 0, "the anchor maps the retained fixture file");
+    entry
+}
+
+fn anchor_mapping_held(mapping: &MapEntry) -> bool {
+    mapped(mapping.start)
+}
+
+#[test]
+fn d3b_reused_anchor_address_cannot_authorize_uninstalled_or_stale_pass() {
+    const CHILD: &str = "P11SCOPE_D3B_ANCHOR_REUSE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Keep deliberate address reuse out of other tests' address space.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "discovery::kernel_identity::tests::d3b_reused_anchor_address_cannot_authorize_uninstalled_or_stale_pass",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "anchor reuse child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    struct ReusedAddress {
+        base: *mut libc::c_void,
+        len: usize,
+    }
+    impl Drop for ReusedAddress {
+        fn drop(&mut self) {
+            // SAFETY: this guard owns exactly the successful mapping below.
+            unsafe { libc::munmap(self.base, self.len) };
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let pins = PinnedObjects::empty();
+    let prepare = |name: &str| {
+        let (file, examined) = opened(dir.path(), name);
+        let mut custody = custody(1, BTreeMap::new());
+        let scan = custody.begin_scan();
+        assert!(custody.offer_for_test(scan, examined, file));
+        AnchorPass::prepare(&pins, [], custody)
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut session = fixture_session();
+    let installed = session
+        .install_unowned_for_test(prepare("released.so"), 1, deadline)
+        .unwrap();
+    let arena = installed.arena.as_ref().unwrap();
+    let address = arena.base();
+    let len = arena.len() as usize;
+    let mapping = anchor_mapping(address);
+    let stale = installed.binding.as_ref().unwrap().clone();
+    drop(installed);
+    // SAFETY: NOREPLACE claims only an unmapped range. A racing allocation
+    // makes the test refuse, never overwrite somebody else's mapping.
+    let base = unsafe {
+        libc::mmap(
+            address as *mut libc::c_void,
+            len,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(
+        base,
+        libc::MAP_FAILED,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    let reused = ReusedAddress { base, len };
+    assert_eq!(reused.base.addr() as u64, address);
+    assert!(
+        mapped(address),
+        "a different VMA now occupies the old address"
+    );
+    assert!(
+        !anchor_mapping_held(&mapping),
+        "address reuse must not revive the released fixture mapping"
+    );
+
+    let mut pass = prepare("uninstalled.so");
+    assert_ne!(pass.arena.as_ref().unwrap().base(), address);
+    assert!(session.scope.ready() && session.binding.is_some());
+    let read_count = || match &session.object {
+        SessionObject::Fixture { reads, .. } => reads.get(),
+        _ => unreachable!(),
+    };
+    let before = read_count();
+    for binding in [None, Some(stale)] {
+        pass.binding = binding;
+        assert!(
+            pass.read_run(&session, RunKind::Target, None, deadline, 128)
+                .is_err(),
+            "an occupied old address authorized an uninstalled or stale pass"
+        );
+        assert_eq!(before, read_count(), "refusal performed iterator I/O");
+    }
 }
 
 #[test]
@@ -734,11 +853,12 @@ fn d3b_run_closes_before_anchor_and_file_release_on_success_or_error() {
         let mut pass = AnchorPass::prepare(&pins, [], custody);
         assert!(pass.arena.is_some());
         let arena_address = pass.arena.as_ref().unwrap().base();
+        let arena_mapping = anchor_mapping(arena_address);
         let events = Rc::new(RefCell::new(Vec::new()));
         let arena_events = events.clone();
         pass.after_arena = Some(DropObserver(Some(Box::new(move || {
             assert!(
-                !mapped(arena_address),
+                !anchor_mapping_held(&arena_mapping),
                 "arena stayed mapped when files began to release"
             );
             assert!(
@@ -795,6 +915,7 @@ fn d3b_partial_anchor_install_and_failed_target_close_all_custody() {
     let pins = PinnedObjects::empty();
     let pass = AnchorPass::prepare(&pins, [], custody);
     let address = pass.arena.as_ref().unwrap().base();
+    let arena_mapping = anchor_mapping(address);
     let mut session = fixture_session();
     if let SessionObject::Fixture { target, .. } = &mut session.object {
         *target = vec![1; 64];
@@ -814,7 +935,7 @@ fn d3b_partial_anchor_install_and_failed_target_close_all_custody() {
     assert!(result.is_err());
     assert!(mapped(address) && fds.iter().all(|fd| fd_open(*fd)));
     drop(installed);
-    assert!(!mapped(address));
+    assert!(!anchor_mapping_held(&arena_mapping));
     assert!(fds.iter().all(|fd| !fd_open(*fd)));
     assert_eq!(owner.examined_for_test().0, 0);
     assert!(session.binding.is_none() && !session.scope.ready());

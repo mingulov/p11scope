@@ -225,6 +225,7 @@ fn anchor_mapping_held(mapping: &MapEntry) -> bool {
 #[test]
 fn d3b_reused_anchor_address_cannot_authorize_uninstalled_or_stale_pass() {
     const CHILD: &str = "P11SCOPE_D3B_ANCHOR_REUSE_CHILD";
+    const COMPLETED: &str = "P11SCOPE_D3B_ANCHOR_REUSE_REFUSALS_COMPLETED";
     if std::env::var_os(CHILD).is_none() {
         // Keep deliberate address reuse out of other tests' address space.
         let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -242,6 +243,13 @@ fn d3b_reused_anchor_address_cannot_authorize_uninstalled_or_stale_pass() {
             "anchor reuse child failed:\n{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line == COMPLETED),
+            "anchor reuse child did not complete its refusal assertions:\n{}",
+            String::from_utf8_lossy(&output.stdout)
         );
         return;
     }
@@ -323,6 +331,7 @@ fn d3b_reused_anchor_address_cannot_authorize_uninstalled_or_stale_pass() {
         );
         assert_eq!(before, read_count(), "refusal performed iterator I/O");
     }
+    println!("\n{COMPLETED}");
 }
 
 #[test]

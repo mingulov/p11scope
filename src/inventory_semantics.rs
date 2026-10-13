@@ -257,6 +257,7 @@ pub(crate) trait LaneTestIo {
     fn validate_current(
         &mut self,
         receipt: &CurrentPartitionReceipt,
+        report: &mut TickReport,
     ) -> Result<(), CurrentReceiptRefusal>;
     /// The real H0 tick plus the production stash merge and batch
     /// construction.
@@ -816,18 +817,18 @@ impl AttestedSemanticLane {
     pub(crate) fn validate_current(
         &mut self,
         receipt: &CurrentPartitionReceipt,
+        report: &mut TickReport,
     ) -> Result<LaneCoverage, CurrentReceiptRefusal> {
         #[cfg(test)]
         if let Some(test) = self.test_io.as_mut() {
-            test.validate_current(receipt)?;
+            test.validate_current(receipt, report)?;
             return Ok(LaneCoverage::from_validated_receipt(receipt));
         }
         let Some(live) = self.live.as_mut() else {
             return Err(CurrentReceiptRefusal::Custody);
         };
-        let mut report = TickReport::default();
         live.capture
-            .validate_current(&mut live.session, receipt, &mut report)?;
+            .validate_current(&mut live.session, receipt, report)?;
         Ok(LaneCoverage::from_validated_receipt(receipt))
     }
 

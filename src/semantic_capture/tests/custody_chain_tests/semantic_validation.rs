@@ -314,6 +314,7 @@ impl LaneTestIo for SharedH0 {
     fn validate_current(
         &mut self,
         receipt: &CurrentPartitionReceipt,
+        report: &mut TickReport,
     ) -> Result<(), CurrentReceiptRefusal> {
         let mut owned = self.0.borrow_mut();
         owned.validations += 1;
@@ -337,11 +338,11 @@ impl LaneTestIo for SharedH0 {
             };
             owned.io.script.health.extend([Ok(clean), Ok(after)]);
         }
-        let mut scratch = TickReport::default();
+        let start = report.outcomes().len();
         let HeldH0 { capture, io, .. } = &mut *owned;
-        let result = capture.validate_current_with(io, receipt, &mut scratch);
+        let result = capture.validate_current_with(io, receipt, report);
         owned.io.script.receipt_refusal = None;
-        for outcome in scratch.into_outcomes() {
+        for outcome in &report.outcomes()[start..] {
             if let TickOutcome::Invalidation(invalidation) = outcome {
                 let name = match invalidation.scope() {
                     InvalidationScope::FaultEra => "fault_era",
@@ -353,9 +354,6 @@ impl LaneTestIo for SharedH0 {
                     .push((name, invalidation.position()));
             }
         }
-        // Match the current production LaneTestIo contract: the real H0
-        // report is consumed here, while only the validation result reaches
-        // the lane. The regressions require its negative facts to publish.
         result
     }
     fn tick(&mut self, domain: NativeDomainId) -> Result<SemanticBatch, SemanticRefusal> {
@@ -750,4 +748,93 @@ fn semantic_validation_later_receipt_fault_fences_earlier_same_batch_coverage() 
     assert_eq!(reducer.unknown(), 1);
     assert!(first.lossy);
     assert_eq!(first.historical_only_returns, 1);
+}
+
+#[test]
+fn semantic_validation_full_batch_preserves_calls_and_distinct_validation_loss() {
+    use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+    let child = OwnedStoppedChild::new();
+    let pid_b = child.id();
+    let pid_a = std::process::id();
+    let mut fixture = RealScene::new(1);
+    let caller_a = fixture.bind(pid_a, image(7), 0);
+    let caller_b = fixture.bind(pid_b, image(8), 0);
+    fixture.enqueue(pid_a, 0, "C_SignInit", 0x000d, 0);
+    fixture.enqueue(pid_b, 0, "C_SignInit", 0x0001, 0);
+    let initial = fixture.tick();
+    fixture.publish(initial);
+    assert_eq!(
+        operation_edge_rows(&fixture.scene),
+        vec![(Some(1), 0, false, 1, 0), (Some(1), 0, false, 1, 0),]
+    );
+
+    // Exercise the consumer's declared 4096-outcome capacity. Every
+    // record is uniquely minted by the same H0 timeline; aggregating these
+    // reports is test-only boundary stress, not another production queue.
+    let limit = crate::discovery::instances::MAX_INSTANCES;
+    let mut outcomes = Vec::new();
+    let mut current = Vec::new();
+    let mut remaining = limit - 1;
+    while remaining != 0 {
+        let quantum = remaining.min(MAX_PENDING);
+        for _ in 0..quantum {
+            fixture.enqueue(pid_a, 0, "C_Sign", 0, 0);
+        }
+        let (owned, receipts, negatives) = fixture.tick().into_parts();
+        assert!(negatives.is_empty());
+        assert_eq!(owned.len(), quantum);
+        assert!(owned.iter().all(|outcome| matches!(outcome,
+            TickOutcome::Call(call) if matches!(call.route(), Route::Joined(_)))));
+        outcomes.extend(owned);
+        current.extend(receipts);
+        remaining -= quantum;
+    }
+    fixture.refresh(caller_a, 0);
+    {
+        let mut h0 = fixture.h0.0.borrow_mut();
+        h0.io.targets.get_mut(&pid_b).unwrap().1.exec_id = 2;
+    }
+    fixture.refresh(caller_b, 0);
+    let (retirement, receipts, negatives) = fixture.tick().into_parts();
+    assert!(negatives.is_empty());
+    assert_eq!(retirement.len(), 1);
+    assert!(
+        matches!(&retirement[0], TickOutcome::Invalidation(invalidation)
+        if matches!(invalidation.scope(), InvalidationScope::ImageRetired(retired) if *retired == image(8)))
+    );
+    outcomes.extend(retirement);
+    current.extend(receipts);
+    assert_eq!(outcomes.len(), limit);
+    assert_eq!(current.len(), 2);
+    let batch = SemanticBatch::from_tick_report(
+        fixture.lane.domain(),
+        TickReport::scripted(outcomes, current),
+        Vec::new(),
+        now_ns(),
+    )
+    .unwrap();
+    fixture.inject_validation(1, ValidationFailure::Fault);
+    fixture.publish(batch);
+    assert_eq!(fixture.h0.0.borrow().validation_negatives.len(), 1);
+    let edges: Vec<_> = fixture
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .collect();
+    let a = edges.iter().find(|row| row.caller == caller_a).unwrap();
+    let b = edges.iter().find(|row| row.caller == caller_b).unwrap();
+    assert_eq!(
+        a.api_returns,
+        Some(limit as u64),
+        "a validation negative must not spend the bounded positive-call capacity"
+    );
+    assert_eq!(a.historical_only_returns, (limit - 1) as u64);
+    assert_eq!(a.semantics.as_ref().unwrap().unknown(), 1);
+    assert!(a.lossy && a.reasons.contains(&InstanceReason::SemanticLoss));
+    assert!(
+        b.reasons.contains(&InstanceReason::ImageRetired),
+        "the distinct image negative must reach H2 beside the domain validation loss"
+    );
+    assert_eq!(b.semantics.as_ref().unwrap().unknown(), 1);
 }

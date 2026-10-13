@@ -622,9 +622,10 @@ fn native_semantic_resource_final_types_pinned() {
     assert_eq!(size_of::<crate::semantic_capture::TickOutcome>(), 432);
     assert_eq!(size_of::<crate::semantic_capture::TickReport>(), 112);
     assert_eq!(size_of::<crate::semantic_capture::RoutedCall>(), 432);
+    // H6 retains the calibrated mapped-file identity in the watched target.
     assert_eq!(
         size_of::<crate::semantic_capture::CurrentPartitionReceipt>(),
-        392
+        424
     );
     assert_eq!(size_of::<crate::semantic_capture::Invalidation>(), 72);
     assert_eq!(size_of::<crate::semantic_capture::InvalidationScope>(), 48);

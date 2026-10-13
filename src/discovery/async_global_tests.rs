@@ -158,6 +158,109 @@ fn wait_for(mut predicate: impl FnMut() -> bool) {
 }
 
 #[test]
+fn async_global_cgroup_departure_defers_conservative_replay_until_actual_close() {
+    let (fixture, mut engine, mut session, scope) = exec_rearm_cgroup_twin_route();
+    engine.frame_work_budget_ns = u64::MAX;
+    let pid = fixture.child.id();
+    let peer = fixture.peers[0].id();
+    let original = engine.views[0].id();
+    let original_admission = engine.views[0].view_admission();
+    let sibling = engine.views[1].view_admission();
+    let slots = engine.plan.slots.len();
+    let attachments = session.attached_slots.iter().sum::<usize>();
+    let detaches = session.detached_slot_indices.len();
+    let held = engine.pinned.pinned().count();
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    struct ReleaseOnDrop(Arc<(Mutex<bool>, Condvar)>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            *self.0.0.lock().unwrap() = true;
+            self.0.1.notify_all();
+        }
+    }
+    let release_guard = ReleaseOnDrop(Arc::clone(&release));
+    let gate = Arc::clone(&release);
+    let (sender, entered) = mpsc::channel();
+    session.global_retirement = Some(RefCell::new(RetirementFixture::new(
+        &engine.plan.slots,
+        &engine.pinned,
+        Box::new(move |owned, producer| {
+            if producer == ProducerProgram::UProbe("p11_return") {
+                sender.send(()).map_err(|error| error.to_string())?;
+                let (lock, changed) = &*gate;
+                let released = changed
+                    .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |ready| {
+                        !*ready
+                    })
+                    .map_err(|error| error.to_string())?;
+                if !*released.0 {
+                    return Err("owned Cgroup retirement release deadline".into());
+                }
+            }
+            drop(owned);
+            Ok(())
+        }),
+    )));
+    // A complete actual scope listing proves departure while the original
+    // process stays alive. No EXIT hint or forged pending ticket is supplied.
+    e06_write_listing(scope.path(), &[peer]);
+    let outcome = apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+    assert!(
+        session.detached_slot_indices[detaches..]
+            .iter()
+            .all(Vec::is_empty),
+        "conservative retirement cannot synchronously close static links before its handoff"
+    );
+    assert!(
+        engine.pending_global_retirement.is_some(),
+        "authoritative departure must defer its conservative native retirement"
+    );
+    assert!(!outcome.required_complete);
+    entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(engine.pending_retirements.contains(&original));
+    assert_eq!(engine.pinned.pinned().count(), held);
+    assert_eq!(session.attached_slots.iter().sum::<usize>(), attachments);
+    assert!(
+        engine
+            .views
+            .iter()
+            .any(|view| view.view_admission().same_allocation(&sibling))
+    );
+    let replay = engine.replay_pending_conservative(
+        &mut session,
+        &mut true,
+        &mut PendingViewRetirements::new(),
+    );
+    assert_eq!(replay.disposition, ApplyDisposition::Deferred);
+    let scans = engine.deep_scans;
+    e06_write_listing(scope.path(), &[pid, peer]);
+    for _ in 0..3 {
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+        assert!(engine.pending_retirements.contains(&original));
+        assert_eq!(engine.deep_scans, scans);
+        assert_eq!(engine.plan.slots.len(), slots);
+        assert_eq!(session.attached_slots.iter().sum::<usize>(), attachments);
+    }
+    drop(release_guard);
+    wait_for(|| {
+        engine.service_backlog_quantum(&mut session).unwrap();
+        engine.pending_global_retirement.is_none()
+    });
+    assert!(engine.take_immediate_exec_recovery_frame());
+    apply_ordinary_batch(&mut engine, &mut session, Vec::new()).unwrap();
+    let admitted = engine.views.iter().find(|view| view.pid() == pid).unwrap();
+    assert!(
+        !admitted
+            .view_admission()
+            .same_allocation(&original_admission)
+    );
+    assert!(!engine.pending_retirements.contains(&original));
+    assert!(session.attached_slots.iter().sum::<usize>() > attachments);
+    assert!(engine.deep_scans > scans);
+    assert!(!engine.global_retirement_frame_owed);
+}
+
+#[test]
 fn async_global_candidate_handoff_keeps_only_actual_historical_retired_prefix() {
     let mut case = Case::new();
     let prior_pins = case.engine.pinned.pinned().count();

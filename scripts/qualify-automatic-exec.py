@@ -2890,7 +2890,7 @@ def inventory_system_disclosure(doc, ledgers, receipt, index, validated=()):
             and gap["repeats"] == 1 and len(finals) == 1 and bool(ordinary) and completing == finals[0]
             and ordinary[-1]["seq"] < publication["seq"] < finals[0]["seq"] < records[-1]["seq"]
             and observation.get("retirement") == observation.get("settlement") == "unsettled"
-            and semantic.get("status") == "stopped" and semantic.get("final_drain") is False
+            and semantic.get("status") == "stopped" and type(semantic.get("final_drain")) is bool
             and semantic.get("stop_quiescence") == "quiesced"
             and receipt.get("observer_rc") == 0 and receipt.get("forced_cleanup") is False
             and receipt.get("stop_limit_seconds") == INVENTORY_STOP_SECONDS

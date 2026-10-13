@@ -386,7 +386,10 @@ elif kind == "harness":
             raise SystemExit(config["workload_status"])
         print("harness OK", flush=True)
         phase = Path(sys.argv[2] + ".phase")
-        phase.write_text("held" if len(sys.argv) == 4 else "exiting")
+        # Existence is the observer's handoff; publish only a complete phase.
+        pending_phase = phase.with_suffix(".pending")
+        pending_phase.write_text("held" if len(sys.argv) == 4 else "exiting")
+        pending_phase.replace(phase)
         if len(sys.argv) == 4:
             while not Path(sys.argv[3]).exists():
                 if time.monotonic() > deadline:

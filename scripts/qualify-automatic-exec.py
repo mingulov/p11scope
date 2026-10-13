@@ -2365,7 +2365,8 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
     if receipt.get("scope_kind") == "cgroup":
         intervals = receipt.get("scope_intervals", [])
         for row in all_batches:
-            if (row["fn"] == "C_GetFunctionList" or row["t0"] >= receipt["observer_stopped_ns"]
+            if (not inventory_physical_batch(row, receipt.get("physical_hooks"))
+                    or row["t0"] >= receipt["observer_stopped_ns"]
                     or row["t1"] < receipt["observer_started_ns"]):
                 continue
             if not any(interval["pid"] == row["pid"] and interval["membership"] == "selected"
@@ -2403,7 +2404,8 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
         baseline_record = proof["baseline"]["pass"]
         baseline = inventory_boundary([row for row in records if row["seq"] <= baseline_record["seq"]],
             owner, image, provider, admission, max(proof["cursor"]["seq"], admission["seq"]),
-            warm, prefix)
+            warm, prefix, physical_hooks=proof["physical_hooks"],
+            started_ns=proof["observer_started_ns"])
         if baseline is None or baseline != proof["baseline"]:
             errors.append(f"{label}: fresh same-observer physical/instance/S1 baseline is unresolved")
             continue
@@ -2440,7 +2442,8 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
         end_record = measurement["end"]["pass"]
         end = inventory_boundary([row for row in records if row["seq"] <= end_record["seq"]],
             owner, image, provider, admission, baseline_record["seq"], marker,
-            [row for row in population if row["t1"] <= ack["t1"]], prior=baseline)
+            [row for row in population if row["t1"] <= ack["t1"]], prior=baseline,
+            physical_hooks=proof["physical_hooks"], started_ns=proof["observer_started_ns"])
         if end is None or end != measurement["end"]:
             errors.append(f"{label}: measured end lacks a corresponding observed idle boundary")
             continue
@@ -2451,7 +2454,9 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
         before, after = baseline["counts"], end["counts"]
         delta = {name: after[name] - before[name] for name in
                  ("physical", "api", "calls", "completed", "failed", "unknown", "orphans", "dropped")}
-        desired = {"physical": wanted[5].get(key, 0), "api": wanted[5].get(key, 0),
+        physical_wanted = counted_totals(fixed, receipt["observer_started_ns"],
+            receipt["observer_stopped_ns"], physical_hooks=proof["physical_hooks"]).get(key, 0)
+        desired = {"physical": physical_wanted, "api": wanted[5].get(key, 0),
                    "calls": wanted[4].get(key, 0), "completed": wanted[2].get(key, 0),
                    "failed": wanted[3].get(key, 0), "unknown": 0, "orphans": 0, "dropped": 0}
         if delta != desired or delta["physical"] != 22:
@@ -4071,6 +4076,69 @@ def provider_receipt(pin):
     return dict(PIN_FD(pin.fd), path=str(pin.path))
 
 
+def inventory_manifest_hooks(manifest, pin):
+    """Calibrate selected table hooks and the ledger's dlsym getter on one held FD."""
+    provider = provider_receipt(pin)
+    if not isinstance(manifest, dict) or manifest.get("schema") != "p11scope-manifest/5":
+        raise SetupError("Inventory physical hooks lack the selected manifest")
+    objects = [row for row in manifest.get("objects", []) if row.get("path") == provider["path"]]
+    provenance = [row for row in manifest.get("provenance_objects", []) if row.get("path") == provider["path"]]
+    if (len(objects) != 1 or len(provenance) != 1
+            or type(objects[0].get("id")) is not int
+            or any((row.get("identity") or {}).get("sha256") != provider["sha256"]
+                   for row in objects + provenance)
+            or [provenance[0].get("device_major"), provenance[0].get("device_minor")] != provider["dev"]
+            or provenance[0].get("inode") != provider["ino"]):
+        raise SetupError("Inventory manifest hooks disagree with the held provider identity")
+    functions = {}
+    for surface in manifest.get("surfaces", []):
+        if (surface.get("acquisition") or {}).get("status") != "ok":
+            continue
+        for row in surface.get("functions", []):
+            name, resolution = row.get("name"), row.get("resolution") or {}
+            belongs = (resolution.get("status") == "resolved"
+                       and type(resolution.get("object")) is int and resolution["object"] == objects[0]["id"]
+                       and type(resolution.get("file_offset")) is int and resolution["file_offset"] >= 0)
+            if name == "C_GetFunctionList" and not belongs:
+                raise SetupError("Inventory getter lacks a resolved hook on the held provider")
+            if not belongs:
+                continue
+            if not isinstance(name, str) or not name.startswith("C_") or (
+                    name in functions and functions[name] != resolution["file_offset"]):
+                raise SetupError("Inventory manifest physical functions are invalid or ambiguous")
+            functions[name] = resolution["file_offset"]
+    getter = functions.get("C_GetFunctionList")
+    if getter is None:
+        raise SetupError("Inventory manifest has no selected getter hook")
+    # Reuse the existing ELF reader through the held descriptor. This never
+    # dlopens provider code or reopens the provider by its pathname.
+    reader = runpy.run_path(str(ROOT / "scripts/check-live-discovery-evidence.py"))["elf_facts"]
+    try:
+        elf = reader(f"/proc/self/fd/{pin.fd}", ("C_GetFunctionList",))
+    except (RuntimeError, ValueError) as error:
+        raise SetupError("Inventory getter export cannot be calibrated from the held ELF") from error
+    if (elf["sha256"] != provider["sha256"]
+            or elf["symbols"]["C_GetFunctionList"]["file_offset"] != getter
+            or provider_receipt(pin) != provider):
+        raise SetupError("Inventory selected getter hook differs from its held ELF export")
+    return {provider["path"]: {"provider": provider, "functions": functions,
+                               "getter_export_offset": getter}}
+
+
+def inventory_physical_batch(batch, physical_hooks=None):
+    """Keep legacy getter exclusion unless its actual physical hook is proved."""
+    hooks = (physical_hooks or {}).get(batch["module"])
+    if hooks is None:
+        return batch["fn"] != "C_GetFunctionList"
+    if (hooks["provider"]["path"] != batch["module"]
+            or batch["fn"] not in hooks["functions"]):
+        raise SetupError("Inventory ledger function lacks selected physical hook membership")
+    if batch["fn"] == "C_GetFunctionList":
+        return (type(hooks.get("getter_export_offset")) is int
+                and hooks["getter_export_offset"] == hooks["functions"][batch["fn"]])
+    return True
+
+
 def session_reuse_from(ledger):
     by_image = {}
     for row in ledger:
@@ -5583,6 +5651,7 @@ class R5AdmissionCursor:
             original_executable.verify()
             image = original_executable.image_receipt({"image": 0}, owner)
             records, _complete = self.read()
+            self.started_ns = records[0]["event"]["started_ns"]
             self.seq = records[-1]["seq"] if records else -1
             self.at_ns = records[-1]["at_ns"] if records else 0
             self.saved_bytes = self.complete_bytes
@@ -5838,24 +5907,28 @@ def inventory_semantic_totals(row):
     return {**fields, "mechanisms": mechanisms}
 
 
-def inventory_early_phase_populations(batches, expected, physical, api):
+def inventory_early_phase_populations(batches, expected, physical, api, *, api_expected=None,
+                                      physical_hooks=None, started_ns=0):
+    api_expected = expected if api_expected is None else api_expected
     result = {}
     for label, predicate in (("setup", lambda phase: phase == "h6-setup"),
                               ("warmup", lambda phase: phase.startswith("h6-warm"))):
-        population = [row for row in batches if predicate(row["phase"]) and row["fn"] != "C_GetFunctionList"]
-        count = sum(row["n"] for row in population)
+        population = [row for row in batches if predicate(row["phase"]) and row["t0"] >= started_ns]
+        count = sum(row["n"] for row in population if inventory_physical_batch(row, physical_hooks))
+        api_count = sum(row["n"] for row in population if row["fn"] != "C_GetFunctionList")
         result[label] = {"phases": sorted({row["phase"] for row in population}), "expected": count,
+            "api_expected": api_count,
             "observed_physical": count if physical == expected else None,
-            "observed_api": count if api == expected else None,
+            "observed_api": api_count if api == api_expected else None,
             "missed_physical": 0 if physical == expected else None,
-            "missed_api": 0 if api == expected else None,
+            "missed_api": 0 if api == api_expected else None,
             "physical_phase_attribution_unknown": 0 if physical == expected else count,
-            "api_phase_attribution_unknown": 0 if api == expected else count}
+            "api_phase_attribution_unknown": 0 if api == api_expected else api_count}
     return result
 
 
 def inventory_boundary(records, owner, image, provider, admission, floor, marker, prefix_batches,
-                       *, exact=False, deadline=None, prior=None):
+                       *, exact=False, deadline=None, prior=None, physical_hooks=None, started_ns=0):
     """Derive a complete idle boundary from the actual same-observer records.
 
     Physical and instance rows are cumulative replacements. A pass without a
@@ -5939,8 +6012,12 @@ def inventory_boundary(records, owner, image, provider, admission, floor, marker
     if any(row["seq"] >= settled["seq"] for row in (physical, instance, semantic)):
         return None
     key = (owner.pid, admission["incarnation"], provider["path"])
+    hooks = (physical_hooks or {}).get(provider["path"])
+    if hooks is not None and hooks["provider"] != provider:
+        raise SetupError("Inventory physical hooks changed the held provider")
     totals = ledger_s1_totals(prefix_batches, 0)
-    expected = totals[5].get(key, 0)
+    api_expected = totals[5].get(key, 0)
+    expected = counted_totals(prefix_batches, started_ns, physical_hooks=physical_hooks).get(key, 0)
     warm = [row for row in marker["batches"] if row["fn"] != "C_GetFunctionList"
             and row["phase"].startswith("h6-warm")]
     if not warm and ack["command"] == "W":
@@ -5951,14 +6028,14 @@ def inventory_boundary(records, owner, image, provider, admission, floor, marker
     observed_last = (semantic["event"].get("operations") or {}).get("last_seen_ns")
     if (physical["at_ns"] < last_call or semantic["at_ns"] < last_call or settled["at_ns"] < ack["t1"]
             or type(observed_last) is not int or not last_call <= observed_last <= settled["at_ns"]
-            or entries["count"] > expected or counts["api"] > expected
+            or entries["count"] > expected or counts["api"] > api_expected
             or counts["completed"] > totals[2].get(key, 0)
             or counts["failed"] > totals[3].get(key, 0)):
         return None
     for mech, values in counts["mechanisms"].items():
         if values[0] > totals[0].get(key + (mech,), 0) or values[1] > totals[1].get(key + (mech,), 0):
             return None
-    if entries["count"] < expected or counts["api"] < expected:
+    if entries["count"] < expected or counts["api"] < api_expected:
         lower = min(row["t0"] for row in prefix_batches
                     if (row["pid"], row["gen"], row["module"]) == key)
         gaps = inventory_early_gaps(records, owner, admission, edge["module"], lower, settled["at_ns"])
@@ -5974,15 +6051,17 @@ def inventory_boundary(records, owner, image, provider, admission, floor, marker
     return {"physical": physical, "instance": instance, "semantic": semantic, "pass": settled,
             "counts": {"physical": entries["count"], **counts},
             "early": {"physical_expected": expected, "physical_observed": entries["count"],
-                      "physical_missed": expected - entries["count"], "api_expected": expected,
-                      "api_observed": counts["api"], "api_missed": expected - counts["api"],
+                      "physical_missed": expected - entries["count"], "api_expected": api_expected,
+                      "api_observed": counts["api"], "api_missed": api_expected - counts["api"],
                       "unknown": counts["unknown"], "gaps": gaps,
-                      "populations": inventory_early_phase_populations(prefix_batches, expected,
-                                                                        entries["count"], counts["api"])}}
+                      "populations": inventory_early_phase_populations(
+                          [row for row in prefix_batches if (row["pid"], row["gen"], row["module"]) == key],
+                          expected, entries["count"], counts["api"], api_expected=api_expected,
+                          physical_hooks=physical_hooks, started_ns=started_ns)}}
 
 
 def wait_inventory_s1_ready(owner, executable, provider_pin, admission, cursor, attempt, deadline,
-                            *, prefix_batches=(), prefix_markers=()):
+                            *, prefix_batches=(), prefix_markers=(), physical_hooks=None):
     """Release measurement only on fresh held-provider/instance/S1 proof."""
     if owner is not cursor.owner or owner.identity != cursor.birth_identity:
         raise SetupError("Inventory readiness changed the original owned birth or observer cursor")
@@ -6008,7 +6087,8 @@ def wait_inventory_s1_ready(owner, executable, provider_pin, admission, cursor, 
         while True:
             records, complete = cursor.read(deadline)
             boundary = inventory_boundary(cursor.saved_gaps + records, owner, image, provider,
-                admission, max(cursor.seq, admission["seq"]), marker, prefix, deadline=deadline)
+                admission, max(cursor.seq, admission["seq"]), marker, prefix, deadline=deadline,
+                physical_hooks=physical_hooks, started_ns=cursor.started_ns)
             if complete and boundary is not None:
                 remaining_until(deadline)
                 executable.verify()
@@ -6020,6 +6100,7 @@ def wait_inventory_s1_ready(owner, executable, provider_pin, admission, cursor, 
                     "module": boundary["physical"]["event"]["module"],
                     "instance": boundary["instance"]["event"]["id"], "image": image,
                     "provider": provider, "admission": admission, "cursor": cursor.receipt(),
+                    "physical_hooks": physical_hooks or {}, "observer_started_ns": cursor.started_ns,
                     "started_ns": started, "observed_ns": monotonic_ns(), "deadline_ns": deadline,
                     "attempts": number, "max_attempts": 20, "markers": markers,
                     "baseline": boundary}
@@ -6038,7 +6119,8 @@ def wait_inventory_measured_boundary(owner, executable, provider_pin, admission,
         records, complete = cursor.read(deadline)
         boundary = inventory_boundary(cursor.saved_gaps + records, owner, image, provider, admission,
             proof["baseline"]["pass"]["seq"], marker, prefix_batches, deadline=deadline,
-            prior=proof["baseline"])
+            prior=proof["baseline"], physical_hooks=proof["physical_hooks"],
+            started_ns=proof["observer_started_ns"])
         if complete and boundary is not None:
             if boundary["instance"]["event"]["id"] != proof["instance"]:
                 raise SetupError("Inventory measured phase changed its authorized instance")
@@ -6579,7 +6661,7 @@ def phase_window(batches, phases):
             max(batch["t1"] for batch in picked), total)
 
 
-def counted_totals(batches, started_ns, stopped_ns=None):
+def counted_totals(batches, started_ns, stopped_ns=None, *, physical_hooks=None, scope_intervals=None):
     """Per-(pid, gen, module) entered totals over in-capture phases only.
 
     Generation 0 runs setup before READY, which strictly precedes the
@@ -6590,14 +6672,21 @@ def counted_totals(batches, started_ns, stopped_ns=None):
     """
     totals: Counter = Counter()
     for batch in batches:
-        if batch["fn"] == "C_GetFunctionList":
-            continue
-        if stopped_ns is not None and batch["t0"] >= stopped_ns:
-            continue
         if batch["gen"] == 0 and batch["phase"] == "setup":
             if batch["t1"] >= started_ns:
                 raise SetupError("gen0 setup overlaps the observer lifetime: "
                                  "the gated start is broken")
+            continue
+        if batch["t1"] < started_ns or stopped_ns is not None and batch["t0"] >= stopped_ns:
+            continue
+        if batch["t0"] < started_ns or stopped_ns is not None and batch["t1"] > stopped_ns:
+            raise SetupError("Inventory physical ledger batch overlaps the observer boundary")
+        if scope_intervals is not None and not any(
+                interval["pid"] == batch["pid"] and interval["membership"] == "selected"
+                and interval["t0"] <= batch["t0"] <= batch["t1"] <= interval["t1"]
+                for interval in scope_intervals):
+            continue
+        if not inventory_physical_batch(batch, physical_hooks):
             continue
         totals[(batch["pid"], batch["gen"], batch["module"])] += batch["n"]
     return totals
@@ -6625,7 +6714,7 @@ def release_inventory_measurement(controller, provider, proof, deadline, *, pend
 
 def inventory_target_phases(ctx, log_path, target, original_executable, successor_executable,
                             provider, *, outside=None, sub=None, moves=None,
-                            sibling=None):
+                            sibling=None, physical_hooks=None):
     """The shared real R5/SystemMixed gate, with independent sibling batches."""
     moves = moves if moves is not None else []
     proofs, measured, stages = [], [], []
@@ -6643,7 +6732,7 @@ def inventory_target_phases(ctx, log_path, target, original_executable, successo
         "completed_pass": initial_cursor.completed_pass}
     initial = wait_inventory_s1_ready(target.owner, original_executable, provider,
         initial_admission, initial_cursor, target.warm, recovery0,
-        prefix_batches=first["batches"], prefix_markers=[first])
+        prefix_batches=first["batches"], prefix_markers=[first], physical_hooks=physical_hooks)
     proofs.append(initial)
     fixed_deadline = inventory_phase_deadline("fixed-measurement")
     first_measurement = release_inventory_measurement(target, provider, initial, fixed_deadline)
@@ -6691,7 +6780,7 @@ def inventory_target_phases(ctx, log_path, target, original_executable, successo
     admission = wait_r5_successor_admitted(log_path, target.owner, successor_executable, checkpoint,
         not_before_ns=t_in, timeout=remaining_until(recovery))
     proof = wait_inventory_s1_ready(target.owner, successor_executable, provider, admission,
-        checkpoint, target.warm, recovery)
+        checkpoint, target.warm, recovery, physical_hooks=physical_hooks)
     proofs.append(proof)
     stages.append({"label": "recovery", "t0": resumed, "t1": proof["observed_ns"]})
     fixed_deadline = inventory_phase_deadline("fixed-measurement")
@@ -6737,8 +6826,9 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
     # Discover executes provider code as the workload UID; only this owned
     # subtree is writable by it, while the observer's leg directory is not.
     manifest_path = leg_dir / "workload" / "manifest-A.json"
-    build_manifest(ctx.discover_pin, provider.path, manifest_path, env,
-                   ctx.args.uid, ctx.args.gid)
+    manifest = build_manifest(ctx.discover_pin, provider.path, manifest_path, env,
+                              ctx.args.uid, ctx.args.gid)
+    physical_hooks = inventory_manifest_hooks(manifest, provider)
     root, _ = create_tracked(ctx, Path("/sys/fs/cgroup") / f"p11scope-h6-{uuid.uuid4().hex[:8]}")
     selected, _ = create_tracked(ctx, root.path / "selected")
     outside, _ = create_tracked(ctx, root.path / "outside")
@@ -6781,7 +6871,8 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
     wait_passes(log_path, 2)
     gate_s.touch()
     control = inventory_target_phases(ctx, log_path, control_x, original_executable,
-        successor_executable, provider, outside=outside, sub=sub, moves=moves)
+        successor_executable, provider, outside=outside, sub=sub, moves=moves,
+        physical_hooks=physical_hooks)
     out_s.wait(lambda r: any(line.startswith("DONE ") for line in r.lines), 60)
     obs_rc, stopped, latency = stop_inventory(owned)
     enter_phase("cleanup")
@@ -6796,29 +6887,30 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
     finish_readers([out_x, err_x, out_s, err_s, capture, errors])
     ledgers = {"RX": parse_inv_ledger("".join(out_x.lines)),
                "RS0": parse_inv_ledger("".join(out_s.lines))}
-    totals = counted_totals(ledgers["RX"]["batches"], started, stopped)
+    scope_intervals = [
+        {"pid": x_pid, "membership": "selected", "t0": ready, "t1": control["outside_ns"]},
+        {"pid": x_pid, "membership": "selected", "t0": control["reentry_ns"], "t1": stopped},
+        {"pid": s_pid, "membership": "selected", "t0": ready, "t1": stopped}]
+    totals = counted_totals(ledgers["RX"]["batches"], started, stopped,
+                            physical_hooks=physical_hooks, scope_intervals=scope_intervals)
     m_t0, m_t1, m_n = phase_window(
         ledgers["RX"]["batches"], ["RX:h6-measured:gen1", "RX:h6-failed:gen1"])
     warm_phases = sorted({inventory_phase_name(row) for row in ledgers["RX"]["batches"]
         if row["t1"] < m_t0 and row["fn"] != "C_GetFunctionList"})
     w_t0, w_t1, w_n = phase_window(ledgers["RX"]["batches"], warm_phases)
-    t_out, t_in = control["outside_ns"], control["reentry_ns"]
     key0 = (x_pid, 0, str(provider.path))
     key1 = (x_pid, 1, str(provider.path))
     receipt = {
         "cell": "cgroup-reentry", "leg": f"inventory/{backend}", "scope_kind": "cgroup",
         "scope_label": "cgroup", "owned_pids": [x_pid, s_pid],
-        "scope_intervals": [
-            {"pid": x_pid, "membership": "selected", "t0": ready, "t1": t_out},
-            {"pid": x_pid, "membership": "selected", "t0": t_in, "t1": stopped},
-            {"pid": s_pid, "membership": "selected", "t0": ready, "t1": stopped},
-        ],
+        "scope_intervals": scope_intervals,
         "moves": moves,
         "observer_started_ns": started, "observer_ready_ns": ready,
         "observer_stopped_ns": stopped, "observer_rc": obs_rc,
         **stop_receipt(owned, latency, INVENTORY_STOP_SECONDS),
         "manual_rebind": False, "s1_expected": True,
         "providers": {"A": provider_receipt(provider)},
+        "physical_hooks": physical_hooks,
         "expected_incarnations": {
             str(x_pid): {"gens": {
                 "0": {"exe": str(ledger_bin), "retired": True},
@@ -6880,8 +6972,9 @@ def run_system_mixed(ctx, cell_dir, backend):
     shutil.copyfile(provider_a.path, provider_f)
     provider_f.chmod(0o755)
     manifest_path = leg_dir / "workload" / "manifest-A.json"
-    build_manifest(ctx.discover_pin, provider_a.path, manifest_path, env,
-                   ctx.args.uid, ctx.args.gid)
+    manifest = build_manifest(ctx.discover_pin, provider_a.path, manifest_path, env,
+                              ctx.args.uid, ctx.args.gid)
+    physical_hooks = inventory_manifest_hooks(manifest, provider_a)
     gate_f = leg_dir / "gate-F"
     # XE and XS spawn from the same file: independent same-file callers.
     owned_e, out_e, err_e = spawn_ledger(
@@ -6926,7 +7019,7 @@ def run_system_mixed(ctx, cell_dir, backend):
     wait_passes(log_path, 2)
     gate_f.touch()
     control = inventory_target_phases(ctx, log_path, control_e, original_executable,
-        successor_executable, provider_a, sibling=control_s)
+        successor_executable, provider_a, sibling=control_s, physical_hooks=physical_hooks)
     out_f.wait(lambda r: any(line.startswith("DONE ") for line in r.lines), 120)
     obs_rc, stopped, latency = stop_inventory(owned)
     enter_phase("cleanup")
@@ -6945,8 +7038,8 @@ def run_system_mixed(ctx, cell_dir, backend):
     ledgers = {"MX": parse_inv_ledger("".join(out_e.lines)),
                "MS": parse_inv_ledger("".join(out_s.lines)),
                "MF": parse_inv_ledger("".join(out_f.lines))}
-    totals_e = counted_totals(ledgers["MX"]["batches"], started, stopped)
-    totals_s = counted_totals(ledgers["MS"]["batches"], started, stopped)
+    totals_e = counted_totals(ledgers["MX"]["batches"], started, stopped, physical_hooks=physical_hooks)
+    totals_s = counted_totals(ledgers["MS"]["batches"], started, stopped, physical_hooks=physical_hooks)
     m_t0, m_t1, m_n = phase_window(
         ledgers["MX"]["batches"], ["MX:h6-measured:gen1", "MX:h6-failed:gen1"])
     warm_phases = sorted({inventory_phase_name(row) for row in ledgers["MX"]["batches"]
@@ -6963,6 +7056,7 @@ def run_system_mixed(ctx, cell_dir, backend):
         "manual_rebind": False, "s1_expected": True,
         "providers": {"A": provider_receipt(provider_a),
                       "B": provider_receipt(provider_b_pin)},
+        "physical_hooks": physical_hooks,
         "count_only_providers": ["B"],
         "expected_incarnations": {
             str(e_pid): {"gens": {

@@ -1770,6 +1770,33 @@ def ledger_s1_totals(batches, started_ns):
     return mech_calls, mech_errors, op_completed, op_failed, op_calls, entered
 
 
+def inventory_held_provider_module(doc, provider):
+    """Resolve the independently calibrated maps identity before path/content checks."""
+    mapping = provider.get("mapping") or {}
+    device, inode = mapping.get("dev"), mapping.get("ino")
+    if (not isinstance(device, list) or len(device) != 2
+            or any(type(part) is not int or part < 0 for part in device)
+            or type(inode) is not int or inode <= 0
+            or provider.get("dev") != device or provider.get("ino") != inode):
+        raise SetupError("held provider mapping identity is unavailable or inconsistent")
+    candidates = []
+    for module in doc.get("modules", []):
+        identity = module.get("identity") or {}
+        mapped = identity.get("device") or {}
+        actual = [mapped.get("major"), mapped.get("minor")]
+        if (all(type(part) is int for part in actual) and actual == device
+                and type(identity.get("inode")) is int and identity["inode"] == inode):
+            candidates.append(module)
+    if len(candidates) != 1:
+        raise SetupError("module identity is absent or ambiguous for the held provider file")
+    module = candidates[0]
+    if (provider["path"] not in module.get("paths", [])
+            or not provider.get("sha256")
+            or module["identity"].get("sha256") != provider["sha256"]):
+        raise SetupError("module identity/path disagrees with the held provider file")
+    return module
+
+
 def _evaluate_inventory_h6(doc, ledgers, receipt):
     if receipt.get("inventory_control"):
         return evaluate_controlled_inventory_h6(doc, ledgers, receipt)
@@ -1802,10 +1829,8 @@ def _evaluate_inventory_h6(doc, ledgers, receipt):
         calls, receipt, ready, stop)
     errors.extend(boundary_errors)
     callers = {caller["id"]: caller for caller in doc.get("callers", [])}
-    module_by_path = {}
-    for module in doc.get("modules", []):
-        for path in module.get("paths", []):
-            module_by_path.setdefault(path, module)
+    module_by_provider = {name: inventory_held_provider_module(doc, provider)
+                          for name, provider in receipt["providers"].items()}
     owned_ids: set = set()
     per_pid: dict = {}
     for pid_text, want in receipt.get("expected_incarnations", {}).items():
@@ -1835,15 +1860,7 @@ def _evaluate_inventory_h6(doc, ledgers, receipt):
     for key, want in receipt.get("expected_edges", {}).items():
         pid_text, gen_text, module_key = key.split(":")
         pid, gen = int(pid_text), int(gen_text)
-        provider = receipt["providers"][module_key]
-        module = module_by_path.get(provider["path"])
-        if module is not None and provider.get("ino") is not None:
-            identity = module.get("identity") or {}
-            if identity.get("inode") != provider["ino"] or (
-                    provider.get("sha256") is not None
-                    and identity.get("sha256") != provider["sha256"]):
-                errors.append(f"pid {pid} gen {gen} {module_key}: module identity "
-                              f"disagrees with the held provider file")
+        module = module_by_provider[module_key]
         caller_id = next((caller["id"] for caller in doc.get("callers", [])
                           if caller.get("pid") == pid and caller.get("incarnation") == gen), None)
         edge = next((edge for edge in doc.get("edges", [])
@@ -1888,8 +1905,7 @@ def _evaluate_inventory_h6(doc, ledgers, receipt):
     for key in receipt.get("expected_edges", {}):
         pid_text, gen_text, module_key = key.split(":")
         pid, gen = int(pid_text), int(gen_text)
-        provider = receipt["providers"][module_key]
-        module = module_by_path.get(provider["path"])
+        module = module_by_provider[module_key]
         caller_id = next((caller["id"] for caller in doc.get("callers", [])
                           if caller.get("pid") == pid and caller.get("incarnation") == gen), None)
         if caller_id is not None and module is not None:
@@ -1920,7 +1936,7 @@ def _evaluate_inventory_h6(doc, ledgers, receipt):
                           for module in doc.get("modules", [])}
         count_only_ids = set()
         for module_key in receipt.get("count_only_providers", []):
-            module = module_by_path.get(receipt["providers"][module_key]["path"])
+            module = module_by_provider[module_key]
             if module is not None:
                 count_only_ids.add(module.get("id"))
 
@@ -2069,8 +2085,7 @@ def _evaluate_inventory_h6(doc, ledgers, receipt):
                 break
     # Count-only providers: physical counts without semantic rows.
     for module_key in receipt.get("count_only_providers", []):
-        provider = receipt["providers"][module_key]
-        module = module_by_path.get(provider["path"])
+        module = module_by_provider[module_key]
         if module is None:
             continue
         for edge in doc.get("edges", []):
@@ -2390,12 +2405,12 @@ def inventory_sibling_s1_errors(doc, ledger, receipt, records):
             if name in receipt.get("count_only_providers", []):
                 continue
             path = receipt["providers"][name]["path"]
-            modules = [row["id"] for row in doc["modules"] if path in row.get("paths", [])]
             label = f"SystemMixed sibling pid {pid} gen {gen} {name}"
-            if len(modules) != 1:
-                errors.append(f"{label}: attested module identity is ambiguous")
+            try:
+                module = inventory_held_provider_module(doc, receipt["providers"][name])["id"]
+            except SetupError as error:
+                errors.append(f"{label}: {error}")
                 continue
-            module = modules[0]
             instances = [row for row in doc["instances"] if (row["caller"], row["module"]) == (caller, module)]
             semantic = [row for row in doc["semantic_edges"] if (row["caller"], row["module"]) == (caller, module)]
             physical = [row for row in doc["edges"] if (row["caller"], row["module"]) == (caller, module)]
@@ -3259,9 +3274,8 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
         result["out_of_scope_calls"] -= max(0, post_stop - result["post_stop_calls"])
         result["post_stop_calls"] = post_stop
     errors.extend(result["errors"])
-    count_only = {module["id"] for module in doc.get("modules", []) if any(
-        receipt["providers"][name]["path"] in module.get("paths", [])
-        for name in receipt.get("count_only_providers", []))}
+    count_only = {inventory_held_provider_module(doc, receipt["providers"][name])["id"]
+                  for name in receipt.get("count_only_providers", [])}
     for row in doc.get("edges", []) + doc.get("semantic_edges", []):
         if row.get("module") in count_only and (row.get("mechanisms") is not None
                 or row.get("operations") is not None or not str(row.get("semantics", "unknown")).startswith("unknown")

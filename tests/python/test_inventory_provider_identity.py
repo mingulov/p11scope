@@ -78,11 +78,16 @@ class InventoryProviderIdentityTest(unittest.TestCase):
 
     def test_duplicate_exact_module_identity_cannot_satisfy_physical_or_sibling_claims(self):
         for factory in (lambda: BASE["inventory_inputs"](s1_expected=False), SYSTEM["controlled_inputs"]):
-            for duplicate_id in ("m0", "m-duplicate"):
-                with self.subTest(factory=factory.__name__, duplicate_id=duplicate_id):
+            for duplicate_id, divergent in (("m0", None), ("m-duplicate", None),
+                                           ("m-duplicate", "digest"), ("m-duplicate", "path")):
+                with self.subTest(factory=factory.__name__, duplicate_id=duplicate_id, divergent=divergent):
                     doc, ledgers, receipt = factory()
                     duplicate = copy.deepcopy(doc["modules"][0])
                     duplicate["id"] = duplicate_id
+                    if divergent == "digest":
+                        duplicate["identity"]["sha256"] = "f" * 64
+                    elif divergent == "path":
+                        duplicate["paths"] = ["/w/other.so"]
                     doc["modules"].append(duplicate)
                     result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
                     self.assertFalse(result["pass"], result["errors"])

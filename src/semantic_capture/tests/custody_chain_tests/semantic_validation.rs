@@ -3,7 +3,7 @@
 //! These tests establish source behavior, not native attachment qualification.
 
 use super::*;
-use crate::discovery::caller_registry::instance_input::InstanceReason;
+use crate::discovery::caller_registry::instance_input::{InstanceLifecycle, InstanceReason};
 use crate::discovery::engine::inventory_coordinator::semantics::{
     AttestedSubset, engine_for_test, prepare_attested_subset,
 };
@@ -305,6 +305,8 @@ struct HeldH0 {
     validations: usize,
     inject: Option<(usize, ValidationFailure)>,
     validation_negatives: Vec<(&'static str, Option<u64>)>,
+    last_terminal_tasks: Vec<(u64, u64)>,
+    last_calls: Vec<(ImageIdentity, u64)>,
 }
 
 #[derive(Clone)]
@@ -365,6 +367,23 @@ impl LaneTestIo for SharedH0 {
             .tick_with(io)
             .map_err(|_| SemanticRefusal::Unavailable)?;
         assert_eq!(merge_stash_into_report(stash, &mut report), 0);
+        owned.last_terminal_tasks = report
+            .outcomes()
+            .iter()
+            .filter_map(|outcome| {
+                let TickOutcome::Invalidation(invalidation) = outcome else {
+                    return None;
+                };
+                let InvalidationScope::TaskRetired(cookie) = invalidation.scope() else {
+                    return None;
+                };
+                Some((*cookie, invalidation.position().unwrap()))
+            })
+            .collect();
+        owned.last_calls = report
+            .calls()
+            .filter_map(|call| Some((call.image(), call.position()?)))
+            .collect();
         SemanticBatch::from_tick_report(domain, report, Vec::new(), now_ns())
     }
     fn refresh(
@@ -449,6 +468,15 @@ impl RealScene {
             })
             .collect();
         let mut scene = CustodyScene::new();
+        scene.coordinator = InventoryCoordinator::new(
+            Scope::System,
+            HookRegistry::builtin(),
+            Vec::new(),
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        scene.coordinator.set_semantic_binding_clock(sight_clock);
         scene.coordinator.note_extend_receipt(&ExtendReceipt {
             activated_roots: true,
             exec_coverage: Some(ExecCoverage::scripted(domain, 0)),
@@ -461,6 +489,8 @@ impl RealScene {
             validations: 0,
             inject: None,
             validation_negatives: Vec::new(),
+            last_terminal_tasks: Vec::new(),
+            last_calls: Vec::new(),
         })));
         let mut scene = Self {
             scene,
@@ -837,4 +867,137 @@ fn semantic_validation_full_batch_preserves_calls_and_distinct_validation_loss()
         "the distinct image negative must reach H2 beside the domain validation loss"
     );
     assert_eq!(b.semantics.as_ref().unwrap().unknown(), 1);
+}
+
+#[test]
+fn semantic_validation_terminal_task_preserves_healthy_peer_before_its_barrier() {
+    use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+    let child = OwnedStoppedChild::new();
+    let pid_a = child.id();
+    let pid_b = std::process::id();
+    let mut fixture = RealScene::new(1);
+    let caller_a = fixture.bind(pid_a, image(7), 0);
+    let caller_b = fixture.bind(pid_b, image(8), 0);
+    fixture.enqueue(pid_a, 0, "C_SignInit", 0x0001, 0);
+    fixture.enqueue(pid_b, 0, "C_SignInit", 0x000d, 0);
+    let batch = fixture.tick();
+    fixture.publish(batch);
+    assert_eq!(
+        operation_edge_rows(&fixture.scene),
+        vec![(Some(1), 0, false, 1, 0), (Some(1), 0, false, 1, 0),],
+        "both real callers have independently published, live operations"
+    );
+    fixture.refresh(caller_b, 0);
+    let pin_a = fixture.h0.0.borrow().io.targets[&pid_a].0.clone();
+    // SAFETY: only this retained owned child is signaled. It remains
+    // unreaped until its owner drops, so its pid cannot be reused here.
+    assert_eq!(
+        unsafe { libc::kill(pid_a as libc::pid_t, libc::SIGKILL) },
+        0
+    );
+    assert!(pin_a.wait_ready(Some(Duration::from_secs(3))).unwrap());
+    fixture.enqueue(pid_b, 0, "C_Sign", 0, 0);
+    let batch = fixture.tick();
+    {
+        let h0 = fixture.h0.0.borrow();
+        assert_eq!(
+            h0.last_terminal_tasks.len(),
+            1,
+            "H0 minted one original-pidfd TaskRetired fact"
+        );
+        assert_eq!(h0.last_terminal_tasks[0].0, 7);
+        let peer_position = h0
+            .last_calls
+            .iter()
+            .find(|(caller_image, _)| *caller_image == image(8))
+            .unwrap()
+            .1;
+        assert!(
+            peer_position < h0.last_terminal_tasks[0].1,
+            "the healthy peer return was collected before the dead task's barrier"
+        );
+    }
+    fixture.publish(batch);
+    let peer = fixture
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .find(|row| row.caller == caller_b)
+        .unwrap();
+    assert_eq!(peer.api_returns, Some(2));
+    assert_eq!(
+        peer.historical_only_returns, 0,
+        "a different task's barrier cannot demote the healthy peer return"
+    );
+    assert!(!peer.lossy);
+    let reducer = peer.semantics.as_ref().unwrap();
+    assert_eq!(
+        (reducer.started(), reducer.completed(), reducer.unknown()),
+        (1, 1, 0)
+    );
+    let dead = fixture
+        .scene
+        .coordinator
+        .registry()
+        .instances()
+        .find(|row| row.caller == caller_a)
+        .unwrap();
+    assert_eq!(
+        dead.state,
+        InstanceLifecycle::Retired,
+        "a terminal task is permanently retired, with its own operation ended unknown"
+    );
+}
+
+#[test]
+fn semantic_validation_global_fault_still_fences_two_real_callers() {
+    use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+    let child = OwnedStoppedChild::new();
+    let pid_a = child.id();
+    let pid_b = std::process::id();
+    let mut fixture = RealScene::new(1);
+    let caller_a = fixture.bind(pid_a, image(7), 0);
+    let caller_b = fixture.bind(pid_b, image(8), 0);
+    fixture.enqueue(pid_a, 0, "C_SignInit", 0x0001, 0);
+    fixture.enqueue(pid_b, 0, "C_SignInit", 0x000d, 0);
+    let batch = fixture.tick();
+    fixture.publish(batch);
+    assert_eq!(
+        operation_edge_rows(&fixture.scene),
+        vec![(Some(1), 0, false, 1, 0), (Some(1), 0, false, 1, 0),]
+    );
+    fixture
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .script
+        .health
+        .push_back(Ok(Health {
+            fault: 1,
+            sticky: 0,
+        }));
+    fixture.refresh(caller_a, 0);
+    fixture.refresh(caller_b, 0);
+    let batch = fixture.tick();
+    fixture.publish(batch);
+    let old: Vec<_> = fixture
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .filter(|row| row.api_returns == Some(1))
+        .collect();
+    assert_eq!(old.len(), 2);
+    for edge in old {
+        assert!(edge.lossy && edge.reasons.contains(&InstanceReason::SemanticLoss));
+        let reducer = edge.semantics.as_ref().unwrap();
+        assert_eq!(
+            (reducer.completed(), reducer.unknown()),
+            (0, 1),
+            "the real H0 fault era ends both original operations unknown"
+        );
+        assert!(!reducer.has_live_operations());
+    }
 }

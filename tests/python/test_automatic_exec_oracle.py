@@ -622,20 +622,24 @@ class InitialLoadFixtureTest(unittest.TestCase):
     def setUp(self):
         self.ctx = H6["Case"](SimpleNamespace(out=self.directory, uid=os.getuid(), gid=os.getgid()))
         self.addCleanup(H6["cleanup_leg_resources"], self.ctx)
+        self.launches = {}
 
     def start(self, deadline=None, extra=(), image=0, prefix=()):
         argv = [*prefix, str(self.executable), str(self.provider), str(image), "selected",
                 "--canary", H6["CANARIES"][2]]
         if deadline is not None:
             argv += ["--h6-load-deadline", str(deadline)]
+        launch_ns = time.monotonic_ns()
         owner = H6["spawn_owned"](
             self.ctx.owners, [*argv, *extra], os.getuid(), env=self.env,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, start_new_session=True)
+        owned_ns = time.monotonic_ns()
         reader = H6["owned_reader"](self.ctx.readers, H6["Reader"], owner.popen.stdout,
                                     self.directory / f"load-{owner.pid}.out")
-        H6["owned_reader"](self.ctx.readers, H6["Reader"], owner.popen.stderr,
-                           self.directory / f"load-{owner.pid}.err")
+        errors = H6["owned_reader"](self.ctx.readers, H6["Reader"], owner.popen.stderr,
+                                  self.directory / f"load-{owner.pid}.err")
+        self.launches[owner.pid] = (deadline, launch_ns, owned_ns, errors)
         return owner, reader
 
     def send(self, owner, command):
@@ -646,10 +650,17 @@ class InitialLoadFixtureTest(unittest.TestCase):
     def unloaded(self, owner, reader):
         try:
             reader.record("ack", 0, "load-wait", seconds=1)
-        except TimeoutError:
+        except TimeoutError as error:
+            deadline, launch_ns, owned_ns, errors = self.launches[owner.pid]
+            wait_end_ns = time.monotonic_ns()
+            slack_ns = None if deadline is None else deadline - wait_end_ns
+            stderr_tail = "".join(errors.lines[-8:]).encode("utf-8", "replace")[-4096:].decode("utf-8", "replace")
+            diagnostic = (f"deadline_ns={deadline} launch_ns={launch_ns} owned_ns={owned_ns} "
+                          f"wait_end_ns={wait_end_ns} deadline_slack_ns={slack_ns} "
+                          f"stderr_tail={stderr_tail!r}")
             if owner.popen.poll() is not None:
-                self.fail(f"caller exited rc={owner.popen.returncode} before required load-wait acknowledgement")
-            raise
+                self.fail(f"caller exited rc={owner.popen.returncode} before required load-wait acknowledgement; {diagnostic}")
+            raise TimeoutError(f"{error}; {diagnostic}") from error
         image = self.pin.image_receipt(reader.record("image", 0), owner)
         self.assertNotIn(str(self.provider), Path(f"/proc/{owner.pid}/maps").read_text())
         self.assertFalse(any(row["kind"] in ("target", "call", "ready") for row in reader.records))
@@ -823,8 +834,9 @@ class InitialLoadFixtureTest(unittest.TestCase):
                 self.retired(owner, reader, rc=1 if command == "load " else 2, unloaded=True)
 
     def test_invalid_deadlines_images_and_gate_combinations_fail_before_provider(self):
+        expired = str(time.monotonic_ns() - 1)
         cases = [(value, (), 0) for value in ("", "0", "-1", "12x", "18446744073709551616",
-                                              str(time.monotonic_ns() - 1))]
+                                              expired)]
         future = time.monotonic_ns() + 3_000_000_000
         cases += [(future, (), 1), (future, ("--start-gate", "/unused"), 0),
                   (future, ("--auto-gate", "/unused"), 0),
@@ -839,6 +851,12 @@ class InitialLoadFixtureTest(unittest.TestCase):
                     env=self.env, input="", capture_output=True, text=True, timeout=2)
                 self.assertEqual(completed.returncode, 2)
                 self.assertEqual(completed.stdout, "")
+                if deadline == expired:
+                    self.assertTrue(completed.stderr.startswith("H6_LOAD_DEADLINE_EXPIRED "),
+                                    completed.stderr)
+                    fields = dict(field.split("=", 1) for field in completed.stderr.split()[1:])
+                    self.assertEqual(int(fields["deadline_ns"]), int(expired))
+                    self.assertGreaterEqual(int(fields["now_ns"]), int(expired))
 
     def test_duplicate_load_cannot_reload_provider(self):
         owner, reader = self.start(time.monotonic_ns() + 2_000_000_000)

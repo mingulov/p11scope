@@ -224,7 +224,13 @@ int main(int argc, char **argv) {
         if (!isdigit(*p)) return 2;
       char *end; errno = 0;
       load_deadline = strtoull(argv[i + 1], &end, 10);
-      if (errno || *end || !load_deadline || load_deadline <= now_ns()) return 2;
+      if (errno || *end || !load_deadline) return 2;
+      unsigned long long observed_ns = now_ns();
+      if (load_deadline <= observed_ns) {
+        fprintf(stderr, "H6_LOAD_DEADLINE_EXPIRED deadline_ns=%llu now_ns=%llu\n",
+                load_deadline, observed_ns);
+        return 2;
+      }
     }
     else if (!strcmp(argv[i], "--canary")) { private_buffer[63] ^= (unsigned char)argv[i + 1][0]; }
     else return 2;

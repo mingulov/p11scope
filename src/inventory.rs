@@ -1332,6 +1332,37 @@ pub(crate) fn classic_semantic_tick_for_test(
     driver.semantic.take().unwrap()
 }
 
+/// Drive the real apply/commit boundary without the native loop or a worker.
+/// The caller supplies a real collected catalog/owned cgroup transaction;
+/// neither this seam nor its native identity can pre-bind a Detailed caller.
+#[cfg(test)]
+pub(crate) fn classic_semantic_pass_for_test(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    lane: crate::inventory_semantics::AttestedSemanticLane,
+    scope: &Scope,
+    collected: CollectedPass,
+    identity: &mut dyn NativeIdentity<PidPin>,
+) -> crate::inventory_semantics::AttestedSemanticLane {
+    let mut driver = ClassicDriver {
+        coordinator,
+        inventory_scope: None,
+        scope: scope.into(),
+        cgroup: None,
+        max_scan_pids: None,
+        guard: UnavailableImageGuard,
+        deadline: None,
+        identity: None,
+        display: None,
+        semantic: Some(lane),
+        semantic_staged: false,
+    };
+    let report = driver.apply(collected, identity, now_ns()).unwrap();
+    driver.commit(report.engine_changed).unwrap();
+    driver.on_tick();
+    driver.commit(false).unwrap();
+    driver.semantic.take().unwrap()
+}
+
 impl ClassicDriver<'_> {
     /// A pass warning: stderr on the classic path; under the dashboard
     /// (which must never scribble beside its screen) the log tail, kept

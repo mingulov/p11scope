@@ -253,6 +253,17 @@ impl LaneCoverage {
 /// production stash/merge/batch/finalize/commit path.
 #[cfg(test)]
 pub(crate) trait LaneTestIo {
+    /// The exact targets the production driver selected for this tick.
+    fn tick_targets(&mut self, _pins: &[Arc<PidPin>]) {}
+    /// Optional real H0 cut servicing. A handler drains `gaps`; otherwise
+    /// the existing shell cut seam retains them for its own assertions.
+    fn physical_gaps(
+        &mut self,
+        _domain: NativeDomainId,
+        _gaps: &mut Vec<PhysicalSemanticGap>,
+    ) -> Option<Result<SemanticBatch, SemanticRefusal>> {
+        None
+    }
     /// The real H0 receipt validation through substituted I/O.
     fn validate_current(
         &mut self,
@@ -663,7 +674,12 @@ impl AttestedSemanticLane {
             }
             // Targets resolve through the substituted I/O; the H0 tick,
             // stash merge and batch construction are the shared ones.
-            let _ = bindings;
+            test.tick_targets(
+                &bindings
+                    .iter()
+                    .map(SemanticCallerBinding::pin)
+                    .collect::<Vec<_>>(),
+            );
             return test.tick(domain);
         }
         let Some(live) = self.live.as_mut() else {
@@ -747,6 +763,16 @@ impl AttestedSemanticLane {
         &mut self,
         gaps: Vec<PhysicalSemanticGap>,
     ) -> Result<SemanticBatch, SemanticRefusal> {
+        #[cfg(test)]
+        let gaps = {
+            let mut gaps = gaps;
+            if let Some(test) = self.test_io.as_mut()
+                && let Some(batch) = test.physical_gaps(self.domain, &mut gaps)
+            {
+                return batch;
+            }
+            gaps
+        };
         if let Some(live) = self.live.as_mut() {
             let domain = self.domain;
             if live.finished {

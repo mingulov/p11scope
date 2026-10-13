@@ -102,6 +102,8 @@ struct InventoryCloseBatch<L> {
     _leases: FileLeases,
 }
 
+type InventoryCloser<L> = dyn Fn(&mut L) -> Result<()> + Send + Sync;
+
 impl<L> Drop for InventoryCloseBatch<L> {
     fn drop(&mut self) {
         // The pool is declared after this owner and therefore joins its
@@ -119,7 +121,7 @@ impl<L> Drop for InventoryCloseBatch<L> {
 }
 
 impl<L: Send + 'static> RetirementWork<L> {
-    fn run_concurrent(&mut self, close: Arc<dyn Fn(&mut L) -> Result<()> + Send + Sync>) {
+    fn run_concurrent(&mut self, close: Arc<InventoryCloser<L>>) {
         let mut batch = InventoryCloseBatch {
             slots: Vec::new(),
             _leases: Arc::clone(&self._leases),

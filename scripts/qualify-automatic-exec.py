@@ -2528,7 +2528,8 @@ def inventory_sibling_s1_errors(doc, ledger, receipt, records):
 
 
 CGROUP_DISCLOSURE_SUBJECTS = {"scoped native owner admission deferred", "semantic admission refused"}
-SYSTEM_DISCLOSURE_SUBJECTS = {"discovery capped", "capture discovery", "semantic admission refused"}
+SYSTEM_DISCLOSURE_SUBJECTS = {"discovery capped", "capture discovery", "semantic admission refused",
+    "process maps sweep", "semantic input refused", "native capture retirement unsettled"}
 SEMANTIC_EARLY_SUBJECTS = {"physical provider use preceded first observed semantic registration",
                          "initial semantic proof followed earlier physical provider use"}
 SYSTEM_SCAN_LIMIT = 256
@@ -2537,7 +2538,12 @@ SYSTEM_EMPTY_MAPS_REFUSAL = (
 SYSTEM_H6_LIMITATION = (
     "System H6 qualifies only independently ledgered owned callers. Global discovery remains partial "
     "and ambient usage remains unqualified; recognized disclosures are retained unresolved. "
-    "This does not prove a complete host census.")
+    "This does not prove a complete host census. Recovery refusal publication does not establish "
+    "occurrence times or caller attribution; these outcomes remain unattributed. "
+    "An unsettled terminal drain remains unqualified even after normal observer exit.")
+SYSTEM_UNSETTLED_RETIREMENT = (
+    "the probes did not detach within 10000 ms; the document was written while the Inventory probes may "
+    "still be attached, and they are reclaimed (blocking) after it")
 SCOPED_OWNER_DEFERRAL = (
     "native owner activation and refresh cannot yet be enclosed by the final cgroup membership bracket; "
     "sampled scan-pinned callers and retained native totals remain available")
@@ -2781,7 +2787,59 @@ def inventory_system_preuse_disclosure(doc, ledgers, receipt, gap, publication):
                 and row["seq"] > last_prefix and row["at_ns"] < dispatch for row in records))
 
 
-def inventory_system_disclosure(doc, ledgers, receipt, index):
+def inventory_system_custody_publications(receipt, publications, completions, validated):
+    """Recognize recovery publication ordering, never attribute the refused outcomes."""
+    measurements = receipt["inventory_control"]["measurements"]
+    records = receipt["inventory_control"]["final_records"]
+    if len(measurements) != 2 or len(validated) != 2:
+        return False
+    previous, successor = measurements
+    old, new = previous["proof"], successor["proof"]
+    if (old["incarnation"] != 0 or new["incarnation"] != 1
+            or old["image"]["pid"] != new["image"]["pid"]
+            or old["image"]["start_time"] != new["image"]["start_time"]
+            or old["provider"] != new["provider"] or old["module"] != new["module"]
+            or old["caller"] == new["caller"] or old["instance"] == new["instance"]
+            or any(summary["tuple"] != [proof["image"]["start_time"], proof["caller"],
+                proof["incarnation"], proof["module"], proof["instance"]]
+                for summary, proof in zip(validated, (old, new)))):
+        return False
+    by_seq = {row["seq"]: row for row in records}
+    admitted = by_seq.get(new["admission"]["seq"])
+    if (admitted is None or admitted["kind"] != "caller_event"
+            or admitted["event"].get("event") not in ("admitted", "exec_retired")):
+        return False
+    owner = SimpleNamespace(pid=new["image"]["pid"], identity={"start_time": new["image"]["start_time"]})
+    subject = "new" if admitted["event"]["event"] == "exec_retired" else "caller"
+    context = r5_caller_context(admitted["event"], owner, new["image"], subject=subject)
+    if (context["id"], context["incarnation"]) != (new["caller"], 1):
+        return False
+    retired = [row for row in records if previous["end"]["pass"]["seq"] < row["seq"] <= admitted["seq"]
+               and inventory_exec_retirement(row, old["caller"])]
+    if len(retired) != 1:
+        return False
+    context = r5_caller_context(retired[0]["event"], owner, old["image"],
+        subject=inventory_exec_retirement(retired[0], old["caller"]), lifecycle="exec_retired")
+    if (context["id"], context["incarnation"]) != (old["caller"], 0):
+        return False
+    first = next((row for row in records if row["kind"] == "instance_observed"
+                  and row["event"].get("caller") == new["caller"]), None)
+    if (first is None or (first["event"].get("id"), first["event"].get("module"))
+            != (new["instance"], new["module"])
+            or not all(admitted["seq"] < row["seq"] < completion["seq"] < first["seq"]
+                       for row, completion in zip(publications, completions))):
+        return False
+    # The existing full evaluator independently replays both measured endpoints,
+    # the whole physical ledger, and sibling deltas. Borrow only its exact early
+    # boundary row, not a subject label or a guessed count of refused old calls.
+    return any(by_seq.get(row["seq"]) == row and admitted["seq"] < row["seq"] < first["seq"]
+        and row["event"].get("caller") == new["caller"] and row["event"].get("module") == new["module"]
+        and row["event"].get("subject") in SEMANTIC_EARLY_SUBJECTS
+        and row["event"].get("reason") == "before_semantic_boundary"
+        for row in validated[1]["early"]["gaps"])
+
+
+def inventory_system_disclosure(doc, ledgers, receipt, index, validated=()):
     """Recognize exact bounded/ambient limitations without granting owned authority."""
     gap = doc["gaps"][index]
     records = receipt["inventory_control"]["final_records"]
@@ -2796,7 +2854,8 @@ def inventory_system_disclosure(doc, ledgers, receipt, index):
             or set(gap) != {"subject", "reason", "caller", "module", "pid", "budget", "repeats"}
             or gap["module"] is not None or gap["budget"] is not None
             or type(gap["repeats"]) is not int or type(observation.get("passes")) is not int
-            or not 1 <= gap["repeats"] <= observation["passes"]):
+            or not 1 <= gap["repeats"] <= 18446744073709551615
+            or gap["subject"] != "semantic input refused" and gap["repeats"] > observation["passes"]):
         return False
     births = inventory_system_owned_births(ledgers, receipt)
     if births is None:
@@ -2809,22 +2868,82 @@ def inventory_system_disclosure(doc, ledgers, receipt, index):
         return False
     publication = publications[0]
     repeats = 1
+    updates = [publication]
     for row in records:
         if row["kind"] == "gap_repeated" and row["event"].get("index") == index:
             count = row["event"].get("repeats")
-            if (row["seq"] <= publication["seq"] or type(row["event"]["index"]) is not int
+            if (row["seq"] <= updates[-1]["seq"] or type(row["event"]["index"]) is not int
+                    or set(row["event"]) != {"index", "repeats"}
                     or type(count) is not int or not repeats < count <= gap["repeats"]):
                 return False
             repeats = count
+            updates.append(row)
     if repeats != gap["repeats"]:
         return False
     completing = next((row for row in records if row["kind"] == "pass_committed"
                        and row["seq"] > publication["seq"]), None)
+    if gap["subject"] == "native capture retirement unsettled":
+        ordinary = [row for row in records if row["kind"] == "pass_committed" and not row["event"].get("final")]
+        finals = [row for row in records if row["kind"] == "pass_committed" and row["event"].get("final") is True]
+        semantic = observation.get("semantic_capture") or {}
+        return (gap["caller"] is None and gap["pid"] is None and gap["reason"] == SYSTEM_UNSETTLED_RETIREMENT
+            and gap["repeats"] == 1 and len(finals) == 1 and bool(ordinary) and completing == finals[0]
+            and ordinary[-1]["seq"] < publication["seq"] < finals[0]["seq"] < records[-1]["seq"]
+            and observation.get("retirement") == observation.get("settlement") == "unsettled"
+            and semantic.get("status") == "stopped" and semantic.get("final_drain") is False
+            and semantic.get("stop_quiescence") == "quiesced"
+            and receipt.get("observer_rc") == 0 and receipt.get("forced_cleanup") is False
+            and receipt.get("stop_limit_seconds") == INVENTORY_STOP_SECONDS
+            and type(receipt.get("stop_latency_seconds")) in (int, float)
+            and 0 <= receipt["stop_latency_seconds"] <= INVENTORY_STOP_SECONDS
+            and observation["passes"] == ordinary[-1]["event"]["pass"] + 1
+            and finals[0]["event"]["pass"] == ordinary[-1]["event"]["pass"]
+            and records[-1]["event"].get("passes") == observation["passes"]
+            and records[-1]["event"].get("gaps_suppressed") == finals[0]["event"].get("gaps_suppressed") == 0
+            and observation.get("ended_ns") == records[-1]["event"].get("ended_ns") == records[-1]["at_ns"]
+            and ordinary[-1]["at_ns"] <= publication["at_ns"] <= finals[0]["at_ns"]
+                <= records[-1]["at_ns"] <= receipt["observer_stopped_ns"])
     if (completing is None or completing["event"].get("final")
             or type(completing["event"].get("pass")) is not int
             or not 0 <= completing["event"]["pass"] < observation["passes"]
             or completing["event"].get("gaps_suppressed") != 0):
         return False
+    if gap["subject"] in ("process maps sweep", "semantic input refused"):
+        completions = [next((row for row in records if row["kind"] == "pass_committed"
+                             and row["seq"] > update["seq"]), None) for update in updates]
+        if (gap["caller"] is not None or gap["pid"] is not None
+                or any(row is None or row["event"].get("final")
+                    or type(row["event"].get("pass")) is not int
+                    or not 0 <= row["event"]["pass"] < observation["passes"]
+                    or row["event"].get("gaps_suppressed") != 0 for row in completions)):
+            return False
+        if gap["subject"] == "semantic input refused":
+            return gap["reason"] == "custody" and inventory_system_custody_publications(
+                receipt, updates, completions, validated)
+        match = re.fullmatch(r"maps snapshots unavailable for ([1-9][0-9]*) of ([1-9][0-9]*) "
+                             r"attempted processes; provider presence remains unknown", gap["reason"])
+        if match is None:
+            return False
+        unavailable, attempted = map(int, match.groups())
+        if not 0 < unavailable <= attempted <= 18446744073709551615:
+            return False
+        for completion in completions:
+            previous = max((row["seq"] for row in records if row["kind"] == "pass_committed"
+                            and row["seq"] < completion["seq"]), default=-1)
+            for row in records:
+                if (row["kind"] not in ("gap_recorded", "gap_repeated")
+                        or not previous < row["seq"] < completion["seq"]):
+                    continue
+                other = doc["gaps"][row["event"]["index"]]
+                if other["subject"] != "discovery capped":
+                    continue
+                if not inventory_system_disclosure(doc, ledgers, receipt, row["event"]["index"]):
+                    return False
+                total = re.match(r"([0-9]+) processes in scope;", other["reason"])
+                missing = re.search(r"; ([0-9]+) processes past the cap had no maps snapshot$", other["reason"])
+                if int(total[1]) != attempted or int(missing[1] if missing else 0) > unavailable:
+                    return False
+        return True
     if gap["subject"] == "discovery capped":
         if gap["caller"] is not None or gap["pid"] is not None:
             return False
@@ -3267,7 +3386,7 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
         if (gap.get("subject") in CGROUP_DISCLOSURE_SUBJECTS and inventory_cgroup_disclosure(
                 doc, ledgers, receipt, index)
                 or gap.get("subject") in SYSTEM_DISCLOSURE_SUBJECTS and inventory_system_disclosure(
-                    doc, ledgers, receipt, index)
+                    doc, ledgers, receipt, index, summaries)
                 or inventory_semantic_early_disclosure(doc, records, index, early)):
             disclosures.append(gap)
         else:
@@ -3279,6 +3398,9 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
     result = _evaluate_inventory_h6(physical_doc, ledgers, physical_receipt)
     result["gaps"] = [(gap.get("subject"), gap.get("detail")) for gap in doc.get("gaps", [])]
     result["expected_disclosures"] = disclosures
+    if any(gap["subject"] == "native capture retirement unsettled" for gap in disclosures):
+        result["unresolved_observation"] = {key: doc["observation"][key]
+            for key in ("retirement", "settlement", "semantic_capture")}
     post_stop = sum(row["n"] for row in all_batches if row["fn"] != "C_GetFunctionList"
                     and row["t0"] >= receipt["observer_stopped_ns"])
     if receipt.get("scope_kind") == "cgroup":

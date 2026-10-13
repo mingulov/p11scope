@@ -1841,11 +1841,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         // Validated registrations second: every covered id registers.
         // Conversion borrows end before staging mutates the registry.
-        let mut initial_coverage_gaps = BTreeSet::new();
         for coverage in &coverages {
             let staged: Vec<(
                 CallerId,
-                Option<ModuleId>,
                 Result<
                     crate::discovery::caller_registry::instance_input::AdmittedInstance,
                     ConversionRefusal,
@@ -1858,30 +1856,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     continue;
                 };
                 let caller = binding.caller();
-                // Read only the prior immutable publication. Physical use
-                // staged beside this first registration proves no earlier
-                // coverage interval, and another caller/provider cannot do so.
-                let initial_gap =
-                    self.registry
-                        .module_id_for(binding.module())
-                        .filter(|module| {
-                            self.registry.edge(caller, *module).is_some_and(|edge| {
-                                edge.entry_count > 0
-                                    || matches!(
-                                        self.registry.coverage(edge),
-                                        UseCoverage::Witnessed { .. }
-                                    )
-                            }) && !self.registry.instances().any(|instance| {
-                                instance.caller == caller && instance.module == *module
-                            })
-                        });
                 coverage
                     .instances()
                     .iter()
                     .map(|id| {
                         (
                             caller,
-                            initial_gap,
                             admit_registration_from_coverage(
                                 coverage,
                                 binding,
@@ -1894,29 +1874,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     })
                     .collect()
             };
-            for (caller, initial_gap, result) in staged {
+            for (caller, result) in staged {
                 match result {
-                    Ok(input) => {
-                        // Successful conversion proves the current binding and
-                        // attested provider. Disclose only when its initial
-                        // proof began; infer no old call count or attribution
-                        // and preserve fresh reducer/physical coverage.
-                        if let Some(module) = initial_gap
-                            && initial_coverage_gaps.insert((caller, module))
-                        {
-                            self.registry.record_gap(RegistryGap {
-                                caller: Some(caller),
-                                module: Some(module),
-                                pid: None,
-                                subject:
-                                    "initial semantic proof followed earlier physical provider use"
-                                        .into(),
-                                reason: InstanceReason::BeforeSemanticBoundary.label().into(),
-                                budget: None,
-                            });
-                        }
-                        self.registry.note_instance(input);
-                    }
+                    Ok(input) => self.registry.note_instance(input),
                     Err(reason) => self.conversion_gap(Some(caller), reason),
                 }
             }

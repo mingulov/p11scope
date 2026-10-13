@@ -539,6 +539,91 @@ def initial_ready_errors(trace, ledger, receipt):
         return [f"invalid bounded initial public readiness proof: {error}"]
 
 
+def cgroup_operator_path_errors(receipt):
+    """R1 proves pathname changes around one retained physical cgroup root."""
+    if receipt.get("cell") != "cgroup-reentry" or not receipt.get("leg", "").startswith("trace/"):
+        return []
+    try:
+        proof = receipt["operator_path"]
+        if proof["operation"] != "operator-path-ancestor-rename-and-alias-replacement":
+            raise ValueError("wrong operator-path operation")
+        ns = proof["namespace"]
+        names = {"mnt", "pid", "time", "user", "cgroup"}
+        if (set(ns["before"]) != names or set(ns["after"]) != names
+                or any(type(value) is not int or value <= 0 for state in (ns["before"], ns["after"])
+                       for value in state.values())
+                or ns["before"]["mnt"] == ns["after"]["mnt"]
+                or any(ns["before"][name] != ns["after"][name] for name in names - {"mnt"})
+                or ns["after"]["pid"] != receipt["pid_namespace"]
+                or ns["after"]["time"] != receipt["time_namespace"]
+                or ns["private"] is not True or ns["shared_or_slave"] != 0
+                or type(ns["mountinfo_entries"]) is not int or ns["mountinfo_entries"] <= 0):
+            raise ValueError("namespace or recursive private propagation proof disagrees")
+        selected, outside = proof["selected"], proof["outside"]
+        def identity(row):
+            if (any(type(row[key]) is not int or row[key] <= 0 for key in ("dev", "ino", "magic"))
+                    or row["magic"] != 0x63677270):
+                raise ValueError("missing real held cgroup2 identity")
+            return row["dev"], row["ino"]
+        original_key, outside_key = identity(selected), identity(outside)
+        if original_key == outside_key:
+            raise ValueError("outside is the selected physical cgroup")
+        selected_path, outside_path = Path(selected["path"]), Path(outside["path"])
+        for native in (selected_path, outside_path):
+            native.relative_to("/sys/fs/cgroup")
+        if selected_path.parent != outside_path.parent:
+            raise ValueError("canonical cgroups are not the owned sibling pair")
+        initial, renamed, replacement, held = (proof[key] for key in
+            ("initial", "renamed", "replacement", "held_after_replacement"))
+        operator = Path(initial["path"])
+        if (not operator.is_absolute() or operator.name != "root" or operator.parent.name != "current"
+                or operator.parent.parent.name != "scope-path"
+                or Path(renamed["path"]) != operator.parent.parent / "retained/root"
+                or replacement["path"] != initial["path"] or held["path"] != renamed["path"]):
+            raise ValueError("operator ancestor rename/replacement paths disagree")
+        for row, expected in ((initial, original_key), (renamed, original_key),
+                              (replacement, outside_key), (held, original_key)):
+            if (identity(row) != expected or type(row["mount_id"]) is not int or row["mount_id"] <= 0
+                    or row["mount_namespace"] != ns["after"]["mnt"] or row["filesystem"] != "cgroup2"):
+                raise ValueError("operator path or held FD has the wrong physical/mount identity")
+        if not initial["mount_id"] == renamed["mount_id"] == held["mount_id"] != replacement["mount_id"]:
+            raise ValueError("original mount was not retained independently of replacement")
+        phases = receipt["phases"]
+        fixed = [("warm", 0, "C_GenerateRandom", 5, "selected"),
+                 ("aside", 0, "C_GetInfo", 3, "outside"),
+                 ("outside-b", 1, "C_GetInfo", 3, "outside"),
+                 ("measured", 1, "C_GetSessionInfo", 10, "selected"),
+                 ("still", 1, "C_GetSessionInfo", 3, "selected"),
+                 ("renamed", 1, "C_GetSessionInfo", 3, "selected"),
+                 ("operator-outside", 1, "C_GetInfo", 3, "outside")]
+        controlled = {}
+        for label, image, fn, count, scope in fixed:
+            matches = [phase for phase in phases if phase["phase"] == label]
+            if len(matches) != 1 or any(matches[0][key] != value for key, value in
+                    (("image", image), ("fn", fn), ("count", count), ("scope", scope))):
+                raise ValueError("fixed R1 phase population changed: " + label)
+            controlled[label] = matches[0]
+        still, stable, negative = (controlled[key] for key in ("still", "renamed", "operator-outside"))
+        actual_selected = "/" + str(selected_path.relative_to("/sys/fs/cgroup"))
+        actual_outside = "/" + str(outside_path.relative_to("/sys/fs/cgroup"))
+        if (any(phase["actual_cgroup"] != actual_selected for phase in (still, stable))
+                or negative["actual_cgroup"] != actual_outside):
+            raise ValueError("rename/replacement phases lack canonical actual membership")
+        stamps = [ns["prepared_ns"], proof["probe_ns"], initial["t"], receipt["observer_started_ns"],
+                  controlled["measured"]["t1"], renamed["t"], still["t0"], still["t1"], replacement["t"],
+                  held["t"], stable["t0"], stable["t1"], proof["outside_move_ns"],
+                  negative["t0"], negative["t1"], receipt["observer_stopped_ns"]]
+        if (any(type(stamp) is not int or stamp <= 0 for stamp in stamps)
+                or any(a > b for a, b in zip(stamps, stamps[1:]))):
+            raise ValueError("operator-path preflight/rename/replacement/membership chronology disagrees")
+        intervals = receipt["scope_intervals"]
+        if len(intervals) != 2 or intervals[-1]["t1"] != proof["outside_move_ns"]:
+            raise ValueError("selected scope interval extends past the actual outside move")
+        return []
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError) as error:
+        return [f"invalid held-root operator-path control: {error}"]
+
+
 def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
     rows, counts, evidence, errors = N3_PARSE_TRACE(trace)
     # Default every finding to capture integrity. Only the specific recovery
@@ -551,6 +636,7 @@ def _evaluate_trace_h6(trace, ledger, receipt, file_trace):
             errors.append(error)
             (expected_mode2_abandonment_errors if abandonment else successor_recovery_errors).append(error)
     errors.extend(stop_errors(receipt))
+    errors.extend(cgroup_operator_path_errors(receipt))
     if (receipt.get("b_setup") or {}).get("mode") == "3":
         errors.extend(held_entry_errors(trace, ledger, receipt))
     if receipt.get("expect_empty"):
@@ -2346,6 +2432,7 @@ OwnedProcess = N3HARNESS["OwnedProcess"]
 InitialExecProcess = INITIAL_EXEC["InitialExecProcess"]
 spawn_initial_exec = INITIAL_EXEC["spawn_initial_exec"]
 FilePin = N3HARNESS["FilePin"]
+fs_magic = N3HARNESS["fs_magic"]
 cleanup_processes = N3HARNESS["cleanup_processes"]
 cleanup_cgroups = N3HARNESS["cleanup_cgroups"]
 create_cgroup = N3HARNESS["create_cgroup"]
@@ -3892,6 +3979,7 @@ class Case:
         self.owners: list = []
         self.readers: list = []
         self.groups: list = []
+        self.operator_paths: list = []
         self.leg_pins: list = []
         self.traced: list = []
         self.scopes: list = []
@@ -3985,7 +4073,7 @@ def wait_terminal_child(owner):
 
 
 def cleanup_leg_resources(ctx, close_pins=True):
-    if not any((ctx.owners, ctx.readers, ctx.groups, ctx.leg_pins, ctx.traced)):
+    if not any((ctx.owners, ctx.readers, ctx.groups, ctx.leg_pins, ctx.traced, getattr(ctx, "operator_paths", ()))):
         return  # Completed scopes need no new budget, including the backstop.
     # The final case backstop has no live leg context. It still gets one
     # finite cleanup allowance, shared by every remaining child and reader.
@@ -4007,7 +4095,7 @@ def _cleanup_leg_resources(ctx, close_pins=True):
     failures = []
     with cleanup_section():
         owners, readers, groups = list(ctx.owners), list(ctx.readers), list(ctx.groups)
-        if owners or readers:
+        if owners or readers or getattr(ctx, "operator_paths", ()):
             try:
                 enter_phase("cleanup")
             except TimeoutError as error:
@@ -4074,7 +4162,23 @@ def _cleanup_leg_resources(ctx, close_pins=True):
                 except Exception as error:
                     failures.append(f"leg pin: {type(error).__name__}: {error}")
             ctx.leg_pins.clear()
-        if not pending:
+        aliases = list(getattr(ctx, "operator_paths", ()))
+        unsettled_readers = any(getattr(reader, "thread", None) is not None and reader.thread.is_alive()
+                                for reader in readers)
+        retained_aliases = []
+        if aliases and (pending or unsettled_readers):
+            retained_aliases = aliases
+            failures.append("operator paths retained for unsettled owned child/reader")
+        else:
+            for alias in reversed(aliases):
+                try:
+                    alias.remove()
+                except Exception as error:
+                    retained_aliases.append(alias)
+                    failures.append(f"operator path: {type(error).__name__}: {error}")
+        if hasattr(ctx, "operator_paths"):
+            ctx.operator_paths[:] = [alias for alias in aliases if alias in retained_aliases]
+        if not pending and not retained_aliases:
             for group in reversed(groups):
                 try:
                     group.remove()
@@ -4104,6 +4208,7 @@ class LegContext:
     def __init__(self, parent):
         self.parent, self.case = parent, getattr(parent, "case", parent)
         self.owners, self.readers, self.groups, self.leg_pins, self.traced = [], [], [], [], []
+        self.operator_paths = []
         self.case.scopes.append(self)
 
     def __getattr__(self, name):
@@ -5892,9 +5997,314 @@ def fixup_renamed_wrappers(moves, top_wrapper, new_top, children):
     moves.append({"t": monotonic_ns(), "cgroup": str(new_top), "note": "rename-held"})
 
 
+def _namespace_ids():
+    return {name: (Path("/proc/self/ns") / name).stat().st_ino
+            for name in ("mnt", "pid", "time", "user", "cgroup")}
+
+
+def _read_mountinfo():
+    def decode(value):
+        return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match[1], 8)), value)
+    rows = []
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        left, right = line.split(" - ", 1)
+        fields, filesystem = left.split(), right.split()
+        rows.append({"id": int(fields[0]), "target": decode(fields[4]),
+                     "optional": fields[6:], "fs": filesystem[0]})
+    if not rows:
+        raise SetupError("empty mountinfo cannot prove private operator namespace")
+    return rows
+
+
+def _mount_call(source, target, flags):
+    ctypes.set_errno(0)
+    result = _LIBC.mount(ctypes.c_char_p(os.fsencode(source) if source is not None else None),
+        ctypes.c_char_p(os.fsencode(target)), ctypes.c_char_p(None), ctypes.c_ulong(flags), ctypes.c_void_p(None))
+    if result:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(target))
+
+
+def _unshare_mount_namespace():
+    ctypes.set_errno(0)
+    if _LIBC.unshare(ctypes.c_int(0x00020000)):  # CLONE_NEWNS only
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def _make_mounts_private():
+    _mount_call(None, "/", (1 << 14) | (1 << 18))  # MS_REC | MS_PRIVATE, after CLONE_NEWNS
+
+
+def _bind_operator_mount(source, target):
+    _mount_call(source, target, 1 << 12)  # MS_BIND, one actual cgroup root
+
+
+def _unmount_operator_mount(target):
+    ctypes.set_errno(0)
+    if _LIBC.umount2(ctypes.c_char_p(os.fsencode(target)), ctypes.c_int(0)):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), str(target))
+
+
+class PrivateOperatorNamespace:
+    """One process-owned mount clone, entered before any child or reader."""
+    def __init__(self):
+        self.original_fd = self.private_fd = None
+        self.proof = None
+
+    def acquire(self):
+        if threading.active_count() != 1 or len(list(Path("/proc/self/task").iterdir())) != 1:
+            raise SetupError("operator namespace must precede every reader thread")
+        if (Path("/proc/self/task") / str(os.getpid()) / "children").read_text().strip():
+            raise SetupError("operator namespace must precede every child")
+        before = _namespace_ids()
+        self.original_fd = os.open("/proc/self/ns/mnt", os.O_RDONLY | os.O_CLOEXEC)
+        _unshare_mount_namespace()
+        after = _namespace_ids()
+        if before["mnt"] == after["mnt"] or any(before[name] != after[name] for name in before if name != "mnt"):
+            raise SetupError("mount-only namespace clone changed the wrong namespace")
+        self.private_fd = os.open("/proc/self/ns/mnt", os.O_RDONLY | os.O_CLOEXEC)
+        _make_mounts_private()
+        rows = _read_mountinfo()
+        if any(flag.startswith(("shared:", "master:", "propagate_from:")) for row in rows for flag in row["optional"]):
+            raise SetupError("operator mount namespace still has shared/slave propagation")
+        self.proof = {"before": before, "after": after, "prepared_ns": monotonic_ns(),
+                      "private": True, "shared_or_slave": 0, "mountinfo_entries": len(rows)}
+        self.verify()
+
+    def verify(self):
+        if self.proof is None or _namespace_ids() != self.proof["after"]:
+            raise SetupError("operator namespace identity changed")
+        if any(flag.startswith(("shared:", "master:", "propagate_from:"))
+               for row in _read_mountinfo() for flag in row["optional"]):
+            raise SetupError("operator mount namespace propagation changed")
+
+    def close(self):
+        # The process remains in its private clone until exit; never mutate or
+        # re-enter the original namespace during capture or cleanup.
+        for name in ("private_fd", "original_fd"):
+            if (fd := getattr(self, name)) is not None:
+                os.close(fd)
+                setattr(self, name, None)
+
+
+def initialize_operator_namespace(ctx):
+    with cleanup_section():
+        if getattr(ctx, "operator_namespace", None) is not None:
+            raise SetupError("operator mount namespace was already initialized")
+        ctx.operator_namespace = PrivateOperatorNamespace()  # enroll before unshare
+        ctx.operator_namespace.acquire()
+
+
+def _open_operator_dir(path):
+    return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+
+
+def _operator_mount_id(fd):
+    matches = re.findall(r"^mnt_id:\s+([0-9]+)$", Path(f"/proc/self/fdinfo/{fd}").read_text(), re.MULTILINE)
+    if len(matches) != 1:
+        raise SetupError("held operator FD lacks an actual mount ID")
+    return int(matches[0])
+
+
+class OperatorCgroupPath:
+    """Owned ordinary ancestors and bind roots; native N3 groups stay canonical."""
+    def __init__(self, ctx, directory, selected, outside):
+        self.namespace = ctx.operator_namespace
+        self.base = Path(directory) / "scope-path"
+        self.selected, self.outside = selected, outside
+        self.parent_fd = self.base_fd = self.root_fd = None
+        self.base_identity = self.parent_identity = None
+        self.base_created = False
+        self.directories, self.mounts = {}, []
+        self.proof = {"operation": "operator-path-ancestor-rename-and-alias-replacement"}
+
+    @property
+    def path(self):
+        return self.base / "current/root"
+
+    def _verify_parent(self):
+        for fd, path, expected in ((self.parent_fd, self.base.parent, self.parent_identity),
+                                   (self.base_fd, self.base, self.base_identity)):
+            if fd is None:
+                continue
+            held, actual = os.fstat(fd), path.stat(follow_symlinks=False)
+            if (not stat.S_ISDIR(actual.st_mode) or expected != (held.st_dev, held.st_ino)
+                    or expected != (actual.st_dev, actual.st_ino)):
+                raise SetupError("owned operator ancestor was replaced")
+
+    def _mkdir(self, relative):
+        self._verify_parent()
+        os.mkdir(relative, mode=0o755, dir_fd=self.base_fd)
+        self.directories[relative] = None  # enroll immediately, before stat
+        info = os.stat(relative, dir_fd=self.base_fd, follow_symlinks=False)
+        self.directories[relative] = (info.st_dev, info.st_ino)
+
+    def _rmdir(self, relative):
+        self._verify_parent()
+        info = os.stat(relative, dir_fd=self.base_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != self.directories[relative]:
+            raise SetupError("owned operator directory was replaced")
+        os.rmdir(relative, dir_fd=self.base_fd)
+        del self.directories[relative]
+
+    def snapshot(self, path, fd=None):
+        self.namespace.verify()
+        opened = fd is None
+        fd = _open_operator_dir(path) if opened else fd
+        try:
+            info, magic, mount = os.fstat(fd), fs_magic(fd), _operator_mount_id(fd)
+            matches = [row for row in _read_mountinfo() if row["id"] == mount and row["target"] == str(path)]
+            if magic != 0x63677270 or len(matches) != 1 or matches[0]["fs"] != "cgroup2":
+                raise SetupError("operator path is not the actual held cgroup2 bind mount")
+            return {"path": str(path), "dev": info.st_dev, "ino": info.st_ino, "magic": magic,
+                    "mount_id": mount, "mount_namespace": self.namespace.proof["after"]["mnt"],
+                    "filesystem": matches[0]["fs"], "t": monotonic_ns()}
+        finally:
+            if opened:
+                os.close(fd)
+
+    def native(self, group):
+        group.verify()
+        group.path.relative_to("/sys/fs/cgroup")
+        held = os.fstat(group.fd)
+        if (held.st_dev, held.st_ino) != group.identity or fs_magic(group.fd) != 0x63677270:
+            raise SetupError("operator target lacks its actual canonical held cgroup2 identity")
+        return {"path": str(group.path), "dev": held.st_dev, "ino": held.st_ino, "magic": 0x63677270}
+
+    def _bind(self, relative, group):
+        check_dispatch()
+        self.namespace.verify()
+        native = self.native(group)
+        entry = {"relative": relative, "expected": (native["dev"], native["ino"]), "snapshot": None}
+        self.mounts.append(entry)  # retain even a failed/uncertain mount attempt
+        _bind_operator_mount(group.path, self.base / relative)
+        actual = self.snapshot(self.base / relative)
+        if (actual["dev"], actual["ino"]) != entry["expected"]:
+            raise SetupError("bind mount differs from the actual owned canonical cgroup")
+        entry["snapshot"] = actual
+        check_dispatch()
+        return actual
+
+    def _unmount(self, entry):
+        check_dispatch()
+        self.namespace.verify()
+        path = self.base / entry["relative"]
+        matches = [row for row in _read_mountinfo() if row["target"] == str(path)]
+        if matches:
+            expected = entry["snapshot"]
+            if expected is None:
+                raise SetupError("unproven operator bind remains owned for failed cleanup")
+            actual = self.snapshot(path)
+            if ((actual["dev"], actual["ino"]) != entry["expected"]
+                    or expected is not None and actual["mount_id"] != expected["mount_id"]):
+                raise SetupError("refusing to unmount a replaced operator mount")
+            _unmount_operator_mount(path)  # normal unmount only; all alias FDs are closed
+            if any(row["target"] == str(path) for row in _read_mountinfo()):
+                raise SetupError("operator mount remained after normal unmount")
+        elif entry["snapshot"] is not None:
+            raise SetupError("original owned operator mount disappeared before cleanup")
+        self.mounts.remove(entry)
+        check_dispatch()
+
+    def _rename(self, source, target):
+        check_dispatch()
+        self._verify_parent()
+        info = os.stat(source, dir_fd=self.base_fd, follow_symlinks=False)
+        if (info.st_dev, info.st_ino) != self.directories[source]:
+            raise SetupError("operator ancestor identity changed before rename")
+        try:
+            os.stat(target, dir_fd=self.base_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise SetupError("operator rename would replace a foreign ancestor")
+        os.rename(source, target, src_dir_fd=self.base_fd, dst_dir_fd=self.base_fd)
+        self.directories = {target + relative[len(source):] if relative == source or relative.startswith(source + "/")
+                            else relative: identity for relative, identity in self.directories.items()}
+        for entry in self.mounts:
+            if entry["relative"].startswith(source + "/"):
+                entry["relative"] = target + entry["relative"][len(source):]
+        check_dispatch()
+
+    def acquire(self):
+        self.namespace.verify()
+        self.parent_fd = os.open(self.base.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        info = os.fstat(self.parent_fd)
+        self.parent_identity = info.st_dev, info.st_ino
+        os.mkdir(self.base.name, mode=0o755, dir_fd=self.parent_fd)
+        self.base_created = True
+        info = os.stat(self.base.name, dir_fd=self.parent_fd, follow_symlinks=False)
+        self.base_identity = info.st_dev, info.st_ino
+        self.base_fd = os.open(self.base, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        self._mkdir("current")
+        self._mkdir("current/root")
+        self.proof.update(namespace=self.namespace.proof, selected=self.native(self.selected), outside=self.native(self.outside))
+        first = self._bind("current/root", self.selected)
+        self.root_fd = _open_operator_dir(self.path)
+        # Exercise both required mechanics before starting any observer. The
+        # retained alias mount itself is never renamed or detached by this probe.
+        self._rename("current", "retained")
+        retained = self.snapshot(self.base / "retained/root", self.root_fd)
+        if any(retained[key] != first[key] for key in ("dev", "ino", "magic", "mount_id")):
+            raise SetupError("pre-observer ancestor rename changed the held root")
+        self._rename("retained", "current")
+        self._mkdir("probe-root")
+        probe = self._bind("probe-root", self.outside)
+        if (probe["dev"], probe["ino"]) == (first["dev"], first["ino"]) or probe["mount_id"] == first["mount_id"]:
+            raise SetupError("outside probe is not an independent physical/mount identity")
+        self._unmount(self.mounts[-1])
+        self._rmdir("probe-root")
+        self.proof["probe_ns"] = monotonic_ns()
+        self.proof["initial"] = self.snapshot(self.path, self.root_fd)
+
+    def rename_selected(self):
+        with cleanup_section():
+            self._rename("current", "retained")
+            self.proof["renamed"] = self.snapshot(self.base / "retained/root", self.root_fd)
+
+    def replace_original(self):
+        with cleanup_section():
+            self._mkdir("current")
+            self._mkdir("current/root")
+            self.proof["replacement"] = self._bind("current/root", self.outside)
+            self.proof["held_after_replacement"] = self.snapshot(self.base / "retained/root", self.root_fd)
+
+    def remove(self):
+        with cleanup_section():
+            self._verify_parent()
+            if self.root_fd is not None:
+                os.close(self.root_fd)
+                self.root_fd = None
+            for entry in list(reversed(self.mounts)):
+                self._unmount(entry)
+            for relative in sorted(self.directories, key=lambda name: name.count("/"), reverse=True):
+                self._rmdir(relative)
+            if self.base_created:
+                self._verify_parent()
+                actual = os.stat(self.base.name, dir_fd=self.parent_fd, follow_symlinks=False)
+                if not stat.S_ISDIR(actual.st_mode) or (actual.st_dev, actual.st_ino) != self.base_identity:
+                    raise SetupError("owned operator base was replaced before cleanup")
+                os.rmdir(self.base.name, dir_fd=self.parent_fd)
+                self.base_created = False
+            for name in ("base_fd", "parent_fd"):
+                if (fd := getattr(self, name)) is not None:
+                    os.close(fd)
+                    setattr(self, name, None)
+
+
+def create_operator_path(ctx, directory, selected, outside):
+    with cleanup_section():
+        owned = OperatorCgroupPath(ctx, directory, selected, outside)
+        ctx.operator_paths.append(owned)
+        owned.acquire()
+        return owned
+
+
 @owned_leg
 def run_cgroup_r1(ctx, cell_dir, backend):
-    """Inside -> outside exec -> descendant re-entry, same-image move, rename."""
+    """Re-entry plus retained-root operator ancestor rename/alias replacement."""
     leg_dir = Path(cell_dir) / backend / "trace"
     (leg_dir / "workload").mkdir(mode=0o755, parents=True, exist_ok=True)
     env = init_token(leg_dir / "workload", ctx.args.uid, ctx.args.gid, "h6-r1")
@@ -5906,16 +6316,17 @@ def run_cgroup_r1(ctx, cell_dir, backend):
         pins[name] = leg_pin(ctx, path)
     provider = ctx.provider_pin
     root, _ = create_tracked(ctx, Path("/sys/fs/cgroup") / f"p11scope-h6-{uuid.uuid4().hex[:8]}")
-    selected, selected_w = create_tracked(ctx, root.path / "selected")
+    selected, _ = create_tracked(ctx, root.path / "selected")
     outside, _ = create_tracked(ctx, root.path / "outside")
-    sub, sub_w = create_tracked(ctx, selected.path / "sub")
+    sub, _ = create_tracked(ctx, selected.path / "sub")
+    operator = create_operator_path(ctx, leg_dir, selected, outside)
     caller, stdout, _ = spawn_caller(ctx.owners, ctx.readers, leg_dir, pins["caller-a"],
                                      provider, ctx.args.uid, ctx.args.gid, env)
     stdout.record("ready", 0)
     images = [pins["caller-a"].image_receipt(stdout.record("image", 0), caller)]
     moves = []
     move_and_verify(selected, caller, moves, "initial")
-    argv = [str(ctx.binary.path), "trace", "--cgroup", str(selected.path),
+    argv = [str(ctx.binary.path), "trace", "--cgroup", str(operator.path),
            "--module", str(provider.path), "--attach-backend", backend,
            "--duration", "240s", "-o", str(leg_dir / "trace.file.txt")]
     owned, capture, errors, started = spawn_observer(
@@ -5950,22 +6361,16 @@ def run_cgroup_r1(ctx, cell_dir, backend):
     n3_command(caller, stdout, "C_GetSessionInfo", 10, 200, "measured", "selected",
                1, sub, phases)
     move_and_verify(selected, caller, moves, "same-image-move")
+    operator.rename_selected()
     n3_command(caller, stdout, "C_GetSessionInfo", 3, 100, "still", "selected",
                1, selected, phases)
-    renamed = root.path / "selected-renamed"
-    fixup_renamed_wrappers(moves, selected_w, renamed, [(sub_w, "sub")])
-    assert cgroup_of(caller.pid).endswith("selected-renamed")
-    # The N3 group object still points at the old path: verify by raw path.
-    begin = monotonic_ns()
-    check_dispatch()
-    caller.popen.stdin.write("calls C_GetSessionInfo 3 100 renamed selected\n")
-    caller.popen.stdin.flush()
-    stdout.record("ack", 1, "renamed")
-    finish = monotonic_ns()
-    assert cgroup_of(caller.pid).endswith("selected-renamed")
-    phases.append({"image": 1, "fn": "C_GetSessionInfo", "phase": "renamed",
-                   "scope": "selected", "count": 3, "t0": begin, "t1": finish,
-                   "actual_cgroup": cgroup_of(caller.pid)})
+    operator.replace_original()
+    n3_command(caller, stdout, "C_GetSessionInfo", 3, 100, "renamed", "selected",
+               1, selected, phases)
+    move_and_verify(outside, caller, moves, "operator-path-replacement-negative")
+    operator.proof["outside_move_ns"] = moves[-1]["t"]
+    n3_command(caller, stdout, "C_GetInfo", 3, 100, "operator-outside", "outside",
+               1, outside, phases)
     obs_rc, stopped, latency = stop_observer(owned)
     caller_rc = stop_caller(caller, stdout, 1)
     finish_readers([stdout, capture, errors])
@@ -5976,8 +6381,9 @@ def run_cgroup_r1(ctx, cell_dir, backend):
         "owned_pids": [caller.pid],
         "scope_intervals": [
             {"pid": caller.pid, "membership": "selected", "t0": ready, "t1": t_out},
-            {"pid": caller.pid, "membership": "selected", "t0": t_in, "t1": stopped},
+            {"pid": caller.pid, "membership": "selected", "t0": t_in, "t1": operator.proof["outside_move_ns"]},
         ],
+        "operator_path": operator.proof,
         "moves": moves,
         "images": images, "provider_before": provider_receipt(provider),
         "provider_after": provider_receipt(provider),
@@ -6582,6 +6988,8 @@ def main(argv=None):
     cleanup_receipt: dict = {"processes": 0, "cgroups": 0, "pins": 0, "errors": []}
     with signal_cleanup():
         try:
+            if "cgroup-reentry" in cells:
+                initialize_operator_namespace(ctx)
             with cleanup_section():
                 ctx.binary = FilePin(args.binary)
                 pins.append(ctx.binary)
@@ -6614,6 +7022,15 @@ def main(argv=None):
                     cleanup_leg_resources(ctx)
                 except LegCleanupError:
                     pass
+                namespace = getattr(ctx, "operator_namespace", None)
+                if namespace is not None and not any(
+                        any((scope.owners, scope.readers, scope.traced, getattr(scope, "operator_paths", ())))
+                        for scope in ctx.scopes):
+                    try:
+                        namespace.close()
+                    except OSError as error:
+                        ctx.cleanup_failed = True
+                        ctx.cleanup_errors.append(f"operator namespace FD: {type(error).__name__}: {error}")
                 cleanup_receipt.update(ctx.cleanup_totals, errors=list(ctx.cleanup_errors))
                 try:
                     write_json(args.out / "cleanup.json", cleanup_receipt)

@@ -2975,6 +2975,7 @@ class LegCleanupTest(unittest.TestCase):
             return rows if isinstance(rows, list) else [rows]
         try:
             with mock.patch.dict(self.globals, {"FilePin": pin,
+                    "initialize_operator_namespace": lambda _ctx: None,
                     "compile_case_fixtures": lambda *_args: {}, "symbol_file_offset": lambda *_args: 0}), \
                     mock.patch.dict(H6["CELL_RUNNERS"], {name: cell for name in cells}), \
                     mock.patch.object(os, "geteuid", return_value=0):

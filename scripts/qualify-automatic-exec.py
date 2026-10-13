@@ -3472,9 +3472,10 @@ def warm_successor(capture, image, attempt, mode="trace", marker_fn="C_GetInfo",
         remaining = remaining_until(deadline)
         phases.append(attempt(seq, remaining, deadline) if initial else attempt(seq, remaining))
         remaining_until(deadline)
-        # A bounded observation interval permits another real attempt when
-        # discovery is still cold; it never substitutes a sleep for proof.
-        attempt_deadline = min(deadline, monotonic_ns() + 500_000_000)
+        # Share the remaining absolute time across the real attempts still
+        # available. Preparation and ACK waits consume that same budget.
+        now = monotonic_ns()
+        attempt_deadline = min(deadline, now + (deadline - now) // (max_attempts - seq + 1))
         def fresh_proof():
             if mode == "trace":
                 for index in range(cursor, len(capture.lines)):

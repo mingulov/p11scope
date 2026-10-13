@@ -4686,9 +4686,11 @@ class InventoryFixtureTest(unittest.TestCase):
         ctx.cleanup_totals = {"processes": 0, "readers": 0, "cgroups": 0, "pins": 0}
         observers = []
         membership, events, exec_deadline = {}, [], []
+        calibration_pins = {provider_pin.path: provider_pin}
         real_pin = H6["leg_pin"]
         def pinned(scope, path):
             pin = real_pin(scope, path)
+            calibration_pins[pin.path] = pin
             actual_verify = pin.verify
             def verify():
                 actual_verify()
@@ -4709,7 +4711,7 @@ class InventoryFixtureTest(unittest.TestCase):
                 owners.append(owner)
                 readers.extend((stdout, stderr))
             return owner, stdout, stderr
-        def manifest(*_args):
+        def manifest(_discover, module_path, *_args):
             # The observer seam receives a selected manifest, with endpoints
             # read from the held ELF rather than resolved by loading it here.
             names = ("C_GetFunctionList", "C_Initialize", "C_Finalize", "C_GetSlotList",
@@ -4717,8 +4719,9 @@ class InventoryFixtureTest(unittest.TestCase):
                 "C_DigestInit", "C_Digest", "C_GenerateKey", "C_EncryptInit", "C_Encrypt",
                 "C_SignInit", "C_Sign", "C_VerifyInit", "C_Verify")
             reader = runpy.run_path(str(ROOT / "scripts/check-live-discovery-evidence.py"))["elf_facts"]
-            facts = reader(f"/proc/self/fd/{provider_pin.fd}", names)
-            pin = H6["provider_receipt"](provider_pin)
+            selected = calibration_pins[Path(module_path)]
+            facts = reader(f"/proc/self/fd/{selected.fd}", names)
+            pin = H6["provider_receipt"](selected)
             return {"schema": "p11scope-manifest/5", "objects": [{"id": 0, "path": pin["path"],
                 "identity": {"sha256": pin["sha256"]}}], "provenance_objects": [{"path": pin["path"],
                 "device_major": pin["dev"][0], "device_minor": pin["dev"][1], "inode": pin["ino"],

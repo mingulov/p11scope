@@ -4767,6 +4767,88 @@ class InventoryFixtureTest(unittest.TestCase):
             for pin in pins:
                 pin.close()
 
+    def cgroup_disclosure_inputs(self):
+        doc, ledgers, receipt = self.run_inventory_route(cell="cgroup-reentry")
+        records = receipt["inventory_control"]["final_records"]
+        ident = ledgers["RS0"]["idents"][0]
+        caller = next(row for row in doc["callers"] if row["pid"] == ident["pid"])
+        admission = next(row for row in records if row["kind"] == "caller_event"
+                         and row["event"].get("caller") == caller["id"])
+        context = admission["event"]["identity_context"]["caller"]
+        context["authority"] = "scan_pinned"
+        caller["image"] = {"authority": "scan_pinned", "exe": copy.deepcopy(context["executable"])}
+        doc["observation"].update(lane="native", passes=100)
+        doc["observation"]["attach"]["scope_filter"] = "bpf-cgroup"
+        doc["gaps_suppressed"] = 0
+        for edge in doc["edges"] + [row["event"] for row in records if row["kind"] == "edge_observed"]:
+            if edge["caller"] == caller["id"]:
+                edge["entries"].update(count=0, saturated=False, in_flight=False,
+                    coverage={"state": "unknown", "reason": "scope_membership_unproven", "lossy": None})
+        doc["gaps"] = [
+            {"subject": "scoped native owner admission deferred", "caller": None,
+             "module": None, "pid": None, "budget": None, "repeats": 4,
+             "reason": "native owner activation and refresh cannot yet be enclosed by the final cgroup membership bracket; sampled scan-pinned callers and retained native totals remain available"},
+            {"subject": "semantic admission refused", "caller": caller["id"],
+             "module": None, "pid": None, "budget": None, "repeats": 3,
+             "reason": "semantic_unavailable"}]
+        # Preserve every measured cursor; add the retained gap publications
+        # immediately before the terminal commit, with normal stream indexing.
+        position = next(i for i, row in enumerate(records)
+                        if row["kind"] == "pass_committed" and row["event"].get("final"))
+        for index, gap in enumerate(doc["gaps"]):
+            records.insert(position + index, {"schema": "p11scope/inventory-events/v1",
+                "kind": "gap_recorded", "at_ns": records[position]["at_ns"],
+                "event": {**{key: value for key, value in gap.items() if key != "repeats"}, "index": index}})
+        for seq, row in enumerate(records):
+            row["seq"] = seq
+        return doc, ledgers, receipt
+
+    def test_cgroup_disclosures_preserve_mapping_only_unknown_and_exact_measured_counts(self):
+        doc, ledgers, receipt = self.cgroup_disclosure_inputs()
+        result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+        self.assertTrue(result["pass"], result["errors"])
+        self.assertEqual(result["completed_operations"], 20)
+        self.assertEqual(result["physical_counted"], result["physical_entered"])
+        self.assertEqual(result["gaps"], [(row["subject"], None) for row in doc["gaps"]])
+
+    def test_cgroup_disclosures_reject_wrong_scope_caller_reason_budget_and_authority(self):
+        original = self.cgroup_disclosure_inputs()
+        def gap_change(data, index, field, value):
+            data[0]["gaps"][index][field] = value
+            for row in data[2]["inventory_control"]["final_records"]:
+                if row["kind"] == "gap_recorded" and row["event"]["index"] == index:
+                    row["event"][field] = value
+        cases = {
+            "scope": lambda d: d[2].update(scope_kind="system"),
+            "stream-scope": lambda d: d[2]["inventory_control"]["final_records"][0]["event"].update(scope="system"),
+            "lane": lambda d: d[0]["observation"].update(lane="scan"),
+            "filter": lambda d: d[0]["observation"]["attach"].update(scope_filter="bpf-pid"),
+            "global-caller": lambda d: gap_change(d, 0, "caller", d[0]["callers"][0]["id"]),
+            "global-reason": lambda d: gap_change(d, 0, "reason", "different limitation"),
+            "global-budget": lambda d: gap_change(d, 0, "budget", "callers"),
+            "target-caller": lambda d: gap_change(d, 1, "caller", d[0]["callers"][0]["id"]),
+            "foreign-caller": lambda d: gap_change(d, 1, "caller", "c999"),
+            "semantic-reason": lambda d: gap_change(d, 1, "reason", "provider_instance_unproven"),
+            "semantic-budget": lambda d: gap_change(d, 1, "budget", "semantic_state"),
+            "semantic-module": lambda d: gap_change(d, 1, "module", "m0"),
+            "semantic-pid": lambda d: gap_change(d, 1, "pid", d[1]["RS0"]["idents"][0]["pid"]),
+            "birth": lambda d: d[1]["RS0"]["idents"][0].update(start=1),
+            "ledger-call": lambda d: d[1]["RS0"]["batches"].append({**d[1]["RX"]["batches"][0],
+                "pid": d[1]["RS0"]["idents"][0]["pid"]}),
+            "unowned": lambda d: d[2]["owned_pids"].remove(d[1]["RS0"]["idents"][0]["pid"]),
+            "positive-instance": lambda d: d[0]["instances"].append({"id": "i999",
+                "caller": d[0]["gaps"][1]["caller"], "module": "m0", "state": "observed"}),
+            "stream-gap": lambda d: next(row for row in d[2]["inventory_control"]["final_records"]
+                if row["kind"] == "gap_recorded" and row["event"]["index"] == 1)["event"].update(reason="other"),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(name=name):
+                data = copy.deepcopy(original)
+                mutate(data)
+                result = H6["evaluate_inventory_h6"](*data)
+                self.assertFalse(result["pass"], result)
+                self.assertTrue(any("unexpected inventory gap" in error for error in result["errors"]), result)
+
     def test_recovered_successor_keeps_inherited_loss_and_exact_fixed_outcomes(self):
         doc, ledgers, receipt = self.run_inventory_route(cell="cgroup-reentry", fault="recovered-history")
         phase = receipt["inventory_control"]["measurements"][1]

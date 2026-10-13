@@ -4370,11 +4370,10 @@ class ControlledInventoryObserver:
                     key = owner.pid, ident["gen"], module_path
                     totals = H6["ledger_s1_totals"](batches, 0)
                     # Physical publication is independently fed by actual
-                    # in-window calls. Provider A's exported getter is among
-                    # its selected physical hooks; S1 remains a separate row.
+                    # in-window calls. Both providers' exported getters are
+                    # table targets; semantic attestation is a separate row.
                     count = sum(row["n"] for row in batches if row["module"] == module_path
-                        and row["t0"] >= self.started
-                        and (row["fn"] != "C_GetFunctionList" or module_path == self.provider["path"]))
+                        and row["t0"] >= self.started)
                     api_count = totals[5].get(key, 0)
                     last_seen = max((row["t1"] for row in batches if row["module"] == module_path), default=None)
                     edge = {"caller": context["id"], "module": module_id, "mapping": {"state": "mapped"},

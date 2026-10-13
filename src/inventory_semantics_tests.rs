@@ -6543,12 +6543,47 @@ struct H6Child(std::process::Child);
 
 impl H6Child {
     fn spawn() -> Self {
-        Self(
+        use crate::discovery::caller_registry::{ExeIdentity, read_exe_identity};
+        use std::os::unix::fs::MetadataExt;
+
+        let target = std::fs::canonicalize("/bin/sleep").unwrap();
+        let metadata = std::fs::metadata(&target).unwrap();
+        let expected = ExeIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            mtime_secs: metadata.mtime(),
+            mtime_nanos: metadata.mtime_nsec(),
+            path: Some(target.to_string_lossy().into_owned()),
+        };
+        // Keep the reaping guard even if readiness fails. A just-spawned
+        // child can still expose this test binary before its exec completes;
+        // admitting that image makes the capacity retry spend another slot.
+        let mut child = Self(
             std::process::Command::new("/bin/sleep")
                 .arg("30")
                 .spawn()
                 .unwrap(),
-        )
+        );
+        let started = std::time::Instant::now();
+        loop {
+            let observed = read_exe_identity(child.pid());
+            if observed.as_ref() == Some(&expected) {
+                return child;
+            }
+            if let Some(status) = child.0.try_wait().unwrap() {
+                panic!(
+                    "sleep child {} exited before its expected image: status={status}, expected={expected:?}, observed={observed:?}",
+                    child.pid()
+                );
+            }
+            if started.elapsed() >= std::time::Duration::from_secs(10) {
+                panic!(
+                    "sleep child {} never reached its expected image: expected={expected:?}, observed={observed:?}",
+                    child.pid()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     fn pid(&self) -> u32 {

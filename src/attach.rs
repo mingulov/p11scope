@@ -1866,6 +1866,12 @@ impl Clone for RetainedStaticTarget {
     }
 }
 
+impl RetainedStaticTarget {
+    fn retirement_lease(&self) -> Option<Arc<std::fs::File>> {
+        self.held.as_ref().map(|target| target.retirement_lease())
+    }
+}
+
 /// Session-owned attachment authority. Fields and constructor stay private.
 pub(crate) struct AttachedSemanticSet {
     domain: crate::attach::capture::NativeDomainId,
@@ -5237,6 +5243,12 @@ impl Session {
         let mut first_error = None;
         if had_links {
             let worker = self.take_cleanup_worker()?;
+            let leases = Arc::new(
+                self.retained_static
+                    .values()
+                    .filter_map(RetainedStaticTarget::retirement_lease)
+                    .collect(),
+            );
             // Start terminal elapsed time before transfers, even when all
             // producer links already belong to earlier live batches.
             worker.begin_terminal();
@@ -5257,7 +5269,7 @@ impl Session {
                 }
             }
             worker.note_transfer_failed(transfer_failed);
-            worker.submit(owned, DetachOrder);
+            worker.submit(owned, leases, DetachOrder);
             // A second SIGINT abandons the wait: the worker keeps closing
             // in the background and the kernel finishes at exit. The typed
             // outcome travels up the stop path to `main` (exit 130).
@@ -6085,6 +6097,12 @@ impl Drop for Session {
         if self.links.is_empty() {
             return;
         }
+        let leases = Arc::new(
+            self.retained_static
+                .values()
+                .filter_map(RetainedStaticTarget::retirement_lease)
+                .collect(),
+        );
         let mut owned = Vec::new();
         for link in std::mem::take(&mut self.links) {
             let producer = link.producer();
@@ -6093,13 +6111,13 @@ impl Drop for Session {
             }
         }
         if let Some(worker) = self.cleanup_worker.take() {
-            worker.submit(owned, DetachOrder);
+            worker.submit(owned, leases, DetachOrder);
             drop(worker);
         } else if !owned.is_empty() {
             // A terminal/second-signal path already owns the sole worker.
             // Never introduce another thread or block this destructor on
             // native closes; process exit releases this explicit abandon.
-            std::mem::forget(owned);
+            std::mem::forget((owned, leases));
         }
     }
 }

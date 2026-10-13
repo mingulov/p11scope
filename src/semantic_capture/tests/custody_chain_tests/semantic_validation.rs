@@ -715,11 +715,30 @@ fn validation_loss_case(failure: ValidationFailure) {
     let batch = fixture.tick();
     fixture.inject_validation(1, failure);
     fixture.publish(batch);
-    assert_eq!(
-        fixture.h0.0.borrow().validation_negatives.len(),
-        1,
-        "the actual H0 receipt validator emitted the loss fact during validation"
-    );
+    {
+        let h0 = fixture.h0.0.borrow();
+        let scopes: Vec<_> = h0
+            .validation_negatives
+            .iter()
+            .map(|(scope, _)| *scope)
+            .collect();
+        let expected = match failure {
+            // The failed native read permanently closes coverage and raises
+            // the fault epoch. The next genuine receipt audits that new era.
+            ValidationFailure::NativeRead => vec!["coverage_failed", "fault_era"],
+            ValidationFailure::Fault | ValidationFailure::Sticky => vec!["fault_era"],
+        };
+        assert_eq!(scopes, expected);
+        let positions: Vec<_> = h0
+            .validation_negatives
+            .iter()
+            .map(|(_, position)| {
+                position.expect("each distinct validation loss owns a timeline position")
+            })
+            .collect();
+        assert!(positions.iter().all(|position| *position != 0));
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+    }
     let edge = fixture
         .scene
         .coordinator
@@ -771,8 +790,12 @@ fn semantic_validation_later_receipt_fault_fences_earlier_same_batch_coverage() 
     fixture.refresh(caller, 1);
     fixture.enqueue(pid, 0, "C_Sign", 0, 0);
     let batch = fixture.tick();
-    fixture.inject_validation(2, ValidationFailure::Fault);
+    // The Joined-call scan precedes the two stashed refreshes: A, A, B.
+    // Fault B's receipt after both proofs for A have actually validated.
+    let validations_before = fixture.h0.0.borrow().validations;
+    fixture.inject_validation(3, ValidationFailure::Fault);
     fixture.publish(batch);
+    assert_eq!(fixture.h0.0.borrow().validations - validations_before, 3);
     assert_eq!(fixture.h0.0.borrow().validation_negatives.len(), 1);
     let first = fixture
         .scene
@@ -827,6 +850,11 @@ fn semantic_validation_full_batch_preserves_calls_and_distinct_validation_loss()
         assert_eq!(owned.len(), quantum);
         assert!(owned.iter().all(|outcome| matches!(outcome,
             TickOutcome::Call(call) if matches!(call.route(), Route::Joined(_)))));
+        assert_eq!(
+            receipts.len(),
+            1,
+            "one actual Joined-partition scan per quantum"
+        );
         outcomes.extend(owned);
         current.extend(receipts);
         remaining -= quantum;
@@ -839,6 +867,11 @@ fn semantic_validation_full_batch_preserves_calls_and_distinct_validation_loss()
     fixture.refresh(caller_b, 0);
     let (retirement, receipts, negatives) = fixture.tick().into_parts();
     assert!(negatives.is_empty());
+    assert_eq!(
+        receipts.len(),
+        2,
+        "the two explicit final refreshes remain distinct"
+    );
     assert_eq!(retirement.len(), 1);
     assert!(
         matches!(&retirement[0], TickOutcome::Invalidation(invalidation)
@@ -847,7 +880,7 @@ fn semantic_validation_full_batch_preserves_calls_and_distinct_validation_loss()
     outcomes.extend(retirement);
     current.extend(receipts);
     assert_eq!(outcomes.len(), limit);
-    assert_eq!(current.len(), 2);
+    assert_eq!(current.len(), (limit - 1).div_ceil(MAX_PENDING) + 2);
     let batch = SemanticBatch::from_tick_report(
         fixture.lane.domain(),
         TickReport::scripted(outcomes, current),

@@ -750,6 +750,87 @@ fn owner_admission_system_uses_detailed_owner_receipt() {
     admission_positive(Selection::System);
 }
 
+#[test]
+fn owner_admission_system_late_attested_caller_survives_unrelated_provider_catalog() {
+    let mut scene = AdmissionScene::new(Selection::System);
+    let provider = scene.dir.path().join("scoped-provider.so");
+    let mut hints = vec![provider.clone()];
+    let mut children = Vec::new();
+    for index in 0..4 {
+        let unrelated = scene.dir.path().join(format!("unattested-{index}.so"));
+        std::fs::copy(&provider, &unrelated).unwrap();
+        hints.push(unrelated.clone());
+        let ready = scene.dir.path().join(format!("unattested-ready-{index}"));
+        let child = OwnedStoppedChild::spawn_stopped(
+            std::process::Command::new(scene.dir.path().join("scoped-driver"))
+                .arg("--ready")
+                .arg(&ready)
+                .arg("--call")
+                .arg(&unrelated)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+            |pid| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !ready.exists() {
+                    assert!(Instant::now() < deadline, "unrelated provider child did not load");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                // SAFETY: this pid names only the retained owned child.
+                assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) }, 0);
+            },
+        );
+        children.push(child);
+    }
+    scene.coordinator = InventoryCoordinator::new(
+        Scope::System,
+        HookRegistry::builtin(),
+        hints,
+        OsProcessSource,
+        RegistryLimits::default_limits(),
+    ).unwrap();
+    // Populate real catalogs without servicing H0 yet, so the first semantic
+    // quantum faces four earlier unrelated callers and one late attested pair.
+    for pid in children.iter().map(OwnedStoppedChild::id).chain([scene.child.id()]) {
+        let catalog = scene.coordinator.collector(InventoryScope::Pid(pid), None)().unwrap();
+        scene.coordinator.apply_catalog(
+            catalog,
+            &mut crate::discovery::inventory::UnavailableImageGuard,
+            &mut scene.identity,
+            u64::MAX,
+            now_ns(),
+        );
+        scene.coordinator.commit_batch(false).unwrap();
+    }
+    let caller = scene.caller();
+    for child in &children {
+        let other = scene.coordinator.adapter().live_id(child.id()).unwrap();
+        assert!(other < caller, "the attested caller must be late in the real catalog");
+        assert!(scene.coordinator.registry().edges_of(other).any(|edge| {
+            edge.mapping == crate::discovery::caller_registry::MappingState::Mapped
+        }));
+    }
+    scene.observe_entry();
+    let pid = scene.child.id();
+    scene.h0.0.borrow_mut().after_refresh = Some(Box::new(move |owned| {
+        owned.io.held.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+        owned.io.held.enqueue(pid, 0, "C_Sign", 0, 0);
+    }));
+    scene.pass();
+    scene.assert_admitted();
+    assert_eq!(scene.h0.0.borrow().accepted, 1);
+    assert_eq!(scene.coordinator.semantic_bindings().len(), 1);
+    for child in &children {
+        let other = scene.coordinator.adapter().live_id(child.id()).unwrap();
+        assert!(scene.coordinator.semantic_bindings().get(other).is_none());
+    }
+    let rows: Vec<_> = scene.coordinator.registry().instance_semantic_edges().map(|row| {
+        (row.caller, row.api_returns, row.lossy,
+         row.semantics.as_ref().map(|value| value.completed()).unwrap_or(0))
+    }).collect();
+    assert_eq!(rows, vec![(caller, Some(2), false, 1)]);
+}
+
 fn later_cached_calls_refresh_current_owner_proof(selection: Selection) {
     let mut scene = AdmissionScene::new(selection);
     scene.prepare_without_cookie();

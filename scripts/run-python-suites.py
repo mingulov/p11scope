@@ -63,6 +63,7 @@ RUN = [
     ("test_inventory_count_only_hooks.py", []),
     ("test_inventory_provider_identity.py", []),
     ("test_inventory_readiness_cadence.py", []),
+    ("test_inventory_system_recovery_disclosures.py", []),
     ("test_inventory_system_sibling.py", []),
     ("test_key_operation_ledger.py", []),
     ("test_loader.py", []),

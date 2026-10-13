@@ -112,6 +112,8 @@ impl CaptureIo for AdmissionIo {
     }
 }
 
+type AfterAdmissionRefresh = Box<dyn FnOnce(&mut AdmissionH0)>;
+
 struct AdmissionH0 {
     capture: SemanticCapture,
     io: AdmissionIo,
@@ -122,7 +124,7 @@ struct AdmissionH0 {
     fault_on_validation: bool,
     validation_negatives: usize,
     last_effective: Option<Arc<PidPin>>,
-    after_refresh: Option<Box<dyn FnOnce(&mut AdmissionH0)>>,
+    after_refresh: Option<AfterAdmissionRefresh>,
 }
 
 #[derive(Clone)]

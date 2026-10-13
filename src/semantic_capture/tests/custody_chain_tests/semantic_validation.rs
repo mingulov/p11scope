@@ -14,6 +14,9 @@ use p11scope_manifest::manifest::*;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+#[path = "owner_admission.rs"]
+mod owner_admission;
+
 struct HeldProviders {
     _dir: tempfile::TempDir,
     subset: AttestedSubset,
@@ -22,11 +25,20 @@ struct HeldProviders {
 impl HeldProviders {
     fn new(count: usize) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let mut paths = Vec::new();
+        let mut providers = Vec::new();
         for index in 0..count {
             let path = dir.path().join(format!("provider-{index}.so"));
             std::fs::copy("/usr/bin/true", &path).unwrap();
-            let file = open_object(&path).unwrap();
+            providers.push(path);
+        }
+        Self::from_paths(dir, &providers)
+    }
+
+    fn from_paths(dir: tempfile::TempDir, providers: &[std::path::PathBuf]) -> Self {
+        let count = providers.len();
+        let mut paths = Vec::new();
+        for (index, path) in providers.iter().enumerate() {
+            let file = open_object(path).unwrap();
             let inspected = inspect_file(&file).unwrap();
             let mapping = mapping_file_key(&file).unwrap();
             let executable = inspected

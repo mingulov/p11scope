@@ -6416,6 +6416,98 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// The source still holds a real OS pin, but owner-handle duplication is
+    /// refused. This models a full FD table without changing process limits.
+    struct RefusingSemanticCloneSource {
+        attempted: std::rc::Rc<Cell<usize>>,
+    }
+
+    impl ProcessSource for RefusingSemanticCloneSource {
+        type Pin = crate::process::PidPin;
+
+        fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
+            OsProcessSource.open(pid)
+        }
+        fn still_the_same(&self, pin: &Self::Pin) -> bool {
+            OsProcessSource.still_the_same(pin)
+        }
+        fn start_time(&self, pid: u32) -> Option<u64> {
+            OsProcessSource.start_time(pid)
+        }
+        fn exe_identity(&self, pid: u32) -> Option<ExeIdentity> {
+            OsProcessSource.exe_identity(pid)
+        }
+        fn gone(&self, pid: u32) -> bool {
+            OsProcessSource.gone(pid)
+        }
+        fn semantic_custody(&self, _pin: &Self::Pin) -> Option<crate::process::PidPin> {
+            self.attempted.set(self.attempted.get() + 1);
+            None
+        }
+        fn semantic_custody_ref<'pin>(&self, pin: &'pin Self::Pin) -> Option<&'pin crate::process::PidPin> {
+            Some(pin)
+        }
+    }
+
+    #[test]
+    fn known_semantic_custody_survives_clone_refusal_but_first_admission_does_not() {
+        let pid = std::process::id();
+        let attempted = std::rc::Rc::new(Cell::new(0));
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::Pid(pid),
+            HookRegistry::builtin(),
+            Vec::new(),
+            RefusingSemanticCloneSource {
+                attempted: attempted.clone(),
+            },
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let caller = coordinator
+            .adapter
+            .admit(pid, ImageAuthority::ScanPinned, 1)
+            .unwrap();
+        let domain = NativeDomainId::mint();
+
+        assert!(
+            coordinator
+                .prepare_legacy_semantic_candidate(caller, domain)
+                .is_none(),
+            "first owner admission requires an actual duplicated handle"
+        );
+        assert_eq!(attempted.get(), 1);
+
+        let original = Arc::new(
+            coordinator
+                .adapter
+                .live_pin(pid)
+                .unwrap()
+                .1
+                .try_clone()
+                .unwrap(),
+        );
+        coordinator
+            .semantic_bindings
+            .insert_for_test(semantics::SemanticCallerBinding::scripted(
+                caller,
+                ModuleKey::Unidentified {
+                    path: "/clone-refusal/provider.so".into(),
+                },
+                domain,
+                ImageIdentity {
+                    task_cookie: 7,
+                    exec_id: 0,
+                },
+                original.clone(),
+            ))
+            .unwrap();
+        let candidate = coordinator
+            .prepare_legacy_semantic_candidate(caller, domain)
+            .expect("known original owner custody must not need a second pidfd");
+        assert!(Arc::ptr_eq(&candidate.pin(), &original));
+        assert_eq!(attempted.get(), 1, "known custody must skip duplication");
+    }
+
     /// Heap-built cgroup-scope coordinator over `dir` (H6 slice 2
     /// oracles): coverage begins here, like `cgroup_os_scene`.
     fn boxed_cgroup_coordinator(

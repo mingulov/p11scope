@@ -4590,9 +4590,11 @@ class InventoryFixtureTest(unittest.TestCase):
             if cell != "system-mixed":
                 self.assertTrue(membership[pid].endswith("/selected/sub"))
             events.append("resume")
-            # These one-exec fixture routes release at the known kernel stop,
-            # settling tracer custody before ordinary child cleanup.
-            H6["ptrace_detach"](pid, ctx.scopes[-1])
+            # Match production: resume while retaining tracing custody, then
+            # exercise the real running-target detach at observer shutdown.
+            H6["ptrace_continue"](pid)
+            self.assertIn(f"TracerPid:\t{os.getpid()}\n", (Path("/proc") / str(pid) / "status").read_text())
+            events.append("running-traced-after-resume")
         def detach(pid, scope):
             if any(owner.pid == pid for owner in scope.traced):
                 H6["ptrace_detach"](pid, scope)
@@ -4851,6 +4853,13 @@ class InventoryFixtureTest(unittest.TestCase):
         tail = receipt["inventory_control"]["teardown"]
         self.assertEqual(sum(row["n"] for row in tail["marker"]["batches"]), 4)
         self.assertLess(tail["end"]["pass"]["at_ns"], receipt["freeze"]["checkpoint"]["at_ns"] + 1)
+
+    def test_actual_inventory_stop_detaches_the_resumed_owned_successor(self):
+        doc, ledgers, receipt = self.run_inventory_route(cell="cgroup-reentry")
+        self.assertIn("running-traced-after-resume", self.route_events)
+        self.assertFalse(self.route_case.scopes[-1].traced)
+        result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+        self.assertTrue(result["pass"], result["errors"])
 
     def test_system_mixed_real_sibling_calls_overlap_target_measurement(self):
         doc, ledgers, receipt = self.run_inventory_route()

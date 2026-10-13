@@ -1415,7 +1415,10 @@ fn submit_terminal_ownership(
 ) -> Vec<String> {
     let mut owned = Vec::new();
     let mut failures = Vec::new();
-    for family in [TerminalProducerFamily::Registered] {
+    for family in [
+        TerminalProducerFamily::Registered,
+        TerminalProducerFamily::InstanceHooks,
+    ] {
         for outcome in take(family) {
             match outcome {
                 Ok(link) => owned.push(link),
@@ -1523,6 +1526,7 @@ pub(crate) enum ProducerProgram {
     UProbe(&'static str),
     RawTracePoint(&'static str),
     BtfTracePoint(&'static str),
+    InstanceHook(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1785,6 +1789,7 @@ fn detach_selected_with<T>(
         ProducerProgram::BtfTracePoint("task_newtask") => 5,
         ProducerProgram::UProbe("p11_return") => 6,
         ProducerProgram::RawTracePoint(_) => 8,
+        ProducerProgram::InstanceHook(_) => 9,
         _ => 7,
     });
     selected
@@ -5358,9 +5363,13 @@ impl Session {
         // ownership never reopens attachment or mints an empty success later.
         self.producer_detach = OwnedProducerDetach::Unproved;
         invalidate_pid_session(&mut self.pid_pairs, self.pid_lifecycle.as_ref());
+        // No owner proof may survive retirement of the continuity hooks.
+        self.image_coverage.fail();
         let started = std::time::Instant::now();
         let worker = self.take_cleanup_worker()?;
-        let had_work = !self.links.is_empty() || worker.has_submissions();
+        let had_work = !self.links.is_empty()
+            || self.instance.hook_link_count() != 0
+            || worker.has_submissions();
         let leases = Arc::new(
             self.retained_static
                 .values()
@@ -5398,7 +5407,7 @@ impl Session {
                 }
                 outcomes
             }
-            TerminalProducerFamily::InstanceHooks => Vec::new(),
+            TerminalProducerFamily::InstanceHooks => self.instance.take_owned_hooks(&mut self.ebpf),
         }
     }
 
@@ -7107,11 +7116,11 @@ mod tests {
 
     fn terminal_fixture_payload(
         file: &std::fs::File,
-        program: &'static str,
+        producer: ProducerProgram,
     ) -> (OwnedLink, ProducerProgram) {
         (
             OwnedLink::Multi(vec![file.try_clone().unwrap().into()]),
-            ProducerProgram::UProbe(program),
+            producer,
         )
     }
 
@@ -7127,7 +7136,10 @@ mod tests {
             }),
             Arc::new(|| std::time::Duration::ZERO),
         );
-        let mut source = Some(terminal_fixture_payload(&file, "p11_entry"));
+        let mut source = Some(terminal_fixture_payload(
+            &file,
+            ProducerProgram::UProbe("p11_entry"),
+        ));
         let mut calls = Vec::new();
         let mut failures = submit_terminal_ownership(&worker, Arc::new(vec![file]), |family| {
             calls.push(family);
@@ -7167,9 +7179,18 @@ mod tests {
         let (entered, entered_rx) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel();
         let released = std::sync::Mutex::new(released);
+        let closed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let close_log = Arc::clone(&closed);
         let worker = CleanupWorker::pre_start_with(
             Box::new(move |payload, program| {
-                if program != ProducerProgram::UProbe("p11_entry") {
+                if matches!(program, ProducerProgram::InstanceHook(_)) {
+                    let prior = close_log.lock().unwrap();
+                    assert!(prior.contains(&ProducerProgram::UProbe("p11_return")));
+                    assert!(
+                        prior.contains(&ProducerProgram::RawTracePoint("sched_process_exit")),
+                        "instance hooks retire after registered endpoint/lifecycle producers"
+                    );
+                    drop(prior);
                     entered.send(()).unwrap();
                     let _ = released
                         .lock()
@@ -7178,14 +7199,21 @@ mod tests {
                 }
                 assert!(original.upgrade().unwrap().metadata().is_ok());
                 drop(payload.take());
+                close_log.lock().unwrap().push(program);
                 Ok(())
             }),
             Arc::new(|| std::time::Duration::ZERO),
         );
-        let mut registered = vec![terminal_fixture_payload(&file, "p11_entry")];
+        let mut registered = vec![
+            terminal_fixture_payload(&file, ProducerProgram::UProbe("p11_entry")),
+            terminal_fixture_payload(&file, ProducerProgram::UProbe("p11_return")),
+            terminal_fixture_payload(&file, ProducerProgram::RawTracePoint("sched_process_exit")),
+        ];
         let mut hooks: Vec<_> = INSTANCE_PROGRAMS
             .iter()
-            .map(|(program, _)| terminal_fixture_payload(&file, program))
+            .map(|(program, _)| {
+                terminal_fixture_payload(&file, ProducerProgram::InstanceHook(program))
+            })
             .collect();
         let mut failures = submit_terminal_ownership(&worker, Arc::new(vec![file]), |family| {
             std::mem::take(match family {
@@ -7226,7 +7254,7 @@ mod tests {
         assert!(
             String::from_utf8(out)
                 .unwrap()
-                .contains("5/5 links released")
+                .contains("7/7 links released")
         );
     }
 
@@ -7240,10 +7268,15 @@ mod tests {
             }),
             Arc::new(|| std::time::Duration::ZERO),
         );
-        let mut registered = vec![terminal_fixture_payload(&file, "p11_entry")];
+        let mut registered = vec![terminal_fixture_payload(
+            &file,
+            ProducerProgram::UProbe("p11_entry"),
+        )];
         let mut hooks: Vec<_> = INSTANCE_PROGRAMS
             .iter()
-            .map(|(program, _)| terminal_fixture_payload(&file, program))
+            .map(|(program, _)| {
+                terminal_fixture_payload(&file, ProducerProgram::InstanceHook(program))
+            })
             .collect();
         let mut refused_original = None;
         let mut failures = submit_terminal_ownership(&worker, Arc::new(vec![file]), |family| {

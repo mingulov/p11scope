@@ -35,7 +35,7 @@ pub(crate) enum OwnedLink {
 
 /// The existing producer detach order from `detach_selected_with` as data:
 /// entries, then `task_newtask`, then `p11_return`, then dynamic/export,
-/// then raw exec/exit last.
+/// then raw exec/exit and the instance continuity hooks last.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct DetachOrder;
 
@@ -56,6 +56,7 @@ impl DetachOrder {
         }
         match producer {
             ProducerProgram::RawTracePoint(_) => 8,
+            ProducerProgram::InstanceHook(_) => 9,
             _ => 7,
         }
     }

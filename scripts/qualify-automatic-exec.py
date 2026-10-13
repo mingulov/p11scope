@@ -5616,11 +5616,13 @@ def run_cgroup_r2(ctx, cell_dir, backend):
 
 _LIBC = ctypes.CDLL("libc.so.6", use_errno=True)
 _PTRACE_SEIZE = 0x4206
+_PTRACE_INTERRUPT = 0x4207
 _PTRACE_CONT = 7
 _PTRACE_DETACH = 17
 _PTRACE_O_TRACEEXEC = 0x10
 _PTRACE_O_EXITKILL = 1 << 20
 _PTRACE_EVENT_EXEC = 4
+_PTRACE_EVENT_STOP = 128
 
 
 def _ptrace(request, pid, addr=0, data=0):
@@ -5677,9 +5679,46 @@ def ptrace_continue(pid):
 
 
 def ptrace_detach(pid, ctx):
+    """Detach after an actual ptrace-stop has been consumed by this tracer."""
     with cleanup_section():
+        owners = [owner for owner in ctx.traced if owner.pid == pid]
+        if len(owners) != 1 or not any(candidate is owners[0] for candidate in ctx.owners):
+            raise SetupError("ptrace detach target is not the registered traced owned child")
+        owner = owners[0]
+        owner.verify()
+        check_dispatch()
         _ptrace(_PTRACE_DETACH, pid)
-        ctx.traced[:] = [owner for owner in ctx.traced if owner.pid != pid]
+        ctx.traced[:] = [candidate for candidate in ctx.traced if candidate is not owner]
+
+
+def ptrace_detach_running(pid, ctx):
+    """Interrupt the still-seized idle caller within its existing cleanup bound."""
+    with cleanup_section():
+        enter_phase("cleanup")
+        deadline = wait_deadline(3)
+        owners = [owner for owner in ctx.traced if owner.pid == pid]
+        if len(owners) != 1 or not any(candidate is owners[0] for candidate in ctx.owners):
+            raise SetupError("ptrace detach target is not the registered traced owned child")
+        owner = owners[0]
+        owner.verify()
+        remaining_until(deadline)
+        _ptrace(_PTRACE_INTERRUPT, pid)
+        while True:
+            remaining_until(deadline)
+            waited, status = os.waitpid(pid, os.WNOHANG | 0x40000000)  # __WALL
+            if waited:
+                if waited != pid:
+                    raise SetupError("ptrace interrupt returned another child's wait status")
+                if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+                    owner.popen.returncode = os.waitstatus_to_exitcode(status)
+                    raise SetupError("owned ptrace target died before detach")
+                if not (os.WIFSTOPPED(status) and os.WSTOPSIG(status) == signal.SIGTRAP
+                        and status >> 16 == _PTRACE_EVENT_STOP):
+                    raise SetupError("owned ptrace target reached an unexpected detach stop")
+                remaining_until(deadline)
+                ptrace_detach(pid, ctx)
+                return
+            pause_until(deadline, 0.01)
 
 
 def wait_caller_admitted(jsonl_path, pid, exe, timeout=90):
@@ -7110,7 +7149,7 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
     try:
         ready = wait_inventory_ready(owned, errors, log_path, backend)
     except BackendRefused as refused:
-        ptrace_detach(x_pid, ctx)
+        ptrace_detach_running(x_pid, ctx)
         owned_x.popen.send_signal(signal.SIGINT)
         owned_s.popen.send_signal(signal.SIGINT)
         receipt = {"cell": "cgroup-reentry", "leg": f"inventory/{backend}",
@@ -7126,7 +7165,7 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
     out_s.wait(lambda r: any(line.startswith("DONE ") for line in r.lines), 60)
     obs_rc, stopped, latency = stop_inventory(owned)
     enter_phase("cleanup")
-    ptrace_detach(x_pid, ctx)
+    ptrace_detach_running(x_pid, ctx)
     cleanup_deadline = inventory_phase_deadline("cleanup")
     final_records = inventory_final_records(control["cursor"], cleanup_deadline)
     control_x.command("T", cleanup_deadline)
@@ -7258,7 +7297,7 @@ def run_system_mixed(ctx, cell_dir, backend):
     try:
         ready = wait_inventory_ready(owned, errors, log_path, backend)
     except BackendRefused as refused:
-        ptrace_detach(e_pid, ctx)
+        ptrace_detach_running(e_pid, ctx)
         for owned_p in (owned_e, owned_s, owned_f):
             owned_p.popen.send_signal(signal.SIGINT)
         receipt = {"cell": "system-mixed", "leg": f"inventory/{backend}",
@@ -7273,7 +7312,7 @@ def run_system_mixed(ctx, cell_dir, backend):
     out_f.wait(lambda r: any(line.startswith("DONE ") for line in r.lines), 120)
     obs_rc, stopped, latency = stop_inventory(owned)
     enter_phase("cleanup")
-    ptrace_detach(e_pid, ctx)
+    ptrace_detach_running(e_pid, ctx)
     cleanup_deadline = inventory_phase_deadline("cleanup")
     final_records = inventory_final_records(control["cursor"], cleanup_deadline)
     control_e.command("T", cleanup_deadline)

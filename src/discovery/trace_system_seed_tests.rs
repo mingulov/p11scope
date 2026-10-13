@@ -107,6 +107,21 @@ impl Drop for Children {
     }
 }
 
+fn open_spawned_view(
+    id: ProcessViewId,
+    child: &mut Child,
+    _image: &Path,
+    after_snapshot: impl FnOnce(&mut Child),
+) -> (ProcessView, String) {
+    let view = ProcessView::open(id, child.id()).unwrap();
+    let path = std::fs::read_link(format!("/proc/{}/exe", child.id()))
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    after_snapshot(child);
+    (view, path)
+}
+
 struct Io {
     proof: ProofSession,
     target: u32,
@@ -284,6 +299,7 @@ impl Capture {
             (!matches!(provider_stage, ProviderStage::Absent)).then(ProviderFixture::new);
         let mut children = Children(Vec::new());
         let mut views = Vec::new();
+        let mut expected_path = None;
         for index in 0..=unrelated {
             let child = if index == unrelated {
                 if let Some(provider) = &provider {
@@ -303,14 +319,24 @@ impl Capture {
             if index == unrelated && matches!(provider_stage, ProviderStage::InitiallyMapped) {
                 ProviderFixture::ready(children.0.last_mut().unwrap());
             }
-            views.push(ProcessView::open(ProcessViewId(index as u32), pid).unwrap());
+            let image = provider
+                .as_ref()
+                .filter(|_| index == unrelated)
+                .map_or(Path::new("/bin/sleep"), |provider| provider.driver.as_path());
+            let (view, path) = open_spawned_view(
+                ProcessViewId(index as u32),
+                children.0.last_mut().unwrap(),
+                image,
+                |_| {},
+            );
+            if index == unrelated {
+                expected_path = Some(path);
+            }
+            views.push(view);
         }
         let target = views.last().unwrap().pid();
         assert!(views[..unrelated].iter().all(|view| view.pid() < target));
-        let expected_path = std::fs::read_link(format!("/proc/{target}/exe"))
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
+        let expected_path = expected_path.unwrap();
         let mut engine = Engine::empty();
         engine.scope = if system {
             Scope::System
@@ -456,7 +482,14 @@ impl Capture {
         self.io.cookie.set(Some(self.key.generation));
         self.io.pending(&self.engine, "CALL witness ingress");
         let observed = self.store.lookup(self.key, event.ts_ns).path();
-        assert!(observed.is_none_or(|path| path == self.expected_path));
+        assert!(
+            observed.is_none_or(|path| path == self.expected_path),
+            "target {} expected {:?}, observed {:?}, current exe {:?}",
+            self.io.target,
+            self.expected_path,
+            observed,
+            std::fs::read_link(format!("/proc/{}/exe", self.io.target)),
+        );
         self.io.boundary("emitted row named", observed.is_some());
         observed.is_some()
     }
@@ -495,6 +528,60 @@ impl Capture {
         }
         None
     }
+}
+
+#[test]
+fn late_provider_fixture_waits_for_driver_exec_before_original_view() {
+    use std::io::Write as _;
+
+    let _serial = CAPTURE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let provider = ProviderFixture::new();
+    let child = Command::new("sh")
+        .args([
+            "-c",
+            "printf 'ready\\n'; read -r ignored; exec \"$@\"",
+            "trace-pre-exec",
+        ])
+        .arg(&provider.driver)
+        .arg("dlopen")
+        .arg(&provider.library)
+        .env_clear()
+        .env("P11SCOPE_FIXTURE_INTERFACES", "0")
+        .env("P11SCOPE_FIXTURE_POST_GATE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut held = crate::discovery::test_subject::OwnedMapper::from_child(
+        child,
+        std::time::Duration::from_secs(10),
+    )
+    .unwrap();
+    let pid = held.pid();
+    let before = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+    assert_ne!(before, provider.driver, "launcher exec'd before release");
+    let (view, expected) = open_spawned_view(
+        ProcessViewId(0),
+        &mut held.0,
+        &provider.driver,
+        |child| {
+            child.stdin.as_mut().unwrap().write_all(b"!\n").unwrap();
+            // SAFETY: OwnedMapper acknowledged and stopped this unreaped child.
+            assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGCONT) }, 0);
+            ProviderFixture::ready(child);
+        },
+    );
+    let observed = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+    assert_eq!(observed, provider.driver);
+    assert!(view.still_the_same());
+    assert_eq!(
+        expected,
+        observed.to_string_lossy(),
+        "the fixture recorded the pre-exec launcher {before:?} instead of the mapped caller",
+    );
 }
 
 #[test]

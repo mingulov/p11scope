@@ -6016,6 +6016,73 @@ class InventoryReadinessTest(unittest.TestCase):
                 self.assertRaisesRegex(H6["SetupError"], "instance"):
             self.measured_boundary(proof, marker)
 
+    def boundary_records(self, proof, records, *, prior=True):
+        marker = proof["markers"][-1]
+        return H6["inventory_boundary"](records, self.owner, proof["image"], proof["provider"],
+            self.accepted, proof["baseline"]["pass"]["seq"] if prior else proof["cursor"]["seq"],
+            marker, marker["batches"], prior=proof["baseline"] if prior else None,
+            physical_hooks=proof["physical_hooks"], started_ns=proof["observer_started_ns"])
+
+    def test_measured_retirement_and_replacement_each_refuse_without_physical_rows(self):
+        proof = self.gate(self.prepare())
+        for change in ({"state": "retired", "reason": "instance_retired"}, {"id": "i2"},
+                       {"state": "uncertain"}, {"reason": "instance_unproven"}):
+            with self.subTest(change=change), self.assertRaisesRegex(H6["SetupError"], "instance"):
+                self.boundary_records(proof, [self.instance_update(proof, **change)])
+
+    def test_unrelated_or_stale_instance_rows_do_not_refuse_measurement(self):
+        proof = self.gate(self.prepare())
+        for change in ({"caller": "c9"}, {"module": "m9"}, {}):
+            with self.subTest(change=change):
+                row = self.instance_update(proof, id="i2", state="retired",
+                                           reason="instance_retired", **change)
+                if not change:
+                    row["seq"] = proof["baseline"]["pass"]["seq"]
+                self.assertIsNone(self.boundary_records(proof, [row]))
+
+    def test_readiness_without_prior_keeps_multiple_instances_pending(self):
+        proof = self.gate(self.prepare())
+        rows = [copy.deepcopy(proof["baseline"][key]) for key in ("physical", "instance", "semantic", "pass")]
+        self.assertIsNotNone(self.boundary_records(proof, rows, prior=False))
+        rows.append(self.instance_update(proof, id="i2"))
+        completed = self.record(self.sequence, "pass_committed", {"pass": 3, "instance_events": 1})
+        completed["at_ns"] = time.monotonic_ns()
+        rows.append(completed)
+        self.assertIsNone(self.boundary_records(proof, rows, prior=False))
+
+    def test_healthy_measured_instance_still_waits_for_physical_and_settled_pass(self):
+        proof = self.gate(self.prepare())
+        rows = [copy.deepcopy(proof["baseline"][key]) for key in ("physical", "instance", "semantic", "pass")]
+        for row in rows:
+            row.update(seq=self.sequence, at_ns=time.monotonic_ns())
+            self.sequence += 1
+        rows[-1]["event"]["pass"] += 1
+        for pending in (rows[1:3], rows[:-1]):
+            self.assertIsNone(self.boundary_records(proof, pending))
+        rows[-1]["event"]["semantic_edge_events_deferred"] = 1
+        self.assertIsNone(self.boundary_records(proof, rows))
+        rows[-1]["event"]["semantic_edge_events_deferred"] = 0
+        accepted = self.boundary_records(proof, rows)
+        self.assertEqual(accepted["instance"]["event"]["id"], "i1")
+        self.assertEqual(accepted["counts"], proof["baseline"]["counts"])
+
+    def test_partial_retirement_waits_only_until_its_record_is_complete(self):
+        proof = self.gate(self.prepare())
+        marker = self.measured_marker(proof)
+        row = self.instance_update(proof, state="retired", reason="instance_retired")
+        with self.log.open("ab") as stream:
+            stream.write(json.dumps(row).encode())
+        polls = []
+        def complete_record(*_):
+            self.assertFalse(polls, "completed retirement waited for another physical/pass row")
+            polls.append(True)
+            with self.log.open("ab") as stream:
+                stream.write(b"\n")
+        with mock.patch.dict(H6["wait_inventory_measured_boundary"].__globals__, pause_until=complete_record), \
+                self.assertRaisesRegex(H6["SetupError"], "instance"):
+            self.measured_boundary(proof, marker)
+        self.assertEqual(len(polls), 1)
+
     def test_unmapped_unattached_unknown_and_wrong_subjects_cannot_release(self):
         def wrong_birth(p, _i, _s): p["identity_context"]["caller"]["start_time"] += 1
         def wrong_incarnation(p, _i, _s): p["identity_context"]["caller"]["incarnation"] = 0

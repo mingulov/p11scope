@@ -249,6 +249,23 @@ impl LaneTestIo for AdmissionLane {
         }
         Ok(())
     }
+    fn finish_terminal_cleanup(
+        &mut self,
+        second_signal: &dyn Fn() -> bool,
+        out: &mut dyn std::io::Write,
+    ) -> anyhow::Result<()> {
+        let mut owned = self.0.borrow_mut();
+        assert!(owned.capture.stopped);
+        let Some(terminal) = owned.terminal.as_mut() else {
+            return Ok(());
+        };
+        terminal.begin();
+        crate::attach::drive_owned_producer_detach_for_test(
+            terminal.worker.take().unwrap(),
+            second_signal,
+            out,
+        )
+    }
     fn tick_targets(&mut self, pins: &[Arc<PidPin>]) {
         self.0.borrow_mut().io.tick_pins = pins.to_vec();
     }
@@ -1670,14 +1687,36 @@ fn owner_terminal_driver_begins_detailed_closes_before_native_retirement() {
     let terminal = owned.terminal.as_mut().unwrap();
     let begins_before_native = terminal.begins;
     if !entered_before_native {
-        // Calibrate and reap the actual worker even on the expected RED path.
+        // Release/join even on a regression; the assertion never strands a
+        // real gated worker merely because production failed to start it.
         terminal.begin();
         control
             .entered
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
+        terminal.settle(&mut control);
     }
-    terminal.settle(&mut control);
+    drop(owned);
+    if entered_before_native {
+        control.release.take().unwrap().send(()).unwrap();
+        scene
+            .lane
+            .take()
+            .unwrap()
+            .finish_owned_terminal_cleanup(&|| false, &mut Vec::new())
+            .unwrap();
+        assert!(
+            scene
+                .h0
+                .0
+                .borrow()
+                .terminal
+                .as_ref()
+                .unwrap()
+                .worker
+                .is_none()
+        );
+    }
     assert!(
         entered_before_native,
         "Detailed close must begin after real H0 Finish publication, before Inventory retirement"
@@ -1686,4 +1725,72 @@ fn owner_terminal_driver_begins_detailed_closes_before_native_retirement() {
         begins_before_native, 1,
         "the post-retirement safety hook must not resubmit"
     );
+}
+
+#[test]
+fn owner_terminal_failed_publication_does_not_start_or_claim_early_retirement() {
+    let mut scene = AdmissionScene::new(Selection::Pid);
+    scene.prepare_without_cookie();
+    scene.observe_entry();
+    let pid = scene.child.id();
+    scene.h0.0.borrow_mut().after_refresh = Some(Box::new(move |owned| {
+        owned.io.held.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+    }));
+    for _ in 0..3 {
+        scene.pass();
+    }
+    scene.assert_admitted();
+    let original = scene
+        .h0
+        .0
+        .borrow()
+        .io
+        .retained_attachment(0)
+        .unwrap()
+        .retirement_lease();
+    let (terminal, mut control) = TerminalCloseFixture::new(original);
+    scene.h0.0.borrow_mut().terminal = Some(terminal);
+    scene.lane = Some(
+        crate::inventory::classic_semantic_stop_refusing_publication_for_test(
+            &mut scene.coordinator,
+            scene.lane.take().unwrap(),
+        ),
+    );
+    assert!(
+        scene.h0.0.borrow().capture.stopped,
+        "real H0 stopped before the injected publication refusal"
+    );
+    assert!(scene.lane.as_ref().unwrap().staged_semantic_age().is_some());
+    assert!(!scene.h0.0.borrow().terminal_published);
+    assert_eq!(scene.h0.0.borrow().terminal.as_ref().unwrap().begins, 0);
+    assert!(control.entered.try_recv().is_err());
+    assert!(
+        scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .all(|row| !row.reasons.contains(&InstanceReason::CaptureStopped))
+    );
+    // The command still owns this complete envelope after a refused Finish.
+    // Explicit negative cleanup after outputs may start and settle it, without
+    // retroactively publishing the missing Finish or granting any semantics.
+    control.release.take().unwrap().send(()).unwrap();
+    scene
+        .lane
+        .take()
+        .unwrap()
+        .finish_owned_terminal_cleanup(&|| false, &mut Vec::new())
+        .unwrap();
+    assert!(
+        scene
+            .h0
+            .0
+            .borrow()
+            .terminal
+            .as_ref()
+            .unwrap()
+            .worker
+            .is_none()
+    );
+    assert!(!scene.h0.0.borrow().terminal_published);
 }

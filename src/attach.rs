@@ -1303,8 +1303,101 @@ pub struct Session {
     /// driven it to completion; a fresh worker is created if links ever
     /// need closing afterwards.
     cleanup_worker: Option<CleanupWorker>,
+    /// Terminal transfer and settlement belong to this exact Session. An
+    /// interrupted/failed drive can never infer success from empty links.
+    producer_detach: OwnedProducerDetach,
     #[cfg(feature = "h6-reexec-diagnostic")]
     reexec_diagnostic: Option<reexec_diagnostic::Diagnostic>,
+}
+
+/// Move-only terminal work, stored inside its original Session. Submission is
+/// not settlement; only the joined worker receipt can reach Complete.
+#[derive(Default)]
+enum OwnedProducerDetach {
+    #[default]
+    NotStarted,
+    Pending {
+        worker: CleanupWorker,
+        started: std::time::Instant,
+        had_work: bool,
+    },
+    Unproved,
+    Complete,
+}
+
+impl OwnedProducerDetach {
+    fn started(&self) -> bool {
+        !matches!(self, Self::NotStarted)
+    }
+
+    fn drive(
+        &mut self,
+        failures: &mut Vec<String>,
+        detached: &mut bool,
+        wall_ms: &mut u64,
+        second_signal: impl Fn() -> bool,
+        out: &mut dyn std::io::Write,
+    ) -> Result<()> {
+        let prior = std::mem::replace(self, Self::Unproved);
+        let Self::Pending {
+            worker,
+            started,
+            had_work,
+        } = prior
+        else {
+            if matches!(prior, Self::Complete) {
+                *self = Self::Complete;
+                return finish_producer_detach(detached, failures, Ok(()));
+            }
+            *detached = false;
+            bail!("producer detach has no unsettled owned job; completion remains unproven");
+        };
+        // Empty workers still join honestly, without adding an empty-cleanup
+        // notice to captures which owned no native producers.
+        let mut quiet = std::io::sink();
+        let output: &mut dyn std::io::Write = if had_work { out } else { &mut quiet };
+        let exit = drive_cleanup(
+            worker,
+            second_signal,
+            output,
+            std::time::Duration::from_secs(1),
+        );
+        *wall_ms = record_detach_wall_ms(*wall_ms, had_work, detach_wall_ms_since(started));
+        let complete =
+            matches!(&exit, cleanup_worker::CleanupExit::Completed(receipt) if receipt.completed);
+        let result = match cleanup_worker::settle_cleanup_exit(exit) {
+            Ok(joined_failures) => {
+                failures.extend(joined_failures);
+                if !complete && failures.is_empty() {
+                    failures
+                        .push("joined producer cleanup did not prove complete settlement".into());
+                }
+                Ok(())
+            }
+            Err(interrupted) => Err(interrupted.into()),
+        };
+        let result = finish_producer_detach(detached, failures, result);
+        if result.is_ok() {
+            *self = Self::Complete;
+        }
+        result
+    }
+}
+
+/// Substituted native I/O drives the same terminal state/receipt consumer.
+#[cfg(test)]
+pub(crate) fn drive_owned_producer_detach_for_test(
+    worker: CleanupWorker,
+    second_signal: &dyn Fn() -> bool,
+    out: &mut dyn std::io::Write,
+) -> Result<()> {
+    let had_work = worker.has_submissions();
+    let mut job = OwnedProducerDetach::Pending {
+        worker,
+        started: std::time::Instant::now(),
+        had_work,
+    };
+    job.drive(&mut Vec::new(), &mut false, &mut 0, second_signal, out)
 }
 
 /// A detach error leaves this Session's ownership bookkeeping inconsistent.
@@ -3972,6 +4065,7 @@ impl Session {
             links,
             instance,
             cleanup_worker: Some(CleanupWorker::pre_start()),
+            producer_detach: OwnedProducerDetach::NotStarted,
             #[cfg(feature = "h6-reexec-diagnostic")]
             reexec_diagnostic: None,
         })
@@ -4012,6 +4106,7 @@ impl Session {
 
     pub(crate) fn mutation_stopped(&self) -> bool {
         self.stop_gate.stop_requested()
+            || self.producer_detach.started()
             || self.producers_detached
             || !self.detach_failures.is_empty()
             || self.pid_health.terminal()
@@ -5222,79 +5317,76 @@ impl Session {
         self.detach_producers_driven(|| false, &mut std::io::stderr())
     }
 
-    /// Move every producer link out of Aya into the background cleanup
-    /// worker, print progress to `out` about once a second until it joins,
-    /// then report. `second_signal` interrupts the wait: the progress and
-    /// "cleanup incomplete" are printed and this returns
-    /// [`CleanupInterrupted`] for the caller to propagate (exit 130) — the
-    /// kernel finishes the remaining closes at exit.
+    /// Submit this Session's original producer ownership once, without
+    /// waiting for native close. Maps, readers and targets remain in Session.
+    /// Prior live submissions stay in the same worker and cumulative receipt.
+    pub(crate) fn begin_owned_producer_detach(&mut self) -> Result<()> {
+        match self.producer_detach {
+            OwnedProducerDetach::Pending { .. } | OwnedProducerDetach::Complete => return Ok(()),
+            OwnedProducerDetach::Unproved => bail!("producer detach ownership remains unproven"),
+            OwnedProducerDetach::NotStarted => {}
+        }
+        // Mark terminal before any fallible transfer, so missing/partial
+        // ownership never reopens attachment or mints an empty success later.
+        self.producer_detach = OwnedProducerDetach::Unproved;
+        invalidate_pid_session(&mut self.pid_pairs, self.pid_lifecycle.as_ref());
+        let started = std::time::Instant::now();
+        let worker = self.take_cleanup_worker()?;
+        let had_work = !self.links.is_empty() || worker.has_submissions();
+        let leases = Arc::new(
+            self.retained_static
+                .values()
+                .filter_map(RetainedStaticTarget::retirement_lease)
+                .collect(),
+        );
+        worker.begin_terminal();
+        let mut owned = Vec::new();
+        let mut transfer_failed = 0;
+        for link in std::mem::take(&mut self.links) {
+            let producer = link.producer();
+            match take_owned_links(&mut self.ebpf, link) {
+                Ok(links) => owned.extend(links.into_iter().map(|link| (link, producer))),
+                Err(error) => {
+                    transfer_failed += 1;
+                    self.detach_failures.push(format!("{error:#}"));
+                }
+            }
+        }
+        worker.note_transfer_failed(transfer_failed);
+        worker.submit(owned, leases, DetachOrder);
+        self.producer_detach = OwnedProducerDetach::Pending {
+            worker,
+            started,
+            had_work,
+        };
+        Ok(())
+    }
+
+    /// Drive only the original owned job. A second signal returns its typed
+    /// interruption without a foreground close/join. Neither that result nor
+    /// a failed transfer can later be promoted by observing empty links.
+    pub(crate) fn finish_owned_producer_detach_driven(
+        &mut self,
+        second_signal: impl Fn() -> bool,
+        out: &mut dyn std::io::Write,
+    ) -> Result<()> {
+        self.producer_detach.drive(
+            &mut self.detach_failures,
+            &mut self.producers_detached,
+            &mut self.detach_wall_ms,
+            second_signal,
+            out,
+        )
+    }
+
+    /// Existing one-step callers submit and then drive that exact job.
     pub(crate) fn detach_producers_driven(
         &mut self,
         second_signal: impl Fn() -> bool,
         out: &mut dyn std::io::Write,
     ) -> Result<()> {
-        invalidate_pid_session(&mut self.pid_pairs, self.pid_lifecycle.as_ref());
-        let start = std::time::Instant::now();
-        let had_links = !self.links.is_empty()
-            || self
-                .cleanup_worker
-                .as_ref()
-                .is_some_and(CleanupWorker::has_submissions);
-        let mut first_error = None;
-        if had_links {
-            let worker = self.take_cleanup_worker()?;
-            let leases = Arc::new(
-                self.retained_static
-                    .values()
-                    .filter_map(RetainedStaticTarget::retirement_lease)
-                    .collect(),
-            );
-            // Start terminal elapsed time before transfers, even when all
-            // producer links already belong to earlier live batches.
-            worker.begin_terminal();
-            let mut owned = Vec::new();
-            let mut transfer_failed = 0;
-            for link in std::mem::take(&mut self.links) {
-                let producer = link.producer();
-                match take_owned_links(&mut self.ebpf, link) {
-                    Ok(links) => owned.extend(links.into_iter().map(|link| (link, producer))),
-                    Err(error) => {
-                        transfer_failed += 1;
-                        let message = format!("{error:#}");
-                        self.detach_failures.push(message.clone());
-                        if first_error.is_none() {
-                            first_error = Some(anyhow!(message));
-                        }
-                    }
-                }
-            }
-            worker.note_transfer_failed(transfer_failed);
-            worker.submit(owned, leases, DetachOrder);
-            // A second SIGINT abandons the wait: the worker keeps closing
-            // in the background and the kernel finishes at exit. The typed
-            // outcome travels up the stop path to `main` (exit 130).
-            let failures = cleanup_worker::settle_cleanup_exit(drive_cleanup(
-                worker,
-                second_signal,
-                out,
-                std::time::Duration::from_secs(1),
-            ))?;
-            for failure in failures {
-                if first_error.is_none() {
-                    first_error = Some(anyhow!(failure.clone()));
-                }
-                self.detach_failures.push(failure);
-            }
-        } else {
-            let _ = (second_signal, out);
-        }
-        self.detach_wall_ms =
-            record_detach_wall_ms(self.detach_wall_ms, had_links, detach_wall_ms_since(start));
-        finish_producer_detach(
-            &mut self.producers_detached,
-            &self.detach_failures,
-            first_error.map_or(Ok(()), Err),
-        )
+        self.begin_owned_producer_detach()?;
+        self.finish_owned_producer_detach_driven(second_signal, out)
     }
 
     fn take_cleanup_worker(&mut self) -> Result<CleanupWorker> {
@@ -6971,6 +7063,196 @@ mod tests {
         );
         assert_eq!(failures.len(), 8);
         assert_eq!(&detached[6..], &["exit", "exec"]);
+    }
+
+    #[test]
+    fn owner_terminal_prior_live_work_requires_the_original_joined_receipt() {
+        let file = std::sync::Arc::new(tempfile::tempfile().unwrap());
+        let original = std::sync::Arc::downgrade(&file);
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(move |payload, _| {
+                assert!(original.upgrade().unwrap().metadata().is_ok());
+                drop(payload.take());
+                Ok(())
+            }),
+            Arc::new(|| std::time::Duration::ZERO),
+        );
+        let ticket = worker
+            .submit_live(
+                vec![(
+                    OwnedLink::Multi(vec![file.try_clone().unwrap().into()]),
+                    ProducerProgram::UProbe("p11_entry"),
+                )],
+                Arc::new(vec![file]),
+                DetachOrder,
+            )
+            .unwrap();
+        assert!(worker.has_submissions());
+        worker.begin_terminal();
+        // The terminal batch can be empty while earlier actual live work
+        // still belongs to this exact coordinator and receipt.
+        worker.submit(Vec::new(), Arc::default(), DetachOrder);
+        let mut job = OwnedProducerDetach::Pending {
+            worker,
+            started: std::time::Instant::now(),
+            had_work: true,
+        };
+        let mut detached = false;
+        let mut failures = Vec::new();
+        let mut wall = 0;
+        let mut out = Vec::new();
+        job.drive(&mut failures, &mut detached, &mut wall, || false, &mut out)
+            .unwrap();
+        assert!(detached && matches!(job, OwnedProducerDetach::Complete));
+        assert!(
+            String::from_utf8(out.clone())
+                .unwrap()
+                .contains("1/1 links released")
+        );
+        job.drive(&mut failures, &mut detached, &mut wall, || true, &mut out)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out)
+                .unwrap()
+                .matches("cleanup completed")
+                .count(),
+            1
+        );
+        drop(ticket);
+    }
+
+    #[test]
+    fn owner_terminal_interrupted_job_cannot_turn_empty_into_success() {
+        let (release, released) = std::sync::mpsc::channel();
+        let released = std::sync::Mutex::new(released);
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (done, done_rx) = std::sync::mpsc::channel();
+        let worker = CleanupWorker::pre_start_with_spawn(
+            Box::new(move |payload, _| {
+                entered.send(()).unwrap();
+                let _ = released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5));
+                drop(payload.take());
+                Ok(())
+            }),
+            Arc::new(|| std::time::Duration::ZERO),
+            |task| {
+                Ok(std::thread::spawn(move || {
+                    task();
+                    let _ = done.send(());
+                }))
+            },
+        );
+        worker.submit(
+            vec![(
+                OwnedLink::Multi(vec![tempfile::tempfile().unwrap().into()]),
+                ProducerProgram::UProbe("p11_return"),
+            )],
+            Arc::default(),
+            DetachOrder,
+        );
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let progress = worker.progress();
+        assert_eq!(
+            (progress.attempted, progress.released, progress.remaining),
+            (1, 0, 0)
+        );
+        let mut job = OwnedProducerDetach::Pending {
+            worker,
+            started: std::time::Instant::now(),
+            had_work: true,
+        };
+        let mut detached = false;
+        let mut failures = Vec::new();
+        let mut wall = 0;
+        let result = job.drive(
+            &mut failures,
+            &mut detached,
+            &mut wall,
+            || true,
+            &mut Vec::new(),
+        );
+        // Drain every actual test-owned close/coordinator before asserting.
+        release.send(()).unwrap();
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(result.unwrap_err().is::<CleanupInterrupted>());
+        assert!(!detached && matches!(job, OwnedProducerDetach::Unproved));
+        assert!(
+            job.drive(
+                &mut failures,
+                &mut detached,
+                &mut wall,
+                || false,
+                &mut Vec::new()
+            )
+            .is_err()
+        );
+        assert!(!detached);
+    }
+
+    #[test]
+    fn owner_terminal_partial_transfer_and_close_failure_stay_unproved() {
+        for mode in 0..3 {
+            let worker = CleanupWorker::pre_start_with(
+                Box::new(move |payload, _| {
+                    drop(payload.take());
+                    match mode {
+                        0 => Ok(()),
+                        1 => Err("injected close failure".into()),
+                        _ => panic!("injected close panic"),
+                    }
+                }),
+                Arc::new(|| std::time::Duration::ZERO),
+            );
+            let mut failures = Vec::new();
+            if mode == 0 {
+                worker.note_transfer_failed(1);
+                failures.push("original Aya registry transfer refused".into());
+            }
+            worker.submit(
+                vec![(
+                    OwnedLink::Multi(Vec::new()),
+                    ProducerProgram::UProbe("p11_entry"),
+                )],
+                Arc::default(),
+                DetachOrder,
+            );
+            let mut job = OwnedProducerDetach::Pending {
+                worker,
+                started: std::time::Instant::now(),
+                had_work: true,
+            };
+            let mut detached = false;
+            let mut wall = 0;
+            assert!(
+                job.drive(
+                    &mut failures,
+                    &mut detached,
+                    &mut wall,
+                    || false,
+                    &mut Vec::new()
+                )
+                .is_err()
+            );
+            assert!(!detached && !failures.is_empty());
+            assert!(
+                job.drive(
+                    &mut failures,
+                    &mut detached,
+                    &mut wall,
+                    || false,
+                    &mut Vec::new()
+                )
+                .is_err()
+            );
+            assert!(!detached);
+        }
     }
 
     #[test]

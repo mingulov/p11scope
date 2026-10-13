@@ -3684,6 +3684,8 @@ mod tests {
         };
         use std::collections::HashMap;
 
+        mod semantic_validation;
+
         #[derive(Default)]
         struct ChainIdentity {
             answers: HashMap<(u32, NativeDomainId), CookieQuery>,

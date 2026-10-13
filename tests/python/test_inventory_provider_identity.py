@@ -20,6 +20,37 @@ def foreign_module(module, *, device=(0, 275), inode=3161916):
     return foreign
 
 
+def cgroup_mapping_zero_inputs():
+    """Reuse the public sibling shapes for an independently idle owned mapping."""
+    doc, original, receipt, sibling_records = SYSTEM["sibling_inputs"]()
+    ident = original["idents"][0]
+    ledger = H6["parse_inv_ledger"]("")
+    ledger.update(idents=[ident], mapped=original["mapped"], readys=[ident],
+                  dones=[{**ident, "status": "ok"}])
+    edge = copy.deepcopy(doc["edges"][0])
+    edge["entries"].update(count=0, saturated=False, in_flight=False,
+        coverage={"state": "unknown", "reason": "scope_membership_unproven", "lossy": None})
+    first = copy.deepcopy(edge)
+    first["entries"]["coverage"]["reason"] = "not_attached"
+    gap = {"subject": "semantic admission refused", "caller": "c2", "module": None,
+           "pid": None, "budget": None, "reason": "semantic_unavailable", "repeats": 1}
+    events = [("started", {"scope": "cgroup"}),
+        ("caller_event", sibling_records[1]["event"]), ("edge_observed", first),
+        ("gap_recorded", {**{key: value for key, value in gap.items() if key != "repeats"}, "index": 0}),
+        ("edge_observed", copy.deepcopy(edge))]
+    records = [{"schema": "p11scope/inventory-events/v1", "seq": seq, "at_ns": BASE["START"] + seq,
+                "kind": kind, "event": event} for seq, (kind, event) in enumerate(events)]
+    doc.update(scope="cgroup", edges=[edge], instances=[], semantic_edges=[], gaps=[gap], gaps_suppressed=0)
+    doc["observation"].update(lane="native", passes=2)
+    doc["observation"]["attach"]["scope_filter"] = "bpf-cgroup"
+    receipt.update(scope_kind="cgroup", scope_label="cgroup", count_only_providers=[],
+        expected_edges={"2000:0:A": {"zero_ok": True}},
+        expected_incarnations={"2000": {"gens": {"0": {"exe": ident["exe"], "retired": False}}}},
+        scope_intervals=[{"pid": 2000, "membership": "selected", "t0": BASE["START"], "t1": BASE["STOP"]}],
+        inventory_control={"measurements": [], "final_records": records})
+    return doc, {"MS": ledger}, receipt
+
+
 class InventoryProviderIdentityTest(unittest.TestCase):
     def test_full_system_oracle_ignores_same_path_and_digest_foreign_identity(self):
         for position in (0, 2):
@@ -123,6 +154,48 @@ class InventoryProviderIdentityTest(unittest.TestCase):
                         ambient["identity"]["device"] = value
                     result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
                     self.assertFalse(result["pass"], result["errors"])
+
+    def test_path_evidence_requires_exact_elements_in_a_string_list(self):
+        for paths in ("/w/libA.so.foreign", "/w/libA.so", ["/w/libA.so", True]):
+            with self.subTest(paths=paths):
+                doc, ledgers, receipt = BASE["inventory_inputs"](s1_expected=False)
+                doc["modules"][0]["paths"] = paths
+                result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+                self.assertFalse(result["pass"], result["errors"])
+
+    def test_cgroup_mapping_zero_disclosure_ignores_same_path_foreign_module(self):
+        doc, ledgers, receipt = cgroup_mapping_zero_inputs()
+        self.assertTrue(H6["inventory_cgroup_disclosure"](doc, ledgers, receipt, 0))
+        doc["modules"].insert(0, foreign_module(doc["modules"][0]))
+        self.assertTrue(H6["inventory_cgroup_disclosure"](doc, ledgers, receipt, 0))
+        self.assertEqual(doc["edges"][0]["entries"]["count"], 0)
+        self.assertEqual(doc["edges"][0]["entries"]["coverage"]["reason"], "scope_membership_unproven")
+
+    def test_cgroup_mapping_zero_identity_and_owned_idle_proof_remain_required(self):
+        for fault in ("device", "inode", "digest", "path", "duplicate", "count", "in-flight", "birth", "outside", "work"):
+            with self.subTest(fault=fault):
+                doc, ledgers, receipt = cgroup_mapping_zero_inputs()
+                module = doc["modules"][0]
+                if fault == "device":
+                    module["identity"]["device"]["minor"] += 1
+                elif fault == "inode":
+                    module["identity"]["inode"] += 1
+                elif fault == "digest":
+                    module["identity"]["sha256"] = "f" * 64
+                elif fault == "path":
+                    module["paths"] = ["/w/other.so"]
+                elif fault == "duplicate":
+                    doc["modules"].append({**copy.deepcopy(module), "id": "m-duplicate"})
+                elif fault in ("count", "in-flight"):
+                    field, value = ("count", 1) if fault == "count" else ("in_flight", True)
+                    doc["edges"][0]["entries"][field] = value
+                elif fault == "birth":
+                    ledgers["MS"]["idents"][0]["start"] += 1
+                elif fault == "outside":
+                    receipt["scope_intervals"][0]["membership"] = "outside"
+                else:
+                    ledgers["MS"]["batches"] = [{"pid": 2000}]
+                self.assertFalse(H6["inventory_cgroup_disclosure"](doc, ledgers, receipt, 0))
 
     def test_count_only_claim_does_not_borrow_same_path_foreign_semantics(self):
         doc, ledgers, receipt = BASE["inventory_inputs"](s1_expected=False)

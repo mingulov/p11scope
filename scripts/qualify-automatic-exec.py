@@ -1800,7 +1800,9 @@ def inventory_held_provider_module(doc, provider):
     if len(candidates) != 1:
         raise SetupError("module identity is absent or ambiguous for the held provider file")
     module = candidates[0]
-    if (provider["path"] not in module.get("paths", [])
+    paths = module.get("paths")
+    if (not isinstance(paths, list) or any(not isinstance(path, str) for path in paths)
+            or provider["path"] not in paths
             or not provider.get("sha256")
             or module["identity"].get("sha256") != provider["sha256"]):
         raise SetupError("module identity/path disagrees with the held provider file")
@@ -2956,10 +2958,11 @@ def inventory_cgroup_disclosure(doc, ledgers, receipt, index):
     if len(providers) != 1:
         return False
     name, provider = providers[0]
-    modules = [row for row in doc["modules"] if provider["path"] in row.get("paths", [])]
-    if (len(modules) != 1 or modules[0]["identity"].get("inode") != provider["ino"]
-            or modules[0]["identity"].get("sha256") != provider["sha256"]
-            or receipt["expected_edges"].get(f"{pid}:{gen}:{name}") != {"zero_ok": True}
+    try:
+        module = inventory_held_provider_module(doc, provider)
+    except SetupError:
+        return False
+    if (receipt["expected_edges"].get(f"{pid}:{gen}:{name}") != {"zero_ok": True}
             or receipt["expected_incarnations"].get(str(pid)) != {
                 "gens": {str(gen): {"exe": ident["exe"], "retired": False}}}
             or not any(row["pid"] == pid and row["membership"] == "selected"
@@ -2991,7 +2994,7 @@ def inventory_cgroup_disclosure(doc, ledgers, receipt, index):
                     and row["seq"] < min(scoped[0], publication[0]["seq"])) for row in history)):
         return False
     return all(
-        row["module"] == modules[0]["id"] and row.get("mapping", {}).get("state") == "mapped"
+        row["module"] == module["id"] and row.get("mapping", {}).get("state") == "mapped"
         and row.get("entries", {}).get("count") == 0
         and row["entries"].get("saturated") is False and row["entries"].get("in_flight") is False
         and coverage_of(row).get("state") == "unknown"

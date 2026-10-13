@@ -4060,6 +4060,11 @@ def _cleanup_leg_resources(ctx, close_pins=True):
                     owner.close()
                 except Exception as error:
                     failures.append(f"process FD: {type(error).__name__}: {error}")
+        if close_pins and ctx.leg_pins and any(
+                any((child.owners, child.readers, child.groups, child.traced))
+                for child in getattr(ctx, "pin_borrowers", ())):
+            close_pins = False
+            failures.append("shared image pins retained for unsettled owned child scope")
         if close_pins:
             for pin in reversed(ctx.leg_pins):
                 try:
@@ -4154,12 +4159,12 @@ def owned_leg(function=None, *, inventory=False, stop_b=False):
         with cleanup_section():
             scope = LegContext(ctx)
             scope.budget = LegBudget(inventory=inventory)
+            scope.terminal_budget = scope.budget  # No cleanup backstop may renew its interval.
             if stop_b:
                 scope.observer_start = scope.observer_owned = None
                 scope.observer_stop_attempted = False
                 scope.observer_stop_result = scope.terminal_token = None
                 scope.observer_stop_error = None
-                scope.terminal_budget = scope.budget  # No-observer cleanup also cannot renew.
         token = ACTIVE_LEG.set(scope.budget)
         primary = None
         try:
@@ -4783,15 +4788,42 @@ def run_leader_exit_exec(ctx, cell_dir, backend):
 @owned_leg
 def run_rapid_chain(ctx, cell_dir, backend):
     """Bounded 3-exec leader chain (A->B->A->B) plus reuse and group-death legs."""
-    leg_dir = Path(cell_dir) / backend / "trace"
-    (leg_dir / "workload").mkdir(mode=0o755, parents=True, exist_ok=True)
-    env = init_token(leg_dir / "workload", ctx.args.uid, ctx.args.gid, "h6-rapid")
-    pins = {}
-    for name in ("caller-a", "caller-b"):
-        path = leg_dir / name
-        shutil.copyfile(ctx.pins["caller"].path, path)
-        path.chmod(0o755)
-        pins[name] = leg_pin(ctx, path)
+    children_start = len(ctx.case.scopes)
+    ctx.pin_borrowers = []
+    try:
+        leg_dir = Path(cell_dir) / backend / "trace"
+        (leg_dir / "workload").mkdir(mode=0o755, parents=True, exist_ok=True)
+        env = init_token(leg_dir / "workload", ctx.args.uid, ctx.args.gid, "h6-rapid")
+        pins = {}
+        for name in ("caller-a", "caller-b"):
+            path = leg_dir / name
+            shutil.copyfile(ctx.pins["caller"].path, path)
+            path.chmod(0o755)
+            pins[name] = leg_pin(ctx, path)
+        result, dead_pid = run_rapid_trace_leg(ctx, leg_dir, backend, env, pins)
+        ctx.case.completed_results.append(result)
+        if dead_pid is None:
+            return [result]
+        control = run_reuse_control(ctx, Path(cell_dir) / backend / "reuse", backend, env,
+                                    dead_pid, pins["caller-a"])
+        death = run_group_death_leg(ctx, Path(cell_dir) / backend / "group-death",
+                                    backend, env, pins["caller-a"])
+        return [result, control, death]
+    finally:
+        ctx.pin_borrowers[:] = [child for child in ctx.case.scopes[children_start:]
+                               if child.parent is ctx]
+        enter_phase("cleanup")  # One interval for the coordinator's held images.
+
+
+@owned_leg
+def run_rapid_trace_leg(ctx, leg_dir, backend, env, pins):
+    """Own the trace's terminal cleanup independently of its later controls."""
+    # Fixture setup belongs to the original coordinator. A new resource scope
+    # cannot grant the trace another setup or overall leg allowance.
+    ctx.budget.deadline_ns = min(ctx.budget.deadline_ns, ctx.parent.budget.deadline_ns)
+    setup = min(ctx.budget.phase_deadline_ns, ctx.parent.budget.deadlines["setup", 0])
+    ctx.budget.deadlines["setup", 0] = ctx.budget.phase_deadline_ns = setup
+    check_dispatch()
     provider = ctx.provider_pin
     caller, stdout, _ = spawn_caller(ctx.owners, ctx.readers, leg_dir, pins["caller-a"],
                                      provider, ctx.args.uid, ctx.args.gid, env)
@@ -4810,7 +4842,7 @@ def run_rapid_chain(ctx, cell_dir, backend):
                    "backend_refused": str(refused)}
         result = evaluate_trace_h6("", [], receipt)
         write_json(leg_dir / "result.json", result)
-        return [result]
+        return result, None
     phases = []
     # Sequential public stream boundaries distinguish reused function keys.
     initial_ready = warm_initial_caller(ctx, capture, caller, stdout, images[0], pins["caller-a"], provider, phases)
@@ -4865,15 +4897,7 @@ def run_rapid_chain(ctx, cell_dir, backend):
                                (leg_dir / "trace.file.txt").read_text())
     write_json(leg_dir / "receipt.json", receipt)
     write_json(leg_dir / "result.json", result)
-    # The copied images remain pinned for the following controls. The main
-    # observer leg must release every process/reader/group before they start.
-    cleanup_leg_resources(ctx, close_pins=False)
-    ctx.case.completed_results.append(result)
-    control = run_reuse_control(ctx, Path(cell_dir) / backend / "reuse", backend, env,
-                                dead_pid, pins["caller-a"])
-    death = run_group_death_leg(ctx, Path(cell_dir) / backend / "group-death",
-                                backend, env, pins["caller-a"])
-    return [result, control, death]
+    return result, dead_pid
 
 
 @owned_leg

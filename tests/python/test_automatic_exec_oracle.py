@@ -3339,29 +3339,141 @@ class LegCleanupTest(unittest.TestCase):
         trace_dir = cell_dir / "singles" / "trace"
         trace_dir.mkdir(parents=True)
         (trace_dir / "trace.file.txt").write_text("controlled oracle input\n")
-        order = []
+        order, held = [], []
+        now = [time.monotonic_ns()]
+        budget_class = H6["LegBudget"]
+        budgets = []
+        def budget(**options):
+            value = budget_class(clock=lambda: now[0], **options)
+            budgets.append(value)
+            return value
+        def initial_setup(*_args):
+            now[0] += 2_000_000_000
+            return dict(os.environ)
         def control(label):
             @H6["owned_leg"]
             def run(ctx, leg_dir, backend, env, *args):
                 self.assert_released()  # includes the preceding control on entry to death
                 image_pin = args[-1]
-                os.fstat(image_pin.fd)
+                info = os.fstat(image_pin.fd)
+                held.append((image_pin, image_pin.fd, info.st_dev, info.st_ino))
                 self.assertTrue(all(pin.fd is not None for pin in self.local_pins))
                 order.append(label)
                 Path(leg_dir).mkdir(parents=True)
                 self.child(ctx.owners, ctx.readers, leg_dir)
+                # Healthy independent controls may exceed the earlier trace's
+                # cleanup interval; they do not renew that original deadline.
+                now[0] += 8_000_000_000
                 return {"cell": "rapid-chain", "leg": label, "pass": True}
             return run
         patch, image_patch = self.patches(lambda *_args: time.monotonic_ns())
         with patch, image_patch, self.driven_patches(lambda *_args: {"leg": "main", "pass": True}), \
-                mock.patch.dict(self.globals, {"run_reuse_control": control("reuse"),
+                mock.patch.dict(self.globals, {"LegBudget": budget, "init_token": initial_setup,
+                                               "run_reuse_control": control("reuse"),
                                                "run_group_death_leg": control("death")}):
             results = H6["run_rapid_chain"](self.ctx, cell_dir, "singles")
         self.assertEqual(order, ["reuse", "death"])
         self.assertEqual([row["leg"] for row in results], ["main", "reuse", "death"])
         self.assertEqual([row["leg"] for row in self.ctx.completed_results], ["main", "reuse", "death"])
+        self.assertEqual(held[0], held[1], "controls lost the original held executable identity")
+        self.assertFalse(self.ctx.cleanup_failed)
+        coordinator, trace = budgets[:2]
+        self.assertEqual(trace.deadlines["cleanup", 0], trace.started_ns + 5_000_000_000)
+        self.assertGreater(now[0], trace.deadlines["cleanup", 0])
+        self.assertEqual(coordinator.deadlines["cleanup", 0], now[0] + 5_000_000_000)
+        self.assertEqual(trace.deadline_ns, coordinator.deadline_ns)
+        self.assertEqual(trace.deadlines["setup", 0], coordinator.deadlines["setup", 0])
+        for value in budgets:
+            self.assertEqual(value.budgets["cleanup"], 5)
         self.assert_released()
         self.assertTrue(all(pin.fd is None for pin in self.local_pins))
+
+    def test_rapid_failed_borrower_retains_images_and_original_expired_backstop(self):
+        cell_dir = self.directory / "rapid-chain"
+        trace_dir = cell_dir / "singles" / "trace"
+        trace_dir.mkdir(parents=True)
+        (trace_dir / "trace.file.txt").write_text("controlled oracle input\n")
+        now = [time.monotonic_ns()]
+        budget_class = H6["LegBudget"]
+        pending = {}
+        terminate = H6["terminate_owned"]
+        def keep_pending(owner):
+            if owner is pending.get("owner"):
+                raise TimeoutError("controlled still-owned child at cleanup expiry")
+            return terminate(owner)
+        @H6["owned_leg"]
+        def control(ctx, leg_dir, _backend, _env, _dead_pid, image_pin):
+            self.assert_released()
+            os.fstat(image_pin.fd)
+            Path(leg_dir).mkdir(parents=True)
+            owner, _stdout, _stderr = self.child(ctx.owners, ctx.readers, leg_dir)
+            pending.update(owner=owner, scope=ctx)
+            H6["enter_phase"]("cleanup")
+            now[0] += 6_000_000_000
+            raise H6["SetupError"]("controlled borrower failure")
+        patch, image_patch = self.patches(lambda *_args: time.monotonic_ns())
+        with patch, image_patch, self.driven_patches(lambda *_args: {"leg": "main", "pass": True}), \
+                mock.patch.dict(self.globals, {
+                    "LegBudget": lambda **options: budget_class(clock=lambda: now[0], **options),
+                    "run_reuse_control": control, "terminate_owned": keep_pending,
+                    "run_group_death_leg": mock.Mock(side_effect=AssertionError("later control ran"))}), \
+                self.assertRaisesRegex(H6["LegCleanupError"], "deadline exhausted"):
+            H6["run_rapid_chain"](self.ctx, cell_dir, "singles")
+        self.assertEqual(pending["scope"].owners, [pending["owner"]])
+        self.assertIsNone(pending["owner"].popen.poll(), "negative lost its actual pending child")
+        self.assertTrue(all(pin.fd is not None for pin in self.local_pins),
+                        "borrowed original images closed before the failed child's backstop")
+        self.assertTrue(self.ctx.cleanup_failed)
+        self.assertIsNone(H6["ACTIVE_LEG"].get())
+        deadlines = [(scope, dict(scope.budget.deadlines), scope.budget.deadline_ns)
+                     for scope in self.ctx.scopes]
+        # Keep the same expired intervals, but prove and reap the actual owned
+        # child before asking the reverse-order backstop to release shared pins.
+        now[0] += 6_000_000_000
+        pending["owner"].send(signal.SIGKILL)
+        pending["owner"].popen.wait(timeout=2)
+        for reader in pending["scope"].readers:
+            reader.thread.join(2)
+        with mock.patch.dict(self.globals, {"LegBudget": mock.Mock(
+                side_effect=AssertionError("expired backstop renewed its cleanup budget"))}):
+            for scope in reversed(self.ctx.scopes):
+                try:
+                    H6["cleanup_leg_resources"](scope)
+                except H6["LegCleanupError"]:
+                    pass  # The original cleanup failure remains a failure.
+        for scope, phases, limit in deadlines:
+            self.assertEqual(scope.budget.deadlines, phases)
+            self.assertEqual(scope.budget.deadline_ns, limit)
+        self.assertTrue(all(pin.fd is None for pin in self.local_pins))
+        self.assert_released()
+
+    def test_ordinary_owned_scope_pending_backstop_uses_unexpired_original_budget(self):
+        now = [time.monotonic_ns()]
+        budget_class = H6["LegBudget"]
+        @H6["owned_leg"]
+        def leg(ctx):
+            self.child(ctx.owners, ctx.readers, self.directory)
+            H6["enter_phase"]("cleanup")
+            raise H6["SetupError"]("controlled first cleanup interruption")
+        with mock.patch.dict(self.globals, {
+                "LegBudget": lambda **options: budget_class(clock=lambda: now[0], **options),
+                "terminate_owned": mock.Mock(side_effect=TimeoutError("controlled first termination failure"))}), \
+                self.assertRaises(H6["LegCleanupError"]):
+            leg(self.ctx)
+        scope = self.ctx.scopes[0]
+        self.assertEqual(len(scope.owners), 1)
+        self.assertIsNone(scope.owners[0].popen.poll())
+        budget = scope.budget
+        phases, limit = dict(budget.deadlines), budget.deadline_ns
+        now[0] += 2_000_000_000
+        with mock.patch.dict(self.globals, {"LegBudget": mock.Mock(
+                side_effect=AssertionError("unexpired backstop renewed its cleanup budget"))}):
+            H6["cleanup_leg_resources"](scope)
+        self.assertEqual(budget.deadlines, phases)
+        self.assertEqual(budget.deadline_ns, limit)
+        self.assertEqual(phases["cleanup", 0], budget.started_ns + 5_000_000_000)
+        self.assertTrue(self.ctx.cleanup_failed, "healthy backstop erased the earlier failed cleanup")
+        self.assert_released()
 
     def test_partial_pty_acquisition_closes_fds_and_settles_started_thread(self):
         original_open, capture_class = H6["pty"].openpty, H6["PtyCapture"]

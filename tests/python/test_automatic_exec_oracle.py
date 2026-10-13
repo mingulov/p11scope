@@ -4260,6 +4260,7 @@ class ControlledInventoryObserver:
         self.records, self.callers, self.last, self.instances, self.semantic = [], {}, {}, {}, {}
         self.passed, self.previous_counts = -1, {}
         self.last_acks = {}
+        self.release_original_admission = False
         self.quiet_publications = {}
         self.release_teardown = fault not in ("delayed-teardown", "withheld-teardown")
         self.teardown_published = False
@@ -4311,6 +4312,14 @@ class ControlledInventoryObserver:
             if self.membership is not None and "/selected" not in self.membership.get(owner.pid, ""):
                 continue
             for ident in idents:
+                if self.fault in ("deferred-target-admission", "deferred-sibling-admission") and ident["gen"] == 0:
+                    # Model MapsMatched: the same real child must first map
+                    # its provider, then await its own later admission pass.
+                    if not any(row["gen"] == 0 for row in parsed["mapped"]):
+                        continue
+                    deferred_cell = "MX" if self.fault == "deferred-target-admission" else "MS"
+                    if ident["cell"] == deferred_cell and not self.release_original_admission:
+                        continue
                 caller_key = owner.pid, ident["gen"]
                 if caller_key not in self.callers:
                     caller_id = f"c{len(self.callers)}"
@@ -4512,10 +4521,14 @@ class InventoryFixtureTest(unittest.TestCase):
                     and f" gen={gen} " in line for line in r.lines), 2)
         return H6["parse_inv_ledger"]("".join(reader.lines))
 
-    def test_control_holds_before_loading_and_flushes_each_actual_phase(self):
+    def test_control_maps_before_ready_and_holds_api_calls_until_warmup(self):
         proc, reader, deadline = self.child()
         reader.wait(lambda r: any(line.startswith("H6_READY ") for line in r.lines), 2)
-        self.assertFalse(H6["parse_inv_ledger"]("".join(reader.lines))["mapped"])
+        ready = H6["parse_inv_ledger"]("".join(reader.lines))
+        self.assertEqual(len(ready["mapped"]), 1)
+        self.assertFalse(ready["batches"])
+        self.assertFalse(ready["acks"])
+        self.assertIn(str(self.provider.resolve()), (Path("/proc") / str(proc.pid) / "maps").read_text())
         for attempt in (1, 2):
             ledger = self.command(proc, reader, "W", attempt, deadline, attempt=attempt)
             rows = [row for row in ledger["batches"] if row["phase"] == f"h6-warm{attempt}"]
@@ -4530,6 +4543,28 @@ class InventoryFixtureTest(unittest.TestCase):
         self.assertIsNone(proc.poll())
         self.command(proc, reader, "T", 4, deadline)
         self.command(proc, reader, "F", 5, deadline)
+        self.assertEqual(proc.wait(2), 0)
+
+    def test_control_maps_both_sibling_providers_without_api_calls_until_warmup(self):
+        second = self.directory / f"premap-B-{time.monotonic_ns()}.so"
+        shutil.copyfile(self.provider, second)
+        proc, reader, deadline = self.child(mode="mech", extra=("--module", str(second)))
+        reader.wait(lambda r: any(line.startswith("H6_READY ") for line in r.lines), 2)
+        ready = H6["parse_inv_ledger"]("".join(reader.lines))
+        paths = {str(self.provider.resolve()), str(second)}
+        self.assertEqual({row["module"] for row in ready["mapped"]}, paths)
+        self.assertFalse(ready["batches"])
+        self.assertFalse(ready["acks"])
+        maps = (Path("/proc") / str(proc.pid) / "maps").read_text()
+        self.assertTrue(all(path in maps for path in paths))
+        ledger = self.command(proc, reader, "W", 1, deadline, attempt=1)
+        for path in paths:
+            self.assertEqual(sum(row["n"] for row in ledger["batches"]
+                if row["module"] == path and row["fn"] == "C_GetFunctionList"), 1)
+            self.assertEqual(sum(row["n"] for row in ledger["batches"]
+                if row["module"] == path and row["phase"] == "h6-warm1"), 10)
+        self.command(proc, reader, "T", 2, deadline)
+        self.command(proc, reader, "F", 3, deadline)
         self.assertEqual(proc.wait(2), 0)
 
     def test_eof_and_initial_absolute_bound_end_the_actual_child(self):
@@ -4714,6 +4749,18 @@ class InventoryFixtureTest(unittest.TestCase):
                 H6["ptrace_detach"](pid, scope)
         cursor_read = H6["R5AdmissionCursor"].read
         def read_cursor(cursor, deadline=None, **kwargs):
+            if fault in ("deferred-target-admission", "deferred-sibling-admission") and observers:
+                injected = observers[-1]
+                parsed = H6["parse_inv_ledger"]("".join(cursor.owner.h6_test_reader.lines))
+                deferred_cell = "MX" if fault == "deferred-target-admission" else "MS"
+                if parsed["idents"][0]["cell"] == deferred_cell and not injected.release_original_admission:
+                    records = [json.loads(line) for line in injected.path.read_text().splitlines()]
+                    self.assertGreaterEqual(sum(row["kind"] == "pass_committed" for row in records), 2)
+                    for owner in owners:
+                        own = H6["parse_inv_ledger"]("".join(owner.h6_test_reader.lines))
+                        if own["idents"] and own["idents"][0]["cell"] in ("MX", "MS"):
+                            self.assertFalse(own["batches"], "provider API work preceded owned admission")
+                    injected.release_original_admission = True
             if fault == "delayed-teardown" and deadline is not None and observers:
                 parsed = H6["parse_inv_ledger"]("".join(cursor.owner.h6_test_reader.lines))
                 if any(row["command"] == "T" and row["gen"] == 0 for row in parsed["acks"]):
@@ -4722,7 +4769,8 @@ class InventoryFixtureTest(unittest.TestCase):
         patches = {"init_token": lambda *_args: self.env, "build_manifest": manifest, "leg_pin": pinned,
             "spawn_owned": ordinary, "spawn_ledger": ledger, "spawn_inventory": observer,
             "wait_inventory_ready": lambda *_args: time.monotonic_ns(),
-            "wait_passes": lambda *_args: 2,
+            "wait_passes": H6["wait_passes"] if fault in (
+                "deferred-target-admission", "deferred-sibling-admission") else lambda *_args: 2,
             "wait_exec_stop": exec_stop,
             "ptrace_continue": resume, "create_tracked": group, "cgroup_of": lambda pid: membership[pid],
             "ptrace_detach": detach,
@@ -4733,7 +4781,8 @@ class InventoryFixtureTest(unittest.TestCase):
         actual_budget = H6["LegBudget"]
         patches["LegBudget"] = lambda **_kwargs: actual_budget(inventory=True, budgets={"setup": 3,
             "successor-recovery": 0.4 if fault not in (None, "failed-move", "initial-no-calls", "history-prefix",
-                "recovered-history", "recovered-no-calls", "split-retirement", "delayed-teardown", "withheld-teardown") else 3,
+                "recovered-history", "recovered-no-calls", "split-retirement", "delayed-teardown", "withheld-teardown",
+                "deferred-target-admission", "deferred-sibling-admission") else 3,
             "fixed-measurement": 2 if fault == "withheld-teardown" else 8,
             "normal-stop": 2, "cleanup": 2}, leg_seconds=15)
         self.route_events, self.route_owners, self.route_case = events, owners, ctx
@@ -5103,6 +5152,23 @@ class InventoryFixtureTest(unittest.TestCase):
         sibling = result["s1"]["sibling_instances"][0]
         self.assertEqual((sibling["api_returns"], sibling["ledger_api_returns"]), (47, 47))
         self.assertEqual(sibling["operations"]["completed"], 22)
+
+    def test_system_first_provider_calls_wait_for_each_deferred_owned_admission(self):
+        for fault in ("deferred-target-admission", "deferred-sibling-admission"):
+            with self.subTest(fault=fault):
+                doc, ledgers, receipt = self.run_inventory_route(fault=fault)
+                records = receipt["inventory_control"]["final_records"]
+                for name in ("MX", "MS"):
+                    pid = ledgers[name]["idents"][0]["pid"]
+                    admitted = next(row for row in records if row["kind"] == "caller_event"
+                        and row["event"].get("event") == "admitted"
+                        and row["event"]["identity_context"]["caller"]["pid"] == pid)
+                    completed = next(row for row in records if row["kind"] == "pass_committed"
+                                     and row["seq"] > admitted["seq"])
+                    first = min(row["t0"] for row in ledgers[name]["batches"])
+                    self.assertGreaterEqual(first, completed["at_ns"])
+                result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+                self.assertTrue(result["pass"], result["errors"])
 
     def test_system_mixed_sibling_physical_counts_and_instance_s1_use_separate_channels(self):
         doc, ledgers, receipt = self.run_inventory_route()
@@ -5835,6 +5901,29 @@ class R5FreshAdmissionTest(unittest.TestCase):
 
     def fresh(self):
         return [self.admission(3, "c1", 1), self.record(4, "pass_committed", {"pass": 1})]
+
+    def test_inventory_initial_gate_rejects_nonzero_or_uncompleted_origin_before_warmup(self):
+        self.cursor.close()
+        for fault in ("incarnation", "missing-pass", "expired"):
+            with self.subTest(fault=fault):
+                rows = copy.deepcopy(self.prefix)
+                if fault == "incarnation":
+                    rows[1]["event"]["identity_context"]["caller"]["incarnation"] = 1
+                elif fault == "missing-pass":
+                    rows.pop()
+                self.write(rows)
+                now, deadline = [START], START + 1_000_000_000
+                if fault == "expired":
+                    now[0] = deadline
+                def pause(*_args):
+                    now[0] = deadline
+                target = SimpleNamespace(owner=self.owner,
+                    warm=lambda *_args: self.fail("initial provider work preceded original admission proof"))
+                with mock.patch.dict(H6["inventory_target_phases"].__globals__, dict(
+                        monotonic_ns=lambda: now[0], inventory_phase_deadline=lambda *_args: deadline,
+                        pause_until=pause)):
+                    with self.assertRaises((H6["SetupError"], TimeoutError)):
+                        H6["inventory_target_phases"](self.ctx, self.log, target, self.pin, None, None)
 
     def turnover(self):
         old = copy.deepcopy(self.prefix[1]["event"]["identity_context"]["caller"])

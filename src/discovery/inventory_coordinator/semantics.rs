@@ -435,16 +435,62 @@ pub(crate) struct SemanticBindingSet {
     /// A later Detailed exec cannot silently reuse the chosen scan-pinned
     /// incarnation merely because its executable pathname/inode stayed equal.
     admission_images: HashMap<CallerId, SemanticAdmissionHistory>,
+    /// One move-only H0 custody reservation per successful physical successor.
+    /// An accepted owner receipt consumes it, including a provider/scope refusal.
+    successors: HashMap<CallerId, PublishedSemanticSuccessor>,
+    /// Accepted receipts that could not retain canonical custody (for example
+    /// a divergent H0 Arc or a full history) remain refusal-only for later execs.
+    refused_successors: HashMap<CallerId, PublishedSemanticSuccessor>,
 }
 
-/// Negative-only accepted-scan history. The first image can forbid a later
-/// join, never authorize one. A failed initial scope transaction may retain
-/// its sealed original-custody gap only until the normal finalizer consumes it.
+/// Accepted-scan history is negative-only: its image can forbid a later join,
+/// and its original Arc can be forwarded through an actual physical handoff.
+/// Neither fact grants semantic permission to the successor. A failed initial
+/// scope transaction may retain its sealed gap until the normal finalizer.
 struct SemanticAdmissionHistory {
     domain: NativeDomainId,
     image: ImageIdentity,
+    incarnation: u32,
+    generation: crate::inspect_system::MemberGeneration,
+    pin: Arc<PidPin>,
     initial_scope_cut: bool,
     pending_gap: Option<PhysicalSemanticGap>,
+}
+
+/// The original H0 Arc travels only through a retained physical handoff.
+/// Refusal moves with it, so another exec cannot turn a known mismatch into
+/// a newly duplicated, apparently unrelated candidate.
+pub(super) struct SemanticHandoffCustody {
+    origin: CallerId,
+    domain: NativeDomainId,
+    pin: Arc<PidPin>,
+    refusal: Option<SemanticBindingRefusal>,
+}
+
+impl SemanticHandoffCustody {
+    pub(super) fn is_exact(&self) -> bool {
+        self.refusal.is_none()
+    }
+
+    fn refuse(&mut self, reason: SemanticBindingRefusal) {
+        self.refusal.get_or_insert(reason);
+    }
+}
+
+struct PublishedSemanticSuccessor {
+    custody: SemanticHandoffCustody,
+    incarnation: u32,
+    generation: crate::inspect_system::MemberGeneration,
+}
+
+impl PublishedSemanticSuccessor {
+    fn matches(
+        &self,
+        incarnation: u32,
+        generation: &crate::inspect_system::MemberGeneration,
+    ) -> bool {
+        self.incarnation == incarnation && &self.generation == generation
+    }
 }
 
 impl SemanticBindingSet {
@@ -456,6 +502,8 @@ impl SemanticBindingSet {
             limit: MAX_INSTANCES,
             refresh_cursor: None,
             admission_images: HashMap::new(),
+            successors: HashMap::new(),
+            refused_successors: HashMap::new(),
         }
     }
 
@@ -501,6 +549,192 @@ impl SemanticBindingSet {
         self.index.insert(binding.caller, self.bindings.len());
         self.bindings.push(binding);
         Ok(())
+    }
+
+    /// Select the exact H0 Arc already owned by this incarnation, if any.
+    /// A known successor or accepted scan never falls back to a fresh Arc on
+    /// a domain, generation, or custody mismatch.
+    fn candidate_custody(
+        &self,
+        caller: CallerId,
+        incarnation: u32,
+        generation: &crate::inspect_system::MemberGeneration,
+        domain: NativeDomainId,
+    ) -> Option<(Option<Arc<PidPin>>, bool)> {
+        if self.refused_successors.contains_key(&caller) {
+            return None;
+        }
+        if let Some(successor) = self.successors.get(&caller) {
+            let custody = &successor.custody;
+            return (successor.matches(incarnation, generation)
+                && custody.is_exact()
+                && custody.domain == domain
+                && custody.pin.still_the_same())
+            .then(|| (Some(custody.pin.clone()), true));
+        }
+        let binding = self.get(caller);
+        let history = self.admission_images.get(&caller);
+        if let (Some(binding), Some(history)) = (binding, history)
+            && (binding.domain != history.domain || !Arc::ptr_eq(&binding.pin, &history.pin))
+        {
+            return None;
+        }
+        if let Some(history) = history {
+            return (history.incarnation == incarnation
+                && &history.generation == generation
+                && history.domain == domain
+                && history.pin.still_the_same())
+            .then(|| (Some(history.pin.clone()), false));
+        }
+        if let Some(binding) = binding {
+            return (binding.domain == domain && binding.pin.still_the_same())
+                .then(|| (Some(binding.pin.clone()), false));
+        }
+        Some((None, false))
+    }
+
+    /// Move one canonical H0 lineage into the physical handoff. A middle
+    /// incarnation that never scanned forwards its published token; an
+    /// accepted-but-refused predecessor uses its retained receipt history.
+    pub(super) fn take_handoff(
+        &mut self,
+        caller: CallerId,
+        incarnation: u32,
+        generation: &crate::inspect_system::MemberGeneration,
+        pending_exact: usize,
+    ) -> Option<SemanticHandoffCustody> {
+        if let Some(successor) = self
+            .successors
+            .remove(&caller)
+            .or_else(|| self.refused_successors.remove(&caller))
+        {
+            let matches = successor.matches(incarnation, generation);
+            let mut custody = successor.custody;
+            if !matches || !custody.pin.still_the_same() {
+                custody.refuse(SemanticBindingRefusal::NoLiveCaller);
+            }
+            return Some(custody);
+        }
+        let binding = self.get(caller);
+        let history = self.admission_images.get(&caller);
+        let (domain, pin) = binding
+            .map(|binding| (binding.domain, binding.pin.clone()))
+            .or_else(|| history.map(|history| (history.domain, history.pin.clone())))?;
+        let mut custody = SemanticHandoffCustody {
+            origin: caller,
+            domain,
+            pin,
+            refusal: None,
+        };
+        if let (Some(binding), Some(history)) = (binding, history)
+            && (binding.domain != history.domain || !Arc::ptr_eq(&binding.pin, &history.pin))
+        {
+            custody.refuse(SemanticBindingRefusal::ImageUnproven(
+                UnboundReason::ExecAmbiguous,
+            ));
+        }
+        if history.is_some_and(|history| {
+            history.incarnation != incarnation || &history.generation != generation
+        }) || !custody.pin.still_the_same()
+        {
+            custody.refuse(SemanticBindingRefusal::NoLiveCaller);
+        }
+        if custody.is_exact()
+            && pending_exact
+                + self
+                    .successors
+                    .values()
+                    .filter(|successor| successor.custody.is_exact())
+                    .count()
+                >= self.limit
+        {
+            custody.refuse(SemanticBindingRefusal::Capacity);
+        }
+        Some(custody)
+    }
+
+    /// Publish only after the physical retained-custody handoff succeeded.
+    /// The destination identity is the actual newly minted or adopted caller.
+    pub(super) fn publish_successor(
+        &mut self,
+        mut custody: SemanticHandoffCustody,
+        destination: CallerId,
+        pid: u32,
+        incarnation: u32,
+        generation: crate::inspect_system::MemberGeneration,
+        pending_exact: usize,
+    ) -> Option<SemanticBindingRefusal> {
+        if custody.origin == destination
+            || custody.pin.pid() != pid
+            || custody.pin.start_time() != generation.start_time
+            || !custody.pin.still_the_same()
+        {
+            custody.refuse(SemanticBindingRefusal::NoLiveCaller);
+        }
+        if let Some(binding) = self.index.get(&destination).copied() {
+            let binding = &mut self.bindings[binding];
+            if binding.domain != custody.domain || !Arc::ptr_eq(&binding.pin, &custody.pin) {
+                binding.scope_current = false;
+                binding.suspension_cut = false;
+                custody.refuse(SemanticBindingRefusal::ImageUnproven(
+                    UnboundReason::ExecAmbiguous,
+                ));
+            }
+        }
+        if self
+            .admission_images
+            .get(&destination)
+            .is_some_and(|history| {
+                history.incarnation != incarnation
+                    || history.generation != generation
+                    || history.domain != custody.domain
+                    || !Arc::ptr_eq(&history.pin, &custody.pin)
+            })
+            || self.refused_successors.contains_key(&destination)
+            || self.successors.contains_key(&destination)
+        {
+            custody.refuse(SemanticBindingRefusal::ImageUnproven(
+                UnboundReason::ExecAmbiguous,
+            ));
+        }
+        if custody.is_exact()
+            && pending_exact
+                + self
+                    .successors
+                    .values()
+                    .filter(|successor| successor.custody.is_exact())
+                    .count()
+                >= self.limit
+        {
+            custody.refuse(SemanticBindingRefusal::Capacity);
+        }
+        let refusal = custody.refusal;
+        self.successors.insert(
+            destination,
+            PublishedSemanticSuccessor {
+                custody,
+                incarnation,
+                generation,
+            },
+        );
+        refusal
+    }
+
+    pub(super) fn release_successor(&mut self, caller: CallerId) {
+        self.successors.remove(&caller);
+        self.refused_successors.remove(&caller);
+    }
+
+    pub(super) fn release_unused_successors(&mut self) {
+        self.successors.clear();
+        self.refused_successors.clear();
+    }
+
+    pub(super) fn release_dead_successors(&mut self) {
+        self.successors
+            .retain(|_, successor| successor.custody.pin.still_the_same());
+        self.refused_successors
+            .retain(|_, successor| successor.custody.pin.still_the_same());
     }
 
     /// Tests-only binding insert over the production insert: driver
@@ -560,6 +794,11 @@ pub(crate) struct SemanticAdmissionCandidate {
     incarnation: u32,
     generation: crate::inspect_system::MemberGeneration,
     pin: Arc<PidPin>,
+    domain: NativeDomainId,
+    /// Present for an accepted prior receipt or a physical successor. H0
+    /// must return this very Arc; only a first-ever scan may choose its own.
+    expected_pin: Option<Arc<PidPin>>,
+    from_successor: bool,
     scope: AdmissionScope,
 }
 
@@ -673,6 +912,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         caller: CallerId,
         pin: PidPin,
         scope: AdmissionScope,
+        domain: NativeDomainId,
     ) -> Option<SemanticAdmissionCandidate> {
         let record = self.adapter.record(caller)?;
         if record.retired
@@ -685,14 +925,30 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         {
             return None;
         }
+        let generation = crate::inspect_system::MemberGeneration {
+            start_time: record.start_time,
+            exe: record.exe.clone(),
+        };
+        let (expected_pin, from_successor) = self.semantic_bindings.candidate_custody(
+            caller,
+            record.incarnation,
+            &generation,
+            domain,
+        )?;
+        if expected_pin.as_ref().is_some_and(|expected| {
+            expected.pid() != pin.pid() || expected.start_time() != pin.start_time()
+        }) {
+            return None;
+        }
+        let pin = expected_pin.clone().unwrap_or_else(|| Arc::new(pin));
         Some(SemanticAdmissionCandidate {
             caller,
             incarnation: record.incarnation,
-            generation: crate::inspect_system::MemberGeneration {
-                start_time: record.start_time,
-                exe: record.exe.clone(),
-            },
-            pin: Arc::new(pin),
+            generation,
+            pin,
+            domain,
+            expected_pin,
+            from_successor,
             scope,
         })
     }
@@ -700,6 +956,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     pub(crate) fn prepare_legacy_semantic_candidate(
         &self,
         caller: CallerId,
+        domain: NativeDomainId,
     ) -> Option<SemanticAdmissionCandidate> {
         let scope = match self.engine.scope {
             Scope::Pid(pid) => AdmissionScope::Pid(pid),
@@ -710,16 +967,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if matches!(scope, AdmissionScope::Pid(pid) if pid != pin.pid()) {
             return None;
         }
-        self.seal_semantic_candidate(caller, pin, scope)
+        self.seal_semantic_candidate(caller, pin, scope, domain)
     }
 
     pub(crate) fn prepare_scoped_semantic_candidate(
         &self,
         prepared: &crate::discovery::caller_registry::PreparedScopedCaller<Source::Pin>,
+        domain: NativeDomainId,
     ) -> Option<SemanticAdmissionCandidate> {
         let caller = prepared.existing()?;
         let pin = self.adapter.scoped_semantic_custody(prepared)?;
-        let candidate = self.seal_semantic_candidate(caller, pin, AdmissionScope::Cgroup)?;
+        let candidate =
+            self.seal_semantic_candidate(caller, pin, AdmissionScope::Cgroup, domain)?;
         (candidate.generation == *prepared.generation()).then_some(candidate)
     }
 
@@ -737,16 +996,42 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     ) {
         let (receipt, provider) = prepared.into_parts();
         let caller = candidate.caller;
+        // The accepted H0 scan consumes the published handoff even when the
+        // provider or final scope proof refuses positive admission below.
+        let bridge = self.semantic_bindings.successors.remove(&caller);
         let result = (|| {
             use SemanticBindingRefusal as Refusal;
+            if candidate.from_successor != bridge.is_some() {
+                return Err(Refusal::ImageUnproven(UnboundReason::ExecAmbiguous));
+            }
+            if let Some(bridge) = &bridge
+                && (!bridge.matches(candidate.incarnation, &candidate.generation)
+                    || !bridge.custody.is_exact()
+                    || bridge.custody.domain != candidate.domain
+                    || !Arc::ptr_eq(&bridge.custody.pin, &candidate.pin))
+            {
+                return Err(Refusal::ImageUnproven(UnboundReason::ExecAmbiguous));
+            }
             if receipt.original_pin().pid() != candidate.pin.pid()
                 || receipt.original_pin().start_time() != candidate.generation.start_time
             {
                 return Err(Refusal::NoLiveCaller);
             }
+            if receipt.domain() != candidate.domain
+                || candidate
+                    .expected_pin
+                    .as_ref()
+                    .is_some_and(|expected| !Arc::ptr_eq(expected, receipt.original_pin()))
+            {
+                return Err(Refusal::ImageUnproven(UnboundReason::ExecAmbiguous));
+            }
             let observed = (receipt.domain(), receipt.image());
             if let Some(previous) = self.semantic_bindings.admission_images.get(&caller) {
-                if (previous.domain, previous.image) != observed {
+                if (previous.domain, previous.image) != observed
+                    || previous.incarnation != candidate.incarnation
+                    || previous.generation != candidate.generation
+                    || !Arc::ptr_eq(&previous.pin, receipt.original_pin())
+                {
                     return Err(Refusal::ImageUnproven(UnboundReason::ExecAmbiguous));
                 }
             } else {
@@ -758,6 +1043,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     SemanticAdmissionHistory {
                         domain: observed.0,
                         image: observed.1,
+                        incarnation: candidate.incarnation,
+                        generation: candidate.generation.clone(),
+                        pin: receipt.original_pin().clone(),
                         initial_scope_cut: false,
                         pending_gap: None,
                     },
@@ -868,6 +1156,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             })
         })();
         if let Err(reason) = result {
+            if let Some(mut bridge) = bridge
+                && !self
+                    .semantic_bindings
+                    .admission_images
+                    .contains_key(&caller)
+            {
+                // An accepted scan with divergent custody or exhausted
+                // history cannot later retry through a fresh duplicate.
+                bridge.custody.refuse(reason);
+                self.semantic_bindings
+                    .refused_successors
+                    .insert(caller, bridge);
+            }
             self.semantic_admission_refused(caller, reason.code());
         }
         (receipt, result)

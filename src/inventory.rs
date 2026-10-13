@@ -1644,7 +1644,9 @@ fn bind_semantic_callers(
             coordinator.semantic_admission_refused(attempt.caller, "provider_mapping_unproven");
             continue;
         };
-        let Some(candidate) = coordinator.prepare_legacy_semantic_candidate(attempt.caller) else {
+        let Some(candidate) =
+            coordinator.prepare_legacy_semantic_candidate(attempt.caller, lane.domain())
+        else {
             coordinator.semantic_admission_refused(attempt.caller, "caller_custody_unproven");
             continue;
         };

@@ -197,6 +197,9 @@ struct PendingExecSuccessor<Pin> {
     old_incarnation: u32,
     pid: u32,
     custody: Pin,
+    /// The exact H0 Arc, when the ended incarnation had accepted Detailed
+    /// custody. It moves with the physical handoff and grants nothing alone.
+    semantic: Option<semantics::SemanticHandoffCustody>,
     /// Current generation/image reads at mint: commit refuses when they
     /// moved (a newer image or generation arrived before commit).
     mint_start: Option<u64>,
@@ -2368,6 +2371,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     fn retire_caller_in_registry(&mut self, id: CallerId, now_ns: u64) {
+        self.semantic_bindings.release_successor(id);
         // Each retirement stages once: held handoffs report the old
         // incarnation at mint and again at commit, and the second report
         // is a no-op here (owner binding rides the normal event path).
@@ -4964,6 +4968,28 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             });
             return None;
         }
+        let old = self.adapter.record(caller)?;
+        let old_incarnation = old.incarnation;
+        let old_generation = crate::inspect_system::MemberGeneration {
+            start_time: old.start_time,
+            exe: old.exe.clone(),
+        };
+        let pending_exact = self
+            .pending_successors
+            .values()
+            .filter(|pending| {
+                pending
+                    .semantic
+                    .as_ref()
+                    .is_some_and(|semantic| semantic.is_exact())
+            })
+            .count();
+        let semantic = self.semantic_bindings.take_handoff(
+            caller,
+            old_incarnation,
+            &old_generation,
+            pending_exact,
+        );
         let Some((pid, pin)) = self.adapter.retire_for_exec_handoff(caller, now_ns) else {
             self.registry.record_gap(RegistryGap {
                 caller: Some(caller),
@@ -4977,11 +5003,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             });
             return None;
         };
-        let old_incarnation = self
-            .adapter
-            .record(caller)
-            .expect("the retired caller retains its record")
-            .incarnation;
         self.pending_successors.insert(
             caller,
             PendingExecSuccessor {
@@ -4989,12 +5010,58 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 old_incarnation,
                 pid,
                 custody: pin,
+                semantic,
                 mint_start: self.adapter.source().start_time(pid),
                 mint_exe: self.adapter.source().exe_identity(pid),
                 transition,
             },
         );
         Some(())
+    }
+
+    /// A physical success only transfers the original H0 Arc. A new
+    /// semantic binding still requires this destination's accepted owner
+    /// scan, provider receipt, and current scope guard.
+    fn publish_semantic_successor(
+        &mut self,
+        destination: CallerId,
+        custody: Option<semantics::SemanticHandoffCustody>,
+    ) {
+        let Some(custody) = custody else {
+            return;
+        };
+        let Some(record) = self.adapter.record(destination) else {
+            self.semantic_admission_refused(destination, "no_live_caller");
+            return;
+        };
+        let (pid, incarnation, generation) = (
+            record.pid,
+            record.incarnation,
+            crate::inspect_system::MemberGeneration {
+                start_time: record.start_time,
+                exe: record.exe.clone(),
+            },
+        );
+        let pending_exact = self
+            .pending_successors
+            .values()
+            .filter(|pending| {
+                pending
+                    .semantic
+                    .as_ref()
+                    .is_some_and(|semantic| semantic.is_exact())
+            })
+            .count();
+        if let Some(reason) = self.semantic_bindings.publish_successor(
+            custody,
+            destination,
+            pid,
+            incarnation,
+            generation,
+            pending_exact,
+        ) {
+            self.semantic_admission_refused(destination, reason.code());
+        }
     }
 
     /// Commit one held exec handoff: the fresh admission transaction (H6
@@ -5014,13 +5081,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         };
         let pid = pending.pid;
         match self.verify_pending_successor(&pending) {
-            Ok(Some(_)) => {
+            Ok(Some(new)) => {
                 // An already-admitted same-incarnation candidate stands on
                 // its own admission; the handoff links to it by retirement
                 // order (same pid, next incarnation) without minting again.
+                self.publish_semantic_successor(new, pending.semantic);
                 Vec::new()
             }
             Ok(None) => {
+                let semantic = pending.semantic;
                 let events = match self.adapter.admit_retained_successor(
                     pid,
                     pending.custody,
@@ -5028,7 +5097,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     now_ns,
                     detected,
                 ) {
-                    Ok(new) => vec![CallerEvent::ExecRetired { old, new }],
+                    Ok(new) => {
+                        self.publish_semantic_successor(new, semantic);
+                        vec![CallerEvent::ExecRetired { old, new }]
+                    }
                     Err(failure) => vec![CallerEvent::AdmitFailed {
                         pid,
                         reason: format!("post-exec re-admission failed: {}", failure.reason),
@@ -5118,6 +5190,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// of holding its FD for a re-entry that cannot come. Live-but-absent
     /// handoffs stay held: the member may re-enter.
     fn release_dead_handoffs(&mut self) {
+        self.semantic_bindings.release_dead_successors();
         let dead: Vec<CallerId> = self
             .pending_successors
             .iter()
@@ -5152,6 +5225,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.stopped = true;
         let held = self.pending_successors.len();
         self.pending_successors.clear();
+        self.semantic_bindings.release_unused_successors();
         if held > 0 {
             self.registry.record_gap(RegistryGap {
                 caller: None,
@@ -5200,6 +5274,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.complete_scanned.clear();
         let mut publishing_cgroup = self.pending_cgroup.take();
         let mut scoped_events = Vec::new();
+        let mut scoped_semantic_successors = Vec::new();
         let mut scoped_admitted = 0;
         let mut scoped_scan_callers = 0;
         let mut cgroup_proof_complete = false;
@@ -5314,7 +5389,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     let candidate = prepared
                         .values()
                         .find(|pin| pin.existing() == Some(attempt.caller))
-                        .and_then(|pin| self.prepare_scoped_semantic_candidate(pin));
+                        .and_then(|pin| self.prepare_scoped_semantic_candidate(pin, lane.domain()));
                     let Some(candidate) = candidate else {
                         self.semantic_admission_refused(attempt.caller, "caller_custody_unproven");
                         continue;
@@ -5413,6 +5488,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     self.pending_successors.insert(old, pending);
                     continue;
                 };
+                let semantic = pending.semantic;
                 match self.adapter.commit_handoff_caller(
                     pid,
                     pending.custody,
@@ -5422,6 +5498,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     &mut crate::attach::monotonic_ns,
                 ) {
                     Ok((new, admitted)) => {
+                        if let Some(semantic) = semantic {
+                            scoped_semantic_successors.push((new, semantic));
+                        }
                         allowed.insert(pid);
                         allowed_callers.insert(new);
                         if admitted {
@@ -5466,6 +5545,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             };
             // The prepared guard has been consumed/dropped, so ordinary staging
             // can borrow the coordinator again. It performed no provider reads.
+            for (new, semantic) in scoped_semantic_successors.drain(..) {
+                self.publish_semantic_successor(new, Some(semantic));
+            }
             self.apply_reconcile_events(&scoped_events, *now_ns);
             let verdicts =
                 absorbed.map_or_else(BTreeMap::new, |absorbed| self.record_absorbed(absorbed));

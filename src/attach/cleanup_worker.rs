@@ -1159,3 +1159,7 @@ mod tests {
 #[cfg(test)]
 #[path = "cleanup_worker_live_tests.rs"]
 mod live_tests;
+
+#[cfg(test)]
+#[path = "cleanup_worker_concurrency_tests.rs"]
+pub(crate) mod concurrency_tests;

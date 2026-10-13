@@ -1097,6 +1097,127 @@ fn dir_is_btrfs(dir: &Path) -> Result<bool> {
 
 #[test]
 #[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
+fn privileged_inventory_worker_scan_preserves_watched_instance() -> Result<()> {
+    use crate::discovery::hooks::HookRegistry;
+
+    let CmdSetup {
+        _directory,
+        provider,
+        mut target,
+    } = spawn_cmd_target()?;
+    let (_view, pins, plan, _key) = pin_and_plan(target.pid(), &provider, &["C_GetSlotInfo"])?;
+    let mut harness = Harness::start(&plan, target.pid(), &pins)?;
+    target.command(b'c')?;
+    let first = single_join(&pump_until(&mut harness, &target, 1)?)?;
+
+    // Establish the genuine global-mutation control before the regression
+    // assertion, so RED still proves that the real hooks and router respond.
+    // The existing fixture's short-lived CLONE_VM child is reaped by 'v'.
+    let external_before = harness.session.instance_maps().counters()?;
+    ensure!(target.command(b'v')? == "SHARER");
+    let external_after = harness.session.instance_maps().counters()?;
+    target.command(b'c')?;
+    let original = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(
+        external_after.global_bumps > external_before.global_bumps
+            && external_after.shared > external_before.shared
+            && original != first,
+        "a real external shared-mm mutation must change the instance: \
+         {external_before:?} -> {external_after:?}"
+    );
+    let pid = target.pid();
+    let pin = target.pin.clone();
+    let cookie = harness
+        .session
+        .instance_maps()
+        .cookie(pin.pidfd().map_err(anyhow::Error::msg)?)?
+        .context("the real target call established its image cookie")?;
+    let current_image = |harness: &mut Harness| -> Result<_> {
+        harness
+            .session
+            .query_images(
+                &[&pin],
+                capture::ReadWindow::new(1, Instant::now() + Duration::from_secs(3))?,
+            )
+            .map_err(|reason| anyhow!("native current image query refused: {reason:?}"))?
+            .image(cookie)
+            .context("the original process still has its current image")
+    };
+    let image = current_image(&mut harness)?;
+    let policy = crate::plan::AdmissionPolicy::inventory(
+        crate::capacity::inventory_endpoint_budget(None).map_err(anyhow::Error::msg)?,
+    );
+    let main_thread = std::thread::current().id();
+    let mut preserved = true;
+    for pass in 0..2 {
+        let before_maps = std::fs::read(format!("/proc/{}/maps", target.pid()))?;
+        let before = harness.session.instance_maps().complete_epochs(
+            target.pin.pidfd().map_err(anyhow::Error::msg)?,
+            harness.file_slot,
+        )?;
+        let counters_before = harness.session.instance_maps().counters()?;
+        // The same production scan/pinning path used by Inventory's collector,
+        // on its real worker. No target command runs during this collection.
+        let (worker, catalog) = crate::inventory_capture::collect_off_thread(
+            || {
+                (
+                    std::thread::current().id(),
+                    crate::inspect_system::collect_pid(
+                        pid,
+                        std::slice::from_ref(&provider),
+                        &HookRegistry::default(),
+                        policy,
+                    ),
+                )
+            },
+            Duration::from_millis(20),
+            &mut || {},
+        );
+        ensure!(
+            worker != main_thread,
+            "the production scan must run on its worker"
+        );
+        ensure!(
+            catalog?.scanned == 1,
+            "the owned target was not deep-scanned"
+        );
+        let after = harness.session.instance_maps().complete_epochs(
+            target.pin.pidfd().map_err(anyhow::Error::msg)?,
+            harness.file_slot,
+        )?;
+        let counters_after = harness.session.instance_maps().counters()?;
+        ensure!(
+            before_maps == std::fs::read(format!("/proc/{}/maps", target.pid()))?
+                && current_image(&mut harness)? == image,
+            "the idle target changed its mapping or image during the observer scan"
+        );
+        let observation = harness.scan(&target, false)?;
+        target.command(b'c')?;
+        let joined = single_join(&pump_until(&mut harness, &target, 1)?)?;
+        let continued = observation == Some(ObserveOutcome::Continued) && joined == original;
+        // Aggregate deltas come from the actual native maps. No epoch values
+        // or image identities are fabricated or emitted as public evidence.
+        eprintln!(
+            "H6_OBSERVER_SCAN pass={pass} epochs_equal={} continued={continued} \
+             local_delta={} global_delta={} fault_delta={} \
+             counters_before={counters_before:?} counters_after={counters_after:?}",
+            before == after,
+            after.local.saturating_sub(before.local),
+            after.global.saturating_sub(before.global),
+            after.fault.saturating_sub(before.fault),
+        );
+        preserved &= before == after && continued;
+    }
+    ensure!(
+        preserved,
+        "Inventory's observer scan changed an idle target's watched instance; \
+         inspect the actual H6_OBSERVER_SCAN epoch/counter deltas"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
 fn privileged_instance_routing_separates_reload_sibling_and_mutation() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let provider = compile(directory.path(), true)?;

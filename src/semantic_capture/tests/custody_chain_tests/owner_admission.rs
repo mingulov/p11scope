@@ -12,10 +12,10 @@ use crate::inventory_capture::CollectedPass;
 use crate::inventory_semantics::LaneNegative;
 use crate::scope::inventory_cgroup::{CgroupWalkLimits, CgroupWalkState, CollectionControl};
 
-#[path = "owner_admission/successor_replay.rs"]
-mod successor_replay;
 #[path = "owner_admission/initial_coverage.rs"]
 mod initial_coverage;
+#[path = "owner_admission/successor_replay.rs"]
+mod successor_replay;
 
 #[derive(Clone, Copy, Debug)]
 enum Selection {

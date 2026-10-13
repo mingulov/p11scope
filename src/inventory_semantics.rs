@@ -34,7 +34,13 @@ pub(crate) enum SemanticRefusal {
 
 impl std::fmt::Display for SemanticRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
+        f.write_str(self.code())
+    }
+}
+
+impl SemanticRefusal {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
             Self::ManifestInput => "manifest_input_refused",
             Self::Unattested => "unattested",
             Self::IncompleteProvider => "incomplete_provider",
@@ -42,7 +48,7 @@ impl std::fmt::Display for SemanticRefusal {
             Self::Descriptor => "semantic_descriptor_refused",
             Self::ProviderInstanceUnproven => "provider_instance_unproven",
             Self::Unavailable => "semantic_unavailable",
-        })
+        }
     }
 }
 
@@ -69,11 +75,18 @@ impl SemanticProviderTarget {
 /// to normal finalization after consuming (or refusing) scoped admission.
 pub(crate) struct PreparedSemanticAdmission {
     receipt: CurrentPartitionReceipt,
-    provider: SemanticProviderTarget,
+    // Even a refused validation follows an accepted owner scan. Its original
+    // receipt must reach the coordinator's refusal-only history exactly once.
+    provider: Result<SemanticProviderTarget, SemanticRefusal>,
 }
 
 impl PreparedSemanticAdmission {
-    pub(crate) fn into_parts(self) -> (CurrentPartitionReceipt, SemanticProviderTarget) {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        CurrentPartitionReceipt,
+        Result<SemanticProviderTarget, SemanticRefusal>,
+    ) {
         (self.receipt, self.provider)
     }
 }
@@ -901,13 +914,10 @@ impl AttestedSemanticLane {
         // Validation may consume invalidations even on refusal. Keep them
         // beside the original receipt, never copy that receipt into two paths.
         self.stash_admission_evidence(Vec::new(), validation.into_outcomes());
-        match result {
-            Ok(provider) => Ok(PreparedSemanticAdmission { receipt, provider }),
-            Err(reason) => {
-                self.deliver_admission_receipt(receipt);
-                Err(reason)
-            }
-        }
+        Ok(PreparedSemanticAdmission {
+            receipt,
+            provider: result,
+        })
     }
 
     pub(crate) fn deliver_admission_receipt(&mut self, receipt: CurrentPartitionReceipt) {

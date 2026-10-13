@@ -155,6 +155,7 @@ class Ia32Driver:
         self.ctx, self.directory, self.pins, self.mode = ctx, Path(directory), pins, mode
         self.images, self.targets, self.exec_transitions = [], [], []
         self.failed_exec, self.held = None, None
+        self.trace_shared_key_guard = None
         self.index, self.stamps = 0, {}
         self.abi = {key: elf32_metadata(pin, APIS if key == "provider.so" else ())
                     for key, pin in pins.items() if key in ("before", "after", "provider.so")}
@@ -290,6 +291,7 @@ class Ia32Driver:
                 "provider_after": H6["provider_receipt"](self.pins["provider.so"]),
                 "pid": self.pid, "birth": self.birth, "abi": self.abi,
                 "spawned_ns": self.spawned_ns, "finished_ns": H6["monotonic_ns"](),
+                "trace_shared_key_guard": self.trace_shared_key_guard,
                 "command_stamps": dict(self.stamps)}
 
     def finish(self):
@@ -464,6 +466,89 @@ def build_receipt(snapshot, mode, backend, observer_kind, observer, proof=None):
             "va_reuse": H6["va_reuse_from"](ledger), "requested_backend": backend}
 
 
+def shared_setup_call(ledger, image):
+    calls = [r for r in ledger if r["kind"] == "call" and r["image"] == 0
+             and r["fn"] == "C_OpenSession"]
+    if len(calls) != 1 or any(calls[0][k] != v for k, v in {
+            "pid": image["pid"], "tid": image["pid"], "phase": "setup", "rv": 0, "sess": 1}.items()):
+        raise ValueError("ia32 shared-key guard lacks one actual old setup return")
+    return calls[0]
+
+
+def shared_setup_rows(lines, image):
+    rows = [row for line in lines if (row := H6["ROW"].fullmatch(line.strip()))
+            and row["fn"] == "C_OpenSession"]
+    for row in rows:
+        unknown = row["label"] == "Unknown executable"
+        if (int(row["pid"]) != image["pid"] or int(row["tid"]) != image["pid"]
+                or row["rv"] != "CKR_OK" or (unknown and row["path"] is not None)
+                or (not unknown and (not row["path"] or json.loads(row["path"]) != image["path"]
+                                     or json.loads(row["label"]) != Path(image["path"]).name))):
+            raise ValueError("ia32 shared-key return disagrees with owned old image/task/RV")
+    if len(rows) > 1:
+        raise ValueError("duplicate ia32 old shared-key return before exec")
+    return rows
+
+
+def drain_old_shared_return(driver, capture, observer, errors, cursor, started_ns):
+    """X is still held: drain only the key that both generations will reuse.
+
+    Unique C_Initialize returns may remain unobserved or arrive later. They do
+    not need a cursor to identify their ledger generation. The shared setup
+    return does, so a missing one must fail within the existing finite wait.
+    """
+    image = driver.images[0]
+    call = shared_setup_call(driver.stdout.records, image)
+    deadline = min(H6["wait_deadline"](10), driver.held["t0"] + 15_000_000_000)
+
+    def verify_original():
+        current = driver.pins["before"].image_receipt(image, driver.owned)
+        driver.pins["provider.so"].verify()
+        if any(current[key] != image[key] for key in H6["IMAGE_FIELDS"]):
+            raise ValueError("ia32 old image changed before the shared-key drain")
+
+    verify_original()
+    def population():
+        require_observer_live(observer, capture, errors)
+        end = len(capture.lines)
+        if not shared_setup_rows(capture.lines[cursor:end], image):
+            return None
+        return {"image": 0, "ledger_seq": call["seq"], "output_cursor": cursor,
+                "output_end": end, "started_ns": started_ns,
+                "observed_ns": H6["monotonic_ns"](), "deadline_ns": deadline}
+    guard = H6["_output_wait"](capture, population, deadline)
+    verify_original()
+    return guard
+
+
+def shared_key_guard_errors(text, ledger, receipt):
+    """A caller ACK alone cannot authorize the public generation cursor."""
+    try:
+        guard = receipt["trace_shared_key_guard"]
+        image = receipt["images"][0]
+        call = shared_setup_call(ledger, image)
+        proof, = receipt["successor_ready"]
+        request, = [r for r in ledger if r["kind"] == "exec"]
+        held_ack, = [r for r in ledger if r["kind"] == "ack" and r["phase"] == "held"]
+        stamps = receipt["command_stamps"]
+        start, end = guard["output_cursor"], guard["output_end"]
+        lines = text.splitlines()
+        if (guard["image"] != 0 or guard["ledger_seq"] != call["seq"]
+                or type(start) is not int or type(end) is not int
+                or not 0 <= start < end <= len(lines) or proof["output_cursor"] != end
+                or not receipt["observer_ready_ns"] <= guard["started_ns"] <= stamps["pre-start"]
+                <= call["t0"] <= call["t1"] <= receipt["held"]["t0"] <= receipt["held"]["t"]
+                <= held_ack["t"] <= stamps["held-ack"] <= guard["observed_ns"]
+                <= stamps["exec-start"] <= request["t"]
+                or not guard["observed_ns"] < guard["deadline_ns"] <= receipt["held"]["t0"] + 15_000_000_000
+                or len(shared_setup_rows(lines[start:end], image)) != 1
+                or shared_setup_rows(lines[:start], image)):
+            raise ValueError("ia32 shared-key drain lacks its ledger/held-X/public-cursor boundary")
+    except (KeyError, TypeError, ValueError, IndexError, OverflowError) as error:
+        return [f"invalid ia32 pre-exec shared-key guard: {error}"]
+    return []
+
+
 def evaluate_ia32(text, doc, ledger, receipt, mode, file_text=None):
     """Keep H6's positive/early-gap/naming tests; add the finite ia32 contract."""
     if receipt.get("backend_refused"):
@@ -496,6 +581,8 @@ def evaluate_ia32(text, doc, ledger, receipt, mode, file_text=None):
                     or proof["marker_fn"] != "C_GetInfo"):
                 errors.append("ia32 successor warm-up exceeded20 attempts/15seconds or changed marker")
         if mode == "trace":
+            if workload == "leader":
+                errors.extend(shared_key_guard_errors(text, ledger, receipt))
             result = H6["evaluate_trace_h6"](text, ledger, receipt, file_text)
             _rows, _counts, evidence, parse_errors = H6["N3_PARSE_TRACE"](text)
             errors.extend(parse_errors)
@@ -568,8 +655,15 @@ def run_leg(ctx, cell, backend, mode, directory):
         # enrolled streams. A refusal is a negative result, never recovery.
         return {"cell": cell, "leg": f"{mode}/{backend}", "pass": False, "status": "negative",
                 "abi": "ia32", "backend_refused": str(refused), "errors": [str(refused)]}
+    shared_cursor = len(capture.lines)
+    shared_started = H6["monotonic_ns"]()
     driver.start_held()
-    cursor = len(capture.lines) if mode == "trace" else None
+    if mode == "trace" and workload == "leader":
+        driver.trace_shared_key_guard = drain_old_shared_return(
+            driver, capture, owned, errors, shared_cursor, shared_started)
+        cursor = driver.trace_shared_key_guard["output_end"]
+    else:
+        cursor = len(capture.lines) if mode == "trace" else None
     driver.do_exec()
     proof = None
     if workload == "leader":

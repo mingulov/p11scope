@@ -809,7 +809,7 @@ pub(crate) struct SemanticRefreshAttempt {
 }
 
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
-    /// Four attempts, including missing targets and every failed refresh.
+    /// Four exact mapped attested pairs, including every failed refresh.
     /// Selection scans bounded retained catalogs without allocating a caller
     /// cross-product. The cursor advances per caller/provider, including failure.
     pub(crate) fn semantic_refresh_attempts(
@@ -868,6 +868,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         return attempts;
                     }
                     let module = module.map(|module| module.key.clone());
+                    if module.is_none() {
+                        continue;
+                    }
                     if self
                         .semantic_bindings
                         .get(record.id)

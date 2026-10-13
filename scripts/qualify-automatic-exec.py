@@ -6734,7 +6734,9 @@ def run_cgroup_inventory_r5(ctx, cell_dir, backend):
     ledger2.chmod(0o755)
     successor_executable = leg_pin(ctx, ledger2)
     provider = ctx.provider_pin
-    manifest_path = leg_dir / "manifest-A.json"
+    # Discover executes provider code as the workload UID; only this owned
+    # subtree is writable by it, while the observer's leg directory is not.
+    manifest_path = leg_dir / "workload" / "manifest-A.json"
     build_manifest(ctx.discover_pin, provider.path, manifest_path, env,
                    ctx.args.uid, ctx.args.gid)
     root, _ = create_tracked(ctx, Path("/sys/fs/cgroup") / f"p11scope-h6-{uuid.uuid4().hex[:8]}")
@@ -6877,7 +6879,7 @@ def run_system_mixed(ctx, cell_dir, backend):
     provider_f = leg_dir / "provider-F.so"
     shutil.copyfile(provider_a.path, provider_f)
     provider_f.chmod(0o755)
-    manifest_path = leg_dir / "manifest-A.json"
+    manifest_path = leg_dir / "workload" / "manifest-A.json"
     build_manifest(ctx.discover_pin, provider_a.path, manifest_path, env,
                    ctx.args.uid, ctx.args.gid)
     gate_f = leg_dir / "gate-F"

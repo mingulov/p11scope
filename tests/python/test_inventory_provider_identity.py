@@ -108,6 +108,22 @@ class InventoryProviderIdentityTest(unittest.TestCase):
                 errors, _ = H6["inventory_sibling_s1_errors"](doc, ledger, receipt, records)
                 self.assertTrue(errors)
 
+    def test_malformed_identity_objects_return_a_failed_verdict(self):
+        for subject in ("receipt-mapping", "ambient-identity", "ambient-device"):
+            for value in ([8, 1], "8:1", True):
+                with self.subTest(subject=subject, value=value):
+                    doc, ledgers, receipt = BASE["inventory_inputs"](s1_expected=False)
+                    ambient = foreign_module(doc["modules"][0])
+                    doc["modules"].append(ambient)
+                    if subject == "receipt-mapping":
+                        receipt["providers"]["A"]["mapping"] = value
+                    elif subject == "ambient-identity":
+                        ambient["identity"] = value
+                    else:
+                        ambient["identity"]["device"] = value
+                    result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+                    self.assertFalse(result["pass"], result["errors"])
+
     def test_count_only_claim_does_not_borrow_same_path_foreign_semantics(self):
         doc, ledgers, receipt = BASE["inventory_inputs"](s1_expected=False)
         receipt["count_only_providers"] = ["A"]

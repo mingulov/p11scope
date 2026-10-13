@@ -1103,11 +1103,42 @@ fn run_with_terminal_budget(
     outcome.notices(previously_reported.as_deref(), &mut |line| {
         let _ = crate::sink::try_stderr_line(line);
     });
-    drop(semantic_lane);
-    if let Some(error) = capture_error {
-        return Err(error);
-    }
+    let cleanup = finish_semantic_native_cleanup(semantic_lane, request.second_signal);
+    combine_semantic_terminal_errors(capture_error, cleanup)?;
     Ok(outcome.exit_code())
+}
+
+fn finish_semantic_native_cleanup(
+    lane: Option<crate::inventory_semantics::AttestedSemanticLane>,
+    second_signal: &dyn Fn() -> bool,
+) -> Result<()> {
+    lane.map_or(Ok(()), |lane| {
+        lane.finish_owned_terminal_cleanup(second_signal, &mut std::io::stderr())
+    })
+}
+
+fn combine_semantic_terminal_errors(
+    primary: Option<anyhow::Error>,
+    cleanup: Result<()>,
+) -> Result<()> {
+    match (primary, cleanup) {
+        (None, result) => result,
+        (Some(primary), Ok(())) => Err(primary),
+        (Some(primary), Err(cleanup)) => {
+            if cleanup
+                .downcast_ref::<crate::attach::CleanupInterrupted>()
+                .is_some()
+            {
+                // Keep the original failure as root cause so main still
+                // reports it, and the typed interrupt so its status is 130.
+                Err(primary
+                    .context("Detailed cleanup also failed")
+                    .context(crate::attach::CleanupInterrupted))
+            } else {
+                Err(primary.context(format!("Detailed cleanup also failed: {cleanup:#}")))
+            }
+        }
+    }
 }
 
 /// A native startup failure still attempts requested final sinks. Capture
@@ -1366,6 +1397,27 @@ pub(crate) fn classic_semantic_pass_for_test(
     driver.semantic.take().unwrap()
 }
 
+#[cfg(test)]
+thread_local! {
+    // Substitute only the fallible publication boundary, after real H0
+    // Finish exists. No receipt, semantic row or native success is scripted.
+    static FAIL_TERMINAL_PUBLICATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn classic_semantic_stop_refusing_publication_for_test(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    lane: crate::inventory_semantics::AttestedSemanticLane,
+) -> crate::inventory_semantics::AttestedSemanticLane {
+    FAIL_TERMINAL_PUBLICATION.with(|fail| fail.set(true));
+    let lane = classic_semantic_stop_for_test(coordinator, lane);
+    assert!(
+        !FAIL_TERMINAL_PUBLICATION.with(|fail| fail.get()),
+        "the real terminal commit boundary must be reached"
+    );
+    lane
+}
+
 /// Drive the production stop hook over real H0 with substituted native I/O.
 #[cfg(test)]
 pub(crate) fn classic_semantic_stop_for_test(
@@ -1454,30 +1506,52 @@ impl ClassicDriver<'_> {
             return;
         };
         lane.run_semantic_drain_committing(coordinator, &pins, std::time::Instant::now);
-        // H0 stops once, after every drained batch was consumed and
-        // published; the terminal Finish batch commits separately.
+        // H0 stops once. Finish publication must succeed before its stamp
+        // clears and native retirement begins; failed commits remain gaps.
         if let Some(finish) = self
             .semantic
             .as_mut()
             .and_then(|lane| lane.finish_semantic_stop())
         {
             self.coordinator.stage_semantic_batch(finish);
-            if let Some(lane) = self.semantic.as_mut()
-                && let Err(error) = self
-                    .coordinator
-                    .commit_batch_with_semantics(false, Some(lane))
-            {
-                self.coordinator.note_scope_gap(
+            self.semantic_staged = true;
+            let lane = self
+                .semantic
+                .as_mut()
+                .expect("the live Finish lane remains owned");
+            lane.note_semantic_staged();
+            let publication = commit_semantic_finish(self.coordinator, lane);
+            match publication {
+                Ok(_) => {
+                    self.semantic_staged = false;
+                    lane.note_semantic_published();
+                    if let Err(error) = lane.begin_owned_terminal_cleanup() {
+                        self.coordinator.note_scope_gap(
+                            "semantic native cleanup could not begin".into(),
+                            format!("{error:#}"),
+                        );
+                    }
+                }
+                Err(error) => self.coordinator.note_scope_gap(
                     "semantic terminal commit failed".into(),
                     format!("{error:#}"),
-                );
+                ),
             }
         }
-        self.semantic_staged = false;
-        if let Some(lane) = self.semantic.as_mut() {
-            lane.note_semantic_published();
-        }
     }
+}
+
+fn commit_semantic_finish(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    lane: &mut crate::inventory_semantics::AttestedSemanticLane,
+) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_TERMINAL_PUBLICATION.with(|fail| fail.replace(false)) {
+        anyhow::bail!("injected terminal publication refusal");
+    }
+    coordinator
+        .commit_batch_with_semantics(false, Some(lane))
+        .map(|_| ())
 }
 
 /// Optional lane startup: no manifests means no Detailed Session, maps,
@@ -2864,7 +2938,7 @@ fn run_dashboard(
         outputs_attempted,
         &mut |line| display_notices.borrow_mut().notice(&line),
     );
-    drop(semantic_lane);
+    let cleanup = finish_semantic_native_cleanup(semantic_lane, second_signal);
     // A restore the terminal shed (Ctrl-S then `q`) leaves the shell in
     // the alternate screen: after output attempts, it can wait longer.
     display.retry_restore(if outcome.stdout_cancelled() {
@@ -2891,16 +2965,16 @@ fn run_dashboard(
     if let Some(slot) = &terminal.account {
         slot.set(Some(display.account()));
     }
-    if let Some(error) = capture_error {
-        return Err(error);
-    }
     // Sink errors use the bounded notices above, including a simultaneous
-    // display error. Preserve the existing display-only error policy.
-    if outcome.exit_code() == 0
-        && let Some(error) = failure
-    {
-        return Err(anyhow::anyhow!(error)).context("writing the dashboard terminal");
-    }
+    // display error. Preserve the existing display-only error policy and
+    // carry an interrupted Detailed cleanup as a typed secondary outcome.
+    let primary = capture_error.or_else(|| {
+        (outcome.exit_code() == 0)
+            .then_some(failure)
+            .flatten()
+            .map(|error| anyhow::anyhow!(error).context("writing the dashboard terminal"))
+    });
+    combine_semantic_terminal_errors(primary, cleanup)?;
     Ok(outcome.exit_code())
 }
 
@@ -3588,6 +3662,25 @@ pub(crate) fn render_text<Source: ProcessSource>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owner_terminal_error_preserves_primary_and_typed_interruption() {
+        let error = super::combine_semantic_terminal_errors(
+            Some(anyhow::anyhow!("capture failed")),
+            Err(crate::attach::CleanupInterrupted.into()),
+        )
+        .unwrap_err();
+        assert_eq!(crate::run::failure_exit_code(&error), 130);
+        assert!(!crate::run::failure_already_reported(&error));
+        assert!(format!("{error:#}").contains("capture failed"));
+        let error = super::combine_semantic_terminal_errors(
+            None,
+            Err(crate::attach::CleanupInterrupted.into()),
+        )
+        .unwrap_err();
+        assert_eq!(crate::run::failure_exit_code(&error), 130);
+        assert!(crate::run::failure_already_reported(&error));
+    }
+
     #[test]
     fn cgroup_stop_acceptance_inherited_fd_child() {
         if std::env::var_os("P11SCOPE_CGROUP_STOP_TEST_CHILD").is_none() {

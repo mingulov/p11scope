@@ -92,6 +92,9 @@ def inputs(subject, *, placement=None, cap=None):
     control = receipt["inventory_control"]
     if subject == MAPS:
         position = next(i for i, row in enumerate(stream) if row["kind"] == "pass_committed")
+        if placement == "terminal":
+            position = max(i for i, row in enumerate(stream)
+                           if row["kind"] == "pass_committed" and not row["event"].get("final")) + 1
         index = add_gap(data, MAPS,
             "maps snapshots unavailable for 2 of 32 attempted processes; provider presence remains unknown", position)
         if cap is not None:
@@ -100,8 +103,9 @@ def inputs(subject, *, placement=None, cap=None):
                        "provider presence remains unknown")
             reason = (f"{total} processes in scope; 256 deep-scanned by provider rarity (limit 256); "
                 "1 attributed to pinned provider objects by exact maps identity; "
-                "5 processes map 3 shared objects no deep scan examined and may use undiscovered providers"
-                f"; {missing} processes past the cap had no maps snapshot")
+                "5 processes map 3 shared objects no deep scan examined and may use undiscovered providers")
+            if missing:
+                reason += f"; {missing} processes past the cap had no maps snapshot"
             add_gap(data, "discovery capped", reason, position)
             completing = next(row for row in stream if row["kind"] == "pass_committed")
             completing["event"].update(scanned=257, maps_matched=1)
@@ -182,6 +186,19 @@ class SystemRecoveryDisclosureTest(unittest.TestCase):
             "maps snapshots unavailable for 2 of 438 attempted processes; provider presence remains unknown")
         self.assert_refused(data, index)
 
+    def test_maps_repeat_needs_its_own_ordinary_completing_pass(self):
+        data, index = inputs(MAPS)
+        data[0]["gaps"][index]["repeats"] = 2
+        position = [row for row in records(data) if row["kind"] == "pass_committed"][1]["seq"]
+        insert(data, position, [{"kind": "gap_repeated", "event": {"index": index, "repeats": 2}}])
+        self.assert_positive(data, index)
+        data[0]["gaps"][index]["repeats"] = 3
+        position = max(i for i, row in enumerate(records(data))
+                       if row["kind"] == "pass_committed" and not row["event"].get("final")) + 1
+        insert(data, position, [{"kind": "gap_repeated", "event": {"index": index, "repeats": 3}}])
+        self.assert_refused(data, index)
+        self.assert_refused(*inputs(MAPS, placement="terminal"))
+
     def test_clean_successor_recovery_keeps_coalesced_custody_refusals_unattributed(self):
         data, index = inputs(CUSTODY)
         self.assertIsNone(data[2]["inventory_control"]["measurements"][1]["proof"]["baseline"]["recovery"])
@@ -221,6 +238,12 @@ class SystemRecoveryDisclosureTest(unittest.TestCase):
         insert(data, position, [{"kind": "gap_repeated", "event": {"index": index, "repeats": 19}}])
         self.assert_refused(data, index)
 
+    def test_custody_needs_an_ordinary_commit_before_first_successor_registration(self):
+        data, index = inputs(CUSTODY)
+        proof = data[2]["inventory_control"]["measurements"][1]["proof"]
+        records(data)[proof["admission"]["completed_pass"]["seq"]]["kind"] = "incomplete_pass"
+        self.assert_refused(data, index)
+
     def test_terminal_unsettled_retirement_retains_false_final_drain_and_normal_stop(self):
         data, index = inputs(TERMINAL)
         result = self.assert_positive(data, index)
@@ -251,9 +274,25 @@ class SystemRecoveryDisclosureTest(unittest.TestCase):
                     receipt[key] = value
                 self.assert_refused(data, index)
 
+    def test_terminal_retirement_requires_the_exact_single_ten_second_final_report(self):
+        for fault in ("repeated", "different-timeout", "missing-final"):
+            with self.subTest(fault=fault):
+                data, index = inputs(TERMINAL)
+                if fault == "repeated":
+                    data[0]["gaps"][index]["repeats"] = 2
+                    position = next(i for i, row in enumerate(records(data))
+                                    if row["kind"] == "pass_committed" and row["event"].get("final"))
+                    insert(data, position, [{"kind": "gap_repeated", "event": {"index": index, "repeats": 2}}])
+                elif fault == "different-timeout":
+                    change_gap(data, index, "reason", RETIREMENT.replace("10000", "5000"))
+                else:
+                    next(row for row in records(data) if row["kind"] == "pass_committed"
+                         and row["event"].get("final"))["kind"] = "incomplete_final_pass"
+                self.assert_refused(data, index)
+
     def test_residual_disclosures_refuse_scoped_changed_reason_or_missing_repeat_parity(self):
         for subject in (MAPS, CUSTODY, TERMINAL):
-            for fault in ("scope", "caller", "budget", "reason", "suppressed", "repeat", "publication"):
+            for fault in ("scope", "caller", "module", "pid", "budget", "reason", "suppressed", "repeat", "publication"):
                 with self.subTest(subject=subject, fault=fault):
                     data, index = inputs(subject)
                     if fault == "scope":

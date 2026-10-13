@@ -1220,7 +1220,8 @@ pub(crate) fn admit_call_from_evidence(
     if slot.object != endpoint.object || slot.file_offset != endpoint.offset {
         return Err(ConversionRefusal::Slot);
     }
-    if !subset.proves_provider_module(endpoint.object, module) {
+    if !subset.proves_provider_module(endpoint.object, module) || !binding.proves_endpoint(endpoint)
+    {
         return Err(ConversionRefusal::Module);
     }
     // Descriptor authority comes only from the attested plan: one
@@ -1242,7 +1243,8 @@ pub(crate) fn admit_call_from_evidence(
             // on other endpoints of the same file share it, while their
             // own descriptor authority comes from the slot proof above.
             let covered = coverage.endpoint();
-            if coverage.domain() != evidence.domain
+            if !binding.scope_current()
+                || coverage.domain() != evidence.domain
                 || coverage.image() != evidence.image
                 || covered.file_slot != endpoint.file_slot
                 || covered.object != endpoint.object
@@ -1312,7 +1314,10 @@ pub(crate) fn admit_registration_from_coverage(
         return Err(ConversionRefusal::Coverage);
     }
     let module = binding.module();
-    if !subset.proves_provider_module(coverage.endpoint().object, module) {
+    if !binding.scope_current()
+        || !subset.proves_provider_module(coverage.endpoint().object, module)
+        || !binding.proves_endpoint(coverage.endpoint())
+    {
         return Err(ConversionRefusal::Module);
     }
     let boundary = match boundary {

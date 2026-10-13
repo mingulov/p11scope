@@ -3,9 +3,11 @@
 
 use crate::attach::capture::NativeDomainId;
 use crate::attach::{AttachedSemanticSet, BackendSelection, Scope, Session};
+use crate::discovery::caller_registry::ModuleKey;
 use crate::discovery::caller_registry::{OsProcessSource, now_ns};
 use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
 use crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding;
+use crate::discovery::identity::RetainedInventoryTarget;
 use crate::process::PidPin;
 use crate::run::{STOP_QUIESCE_BUDGET, StopState, TerminalQuiescence};
 use crate::semantic_capture::{
@@ -45,6 +47,36 @@ impl std::fmt::Display for SemanticRefusal {
 }
 
 pub(crate) use crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset;
+
+/// The actual attached provider, proved by the Detailed owner before scope's
+/// final sample. Coordinates select the retained file; they never mint it.
+pub(crate) struct SemanticProviderTarget {
+    module: ModuleKey,
+    endpoint: Endpoint,
+    _retained: RetainedInventoryTarget,
+}
+
+impl SemanticProviderTarget {
+    pub(crate) fn module(&self) -> &ModuleKey {
+        &self.module
+    }
+    pub(crate) fn matches(&self, endpoint: Endpoint) -> bool {
+        self.endpoint.object == endpoint.object && self.endpoint.file_slot == endpoint.file_slot
+    }
+}
+
+/// Move-only bootstrap evidence. The owner receipt is delivered exactly once
+/// to normal finalization after consuming (or refusing) scoped admission.
+pub(crate) struct PreparedSemanticAdmission {
+    receipt: CurrentPartitionReceipt,
+    provider: SemanticProviderTarget,
+}
+
+impl PreparedSemanticAdmission {
+    pub(crate) fn into_parts(self) -> (CurrentPartitionReceipt, SemanticProviderTarget) {
+        (self.receipt, self.provider)
+    }
+}
 
 /// Lane-staged negative facts: the accompanying negatives one owned H0
 /// outcome batch carries. The cut barrier ordinal is H0-timeline evidence
@@ -255,6 +287,25 @@ impl LaneCoverage {
 pub(crate) trait LaneTestIo {
     /// The exact targets the production driver selected for this tick.
     fn tick_targets(&mut self, _pins: &[Arc<PidPin>]) {}
+    /// Substitute Session attachment I/O, retaining the production subset
+    /// matching and owner receipt checks around it.
+    fn validate_attachment(&mut self, _subset: &AttestedSubset) -> Result<(), SemanticRefusal> {
+        Err(SemanticRefusal::Unavailable)
+    }
+    fn take_refresh_receipt(
+        &mut self,
+        _pin: &Arc<PidPin>,
+        _slot: u32,
+    ) -> Option<CurrentPartitionReceipt> {
+        None
+    }
+    fn stash_admission_evidence(
+        &mut self,
+        _receipts: Vec<CurrentPartitionReceipt>,
+        _outcomes: Vec<TickOutcome>,
+    ) {
+        unreachable!("an admission-capable test owner must retain its evidence")
+    }
     /// Optional real H0 cut servicing. A handler drains `gaps`; otherwise
     /// the existing shell cut seam retains them for its own assertions.
     fn physical_gaps(
@@ -413,6 +464,17 @@ impl RefreshReceiptStash {
     /// Drain the stashed outcomes in order into the next tick batch.
     pub(crate) fn take_outcomes(&mut self) -> Vec<TickOutcome> {
         std::mem::take(&mut self.outcomes).into_iter().collect()
+    }
+
+    pub(crate) fn take_for_admission(
+        &mut self,
+        pin: &Arc<PidPin>,
+        slot: u32,
+    ) -> Option<CurrentPartitionReceipt> {
+        let at = self.stashed.iter().rposition(|receipt| {
+            Arc::ptr_eq(receipt.original_pin(), pin) && receipt.attachment_slot() == slot
+        })?;
+        self.stashed.remove(at)
     }
 }
 
@@ -677,6 +739,7 @@ impl AttestedSemanticLane {
             test.tick_targets(
                 &bindings
                     .iter()
+                    .filter(|binding| binding.scope_current())
                     .map(SemanticCallerBinding::pin)
                     .collect::<Vec<_>>(),
             );
@@ -688,7 +751,11 @@ impl AttestedSemanticLane {
         if live.gated || live.finished {
             return Err(SemanticRefusal::Unavailable);
         }
-        let pins: Vec<Arc<PidPin>> = bindings.iter().map(SemanticCallerBinding::pin).collect();
+        let pins: Vec<Arc<PidPin>> = bindings
+            .iter()
+            .filter(|binding| binding.scope_current())
+            .map(SemanticCallerBinding::pin)
+            .collect();
         let mut report = live
             .capture
             .tick(&mut live.session, &pins)
@@ -757,6 +824,110 @@ impl AttestedSemanticLane {
         let (images, shed) = stash_refresh_report(&mut live.stashed_refresh, &mut report);
         live.scan_refusals = live.scan_refusals.saturating_add(shed);
         Ok((images, effective))
+    }
+
+    /// Bootstrap from H0's accepted original-custody scan, independent of
+    /// Inventory's native identity domain. Every fallible owner/provider read
+    /// happens here, before cgroup's final membership sample.
+    pub(crate) fn prepare_caller_admission(
+        &mut self,
+        pin: Arc<PidPin>,
+        slot: u32,
+        module: &ModuleKey,
+    ) -> Result<PreparedSemanticAdmission, SemanticRefusal> {
+        let (_, effective) = self.refresh_candidate_with_custody(pin, slot)?;
+        #[cfg(test)]
+        let receipt = if let Some(test) = self.test_io.as_mut() {
+            test.take_refresh_receipt(&effective, slot)
+        } else {
+            self.live
+                .as_mut()
+                .and_then(|live| live.stashed_refresh.take_for_admission(&effective, slot))
+        };
+        #[cfg(not(test))]
+        let receipt = self
+            .live
+            .as_mut()
+            .and_then(|live| live.stashed_refresh.take_for_admission(&effective, slot));
+        let receipt = receipt.ok_or(SemanticRefusal::Unavailable)?;
+
+        let mut validation = TickReport::default();
+        let result = (|| {
+            #[cfg(test)]
+            if let Some(test) = self.test_io.as_mut() {
+                test.validate_attachment(&self.subset)?;
+            } else {
+                let live = self.live.as_ref().ok_or(SemanticRefusal::Unavailable)?;
+                live.session
+                    .validate_semantic_set(&live.attached)
+                    .map_err(|_| SemanticRefusal::Attachment)?;
+            }
+            #[cfg(not(test))]
+            {
+                let live = self.live.as_ref().ok_or(SemanticRefusal::Unavailable)?;
+                live.session
+                    .validate_semantic_set(&live.attached)
+                    .map_err(|_| SemanticRefusal::Attachment)?;
+            }
+            let endpoint = receipt.endpoint();
+            if receipt.domain() != self.domain
+                || !Arc::ptr_eq(receipt.original_pin(), &effective)
+                || !self.subset.proves_provider_module(endpoint.object, module)
+                || !receipt
+                    .watched()
+                    .same_object_as(self.subset.pins(), endpoint.object)
+                || receipt.watched().check_unchanged() != Ok(true)
+                || !self
+                    .subset
+                    .required()
+                    .get(&endpoint.object)
+                    .is_some_and(|required| required.contains(&slot))
+                || !self.subset.plan().slots.iter().any(|actual| {
+                    actual.index == slot
+                        && actual.object == endpoint.object
+                        && actual.file_offset == endpoint.offset
+                })
+            {
+                return Err(SemanticRefusal::ProviderInstanceUnproven);
+            }
+            self.validate_current(&receipt, &mut validation)
+                .map_err(|_| SemanticRefusal::ProviderInstanceUnproven)?;
+            Ok(SemanticProviderTarget {
+                module: module.clone(),
+                endpoint,
+                _retained: receipt.watched().share(),
+            })
+        })();
+        // Validation may consume invalidations even on refusal. Keep them
+        // beside the original receipt, never copy that receipt into two paths.
+        self.stash_admission_evidence(Vec::new(), validation.into_outcomes());
+        match result {
+            Ok(provider) => Ok(PreparedSemanticAdmission { receipt, provider }),
+            Err(reason) => {
+                self.deliver_admission_receipt(receipt);
+                Err(reason)
+            }
+        }
+    }
+
+    pub(crate) fn deliver_admission_receipt(&mut self, receipt: CurrentPartitionReceipt) {
+        self.stash_admission_evidence(vec![receipt], Vec::new());
+    }
+
+    fn stash_admission_evidence(
+        &mut self,
+        receipts: Vec<CurrentPartitionReceipt>,
+        outcomes: Vec<TickOutcome>,
+    ) {
+        #[cfg(test)]
+        if let Some(test) = self.test_io.as_mut() {
+            test.stash_admission_evidence(receipts, outcomes);
+            return;
+        }
+        if let Some(live) = self.live.as_mut() {
+            let shed = live.stashed_refresh.push_all(receipts, outcomes);
+            live.scan_refusals = live.scan_refusals.saturating_add(shed);
+        }
     }
 
     pub(crate) fn apply_physical_gaps(

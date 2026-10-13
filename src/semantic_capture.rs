@@ -89,6 +89,14 @@ impl CurrentPartitionReceipt {
     pub(crate) fn original_pin(&self) -> &Arc<PidPin> {
         &self.pin
     }
+    pub(crate) fn attachment_slot(&self) -> u32 {
+        self.attachment_slot
+    }
+    /// The actual watched file retained by the accepted owner scan. This
+    /// accessor transfers no construction or renewal authority.
+    pub(crate) fn watched(&self) -> &RetainedInventoryTarget {
+        &self.watched
+    }
 }
 impl fmt::Debug for CurrentPartitionReceipt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

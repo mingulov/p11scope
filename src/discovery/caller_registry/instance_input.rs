@@ -1424,12 +1424,13 @@ pub(crate) fn finalize_invalidation(
             )],
             Vec::new(),
         )),
-        InvalidationScope::TaskRetired(_) => Ok((
-            vec![loss(
-                InstanceScope::Domain(domain),
-                InstanceReason::TaskRetired,
-            )],
+        InvalidationScope::TaskRetired(cookie) => Ok((
             Vec::new(),
+            vec![InstanceRetirement {
+                scope: RetirementScope::Task(domain, *cookie),
+                position: at,
+                reason: InstanceReason::TaskRetired,
+            }],
         )),
         InvalidationScope::ImageRetired(image) => Ok((
             vec![loss(

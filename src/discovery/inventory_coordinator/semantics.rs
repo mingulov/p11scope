@@ -994,9 +994,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // negatives directly into H2's bounded ledger instead of spending
         // call capacity on them or truncating distinct negative scopes.
         let validation_outcomes = validation.into_outcomes();
-        // Negatives first: lane facts, then H0 invalidations. The domain
-        // maximum fences conversion as defense-in-depth; the registry's
-        // staged-before-positive order enforces scope precision. A cut
+        // Negatives first: lane facts, then H0 invalidations. Only
+        // domain-wide facts advance the conversion barrier; the registry's
+        // staged-before-positive order enforces narrower scopes. A cut
         // floor from the same publication fences queued calls first.
         let mut barrier: Option<u64> = floor;
         for negative in &negatives {
@@ -1053,7 +1053,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         &coverages,
                     ) {
                         Ok((losses, retirements)) => {
-                            if let Some(at) = invalidation.position() {
+                            if matches!(
+                                invalidation.scope(),
+                                InvalidationScope::CoverageFailed
+                                    | InvalidationScope::AuthorityExhausted
+                                    | InvalidationScope::FaultEra
+                                    | InvalidationScope::Stopped
+                            ) && let Some(at) = invalidation.position()
+                            {
                                 barrier = Some(barrier.map_or(at, |b: u64| b.max(at)));
                             }
                             for loss in losses {

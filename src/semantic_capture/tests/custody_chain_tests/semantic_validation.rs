@@ -948,6 +948,18 @@ fn semantic_validation_terminal_task_preserves_healthy_peer_before_its_barrier()
         InstanceLifecycle::Retired,
         "a terminal task is permanently retired, with its own operation ended unknown"
     );
+    let dead_edge = fixture
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .find(|row| row.caller == caller_a)
+        .unwrap();
+    assert!(dead_edge.lossy && dead_edge.reasons.contains(&InstanceReason::TaskRetired));
+    let dead_reducer = dead_edge.semantics.as_ref().unwrap();
+    assert_eq!((dead_reducer.completed(), dead_reducer.unknown()), (0, 1));
+    assert!(!dead_reducer.has_live_operations());
+    assert!(!peer.reasons.contains(&InstanceReason::TaskRetired));
 }
 
 #[test]

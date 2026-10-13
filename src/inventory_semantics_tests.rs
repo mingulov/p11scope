@@ -3597,10 +3597,11 @@ fn native_semantic_finalize_invalidation_covers_domain_reasons() {
             ],
         ),
         (
-            InvalidationScope::TaskRetired(7),
-            vec![InstanceReason::SemanticLoss, InstanceReason::TaskRetired],
+            InvalidationScope::FaultEra,
+            vec![InstanceReason::SemanticLoss],
             vec![
                 InstanceReason::CaptureStopped,
+                InstanceReason::TaskRetired,
                 InstanceReason::AuthorityExhausted,
             ],
         ),
@@ -3610,7 +3611,7 @@ fn native_semantic_finalize_invalidation_covers_domain_reasons() {
             InvalidationScope::CoverageFailed => "coverage_failed",
             InvalidationScope::AuthorityExhausted => "authority_exhausted",
             InvalidationScope::Stopped => "stopped",
-            InvalidationScope::TaskRetired(_) => "task_retired",
+            InvalidationScope::FaultEra => "fault_era",
             _ => unreachable!("domain-scope legs only"),
         };
         let mut conv = ConversionScene::new();

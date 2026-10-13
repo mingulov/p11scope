@@ -12731,6 +12731,25 @@ fn semantic_capture_private_record_test_children_remain_test_only() {
         "moving the child outside the cfg(test) module must revoke its exemption"
     );
 
+    // Retaining the canonical cfg(test) chain cannot license a second
+    // production inclusion of the same private-field fixture.
+    for inclusion in [
+        "#[path = \"semantic_capture/tests/custody_chain_tests/semantic_validation.rs\"]\nmod production_validation;",
+        "include!(\"semantic_capture/tests/custody_chain_tests/semantic_validation.rs\");",
+        "#[path = \"semantic_capture/tests/custody_chain_tests/owner_admission.rs\"]\nmod production_owner;",
+        "include!(\"semantic_capture/tests/custody_chain_tests/owner_admission.rs\");",
+    ] {
+        let alias = format!("{capture}\n{inclusion}\n");
+        assert!(
+            !semantic_capture_private_test_children_are_isolated(
+                &alias,
+                &validation,
+                owner_admission_present,
+            ),
+            "an alternate production inclusion must revoke the child exemption: {inclusion}"
+        );
+    }
+
     // Calibrate the second exact child even before it is integrated. Its path
     // override is relative to semantic_validation.rs, not a new top-level module.
     let owner_parent =
@@ -12748,6 +12767,8 @@ fn semantic_capture_private_record_test_children_remain_test_only() {
     for invalid_parent in [
         owner_parent.replace("mod owner_admission;", ""),
         owner_parent.replace("owner_admission.rs", "other.rs"),
+        format!("{owner_parent}\n#[path = \"owner_admission.rs\"]\nmod alias_owner;\n"),
+        format!("{owner_parent}\ninclude!(\"owner_admission.rs\");\n"),
     ] {
         assert!(
             !semantic_capture_private_test_children_are_isolated(&capture, &invalid_parent, true),

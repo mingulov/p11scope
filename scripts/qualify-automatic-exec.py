@@ -1772,7 +1772,9 @@ def ledger_s1_totals(batches, started_ns):
 
 def inventory_held_provider_module(doc, provider):
     """Resolve the independently calibrated maps identity before path/content checks."""
-    mapping = provider.get("mapping") or {}
+    if not isinstance(provider, dict) or not isinstance(provider.get("mapping"), dict):
+        raise SetupError("held provider mapping identity is not an object")
+    mapping = provider["mapping"]
     device, inode = mapping.get("dev"), mapping.get("ino")
     if (not isinstance(device, list) or len(device) != 2
             or any(type(part) is not int or part < 0 for part in device)
@@ -1781,8 +1783,16 @@ def inventory_held_provider_module(doc, provider):
         raise SetupError("held provider mapping identity is unavailable or inconsistent")
     candidates = []
     for module in doc.get("modules", []):
-        identity = module.get("identity") or {}
-        mapped = identity.get("device") or {}
+        identity = module.get("identity")
+        if identity is None:
+            identity = {}
+        if not isinstance(identity, dict):
+            raise SetupError("inventory module identity is not an object")
+        mapped = identity.get("device")
+        if mapped is None:
+            mapped = {}
+        if not isinstance(mapped, dict):
+            raise SetupError("inventory module device is not an object")
         actual = [mapped.get("major"), mapped.get("minor")]
         if (all(type(part) is int for part in actual) and actual == device
                 and type(identity.get("inode")) is int and identity["inode"] == inode):

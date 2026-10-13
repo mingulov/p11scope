@@ -324,3 +324,70 @@ fn native_semantic_initial_coverage_stamp_does_not_demote_current_calls() {
         }
     );
 }
+
+fn assert_mixed_witness_disclosure(delayed_physical: bool) {
+    let mut conv = ConversionScene::new();
+    let module = conv.scene.module.clone();
+    let id = conv.ids[0];
+    let coverage = conv.coverage(vec![id]);
+    conv.register(&coverage, id, 200, None);
+    if delayed_physical {
+        conv.commit();
+        assert!(gaps(conv.scene.coordinator.registry()).is_empty());
+    }
+    // Both physical facts join the first publication that can disclose this
+    // interval. A prior witness-only gap cannot hide count-precedence bugs.
+    conv.scene
+        .coordinator
+        .registry_mut()
+        .note_witness(conv.caller, &module, 100);
+    conv.scene
+        .coordinator
+        .registry_mut()
+        .note_counted_use(conv.caller, &module, 7, 300, 400, 0);
+    conv.feed(
+        conv.evidence(1, id, conv.init_slot, conv.init_event(310)),
+        CallStanding::Current(&coverage),
+        None,
+    );
+    conv.feed(
+        conv.evidence(2, id, conv.sign_slot, conv.sign_event(320)),
+        CallStanding::Current(&coverage),
+        None,
+    );
+    conv.commit();
+    let registry = conv.scene.coordinator.registry();
+    let module_id = registry.module_id_for(&module).unwrap();
+    let edge = registry.edge(conv.caller, module_id).unwrap();
+    assert_eq!(edge.entry_count, 7);
+    assert_eq!(edge.entry_first_seen_ns, Some(300));
+    assert_eq!(
+        registry.coverage(edge),
+        UseCoverage::Counted {
+            since_ns: 300,
+            lossy: false
+        }
+    );
+    assert_eq!(conv.edge_rows(), vec![(Some(2), 0, false, 1, 1)]);
+    assert_eq!(conv.instance_states(), vec![InstanceLifecycle::Observed]);
+    let disclosed = gaps(registry);
+    assert_eq!(
+        disclosed.len(),
+        1,
+        "the retained witness at100 precedes registration200 despite counted first300"
+    );
+    assert_eq!(
+        (disclosed[0].caller, disclosed[0].module),
+        (Some(conv.caller), Some(module_id))
+    );
+}
+
+#[test]
+fn native_semantic_initial_coverage_mixed_witness_same_pass_is_disclosed() {
+    assert_mixed_witness_disclosure(false);
+}
+
+#[test]
+fn native_semantic_initial_coverage_mixed_witness_delayed_publication_is_disclosed() {
+    assert_mixed_witness_disclosure(true);
+}

@@ -165,6 +165,11 @@ pub(crate) trait ProcessSource {
     /// the generation is dead even though `/proc` still parses — so a
     /// dead-but-unreaped target retires instead of re-admitting.
     fn gone(&self, pid: u32) -> bool;
+    /// Duplicate already owned process custody for the Detailed owner. A
+    /// source without real pidfd custody cannot bootstrap semantic authority.
+    fn semantic_custody(&self, _pin: &Self::Pin) -> Option<PidPin> {
+        None
+    }
 }
 
 /// The exe identity of `pid` (`/proc/<pid>/exe` metadata plus its link
@@ -209,6 +214,9 @@ impl ProcessSource for OsProcessSource {
 
     fn gone(&self, pid: u32) -> bool {
         generation_gone(pid) || process_is_zombie(pid)
+    }
+    fn semantic_custody(&self, pin: &PidPin) -> Option<PidPin> {
+        pin.try_clone().ok()
     }
 }
 
@@ -294,7 +302,32 @@ pub(crate) struct PreparedScopedCaller<Pin> {
     existing: Option<CallerId>,
 }
 
+impl<Pin> PreparedScopedCaller<Pin> {
+    pub(crate) fn existing(&self) -> Option<CallerId> {
+        self.existing
+    }
+    pub(crate) fn generation(&self) -> &crate::inspect_system::MemberGeneration {
+        &self.generation
+    }
+}
+
 impl<Source: ProcessSource> CallerAdapter<Source> {
+    /// Never reopen the PID: this is the source pin enclosed by the original
+    /// scoped preparation, before the collection's final sample.
+    pub(crate) fn scoped_semantic_custody(
+        &self,
+        prepared: &PreparedScopedCaller<Source::Pin>,
+    ) -> Option<PidPin> {
+        self.source.semantic_custody(&prepared.pin)
+    }
+
+    pub(crate) fn semantic_custody(&self, caller: CallerId) -> Option<PidPin> {
+        let tracked = self.callers.get(&caller)?;
+        if tracked.record.retired || self.live_id(tracked.record.pid) != Some(caller) {
+            return None;
+        }
+        self.source.semantic_custody(tracked.pin.as_ref()?)
+    }
     pub(crate) fn new(source: Source) -> Self {
         Self {
             source,

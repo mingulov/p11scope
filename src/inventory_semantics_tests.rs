@@ -3300,7 +3300,7 @@ impl CgroupScene {
 }
 
 #[test]
-fn native_semantic_cgroup_provisional_unscanned_remap_recovers_without_erasing_gaps() {
+fn native_semantic_cgroup_physical_remap_does_not_renew_suspended_semantics() {
     let mut scene = CgroupScene::new();
     let pid = scene.child.id();
 
@@ -3362,19 +3362,28 @@ fn native_semantic_cgroup_provisional_unscanned_remap_recovers_without_erasing_g
         "the earlier cut fence persists through recovery"
     );
 
-    // Scope loss stages again: a second empty census mints a second cut.
+    // The shell cannot supply a new owner receipt. Physical remap alone
+    // must not renew current semantic authority or another cut episode.
+    assert!(
+        !scene
+            .coordinator
+            .semantic_bindings()
+            .get(scene.caller)
+            .unwrap()
+            .scope_current()
+    );
     scene.set_procs(None);
     let outcome = scene.pass(CgroupWalkLimits::default(), 6_000);
     assert_eq!(outcome, ScopedCollectionOutcome::Complete);
     assert_eq!(scene.mapping(), MappingState::Uncertain);
-    assert_eq!(scene.lane.recorded_gaps().len(), 2);
+    assert_eq!(scene.lane.recorded_gaps().len(), 1);
 
-    // Recovery again: mapped, suppressed, both cuts intact.
+    // Physical recovery again: the original semantic suspension still holds.
     scene.set_procs(Some(pid));
     let outcome = scene.pass(CgroupWalkLimits::default(), 7_000);
     assert_eq!(outcome, ScopedCollectionOutcome::Complete);
     assert_eq!(scene.mapping(), MappingState::Mapped);
-    assert_eq!(scene.lane.recorded_gaps().len(), 2);
+    assert_eq!(scene.lane.recorded_gaps().len(), 1);
 
     // A failed publication stages through the other branch: the
     // transaction gap discloses the failure and the marker stands.
@@ -3396,7 +3405,7 @@ fn native_semantic_cgroup_provisional_unscanned_remap_recovers_without_erasing_g
         scene.gap_pairs()
     );
     assert_eq!(scene.mapping(), MappingState::Uncertain);
-    assert_eq!(scene.lane.recorded_gaps().len(), 3);
+    assert_eq!(scene.lane.recorded_gaps().len(), 1);
 
     // Markers stay bounded across passes: repeated complete passes
     // suppress every time without multiplying gaps or cuts.
@@ -3406,7 +3415,7 @@ fn native_semantic_cgroup_provisional_unscanned_remap_recovers_without_erasing_g
         assert_eq!(outcome, ScopedCollectionOutcome::Complete);
         assert_eq!(scene.mapping(), MappingState::Mapped);
     }
-    assert_eq!(scene.lane.recorded_gaps().len(), 3);
+    assert_eq!(scene.lane.recorded_gaps().len(), 1);
     assert_eq!(
         scene.gap_pairs().len(),
         gaps_before,
@@ -5343,8 +5352,8 @@ fn native_semantic_live_stream_retention_matches_snapshot() {
 
 impl BindingScene {
     /// Map one caller to an explicit registry module: the refresh-target
-    /// tests name each provider's attach path per caller instead of the
-    /// shared single-provider fixture module.
+    /// tests retain the physical key and digest instead of treating an
+    /// attachment pathname as provider authority.
     fn map_module(&mut self, caller: CallerId, pid: u32, key: &ModuleKey, path: &str, at_ns: u64) {
         let info = ModuleInfo {
             path: path.into(),
@@ -5410,26 +5419,35 @@ fn native_semantic_multiprovider_candidates_bind_per_provider() {
         exec_coverage: Some(ExecCoverage::scripted(detailed, 0)),
         ..ExtendReceipt::default()
     });
-    // One registry module per provider attach path, plus a foreign
-    // module no provider claims.
-    let providers: Vec<(PinnedObjectId, String)> = lane
+    // One actual physical registry module per retained provider, plus
+    // a foreign inode no provider claims.
+    let providers: Vec<(PinnedObjectId, String, ModuleKey)> = lane
         .subset()
         .required()
         .keys()
         .map(|object| {
-            let path = lane
+            let pin = lane
                 .subset()
                 .pins()
-                .attach_path_for(*object)
-                .expect("required provider stays pinned")
-                .to_string_lossy()
-                .into_owned();
-            (*object, path)
+                .pinned()
+                .find(|pin| pin.id == *object)
+                .unwrap();
+            (
+                *object,
+                pin.path.to_owned(),
+                ModuleKey::physical(
+                    pin.key.device.major,
+                    pin.key.device.minor,
+                    pin.key.inode,
+                    Some(pin.sha256.to_owned()),
+                    pin.path,
+                ),
+            )
         })
         .collect();
     assert_eq!(providers.len(), 2);
-    let module_a = ModuleKey::physical(7, 7, 771, None, &providers[0].1);
-    let module_b = ModuleKey::physical(7, 7, 772, None, &providers[1].1);
+    let module_a = providers[0].2.clone();
+    let module_b = providers[1].2.clone();
     let foreign = ModuleKey::physical(7, 7, 773, None, "/task3/foreign.so");
     let caller_a = scene.admit(pid_a, 7_000);
     let caller_b = scene.admit(child_b.id(), 7_001);
@@ -5527,6 +5545,50 @@ fn native_semantic_multiprovider_candidates_bind_per_provider() {
 }
 
 #[test]
+fn native_semantic_failed_refresh_attempts_remain_bounded_and_fair() {
+    let fixture = ProviderFixture::new();
+    let mut scene = BindingScene::new();
+    let children: Vec<_> = (0..5).map(|_| OwnedStoppedChild::new()).collect();
+    let callers: Vec<_> = children
+        .iter()
+        .enumerate()
+        .map(|(index, child)| {
+            let caller = scene.admit(child.id(), 100 + index as u64);
+            // A mapped but unattested provider is still a failed attempt; it
+            // cannot cause more than four scans or strand the next caller.
+            scene.map(caller, child.id(), 200 + index as u64);
+            caller
+        })
+        .collect();
+    let lane =
+        AttestedSemanticLane::start(fixture.subset(), &Scope::System, BackendSelection::Auto)
+            .unwrap();
+    let first = scene
+        .coordinator
+        .semantic_refresh_attempts(&lane, None, |_| true);
+    assert_eq!(first.len(), 4);
+    assert!(first.iter().all(|attempt| attempt.module.is_none()));
+    assert_eq!(
+        first
+            .iter()
+            .map(|attempt| attempt.caller)
+            .collect::<Vec<_>>(),
+        callers[..4]
+    );
+    let second = scene
+        .coordinator
+        .semantic_refresh_attempts(&lane, None, |_| true);
+    assert_eq!(second.len(), 4);
+    assert_eq!(second[0].caller, callers[4]);
+    assert!(
+        scene
+            .coordinator
+            .semantic_refresh_attempts(&lane, None, |_| false)
+            .is_empty()
+    );
+}
+
+#[test]
 fn native_semantic_single_provider_refresh_target_preserved() {
     set_sight(1_005);
     let fixture = ProviderFixture::new();
@@ -5542,8 +5604,8 @@ fn native_semantic_single_provider_refresh_target_preserved() {
         exec_coverage: Some(ExecCoverage::scripted(detailed, 0)),
         ..ExtendReceipt::default()
     });
-    // The previous inline chain: the first required slot, its object's
-    // attach path, the first registry module carrying that path.
+    // Retained physical identity and digest select the provider. The
+    // registry path may differ from the attachment FD path.
     let subset = lane.subset();
     let slot = subset
         .required()
@@ -5564,12 +5626,19 @@ fn native_semantic_single_provider_refresh_target_preserved() {
         .expect("required provider stays pinned")
         .to_string_lossy()
         .into_owned();
-    let module = ModuleKey::physical(7, 7, 777, None, &attach);
+    let pin = subset.pins().pinned().find(|pin| pin.id == object).unwrap();
+    let module = ModuleKey::physical(
+        pin.key.device.major,
+        pin.key.device.minor,
+        pin.key.inode,
+        Some(pin.sha256.to_owned()),
+        pin.path,
+    );
     let foreign = ModuleKey::physical(7, 7, 778, None, "/task3/foreign.so");
     let caller = scene.admit(pid, 7_000);
     let stranger = scene.admit(child.id(), 7_001);
     scene.map_module(caller, pid, &module, &attach, 7_100);
-    scene.map_module(stranger, child.id(), &foreign, "/task3/foreign.so", 7_101);
+    scene.map_module(stranger, child.id(), &foreign, &attach, 7_101);
     scene.answer(pid, detailed, 100);
     scene.answer(child.id(), detailed, 101);
     scene.bind_image(
@@ -5578,20 +5647,12 @@ fn native_semantic_single_provider_refresh_target_preserved() {
         7_300,
     );
     set_sight(7_100);
-    // Per-candidate resolution reduces to the previous chain for one
-    // provider: the mapped caller resolves it, a caller without the
-    // provider mapping stays unresolvable.
-    let expected = scene
-        .coordinator
-        .registry()
-        .modules()
-        .find(|record| record.paths.contains(&attach))
-        .map(|record| record.key.clone())
-        .expect("provider module registered");
+    // An equal pathname carrying a foreign inode remains unresolvable.
+    let expected = module.clone();
     assert_eq!(
         crate::inventory::refresh_target_for_candidate(&scene.coordinator, &lane, caller),
         Some((slot, expected.clone())),
-        "single-provider resolution matches the previous inline chain"
+        "single-provider resolution requires the retained physical target"
     );
     assert_eq!(
         crate::inventory::refresh_target_for_candidate(&scene.coordinator, &lane, stranger),

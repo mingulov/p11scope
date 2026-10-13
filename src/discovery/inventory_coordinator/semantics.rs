@@ -2,14 +2,17 @@
 //! Sole subset minter over the coordinator's retained, accepted sources.
 
 use super::*;
+#[cfg(test)]
 use crate::discovery::caller_registry::OsProcessSource;
 use crate::discovery::caller_registry::instance_input::{
     CallEvidence, CallStanding, ConversionRefusal, InstanceReason, admit_call_from_evidence,
     admit_registration_from_coverage, finalize_invalidation, tail_loss_from_negative,
 };
 use crate::discovery::instances::{MAX_INSTANCES, MAX_PENDING};
+#[cfg(test)]
 use crate::discovery::native_binding::CallerLookup;
 use crate::inventory_semantics::{LaneNegative, SemanticRefusal};
+use crate::inventory_semantics::{PreparedSemanticAdmission, SemanticProviderTarget};
 use crate::process::PidPin;
 use crate::semantic_capture::{
     CurrentReceiptRefusal, InvalidationScope, PhysicalSemanticGap, TickOutcome,
@@ -329,6 +332,9 @@ pub(crate) struct SemanticCallerBinding {
     domain: NativeDomainId,
     image: ImageIdentity,
     pin: Arc<PidPin>,
+    scope_current: bool,
+    suspension_cut: bool,
+    provider: Option<SemanticProviderTarget>,
 }
 
 impl std::fmt::Debug for SemanticCallerBinding {
@@ -355,6 +361,14 @@ impl SemanticCallerBinding {
     pub(crate) fn pin(&self) -> Arc<PidPin> {
         self.pin.clone()
     }
+    pub(crate) fn scope_current(&self) -> bool {
+        self.scope_current
+    }
+    pub(crate) fn proves_endpoint(&self, endpoint: crate::semantic_capture::Endpoint) -> bool {
+        self.provider
+            .as_ref()
+            .is_none_or(|provider| provider.matches(endpoint))
+    }
 
     /// Tests-only binding: conversion tests script modules (including
     /// unidentified ones production proof refuses) that binding proof
@@ -373,6 +387,9 @@ impl SemanticCallerBinding {
             domain,
             image,
             pin,
+            scope_current: true,
+            suspension_cut: false,
+            provider: None,
         }
     }
 }
@@ -390,13 +407,6 @@ pub(crate) enum SemanticBindingRefusal {
 }
 
 impl SemanticBindingRefusal {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "bind/refresh refusals are currently silent; code() awaits Task6 refusal-visibility wiring"
-        )
-    )]
     pub(crate) const fn code(self) -> &'static str {
         match self {
             Self::NoLiveCaller => "no_live_caller",
@@ -418,6 +428,11 @@ pub(crate) struct SemanticBindingSet {
     index: HashMap<CallerId, usize>,
     cursor: usize,
     limit: usize,
+    refresh_cursor: Option<(CallerId, PinnedObjectId)>,
+    /// Refusal-only history across accepted owner scan / failed scope commit.
+    /// A later Detailed exec cannot silently reuse the chosen scan-pinned
+    /// incarnation merely because its executable pathname/inode stayed equal.
+    admission_images: HashMap<CallerId, (NativeDomainId, ImageIdentity)>,
 }
 
 impl SemanticBindingSet {
@@ -427,9 +442,12 @@ impl SemanticBindingSet {
             index: HashMap::new(),
             cursor: 0,
             limit: MAX_INSTANCES,
+            refresh_cursor: None,
+            admission_images: HashMap::new(),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.bindings.len()
     }
@@ -516,6 +534,314 @@ impl SemanticBindingSet {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdmissionScope {
+    Pid(u32),
+    System,
+    Cgroup,
+}
+
+/// Sealed before owner I/O: one chosen incarnation and already-owned process
+/// handle. Commit checks this candidate; it never chooses a caller by PID.
+pub(crate) struct SemanticAdmissionCandidate {
+    caller: CallerId,
+    incarnation: u32,
+    generation: crate::inspect_system::MemberGeneration,
+    pin: Arc<PidPin>,
+    scope: AdmissionScope,
+}
+
+pub(crate) struct SemanticRefreshAttempt {
+    pub(crate) caller: CallerId,
+    pub(crate) slot: u32,
+    pub(crate) module: Option<ModuleKey>,
+}
+
+impl<Source: ProcessSource> InventoryCoordinator<Source> {
+    /// Four attempts, including missing targets and every failed refresh.
+    /// Selection scans bounded retained catalogs without allocating a caller
+    /// cross-product. The cursor advances per caller/provider, including failure.
+    pub(crate) fn semantic_refresh_attempts(
+        &mut self,
+        lane: &AttestedSemanticLane,
+        eligible: Option<&BTreeSet<CallerId>>,
+        mut charge: impl FnMut(usize) -> bool,
+    ) -> Vec<SemanticRefreshAttempt> {
+        if !charge(5) {
+            return Vec::new();
+        }
+        let mut attempts = Vec::with_capacity(4);
+        let mut selected = BTreeSet::new();
+        for _ in 0..4 {
+            let mut next = None;
+            let mut wrap = None;
+            for record in self.adapter.records().filter(|record| {
+                !record.retired
+                    && self.adapter.live_id(record.pid) == Some(record.id)
+                    && eligible.is_none_or(|eligible| eligible.contains(&record.id))
+            }) {
+                if !charge(1) {
+                    return attempts;
+                }
+                if !self
+                    .registry
+                    .edges_of(record.id)
+                    .any(|edge| edge.mapping == MappingState::Mapped)
+                {
+                    continue;
+                }
+                for (object, slots) in lane.subset().required() {
+                    if !charge(1) {
+                        return attempts;
+                    }
+                    let key = (record.id, *object);
+                    if selected.contains(&key) {
+                        continue;
+                    }
+                    let Some(slot) = slots.first().copied() else {
+                        continue;
+                    };
+                    let mut exhausted = false;
+                    let module = self.registry.modules().find(|module| {
+                        if !charge(1) {
+                            exhausted = true;
+                            return true;
+                        }
+                        lane.subset().proves_provider_module(*object, &module.key)
+                            && self
+                                .registry
+                                .edge(record.id, module.id)
+                                .is_some_and(|edge| edge.mapping == MappingState::Mapped)
+                    });
+                    if exhausted {
+                        return attempts;
+                    }
+                    let module = module.map(|module| module.key.clone());
+                    if self
+                        .semantic_bindings
+                        .get(record.id)
+                        .is_some_and(|binding| {
+                            binding.scope_current && module.as_ref() == Some(binding.module())
+                        })
+                    {
+                        continue;
+                    }
+                    let item = (
+                        key,
+                        SemanticRefreshAttempt {
+                            caller: record.id,
+                            slot,
+                            module,
+                        },
+                    );
+                    if self
+                        .semantic_bindings
+                        .refresh_cursor
+                        .is_none_or(|cursor| key > cursor)
+                        && next.as_ref().is_none_or(|(old, _)| key < *old)
+                    {
+                        next = Some(item);
+                    } else if wrap.as_ref().is_none_or(|(old, _)| key < *old) {
+                        wrap = Some(item);
+                    }
+                }
+            }
+            let Some((key, attempt)) = next.or(wrap) else {
+                break;
+            };
+            selected.insert(key);
+            self.semantic_bindings.refresh_cursor = Some(key);
+            attempts.push(attempt);
+        }
+        attempts
+    }
+
+    fn seal_semantic_candidate(
+        &self,
+        caller: CallerId,
+        pin: PidPin,
+        scope: AdmissionScope,
+    ) -> Option<SemanticAdmissionCandidate> {
+        let record = self.adapter.record(caller)?;
+        if record.retired
+            || self.adapter.live_id(record.pid) != Some(caller)
+            || record.pid != pin.pid()
+            || record.start_time.is_none()
+            || record.start_time != pin.start_time()
+            || record.exe.is_none()
+            || !pin.still_the_same()
+        {
+            return None;
+        }
+        Some(SemanticAdmissionCandidate {
+            caller,
+            incarnation: record.incarnation,
+            generation: crate::inspect_system::MemberGeneration {
+                start_time: record.start_time,
+                exe: record.exe.clone(),
+            },
+            pin: Arc::new(pin),
+            scope,
+        })
+    }
+
+    pub(crate) fn prepare_legacy_semantic_candidate(
+        &self,
+        caller: CallerId,
+    ) -> Option<SemanticAdmissionCandidate> {
+        let scope = match self.engine.scope {
+            Scope::Pid(pid) => AdmissionScope::Pid(pid),
+            Scope::System => AdmissionScope::System,
+            _ => return None,
+        };
+        let pin = self.adapter.semantic_custody(caller)?;
+        if matches!(scope, AdmissionScope::Pid(pid) if pid != pin.pid()) {
+            return None;
+        }
+        self.seal_semantic_candidate(caller, pin, scope)
+    }
+
+    pub(crate) fn prepare_scoped_semantic_candidate(
+        &self,
+        prepared: &crate::discovery::caller_registry::PreparedScopedCaller<Source::Pin>,
+    ) -> Option<SemanticAdmissionCandidate> {
+        let caller = prepared.existing()?;
+        let pin = self.adapter.scoped_semantic_custody(prepared)?;
+        let candidate = self.seal_semantic_candidate(caller, pin, AdmissionScope::Cgroup)?;
+        (candidate.generation == *prepared.generation()).then_some(candidate)
+    }
+
+    /// Consume unchanged owner evidence under the exact current scope guard.
+    /// All provider/owner I/O precedes this call. After the final guard, only
+    /// retained-record matching and bounded insertion remain.
+    pub(crate) fn consume_semantic_admission(
+        &mut self,
+        candidate: SemanticAdmissionCandidate,
+        prepared: PreparedSemanticAdmission,
+        permit: Option<crate::inspect_system::inventory_cgroup::CgroupAdmissionPermit<'_>>,
+    ) -> (
+        crate::semantic_capture::CurrentPartitionReceipt,
+        Result<(), SemanticBindingRefusal>,
+    ) {
+        let (receipt, provider) = prepared.into_parts();
+        let caller = candidate.caller;
+        let result = (|| {
+            use SemanticBindingRefusal as Refusal;
+            let observed = (receipt.domain(), receipt.image());
+            if let Some(previous) = self.semantic_bindings.admission_images.get(&caller) {
+                if *previous != observed {
+                    return Err(Refusal::ImageUnproven(UnboundReason::ExecAmbiguous));
+                }
+            } else {
+                if self.semantic_bindings.admission_images.len() >= self.semantic_bindings.limit {
+                    return Err(Refusal::Capacity);
+                }
+                self.semantic_bindings
+                    .admission_images
+                    .insert(caller, observed);
+            }
+            let guarded = match (candidate.scope, permit) {
+                (AdmissionScope::Cgroup, Some(permit)) => {
+                    candidate.pin.pid() == permit.pid()
+                        && candidate.generation == *permit.generation()
+                        && permit.check()
+                        && candidate.pin.still_the_same()
+                        && receipt.original_pin().still_the_same()
+                        && permit.finish_check()
+                }
+                (AdmissionScope::Pid(pid), None) if pid == candidate.pin.pid() => {
+                    candidate.pin.still_the_same() && receipt.original_pin().still_the_same()
+                }
+                (AdmissionScope::System, None) => {
+                    candidate.pin.still_the_same() && receipt.original_pin().still_the_same()
+                }
+                _ => false,
+            };
+            if !guarded {
+                return Err(Refusal::NoLiveCaller);
+            }
+            let record = self.adapter.record(caller).ok_or(Refusal::NoLiveCaller)?;
+            if record.retired
+                || record.incarnation != candidate.incarnation
+                || record.pid != candidate.pin.pid()
+                || record.start_time != candidate.generation.start_time
+                || record.exe != candidate.generation.exe
+                || self.adapter.live_id(record.pid) != Some(caller)
+                || receipt.original_pin().pid() != candidate.pin.pid()
+                || receipt.original_pin().start_time() != candidate.generation.start_time
+            {
+                return Err(Refusal::NoLiveCaller);
+            }
+            if let Some(at) = self.semantic_bindings.index.get(&caller).copied() {
+                let existing = &mut self.semantic_bindings.bindings[at];
+                if existing.domain != receipt.domain() {
+                    return Err(Refusal::DomainConflict);
+                }
+                if existing.image != receipt.image()
+                    || !Arc::ptr_eq(&existing.pin, receipt.original_pin())
+                {
+                    return Err(Refusal::ImageUnproven(UnboundReason::ExecAmbiguous));
+                }
+                if existing.module != *provider.module() {
+                    return Err(Refusal::ModuleConflict);
+                }
+                existing.scope_current = true;
+                existing.suspension_cut = false;
+                existing.provider = Some(provider);
+                return Ok(());
+            }
+            self.semantic_bindings.insert(SemanticCallerBinding {
+                caller,
+                module: provider.module().clone(),
+                domain: receipt.domain(),
+                image: receipt.image(),
+                pin: receipt.original_pin().clone(),
+                scope_current: true,
+                suspension_cut: false,
+                provider: Some(provider),
+            })
+        })();
+        if let Err(reason) = result {
+            self.semantic_admission_refused(caller, reason.code());
+        }
+        (receipt, result)
+    }
+
+    pub(crate) fn semantic_admission_refused(&mut self, caller: CallerId, reason: &str) {
+        self.registry.record_gap(RegistryGap {
+            caller: Some(caller),
+            module: None,
+            pid: None,
+            subject: "semantic admission refused".into(),
+            reason: reason.into(),
+            budget: None,
+        });
+    }
+
+    /// A failed fresh membership proof is a persistent suspension, not only
+    /// a one-publication loss marker. History retains its original custody.
+    pub(crate) fn suspend_semantic_scope_except(&mut self, allowed: &BTreeSet<CallerId>) {
+        for binding in &mut self.semantic_bindings.bindings {
+            if binding.scope_current && !allowed.contains(&binding.caller) {
+                binding.scope_current = false;
+                binding.suspension_cut = false;
+                self.registry.note_member_unscanned(binding.caller);
+                self.tail_uncertain.insert(binding.caller);
+            }
+        }
+    }
+}
+
+impl SemanticAdmissionCandidate {
+    pub(crate) fn pin(&self) -> Arc<PidPin> {
+        self.pin.clone()
+    }
+    pub(crate) fn pid(&self) -> u32 {
+        self.pin.pid()
+    }
+}
+
+#[cfg(test)]
 impl InventoryCoordinator<OsProcessSource> {
     /// Bind one semantic caller through retained custody: the caller must
     /// be the live incarnation for its pid with its original pin, the
@@ -551,6 +877,9 @@ impl InventoryCoordinator<OsProcessSource> {
             domain,
             image,
             pin,
+            scope_current: true,
+            suspension_cut: false,
+            provider: None,
         })
     }
 
@@ -576,6 +905,9 @@ impl InventoryCoordinator<OsProcessSource> {
                 domain,
                 image,
                 pin,
+                scope_current: true,
+                suspension_cut: false,
+                provider: None,
             }),
         }
     }
@@ -785,6 +1117,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let Some(binding) = self.semantic_bindings.get(caller) else {
                 continue;
             };
+            if !binding.scope_current && binding.suspension_cut {
+                continue;
+            }
             let domain = binding.domain();
             if self.refused_semantic_domains.contains(&domain) {
                 continue;
@@ -812,6 +1147,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 image,
                 binding.pin(),
             ));
+            if !binding.scope_current {
+                let at = self.semantic_bindings.index[&caller];
+                self.semantic_bindings.bindings[at].suspension_cut = true;
+            }
             if !domains.contains(&domain) {
                 domains.push(domain);
             }
@@ -1154,7 +1493,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 };
                 let caller = binding.caller();
                 let coverage = coverages.iter().find(|coverage| {
-                    coverage.domain() == evidence.domain()
+                    binding.scope_current()
+                        && coverage.domain() == evidence.domain()
                         && coverage.image() == evidence.image()
                         && coverage.instances().contains(&evidence.router())
                 });

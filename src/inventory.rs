@@ -15,9 +15,11 @@ use crate::attach::Scope;
 use crate::capacity::{InventoryBudget, inventory_endpoint_budget};
 use crate::cli::{CaptureMode, InspectScope};
 use crate::discovery::caller_registry::{
-    CallerEvent, CallerId, ImageAuthority, MappingState, ModuleId, ModuleKey, OsProcessSource,
-    ProcessSource, RegistryLimits, UseCoverage, now_ns,
+    CallerEvent, ImageAuthority, ModuleId, OsProcessSource, ProcessSource, RegistryLimits,
+    UseCoverage, now_ns,
 };
+#[cfg(test)]
+use crate::discovery::caller_registry::{CallerId, MappingState, ModuleKey};
 use crate::discovery::engine::inventory::UnavailableImageGuard;
 use crate::discovery::engine::inventory_coordinator::{
     InventoryCoordinator, InventoryScope, PassReport,
@@ -51,6 +53,7 @@ use crate::inventory_present::{DASHBOARD_ACTIVITY_WINDOW_NS, Presentation, rende
 use crate::output::AtomicFile;
 use crate::process::PidPin;
 use anyhow::{Context as _, Result};
+#[cfg(test)]
 use p11scope_ebpf_common::ImageIdentity;
 use std::collections::BTreeMap;
 use std::io::Write as _;
@@ -1413,6 +1416,7 @@ impl ClassicDriver<'_> {
             .semantic_bindings_mut()
             .bindings_for_tick()
             .iter()
+            .filter(|binding| binding.scope_current())
             .map(|binding| binding.pin())
             .collect();
         // Borrow-split: the drain borrows the lane per quantum and the
@@ -1503,121 +1507,59 @@ fn start_semantic_lane(
     }
 }
 
-/// Resolve one refresh candidate's bind target: the first required
-/// provider, in subset order, whose registry module the candidate
-/// currently maps. The slot→object→attach-path→registry-module chain is
-/// the same proof the single-provider refresh used, applied per
-/// candidate rather than once: one refresh slot still suffices for the
-/// image hint because the image is process-level, shared by every slot
-/// of the provider. A candidate no provider's module maps stays
-/// unresolvable: no positive without proof.
+/// Test-facing selection control: physical retained provider identity, never
+/// the attachment FD pathname. Production uses the bounded rotating selector.
+#[cfg(test)]
 pub(crate) fn refresh_target_for_candidate(
     coordinator: &InventoryCoordinator<OsProcessSource>,
     lane: &crate::inventory_semantics::AttestedSemanticLane,
     caller: CallerId,
 ) -> Option<(u32, ModuleKey)> {
-    let subset = lane.subset();
-    for slots in subset.required().values() {
-        let Some(slot) = slots.first().copied() else {
-            continue;
-        };
-        // The refreshed slot's object names the provider; the registry
-        // module carrying that path is the bind target.
-        let module = subset
-            .plan()
-            .slots
-            .iter()
-            .find(|slot_info| slot_info.index == slot)
-            .and_then(|slot_info| subset.pins().attach_path_for(slot_info.object).ok())
-            .and_then(|path| {
-                let path = path.to_string_lossy().into_owned();
-                coordinator
+    for (object, slots) in lane.subset().required() {
+        let slot = *slots.first()?;
+        if let Some(module) = coordinator.registry().modules().find(|module| {
+            lane.subset().proves_provider_module(*object, &module.key)
+                && coordinator
                     .registry()
-                    .modules()
-                    .find(|module| module.paths.contains(&path))
-                    .map(|module| module.key.clone())
-            });
-        let Some(module) = module else {
-            continue;
-        };
-        let mapped = coordinator
-            .registry()
-            .module_id_for(&module)
-            .and_then(|id| coordinator.registry().edge(caller, id))
-            .is_some_and(|edge| edge.mapping == MappingState::Mapped);
-        if mapped {
-            return Some((slot, module));
+                    .edge(caller, module.id)
+                    .is_some_and(|edge| edge.mapping == MappingState::Mapped)
+        }) {
+            return Some((slot, module.key.clone()));
         }
     }
     None
 }
 
-/// Bind lane callers after the pass applied: re-prove accepted
-/// bindings and refresh a bounded, rotating set of unbound candidates.
-/// Every bind re-proves through live native state; refusals stay
-/// unbound, honestly without positives.
+/// Bootstrap through the Detailed owner receipt, independently of the native
+/// Inventory identity facade. Cgroup uses this same preparation inside its
+/// original final-sample transaction, in commit_batch_inner.
 fn bind_semantic_callers(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     lane: &mut crate::inventory_semantics::AttestedSemanticLane,
-    identity: &mut dyn NativeIdentity<PidPin>,
 ) {
     if !lane.is_live() || lane.is_finished() {
         return;
     }
-    // Accepted bindings re-prove in place through the same custody.
-    // The full window is rotation-neutral (storage and cursor untouched),
-    // so re-proof never steals the tick window's turn.
-    let rebind: Vec<(CallerId, ModuleKey, ImageIdentity)> = {
-        let len = coordinator.semantic_bindings().len();
-        coordinator
-            .semantic_bindings_mut()
-            .windowed(len)
-            .iter()
-            .map(|binding| (binding.caller(), binding.module().clone(), binding.image()))
-            .collect()
-    };
-    let domain = lane.domain();
-    for (caller, module, image) in rebind {
-        let _ = coordinator.bind_semantic_caller(caller, module, domain, image, identity);
+    for attempt in coordinator.semantic_refresh_attempts(lane, None, |_| true) {
+        let Some(module) = attempt.module else {
+            coordinator.semantic_admission_refused(attempt.caller, "provider_mapping_unproven");
+            continue;
+        };
+        let Some(candidate) = coordinator.prepare_legacy_semantic_candidate(attempt.caller) else {
+            coordinator.semantic_admission_refused(attempt.caller, "caller_custody_unproven");
+            continue;
+        };
+        match lane.prepare_caller_admission(candidate.pin(), attempt.slot, &module) {
+            Ok(prepared) => {
+                let (receipt, _) =
+                    coordinator.consume_semantic_admission(candidate, prepared, None);
+                lane.deliver_admission_receipt(receipt);
+            }
+            Err(reason) => {
+                coordinator.semantic_admission_refused(attempt.caller, &reason.to_string())
+            }
+        }
     }
-    // Unbound live callers with a mapped edge are refresh candidates,
-    // rotated by pass so no fixed prefix starves.
-    let mut candidates: Vec<(CallerId, u32)> = coordinator
-        .adapter()
-        .records()
-        .filter(|record| {
-            !record.retired
-                && coordinator.adapter().live_id(record.pid) == Some(record.id)
-                && coordinator.semantic_bindings().get(record.id).is_none()
-                && coordinator
-                    .registry()
-                    .edges_of(record.id)
-                    .any(|edge| edge.mapping == MappingState::Mapped)
-        })
-        .map(|record| (record.id, record.pid))
-        .collect();
-    if candidates.is_empty() {
-        return;
-    }
-    let passes = coordinator.passes() as usize;
-    let candidates_len = candidates.len();
-    candidates.rotate_left(passes % candidates_len);
-    // Each candidate binds against ITS provider's module: a
-    // candidate no provider's module maps stays unbound, honestly
-    // without positives. Targets resolve before the refresh closure
-    // borrows the lane, so each pass still spends one of its four
-    // slots on an unresolvable candidate.
-    let targets: Vec<(CallerId, u32, u32, ModuleKey)> = candidates
-        .into_iter()
-        .take(4)
-        .filter_map(|(caller, pid)| {
-            refresh_target_for_candidate(coordinator, lane, caller)
-                .map(|(slot, module)| (caller, pid, slot, module))
-        })
-        .collect();
-    bind_semantic_candidates(coordinator, domain, identity, &targets, |pin, slot| {
-        lane.refresh_candidate_with_custody(pin, slot)
-    });
 }
 
 /// Refresh one pass's precomputed candidates and bind every accepted
@@ -1628,6 +1570,7 @@ fn bind_semantic_callers(
 /// the fresh duplicate would strand the caller behind H0's `ptr_eq`
 /// gate. The refresh seam substitutes only H0's I/O in tests; all
 /// decisions stay in this shared production loop.
+#[cfg(test)]
 pub(crate) fn bind_semantic_candidates(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     domain: crate::attach::capture::NativeDomainId,
@@ -1767,7 +1710,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             self.warn(&warning);
         }
         if let Some(lane) = self.semantic.as_mut() {
-            bind_semantic_callers(self.coordinator, lane, identity);
+            bind_semantic_callers(self.coordinator, lane);
         }
         Ok(report)
     }

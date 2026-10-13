@@ -1005,6 +1005,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     /// Accepted semantic bindings (H3 Task 3): the tick window borrows
     /// from here; tests observe stable custody through it.
+    #[cfg(test)]
     pub(crate) fn semantic_bindings(&self) -> &semantics::SemanticBindingSet {
         &self.semantic_bindings
     }
@@ -5159,7 +5160,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     fn commit_batch_inner(
         &mut self,
         engine_changed: bool,
-        lane: Option<&mut AttestedSemanticLane>,
+        mut lane: Option<&mut AttestedSemanticLane>,
     ) -> Result<BatchReceipt> {
         // Original cgroup custody is still in self during the fallible engine
         // tail. Scoped preparation/staging then has no later fallible tail.
@@ -5255,6 +5256,51 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     }
                 }
             }
+            // Owner scans use the original prepared source pin, while this
+            // collection still owns its membership/generation bracket. At
+            // most four attempts (including failures) allocate proof here.
+            let mut semantic_prepared = Vec::with_capacity(4);
+            if let Some(lane) = lane
+                .as_deref_mut()
+                .filter(|lane| lane.is_live() && !lane.is_finished())
+            {
+                let eligible = if work.charge(prepared.len().saturating_add(1)) {
+                    prepared.values().filter_map(|pin| pin.existing()).collect()
+                } else {
+                    BTreeSet::new()
+                };
+                for attempt in self
+                    .semantic_refresh_attempts(lane, Some(&eligible), |units| work.charge(units))
+                {
+                    if !work.charge(4) {
+                        break;
+                    }
+                    let Some(module) = attempt.module else {
+                        self.semantic_admission_refused(
+                            attempt.caller,
+                            "provider_mapping_unproven",
+                        );
+                        continue;
+                    };
+                    let candidate = prepared
+                        .values()
+                        .find(|pin| pin.existing() == Some(attempt.caller))
+                        .and_then(|pin| self.prepare_scoped_semantic_candidate(pin));
+                    let Some(candidate) = candidate else {
+                        self.semantic_admission_refused(attempt.caller, "caller_custody_unproven");
+                        continue;
+                    };
+                    match lane.prepare_caller_admission(candidate.pin(), attempt.slot, &module) {
+                        Ok(owner) => semantic_prepared.push((candidate, owner)),
+                        Err(reason) => {
+                            self.semantic_admission_refused(attempt.caller, &reason.to_string())
+                        }
+                    }
+                    if !work.charge(0) {
+                        break;
+                    }
+                }
+            }
             // Prepare every provider read while retaining exclusive attach-set
             // custody. No aliases/endpoints/memberships are published here.
             let provider = if collection.reserve_projection(self.registry.edge_count()) {
@@ -5301,6 +5347,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             // records order against detection time, never the
             // pass-start clock (F7a).
             let mut allowed = BTreeSet::new();
+            let mut allowed_callers = BTreeSet::new();
             for (pid, pin) in prepared {
                 let Some(permit) = collection.permit(pid) else {
                     continue;
@@ -5313,6 +5360,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 ) {
                     Ok((id, admitted)) => {
                         allowed.insert(pid);
+                        allowed_callers.insert(id);
                         if admitted {
                             scoped_admitted += 1;
                             scoped_events.push(CallerEvent::Admitted { id });
@@ -5346,6 +5394,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 ) {
                     Ok((new, admitted)) => {
                         allowed.insert(pid);
+                        allowed_callers.insert(new);
                         if admitted {
                             scoped_admitted += 1;
                             scoped_events.push(CallerEvent::ExecRetired { old, new });
@@ -5392,11 +5441,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let verdicts =
                 absorbed.map_or_else(BTreeMap::new, |absorbed| self.record_absorbed(absorbed));
             self.project_catalog(&catalog, &verdicts, *now_ns);
+            if let Some(lane) = lane.as_deref_mut() {
+                for (candidate, prepared) in semantic_prepared {
+                    // The same final sampled member owns this permit. No
+                    // owner/provider scan, PID reopen, or replacement
+                    // candidate can run beyond this boundary.
+                    let permit = collection.permit(candidate.pid());
+                    let (receipt, _) = self.consume_semantic_admission(candidate, prepared, permit);
+                    lane.deliver_admission_receipt(receipt);
+                }
+            }
             self.registry.record_gap(RegistryGap { caller: None, module: None, pid: None,
                 subject: "scoped native owner admission deferred".into(),
                 reason: "native owner activation and refresh cannot yet be enclosed by the final cgroup membership bracket; sampled scan-pinned callers and retained native totals remain available".into(), budget: None });
             let outcome = collection.outcome(); // final cancellation/deadline poll
             if outcome != ScopedCollectionOutcome::Complete {
+                allowed_callers.clear();
                 self.registry.record_gap(RegistryGap {
                     caller: None,
                     module: None,
@@ -5408,6 +5468,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             } else {
                 cgroup_proof_complete = true;
             }
+            // A prior binding is not current membership. Suspend failed
+            // members and cut their live operations before any queued owner
+            // receipt/call can regain current standing in finalization.
+            self.suspend_semantic_scope_except(&allowed_callers);
         }
         // Provisional adjudication runs at the end of the commit's catalog
         // work, before any semantic input stages: suppression needs a

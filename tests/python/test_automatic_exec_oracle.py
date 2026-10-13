@@ -4146,6 +4146,7 @@ class ControlledInventoryObserver:
         self.records, self.callers, self.last, self.instances, self.semantic = [], {}, {}, {}, {}
         self.passed, self.previous_counts = -1, {}
         self.last_acks = {}
+        self.quiet_publications = {}
         self.release_teardown = fault not in ("delayed-teardown", "withheld-teardown")
         self.teardown_published = False
         self.module_ids = {value["path"]: f"m{index}" for index, value in enumerate(providers.values())}
@@ -4269,13 +4270,17 @@ class ControlledInventoryObserver:
                             "api_returns": {"count": api_count, "saturated": False, "historical_only_returns": 0},
                             "semantics": "observed", "mechanisms": mechanisms, "operations": ops,
                             "coverage": {"lossy": False, "reasons": []}}
-                        if self.fault in ("initial-no-calls", "recovered-no-calls") and instance_id not in self.instances and not final:
+                        quiet_prefix = (instance_id not in self.instances or self.fault == "recovered-no-calls"
+                                        and self.quiet_publications.get(instance_id, 0) < 2)
+                        if self.fault in ("initial-no-calls", "recovered-no-calls") and quiet_prefix and not final:
                             # Registration can publish before admitted returns.
                             # Serve this same independently ledgered ACK next pass.
                             semantic.update(semantics="unknown (no calls observed)", mechanisms=None,
                                             operations=None, coverage={"lossy": False, "reasons": ["no_calls"]})
                             semantic["api_returns"]["count"] = None
                             pending_no_calls = True
+                            self.quiet_publications[instance_id] = self.quiet_publications.get(instance_id, 0) + 1
+                            instance["last_seen_ns"] = time.monotonic_ns()
                         retired = context["lifecycle"] == "exec_retired"
                         if retired:
                             instance.update(state="retired", reason="instance_retired")
@@ -4665,6 +4670,12 @@ class InventoryFixtureTest(unittest.TestCase):
                          ("uncertain", "semantic_loss"))
         self.assertEqual(first["coverage"], {"lossy": True, "reasons": ["no_calls", "semantic_loss"]})
         self.assertGreater(proof["baseline"]["counts"]["completed"], 0)
+        quiet = [row for row in receipt["inventory_control"]["final_records"]
+                 if row["kind"] == "instance_observed" and row["event"]["id"] == proof["instance"]
+                 and row["seq"] < proof["baseline"]["semantic"]["seq"]
+                 and row["event"]["state"] == "uncertain"]
+        self.assertEqual(len(quiet), 2)
+        self.assertGreater(quiet[1]["event"]["last_seen_ns"], quiet[0]["event"]["last_seen_ns"])
         result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
         self.assertTrue(result["pass"], result["errors"])
         for fault in ("false-positive", "historical", "other-uncertainty"):

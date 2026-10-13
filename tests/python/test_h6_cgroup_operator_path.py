@@ -5,6 +5,7 @@ import copy
 import contextlib
 import errno
 import io
+import json
 import os
 from pathlib import Path
 import runpy
@@ -20,7 +21,7 @@ BASE = runpy.run_path(str(ROOT / "tests/python/test_automatic_exec_oracle.py"))
 H6 = BASE["H6"]
 
 
-def r1_inputs():
+def r1_inputs(marker_fn="C_GenerateRandom", attempts=1, captured=1):
     ready, start = BASE["READY"], BASE["START"]
     image = BASE["image_record"]
     target = BASE["target_record"]
@@ -65,21 +66,28 @@ def r1_inputs():
                          {"pid": 1000, "membership": "selected", "t0": ready + 500_000_000,
                           "t1": negative["t0"] - 1}],
         require_named=True, require_named_images=[1], first_unknown_images=[])
-    marker_t = measured["t0"] - 1000
-    marker = call(1, "C_GetInfo", 0, "successor-marker", "selected", marker_t, marker_t + 10)
-    ledger.extend((target(1, "C_GetInfo"), marker))
-    receipt["phases"].append({"image": 1, "fn": "C_GetInfo", "phase": "successor-marker",
-        "scope": "selected", "count": 1, "t0": marker_t, "t1": marker_t + 10})
-    receipt["warmup"]["t1"] = marker_t + 10
-    receipt["warmup"]["expected_calls"] += 1
-    receipt["warmup"]["phases"].append("successor-marker")
+    marker_t = measured["t0"] - 100_000
+    labels = []
+    ledger.append(target(1, marker_fn))
+    for index in range(attempts):
+        label, t = f"successor-1-{index + 1}", marker_t + index * 20
+        labels.append(label)
+        ledger.append(call(1, marker_fn, 0, label, "selected", t, t + 10))
+        receipt["phases"].append({"image": 1, "fn": marker_fn, "phase": label,
+            "scope": "selected", "count": 1, "t0": t, "t1": t + 10})
+    receipt["warmup"]["t1"] = t + 10
+    receipt["warmup"]["expected_calls"] += attempts
+    receipt["warmup"]["phases"].extend(labels)
     receipt["successor_policy"] = "public-successor"
     receipt["successor_ready"] = [{"image": 1, "proof_kind": "trace-row", "started_ns": marker_t,
-        "observed_ns": marker_t + 20, "deadline_ns": marker_t + 1_000_000_000,
-        "attempts": 1, "max_attempts": 20, "output_cursor": 8, "proof_cursor": 9,
-        "marker_fn": "C_GetInfo", "phases": ["successor-marker"]}]
-    rows.insert(5, BASE["named_row"](1000, 1000, "/w/caller-b", "C_GetInfo"))
-    text = BASE["trace_text"](rows, len(rows), len(rows), BASE["evidence"]())
+        "observed_ns": t + 20, "deadline_ns": marker_t + 1_000_000_000,
+        "attempts": attempts, "max_attempts": 20, "output_cursor": 8, "proof_cursor": 8 + captured,
+        "marker_fn": marker_fn, "phases": labels}]
+    rows[5:5] = [BASE["named_row"](1000, 1000, "/w/caller-b", marker_fn)] * captured
+    warm = next(phase for phase in phases if phase["phase"] == "warm")
+    warm.update(output_cursor=3, output_end=8, output_observed_ns=warm["t1"] + 1)
+    receipt["cgroup_positive_tail"] = {"output_cursor": 8 + captured, "output_end": 24 + captured,
+        "observed_ns": ready + 850_000_000}
     selected = {"path": "/sys/fs/cgroup/owned/selected", "dev": 7, "ino": 111, "magic": 0x63677270}
     outside = {"path": "/sys/fs/cgroup/owned/outside", "dev": 7, "ino": 222, "magic": 0x63677270}
     original = {"path": "/w/scope-path/current/root", "dev": 7, "ino": 111,
@@ -98,10 +106,122 @@ def r1_inputs():
         "held_after_replacement": dict(renamed, t=ready + 760_000_000),
         "outside_move_ns": negative["t0"] - 1,
     }
+    receipt["observer_argv"] = ["/held/p11scope", "trace", "--cgroup", original["path"],
+        "--module", "/w/lib.so", "--attach-backend", "singles", "--duration", "240s", "-o", "/w/trace.txt"]
+    pin = copy.deepcopy(BASE["PIN"])
+    pin["mapping"].update(file_offset=0, length=4096, permissions="r--p")
+    receipt.update(provider_before=pin, provider_after=copy.deepcopy(pin))
+    identity = {key: pin[key] for key in ("path", "dev", "ino", "sha256")}
+    ev = BASE["evidence"](authority="hash-pinned", attach_gap_ms=7273,
+        verdict_detail="concrete_gap", unprotected_live_windows=0,
+        skipped=[{"name": "discovery subject", "reason": "static probes detached and exact pairs reattached"}],
+        discovery=[dict(identity, objects=[dict(identity)])],
+        gap_classes={"observation": {"status": "lossy", "causes": ["skipped"]}})
+    ev["attach_backend"]["scope_filter"] = None
+    text = BASE["trace_text"](rows, len(rows), len(rows), ev)
     return text, ledger, receipt
 
 
 class OperatorPathOracleTests(unittest.TestCase):
+    def test_real_cgroup_recovered_gap_keeps_fourteen_missing_warm_calls(self):
+        text, ledger, receipt = r1_inputs(attempts=18, captured=4)
+        result = H6["evaluate_trace_h6"](text, ledger, receipt, text)
+        self.assertTrue(result["pass"], result["errors"])
+        self.assertEqual(result["early_coverage"]["deficit"], 14)
+        self.assertEqual(result["measured_calls"], 10)
+        self.assertEqual(result["phase_populations"]["renamed"]["named"], 3)
+
+    def test_negative_calls_cannot_fill_the_old_marker_deficit(self):
+        for phase in ("outside-b", "operator-outside"):
+            with self.subTest(phase=phase):
+                text, ledger, receipt = r1_inputs(marker_fn="C_GetInfo", attempts=18, captured=4)
+                rows = text.splitlines()[3:-2]
+                position = 5 if phase == "outside-b" else len(rows)
+                rows[position:position] = [BASE["named_row"](1000, 1000, "/w/caller-b", "C_GetInfo")] * 3
+                if phase == "outside-b":
+                    receipt["successor_ready"][0]["proof_cursor"] += 3
+                ev = json.loads(text.splitlines()[-1].split(" ", 1)[1])
+                text = BASE["trace_text"](rows, len(rows), len(rows), ev)
+                result = H6["evaluate_trace_h6"](text, ledger, receipt, text)
+                self.assertTrue(result["capture_integrity_errors"], result)
+
+    def test_delayed_positive_rows_cannot_claim_a_drained_boundary(self):
+        for boundary in ("warm", "tail"):
+            with self.subTest(boundary=boundary):
+                text, ledger, receipt = r1_inputs()
+                if boundary == "warm":
+                    next(phase for phase in receipt["phases"] if phase["phase"] == "warm")["output_end"] -= 1
+                else:
+                    receipt["cgroup_positive_tail"]["output_end"] -= 3
+                result = H6["evaluate_trace_h6"](text, ledger, receipt, text)
+                self.assertFalse(result["pass"], "undrained original population was accepted")
+
+    def test_disjoint_marker_excludes_outside_rows_despite_fourteen_missing_calls(self):
+        for phase in ("aside", "outside-b", "operator-outside"):
+            for named in (False, True):
+                with self.subTest(phase=phase, named=named):
+                    text, ledger, receipt = r1_inputs(attempts=18, captured=4)
+                    rows = text.splitlines()[3:-2]
+                    pid_image = "a" if phase == "aside" else "b"
+                    injected = (BASE["named_row"](1000, 1000, f"/w/caller-{pid_image}", "C_GetInfo")
+                                if named else BASE["unknown_row"](1000, 1000, "C_GetInfo"))
+                    position = len(rows) if phase == "operator-outside" else 5
+                    rows[position:position] = [injected] * 3
+                    if phase != "operator-outside":
+                        receipt["successor_ready"][0]["proof_cursor"] += 3
+                        receipt["cgroup_positive_tail"]["output_cursor"] += 3
+                        receipt["cgroup_positive_tail"]["output_end"] += 3
+                    ev = json.loads(text.splitlines()[-1].split(" ", 1)[1])
+                    result = H6["evaluate_trace_h6"](BASE["trace_text"](rows, len(rows), len(rows), ev), ledger, receipt)
+                    self.assertFalse(result["pass"])
+                    self.assertTrue(any("foreign count" in error for error in result["capture_integrity_errors"]), result)
+                    self.assertEqual(result["early_coverage"]["deficit"], 14)
+
+    def test_recovered_cgroup_gap_requires_real_domain_and_complete_category(self):
+        mutations = {
+            "no-argv": lambda r, e, l: r.pop("observer_argv"),
+            "wrong-root": lambda r, e, l: r["observer_argv"].__setitem__(3, "/sys/fs/cgroup"),
+            "other-module": lambda r, e, l: r["observer_argv"].__setitem__(5, "/other.so"),
+            "extra-module": lambda r, e, l: r["observer_argv"].extend(["--module", "/other.so"]),
+            "system": lambda r, e, l: r["observer_argv"].extend(["--system"]),
+            "wrong-mode": lambda r, e, l: r["observer_argv"].__setitem__(1, "profile"),
+            "other-cell": lambda r, e, l: r.update(cell="system-mixed"),
+            "other-scope": lambda r, e, l: r.update(scope_kind="system"),
+            "other-leg": lambda r, e, l: r.update(leg="replacement/singles"),
+            "extra-owner": lambda r, e, l: r["owned_pids"].append(2000),
+            "birth": lambda r, e, l: r["images"][1].update(start_time=9999),
+            "image-field": lambda r, e, l: r["images"][1].pop("mtime_ns"),
+            "namespace": lambda r, e, l: r["images"][1].update(time_namespace=99),
+            "held-root": lambda r, e, l: r["operator_path"]["held_after_replacement"].update(ino=222),
+            "mapping": lambda r, e, l: r["provider_before"].pop("mapping"),
+            "changed-provider": lambda r, e, l: r["provider_after"].update(ino=999),
+            "target": lambda r, e, l: next(row for row in l if row["kind"] == "target").update(dev=[8, 2]),
+            "authority": lambda r, e, l: e.pop("authority"),
+            "scope-filter": lambda r, e, l: e["attach_backend"].update(scope_filter="kernel-pid+bpf"),
+            "missing-filter": lambda r, e, l: e["attach_backend"].pop("scope_filter"),
+            "backend": lambda r, e, l: e["attach_backend"].update(selection="multi"),
+            "fallback": lambda r, e, l: e["attach_backend"].update(fallback="singles"),
+            "no-gap": lambda r, e, l: e.update(attach_gap_ms=0),
+            "no-provider": lambda r, e, l: e.update(discovery=[]),
+            "extra-provider": lambda r, e, l: e["discovery"].append(copy.deepcopy(e["discovery"][0])),
+            "foreign-object": lambda r, e, l: e["discovery"][0]["objects"][0].update(ino=999),
+            "digest": lambda r, e, l: e["discovery"][0].update(sha256="f" * 64),
+            "generic-gap": lambda r, e, l: e["skipped"][0].update(reason="discovery unavailable"),
+            "incomplete-gap": lambda r, e, l: e["skipped"][0].update(reason="static probe coverage gap incomplete"),
+            "no-cause": lambda r, e, l: e["gap_classes"]["observation"].update(causes=[]),
+            "attribution": lambda r, e, l: e.update(verdict_detail="attribution_only"),
+            "complete": lambda r, e, l: e.update(completeness="COMPLETE"),
+            "extra-attempts": lambda r, e, l: r["successor_ready"][0].update(max_attempts=21),
+            "renewed-wait": lambda r, e, l: r["successor_ready"][0].update(deadline_ns=BASE["STOP"]),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(guard=name):
+                text, ledger, receipt = r1_inputs(attempts=18, captured=4)
+                ev = json.loads(text.splitlines()[-1].split(" ", 1)[1])
+                mutate(receipt, ev, ledger)
+                self.assertTrue(H6["_early_gap_errors"](ev, 14, receipt, ledger, mode="trace"), name)
+
+
     def test_complete_original_population_passes(self):
         text, ledger, receipt = r1_inputs()
         result = H6["evaluate_trace_h6"](text, ledger, receipt)
@@ -162,6 +282,49 @@ class OperatorPathOracleTests(unittest.TestCase):
         result = H6["evaluate_trace_h6"](captured, ledger, receipt)
         self.assertFalse(result["pass"])
         self.assertTrue(any("foreign count" in error for error in result["errors"]), result["errors"])
+
+
+class CgroupPublicDrainTests(unittest.TestCase):
+    def test_waits_for_all_sixteen_rows_when_only_prior_thirteen_are_visible(self):
+        image = {"pid": 1000, "path": "/w/caller-b"}
+        row = BASE["named_row"](1000, 1000, image["path"], "C_GetSessionInfo")
+        capture = SimpleNamespace(lines=[row] * 13, errors=[],
+                                  thread=SimpleNamespace(is_alive=lambda: True))
+        # The existing transport has delivered the measured10 and still3;
+        # the final three returns arrive on its next normal notification.
+        capture.updates = SimpleNamespace(get=lambda timeout: capture.lines.extend([row] * 3))
+        result = H6["wait_cgroup_trace_population"](capture, image, "C_GetSessionInfo", 16, 0, named=True)
+        self.assertEqual(result["output_end"], 16)
+
+    def test_tail_rejects_an_unknown_or_foreign_current_image(self):
+        image = {"pid": 1000, "path": "/w/caller-b"}
+        good = BASE["named_row"](1000, 1000, image["path"], "C_GetSessionInfo")
+        for bad in (BASE["unknown_row"](1000, 1000, "C_GetSessionInfo"),
+                    BASE["named_row"](1000, 1000, "/w/caller-a", "C_GetSessionInfo")):
+            capture = SimpleNamespace(lines=[good] * 15 + [bad], errors=[])
+            with self.assertRaises(H6["SetupError"]):
+                H6["wait_cgroup_trace_population"](capture, image, "C_GetSessionInfo", 16, 0, named=True)
+
+    def test_drain_keeps_the_original_measurement_deadline(self):
+        tick = [BASE["START"]]
+        image = {"pid": 1000, "path": "/w/caller-b"}
+        row = BASE["named_row"](1000, 1000, image["path"], "C_GetSessionInfo")
+        budget = H6["LegBudget"](clock=lambda: tick[0], budgets={"fixed-measurement": 0.5})
+        budget.enter("fixed-measurement")
+        deadlines = dict(budget.deadlines)
+        capture = SimpleNamespace(lines=[row] * 13, errors=[], thread=SimpleNamespace(is_alive=lambda: True))
+        def late_delivery(timeout):
+            tick[0] += 600_000_000
+            capture.lines.extend([row] * 3)
+        capture.updates = SimpleNamespace(get=late_delivery)
+        token = H6["ACTIVE_LEG"].set(budget)
+        try:
+            with mock.patch.dict(H6["wait_cgroup_trace_population"].__globals__, {"monotonic_ns": lambda: tick[0]}):
+                with self.assertRaises(TimeoutError):
+                    H6["wait_cgroup_trace_population"](capture, image, "C_GetSessionInfo", 16, 0, named=True)
+            self.assertEqual(budget.deadlines, deadlines)
+        finally:
+            H6["ACTIVE_LEG"].reset(token)
 
 
 class OperatorNamespaceTests(unittest.TestCase):
@@ -376,16 +539,24 @@ class OperatorPathRouteTests(unittest.TestCase):
                 begin = clock()
                 phases.append({"image": image, "fn": fn, "count": count, "phase": phase, "scope": scope,
                                "t0": begin, "t1": clock(), "actual_cgroup": member[0]})
+                if scope == "selected":
+                    path = root / "cgroup-reentry/singles/trace" / ("caller-a" if image == 0 else "caller-b")
+                    capture.lines.extend(BASE["named_row"](1000, 1000, str(path), fn) for _ in range(count))
             caller = SimpleNamespace(pid=1000, identity={"pid_namespace": 2, "time_namespace": 3})
             stream = SimpleNamespace(record=lambda *args: {}, records=[])
-            capture = SimpleNamespace(lines=[])
+            capture = SimpleNamespace(lines=[], errors=[])
             observer = SimpleNamespace()
             pin = SimpleNamespace(path=executable)
             def local_pin(ctx, path):
-                return SimpleNamespace(path=Path(path), image_receipt=lambda row, owner: {"image": 0, "path": str(path)})
+                return SimpleNamespace(path=Path(path), image_receipt=lambda row, owner: {"image": 0, "pid": 1000, "path": str(path)})
             def execute(caller, stdout, images, mode, image_pin):
-                images.append({"image": 1, "path": str(image_pin.path)})
+                images.append({"image": 1, "pid": 1000, "path": str(image_pin.path)})
                 return {}, None, clock(), clock()
+            def warm(capture, caller, stdout, image, phases, *, group, output_cursor, marker_fn):
+                self.assertEqual(len(capture.lines), 5, "exec began before the original warm population drained")
+                self.assertEqual(marker_fn, "C_GenerateRandom", "negative and adaptive populations share a key")
+                command(caller, stdout, marker_fn, 1, 0, "successor-1-1", "selected", 1, group, phases)
+                return {"proof_cursor": len(capture.lines)}
             def observe(owners, readers, directory, argv, env):
                 observed_argv.append(argv)
                 (Path(directory) / "trace.file.txt").write_text("")
@@ -405,7 +576,7 @@ class OperatorPathRouteTests(unittest.TestCase):
                 "create_tracked": group, "move_and_verify": move, "cgroup_of": lambda pid: member[0],
                 "spawn_caller": lambda *args: (caller, stream, stream), "spawn_observer": observe,
                 "observer_ready": lambda *args: clock(), "caller_exec": execute,
-                "warm_caller": lambda *args, **kwargs: {}, "n3_command": command,
+                "warm_caller": warm, "n3_command": command,
                 "stop_observer": lambda *args: (0, clock(), 0.1), "stop_caller": lambda *args: 0,
                 "finish_readers": lambda *args: None, "provider_receipt": lambda *args: {},
                 "stop_receipt": lambda *args: {}, "session_reuse_from": lambda *args: {},

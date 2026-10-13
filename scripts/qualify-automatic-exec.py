@@ -2341,6 +2341,91 @@ SCOPED_OWNER_DEFERRAL = (
     "sampled scan-pinned callers and retained native totals remain available")
 
 
+def inventory_target_preuse_disclosure(doc, ledgers, receipt, gap, publication, caller):
+    """A refused premapped target may later prove S1; its earlier gap stays visible."""
+    phases = [row for row in receipt["inventory_control"]["measurements"]
+              if row["proof"]["caller"] == caller["id"] and row["proof"]["incarnation"] == 0]
+    if len(phases) != 1 or caller["pid"] not in receipt["owned_pids"] or caller["incarnation"] != 0:
+        return False
+    proof = phases[0]["proof"]
+    image, provider, admission = proof["image"], proof["provider"], proof["admission"]
+    owner = SimpleNamespace(pid=caller["pid"], identity={"start_time": caller["start_time"]})
+    records = receipt["inventory_control"]["final_records"]
+    by_seq = {row["seq"]: row for row in records}
+    if (image["pid"] != owner.pid or image["start_time"] != owner.identity["start_time"]
+            or image.get("image") != 0 or admission["caller"] != caller["id"] or admission["incarnation"] != 0
+            or provider not in receipt["providers"].values() or not proof["markers"]):
+        return False
+    admitted = by_seq.get(admission["seq"])
+    completed = by_seq.get(admission["completed_pass"]["seq"])
+    if (admitted is None or admitted["kind"] != "caller_event" or admitted["event"].get("event") != "admitted"
+            or completed is None or completed["kind"] != "pass_committed"
+            or r5_pass_receipt(completed) != admission["completed_pass"]
+            or not admitted["seq"] < publication["seq"]):
+        return False
+    context = r5_caller_context(admitted["event"], owner, image)
+    caller_image = caller.get("image") or {}
+    if (context["id"] != caller["id"] or context["incarnation"] != 0 or context["authority"] != "scan_pinned"
+            or caller_image.get("authority") != "scan_pinned" or caller_image.get("exe") != context["executable"]):
+        return False
+    ids = [row for parsed in ledgers.values() for row in parsed["idents"]
+           if row["pid"] == owner.pid and row["gen"] == 0]
+    mapped = [row for parsed in ledgers.values() for row in parsed["mapped"]
+              if row["pid"] == owner.pid and row["gen"] == 0]
+    calls = [row for parsed in ledgers.values() for row in parsed["batches"]
+             if row["pid"] == owner.pid and row["gen"] == 0]
+    if (len(ids) != 1 or ids[0]["start"] != image["start_time"] or ids[0]["exe"] != image["path"]
+            or mapped != [{**ids[0], "module": provider["path"], "ino": provider["ino"]}] or not calls
+            or any(row["start"] != image["start_time"] or row["exe"] != image["path"]
+                   or row["module"] != provider["path"] for row in calls)):
+        return False
+    first = proof["markers"][0]
+    dispatch, ack = first["dispatch_ns"], first["ack"]
+    if (ack["command"] != "W" or ack["seq"] != 1 or ack["attempt"] != 1
+            or sum(row == ack for parsed in ledgers.values() for row in parsed["acks"]) != 1
+            or not completed["at_ns"] < dispatch <= ack["t0"] <= min(row["t0"] for row in calls)):
+        return False
+    # Power-of-two repeat publications cover all recordings up to their count.
+    # A later final flush cannot retrospectively prove a pre-use-only gap.
+    repeats, last_publication = 1, publication
+    for row in records:
+        if row["kind"] == "gap_repeated" and row["event"].get("index") == publication["event"]["index"]:
+            event = row["event"]
+            if (set(event) != {"index", "repeats"} or type(event["repeats"]) is not int
+                    or event["repeats"] <= repeats or row["seq"] <= last_publication["seq"]
+                    or not publication["at_ns"] <= row["at_ns"] < dispatch):
+                return False
+            repeats, last_publication = event["repeats"], row
+    if repeats != gap["repeats"] or not admitted["at_ns"] <= publication["at_ns"] < dispatch:
+        return False
+    prefix = [row for row in records if row["at_ns"] < dispatch and row["event"].get("caller") == caller["id"]]
+    if any(row["kind"] in ("instance_observed", "semantic_edge_observed") for row in prefix):
+        return False
+    edges = [row for row in prefix if row["kind"] == "edge_observed"]
+    scoped = False
+    for row in edges:
+        event, coverage = row["event"], coverage_of(row["event"])
+        entries = event.get("entries") or {}
+        module = (event.get("identity_context") or {}).get("module")
+        if (row["seq"] <= admitted["seq"] or r5_caller_context(event, owner, image) != context
+                or event.get("module") != proof["module"]
+                or module != {"id": proof["module"], "status": "observed", "path": provider["path"],
+                    "device_major": provider["dev"][0], "device_minor": provider["dev"][1], "inode": provider["ino"]}
+                or event.get("mapping", {}).get("state") != "mapped" or type(entries.get("count")) is not int
+                or entries["count"] != 0 or entries.get("in_flight") is not False or entries.get("saturated") is not False
+                or entries.get("first_seen_ns") is not None or entries.get("last_seen_ns") is not None
+                or coverage.get("state") != "unknown" or coverage.get("lossy") is not None
+                or coverage.get("reason") not in (("scope_membership_unproven",) if scoped else
+                                                  ("not_attached", "scope_membership_unproven"))
+                or event.get("mechanisms") is not None or event.get("operations") is not None
+                or event.get("semantics") != "unknown (semantic capture withheld)"):
+            return False
+        scoped = coverage["reason"] == "scope_membership_unproven"
+    return scoped and any(row["kind"] == "pass_committed" and not row["event"].get("final")
+        and row["seq"] > max(edges[-1]["seq"], last_publication["seq"])
+        and row["at_ns"] < dispatch for row in records)
+
+
 def inventory_cgroup_disclosure(doc, ledgers, receipt, index):
     """Recognize retained limitations, without granting positive capture authority."""
     gap = doc["gaps"][index]
@@ -2369,6 +2454,11 @@ def inventory_cgroup_disclosure(doc, ledgers, receipt, index):
     if len(callers) != 1:
         return False
     caller = callers[0]
+    try:
+        if inventory_target_preuse_disclosure(doc, ledgers, receipt, gap, publication[0], caller):
+            return True
+    except (KeyError, TypeError, ValueError, SetupError):
+        return False
     pid, gen = caller["pid"], caller["incarnation"]
     image = caller.get("image") or {}
     candidates = [parsed for parsed in ledgers.values() if len(parsed["idents"]) == 1

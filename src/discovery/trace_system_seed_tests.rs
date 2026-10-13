@@ -110,16 +110,49 @@ impl Drop for Children {
 fn open_spawned_view(
     id: ProcessViewId,
     child: &mut Child,
-    _image: &Path,
-    after_snapshot: impl FnOnce(&mut Child),
+    image: &Path,
+    after_first_observation: impl FnOnce(&mut Child),
 ) -> (ProcessView, String) {
-    let view = ProcessView::open(id, child.id()).unwrap();
-    let path = std::fs::read_link(format!("/proc/{}/exe", child.id()))
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-    after_snapshot(child);
-    (view, path)
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let image = std::fs::canonicalize(image).unwrap();
+    let pid = child.id();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut after_first = Some(after_first_observation);
+    loop {
+        let observed = std::fs::read_link(format!("/proc/{pid}/exe"));
+        let maps = std::fs::read(format!("/proc/{pid}/maps"))
+            .ok()
+            .and_then(|bytes| p11scope_manifest::maps::parse_maps(&bytes).ok());
+        // As in engine_tests' exec-settling helper, the exe link can switch
+        // before load_elf_binary maps the new executable. Require both, and
+        // exactly the owned image rather than merely leaving the test runner.
+        let settled = observed.as_ref().is_ok_and(|path| path == &image)
+            && maps.as_ref().is_some_and(|maps| {
+                maps.iter().any(|mapping| {
+                    mapping.permissions[2] == b'x'
+                        && mapping.raw_path.as_deref() == Some(image.as_os_str().as_bytes())
+                })
+            });
+        if let Some(after_first) = after_first.take() {
+            after_first(child);
+        }
+        if settled {
+            let view = ProcessView::open(id, pid).unwrap();
+            let path = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+            assert_eq!(path, image);
+            return (view, path.to_string_lossy().into_owned());
+        }
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child {pid} exited before {image:?}"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child {pid} never mapped {image:?}; last exe {observed:?}",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 struct Io {
@@ -314,7 +347,6 @@ impl Capture {
             } else {
                 Command::new("/bin/sleep").arg("30").spawn().unwrap()
             };
-            let pid = child.id();
             children.0.push(child);
             if index == unrelated && matches!(provider_stage, ProviderStage::InitiallyMapped) {
                 ProviderFixture::ready(children.0.last_mut().unwrap());
@@ -322,7 +354,9 @@ impl Capture {
             let image = provider
                 .as_ref()
                 .filter(|_| index == unrelated)
-                .map_or(Path::new("/bin/sleep"), |provider| provider.driver.as_path());
+                .map_or(Path::new("/bin/sleep"), |provider| {
+                    provider.driver.as_path()
+                });
             let (view, path) = open_spawned_view(
                 ProcessViewId(index as u32),
                 children.0.last_mut().unwrap(),
@@ -563,17 +597,13 @@ fn late_provider_fixture_waits_for_driver_exec_before_original_view() {
     let pid = held.pid();
     let before = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
     assert_ne!(before, provider.driver, "launcher exec'd before release");
-    let (view, expected) = open_spawned_view(
-        ProcessViewId(0),
-        &mut held.0,
-        &provider.driver,
-        |child| {
+    let (view, expected) =
+        open_spawned_view(ProcessViewId(0), &mut held.0, &provider.driver, |child| {
             child.stdin.as_mut().unwrap().write_all(b"!\n").unwrap();
             // SAFETY: OwnedMapper acknowledged and stopped this unreaped child.
             assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGCONT) }, 0);
             ProviderFixture::ready(child);
-        },
-    );
+        });
     let observed = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
     assert_eq!(observed, provider.driver);
     assert!(view.still_the_same());

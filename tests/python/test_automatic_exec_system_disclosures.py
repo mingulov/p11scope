@@ -121,9 +121,11 @@ class SystemDisclosureTest(unittest.TestCase):
         self.assertEqual(result["completed_operations"], 20)
         self.assertEqual(result["physical_counted"], result["physical_entered"])
         self.assertEqual(result["expected_disclosures"], original[0]["gaps"])
-        self.assertEqual(result["system_disclosures"]["population"], "independently ledgered owned callers")
-        self.assertEqual(result["system_disclosures"]["global_discovery"], "partial")
-        self.assertEqual(result["system_disclosures"]["ambient_usage"], "unqualified")
+        limitation = result["s1"]["limitation"]
+        self.assertIn("only independently ledgered owned callers", limitation)
+        self.assertIn("Global discovery remains partial", limitation)
+        self.assertIn("ambient usage remains unqualified", limitation)
+        self.assertIn("does not prove a complete host census", limitation)
         self.assertEqual(original[0]["edges"][-1]["semantics"], "unknown (semantic capture withheld)")
 
     def test_system_disclosures_require_exact_scope_publication_and_terminal_repeats(self):
@@ -156,6 +158,17 @@ class SystemDisclosureTest(unittest.TestCase):
                 mutate(data)
                 result = H6["evaluate_inventory_h6"](*data)
                 self.assertFalse(result["pass"], result)
+        data = copy.deepcopy(original)
+        # Public repeated counts are exact only after the terminal flush.
+        data[0]["gaps"][1]["repeats"] = 2
+        records = data[2]["inventory_control"]["final_records"]
+        records.insert(-1, {"schema": "p11scope/inventory-events/v1", "kind": "gap_repeated",
+            "event": {"index": 1, "repeats": 2}, "at_ns": records[-1]["at_ns"]})
+        for seq, row in enumerate(records):
+            row["seq"] = seq
+        result = H6["evaluate_inventory_h6"](*data)
+        self.assertTrue(result["pass"], result["errors"])
+        self.assertEqual(result["expected_disclosures"][1]["repeats"], 2)
 
     def test_system_scan_disclosures_cannot_hide_owned_births_or_unknown_reasons(self):
         original = self.inputs("scan")
@@ -195,6 +208,12 @@ class SystemDisclosureTest(unittest.TestCase):
                         and row["event"].get("caller") == "c800")
                 caller["start_time"] = None
                 self.assertFalse(H6["evaluate_inventory_h6"](*data)["pass"])
+        data = copy.deepcopy(original)
+        context = next(row["event"]["identity_context"]["caller"] for row in
+            data[2]["inventory_control"]["final_records"] if row["kind"] == "caller_event"
+            and row["event"].get("caller") == "c800")
+        context["incarnation"] = False
+        self.assertFalse(H6["evaluate_inventory_h6"](*data)["pass"])
 
     def test_system_cap_disclosures_require_real_bounded_scan_metadata(self):
         original = self.inputs("cap")
@@ -223,6 +242,23 @@ class SystemDisclosureTest(unittest.TestCase):
         self.change_gap(data, "reason", CAP_REASON.replace("5 processes map 3", "0 processes map 0")
                         + "; 2 processes past the cap had no maps snapshot")
         self.assertTrue(H6["evaluate_inventory_h6"](*data)["pass"])
+        data = copy.deepcopy(original)
+        # One past-cap PID can both match A and map an unexamined object.
+        self.change_gap(data, "reason",
+            "257 processes in scope; 256 deep-scanned by provider rarity (limit 256); "
+            "1 attributed to pinned provider objects by exact maps identity; "
+            "1 processes map 1 shared objects no deep scan examined and may use undiscovered providers")
+        result = H6["evaluate_inventory_h6"](*data)
+        self.assertTrue(result["pass"], result["errors"])
+        for field, value in (("scanned", 258), ("maps_matched", 2), ("maps_matched", True)):
+            with self.subTest(pass_metadata=field, value=value):
+                data = copy.deepcopy(original)
+                records = data[2]["inventory_control"]["final_records"]
+                publication = next(row for row in records if row["kind"] == "gap_recorded")
+                completing = next(row for row in records if row["kind"] == "pass_committed"
+                                  and row["seq"] > publication["seq"])
+                completing["event"][field] = value
+                self.assertFalse(H6["evaluate_inventory_h6"](*data)["pass"])
 
     def test_system_semantic_disclosures_require_unowned_birth_and_physical_context(self):
         original = self.inputs("semantic")
@@ -230,15 +266,12 @@ class SystemDisclosureTest(unittest.TestCase):
             with self.subTest(owned=name):
                 data = copy.deepcopy(original)
                 ident = data[1][name]["idents"][0]
-                self.change_gap(data, "caller", next(row["id"] for row in data[0]["callers"]
-                    if row["pid"] == ident["pid"]) if name != "MF" else "c800")
-                if name == "MF":
-                    context = next(row["event"]["identity_context"]["caller"] for row in
-                        data[2]["inventory_control"]["final_records"] if row["kind"] == "caller_event"
-                        and row["event"].get("caller") == "c800")
-                    context.update(pid=ident["pid"], start_time=ident["start"])
-                    caller = next(row for row in data[0]["callers"] if row["id"] == "c800")
-                    caller.update(pid=ident["pid"], start_time=ident["start"])
+                context = next(row["event"]["identity_context"]["caller"] for row in
+                    data[2]["inventory_control"]["final_records"] if row["kind"] == "caller_event"
+                    and row["event"].get("caller") == "c801")
+                context.update(pid=ident["pid"], start_time=ident["start"] + 1)
+                caller = next(row for row in data[0]["callers"] if row["id"] == "c801")
+                caller.update(pid=ident["pid"], start_time=ident["start"] + 1)
                 self.assertFalse(H6["evaluate_inventory_h6"](*data)["pass"])
         for reason in ("provider_instance_unproven", "semantic_descriptor_refused", "future_refusal"):
             with self.subTest(reason=reason):
@@ -257,6 +290,19 @@ class SystemDisclosureTest(unittest.TestCase):
         data = copy.deepcopy(original)
         self.change_gap(data, "reason", "provider_mapping_unproven")
         self.assertTrue(H6["evaluate_inventory_h6"](*data)["pass"])
+
+    def test_system_owned_births_reject_boolean_generation_and_duplicate_pid_populations(self):
+        _, ledgers, receipt = self.inputs()
+        for fault in ("boolean-generation", "duplicate-pid"):
+            with self.subTest(fault=fault):
+                data, claimed = copy.deepcopy(ledgers), copy.deepcopy(receipt)
+                if fault == "boolean-generation":
+                    data["MX"]["idents"][1]["gen"] = True
+                else:
+                    data["MS"]["idents"][0].update(pid=data["MX"]["idents"][0]["pid"],
+                                                  start=data["MX"]["idents"][0]["start"] + 1)
+                    claimed["owned_pids"] = [data[name]["idents"][0]["pid"] for name in ("MX", "MS", "MF")]
+                self.assertIsNone(H6["inventory_system_owned_births"](data, claimed))
 
     def test_system_disclosures_leave_owned_count_identity_and_s1_history_failures_red(self):
         original = self.inputs()

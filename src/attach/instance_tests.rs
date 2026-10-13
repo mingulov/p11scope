@@ -1098,7 +1098,8 @@ fn dir_is_btrfs(dir: &Path) -> Result<bool> {
 #[test]
 #[ignore = "privileged: loads BPF, attaches fentry hooks and uprobes"]
 fn privileged_system_identity_anchor_preserves_watched_instance() -> Result<()> {
-    use crate::discovery::kernel_identity::{AnchorPass, ExaminedCustody};
+    use crate::discovery::identity::ExaminedObject;
+    use crate::discovery::kernel_identity::{AnchorPass, ExaminedCustody, KernelAnchorExclusions};
     use crate::discovery::sweep_attribution::{ReservationOwner, SegmentPolicy};
 
     let CmdSetup {
@@ -1118,15 +1119,57 @@ fn privileged_system_identity_anchor_preserves_watched_instance() -> Result<()> 
     ensure!(target.command(b'v')? == "SHARER");
     let mutation_after = harness.session.instance_maps().counters()?;
     target.command(b'c')?;
-    let original = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    let after_mutation = single_join(&pump_until(&mut harness, &target, 1)?)?;
     ensure!(
         mutation_after.global_bumps > mutation_before.global_bumps
             && mutation_after.shared > mutation_before.shared
-            && original != first,
+            && after_mutation != first,
         "real shared-mm mutation did not renew the watched instance: \
          {mutation_before:?} -> {mutation_after:?}"
     );
 
+    // The unexcluded anchor path must also exercise the actual native
+    // witness. Excluding selected files changes no BPF hook semantics.
+    let unexcluded_before = harness.session.instance_maps().complete_epochs(
+        target.pin.pidfd().map_err(anyhow::Error::msg)?,
+        harness.file_slot,
+    )?;
+    let unexcluded_pins = pins.clone();
+    crate::inventory_capture::collect_off_thread(
+        move || {
+            let custody = ExaminedCustody::new(
+                ReservationOwner::for_examined(SegmentPolicy::from_headroom(128, 0, 0), 0),
+                BTreeMap::new(),
+            );
+            drop(AnchorPass::prepare(
+                &unexcluded_pins,
+                [(key, object)],
+                custody,
+            ));
+        },
+        Duration::from_millis(20),
+        &mut || {},
+    );
+    let unexcluded_after = harness.session.instance_maps().complete_epochs(
+        target.pin.pidfd().map_err(anyhow::Error::msg)?,
+        harness.file_slot,
+    )?;
+    target.command(b'c')?;
+    let original = single_join(&pump_until(&mut harness, &target, 1)?)?;
+    ensure!(
+        unexcluded_after.global > unexcluded_before.global && original != after_mutation,
+        "unexcluded System identity anchors did not renew the actual watched instance"
+    );
+
+    let retained = harness
+        .session
+        .instance_tracking()
+        .watched(object)
+        .context("the original provider is still watched")?
+        .retained_target();
+    let unrelated_path = _directory.path().join("unrelated-anchor");
+    std::fs::write(&unrelated_path, [0u8; 4096])?;
+    let unrelated_path = unrelated_path.canonicalize()?;
     let main_thread = std::thread::current().id();
     let mut preserved = true;
     for pass in 0..2 {
@@ -1136,24 +1179,63 @@ fn privileged_system_identity_anchor_preserves_watched_instance() -> Result<()> 
             harness.file_slot,
         )?;
         let counters_before = harness.session.instance_maps().counters()?;
-        // System identity anchors are mapped during prepare, before an
-        // IdentitySession installs its iterator. Clone the original held
-        // files, never a pathname; map and release on the observer worker
-        // while the owned target remains idle and unchanged.
+        // Use the production exclusion snapshot of the actual watched
+        // target. An unrelated examined anchor must still be mapped and
+        // released, so the mixed pass cannot pass by disabling all anchors.
         let worker_pins = pins.clone();
+        let worker_exclusions = KernelAnchorExclusions::from_targets([&retained]);
+        let worker_unrelated = unrelated_path.clone();
         let worker = crate::inventory_capture::collect_off_thread(
-            move || {
-                let custody = ExaminedCustody::new(
-                    ReservationOwner::for_examined(SegmentPolicy::from_headroom(128, 0, 0), 0),
+            move || -> Result<_> {
+                let file = std::fs::File::open(&worker_unrelated)?;
+                let mapping = mapping_file_key(&file).map_err(anyhow::Error::msg)?;
+                let mapped = crate::discovery::identity::self_mapped_file(&file)
+                    .map_err(anyhow::Error::msg)?;
+                let examined = ExaminedObject {
+                    key: ObjectKey {
+                        device: Device {
+                            major: mapping.device_major,
+                            minor: mapping.device_minor,
+                        },
+                        inode: mapping.inode,
+                    },
+                    identity: mapped.identity,
+                    key_is_identity: false,
+                };
+                let mut custody = ExaminedCustody::new(
+                    ReservationOwner::for_examined(SegmentPolicy::from_headroom(128, 0, 0), 1),
                     BTreeMap::new(),
                 );
-                let anchors = AnchorPass::prepare(&worker_pins, [(key, object)], custody);
+                let scan = custody.begin_scan();
+                ensure!(
+                    custody.offer(scan, examined, file),
+                    "unrelated custody refused"
+                );
+                let anchors = AnchorPass::prepare_excluding(
+                    &worker_pins,
+                    [(key, object)],
+                    custody,
+                    &worker_exclusions,
+                );
+                let has_unrelated_mapping = || -> Result<bool> {
+                    Ok(std::fs::read_to_string("/proc/self/maps")?
+                        .lines()
+                        .any(|line| line.ends_with(worker_unrelated.to_str().unwrap())))
+                };
+                ensure!(
+                    has_unrelated_mapping()?,
+                    "unrelated identity anchor was not mapped"
+                );
                 drop(anchors);
-                std::thread::current().id()
+                ensure!(
+                    !has_unrelated_mapping()?,
+                    "unrelated identity anchor was not released"
+                );
+                Ok(std::thread::current().id())
             },
             Duration::from_millis(20),
             &mut || {},
-        );
+        )?;
         ensure!(
             worker != main_thread,
             "identity anchors did not use the worker"

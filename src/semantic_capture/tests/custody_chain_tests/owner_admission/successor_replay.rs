@@ -222,18 +222,11 @@ fn physical_counts(scene: &AdmissionScene) -> Vec<(CallerId, ModuleId, u64)> {
     counts
 }
 
-fn run_successor_replay(
-    selection: Selection,
-    shape: ExecShape,
-    deferred: DeferredOperation,
-    quantum: usize,
-) {
+fn admitted_scene(selection: Selection) -> Box<AdmissionScene> {
     let mut scene = Box::new(AdmissionScene::new(selection));
     scene.prepare_without_cookie();
-    let old = scene.caller();
-    let pid = scene.child.id();
-    let old_start = scene.coordinator.adapter().record(old).unwrap().start_time;
     scene.observe_entry();
+    let pid = scene.child.id();
     scene.h0.0.borrow_mut().after_refresh = Some(Box::new(move |owned| {
         owned.io.held.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
     }));
@@ -241,6 +234,65 @@ fn run_successor_replay(
         scene.pass();
     }
     scene.assert_admitted();
+    scene
+}
+
+fn inventory_original(scene: &mut AdmissionScene) -> InventoryReplay {
+    let mut inventory = InventoryReplay {
+        domain: scene.identity.0,
+        pid: scene.child.id(),
+        cookie: 41,
+        queried: Vec::new(),
+    };
+    assert_ne!(inventory.domain, scene.lane.as_ref().unwrap().domain());
+    scene.coordinator.set_semantic_binding_clock(sight_clock);
+    scene.coordinator.note_extend_receipt(&ExtendReceipt {
+        activated_roots: true,
+        exec_coverage: Some(ExecCoverage::scripted(inventory.domain, 0)),
+        ..ExtendReceipt::default()
+    });
+    assert!(
+        witness_wave(
+            scene,
+            &mut inventory,
+            ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1
+            },
+            now_ns(),
+        )
+        .is_empty()
+    );
+    inventory
+}
+
+fn retained_handoff(
+    scene: &mut AdmissionScene,
+    inventory: &mut InventoryReplay,
+    image: ImageIdentity,
+) -> CallerId {
+    let previous = scene.caller();
+    inventory.cookie = image.task_cookie;
+    let events = witness_wave(scene, inventory, image, now_ns());
+    let [CallerEvent::ExecRetired { old, new }] = events.as_slice() else {
+        panic!("the actual coordinator must commit the retained handoff: {events:?}");
+    };
+    assert_eq!(*old, previous);
+    assert_ne!(*new, previous);
+    assert_eq!(scene.caller(), *new);
+    *new
+}
+
+fn run_successor_replay(
+    selection: Selection,
+    shape: ExecShape,
+    deferred: DeferredOperation,
+    quantum: usize,
+) {
+    let mut scene = admitted_scene(selection);
+    let old = scene.caller();
+    let pid = scene.child.id();
+    let old_start = scene.coordinator.adapter().record(old).unwrap().start_time;
     let original = scene
         .coordinator
         .semantic_bindings()
@@ -477,4 +529,170 @@ fn cross_cookie_successor_replay_keeps_delayed_calls_historical() {
             run_successor_replay(selection, ExecShape::CrossCookie, deferred, quantum);
         }
     }
+}
+
+#[test]
+fn rapid_cross_cookie_handoffs_keep_custody_when_middle_never_scans() {
+    let mut scene = admitted_scene(Selection::Pid);
+    let pid = scene.child.id();
+    let first = scene.caller();
+    let original = scene
+        .coordinator
+        .semantic_bindings()
+        .get(first)
+        .unwrap()
+        .pin();
+    let deferred = {
+        let mut owned = scene.h0.0.borrow_mut();
+        owned.io.held.enqueue(pid, 0, "C_Sign", 0, 0);
+        DeferredCalls::take(&mut owned)
+    };
+    let mut inventory = inventory_original(&mut scene);
+    let middle_image = ImageIdentity {
+        task_cookie: 42,
+        exec_id: 0,
+    };
+    let middle = retained_handoff(&mut scene, &mut inventory, middle_image);
+    assert!(scene.coordinator.semantic_bindings().get(middle).is_none());
+    assert_eq!(scene.h0.0.borrow().accepted, 1);
+    // The proving row was unbound. A later Inventory wave binds the actual
+    // middle incarnation before its next exec; no Detailed pass/scan runs.
+    assert!(witness_wave(&mut scene, &mut inventory, middle_image, now_ns()).is_empty());
+    let last = retained_handoff(
+        &mut scene,
+        &mut inventory,
+        ImageIdentity {
+            task_cookie: 43,
+            exec_id: 0,
+        },
+    );
+    assert_ne!(last, first);
+    assert!(scene.coordinator.adapter().record(middle).unwrap().retired);
+    assert_eq!(
+        scene.h0.0.borrow().accepted,
+        1,
+        "the middle image never entered H0"
+    );
+    let before = physical_counts(&scene);
+    scene.h0.0.borrow_mut().io.current = Some(ImageIdentity {
+        task_cookie: 9,
+        exec_id: 0,
+    });
+    scene.h0.0.borrow_mut().after_refresh = Some(Box::new(move |owned| deferred.replay(owned, 1)));
+    for _ in 0..3 {
+        pass_with_inventory(&mut scene, &mut inventory);
+    }
+    let pin = scene
+        .coordinator
+        .semantic_bindings()
+        .get(last)
+        .expect("the final actual successor must receive fresh owner coverage")
+        .pin();
+    assert!(
+        Arc::ptr_eq(&original, &pin),
+        "the unscanned middle handoff must forward original H0 custody"
+    );
+    assert_eq!(completed(&scene, first), 0);
+    assert_eq!(completed(&scene, middle), 0);
+    assert_eq!(completed(&scene, last), 0);
+    assert_eq!(physical_counts(&scene), before);
+    let slot = scene.h0.0.borrow().io.held.slot(0, "C_SignInit");
+    scene
+        .lane
+        .as_mut()
+        .unwrap()
+        .refresh_candidate_with_custody(pin, slot)
+        .unwrap();
+    {
+        let mut owned = scene.h0.0.borrow_mut();
+        owned.io.held.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+        owned.io.held.enqueue(pid, 0, "C_Sign", 0, 0);
+    }
+    pass_with_inventory(&mut scene, &mut inventory);
+    assert_eq!(completed(&scene, last), 1);
+    assert_eq!(physical_counts(&scene), before);
+    assert_eq!(scene.h0.0.borrow().capture.continuity_cuts(), 0);
+}
+
+#[test]
+fn retained_successor_does_not_evict_full_admission_history() {
+    let mut scene = admitted_scene(Selection::Pid);
+    scene.coordinator.semantic_bindings_mut().reference_limit(1);
+    let pid = scene.child.id();
+    let old = scene.caller();
+    let original = scene
+        .coordinator
+        .semantic_bindings()
+        .get(old)
+        .unwrap()
+        .pin();
+    assert_eq!(scene.refresh_direct().0, vec![image(7)]);
+    scene
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .held
+        .enqueue(pid, 0, "C_Sign", 0, 0);
+    scene.pass();
+    assert_eq!(
+        completed(&scene, old),
+        1,
+        "an existing-key retry stays useful at N"
+    );
+    let mut inventory = inventory_original(&mut scene);
+    let new = retained_handoff(
+        &mut scene,
+        &mut inventory,
+        ImageIdentity {
+            task_cookie: 42,
+            exec_id: 0,
+        },
+    );
+    let before = physical_counts(&scene);
+    scene.h0.0.borrow_mut().io.current = Some(ImageIdentity {
+        task_cookie: 8,
+        exec_id: 0,
+    });
+    scene.h0.0.borrow_mut().after_refresh = Some(Box::new(move |owned| {
+        owned.io.held.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+        owned.io.held.enqueue(pid, 0, "C_Sign", 0, 0);
+    }));
+    for _ in 0..3 {
+        pass_with_inventory(&mut scene, &mut inventory);
+    }
+    assert!(scene.coordinator.semantic_bindings().get(new).is_none());
+    assert!(Arc::ptr_eq(
+        &original,
+        &scene
+            .coordinator
+            .semantic_bindings()
+            .get(old)
+            .unwrap()
+            .pin()
+    ));
+    assert_eq!(scene.coordinator.semantic_bindings().len(), 1);
+    assert!(
+        scene
+            .coordinator
+            .registry()
+            .instances()
+            .all(|instance| instance.caller == old)
+    );
+    assert_eq!(
+        completed(&scene, new),
+        0,
+        "a distinct N+1 caller has no semantic permission"
+    );
+    assert_eq!(
+        completed(&scene, old),
+        1,
+        "old completed history is retained"
+    );
+    assert!(scene.coordinator.registry().gaps().iter().any(|gap| {
+        gap.caller == Some(new)
+            && gap.subject == "semantic admission refused"
+            && gap.reason == "capacity"
+    }));
+    assert_eq!(physical_counts(&scene), before);
 }

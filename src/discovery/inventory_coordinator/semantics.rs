@@ -402,6 +402,7 @@ pub(crate) enum SemanticBindingRefusal {
     MappingIncomplete,
     DomainConflict,
     ModuleConflict,
+    OwnerRefused(SemanticRefusal),
     ImageUnproven(UnboundReason),
     Capacity,
 }
@@ -413,6 +414,7 @@ impl SemanticBindingRefusal {
             Self::MappingIncomplete => "mapping_incomplete",
             Self::DomainConflict => "domain_conflict",
             Self::ModuleConflict => "module_conflict",
+            Self::OwnerRefused(reason) => reason.code(),
             Self::ImageUnproven(reason) => reason.code(),
             Self::Capacity => "capacity",
         }
@@ -432,7 +434,17 @@ pub(crate) struct SemanticBindingSet {
     /// Refusal-only history across accepted owner scan / failed scope commit.
     /// A later Detailed exec cannot silently reuse the chosen scan-pinned
     /// incarnation merely because its executable pathname/inode stayed equal.
-    admission_images: HashMap<CallerId, (NativeDomainId, ImageIdentity)>,
+    admission_images: HashMap<CallerId, SemanticAdmissionHistory>,
+}
+
+/// Negative-only accepted-scan history. The first image can forbid a later
+/// join, never authorize one. A failed initial scope transaction may retain
+/// its sealed original-custody gap only until the normal finalizer consumes it.
+struct SemanticAdmissionHistory {
+    domain: NativeDomainId,
+    image: ImageIdentity,
+    initial_scope_cut: bool,
+    pending_gap: Option<PhysicalSemanticGap>,
 }
 
 impl SemanticBindingSet {
@@ -727,18 +739,29 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let caller = candidate.caller;
         let result = (|| {
             use SemanticBindingRefusal as Refusal;
+            if receipt.original_pin().pid() != candidate.pin.pid()
+                || receipt.original_pin().start_time() != candidate.generation.start_time
+            {
+                return Err(Refusal::NoLiveCaller);
+            }
             let observed = (receipt.domain(), receipt.image());
             if let Some(previous) = self.semantic_bindings.admission_images.get(&caller) {
-                if *previous != observed {
+                if (previous.domain, previous.image) != observed {
                     return Err(Refusal::ImageUnproven(UnboundReason::ExecAmbiguous));
                 }
             } else {
                 if self.semantic_bindings.admission_images.len() >= self.semantic_bindings.limit {
                     return Err(Refusal::Capacity);
                 }
-                self.semantic_bindings
-                    .admission_images
-                    .insert(caller, observed);
+                self.semantic_bindings.admission_images.insert(
+                    caller,
+                    SemanticAdmissionHistory {
+                        domain: observed.0,
+                        image: observed.1,
+                        initial_scope_cut: false,
+                        pending_gap: None,
+                    },
+                );
             }
             let guarded = match (candidate.scope, permit) {
                 (AdmissionScope::Cgroup, Some(permit)) => {
@@ -758,8 +781,30 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 _ => false,
             };
             if !guarded {
+                // H0 already accepted this exact original-Arc association,
+                // even though no coordinator binding exists yet. A genuine
+                // final-scope refusal must fence that association before old
+                // unread returns can meet a later fresh coverage receipt.
+                if candidate.scope == AdmissionScope::Cgroup
+                    && self.semantic_bindings.get(caller).is_none()
+                {
+                    let history = self
+                        .semantic_bindings
+                        .admission_images
+                        .get_mut(&caller)
+                        .expect("the accepted owner scan was recorded above");
+                    if !history.initial_scope_cut {
+                        history.pending_gap = Some(PhysicalSemanticGap::adjudicated(
+                            receipt.domain(),
+                            receipt.image(),
+                            receipt.original_pin().clone(),
+                        ));
+                        history.initial_scope_cut = true;
+                    }
+                }
                 return Err(Refusal::NoLiveCaller);
             }
+            let provider = provider.map_err(Refusal::OwnerRefused)?;
             let record = self.adapter.record(caller).ok_or(Refusal::NoLiveCaller)?;
             if record.retired
                 || record.incarnation != candidate.incarnation
@@ -801,8 +846,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 provider: Some(provider),
             })
         })();
-        if let Err(reason) = result {
-            self.semantic_admission_refused(caller, reason.code());
+        match result {
+            Err(reason) => self.semantic_admission_refused(caller, reason.code()),
+            Ok(()) => {
+                self.semantic_bindings
+                    .admission_images
+                    .get_mut(&caller)
+                    .expect("successful admission retained its accepted scan")
+                    .initial_scope_cut = false;
+            }
         }
         (receipt, result)
     }
@@ -1104,15 +1156,26 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
-    /// Assemble tail gaps for genuinely uncertain bound callers: one
-    /// minted gap per bound caller with a proven H0 association for its
-    /// exact current image, plus the affected domains for cut-failure
+    /// Assemble tail gaps for genuinely uncertain callers: one gap from a
+    /// denied first admission's accepted H0 receipt, or from a bound caller's
+    /// proven exact current image, plus affected domains for cut-failure
     /// handling. Genuine gaps before the first accepted H0 scan keep
     /// conservative refusal: no mint, no cut, audited disclosure, while
     /// the staged physical uncertainty stands on its own.
     fn assemble_tail_gaps(&mut self) -> (Vec<PhysicalSemanticGap>, Vec<NativeDomainId>) {
         let mut gaps = Vec::new();
         let mut domains = Vec::new();
+        for history in self.semantic_bindings.admission_images.values_mut() {
+            if let Some(gap) = history.pending_gap.take() {
+                if self.refused_semantic_domains.contains(&history.domain) {
+                    continue;
+                }
+                gaps.push(gap);
+                if !domains.contains(&history.domain) {
+                    domains.push(history.domain);
+                }
+            }
+        }
         for caller in std::mem::take(&mut self.tail_uncertain) {
             let Some(binding) = self.semantic_bindings.get(caller) else {
                 continue;

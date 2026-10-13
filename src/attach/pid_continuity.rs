@@ -1017,7 +1017,10 @@ impl CurrentPairs<'_> {
         loss: u64,
     ) -> Option<CompletedRearmReceipt> {
         if !binding.matches(tap, domain, view, serial)
-            || binding.key.class != ExecClass::SameTaskCandidate
+            || !matches!(
+                binding.key.class,
+                ExecClass::SameTaskCandidate | ExecClass::TaskReplaced
+            )
             || binding.key.hook_ts_ns == 0
             || slots.is_empty()
             || !clock_origins_comparable()

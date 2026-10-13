@@ -57,6 +57,7 @@ RUN = [
     ("test_help_usage_drift.py", []),
     ("test_ia32_automatic_exec.py", []),
     ("test_inventory_capacity_oracle.py", []),
+    ("test_key_operation_ledger.py", []),
     ("test_loader.py", []),
     ("test_measure_e03.py", []),
     ("test_merge_checksum_ledgers.py", []),

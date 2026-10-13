@@ -169,6 +169,17 @@ impl ProviderFixture {
         subset
     }
 
+    fn module_key(&self) -> ModuleKey {
+        let pin = self.pins.pinned().next().unwrap();
+        ModuleKey::physical(
+            pin.key.device.major,
+            pin.key.device.minor,
+            pin.key.inode,
+            Some(pin.sha256.to_owned()),
+            pin.path,
+        )
+    }
+
     fn write_manifest(&self) -> PathBuf {
         let path = self.dir.path().join("operator-input.json");
         std::fs::write(&path, serde_json::to_vec(&self.manifest).unwrap()).unwrap();
@@ -1935,8 +1946,8 @@ fn native_semantic_lane_shell_documents_task5_wiring() {
 // ---- H3 Task 3: evidence-adapter conversion ----
 
 use crate::discovery::caller_registry::instance_input::{
-    AdmittedInstanceCall, CallEvidence, CallStanding, ConversionRefusal, InstanceLifecycle,
-    InstanceReason, admit_call_from_evidence, admit_registration_from_coverage,
+    self as instance, AdmittedInstanceCall, CallEvidence, CallStanding, ConversionRefusal,
+    InstanceLifecycle, InstanceReason, admit_call_from_evidence, admit_registration_from_coverage,
     finalize_invalidation, tail_loss_from_negative,
 };
 use crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding;
@@ -2020,6 +2031,8 @@ impl ConversionScene {
         set_sight(1_005);
         let mut scene = BindingScene::new();
         let pid = std::process::id();
+        let fixture = ProviderFixture::new();
+        scene.module = fixture.module_key();
         let caller = scene.admit(pid, 50);
         scene.map(caller, pid, 60);
         let image = ImageIdentity {
@@ -2028,7 +2041,6 @@ impl ConversionScene {
         };
         // The lane starts first: bindings, coverages and batches all
         // carry the lane's own domain.
-        let fixture = ProviderFixture::new();
         let lane =
             AttestedSemanticLane::start(fixture.subset(), &Scope::Pid(pid), BackendSelection::Auto)
                 .expect("shell lane starts");
@@ -2166,8 +2178,15 @@ impl ConversionScene {
     ) {
         let input = {
             let binding = self.binding();
-            admit_registration_from_coverage(coverage, binding, router, observed_ns, boundary)
-                .expect("scripted coverage registers")
+            admit_registration_from_coverage(
+                coverage,
+                binding,
+                self.lane.subset(),
+                router,
+                observed_ns,
+                boundary,
+            )
+            .expect("scripted coverage registers")
         };
         self.scene.coordinator.registry_mut().note_instance(input);
     }
@@ -2556,6 +2575,7 @@ fn native_semantic_convert_refuses_unproven_call() {
         refusal(admit_registration_from_coverage(
             &coverage,
             binding,
+            subset,
             conv.ids[1],
             100,
             None
@@ -2567,6 +2587,7 @@ fn native_semantic_convert_refuses_unproven_call() {
         refusal(admit_registration_from_coverage(
             &coverage,
             binding,
+            subset,
             r0,
             100,
             Some(0)
@@ -3663,22 +3684,14 @@ fn native_semantic_finalize_invalidation_narrows_partition_scopes() {
     map_sibling_module(&mut conv, &other, "/task3/other.so", 70);
     let coverage = conv.coverage(vec![r0]);
     conv.register(&coverage, r0, 100, None);
-    let sibling_binding = SemanticCallerBinding::scripted(
+    // This leg tests the H2 scoped consumer, not provider association:
+    // the sibling is a reference registration and supplies no H3 proof.
+    let input = instance::registration(
+        instance::key(conv.detailed(), conv.image, r1, other.clone()),
         conv.caller,
-        other.clone(),
-        conv.detailed(),
-        conv.image,
-        conv.binding().pin(),
+        100,
+        None,
     );
-    let sibling_coverage = LaneCoverage::scripted(
-        conv.detailed(),
-        conv.image,
-        conv.endpoint(conv.init_slot),
-        vec![r1],
-    );
-    let input =
-        admit_registration_from_coverage(&sibling_coverage, &sibling_binding, r1, 100, None)
-            .expect("sibling module registers");
     conv.scene.coordinator.registry_mut().note_instance(input);
     conv.commit();
     let (losses, retirements) = {
@@ -3721,22 +3734,12 @@ fn native_semantic_finalize_invalidation_narrows_partition_scopes() {
     map_sibling_module(&mut conv, &other, "/task3/other.so", 70);
     let coverage = conv.coverage(vec![r0]);
     conv.register(&coverage, r0, 100, None);
-    let sibling_binding = SemanticCallerBinding::scripted(
+    let input = instance::registration(
+        instance::key(conv.detailed(), conv.image, r1, other.clone()),
         conv.caller,
-        other.clone(),
-        conv.detailed(),
-        conv.image,
-        conv.binding().pin(),
+        100,
+        None,
     );
-    let sibling_coverage = LaneCoverage::scripted(
-        conv.detailed(),
-        conv.image,
-        conv.endpoint(conv.init_slot),
-        vec![r1],
-    );
-    let input =
-        admit_registration_from_coverage(&sibling_coverage, &sibling_binding, r1, 100, None)
-            .expect("sibling module registers");
     conv.scene.coordinator.registry_mut().note_instance(input);
     conv.commit();
     let (losses, retirements) = finalize_invalidation(
@@ -4023,6 +4026,7 @@ fn native_semantic_register_refuses_domain_and_custody_mismatch() {
         refusal(admit_registration_from_coverage(
             &foreign_coverage,
             binding,
+            conv.lane.subset(),
             r0,
             100,
             None
@@ -4042,7 +4046,12 @@ fn native_semantic_register_refuses_domain_and_custody_mismatch() {
     );
     assert_eq!(
         refusal(admit_registration_from_coverage(
-            &stale, binding, r0, 100, None
+            &stale,
+            binding,
+            conv.lane.subset(),
+            r0,
+            100,
+            None
         )),
         Err(ConversionRefusal::Custody)
     );
@@ -5758,8 +5767,15 @@ fn h6_register(
             .semantic_bindings()
             .get(caller)
             .unwrap();
-        admit_registration_from_coverage(coverage, binding, router, observed_ns, boundary)
-            .expect("scripted coverage registers")
+        admit_registration_from_coverage(
+            coverage,
+            binding,
+            conv.lane.subset(),
+            router,
+            observed_ns,
+            boundary,
+        )
+        .expect("scripted coverage registers")
     };
     conv.scene.coordinator.registry_mut().note_instance(input);
 }
@@ -6019,7 +6035,12 @@ fn automatic_exec_late_old_records_keep_only_old_authority() {
             .unwrap();
         assert_eq!(
             refusal(admit_registration_from_coverage(
-                &coverage0, binding, r0, 3_100, None
+                &coverage0,
+                binding,
+                conv.lane.subset(),
+                r0,
+                3_100,
+                None
             )),
             Err(ConversionRefusal::Custody),
             "old coverage never registers the successor"

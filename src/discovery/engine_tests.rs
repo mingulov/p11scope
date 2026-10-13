@@ -26,6 +26,7 @@ use crate::discovery::scan::{
 };
 use crate::discovery::scheduler::MAX_PENDING_REFRESH;
 use crate::{semantics, trace};
+use p11scope_ebpf_common::{DISCOVERY_EXEC_SAME_TASK_CANDIDATE, DISCOVERY_EXEC_TASK_REPLACED};
 use p11scope_manifest::manifest::{
     Acquisition, AliasEntry, AliasGroup, FunctionRecord, InterfaceClassification, SurfaceRecord,
     SurfaceSource, Version, WalkOutcome,
@@ -38588,10 +38589,12 @@ fn automatic_exec_loader_arm_catchup_does_not_mint_for_global_or_prearm_contexts
 /// inventory request is still pending. Exercise that same ordinary apply
 /// transaction, using production sealing and retained files, before the final
 /// ordinary-batch refresh: no test receipt or recovery flag is installed.
-fn completed_rearm_route() -> (TabledSeedProvider, Engine, ScriptedSession, DiscoveryRecord) {
+fn completed_rearm_route(
+    class: u8,
+) -> (TabledSeedProvider, Engine, ScriptedSession, DiscoveryRecord) {
     let (mut fixture, mut engine, mut session) = continuity_route();
     fixture.reexec(false);
-    let record = observed_candidate_exec(&engine, &mut session);
+    let record = continuity_exec_class(&engine, &mut session, class);
     let view = engine.views[0].id();
     let pid = engine.views[0].pid();
     engine.dispatch_lifecycle_record(&mut session, &record, &mut PendingViewRetirements::new());
@@ -38629,9 +38632,16 @@ fn completed_rearm_route() -> (TabledSeedProvider, Engine, ScriptedSession, Disc
     let times = pairs.current_pair_times(&engine.plan.slots, &engine.pinned);
     assert_eq!(times.len(), engine.plan.active_slot_count());
     assert!(!times.is_empty());
+    let breaking = pairs.greatest_break_ns();
+    if class == DISCOVERY_EXEC_TASK_REPLACED {
+        assert_eq!(breaking, Some(record.hook_ts_ns));
+    }
     let empty_start = pairs.fresh_empty_started_ns();
     assert!(times.iter().all(|(_, start, end)| {
-        record.hook_ts_ns < *start && *start < *end && *end < empty_start
+        record.hook_ts_ns < *start
+            && breaking.is_none_or(|cut| cut < *start)
+            && *start < *end
+            && *end < empty_start
     }));
     drop(pairs);
     (fixture, engine, session, record)
@@ -38639,7 +38649,16 @@ fn completed_rearm_route() -> (TabledSeedProvider, Engine, ScriptedSession, Disc
 
 #[test]
 fn automatic_exec_completed_rearm_same_request_keeps_fresh_pairs() {
-    let (_fixture, mut engine, mut session, _record) = completed_rearm_route();
+    assert_completed_rearm_same_request_keeps_fresh_pairs(DISCOVERY_EXEC_SAME_TASK_CANDIDATE);
+}
+
+#[test]
+fn automatic_exec_completed_rearm_task_replaced_same_request_keeps_fresh_pairs() {
+    assert_completed_rearm_same_request_keeps_fresh_pairs(DISCOVERY_EXEC_TASK_REPLACED);
+}
+
+fn assert_completed_rearm_same_request_keeps_fresh_pairs(recovered_class: u8) {
+    let (_fixture, mut engine, mut session, _record) = completed_rearm_route(recovered_class);
     let pid = engine.views[0].pid();
     let view = engine.views[0].id();
     let bound = engine.refresh_requested[&pid].clone();
@@ -38743,8 +38762,17 @@ fn carried_completed_rearm(engine: &mut Engine, session: &mut ScriptedSession) -
 
 #[test]
 fn automatic_exec_completed_rearm_revalidates_after_fallible_preflight() {
+    assert_completed_rearm_revalidates_after_fallible_preflight(DISCOVERY_EXEC_SAME_TASK_CANDIDATE);
+}
+
+#[test]
+fn automatic_exec_completed_rearm_task_replaced_revalidates_after_fallible_preflight() {
+    assert_completed_rearm_revalidates_after_fallible_preflight(DISCOVERY_EXEC_TASK_REPLACED);
+}
+
+fn assert_completed_rearm_revalidates_after_fallible_preflight(recovered_class: u8) {
     for case in 0..10 {
-        let (_fixture, mut engine, mut session, _record) = completed_rearm_route();
+        let (_fixture, mut engine, mut session, _record) = completed_rearm_route(recovered_class);
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         engine.set_cancel_flag(cancel.clone());
         let candidate = carried_completed_rearm(&mut engine, &mut session);
@@ -38800,8 +38828,19 @@ fn automatic_exec_completed_rearm_revalidates_after_fallible_preflight() {
 
 #[test]
 fn automatic_exec_completed_rearm_health_fault_and_missing_identity_refuse() {
+    assert_completed_rearm_health_fault_and_missing_identity_refuse(
+        DISCOVERY_EXEC_SAME_TASK_CANDIDATE,
+    );
+}
+
+#[test]
+fn automatic_exec_completed_rearm_task_replaced_health_fault_and_missing_identity_refuse() {
+    assert_completed_rearm_health_fault_and_missing_identity_refuse(DISCOVERY_EXEC_TASK_REPLACED);
+}
+
+fn assert_completed_rearm_health_fault_and_missing_identity_refuse(recovered_class: u8) {
     for case in 0..8 {
-        let (_fixture, engine, mut session, _record) = completed_rearm_route();
+        let (_fixture, engine, mut session, _record) = completed_rearm_route(recovered_class);
         let request = &engine.refresh_requested[&engine.views[0].pid()];
         {
             let mut pairs = session.pid_continuity.as_ref().unwrap().borrow_mut();
@@ -38834,7 +38873,16 @@ fn automatic_exec_completed_rearm_health_fault_and_missing_identity_refuse() {
 
 #[test]
 fn automatic_exec_completed_rearm_rejects_foreign_owner_and_renewal() {
-    let (_fixture, mut engine, mut session, record) = completed_rearm_route();
+    assert_completed_rearm_rejects_foreign_owner_and_renewal(DISCOVERY_EXEC_SAME_TASK_CANDIDATE);
+}
+
+#[test]
+fn automatic_exec_completed_rearm_task_replaced_rejects_foreign_owner_and_renewal() {
+    assert_completed_rearm_rejects_foreign_owner_and_renewal(DISCOVERY_EXEC_TASK_REPLACED);
+}
+
+fn assert_completed_rearm_rejects_foreign_owner_and_renewal(recovered_class: u8) {
+    let (_fixture, mut engine, mut session, record) = completed_rearm_route(recovered_class);
     let view = engine.views[0].id();
     let pid = engine.views[0].pid();
     let request = engine.refresh_requested[&pid].clone();
@@ -38913,11 +38961,22 @@ fn automatic_exec_completed_rearm_rejects_foreign_owner_and_renewal() {
 
 #[test]
 fn automatic_exec_completed_rearm_new_exec_cannot_borrow_previous_recovery() {
+    assert_completed_rearm_new_exec_cannot_borrow_previous_recovery(
+        DISCOVERY_EXEC_SAME_TASK_CANDIDATE,
+    );
+}
+
+#[test]
+fn automatic_exec_completed_rearm_task_replaced_new_exec_cannot_borrow_previous_recovery() {
+    assert_completed_rearm_new_exec_cannot_borrow_previous_recovery(DISCOVERY_EXEC_TASK_REPLACED);
+}
+
+fn assert_completed_rearm_new_exec_cannot_borrow_previous_recovery(recovered_class: u8) {
     for class in [
         p11scope_ebpf_common::DISCOVERY_EXEC_SAME_TASK_CANDIDATE,
         p11scope_ebpf_common::DISCOVERY_EXEC_TASK_REPLACED,
     ] {
-        let (_fixture, mut engine, mut session, _record) = completed_rearm_route();
+        let (_fixture, mut engine, mut session, _record) = completed_rearm_route(recovered_class);
         let candidate = carried_completed_rearm(&mut engine, &mut session);
         // Encode this class before the production decoder/observer and binding.
         let newer = continuity_exec_class(&engine, &mut session, class);
@@ -38978,7 +39037,8 @@ fn automatic_exec_completed_rearm_requires_accepted_publication_for_acknowledgem
         candidate_publication_disposition(false, &failed_publication),
         candidate_publication_disposition(false, &Ok(())),
     ] {
-        let (_fixture, mut engine, mut session, _record) = completed_rearm_route();
+        let (_fixture, mut engine, mut session, _record) =
+            completed_rearm_route(DISCOVERY_EXEC_SAME_TASK_CANDIDATE);
         let candidate = carried_completed_rearm(&mut engine, &mut session);
         let view = engine.views[0].id();
         let pid = engine.views[0].pid();
@@ -39014,7 +39074,8 @@ fn automatic_exec_completed_rearm_requires_accepted_publication_for_acknowledgem
         );
         drop(candidate);
     }
-    let (_fixture, mut engine, _session, _record) = completed_rearm_route();
+    let (_fixture, mut engine, _session, _record) =
+        completed_rearm_route(DISCOVERY_EXEC_SAME_TASK_CANDIDATE);
     let view = engine.views[0].id();
     let serial = engine.refresh_requested[&engine.views[0].pid()].serial;
     engine.settle_applied_exec_rearms(
@@ -39033,7 +39094,16 @@ fn automatic_exec_completed_rearm_requires_accepted_publication_for_acknowledgem
 
 #[test]
 fn automatic_exec_completed_rearm_requires_every_requested_unique_pair() {
-    let (_fixture, engine, mut session, _record) = completed_rearm_route();
+    assert_completed_rearm_requires_every_requested_unique_pair(DISCOVERY_EXEC_SAME_TASK_CANDIDATE);
+}
+
+#[test]
+fn automatic_exec_completed_rearm_task_replaced_requires_every_requested_unique_pair() {
+    assert_completed_rearm_requires_every_requested_unique_pair(DISCOVERY_EXEC_TASK_REPLACED);
+}
+
+fn assert_completed_rearm_requires_every_requested_unique_pair(recovered_class: u8) {
+    let (_fixture, engine, mut session, _record) = completed_rearm_route(recovered_class);
     let request = &engine.refresh_requested[&engine.views[0].pid()];
     for slots in [
         Vec::new(),
@@ -39077,7 +39147,8 @@ fn automatic_exec_completed_rearm_requires_every_requested_unique_pair() {
 #[test]
 fn automatic_exec_completed_rearm_excludes_ordinary_targets_and_multi_siblings() {
     for grouped in [false, true] {
-        let (_fixture, engine, mut session, _record) = completed_rearm_route();
+        let (_fixture, engine, mut session, _record) =
+            completed_rearm_route(DISCOVERY_EXEC_SAME_TASK_CANDIDATE);
         let request = &engine.refresh_requested[&engine.views[0].pid()];
         let selected = engine.plan.slots.last().unwrap().clone();
         let spared = &engine.plan.slots[..engine.plan.slots.len() - 1];
@@ -39116,8 +39187,19 @@ fn automatic_exec_completed_rearm_excludes_ordinary_targets_and_multi_siblings()
 
 #[test]
 fn automatic_exec_completed_rearm_clock_boundaries_and_unavailability_refuse() {
+    assert_completed_rearm_clock_boundaries_and_unavailability_refuse(
+        DISCOVERY_EXEC_SAME_TASK_CANDIDATE,
+    );
+}
+
+#[test]
+fn automatic_exec_completed_rearm_task_replaced_clock_boundaries_and_unavailability_refuse() {
+    assert_completed_rearm_clock_boundaries_and_unavailability_refuse(DISCOVERY_EXEC_TASK_REPLACED);
+}
+
+fn assert_completed_rearm_clock_boundaries_and_unavailability_refuse(recovered_class: u8) {
     for case in 0..7 {
-        let (_fixture, mut engine, mut session, record) = completed_rearm_route();
+        let (_fixture, mut engine, mut session, record) = completed_rearm_route(recovered_class);
         let request = engine.refresh_requested[&engine.views[0].pid()].clone();
         let mut recovery = engine
             .live_candidate(
@@ -39184,7 +39266,16 @@ fn automatic_exec_completed_rearm_clock_boundaries_and_unavailability_refuse() {
 
 #[test]
 fn automatic_exec_completed_rearm_mixed_pre_and_post_exec_pairs_refuse() {
-    let (_fixture, mut engine, mut session, record) = completed_rearm_route();
+    assert_completed_rearm_mixed_pre_and_post_exec_pairs_refuse(DISCOVERY_EXEC_SAME_TASK_CANDIDATE);
+}
+
+#[test]
+fn automatic_exec_completed_rearm_task_replaced_mixed_pre_and_post_exec_pairs_refuse() {
+    assert_completed_rearm_mixed_pre_and_post_exec_pairs_refuse(DISCOVERY_EXEC_TASK_REPLACED);
+}
+
+fn assert_completed_rearm_mixed_pre_and_post_exec_pairs_refuse(recovered_class: u8) {
+    let (_fixture, mut engine, mut session, record) = completed_rearm_route(recovered_class);
     let mut recovery = engine
         .live_candidate(
             engine.pinned.clone(),
@@ -39239,84 +39330,91 @@ fn automatic_exec_completed_rearm_mixed_pre_and_post_exec_pairs_refuse() {
 
 #[test]
 fn automatic_exec_completed_rearm_unclassified_recovery_stays_conservative() {
-    for class in [
-        p11scope_ebpf_common::DISCOVERY_EXEC_UNKNOWN,
-        p11scope_ebpf_common::DISCOVERY_EXEC_TASK_REPLACED,
-    ] {
-        let (_fixture, mut engine, mut session, _record) = completed_rearm_route();
-        let mut record = exec_record_for(engine.views[0].pid());
-        record.pid_tgid |= u64::from(engine.views[0].pid());
-        record.case_id = class;
-        session
-            .pid_continuity
-            .as_ref()
-            .unwrap()
-            .borrow_mut()
-            .observe(record);
-        engine.dispatch_lifecycle_record(&mut session, &record, &mut PendingViewRetirements::new());
-        let mut recovery = engine
-            .live_candidate(
-                engine.pinned.clone(),
-                engine
-                    .modules
-                    .iter()
-                    .map(|module| module.scanned.clone())
-                    .collect(),
-                Vec::new(),
-            )
-            .unwrap();
-        recovery.delta.replace = recovery.plan.slots.clone();
-        assert!(
+    let (_fixture, mut engine, mut session, _record) =
+        completed_rearm_route(DISCOVERY_EXEC_SAME_TASK_CANDIDATE);
+    let mut record = exec_record_for(engine.views[0].pid());
+    record.pid_tgid |= u64::from(engine.views[0].pid());
+    record.case_id = p11scope_ebpf_common::DISCOVERY_EXEC_UNKNOWN;
+    session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow_mut()
+        .observe(record);
+    engine.dispatch_lifecycle_record(&mut session, &record, &mut PendingViewRetirements::new());
+    let mut recovery = engine
+        .live_candidate(
+            engine.pinned.clone(),
             engine
-                .apply_candidate(&mut session, recovery, &mut true, false, &[])
-                .unwrap()
-                .accepted()
-        );
-        session
-            .pid_continuity
-            .as_ref()
+                .modules
+                .iter()
+                .map(|module| module.scanned.clone())
+                .collect(),
+            Vec::new(),
+        )
+        .unwrap();
+    recovery.delta.replace = recovery.plan.slots.clone();
+    assert!(
+        engine
+            .apply_candidate(&mut session, recovery, &mut true, false, &[])
             .unwrap()
-            .borrow_mut()
-            .fresh_empty_started_ns();
-        let request = &engine.refresh_requested[&engine.views[0].pid()];
-        assert!(
-            session
-                .prepare_completed_rearm(
-                    request.exec_binding.as_ref().unwrap(),
-                    &engine.views[0],
-                    request.serial,
-                    &engine.plan.slots,
-                    &[],
-                    &engine.pinned
-                )
-                .is_none()
-        );
-        let before = session
+            .accepted()
+    );
+    session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow_mut()
+        .fresh_empty_started_ns();
+    let request = &engine.refresh_requested[&engine.views[0].pid()];
+    assert!(
+        session
+            .prepare_completed_rearm(
+                request.exec_binding.as_ref().unwrap(),
+                &engine.views[0],
+                request.serial,
+                &engine.plan.slots,
+                &[],
+                &engine.pinned
+            )
+            .is_none()
+    );
+    let before = session
+        .pid_continuity
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .identities();
+    assert!(
+        apply_ordinary_batch(&mut engine, &mut session, Vec::new())
+            .unwrap()
+            .required_complete
+    );
+    assert_ne!(
+        session
             .pid_continuity
             .as_ref()
             .unwrap()
             .borrow()
-            .identities();
-        assert!(
-            apply_ordinary_batch(&mut engine, &mut session, Vec::new())
-                .unwrap()
-                .required_complete
-        );
-        assert_ne!(
-            session
-                .pid_continuity
-                .as_ref()
-                .unwrap()
-                .borrow()
-                .identities(),
-            before
-        );
-    }
+            .identities(),
+        before
+    );
 }
 
 #[test]
 fn automatic_exec_completed_rearm_partial_native_success_cannot_mint_subset() {
-    let (_fixture, mut engine, mut session, _record) = completed_rearm_route();
+    assert_completed_rearm_partial_native_success_cannot_mint_subset(
+        DISCOVERY_EXEC_SAME_TASK_CANDIDATE,
+    );
+}
+
+#[test]
+fn automatic_exec_completed_rearm_task_replaced_partial_native_success_cannot_mint_subset() {
+    assert_completed_rearm_partial_native_success_cannot_mint_subset(DISCOVERY_EXEC_TASK_REPLACED);
+}
+
+fn assert_completed_rearm_partial_native_success_cannot_mint_subset(recovered_class: u8) {
+    let (_fixture, mut engine, mut session, _record) = completed_rearm_route(recovered_class);
     let failed = engine.plan.slots.last().unwrap().index;
     session
         .pid_continuity
@@ -39382,7 +39480,20 @@ fn automatic_exec_completed_rearm_partial_native_success_cannot_mint_subset() {
 
 #[test]
 fn automatic_exec_completed_rearm_held_identity_changes_refuse_prepare_and_apply() {
-    let (fixture, mut engine, mut session, _record) = completed_rearm_route();
+    assert_completed_rearm_held_identity_changes_refuse_prepare_and_apply(
+        DISCOVERY_EXEC_SAME_TASK_CANDIDATE,
+    );
+}
+
+#[test]
+fn automatic_exec_completed_rearm_task_replaced_held_identity_changes_refuse_prepare_and_apply() {
+    assert_completed_rearm_held_identity_changes_refuse_prepare_and_apply(
+        DISCOVERY_EXEC_TASK_REPLACED,
+    );
+}
+
+fn assert_completed_rearm_held_identity_changes_refuse_prepare_and_apply(recovered_class: u8) {
+    let (fixture, mut engine, mut session, _record) = completed_rearm_route(recovered_class);
     let candidate = carried_completed_rearm(&mut engine, &mut session);
     let request = &engine.refresh_requested[&engine.views[0].pid()];
     for field in 0..2 {
@@ -39434,7 +39545,8 @@ fn automatic_exec_completed_rearm_held_identity_changes_refuse_prepare_and_apply
 
 #[test]
 fn automatic_exec_completed_rearm_changed_provider_keeps_ordinary_delta_authority() {
-    let (mut fixture, mut engine, mut session, _record) = completed_rearm_route();
+    let (mut fixture, mut engine, mut session, _record) =
+        completed_rearm_route(DISCOVERY_EXEC_SAME_TASK_CANDIDATE);
     let replacement = fixture.replace_mapped_provider();
     engine.module_hints.push(replacement);
     let before = session
@@ -39467,7 +39579,8 @@ fn automatic_exec_completed_rearm_changed_provider_keeps_ordinary_delta_authorit
 
 #[test]
 fn automatic_exec_completed_rearm_health_read_follows_held_registry_validation() {
-    let (_fixture, mut engine, mut session, _record) = completed_rearm_route();
+    let (_fixture, mut engine, mut session, _record) =
+        completed_rearm_route(DISCOVERY_EXEC_SAME_TASK_CANDIDATE);
     let candidate = carried_completed_rearm(&mut engine, &mut session);
     let request = &engine.refresh_requested[&engine.views[0].pid()];
     let reads = session
@@ -39519,7 +39632,23 @@ fn automatic_exec_completed_rearm_health_read_follows_held_registry_validation()
 
 #[test]
 fn automatic_exec_completed_rearm_final_clock_producer_advance_refuses_before_mutation() {
-    let (_fixture, mut engine, mut session, _record) = completed_rearm_route();
+    assert_completed_rearm_final_clock_producer_advance_refuses_before_mutation(
+        DISCOVERY_EXEC_SAME_TASK_CANDIDATE,
+    );
+}
+
+#[test]
+fn automatic_exec_completed_rearm_task_replaced_final_clock_producer_advance_refuses_before_mutation()
+ {
+    assert_completed_rearm_final_clock_producer_advance_refuses_before_mutation(
+        DISCOVERY_EXEC_TASK_REPLACED,
+    );
+}
+
+fn assert_completed_rearm_final_clock_producer_advance_refuses_before_mutation(
+    recovered_class: u8,
+) {
+    let (_fixture, mut engine, mut session, _record) = completed_rearm_route(recovered_class);
     let candidate = carried_completed_rearm(&mut engine, &mut session);
     let pid = engine.views[0].pid();
     let view = engine.views[0].id();
@@ -39581,7 +39710,8 @@ fn automatic_exec_completed_rearm_final_clock_unknown_or_incomparable_refuses() 
         (same, same, Some("monotonic 0")),
         (same, same, Some("monotonic unknown 0")),
     ] {
-        let (_fixture, mut engine, mut session, _record) = completed_rearm_route();
+        let (_fixture, mut engine, mut session, _record) =
+            completed_rearm_route(DISCOVERY_EXEC_SAME_TASK_CANDIDATE);
         let candidate = carried_completed_rearm(&mut engine, &mut session);
         let pid = engine.views[0].pid();
         let view = engine.views[0].id();
@@ -39619,7 +39749,8 @@ fn automatic_exec_completed_rearm_final_clock_unknown_or_incomparable_refuses() 
 
 #[test]
 fn automatic_exec_completed_rearm_final_clock_healthy_origin_keeps_current_pairs() {
-    let (_fixture, mut engine, mut session, _record) = completed_rearm_route();
+    let (_fixture, mut engine, mut session, _record) =
+        completed_rearm_route(DISCOVERY_EXEC_SAME_TASK_CANDIDATE);
     let candidate = carried_completed_rearm(&mut engine, &mut session);
     let (identities, calls, frontier) = {
         let pairs = session.pid_continuity.as_ref().unwrap().borrow();

@@ -38,6 +38,7 @@ SUITE_DIR = "tests/python"
 # (file, extra args). A file may appear more than once with different args.
 RUN = [
     ("test_automatic_exec_oracle.py", []),
+    ("test_automatic_exec_system_disclosures.py", []),
     ("test_automatic_initial_readiness.py", []),
     ("test_bpf_noninterference.py", []),
     ("test_cargo_wrapper.py", []),

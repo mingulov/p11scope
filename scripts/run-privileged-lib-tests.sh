@@ -95,6 +95,10 @@ attach::instance_tests::privileged_instance_reload_race_has_zero_false_joins
 attach::instance_tests::privileged_instance_routing_separates_reload_sibling_and_mutation
 attach::instance_tests::privileged_instance_vfork_unmap_globalizes
 attach::instance_tests::privileged_instance_zombie_leader_sharer_globalizes
+# H6 observer mapping interactions: owned idle target and genuine external
+# mutation control; distinguish ordinary scans from System identity anchors.
+attach::instance_tests::privileged_inventory_worker_scan_preserves_watched_instance
+attach::instance_tests::privileged_system_identity_anchor_preserves_watched_instance
 # DR-CLASSIC-PID0: classic --pid sessions (auto, singles, forced multi)
 # keep a foreign process and a PID reuser out at the kernel boundary (BPF
 # run statistics flat while they call) and in counts and call events; they

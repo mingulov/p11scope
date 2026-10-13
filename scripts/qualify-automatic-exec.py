@@ -2081,7 +2081,9 @@ def _evaluate_inventory_h6(doc, ledgers, receipt):
             semantics = edge.get("semantics")
             if semantics is not None and not str(semantics).startswith("unknown"):
                 errors.append(f"count-only provider {module_key} publishes semantic rows")
-    allowed_gaps = set(receipt.get("allowed_gap_subjects", []))
+    # These disclosures need their full controlled scope/ledger proof below;
+    # a subject-only allowlist can never authorize them.
+    allowed_gaps = set(receipt.get("allowed_gap_subjects", [])) - CGROUP_DISCLOSURE_SUBJECTS
     allow_path_gaps = receipt.get("allow_path_gaps", False)
     gaps = [(gap.get("subject"), gap.get("detail")) for gap in doc.get("gaps", [])]
     for subject, _ in gaps:
@@ -2331,6 +2333,110 @@ def inventory_sibling_s1_errors(doc, ledger, receipt, records):
     if not summaries:
         errors.append("SystemMixed sibling attested semantic history is absent")
     return errors, summaries
+
+
+CGROUP_DISCLOSURE_SUBJECTS = {"scoped native owner admission deferred", "semantic admission refused"}
+SCOPED_OWNER_DEFERRAL = (
+    "native owner activation and refresh cannot yet be enclosed by the final cgroup membership bracket; "
+    "sampled scan-pinned callers and retained native totals remain available")
+
+
+def inventory_cgroup_disclosure(doc, ledgers, receipt, index):
+    """Recognize retained limitations, without granting positive capture authority."""
+    gap = doc["gaps"][index]
+    records = receipt["inventory_control"]["final_records"]
+    observation = doc.get("observation") or {}
+    if (doc.get("scope") != "cgroup" or receipt.get("scope_kind") != "cgroup"
+            or receipt.get("scope_label") != "cgroup" or observation.get("lane") != "native"
+            or (observation.get("attach") or {}).get("scope_filter") != "bpf-cgroup"
+            or records[0]["kind"] != "started" or records[0]["event"].get("scope") != "cgroup"
+            or doc.get("gaps_suppressed") != 0
+            or set(gap) != {"subject", "reason", "caller", "module", "pid", "budget", "repeats"}
+            or gap["module"] is not None or gap["pid"] is not None or gap["budget"] is not None
+            or type(gap["repeats"]) is not int or type(observation.get("passes")) is not int
+            or not 1 <= gap["repeats"] <= observation["passes"]):
+        return False
+    publication = [row for row in records if row["kind"] == "gap_recorded"
+                   and row["event"].get("index") == index]
+    expected = {**{key: value for key, value in gap.items() if key != "repeats"}, "index": index}
+    if len(publication) != 1 or publication[0]["event"] != expected:
+        return False
+    if gap["subject"] == "scoped native owner admission deferred":
+        return gap["caller"] is None and gap["reason"] == SCOPED_OWNER_DEFERRAL
+    if gap["subject"] != "semantic admission refused" or gap["reason"] != "semantic_unavailable":
+        return False
+    callers = [row for row in doc["callers"] if row["id"] == gap["caller"]]
+    if len(callers) != 1:
+        return False
+    caller = callers[0]
+    pid, gen = caller["pid"], caller["incarnation"]
+    image = caller.get("image") or {}
+    candidates = [parsed for parsed in ledgers.values() if len(parsed["idents"]) == 1
+                  and parsed["idents"][0]["pid"] == pid]
+    if (pid not in receipt["owned_pids"] or len(candidates) != 1 or gen != 0
+            or caller.get("retired") is not False or caller.get("lifecycle") != "mapped"
+            or image.get("authority") != "scan_pinned"):
+        return False
+    parsed, ident = candidates[0], candidates[0]["idents"][0]
+    if (ident["start"] != caller["start_time"] or ident["gen"] != gen
+            or ident["exe"] != (image.get("exe") or {}).get("path")
+            or any(parsed[key] for key in ("batches", "held", "returned", "zombie", "execs",
+                                          "acks", "controls", "strange", "unflushed"))
+            or any(row["pid"] == pid for ledger in ledgers.values() for row in ledger["batches"])
+            or len(parsed["mapped"]) != 1 or parsed["readys"] != [ident]
+            or parsed["dones"] != [{**ident, "status": "ok"}]):
+        return False
+    mapped = parsed["mapped"][0]
+    if any(mapped.get(key) != value for key, value in ident.items()):
+        return False
+    providers = [(key, row) for key, row in receipt["providers"].items()
+                 if row["path"] == mapped["module"] and row["ino"] == mapped["ino"]]
+    if len(providers) != 1:
+        return False
+    name, provider = providers[0]
+    modules = [row for row in doc["modules"] if provider["path"] in row.get("paths", [])]
+    if (len(modules) != 1 or modules[0]["identity"].get("inode") != provider["ino"]
+            or modules[0]["identity"].get("sha256") != provider["sha256"]
+            or receipt["expected_edges"].get(f"{pid}:{gen}:{name}") != {"zero_ok": True}
+            or receipt["expected_incarnations"].get(str(pid)) != {
+                "gens": {str(gen): {"exe": ident["exe"], "retired": False}}}
+            or not any(row["pid"] == pid and row["membership"] == "selected"
+                and row["t0"] <= receipt["observer_ready_ns"] <= receipt["observer_stopped_ns"] <= row["t1"]
+                for row in receipt.get("scope_intervals", []))):
+        return False
+    admissions = [row for row in records if row["kind"] == "caller_event"
+                  and row["event"].get("caller") == caller["id"]]
+    if len(admissions) != 1 or admissions[0]["event"].get("event") != "admitted":
+        return False
+    context = r5_admitted_subject(admissions[0]["event"])
+    if (admissions[0]["seq"] >= publication[0]["seq"] or context != {
+            "id": caller["id"], "pid": pid, "start_time": ident["start"], "incarnation": gen,
+            "authority": "scan_pinned", "lifecycle": "mapped", "status": "observed",
+            "executable": image["exe"]}
+            or any(row.get("caller") == caller["id"] for row in doc["instances"] + doc["semantic_edges"])
+            or any(row["kind"] in ("instance_observed", "semantic_edge_observed")
+                and row["event"].get("caller") == caller["id"] for row in records)):
+        return False
+    edges = [row for row in doc["edges"] if row["caller"] == caller["id"]]
+    history = [row for row in records if row["kind"] == "edge_observed"
+               and row["event"].get("caller") == caller["id"]]
+    scoped = [row["seq"] for row in history
+              if coverage_of(row["event"]).get("reason") == "scope_membership_unproven"]
+    if (len(edges) != 1 or not scoped
+            or coverage_of(edges[0]).get("reason") != "scope_membership_unproven"
+            or any(coverage_of(row["event"]).get("reason") != "scope_membership_unproven"
+                and not (coverage_of(row["event"]).get("reason") == "not_attached"
+                    and row["seq"] < min(scoped[0], publication[0]["seq"])) for row in history)):
+        return False
+    return all(
+        row["module"] == modules[0]["id"] and row.get("mapping", {}).get("state") == "mapped"
+        and row.get("entries", {}).get("count") == 0
+        and row["entries"].get("saturated") is False and row["entries"].get("in_flight") is False
+        and coverage_of(row).get("state") == "unknown"
+        and coverage_of(row).get("lossy") is None
+        and row.get("mechanisms") is None and row.get("operations") is None
+        and row.get("semantics") == "unknown (semantic capture withheld)"
+        for row in edges + [record["event"] for record in history])
 
 
 def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
@@ -2588,11 +2694,22 @@ def evaluate_controlled_inventory_h6(doc, ledgers, receipt):
     # physical projection; the actual S1 facts are independently judged above.
     physical_doc = {**doc, "instances": [], "semantic_edges": [], "edges": [
         {**row, "semantics": None, "mechanisms": None, "operations": None} for row in doc.get("edges", [])]}
+    # Validate against the original rows, before the physical-only projection
+    # removes S1. Keep every disclosure in the reported result.
+    physical_doc["gaps"], disclosures = [], []
+    for index, gap in enumerate(doc.get("gaps", [])):
+        if gap.get("subject") in CGROUP_DISCLOSURE_SUBJECTS and inventory_cgroup_disclosure(
+                doc, ledgers, receipt, index):
+            disclosures.append(gap)
+        else:
+            physical_doc["gaps"].append(gap)
     physical_receipt = {**receipt, "s1_expected": False, "expected_edges": adjusted}
     physical_receipt.pop("inventory_control")
     physical_receipt["allowed_gap_subjects"] = sorted(set(receipt.get("allowed_gap_subjects", [])) | {
         gap["event"]["subject"] for summary in summaries for gap in summary["early"]["gaps"]})
     result = _evaluate_inventory_h6(physical_doc, ledgers, physical_receipt)
+    result["gaps"] = [(gap.get("subject"), gap.get("detail")) for gap in doc.get("gaps", [])]
+    result["expected_disclosures"] = disclosures
     post_stop = sum(row["n"] for row in all_batches if row["fn"] != "C_GetFunctionList"
                     and row["t0"] >= receipt["observer_stopped_ns"])
     if receipt.get("scope_kind") == "cgroup":

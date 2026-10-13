@@ -54,6 +54,7 @@ RUN = [
     ("test_h6_cgroup_operator_path.py", []),
     ("test_h6_initial_exec_controller.py", []),
     ("test_h6_initial_exec_process.py", []),
+    ("test_h6_provider_receipt.py", []),
     ("test_help_usage_drift.py", []),
     ("test_ia32_automatic_exec.py", []),
     ("test_inventory_capacity_oracle.py", []),

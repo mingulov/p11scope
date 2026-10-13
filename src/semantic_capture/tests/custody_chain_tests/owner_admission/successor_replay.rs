@@ -696,3 +696,112 @@ fn retained_successor_does_not_evict_full_admission_history() {
     }));
     assert_eq!(physical_counts(&scene), before);
 }
+
+#[test]
+fn successor_cannot_adopt_an_independently_accepted_divergent_h0_arc() {
+    let mut scene = admitted_scene(Selection::Pid);
+    let old = scene.caller();
+    let original = scene
+        .coordinator
+        .semantic_bindings()
+        .get(old)
+        .unwrap()
+        .pin();
+    let mut inventory = inventory_original(&mut scene);
+    let new = retained_handoff(
+        &mut scene,
+        &mut inventory,
+        ImageIdentity {
+            task_cookie: 42,
+            exec_id: 0,
+        },
+    );
+    scene.h0.0.borrow_mut().io.current = Some(ImageIdentity {
+        task_cookie: 8,
+        exec_id: 0,
+    });
+    // Independently accepted H0 discovery can already hold this new cookie.
+    // This actual refresh uses a real duplicate, not a fabricated receipt or
+    // a replacement of H0's binding fields. A later canonical successor
+    // candidate must detect H0 silently adopting that different outer Arc.
+    let (images, divergent) = scene.refresh_direct();
+    assert_eq!(
+        images,
+        vec![ImageIdentity {
+            task_cookie: 8,
+            exec_id: 0
+        }]
+    );
+    assert!(!Arc::ptr_eq(&original, &divergent));
+    let before = physical_counts(&scene);
+    for _ in 0..3 {
+        pass_with_inventory(&mut scene, &mut inventory);
+    }
+    assert!(
+        scene.coordinator.semantic_bindings().get(new).is_none(),
+        "a divergent H0 receipt cannot satisfy original successor custody"
+    );
+    assert!(
+        scene
+            .coordinator
+            .registry()
+            .instances()
+            .all(|instance| instance.caller == old)
+    );
+    assert_eq!(completed(&scene, new), 0);
+    assert_eq!(physical_counts(&scene), before);
+}
+
+#[test]
+fn accepted_but_refused_predecessor_keeps_custody_for_real_handoff() {
+    let mut scene = Box::new(AdmissionScene::new(Selection::Pid));
+    scene.prepare_without_cookie();
+    scene.observe_entry();
+    let _other = install_owner_refusal(&mut scene, OwnerRefusal::Expired);
+    scene.pass();
+    assert_eq!(scene.h0.0.borrow().accepted, 1);
+    assert_eq!(scene.coordinator.semantic_bindings().len(), 0);
+    assert_eq!(scene.coordinator.registry().instances().count(), 0);
+    assert_eq!(
+        scene.h0.0.borrow().last_validation_refusal,
+        Some(CurrentReceiptRefusal::Deadline)
+    );
+    let original = scene.h0.0.borrow().last_effective.clone().unwrap();
+    let mut inventory = inventory_original(&mut scene);
+    let new = retained_handoff(
+        &mut scene,
+        &mut inventory,
+        ImageIdentity {
+            task_cookie: 42,
+            exec_id: 0,
+        },
+    );
+    let before = physical_counts(&scene);
+    let pid = scene.child.id();
+    scene.h0.0.borrow_mut().io.current = Some(ImageIdentity {
+        task_cookie: 8,
+        exec_id: 0,
+    });
+    scene.h0.0.borrow_mut().after_refresh = Some(Box::new(move |owned| {
+        owned.io.held.enqueue(pid, 0, "C_SignInit", 0x000d, 0);
+        owned.io.held.enqueue(pid, 0, "C_Sign", 0, 0);
+    }));
+    for _ in 0..3 {
+        pass_with_inventory(&mut scene, &mut inventory);
+    }
+    let binding = scene
+        .coordinator
+        .semantic_bindings()
+        .get(new)
+        .expect("fresh successor owner proof can recover from a refused predecessor");
+    assert!(
+        Arc::ptr_eq(&original, &binding.pin()),
+        "accepted-scan negative history must retain original process custody"
+    );
+    assert_eq!(
+        completed(&scene, new),
+        1,
+        "permission requires this fresh successor receipt"
+    );
+    assert_eq!(physical_counts(&scene), before);
+}

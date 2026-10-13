@@ -4731,6 +4731,98 @@ class InventoryFixtureTest(unittest.TestCase):
 
 
 
+class InventoryManifestAccessTest(unittest.TestCase):
+    """Real helper writes under an unprivileged UID; no observer or cgroups."""
+    def test_inventory_legs_write_manifest_in_owned_workload(self):
+        if os.geteuid() == 0:
+            self.skipTest("requires ordinary UID so directory write permissions are enforced")
+        for name in ("run_cgroup_inventory_r5", "run_system_mixed"):
+            with self.subTest(route=name), tempfile.TemporaryDirectory(prefix="h6-manifest-") as temporary:
+                self.run_route(name, Path(temporary))
+
+    def run_route(self, name, directory):
+        source = directory / "source"
+        source.write_bytes(b"controlled ledger and provider input")
+        source.chmod(0o755)
+        helper = directory / "discover"
+        helper.write_text(f"#!{sys.executable}\n" + textwrap.dedent("""\
+            import json, os, pathlib, sys
+            output = pathlib.Path(sys.argv[sys.argv.index('-o') + 1])
+            output.write_text(json.dumps({'schema': 'p11scope-manifest/5',
+                'objects': [{'path': sys.argv[sys.argv.index('--module') + 1]}],
+                'writer_uid': os.geteuid()}))
+            """))
+        helper.chmod(0o755)
+        ctx = H6["Case"](SimpleNamespace(out=directory, uid=os.getuid(), gid=os.getgid()))
+        ctx.pins = {"ledger": SimpleNamespace(path=source)}
+        ctx.provider_pin = SimpleNamespace(path=source)
+        ctx.discover_pin = H6["FilePin"](helper)
+        observed = {}
+
+        class ManifestReady(Exception):
+            pass
+
+        def reached(*_args, **_kwargs):
+            raise ManifestReady
+
+        def init(workload, uid, gid, _label):
+            self.assertEqual((uid, gid), (os.getuid(), os.getgid()))
+            workload.chmod(0o700)
+            observed["workload"] = workload
+            return dict(os.environ)
+
+        def metadata(path):
+            result = path.lstat()
+            return result.st_dev, result.st_ino, result.st_uid, result.st_gid, result.st_mode
+
+        real_run = subprocess.run
+        def ordinary(argv, **kwargs):
+            # The live root controller drops credentials here. This host test
+            # already has that ordinary UID and cannot issue setgroups(2).
+            self.assertEqual(kwargs.pop("user"), os.getuid())
+            self.assertEqual(kwargs.pop("group"), os.getgid())
+            self.assertEqual(kwargs.pop("extra_groups"), [])
+            return real_run(argv, **kwargs)
+
+        real_build = H6["build_manifest"]
+        def manifest(pin, module, output, env, uid, gid):
+            workload = observed["workload"]
+            leg = workload.parent
+            # Model root-owned 0755 as non-writable by this ordinary UID.
+            # Input copies are complete before the actual discover boundary.
+            leg.chmod(0o555)
+            before = {path: metadata(path) for path in (directory, leg.parent, leg, source, helper)}
+            try:
+                with mock.patch.object(subprocess, "run", ordinary):
+                    with self.assertRaisesRegex(H6["SetupError"], "Permission denied"):
+                        real_build(pin, module, leg / "calibrate-denied.json", env, uid, gid)
+                    positive = real_build(pin, module, workload / "calibrate-writable.json", env, uid, gid)
+                    self.assertEqual(positive["writer_uid"], os.getuid())
+                    result = real_build(pin, module, output, env, uid, gid)
+                self.assertEqual(result["writer_uid"], os.getuid())
+                self.assertEqual(Path(output).parent, workload)
+                self.assertTrue(Path(output).is_file())
+                observed["manifest"] = Path(output)
+            finally:
+                self.assertEqual({path: metadata(path) for path in before}, before)
+                self.assertFalse((leg / "calibrate-denied.json").exists())
+                leg.chmod(0o755)
+
+        patches = {"init_token": init, "build_manifest": manifest,
+                   "create_tracked": reached, "spawn_ledger": reached}
+        try:
+            with mock.patch.dict(H6[name].__globals__, patches):
+                with self.assertRaises(ManifestReady):
+                    try:
+                        H6[name].__wrapped__(ctx, directory / "case", "singles")
+                    except H6["SetupError"] as error:
+                        self.fail(f"ordinary helper could not build the route's manifest: {error}")
+            self.assertIn("manifest", observed)
+        finally:
+            ctx.discover_pin.close()
+            H6["cleanup_leg_resources"](ctx)
+
+
 class R5OrderingTest(unittest.TestCase):
     """Exercise the real R5 route with ordinary cgroup/ptrace seams."""
     def run_route(self, failed_move=False):

@@ -252,20 +252,27 @@ class SystemRecoveryDisclosureTest(unittest.TestCase):
         self.assertIs(result["unresolved_observation"]["semantic_capture"]["final_drain"], False)
         self.assertIn("terminal drain remains unqualified", result["s1"]["limitation"])
 
+    def test_unsettled_physical_retirement_preserves_successful_independent_semantic_drain(self):
+        data, index = inputs(TERMINAL)
+        data[0]["observation"]["semantic_capture"]["final_drain"] = True
+        result = self.assert_positive(data, index)
+        self.assertEqual(result["unresolved_observation"]["retirement"], "unsettled")
+        self.assertIs(result["unresolved_observation"]["semantic_capture"]["final_drain"], True)
+
     def test_terminal_retirement_refuses_nonterminal_or_after_final_placement(self):
         for placement in ("ordinary", "after-final"):
             with self.subTest(placement=placement):
                 self.assert_refused(*inputs(TERMINAL, placement=placement))
 
     def test_terminal_retirement_refuses_contradictory_state_force_failure_or_late_stop(self):
-        for fault in ("closed", "settled", "drained", "forced", "exit", "late", "limit", "ended"):
+        for fault in ("closed", "settled", "drain-unavailable", "forced", "exit", "late", "limit", "ended"):
             with self.subTest(fault=fault):
                 data, index = inputs(TERMINAL)
                 doc, _ledgers, receipt = data
                 if fault in ("closed", "settled"):
                     doc["observation"]["retirement" if fault == "closed" else "settlement"] = fault
-                elif fault == "drained":
-                    doc["observation"]["semantic_capture"]["final_drain"] = True
+                elif fault == "drain-unavailable":
+                    doc["observation"]["semantic_capture"]["final_drain"] = None
                 elif fault == "ended":
                     doc["observation"]["ended_ns"] += 1
                 else:

@@ -12666,11 +12666,42 @@ const SEMANTIC_VALIDATION_TEST_CHILD: &str =
 const OWNER_ADMISSION_TEST_CHILD: &str =
     "src/semantic_capture/tests/custody_chain_tests/owner_admission.rs";
 
+fn semantic_capture_private_test_child_references_are_canonical(path: &str, source: &str) -> bool {
+    // Strip only the two approved source sites. Concrete filename references
+    // elsewhere also catch differently named #[path] aliases and include!.
+    let remainder = match path {
+        "src/semantic_capture.rs" => source.replacen("\n        mod semantic_validation;\n", "", 1),
+        SEMANTIC_VALIDATION_TEST_CHILD => source.replacen(
+            "\n#[path = \"owner_admission.rs\"]\nmod owner_admission;\n",
+            "",
+            1,
+        ),
+        _ => source.to_owned(),
+    };
+    ![
+        "semantic_validation.rs",
+        "owner_admission.rs",
+        "mod semantic_validation;",
+        "mod owner_admission;",
+    ]
+    .iter()
+    .any(|reference| remainder.contains(reference))
+}
+
 fn semantic_capture_private_test_children_are_isolated(
     capture: &str,
     validation: &str,
     owner_admission_present: bool,
 ) -> bool {
+    if !semantic_capture_private_test_child_references_are_canonical(
+        "src/semantic_capture.rs",
+        capture,
+    ) || !semantic_capture_private_test_child_references_are_canonical(
+        SEMANTIC_VALIDATION_TEST_CHILD,
+        validation,
+    ) {
+        return false;
+    }
     // These canonical, rustfmt-indented module boundaries prove ancestry,
     // rather than finding a cfg(test) elsewhere in this large source file.
     let Some((_, tests)) = capture.split_once("\n#[cfg(test)]\nmod tests {\n") else {
@@ -12748,6 +12779,28 @@ fn semantic_capture_private_record_test_children_remain_test_only() {
             ),
             "an alternate production inclusion must revoke the child exemption: {inclusion}"
         );
+    }
+
+    for path in [
+        "src/lib.rs",
+        "src/render.rs",
+        "src/semantic_capture.rs",
+        SEMANTIC_VALIDATION_TEST_CHILD,
+        OWNER_ADMISSION_TEST_CHILD,
+    ] {
+        for inclusion in [
+            "#[path = \"semantic_validation.rs\"]\nmod alias_validation;",
+            "#[path = \"owner_admission.rs\"]\nmod alias_owner;",
+            "include!(\"../custody_chain_tests/semantic_validation.rs\");",
+            "include!(\"../custody_chain_tests/owner_admission.rs\");",
+            "mod semantic_validation;",
+            "mod owner_admission;",
+        ] {
+            assert!(
+                !semantic_capture_private_test_child_references_are_canonical(path, inclusion),
+                "{path} must refuse alternate fixture reference {inclusion:?}"
+            );
+        }
     }
 
     // Calibrate the second exact child even before it is integrated. Its path
@@ -12893,6 +12946,14 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
                 continue;
             }
             let source = fs::read_to_string(&path).expect("read source");
+            assert!(
+                semantic_capture_private_test_child_references_are_canonical(
+                    &path.to_string_lossy(),
+                    &source,
+                ),
+                "{} references a private semantic fixture outside its canonical test inclusion",
+                path.display(),
+            );
             if source_uses_private_record_fields(&source) {
                 users.push(path.to_string_lossy().into_owned());
             }

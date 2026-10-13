@@ -1109,17 +1109,15 @@ mod tests {
     }
     #[test]
     fn pid_inspect_os_reader_names_the_owned_process() {
+        // Parallel libtest threads can remap this test process while /proc
+        // streams its maps. The stopped owned child has a stable image/maps.
+        let child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let pid = child.id();
         let mut bytes = Vec::new();
-        run_with_writer(
-            std::process::id(),
-            &[],
-            &HookRegistry::builtin(),
-            true,
-            &mut bytes,
-        )
-        .unwrap();
+        run_with_writer(pid, &[], &HookRegistry::builtin(), true, &mut bytes).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let expected = std::fs::read_link("/proc/self/exe")
+        let expected = std::fs::read_link(format!("/proc/{pid}/exe"))
             .unwrap()
             .to_string_lossy()
             .into_owned();
@@ -1127,7 +1125,7 @@ mod tests {
         assert_eq!(json["application"]["path"], expected);
         assert_eq!(
             json["application"]["start_time"],
-            crate::process::process_start_time(std::process::id()).unwrap()
+            crate::process::process_start_time(pid).unwrap()
         );
     }
 

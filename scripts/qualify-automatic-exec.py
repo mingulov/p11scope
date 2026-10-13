@@ -2304,7 +2304,9 @@ def inventory_sibling_s1_errors(doc, ledger, receipt, records):
                 "failed": totals[3].get(key, 0), "unknown": 0, "orphans": 0, "dropped": 0}
             desired_mechs = {mech: [count, totals[1].get(key + (mech,), 0)]
                 for (*group, mech), count in totals[0].items() if tuple(group) == key}
-            for row in (physical[0], semantic[0]):
+            # The physical projection judges legacy edge counts and identity;
+            # attested S1 history belongs only to the instance semantic edge.
+            for row in semantic:
                 ops = row.get("operations") or {}
                 actual = {name: ops.get(name) for name in expected}
                 if (row.get("semantics") != "observed" or actual != expected

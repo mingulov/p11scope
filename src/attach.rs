@@ -1400,6 +1400,34 @@ pub(crate) fn drive_owned_producer_detach_for_test(
     job.drive(&mut Vec::new(), &mut false, &mut 0, second_signal, out)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalProducerFamily {
+    Registered,
+    InstanceHooks,
+}
+
+/// The terminal submission boundary over the Session's original owner
+/// registries. Tests replace native take I/O while using its actual worker.
+fn submit_terminal_ownership(
+    worker: &CleanupWorker,
+    leases: cleanup_worker::FileLeases,
+    mut take: impl FnMut(TerminalProducerFamily) -> Vec<Result<(OwnedLink, ProducerProgram)>>,
+) -> Vec<String> {
+    let mut owned = Vec::new();
+    let mut failures = Vec::new();
+    for family in [TerminalProducerFamily::Registered] {
+        for outcome in take(family) {
+            match outcome {
+                Ok(link) => owned.push(link),
+                Err(error) => failures.push(format!("{error:#}")),
+            }
+        }
+    }
+    worker.note_transfer_failed(failures.len());
+    worker.submit(owned, leases, DetachOrder);
+    failures
+}
+
 /// A detach error leaves this Session's ownership bookkeeping inconsistent.
 /// It does not prove a kernel producer survived or that the kernel is quiet;
 /// recovery is a new Session. Refusing unrelated additions is the accepted
@@ -5340,26 +5368,38 @@ impl Session {
                 .collect(),
         );
         worker.begin_terminal();
-        let mut owned = Vec::new();
-        let mut transfer_failed = 0;
-        for link in std::mem::take(&mut self.links) {
-            let producer = link.producer();
-            match take_owned_links(&mut self.ebpf, link) {
-                Ok(links) => owned.extend(links.into_iter().map(|link| (link, producer))),
-                Err(error) => {
-                    transfer_failed += 1;
-                    self.detach_failures.push(format!("{error:#}"));
-                }
-            }
-        }
-        worker.note_transfer_failed(transfer_failed);
-        worker.submit(owned, leases, DetachOrder);
+        let failures = submit_terminal_ownership(&worker, leases, |family| {
+            self.take_terminal_ownership(family)
+        });
+        self.detach_failures.extend(failures);
         self.producer_detach = OwnedProducerDetach::Pending {
             worker,
             started,
             had_work,
         };
         Ok(())
+    }
+
+    fn take_terminal_ownership(
+        &mut self,
+        family: TerminalProducerFamily,
+    ) -> Vec<Result<(OwnedLink, ProducerProgram)>> {
+        match family {
+            TerminalProducerFamily::Registered => {
+                let mut outcomes = Vec::new();
+                for link in std::mem::take(&mut self.links) {
+                    let producer = link.producer();
+                    match take_owned_links(&mut self.ebpf, link) {
+                        Ok(links) => {
+                            outcomes.extend(links.into_iter().map(|link| Ok((link, producer))))
+                        }
+                        Err(error) => outcomes.push(Err(error)),
+                    }
+                }
+                outcomes
+            }
+            TerminalProducerFamily::InstanceHooks => Vec::new(),
+        }
     }
 
     /// Drive only the original owned job. A second signal returns its typed
@@ -7063,6 +7103,182 @@ mod tests {
         );
         assert_eq!(failures.len(), 8);
         assert_eq!(&detached[6..], &["exit", "exec"]);
+    }
+
+    fn terminal_fixture_payload(
+        file: &std::fs::File,
+        program: &'static str,
+    ) -> (OwnedLink, ProducerProgram) {
+        (
+            OwnedLink::Multi(vec![file.try_clone().unwrap().into()]),
+            ProducerProgram::UProbe(program),
+        )
+    }
+
+    #[test]
+    fn owner_terminal_hooks_registered_control_joins_actual_original_ownership() {
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        let original = Arc::downgrade(&file);
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(move |payload, _| {
+                assert!(original.upgrade().unwrap().metadata().is_ok());
+                drop(payload.take());
+                Ok(())
+            }),
+            Arc::new(|| std::time::Duration::ZERO),
+        );
+        let mut source = Some(terminal_fixture_payload(&file, "p11_entry"));
+        let mut calls = Vec::new();
+        let mut failures = submit_terminal_ownership(&worker, Arc::new(vec![file]), |family| {
+            calls.push(family);
+            match family {
+                TerminalProducerFamily::Registered => source.take().into_iter().map(Ok).collect(),
+                TerminalProducerFamily::InstanceHooks => Vec::new(),
+            }
+        });
+        let mut job = OwnedProducerDetach::Pending {
+            worker,
+            started: std::time::Instant::now(),
+            had_work: true,
+        };
+        let mut detached = false;
+        let mut out = Vec::new();
+        job.drive(&mut failures, &mut detached, &mut 0, || false, &mut out)
+            .unwrap();
+        assert!(source.is_none() && detached);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|family| **family == TerminalProducerFamily::Registered)
+                .count(),
+            1
+        );
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("1/1 links released")
+        );
+    }
+
+    #[test]
+    fn owner_terminal_hooks_all_original_owners_enter_the_same_receipt() {
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        let original = Arc::downgrade(&file);
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let released = std::sync::Mutex::new(released);
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(move |payload, program| {
+                if program != ProducerProgram::UProbe("p11_entry") {
+                    entered.send(()).unwrap();
+                    let _ = released
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(5));
+                }
+                assert!(original.upgrade().unwrap().metadata().is_ok());
+                drop(payload.take());
+                Ok(())
+            }),
+            Arc::new(|| std::time::Duration::ZERO),
+        );
+        let mut registered = vec![terminal_fixture_payload(&file, "p11_entry")];
+        let mut hooks: Vec<_> = INSTANCE_PROGRAMS
+            .iter()
+            .map(|(program, _)| terminal_fixture_payload(&file, program))
+            .collect();
+        let mut failures = submit_terminal_ownership(&worker, Arc::new(vec![file]), |family| {
+            std::mem::take(match family {
+                TerminalProducerFamily::Registered => &mut registered,
+                TerminalProducerFamily::InstanceHooks => &mut hooks,
+            })
+            .into_iter()
+            .map(Ok)
+            .collect()
+        });
+        let hook_started = entered_rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_ok();
+        let before = worker.progress();
+        // Always release and actually join this owned worker before asserting,
+        // including the current registered-only RED implementation.
+        for _ in INSTANCE_PROGRAMS {
+            let _ = release.send(());
+        }
+        let mut job = OwnedProducerDetach::Pending {
+            worker,
+            started: std::time::Instant::now(),
+            had_work: true,
+        };
+        let mut detached = false;
+        let mut out = Vec::new();
+        let result = job.drive(&mut failures, &mut detached, &mut 0, || false, &mut out);
+        assert!(
+            hooks.is_empty(),
+            "a completed worker cannot omit the four original instance-hook owners"
+        );
+        assert!(
+            hook_started && before.released < before.total,
+            "an actual hook close must remain unsettled until its leaf returns"
+        );
+        result.unwrap();
+        assert!(detached);
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("5/5 links released")
+        );
+    }
+
+    #[test]
+    fn owner_terminal_hooks_partial_take_failure_cannot_claim_complete() {
+        let file = Arc::new(tempfile::tempfile().unwrap());
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(|payload, _| {
+                drop(payload.take());
+                Ok(())
+            }),
+            Arc::new(|| std::time::Duration::ZERO),
+        );
+        let mut registered = vec![terminal_fixture_payload(&file, "p11_entry")];
+        let mut hooks: Vec<_> = INSTANCE_PROGRAMS
+            .iter()
+            .map(|(program, _)| terminal_fixture_payload(&file, program))
+            .collect();
+        let mut refused_original = None;
+        let mut failures = submit_terminal_ownership(&worker, Arc::new(vec![file]), |family| {
+            if family == TerminalProducerFamily::Registered {
+                return std::mem::take(&mut registered)
+                    .into_iter()
+                    .map(Ok)
+                    .collect();
+            }
+            let mut outcomes: Vec<_> = std::mem::take(&mut hooks).into_iter().map(Ok).collect();
+            let refused =
+                std::mem::replace(&mut outcomes[1], Err(anyhow!("original hook take refused")));
+            // Exactly as a failed Aya take: original owner remains in its
+            // registry envelope; the worker never acquires that handle.
+            refused_original = refused.ok();
+            outcomes
+        });
+        let mut job = OwnedProducerDetach::Pending {
+            worker,
+            started: std::time::Instant::now(),
+            had_work: true,
+        };
+        let mut detached = false;
+        let mut out = Vec::new();
+        let result = job.drive(&mut failures, &mut detached, &mut 0, || false, &mut out);
+        assert!(
+            result.is_err(),
+            "one failed original hook take must refuse completed cleanup"
+        );
+        assert!(!detached && refused_original.is_some());
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("cleanup incomplete") && text.contains("1 uncertain"),
+            "{text}"
+        );
     }
 
     #[test]

@@ -55,8 +55,9 @@ aya = { path = "third-party/src/aya-0.14.0-p2" }
 aya-obj = { path = "third-party/src/aya-obj-0.3.0-p2" }
 
 [profile.test]
-# 0b: line tables only. Full debuginfo pushes the lib unit-test
-# binary past the product's 256 MiB MAX_OBJECT_BYTES cap, and many
-# tests pin/identify their own test binary as a fixture object.
-# Backtraces keep file:line; variable inspection in tests is reduced.
+# Tests pin/identify their own executable as a fixture object. Even line
+# tables exceed the product's 256 MiB cap as the suite grows, so strip debug
+# info only. ELF symbols and LLVM coverage maps remain; backtraces lose
+# file:line detail. Product build profiles and object limits are unchanged.
 debug = "line-tables-only"
+strip = "debuginfo"

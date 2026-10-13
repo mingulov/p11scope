@@ -7,7 +7,6 @@ from pathlib import Path
 import runpy
 from types import SimpleNamespace
 import unittest
-from collections import Counter
 
 ROOT = Path(__file__).resolve().parents[2]
 BASE = runpy.run_path(str(ROOT / "tests/python/test_automatic_exec_oracle.py"))
@@ -283,7 +282,8 @@ def controlled_inputs(*, missing_target=True, target_gap=None):
     functions = {name: i for i, name in enumerate(("C_GetFunctionList", "C_Initialize", "C_GetSlotList",
         "C_OpenSession", "C_Login", "C_GenerateKey", "C_SignInit", "C_Sign", "C_DigestInit", "C_Digest",
         "C_EncryptInit", "C_Encrypt", "C_DestroyObject", "C_VerifyInit", "C_Verify", "C_Logout", "C_CloseSession", "C_Finalize"))}
-    hooks = {pins["A"]["path"]: {"provider": pins["A"], "functions": functions, "getter_export_offset": 0}}
+    hooks = {pin["path"]: {"provider": pin, "functions": functions, "getter_export_offset": 0}
+             for pin in pins.values()}
     owner = owners[0]
     def boundary(gen, admission, marker, floor, prior=None):
         return H6["inventory_boundary"](observer.records, owner, images[gen], pins["A"], admission,
@@ -321,14 +321,14 @@ def controlled_inputs(*, missing_target=True, target_gap=None):
         if kind == "MAPPED":
             row.update(module=pins["A"]["path"], ino=111)
         owners[0].h6_test_reader.lines.append(line(kind, row))
-    second_sibling = command("MS", 2)
+    command("MS", 2)
     observer.sweep()
     successor_record = next(row for row in observer.records if row["kind"] == "caller_event"
                             and row["event"].get("new") == "c2")
     admission1 = {"caller": "c2", "incarnation": 1, "seq": successor_record["seq"],
                   "completed_pass": H6["r5_pass_receipt"](observer.records[-1])}
     resumed = clock[0]
-    third_sibling = command("MS", 3)
+    command("MS", 3)
     successor_warm = command("MX", 1, gen=1)
     observer.sweep()
     baseline1 = boundary(1, admission1, successor_warm, admission1["completed_pass"]["seq"])
@@ -336,7 +336,7 @@ def controlled_inputs(*, missing_target=True, target_gap=None):
         "admission": admission1, "cursor": checkpoint, "started_ns": successor_warm["ack"]["t0"],
         "observed_ns": clock[0] + 1, "attempts": 1, "markers": [successor_warm], "baseline": baseline1}
     measurement_start = clock[0]
-    fourth_sibling = command("MS", 4)
+    command("MS", 4)
     fixed1 = command("MX", 2, "M", gen=1)
     observer.sweep()
     end1 = boundary(1, admission1, fixed1, baseline1["pass"]["seq"], baseline1)

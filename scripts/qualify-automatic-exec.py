@@ -7985,6 +7985,11 @@ def run_system_mixed(ctx, cell_dir, backend):
     manifest = build_manifest(ctx.discover_pin, provider_a.path, manifest_path, env,
                               ctx.args.uid, ctx.args.gid)
     physical_hooks = inventory_manifest_hooks(manifest, provider_a)
+    # B's private calibration proves its own table/getter physical targets.
+    # Only A's manifest below reaches the observer; B remains count-only.
+    calibration_b = build_manifest(ctx.discover_pin, provider_b_pin.path,
+        leg_dir / "workload" / "manifest-B-physical.json", env, ctx.args.uid, ctx.args.gid)
+    physical_hooks.update(inventory_manifest_hooks(calibration_b, provider_b_pin))
     gate_f = leg_dir / "gate-F"
     # XE and XS spawn from the same file: independent same-file callers.
     owned_e, out_e, err_e = spawn_ledger(

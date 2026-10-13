@@ -1884,7 +1884,7 @@ fn instance_entry_ip_and_stamps_never_reach_trace_rendering() {
         flags: p11scope_ebpf_common::instance::STAMP_VALID,
     };
     let record = p11scope_ebpf_common::EventRecord {
-        event: open_event(11),
+        event: canary_event(),
         continuity: p11scope_ebpf_common::InstanceContinuity {
             entry_ip: IP,
             entry_stamp: stamp,
@@ -1894,7 +1894,7 @@ fn instance_entry_ip_and_stamps_never_reach_trace_rendering() {
     let plan = open_plan();
     let mut state = semantics::State::new(&plan);
     let mut tracker = tracker();
-    let mut tracer = trace::Tracer::new(&plan);
+    let mut tracer = canary_tracer(&plan);
     let mut malformed_records = 0;
     let mut context = context(plan, []);
     context.out_file = Some(Vec::new());
@@ -2183,6 +2183,23 @@ mod continuity_canary {
 
 use continuity_canary::{ContinuityCanary, struct_bytes};
 
+// Public canary input is fixed, independently of the observer's clock/PID.
+// The scripted EVENTS domain supplies CALL history, not native PID authority.
+const CANARY_PID: u32 = 4242;
+const CANARY_MONO_NS: u64 = 1100;
+
+fn canary_event() -> Event {
+    Event {
+        ts_ns: CANARY_MONO_NS,
+        pid_tgid: u64::from(CANARY_PID) << 32,
+        ..open_event(11)
+    }
+}
+
+fn canary_tracer(plan: &crate::plan::AttachPlan) -> trace::Tracer {
+    trace::tracer_with_test_wall_anchor(plan, CANARY_MONO_NS, 0)
+}
+
 /// Sentinel entry IP, shared with the trace-only test above.
 const CANARY_IP: u64 = 0x7E5C_A1AB_1E5E_C0DE;
 
@@ -2218,7 +2235,7 @@ fn canary_continuity() -> p11scope_ebpf_common::InstanceContinuity {
 
 fn canary_record() -> p11scope_ebpf_common::EventRecord {
     p11scope_ebpf_common::EventRecord {
-        event: open_event(11),
+        event: canary_event(),
         continuity: canary_continuity(),
     }
 }
@@ -2237,7 +2254,7 @@ fn drive_trace_capture(record: &[u8]) -> TraceDrive {
     let plan = open_plan();
     let mut state = semantics::State::new(&plan);
     let mut tracker = tracker();
-    let mut tracer = trace::Tracer::new(&plan);
+    let mut tracer = canary_tracer(&plan);
     let mut malformed_records = 0;
     let mut context = context(plan, []);
     context.out_file = Some(Vec::new());
@@ -2680,7 +2697,7 @@ fn failing_drain_error(record: &[u8]) -> String {
     let plan = open_plan();
     let mut state = semantics::State::new(&plan);
     let mut tracker = tracker();
-    let mut tracer = trace::Tracer::new(&plan);
+    let mut tracer = canary_tracer(&plan);
     let mut writer = TerminalWriter {
         fail: true,
         bytes: Vec::new(),
@@ -2786,6 +2803,8 @@ fn continuity_canary_public_metadata_is_deterministic() {
         String::from_utf8_lossy(&driven.stdout),
     );
     assert_eq!(driven.stdout, driven.out_file);
+    let repeated = drive_trace_capture(&crate::events::record_bytes(&record));
+    assert_eq!(driven.stdout, repeated.stdout, "fresh canary drives agree");
 }
 
 /// R1+R2, EVENTS-tail layout: the scanner covers every needle form, and
@@ -2837,7 +2856,7 @@ fn instance_continuity_tail_never_reaches_any_renderer() {
     let continuity = canary_continuity();
     let canary = ContinuityCanary::from_continuity(&continuity);
     let record = p11scope_ebpf_common::EventRecord {
-        event: open_event(11),
+        event: canary_event(),
         continuity,
     };
     let bytes = crate::events::record_bytes(&record);

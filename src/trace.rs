@@ -682,6 +682,19 @@ with tempfile.TemporaryDirectory() as raw:
     }
 }
 
+/// A fixed original wall/monotonic anchor for output-only test fixtures.
+/// Production tracers keep deriving their first anchor from `SystemTime`.
+#[cfg(test)]
+pub(crate) fn tracer_with_test_wall_anchor(
+    plan: &AttachPlan,
+    mono_ns: u64,
+    wall_ns: u128,
+) -> Tracer {
+    let mut tracer = Tracer::new(plan);
+    tracer.anchor = Some((mono_ns, wall_ns));
+    tracer
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

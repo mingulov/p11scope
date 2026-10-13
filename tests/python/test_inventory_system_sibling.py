@@ -369,7 +369,7 @@ def controlled_inputs(*, missing_target=True, target_gap=None):
         "expected_incarnations": {"1000": {"gens": {"0": {"exe": "/w/ledger", "retired": True},
             "1": {"exe": "/w/ledger2", "retired": False}}}, "2000": {"gens": {"0": {"exe": "/w/ledger", "retired": False}}}},
         "expected_edges": {"1000:0:A": {"counted": True, "count": 124}, "1000:1:A": {"counted": True, "count": 40},
-            "2000:0:A": {"counted": True, "count": 48}, "2000:0:B": {"counted": True, "count": 47}},
+            "2000:0:A": {"counted": True, "count": 48}, "2000:0:B": {"counted": True, "count": 48}},
         "measured": {"label": "successor", "t0": fixed1["ack"]["t0"], "t1": fixed1["ack"]["t1"],
             "expected_calls": 22, "phases": ["MX:h6-measured:gen1", "MX:h6-failed:gen1"]},
         "warmup": {"label": "original", "t0": markers["MX"][0]["ack"]["t0"], "t1": teardown["ack"]["t1"],

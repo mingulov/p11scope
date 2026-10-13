@@ -92,6 +92,7 @@ pub(crate) enum AnchorDeny {
     FdHeadroom,
     AnchorCap,
     AnchorNotInstalled,
+    CaptureWatched,
 }
 
 pub(crate) struct ExaminedCustody {
@@ -1122,18 +1123,31 @@ impl Drop for DropObserver {
 
 impl<'p> AnchorPass<'p> {
     pub(crate) fn only_capture_excluded(&self) -> bool {
-        false
+        self.arena.is_none()
+            && !self.fallback.is_empty()
+            && self
+                .fallback
+                .values()
+                .all(|reason| *reason == AnchorDeny::CaptureWatched)
     }
 
     pub(crate) fn prepare_excluding(
         pins: &'p PinnedObjects,
         admitted: impl IntoIterator<Item = (ObjectKey, PinnedObjectId)>,
         custody: ExaminedCustody,
-        _exclusions: &KernelAnchorExclusions,
+        exclusions: &KernelAnchorExclusions,
     ) -> Self {
-        Self::prepare(pins, admitted, custody)
+        Self::prepare_limits(
+            pins,
+            admitted,
+            custody,
+            EXAMINED_ANCHOR_CAP,
+            TOTAL_ANCHOR_CAP,
+            exclusions,
+        )
     }
 
+    #[cfg(test)]
     pub(crate) fn prepare(
         pins: &'p PinnedObjects,
         admitted: impl IntoIterator<Item = (ObjectKey, PinnedObjectId)>,
@@ -1145,6 +1159,7 @@ impl<'p> AnchorPass<'p> {
             custody,
             EXAMINED_ANCHOR_CAP,
             TOTAL_ANCHOR_CAP,
+            &KernelAnchorExclusions::default(),
         )
     }
 
@@ -1154,6 +1169,7 @@ impl<'p> AnchorPass<'p> {
         mut custody: ExaminedCustody,
         examined_cap: usize,
         total_cap: usize,
+        exclusions: &KernelAnchorExclusions,
     ) -> Self {
         let mut pass = Self {
             arena: None,
@@ -1185,6 +1201,14 @@ impl<'p> AnchorPass<'p> {
                 }
                 continue;
             };
+            // One retained ID may have several mapped aliases. Exclude the
+            // entire file before allocating or mapping any anchor slot.
+            if exclusions.excludes(&keys, file) {
+                for key in keys {
+                    pass.fallback.insert(key, AnchorDeny::CaptureWatched);
+                }
+                continue;
+            }
             if pass.candidates.len() >= total_cap.min(TOTAL_ANCHOR_CAP) {
                 for key in keys {
                     pass.fallback.insert(key, AnchorDeny::AnchorCap);
@@ -1205,8 +1229,15 @@ impl<'p> AnchorPass<'p> {
                 held.ordinal,
             )
         });
-        for (index, held) in custody.candidates.into_iter().enumerate() {
-            if index >= examined_cap.min(EXAMINED_ANCHOR_CAP)
+        let mut examined_anchors = 0;
+        for held in custody.candidates {
+            let keys = BTreeSet::from([held.examined.key]);
+            if exclusions.excludes(&keys, &held.file) {
+                pass.fallback
+                    .insert(held.examined.key, AnchorDeny::CaptureWatched);
+                continue;
+            }
+            if examined_anchors >= examined_cap.min(EXAMINED_ANCHOR_CAP)
                 || pass.candidates.len() >= total_cap.min(TOTAL_ANCHOR_CAP)
             {
                 pass.fallback
@@ -1214,10 +1245,11 @@ impl<'p> AnchorPass<'p> {
                 continue;
             }
             pass.candidates.push(Candidate {
-                keys: BTreeSet::from([held.examined.key]),
+                keys,
                 slot: Slot(pass.candidates.len() as u32),
                 file: AnchorFile::Examined(held),
             });
+            examined_anchors += 1;
         }
         if pass.candidates.is_empty() {
             return pass;

@@ -327,7 +327,14 @@ fn d3b_pinned_files_precede_examined_and_are_borrowed_without_reopening() {
         assert!(custody.offer_for_test(scan, examined, file));
     }
     std::fs::remove_file(dir.path().join("admitted.so")).unwrap();
-    let pass = AnchorPass::prepare_limits(&pins, [(admitted.key, id)], custody, 2, 2);
+    let pass = AnchorPass::prepare_limits(
+        &pins,
+        [(admitted.key, id)],
+        custody,
+        2,
+        2,
+        &KernelAnchorExclusions::default(),
+    );
     assert_eq!(pass.candidates.len(), 2);
     assert!(std::ptr::eq(pass.candidates[0].file.file(), admitted_file));
     assert_eq!(pass.candidates[0].slot, Slot(0));
@@ -962,6 +969,7 @@ struct AdapterCell {
     exec_changed: bool,
     pid_changed: bool,
     capture_watched: bool,
+    foreign_identity: bool,
 }
 
 #[derive(Default)]
@@ -1159,10 +1167,15 @@ fn adapter_cell(cell: AdapterCell) -> AdapterObservation {
             raw_path: Some(b"/fixture/provider.so".to_vec()),
         })
         .collect();
+    let foreign_file = cell
+        .foreign_identity
+        .then(|| opened(dir.path(), "foreign-mapped.so"));
     let trace = Rc::new(RefCell::new(AdapterTrace::default()));
     let io = AdapterIo {
         entries: entries.clone(),
-        identity: examined.identity,
+        identity: foreign_file
+            .as_ref()
+            .map_or(examined.identity, |(_, foreign)| foreign.identity),
         trace: trace.clone(),
         exe_reads: Cell::new(0),
         exec_changed: cell.exec_changed,
@@ -1233,6 +1246,30 @@ fn capture_watched_anchor_fallback_keeps_same_pin_and_userspace_truth() {
             Some(KernelFallbackReason::AnchorNotInstalled)
         );
     }
+}
+
+#[test]
+fn capture_watched_fallback_rejects_foreign_map_files_identity() {
+    let observation = adapter_cell(AdapterCell {
+        capture_watched: true,
+        foreign_identity: true,
+        target: complete_target(),
+        ..Default::default()
+    });
+    assert_eq!(observation.target_reads, 0);
+    assert_eq!(observation.charges, 2);
+    assert_eq!(
+        observation.trace.borrow().reads,
+        ADAPTER_RANGES.map(|(start, end)| (ADAPTER_PID, start, end))
+    );
+    assert!(
+        observation.out.members.is_empty(),
+        "coarse exclusion became an identity proof"
+    );
+    assert_eq!(
+        observation.fallback_reason,
+        Some(KernelFallbackReason::AnchorNotInstalled)
+    );
 }
 
 fn assert_adapter_attempt(observation: &AdapterObservation, fallback: bool) {

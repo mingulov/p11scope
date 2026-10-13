@@ -1794,20 +1794,32 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     fn collector_budget(
         &self,
         budget: crate::discovery::scan::CaptureWorkBudget,
-        _semantic_capture_live: bool,
+        semantic_capture_live: bool,
     ) -> crate::discovery::scan::CaptureWorkBudget {
         let objects: BTreeSet<_> = self
             .attach_set
             .endpoints()
             .map(|entry| entry.object)
             .collect();
-        budget.with_retained_mapped_identities(
-            crate::discovery::identity::RetainedMappedIdentities::from_targets(
-                objects
-                    .into_iter()
-                    .filter_map(|object| self.attach_set.target(object)),
-            ),
-        )
+        let targets: Vec<_> = objects
+            .into_iter()
+            .filter_map(|object| self.attach_set.target(object))
+            .collect();
+        // Any live native owner may watch these retained files. This negative
+        // snapshot includes changed/unproved targets that the positive mapped
+        // identity cache deliberately refuses; it grants no proof authority.
+        let exclusions = if self.capture.is_some() || semantic_capture_live {
+            crate::discovery::kernel_identity::KernelAnchorExclusions::from_targets(
+                targets.iter().copied(),
+            )
+        } else {
+            crate::discovery::kernel_identity::KernelAnchorExclusions::default()
+        };
+        budget
+            .with_retained_mapped_identities(
+                crate::discovery::identity::RetainedMappedIdentities::from_targets(targets),
+            )
+            .with_kernel_anchor_exclusions(exclusions)
     }
 
     /// The pass's collection as an owned job (Task 6 C5.7): it reads

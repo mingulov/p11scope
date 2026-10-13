@@ -6444,7 +6444,10 @@ pub(crate) mod tests {
             self.attempted.set(self.attempted.get() + 1);
             None
         }
-        fn semantic_custody_ref<'pin>(&self, pin: &'pin Self::Pin) -> Option<&'pin crate::process::PidPin> {
+        fn semantic_custody_ref<'pin>(
+            &self,
+            pin: &'pin Self::Pin,
+        ) -> Option<&'pin crate::process::PidPin> {
             Some(pin)
         }
     }

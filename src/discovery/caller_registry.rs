@@ -224,6 +224,10 @@ impl ProcessSource for OsProcessSource {
     fn semantic_custody(&self, pin: &PidPin) -> Option<PidPin> {
         pin.try_clone().ok()
     }
+
+    fn semantic_custody_ref<'pin>(&self, pin: &'pin PidPin) -> Option<&'pin PidPin> {
+        Some(pin)
+    }
 }
 
 /// What one `reconcile` concluded about a caller.
@@ -327,12 +331,27 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         self.source.semantic_custody(&prepared.pin)
     }
 
+    pub(crate) fn scoped_semantic_custody_ref<'pin>(
+        &self,
+        prepared: &'pin PreparedScopedCaller<Source::Pin>,
+    ) -> Option<&'pin PidPin> {
+        self.source.semantic_custody_ref(&prepared.pin)
+    }
+
     pub(crate) fn semantic_custody(&self, caller: CallerId) -> Option<PidPin> {
         let tracked = self.callers.get(&caller)?;
         if tracked.record.retired || self.live_id(tracked.record.pid) != Some(caller) {
             return None;
         }
         self.source.semantic_custody(tracked.pin.as_ref()?)
+    }
+
+    pub(crate) fn semantic_custody_ref(&self, caller: CallerId) -> Option<&PidPin> {
+        let tracked = self.callers.get(&caller)?;
+        if tracked.record.retired || self.live_id(tracked.record.pid) != Some(caller) {
+            return None;
+        }
+        self.source.semantic_custody_ref(tracked.pin.as_ref()?)
     }
     pub(crate) fn new(source: Source) -> Self {
         Self {

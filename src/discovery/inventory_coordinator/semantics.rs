@@ -910,9 +910,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     fn seal_semantic_candidate(
         &self,
         caller: CallerId,
-        pin: PidPin,
+        pin: &PidPin,
         scope: AdmissionScope,
         domain: NativeDomainId,
+        required_generation: Option<&crate::inspect_system::MemberGeneration>,
+        duplicate_first_custody: impl FnOnce() -> Option<PidPin>,
     ) -> Option<SemanticAdmissionCandidate> {
         let record = self.adapter.record(caller)?;
         if record.retired
@@ -929,6 +931,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             start_time: record.start_time,
             exe: record.exe.clone(),
         };
+        if required_generation.is_some_and(|required| required != &generation) {
+            return None;
+        }
         let (expected_pin, from_successor) = self.semantic_bindings.candidate_custody(
             caller,
             record.incarnation,
@@ -940,7 +945,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }) {
             return None;
         }
-        let pin = expected_pin.clone().unwrap_or_else(|| Arc::new(pin));
+        let pin = if let Some(expected) = &expected_pin {
+            expected.clone()
+        } else {
+            // Only the first accepted owner needs a new independent handle.
+            // A known H0 Arc has already retained custody, and a failed
+            // duplicate must never veto its exact reuse.
+            let duplicate = duplicate_first_custody()?;
+            if duplicate.pid() != pin.pid()
+                || duplicate.start_time() != pin.start_time()
+                || !duplicate.still_the_same()
+                || !pin.still_the_same()
+            {
+                return None;
+            }
+            Arc::new(duplicate)
+        };
         Some(SemanticAdmissionCandidate {
             caller,
             incarnation: record.incarnation,
@@ -963,11 +983,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             Scope::System => AdmissionScope::System,
             _ => return None,
         };
-        let pin = self.adapter.semantic_custody(caller)?;
+        let pin = self.adapter.semantic_custody_ref(caller)?;
         if matches!(scope, AdmissionScope::Pid(pid) if pid != pin.pid()) {
             return None;
         }
-        self.seal_semantic_candidate(caller, pin, scope, domain)
+        self.seal_semantic_candidate(caller, pin, scope, domain, None, || {
+            self.adapter.semantic_custody(caller)
+        })
     }
 
     pub(crate) fn prepare_scoped_semantic_candidate(
@@ -976,10 +998,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         domain: NativeDomainId,
     ) -> Option<SemanticAdmissionCandidate> {
         let caller = prepared.existing()?;
-        let pin = self.adapter.scoped_semantic_custody(prepared)?;
-        let candidate =
-            self.seal_semantic_candidate(caller, pin, AdmissionScope::Cgroup, domain)?;
-        (candidate.generation == *prepared.generation()).then_some(candidate)
+        let pin = self.adapter.scoped_semantic_custody_ref(prepared)?;
+        self.seal_semantic_candidate(
+            caller,
+            pin,
+            AdmissionScope::Cgroup,
+            domain,
+            Some(prepared.generation()),
+            || self.adapter.scoped_semantic_custody(prepared),
+        )
     }
 
     /// Consume unchanged owner evidence under the exact current scope guard.

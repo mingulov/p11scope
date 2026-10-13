@@ -7098,7 +7098,11 @@ def wait_inventory_original_checkpoint(ctx, path, owner, executable, deadline):
     while True:
         remaining_until(deadline)
         try:
-            return r5_admission_checkpoint(ctx, path, owner, executable)
+            cursor = r5_admission_checkpoint(ctx, path, owner, executable)
+            remaining_until(deadline)
+            if cursor.retired_incarnation != 0:
+                raise SetupError("Inventory initial caller is not its original incarnation")
+            return cursor
         except SetupError as error:
             if str(error) != "R5 original caller lacks complete same-stream admission/pass":
                 raise
@@ -7123,11 +7127,12 @@ def inventory_target_phases(ctx, log_path, target, original_executable, successo
     recovery0 = inventory_phase_deadline("successor-recovery", 0)
     budget = ACTIVE_LEG.get()
     sibling_deadline = (budget.deadline_ns if budget else wait_deadline(815)) if sibling else None
-    if sibling:
-        sibling.warm(1, sibling_deadline)
-    first = target.warm(1, recovery0)
     initial_cursor = wait_inventory_original_checkpoint(ctx, log_path, target.owner,
                                                         original_executable, recovery0)
+    if sibling:
+        wait_inventory_original_checkpoint(ctx, log_path, sibling.owner, original_executable, recovery0)
+        sibling.warm(1, sibling_deadline)
+    first = target.warm(1, recovery0)
     initial_admission = {"caller": initial_cursor.retired_caller,
         "incarnation": initial_cursor.retired_incarnation,
         "seq": getattr(initial_cursor, "retired_admission_seq", initial_cursor.seq),

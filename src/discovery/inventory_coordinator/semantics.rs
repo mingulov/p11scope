@@ -42,6 +42,37 @@ impl AttestedSubset {
         &self.required
     }
 
+    /// The watched endpoint must be this attested provider's physical
+    /// file, with its retained whole-file digest. Paths and matching
+    /// content in another inode cannot supply this association.
+    pub(crate) fn proves_provider_module(
+        &self,
+        object: PinnedObjectId,
+        module: &ModuleKey,
+    ) -> bool {
+        let ModuleKey::Physical {
+            dev_major,
+            dev_minor,
+            ino,
+            sha256: Some(sha256),
+        } = module
+        else {
+            return false;
+        };
+        if !self.required.contains_key(&object) || sha256.is_empty() {
+            return false;
+        }
+        let Some(pin) = self.pins.pinned().find(|pin| pin.id == object) else {
+            return false;
+        };
+        pin.sha256 == sha256
+            && self.pins.raw_keys_for(object).iter().any(|key| {
+                key.device.major == *dev_major
+                    && key.device.minor == *dev_minor
+                    && key.inode == *ino
+            })
+    }
+
     /// Tests-only envelope: conversion tests script descriptor shapes
     /// (unauthorized, ambiguous, count-only) that `prepare` never admits,
     /// to pin the defense-in-depth refusals above the proven Slot paths.
@@ -928,9 +959,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // Receipts: presence proves H0 association either way; only the
         // lane owner's validation admits coverage.
         let mut coverages = Vec::new();
+        let mut validation = crate::semantic_capture::TickReport::default();
         for receipt in &current {
             self.observe_proven_image(receipt);
-            match lane.validate_current(receipt) {
+            match lane.validate_current(receipt, &mut validation) {
                 Ok(coverage) => coverages.push(coverage),
                 Err(reason) => {
                     let code = match reason {
@@ -954,6 +986,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }
             }
         }
+        // Validation audits can consume a fault and resolve pending calls
+        // even when the receipt refuses. Preserve those owned outcomes in
+        // this publication; every negative below precedes all positives,
+        // including coverage validated before a later receipt's fault.
+        // The two producers are independently bounded. Consume their
+        // negatives directly into H2's bounded ledger instead of spending
+        // call capacity on them or truncating distinct negative scopes.
+        let validation_outcomes = validation.into_outcomes();
         // Negatives first: lane facts, then H0 invalidations. The domain
         // maximum fences conversion as defense-in-depth; the registry's
         // staged-before-positive order enforces scope precision. A cut
@@ -984,11 +1024,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
         }
         let mut calls = Vec::new();
-        for outcome in outcomes {
+        let mut shed_calls = 0usize;
+        for outcome in outcomes.into_iter().chain(validation_outcomes) {
             match outcome {
                 TickOutcome::Call(call) => {
                     if let Some(evidence) = CallEvidence::from_routed(call) {
-                        calls.push(evidence);
+                        if calls.len() < MAX_INSTANCES {
+                            calls.push(evidence);
+                        } else {
+                            shed_calls += 1;
+                        }
                     }
                 }
                 TickOutcome::Invalidation(invalidation) => {
@@ -1024,6 +1069,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 TickOutcome::Other(_) => {}
             }
         }
+        if shed_calls != 0 {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "semantic call outcome capacity".into(),
+                reason: format!("{shed_calls} calls refused at the bounded finalization limit"),
+                budget: Some(BudgetRefusal {
+                    resource: "semantic_call_outcomes",
+                    limit: MAX_INSTANCES,
+                    requested: MAX_INSTANCES + shed_calls,
+                }),
+            });
+        }
         // Validated registrations second: every covered id registers.
         // Conversion borrows end before staging mutates the registry.
         for coverage in &coverages {
@@ -1050,6 +1109,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             admit_registration_from_coverage(
                                 coverage,
                                 binding,
+                                lane.subset(),
                                 *id,
                                 observed_ns,
                                 None,
@@ -1410,7 +1470,15 @@ mod finalizer_history_tests {
             .adapter_mut()
             .admit(pid, ImageAuthority::ScanPinned, 50)
             .unwrap();
-        let module = ModuleKey::physical(7, 7, 777, None, "/task3/provider.so");
+        let fixture = HistoryFixture::new();
+        let pin = fixture.pins.pinned().next().unwrap();
+        let module = ModuleKey::physical(
+            pin.key.device.major,
+            pin.key.device.minor,
+            pin.key.inode,
+            Some(pin.sha256.to_owned()),
+            pin.path,
+        );
         coordinator.registry_mut().note_mapping(
             caller,
             pid,
@@ -1428,7 +1496,6 @@ mod finalizer_history_tests {
             60,
         );
         coordinator.commit_batch(false).unwrap();
-        let fixture = HistoryFixture::new();
         let mut lane =
             AttestedSemanticLane::start(fixture.subset(), &Scope::Pid(pid), BackendSelection::Auto)
                 .expect("shell lane starts");
@@ -1473,7 +1540,7 @@ mod finalizer_history_tests {
         let coverage = LaneCoverage::scripted(detailed, image, endpoint, vec![r0]);
         let input = {
             let binding = coordinator.semantic_bindings().get(caller).unwrap();
-            admit_registration_from_coverage(&coverage, binding, r0, 100, None)
+            admit_registration_from_coverage(&coverage, binding, lane.subset(), r0, 100, None)
                 .expect("scripted coverage registers")
         };
         coordinator.registry_mut().note_instance(input);

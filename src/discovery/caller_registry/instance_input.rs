@@ -1220,6 +1220,9 @@ pub(crate) fn admit_call_from_evidence(
     if slot.object != endpoint.object || slot.file_offset != endpoint.offset {
         return Err(ConversionRefusal::Slot);
     }
+    if !subset.proves_provider_module(endpoint.object, module) {
+        return Err(ConversionRefusal::Module);
+    }
     // Descriptor authority comes only from the attested plan: one
     // canonical operator-attested name, unambiguous, never count-only.
     // The flags below are derived from these checks, never selected.
@@ -1294,6 +1297,7 @@ pub(crate) fn admit_call_from_evidence(
 pub(crate) fn admit_registration_from_coverage(
     coverage: &LaneCoverage,
     binding: &SemanticCallerBinding,
+    subset: &AttestedSubset,
     router: InstanceId,
     observed_ns: u64,
     boundary: Option<u64>,
@@ -1308,7 +1312,7 @@ pub(crate) fn admit_registration_from_coverage(
         return Err(ConversionRefusal::Coverage);
     }
     let module = binding.module();
-    if matches!(module, ModuleKey::Unidentified { .. }) {
+    if !subset.proves_provider_module(coverage.endpoint().object, module) {
         return Err(ConversionRefusal::Module);
     }
     let boundary = match boundary {

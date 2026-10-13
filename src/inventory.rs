@@ -6649,9 +6649,44 @@ mod tests {
             let plan = crate::plan::AttachPlan::from_slots(vec![slot]);
             AttestedSubset::scripted(
                 plan,
-                PinnedObjects::empty(),
-                std::collections::BTreeMap::new(),
+                stub_pins(),
+                std::collections::BTreeMap::from([(
+                    PinnedObjectId(0),
+                    std::collections::BTreeSet::from([0]),
+                )]),
             )
+        }
+
+        fn stub_pins() -> PinnedObjects {
+            static PINS: std::sync::OnceLock<std::sync::Mutex<PinnedObjects>> =
+                std::sync::OnceLock::new();
+            PINS.get_or_init(|| {
+                std::sync::Mutex::new({
+                    use p11scope_manifest::identity::{
+                        inspect_file, mapping_file_key, open_object,
+                    };
+                    let path = std::env::current_exe().unwrap();
+                    let file = open_object(&path).unwrap();
+                    let inspected = inspect_file(&file).unwrap();
+                    let mapping = mapping_file_key(&file).unwrap();
+                    let key = p11scope_manifest::maps::ObjectKey {
+                        device: p11scope_manifest::maps::Device {
+                            major: mapping.device_major,
+                            minor: mapping.device_minor,
+                        },
+                        inode: mapping.inode,
+                    };
+                    crate::discovery::identity::test_fixture::real_scan_pin(
+                        &path,
+                        Some(key),
+                        mapping.mount_id,
+                        inspected.identity.sha256.as_deref().unwrap(),
+                    )
+                })
+            })
+            .lock()
+            .unwrap()
+            .clone()
         }
 
         struct StubLaneIo {
@@ -6693,6 +6728,7 @@ mod tests {
             fn validate_current(
                 &mut self,
                 _receipt: &CurrentPartitionReceipt,
+                _report: &mut TickReport,
             ) -> Result<(), CurrentReceiptRefusal> {
                 Ok(())
             }
@@ -6784,7 +6820,15 @@ mod tests {
                 .adapter_mut()
                 .admit(pid, ImageAuthority::ScanPinned, 50)
                 .unwrap();
-            let module = ModuleKey::physical(7, 7, 777, None, "/task3/provider.so");
+            let pins = stub_pins();
+            let pin = pins.pinned().next().unwrap();
+            let module = ModuleKey::physical(
+                pin.key.device.major,
+                pin.key.device.minor,
+                pin.key.inode,
+                Some(pin.sha256.to_owned()),
+                pin.path,
+            );
             coordinator.registry_mut().note_mapping(
                 caller,
                 pid,

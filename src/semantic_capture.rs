@@ -3736,11 +3736,20 @@ mod tests {
                     ..ExtendReceipt::default()
                 });
                 coordinator.set_semantic_binding_clock(sight_clock);
+                let pins = operation_pins();
+                let pin = pins.pinned().next().unwrap();
+                let module = ModuleKey::physical(
+                    pin.key.device.major,
+                    pin.key.device.minor,
+                    pin.key.inode,
+                    Some(pin.sha256.to_owned()),
+                    pin.path,
+                );
                 Self {
                     coordinator,
                     identity: ChainIdentity::default(),
                     detailed,
-                    module: ModuleKey::physical(7, 7, 777, None, "/task3/provider.so"),
+                    module,
                 }
             }
 
@@ -3859,12 +3868,45 @@ mod tests {
             }
         }
 
-        /// Attested subset over the two ScriptIo semantic slots, aligned
+        fn operation_pins() -> crate::discovery::identity::PinnedObjects {
+            static PINS: std::sync::OnceLock<
+                std::sync::Mutex<crate::discovery::identity::PinnedObjects>,
+            > = std::sync::OnceLock::new();
+            PINS.get_or_init(|| {
+                std::sync::Mutex::new({
+                    use p11scope_manifest::identity::{
+                        inspect_file, mapping_file_key, open_object,
+                    };
+                    let path = std::env::current_exe().unwrap();
+                    let file = open_object(&path).unwrap();
+                    let inspected = inspect_file(&file).unwrap();
+                    let mapping = mapping_file_key(&file).unwrap();
+                    let key = p11scope_manifest::maps::ObjectKey {
+                        device: p11scope_manifest::maps::Device {
+                            major: mapping.device_major,
+                            minor: mapping.device_minor,
+                        },
+                        inode: mapping.inode,
+                    };
+                    crate::discovery::identity::test_fixture::real_scan_pin(
+                        &path,
+                        Some(key),
+                        mapping.mount_id,
+                        inspected.identity.sha256.as_deref().unwrap(),
+                    )
+                })
+            })
+            .lock()
+            .unwrap()
+            .clone()
+        }
+
+        /// Scripted descriptors over a real held file, aligned
         /// to `ScriptIo::endpoint` so real routed Init/Sign calls convert.
         fn operation_subset()
         -> crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset {
             use crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset;
-            use crate::discovery::identity::{PinnedObjectId, PinnedObjects};
+            use crate::discovery::identity::PinnedObjectId;
             let slot = |index: u32, name: &str, offset: u64| crate::plan::Slot {
                 index,
                 descriptor_index: crate::kinds::function_id(name).unwrap() + 1,
@@ -3885,8 +3927,11 @@ mod tests {
             ]);
             AttestedSubset::scripted(
                 plan,
-                PinnedObjects::empty(),
-                std::collections::BTreeMap::new(),
+                operation_pins(),
+                std::collections::BTreeMap::from([(
+                    PinnedObjectId(0),
+                    std::collections::BTreeSet::from([0, 1]),
+                )]),
             )
         }
 
@@ -3933,10 +3978,10 @@ mod tests {
             fn validate_current(
                 &mut self,
                 receipt: &CurrentPartitionReceipt,
+                report: &mut TickReport,
             ) -> Result<(), CurrentReceiptRefusal> {
-                let mut scratch = TickReport::default();
                 self.capture
-                    .validate_current_with(&mut self.io, receipt, &mut scratch)
+                    .validate_current_with(&mut self.io, receipt, report)
             }
 
             fn tick(&mut self, domain: NativeDomainId) -> Result<SemanticBatch, SemanticRefusal> {

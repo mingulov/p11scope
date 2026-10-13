@@ -8137,7 +8137,7 @@ CELL_RUNNERS = {
     "leader-exit-exec": run_leader_exit_exec,
     "rapid-chain": run_rapid_chain,
     "cgroup-reentry": run_cgroup_reentry,
-    "system-mixed": run_system_mixed,
+    "system-mixed": lambda ctx, cell_dir, backend: [run_system_mixed(ctx, cell_dir, backend)],
 }
 
 

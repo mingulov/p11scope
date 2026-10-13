@@ -7866,11 +7866,42 @@ impl LoadedSeedProvider {
 
 fn wait_loaded_seed_peer(
     child: &mut std::process::Child,
-    _runner: &Path,
-    _library: &Path,
+    runner: &Path,
+    library: &Path,
     mut after_probe: impl FnMut(&mut std::process::Child),
 ) {
-    after_probe(child);
+    let runner = std::fs::canonicalize(runner).unwrap();
+    let library = std::fs::canonicalize(library).unwrap();
+    let pid = child.id();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let image = std::fs::read_link(format!("/proc/{pid}/exe"));
+        let maps = std::fs::read_to_string(format!("/proc/{pid}/maps"));
+        let runner_mapped = maps
+            .as_ref()
+            .is_ok_and(|maps| maps_have_executable_image(maps, &runner));
+        let provider_mapped = maps
+            .as_ref()
+            .is_ok_and(|maps| maps_have_executable_image(maps, &library));
+        // The peer promises the same loaded state as the primary fixture.
+        // Exe alone can switch before executable segments appear, and a
+        // different initialized image (such as a launcher) is not this peer.
+        if image.as_ref().is_ok_and(|image| image == &runner) && runner_mapped && provider_mapped {
+            return;
+        }
+        after_probe(child);
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "seed peer {pid} exited before mapping {runner:?} and {library:?}"
+        );
+        // Test the final predicate after the last sleep before rejecting the
+        // deadline, just as the existing exec-settling helper does.
+        assert!(
+            std::time::Instant::now() < deadline,
+            "seed peer {pid} never became ready: exe={image:?}, runner executable={runner_mapped}, provider executable={provider_mapped}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 #[test]

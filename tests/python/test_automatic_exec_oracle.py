@@ -4271,6 +4271,22 @@ class InventoryFixtureTest(unittest.TestCase):
                 owners.append(owner)
                 readers.extend((stdout, stderr))
             return owner, stdout, stderr
+        def manifest(*_args):
+            # The observer seam receives a selected manifest, with endpoints
+            # read from the held ELF rather than resolved by loading it here.
+            names = ("C_GetFunctionList", "C_Initialize", "C_Finalize", "C_GetSlotList",
+                "C_OpenSession", "C_CloseSession", "C_Login", "C_Logout", "C_DestroyObject",
+                "C_DigestInit", "C_Digest", "C_GenerateKey", "C_EncryptInit", "C_Encrypt",
+                "C_SignInit", "C_Sign", "C_VerifyInit", "C_Verify")
+            reader = runpy.run_path(str(ROOT / "scripts/check-live-discovery-evidence.py"))["elf_facts"]
+            facts = reader(f"/proc/self/fd/{provider_pin.fd}", names)
+            pin = H6["provider_receipt"](provider_pin)
+            return {"schema": "p11scope-manifest/5", "objects": [{"id": 0, "path": pin["path"],
+                "identity": {"sha256": pin["sha256"]}}], "provenance_objects": [{"path": pin["path"],
+                "device_major": pin["dev"][0], "device_minor": pin["dev"][1], "inode": pin["ino"],
+                "identity": {"sha256": pin["sha256"]}}], "surfaces": [{"acquisition": {"status": "ok"},
+                    "functions": [{"name": name, "resolution": {"status": "resolved", "object": 0,
+                        "file_offset": facts["symbols"][name]["file_offset"]}} for name in names]}]}
         def observer(_ctx, leg_dir, *_args):
             log, doc = leg_dir / "events.jsonl", leg_dir / "inventory.json"
             log.write_text("")
@@ -4315,7 +4331,7 @@ class InventoryFixtureTest(unittest.TestCase):
         def detach(pid, scope):
             if any(owner.pid == pid for owner in scope.traced):
                 H6["ptrace_detach"](pid, scope)
-        patches = {"init_token": lambda *_args: self.env, "build_manifest": lambda *_args: None, "leg_pin": pinned,
+        patches = {"init_token": lambda *_args: self.env, "build_manifest": manifest, "leg_pin": pinned,
             "spawn_owned": ordinary, "spawn_ledger": ledger, "spawn_inventory": observer,
             "wait_inventory_ready": lambda *_args: time.monotonic_ns(),
             "wait_passes": lambda *_args: 2,
@@ -4431,6 +4447,17 @@ class InventoryFixtureTest(unittest.TestCase):
             {"lossy": True, "reasons": ["capture_stopped", "semantic_loss"]}, "uncertain")
         result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
         self.assertTrue(result["pass"], result["errors"])
+
+    def test_proved_getter_cannot_be_counted_outside_selected_membership(self):
+        doc, ledgers, receipt = self.run_inventory_route(cell="cgroup-reentry")
+        positive = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+        self.assertTrue(positive["pass"], positive["errors"])
+        getter = next(row for row in ledgers["RX"]["batches"]
+                      if row["gen"] == 0 and row["fn"] == "C_GetFunctionList")
+        receipt["scope_intervals"][0]["t0"] = getter["t1"] + 1
+        result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+        self.assertFalse(result["pass"], result)
+        self.assertIn("Inventory outside-scope ledger work entered the controlled scoped population", result["errors"])
 
     def test_unexplained_or_early_final_semantic_loss_cannot_pass(self):
         original = self.run_inventory_route(cell="cgroup-reentry")
@@ -4815,7 +4842,7 @@ class InventoryManifestAccessTest(unittest.TestCase):
                 self.assertFalse((leg / "calibrate-denied.json").exists())
                 leg.chmod(0o755)
 
-        patches = {"init_token": init, "build_manifest": manifest,
+        patches = {"init_token": init, "build_manifest": manifest, "inventory_manifest_hooks": reached,
                    "create_tracked": reached, "spawn_ledger": reached}
         try:
             with mock.patch.dict(H6[name].__globals__, patches):
@@ -4917,6 +4944,7 @@ class R5OrderingTest(unittest.TestCase):
             owner.verify()
             return {"pid": owner.pid, "start_time": 7777, **pin.metadata()}
         patches = {"init_token": lambda *_args: {}, "build_manifest": lambda *_args: None,
+            "inventory_manifest_hooks": lambda *_args: {},
             "create_tracked": group, "spawn_ledger": ledger, "spawn_inventory": observer,
             "wait_ledger_line": lambda *_args, **_kwargs: None,
             "wait_inventory_ready": lambda *_args: 20, "wait_passes": lambda *_args: 2,
@@ -4936,7 +4964,7 @@ class R5OrderingTest(unittest.TestCase):
             "stop_receipt": lambda *_args: {}, "wait_process": lambda *_args: 0,
             "finish_readers": lambda *_args: None,
             "parse_inv_ledger": lambda *_args: {"batches": []},
-            "counted_totals": lambda *_args: {}, "phase_window": lambda *_args: (30, 40, 1),
+            "counted_totals": lambda *_args, **_kwargs: {}, "phase_window": lambda *_args: (30, 40, 1),
             "provider_entry": lambda *_args: {}, "provider_receipt": lambda *_args: {},
             "evaluate_inventory_h6": lambda _doc, _ledgers, receipt: receipt}
         try:
@@ -5692,20 +5720,11 @@ class InventoryPhysicalLedgerTest(unittest.TestCase):
 
     def boundary(self, data, hooks=None):
         records, image, admission, marker, batches = data
-        function = H6["inventory_boundary"]
-        # The legacy API reaches its real count rejection before the new
-        # independently calibrated hook input is implemented.
-        kwargs = {"physical_hooks": self.hooks if hooks is None else hooks,
-                  "started_ns": self.started} if "physical_hooks" in inspect.signature(function).parameters else {}
-        return function(records, self.owner, image, self.provider, admission, 4, marker, batches, **kwargs)
+        return H6["inventory_boundary"](records, self.owner, image, self.provider, admission, 4,
+            marker, batches, physical_hooks=self.hooks if hooks is None else hooks, started_ns=self.started)
 
     def totals(self, batches, **kwargs):
-        function = H6["counted_totals"]
-        if "physical_hooks" in inspect.signature(function).parameters:
-            kwargs["physical_hooks"] = self.hooks
-        else:
-            kwargs.pop("scope_intervals", None)
-        return function(batches, self.started, **kwargs)
+        return H6["counted_totals"](batches, self.started, physical_hooks=self.hooks, **kwargs)
 
     def test_captured_getter_is_physical_work_without_fabricating_s1_returns(self):
         for n, physical in ((1, 11), (3, 13)):
@@ -5737,13 +5756,10 @@ class InventoryPhysicalLedgerTest(unittest.TestCase):
                 self.assertEqual(self.totals(rows, **kwargs).get(key, 0), 10)
 
     def test_manifest_hooks_bind_the_export_to_the_same_held_physical_object(self):
-        function = H6.get("inventory_manifest_hooks")
-        self.assertTrue(callable(function), "qualification lacks held-provider physical hook calibration")
-        self.assertEqual(function(self.manifest, self.provider_pin), self.hooks)
+        self.assertEqual(H6["inventory_manifest_hooks"](self.manifest, self.provider_pin), self.hooks)
 
     def test_manifest_getter_unresolved_foreign_or_wrong_offset_never_grants_membership(self):
-        function = H6.get("inventory_manifest_hooks")
-        self.assertTrue(callable(function), "qualification lacks held-provider physical hook calibration")
+        function = H6["inventory_manifest_hooks"]
         for fault in ("unresolved", "foreign-object", "wrong-offset", "wrong-inode", "wrong-device", "wrong-digest"):
             with self.subTest(fault=fault):
                 manifest = copy.deepcopy(self.manifest)
@@ -5768,6 +5784,40 @@ class InventoryPhysicalLedgerTest(unittest.TestCase):
         rows.append({**rows[-1], "fn": "C_ForeignFunction", "n": 1})
         with self.assertRaises(H6["SetupError"]):
             self.totals(rows)
+
+    def test_physical_hook_provider_mismatch_is_not_a_same_path_proof(self):
+        hooks = copy.deepcopy(self.hooks)
+        hooks[str(self.provider_path)]["provider"]["ino"] += 1
+        with self.assertRaises(H6["SetupError"]):
+            self.boundary(self.boundary_inputs(), hooks=hooks)
+
+    def test_physical_getter_does_not_establish_missing_or_inflated_s1_rows(self):
+        data = self.boundary_inputs()
+        data[0][2]["event"]["api_returns"]["count"] = 11
+        self.assertIsNone(self.boundary(data))
+        data = self.boundary_inputs()
+        data[0][:] = [row for row in data[0] if row["kind"] not in ("instance_observed", "semantic_edge_observed")]
+        self.assertIsNone(self.boundary(data))
+
+    def test_observer_boundary_overlap_refuses_and_post_stop_getter_stays_out(self):
+        for stop, lower, upper in ((None, self.started - 1, self.started + 1),
+                (self.started + 1000, self.started + 900, self.started + 1001)):
+            with self.subTest(stop=stop):
+                rows = self.boundary_inputs()[-1]
+                rows[0].update(t0=lower, t1=upper)
+                with self.assertRaises(H6["SetupError"]):
+                    self.totals(rows, stopped_ns=stop)
+        rows = self.boundary_inputs()[-1]
+        rows[0].update(t0=self.started + 1001, t1=self.started + 1002)
+        self.assertEqual(self.totals(rows, stopped_ns=self.started + 1000)
+                         [(self.owner.pid, 1, str(self.provider_path))], 10)
+
+    def test_legacy_pre_observer_setup_keeps_the_getter_excluded(self):
+        rows = self.boundary_inputs()[-1]
+        rows[0].update(gen=0, phase="setup", t0=self.started - 10, t1=self.started - 1)
+        totals = self.totals(rows)
+        self.assertEqual(totals.get((self.owner.pid, 0, str(self.provider_path)), 0), 0)
+        self.assertEqual(totals[(self.owner.pid, 1, str(self.provider_path))], 10)
 
 
 class InventoryReadinessTest(unittest.TestCase):

@@ -3133,13 +3133,14 @@ impl CallerRegistry {
             let Some(edge) = self.edge(caller, module) else {
                 continue;
             };
-            let physical_first_ns = if edge.entry_count > 0 {
-                edge.entry_first_seen_ns
-            } else if let UseCoverage::Witnessed { first_ns } = self.coverage(edge) {
-                Some(first_ns)
-            } else {
-                None
-            };
+            // Counted presentation can hide an earlier retained witness;
+            // either positive history can precede this registration stamp.
+            let physical_first_ns = edge
+                .entry_first_seen_ns
+                .filter(|_| edge.entry_count > 0)
+                .into_iter()
+                .chain(edge.coverage.witnessed_first_ns)
+                .min();
             if !physical_first_ns.is_some_and(|first| first < first_observed_ns) {
                 continue;
             }

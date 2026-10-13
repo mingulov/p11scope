@@ -4260,6 +4260,7 @@ class ControlledInventoryObserver:
         self.records, self.callers, self.last, self.instances, self.semantic = [], {}, {}, {}, {}
         self.passed, self.previous_counts = -1, {}
         self.last_acks = {}
+        self.gaps = []
         self.release_original_admission = False
         self.quiet_publications = {}
         self.release_teardown = fault not in ("delayed-teardown", "withheld-teardown")
@@ -4281,7 +4282,9 @@ class ControlledInventoryObserver:
     def context(self, owner, ident, caller_id):
         info = os.stat(ident["exe"])
         return {"id": caller_id, "pid": owner.pid, "start_time": owner.identity["start_time"],
-            "incarnation": ident["gen"], "authority": "native_exact", "lifecycle": "mapped", "status": "observed",
+            "incarnation": ident["gen"], "authority": "scan_pinned" if self.fault in (
+                "target-preuse", "target-preuse-repeated") else "native_exact",
+            "lifecycle": "mapped", "status": "observed",
             "executable": {"path": ident["exe"], "dev": info.st_dev, "ino": info.st_ino,
                 "mtime_secs": info.st_mtime_ns // 1_000_000_000,
                 "mtime_nanos": info.st_mtime_ns % 1_000_000_000}}
@@ -4291,13 +4294,20 @@ class ControlledInventoryObserver:
             "incarnation": value["incarnation"], "lifecycle": value["lifecycle"],
             "retired": value["lifecycle"] == "exec_retired", "image": {"exe": {"path": value["executable"]["path"]}}}
             for value in self.callers.values()]
-        return {"schema": "p11scope/inventory/v1", "scope": "system" if self.membership is None else "cgroup",
+        doc = {"schema": "p11scope/inventory/v1", "scope": "system" if self.membership is None else "cgroup",
             "callers": rows, "modules": [{"id": self.module_ids[pin["path"]], "paths": [pin["path"]],
                 "identity": {"inode": pin["ino"], "sha256": pin["sha256"]}} for pin in self.providers.values()],
             "edges": [{key: value for key, value in row.items() if key != "identity_context"}
                       for row in self.last.values()], "instances": list(self.instances.values()),
-            "semantic_edges": list(self.semantic.values()), "gaps": [],
+            "semantic_edges": list(self.semantic.values()), "gaps": list(self.gaps),
             "observation": {"attach": {"selection": "singles", "fallback": None}}}
+        if self.fault in ("target-preuse", "target-preuse-repeated"):
+            for row, context in zip(rows, self.callers.values()):
+                row["image"] = {"authority": context["authority"], "exe": dict(context["executable"])}
+            doc["gaps_suppressed"] = 0
+            doc["observation"].update(lane="native", passes=self.passed + 1)
+            doc["observation"]["attach"]["scope_filter"] = "bpf-cgroup"
+        return doc
 
     def sweep(self, final=False):
         written = Counter()
@@ -4375,6 +4385,22 @@ class ControlledInventoryObserver:
                             "id": module_id, "device_major": pin["mapping"]["dev"][0],
                             "device_minor": pin["mapping"]["dev"][1], "inode": pin["ino"],
                             "path": module_path, "status": "observed"}}}
+                    if (self.fault in ("target-preuse", "target-preuse-repeated")
+                            and ident["cell"] == "RX" and ident["gen"] == 0 and not count):
+                        edge["entries"].update(in_flight=False, coverage={"state": "unknown",
+                            "lossy": None, "reason": "scope_membership_unproven"})
+                        if not self.gaps:
+                            initial = copy.deepcopy(edge)
+                            initial["entries"]["coverage"]["reason"] = "not_attached"
+                            self.emit("edge_observed", initial)
+                            written["edge_events"] += 1
+                            gap = {"caller": context["id"], "module": None, "pid": None, "budget": None,
+                                "subject": "semantic admission refused", "reason": "semantic_unavailable"}
+                            self.gaps.append({**gap, "repeats": 1})
+                            self.emit("gap_recorded", {**gap, "index": 0})
+                            if self.fault == "target-preuse-repeated":
+                                self.gaps[0]["repeats"] = 2
+                                self.emit("gap_repeated", {"index": 0, "repeats": 2})
                     if module_path == self.provider["path"] and count:
                         instance_id = f"i{context['id'][1:]}"
                         mechanisms = [{"mechanism_hex": mech, "calls": value,
@@ -4783,7 +4809,7 @@ class InventoryFixtureTest(unittest.TestCase):
         patches["LegBudget"] = lambda **_kwargs: actual_budget(inventory=True, budgets={"setup": 3,
             "successor-recovery": 0.4 if fault not in (None, "failed-move", "initial-no-calls", "history-prefix",
                 "recovered-history", "recovered-no-calls", "split-retirement", "delayed-teardown", "withheld-teardown",
-                "deferred-target-admission", "deferred-sibling-admission") else 3,
+                "deferred-target-admission", "deferred-sibling-admission", "target-preuse", "target-preuse-repeated") else 3,
             "fixed-measurement": 2 if fault == "withheld-teardown" else 8,
             "normal-stop": 2, "cleanup": 2}, leg_seconds=15)
         self.route_events, self.route_owners, self.route_case = events, owners, ctx
@@ -4816,6 +4842,67 @@ class InventoryFixtureTest(unittest.TestCase):
                 reader.thread.join(2)
             for pin in pins:
                 pin.close()
+
+    def test_target_preuse_disclosure_retains_zero_prefix_and_exact_later_measurement(self):
+        for fault in ("target-preuse", "target-preuse-repeated"):
+            with self.subTest(fault=fault):
+                doc, ledgers, receipt = self.run_inventory_route(cell="cgroup-reentry", fault=fault)
+                proof = receipt["inventory_control"]["measurements"][0]["proof"]
+                gap = next(row for row in receipt["inventory_control"]["final_records"] if row["kind"] == "gap_recorded")
+                self.assertLess(gap["at_ns"], proof["markers"][0]["dispatch_ns"])
+                self.assertLess(gap["at_ns"], min(row["t0"] for row in ledgers["RX"]["batches"]))
+                result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
+                self.assertTrue(result["pass"], result["errors"])
+                self.assertEqual(result["physical_counted"], result["physical_entered"])
+                self.assertEqual(result["completed_operations"], 20)
+                self.assertEqual(result["expected_disclosures"], doc["gaps"])
+
+    def test_target_preuse_disclosure_refuses_time_identity_and_prefix_twins(self):
+        original = self.run_inventory_route(cell="cgroup-reentry", fault="target-preuse")
+        for fault in ("after-first-call", "after-dispatch", "repeat-unproven", "late-repeat", "birth", "image", "provider",
+                      "missing-proof", "missing-admission", "positive-prefix", "in-flight-prefix",
+                      "wrong-prefix-reason", "missing-zero-prefix", "missing-completing-pass"):
+            with self.subTest(fault=fault):
+                doc, ledgers, receipt = copy.deepcopy(original)
+                control = receipt["inventory_control"]
+                proof = control["measurements"][0]["proof"]
+                records = control["final_records"]
+                gap = next(row for row in records if row["kind"] == "gap_recorded")
+                edges = [row for row in records if row["kind"] == "edge_observed"
+                    and row["event"]["caller"] == proof["caller"] and row["event"]["entries"]["count"] == 0]
+                if fault == "after-first-call":
+                    gap["at_ns"] = min(row["t0"] for row in ledgers["RX"]["batches"]) + 1
+                elif fault == "after-dispatch":
+                    proof["markers"][0]["dispatch_ns"] = gap["at_ns"]
+                elif fault in ("repeat-unproven", "late-repeat"):
+                    doc["gaps"][0]["repeats"] = 2
+                    if fault == "late-repeat":
+                        records.insert(-1, {"schema": "p11scope/inventory-events/v1", "seq": records[-1]["seq"],
+                            "at_ns": records[-1]["at_ns"], "kind": "gap_repeated", "event": {"index": 0, "repeats": 2}})
+                        records[-1]["seq"] += 1
+                elif fault == "birth":
+                    proof["image"]["start_time"] += 1
+                elif fault == "image":
+                    proof["image"]["ino"] += 1
+                elif fault == "provider":
+                    proof["provider"]["ino"] += 1
+                elif fault == "missing-proof":
+                    control["measurements"].clear()
+                elif fault == "missing-admission":
+                    next(row for row in records if row["seq"] == proof["admission"]["seq"])["event"]["event"] = "other"
+                elif fault == "missing-completing-pass":
+                    proof["admission"]["completed_pass"]["seq"] = gap["seq"]
+                elif fault == "missing-zero-prefix":
+                    for row in edges:
+                        row["event"]["caller"] = "c999"
+                elif fault == "positive-prefix":
+                    edges[0]["event"]["entries"]["count"] = 1
+                elif fault == "in-flight-prefix":
+                    edges[0]["event"]["entries"]["in_flight"] = True
+                else:
+                    edges[0]["event"]["entries"]["coverage"]["reason"] = "semantic_loss"
+                self.assertFalse(H6["inventory_cgroup_disclosure"](doc, ledgers, receipt, 0))
+                self.assertFalse(H6["evaluate_inventory_h6"](doc, ledgers, receipt)["pass"])
 
     def cgroup_disclosure_inputs(self):
         doc, ledgers, receipt = self.run_inventory_route(cell="cgroup-reentry")

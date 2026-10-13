@@ -3108,9 +3108,58 @@ impl CallerRegistry {
                 observer.as_mut().expect("enabled count observer")(count);
             }
         }
+        self.reconcile_initial_semantic_coverage();
         self.facts_revision = self.facts_revision.saturating_add(1);
         self.published_revision = self.facts_revision;
         applied
+    }
+
+    /// Disclose the initial observation interval after physical and semantic
+    /// mutations join this publication, including a later physical reveal.
+    /// Instance batch stamps are non-authority metadata: use before a stamp
+    /// proves neither missing calls nor the actual start of semantic proof.
+    /// Current receipts, reducers and physical counters remain untouched.
+    fn reconcile_initial_semantic_coverage(&mut self) {
+        let mut first_observed = BTreeMap::<(CallerId, ModuleId), u64>::new();
+        for instance in self.instances() {
+            first_observed
+                .entry((instance.caller, instance.module))
+                .and_modify(|first| *first = (*first).min(instance.first_seen_ns))
+                .or_insert(instance.first_seen_ns);
+        }
+        // Retained instances bound this transient index; direct edge lookups
+        // avoid scanning every edge for each registration or replacement.
+        for ((caller, module), first_observed_ns) in first_observed {
+            let Some(edge) = self.edge(caller, module) else {
+                continue;
+            };
+            let physical_first_ns = if edge.entry_count > 0 {
+                edge.entry_first_seen_ns
+            } else if let UseCoverage::Witnessed { first_ns } = self.coverage(edge) {
+                Some(first_ns)
+            } else {
+                None
+            };
+            if !physical_first_ns.is_some_and(|first| first < first_observed_ns) {
+                continue;
+            }
+            let gap = RegistryGap {
+                caller: Some(caller),
+                module: Some(module),
+                pid: None,
+                subject: "physical provider use preceded first observed semantic registration"
+                    .into(),
+                reason: instance_input::InstanceReason::BeforeSemanticBoundary
+                    .label()
+                    .into(),
+                budget: None,
+            };
+            // Reconciliation is not a new occurrence each pass. Suppressed
+            // identities retain the existing bounded fingerprint policy.
+            if !self.gap_index.contains_key(&gap) {
+                self.push_gap(gap);
+            }
+        }
     }
 
     /// Publish one gap once per run. Identity is every published field

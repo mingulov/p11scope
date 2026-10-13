@@ -4463,6 +4463,13 @@ class ControlledInventoryObserver:
                             self.emit("semantic_edge_observed", semantic)
                             written["semantic_edge_events"] += 1
                             self.semantic[instance_id] = semantic
+                    if (self.fault == "history-prefix" and ident["cell"] in ("RX", "MX")
+                            and ident["gen"] == 0 and ack is not None
+                            and ack["command"] == "W" and ack["seq"] == 1):
+                        # Retain the actual zero-use physical publication while
+                        # W1's semantic history arrives. Settled idle passes
+                        # must prompt a real W2 before this fixture can be ready.
+                        continue
                     pair = context["id"], module_id
                     if self.last.get(pair) != edge:
                         self.emit("edge_observed", edge)

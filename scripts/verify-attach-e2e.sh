@@ -97,12 +97,14 @@ softhsm2-util --init-token --free --label e2e --so-pin 1234 --pin 1234 >/dev/nul
 # p11scope arguments this lane adds. The workload dlopens the provider, then
 # blocks on the go-file: the scan needs the provider mapped before it runs,
 # and the oracle needs every PKCS#11 call to happen after the probes are on.
+# After its last call it stays mapped until the observer finishes cleanup.
 run_lane() {
     lane=$1
     mode=$2
     shift 2
-    rm -f "$WORK/$lane-go"
-    "$WORK/harness" "$MODULE" "$WORK/$lane-go" > "$WORK/$lane-workload.log" 2>&1 &
+    rm -f "$WORK/$lane-go" "$WORK/$lane-finish"
+    "$WORK/harness" "$MODULE" "$WORK/$lane-go" "$WORK/$lane-finish" \
+        > "$WORK/$lane-workload.log" 2>&1 &
     WPID=$!
     wait_for_mapped_provider "$WPID" libsofthsm2.so
     sudo --preserve-env=SOFTHSM2_CONF "$WORK/build/release/p11scope" profile \
@@ -112,19 +114,39 @@ run_lane() {
     SPID=$!
     wait_for_capture_ready "$WORK/$lane.log" aggregate-only metrics
     touch "$WORK/$lane-go"
-    if wait "$WPID"; then WPID=; else status=$?; WPID=; echo "workload failed: $status"; cat "$WORK/$lane-workload.log"; exit "$status"; fi
+    completion_attempt=0
+    until grep -Fxq 'harness OK' "$WORK/$lane-workload.log"; do
+        if ! kill -0 "$WPID" 2>/dev/null; then
+            if wait "$WPID"; then status=1; else status=$?; fi
+            WPID=
+            echo "workload failed before completion: $status"
+            cat "$WORK/$lane-workload.log"
+            exit "$status"
+        fi
+        completion_attempt=$((completion_attempt + 1))
+        if [ "$completion_attempt" -ge 400 ]; then
+            echo "workload never acknowledged completion"
+            cat "$WORK/$lane-workload.log"
+            exit 1
+        fi
+        sleep 0.05
+    done
     if wait "$SPID"; then
-        SPID=
+        profiler_status=0
     else
-        status=$?
-        SPID=
-        echo "profiler failed: $status"
+        profiler_status=$?
+    fi
+    SPID=
+    touch "$WORK/$lane-finish"
+    if wait "$WPID"; then WPID=; else status=$?; WPID=; echo "workload failed: $status"; cat "$WORK/$lane-workload.log"; exit "$status"; fi
+    if [ "$profiler_status" -ne 0 ]; then
+        echo "profiler failed: $profiler_status"
         if [ "$diagnose_skips" -eq 1 ]; then
             tail -n 20 "$WORK/$lane.log" | sed '/^p11scope: skip-attribution: /d' || :
         else
             tail -n 20 "$WORK/$lane.log" || true
         fi
-        exit "$status"
+        exit "$profiler_status"
     fi
     if [ "$diagnose_skips" -eq 1 ]; then
         # Attribution belongs only in the bounded checker-failure dump below.

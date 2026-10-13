@@ -2187,10 +2187,8 @@ def inventory_instance_history_errors(records, instance_id, caller, module, rece
         retired = retired_at is not None and retired_at < record["seq"]
         if kind == "instance_observed":
             state, reason = row.get("state"), row.get("reason")
-            if (recovery is not None and record == recovery["successor_instance"]
-                    and (state, reason) == ("uncertain", "semantic_loss")
-                    and inventory_inherited_no_calls(recovery["successor_semantic"]["event"])):
-                continue  # First registration inherited a cut, before any reducer-positive call.
+            if inventory_recovered_quiet_instance(record, recovery):
+                continue  # Registrations can refresh the inherited no-call prefix.
             if (state, reason) == ("observed", None):
                 if authority_ended:
                     errors.append("Inventory instance history revived lost authority")
@@ -5989,6 +5987,17 @@ def inventory_inherited_no_calls(row):
         and row.get("coverage") == {"lossy": True, "reasons": ["no_calls", "semantic_loss"]})
 
 
+def inventory_recovered_quiet_instance(record, recovery):
+    if recovery is None or not inventory_inherited_no_calls(recovery["successor_semantic"]["event"]):
+        return False
+    first, positive = recovery["successor_instance"], recovery["successor_first_return"]
+    row = record["event"]
+    return (record["kind"] == "instance_observed" and record["seq"] >= first["seq"]
+        and (positive is None or record["seq"] < positive["seq"])
+        and all(row.get(key) == first["event"].get(key) for key in ("id", "caller", "module"))
+        and (row.get("state"), row.get("reason")) == ("uncertain", "semantic_loss"))
+
+
 def inventory_recovered_history(records, previous, owner, image, provider, admission, semantic):
     """Bind the one supported inherited-loss shape to this observer's exec history.
 
@@ -6032,6 +6041,14 @@ def inventory_recovered_history(records, previous, owner, image, provider, admis
                   and row["event"].get("instance") == semantic["event"]["instance"]), None)
     if first is None or first["seq"] <= admission["seq"]:
         raise SetupError("Inventory recovered history lacks its first successor semantic publication")
+    first_return = next((row for row in records if row["kind"] == "semantic_edge_observed"
+        and row["event"].get("instance") == semantic["event"]["instance"]
+        and type((row["event"].get("api_returns") or {}).get("count")) is int
+        and row["event"]["api_returns"]["count"] > 0), None)
+    if any(not inventory_inherited_no_calls(row["event"]) for row in records
+           if row["kind"] == "semantic_edge_observed" and row["event"].get("instance") == semantic["event"]["instance"]
+           and (first_return is None or row["seq"] < first_return["seq"])):
+        raise SetupError("Inventory recovered history changed its inherited no-call prefix")
     old_instances = [row for row in records if retirement["seq"] < row["seq"] < first["seq"]
         and row["kind"] == "instance_observed" and row["event"].get("id") == proof["instance"]
         and (row["event"].get("caller"), row["event"].get("module"), row["event"].get("state"),
@@ -6058,6 +6075,7 @@ def inventory_recovered_history(records, previous, owner, image, provider, admis
     return {"previous_end_seq": end["pass"]["seq"], "retirement": retirement,
         "old_instance": old_instances[0], "old_semantic": old_loss[0],
         "successor_admission": admitted, "successor_instance": first_instance, "successor_semantic": first,
+        "successor_first_return": first_return,
         "limitation": RECOVERED_HISTORY_LIMITATION}
 
 
@@ -6200,7 +6218,7 @@ def inventory_boundary(records, owner, image, provider, admission, floor, marker
     if prior is None and (semantic["event"].get("coverage") or {}).get("lossy"):
         recovery = inventory_recovered_history(records, recovery_from, owner, image, provider, admission, semantic)
     if instance["event"].get("state") != "observed" or instance["event"].get("reason") is not None:
-        if (prior is None and recovery is not None and instance == recovery["successor_instance"]
+        if (prior is None and inventory_recovered_quiet_instance(instance, recovery)
                 and inventory_inherited_no_calls(semantic["event"])):
             return None
         raise SetupError("Inventory S1 instance is retired or uncertain")

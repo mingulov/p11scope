@@ -4678,12 +4678,17 @@ class InventoryFixtureTest(unittest.TestCase):
         self.assertGreater(quiet[1]["event"]["last_seen_ns"], quiet[0]["event"]["last_seen_ns"])
         result = H6["evaluate_inventory_h6"](doc, ledgers, receipt)
         self.assertTrue(result["pass"], result["errors"])
-        for fault in ("false-positive", "historical", "other-uncertainty"):
+        for fault in ("false-positive", "historical", "other-uncertainty", "second-uncertainty", "later-uncertainty"):
             changed = copy.deepcopy(receipt)
             recovery = changed["inventory_control"]["measurements"][1]["proof"]["baseline"]["recovery"]
             records = changed["inventory_control"]["final_records"]
             if fault == "other-uncertainty":
                 records[recovery["successor_instance"]["seq"]]["event"]["reason"] = "task_retired"
+            elif fault == "second-uncertainty":
+                records[quiet[1]["seq"]]["event"]["reason"] = "task_retired"
+            elif fault == "later-uncertainty":
+                endpoint = changed["inventory_control"]["measurements"][1]["end"]["instance"]
+                records[endpoint["seq"]]["event"].update(state="uncertain", reason="semantic_loss")
             else:
                 row = records[recovery["successor_semantic"]["seq"]]["event"]
                 row["api_returns"]["count" if fault == "false-positive" else "historical_only_returns"] = 1

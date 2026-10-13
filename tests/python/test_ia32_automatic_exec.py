@@ -8,6 +8,7 @@ import json
 import os
 import pty
 from pathlib import Path
+from types import SimpleNamespace
 import runpy
 import signal
 import subprocess
@@ -411,6 +412,79 @@ int main(int argc, char **argv) {
         return (f'21:37:58.638119 {json.dumps(Path(path).name)} '
                 f'(PID {image["pid"]}, TID {image["pid"]}) exe={json.dumps(path)} '
                 'C_GetInfo [semantics unverified] → CKR_OK 10µs\n')
+
+    def test_trace_exec_waits_for_old_shared_return_after_held_ack(self):
+        gate = self.load()
+        with tempfile.TemporaryDirectory(prefix="ia32-shared-return-") as tmp:
+            directory = Path(tmp)
+            fixtures = gate["compile_fixtures"](directory / "fixtures")
+            case = gate["H6"]["Case"](SimpleNamespace(out=directory, uid=os.getuid(),
+                gid=os.getgid(), binary=Path(sys.executable)))
+            case.fixtures = fixtures
+            state, writers = {}, []
+
+            def observer(_owners, readers, leg_dir, _argv, _env, live):
+                self.assertFalse(live)
+                streams = []
+                for name in ("public", "errors"):
+                    read_fd, write_fd = os.pipe()
+                    writers.append(write_fd)
+                    streams.append(gate["H6"]["owned_reader"](readers, gate["H6"]["Reader"],
+                        os.fdopen(read_fd, "r", encoding="utf-8"), leg_dir / name))
+                capture, errors = streams
+                state["capture"] = capture
+                original_get = capture.updates.get
+
+                def publish_after_wait(*args, **kwargs):
+                    driver = state["driver"]
+                    self.assertIn("held-ack", driver.stamps)
+                    self.assertNotIn("exec-start", driver.stamps)
+                    if not state.get("published"):
+                        row = next(r for r in driver.stdout.records if r.get("fn") == "C_OpenSession")
+                        self.assertEqual((row["image"], row["phase"], row["rv"]), (0, "setup", 0))
+                        text = (f'21:37:58.638119 Unknown executable (PID {row["pid"]}, TID {row["tid"]}) '
+                                'C_OpenSession [semantics unverified] → CKR_OK 10µs\n')
+                        os.write(writers[0], text.encode())
+                        state["published"] = True
+                    return original_get(*args, **kwargs)
+
+                capture.updates.get = publish_after_wait
+                # Only privileged observer construction is substituted; the caller,
+                # original pidfd/file pins, held ACK and pipe reader remain real.
+                owner = SimpleNamespace(popen=SimpleNamespace(poll=lambda: None), verify=lambda: None)
+                return owner, capture, errors, gate["H6"]["monotonic_ns"]()
+
+            original_start = gate["Ia32Driver"].start_held
+            original_exec = gate["Ia32Driver"].do_exec
+            def held(driver):
+                state["driver"] = driver
+                return original_start(driver)
+            def execute(driver):
+                self.assertEqual(len(state["capture"].lines), 1,
+                                 "X released before the delayed old shared-key return was drained")
+                original_exec(driver)
+                self.assertEqual([r["image"] for r in driver.images], [0, 1])
+                raise RuntimeError("controlled stop after guarded exec")
+
+            @gate["H6"]["owned_leg"]
+            def exercise(ctx):
+                try:
+                    with mock.patch.dict(gate["H6"], spawn_observer=observer,
+                            observer_ready=lambda *_: gate["H6"]["monotonic_ns"]()), \
+                            mock.patch.object(gate["Ia32Driver"], "start_held", held), \
+                            mock.patch.object(gate["Ia32Driver"], "do_exec", execute):
+                        gate["run_leg"].__wrapped__(ctx, "pid-leader", "singles", "trace", directory / "leg")
+                finally:
+                    for fd in writers:
+                        os.close(fd)
+
+            with self.assertRaisesRegex(RuntimeError, "controlled stop after guarded exec"):
+                exercise(case)
+            self.assertTrue(state["published"])
+            self.assertFalse(case.cleanup_failed, case.cleanup_errors)
+            self.assertIsNone(state["driver"].owned.pidfd)
+            self.assertTrue(all(not scope.owners and not scope.readers and not scope.leg_pins
+                                for scope in case.scopes))
 
     def live_frame(self, calls, complete=True):
         text = ("\x1b[2J\x1b[Hp11scope — profile\n"

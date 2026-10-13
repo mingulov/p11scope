@@ -705,6 +705,102 @@ class InitialLoadFixtureTest(unittest.TestCase):
         reader.record("ack", 1, "done", seconds=1)
         self.retired(owner, reader)
 
+    def stop_during_exec(self, fault=None):
+        """Run the real caller through R4's pre-exec route; substitute only cgroup/observer I/O."""
+        provider = H6["FilePin"](self.provider)
+        self.addCleanup(provider.close)
+        self.ctx.pins = {"caller": self.pin}
+        self.ctx.provider_pin = provider
+        self.ctx.binary = self.pin
+        membership, observed = {}, {}
+        budget = H6["LegBudget"]()
+        token = H6["ACTIVE_LEG"].set(budget)
+        self.addCleanup(H6["ACTIVE_LEG"].reset, token)
+        # A pre-existing successor deadline must survive the scope ACK and exec.
+        budget.enter("successor-recovery", key=1)
+        original_deadline = budget.phase_deadline_ns
+        budget.enter("setup")
+
+        class ReachedExec(Exception):
+            pass
+
+        def group(_ctx, path):
+            path = Path(path)
+            expected = "/" + str(path.relative_to("/sys/fs/cgroup"))
+            def move(owner):
+                owner.verify()
+                membership[owner.pid] = expected
+            return SimpleNamespace(path=path, move=move, verify=lambda: None), None
+
+        def current(pid):
+            actual = membership[pid]
+            if actual.endswith("/outside"):
+                observed["outside_reads"] = observed.get("outside_reads", 0) + 1
+                if fault == "changed-membership" and observed["outside_reads"] > 1:
+                    return actual.replace("/outside", "/selected")
+            return actual
+
+        real_spawn = H6["spawn_owned"]
+        def ordinary(*args, **kwargs):
+            for key in ("user", "group", "extra_groups"):
+                kwargs.pop(key)
+            return real_spawn(*args, **kwargs)
+
+        real_exec, real_record = H6["caller_exec"], H6["Reader"].record
+        def record(reader, kind, image=0, phase=None, seconds=10):
+            if phase == "exec-scope":
+                self.assertEqual(budget.phase_deadline_ns, original_deadline)
+                self.assertLessEqual(seconds, budget.budgets["successor-recovery"])
+                if fault == "missing-ack":
+                    raise TimeoutError("controlled missing scope acknowledgement")
+            return real_record(reader, kind, image, phase, seconds)
+
+        def execute(caller, reader, images, method, target):
+            observed["exec_dispatched"] = True
+            request, image, t0, t1 = real_exec(caller, reader, images, method, target)
+            observed.update(request=request, image=image, ledger=list(reader.records),
+                            membership=membership[caller.pid], t0=t0, t1=t1)
+            raise ReachedExec
+
+        patches = {"init_token": lambda *_args: self.env, "create_tracked": group,
+            "spawn_owned": ordinary, "cgroup_of": current, "caller_exec": execute,
+            "spawn_observer": lambda *_args: (None, SimpleNamespace(lines=[]), None, time.monotonic_ns()),
+            "observer_ready": lambda *_args: time.monotonic_ns()}
+        self.stop_observed = observed
+        with mock.patch.dict(H6["run_cgroup_stop_during"].__globals__, patches), \
+                mock.patch.dict(H6["N3HARNESS"]["command"].__globals__, cgroup_of=current), \
+                mock.patch.object(H6["Reader"], "record", record):
+            try:
+                H6["run_cgroup_stop_during"].__wrapped__(self.ctx,
+                    self.directory / f"stop-{time.monotonic_ns()}", "singles")
+            except ReachedExec:
+                pass
+        self.assertEqual(budget.deadlines[("successor-recovery", 1)], original_deadline)
+        return observed
+
+    def test_stop_during_exec_scope_matches_verified_move_without_extra_calls(self):
+        observed = self.stop_during_exec()
+        self.assertTrue(observed["membership"].endswith("/outside"))
+        request, ledger = observed["request"], observed["ledger"]
+        self.assertEqual(request["scope"], "outside")
+        self.assertNotEqual(request["tid"], request["pid"])
+        self.assertEqual(request["start_time"], observed["image"]["start_time"])
+        calls = [row for row in ledger if row["kind"] == "call" and row["phase"] != "setup"]
+        self.assertEqual(len(calls), 5)
+        self.assertTrue(all(row["phase"] == "warm" and row["scope"] == "selected" for row in calls))
+        ack = next(row for row in ledger if row["kind"] == "ack" and row["phase"] == "exec-scope")
+        self.assertLess(ack["t"], request["t"])
+
+    def test_stop_during_membership_change_prevents_exec(self):
+        with self.assertRaisesRegex(ValueError, "starts outside"):
+            self.stop_during_exec("changed-membership")
+        self.assertNotIn("exec_dispatched", self.stop_observed)
+
+    def test_stop_during_requires_scope_ack_before_exec(self):
+        with self.assertRaisesRegex(TimeoutError, "missing scope acknowledgement"):
+            self.stop_during_exec("missing-ack")
+        self.assertNotIn("exec_dispatched", self.stop_observed)
+
     def test_preload_stop_and_eof_never_load_provider(self):
         for eof in (False, True):
             with self.subTest(eof=eof):

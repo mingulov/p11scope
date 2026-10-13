@@ -7379,6 +7379,12 @@ def run_cgroup_stop_during(ctx, cell_dir, backend):
                0, selected, phases)
     t_out = monotonic_ns()
     move_and_verify(outside, caller, moves, "exit")
+    # Unlike R1, this stop leg makes no outside API calls before exec.
+    # Synchronize the caller's ledger label with the verified move using
+    # its existing zero-call ACK, within the original successor budget.
+    enter_phase("successor-recovery", key=len(images))
+    n3_command(caller, stdout, "C_GetInfo", 0, 0, "exec-scope", "outside",
+               0, outside, phases)
     output_cursor = len(capture.lines)
     request, _, t0, t1 = caller_exec(caller, stdout, images, "thread-exec", pins["caller-b"])
     transitions = [{"from_image": 0, "to_image": 1, "mode": "nonleader",

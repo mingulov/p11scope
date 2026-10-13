@@ -804,6 +804,7 @@ impl CollectionWork {
 #[derive(Debug)]
 pub struct CaptureWorkBudget {
     collection_work: Option<CollectionWork>,
+    retained_mapped: crate::discovery::identity::RetainedMappedIdentities,
     limits: ScanLimits,
     policy: DiscoveryPolicy,
     domain: Option<Arc<BudgetDomain>>,
@@ -847,6 +848,7 @@ impl CaptureWorkBudget {
     pub fn new(limits: ScanLimits) -> Self {
         Self {
             collection_work: None,
+            retained_mapped: crate::discovery::identity::RetainedMappedIdentities::default(),
             limits,
             policy: DiscoveryPolicy::DetailedLegacy,
             domain: None,
@@ -881,6 +883,21 @@ impl CaptureWorkBudget {
 
     pub(crate) fn set_collection_work(&mut self, work: CollectionWork) {
         self.collection_work = Some(work);
+    }
+
+    pub(crate) fn with_retained_mapped_identities(
+        mut self,
+        retained: crate::discovery::identity::RetainedMappedIdentities,
+    ) -> Self {
+        self.retained_mapped = retained;
+        self
+    }
+
+    pub(crate) fn retained_mapped_identity(
+        &self,
+        file: &File,
+    ) -> Option<crate::discovery::identity::MappedFile> {
+        self.retained_mapped.identity_for(file)
     }
 
     pub(crate) fn has_collection_work(&self) -> bool {
@@ -3946,7 +3963,9 @@ fn scan_view_examined_mode(
             skipped.push(Skipped { subject, reason });
             continue;
         }
-        let held = io.held_identity(&file);
+        let held = budget
+            .retained_mapped_identity(&file)
+            .or_else(|| io.held_identity(&file));
         let scanned_identity = held.map(|held| held.identity);
         if let Err(reason) = mapped_file_guard(io, view, scanned_identity, key, &group) {
             skipped.push(Skipped { subject, reason });

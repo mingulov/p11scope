@@ -779,8 +779,8 @@ accepted LP64/ia32 ABI and the live START owner):
   cell carries the constant unavailable status, never the array base.
 
 BPF performs no entry template inspection and no GetAttributeValue
-protocol: those need 72–200 B helper frames the 512 B return chain
-cannot spare. Slice D therefore marks never-inspected lists honestly
+protocol: those need 72–200 B helper frames the measured <=512 B
+return chain cannot spare. Slice D therefore marks never-inspected lists honestly
 instead of emitting fake inspected-empty lists: present request pairs
 and the Get result list carry attribute-list flags bit 4
 (`0x10`, uninspected), accepted by the validator only with zero cells,
@@ -794,12 +794,12 @@ Retention: one 432 B side row per in-flight required call (bounded by
 240 B tail rides the completed 608 B CALL record through the single
 H3 cursor, collection, pending queue, owned routed call, move-only
 evidence and the descriptor-bound admission result, and is dropped
-unread at registry apply. No disk, log, error, map-dump or public
-output carries raw words; `ValidatedObjectCall`, the envelope, the
+unread at registry apply. No production disk, log, error, map-dump
+or public output carries raw words; `ValidatedObjectCall`, the envelope, the
 evidence and the admission result have no raw-value Debug/Serialize.
 Ring records grow to 616 B with header for object CALLs only; the
 4 MiB ring and all caps are unchanged. Measured 2026-10-14: entry and
-return chains stay exactly at 512 B (roots 440/448 B;
+return chains stay <=512 B (roots 440/448 B;
 `object_fill_return` 64 B and `object_emit_find` 56 B as leaves,
 `object_tail_fill` 4 B over the single memset edge).
 

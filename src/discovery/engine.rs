@@ -17051,6 +17051,19 @@ impl Engine {
         }
     }
 
+    /// The owner deliberately reaped the named PID-scope target during
+    /// settlement (SIGKILL after signal-forwarding grace): its absence
+    /// from later terminal passes is expected, not a lost generation.
+    /// Observation-driven arming cannot cover this ordering — the exit
+    /// record is still fresh when the terminal pass runs — so settlement
+    /// marks it directly. PID scope only; other scopes never name one
+    /// generation.
+    pub(crate) fn note_owned_target_reaped(&mut self) {
+        if matches!(self.scope, Scope::Pid(_)) {
+            self.expected_target_exit = true;
+        }
+    }
+
     fn finalize_expected_target_exit(&mut self) {
         let Some(view) = self.expected_target_exit_pending else {
             return;

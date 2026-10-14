@@ -210,8 +210,10 @@ fn finish_capture_preserves_settlement_detach_and_terminal_attempt_boundaries() 
 
 /// I1: a quiesce-block failure settles like a capture-loop failure.
 /// Settlement (pause cleanup plus policy settlement in production) runs
-/// with the loop's real end, then detach runs, and every error — quiesce,
-/// settlement, detach — is retained in the returned error.
+/// with the loop's real end, then publication seals the report from
+/// partial state, then detach runs. Every error — quiesce, settlement,
+/// publication, detach — is retained in the returned error. Publication
+/// needs the settled disposition, so a settlement failure skips it.
 #[test]
 fn quiesce_error_runs_settlement_with_the_loop_end_then_detaches() {
     #[derive(Clone, Copy)]
@@ -243,6 +245,10 @@ fn quiesce_error_runs_settlement_with_the_loop_end_then_detaches() {
                 Ok(())
             },
             |phases| {
+                phases.push("publish");
+                Ok(())
+            },
+            |phases| {
                 phases.push("detach");
                 if matches!(case, Case::DetachError | Case::BothError) {
                     anyhow::bail!("detach failure");
@@ -252,8 +258,13 @@ fn quiesce_error_runs_settlement_with_the_loop_end_then_detaches() {
         );
         // Settlement runs (not skipped) with the loop's real end, before
         // detach — the `--duration` handoff end survives a quiesce failure.
+        // Publication runs between them exactly when settlement succeeded.
         assert_eq!(settled_end, Some(CaptureEnd::DurationExpired));
-        assert_eq!(phases, ["settle", "detach"]);
+        if matches!(case, Case::SettleError | Case::BothError) {
+            assert_eq!(phases, ["settle", "detach"]);
+        } else {
+            assert_eq!(phases, ["settle", "publish", "detach"]);
+        }
         let message = format!("{error:#}");
         assert!(
             message.contains("quiesce failure"),
@@ -285,6 +296,38 @@ fn quiesce_error_runs_settlement_with_the_loop_end_then_detaches() {
     }
 }
 
+/// I1: a publication failure behind a quiesce failure keeps its own
+/// layer, and detach still runs behind both.
+#[test]
+fn quiesce_error_with_publish_failure_labels_publication_and_still_detaches() {
+    let mut phases = Vec::new();
+    let error = finish_quiesce_error(
+        anyhow::anyhow!("quiesce failure"),
+        Ok(CaptureEnd::Signal),
+        &mut phases,
+        |phases, _| {
+            phases.push("settle");
+            Ok(())
+        },
+        |phases| {
+            phases.push("publish");
+            anyhow::bail!("seal failure");
+        },
+        |phases| {
+            phases.push("detach");
+            Ok(())
+        },
+    );
+    assert_eq!(phases, ["settle", "publish", "detach"]);
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("quiesce failure")
+            && message.contains("seal failure")
+            && message.contains("terminal publication"),
+        "publication error lost or mislabeled: {message}"
+    );
+}
+
 /// I1: a loop failure plus a quiesce failure keeps both errors (the loop
 /// error is the capture failure, the quiesce error attaches to it), and
 /// settlement runs with `Error` — a failed loop never hands a child back.
@@ -302,11 +345,16 @@ fn quiesce_error_after_loop_failure_keeps_both_errors_and_settles_as_error() {
             Ok(())
         },
         |phases| {
+            phases.push("publish");
+            Ok(())
+        },
+        |phases| {
             phases.push("detach");
             Ok(())
         },
     );
     assert_eq!(settled_end, Some(CaptureEnd::Error));
+    // A failed loop keeps settle-and-detach without a report.
     assert_eq!(phases, ["settle", "detach"]);
     let message = format!("{error:#}");
     assert!(

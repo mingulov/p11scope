@@ -625,7 +625,9 @@ def u32(raw, offset):
 
 def decode_start(raw):
     assert len(raw) == CALL_START_SIZE
-    assert u64(raw, 264) == 0, "CallStart padding must be zero"
+    marker = u64(raw, 264)
+    assert marker == 0 or marker in OBJECT_ELIGIBLE_MARKERS, \
+        f"CallStart object marker {marker} is not finite and required"
     return {
         "raw": raw, "session": u64(raw, 8), "slot_id": u64(raw, 16),
         "mechanism": u64(raw, 24), "mechanism_ptr": u64(raw, 32),

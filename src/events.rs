@@ -8,7 +8,12 @@
 use anyhow::{Context as _, Result};
 use aya::Ebpf;
 use aya::maps::{Map, MapData};
-use p11scope_ebpf_common::{DiscoveryRecord, Event, EventRecord, valid_discovery_record};
+use p11scope_ebpf_common::object_wire::{
+    OBJECT_TAIL_BYTES, ObjectDescriptorWire, ValidatedObjectCall,
+};
+use p11scope_ebpf_common::{
+    DiscoveryRecord, Event, EventRecord, MAX_DESCRIPTORS, event_type, valid_discovery_record,
+};
 use std::mem::size_of;
 use std::ops::{ControlFlow, Deref};
 use std::{
@@ -168,6 +173,46 @@ pub(crate) fn decode_record(bytes: &[u8]) -> Option<EventRecord> {
 pub(crate) fn decode_discovery(bytes: &[u8]) -> Option<DiscoveryRecord> {
     let record = decode_exact(bytes)?;
     valid_discovery_record(&record).then_some(record)
+}
+
+/// One decoded EVENTS record with its optional validated object tail.
+/// Inactive in slice A: no production path constructs this yet.
+#[cfg_attr(not(test), allow(dead_code))] // Slice D wires the transport.
+pub(crate) struct DecodedEventRecord {
+    pub(crate) base: EventRecord,
+    pub(crate) object: Option<ValidatedObjectCall>,
+}
+
+/// Decode the exact 368/608-byte forms atomically; the extended form is
+/// CALL-only and returns the validated tail intact. Inactive in slice A:
+/// production `decode_record` stays 368-only until the transport handoff.
+#[cfg_attr(not(test), allow(dead_code))] // Slice D wires the transport.
+pub(crate) fn decode_object_record(
+    bytes: &[u8],
+    descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+) -> Option<DecodedEventRecord> {
+    if bytes.len() == size_of::<EventRecord>() {
+        return decode_record(bytes).map(|base| DecodedEventRecord { base, object: None });
+    }
+    if bytes.len() != size_of::<EventRecord>() + OBJECT_TAIL_BYTES {
+        return None;
+    }
+    let base = decode_record(&bytes[..size_of::<EventRecord>()])?;
+    if base.event.event_type != event_type::CALL {
+        return None;
+    }
+    let index = u32::from_le_bytes(bytes[372..376].try_into().ok()?);
+    if index == 0 || index >= MAX_DESCRIPTORS {
+        return None;
+    }
+    let object = ValidatedObjectCall::validate(
+        &bytes[size_of::<EventRecord>()..],
+        &descriptors[index as usize],
+    )?;
+    Some(DecodedEventRecord {
+        base,
+        object: Some(object),
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -1218,6 +1263,78 @@ mod runtime_tests;
 mod tests {
     use super::*;
     use p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+
+    #[test]
+    fn object_producer_decoded_envelope_carries_validated_tail() {
+        use p11scope_ebpf_common::object_wire::{
+            OBJECT_ACTION_CREATE, OBJECT_CALL_BYTES, OBJECT_CALL_VERSION, OBJECT_LAYOUT_LP64,
+            OBJECT_TAIL_BYTES, publish_object_descriptors,
+        };
+        let table = publish_object_descriptors();
+        let base_record = |kind: u32, root_affiliation: u64| EventRecord {
+            event: Event {
+                event_type: kind,
+                root_affiliation,
+                ..Default::default()
+            },
+            continuity: Default::default(),
+        };
+        fn put(buf: &mut [u8], offset: usize, bytes: &[u8]) {
+            buf[offset..offset + bytes.len()].copy_from_slice(bytes);
+        }
+        // Valid Create tail, encoded byte by byte: version 1, 240 bytes,
+        // index 21 (C_CreateObject), LP64, one value result.
+        let mut tail = [0u8; OBJECT_TAIL_BYTES];
+        put(&mut tail, 0, &OBJECT_CALL_VERSION.to_le_bytes());
+        put(&mut tail, 2, &OBJECT_CALL_BYTES.to_le_bytes());
+        put(&mut tail, 4, &21u32.to_le_bytes());
+        tail[12] = OBJECT_LAYOUT_LP64;
+        tail[13] = OBJECT_ACTION_CREATE;
+        put(&mut tail, 32, &0x1234u64.to_le_bytes());
+        tail[114] = 1;
+
+        // Ordinary form: CALL and lifecycle decode without a tail.
+        let call = record_bytes(&base_record(event_type::CALL, 0));
+        let decoded = decode_object_record(&call, &table).expect("ordinary CALL decodes");
+        assert_eq!(decoded.base.event.event_type, event_type::CALL);
+        assert!(decoded.object.is_none());
+        let fork = record_bytes(&base_record(event_type::FORK, 1));
+        let decoded = decode_object_record(&fork, &table).expect("lifecycle decodes");
+        assert!(decoded.object.is_none());
+        assert!(
+            decode_object_record(&record_bytes(&base_record(event_type::CALL, 2)), &table)
+                .is_none()
+        );
+        assert!(decode_object_record(&[0u8; 367], &table).is_none());
+        assert!(decode_object_record(&[0u8; 369], &table).is_none());
+
+        // Extended form is CALL-only and returns the exact tail.
+        let mut extended = record_bytes(&base_record(event_type::CALL, 0));
+        extended.extend_from_slice(&tail);
+        let decoded = decode_object_record(&extended, &table).expect("extended CALL decodes");
+        assert_eq!(decoded.base.event.event_type, event_type::CALL);
+        let object = decoded.object.expect("validated tail rides along");
+        assert_eq!(object.tail_bytes(), &tail);
+        assert_eq!(object.descriptor_index(), 21);
+        assert_eq!(object.action(), OBJECT_ACTION_CREATE);
+        assert_eq!(object.layout(), OBJECT_LAYOUT_LP64);
+
+        let mut forked = record_bytes(&base_record(event_type::FORK, 0));
+        forked.extend_from_slice(&tail);
+        assert!(decode_object_record(&forked, &table).is_none());
+        let mut zeroed = record_bytes(&base_record(event_type::CALL, 0));
+        zeroed.extend_from_slice(&[0u8; OBJECT_TAIL_BYTES]);
+        assert!(decode_object_record(&zeroed, &table).is_none());
+        let mut unaffiliated = record_bytes(&base_record(event_type::CALL, 2));
+        unaffiliated.extend_from_slice(&tail);
+        assert!(decode_object_record(&unaffiliated, &table).is_none());
+        assert!(decode_object_record(&[0u8; 607], &table).is_none());
+        assert!(decode_object_record(&[0u8; 609], &table).is_none());
+
+        // Production decoding stays 368-only until the transport handoff.
+        assert!(decode_record(&extended).is_none());
+        assert!(decode(&extended).is_none());
+    }
 
     #[test]
     fn poll_records_to_position_delivers_whole_records_to_q() {

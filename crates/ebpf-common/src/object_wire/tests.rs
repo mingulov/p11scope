@@ -179,6 +179,19 @@ fn object_producer_wire_layout_and_zero_padding() {
         tail[offset] = 1;
         assert!(!validate_object_tail(&tail, &descriptor), "offset {offset}");
     }
+    // ia32 tails reject handles with high bits; u32::MAX stays valid and
+    // LP64 keeps full words.
+    let mut ia32 = valid_create_tail();
+    ia32[12] = OBJECT_LAYOUT_ILP32;
+    assert!(validate_object_tail(&ia32, &descriptor));
+    let mut ia32max = valid_create_tail();
+    ia32max[12] = OBJECT_LAYOUT_ILP32;
+    put_u64(&mut ia32max, 32, u64::from(u32::MAX));
+    assert!(validate_object_tail(&ia32max, &descriptor));
+    let mut high = valid_create_tail();
+    high[12] = OBJECT_LAYOUT_ILP32;
+    put_u64(&mut high, 32, 0x1_0000_1234);
+    assert!(!validate_object_tail(&high, &descriptor));
 }
 
 #[test]

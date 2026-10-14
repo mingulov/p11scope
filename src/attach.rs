@@ -16,6 +16,7 @@ use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeLinkI
 use aya::programs::{BtfTracePoint, RawTracePoint, UProbe};
 use aya::{Btf, Ebpf, EbpfLoader};
 use p11scope_bpf_multi::{GroupHalt, attach_group, bisect_attach};
+use p11scope_ebpf_common::object_wire::{ObjectDescriptorWire, publish_object_descriptors};
 use p11scope_ebpf_common::{
     ARG_NONE, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
     DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
@@ -27,7 +28,6 @@ use p11scope_ebpf_common::{
     TAIL_CALLS_INTERFACE_WORKER_SLOT, TAIL_CALLS_TEMPLATE_SECOND_SLOT, THREAD_OWNER_LIMIT,
     ThreadOwnerControl, attach_cookie,
 };
-use p11scope_ebpf_common::object_wire::{ObjectDescriptorWire, publish_object_descriptors};
 use p11scope_manifest::elf::ElfAbi;
 use pkcs11_types::mechanism_registry::MechanismRegistry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -2124,12 +2124,40 @@ impl AttachedSemanticSet {
         self,
         frozen: FrozenObjectDescriptors<S>,
         readback: SemanticAttachmentReadback<'_>,
-        watched: impl Fn(
-            PinnedObjectId,
-        ) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
+        watched: impl Fn(PinnedObjectId) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
     ) -> ObjectResult<FrozenObjectTable<S>> {
-        let _ = (self, frozen, readback, watched);
-        todo!("H7 slice A: freeze the object table against the receipt")
+        use crate::inventory_semantics::SemanticRefusal;
+        if frozen.domain != self.domain {
+            return Err(SemanticRefusal::Attachment);
+        }
+        self.validate_with(
+            readback.domain,
+            readback.policy,
+            readback.descriptors,
+            readback.retained,
+            readback.owned_sides,
+            watched,
+        )?;
+        let plan = self.subset.plan();
+        let pins = self.subset.pins();
+        let mut slots = BTreeMap::new();
+        for indices in self.subset.required().values() {
+            for index in indices {
+                let slot = plan
+                    .slots
+                    .get(*index as usize)
+                    .ok_or(SemanticRefusal::IncompleteProvider)?;
+                let abi = pins
+                    .abi_for(slot.object)
+                    .ok_or(SemanticRefusal::IncompleteProvider)?;
+                slots.insert(*index, (plan.object_slot_eligibility(*index), abi));
+            }
+        }
+        Ok(FrozenObjectTable {
+            descriptors: frozen,
+            attached: self,
+            slots,
+        })
     }
 }
 
@@ -2152,12 +2180,24 @@ impl<S> FrozenObjectTable<S> {
         &self,
         slot: u32,
         readback: SemanticAttachmentReadback<'_>,
-        watched: impl Fn(
-            PinnedObjectId,
-        ) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
+        watched: impl Fn(PinnedObjectId) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
     ) -> ObjectResult<(u32, ElfAbi)> {
-        let _ = (slot, readback, watched);
-        todo!("H7 slice A: serve frozen slot eligibility")
+        use crate::inventory_semantics::SemanticRefusal;
+        self.attached.validate_with(
+            readback.domain,
+            readback.policy,
+            readback.descriptors,
+            readback.retained,
+            readback.owned_sides,
+            watched,
+        )?;
+        match self.slots.get(&slot) {
+            Some((ObjectSlotEligibility::Eligible { descriptor_index }, abi)) => {
+                Ok((*descriptor_index, *abi))
+            }
+            Some((ObjectSlotEligibility::Refused { reason, .. }, _)) => Err(*reason),
+            None => Err(SemanticRefusal::Attachment),
+        }
     }
 
     /// The attested receipt this table is frozen against.
@@ -3072,8 +3112,26 @@ fn publish_and_freeze_object_descriptors_with<S>(
     mut readback: impl FnMut(&mut S) -> Result<Vec<ObjectDescriptorWire>>,
     freeze: impl FnOnce(&mut S) -> Result<()>,
 ) -> ObjectResult<FrozenObjectDescriptors<S>> {
-    let _ = (state, domain, set, readback, freeze);
-    todo!("H7 slice A: publish, read back and freeze the object rows")
+    use crate::inventory_semantics::SemanticRefusal;
+    let expected = publish_object_descriptors();
+    let mut state = state;
+    for (index, row) in expected.iter().copied().enumerate() {
+        set(&mut state, index as u32, row).map_err(|_| SemanticRefusal::Descriptor)?;
+    }
+    let actual = readback(&mut state).map_err(|_| SemanticRefusal::Descriptor)?;
+    if actual.as_slice() != expected.as_slice() {
+        return Err(SemanticRefusal::Descriptor);
+    }
+    freeze(&mut state).map_err(|_| SemanticRefusal::Descriptor)?;
+    let recheck = readback(&mut state).map_err(|_| SemanticRefusal::Descriptor)?;
+    if recheck.as_slice() != expected.as_slice() {
+        return Err(SemanticRefusal::Descriptor);
+    }
+    Ok(FrozenObjectDescriptors {
+        state,
+        domain,
+        rows: expected,
+    })
 }
 
 fn publish_async_catalog(ebpf: &mut Ebpf) -> Result<()> {
@@ -6471,11 +6529,7 @@ mod tests {
             }
         }
 
-        fn set(
-            map: &mut Self,
-            index: u32,
-            row: ObjectDescriptorWire,
-        ) -> anyhow::Result<()> {
+        fn set(map: &mut Self, index: u32, row: ObjectDescriptorWire) -> anyhow::Result<()> {
             if map.frozen {
                 anyhow::bail!("frozen map rejects writes");
             }
@@ -6494,7 +6548,12 @@ mod tests {
             }
             map.frozen_at_readback.push(map.frozen);
             (0..105)
-                .map(|index| map.rows.get(&index).copied().ok_or_else(|| anyhow::anyhow!("missing row {index}")))
+                .map(|index| {
+                    map.rows
+                        .get(&index)
+                        .copied()
+                        .ok_or_else(|| anyhow::anyhow!("missing row {index}"))
+                })
                 .collect()
         }
 

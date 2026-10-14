@@ -934,6 +934,10 @@ fn object_producer_freeze_requires_actual_attached_receipt() {
         )
         .unwrap();
     assert_eq!(table.semantic_set().domain, sealed.domain);
+    assert_eq!(
+        table.descriptors.rows,
+        p11scope_ebpf_common::object_wire::publish_object_descriptors()
+    );
 
     // A table frozen for another domain never binds to this receipt.
     let sealed = seal_fixture(&fixture);
@@ -1080,7 +1084,10 @@ fn object_producer_freeze_preserves_eligible_neighbors_of_refused_slots() {
     assert_eq!(cookie, crate::kinds::function_id("C_SignInit").unwrap() + 1);
     assert_eq!(
         abi,
-        fixture.pins.abi_for(slots[eligible as usize].object).unwrap()
+        fixture
+            .pins
+            .abi_for(slots[eligible as usize].object)
+            .unwrap()
     );
     assert!(matches!(
         table.eligible_slot_with(ordinary, fresh(), |object| fixture.watched(object)),

@@ -800,8 +800,8 @@ evidence and the admission result have no raw-value Debug/Serialize.
 Ring records grow to 616 B with header for object CALLs only; the
 4 MiB ring and all caps are unchanged. Measured 2026-10-14: entry and
 return chains stay exactly at 512 B (roots 440/448 B;
-`object_fill_return` 64 B, `object_emit_find` 56 B,
-`object_tail_fill` 16 B, all leaf-flat).
+`object_fill_return` 64 B and `object_emit_find` 56 B as leaves,
+`object_tail_fill` 4 B over the single memset edge).
 
 Required live qualification before release use: owned LP64/ia32
 producer positives with independently expected nonempty facts,

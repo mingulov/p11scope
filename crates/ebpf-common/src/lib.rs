@@ -5,6 +5,7 @@
 #![no_std]
 
 pub mod inventory_callers;
+pub mod object_capture;
 pub mod object_policy;
 pub mod object_wire;
 

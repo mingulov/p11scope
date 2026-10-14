@@ -268,7 +268,12 @@ fn object_producer_sweep_path_within_jump_budget() {
     // outlined sweep worker stay out for the same reason.
     let native =
         std::fs::read_to_string("crates/ebpf/native/task_owner.c").expect("read native owner");
-    for forbidden in ["object_sweep_orphan_slot", "count_add", "u64 retired", "u64 swept"] {
+    for forbidden in [
+        "object_sweep_orphan_slot",
+        "count_add",
+        "u64 retired",
+        "u64 swept",
+    ] {
         assert!(
             !native.contains(forbidden),
             "sweep path must not carry {forbidden}"

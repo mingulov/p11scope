@@ -50,21 +50,21 @@ fn object_producer_adapters_entry_fill_shape() {
     let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF entry root");
     // Adapter helpers are outlined like the marker/ABI helpers: one
     // rounding quantum per level, never inlined into the hot root frame.
-    for helper in ["fn object_fill_entry", "fn object_fill_return"] {
+    for helper in [
+        "fn object_fill_entry",
+        "fn object_entry_derive",
+        "fn object_entry_results",
+        "fn object_entry_find",
+        "fn object_fill_return",
+    ] {
         assert!(source.contains(helper), "missing adapter helper {helper}");
+        let marker = source.find(helper).expect("adapter helper");
+        let window = &source[marker.saturating_sub(400)..marker];
+        assert!(
+            window.contains("#[inline(never)]"),
+            "{helper} must be #[inline(never)]"
+        );
     }
-    let marker = source.find("fn object_fill_entry").expect("entry helper");
-    let window = &source[marker.saturating_sub(400)..marker];
-    assert!(
-        window.contains("#[inline(never)]"),
-        "entry helper must be #[inline(never)]"
-    );
-    let marker = source.find("fn object_fill_return").expect("return helper");
-    let window = &source[marker.saturating_sub(400)..marker];
-    assert!(
-        window.contains("#[inline(never)]"),
-        "return helper must be #[inline(never)]"
-    );
 
     // Entry: ABI record, then fill, then abandon on refusal.
     let entry = source_between(
@@ -168,7 +168,13 @@ fn object_producer_adapters_helpers_in_elf() {
     let symbols = nm_text_symbols(&object);
     // Helpers are private like the marker/ABI levels, so their symbols are
     // local text (`t`), not global (`T`). Either proves the outline survived.
-    for helper in ["object_fill_entry", "object_fill_return"] {
+    for helper in [
+        "object_fill_entry",
+        "object_entry_derive",
+        "object_entry_results",
+        "object_entry_find",
+        "object_fill_return",
+    ] {
         let hits: Vec<&str> = symbols
             .lines()
             .filter(|line| line.contains(helper) && (line.contains(" T ") || line.contains(" t ")))

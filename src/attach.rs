@@ -5933,12 +5933,6 @@ impl Session {
         Ok((consumer, table))
     }
 
-    /// The frozen receipt-bound object rows on the attested allowlisted
-    /// lane, if this session froze them at startup.
-    pub(crate) fn object_decode_table(&self) -> Option<&ObjectRows> {
-        self.object_decode.as_ref().map(ObjectDecodeTable::rows)
-    }
-
     /// Borrow the EVENTS map descriptor for readiness waits. The idle
     /// wait polls this fd (wake on data or timeout); draining still
     /// goes through `event_drain`, the single consumer.

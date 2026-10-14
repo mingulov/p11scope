@@ -25,14 +25,14 @@
 //! merge rules rather than two that can drift.
 
 use crate::discovery::identity::{PinnedObjectId, PinnedObjects, ReconciledModule};
-use crate::inventory_semantics::SemanticRefusal;
-use crate::kinds::AliasAgreement;
 pub use crate::discovery::scan::Skipped;
 use crate::discovery::scan::{
     ObjectExports, ScannedInterface, ScannedTable, TableEvidenceScore, export_agreement,
     order_tables_by_evidence, standard_ordinal, table_evidence_score, table_linkage,
     table_name_authorized,
 };
+use crate::inventory_semantics::SemanticRefusal;
+use crate::kinds::AliasAgreement;
 use p11scope_ebpf_common::{MAX_SLOTS, SlotSemantics};
 use p11scope_manifest::manifest::{
     Acquisition, InterfaceClassification, Manifest, ObjectRecord, Resolution, SurfaceSource,
@@ -775,8 +775,60 @@ impl AttachPlan {
     /// slot's names. The frozen cookie is preserved, never reselected.
     #[cfg_attr(not(test), allow(dead_code))] // Slices B/C admit markers from this.
     pub(crate) fn object_slot_eligibility(&self, slot: u32) -> ObjectSlotEligibility {
-        let _ = slot;
-        todo!("H7 slice A: plan-scoped object slot eligibility")
+        let Some(entry) = self.slots.get(slot as usize) else {
+            let (_, agreement) = crate::kinds::descriptor_index_with_object_agreement(&[]);
+            return ObjectSlotEligibility::Refused {
+                reason: SemanticRefusal::IncompleteProvider,
+                agreement,
+            };
+        };
+        let (_, agreement) = crate::kinds::descriptor_index_with_object_agreement(&entry.names);
+        let refused = |reason| ObjectSlotEligibility::Refused { reason, agreement };
+        if entry.index != slot {
+            return refused(SemanticRefusal::IncompleteProvider);
+        }
+        if entry.module_ids.is_empty() {
+            return refused(SemanticRefusal::IncompleteProvider);
+        }
+        if entry.module_ids.len() >= 2 {
+            return refused(SemanticRefusal::Descriptor);
+        }
+        if !entry.semantic_authorized {
+            return refused(SemanticRefusal::Unattested);
+        }
+        if entry.semantic_ambiguous {
+            return refused(SemanticRefusal::Descriptor);
+        }
+        if entry.descriptor_index == 0
+            || entry.descriptor_index >= p11scope_ebpf_common::MAX_DESCRIPTORS
+        {
+            return refused(SemanticRefusal::Descriptor);
+        }
+        if entry.semantics != crate::kinds::DESCRIPTORS[entry.descriptor_index as usize] {
+            return refused(SemanticRefusal::Descriptor);
+        }
+        if agreement != AliasAgreement::Agree {
+            return refused(SemanticRefusal::Descriptor);
+        }
+        // The frozen cookie is preserved, never reselected: its function
+        // must remain among the slot's names with a canonical non-NONE
+        // object protocol. Extensions can only narrow, never upgrade.
+        let function = entry.descriptor_index - 1;
+        if !entry
+            .names
+            .iter()
+            .any(|name| crate::kinds::function_id(name) == Some(function))
+        {
+            return refused(SemanticRefusal::Descriptor);
+        }
+        if p11scope_ebpf_common::object_wire::canonical_object_wire(function)
+            == p11scope_ebpf_common::object_wire::none_object_wire()
+        {
+            return refused(SemanticRefusal::Descriptor);
+        }
+        ObjectSlotEligibility::Eligible {
+            descriptor_index: entry.descriptor_index,
+        }
     }
 
     /// Initial subset only: retain descriptor decisions made with every rival
@@ -3543,7 +3595,9 @@ mod tests {
         let plan = object_plan(vec![object_slot(0, &["C_SignInit"], 43)]);
         assert_eq!(
             plan.object_slot_eligibility(0),
-            Eligible { descriptor_index: 43 }
+            Eligible {
+                descriptor_index: 43
+            }
         );
         // Missing slots and index/owner bookkeeping refuse without authority.
         assert!(matches!(
@@ -3621,8 +3675,8 @@ mod tests {
 
     #[test]
     fn object_producer_plan_eligibility_refuses_count_only_none_and_ambiguous() {
-        use ObjectSlotEligibility::{Eligible, Refused};
         use crate::kinds::AliasAgreement;
+        use ObjectSlotEligibility::{Eligible, Refused};
         // Eligible names never upgrade a frozen count-only slot.
         let plan = object_plan(vec![object_slot(0, &["C_CreateObject"], 0)]);
         assert!(matches!(
@@ -3687,25 +3741,31 @@ mod tests {
         )]);
         assert_eq!(
             plan.object_slot_eligibility(0),
-            Eligible { descriptor_index: 49 }
+            Eligible {
+                descriptor_index: 49
+            }
         );
     }
 
     #[test]
     fn object_producer_plan_eligibility_preserves_frozen_cookie_and_rechecks_extensions() {
-        use ObjectSlotEligibility::{Eligible, Refused};
         use crate::kinds::AliasAgreement;
+        use ObjectSlotEligibility::{Eligible, Refused};
         // An agreeing alias added by extension changes the lowest index,
         // but eligibility keeps the frozen cookie.
         let mut plan = object_plan(vec![object_slot(0, &["C_VerifySignatureInit"], 95)]);
         assert_eq!(
             plan.object_slot_eligibility(0),
-            Eligible { descriptor_index: 95 }
+            Eligible {
+                descriptor_index: 95
+            }
         );
         plan.slots[0].names.push("C_VerifyInit".into());
         assert_eq!(
             plan.object_slot_eligibility(0),
-            Eligible { descriptor_index: 95 }
+            Eligible {
+                descriptor_index: 95
+            }
         );
         // A disagreeing extension is rechecked and refused.
         plan.slots[0].names.push("C_SignInit".into());

@@ -670,3 +670,12 @@ __attribute__((noinline)) u32 p11_instance_return(const struct instance_start_ke
     inst_map_delete(&INSTANCE_START, &k);
     return 1;
 }
+
+/* H7 slice B object custody: the narrow fault leaf. Probe roots call it
+ * sequentially after an owner/custody failure; it advances the existing
+ * checked fault cell without inventing a counter. Never nested inside an
+ * owner helper. */
+__attribute__((noinline)) void p11_object_fault(void)
+{
+    inst_fault(inst_counters());
+}

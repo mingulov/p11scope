@@ -164,7 +164,7 @@ const fn map_metadata(
     }
 }
 
-const BASE_POLICY_MAPS: [(&str, ExactMapMetadata); 8] = [
+const BASE_POLICY_MAPS: [(&str, ExactMapMetadata); 10] = [
     (
         "CONFIG",
         map_metadata(MapType::Array, 4, 8, 2, BPF_F_RDONLY_PROG),
@@ -206,6 +206,18 @@ const BASE_POLICY_MAPS: [(&str, ExactMapMetadata); 8] = [
     (
         "STACK_GUARD",
         map_metadata(MapType::ProgramArray, 4, 4, 1, 0),
+    ),
+    // H7 slice B subordinate custody: the loader-published frozen object
+    // descriptor table (multi-entry read-only array: freezing defers past
+    // load like DESCRIPTORS) and the verified zero template (frozen with
+    // the published maps before any program loads).
+    (
+        "OBJECT_DESCRIPTORS",
+        map_metadata(MapType::Array, 4, 16, MAX_DESCRIPTORS, BPF_F_RDONLY_PROG),
+    ),
+    (
+        "OBJECT_ZERO",
+        map_metadata(MapType::Array, 4, 432, 1, BPF_F_RDONLY_PROG),
     ),
 ];
 const FEATURE_POLICY_MAPS: [(&str, ExactMapMetadata); 2] = [
@@ -3061,6 +3073,72 @@ fn standard_async_catalog() -> Result<BTreeMap<FunctionNameKey, u32>> {
     Ok(catalog)
 }
 
+/// Exact bytes of one frozen object descriptor row for map publication.
+/// `ObjectDescriptorWire` is 16 bytes of plain data with no padding; the
+/// encoding spells every field so a layout drift fails loudly here rather
+/// than in the kernel.
+fn object_descriptor_row_bytes(row: &ObjectDescriptorWire) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&row.function.to_le_bytes());
+    bytes[4..6].copy_from_slice(&row.input_args);
+    bytes[6..8].copy_from_slice(&row.result_args);
+    bytes[8..12].copy_from_slice(&row.template_args);
+    bytes[12] = row.find_capacity_arg;
+    bytes[13] = row.find_count_arg;
+    bytes[14] = row.action;
+    bytes[15] = row.guard;
+    bytes
+}
+
+/// Publish the subordinate-custody maps before links: every canonical
+/// object descriptor row with exact readback, the zero template verified
+/// clean, and the side table capacity tied to START (no cap increase).
+/// Freezing stays with the standard freeze machinery through
+/// BASE_POLICY_MAPS.
+fn publish_object_custody_maps(ebpf: &mut Ebpf) -> Result<()> {
+    let expected = publish_object_descriptors();
+    let mut table: Array<_, [u8; 16]> = Array::try_from(
+        ebpf.map_mut("OBJECT_DESCRIPTORS")
+            .context("OBJECT_DESCRIPTORS map")?,
+    )?;
+    for (index, row) in expected.iter().enumerate() {
+        table
+            .set(index as u32, object_descriptor_row_bytes(row), 0)
+            .with_context(|| format!("publishing OBJECT_DESCRIPTORS row {index}"))?;
+    }
+    for (index, row) in expected.iter().enumerate() {
+        let actual: [u8; 16] = table
+            .get(&(index as u32), 0)
+            .with_context(|| format!("reading OBJECT_DESCRIPTORS row {index}"))?;
+        if actual != object_descriptor_row_bytes(row) {
+            bail!("OBJECT_DESCRIPTORS exact readback differs at row {index}");
+        }
+    }
+    let zero: Array<_, [u8; 432]> =
+        Array::try_from(ebpf.map("OBJECT_ZERO").context("OBJECT_ZERO map")?)?;
+    let template: [u8; 432] = zero.get(&0, 0).context("reading OBJECT_ZERO row 0")?;
+    if template != [0u8; 432] {
+        bail!("OBJECT_ZERO row 0 is not clean");
+    }
+    let start_max = {
+        let map = ebpf.map("START").context("START map")?;
+        let Map::HashMap(data) = map else {
+            bail!("unexpected START map variant");
+        };
+        read_map_metadata("START", data)?.max_entries
+    };
+    let map = ebpf.map("OBJECT_START").context("OBJECT_START map")?;
+    let Map::HashMap(data) = map else {
+        bail!("unexpected OBJECT_START map variant");
+    };
+    validate_map_metadata(
+        "OBJECT_START",
+        data,
+        map_metadata(MapType::Hash, 16, 432, start_max, 0),
+    )?;
+    Ok(())
+}
+
 fn publish_descriptors<S>(
     state: &mut S,
     mut set: impl FnMut(&mut S, u32, SlotSemantics) -> Result<()>,
@@ -3521,6 +3599,7 @@ enum SessionPreparation {
     PublishAsync,
     PublishShapes,
     PublishAttributes,
+    PublishObjects,
     FreezePublished,
     SelectScope,
     LoadProgram(&'static str),
@@ -3548,6 +3627,7 @@ fn prepare_session_with(
         PublishAsync,
         PublishShapes,
         PublishAttributes,
+        PublishObjects,
         FreezePublished,
         SelectScope,
     ] {
@@ -4070,6 +4150,10 @@ impl Session {
                 SessionPreparation::PublishAttributes => {
                     publish_attribute_catalog(&mut ebpf, unsafe_enabled)
                         .context("publishing ATTR_BOOL_BITS")?;
+                }
+                SessionPreparation::PublishObjects => {
+                    publish_object_custody_maps(&mut ebpf)
+                        .context("publishing OBJECT_DESCRIPTORS")?;
                 }
                 SessionPreparation::FreezePublished => {
                     freeze_published_maps(&ebpf).context("freezing published policy maps")?;
@@ -6585,6 +6669,37 @@ mod tests {
     }
 
     #[test]
+    fn object_custody_publication_encodes_canonical_rows() {
+        use super::object_descriptor_row_bytes;
+        use p11scope_ebpf_common::object_wire::{
+            OBJECT_ACTION_DESTROY, OBJECT_GUARD_NAMED, verify_object_descriptors,
+        };
+        let rows = publish_object_descriptors();
+        assert!(verify_object_descriptors(&rows));
+        assert_eq!(rows.len(), 105);
+        for (index, row) in rows.iter().enumerate() {
+            let bytes = object_descriptor_row_bytes(row);
+            assert_eq!(
+                u32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+                row.function,
+                "row {index} function"
+            );
+            assert_eq!(&bytes[4..6], &row.input_args, "row {index} inputs");
+            assert_eq!(&bytes[6..8], &row.result_args, "row {index} results");
+            assert_eq!(&bytes[8..12], &row.template_args, "row {index} template");
+            assert_eq!(bytes[12], row.find_capacity_arg, "row {index} capacity");
+            assert_eq!(bytes[13], row.find_count_arg, "row {index} count");
+            assert_eq!(bytes[14], row.action, "row {index} action");
+            assert_eq!(bytes[15], row.guard, "row {index} guard");
+        }
+        assert_eq!(rows[0], none_object_wire());
+        assert_eq!(object_descriptor_row_bytes(&rows[0])[14..], [0, 0]);
+        assert_eq!(rows[23].function, 22);
+        assert_eq!(rows[23].action, OBJECT_ACTION_DESTROY);
+        assert_eq!(rows[23].guard, OBJECT_GUARD_NAMED);
+    }
+
+    #[test]
     fn object_producer_publication_stops_at_each_io_failure() {
         for fail_at in [0, 57, 104] {
             let mut map = FakeObjectMap::new();
@@ -7910,6 +8025,7 @@ mod tests {
             PublishAsync,
             PublishShapes,
             PublishAttributes,
+            PublishObjects,
             FreezePublished,
             SelectScope,
             LoadProgram("dl_debug_state"),
@@ -7939,6 +8055,7 @@ mod tests {
             LoadImagePrograms,
             FreezeDeferred("CONFIG"),
             FreezeDeferred("DESCRIPTORS"),
+            FreezeDeferred("OBJECT_DESCRIPTORS"),
             PublishTailCalls,
             PrepareEventsDomain,
         ]);
@@ -7967,7 +8084,7 @@ mod tests {
             });
             activate_after_preparation_with(preparation, || {
                 assert!(image_loaded.get());
-                assert_eq!(deferred_frozen.get(), 2);
+                assert_eq!(deferred_frozen.get(), 3);
                 activation_called.set(true);
                 Ok(())
             })
@@ -8575,7 +8692,15 @@ mod tests {
             .filter(|(name, meta)| defers_freeze_until_loaded(name, meta))
             .map(|(name, _)| *name)
             .collect();
-        assert_eq!(deferred, ["CONFIG", "DESCRIPTORS", TAIL_POLICY_MAP]);
+        assert_eq!(
+            deferred,
+            [
+                "CONFIG",
+                "DESCRIPTORS",
+                TAIL_POLICY_MAP,
+                "OBJECT_DESCRIPTORS"
+            ]
+        );
         // PAIR_CALLS is the only feature map populated after the load, so it
         // is the only one that defers its freeze past publication.
         let deferred_feature: Vec<&str> = FEATURE_POLICY_MAPS
@@ -10948,6 +11073,8 @@ mod tests {
                 "MECH_SHAPE",
                 "TAIL_CALLS",
                 "STACK_GUARD",
+                "OBJECT_DESCRIPTORS",
+                "OBJECT_ZERO",
             ]
         );
         assert_eq!(

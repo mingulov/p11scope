@@ -18,49 +18,55 @@ mod inventory_callers;
 
 use aya_ebpf::bindings::{BPF_F_MMAPABLE, BPF_F_RDONLY_PROG};
 use aya_ebpf::macros::{map, raw_tracepoint, uprobe, uretprobe};
-use aya_ebpf::maps::ring_buf::RingBufEntry;
 #[cfg(not(feature = "inventory-only"))]
 use aya_ebpf::maps::PerCpuHashMap;
 use aya_ebpf::maps::ProgramArray;
+use aya_ebpf::maps::ring_buf::RingBufEntry;
 use aya_ebpf::maps::{Array, CgroupArray, HashMap, PerCpuArray, RingBuf};
 use aya_ebpf::programs::{ProbeContext, RawTracePointContext, RetProbeContext};
-use aya_ebpf::{helpers, EbpfContext as _};
+use aya_ebpf::{EbpfContext as _, helpers};
 #[cfg(not(feature = "inventory-only"))]
 use core::mem::MaybeUninit;
 #[cfg(feature = "inventory-only")]
 use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
+#[cfg(not(feature = "inventory-only"))]
+use p11scope_ebpf_common::object_wire::{
+    OBJECT_ACTION_MAX, OBJECT_ACTION_NONE, OBJECT_GUARD_NONE, OBJECT_GUARD_SCALAR_DERIVE,
+    OBJECT_LAYOUT_ILP32, OBJECT_LAYOUT_LP64, ObjectDescriptorWire, ObjectStart,
+};
 #[cfg_attr(feature = "inventory-only", allow(unused_imports))]
 use p11scope_ebpf_common::{
-    bucket_of, capture, classify_exec_task, classify_task_newtask, cookie_descriptor, cookie_slot,
-    decode_export_attach_cookie, discovery_pause_coalesced, discovery_pause_enabled,
-    discovery_state_take_failed, discovery_state_take_scope_lost, discovery_table_slots,
-    discovery_usable_prefix, discovery_version_class, event_type, image_pair_matches,
-    interface_continuation_next, interface_continuation_pack, interface_continuation_unpack,
-    interface_flags_class, lifecycle, normalize_target_word, read_ia32_arg_with,
-    return_allows_mechanism, shape, stop_gate_admit_with, target_layout_from_cs,
-    target_stack_arg_address, target_word_end, valid_config, valid_loader_cookie, CallStart,
-    DiscoveryRecord, Event, EventRecord, FunctionNameKey, ImageIdentity, InstanceContinuity,
-    LinuxLayout, PauseKey, RvKey, SlotSemantics, SlotStats, StartKey, StartState, StateKey,
-    ARG_NONE, CFG_FLAGS, COALESCED_NO_HELPER_RC, DISCOVERY_BYTES, DISCOVERY_COUNTER_CELLS,
-    DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES, DISCOVERY_COUNTER_EXPORT_STATE_FAILURES,
-    DISCOVERY_COUNTER_LOADER_HITS, DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES,
-    DISCOVERY_COUNTER_RING_LOSS, DISCOVERY_EXEC_SAME_TASK_CANDIDATE, DISCOVERY_EXEC_UNKNOWN,
-    DISCOVERY_INTERFACES, DISCOVERY_KIND_EXEC, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
+    ARG_NONE, CFG_FLAGS, COALESCED_NO_HELPER_RC, CallStart, DISCOVERY_BYTES,
+    DISCOVERY_COUNTER_CELLS, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
+    DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
+    DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, DISCOVERY_COUNTER_RING_LOSS,
+    DISCOVERY_EXEC_SAME_TASK_CANDIDATE, DISCOVERY_EXEC_UNKNOWN, DISCOVERY_INTERFACES,
+    DISCOVERY_KIND_EXEC, DISCOVERY_KIND_FUNCTION_LIST_RETURN,
     DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN, DISCOVERY_KIND_INTERFACE_RETURN,
     DISCOVERY_KIND_LEADER_EXIT, DISCOVERY_KIND_LOADER, DISCOVERY_NAME_EXACT_STANDARD,
     DISCOVERY_NAME_NA, DISCOVERY_NAME_NULL, DISCOVERY_NAME_OTHER, DISCOVERY_NAME_UNREADABLE,
     DISCOVERY_STATUS_COALESCED_NO_HELPER, DISCOVERY_STATUS_LOADER_CONTEXT_INVALID,
     DISCOVERY_STATUS_READ_FAILURE, DISCOVERY_VERSION_NULL, DISCOVERY_VERSION_UNREADABLE,
-    DISCOVERY_VERSION_V3_0, DISCOVERY_VERSION_V3_1, DISCOVERY_VERSION_V3_2, EVIDENCE_ABI_REFUSALS,
-    EVIDENCE_CELLS, EVIDENCE_CGROUP_SCOPE_FAILURES, EVIDENCE_RING_LOSS,
+    DISCOVERY_VERSION_V3_0, DISCOVERY_VERSION_V3_1, DISCOVERY_VERSION_V3_2, DiscoveryRecord,
+    EVIDENCE_ABI_REFUSALS, EVIDENCE_CELLS, EVIDENCE_CGROUP_SCOPE_FAILURES, EVIDENCE_RING_LOSS,
     EVIDENCE_RV_UPDATE_FAILURES, EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
     EVIDENCE_START_INSERT_FAILURES, EVIDENCE_UNMATCHED_RETURNS, EVIDENCE_UNREGISTERED_MECHANISMS,
-    FLAG_CGROUP_FILTER, FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE, FLAG_POLICY_ALLOWLISTED,
-    FLAG_SYSTEM_FILTER, FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE, LOADER_STATE_PRESENT,
+    Event, EventRecord, FLAG_CGROUP_FILTER, FLAG_PID_FILTER, FLAG_POLICY_AGGREGATE,
+    FLAG_POLICY_ALLOWLISTED, FLAG_SYSTEM_FILTER, FUNCTION_NAME_MAX_BYTES, FUNCTION_NONE,
+    FunctionNameKey, ImageIdentity, InstanceContinuity, LOADER_STATE_PRESENT, LinuxLayout,
     MAX_DESCRIPTORS, MAX_MECH_SHAPES, MAX_SLOTS, MECH_NONE, NATIVE_OWNER_SLOT_BOUND, PAUSE_ARMED,
-    PAUSE_REQUESTED, RING_BYTES, RV_ENTRIES, SESSION_NONE, STACK_GUARD_ENTRIES, START_ENTRIES,
-    STATE_DOMAIN_EXPORT, STATE_DOMAIN_SELECTION, TAIL_CALLS_ENTRIES,
-    TAIL_CALLS_INTERFACE_WORKER_SLOT, TAIL_CALLS_NO_PRIVATE_STACK_INDEX, USER_TYPE_NONE,
+    PAUSE_REQUESTED, PauseKey, RING_BYTES, RV_ENTRIES, RvKey, SESSION_NONE, STACK_GUARD_ENTRIES,
+    START_ENTRIES, STATE_DOMAIN_EXPORT, STATE_DOMAIN_SELECTION, SlotSemantics, SlotStats, StartKey,
+    StartState, StateKey, TAIL_CALLS_ENTRIES, TAIL_CALLS_INTERFACE_WORKER_SLOT,
+    TAIL_CALLS_NO_PRIVATE_STACK_INDEX, USER_TYPE_NONE, bucket_of, capture, classify_exec_task,
+    classify_task_newtask, cookie_descriptor, cookie_slot, decode_export_attach_cookie,
+    discovery_pause_coalesced, discovery_pause_enabled, discovery_state_take_failed,
+    discovery_state_take_scope_lost, discovery_table_slots, discovery_usable_prefix,
+    discovery_version_class, event_type, image_pair_matches, interface_continuation_next,
+    interface_continuation_pack, interface_continuation_unpack, interface_flags_class, lifecycle,
+    normalize_target_word, read_ia32_arg_with, return_allows_mechanism, shape,
+    stop_gate_admit_with, target_layout_from_cs, target_stack_arg_address, target_word_end,
+    valid_config, valid_loader_cookie,
 };
 #[cfg(feature = "unsafe-unvalidated-metadata")]
 use p11scope_ebpf_common::{
@@ -88,6 +94,23 @@ static STATS: PerCpuArray<SlotStats> = PerCpuArray::with_max_entries(MAX_SLOTS, 
 #[cfg(not(feature = "inventory-only"))]
 #[map]
 static START: HashMap<StartKey, CallStart> = HashMap::with_max_entries(START_ENTRIES, 0);
+
+// H7 slice B subordinate custody: one 432-byte row per required object call
+// keyed by the START key, a loader-published frozen descriptor table, and a
+// loader-verified zero template the native owner copies from (no 432-byte
+// stack temporary anywhere on the insert path).
+#[cfg(not(feature = "inventory-only"))]
+#[map]
+static OBJECT_START: HashMap<StartKey, ObjectStart> = HashMap::with_max_entries(START_ENTRIES, 0);
+
+#[cfg(not(feature = "inventory-only"))]
+#[map]
+static OBJECT_DESCRIPTORS: Array<ObjectDescriptorWire> =
+    Array::with_max_entries(MAX_DESCRIPTORS, BPF_F_RDONLY_PROG);
+
+#[cfg(not(feature = "inventory-only"))]
+#[map]
+static OBJECT_ZERO: Array<ObjectStart> = Array::with_max_entries(1, BPF_F_RDONLY_PROG);
 
 #[cfg(not(feature = "inventory-only"))]
 #[map]
@@ -1787,7 +1810,14 @@ pub fn sched_process_exec(_ctx: RawTracePointContext) -> u32 {
 #[inline(always)]
 fn sched_process_exec_impl(_ctx: RawTracePointContext) -> u32 {
     // Mandatory current-physical-task cleanup precedes all capture filters.
-    unsafe { p11_owner_cleanup() };
+    // A failed custody settlement is capture loss: invalidate the audit
+    // before lifecycle bookkeeping, then continue mandatorily.
+    #[cfg(not(feature = "inventory-only"))]
+    if unsafe { p11_owner_cleanup() } != 0 {
+        unsafe { p11_object_fault() };
+    }
+    #[cfg(feature = "inventory-only")]
+    let _ = unsafe { p11_owner_cleanup() };
     // Task 3 Stage A: a new mm ends CLONE_VM sharing for this process.
     #[cfg(not(feature = "inventory-only"))]
     unsafe {
@@ -1820,7 +1850,14 @@ pub fn sched_process_exit(_ctx: RawTracePointContext) -> u32 {
 #[inline(always)]
 fn sched_process_exit_impl(_ctx: RawTracePointContext) -> u32 {
     // Retained original keys also cover fatal nonleader post-de_thread exit.
-    unsafe { p11_owner_cleanup() };
+    // A failed custody settlement is capture loss: invalidate the audit
+    // before lifecycle bookkeeping, then continue mandatorily.
+    #[cfg(not(feature = "inventory-only"))]
+    if unsafe { p11_owner_cleanup() } != 0 {
+        unsafe { p11_object_fault() };
+    }
+    #[cfg(feature = "inventory-only")]
+    let _ = unsafe { p11_owner_cleanup() };
     #[cfg(not(feature = "inventory-only"))]
     unsafe {
         p11_root_current_exit()
@@ -2537,7 +2574,7 @@ fn p11_entry_template_second_impl(ctx: ProbeContext) -> u32 {
         _pad: 0,
     };
     let Some(layout) = probe_layout(&ctx) else {
-        let _ = owned_start_remove(&key, false);
+        owned_start_discard(&key);
         bump_evidence(EVIDENCE_ABI_REFUSALS);
         return 0;
     };
@@ -2576,7 +2613,22 @@ unsafe extern "C" {
     #[cfg(not(feature = "inventory-only"))]
     fn p11_instance_exec() -> u32;
     fn p11_owner_healthy() -> u32;
-    fn p11_owner_cleanup();
+    fn p11_owner_cleanup() -> u32;
+    /// H7 slice B subordinate custody (native task_owner.c): the query row
+    /// hands a validated live side row to the return terminal drain (which
+    /// checks agreement, then retires through the ordinary removal) and to
+    /// return-phase fill; only ready authorizes reads.
+    #[cfg(not(feature = "inventory-only"))]
+    fn p11_object_side_get(
+        key: *const StartKey,
+        descriptor: u32,
+        required: u32,
+    ) -> *mut ObjectStart;
+    /// H7 slice B fault leaf (native instance_epoch.c): advances the
+    /// existing checked fault cell. Probe roots call it sequentially after
+    /// an owner/custody failure, never nested inside an owner helper.
+    #[cfg(not(feature = "inventory-only"))]
+    fn p11_object_fault();
     #[cfg(not(feature = "inventory-only"))]
     fn p11_owner_start_get(key: *const StartKey, required: u32) -> *mut CallStart;
     #[cfg(not(feature = "inventory-only"))]
@@ -2613,6 +2665,73 @@ fn owned_start_remove(key: &StartKey, required: bool) -> Result<(), ()> {
     (unsafe { p11_owner_start_remove(key, u32::from(required)) } == 0)
         .then_some(())
         .ok_or(())
+}
+
+// Raw removal result for terminal drains: 0 retired, -2 healthy absence,
+// anything else a custody failure the caller must fault on.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn owned_start_remove_rc(key: &StartKey, required: bool) -> i64 {
+    unsafe { p11_owner_start_remove(key, u32::from(required)) }
+}
+
+// Required-object marker for this attachment cookie: the frozen descriptor
+// row must be an exact non-NONE object row for the attached descriptor,
+// else the call stays ordinary. Mirrors object_wire::validate_start_marker.
+// Out of line on purpose: entry has no frame to spare, and this helper
+// only makes map-helper calls (which consume no BPF frame), so its level
+// costs the chain a single rounding quantum.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_marker_for(cookie: u64) -> u64 {
+    let descriptor = cookie_descriptor(cookie);
+    if descriptor == 0 || descriptor >= MAX_DESCRIPTORS {
+        return 0;
+    }
+    let Some(row) = OBJECT_DESCRIPTORS.get(descriptor) else {
+        return 0;
+    };
+    if row.function != descriptor - 1
+        || row.action == OBJECT_ACTION_NONE
+        || row.action > OBJECT_ACTION_MAX
+        || row.guard == OBJECT_GUARD_NONE
+        || row.guard > OBJECT_GUARD_SCALAR_DERIVE
+    {
+        return 0;
+    }
+    u64::from(descriptor) + 1
+}
+
+// Record the entry ABI on the subordinate row through the query row:
+// return requires it unset or equal to the return layout. Out of line on
+// purpose: entry has no frame to spare, and this level only queries (its
+// chain costs a single rounding quantum). The caller abandons the
+// invocation loudly on false.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_record_entry_abi(key: &StartKey, descriptor: u32, layout: LinuxLayout) -> bool {
+    let side = unsafe { p11_object_side_get(key, descriptor, 0).as_mut() };
+    match side {
+        // SAFETY: a validated live map row; the layout byte is ours.
+        Some(side) => unsafe {
+            core::ptr::addr_of_mut!((*side).layout).write(match layout {
+                LinuxLayout::Lp64 => OBJECT_LAYOUT_LP64,
+                LinuxLayout::Ilp32 => OBJECT_LAYOUT_ILP32,
+            });
+            true
+        },
+        None => false,
+    }
+}
+
+// Discard a possibly stale START row on a refusal path; a failed discard
+// is capture loss and faults.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn owned_start_discard(key: &StartKey) {
+    if !matches!(owned_start_remove_rc(key, false), 0 | -2) {
+        unsafe { p11_object_fault() };
+    }
 }
 
 #[inline(always)]
@@ -2712,7 +2831,6 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         record_aggregate_start(&key);
         return 0;
     }
-    let semantics = semantics_of(&ctx);
     let mut storage = MaybeUninit::<CallStart>::uninit();
     zero_call_start(&mut storage);
     // SAFETY: zero_call_start initialized every byte, including padding.
@@ -2745,6 +2863,20 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
     start.capture = capture::MECHANISM_NONE | capture::OUTPUT_NONE;
     start.target_function = FUNCTION_NONE;
 
+    // H7 slice B custody: bind the required-object marker after
+    // descriptor/attachment admission, before native NOEXIST insertion. The
+    // native transaction establishes the subordinate row and its immutable
+    // binding; a zero marker keeps the ordinary path. Placed before the
+    // capture sequences on purpose: entry has no frame to spare, and the
+    // marker computation is independent of every captured field.
+    if flags & FLAG_POLICY_ALLOWLISTED != 0 {
+        start.object_required = object_marker_for(cookie_of(&ctx));
+    }
+
+    // Materialized late on purpose: its fields stay out of entry's live set
+    // across the marker call above. The descriptor table is frozen, so this
+    // reads the same row it would have read earlier.
+    let semantics = semantics_of(&ctx);
     if let Some(value) = capture_scalar(&ctx, semantics.session_arg, layout, start) {
         start.session = value;
     }
@@ -2887,6 +3019,22 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
     if !store_start(&key, start) {
         return 0;
     }
+    if start.object_required != 0 {
+        // Record the entry ABI on the subordinate row through the query
+        // row: return requires it unset or equal to the return layout. The
+        // marker is descriptor-plus-one by construction, so the query
+        // descriptor derives from it without another cookie read. A
+        // missing row here contradicts the just-committed transaction, so
+        // abandon the invocation loudly instead of running half-bound.
+        let recorded =
+            object_record_entry_abi(&key, (start.object_required - 1) as u32, layout);
+        if !recorded {
+            let _ = owned_start_remove(&key, true);
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_START_INSERT_FAILURES);
+            return 0;
+        }
+    }
     #[cfg(feature = "unsafe-unvalidated-metadata")]
     if TEMPLATE_MODE == 3 {
         // Success never returns. Failure leaves template0 as usable partial
@@ -2957,25 +3105,61 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         // Entry-time scope owns this pairing record. If a task migrates out
         // of a selected cgroup mid-call, clean it up without emitting an
         // out-of-scope event and disclose the lost completion.
-        if owned_start_remove(&key, false).is_ok() {
-            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        match owned_start_remove_rc(&key, false) {
+            0 => bump_evidence(EVIDENCE_UNMATCHED_RETURNS),
+            -2 => {}
+            _ => {
+                unsafe { p11_object_fault() };
+                bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+            }
         }
         return 0;
     };
     let Some(layout) = ret_probe_layout(&ctx) else {
-        let _ = owned_start_remove(&key, false);
+        owned_start_discard(&key);
         bump_evidence(EVIDENCE_ABI_REFUSALS);
         return 0;
     };
     // No start entry means the entry probe filtered this call out (or the
     // process was already inside the function at attach time). Either way
-    // there is nothing to attribute.
+    // there is nothing to attribute. The row is copied: the drain below
+    // deletes it, and the event is built from the copy afterwards.
     let Some(&start) = owned_start_get(&key) else {
         return 0;
     };
-    if owned_start_remove(&key, true).is_err() {
-        bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
-        return 0;
+    if start.object_required == 0 {
+        if owned_start_remove(&key, true).is_err() {
+            // Removal failure is capture loss (a contradicted subordinate
+            // row fails here too): disclose it and invalidate the audit.
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+            return 0;
+        }
+    } else {
+        // Object custody terminal drain: query the validated side row,
+        // require attached-descriptor and retained-ABI agreement, then
+        // retire both rows through the ordinary removal (which re-validates
+        // marker, side and binding, scrubs, deletes and settles the lease).
+        // Query plus retire is the drain: a monolithic native drain nests
+        // too deep for return's 512-byte call-chain budget (see
+        // object_producer_compiled_frames_are_bounded). Any failure
+        // discards the record: no ring reservation, no facts.
+        let layout_code = match layout {
+            LinuxLayout::Lp64 => u32::from(OBJECT_LAYOUT_LP64),
+            LinuxLayout::Ilp32 => u32::from(OBJECT_LAYOUT_ILP32),
+        };
+        let descriptor = cookie_descriptor(cookie_of(&ctx));
+        let side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
+        let agreed = side.is_some_and(|row| {
+            row.descriptor_index == descriptor
+                && (row.layout == 0 || u32::from(row.layout) == layout_code)
+        });
+        let retired = owned_start_remove(&key, true).is_ok();
+        if !agreed || !retired {
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+            return 0;
+        }
     }
 
     let now = unsafe { helpers::bpf_ktime_get_ns() };

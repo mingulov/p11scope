@@ -130,26 +130,73 @@ fn object_producer_missing_side_state_faults_before_return() {
     let object = embedded_object(directory.path());
     let report = run_object_checker(&object, "return-fault");
     println!("{report}");
-    // The terminal drain settles before any new target read: the settle and
-    // fault calls precede the first userspace memory read in the return root.
+    // The terminal drain settles before any new target read: query plus
+    // retire, with agreement and fault all preceding the first userspace
+    // memory read in the return root. A monolithic native drain would nest
+    // one level deeper than the 512-byte call-chain budget allows, so its
+    // name must stay out of the drain.
     let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF return root");
     let returned = source_between(
         &source,
         "fn p11_return_impl(ctx: RetProbeContext) -> u32 {",
         "pub extern \"C\" fn p11_link_fork_allowed",
     );
-    let settle = returned
-        .find("p11_object_return_remove")
-        .expect("return must settle object custody");
+    assert!(
+        !returned.contains("p11_object_return_remove"),
+        "no monolithic native drain: query plus retire fits the chain budget"
+    );
+    let query = returned
+        .find("p11_object_side_get(&key, descriptor, 0)")
+        .expect("return must query the side row before retiring");
+    let agree = returned
+        .find("row.descriptor_index == descriptor")
+        .expect("drain must check attached-descriptor agreement");
+    let abi = returned
+        .find("row.layout == 0 || u32::from(row.layout) == layout_code")
+        .expect("drain must check retained-ABI agreement");
+    let retire = returned
+        .find("owned_start_remove(&key, true)")
+        .expect("return must retire object custody through the ordinary removal");
+    assert_eq!(
+        returned.matches("owned_start_remove(&key, true)").count(),
+        2,
+        "ordinary and drain arms each retire through the ordinary removal"
+    );
+    let drain_retire = returned
+        .rfind("owned_start_remove(&key, true)")
+        .expect("drain arm retires");
+    assert!(
+        query < drain_retire,
+        "drain must query before retiring (retire deletes the row)"
+    );
     let fault = returned
         .find("p11_object_fault()")
         .expect("failed settle must fault");
     let first_read = returned
         .find("read_word(")
         .expect("return reads target words");
+    for (name, site) in [
+        ("query", query),
+        ("agree", agree),
+        ("abi", abi),
+        ("retire", retire),
+        ("fault", fault),
+    ] {
+        assert!(
+            site < first_read,
+            "{name} must precede the first target read"
+        );
+    }
+    let gate = returned
+        .find("if !agreed || !retired")
+        .expect("drain must gate on agreement and retire");
     assert!(
-        settle < first_read && fault < first_read,
-        "settle and fault must precede the first target read"
+        gate < first_read,
+        "drain gate must precede the first target read"
+    );
+    assert!(
+        returned[gate..first_read].contains("p11_object_fault()"),
+        "failed drain must fault before any target read"
     );
     // Slice B retains custody only: no completed object tail is emitted.
     assert!(
@@ -356,7 +403,16 @@ def check_leaves(data, report):
     elf, raws, offsets, bodies, relocations = bodies_and_relocations(data)
     text = elf.indices['.text']
     leaves = {}
-    for name in ('p11_object_side_get', 'p11_object_return_remove', 'p11_object_fault'):
+    # No monolithic native drain exists: query plus retire is the drain, so
+    # the retired name stays out of the object. Re-adding it nests one level
+    # deeper than the call-chain budget below allows.
+    for missing in ('p11_object_return_remove',):
+        matches = [key for key, symbol in bodies.items() if symbol[0] == missing]
+        assert not matches, f'{missing} must stay out of the BPF object'
+        report.append(f'absent {missing}: query-plus-retire drain pinned')
+    # The query row and the fault leaf are true producer leaves: bounded
+    # frames, no nesting.
+    for name in ('p11_object_side_get', 'p11_object_fault'):
         key = only(bodies, name)
         symbol = bodies[key]
         assert symbol[3] == text and symbol[5], f'{name} must be a defined .text function'
@@ -364,9 +420,8 @@ def check_leaves(data, report):
         assert depth <= LEAF_FRAME_BOUND, f'{name} frame {depth} exceeds {LEAF_FRAME_BOUND}'
         leaves[name] = (key, depth, deepest)
         report.append(f'leaf {name}: frame={depth}')
-    fault_key = leaves['p11_object_fault'][0]
-    nested = pseudo_calls(raws, offsets, bodies, relocations, fault_key)
-    assert not nested, 'fault leaf must make no nested BPF call'
+        nested = pseudo_calls(raws, offsets, bodies, relocations, key)
+        assert not nested, f'{name} must make no nested BPF call'
     return leaves
 
 

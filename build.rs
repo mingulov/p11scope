@@ -385,6 +385,13 @@ fn build_variant(
         append_flag("link-arg=--export=START");
         append_flag("-C");
         append_flag("link-arg=--export=STOP_GATE");
+        // H7 slice B subordinate custody: the native owner resolves these.
+        append_flag("-C");
+        append_flag("link-arg=--export=OBJECT_START");
+        append_flag("-C");
+        append_flag("link-arg=--export=OBJECT_DESCRIPTORS");
+        append_flag("-C");
+        append_flag("link-arg=--export=OBJECT_ZERO");
     }
     for bitcode in native_bitcodes {
         append_flag("-C");

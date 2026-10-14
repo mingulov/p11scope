@@ -41,6 +41,9 @@ typedef unsigned long long u64;
 #define OWNER_START_COUNT_MISMATCH 512ULL
 #define OWNER_START_ROW_MISSING 1024ULL
 #define OWNER_DIRECTORY_MISMATCH 2048ULL
+/* A subordinate object row contradicted its START (marker, descriptor,
+ * binding or phase). Always set together with OWNER_BOOKKEEPING_FAILED. */
+#define OWNER_OBJECT_MISMATCH 4096ULL
 
 struct task_struct;
 struct thread_owner {
@@ -89,9 +92,98 @@ _Static_assert(__builtin_offsetof(struct owner_start_key, pad) == 12, "START pad
 _Static_assert(__builtin_offsetof(struct owner_discovery_key, cookie) == 8, "discovery cookie");
 _Static_assert(__builtin_offsetof(struct owner_discovery_key, domain) == 16, "discovery domain");
 
+/* H7 slice B subordinate custody: one 432-byte ObjectStart row per required
+ * object call, keyed by the START key under the same physical owner. The
+ * layouts below mirror ebpf-common object_wire byte-exactly; the static
+ * asserts pin the shared table. Inventory builds exclude this. */
+#ifndef P11SCOPE_INVENTORY_ONLY
+#define OBJECT_DESCRIPTORS_COUNT 105U
+#define OBJECT_START_BYTES 432U
+#define OBJECT_START_WORDS 54U
+#define OBJECT_ACTION_MAX 12U
+#define OBJECT_GUARD_MAX 2U
+#define OBJECT_PHASE_ENTRY 1U
+#define OBJECT_PHASE_READY 2U
+#define OBJECT_PHASE_RETURNING 3U
+#define OBJECT_CALL_START_TS_OFF 0U
+#define OBJECT_CALL_START_MARKER_OFF 264U
+#define OBJECT_CALL_START_IMAGE_OFF 272U
+struct object_descriptor_row {
+    u32 function;
+    unsigned char input_args[2];
+    unsigned char result_args[2];
+    unsigned char template_args[4];
+    unsigned char find_capacity_arg;
+    unsigned char find_count_arg;
+    unsigned char action;
+    unsigned char guard;
+};
+struct object_attr_slot {
+    u64 value_ptr;
+    u64 entry_capacity;
+    u64 returned_len;
+    unsigned char kind;
+    unsigned char slot_index;
+    unsigned char status;
+    unsigned char reserved[5];
+};
+struct object_attr_list {
+    unsigned char cells[32];
+    unsigned char inspected;
+    unsigned char flags;
+    unsigned char reserved[2];
+};
+struct object_start {
+    u64 task_cookie;
+    u64 exec_id;
+    u64 entry_ns;
+    u32 descriptor_index;
+    unsigned char layout;
+    unsigned char action;
+    unsigned char derive;
+    unsigned char phase;
+    u64 inputs[2];
+    u64 result_ptrs[2];
+    u64 get_template_base;
+    u64 inspected_header_end;
+    u64 find_capacity;
+    u64 find_count_ptr;
+    struct object_attr_slot slots[8];
+    struct object_attr_list requested[2];
+    unsigned char input_statuses[2];
+    unsigned char result_statuses[2];
+    unsigned short flags;
+    unsigned char get_inspected;
+    unsigned char reserved;
+};
+_Static_assert(sizeof(struct object_descriptor_row) == 16, "object descriptor ABI");
+_Static_assert(sizeof(struct object_attr_slot) == 32, "object slot ABI");
+_Static_assert(sizeof(struct object_attr_list) == 36, "object list ABI");
+_Static_assert(sizeof(struct object_start) == 432, "object start ABI");
+_Static_assert(__builtin_offsetof(struct object_start, entry_ns) == 16, "object time");
+_Static_assert(__builtin_offsetof(struct object_start, descriptor_index) == 24, "object index");
+_Static_assert(__builtin_offsetof(struct object_start, layout) == 28, "object layout");
+_Static_assert(__builtin_offsetof(struct object_start, inputs) == 32, "object inputs");
+_Static_assert(__builtin_offsetof(struct object_start, result_ptrs) == 48, "object results");
+_Static_assert(__builtin_offsetof(struct object_start, get_template_base) == 64, "object get");
+_Static_assert(__builtin_offsetof(struct object_start, inspected_header_end) == 72, "object span");
+_Static_assert(__builtin_offsetof(struct object_start, find_capacity) == 80, "object capacity");
+_Static_assert(__builtin_offsetof(struct object_start, find_count_ptr) == 88, "object count");
+_Static_assert(__builtin_offsetof(struct object_start, slots) == 96, "object slots");
+_Static_assert(__builtin_offsetof(struct object_start, requested) == 352, "object requested");
+_Static_assert(__builtin_offsetof(struct object_start, input_statuses) == 424, "object input status");
+_Static_assert(__builtin_offsetof(struct object_start, result_statuses) == 426, "object result status");
+_Static_assert(__builtin_offsetof(struct object_start, flags) == 428, "object flags");
+_Static_assert(__builtin_offsetof(struct object_start, get_inspected) == 430, "object inspected");
+_Static_assert(__builtin_offsetof(struct object_start, reserved) == 431, "object reserved");
+#endif
+
 /* Existing real Rust map symbols; only their addresses enter map helpers. */
 #ifndef P11SCOPE_INVENTORY_ONLY
 extern unsigned char START;
+extern unsigned char OBJECT_START;
+extern unsigned char OBJECT_DESCRIPTORS;
+extern unsigned char OBJECT_ZERO;
 #endif
 extern unsigned char DISCOVERY_STATE;
 static void *(*owner_map_lookup)(void *, const void *) = (void *)1;

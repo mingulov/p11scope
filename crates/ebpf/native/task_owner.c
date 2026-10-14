@@ -330,21 +330,39 @@ static __always_inline int object_side_delete(struct owner_control *ctl,
     return 0;
 }
 
+/* Bulk saturating add with the same never-wrap contract as count(): the
+ * cell stops at ~0ULL. Same check-then-add race class as count() under
+ * true concurrency; exact in every reachable single-sweep case. Lives
+ * beside the sweep so the inventory flavor (no sweep) stays warning-free. */
+static __always_inline void count_add(u64 *cell, u64 add)
+{
+    u64 seen;
+    if (!add)
+        return;
+    seen = *(volatile u64 *)cell;
+    if (seen != ~0ULL) {
+        u64 room = ~0ULL - seen;
+        __sync_fetch_and_add(cell, add < room ? add : room);
+    }
+}
+
 /* Orphan sweep per-slot worker, outlined: the sweep loop must not inline
  * the 432-byte scrub — the unrolled stores times the slot trip count
  * exceed the kernel jump-complexity budget (live 8193-jump reject).
- * Verified once as a subprogram; called once per slot. 0 swept-or-absent,
- * 1 failed (poisoned, the row is kept for retry). */
-static __noinline int object_sweep_orphan_slot(struct owner_control *ctl,
-                                               struct owner_start_key *start)
+ * Verified once as a subprogram; called once per present slot. Takes a
+ * present row, scrubs and deletes it, and returns the delete failure
+ * flag by arithmetic shift: delete returns 0 or a negative errno, so
+ * bit63 of rc is 1 exactly on failure. No comparison anywhere — BPF
+ * has no conditional-set, so even (rc != 0) would compile to a jump.
+ * The caller keeps the null-row check and hoists poison and the
+ * saturating count past the loop. A failed row is kept for retry. */
+static __noinline unsigned long object_sweep_orphan_slot(struct owner_start_key *start,
+                                                         void *side)
 {
-    void *orphan = owner_map_lookup(&OBJECT_START, start);
-    if (!orphan)
-        return 0;
-    if (object_side_delete(ctl, start, orphan))
-        return 1;
-    count(&ctl->abandoned_start);
-    return 0;
+    long rc;
+    object_scrub_side(side);
+    rc = owner_map_delete(&OBJECT_START, start);
+    return (unsigned long)rc >> 63;
 }
 
 /* Settle one subordinate row for START removal. 0 means the side row is
@@ -890,11 +908,32 @@ __attribute__((noinline)) u32 p11_owner_cleanup(void)
     }
     /* Orphaned side rows (START gone without its subordinate) hold no live
      * call; scrub and delete them under these proven retained keys. A bare
-     * numeric key never authorizes this sweep. */
-    for (u32 i = 0; i < P11SCOPE_OWNER_SLOT_BOUND; i++) {
-        start.slot = i;
-        if (object_sweep_orphan_slot(ctl, &start))
+     * numeric key never authorizes this sweep. The loop carries two
+     * branches per slot (null-row check, loop-back) and accumulates by
+     * pure arithmetic — comparisons would compile to jumps on BPF, and
+     * the 512-slot trip count must stay inside the kernel jump budget.
+     * Poison and the saturating count run once past the loop. Every
+     * slot is swept even past a failure; a failed row is kept for
+     * retry and still fails cleanup. */
+    {
+        u64 swept = 0;
+        unsigned long failed = 0;
+        for (u32 i = 0; i < P11SCOPE_OWNER_SLOT_BOUND; i++) {
+            void *orphan;
+            unsigned long failed_here = 0;
+            start.slot = i;
+            orphan = owner_map_lookup(&OBJECT_START, &start);
+            if (orphan) {
+                failed_here = object_sweep_orphan_slot(&start, orphan);
+                swept += failed_here ^ 1UL;
+            }
+            failed |= failed_here;
+        }
+        count_add(&ctl->abandoned_start, swept);
+        if (failed) {
+            poison(ctl, OWNER_STATE_DELETE_FAILED);
             return 1;
+        }
     }
 #endif
     struct owner_discovery_key key = { .pid_tgid = owner->original_pid_tgid };

@@ -271,7 +271,7 @@ fn object_producer_cleanup_sweep_delegates_scrub() {
         std::fs::read_to_string("crates/ebpf/native/task_owner.c").expect("read native owner");
     let helper = source_between(
         &native,
-        "static __noinline int object_sweep_orphan_slot",
+        "static __noinline unsigned long object_sweep_orphan_slot",
         "/* Settle one subordinate row for START removal.",
     );
     for forbidden in ["poison(", "count("] {

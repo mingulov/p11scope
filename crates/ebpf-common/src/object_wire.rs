@@ -218,6 +218,46 @@ pub enum ObjectRecordForm {
     Object,
 }
 
+/// One validated 240-byte object tail. Constructible only through
+/// [`validate_object_tail`], so possession proves full validation against
+/// the frozen row. Holds raw target words: deliberately no `Debug`.
+#[derive(Clone, Copy)]
+pub struct ValidatedObjectCall {
+    tail: [u8; OBJECT_TAIL_BYTES],
+}
+
+impl ValidatedObjectCall {
+    /// Validate one complete tail against its frozen descriptor row.
+    pub fn validate(tail: &[u8], descriptor: &ObjectDescriptorWire) -> Option<Self> {
+        if !validate_object_tail(tail, descriptor) {
+            return None;
+        }
+        let mut owned = [0u8; OBJECT_TAIL_BYTES];
+        owned.copy_from_slice(tail);
+        Some(Self { tail: owned })
+    }
+
+    /// The exact validated tail bytes.
+    pub fn tail_bytes(&self) -> &[u8; OBJECT_TAIL_BYTES] {
+        &self.tail
+    }
+
+    /// Canonical descriptor index the tail validated against.
+    pub fn descriptor_index(&self) -> u32 {
+        tail_u32(&self.tail, 4)
+    }
+
+    /// Validated action code.
+    pub fn action(&self) -> u8 {
+        self.tail[13]
+    }
+
+    /// Validated layout code.
+    pub fn layout(&self) -> u8 {
+        self.tail[12]
+    }
+}
+
 /// Meaning of a START `object_required` marker word against the frozen
 /// table: zero is ordinary, a required marker names its table index, and
 /// anything else (NONE row, out of range, reserved bits) is invalid.
@@ -231,33 +271,315 @@ pub enum StartMarkerVerdict {
 /// Canonical wire encoding of one function ordinal's object protocol, or
 /// the NONE row for unknown/ineligible functions. Pure: no reads.
 pub fn canonical_object_wire(function: u32) -> ObjectDescriptorWire {
-    let _ = (
+    let Some(policy) = object_descriptor(function) else {
+        return none_object_wire();
+    };
+    let action = match policy.action {
+        ObjectAction::Create => OBJECT_ACTION_CREATE,
+        ObjectAction::Copy => OBJECT_ACTION_COPY,
+        ObjectAction::Generate => OBJECT_ACTION_GENERATE,
+        ObjectAction::GeneratePair => OBJECT_ACTION_PAIR,
+        ObjectAction::Derive => OBJECT_ACTION_DERIVE,
+        ObjectAction::Unwrap => OBJECT_ACTION_UNWRAP,
+        ObjectAction::Destroy => OBJECT_ACTION_DESTROY,
+        ObjectAction::Access => OBJECT_ACTION_ACCESS,
+        ObjectAction::OperationImport => OBJECT_ACTION_IMPORT,
+        ObjectAction::Find => OBJECT_ACTION_FIND,
+        ObjectAction::GetAttributes => OBJECT_ACTION_GET,
+        ObjectAction::SetAttributes => OBJECT_ACTION_SET,
+    };
+    let guard = match policy.result_protocol_guard {
+        ResultProtocolGuard::NamedFunction => OBJECT_GUARD_NAMED,
+        ResultProtocolGuard::ScalarDeriveMechanism => OBJECT_GUARD_SCALAR_DERIVE,
+    };
+    ObjectDescriptorWire {
         function,
-        ObjectAction::Create,
-        ResultProtocolGuard::NamedFunction,
-    );
-    let _ = object_descriptor;
-    todo!("H7 slice A: encode the closed policy catalog as wire rows")
+        input_args: policy.input_args,
+        result_args: policy.result_pointer_args,
+        template_args: [
+            policy.template_args[0].0,
+            policy.template_args[0].1,
+            policy.template_args[1].0,
+            policy.template_args[1].1,
+        ],
+        find_capacity_arg: policy.find_capacity_arg,
+        find_count_arg: policy.find_count_ptr_arg,
+        action,
+        guard,
+    }
 }
 
 /// Publish the frozen 105-row descriptor table: row 0 is NONE, rows
 /// 1..=104 are the canonical rows in canonical-index order.
 pub fn publish_object_descriptors() -> [ObjectDescriptorWire; MAX_DESCRIPTORS as usize] {
-    todo!("H7 slice A: publish the frozen descriptor table")
+    let mut rows = [none_object_wire(); MAX_DESCRIPTORS as usize];
+    for function in 0..MAX_DESCRIPTORS - 1 {
+        rows[(function + 1) as usize] = canonical_object_wire(function);
+    }
+    rows
 }
 
 /// Every row must equal its canonical encoding; any disagreement refuses.
 pub fn verify_object_descriptors(rows: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize]) -> bool {
-    let _ = rows;
-    todo!("H7 slice A: verify every published row")
+    if rows[0] != none_object_wire() {
+        return false;
+    }
+    for function in 0..MAX_DESCRIPTORS - 1 {
+        if rows[(function + 1) as usize] != canonical_object_wire(function) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Validate one complete 240-byte tail against its frozen descriptor row:
 /// exact version/length, finite codes only, zero padding, possible
 /// action/field combinations and the exact canonical descriptor.
 pub fn validate_object_tail(tail: &[u8], descriptor: &ObjectDescriptorWire) -> bool {
-    let _ = (tail, descriptor);
-    todo!("H7 slice A: validate the complete object tail")
+    if tail.len() != OBJECT_TAIL_BYTES {
+        return false;
+    }
+    if tail_u16(tail, 0) != OBJECT_CALL_VERSION || tail_u16(tail, 2) != OBJECT_CALL_BYTES {
+        return false;
+    }
+    // Exact canonical descriptor: the row's function ordinal is the tail's
+    // index minus one, with matching action. Index 0 has no object
+    // protocol (ordinary calls use the 368-byte form).
+    let index = tail_u32(tail, 4);
+    if index == 0 || index >= MAX_DESCRIPTORS {
+        return false;
+    }
+    if u64::from(descriptor.function) != u64::from(index) - 1 {
+        return false;
+    }
+    if descriptor.action == OBJECT_ACTION_NONE
+        || descriptor.action > OBJECT_ACTION_MAX
+        || descriptor.guard == OBJECT_GUARD_NONE
+        || descriptor.guard > OBJECT_GUARD_SCALAR_DERIVE
+    {
+        return false;
+    }
+    if tail[13] != descriptor.action {
+        return false;
+    }
+    if tail_u32(tail, 8) & !OBJECT_FLAGS_MASK != 0 {
+        return false;
+    }
+    let layout = tail[12];
+    if layout != OBJECT_LAYOUT_LP64 && layout != OBJECT_LAYOUT_ILP32 {
+        return false;
+    }
+    let action = tail[13];
+    if action > OBJECT_ACTION_MAX {
+        return false;
+    }
+    let entry_derive = tail[14];
+    if entry_derive > OBJECT_DERIVE_ECDH1_COFACTOR {
+        return false;
+    }
+    if action != OBJECT_ACTION_DERIVE && entry_derive != OBJECT_DERIVE_UNAVAILABLE {
+        return false;
+    }
+    if tail[15] != 0 {
+        return false;
+    }
+    // Input positions: descriptor-absent positions stay absent with zero
+    // words; present positions carry a non-absent status, except import
+    // inputs, which are absent for zero words.
+    for i in 0..2 {
+        let status = tail[112 + i];
+        if status > OBJECT_HANDLE_STATUS_MAX {
+            return false;
+        }
+        if descriptor.input_args[i] == ARG_NONE {
+            if status != 0 {
+                return false;
+            }
+        } else if action != OBJECT_ACTION_IMPORT && status == 0 {
+            return false;
+        }
+        if !valid_handle_word(status, tail_u64(tail, 16 + 8 * i), layout) {
+            return false;
+        }
+    }
+    // Result positions: descriptor-present results always carry a
+    // non-absent status (unavailable covers unobserved results); descriptor
+    // absent positions stay absent with zero words.
+    for i in 0..2 {
+        let status = tail[114 + i];
+        if status > OBJECT_HANDLE_STATUS_MAX {
+            return false;
+        }
+        if descriptor.result_args[i] == ARG_NONE {
+            if status != 0 {
+                return false;
+            }
+        } else if status == 0 {
+            return false;
+        }
+        if !valid_handle_word(status, tail_u64(tail, 32 + 8 * i), layout) {
+            return false;
+        }
+    }
+    if !valid_find_section(tail, action, layout) {
+        return false;
+    }
+    // Requested lists: descriptor-absent pairs stay all-zero; present pairs
+    // carry a valid list (possibly empty). A half-present pair is corrupt.
+    for i in 0..2 {
+        let pair = &descriptor.template_args[2 * i..2 * i + 2];
+        let present = pair[0] != ARG_NONE && pair[1] != ARG_NONE;
+        if (pair[0] != ARG_NONE) != (pair[1] != ARG_NONE) {
+            return false;
+        }
+        let list = &tail[128 + 36 * i..128 + 36 * (i + 1)];
+        if !present {
+            if list.iter().any(|byte| *byte != 0) {
+                return false;
+            }
+        } else if !valid_attribute_list(list) {
+            return false;
+        }
+    }
+    // Only Get populates the result-attribute list.
+    let results = &tail[200..236];
+    if action != OBJECT_ACTION_GET {
+        if results.iter().any(|byte| *byte != 0) {
+            return false;
+        }
+    } else if !valid_attribute_list(results) {
+        return false;
+    }
+    if tail_u32(tail, 236) != 0 {
+        return false;
+    }
+    true
+}
+
+/// A value status requires a nonzero word (a zero observation carries the
+/// invalid-zero status instead); every other status requires a zero word.
+/// ia32 tails reject words with high bits on every handle.
+fn valid_handle_word(status: u8, word: u64, layout: u8) -> bool {
+    if layout == OBJECT_LAYOUT_ILP32 && word > u64::from(u32::MAX) {
+        return false;
+    }
+    if status == 1 {
+        word != 0
+    } else {
+        word == 0
+    }
+}
+
+/// Only Find populates the Find section. Cells before `find_len` carry a
+/// non-absent status, cells at and after it stay absent with zero words;
+/// an invalid Find carries no length, and truncation implies eight cells.
+fn valid_find_section(tail: &[u8], action: u8, layout: u8) -> bool {
+    let find_len = tail[124];
+    let find_flags = tail[125];
+    let find_valid = tail[126];
+    if tail[127] != 0 {
+        return false;
+    }
+    if find_len > OBJECT_FIND_HANDLES_MAX
+        || find_flags & !OBJECT_FIND_FLAGS_MASK != 0
+        || find_valid > 1
+    {
+        return false;
+    }
+    if action != OBJECT_ACTION_FIND {
+        if find_len != 0 || find_flags != 0 || find_valid != 0 {
+            return false;
+        }
+        for i in 0..8 {
+            if tail[116 + i] != 0 || tail_u64(tail, 48 + 8 * i) != 0 {
+                return false;
+            }
+        }
+        return true;
+    }
+    if find_valid == 0 && find_len != 0 {
+        return false;
+    }
+    if find_flags & 1 != 0 && find_len != OBJECT_FIND_HANDLES_MAX {
+        return false;
+    }
+    for i in 0..8 {
+        let status = tail[116 + i];
+        if status > OBJECT_HANDLE_STATUS_MAX {
+            return false;
+        }
+        if i < find_len as usize {
+            if status == 0 {
+                return false;
+            }
+        } else if status != 0 {
+            return false;
+        }
+        if !valid_handle_word(status, tail_u64(tail, 48 + 8 * i), layout) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Finite codes, zero padding, an inspected count within the cells, a set
+/// present bit for any inspected cell, truncation only at eight cells, and
+/// zero cells at and after the inspected count. A nonzero value requires
+/// the value status (scalar zero stays valid through its status).
+fn valid_attribute_list(list: &[u8]) -> bool {
+    let inspected = list[32];
+    let flags = list[33];
+    if inspected > 8 || list[34] != 0 || list[35] != 0 || flags & !0x0F != 0 {
+        return false;
+    }
+    if inspected > 0 && flags & 1 == 0 {
+        return false;
+    }
+    if flags & 2 != 0 && inspected != 8 {
+        return false;
+    }
+    for i in 0..8 {
+        let base = 4 * i;
+        let kind = list[base];
+        let status = list[base + 1];
+        let value = u16::from_le_bytes([list[base + 2], list[base + 3]]);
+        if kind > OBJECT_ATTR_KIND_MAX || status > OBJECT_ATTR_STATUS_MAX {
+            return false;
+        }
+        if status != 1 && value != 0 {
+            return false;
+        }
+        if i >= inspected as usize && (kind != 0 || status != 0 || value != 0) {
+            return false;
+        }
+    }
+    true
+}
+
+fn tail_u16(tail: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([tail[offset], tail[offset + 1]])
+}
+
+fn tail_u32(tail: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        tail[offset],
+        tail[offset + 1],
+        tail[offset + 2],
+        tail[offset + 3],
+    ])
+}
+
+fn tail_u64(tail: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        tail[offset],
+        tail[offset + 1],
+        tail[offset + 2],
+        tail[offset + 3],
+        tail[offset + 4],
+        tail[offset + 5],
+        tail[offset + 6],
+        tail[offset + 7],
+    ])
 }
 
 /// Dispatch raw ring bytes to their record form: exactly 368 bytes is
@@ -267,8 +589,18 @@ pub fn object_record_form(
     bytes: &[u8],
     descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
 ) -> Option<ObjectRecordForm> {
-    let _ = (bytes, descriptors);
-    todo!("H7 slice A: dispatch the two exact record forms")
+    if bytes.len() == core::mem::size_of::<EventRecord>() {
+        return Some(ObjectRecordForm::Ordinary);
+    }
+    if bytes.len() != OBJECT_RECORD_BYTES {
+        return None;
+    }
+    let index = tail_u32(bytes, 372);
+    if index == 0 || index >= MAX_DESCRIPTORS {
+        return None;
+    }
+    validate_object_tail(&bytes[368..], &descriptors[index as usize])
+        .then_some(ObjectRecordForm::Object)
 }
 
 /// Validate a START marker word against the frozen table.
@@ -276,8 +608,22 @@ pub fn validate_start_marker(
     marker: u64,
     descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
 ) -> StartMarkerVerdict {
-    let _ = (marker, descriptors);
-    todo!("H7 slice A: validate the finite START marker")
+    if marker == 0 {
+        return StartMarkerVerdict::Ordinary;
+    }
+    if marker > START_MARKER_MAX {
+        return StartMarkerVerdict::Invalid;
+    }
+    let row = &descriptors[(marker - 1) as usize];
+    let action_ok = row.action != OBJECT_ACTION_NONE && row.action <= OBJECT_ACTION_MAX;
+    let guard_ok = row.guard != OBJECT_GUARD_NONE && row.guard <= OBJECT_GUARD_SCALAR_DERIVE;
+    if marker >= 2 && u64::from(row.function) == marker - 2 && action_ok && guard_ok {
+        StartMarkerVerdict::Required {
+            index: (marker - 1) as u32,
+        }
+    } else {
+        StartMarkerVerdict::Invalid
+    }
 }
 
 /// Address of the named object-result argument 7 for pair-private and
@@ -290,8 +636,23 @@ pub fn object_result_arg7_address(
     stack_pointer: u64,
     layout: LinuxLayout,
 ) -> Option<u64> {
-    let _ = (descriptor, stack_pointer, layout);
-    todo!("H7 slice A: name and bound the object-result arg7 address")
+    let pair_or_unwrap =
+        descriptor.action == OBJECT_ACTION_PAIR || descriptor.action == OBJECT_ACTION_UNWRAP;
+    if !pair_or_unwrap || !descriptor.result_args.contains(&7) {
+        return None;
+    }
+    match layout {
+        LinuxLayout::Lp64 => {
+            let address = stack_pointer.checked_add(16)?;
+            crate::target_word_end(address, layout)?;
+            Some(address)
+        }
+        LinuxLayout::Ilp32 => {
+            let address = (stack_pointer & u64::from(u32::MAX)).checked_add(32)?;
+            crate::target_word_end(address, layout)?;
+            Some(address)
+        }
+    }
 }
 
 #[cfg(test)]

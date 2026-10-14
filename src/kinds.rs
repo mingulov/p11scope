@@ -4,6 +4,7 @@
 //! aliased slot whose names disagree degrades to OTHER: reading the wrong
 //! argument shape could touch a PIN pointer, so ambiguity never guesses.
 
+use p11scope_ebpf_common::object_policy::ObjectCaptureDescriptor;
 use p11scope_ebpf_common::{
     MAX_DESCRIPTORS, SlotSemantics, direct, lifecycle, operation, semantic_flags, transition,
 };
@@ -90,8 +91,34 @@ pub enum AliasAgreement {
 /// Equal S1 shapes with differing object protocols become count-only with
 /// `ObjectDisagree`; attach-cookie encoding is unchanged.
 pub fn descriptor_index_with_object_agreement(names: &[String]) -> (u32, AliasAgreement) {
-    let _ = names;
-    todo!("H7 slice A: S1 plus object-protocol alias agreement")
+    if names.is_empty() {
+        return (0, AliasAgreement::Agree);
+    }
+    let mut index: Option<u32> = None;
+    let mut selected: Option<(SlotSemantics, Option<ObjectCaptureDescriptor>)> = None;
+    for name in names {
+        let Some(function_id) = function_id(name) else {
+            return (0, AliasAgreement::S1Ambiguous);
+        };
+        let candidate_s1 = DESCRIPTORS[(function_id + 1) as usize];
+        let candidate_object = object_descriptor(name);
+        match (&mut index, &mut selected) {
+            (Some(previous), Some((s1, object))) => {
+                if candidate_s1 != *s1 {
+                    return (0, AliasAgreement::S1Ambiguous);
+                }
+                if candidate_object != *object {
+                    return (0, AliasAgreement::ObjectDisagree);
+                }
+                *previous = (*previous).min(function_id + 1);
+            }
+            _ => {
+                index = Some(function_id + 1);
+                selected = Some((candidate_s1, candidate_object));
+            }
+        }
+    }
+    (index.unwrap_or(0), AliasAgreement::Agree)
 }
 
 fn session(operations: u16, transition: u8) -> SlotSemantics {

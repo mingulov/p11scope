@@ -7522,11 +7522,14 @@ aggregate-only-metrics default metrics"
     let induced = read("scripts/verify-induced-gaps.sh");
     for (name, caller, paths, entrypoint, acquisitions) in [
         (
+            // H7 slice D: run_lane, run_start_lane, run_owned_lane plus the
+            // object cell's completion and blocked acquisitions (5). Every
+            // acquisition still passes both native paths over `python3 -I`.
             "canary",
             canaries.as_str(),
             "\"$TASK_STORAGE_READER\" --obj \"$TASK_STORAGE_OBJECT\"",
             "sudo python3 -I scripts/capture-stopped-canary.py",
-            3,
+            5,
         ),
         (
             "induced-gap",
@@ -7836,7 +7839,9 @@ aggregate-only-metrics default metrics"
     sentinels.extend(canary_literals(&read(
         "scripts/fixtures/privacy-stack-workload.c",
     )));
-    assert_eq!(sentinels.len(), 21, "unexpected fixture sentinel inventory");
+    // H7 slice D: 21 hosted families plus the object-lane CKA_VALUE decoy
+    // (CANARY_OBJECT_*), covered by the scanner self-test like the rest.
+    assert_eq!(sentinels.len(), 22, "unexpected fixture sentinel inventory");
     for sentinel in sentinels {
         assert!(
             lanes.contains(&sentinel),
@@ -11933,8 +11938,11 @@ fn aggregate_policy_returns_before_both_events_reserves() {
         gate < reserve,
         "aggregate gate must precede the return-path EVENTS reserve"
     );
+    // H7 slice D: the gate retires the object side row (map delete plus
+    // fault/evidence counters, never an EVENTS submit) before the early
+    // return. The exact-text pin keeps failing on any added submit site.
     assert!(
-        returned.contains("if flags & FLAG_POLICY_AGGREGATE != 0 {\n        return 0;\n    }"),
+        returned.contains("if flags & FLAG_POLICY_AGGREGATE != 0 {\n        // Aggregate records nothing: retire the object side row (its\n        // retire moved after emission) before the early return.\n        if start.object_required != 0 && owned_start_remove(&key, true).is_err() {\n            unsafe { p11_object_fault() };\n            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);\n        }\n        return 0;\n    }"),
         "aggregate gate must return before any submit"
     );
 

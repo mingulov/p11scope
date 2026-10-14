@@ -2083,6 +2083,7 @@ pub(crate) enum EntryOutcome {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // H7 slice D: the semantic observation carries the 240 B validated object tail inline to its drop point; mutations stay allocation-free.
 enum Mutation {
     NoteInstance(AdmittedInstance),
     ObserveInstanceSemantic(AdmittedInstanceCall),

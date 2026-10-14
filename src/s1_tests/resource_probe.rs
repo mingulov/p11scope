@@ -619,9 +619,13 @@ fn native_semantic_resource_final_types_pinned() {
         size_of::<crate::inventory_semantics::TerminalBatchStage>(),
         40
     );
-    assert_eq!(size_of::<crate::semantic_capture::TickOutcome>(), 432);
+    // H7 slice D: TickOutcome::Call and RoutedCall carry the decoded
+    // envelope with its optional 240 B validated object tail inline
+    // (+248 each, measured 680 on Rust 1.98.1 x86-64 Linux). The pins
+    // keep catching any further drift before SYSTEM activation.
+    assert_eq!(size_of::<crate::semantic_capture::TickOutcome>(), 680);
     assert_eq!(size_of::<crate::semantic_capture::TickReport>(), 112);
-    assert_eq!(size_of::<crate::semantic_capture::RoutedCall>(), 432);
+    assert_eq!(size_of::<crate::semantic_capture::RoutedCall>(), 680);
     // H6 retains the calibrated mapped-file identity in the watched target.
     assert_eq!(
         size_of::<crate::semantic_capture::CurrentPartitionReceipt>(),

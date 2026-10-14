@@ -364,6 +364,7 @@ impl fmt::Debug for OtherRecord {
     }
 }
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)] // H7 slice D: Call is the common outcome and carries the 240 B validated object tail inline; outcomes stay allocation-free per tick.
 pub(crate) enum TickOutcome {
     Call(RoutedCall),
     Invalidation(Invalidation),
@@ -2855,7 +2856,7 @@ mod tests {
         let descriptors = publish_object_descriptors();
         let function = crate::kinds::function_id("C_CreateObject").expect("Create ordinal");
         assert_eq!(function, 20);
-        let index = u32::from(function) + 1;
+        let index = function + 1;
         assert_eq!(descriptors[index as usize].action, OBJECT_ACTION_CREATE);
 
         // One exact validated Create tail: observed result handle plus a

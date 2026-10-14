@@ -677,6 +677,26 @@ static void ordinary_absence(void)
     assert(!ctl.poison && !ctl.outstanding && idle(0) && !deletes);
 }
 #endif
+#ifndef P11SCOPE_INVENTORY_ONLY
+/* H7 slice B object custody controls. Stubs until the subordinate owner
+ * implementation lands; each aborts so the Rust drivers fail RED. */
+static void object_producer_owner_terminal_matrix(void)
+{
+    assert(!"object custody unimplemented");
+}
+static void object_producer_side_state_n_and_n_plus_one(void)
+{
+    assert(!"object custody unimplemented");
+}
+static void object_producer_missing_side_state_faults_before_return(void)
+{
+    assert(!"object custody unimplemented");
+}
+static void object_producer_cleanup_result_reaches_exec_exit_fault(void)
+{
+    assert(!"object custody unimplemented");
+}
+#endif
 #ifdef P11SCOPE_INVENTORY_ONLY
 static void inventory_contract(void)
 {
@@ -734,6 +754,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "threads")) threaded_contention();
         else if (!strcmp(argv[1], "idle")) idle_owner_retention();
         else if (!strcmp(argv[1], "lease")) lease_boundary();
+        else if (!strcmp(argv[1], "object_producer_owner_terminal_matrix")) object_producer_owner_terminal_matrix();
+        else if (!strcmp(argv[1], "object_producer_side_state_n_and_n_plus_one")) object_producer_side_state_n_and_n_plus_one();
+        else if (!strcmp(argv[1], "object_producer_missing_side_state_faults_before_return")) object_producer_missing_side_state_faults_before_return();
+        else if (!strcmp(argv[1], "object_producer_cleanup_result_reaches_exec_exit_fault")) object_producer_cleanup_result_reaches_exec_exit_fault();
         else assert(0);
     } else {
         cas_boundaries(); accounting_contention(); threaded_contention(); idle_owner_retention();

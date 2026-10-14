@@ -5183,11 +5183,13 @@ fn frozen_policy_inventory_matches_embedded_object() {
         (true, true) => ("wide-diagnostic", "wide-default", "diagnostic"),
     };
     // Stage A plus image continuity: four additional private maps, one
-    // pre-mm hook and one same-object task iterator.
+    // pre-mm hook and one same-object task iterator. H7 slice B adds the
+    // three subordinate-custody maps (OBJECT_START, OBJECT_DESCRIPTORS,
+    // OBJECT_ZERO) with no new programs.
     let (maps, programs) = if cfg!(feature = "unsafe-unvalidated-metadata") {
-        (38, 23)
+        (41, 23)
     } else {
-        (36, 18)
+        (39, 18)
     };
     let report = run_ok(
         "python3",
@@ -5406,8 +5408,8 @@ fn descriptor_cookie_and_consumers_source_guard_rejects_contract_regressions() {
         &ebpf[template_second_end..]
     );
     let bypassed_primary_semantics = ebpf.replacen(
-        "    let semantics = semantics_of(&ctx);\n    let mut storage = MaybeUninit::<CallStart>::uninit();",
-        "    let semantics = SlotSemantics::COUNT_ONLY;\n    let mut storage = MaybeUninit::<CallStart>::uninit();",
+        "    let semantics = semantics_of(&ctx);\n    if let Some(value) = capture_scalar(&ctx, semantics.session_arg, layout, start) {",
+        "    let semantics = SlotSemantics::COUNT_ONLY;\n    if let Some(value) = capture_scalar(&ctx, semantics.session_arg, layout, start) {",
         1,
     );
     assert_eq!(

@@ -260,6 +260,205 @@ static __always_inline int start_key_valid(struct thread_owner *owner,
         key->pid_tgid == owner->original_pid_tgid;
 }
 
+/* One aligned word from a START value. Map values and the BPF stack value
+ * are 8-aligned and every call-site offset is a multiple of 8, so this is
+ * a single load with no stack temporary; the host harness aligns its rows
+ * the same way. */
+static __always_inline u64 start_u64(const void *start_value, u32 offset)
+{
+    return *(const u64 *)((const unsigned char *)start_value + offset);
+}
+
+/* Mirror of object_wire::validate_start_marker against the frozen table: 0
+ * ordinary, 1 required (index and action out), -1 invalid. */
+static __always_inline int object_marker_verdict(u64 marker, u32 *index_out,
+                                                 unsigned char *action_out)
+{
+    u32 row_key;
+    const struct object_descriptor_row *row;
+    if (!marker)
+        return 0;
+    if (marker > OBJECT_DESCRIPTORS_COUNT || marker < 2)
+        return -1;
+    row_key = (u32)(marker - 1);
+    row = owner_map_lookup(&OBJECT_DESCRIPTORS, &row_key);
+    if (!row)
+        return -1;
+    if (row->function != row_key - 1)
+        return -1;
+    if (!row->action || row->action > OBJECT_ACTION_MAX)
+        return -1;
+    if (!row->guard || row->guard > OBJECT_GUARD_MAX)
+        return -1;
+    *index_out = row_key;
+    *action_out = row->action;
+    return 1;
+}
+
+/* The side row's immutable binding must equal the live START row: selected
+ * descriptor, entry image and entry time. */
+static __always_inline int object_binding_matches(const void *side, const void *start_value,
+                                                  u32 index)
+{
+    const struct object_start *o = side;
+    return o->descriptor_index == index &&
+        o->task_cookie == start_u64(start_value, OBJECT_CALL_START_IMAGE_OFF) &&
+        o->exec_id == start_u64(start_value, OBJECT_CALL_START_IMAGE_OFF + 8) &&
+        o->entry_ns == start_u64(start_value, OBJECT_CALL_START_TS_OFF);
+}
+
+/* Zero a subordinate value before its deletion so no retained pointer or
+ * length survives in a readable row, even when the deletion then fails. */
+static __always_inline void object_scrub_side(void *side)
+{
+    volatile u64 *words = side;
+    u32 i;
+    for (i = 0; i < OBJECT_START_WORDS; i++)
+        words[i] = 0;
+}
+
+/* Scrub then delete an identified side row. 0 deleted, -1 failed (poisoned,
+ * the row is kept for retry). */
+static __always_inline int object_side_delete(struct owner_control *ctl,
+                                              const struct owner_start_key *key, void *side)
+{
+    object_scrub_side(side);
+    if (owner_map_delete(&OBJECT_START, key)) {
+        poison(ctl, OWNER_STATE_DELETE_FAILED);
+        return -1;
+    }
+    return 0;
+}
+
+/* Settle one subordinate row for START removal. 0 means the side row is
+ * settled (or healthily absent) and START deletion may proceed with a
+ * success report. 1 means the side state contradicted its START
+ * (bookkeeping recorded, identifiable storage scrubbed): the caller still
+ * deletes START so no required row is orphaned, but reports failure. -1
+ * means the side row could not be deleted: START is kept for retry. */
+static __always_inline int object_side_for_remove(struct owner_control *ctl,
+                                                  const void *start_value,
+                                                  const struct owner_start_key *key)
+{
+    u32 index = 0;
+    unsigned char action = 0;
+    int verdict = object_marker_verdict(start_u64(start_value, OBJECT_CALL_START_MARKER_OFF),
+                                        &index, &action);
+    void *side = owner_map_lookup(&OBJECT_START, key);
+    (void)action;
+    if (verdict < 0) {
+        if (side && object_side_delete(ctl, key, side))
+            return -1;
+        bookkeeping(ctl, OWNER_OBJECT_MISMATCH);
+        return 1;
+    }
+    if (!verdict) {
+        if (!side)
+            return 0;
+        if (object_side_delete(ctl, key, side))
+            return -1;
+        bookkeeping(ctl, OWNER_OBJECT_MISMATCH);
+        return 1;
+    }
+    if (!side || !object_binding_matches(side, start_value, index)) {
+        if (side && object_side_delete(ctl, key, side))
+            return -1;
+        bookkeeping(ctl, OWNER_OBJECT_MISMATCH);
+        return 1;
+    }
+    if (((const struct object_start *)side)->phase != OBJECT_PHASE_ENTRY &&
+        ((const struct object_start *)side)->phase != OBJECT_PHASE_READY &&
+        ((const struct object_start *)side)->phase != OBJECT_PHASE_RETURNING) {
+        if (object_side_delete(ctl, key, side))
+            return -1;
+        bookkeeping(ctl, OWNER_OBJECT_MISMATCH);
+        return 1;
+    }
+    return object_side_delete(ctl, key, side) ? -1 : 0;
+}
+
+/* Roll back a START row this transaction just inserted. A failed deletion
+ * keeps its count for teardown; otherwise the count and an emptied lease
+ * are settled exactly as the ordinary insert failure path settles them. */
+static __always_inline void object_rollback_insert(struct owner_control *ctl,
+                                                   struct thread_owner *owner,
+                                                   const struct owner_start_key *key)
+{
+    if (owner_map_delete(&START, key)) {
+        poison(ctl, OWNER_STATE_DELETE_FAILED);
+        return;
+    }
+    owner->start_count--;
+    release_empty(ctl, owner);
+}
+
+/* Establish the subordinate side row for a required marker after the START
+ * row was inserted. Ordinary markers need nothing. Any side failure rolls
+ * back the START row and reports loss; the marker is never downgraded to
+ * ordinary to hide it. */
+static __always_inline long object_side_alloc(struct owner_control *ctl,
+                                              struct thread_owner *owner,
+                                              const struct owner_start_key *key,
+                                              const void *value)
+{
+    u32 index = 0;
+    unsigned char action = 0;
+    int verdict = object_marker_verdict(start_u64(value, OBJECT_CALL_START_MARKER_OFF),
+                                        &index, &action);
+    u32 zero_key = 0;
+    const volatile u64 *zero;
+    struct object_start *side;
+    long rc;
+    u32 i;
+    if (!verdict)
+        return 0;
+    if (verdict < 0) {
+        object_rollback_insert(ctl, owner, key);
+        bookkeeping(ctl, OWNER_OBJECT_MISMATCH);
+        return -1;
+    }
+    zero = owner_map_lookup(&OBJECT_ZERO, &zero_key);
+    if (!zero) {
+        object_rollback_insert(ctl, owner, key);
+        bookkeeping(ctl, OWNER_OBJECT_MISMATCH);
+        return -1;
+    }
+    for (i = 0; i < OBJECT_START_WORDS; i++) {
+        if (zero[i]) {
+            object_rollback_insert(ctl, owner, key);
+            bookkeeping(ctl, OWNER_OBJECT_MISMATCH);
+            return -1;
+        }
+    }
+    rc = owner_map_update(&OBJECT_START, key, (const void *)zero, 1);
+    if (rc) {
+        object_rollback_insert(ctl, owner, key);
+        /* A conflicting row is never replaced; any other failure is a
+         * refused admission, not corruption. */
+        if (rc == -17)
+            bookkeeping(ctl, OWNER_OBJECT_MISMATCH);
+        else
+            count(&ctl->admission_failures);
+        return rc;
+    }
+    side = owner_map_lookup(&OBJECT_START, key);
+    if (!side) {
+        object_rollback_insert(ctl, owner, key);
+        bookkeeping(ctl, OWNER_OBJECT_MISMATCH);
+        return -1;
+    }
+    /* Immutable descriptor/image/time binding; entry-in-progress phase. The
+     * entry ABI is recorded by the entry probe through the query row once
+     * this transaction succeeds. */
+    side->descriptor_index = index;
+    side->action = action;
+    side->task_cookie = start_u64(value, OBJECT_CALL_START_IMAGE_OFF);
+    side->exec_id = start_u64(value, OBJECT_CALL_START_IMAGE_OFF + 8);
+    side->entry_ns = start_u64(value, OBJECT_CALL_START_TS_OFF);
+    side->phase = OBJECT_PHASE_ENTRY;
+    return 0;
+}
+
 #endif
 /* An exact hash absence permits only an optional ordinary no-op. A readable
  * owner is still checked for contradictions. NULL here says nothing about
@@ -305,7 +504,9 @@ __attribute__((noinline)) void *p11_owner_start_get(const struct owner_start_key
 static __always_inline long remove_start(struct owner_control *ctl, struct thread_owner *owner,
                                          const struct owner_start_key *key)
 {
-    if (!owner_map_lookup(&START, key)) {
+    void *start_value = owner_map_lookup(&START, key);
+    int side;
+    if (!start_value) {
         bookkeeping(ctl, OWNER_START_ROW_MISSING);
         return -1;
     }
@@ -313,13 +514,20 @@ static __always_inline long remove_start(struct owner_control *ctl, struct threa
         bookkeeping(ctl, OWNER_START_COUNT_MISMATCH);
         return -1;
     }
+    /* Subordinate custody retires with its START: scrub the side value,
+     * delete it, then delete START and refund below. A contradicted side
+     * row still retires its START (no orphaned required rows) but reports
+     * failure; only a failed side deletion keeps START for retry. */
+    side = object_side_for_remove(ctl, start_value, key);
+    if (side < 0)
+        return -1;
     long rc = owner_map_delete(&START, key);
     if (rc) {
         poison(ctl, OWNER_STATE_DELETE_FAILED);
         return rc;
     }
     owner->start_count--;
-    return 0;
+    return side ? -1 : 0;
 }
 
 __attribute__((noinline)) long p11_owner_start_remove(const struct owner_start_key *key, u32 required)
@@ -339,8 +547,13 @@ __attribute__((noinline)) long p11_owner_start_remove(const struct owner_start_k
         return -1;
     }
     long rc = remove_start(ctl, owner, key);
-    if (rc)
+    if (rc) {
+        /* A contradicted side row still retired its START above; settle an
+         * emptied lease while reporting the failure. A kept row (a failed
+         * deletion) leaves the lease untouched for retry. */
+        release_empty(ctl, owner);
         return rc;
+    }
     if (!release_empty(ctl, owner))
         return -1;
     return rc;
@@ -367,7 +580,7 @@ __attribute__((noinline)) long p11_owner_start_insert(const struct owner_start_k
     owner->start_count++;
     long rc = owner_map_update(&START, key, value, 1);
     if (!rc)
-        return 0;
+        return object_side_alloc(ctl, owner, key, value);
     owner->start_count--;
     count(&ctl->admission_failures);
     /* NOEXIST ambiguity invalidates only a record under this physical owner.
@@ -376,6 +589,74 @@ __attribute__((noinline)) long p11_owner_start_insert(const struct owner_start_k
         remove_start(ctl, owner, key);
     release_empty(ctl, owner);
     return rc;
+}
+
+/* Validated live subordinate row, or NULL. This query validates but records
+ * nothing itself, so a following retire is never blocked by the query's own
+ * poison (only the shared owner lookup may record lookup failure, as on all
+ * owner paths). Every caller MUST follow with p11_owner_start_remove on the
+ * same key in the same probe: the return drain queries with required=0,
+ * checks attached-descriptor and retained-ABI agreement itself, then
+ * retires through the ordinary removal (which re-validates marker, side
+ * and binding and records once): query plus retire is the drain, in one
+ * task with no interleaving mutation. Entry records the retained ABI
+ * through this row and abandons through the same removal; return-phase
+ * fill queries with required=1. Both modes require bound custody when a
+ * row is claimed: the marker is required, the binding matches the live
+ * START, and the phase is sane (entry, ready or returning). required=1
+ * additionally requires ready: only ready authorizes reads. A healthy
+ * ordinary call has no side row: quiet NULL, unless a side row leaked onto
+ * it. Attached descriptor disagreement and non-ready phases refuse quietly
+ * (per-call loss, not corruption). An absent row under required=0 is a
+ * quiet NULL after the same absent-owner inspection the START get
+ * performs. */
+__attribute__((noinline)) void *p11_object_side_get(const struct owner_start_key *key,
+                                                    u32 descriptor, u32 required)
+{
+    struct owner_control *ctl = control();
+    struct thread_owner *owner;
+    void *start_value;
+    void *side;
+    u32 index = 0;
+    unsigned char action = 0;
+    unsigned char phase;
+    if (!healthy(ctl) || !key || key->slot >= P11SCOPE_OWNER_SLOT_BOUND || key->pad)
+        return (void *)0;
+    if (!required && !owner_map_lookup(&OBJECT_START, key)) {
+        /* START count cannot identify which particular absent slot is owed. */
+        peek_absent_owner(ctl);
+        return (void *)0;
+    }
+    owner = get_owner(ctl, 0);
+    if (!owner)
+        return (void *)0;
+    if (!start_key_valid(owner, key))
+        return (void *)0;
+    start_value = owner_map_lookup(&START, key);
+    if (!start_value)
+        return (void *)0;
+    {
+        int verdict = object_marker_verdict(start_u64(start_value, OBJECT_CALL_START_MARKER_OFF),
+                                            &index, &action);
+        if (verdict < 0)
+            return (void *)0;
+        if (!verdict)
+            return (void *)0;
+    }
+    /* Attached-descriptor disagreement is per-call loss, not corruption:
+     * refuse quietly and let the caller fault. */
+    if (index != descriptor)
+        return (void *)0;
+    side = owner_map_lookup(&OBJECT_START, key);
+    if (!side || !object_binding_matches(side, start_value, index))
+        return (void *)0;
+    phase = ((const struct object_start *)side)->phase;
+    if (phase != OBJECT_PHASE_ENTRY && phase != OBJECT_PHASE_READY &&
+        phase != OBJECT_PHASE_RETURNING)
+        return (void *)0;
+    if (required && phase != OBJECT_PHASE_READY)
+        return (void *)0;
+    return side;
 }
 
 #endif
@@ -537,46 +818,74 @@ __attribute__((noinline)) long p11_owner_discovery_insert(const struct owner_dis
 }
 
 /* Called ONLY by the mandatory current-task raw exec/exit hooks. The actual
- * atomic CAS0->0 is the linearization point, not a plain or cached load. */
-__attribute__((noinline)) void p11_owner_cleanup(void)
+ * atomic CAS0->0 is the linearization point, not a plain or cached load.
+ * Returns 0 for healthy proven cleanup (or a healthy no-op) and 1 for
+ * failure or unproven cleanup. Poison is never cleared and a failed
+ * release is never masked: settling rows after poison still reports 1. */
+__attribute__((noinline)) u32 p11_owner_cleanup(void)
 {
     struct owner_control *ctl = control();
     if (!ctl)
-        return;
+        return 1;
     if (__sync_val_compare_and_swap(&ctl->outstanding, 0, 0) == 0)
-        return;
+        return healthy(ctl) ? 0 : 1;
     struct task_struct *task = owner_current_task();
     if (!task) {
         poison(ctl, OWNER_LOOKUP_UNKNOWN);
-        return;
+        return 1;
     }
     struct thread_owner *owner = owner_storage_get(&THREAD_OWNER, task, (void *)0, 0);
     if (!owner) {
         long rc = owner_storage_delete(&THREAD_OWNER, task);
         if (rc != -2)
             poison(ctl, OWNER_CLASSIFIER_FAILED);
-        return;
+        return healthy(ctl) ? 0 : 1;
     }
     /* An idle owner holds no lease, rows or directory cells: nothing to
      * settle. Its storage stays with the task (exec) or is freed with it (exit). */
     if (!owner->flags && !owner->original_pid_tgid && !owner->start_count &&
         !owner->occupied && !owner->selection_domains)
-        return;
+        return healthy(ctl) ? 0 : 1;
     if (!valid_owner(ctl, owner))
-        return;
+        return 1;
 #ifndef P11SCOPE_INVENTORY_ONLY
     struct owner_start_key start = { .pid_tgid = owner->original_pid_tgid, .slot = 0, .pad = 0 };
     for (u32 i = 0; i < P11SCOPE_OWNER_SLOT_BOUND; i++) {
         start.slot = i;
         if (owner_map_lookup(&START, &start)) {
-            if (remove_start(ctl, owner, &start))
-                return;
-            count(&ctl->abandoned_start);
+            long rc = remove_start(ctl, owner, &start);
+            int retired = !owner_map_lookup(&START, &start);
+            if (retired) {
+                count(&ctl->abandoned_start);
+                /* A contradicted row still retired: settle an emptied
+                 * lease instead of stranding it until the next hook. The
+                 * success path releases once below. */
+                if (rc)
+                    release_empty(ctl, owner);
+            }
+            if (rc)
+                return 1;
         }
     }
     if (owner->start_count) {
         bookkeeping(ctl, OWNER_START_COUNT_MISMATCH);
-        return;
+        return 1;
+    }
+    /* Orphaned side rows (START gone without its subordinate) hold no live
+     * call; scrub and delete them under these proven retained keys. A bare
+     * numeric key never authorizes this sweep. */
+    for (u32 i = 0; i < P11SCOPE_OWNER_SLOT_BOUND; i++) {
+        void *orphan;
+        start.slot = i;
+        orphan = owner_map_lookup(&OBJECT_START, &start);
+        if (orphan) {
+            object_scrub_side(orphan);
+            if (owner_map_delete(&OBJECT_START, &start)) {
+                poison(ctl, OWNER_STATE_DELETE_FAILED);
+                return 1;
+            }
+            count(&ctl->abandoned_start);
+        }
     }
 #endif
     struct owner_discovery_key key = { .pid_tgid = owner->original_pid_tgid };
@@ -587,8 +896,10 @@ __attribute__((noinline)) void p11_owner_cleanup(void)
         key.cookie = owner->discovery_cookies[i];
         key.domain = (owner->selection_domains & bit) ? 2 : 1;
         if (remove_discovery(ctl, owner, &key, i))
-            return;
+            return 1;
         count(&ctl->abandoned_discovery);
     }
-    release_empty(ctl, owner);
+    if (!release_empty(ctl, owner))
+        return 1;
+    return healthy(ctl) ? 0 : 1;
 }

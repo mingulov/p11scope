@@ -1554,6 +1554,11 @@ SAFE_MAPS = {
         "RV_COUNTS": (5, 16, 8, 4_096),
         "DESCRIPTORS": (2, 4, 18, 105, 128),
         "START": (1, 16, 288, 16_384),
+        # H7 slice B subordinate custody: one side row per START entry, the
+        # frozen descriptor table, and the verified zero template.
+        "OBJECT_START": (1, 16, 432, 16_384),
+        "OBJECT_DESCRIPTORS": (2, 4, 16, 105, 128),
+        "OBJECT_ZERO": (2, 4, 432, 1, 128),
         "TASK_COOKIE": (29, 4, 8, 0, 1),
         "COOKIE_CTL": (2, 4, 40, 1),
         "THREAD_OWNER": (29, 4, 544, 0, 1),
@@ -1642,6 +1647,7 @@ INVENTORY_FORBIDDEN_MAPS = {
     "ROOT_AFFILIATION", "ROOT_CTL", "WATCHED_FILES", "SLOT_FILE", "PROC_EPOCH", "G_EPOCH",
     "INSTANCE_GEN", "INSTANCE_CALIB", "INSTANCE_COUNT", "INSTANCE_START",
     "IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS", "IMAGE_QUERY_CTL",
+    "OBJECT_START", "OBJECT_DESCRIPTORS", "OBJECT_ZERO",
 }
 INVENTORY_CALLER_MAPS = INVENTORY_MAPS | {
     "ENDPOINT_OBJECT": map_def(2, 4, 8, 1, 128),
@@ -1711,7 +1717,7 @@ def validate_inventory(variant, maps, programs, symbols):
         forbidden = {name for name in symbols if name not in allowed and
                      (name in INVENTORY_FORBIDDEN_MAPS
                       or name.startswith(("p11_owner_start_", "p11_link_", "p11_root_",
-                                          "p11_inst", "p11_image_")))}
+                                          "p11_inst", "p11_image_", "p11_object")))}
         if forbidden:
             raise RuntimeError(f"inventory contains forbidden detailed symbols: {sorted(forbidden)}")
     required_helpers = (REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS
@@ -1757,15 +1763,18 @@ def self_test():
     assert SAFE_MAPS["PID_FILTER"] == map_def(1, 4, 8, 1_024, 128)
     assert SAFE_MAPS["EVIDENCE"] == map_def(6, 4, 8, 9)
     assert SAFE_MAPS["STACK_GUARD"] == map_def(3, 4, 4, 1)
+    assert SAFE_MAPS["OBJECT_START"] == map_def(1, 16, 432, 16_384)
+    assert SAFE_MAPS["OBJECT_DESCRIPTORS"] == map_def(2, 4, 16, 105, 128)
+    assert SAFE_MAPS["OBJECT_ZERO"] == map_def(2, 4, 432, 1, 128)
     assert INVENTORY_MAPS["STACK_GUARD"] == SAFE_MAPS["STACK_GUARD"]
     assert UNSAFE_MAPS["PAIR_CALLS"] == map_def(3, 4, 4, 1)
     assert WIDE_UNSAFE_MAPS["PAIR_CALLS"] == UNSAFE_MAPS["PAIR_CALLS"]
     assert "PAIR_CALLS" not in SAFE_MAPS
     assert "PAIR_CALLS" not in INVENTORY_MAPS
-    assert len(SAFE_MAPS) == 36
-    assert len(UNSAFE_MAPS) == 38
-    assert len(WIDE_MAPS) == 36
-    assert len(WIDE_UNSAFE_MAPS) == 38
+    assert len(SAFE_MAPS) == 39
+    assert len(UNSAFE_MAPS) == 41
+    assert len(WIDE_MAPS) == 39
+    assert len(WIDE_UNSAFE_MAPS) == 41
     assert len(SAFE_PROGRAMS) == 18
     assert len(UNSAFE_PROGRAMS) == 23
     assert not INSTANCE_PROGRAMS & INVENTORY_PROGRAMS

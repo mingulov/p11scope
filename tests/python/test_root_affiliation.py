@@ -38,12 +38,22 @@ def wrapper_contract(main, name):
 def hook_contract(main, identity):
     wrapper_contract(main, "sched_process_exit")
     exit_body = function(main, "sched_process_exit_impl")
-    owner = "unsafe { p11_owner_cleanup() };"
-    owner_at = exit_body.index(owner)
-    before_owner = re.sub(r"//[^\n]*", "", exit_body[:owner_at]).strip()
-    if before_owner != "{" or exit_body.count("p11_owner_cleanup") != 1:
+    # Owner cleanup executes first and unconditionally in both cfgs; a
+    # failed cleanup faults through a fault-only arm that never diverts
+    # teardown (exact text pins the arm: no return, no other call).
+    guard = ('#[cfg(not(feature = "inventory-only"))]\n'
+             '    if unsafe { p11_owner_cleanup() } != 0 {\n'
+             '        unsafe { p11_object_fault() };\n'
+             '    }\n'
+             '    #[cfg(feature = "inventory-only")]\n'
+             '    let _ = unsafe { p11_owner_cleanup() };')
+    guard_at = exit_body.index(guard)
+    before_guard = re.sub(r"//[^\n]*", "", exit_body[:guard_at]).strip()
+    if before_guard != "{":
         raise AssertionError("owner cleanup must unconditionally begin the exit handler")
-    tail = exit_body[owner_at + len(owner):]
+    if exit_body.count("p11_owner_cleanup") != 2:
+        raise AssertionError("exit must run owner cleanup exactly once per cfg")
+    tail = exit_body[guard_at + len(guard):]
     root = re.match(
         r'\s*#\[cfg\(not\(feature = "inventory-only"\)\)\]'
         r'\s*unsafe\s*\{\s*p11_root_current_exit\(\)\s*\};', tail)
@@ -78,7 +88,8 @@ class RootAffiliationTests(unittest.TestCase):
         identity = (ROOT / "crates/ebpf/native/image_identity_fork.c").read_text()
         hook_contract(main, identity)
         exit_body = function(main, "sched_process_exit_impl")
-        root_start = exit_body.index('#[cfg(not(feature = "inventory-only"))]')
+        guard_end = exit_body.index("let _ = unsafe { p11_owner_cleanup() };")
+        root_start = exit_body.index('#[cfg(not(feature = "inventory-only"))]', guard_end)
         root_end = exit_body.index('};', root_start) + 2
         root_block = exit_body[root_start:root_end]
         owner = "unsafe { p11_owner_cleanup() };"

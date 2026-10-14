@@ -326,8 +326,8 @@ fn native_slot_checks_counts_and_cleanup_share_one_bound() {
         source
             .matches("key->slot >= P11SCOPE_OWNER_SLOT_BOUND")
             .count()
-            == 2,
-        "both native lookup and removal paths check the same slot bound"
+            == 3,
+        "native lookup, query and removal paths check the same slot bound"
     );
 }
 

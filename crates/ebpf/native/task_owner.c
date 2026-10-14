@@ -330,6 +330,23 @@ static __always_inline int object_side_delete(struct owner_control *ctl,
     return 0;
 }
 
+/* Orphan sweep per-slot worker, outlined: the sweep loop must not inline
+ * the 432-byte scrub — the unrolled stores times the slot trip count
+ * exceed the kernel jump-complexity budget (live 8193-jump reject).
+ * Verified once as a subprogram; called once per slot. 0 swept-or-absent,
+ * 1 failed (poisoned, the row is kept for retry). */
+static __noinline int object_sweep_orphan_slot(struct owner_control *ctl,
+                                               struct owner_start_key *start)
+{
+    void *orphan = owner_map_lookup(&OBJECT_START, start);
+    if (!orphan)
+        return 0;
+    if (object_side_delete(ctl, start, orphan))
+        return 1;
+    count(&ctl->abandoned_start);
+    return 0;
+}
+
 /* Settle one subordinate row for START removal. 0 means the side row is
  * settled (or healthily absent) and START deletion may proceed with a
  * success report. 1 means the side state contradicted its START
@@ -875,17 +892,9 @@ __attribute__((noinline)) u32 p11_owner_cleanup(void)
      * call; scrub and delete them under these proven retained keys. A bare
      * numeric key never authorizes this sweep. */
     for (u32 i = 0; i < P11SCOPE_OWNER_SLOT_BOUND; i++) {
-        void *orphan;
         start.slot = i;
-        orphan = owner_map_lookup(&OBJECT_START, &start);
-        if (orphan) {
-            object_scrub_side(orphan);
-            if (owner_map_delete(&OBJECT_START, &start)) {
-                poison(ctl, OWNER_STATE_DELETE_FAILED);
-                return 1;
-            }
-            count(&ctl->abandoned_start);
-        }
+        if (object_sweep_orphan_slot(ctl, &start))
+            return 1;
     }
 #endif
     struct owner_discovery_key key = { .pid_tgid = owner->original_pid_tgid };

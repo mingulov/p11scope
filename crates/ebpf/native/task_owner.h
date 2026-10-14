@@ -6,6 +6,7 @@ typedef unsigned int u32;
 typedef unsigned long long u64;
 #define SEC(name) __attribute__((section(name), used))
 #define __always_inline inline __attribute__((always_inline))
+#define __noinline __attribute__((noinline))
 #define __uint(name, value) int (*name)[value]
 #define __type(name, value) typeof(value) *name
 #define OWNER_LEASED 1U

@@ -278,7 +278,10 @@ static __always_inline int object_marker_verdict(u64 marker, u32 *index_out,
     const struct object_descriptor_row *row;
     if (!marker)
         return 0;
-    if (marker > OBJECT_DESCRIPTORS_COUNT || marker < 2)
+    /* Fused unsigned range checks: (v - lo) wraps huge exactly when v is
+     * below lo, so one comparison covers both ends. Exact for every input;
+     * each fused check saves one jump per sweep slot. */
+    if (marker - 2 > OBJECT_DESCRIPTORS_COUNT - 2)
         return -1;
     row_key = (u32)(marker - 1);
     row = owner_map_lookup(&OBJECT_DESCRIPTORS, &row_key);
@@ -286,9 +289,9 @@ static __always_inline int object_marker_verdict(u64 marker, u32 *index_out,
         return -1;
     if (row->function != row_key - 1)
         return -1;
-    if (!row->action || row->action > OBJECT_ACTION_MAX)
+    if ((unsigned int)row->action - 1U > OBJECT_ACTION_MAX - 1U)
         return -1;
-    if (!row->guard || row->guard > OBJECT_GUARD_MAX)
+    if ((unsigned int)row->guard - 1U > OBJECT_GUARD_MAX - 1U)
         return -1;
     *index_out = row_key;
     *action_out = row->action;
@@ -301,10 +304,14 @@ static __always_inline int object_binding_matches(const void *side, const void *
                                                   u32 index)
 {
     const struct object_start *o = side;
-    return o->descriptor_index == index &&
-        o->task_cookie == start_u64(start_value, OBJECT_CALL_START_IMAGE_OFF) &&
-        o->exec_id == start_u64(start_value, OBJECT_CALL_START_IMAGE_OFF + 8) &&
-        o->entry_ns == start_u64(start_value, OBJECT_CALL_START_TS_OFF);
+    /* Xor-accumulated equality: exact (xor is zero iff equal), one jump
+     * instead of three &&s. All reads are safe: both rows are validated
+     * before this runs. */
+    u64 diff = (u64)(o->descriptor_index ^ index);
+    diff |= o->task_cookie ^ start_u64(start_value, OBJECT_CALL_START_IMAGE_OFF);
+    diff |= o->exec_id ^ start_u64(start_value, OBJECT_CALL_START_IMAGE_OFF + 8);
+    diff |= o->entry_ns ^ start_u64(start_value, OBJECT_CALL_START_TS_OFF);
+    return diff == 0;
 }
 
 /* Zero a subordinate value before its deletion so no retained pointer or
@@ -562,7 +569,12 @@ static __always_inline long remove_start(struct owner_control *ctl, struct threa
         return rc;
     }
     owner->start_count--;
-    return side ? -1 : 0;
+    /* Branchless nonzero-to--1: (s|-s) has bit63 set exactly when s != 0.
+     * All-unsigned, so no overflow UB; a comparison would compile to a jump. */
+    {
+        unsigned long mag = (unsigned long)side | (0UL - (unsigned long)side);
+        return -(long)(mag >> 63);
+    }
 }
 
 __attribute__((noinline)) long p11_owner_start_remove(const struct owner_start_key *key, u32 required)
@@ -885,23 +897,30 @@ __attribute__((noinline)) u32 p11_owner_cleanup(void)
         return 1;
 #ifndef P11SCOPE_INVENTORY_ONLY
     struct owner_start_key start = { .pid_tgid = owner->original_pid_tgid, .slot = 0, .pad = 0 };
+    /* Retired slots accumulate locally; the saturating count runs once
+     * past the loop (and once on the early return) so the 512-slot trip
+     * count stays inside the kernel jump budget. Counts, release timing
+     * and the return code match the per-slot version exactly. */
+    u64 retired = 0;
     for (u32 i = 0; i < P11SCOPE_OWNER_SLOT_BOUND; i++) {
         start.slot = i;
         if (owner_map_lookup(&START, &start)) {
             long rc = remove_start(ctl, owner, &start);
-            int retired = !owner_map_lookup(&START, &start);
-            if (retired) {
-                count(&ctl->abandoned_start);
+            if (!owner_map_lookup(&START, &start)) {
+                retired++;
                 /* A contradicted row still retired: settle an emptied
                  * lease instead of stranding it until the next hook. The
                  * success path releases once below. */
                 if (rc)
                     release_empty(ctl, owner);
             }
-            if (rc)
+            if (rc) {
+                count_add(&ctl->abandoned_start, retired);
                 return 1;
+            }
         }
     }
+    count_add(&ctl->abandoned_start, retired);
     if (owner->start_count) {
         bookkeeping(ctl, OWNER_START_COUNT_MISMATCH);
         return 1;

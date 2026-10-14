@@ -264,6 +264,26 @@ fn object_producer_cleanup_sweep_delegates_scrub() {
     let object = embedded_object(directory.path());
     let report = run_object_checker(&object, "sweep-delegate");
     println!("{report}");
+    // Branch diet: the sweep helper runs once per slot (512/2112), so it
+    // must settle branchlessly — no poison/count calls inside. Poison and
+    // the saturating bulk count happen once after the loop.
+    let native =
+        std::fs::read_to_string("crates/ebpf/native/task_owner.c").expect("read native owner");
+    let helper = source_between(
+        &native,
+        "static __noinline int object_sweep_orphan_slot",
+        "/* Settle one subordinate row for START removal.",
+    );
+    for forbidden in ["poison(", "count("] {
+        assert!(
+            !helper.contains(forbidden),
+            "sweep helper must not call {forbidden} per slot"
+        );
+    }
+    assert!(
+        native.contains("static __always_inline void count_add(u64 *cell, u64 add)"),
+        "bulk saturating count helper must exist"
+    );
 }
 
 /// Actual emitted-object custody checks: exact owned-map allocation,

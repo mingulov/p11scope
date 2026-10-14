@@ -166,10 +166,12 @@ fn object_producer_adapters_helpers_in_elf() {
     let directory = tempfile::tempdir().expect("temporary adapter ELF check");
     let object = embedded_object(directory.path());
     let symbols = nm_text_symbols(&object);
+    // Helpers are private like the marker/ABI levels, so their symbols are
+    // local text (`t`), not global (`T`). Either proves the outline survived.
     for helper in ["object_fill_entry", "object_fill_return"] {
         let hits: Vec<&str> = symbols
             .lines()
-            .filter(|line| line.contains(helper) && line.contains(" T "))
+            .filter(|line| line.contains(helper) && (line.contains(" T ") || line.contains(" t ")))
             .collect();
         assert_eq!(
             hits.len(),

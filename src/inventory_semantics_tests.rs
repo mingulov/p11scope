@@ -373,7 +373,7 @@ impl ProviderFixture {
             &targets,
             &outcome.successful,
         );
-        assert_eq!(outcome.completed.len(), 2);
+        assert_eq!(outcome.completed.len(), subset.plan().slots.len());
         (retained, outcome.successful)
     }
 
@@ -823,6 +823,341 @@ fn native_semantic_attached_receipt_rejects_foreign_or_forged_slot() {
         refused.iter().all(|(_, refused)| *refused),
         "refusal controls: {refused:?}"
     );
+}
+
+fn publish_frozen_for(
+    domain: crate::attach::capture::NativeDomainId,
+) -> FrozenObjectDescriptors<BTreeMap<u32, ObjectDescriptorWire>> {
+    publish_and_freeze_object_descriptors_with(
+        BTreeMap::new(),
+        domain,
+        |map, index, row| {
+            map.insert(index, row);
+            Ok(())
+        },
+        |map| {
+            (0..105)
+                .map(|index| {
+                    map.get(&index)
+                        .copied()
+                        .ok_or_else(|| anyhow::anyhow!("missing row {index}"))
+                })
+                .collect()
+        },
+        |_| Ok(()),
+    )
+    .unwrap()
+}
+
+fn attachment_readback_for<'a>(
+    domain: crate::attach::capture::NativeDomainId,
+    retained: &'a BTreeMap<u32, RetainedStaticTarget>,
+    sides: &'a BTreeSet<StaticEndpoint>,
+) -> SemanticAttachmentReadback<'a> {
+    SemanticAttachmentReadback {
+        domain,
+        policy: CapturePolicy::Allowlisted,
+        descriptors: Ok(crate::kinds::DESCRIPTORS.to_vec()),
+        retained,
+        owned_sides: sides,
+    }
+}
+
+struct SealedFixture {
+    receipt: AttachedSemanticSet,
+    domain: crate::attach::capture::NativeDomainId,
+    retained: BTreeMap<u32, RetainedStaticTarget>,
+    sides: BTreeSet<StaticEndpoint>,
+}
+
+fn seal_fixture(fixture: &ProviderFixture) -> SealedFixture {
+    let domain = crate::attach::capture::NativeDomainId::mint();
+    let subset = fixture.subset();
+    let (retained, sides) = fixture.inputs(&subset);
+    let receipt = seal_attached_subset_with(
+        subset,
+        domain,
+        CapturePolicy::Allowlisted,
+        Ok(crate::kinds::DESCRIPTORS.to_vec()),
+        &retained,
+        &sides,
+        |object| fixture.watched(object),
+    )
+    .unwrap();
+    SealedFixture {
+        receipt,
+        domain,
+        retained,
+        sides,
+    }
+}
+
+/// The mixed store: the fixture's eligible `C_SignInit` and ordinary
+/// `C_Sign` plus a real same-target `C_DestroyObject`/`C_GetObjectSize`
+/// alias pair, all through the retained-source planner.
+fn aliased_subset(fixture: &ProviderFixture) -> AttestedSubset {
+    let mut manifest = fixture.manifest.clone();
+    let third = fixture.offsets[0] + 2;
+    for record in &mut manifest.surfaces[0].functions {
+        if ["C_DestroyObject", "C_GetObjectSize"].contains(&record.name.as_str()) {
+            record.resolution = Resolution::Resolved {
+                object: 0,
+                file_offset: third,
+            };
+        }
+    }
+    let path = fixture.dir.path().join("operator-alias-input.json");
+    std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+    let prepared = prepare_attested_subset(&engine, &[path]);
+    assert!(
+        prepared.subset.is_some(),
+        "aliased subset refused: {:?}",
+        prepared.refusals
+    );
+    let subset = prepared.subset.expect("aliased operator subset");
+    assert_eq!(subset.plan().slots.len(), 3);
+    subset
+}
+
+#[test]
+fn object_producer_freeze_requires_actual_attached_receipt() {
+    let fixture = ProviderFixture::new();
+    let sealed = seal_fixture(&fixture);
+    let frozen = publish_frozen_for(sealed.domain);
+    let table = sealed
+        .receipt
+        .freeze_object_table_with(
+            frozen,
+            attachment_readback_for(sealed.domain, &sealed.retained, &sealed.sides),
+            |object| fixture.watched(object),
+        )
+        .unwrap();
+    assert_eq!(table.semantic_set().domain, sealed.domain);
+
+    // A table frozen for another domain never binds to this receipt.
+    let sealed = seal_fixture(&fixture);
+    let foreign = publish_frozen_for(crate::attach::capture::NativeDomainId::mint());
+    let result = sealed.receipt.freeze_object_table_with(
+        foreign,
+        attachment_readback_for(sealed.domain, &sealed.retained, &sealed.sides),
+        |object| fixture.watched(object),
+    );
+    assert!(matches!(result, Err(SemanticRefusal::Attachment)));
+}
+
+#[test]
+fn object_producer_freeze_rejects_foreign_domain_provider_and_abi() {
+    let fixture = ProviderFixture::new();
+    // Forged retained facts refuse at the freeze revalidation.
+    for mutate in [
+        |retained: &mut RetainedStaticTarget| retained.slot.file_offset ^= 1,
+        |retained: &mut RetainedStaticTarget| retained.slot.descriptor_index ^= 1,
+        |retained: &mut RetainedStaticTarget| {
+            retained.slot.object = PinnedObjectId(u32::MAX);
+        },
+    ] {
+        let sealed = seal_fixture(&fixture);
+        let mut retained = sealed.retained.clone();
+        mutate(retained.get_mut(&0).unwrap());
+        let result = sealed.receipt.freeze_object_table_with(
+            publish_frozen_for(sealed.domain),
+            attachment_readback_for(sealed.domain, &retained, &sealed.sides),
+            |object| fixture.watched(object),
+        );
+        assert!(matches!(result, Err(SemanticRefusal::Attachment)));
+    }
+    // A foreign domain, an unwatched provider and a wrong ABI refuse.
+    let sealed = seal_fixture(&fixture);
+    let result = sealed.receipt.freeze_object_table_with(
+        publish_frozen_for(sealed.domain),
+        attachment_readback_for(
+            crate::attach::capture::NativeDomainId::mint(),
+            &sealed.retained,
+            &sealed.sides,
+        ),
+        |object| fixture.watched(object),
+    );
+    assert!(matches!(result, Err(SemanticRefusal::Attachment)));
+    let sealed = seal_fixture(&fixture);
+    let result = sealed.receipt.freeze_object_table_with(
+        publish_frozen_for(sealed.domain),
+        attachment_readback_for(sealed.domain, &sealed.retained, &sealed.sides),
+        |_| None,
+    );
+    assert!(matches!(
+        result,
+        Err(SemanticRefusal::ProviderInstanceUnproven)
+    ));
+    let sealed = seal_fixture(&fixture);
+    let mut retained = sealed.retained.clone();
+    retained.get_mut(&0).unwrap().abi = if retained[&0].abi == ElfAbi::Lp64 {
+        ElfAbi::Ilp32
+    } else {
+        ElfAbi::Lp64
+    };
+    let result = sealed.receipt.freeze_object_table_with(
+        publish_frozen_for(sealed.domain),
+        attachment_readback_for(sealed.domain, &retained, &sealed.sides),
+        |object| fixture.watched(object),
+    );
+    assert!(matches!(result, Err(SemanticRefusal::Attachment)));
+}
+
+#[test]
+fn object_producer_freeze_refuses_incomplete_required_extension() {
+    let fixture = ProviderFixture::new();
+    // A required slot missing from retention refuses.
+    let sealed = seal_fixture(&fixture);
+    let mut retained = sealed.retained.clone();
+    retained.remove(&1);
+    let result = sealed.receipt.freeze_object_table_with(
+        publish_frozen_for(sealed.domain),
+        attachment_readback_for(sealed.domain, &retained, &sealed.sides),
+        |object| fixture.watched(object),
+    );
+    assert!(matches!(result, Err(SemanticRefusal::Attachment)));
+    // A required slot missing a probe side refuses.
+    let sealed = seal_fixture(&fixture);
+    let mut sides = sealed.sides.clone();
+    sides.remove(&(0, ProbeSide::Entry));
+    let result = sealed.receipt.freeze_object_table_with(
+        publish_frozen_for(sealed.domain),
+        attachment_readback_for(sealed.domain, &sealed.retained, &sides),
+        |object| fixture.watched(object),
+    );
+    assert!(matches!(result, Err(SemanticRefusal::Attachment)));
+}
+
+#[test]
+fn object_producer_freeze_preserves_eligible_neighbors_of_refused_slots() {
+    use crate::kinds::AliasAgreement;
+    use crate::plan::ObjectSlotEligibility;
+    let fixture = ProviderFixture::new();
+    let subset = aliased_subset(&fixture);
+    let (retained, sides) = fixture.inputs(&subset);
+    let domain = crate::attach::capture::NativeDomainId::mint();
+    let receipt = seal_attached_subset_with(
+        subset,
+        domain,
+        CapturePolicy::Allowlisted,
+        Ok(crate::kinds::DESCRIPTORS.to_vec()),
+        &retained,
+        &sides,
+        |object| fixture.watched(object),
+    )
+    .unwrap();
+    let table = receipt
+        .freeze_object_table_with(
+            publish_frozen_for(domain),
+            attachment_readback_for(domain, &retained, &sides),
+            |object| fixture.watched(object),
+        )
+        .unwrap();
+    let slots = &table.semantic_set().subset.plan().slots;
+    let eligible = slots
+        .iter()
+        .find(|slot| slot.names == ["C_SignInit"])
+        .unwrap()
+        .index;
+    let ordinary = slots
+        .iter()
+        .find(|slot| slot.names == ["C_Sign"])
+        .unwrap()
+        .index;
+    let alias = slots
+        .iter()
+        .find(|slot| {
+            slot.names.contains(&"C_DestroyObject".to_string())
+                && slot.names.contains(&"C_GetObjectSize".to_string())
+        })
+        .unwrap()
+        .index;
+    let fresh = || attachment_readback_for(domain, &retained, &sides);
+    let (cookie, abi) = table
+        .eligible_slot_with(eligible, fresh(), |object| fixture.watched(object))
+        .unwrap();
+    assert_eq!(cookie, crate::kinds::function_id("C_SignInit").unwrap() + 1);
+    assert_eq!(
+        abi,
+        fixture.pins.abi_for(slots[eligible as usize].object).unwrap()
+    );
+    assert!(matches!(
+        table.eligible_slot_with(ordinary, fresh(), |object| fixture.watched(object)),
+        Err(SemanticRefusal::Descriptor)
+    ));
+    assert!(matches!(
+        table.eligible_slot_with(alias, fresh(), |object| fixture.watched(object)),
+        Err(SemanticRefusal::Descriptor)
+    ));
+    assert_eq!(
+        table.slots.get(&alias),
+        Some(&(
+            ObjectSlotEligibility::Refused {
+                reason: SemanticRefusal::Descriptor,
+                agreement: AliasAgreement::ObjectDisagree,
+            },
+            abi,
+        ))
+    );
+}
+
+#[test]
+fn object_producer_frozen_eligibility_revalidates_current_attachment() {
+    let fixture = ProviderFixture::new();
+    let sealed = seal_fixture(&fixture);
+    let table = sealed
+        .receipt
+        .freeze_object_table_with(
+            publish_frozen_for(sealed.domain),
+            attachment_readback_for(sealed.domain, &sealed.retained, &sealed.sides),
+            |object| fixture.watched(object),
+        )
+        .unwrap();
+    let fresh = || attachment_readback_for(sealed.domain, &sealed.retained, &sealed.sides);
+    assert!(
+        table
+            .eligible_slot_with(0, fresh(), |object| fixture.watched(object))
+            .is_ok()
+    );
+    // Forged facts, a foreign domain and failed table readback refuse,
+    // even though the freeze itself succeeded.
+    let mut retained = sealed.retained.clone();
+    retained.get_mut(&0).unwrap().slot.file_offset ^= 1;
+    assert!(
+        table
+            .eligible_slot_with(
+                0,
+                attachment_readback_for(sealed.domain, &retained, &sealed.sides),
+                |object| fixture.watched(object),
+            )
+            .is_err()
+    );
+    assert!(
+        table
+            .eligible_slot_with(
+                0,
+                attachment_readback_for(
+                    crate::attach::capture::NativeDomainId::mint(),
+                    &sealed.retained,
+                    &sealed.sides
+                ),
+                |object| fixture.watched(object),
+            )
+            .is_err()
+    );
+    let mut failed = attachment_readback_for(sealed.domain, &sealed.retained, &sealed.sides);
+    failed.descriptors = Err(anyhow::anyhow!("descriptors unreadable"));
+    assert!(
+        table
+            .eligible_slot_with(0, failed, |object| fixture.watched(object))
+            .is_err()
+    );
+    // Slots outside the frozen binding refuse.
+    assert!(matches!(
+        table.eligible_slot_with(99, fresh(), |object| fixture.watched(object)),
+        Err(SemanticRefusal::Attachment)
+    ));
 }
 
 #[test]

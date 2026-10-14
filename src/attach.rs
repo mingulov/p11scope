@@ -6,7 +6,7 @@ use crate::discovery::hooks::HookAbi;
 use crate::discovery::identity::{PinnedObjectId, PinnedObjects};
 use crate::discovery::loader::LoaderContextId;
 use crate::events;
-use crate::plan::{AttachPlan, Slot};
+use crate::plan::{AttachPlan, ObjectSlotEligibility, Slot};
 use crate::run::OwnedChild;
 use anyhow::{Context as _, Result, anyhow, bail};
 use aya::maps::{Array, HashMap, Map, MapError, MapType, PerCpuArray, ProgramArray};
@@ -27,6 +27,7 @@ use p11scope_ebpf_common::{
     TAIL_CALLS_INTERFACE_WORKER_SLOT, TAIL_CALLS_TEMPLATE_SECOND_SLOT, THREAD_OWNER_LIMIT,
     ThreadOwnerControl, attach_cookie,
 };
+use p11scope_ebpf_common::object_wire::{ObjectDescriptorWire, publish_object_descriptors};
 use p11scope_manifest::elf::ElfAbi;
 use pkcs11_types::mechanism_registry::MechanismRegistry;
 use std::collections::{BTreeMap, BTreeSet};
@@ -2113,6 +2114,56 @@ impl AttachedSemanticSet {
         }
         Ok(())
     }
+
+    /// Bind a frozen object table to this attested receipt: the publication
+    /// domain must match, the receipt revalidates against fresh facts, and
+    /// every required slot records its object eligibility plus retained ABI.
+    /// Inactive in slice A.
+    #[cfg_attr(not(test), allow(dead_code))] // Slice B/C call the freeze path.
+    fn freeze_object_table_with<S>(
+        self,
+        frozen: FrozenObjectDescriptors<S>,
+        readback: SemanticAttachmentReadback<'_>,
+        watched: impl Fn(
+            PinnedObjectId,
+        ) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
+    ) -> ObjectResult<FrozenObjectTable<S>> {
+        let _ = (self, frozen, readback, watched);
+        todo!("H7 slice A: freeze the object table against the receipt")
+    }
+}
+
+/// An object table frozen against one attested receipt: the published rows,
+/// the consumed receipt and per-required-slot eligibility plus retained ABI.
+/// Inactive in slice A: no production path builds this yet.
+#[cfg_attr(not(test), allow(dead_code))] // Slice B/C admit markers from this.
+pub(crate) struct FrozenObjectTable<S> {
+    descriptors: FrozenObjectDescriptors<S>,
+    attached: AttachedSemanticSet,
+    slots: BTreeMap<u32, (ObjectSlotEligibility, ElfAbi)>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // Slice B/C admit markers from this.
+impl<S> FrozenObjectTable<S> {
+    /// Revalidate the receipt against fresh facts, then serve the stored
+    /// eligibility: the frozen cookie plus retained ABI, or the recorded
+    /// refusal. Slots outside the frozen binding refuse.
+    fn eligible_slot_with(
+        &self,
+        slot: u32,
+        readback: SemanticAttachmentReadback<'_>,
+        watched: impl Fn(
+            PinnedObjectId,
+        ) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
+    ) -> ObjectResult<(u32, ElfAbi)> {
+        let _ = (slot, readback, watched);
+        todo!("H7 slice A: serve frozen slot eligibility")
+    }
+
+    /// The attested receipt this table is frozen against.
+    pub(crate) fn semantic_set(&self) -> &AttachedSemanticSet {
+        &self.attached
+    }
 }
 
 #[cfg(test)]
@@ -2984,6 +3035,45 @@ fn publish_descriptors<S>(
         bail!("DESCRIPTORS exact readback differs from the fixed inventory");
     }
     Ok(())
+}
+
+type ObjectRows = [ObjectDescriptorWire; MAX_DESCRIPTORS as usize];
+type ObjectResult<T> = std::result::Result<T, crate::inventory_semantics::SemanticRefusal>;
+
+/// Exact inputs for one attested-receipt validation, bundled so the object
+/// freeze and later eligibility checks revalidate against the same facts.
+/// Inactive in slice A.
+#[cfg_attr(not(test), allow(dead_code))] // Slice B/C call the freeze path.
+struct SemanticAttachmentReadback<'a> {
+    domain: capture::NativeDomainId,
+    policy: CapturePolicy,
+    descriptors: Result<Vec<SlotSemantics>>,
+    retained: &'a BTreeMap<u32, RetainedStaticTarget>,
+    owned_sides: &'a BTreeSet<StaticEndpoint>,
+}
+
+/// Object rows published, read back and frozen on one state for one domain.
+/// Inactive in slice A: no production map exists yet.
+#[cfg_attr(not(test), allow(dead_code))] // Slice B/C call the freeze path.
+struct FrozenObjectDescriptors<S> {
+    state: S,
+    domain: capture::NativeDomainId,
+    rows: ObjectRows,
+}
+
+/// Publish the canonical 105 rows in order, require an exact readback,
+/// freeze the same resource, then require an exact post-freeze readback.
+/// Any I/O failure or inexact table refuses; only a proven table freezes.
+#[cfg_attr(not(test), allow(dead_code))] // Slice B/C call the freeze path.
+fn publish_and_freeze_object_descriptors_with<S>(
+    state: S,
+    domain: capture::NativeDomainId,
+    mut set: impl FnMut(&mut S, u32, ObjectDescriptorWire) -> Result<()>,
+    mut readback: impl FnMut(&mut S) -> Result<Vec<ObjectDescriptorWire>>,
+    freeze: impl FnOnce(&mut S) -> Result<()>,
+) -> ObjectResult<FrozenObjectDescriptors<S>> {
+    let _ = (state, domain, set, readback, freeze);
+    todo!("H7 slice A: publish, read back and freeze the object rows")
 }
 
 fn publish_async_catalog(ebpf: &mut Ebpf) -> Result<()> {
@@ -6349,6 +6439,203 @@ mod policy_output {
 
 #[cfg(test)]
 mod tests {
+    use super::publish_and_freeze_object_descriptors_with;
+    use crate::attach::capture::NativeDomainId;
+    use crate::inventory_semantics::SemanticRefusal;
+    use p11scope_ebpf_common::object_wire::{
+        OBJECT_ACTION_ACCESS, OBJECT_ACTION_COPY, ObjectDescriptorWire, none_object_wire,
+        publish_object_descriptors,
+    };
+    use std::collections::BTreeMap;
+
+    struct FakeObjectMap {
+        rows: BTreeMap<u32, ObjectDescriptorWire>,
+        order: Vec<u32>,
+        frozen: bool,
+        frozen_at_readback: Vec<bool>,
+        fail_set: Option<u32>,
+        fail_readbacks: usize,
+        fail_freeze: bool,
+    }
+
+    impl FakeObjectMap {
+        fn new() -> Self {
+            Self {
+                rows: BTreeMap::new(),
+                order: Vec::new(),
+                frozen: false,
+                frozen_at_readback: Vec::new(),
+                fail_set: None,
+                fail_readbacks: 0,
+                fail_freeze: false,
+            }
+        }
+
+        fn set(
+            map: &mut Self,
+            index: u32,
+            row: ObjectDescriptorWire,
+        ) -> anyhow::Result<()> {
+            if map.frozen {
+                anyhow::bail!("frozen map rejects writes");
+            }
+            if Some(index) == map.fail_set {
+                anyhow::bail!("injected set failure");
+            }
+            map.order.push(index);
+            map.rows.insert(index, row);
+            Ok(())
+        }
+
+        fn readback(map: &mut Self) -> anyhow::Result<Vec<ObjectDescriptorWire>> {
+            if map.fail_readbacks > 0 {
+                map.fail_readbacks -= 1;
+                anyhow::bail!("injected readback failure");
+            }
+            map.frozen_at_readback.push(map.frozen);
+            (0..105)
+                .map(|index| map.rows.get(&index).copied().ok_or_else(|| anyhow::anyhow!("missing row {index}")))
+                .collect()
+        }
+
+        fn freeze(map: &mut Self) -> anyhow::Result<()> {
+            if map.fail_freeze {
+                anyhow::bail!("injected freeze failure");
+            }
+            map.frozen = true;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn object_producer_publication_reads_freezes_and_rechecks_same_state() {
+        let domain = NativeDomainId::mint();
+        let proof = publish_and_freeze_object_descriptors_with(
+            FakeObjectMap::new(),
+            domain,
+            FakeObjectMap::set,
+            FakeObjectMap::readback,
+            FakeObjectMap::freeze,
+        )
+        .unwrap();
+        assert_eq!(proof.rows, publish_object_descriptors());
+        assert_eq!(proof.domain, domain);
+        assert_eq!(proof.state.order, (0..105).collect::<Vec<_>>());
+        assert_eq!(proof.state.frozen_at_readback, vec![false, true]);
+        assert!(proof.state.frozen);
+    }
+
+    #[test]
+    fn object_producer_publication_stops_at_each_io_failure() {
+        for fail_at in [0, 57, 104] {
+            let mut map = FakeObjectMap::new();
+            map.fail_set = Some(fail_at);
+            let result = publish_and_freeze_object_descriptors_with(
+                map,
+                NativeDomainId::mint(),
+                FakeObjectMap::set,
+                FakeObjectMap::readback,
+                FakeObjectMap::freeze,
+            );
+            assert!(
+                matches!(result, Err(SemanticRefusal::Descriptor)),
+                "set failure at {fail_at} refuses"
+            );
+        }
+        let mut map = FakeObjectMap::new();
+        map.fail_readbacks = 1;
+        let result = publish_and_freeze_object_descriptors_with(
+            map,
+            NativeDomainId::mint(),
+            FakeObjectMap::set,
+            FakeObjectMap::readback,
+            FakeObjectMap::freeze,
+        );
+        assert!(matches!(result, Err(SemanticRefusal::Descriptor)));
+        let mut calls = 0;
+        let result = publish_and_freeze_object_descriptors_with(
+            FakeObjectMap::new(),
+            NativeDomainId::mint(),
+            FakeObjectMap::set,
+            |map: &mut FakeObjectMap| {
+                calls += 1;
+                if calls == 2 {
+                    return Err(anyhow::anyhow!("second readback fails"));
+                }
+                FakeObjectMap::readback(map)
+            },
+            FakeObjectMap::freeze,
+        );
+        assert!(matches!(result, Err(SemanticRefusal::Descriptor)));
+        let mut map = FakeObjectMap::new();
+        map.fail_freeze = true;
+        let result = publish_and_freeze_object_descriptors_with(
+            map,
+            NativeDomainId::mint(),
+            FakeObjectMap::set,
+            FakeObjectMap::readback,
+            FakeObjectMap::freeze,
+        );
+        assert!(matches!(result, Err(SemanticRefusal::Descriptor)));
+    }
+
+    #[test]
+    fn object_producer_publication_refuses_every_inexact_table() {
+        fn published() -> FakeObjectMap {
+            let mut map = FakeObjectMap::new();
+            for (index, row) in publish_object_descriptors().iter().copied().enumerate() {
+                FakeObjectMap::set(&mut map, index as u32, row).unwrap();
+            }
+            map
+        }
+        let canonical = publish_object_descriptors().to_vec();
+        let mut swapped = canonical.clone();
+        swapped.swap(21, 22);
+        let mut altered_eligible = canonical.clone();
+        altered_eligible[21].action = OBJECT_ACTION_COPY;
+        let mut altered_none = canonical.clone();
+        altered_none[5].action = OBJECT_ACTION_ACCESS;
+        let short = canonical[..104].to_vec();
+        let mut long = canonical.clone();
+        long.push(none_object_wire());
+        let cases: Vec<(&str, Vec<ObjectDescriptorWire>)> = vec![
+            ("swapped", swapped),
+            ("altered eligible", altered_eligible),
+            ("altered NONE", altered_none),
+            ("short", short),
+            ("long", long),
+            ("blank", vec![none_object_wire(); 105]),
+            ("empty", Vec::new()),
+        ];
+        for (label, table) in cases {
+            let result = publish_and_freeze_object_descriptors_with(
+                published(),
+                NativeDomainId::mint(),
+                FakeObjectMap::set,
+                |_: &mut FakeObjectMap| Ok(table.clone()),
+                FakeObjectMap::freeze,
+            );
+            assert!(
+                matches!(result, Err(SemanticRefusal::Descriptor)),
+                "{label} readback refuses"
+            );
+        }
+        // A corrupting write path refuses against an honest readback.
+        let result = publish_and_freeze_object_descriptors_with(
+            FakeObjectMap::new(),
+            NativeDomainId::mint(),
+            |map: &mut FakeObjectMap, index, mut row| {
+                if index == 21 {
+                    row.action = OBJECT_ACTION_COPY;
+                }
+                FakeObjectMap::set(map, index, row)
+            },
+            FakeObjectMap::readback,
+            FakeObjectMap::freeze,
+        );
+        assert!(matches!(result, Err(SemanticRefusal::Descriptor)));
+    }
+
     #[test]
     fn backport_multi_sections_parse_for_uprobe_twins() {
         use std::str::FromStr as _;

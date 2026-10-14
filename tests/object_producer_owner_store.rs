@@ -556,14 +556,15 @@ def check_sweep_delegate(data, report):
     assert depth <= LEAF_FRAME_BOUND, f'sweep helper frame {depth} exceeds {LEAF_FRAME_BOUND}'
     report.append(f'sweep helper object_sweep_orphan_slot: frame={depth}')
     # Branchless settle: BPF has no conditional-set, so even (rc != 0)
-    # compiles to a jump. The helper must carry exactly one conditional
-    # jump (the null-row check); the settle code is shifts and logic.
+    # compiles to a jump. The helper takes a present row and returns the
+    # delete failure flag by arithmetic shift, so it carries no
+    # conditional jump at all; the caller keeps the null-row check.
     hbody = body_of(raws, bodies, helper)
     cond = sum(1 for i in range(len(hbody) // 8)
               if (struct.unpack_from('<BBhi', hbody, i * 8)[0] & 7) == 5
               and struct.unpack_from('<BBhi', hbody, i * 8)[0] not in (0x05, 0x85, 0x95))
-    assert cond == 1, f'sweep helper must carry one conditional jump, saw {cond}'
-    report.append('sweep helper settle is branchless (one null check)')
+    assert cond == 0, f'sweep helper must carry no conditional jump, saw {cond}'
+    report.append('sweep helper settle is branchless (caller checks null)')
     cleanup = only(bodies, 'p11_owner_cleanup')
     calls = [call for call in pseudo_calls(raws, offsets, bodies, relocations, cleanup)
              if call[1] == helper]

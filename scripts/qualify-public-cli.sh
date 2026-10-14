@@ -280,7 +280,7 @@ PY
   else result "$cell" 0 "run smoke failed rc=$rc" failed; fi
 done
 gated mt-exact pid "$MT" profile --pid @PID@ --duration 25 -o "$OUT/mt-exact.json"
-gated system system "$GATED" profile --system --duration 25 -o "$OUT/system.json"
+gated system system "$GATED" profile --system --module "$MODULE" --duration 25 -o "$OUT/system.json"
 # Signal cells retain distinct expected exits; readiness is mandatory.
 rm -f sigint.json sig.gate
 asuser "$GATED" "$MODULE" 100000000 1000 "$OUT/sig.gate" > sig.wl 2>&1 & wl=$!; register "$wl" || true

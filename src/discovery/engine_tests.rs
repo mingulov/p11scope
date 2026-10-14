@@ -7467,6 +7467,39 @@ fn only_a_named_targets_expected_exit_finishes_the_capture() {
     );
 }
 
+/// Settlement deliberately reaps the named PID-scope target before the
+/// terminal pass: the mark keeps that pass from bailing on the empty
+/// scope instead of sealing the report. Other scopes never name one
+/// generation, so the mark stays unset there.
+#[test]
+fn owned_target_reap_marks_expected_exit_in_pid_scope_only() {
+    let mut named = Engine::empty();
+    named.scope = Scope::Pid(1);
+    assert!(!named.expected_target_exit(), "nothing has exited yet");
+    named.note_owned_target_reaped();
+    assert!(
+        named.expected_target_exit(),
+        "a reaped named target must read as an expected exit"
+    );
+
+    let mut system = Engine::empty();
+    system.scope = Scope::System;
+    system.note_owned_target_reaped();
+    assert!(
+        !system.expected_target_exit(),
+        "system scope names no generation to expect"
+    );
+
+    let mut cgroup = Engine::empty();
+    let cgroup_dir = tempfile::tempdir().expect("a scope directory");
+    cgroup.scope = crate::scope::cgroup(cgroup_dir.path()).expect("open scope directory");
+    cgroup.note_owned_target_reaped();
+    assert!(
+        !cgroup.expected_target_exit(),
+        "one cgroup member exiting must not end a cgroup capture"
+    );
+}
+
 #[test]
 fn expected_target_exit_completes_only_after_conservative_cleanup() {
     let view = ProcessViewId(17);

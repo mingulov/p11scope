@@ -286,6 +286,37 @@ fn object_producer_cleanup_sweep_delegates_scrub() {
     );
 }
 
+#[test]
+fn object_producer_start_sweep_within_jump_budget() {
+    // The START sweep runs 512 slots per cleanup; every per-slot branch
+    // multiplies into the kernel jump budget (live 8193-jump reject).
+    // Retired-counting, the remove tail, marker ranges and the binding
+    // check stay fused and branch-lean by construction below.
+    let native =
+        std::fs::read_to_string("crates/ebpf/native/task_owner.c").expect("read native owner");
+    let sweep = source_between(
+        &native,
+        "for (u32 i = 0; i < P11SCOPE_OWNER_SLOT_BOUND; i++) {",
+        "if (owner->start_count) {",
+    );
+    assert!(
+        !sweep.contains("count("),
+        "START sweep must hoist counting past the loop"
+    );
+    assert!(
+        !native.contains("return side ? -1 : 0;"),
+        "remove tail must settle branchlessly"
+    );
+    assert!(
+        native.contains("marker - 2 > OBJECT_DESCRIPTORS_COUNT - 2"),
+        "marker range must fuse into one unsigned comparison"
+    );
+    assert!(
+        native.contains("^ start_u64(start_value, OBJECT_CALL_START_IMAGE_OFF)"),
+        "binding check must combine by xor"
+    );
+}
+
 /// Actual emitted-object custody checks: exact owned-map allocation,
 /// bounded leaf frames with no nested calls, bounded root call chains, and
 /// fault-call placement. Modes: `frames`, `return-fault`, `exec-exit-fault`.

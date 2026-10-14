@@ -30,9 +30,12 @@ use core::mem::MaybeUninit;
 #[cfg(feature = "inventory-only")]
 use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
 #[cfg(not(feature = "inventory-only"))]
+use p11scope_ebpf_common::object_capture::{capture_derive_entry, handle_status, object_flag};
+#[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_wire::{
-    OBJECT_ACTION_MAX, OBJECT_ACTION_NONE, OBJECT_GUARD_NONE, OBJECT_GUARD_SCALAR_DERIVE,
-    OBJECT_LAYOUT_ILP32, OBJECT_LAYOUT_LP64, ObjectDescriptorWire, ObjectStart,
+    OBJECT_ACTION_DERIVE, OBJECT_ACTION_FIND, OBJECT_ACTION_IMPORT, OBJECT_ACTION_MAX,
+    OBJECT_ACTION_NONE, OBJECT_GUARD_NONE, OBJECT_GUARD_SCALAR_DERIVE, OBJECT_LAYOUT_ILP32,
+    OBJECT_LAYOUT_LP64, ObjectDescriptorWire, ObjectStart, object_result_arg7_address,
 };
 #[cfg_attr(feature = "inventory-only", allow(unused_imports))]
 use p11scope_ebpf_common::{
@@ -64,7 +67,7 @@ use p11scope_ebpf_common::{
     discovery_state_take_scope_lost, discovery_table_slots, discovery_usable_prefix,
     discovery_version_class, event_type, image_pair_matches, interface_continuation_next,
     interface_continuation_pack, interface_continuation_unpack, interface_flags_class, lifecycle,
-    normalize_target_word, read_ia32_arg_with, return_allows_mechanism, shape,
+    normalize_target_word, read_ia32_arg_with, return_allows_mechanism, semantic_flags, shape,
     stop_gate_admit_with, target_layout_from_cs, target_stack_arg_address, target_word_end,
     valid_config, valid_loader_cookie,
 };
@@ -2724,6 +2727,338 @@ fn object_record_entry_abi(key: &StartKey, descriptor: u32, layout: LinuxLayout)
     }
 }
 
+// H7 adapters tail: entry-fill advances ENTRY to READY after writing the
+// entry verdicts; return-fill advances READY to RETURNING after the
+// return-phase reads. Both are outlined like the marker/ABI helpers so the
+// hot roots keep their frames. The caller abandons (entry) or drains
+// (return) loudly on false.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_fill_entry(
+    ctx: &ProbeContext,
+    side: Option<&mut ObjectStart>,
+    layout: LinuxLayout,
+    null_cancel: bool,
+) -> bool {
+    let Some(side) = side else {
+        return false;
+    };
+    let descriptor = side.descriptor_index;
+    let Some(row) = OBJECT_DESCRIPTORS.get(descriptor) else {
+        return false;
+    };
+    if row.function != descriptor.wrapping_sub(1)
+        || row.action == OBJECT_ACTION_NONE
+        || row.action > OBJECT_ACTION_MAX
+        || row.guard == OBJECT_GUARD_NONE
+        || row.guard > OBJECT_GUARD_SCALAR_DERIVE
+    {
+        return false;
+    }
+    // Entry input handles as data, applying the `capture_entry_inputs`
+    // rules against the frozen map row directly. The core entry takes a
+    // function ordinal through the name table (which would carry .rodata
+    // string tables the BPF object forbids); the map row is already the
+    // validated descriptor, so the same pure rules run without the lookup.
+    // Written per input straight into the side row: holding both verdicts
+    // across the argument reads costs a frame quantum the 512-byte chain
+    // cannot spare.
+    let import = row.action == OBJECT_ACTION_IMPORT;
+    let input0 = row.input_args[0];
+    let input1 = row.input_args[1];
+    let mut flags = 0u32;
+    let mut i = 0;
+    while i < 2 {
+        let arg = if i == 0 { input0 } else { input1 };
+        let (status, word) = if arg == ARG_NONE {
+            (handle_status::ABSENT, 0)
+        } else {
+            match arg_u64(ctx, arg, layout).ok() {
+                None => {
+                    flags |= object_flag::ARG_READ_FAILURE;
+                    (handle_status::UNREADABLE, 0)
+                }
+                Some(0) if import => (handle_status::ABSENT, 0),
+                Some(0) => (handle_status::INVALID_ZERO, 0),
+                Some(word) => {
+                    if layout == LinuxLayout::Ilp32 && word > u64::from(u32::MAX) {
+                        (handle_status::INVALID_SPAN, 0)
+                    } else {
+                        (handle_status::VALUE, word)
+                    }
+                }
+            }
+        };
+        // SAFETY: a validated live map row; these cells are ours.
+        unsafe {
+            core::ptr::addr_of_mut!((*side).inputs[i]).write(word);
+            core::ptr::addr_of_mut!((*side).input_statuses[i]).write(status);
+        }
+        i += 1;
+    }
+    // Null-mechanism cancel, mirroring `apply_null_mechanism_cancel`: value
+    // inputs already written above are suppressed in place.
+    if null_cancel {
+        let mut j = 0;
+        while j < 2 {
+            // SAFETY: a validated live map row; these cells are ours.
+            let status = unsafe { core::ptr::addr_of!((*side).input_statuses[j]).read() };
+            if status == handle_status::VALUE {
+                unsafe {
+                    core::ptr::addr_of_mut!((*side).input_statuses[j])
+                        .write(handle_status::SUPPRESSED);
+                    core::ptr::addr_of_mut!((*side).inputs[j]).write(0);
+                }
+            }
+            j += 1;
+        }
+        flags |= object_flag::NULL_MECHANISM_CANCEL;
+    }
+    // SAFETY: a validated live map row; these fields are ours.
+    unsafe {
+        let old = core::ptr::addr_of!((*side).flags).read();
+        core::ptr::addr_of_mut!((*side).flags).write(old | flags as u16);
+        core::ptr::addr_of_mut!((*side).phase).write(2);
+    }
+    true
+}
+
+// H7 adapters tail: derive entry guard. Only the Derive family retains a
+// result pointer here (after the single mechanism-word check); other
+// families succeed trivially. Outlined separately: the inputs helper above
+// already fills its 32-byte quantum.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_entry_derive(
+    ctx: &ProbeContext,
+    side: Option<&mut ObjectStart>,
+    layout: LinuxLayout,
+) -> bool {
+    let Some(side) = side else {
+        return false;
+    };
+    let descriptor = side.descriptor_index;
+    let Some(row) = OBJECT_DESCRIPTORS.get(descriptor) else {
+        return false;
+    };
+    if row.function != descriptor.wrapping_sub(1)
+        || row.action == OBJECT_ACTION_NONE
+        || row.action > OBJECT_ACTION_MAX
+        || row.guard == OBJECT_GUARD_NONE
+        || row.guard > OBJECT_GUARD_SCALAR_DERIVE
+    {
+        return false;
+    }
+    if row.action != OBJECT_ACTION_DERIVE {
+        return true;
+    }
+    // C_DeriveKey(hSession, pMechanism, hBaseKey, pTemplate, ulCount, phKey):
+    // mechanism at arg 1, result pointer at arg 5. Unreadable arguments
+    // retain zero, which the return core maps to unreadable.
+    let mechanism_ptr = arg_u64(ctx, 1, layout).ok().unwrap_or(0);
+    let out5_ptr = arg_u64(ctx, 5, layout).ok().unwrap_or(0);
+    let (derive, retained) =
+        capture_derive_entry(mechanism_ptr, out5_ptr, layout, |addr| read_word(addr, layout));
+    // SAFETY: a validated live map row; these fields are ours.
+    unsafe {
+        core::ptr::addr_of_mut!((*side).derive).write(derive.code());
+        core::ptr::addr_of_mut!((*side).result_ptrs[0]).write(retained.unwrap_or(0));
+        core::ptr::addr_of_mut!((*side).result_ptrs[1]).write(0);
+    }
+    true
+}
+
+// H7 adapters tail: result-pointer retention for non-Derive families.
+// Derive retains through its mechanism guard above and skips here, so the
+// guard cannot be bypassed by a raw argument read. Arg 7 (pair second,
+// unwrap) lives on the userspace stack via the frozen helper.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_entry_results(
+    ctx: &ProbeContext,
+    side: Option<&mut ObjectStart>,
+    layout: LinuxLayout,
+) -> bool {
+    let Some(side) = side else {
+        return false;
+    };
+    let descriptor = side.descriptor_index;
+    let Some(row) = OBJECT_DESCRIPTORS.get(descriptor) else {
+        return false;
+    };
+    if row.function != descriptor.wrapping_sub(1)
+        || row.action == OBJECT_ACTION_NONE
+        || row.action > OBJECT_ACTION_MAX
+        || row.guard == OBJECT_GUARD_NONE
+        || row.guard > OBJECT_GUARD_SCALAR_DERIVE
+    {
+        return false;
+    }
+    if row.action == OBJECT_ACTION_DERIVE {
+        return true;
+    }
+    let arg0 = row.result_args[0];
+    let arg1 = row.result_args[1];
+    let mut i = 0;
+    while i < 2 {
+        let arg = if i == 0 { arg0 } else { arg1 };
+        let ptr = if arg == ARG_NONE {
+            0
+        } else if arg == 7 {
+            let rsp = unsafe { (*ctx.regs).rsp as u64 };
+            match object_result_arg7_address(row, rsp, layout) {
+                Some(addr) => read_word(addr, layout).ok().unwrap_or(0),
+                None => return false,
+            }
+        } else {
+            arg_u64(ctx, arg, layout).ok().unwrap_or(0)
+        };
+        // SAFETY: a validated live map row; this cell is ours.
+        unsafe {
+            core::ptr::addr_of_mut!((*side).result_ptrs[i]).write(ptr);
+        }
+        i += 1;
+    }
+    true
+}
+
+// H7 adapters tail: Find scalar retention (capacity value plus count
+// pointer). Only the Find family retains here; others succeed trivially.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_entry_find(
+    ctx: &ProbeContext,
+    side: Option<&mut ObjectStart>,
+    layout: LinuxLayout,
+) -> bool {
+    let Some(side) = side else {
+        return false;
+    };
+    let descriptor = side.descriptor_index;
+    let Some(row) = OBJECT_DESCRIPTORS.get(descriptor) else {
+        return false;
+    };
+    if row.function != descriptor.wrapping_sub(1)
+        || row.action == OBJECT_ACTION_NONE
+        || row.action > OBJECT_ACTION_MAX
+        || row.guard == OBJECT_GUARD_NONE
+        || row.guard > OBJECT_GUARD_SCALAR_DERIVE
+    {
+        return false;
+    }
+    if row.action != OBJECT_ACTION_FIND {
+        return true;
+    }
+    let capacity = if row.find_capacity_arg == ARG_NONE {
+        0
+    } else {
+        arg_u64(ctx, row.find_capacity_arg, layout).ok().unwrap_or(0)
+    };
+    let count_ptr = if row.find_count_arg == ARG_NONE {
+        0
+    } else {
+        arg_u64(ctx, row.find_count_arg, layout).ok().unwrap_or(0)
+    };
+    // SAFETY: a validated live map row; these fields are ours.
+    unsafe {
+        core::ptr::addr_of_mut!((*side).find_capacity).write(capacity);
+        core::ptr::addr_of_mut!((*side).find_count_ptr).write(count_ptr);
+    }
+    true
+}
+
+// H7 adapters tail: return-fill reads the first result handle at its
+// retained pointer and advances READY to RETURNING. Find carries its facts
+// in the Find section (slice D) and skips here; families without a first
+// result also skip. The required=1 query already proved ready custody, so
+// only CKR_OK (0) gates the read.
+//
+// Single-result scope is a measured 512-byte chain fit: the two-result
+// alias/duplicate/partial cross-checks (pair second result) need a second
+// level the current return frame cannot spare (see
+// `object_producer_compiled_frames_are_bounded`). Slice D completes the
+// pair path with emission; until then the second slot stays as retained.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_fill_return(
+    ctx: &RetProbeContext,
+    side: Option<&mut ObjectStart>,
+    layout: LinuxLayout,
+) -> bool {
+    let Some(side) = side else {
+        return false;
+    };
+    if side.phase != 2 {
+        return false;
+    }
+    let descriptor = side.descriptor_index;
+    let Some(row) = OBJECT_DESCRIPTORS.get(descriptor) else {
+        return false;
+    };
+    if row.function != descriptor.wrapping_sub(1)
+        || row.action == OBJECT_ACTION_NONE
+        || row.action > OBJECT_ACTION_MAX
+        || row.guard == OBJECT_GUARD_NONE
+        || row.guard > OBJECT_GUARD_SCALAR_DERIVE
+    {
+        return false;
+    }
+    if row.action != OBJECT_ACTION_FIND && row.result_args[0] != ARG_NONE {
+        // Derive additionally requires accepted entry evidence; the full
+        // return-mechanism match stays with slice D emission.
+        let derive_ok = row.action != OBJECT_ACTION_DERIVE || side.derive != 0;
+        let mut flags = 0u32;
+        let (mut status, mut word) = (handle_status::ABSENT, 0u64);
+        if !derive_ok {
+            status = handle_status::PROTOCOL_UNAVAILABLE;
+            flags |= object_flag::UNAVAILABLE_RESULT;
+        } else {
+            let rv = normalize_target_word(ctx.ret(), layout);
+            if rv != 0 {
+                status = handle_status::PROTOCOL_UNAVAILABLE;
+            } else {
+                // SAFETY: a validated live map row; the pointer is ours.
+                let ptr =
+                    unsafe { core::ptr::addr_of!((*side).result_ptrs[0]).read() };
+                if ptr == 0 {
+                    status = handle_status::UNREADABLE;
+                } else if target_word_end(ptr, layout).is_none() {
+                    status = handle_status::INVALID_SPAN;
+                } else {
+                    match read_word(ptr, layout) {
+                        Err(()) => status = handle_status::UNREADABLE,
+                        Ok(0) => status = handle_status::INVALID_ZERO,
+                        Ok(observed) => {
+                            if layout == LinuxLayout::Ilp32
+                                && observed > u64::from(u32::MAX)
+                            {
+                                status = handle_status::INVALID_SPAN;
+                            } else {
+                                status = handle_status::VALUE;
+                                word = observed;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // SAFETY: a validated live map row; these fields are ours. The
+        // retained pointer is overwritten with the observed handle word
+        // (zero for non-value statuses), which slice D emits.
+        unsafe {
+            core::ptr::addr_of_mut!((*side).result_ptrs[0]).write(word);
+            core::ptr::addr_of_mut!((*side).result_statuses[0]).write(status);
+            let old = core::ptr::addr_of!((*side).flags).read();
+            core::ptr::addr_of_mut!((*side).flags).write(old | flags as u16);
+        }
+    }
+    // SAFETY: a validated live map row; the phase byte is ours.
+    unsafe {
+        core::ptr::addr_of_mut!((*side).phase).write(3);
+    }
+    true
+}
+
 // Discard a possibly stale START row on a refusal path; a failed discard
 // is capture loss and faults.
 #[cfg(not(feature = "inventory-only"))]
@@ -3034,6 +3369,43 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
             bump_evidence(EVIDENCE_START_INSERT_FAILURES);
             return 0;
         }
+        // H7 adapters tail: entry-fill after the ABI record.
+        let null_cancel = semantics_of(&ctx).semantic_flags
+            & semantic_flags::NULL_MECHANISM_CANCEL
+            != 0
+            && start.capture & capture::MECHANISM_MASK == capture::MECHANISM_NULL;
+        let fill_side =
+            unsafe { p11_object_side_get(&key, (start.object_required - 1) as u32, 0).as_mut() };
+        if !object_fill_entry(&ctx, fill_side, layout, null_cancel) {
+            let _ = owned_start_remove(&key, true);
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_START_INSERT_FAILURES);
+            return 0;
+        }
+        let derive_side =
+            unsafe { p11_object_side_get(&key, (start.object_required - 1) as u32, 0).as_mut() };
+        if !object_entry_derive(&ctx, derive_side, layout) {
+            let _ = owned_start_remove(&key, true);
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_START_INSERT_FAILURES);
+            return 0;
+        }
+        let results_side =
+            unsafe { p11_object_side_get(&key, (start.object_required - 1) as u32, 0).as_mut() };
+        if !object_entry_results(&ctx, results_side, layout) {
+            let _ = owned_start_remove(&key, true);
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_START_INSERT_FAILURES);
+            return 0;
+        }
+        let find_side =
+            unsafe { p11_object_side_get(&key, (start.object_required - 1) as u32, 0).as_mut() };
+        if !object_entry_find(&ctx, find_side, layout) {
+            let _ = owned_start_remove(&key, true);
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_START_INSERT_FAILURES);
+            return 0;
+        }
     }
     #[cfg(feature = "unsafe-unvalidated-metadata")]
     if TEMPLATE_MODE == 3 {
@@ -3149,11 +3521,18 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
             LinuxLayout::Ilp32 => u32::from(OBJECT_LAYOUT_ILP32),
         };
         let descriptor = cookie_descriptor(cookie_of(&ctx));
+        // H7 adapters tail: return-fill after the required=1 ready query,
+        // before the drain. A fill refusal joins the drain verdict below so
+        // the single ordinary removal retires (query plus retire stays the
+        // drain) and the single fault arm fires before any target read.
+        let ready = unsafe { p11_object_side_get(&key, descriptor, 1).as_mut() };
+        let filled = object_fill_return(&ctx, ready, layout);
         let side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
-        let agreed = side.is_some_and(|row| {
-            row.descriptor_index == descriptor
-                && (row.layout == 0 || u32::from(row.layout) == layout_code)
-        });
+        let agreed = filled
+            && side.is_some_and(|row| {
+                row.descriptor_index == descriptor
+                    && (row.layout == 0 || u32::from(row.layout) == layout_code)
+            });
         let retired = owned_start_remove(&key, true).is_ok();
         if !agreed || !retired {
             unsafe { p11_object_fault() };

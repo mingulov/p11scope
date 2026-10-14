@@ -258,6 +258,14 @@ fn object_producer_compiled_frames_are_bounded() {
     println!("{report}");
 }
 
+#[test]
+fn object_producer_cleanup_sweep_delegates_scrub() {
+    let directory = tempfile::tempdir().expect("temporary orphan sweep delegation check");
+    let object = embedded_object(directory.path());
+    let report = run_object_checker(&object, "sweep-delegate");
+    println!("{report}");
+}
+
 /// Actual emitted-object custody checks: exact owned-map allocation,
 /// bounded leaf frames with no nested calls, bounded root call chains, and
 /// fault-call placement. Modes: `frames`, `return-fault`, `exec-exit-fault`.
@@ -514,6 +522,26 @@ def check_exec_exit_fault(data, report):
     report.append('cleanup nests no fault call')
 
 
+def check_sweep_delegate(data, report):
+    elf, raws, offsets, bodies, relocations = bodies_and_relocations(data)
+    # The orphan sweep must not inline the 432-byte scrub: the unrolled
+    # stores times the 512-slot trip count exceed the kernel jump
+    # complexity budget (live 8193-jump reject on 7.2.9/6.12/7.0). One
+    # noinline subprogram per slot is verified once instead.
+    helper = only(bodies, 'object_sweep_orphan_slot')
+    symbol = bodies[helper]
+    assert symbol[3] == elf.indices['.text'] and symbol[5], \
+        'sweep helper must be a defined .text function'
+    depth, _, _ = frame_of(body_of(raws, bodies, helper))
+    assert depth <= LEAF_FRAME_BOUND, f'sweep helper frame {depth} exceeds {LEAF_FRAME_BOUND}'
+    report.append(f'sweep helper object_sweep_orphan_slot: frame={depth}')
+    cleanup = only(bodies, 'p11_owner_cleanup')
+    calls = [call for call in pseudo_calls(raws, offsets, bodies, relocations, cleanup)
+             if call[1] == helper]
+    assert len(calls) == 1, f'cleanup must call the sweep helper once, saw {len(calls)}'
+    report.append('cleanup delegates orphan scrub to one subprogram call')
+
+
 def main():
     data = Path(sys.argv[1]).read_bytes()
     mode = sys.argv[2]
@@ -524,6 +552,8 @@ def main():
         check_return_fault(data, report)
     elif mode == 'exec-exit-fault':
         check_exec_exit_fault(data, report)
+    elif mode == 'sweep-delegate':
+        check_sweep_delegate(data, report)
     else:
         raise AssertionError(f'unknown checker mode {mode}')
     print('\n'.join(report))

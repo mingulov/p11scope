@@ -259,49 +259,34 @@ fn object_producer_compiled_frames_are_bounded() {
 }
 
 #[test]
-fn object_producer_cleanup_sweep_delegates_scrub() {
-    let directory = tempfile::tempdir().expect("temporary orphan sweep delegation check");
-    let object = embedded_object(directory.path());
-    let report = run_object_checker(&object, "sweep-delegate");
-    println!("{report}");
-    // Branch diet: the sweep helper runs once per slot (512/2112), so it
-    // must settle branchlessly — no poison/count calls inside. Poison and
-    // the saturating bulk count happen once after the loop.
+fn object_producer_sweep_path_within_jump_budget() {
+    // Both teardown sweeps run 512 slots per cleanup; every per-slot
+    // branch multiplies into the kernel jump budget (live 8193-jump
+    // reject). The path stays branch-lean by construction, with no
+    // per-iteration carried accumulators: those multiply verifier
+    // states instead (live 17k-state blowup). Bulk helpers and the
+    // outlined sweep worker stay out for the same reason.
     let native =
         std::fs::read_to_string("crates/ebpf/native/task_owner.c").expect("read native owner");
-    let helper = source_between(
-        &native,
-        "static __noinline unsigned long object_sweep_orphan_slot",
-        "/* Settle one subordinate row for START removal.",
-    );
-    for forbidden in ["poison(", "count("] {
+    for forbidden in ["object_sweep_orphan_slot", "count_add", "u64 retired", "u64 swept"] {
         assert!(
-            !helper.contains(forbidden),
-            "sweep helper must not call {forbidden} per slot"
+            !native.contains(forbidden),
+            "sweep path must not carry {forbidden}"
         );
     }
-    assert!(
-        native.contains("static __always_inline void count_add(u64 *cell, u64 add)"),
-        "bulk saturating count helper must exist"
-    );
-}
-
-#[test]
-fn object_producer_start_sweep_within_jump_budget() {
-    // The START sweep runs 512 slots per cleanup; every per-slot branch
-    // multiplies into the kernel jump budget (live 8193-jump reject).
-    // Retired-counting, the remove tail, marker ranges and the binding
-    // check stay fused and branch-lean by construction below.
-    let native =
-        std::fs::read_to_string("crates/ebpf/native/task_owner.c").expect("read native owner");
     let sweep = source_between(
         &native,
         "for (u32 i = 0; i < P11SCOPE_OWNER_SLOT_BOUND; i++) {",
         "if (owner->start_count) {",
     );
     assert!(
-        !sweep.contains("count("),
-        "START sweep must hoist counting past the loop"
+        !sweep.contains("int retired = "),
+        "START sweep must test retirement directly, not materialize it"
+    );
+    let orphans = source_between(&native, "/* Orphaned side rows", "#endif");
+    assert!(
+        orphans.contains("count(&ctl->abandoned_start);"),
+        "orphan sweep must count per retired row"
     );
     assert!(
         !native.contains("return side ? -1 : 0;"),
@@ -573,36 +558,6 @@ def check_exec_exit_fault(data, report):
     report.append('cleanup nests no fault call')
 
 
-def check_sweep_delegate(data, report):
-    elf, raws, offsets, bodies, relocations = bodies_and_relocations(data)
-    # The orphan sweep must not inline the 432-byte scrub: the unrolled
-    # stores times the 512-slot trip count exceed the kernel jump
-    # complexity budget (live 8193-jump reject on 7.2.9/6.12/7.0). One
-    # noinline subprogram per slot is verified once instead.
-    helper = only(bodies, 'object_sweep_orphan_slot')
-    symbol = bodies[helper]
-    assert symbol[3] == elf.indices['.text'] and symbol[5], \
-        'sweep helper must be a defined .text function'
-    depth, _, _ = frame_of(body_of(raws, bodies, helper))
-    assert depth <= LEAF_FRAME_BOUND, f'sweep helper frame {depth} exceeds {LEAF_FRAME_BOUND}'
-    report.append(f'sweep helper object_sweep_orphan_slot: frame={depth}')
-    # Branchless settle: BPF has no conditional-set, so even (rc != 0)
-    # compiles to a jump. The helper takes a present row and returns the
-    # delete failure flag by arithmetic shift, so it carries no
-    # conditional jump at all; the caller keeps the null-row check.
-    hbody = body_of(raws, bodies, helper)
-    cond = sum(1 for i in range(len(hbody) // 8)
-              if (struct.unpack_from('<BBhi', hbody, i * 8)[0] & 7) == 5
-              and struct.unpack_from('<BBhi', hbody, i * 8)[0] not in (0x05, 0x85, 0x95))
-    assert cond == 0, f'sweep helper must carry no conditional jump, saw {cond}'
-    report.append('sweep helper settle is branchless (caller checks null)')
-    cleanup = only(bodies, 'p11_owner_cleanup')
-    calls = [call for call in pseudo_calls(raws, offsets, bodies, relocations, cleanup)
-             if call[1] == helper]
-    assert len(calls) == 1, f'cleanup must call the sweep helper once, saw {len(calls)}'
-    report.append('cleanup delegates orphan scrub to one subprogram call')
-
-
 def main():
     data = Path(sys.argv[1]).read_bytes()
     mode = sys.argv[2]
@@ -613,8 +568,6 @@ def main():
         check_return_fault(data, report)
     elif mode == 'exec-exit-fault':
         check_exec_exit_fault(data, report)
-    elif mode == 'sweep-delegate':
-        check_sweep_delegate(data, report)
     else:
         raise AssertionError(f'unknown checker mode {mode}')
     print('\n'.join(report))

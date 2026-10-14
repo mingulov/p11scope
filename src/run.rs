@@ -4563,162 +4563,6 @@ fn drain_capture_terminal_with<'state, C, T>(
     })
 }
 
-/// Seals the terminal profile evidence and publishes the `-o` report:
-/// the snapshot half of quiesce-then-publish, shared by the terminal
-/// callback and the quiesce-error path so a second signal during
-/// teardown keeps the "report already written" contract. Drains stay
-/// with the terminal callback; the error path seals from partial state
-/// with quiescence unproven, never reusing Q positions it never reached.
-#[allow(clippy::too_many_arguments)]
-fn seal_profile_terminal(
-    context: &mut ProfileTerminalContext<'_, '_, '_, '_, '_, '_, '_>,
-    consumers: &mut CaptureConsumers<'_>,
-    scope: &Scope,
-    profile: bool,
-    policy: CapturePolicy,
-    mode: &str,
-    ring_bytes: Option<u32>,
-    clock: Instant,
-    wall_start: SystemTime,
-    drain: Duration,
-    live_display: &LiveDisplay,
-    uretprobe_override: &Option<render::UretprobeOverride>,
-    capture_tracking_degraded: bool,
-) -> Result<render::Evidence> {
-    context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
-    let maps_start = Instant::now();
-    let reports = metrics::read(context.1, context.0.plan())?;
-    let mut kernel_evidence = metrics::kernel_evidence(context.1)?;
-    if !profile {
-        kernel_evidence.ring_loss = 0;
-    }
-    consumers
-        .scheduling
-        .add_phase(SchedulingPhase::Maps, maps_start.elapsed());
-    context
-        .0
-        .pinned()
-        .check_unchanged()
-        .map_err(anyhow::Error::msg)?;
-    let settle_start = crate::attach::monotonic_ns();
-    context.0.settle_terminal_drain();
-    consumers.scheduling.span_stage(
-        crate::timing::StageKind::Cleanup,
-        "settle_terminal_drain",
-        settle_start,
-        crate::attach::monotonic_ns(),
-    );
-    consumers.scheduling.note_terminal(
-        kernel_evidence.ring_loss,
-        context.0.capture_facts().discovery_losses()[0],
-    );
-    // Pre-publication detach work only: the terminal
-    // callback publishes before the producers detach, so
-    // this reads 0 in every Detailed report and the
-    // post-publication teardown stays explicitly unmeasured.
-    consumers.scheduling.add_phase(
-        SchedulingPhase::Detach,
-        Duration::from_millis(context.1.detach_wall_ms()),
-    );
-    let render_start = Instant::now();
-    consumers.scheduling.sync_discovery_deferrals(context.0);
-    consumers.scheduling.sync_engine_stages(context.0);
-    consumers
-        .scheduling
-        .sync_newcomer_stats(context.0, crate::attach::monotonic_ns());
-    consumers.scheduling.sync_tail_stats(context.0);
-    let mut ev = evidence_for(
-        context.0,
-        context.0.capture_facts(),
-        context.1.attached_probes(),
-        context.1.dynamic_per_offset_attached(),
-        context.1.static_multi_attached(),
-        context.1.attach_backend_evidence(),
-        context.1.attach_failures(),
-        &reports,
-        kernel_evidence,
-        consumers.tracker.evidence(),
-        *consumers.malformed_records,
-        consumers.state,
-        context.0.pinned().provider_changed(),
-        profile,
-        context
-            .2
-            .as_deref()
-            .map_or_else(Default::default, |owned| owned.coordinator.counters()),
-        context.2.as_deref().map(|owned| owned.still_running),
-        capture_tracking_degraded,
-        consumers
-            .scheduling
-            .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
-        uretprobe_override.clone(),
-        context
-            .2
-            .as_deref()
-            .and_then(|owned| owned.still_running.then_some(owned.pid)),
-    );
-    ev.apply_stop_quiescence(consumers.stop_quiescence);
-    ev.settle_terminal(profile);
-    let facts = context.0.capture_facts();
-    let frame = render::live_scoped(
-        &reports,
-        &ev,
-        clock.elapsed(),
-        &facts.heading(),
-        mode,
-        policy,
-        scope.kind(),
-    );
-    if let Some(bytes) = live_display.frame_bytes(&frame, true) {
-        write_stdout(context.3, context.4, bytes.as_bytes())?;
-        flush_stdout(context.3, context.4)?;
-    }
-    consumers
-        .scheduling
-        .add_phase(SchedulingPhase::Render, render_start.elapsed());
-    collect_sink_drops(context.3, consumers.scheduling, &mut None, Instant::now());
-    settle_terminal_scheduling(
-        &mut ev,
-        consumers
-            .scheduling
-            .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
-        profile,
-    );
-    let summary = timing_summary_line(&ev.scheduling);
-    eprintln!("{summary}");
-
-    if let Some(mut out_file) = context.5.take() {
-        let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let started = fmt_rfc3339(wall_start);
-        let ended = fmt_rfc3339(SystemTime::now());
-        let capture = render::CaptureMeta {
-            started: &started,
-            ended: &ended,
-            kernel: &kernel,
-            policy,
-            scope: scope.kind(),
-            ring_bytes: resolve_ring_bytes(ring_bytes),
-            drain_interval_ms: drain.as_millis() as u64,
-        };
-        let j = if profile {
-            render::profile_json(
-                &reports,
-                render::VersionedEvidence::wrap(&ev),
-                consumers.state,
-                &capture,
-            )
-        } else {
-            render::json(&reports, &ev, &capture)
-        };
-        write_json_report(out_file.file(), &j)?;
-        out_file.commit().map_err(anyhow::Error::msg)?;
-    }
-    Ok(ev)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn capture_profile(
     engine: &mut Engine,
@@ -5258,7 +5102,7 @@ fn capture_profile(
                             post_q_discovery: false,
                         },
                     };
-                    seal_profile_terminal(
+                    run_terminal(
                         &mut terminal_context,
                         &mut consumers,
                         scope,
@@ -5286,7 +5130,7 @@ fn capture_profile(
     };
     let (quiesced, stop_quiescence) = quiesce_outcome;
     let mut finish_context = (&mut *engine, &mut *session, &mut owned);
-    finish_capture_with(
+    let outcome = finish_capture_with(
         &mut finish_context,
         loop_result,
         |context, result| {
@@ -5402,7 +5246,7 @@ fn capture_profile(
                     Ok(())
                 },
                 |context, consumers| {
-                    seal_profile_terminal(
+                    run_terminal(
                         context,
                         consumers,
                         scope,
@@ -5420,7 +5264,165 @@ fn capture_profile(
                 },
             )
         },
-    )
+    );
+
+    /// Seals the terminal profile evidence and publishes the `-o` report:
+    /// the snapshot half of quiesce-then-publish, shared by the terminal
+    /// callback and the quiesce-error path so a second signal during
+    /// teardown keeps the "report already written" contract. Drains stay
+    /// with the terminal callback; the error path seals from partial state
+    /// with quiescence unproven, never reusing Q positions it never reached.
+    #[allow(clippy::too_many_arguments)]
+    fn run_terminal(
+        context: &mut ProfileTerminalContext<'_, '_, '_, '_, '_, '_, '_>,
+        consumers: &mut CaptureConsumers<'_>,
+        scope: &Scope,
+        profile: bool,
+        policy: CapturePolicy,
+        mode: &str,
+        ring_bytes: Option<u32>,
+        clock: Instant,
+        wall_start: SystemTime,
+        drain: Duration,
+        live_display: &LiveDisplay,
+        uretprobe_override: &Option<render::UretprobeOverride>,
+        capture_tracking_degraded: bool,
+    ) -> Result<render::Evidence> {
+        context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
+        let maps_start = Instant::now();
+        let reports = metrics::read(context.1, context.0.plan())?;
+        let mut kernel_evidence = metrics::kernel_evidence(context.1)?;
+        if !profile {
+            kernel_evidence.ring_loss = 0;
+        }
+        consumers
+            .scheduling
+            .add_phase(SchedulingPhase::Maps, maps_start.elapsed());
+        context
+            .0
+            .pinned()
+            .check_unchanged()
+            .map_err(anyhow::Error::msg)?;
+        let settle_start = crate::attach::monotonic_ns();
+        context.0.settle_terminal_drain();
+        consumers.scheduling.span_stage(
+            crate::timing::StageKind::Cleanup,
+            "settle_terminal_drain",
+            settle_start,
+            crate::attach::monotonic_ns(),
+        );
+        consumers.scheduling.note_terminal(
+            kernel_evidence.ring_loss,
+            context.0.capture_facts().discovery_losses()[0],
+        );
+        // Pre-publication detach work only: the terminal
+        // callback publishes before the producers detach, so
+        // this reads 0 in every Detailed report and the
+        // post-publication teardown stays explicitly unmeasured.
+        consumers.scheduling.add_phase(
+            SchedulingPhase::Detach,
+            Duration::from_millis(context.1.detach_wall_ms()),
+        );
+        let render_start = Instant::now();
+        consumers.scheduling.sync_discovery_deferrals(context.0);
+        consumers.scheduling.sync_engine_stages(context.0);
+        consumers
+            .scheduling
+            .sync_newcomer_stats(context.0, crate::attach::monotonic_ns());
+        consumers.scheduling.sync_tail_stats(context.0);
+        let mut ev = evidence_for(
+            context.0,
+            context.0.capture_facts(),
+            context.1.attached_probes(),
+            context.1.dynamic_per_offset_attached(),
+            context.1.static_multi_attached(),
+            context.1.attach_backend_evidence(),
+            context.1.attach_failures(),
+            &reports,
+            kernel_evidence,
+            consumers.tracker.evidence(),
+            *consumers.malformed_records,
+            consumers.state,
+            context.0.pinned().provider_changed(),
+            profile,
+            context
+                .2
+                .as_deref()
+                .map_or_else(Default::default, |owned| owned.coordinator.counters()),
+            context.2.as_deref().map(|owned| owned.still_running),
+            capture_tracking_degraded,
+            consumers
+                .scheduling
+                .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
+            uretprobe_override.clone(),
+            context
+                .2
+                .as_deref()
+                .and_then(|owned| owned.still_running.then_some(owned.pid)),
+        );
+        ev.apply_stop_quiescence(consumers.stop_quiescence);
+        ev.settle_terminal(profile);
+        let facts = context.0.capture_facts();
+        let frame = render::live_scoped(
+            &reports,
+            &ev,
+            clock.elapsed(),
+            &facts.heading(),
+            mode,
+            policy,
+            scope.kind(),
+        );
+        if let Some(bytes) = live_display.frame_bytes(&frame, true) {
+            write_stdout(context.3, context.4, bytes.as_bytes())?;
+            flush_stdout(context.3, context.4)?;
+        }
+        consumers
+            .scheduling
+            .add_phase(SchedulingPhase::Render, render_start.elapsed());
+        collect_sink_drops(context.3, consumers.scheduling, &mut None, Instant::now());
+        settle_terminal_scheduling(
+            &mut ev,
+            consumers
+                .scheduling
+                .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
+            profile,
+        );
+        let summary = timing_summary_line(&ev.scheduling);
+        eprintln!("{summary}");
+
+        if let Some(mut out_file) = context.5.take() {
+            let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let started = fmt_rfc3339(wall_start);
+            let ended = fmt_rfc3339(SystemTime::now());
+            let capture = render::CaptureMeta {
+                started: &started,
+                ended: &ended,
+                kernel: &kernel,
+                policy,
+                scope: scope.kind(),
+                ring_bytes: resolve_ring_bytes(ring_bytes),
+                drain_interval_ms: drain.as_millis() as u64,
+            };
+            let j = if profile {
+                render::profile_json(
+                    &reports,
+                    render::VersionedEvidence::wrap(&ev),
+                    consumers.state,
+                    &capture,
+                )
+            } else {
+                render::json(&reports, &ev, &capture)
+            };
+            write_json_report(out_file.file(), &j)?;
+            out_file.commit().map_err(anyhow::Error::msg)?;
+        }
+        Ok(ev)
+    }
+
+    outcome
 }
 
 /// Writes the `-o` report — the same call whether the loop above it
@@ -14564,18 +14566,7 @@ mod tests {
             .split_once("fn terminal_trace_count_line")
             .unwrap()
             .0;
-        // Profile seals through the shared helper (which also serves the
-        // quiesce-error path); the latch-then-seal order pins there.
-        let seal = source
-            .split_once("fn seal_profile_terminal(")
-            .unwrap()
-            .1
-            .split_once("fn capture_profile(")
-            .unwrap()
-            .0;
-        for (function, body, sealed_body) in
-            [("capture_profile", profile, seal), ("capture_trace", trace, trace)]
-        {
+        for (function, body) in [("capture_profile", profile), ("capture_trace", trace)] {
             let derived = body
                 .find("let stop_quiescence = stop_quiescence_for(stop_state);")
                 .unwrap_or_else(|| panic!("{function} derives the outcome from its StopState"));
@@ -14608,18 +14599,18 @@ mod tests {
                 0,
                 "{function}: every post-Q report also sets its published flag"
             );
-            let applied = sealed_body
+            let applied = body
                 .find(".apply_stop_quiescence(consumers.stop_quiescence);")
                 .unwrap_or_else(|| panic!("{function} derives the latch before the seal"));
-            let sealed = sealed_body[applied..]
+            let sealed = body[applied..]
                 .find(".settle_terminal(")
                 .unwrap_or_else(|| panic!("{function} seals after deriving the latch"));
             assert!(
-                !sealed_body[applied..applied + sealed].contains("mark_terminal_drain_unproven"),
+                !body[applied..applied + sealed].contains("mark_terminal_drain_unproven"),
                 "{function}: no seal between the latch and settle_terminal"
             );
             assert!(
-                !sealed_body.contains("drain_proven = true"),
+                !body.contains("drain_proven = true"),
                 "{function}: the latch has one setter"
             );
         }

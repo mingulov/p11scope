@@ -837,14 +837,16 @@ static void object_expect_binding(struct object_start got, u32 index, unsigned c
     assert(got.slots[3].value_ptr == 0 && got.slots[7].returned_len == 0);
     assert(got.requested[1].inspected == 0 && got.flags == 0);
 }
-/* Fixture-only mirror of the BPF return drain: query the validated side
- * row, check attached-descriptor and retained-ABI agreement, retire through
- * the ordinary removal. Calls production functions only. The agreement below
- * must match p11_return_impl's drain arm line for line; the Rust source-shapes
- * test pins that arm. Returns the drained sane phase, or 0 when the drain
- * faults. A monolithic native drain is kernel-infeasible: it would nest one
- * level deeper than return's 512-byte call-chain budget allows. The query
- * records nothing; the retire records once. */
+/* Fixture-only mirror of the BPF return drain's agreement conjunct: query
+ * the validated side row (required=0), check attached-descriptor and
+ * retained-ABI agreement, retire through the ordinary removal. Calls
+ * production functions only. The agreement below must match the drain arm's
+ * required=0 query plus agreement line for line; the Rust arm additionally
+ * conjoins the required=1 ready fill (`filled &&`), which the Rust
+ * source-shapes test pins. Returns the drained sane phase, or 0 when the
+ * drain faults. A monolithic native drain is kernel-infeasible: it would
+ * nest one level deeper than return's 512-byte call-chain budget allows.
+ * The query records nothing; the retire records once. */
 static unsigned drain_via_query(const struct owner_start_key *key, u32 descriptor, u32 layout)
 {
     const struct object_start *side = p11_object_side_get(key, descriptor, 0);

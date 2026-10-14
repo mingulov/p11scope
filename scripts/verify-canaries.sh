@@ -20,7 +20,7 @@ esac
 
 assert_lanes() {
     case ${1-} in
-        --hostile-starts|--fault-starts)
+        --hostile-starts|--fault-starts|--object-starts)
             sudo python3 -I scripts/check-canary-evidence.py "$@" "$TARGET_BITS"
             ;;
         *) python3 -I scripts/check-canary-evidence.py "$@" "$TARGET_BITS" ;;
@@ -351,6 +351,136 @@ BLOCKED_LANES
 
 echo "=== live diagnostic START policy: distinct template faults ==="
 run_start_lane feature-unsafe-fault feature-unsafe faults 2 --fault-starts
+
+# H7 slice D object cells: the completion phase drives all 25 named object
+# functions (matrix-shaped barrier, immediate provider) and the blocked
+# phase parks four object workers (blocking provider) for the stopped
+# side-row acquisition; the object oracle replays the independent ledger
+# against 608-byte records, exact offsets and cleanup on both.
+run_object_cell() {
+    object_lane=$1
+    object_blocked_lane=${object_lane}-blocked
+    echo "=== $object_lane (default profile, object completion) ==="
+    refuse_lane_destinations "$object_lane"
+    (set -C; exec "$WORK/canary_workload" "$WORK/matrix-provider.so" object \
+        "$WORK/$object_lane.ready" "$WORK/$object_lane.go" "$WORK/$object_lane.done" "$WORK/$object_lane.finish" \
+        > "$WORK/$object_lane.workload.log" 2>&1) &
+    WPID=$!
+    WORKLOAD_STARTTIME=$(process_starttime "$WPID") || {
+        echo "$object_lane workload identity unavailable"
+        exit 1
+    }
+    object_ready_attempt=0
+    while [ ! -f "$WORK/$object_lane.ready" ] && [ "$object_ready_attempt" -lt 160 ]; do
+        kill -0 "$WPID" 2>/dev/null || { echo "$object_lane workload exited before ready"; exit 1; }
+        object_ready_attempt=$((object_ready_attempt + 1))
+        sleep 0.05
+    done
+    test -f "$WORK/$object_lane.ready" || { echo "$object_lane workload never became ready"; exit 1; }
+    object_completed_pid=$WPID
+    sudo python3 -I scripts/capture-stopped-canary.py \
+        --lane "$object_lane" --variant default --mode profile --privacy allowlisted \
+        --target-bits "$TARGET_BITS" --workload-mode object \
+        --workload-pid "$WPID" --generation "$WORKLOAD_STARTTIME" \
+        --out-dir "$WORK" --prefix "$WORK/$object_lane" \
+        --ready "$WORK/$object_lane.ready" --go "$WORK/$object_lane.go" \
+        --done "$WORK/$object_lane.done" --finish "$WORK/$object_lane.finish" \
+        --observer-log "$WORK/$object_lane.observer.log" --workload-log "$WORK/$object_lane.workload.log" \
+        --reader "$TASK_STORAGE_READER" --obj "$TASK_STORAGE_OBJECT" -- \
+        "$P11SCOPE_DEFAULT" profile --manifest "$WORK/matrix-manifest.json" --pid "$WPID" \
+        --mode profile --duration 6 -o "$WORK/$object_lane.output"
+    reclaim_root_output "$WORK"/mapdump_*_"$object_lane".json "$WORK"/mapdump_*_"$object_lane".bin \
+        "$WORK/$object_lane".*.raw "$WORK/$object_lane.observer.log"
+    for handshake in "$WORK/$object_lane".go "$WORK/$object_lane".finish; do
+        [ -e "$handshake" ] || [ -L "$handshake" ] || continue
+        reclaim_root_output "$handshake"
+    done
+    if wait "$WPID"; then
+        WPID=
+        WORKLOAD_STARTTIME=
+    else
+        status=$?
+        echo "$object_lane workload failed: $status"
+        exit "$status"
+    fi
+    reclaim_root_output "$WORK/$object_lane.output"
+    python3 -I scripts/check-capture-evidence.py canary "$object_lane" "$WORK/$object_lane.output" \
+        "$TARGET_BITS"
+
+    echo "=== $object_blocked_lane (default profile, blocked object subset) ==="
+    refuse_lane_destinations "$object_blocked_lane"
+    (set -C; exec "$WORK/canary_workload" "$WORK/privacy-provider.so" object-blocked \
+        "$WORK/$object_blocked_lane.ready" "$WORK/$object_blocked_lane.go" \
+        > "$WORK/$object_blocked_lane.workload.log" 2>&1) &
+    WPID=$!
+    WORKLOAD_STARTTIME=$(process_starttime "$WPID") || {
+        echo "$object_blocked_lane workload identity unavailable"
+        exit 1
+    }
+    object_blocked_pid=$WPID
+    object_blocked_ready_attempt=0
+    while [ ! -f "$WORK/$object_blocked_lane.ready" ] && [ "$object_blocked_ready_attempt" -lt 160 ]; do
+        kill -0 "$WPID" 2>/dev/null || {
+            echo "$object_blocked_lane workload exited before complete READY"
+            exit 1
+        }
+        object_blocked_ready_attempt=$((object_blocked_ready_attempt + 1))
+        sleep 0.05
+    done
+    test -f "$WORK/$object_blocked_lane.ready" || {
+        echo "$object_blocked_lane workload never published complete READY"
+        exit 1
+    }
+    sudo python3 -I scripts/capture-stopped-canary.py \
+        --lane "$object_blocked_lane" --variant default --mode profile --privacy allowlisted \
+        --target-bits "$TARGET_BITS" --workload-mode object-blocked \
+        --workload-pid "$WPID" --generation "$WORKLOAD_STARTTIME" \
+        --out-dir "$WORK" --prefix "$WORK/$object_blocked_lane" \
+        --ready "$WORK/$object_blocked_lane.ready" --go "$WORK/$object_blocked_lane.go" \
+        --done "$WORK/$object_blocked_lane.done" --finish "$WORK/$object_blocked_lane.finish" \
+        --observer-log "$WORK/$object_blocked_lane.observer.log" --workload-log "$WORK/$object_blocked_lane.workload.log" \
+        --reader "$TASK_STORAGE_READER" --obj "$TASK_STORAGE_OBJECT" -- \
+        "$P11SCOPE_DEFAULT" profile --manifest "$WORK/privacy-manifest.json" --pid "$WPID" \
+        --mode profile --duration 8 -o "$WORK/$object_blocked_lane.output"
+    reclaim_root_output "$WORK"/mapdump_*_"$object_blocked_lane".json "$WORK"/mapdump_*_"$object_blocked_lane".bin \
+        "$WORK/$object_blocked_lane".*.raw "$WORK/$object_blocked_lane.observer.log"
+    for handshake in "$WORK/$object_blocked_lane".go "$WORK/$object_blocked_lane".finish; do
+        [ -e "$handshake" ] || [ -L "$handshake" ] || continue
+        reclaim_root_output "$handshake"
+    done
+    assert_lanes --object-starts "$WORK/mapdump_manifest_$object_lane.json" \
+        "$WORK/mapdump_manifest_$object_blocked_lane.json" \
+        "$WORK/$object_lane.workload.log" "$WORK/$object_blocked_lane.workload.log" \
+        "$object_completed_pid" "$object_blocked_pid"
+    process_matches_starttime "$WPID" "$WORKLOAD_STARTTIME" || {
+        echo "$object_blocked_lane workload exited before object oracle completed"
+        exit 1
+    }
+    signal_verified_process TERM "$WPID" "$WORKLOAD_STARTTIME" || {
+        echo "$object_blocked_lane workload could not be terminated"
+        exit 1
+    }
+    if wait "$WPID"; then
+        object_blocked_status=0
+    else
+        object_blocked_status=$?
+    fi
+    [ "$object_blocked_status" -eq 143 ] || {
+        echo "$object_blocked_lane workload exit status $object_blocked_status, expected SIGTERM status 143"
+        exit 1
+    }
+    WPID=
+    WORKLOAD_STARTTIME=
+    reclaim_root_output "$WORK/$object_blocked_lane.output"
+}
+
+if [ "$TARGET_BITS" = 32 ]; then
+    echo "=== live object cell: H7 slice D finite producer (ia32) ==="
+    run_object_cell object-ia32
+else
+    echo "=== live object cell: H7 slice D finite producer (lp64) ==="
+    run_object_cell object-lp64
+fi
 
 run_owned_lane() {
     owned_lane=$1

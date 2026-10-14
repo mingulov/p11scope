@@ -46,6 +46,13 @@ LANES = {
     'feature-unsafe-fault': ('diagnostic', 'profile', 'unsafe-unvalidated-metadata', 'faults'),
     'owned-default-metrics': ('default', 'metrics', 'aggregate-only', 'matrix'),
     'owned-feature-metrics': ('diagnostic', 'metrics', 'aggregate-only', 'matrix'),
+    # H7 slice D object cells: the completion phase drives all 25 named
+    # object functions (matrix-shaped barrier), the blocked phase parks
+    # four object workers for the stopped side-row acquisition.
+    'object-lp64': ('default', 'profile', 'allowlisted', 'object'),
+    'object-lp64-blocked': ('default', 'profile', 'allowlisted', 'object-blocked'),
+    'object-ia32': ('default', 'profile', 'allowlisted', 'object'),
+    'object-ia32-blocked': ('default', 'profile', 'allowlisted', 'object-blocked'),
 }
 OWNED_LANES = frozenset(('owned-default-metrics', 'owned-feature-metrics'))
 OWNED_DURATION_SECONDS = 35
@@ -242,7 +249,7 @@ def validate_config(config):
     destinations = [config.go, config.finish, config.observer_log, Path(f'{config.prefix}.output'),
                     config.out_dir / f'mapdump_manifest_{config.lane}.json',
                     config.out_dir / f'mapdump_snapshot_{config.lane}.json']
-    if config.workload_mode == 'matrix':
+    if config.workload_mode in ('matrix', 'object'):
         destinations.append(config.done)
     if config.workload_origin == 'owned':
         destinations.append(config.ready)
@@ -268,7 +275,8 @@ def ready_roster(config, deadline):
             and doc['schema'] == 'p11scope/canary-roster/v1'
             and doc['mode'] == config.workload_mode and type(doc['pid']) is int
             and doc['pid'] == config.workload_pid, 'invalid READY identity or schema')
-    count = {'matrix': 0, 'blocked': 4, 'faults': 2}[config.workload_mode]
+    count = {'matrix': 0, 'blocked': 4, 'faults': 2, 'object': 0,
+             'object-blocked': 4}[config.workload_mode]
     tasks = doc['tasks']
     require(isinstance(tasks, list) and len(tasks) == count + 1, 'incomplete READY roster')
     tids, indices, leaders = set(), set(), 0
@@ -331,7 +339,7 @@ def start_bindings(entries, tasks, config, *, complete):
                 and slot < 512 and padding == 0, 'invalid START worker key')
         start = evidence.decode_start(evidence.bpftool_bytes(entry['value'], evidence.CALL_START_SIZE))
         index = workers[tid]['call_index']
-        base = 0x301 if config.workload_mode == 'blocked' else 0x401
+        base = {'blocked': 0x301, 'faults': 0x401, 'object-blocked': 0x501}[config.workload_mode]
         require(start['session'] == base + index, 'START session contradicts READY call')
         bindings[tid], slots[index] = key, slot
         starts.append(start)
@@ -339,6 +347,8 @@ def start_bindings(entries, tasks, config, *, complete):
         require(set(bindings) == set(workers), 'incomplete START worker keys')
         if config.workload_mode == 'blocked':
             require(slots[1] == slots[2] == slots[3] and slots[0] != slots[1], 'START runtime slot relationship mismatch')
+        elif config.workload_mode == 'object-blocked':
+            require(len(set(slots.values())) == 4, 'START object runtime slots must differ')
         else:
             require(slots[0] != slots[1], 'START fault runtime slots must differ')
     return bindings, starts
@@ -710,7 +720,7 @@ class Coordinator:
         create_control(cfg.go, lambda: setattr(self, 'go_created', True))
         self.check('GO-created', deadline)
         maps, bindings = None, None
-        if cfg.workload_mode == 'matrix':
+        if cfg.workload_mode in ('matrix', 'object'):
             wait_done(cfg, workload, deadline, self.check)
         else:
             maps = source.inventory(observer.group, deadline)
@@ -774,7 +784,10 @@ class Coordinator:
         self.check('retained-rings', deadline)
         rings = source.ring_records(positions)
         for name, rows in rings.items():
-            raw = b''.join(rows)
+            # Frame each record with its 8-byte ring header (length plus
+            # zero flags) so mixed 368/608-byte EVENTS forms split exactly
+            # in the final scan; the kernel padding lives only in strides.
+            raw = b''.join(struct.pack('<II', len(row), 0) + row for row in rows)
             self.files.write(evidence.ring_raw_path(self.files.stage / cfg.lane, name), raw)
             values[name] = raw
         self.check('after-identities', deadline)
@@ -800,8 +813,13 @@ class Coordinator:
                                              controls=controls, lane=receipt_lane, small_state=False)
         if cfg.mode == 'metrics':
             require(evidence.u64(controls['COOKIE_CTL']['value'], 8) == 0, 'aggregate-only cookie allocation history')
-        if cfg.workload_mode == 'matrix':
+        if cfg.workload_mode in ('matrix', 'object'):
             require(not ordinary['START'], 'completed matrix START is not empty')
+            if cfg.workload_mode == 'object':
+                # Post-return cleanup: every completed object call retired
+                # its side row before the ring record submitted.
+                require(not ordinary['OBJECT_START'],
+                        'completed object OBJECT_START is not empty')
         else:
             final_bindings, starts = start_bindings(ordinary['START'], tasks, cfg, complete=True)
             require(bindings == final_bindings, 'START keys changed after readiness')
@@ -937,7 +955,7 @@ class Coordinator:
                     self.finish_owned_observer(observer, workload)
                 except BaseException as error:
                     issues.extend(sanitized('owned-handoff', error))
-            if self.go_created and self.config.workload_mode == 'matrix':
+            if self.go_created and self.config.workload_mode in ('matrix', 'object'):
                 try:
                     create_control(self.config.finish)
                     if owned and not issues:

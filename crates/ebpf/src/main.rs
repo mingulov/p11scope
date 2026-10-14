@@ -2853,8 +2853,13 @@ fn object_entry_derive(
         return true;
     }
     // C_DeriveKey(hSession, pMechanism, hBaseKey, pTemplate, ulCount, phKey):
-    // mechanism at arg 1, result pointer at arg 5. Unreadable arguments
-    // retain zero, which the return core maps to unreadable.
+    // mechanism at arg 1, result pointer at arg 5. The ordinals below
+    // duplicate the Derive row; refuse loudly if the frozen row disagrees
+    // rather than reading the wrong arguments. Unreadable arguments retain
+    // zero, which the return core maps to unreadable.
+    if row.result_args != [5, ARG_NONE] {
+        return false;
+    }
     let mechanism_ptr = arg_u64(ctx, 1, layout).ok().unwrap_or(0);
     let out5_ptr = arg_u64(ctx, 5, layout).ok().unwrap_or(0);
     let (derive, retained) =

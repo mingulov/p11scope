@@ -106,6 +106,9 @@ fn second_sigint_during_teardown_publishes_truthful_report_and_exits_130() {
         diagnostics.contains("p11scope: capturing:"),
         "observer never reached capture: {diagnostics}"
     );
+    // Let the live loop drain several ticks, so the report's drain samples
+    // prove the document came from this capture.
+    std::thread::sleep(Duration::from_secs(2));
     signal(libc::SIGINT);
     std::thread::sleep(Duration::from_secs(1));
     signal(libc::SIGINT);
@@ -135,10 +138,13 @@ fn second_sigint_during_teardown_publishes_truthful_report_and_exits_130() {
         !diagnostics.contains("panicked"),
         "no panic on the abandon path:\n{diagnostics}"
     );
-    // The published report: valid JSON with the profile schema. Quiescence
-    // was interrupted, so a COMPLETE or drain-proven claim would be a lie;
-    // the live-loop drain samples prove the document came from this capture
-    // rather than a static placeholder.
+    // The published report: valid JSON with the profile schema. Either
+    // seal path may run — quiescence may prove before the second signal
+    // (normal publish, detach abandons after) or fail (error-path
+    // publish) — so the test pins what both owe: PARTIAL (the
+    // provider-free child leaves observation causes on every path) and
+    // the owner-ruling-B consistency between `drain_proven` and the
+    // stop-gate evidence.
     let text = std::fs::read_to_string(&out).expect("abandon must publish the -o report");
     let report: serde_json::Value =
         serde_json::from_str(&text).expect("abandon report must be valid JSON");
@@ -155,14 +161,26 @@ fn second_sigint_during_teardown_publishes_truthful_report_and_exits_130() {
             .get("completeness")
             .and_then(serde_json::Value::as_str),
         Some("PARTIAL"),
-        "interrupted quiescence cannot seal COMPLETE"
+        "an abandoned teardown cannot seal COMPLETE"
     );
+    let stop = evidence
+        .get("stop_quiescence")
+        .expect("abandon report carries stop-gate evidence");
+    let proven = stop.get("state").and_then(serde_json::Value::as_str) == Some("proven")
+        && stop
+            .get("post_q_events")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        && stop
+            .get("post_q_discovery")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false);
     assert_eq!(
         evidence
             .get("drain_proven")
             .and_then(serde_json::Value::as_bool),
-        Some(false),
-        "interrupted quiescence cannot prove the drain"
+        Some(proven),
+        "drain_proven must match the stop-gate evidence: {stop}"
     );
     assert!(
         evidence

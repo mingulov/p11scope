@@ -130,6 +130,15 @@ MECH_NONE = (1 << 64) - 1
 FUNCTION_NONE = (1 << 32) - 1
 ARG_READ_FAILURE = 1 << 4
 CALL_START_SIZE = 288
+# H7 finite object-required markers accepted at CallStart offset 264
+# (marker = eligible function ordinal + 2). Derived from the frozen
+# standard catalog order and the closed object-policy eligible set (25
+# functions); the Rust `object_producer_canary_matches_rust_marker_rule`
+# contract re-derives this set and fails on any drift.
+OBJECT_ELIGIBLE_MARKERS = frozenset({
+    19, 22, 23, 24, 25, 26, 27, 29, 31, 35, 42, 44, 48, 50, 54,
+    60, 61, 62, 63, 64, 74, 79, 84, 89, 96,
+})
 # One EVENTS ring record: the 328-byte Event plus its private 40-byte
 # continuity tail (ebpf-common EventRecord, Task 3 Stage A).
 EVENT_SIZE = 368
@@ -1782,6 +1791,17 @@ def main(argv=None):
         nonzero_pad = bytearray(start_bytes(0x301))
         struct.pack_into("<I", nonzero_pad, 268, 1)
         reject("CallStart padding", lambda: decode_start(bytes(nonzero_pad)))
+        # H7 finite marker: 0 stays ordinary, eligible markers are
+        # accepted, NONE/out-of-range/high-bit markers refuse.
+        for marker in (22, 96):
+            marked = bytearray(start_bytes(0x305))
+            struct.pack_into("<Q", marked, 264, marker)
+            decode_start(bytes(marked))
+        for marker in (1, 2, 18, 106, 255, 256, 1 << 32, (1 << 64) - 1):
+            bad = bytearray(start_bytes(0x305))
+            struct.pack_into("<Q", bad, 264, marker)
+            reject(f"object marker {marker}",
+                   lambda bad=bad: decode_start(bytes(bad)))
         for session in (0x301, 0x302, 0x303, 0x304):
             mutated = [dict(record) for record in starts]
             record = next(record for record in mutated if record["session"] == session)

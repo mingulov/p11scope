@@ -2472,18 +2472,21 @@ mod terminal_drain_tests {
                     };
                     let routed = RoutedCall::scripted(
                         self.domain,
-                        crate::semantic_capture::event_record_with_routing(
-                            Event {
-                                slot: 0,
-                                image: ImageIdentity {
-                                    task_cookie: 71,
-                                    exec_id: 0,
+                        crate::events::DecodedEventRecord {
+                            base: crate::semantic_capture::event_record_with_routing(
+                                Event {
+                                    slot: 0,
+                                    image: ImageIdentity {
+                                        task_cookie: 71,
+                                        exec_id: 0,
+                                    },
+                                    ..Default::default()
                                 },
-                                ..Default::default()
-                            },
-                            stamp,
-                            0x2200,
-                        ),
+                                stamp,
+                                0x2200,
+                            ),
+                            object: None,
+                        },
                         Route::Joined(r0),
                         Some(Endpoint {
                             object: PinnedObjectId(0),

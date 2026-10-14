@@ -58,6 +58,12 @@ pub const OBJECT_HANDLE_STATUS_MAX: u8 = 9;
 /// Only object-flags bits 0..=7 and find-flags bits 0..=5 are defined.
 pub const OBJECT_FLAGS_MASK: u32 = 0xFF;
 pub const OBJECT_FIND_FLAGS_MASK: u8 = 0x3F;
+/// Attribute-list flags bit 4: the list's inspection never ran, so its
+/// all-zero cells are uninspected, never inspected-empty. Slice-D
+/// emission marks request lists (BPF performs no entry template
+/// inspection); the brief's bits 0..=3 keep their inspected meaning.
+pub const OBJECT_ATTR_LIST_FLAGS_MASK: u8 = 0x1F;
+pub const OBJECT_ATTR_LIST_UNINSPECTED: u8 = 0x10;
 /// Find results carry at most eight handles; `find_len` and `find_valid`
 /// are finite (`find_valid` is 0/1 only).
 pub const OBJECT_FIND_HANDLES_MAX: u8 = 8;
@@ -525,12 +531,20 @@ fn valid_find_section(tail: &[u8], action: u8, layout: u8) -> bool {
 /// Finite codes, zero padding, an inspected count within the cells, a set
 /// present bit for any inspected cell, truncation only at eight cells, and
 /// zero cells at and after the inspected count. A nonzero value requires
-/// the value status (scalar zero stays valid through its status).
+/// the value status (scalar zero stays valid through its status). The
+/// uninspected marker accepts only the honest never-inspected shape:
+/// zero cells, zero inspected count and no inspected flag bits.
 fn valid_attribute_list(list: &[u8]) -> bool {
     let inspected = list[32];
     let flags = list[33];
-    if inspected > 8 || list[34] != 0 || list[35] != 0 || flags & !0x0F != 0 {
+    if inspected > 8 || list[34] != 0 || list[35] != 0 || flags & !OBJECT_ATTR_LIST_FLAGS_MASK != 0
+    {
         return false;
+    }
+    if flags & OBJECT_ATTR_LIST_UNINSPECTED != 0 {
+        return inspected == 0
+            && flags == OBJECT_ATTR_LIST_UNINSPECTED
+            && list[..32].iter().all(|byte| *byte == 0);
     }
     if inspected > 0 && flags & 1 == 0 {
         return false;

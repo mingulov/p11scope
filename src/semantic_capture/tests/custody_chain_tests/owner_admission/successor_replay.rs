@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::discovery::caller_registry::{CallerEvent, ModuleId};
-use crate::events::{EventDrain, ScriptedRecords, record_bytes};
+use crate::events::{DecodedEventRecord, EventDrain, ScriptedRecords, record_bytes};
 use std::ops::ControlFlow;
 
 /// Only the Inventory object's cookie-query transport is substituted. The
@@ -45,7 +45,7 @@ impl DeferredCalls {
         Self {
             bytes: std::mem::take(&mut owned.io.held.script.records)
                 .iter()
-                .map(record_bytes)
+                .map(|record| record_bytes(&record.base))
                 .collect(),
         }
     }
@@ -60,7 +60,10 @@ impl DeferredCalls {
         let mut decoded = Vec::new();
         while drain.poll_records(Some(quantum), |record| {
             decoded.push(record_bytes(&record));
-            owned.io.held.script.records.push_back(record);
+            owned.io.held.script.records.push_back(DecodedEventRecord {
+                base: record,
+                object: None,
+            });
             ControlFlow::Continue(())
         }) {}
         assert_eq!(drain.malformed(), 0);

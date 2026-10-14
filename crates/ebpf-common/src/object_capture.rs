@@ -107,12 +107,14 @@ pub mod find_flag {
     pub const UNREADABLE_ELEMENT: u8 = 1 << 5;
 }
 
-/// Attribute-list flag bits (brief bits 0..=3).
+/// Attribute-list flag bits (brief bits 0..=3, plus the slice-D
+/// uninspected marker bit 4 for lists whose inspection never ran).
 pub mod attr_list_flag {
     pub const PRESENT: u8 = 1 << 0;
     pub const TRUNCATED: u8 = 1 << 1;
     pub const HEADER_READ_FAILURE: u8 = 1 << 2;
     pub const INVALID_SPAN: u8 = 1 << 3;
+    pub const UNINSPECTED: u8 = 1 << 4;
 }
 
 /// Finite attribute kinds (brief codes 0..=6).

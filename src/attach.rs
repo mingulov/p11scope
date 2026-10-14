@@ -1319,6 +1319,10 @@ pub struct Session {
     /// Terminal transfer and settlement belong to this exact Session. An
     /// interrupted/failed drive can never infer success from empty links.
     producer_detach: OwnedProducerDetach,
+    /// H7 slice D: receipt-bound object rows for 608-byte decode, frozen
+    /// by `Session::start_attested` only. `None` everywhere else keeps
+    /// those lanes 368-byte-only.
+    object_decode: Option<ObjectDecodeTable>,
     #[cfg(feature = "h6-reexec-diagnostic")]
     reexec_diagnostic: Option<reexec_diagnostic::Diagnostic>,
 }
@@ -3158,6 +3162,43 @@ fn publish_descriptors<S>(
 type ObjectRows = [ObjectDescriptorWire; MAX_DESCRIPTORS as usize];
 type ObjectResult<T> = std::result::Result<T, crate::inventory_semantics::SemanticRefusal>;
 
+/// H7 slice D: object descriptor rows frozen for the attested decode
+/// lane. The live-map readback matched the canonical table exactly at
+/// `Session::start_attested`, so these rows are the receipt-bound table
+/// `decode_object_record` validates tails against. No other lane holds
+/// one: non-attested sessions stay 368-byte-only.
+pub(crate) struct ObjectDecodeTable {
+    rows: ObjectRows,
+}
+
+impl ObjectDecodeTable {
+    pub(crate) fn rows(&self) -> &ObjectRows {
+        &self.rows
+    }
+}
+
+/// Freeze the attested decode lane: read back every live
+/// OBJECT_DESCRIPTORS row and require the exact canonical table the
+/// loader published and froze. Any absence or disagreement refuses the
+/// attested session rather than decoding tails against wrong rows.
+fn freeze_object_decode_table(ebpf: &Ebpf) -> Result<ObjectDecodeTable> {
+    use p11scope_ebpf_common::object_wire::publish_object_descriptors;
+    let expected = publish_object_descriptors();
+    let table: Array<_, [u8; 16]> = Array::try_from(
+        ebpf.map("OBJECT_DESCRIPTORS")
+            .context("OBJECT_DESCRIPTORS map")?,
+    )?;
+    for (index, row) in expected.iter().enumerate() {
+        let actual: [u8; 16] = table
+            .get(&(index as u32), 0)
+            .with_context(|| format!("reading OBJECT_DESCRIPTORS row {index}"))?;
+        if actual != object_descriptor_row_bytes(row) {
+            bail!("OBJECT_DESCRIPTORS attested readback differs at row {index}");
+        }
+    }
+    Ok(ObjectDecodeTable { rows: expected })
+}
+
 /// Exact inputs for one attested-receipt validation, bundled so the object
 /// freeze and later eligibility checks revalidate against the same facts.
 /// Inactive in slice A.
@@ -3915,7 +3956,7 @@ impl Session {
         scope: &Scope,
         selection: BackendSelection,
     ) -> Result<(Self, AttachedSemanticSet)> {
-        let session = Self::start(
+        let mut session = Self::start(
             subset.plan(),
             scope,
             subset.pins(),
@@ -3925,6 +3966,10 @@ impl Session {
             None,
             selection,
         )?;
+        // H7 slice D: freeze the receipt-bound object rows before minting
+        // the receipt. A readback disagreement refuses the attested
+        // session; without verified rows no 608-byte record decodes.
+        session.object_decode = Some(freeze_object_decode_table(&session.ebpf)?);
         let domain = session
             .native_domain()
             .context("Detailed image domain unavailable")?;
@@ -4331,6 +4376,7 @@ impl Session {
             instance,
             cleanup_worker: Some(CleanupWorker::pre_start()),
             producer_detach: OwnedProducerDetach::NotStarted,
+            object_decode: None,
             #[cfg(feature = "h6-reexec-diagnostic")]
             reexec_diagnostic: None,
         })
@@ -5862,15 +5908,35 @@ impl Session {
     /// live, root-tail and terminal poll. Built once on first drain; the
     /// reader owns its mappings and never borrows this session's `Ebpf`.
     pub fn event_drain(&mut self) -> Result<&mut events::OwnedDrain> {
+        self.event_drain_with_object_table().map(|(drain, _)| drain)
+    }
+
+    /// The session's single retained EVENTS consumer plus, on the
+    /// attested allowlisted lane with verified object rows, the frozen
+    /// receipt-bound decode table. One call hands out both disjoint
+    /// borrows, so collection decodes 608-byte records on exactly that
+    /// lane and stays 368-byte-only everywhere else.
+    pub(crate) fn event_drain_with_object_table(
+        &mut self,
+    ) -> Result<(&mut events::OwnedDrain, Option<&ObjectRows>)> {
         if self.events_consumer.is_none() {
             let consumer = events::OwnedDrain::for_session(&self.ebpf, &self.events_domain)?;
             self.events_consumer = Some(consumer);
             self.wire_trace_consumers()
                 .map_err(|reason| anyhow!("private trace proof: {reason:?}"))?;
         }
-        self.events_consumer
+        let consumer = self
+            .events_consumer
             .as_mut()
-            .context("retained EVENTS consumer vanished after creation")
+            .context("retained EVENTS consumer vanished after creation")?;
+        let table = self.object_decode.as_ref().map(ObjectDecodeTable::rows);
+        Ok((consumer, table))
+    }
+
+    /// The frozen receipt-bound object rows on the attested allowlisted
+    /// lane, if this session froze them at startup.
+    pub(crate) fn object_decode_table(&self) -> Option<&ObjectRows> {
+        self.object_decode.as_ref().map(ObjectDecodeTable::rows)
     }
 
     /// Borrow the EVENTS map descriptor for readiness waits. The idle

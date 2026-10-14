@@ -176,17 +176,20 @@ pub(crate) fn decode_discovery(bytes: &[u8]) -> Option<DiscoveryRecord> {
 }
 
 /// One decoded EVENTS record with its optional validated object tail.
-/// Inactive in slice A: no production path constructs this yet.
-#[cfg_attr(not(test), allow(dead_code))] // Slice D wires the transport.
+/// Slice D wires this envelope through the H3 drain, collection, pending
+/// queue and routed call on the attested allowlisted lane only. Like the
+/// base record it wraps, it is a plain validated value; move-only
+/// discipline lives one level up in the owned routed call and evidence.
+#[derive(Clone, Copy)]
 pub(crate) struct DecodedEventRecord {
     pub(crate) base: EventRecord,
     pub(crate) object: Option<ValidatedObjectCall>,
 }
 
 /// Decode the exact 368/608-byte forms atomically; the extended form is
-/// CALL-only and returns the validated tail intact. Inactive in slice A:
-/// production `decode_record` stays 368-only until the transport handoff.
-#[cfg_attr(not(test), allow(dead_code))] // Slice D wires the transport.
+/// CALL-only and returns the validated tail intact. The prefix alone
+/// never validates: a malformed tail refuses the whole record even when
+/// its Event prefix looks valid. Bare `decode_record` stays 368-only.
 pub(crate) fn decode_object_record(
     bytes: &[u8],
     descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
@@ -681,6 +684,48 @@ impl<S: RecordSource> EventDrain<S> {
         }
     }
 
+    /// `poll_records` delivering whole records with the optional
+    /// validated object tail intact (slice D transport). The caller
+    /// supplies the frozen receipt-bound descriptor table: only the
+    /// reviewed allowlisted attested lane decodes 608-byte records;
+    /// malformed tails and lengths count exactly like before, through
+    /// this same single cursor. Bare consumers keep `poll_records`.
+    pub(crate) fn poll_object_records(
+        &mut self,
+        quantum: Option<usize>,
+        descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+        mut f: impl FnMut(DecodedEventRecord) -> ControlFlow<()>,
+    ) -> bool {
+        let mut left = quantum;
+        loop {
+            if left == Some(0) {
+                return true;
+            }
+            let Some(item) = self.source.next_record() else {
+                return false;
+            };
+            if let Some(left) = left.as_mut() {
+                *left -= 1;
+            }
+            match decode_object_record(&item, descriptors) {
+                Some(record) => {
+                    if let Some(tap) = &self.trace_tap {
+                        tap.observe_call(&record.base.event);
+                    }
+                    if f(record).is_break() {
+                        return true;
+                    }
+                }
+                None => {
+                    self.malformed = self.malformed.saturating_add(1);
+                    if let Some(tap) = &self.trace_tap {
+                        tap.observe_failure();
+                    }
+                }
+            }
+        }
+    }
+
     /// Records rejected by the size or affiliation check so far.
     pub fn malformed(&self) -> u64 {
         self.malformed
@@ -840,6 +885,78 @@ pub(crate) fn poll_records_to_position<S: BoundedRecordSource>(
                     Some(record) => {
                         if let Some(tap) = &drain.trace_tap {
                             tap.observe_call(&record.event);
+                        }
+                        if f(record).is_break() {
+                            return Ok((false, true));
+                        }
+                    }
+                    None => {
+                        drain.malformed = drain.malformed.saturating_add(1);
+                        if let Some(tap) = &drain.trace_tap {
+                            tap.observe_failure();
+                        }
+                    }
+                }
+            }
+            BoundedRecord::Reached => {
+                let post_q_record = drain.source.positions().producer != stop;
+                return Ok((post_q_record, false));
+            }
+            BoundedRecord::Pending => {
+                let consumer = drain.source.consumer();
+                if consumer != stop {
+                    return Err(BoundedDrainError::UngatedWriterBeforeQ { consumer, stop }.into());
+                }
+                return Ok((false, false));
+            }
+        }
+    }
+}
+
+/// `poll_records_to_position` delivering whole records with the
+/// optional validated object tail intact (slice D stop-time transport).
+/// Same proven-Q contract, same malformed accounting, same single
+/// cursor; the frozen receipt-bound table gates 608-byte records.
+pub(crate) fn poll_object_records_to_position<S: BoundedRecordSource>(
+    drain: &mut EventDrain<S>,
+    stop: usize,
+    quantum: Option<usize>,
+    descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+    mut f: impl FnMut(DecodedEventRecord) -> ControlFlow<()>,
+) -> Result<(bool, bool)> {
+    let mut left = quantum;
+    loop {
+        if left == Some(0) {
+            return Ok((false, true));
+        }
+        // Decode to an owned record first: matching the borrowed item
+        // directly keeps the source borrow alive across the match,
+        // blocking the post-Reached positions read below.
+        let record: BoundedRecord<Option<DecodedEventRecord>> =
+            match drain.source.bounded_record(stop) {
+                Ok(bounded) => match bounded {
+                    BoundedRecord::Item(item) => {
+                        BoundedRecord::Item(decode_object_record(&item, descriptors))
+                    }
+                    BoundedRecord::Reached => BoundedRecord::Reached,
+                    BoundedRecord::Pending => BoundedRecord::Pending,
+                },
+                Err(error) => {
+                    if let Some(tap) = &drain.trace_tap {
+                        tap.observe_failure();
+                    }
+                    return Ok((map_bounded_error(error)?, false));
+                }
+            };
+        match record {
+            BoundedRecord::Item(record) => {
+                if let Some(left) = left.as_mut() {
+                    *left -= 1;
+                }
+                match record {
+                    Some(record) => {
+                        if let Some(tap) = &drain.trace_tap {
+                            tap.observe_call(&record.base.event);
                         }
                         if f(record).is_break() {
                             return Ok((false, true));

@@ -2801,6 +2801,262 @@ mod tests {
     fn capture(io: &ScriptIo) -> SemanticCapture {
         SemanticCapture::in_domain(io.domain, TickLimits::default()).unwrap()
     }
+
+    /// H7 slice D activation: mixed ordinary/lifecycle/object records flow
+    /// through the session's single retained cursor; a delayed object CALL
+    /// keeps its exact validated payload and original position once; a
+    /// no-call tick resolves it; malformed suffix and partial/extra-length
+    /// twins disclose loss without positive object facts; bare Event
+    /// consumers are unchanged; stop drains without duplicating the call.
+    #[test]
+    fn object_producer_full_record_mixed_cursor_and_pending() {
+        use crate::discovery::caller_registry::instance_input::CallEvidence;
+        use crate::events::{
+            EventDrain, ScriptedRecords, decode, poll_object_records_to_position, record_bytes,
+        };
+        use p11scope_ebpf_common::object_wire::{
+            OBJECT_ACTION_CREATE, OBJECT_LAYOUT_LP64, ObjectAttributeListWire,
+            ObjectAttributeWire, ObjectCallWire, publish_object_descriptors,
+        };
+
+        let descriptors = publish_object_descriptors();
+        let function = crate::kinds::function_id("C_CreateObject").expect("Create ordinal");
+        assert_eq!(function, 20);
+        let index = u32::from(function) + 1;
+        assert_eq!(descriptors[index as usize].action, OBJECT_ACTION_CREATE);
+
+        // One exact validated Create tail: observed result handle plus a
+        // classified request cell, an inspected request list and empty
+        // remainder.
+        let tail = ObjectCallWire {
+            version: 1,
+            bytes: 240,
+            descriptor_index: index,
+            flags: 0,
+            layout: OBJECT_LAYOUT_LP64,
+            action: OBJECT_ACTION_CREATE,
+            entry_derive: 0,
+            reserved0: 0,
+            input_handles: [0, 0],
+            result_handles: [0xA11CE, 0],
+            find_handles: [0; 8],
+            input_status: [0, 0],
+            result_status: [1, 0],
+            find_status: [0; 8],
+            find_len: 0,
+            find_flags: 0,
+            find_valid: 0,
+            reserved1: 0,
+            requested: [
+                ObjectAttributeListWire {
+                    cells: [
+                        ObjectAttributeWire {
+                            kind: 1,
+                            status: 1,
+                            value: 3,
+                        },
+                        ObjectAttributeWire::default(),
+                        ObjectAttributeWire::default(),
+                        ObjectAttributeWire::default(),
+                        ObjectAttributeWire::default(),
+                        ObjectAttributeWire::default(),
+                        ObjectAttributeWire::default(),
+                        ObjectAttributeWire::default(),
+                    ],
+                    inspected: 1,
+                    flags: 1,
+                    reserved: 0,
+                },
+                ObjectAttributeListWire::default(),
+            ],
+            result_attributes: ObjectAttributeListWire::default(),
+            reserved2: 0,
+        };
+        assert_eq!(std::mem::size_of::<ObjectCallWire>(), 240);
+        let tail_bytes: [u8; 240] = unsafe { std::mem::transmute(tail) };
+        assert!(
+            p11scope_ebpf_common::object_wire::validate_object_tail(
+                &tail_bytes,
+                &descriptors[index as usize]
+            ),
+            "the scripted tail must validate against its frozen row"
+        );
+
+        // Base records reuse the exact routing fixtures; the lifecycle
+        // record differs only in its non-CALL type.
+        let domain = NativeDomainId::mint();
+        let mut io = ScriptIo::new(domain);
+        let mut capture = capture(&io);
+        io.call(1, 0);
+        io.call(1, 0);
+        io.call(1, 0);
+        let ordinary = io.records.pop_front().expect("ordinary base").base;
+        let object_base = io.records.pop_front().expect("object base").base;
+        let mut lifecycle = io.records.pop_front().expect("lifecycle base").base;
+        lifecycle.event.event_type = p11scope_ebpf_common::event_type::FORK;
+
+        // The single cursor delivers alternating 368/608-byte records in
+        // order with no second drain: ordinary, lifecycle, object.
+        let mut object_record = record_bytes(&object_base);
+        object_record.extend_from_slice(&tail_bytes);
+        assert_eq!(object_record.len(), 368 + 240);
+        let script = vec![
+            record_bytes(&ordinary),
+            record_bytes(&lifecycle),
+            object_record,
+        ];
+        let mut drain = EventDrain::over(ScriptedRecords::records(script, 3));
+        let mut decoded = Vec::new();
+        assert!(
+            !drain.poll_object_records(None, &descriptors, |record| {
+                decoded.push(record);
+                ControlFlow::Continue(())
+            }),
+            "the scripted source ends after its three records"
+        );
+        assert_eq!(decoded.len(), 3);
+        assert!(decoded[0].object.is_none());
+        assert!(decoded[1].object.is_none());
+        let carried = decoded[2].object.as_ref().expect("validated object tail");
+        assert_eq!(carried.tail_bytes(), &tail_bytes);
+        assert_eq!(carried.descriptor_index(), index);
+        assert_eq!(drain.malformed(), 0);
+
+        // Malformed suffix (valid prefix, corrupt tail) and
+        // partial/extra-length twins disclose loss; nothing decodes.
+        let mut bad_suffix = record_bytes(&object_base);
+        let mut bad_tail = tail_bytes;
+        bad_tail[0] = 2;
+        bad_suffix.extend_from_slice(&bad_tail);
+        let mut twins = vec![
+            bad_suffix,
+            vec![9u8; 367],
+            vec![9u8; 369],
+            vec![9u8; 607],
+            vec![9u8; 609],
+        ];
+        // A truncated valid object record is partial, not a prefix decode.
+        twins.push(record_bytes(&object_base)[..367].to_vec());
+        let mut spoiled = EventDrain::over(ScriptedRecords::records(twins, 6));
+        let mut spoiled_count = 0;
+        assert!(
+            !spoiled.poll_object_records(None, &descriptors, |_| {
+                spoiled_count += 1;
+                ControlFlow::Continue(())
+            }),
+            "the spoiled script ends"
+        );
+        assert_eq!(spoiled_count, 0);
+        assert_eq!(spoiled.malformed(), 6);
+
+        // Bare Event consumers are unchanged: 368 decodes, every other
+        // selected form refuses without a tail read.
+        assert!(decode(&record_bytes(&ordinary)).is_some());
+        let mut full = record_bytes(&object_base);
+        full.extend_from_slice(&tail_bytes);
+        assert!(decode(&full).is_none());
+        assert!(decode(&vec![9u8; 607]).is_none());
+        assert!(decode(&vec![9u8; 609]).is_none());
+
+        // The delayed object CALL: a failing scan parks it in Pending
+        // with its payload; the no-call tick resolves it exactly once
+        // with its original collection position.
+        io.records.extend(decoded);
+        io.fail_file = Some(0);
+        let parked = capture.tick_with(&mut io).unwrap();
+        assert_eq!(parked.collected_calls, 2);
+        assert_eq!(
+            parked.calls().count(),
+            0,
+            "failing scans park both calls in Pending"
+        );
+        assert!(
+            parked
+                .outcomes()
+                .iter()
+                .any(|item| matches!(item, TickOutcome::Other(_))),
+            "the lifecycle record still reports while calls wait"
+        );
+        assert_eq!(capture.awaiting.len(), 2);
+        io.fail_file = None;
+        let resolved = capture.tick_with(&mut io).unwrap();
+        assert_eq!(resolved.collected_calls, 0, "the no-call tick collects none");
+        let joined: Vec<_> = resolved.calls().collect();
+        assert_eq!(joined.len(), 2, "both parked calls resolve once");
+        let object = joined
+            .iter()
+            .find(|call| call.record().event.event_type == event_type::CALL && call.token() == Some(3))
+            .expect("the object CALL resolves at its original position");
+        assert_eq!(object.token(), Some(3));
+        // A quiet tick emits nothing further: no duplicate delivery.
+        let quiet = capture.tick_with(&mut io).unwrap();
+        assert_eq!(quiet.calls().count(), 0);
+        assert!(capture.awaiting.is_empty());
+
+        // The owned H3 routed call converts move-only with its exact
+        // validated payload; the position is the original cursor order.
+        let owned: Vec<_> = resolved.into_outcomes().into_iter().collect();
+        let mut evidence = None;
+        for outcome in owned {
+            if let TickOutcome::Call(call) = outcome
+                && call.token() == Some(3)
+            {
+                evidence = CallEvidence::from_routed(call);
+            }
+        }
+        let evidence = evidence.expect("object CALL converts to evidence");
+        assert_eq!(evidence.token(), 3);
+        assert_eq!(
+            evidence.object_tail().expect("evidence carries the tail").tail_bytes(),
+            &tail_bytes
+        );
+
+        // A malformed collection discloses loss and forbids positives.
+        io.collection_status = CollectionStatus::Malformed;
+        io.call(1, 0);
+        let failed = capture.tick_with(&mut io).unwrap();
+        assert!(
+            failed.calls().all(|call| !matches!(call.route(), Route::Joined(_))),
+            "malformed collection forbids positive routes"
+        );
+
+        // Stop drains once: Stopped is disclosed, nothing is duplicated.
+        let stopped = capture.stop();
+        assert!(
+            stopped.outcomes().iter().any(|item| matches!(
+                item,
+                TickOutcome::Invalidation(value)
+                    if matches!(value.scope(), InvalidationScope::Stopped)
+            )),
+            "stop discloses Stopped"
+        );
+        assert!(capture.awaiting.is_empty());
+
+        // The stop-time bounded cursor delivers the 608-byte form intact.
+        let mut terminal = EventDrain::over(ScriptedRecords::records([full], 1));
+        let mut terminal_decoded = Vec::new();
+        let (post_q, backlog) = poll_object_records_to_position(
+            &mut terminal,
+            usize::MAX,
+            None,
+            &descriptors,
+            |record| {
+                terminal_decoded.push(record);
+                ControlFlow::Continue(())
+            },
+        )
+        .expect("bounded stop drain");
+        assert!(!post_q && !backlog);
+        assert_eq!(terminal_decoded.len(), 1);
+        assert_eq!(
+            terminal_decoded[0]
+                .object
+                .as_ref()
+                .expect("stop drain keeps the tail")
+                .tail_bytes(),
+            &tail_bytes
+        );
+    }
     fn stash_watched() -> RetainedInventoryTarget {
         let pins = crate::discovery::identity::test_fixture::real_scan_pin(
             &std::env::current_exe().unwrap(),

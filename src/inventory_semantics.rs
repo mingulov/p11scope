@@ -1505,11 +1505,27 @@ impl SemanticStopIo for LiveStopIo<'_> {
     fn drain_events_to(&mut self, stop: usize, quantum: usize) -> LaneDrainOutcome {
         let mut records = 0;
         let drained = (|| -> anyhow::Result<(bool, bool)> {
-            let drain = self.session.event_drain()?;
-            crate::events::poll_records_to_position(drain, stop, Some(quantum), |_| {
-                records += 1;
-                std::ops::ControlFlow::Continue(())
-            })
+            let (drain, table) = self.session.event_drain_with_object_table()?;
+            // The stop-time drain counts through the same gate as live
+            // collection: only the attested allowlisted lane decodes
+            // 608-byte records (bare decode stays 368-only, so the plain
+            // stop poll would strand them as malformed here).
+            match table {
+                Some(table) => crate::events::poll_object_records_to_position(
+                    drain,
+                    stop,
+                    Some(quantum),
+                    table,
+                    |_| {
+                        records += 1;
+                        std::ops::ControlFlow::Continue(())
+                    },
+                ),
+                None => crate::events::poll_records_to_position(drain, stop, Some(quantum), |_| {
+                    records += 1;
+                    std::ops::ControlFlow::Continue(())
+                }),
+            }
         })();
         match drained {
             Ok((post_q, backlog)) => LaneDrainOutcome {

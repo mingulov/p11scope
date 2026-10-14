@@ -75,6 +75,25 @@ pub fn descriptor_slot(names: &[String]) -> (SlotSemantics, bool) {
     (DESCRIPTORS[index as usize], ambiguous)
 }
 
+/// Finite alias verdict for the object lane: S1 shapes and object protocols
+/// must both agree, with a named reason otherwise. The production S1 path
+/// (`descriptor_index`) is unchanged; this gates object facts only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasAgreement {
+    Agree,
+    S1Ambiguous,
+    ObjectDisagree,
+}
+
+/// Select one fixed descriptor for one static target, requiring exact S1
+/// agreement (as `descriptor_index`) plus exact object-protocol agreement.
+/// Equal S1 shapes with differing object protocols become count-only with
+/// `ObjectDisagree`; attach-cookie encoding is unchanged.
+pub fn descriptor_index_with_object_agreement(names: &[String]) -> (u32, AliasAgreement) {
+    let _ = names;
+    todo!("H7 slice A: S1 plus object-protocol alias agreement")
+}
+
 fn session(operations: u16, transition: u8) -> SlotSemantics {
     SlotSemantics {
         operations,

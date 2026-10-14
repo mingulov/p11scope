@@ -6,6 +6,7 @@
 
 pub mod inventory_callers;
 pub mod object_policy;
+pub mod object_wire;
 
 pub use pkcs11_module::layout::LinuxLayout;
 
@@ -1549,7 +1550,9 @@ pub struct CallStart {
     pub attr_bools_seen1: u32,
     pub capture: u32,
     pub target_function: u32,
-    pub _pad: u64,
+    /// Finite required-object marker (H7): zero is ordinary, otherwise
+    /// `descriptor_index + 1` (see `object_wire::validate_start_marker`).
+    pub object_required: u64,
     pub image: ImageIdentity,
 }
 
@@ -1966,7 +1969,7 @@ mod tests {
         assert_eq!(offset_of!(CallStart, attr_types), 96);
         assert_eq!(offset_of!(CallStart, attr_types1), 176);
         assert_eq!(offset_of!(CallStart, capture), 256);
-        assert_eq!(offset_of!(CallStart, _pad), 264);
+        assert_eq!(offset_of!(CallStart, object_required), 264);
         assert_eq!(offset_of!(CallStart, image), 272);
         assert_eq!(offset_of!(Event, image), 288);
         assert_eq!(offset_of!(Event, child_image), 304);

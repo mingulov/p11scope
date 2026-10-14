@@ -3206,13 +3206,44 @@ fn object_tail_fill(
     }
     // SAFETY: `tail` is the exclusively owned reserved tail; `side` is a
     // validated live map row whose fields are ours to read.
+    //
+    // Unrolled volatile stores on purpose: any optimizable zeroing
+    // sequence (a loop, or even straight-line stores) lowers to memset
+    // calls, and the kernel floors every subprogram on the call path at
+    // 32 bytes (check_max_stack_depth), so each call level costs budget
+    // this helper does not have. Volatile keeps it leaf-flat.
     unsafe {
         let words = tail.cast::<u64>();
-        let mut i = 0;
-        while i < 30 {
-            words.add(i).write(0);
-            i += 1;
-        }
+        words.add(0).write_volatile(0);
+        words.add(1).write_volatile(0);
+        words.add(2).write_volatile(0);
+        words.add(3).write_volatile(0);
+        words.add(4).write_volatile(0);
+        words.add(5).write_volatile(0);
+        words.add(6).write_volatile(0);
+        words.add(7).write_volatile(0);
+        words.add(8).write_volatile(0);
+        words.add(9).write_volatile(0);
+        words.add(10).write_volatile(0);
+        words.add(11).write_volatile(0);
+        words.add(12).write_volatile(0);
+        words.add(13).write_volatile(0);
+        words.add(14).write_volatile(0);
+        words.add(15).write_volatile(0);
+        words.add(16).write_volatile(0);
+        words.add(17).write_volatile(0);
+        words.add(18).write_volatile(0);
+        words.add(19).write_volatile(0);
+        words.add(20).write_volatile(0);
+        words.add(21).write_volatile(0);
+        words.add(22).write_volatile(0);
+        words.add(23).write_volatile(0);
+        words.add(24).write_volatile(0);
+        words.add(25).write_volatile(0);
+        words.add(26).write_volatile(0);
+        words.add(27).write_volatile(0);
+        words.add(28).write_volatile(0);
+        words.add(29).write_volatile(0);
         core::ptr::addr_of_mut!((*tail).version).write(1);
         core::ptr::addr_of_mut!((*tail).bytes).write(240);
         core::ptr::addr_of_mut!((*tail).descriptor_index).write(descriptor);
@@ -3431,15 +3462,30 @@ fn object_emit_find(
 #[inline(always)]
 unsafe fn zero_find_cells(tail: *mut ObjectCallWire) {
     // SAFETY: the caller holds the exclusively owned reserved tail.
+    //
+    // Unrolled volatile stores like the tail zeroing above: any
+    // optimizable zeroing here lowers to memset calls that cost the
+    // return call chain a 32-byte level each, and this helper's caller
+    // has no budget for it.
     unsafe {
-        let mut i = 0;
-        while i < 8 {
-            core::ptr::addr_of_mut!((*tail).find_handles[i]).write(0);
-            core::ptr::addr_of_mut!((*tail).find_status[i]).write(0);
-            i += 1;
-        }
-        core::ptr::addr_of_mut!((*tail).find_len).write(0);
-        core::ptr::addr_of_mut!((*tail).find_valid).write(0);
+        core::ptr::addr_of_mut!((*tail).find_handles[0]).write_volatile(0);
+        core::ptr::addr_of_mut!((*tail).find_handles[1]).write_volatile(0);
+        core::ptr::addr_of_mut!((*tail).find_handles[2]).write_volatile(0);
+        core::ptr::addr_of_mut!((*tail).find_handles[3]).write_volatile(0);
+        core::ptr::addr_of_mut!((*tail).find_handles[4]).write_volatile(0);
+        core::ptr::addr_of_mut!((*tail).find_handles[5]).write_volatile(0);
+        core::ptr::addr_of_mut!((*tail).find_handles[6]).write_volatile(0);
+        core::ptr::addr_of_mut!((*tail).find_handles[7]).write_volatile(0);
+        core::ptr::addr_of_mut!((*tail).find_status[0]).write_volatile(0);
+        core::ptr::addr_of_mut!((*tail).find_status[1]).write_volatile(0);
+        core::ptr::addr_of_mut!((*tail).find_status[2]).write_volatile(0);
+        core::ptr::addr_of_mut!((*tail).find_status[3]).write_volatile(0);
+        core::ptr::addr_of_mut!((*tail).find_status[4]).write_volatile(0);
+        core::ptr::addr_of_mut!((*tail).find_status[5]).write_volatile(0);
+        core::ptr::addr_of_mut!((*tail).find_status[6]).write_volatile(0);
+        core::ptr::addr_of_mut!((*tail).find_status[7]).write_volatile(0);
+        core::ptr::addr_of_mut!((*tail).find_len).write_volatile(0);
+        core::ptr::addr_of_mut!((*tail).find_valid).write_volatile(0);
     }
 }
 

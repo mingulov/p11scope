@@ -4,8 +4,8 @@
 //! sizes) and proves forbidden fields unread via the read log.
 
 use super::*;
-use crate::object_policy;
-use crate::{ARG_NONE, LinuxLayout};
+use crate::object_policy::{self, ScalarDeriveMechanism};
+use crate::{LinuxLayout, ARG_NONE};
 use core::cell::RefCell;
 
 extern crate std;
@@ -85,14 +85,6 @@ impl FakeTarget {
             log: [(0, 0, 0); LOG_MAX],
             log_len: 0,
         }
-    }
-
-    fn lp64() -> Self {
-        Self::new(8)
-    }
-
-    fn ia32() -> Self {
-        Self::new(4)
     }
 
     fn set_word(&mut self, addr: u64, value: u64) {
@@ -192,6 +184,7 @@ fn word_reader(target: &RefCell<FakeTarget>) -> impl FnMut(u64) -> Result<u64, (
     |addr: u64| target.borrow_mut().read_word(addr)
 }
 
+#[allow(clippy::type_complexity)]
 fn readers(
     target: &RefCell<FakeTarget>,
 ) -> (
@@ -354,7 +347,11 @@ fn object_producer_object_family_matrix() {
             assert_eq!(
                 words[i],
                 if present[i] {
-                    if i == 0 { u64::MAX } else { 0x1_0000_0001 }
+                    if i == 0 {
+                        u64::MAX
+                    } else {
+                        0x1_0000_0001
+                    }
                 } else {
                     0
                 },
@@ -376,12 +373,15 @@ fn object_producer_object_family_matrix() {
             assert_eq!(words[i], 0, "{name} zero[{i}] word");
         }
         // Unreadable arguments cannot join and raise the failure flag.
-        let (verdict, words) =
-            capture_entry_inputs(function, [None, None], LinuxLayout::Lp64);
+        let (verdict, words) = capture_entry_inputs(function, [None, None], LinuxLayout::Lp64);
         let any_present = present[0] || present[1];
         assert_eq!(
             verdict.object_flags,
-            if any_present { ofl::ARG_READ_FAILURE } else { 0 },
+            if any_present {
+                ofl::ARG_READ_FAILURE
+            } else {
+                0
+            },
             "{name} unreadable flags"
         );
         for i in 0..2 {
@@ -415,11 +415,7 @@ fn object_producer_object_family_matrix() {
         assert_eq!(words[0], 0, "{name} ia32 high word");
         assert_eq!(
             verdict.statuses[1],
-            if present[1] {
-                hst::VALUE
-            } else {
-                hst::ABSENT
-            },
+            if present[1] { hst::VALUE } else { hst::ABSENT },
             "{name} ia32 max[{i}]",
             i = 1
         );
@@ -427,16 +423,8 @@ fn object_producer_object_family_matrix() {
     // Import keys are independently optional.
     let import = fid("C_SetOperationState");
     for (args, statuses, words) in [
-        (
-            [Some(0x51), Some(0)],
-            [hst::VALUE, hst::ABSENT],
-            [0x51, 0],
-        ),
-        (
-            [Some(0), Some(0x52)],
-            [hst::ABSENT, hst::VALUE],
-            [0, 0x52],
-        ),
+        ([Some(0x51), Some(0)], [hst::VALUE, hst::ABSENT], [0x51, 0]),
+        ([Some(0), Some(0x52)], [hst::ABSENT, hst::VALUE], [0, 0x52]),
         ([None, Some(0x53)], [hst::UNREADABLE, hst::VALUE], [0, 0x53]),
     ] {
         let (verdict, got_words) = capture_entry_inputs(import, args, LinuxLayout::Lp64);
@@ -449,11 +437,8 @@ fn object_producer_object_family_matrix() {
 
     // (b) Unsupported neighbors and unknown ordinals observe nothing.
     for name in UNSUPPORTED_NAMES {
-        let (verdict, words) = capture_entry_inputs(
-            fid(name),
-            [Some(0x1111), Some(0x2222)],
-            LinuxLayout::Lp64,
-        );
+        let (verdict, words) =
+            capture_entry_inputs(fid(name), [Some(0x1111), Some(0x2222)], LinuxLayout::Lp64);
         assert!(!verdict.supported, "{name}");
         assert_eq!(verdict.statuses, [hst::ABSENT, hst::ABSENT], "{name}");
         assert_eq!(verdict.object_flags, 0, "{name}");
@@ -1046,8 +1031,7 @@ fn object_producer_null_cancel_suppresses_key() {
     for name in INITS {
         let function = fid(name);
         for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
-            let (entry, words) =
-                capture_entry_inputs(function, [Some(KEY), Some(0xBEEF)], layout);
+            let (entry, words) = capture_entry_inputs(function, [Some(KEY), Some(0xBEEF)], layout);
             assert!(entry.supported, "{name}");
             assert_eq!(entry.statuses, [hst::VALUE, hst::ABSENT], "{name}");
             assert_eq!(words, [KEY, 0], "{name}");
@@ -1062,14 +1046,13 @@ fn object_producer_null_cancel_suppresses_key() {
             );
             assert_eq!(cancelled_words, [0, 0], "{name} {layout:?}");
             assert_eq!(
-                cancelled.object_flags, ofl::NULL_MECHANISM_CANCEL,
+                cancelled.object_flags,
+                ofl::NULL_MECHANISM_CANCEL,
                 "{name} {layout:?}"
             );
 
             // Without eligibility or observation the key fact survives.
-            for (eligible, observed) in
-                [(true, false), (false, true), (false, false)]
-            {
+            for (eligible, observed) in [(true, false), (false, true), (false, false)] {
                 let (kept, kept_words) =
                     apply_null_mechanism_cancel(eligible, observed, entry, words);
                 assert_eq!(kept, entry, "{name} {eligible}/{observed}");
@@ -1105,8 +1088,7 @@ fn object_producer_null_cancel_suppresses_key() {
     let (cancelled, _) = apply_null_mechanism_cancel(true, true, entry, words);
     assert_eq!(cancelled.statuses, [hst::INVALID_ZERO, hst::ABSENT]);
     // Cancellation is idempotent and preserves unrelated flags.
-    let (entry, words) =
-        capture_entry_inputs(function, [Some(KEY), None], LinuxLayout::Lp64);
+    let (entry, words) = capture_entry_inputs(function, [Some(KEY), None], LinuxLayout::Lp64);
     let (once, once_words) = apply_null_mechanism_cancel(true, true, entry, words);
     let (twice, twice_words) = apply_null_mechanism_cancel(true, true, once, once_words);
     assert_eq!(twice, once);
@@ -1124,8 +1106,21 @@ const DERIVE_POSITIVES: &[(u64, ScalarDeriveMechanism, u8)] = &[
 /// Successful ignored-`phKey` standards (SSL3/TLS12/WTLS key-material or PRF
 /// results outside `phKey`) plus unknown/unrepresentable mechanisms.
 const DERIVE_IGNORED: &[u64] = &[
-    0x372, 0x3e1, 0x3d3, 0x3d4, 0x3d5, 0, 0x20, 0x22, 0x392, 0x394, 0x104F, 0x1052, 0x8000_0000,
-    u32::MAX as u64, u64::MAX,
+    0x372,
+    0x3e1,
+    0x3d3,
+    0x3d4,
+    0x3d5,
+    0,
+    0x20,
+    0x22,
+    0x392,
+    0x394,
+    0x104F,
+    0x1052,
+    0x8000_0000,
+    u32::MAX as u64,
+    u64::MAX,
 ];
 
 // Mutation caught: any `phKey`/template/no-read bypass of the Derive guard:
@@ -1133,9 +1128,7 @@ const DERIVE_IGNORED: &[u64] = &[
 // re-proven from existing return evidence, with no extra mechanism read.
 #[test]
 fn object_producer_derive_guard_precedes_all_reads() {
-    use capture::{
-        MECHANISM_NONE, MECHANISM_NULL, MECHANISM_UNREADABLE, MECHANISM_VALUE,
-    };
+    use capture::{MECHANISM_NONE, MECHANISM_NULL, MECHANISM_UNREADABLE, MECHANISM_VALUE};
     const MECH: u64 = 0xD000;
     const OUT5: u64 = 0xC400;
     const PHKEY_SENTINEL: u64 = 0xDEAD_BEEF;
@@ -1152,8 +1145,7 @@ fn object_producer_derive_guard_precedes_all_reads() {
             target.borrow_mut().set_word(MECH, *mechanism);
             target.borrow_mut().set_word(MECH + w, 0xCA1A_CAFE);
             target.borrow_mut().set_word(MECH + 2 * w, 0xCA2A_CAFE);
-            let (entry, retained) =
-                capture_derive_entry(MECH, OUT5, layout, word_reader(&target));
+            let (entry, retained) = capture_derive_entry(MECH, OUT5, layout, word_reader(&target));
             assert_eq!(entry, DeriveEntry::Accepted(*expected), "{layout:?}");
             assert_eq!(entry.code(), *code);
             assert_eq!(retained, Some(OUT5));
@@ -1200,8 +1192,7 @@ fn object_producer_derive_guard_precedes_all_reads() {
             let w = layout.word_bytes() as u64;
             let target = fresh(w);
             target.borrow_mut().set_word(MECH, *mechanism);
-            let (entry, retained) =
-                capture_derive_entry(MECH, OUT5, layout, word_reader(&target));
+            let (entry, retained) = capture_derive_entry(MECH, OUT5, layout, word_reader(&target));
             assert_eq!(entry, DeriveEntry::Unavailable, "{mechanism:#x} {layout:?}");
             assert_eq!(retained, None, "{mechanism:#x} {layout:?}");
             assert_log(&target, &[(READ_WORD, MECH, w)]);
@@ -1251,8 +1242,7 @@ fn object_producer_derive_guard_precedes_all_reads() {
                 assert_eq!(retained, None);
                 assert_log(&target, &[(READ_WORD, MECH, w)]);
                 // A matching high-bit return scalar is still not a match.
-                let accepted =
-                    DeriveEntry::Accepted(derive_entry_mechanism(*mechanism).unwrap());
+                let accepted = DeriveEntry::Accepted(derive_entry_mechanism(*mechanism).unwrap());
                 assert!(!authorize_derive_return(
                     accepted,
                     CKR_OK,
@@ -1274,8 +1264,7 @@ fn object_producer_derive_guard_precedes_all_reads() {
 
         let target = fresh(w);
         target.borrow_mut().set_fail(MECH);
-        let (entry, retained) =
-            capture_derive_entry(MECH, OUT5, layout, word_reader(&target));
+        let (entry, retained) = capture_derive_entry(MECH, OUT5, layout, word_reader(&target));
         assert_eq!(entry, DeriveEntry::Unavailable, "unreadable {layout:?}");
         assert_eq!(retained, None);
         assert_log(&target, &[(READ_WORD, MECH, w)]);
@@ -1300,8 +1289,7 @@ fn object_producer_derive_guard_precedes_all_reads() {
     // an unreadable result without a dereference.
     let target = fresh_lp64();
     target.borrow_mut().set_word(MECH, 0x21);
-    let (entry, retained) =
-        capture_derive_entry(MECH, 0, LinuxLayout::Lp64, word_reader(&target));
+    let (entry, retained) = capture_derive_entry(MECH, 0, LinuxLayout::Lp64, word_reader(&target));
     assert!(matches!(entry, DeriveEntry::Accepted(_)));
     assert_eq!(retained, Some(0));
     let target = fresh_lp64();
@@ -1428,9 +1416,7 @@ fn object_producer_find_zero_eight_nine_and_races() {
         let target = fresh(w);
         target.borrow_mut().set_word(COUNT, 8);
         for (i, handle) in HANDLES[..8].iter().enumerate() {
-            target
-                .borrow_mut()
-                .set_word(ARRAY + i as u64 * w, *handle);
+            target.borrow_mut().set_word(ARRAY + i as u64 * w, *handle);
         }
         let (verdict, words) = capture_find_return(
             ARRAY,
@@ -1486,9 +1472,7 @@ fn object_producer_find_zero_eight_nine_and_races() {
         let target = fresh(w);
         target.borrow_mut().set_word(COUNT, 9);
         for (i, handle) in HANDLES.iter().enumerate() {
-            target
-                .borrow_mut()
-                .set_word(ARRAY + i as u64 * w, *handle);
+            target.borrow_mut().set_word(ARRAY + i as u64 * w, *handle);
         }
         let (verdict, words) = capture_find_return(
             ARRAY,
@@ -1530,7 +1514,8 @@ fn object_producer_find_zero_eight_nine_and_races() {
             assert_eq!(words, [0; 8]);
             assert_log(&target, &[(READ_WORD, COUNT, w)]);
         }
-        // A huge count within a huge capacity still fails span validation.
+        // A huge count within a huge capacity still refuses: LP64 fails
+        // span validation, while ia32 rejects the unrepresentable count.
         let target = fresh(w);
         target.borrow_mut().set_word(COUNT, u64::MAX);
         let (verdict, _) = capture_find_return(
@@ -1543,7 +1528,11 @@ fn object_producer_find_zero_eight_nine_and_races() {
             word_reader(&target),
         );
         assert!(!verdict.valid, "huge span {layout:?}");
-        assert_eq!(verdict.flags, ff::INVALID_SPAN, "huge span {layout:?}");
+        let expected = match layout {
+            LinuxLayout::Lp64 => ff::INVALID_SPAN,
+            LinuxLayout::Ilp32 => ff::INVALID_COUNT,
+        };
+        assert_eq!(verdict.flags, expected, "huge span {layout:?}");
         assert_log(&target, &[(READ_WORD, COUNT, w)]);
     }
     // An ia32 count above the 32-bit range is not a count.
@@ -1663,10 +1652,12 @@ fn object_producer_find_zero_eight_nine_and_races() {
         // The count word inside (or at the last byte of) the claimed array.
         for count_ptr in [ARRAY, ARRAY + w, ARRAY + 3 * w - 1] {
             let target = fresh(w);
-            target.borrow_mut().set_word(count_ptr, 3);
             for i in 0..3u64 {
                 target.borrow_mut().set_word(ARRAY + i * w, 0xF0 + i);
             }
+            // Last write wins: the aliased count word reads 3 even where
+            // it shares an address with a claimed element.
+            target.borrow_mut().set_word(count_ptr, 3);
             let (verdict, words) = capture_find_return(
                 ARRAY,
                 8,
@@ -1935,14 +1926,20 @@ fn object_producer_attributes_full_width_and_no_read() {
         attribute_table_span(u64::MAX / 24 + 1, LinuxLayout::Lp64),
         None
     );
-    assert_eq!(validate_target_span(0x1000, 24, LinuxLayout::Lp64), Some(0x1018));
+    assert_eq!(
+        validate_target_span(0x1000, 24, LinuxLayout::Lp64),
+        Some(0x1018)
+    );
     assert_eq!(validate_target_span(0, 0, LinuxLayout::Lp64), Some(0));
     assert_eq!(validate_target_span(0, 1, LinuxLayout::Lp64), None);
     assert_eq!(
         validate_target_span(u64::MAX - 7, 8, LinuxLayout::Lp64),
         Some(u64::MAX)
     );
-    assert_eq!(validate_target_span(u64::MAX - 6, 8, LinuxLayout::Lp64), None);
+    assert_eq!(
+        validate_target_span(u64::MAX - 6, 8, LinuxLayout::Lp64),
+        None
+    );
     assert_eq!(
         validate_target_span(0xFFFF_FFFC, 4, LinuxLayout::Ilp32),
         Some(0x1_0000_0000)
@@ -2074,9 +2071,11 @@ fn object_producer_attributes_full_width_and_no_read() {
         }
     }
     // Scalar zero is a value by status, not by word: class/token/keytype 0.
-    for (selector, kind) in
-        [(SEL_CLASS, ak::CLASS), (SEL_TOKEN, ak::TOKEN), (SEL_KEYTYPE, ak::KEY_TYPE)]
-    {
+    for (selector, kind) in [
+        (SEL_CLASS, ak::CLASS),
+        (SEL_TOKEN, ak::TOKEN),
+        (SEL_KEYTYPE, ak::KEY_TYPE),
+    ] {
         let target = fresh_lp64();
         let w = 8u64;
         let len = if kind == ak::TOKEN { 1 } else { w };
@@ -2135,16 +2134,11 @@ fn object_producer_attributes_full_width_and_no_read() {
                 target.borrow_mut().set_word(0x9000, bad);
             }
             let (mut read_word, mut read_bytes) = readers(&target);
-            let outcome = inspect_request_template(
-                0x5000,
-                1,
-                None,
-                layout,
-                &mut read_word,
-                &mut read_bytes,
-            );
+            let outcome =
+                inspect_request_template(0x5000, 1, None, layout, &mut read_word, &mut read_bytes);
             assert_eq!(
-                outcome.cells[0].status, ast::UNSUPPORTED,
+                outcome.cells[0].status,
+                ast::UNSUPPORTED,
                 "{selector:#x}={bad:#x} {layout:?}"
             );
             assert_eq!(outcome.cells[0].kind, kind);
@@ -2158,17 +2152,19 @@ fn object_producer_attributes_full_width_and_no_read() {
         for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
             let w = layout.word_bytes() as u64;
             let target = fresh(w);
-            prog_attr(&target, 0x5000, 0, w, SEL_ECPARAMS, 0x9000, bytes.len() as u64);
+            prog_attr(
+                &target,
+                0x5000,
+                0,
+                w,
+                SEL_ECPARAMS,
+                0x9000,
+                bytes.len() as u64,
+            );
             target.borrow_mut().set_bytes(0x9000, bytes);
             let (mut read_word, mut read_bytes) = readers(&target);
-            let outcome = inspect_request_template(
-                0x5000,
-                1,
-                None,
-                layout,
-                &mut read_word,
-                &mut read_bytes,
-            );
+            let outcome =
+                inspect_request_template(0x5000, 1, None, layout, &mut read_word, &mut read_bytes);
             assert_eq!(
                 outcome.cells[0],
                 AttrCell {
@@ -2190,11 +2186,13 @@ fn object_producer_attributes_full_width_and_no_read() {
     for len in [7u64, 10] {
         let target = fresh_lp64();
         prog_attr(&target, 0x5000, 0, 8, SEL_ECPARAMS, 0x9000, len);
-        let bytes = if len == 10 { &bad_p256[..] } else { &EC_P384[..] };
+        let bytes: &[u8] = if len == 10 { &bad_p256 } else { EC_P384 };
         let mut mutated = [0u8; 10];
         mutated[..bytes.len()].copy_from_slice(bytes);
         mutated[0] ^= 0x80;
-        target.borrow_mut().set_bytes(0x9000, &mutated[..bytes.len()]);
+        target
+            .borrow_mut()
+            .set_bytes(0x9000, &mutated[..bytes.len()]);
         let (mut read_word, mut read_bytes) = readers(&target);
         let outcome = inspect_request_template(
             0x5000,
@@ -2245,14 +2243,8 @@ fn object_producer_attributes_full_width_and_no_read() {
             let target = fresh(w);
             prog_attr(&target, 0x5000, 0, w, SEL_TOKEN, 0x9000, len);
             let (mut read_word, mut read_bytes) = readers(&target);
-            let outcome = inspect_request_template(
-                0x5000,
-                1,
-                None,
-                layout,
-                &mut read_word,
-                &mut read_bytes,
-            );
+            let outcome =
+                inspect_request_template(0x5000, 1, None, layout, &mut read_word, &mut read_bytes);
             assert_eq!(
                 outcome.cells[0].status,
                 ast::INVALID_LENGTH,
@@ -2271,14 +2263,8 @@ fn object_producer_attributes_full_width_and_no_read() {
             prog_attr(&target, 0x5000, 0, w, selector, 0x9000, w);
             target.borrow_mut().set_word(0x9000, 0x1234);
             let (mut read_word, mut read_bytes) = readers(&target);
-            let outcome = inspect_request_template(
-                0x5000,
-                1,
-                None,
-                layout,
-                &mut read_word,
-                &mut read_bytes,
-            );
+            let outcome =
+                inspect_request_template(0x5000, 1, None, layout, &mut read_word, &mut read_bytes);
             assert_eq!(
                 outcome.cells[0],
                 AttrCell {
@@ -2331,14 +2317,8 @@ fn object_producer_attributes_full_width_and_no_read() {
             prog_attr(&target, 0x5000, 0, w, SEL_CLASS, 0x9000, w);
             target.borrow_mut().set_word(0x9000, 2 | high);
             let (mut read_word, mut read_bytes) = readers(&target);
-            let outcome = inspect_request_template(
-                0x5000,
-                1,
-                None,
-                layout,
-                &mut read_word,
-                &mut read_bytes,
-            );
+            let outcome =
+                inspect_request_template(0x5000, 1, None, layout, &mut read_word, &mut read_bytes);
             assert_eq!(outcome.cells[0].status, ast::UNSUPPORTED, "{high:#x}");
             assert_eq!(target.borrow().log().len(), 7);
 
@@ -2346,14 +2326,8 @@ fn object_producer_attributes_full_width_and_no_read() {
             prog_attr(&target, 0x5000, 0, w, SEL_CLASS, 0x9000, w | high);
             target.borrow_mut().set_word(0x9000, 2);
             let (mut read_word, mut read_bytes) = readers(&target);
-            let outcome = inspect_request_template(
-                0x5000,
-                1,
-                None,
-                layout,
-                &mut read_word,
-                &mut read_bytes,
-            );
+            let outcome =
+                inspect_request_template(0x5000, 1, None, layout, &mut read_word, &mut read_bytes);
             assert_eq!(outcome.cells[0].status, ast::INVALID_LENGTH, "{high:#x}");
             assert_eq!(target.borrow().log().len(), 3, "no value read");
             assert_no_read_of(&target, 0x9000);
@@ -2377,14 +2351,8 @@ fn object_producer_attributes_full_width_and_no_read() {
             prog_attr(&target, 0x5000, 0, w, SEL_MODBITS, 0x9000, len);
             target.borrow_mut().set_word(0x9000, 2048);
             let (mut read_word, mut read_bytes) = readers(&target);
-            let outcome = inspect_request_template(
-                0x5000,
-                1,
-                None,
-                layout,
-                &mut read_word,
-                &mut read_bytes,
-            );
+            let outcome =
+                inspect_request_template(0x5000, 1, None, layout, &mut read_word, &mut read_bytes);
             assert_eq!(
                 outcome.cells[0].status,
                 ast::INVALID_LENGTH,
@@ -2434,7 +2402,16 @@ fn object_producer_attributes_full_width_and_no_read() {
     );
     assert_eq!(outcome.cells[0].status, ast::ALIAS, "value in headers");
     assert_eq!(outcome.object_flags, ofl::ALIAS);
-    assert_no_read_of(&target, 0x5008);
+    // 0x5008 is legitimately read as the header pointer word; the exact
+    // three-read log proves no separate value read happened there.
+    assert_log(
+        &target,
+        &[
+            (READ_WORD, 0x5000, 8),
+            (READ_WORD, 0x5008, 8),
+            (READ_WORD, 0x5010, 8),
+        ],
+    );
 
     let target = fresh_lp64();
     prog_attr(&target, 0x5000, 0, 8, SEL_CLASS, 0x4FF8, 8);
@@ -2502,9 +2479,7 @@ fn object_producer_attributes_full_width_and_no_read() {
         let target = fresh_lp64();
         prog_attr(&target, 0x5000, 0, 8, SEL_CLASS, 0x9000, 8);
         target.borrow_mut().set_word(0x9000, 2);
-        target
-            .borrow_mut()
-            .script_word(index as usize, addr, value);
+        target.borrow_mut().script_word(index as usize, addr, value);
         let (mut read_word, mut read_bytes) = readers(&target);
         let outcome = inspect_request_template(
             0x5000,
@@ -2580,14 +2555,8 @@ fn object_producer_attributes_full_width_and_no_read() {
         for base in [0x5000u64, 0] {
             let target = fresh(w);
             let (mut read_word, mut read_bytes) = readers(&target);
-            let outcome = inspect_request_template(
-                base,
-                0,
-                None,
-                layout,
-                &mut read_word,
-                &mut read_bytes,
-            );
+            let outcome =
+                inspect_request_template(base, 0, None, layout, &mut read_word, &mut read_bytes);
             assert_eq!(outcome.inspected, 0, "empty {base:#x} {layout:?}");
             assert_eq!(outcome.flags, 0);
             assert_log(&target, &[]);
@@ -2631,8 +2600,7 @@ fn object_producer_attributes_full_width_and_no_read() {
 
         let target = fresh(w);
         let (mut read_word, mut read_bytes) = readers(&target);
-        let outcome =
-            inspect_request_template(0, 3, None, layout, &mut read_word, &mut read_bytes);
+        let outcome = inspect_request_template(0, 3, None, layout, &mut read_word, &mut read_bytes);
         assert_eq!(outcome.inspected, 0, "null {layout:?}");
         assert_eq!(outcome.flags, alf::INVALID_SPAN);
         assert_log(&target, &[]);
@@ -2781,8 +2749,13 @@ fn object_producer_attributes_partial_alias_retry() {
     for (base, count) in [(0u64, 3u64), (BASE, u64::MAX)] {
         let target = fresh_lp64();
         let mut state = GetEntryState::default();
-        let verdict =
-            capture_get_entry(base, count, LinuxLayout::Lp64, &mut state, word_reader(&target));
+        let verdict = capture_get_entry(
+            base,
+            count,
+            LinuxLayout::Lp64,
+            &mut state,
+            word_reader(&target),
+        );
         assert_eq!(verdict.inspected, 0);
         assert_eq!(verdict.slot_count, 0);
         assert_eq!(verdict.entry_flags, alf::INVALID_SPAN);
@@ -2867,10 +2840,20 @@ fn object_producer_attributes_partial_alias_retry() {
     assert!(return_accepts_get_results(CKR_ATTRIBUTE_SENSITIVE));
     assert!(return_accepts_get_results(CKR_ATTRIBUTE_TYPE_INVALID));
     assert!(return_accepts_get_results(CKR_BUFFER_TOO_SMALL));
-    for rv in [ERR_FUNCTION_FAILED, ERR_ARGUMENTS_BAD, CKR_PENDING, 0x8000_0000, u64::MAX] {
+    for rv in [
+        ERR_FUNCTION_FAILED,
+        ERR_ARGUMENTS_BAD,
+        CKR_PENDING,
+        0x8000_0000,
+        u64::MAX,
+    ] {
         assert!(!return_accepts_get_results(rv), "rv {rv:#x}");
     }
-    for rv in [CKR_ATTRIBUTE_SENSITIVE, CKR_ATTRIBUTE_TYPE_INVALID, CKR_BUFFER_TOO_SMALL] {
+    for rv in [
+        CKR_ATTRIBUTE_SENSITIVE,
+        CKR_ATTRIBUTE_TYPE_INVALID,
+        CKR_BUFFER_TOO_SMALL,
+    ] {
         let return_target = fresh_lp64();
         prog_attr(&return_target, BASE, 0, 8, SEL_CLASS, 0x9000, 8);
         return_target.borrow_mut().set_word(0x9000, 2);
@@ -2968,7 +2951,15 @@ fn object_producer_attributes_partial_alias_retry() {
         let mut one = GetEntryState::default();
         capture_get_entry(BASE, 1, layout, &mut one, word_reader(&entry_target));
         let return_target = fresh(w);
-        prog_attr(&return_target, BASE, 0, w, SEL_MODBITS, 0x9000, unavailable_len(layout));
+        prog_attr(
+            &return_target,
+            BASE,
+            0,
+            w,
+            SEL_MODBITS,
+            0x9000,
+            unavailable_len(layout),
+        );
         let (mut read_word, mut read_bytes) = readers(&return_target);
         let outcome = capture_get_return(
             &one,
@@ -3216,9 +3207,20 @@ fn object_producer_attributes_partial_alias_retry() {
         &mut read_word,
         &mut read_bytes,
     );
-    assert_eq!(outcome.inspected, 2);
+    // The result list mirrors template slots: the unretained middle slot
+    // stays a zero cell while its neighbors classify.
+    assert_eq!(outcome.inspected, 3);
     assert_eq!(outcome.cells[0].status, ast::VALUE);
-    assert_eq!(outcome.cells[1].status, ast::VALUE);
+    assert_eq!(
+        outcome.cells[1],
+        AttrCell {
+            kind: 0,
+            status: 0,
+            value: 0
+        }
+    );
+    assert_eq!(outcome.cells[2].status, ast::VALUE);
+    assert_eq!(outcome.cells[2].kind, ak::TOKEN);
     for addr in [0x5018u64, 0x5020, 0x5028, 0x9100] {
         assert_no_read_of(&return_target, addr);
     }
@@ -3227,7 +3229,13 @@ fn object_producer_attributes_partial_alias_retry() {
     let entry_target = fresh_lp64();
     prog_attr(&entry_target, BASE, 0, 8, SEL_CLASS, 0x5010, 8);
     let mut headed = GetEntryState::default();
-    capture_get_entry(BASE, 1, LinuxLayout::Lp64, &mut headed, word_reader(&entry_target));
+    capture_get_entry(
+        BASE,
+        1,
+        LinuxLayout::Lp64,
+        &mut headed,
+        word_reader(&entry_target),
+    );
     let return_target = fresh_lp64();
     prog_attr(&return_target, BASE, 0, 8, SEL_CLASS, 0x5010, 8);
     let (mut read_word, mut read_bytes) = readers(&return_target);
@@ -3241,14 +3249,29 @@ fn object_producer_attributes_partial_alias_retry() {
     );
     assert_eq!(outcome.cells[0].status, ast::ALIAS, "value in headers");
     assert_eq!(outcome.object_flags, ofl::ALIAS);
-    assert_no_read_of(&return_target, 0x5010);
+    // 0x5010 is legitimately reread as the header length word; the exact
+    // three-read log proves no separate value read happened there.
+    assert_log(
+        &return_target,
+        &[
+            (READ_WORD, 0x5000, 8),
+            (READ_WORD, 0x5008, 8),
+            (READ_WORD, 0x5010, 8),
+        ],
+    );
 
     let entry_target = fresh_lp64();
     prog_attr(&entry_target, BASE, 0, 8, SEL_CLASS, 0x9000, 8);
     prog_attr(&entry_target, BASE, 1, 8, SEL_CLASS, 0x9004, 8);
     prog_attr(&entry_target, BASE, 2, 8, SEL_CLASS, 0x9010, 8);
     let mut crossed = GetEntryState::default();
-    capture_get_entry(BASE, 3, LinuxLayout::Lp64, &mut crossed, word_reader(&entry_target));
+    capture_get_entry(
+        BASE,
+        3,
+        LinuxLayout::Lp64,
+        &mut crossed,
+        word_reader(&entry_target),
+    );
     let return_target = fresh_lp64();
     for (i, ptr) in [0x9000u64, 0x9004, 0x9010].iter().enumerate() {
         prog_attr(&return_target, BASE, i as u64, 8, SEL_CLASS, *ptr, 8);
@@ -3274,7 +3297,13 @@ fn object_producer_attributes_partial_alias_retry() {
         prog_attr(&entry_target, BASE, 0, 8, SEL_CLASS, 0x9000, 8);
         prog_attr(&entry_target, BASE, 1, 8, SEL_CLASS, 0x9010, 8);
         let mut dup = GetEntryState::default();
-        capture_get_entry(BASE, 2, LinuxLayout::Lp64, &mut dup, word_reader(&entry_target));
+        capture_get_entry(
+            BASE,
+            2,
+            LinuxLayout::Lp64,
+            &mut dup,
+            word_reader(&entry_target),
+        );
         let return_target = fresh_lp64();
         prog_attr(&return_target, BASE, 0, 8, SEL_CLASS, 0x9000, 8);
         prog_attr(&return_target, BASE, 1, 8, SEL_CLASS, 0x9010, 8);
@@ -3301,7 +3330,13 @@ fn object_producer_attributes_partial_alias_retry() {
     prog_attr(&entry_target, BASE, 0, 8, SEL_CLASS, 0x9000, 8);
     prog_attr(&entry_target, BASE, 1, 8, SEL_CLASS, 0x9000, 8);
     let mut shared = GetEntryState::default();
-    capture_get_entry(BASE, 2, LinuxLayout::Lp64, &mut shared, word_reader(&entry_target));
+    capture_get_entry(
+        BASE,
+        2,
+        LinuxLayout::Lp64,
+        &mut shared,
+        word_reader(&entry_target),
+    );
     let return_target = fresh_lp64();
     prog_attr(&return_target, BASE, 0, 8, SEL_CLASS, 0x9000, 8);
     prog_attr(&return_target, BASE, 1, 8, SEL_CLASS, 0x9000, 8);
@@ -3501,7 +3536,11 @@ fn object_producer_attributes_partial_alias_retry() {
         &mut read_word,
         &mut read_bytes,
     );
-    assert_eq!(outcome_a.cells[0].status, ast::VALUE, "adjacent peer window");
+    assert_eq!(
+        outcome_a.cells[0].status,
+        ast::VALUE,
+        "adjacent peer window"
+    );
 
     // Full pair windows stay fixed-bounded: 8+8 headers plus values and
     // rechecks never exceed 80 reads.
@@ -3528,7 +3567,3 @@ fn object_producer_attributes_partial_alias_retry() {
         both.borrow().log().len()
     );
 }
-
-
-
-

@@ -359,10 +359,11 @@ def longest_chain(raws, bodies, relocations, offsets, root):
             total, sub = visit(target, path + (key,))
             if total > best:
                 best, best_path = total, sub
-        # The kernel rounds every subprogram on the path up to 32 bytes
-        # with a 32-byte floor, even a stackless leaf: round_up(max(depth,
-        # 1), 32) per check_max_stack_depth. An empty frame still costs a
-        # level, so the static chain must count it too.
+        # Conservative 32 B floor (>= kernel): round every subprogram on
+        # the path up to 32 bytes with a 32-byte floor, even a stackless
+        # leaf: round_up(max(depth, 1), 32) per check_max_stack_depth. An
+        # empty frame still costs a level, so the static chain counts it
+        # too.
         rounded = ((max(frame(key), 1) + 31) // 32) * 32
         done[key] = (rounded + best, (bodies[key][0],) + best_path)
         return done[key]

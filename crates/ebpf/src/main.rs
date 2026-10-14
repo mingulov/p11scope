@@ -30,12 +30,18 @@ use core::mem::MaybeUninit;
 #[cfg(feature = "inventory-only")]
 use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
 #[cfg(not(feature = "inventory-only"))]
-use p11scope_ebpf_common::object_capture::{capture_derive_entry, handle_status, object_flag};
+use p11scope_ebpf_common::object_capture::{
+    DeriveEntry, authorize_derive_return, capture_derive_entry, find_flag, handle_status,
+    object_flag, spans_overlap, validate_target_span,
+};
+#[cfg(not(feature = "inventory-only"))]
+use p11scope_ebpf_common::object_policy::ScalarDeriveMechanism;
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_wire::{
-    OBJECT_ACTION_DERIVE, OBJECT_ACTION_FIND, OBJECT_ACTION_IMPORT, OBJECT_ACTION_MAX,
-    OBJECT_ACTION_NONE, OBJECT_GUARD_NONE, OBJECT_GUARD_SCALAR_DERIVE, OBJECT_LAYOUT_ILP32,
-    OBJECT_LAYOUT_LP64, ObjectDescriptorWire, ObjectStart, object_result_arg7_address,
+    OBJECT_ACTION_DERIVE, OBJECT_ACTION_FIND, OBJECT_ACTION_GET, OBJECT_ACTION_IMPORT,
+    OBJECT_ACTION_MAX, OBJECT_ACTION_NONE, OBJECT_ATTR_LIST_UNINSPECTED, OBJECT_GUARD_NONE,
+    OBJECT_GUARD_SCALAR_DERIVE, OBJECT_LAYOUT_ILP32, OBJECT_LAYOUT_LP64, ObjectCallWire,
+    ObjectDescriptorWire, ObjectEventRecord, ObjectStart, object_result_arg7_address,
 };
 #[cfg_attr(feature = "inventory-only", allow(unused_imports))]
 use p11scope_ebpf_common::{
@@ -2972,23 +2978,66 @@ fn object_entry_find(
     true
 }
 
-// H7 adapters tail: return-fill reads the first result handle at its
-// retained pointer and advances READY to RETURNING. Find carries its facts
-// in the Find section (slice D) and skips here; families without a first
-// result also skip. The required=1 query already proved ready custody, so
-// only CKR_OK (0) gates the read.
-//
-// Single-result scope is a measured 512-byte chain fit: the two-result
-// alias/duplicate/partial cross-checks (pair second result) need a second
-// level the current return frame cannot spare (see
-// `object_producer_compiled_frames_are_bounded`). Slice D completes the
-// pair path with emission; until then the second slot stays as retained.
+// Per-slot return gates for the unrolled fill below. Always inlined
+// with value semantics: taking `&mut` of the slot scalars would pin
+// them to stack addresses and spill past the 64-byte helper frame.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn slot_gate(arg: u8, action: u8, derive_ok: bool) -> (bool, u8) {
+    if arg == ARG_NONE {
+        (false, handle_status::ABSENT)
+    } else if action == OBJECT_ACTION_DERIVE && !derive_ok {
+        (false, handle_status::PROTOCOL_UNAVAILABLE)
+    } else {
+        (true, handle_status::ABSENT)
+    }
+}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn slot_span(ptr: u64, layout: LinuxLayout) -> (bool, u8) {
+    if ptr == 0 {
+        (false, handle_status::UNREADABLE)
+    } else if target_word_end(ptr, layout).is_none() {
+        (false, handle_status::INVALID_SPAN)
+    } else {
+        (true, handle_status::ABSENT)
+    }
+}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn slot_word(ptr: u64, layout: LinuxLayout) -> (u8, u64) {
+    match read_word(ptr, layout) {
+        Err(()) => (handle_status::UNREADABLE, 0),
+        Ok(0) => (handle_status::INVALID_ZERO, 0),
+        Ok(observed) => {
+            if layout == LinuxLayout::Ilp32 && observed > u64::from(u32::MAX) {
+                (handle_status::INVALID_SPAN, 0)
+            } else {
+                (handle_status::VALUE, observed)
+            }
+        }
+    }
+}
+
+// H7 adapters tail: return-fill reads both result handles at their
+// retained pointers and advances READY to RETURNING, mirroring
+// `capture_return_handles`. Find carries its facts in the Find section
+// (emission reads the retained array base, never a handle) and skips
+// here; families without results keep absent cells. The required=1
+// query already proved ready custody, so only CKR_OK (0) gates reads.
+// Slice D: slot-0 VALUE is pre-cross-check until the pair
+// alias/duplicate/partial rules below recompute both slots from the
+// retained pointers; emission never trusts slot-0 as final.
 #[cfg(not(feature = "inventory-only"))]
 #[inline(never)]
 fn object_fill_return(
     ctx: &RetProbeContext,
     side: Option<&mut ObjectStart>,
     layout: LinuxLayout,
+    mech_status: u32,
+    mech: u64,
 ) -> bool {
     let Some(side) = side else {
         return false;
@@ -3008,51 +3057,107 @@ fn object_fill_return(
     {
         return false;
     }
-    if row.action != OBJECT_ACTION_FIND && row.result_args[0] != ARG_NONE {
-        // Derive additionally requires accepted entry evidence; the full
-        // return-mechanism match stays with slice D emission.
-        let derive_ok = row.action != OBJECT_ACTION_DERIVE || side.derive != 0;
+    if row.action != OBJECT_ACTION_FIND {
+        let rv = normalize_target_word(ctx.ret(), layout);
+        // Derive return authorization is the full S1 match: accepted
+        // entry evidence, CKR_OK, and existing MECHANISM_VALUE return
+        // evidence exactly equal to the entry code. Entry-nonzero alone
+        // never authorizes the phKey read.
+        let derive_entry = match side.derive {
+            1 => DeriveEntry::Accepted(ScalarDeriveMechanism::DhPkcs),
+            2 => DeriveEntry::Accepted(ScalarDeriveMechanism::Sha256),
+            3 => DeriveEntry::Accepted(ScalarDeriveMechanism::Ecdh1),
+            4 => DeriveEntry::Accepted(ScalarDeriveMechanism::Ecdh1Cofactor),
+            _ => DeriveEntry::Unavailable,
+        };
+        let derive_ok = row.action != OBJECT_ACTION_DERIVE
+            || authorize_derive_return(derive_entry, rv, mech_status, mech);
+        // Unrolled two-slot protocol: arrays and loop-carried indices
+        // spill past the 64-byte helper frame, while straight-line
+        // scalars stay in registers. Both retained pointers are
+        // validated before either read; the alias rule consumes them
+        // before the observed words overwrite them below.
         let mut flags = 0u32;
-        let (mut status, mut word) = (handle_status::ABSENT, 0u64);
-        if !derive_ok {
-            status = handle_status::PROTOCOL_UNAVAILABLE;
+        let (gated0, mut status0) = slot_gate(row.result_args[0], row.action, derive_ok);
+        if row.action == OBJECT_ACTION_DERIVE && !derive_ok && row.result_args[0] != ARG_NONE {
             flags |= object_flag::UNAVAILABLE_RESULT;
-        } else {
-            let rv = normalize_target_word(ctx.ret(), layout);
+        }
+        let (gated1, mut status1) = slot_gate(row.result_args[1], row.action, derive_ok);
+        if row.action == OBJECT_ACTION_DERIVE && !derive_ok && row.result_args[1] != ARG_NONE {
+            flags |= object_flag::UNAVAILABLE_RESULT;
+        }
+        let (mut word0, mut word1) = (0u64, 0u64);
+        if gated0 || gated1 {
             if rv != 0 {
-                status = handle_status::PROTOCOL_UNAVAILABLE;
+                if gated0 {
+                    status0 = handle_status::PROTOCOL_UNAVAILABLE;
+                }
+                if gated1 {
+                    status1 = handle_status::PROTOCOL_UNAVAILABLE;
+                }
             } else {
-                // SAFETY: a validated live map row; the pointer is ours.
-                let ptr =
-                    unsafe { core::ptr::addr_of!((*side).result_ptrs[0]).read() };
-                if ptr == 0 {
-                    status = handle_status::UNREADABLE;
-                } else if target_word_end(ptr, layout).is_none() {
-                    status = handle_status::INVALID_SPAN;
+                let ptr0 = side.result_ptrs[0];
+                let ptr1 = side.result_ptrs[1];
+                let mut readable0 = false;
+                let mut readable1 = false;
+                if gated0 {
+                    let (ok, span) = slot_span(ptr0, layout);
+                    readable0 = ok;
+                    if !ok {
+                        status0 = span;
+                    }
+                }
+                if gated1 {
+                    let (ok, span) = slot_span(ptr1, layout);
+                    readable1 = ok;
+                    if !ok {
+                        status1 = span;
+                    }
+                }
+                let w = layout.word_bytes() as u64;
+                if readable0 && readable1 && spans_overlap(ptr0, w, ptr1, w) {
+                    status0 = handle_status::ALIAS;
+                    status1 = handle_status::ALIAS;
+                    flags |= object_flag::ALIAS;
                 } else {
-                    match read_word(ptr, layout) {
-                        Err(()) => status = handle_status::UNREADABLE,
-                        Ok(0) => status = handle_status::INVALID_ZERO,
-                        Ok(observed) => {
-                            if layout == LinuxLayout::Ilp32
-                                && observed > u64::from(u32::MAX)
-                            {
-                                status = handle_status::INVALID_SPAN;
-                            } else {
-                                status = handle_status::VALUE;
-                                word = observed;
-                            }
-                        }
+                    if readable0 {
+                        let (status, word) = slot_word(ptr0, layout);
+                        status0 = status;
+                        word0 = word;
+                    }
+                    if readable1 {
+                        let (status, word) = slot_word(ptr1, layout);
+                        status1 = status;
+                        word1 = word;
+                    }
+                    if status0 == handle_status::VALUE
+                        && status1 == handle_status::VALUE
+                        && word0 == word1
+                    {
+                        status0 = handle_status::DUPLICATE;
+                        status1 = handle_status::DUPLICATE;
+                        word0 = 0;
+                        word1 = 0;
+                        flags |= object_flag::DUPLICATE_RESULT;
+                    }
+                    if gated0
+                        && gated1
+                        && u32::from(status0 == handle_status::VALUE)
+                            + u32::from(status1 == handle_status::VALUE)
+                            == 1
+                    {
+                        flags |= object_flag::PARTIAL_RESULT;
                     }
                 }
             }
         }
         // SAFETY: a validated live map row; these fields are ours. The
-        // retained pointer is overwritten with the observed handle word
-        // (zero for non-value statuses), which slice D emits.
+        // retained pointers are overwritten with the observed handle
+        // words (zero for non-value statuses), which emission reads;
+        // the cross-checks above already consumed the retained pointers.
         unsafe {
-            core::ptr::addr_of_mut!((*side).result_ptrs[0]).write(word);
-            core::ptr::addr_of_mut!((*side).result_statuses[0]).write(status);
+            core::ptr::addr_of_mut!((*side).result_ptrs).write([word0, word1]);
+            core::ptr::addr_of_mut!((*side).result_statuses).write([status0, status1]);
             let old = core::ptr::addr_of!((*side).flags).read();
             core::ptr::addr_of_mut!((*side).flags).write(old | flags as u16);
         }
@@ -3062,6 +3167,280 @@ fn object_fill_return(
         core::ptr::addr_of_mut!((*side).phase).write(3);
     }
     true
+}
+
+// Slice D emission: fill the reserved 240-byte object tail in place
+// from the RETURNING side row. Zeroes the whole tail first (every
+// reserved word, the Find section and the result list stay zero unless
+// their family helper fills them), then copies header, handles and
+// statuses and marks never-inspected request lists honestly. Outlined:
+// the return root has no frame to spare, and this level costs one
+// rounding quantum. False only on custody failure, never on a finite
+// per-field status.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_tail_fill(
+    tail: *mut ObjectCallWire,
+    side: Option<&ObjectStart>,
+    descriptor: u32,
+) -> bool {
+    if tail.is_null() {
+        return false;
+    }
+    let Some(side) = side else {
+        return false;
+    };
+    if side.phase != 3 || side.descriptor_index != descriptor {
+        return false;
+    }
+    let Some(row) = OBJECT_DESCRIPTORS.get(descriptor) else {
+        return false;
+    };
+    if row.function != descriptor.wrapping_sub(1)
+        || row.action == OBJECT_ACTION_NONE
+        || row.action > OBJECT_ACTION_MAX
+        || row.guard == OBJECT_GUARD_NONE
+        || row.guard > OBJECT_GUARD_SCALAR_DERIVE
+    {
+        return false;
+    }
+    // SAFETY: `tail` is the exclusively owned reserved tail; `side` is a
+    // validated live map row whose fields are ours to read.
+    unsafe {
+        let words = tail.cast::<u64>();
+        let mut i = 0;
+        while i < 30 {
+            words.add(i).write(0);
+            i += 1;
+        }
+        core::ptr::addr_of_mut!((*tail).version).write(1);
+        core::ptr::addr_of_mut!((*tail).bytes).write(240);
+        core::ptr::addr_of_mut!((*tail).descriptor_index).write(descriptor);
+        core::ptr::addr_of_mut!((*tail).flags).write(u32::from(side.flags));
+        core::ptr::addr_of_mut!((*tail).layout).write(side.layout);
+        core::ptr::addr_of_mut!((*tail).action).write(row.action);
+        core::ptr::addr_of_mut!((*tail).entry_derive).write(side.derive);
+        core::ptr::addr_of_mut!((*tail).input_handles).write(side.inputs);
+        core::ptr::addr_of_mut!((*tail).input_status).write(side.input_statuses);
+        if row.action == OBJECT_ACTION_FIND {
+            // Precondition (b): Find result_ptrs[0] holds the array base,
+            // never a handle. The single-handle result cell is pinned to
+            // the constant unavailable cell; Find facts live in the Find
+            // section that object_emit_find fills next.
+            core::ptr::addr_of_mut!((*tail).result_handles).write([0, 0]);
+            core::ptr::addr_of_mut!((*tail).result_status)
+                .write([handle_status::PROTOCOL_UNAVAILABLE, handle_status::ABSENT]);
+        } else {
+            core::ptr::addr_of_mut!((*tail).result_handles).write(side.result_ptrs);
+            core::ptr::addr_of_mut!((*tail).result_status).write(side.result_statuses);
+        }
+    }
+    // Requested lists: BPF performs no entry template inspection (no
+    // chain budget for it), so present pairs carry the honest
+    // uninspected marker; absent pairs stay all-zero.
+    let mut p = 0;
+    while p < 2 {
+        let present =
+            row.template_args[2 * p] != ARG_NONE && row.template_args[2 * p + 1] != ARG_NONE;
+        if present {
+            // SAFETY: `tail` is ours; `side` is a validated live map row.
+            unsafe {
+                let dst = core::ptr::addr_of_mut!((*tail).requested[p]);
+                dst.write(side.requested[p]);
+                core::ptr::addr_of_mut!((*dst).flags).write(OBJECT_ATTR_LIST_UNINSPECTED);
+            }
+        }
+        p += 1;
+    }
+    // Get result lists are return-inspected only; slice D runs no Get
+    // protocol in BPF, so a Get tail marks its result list uninspected
+    // rather than claiming an inspected-empty result.
+    if row.action == OBJECT_ACTION_GET {
+        // SAFETY: `tail` is the exclusively owned reserved tail.
+        unsafe {
+            let dst = core::ptr::addr_of_mut!((*tail).result_attributes);
+            core::ptr::addr_of_mut!((*dst).flags).write(OBJECT_ATTR_LIST_UNINSPECTED);
+        }
+    }
+    true
+}
+
+// Slice D emission: stream the bounded Find protocol straight into the
+// reserved tail, mirroring `capture_find_return` without its 8-word
+// stack array. Non-Find families succeed trivially. Every refusal
+// leaves the zeroed section with only its flag byte set; a changed
+// count re-zeroes the streamed cells. Outlined like the tail fill.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_emit_find(
+    tail: *mut ObjectCallWire,
+    side: Option<&ObjectStart>,
+    descriptor: u32,
+    layout: LinuxLayout,
+    rv: u64,
+) -> bool {
+    if tail.is_null() {
+        return false;
+    }
+    let Some(side) = side else {
+        return false;
+    };
+    if side.phase != 3 || side.descriptor_index != descriptor {
+        return false;
+    }
+    let Some(row) = OBJECT_DESCRIPTORS.get(descriptor) else {
+        return false;
+    };
+    if row.function != descriptor.wrapping_sub(1) {
+        return false;
+    }
+    if row.action != OBJECT_ACTION_FIND {
+        return true;
+    }
+    if rv != 0 {
+        return true;
+    }
+    let count_ptr = side.find_count_ptr;
+    if count_ptr == 0 || target_word_end(count_ptr, layout).is_none() {
+        // SAFETY: `tail` is the exclusively owned reserved tail.
+        unsafe {
+            core::ptr::addr_of_mut!((*tail).find_flags).write(find_flag::INVALID_COUNT);
+        }
+        return true;
+    }
+    let count = match read_word(count_ptr, layout) {
+        Ok(count) => count,
+        Err(()) => {
+            // SAFETY: `tail` is the exclusively owned reserved tail.
+            unsafe {
+                core::ptr::addr_of_mut!((*tail).find_flags).write(find_flag::INVALID_COUNT);
+            }
+            return true;
+        }
+    };
+    if layout == LinuxLayout::Ilp32 && count > u64::from(u32::MAX) {
+        // SAFETY: `tail` is the exclusively owned reserved tail.
+        unsafe {
+            core::ptr::addr_of_mut!((*tail).find_flags).write(find_flag::INVALID_COUNT);
+        }
+        return true;
+    }
+    if count > side.find_capacity {
+        // SAFETY: `tail` is the exclusively owned reserved tail.
+        unsafe {
+            core::ptr::addr_of_mut!((*tail).find_flags).write(find_flag::INVALID_COUNT);
+        }
+        return true;
+    }
+    // `count * W` with overflow refusal. A checked 64-bit multiply
+    // lowers to a widening multiply BPF cannot link (`__multi3`), so
+    // shift: the target word is 8 (LP64) or 4 (ILP32) bytes wide.
+    let shift: u32 = match layout {
+        LinuxLayout::Lp64 => 3,
+        LinuxLayout::Ilp32 => 2,
+    };
+    let array_ptr = side.result_ptrs[0];
+    if count > (u64::MAX >> shift) {
+        // SAFETY: `tail` is the exclusively owned reserved tail.
+        unsafe {
+            core::ptr::addr_of_mut!((*tail).find_flags).write(find_flag::INVALID_SPAN);
+        }
+        return true;
+    }
+    let array_len = count << shift;
+    if validate_target_span(array_ptr, array_len, layout).is_none() {
+        // SAFETY: `tail` is the exclusively owned reserved tail.
+        unsafe {
+            core::ptr::addr_of_mut!((*tail).find_flags).write(find_flag::INVALID_SPAN);
+        }
+        return true;
+    }
+    if spans_overlap(array_ptr, array_len, count_ptr, 1u64 << shift) {
+        // SAFETY: `tail` is the exclusively owned reserved tail.
+        unsafe {
+            core::ptr::addr_of_mut!((*tail).find_flags).write(find_flag::COUNT_ALIAS);
+        }
+        return true;
+    }
+    let take = if count > 8 { 8u64 } else { count };
+    let mut flags = 0u8;
+    if count > 8 {
+        flags |= find_flag::TRUNCATED;
+    }
+    let mut i = 0u64;
+    while i < take {
+        let Some(addr) = array_ptr.checked_add(i << shift) else {
+            // SAFETY: `tail` is ours; zero the streamed prefix, keep flags.
+            unsafe {
+                zero_find_cells(tail);
+                core::ptr::addr_of_mut!((*tail).find_flags).write(find_flag::INVALID_SPAN);
+            }
+            return true;
+        };
+        // SAFETY: `tail` is the exclusively owned reserved tail; `i` is
+        // bounded by `take <= 8`.
+        unsafe {
+            match read_word(addr, layout) {
+                Err(()) => {
+                    core::ptr::addr_of_mut!((*tail).find_status[i as usize])
+                        .write(handle_status::UNREADABLE);
+                    flags |= find_flag::UNREADABLE_ELEMENT;
+                }
+                Ok(0) => {
+                    core::ptr::addr_of_mut!((*tail).find_status[i as usize])
+                        .write(handle_status::INVALID_ZERO);
+                }
+                Ok(word) => {
+                    if layout == LinuxLayout::Ilp32 && word > u64::from(u32::MAX) {
+                        core::ptr::addr_of_mut!((*tail).find_status[i as usize])
+                            .write(handle_status::INVALID_SPAN);
+                    } else {
+                        core::ptr::addr_of_mut!((*tail).find_status[i as usize])
+                            .write(handle_status::VALUE);
+                        core::ptr::addr_of_mut!((*tail).find_handles[i as usize]).write(word);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    match read_word(count_ptr, layout) {
+        Ok(stable) if stable == count => (),
+        _ => {
+            // SAFETY: `tail` is ours; the changed count discards the batch.
+            unsafe {
+                zero_find_cells(tail);
+                core::ptr::addr_of_mut!((*tail).find_flags).write(find_flag::CHANGED_COUNT);
+            }
+            return true;
+        }
+    }
+    // SAFETY: `tail` is the exclusively owned reserved tail.
+    unsafe {
+        core::ptr::addr_of_mut!((*tail).find_len).write(take as u8);
+        core::ptr::addr_of_mut!((*tail).find_flags).write(flags);
+        core::ptr::addr_of_mut!((*tail).find_valid).write(1);
+    }
+    true
+}
+
+// Zero the streamed Find cells after a late refusal (changed count or
+// address overflow): the section keeps only its flag byte. Always
+// inlined: it must not cost the return chain another level.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+unsafe fn zero_find_cells(tail: *mut ObjectCallWire) {
+    // SAFETY: the caller holds the exclusively owned reserved tail.
+    unsafe {
+        let mut i = 0;
+        while i < 8 {
+            core::ptr::addr_of_mut!((*tail).find_handles[i]).write(0);
+            core::ptr::addr_of_mut!((*tail).find_status[i]).write(0);
+            i += 1;
+        }
+        core::ptr::addr_of_mut!((*tail).find_len).write(0);
+        core::ptr::addr_of_mut!((*tail).find_valid).write(0);
+    }
 }
 
 // Discard a possibly stale START row on a refusal path; a failed discard
@@ -3513,12 +3892,12 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
             return 0;
         }
     } else {
-        // Object custody terminal drain: query the validated side row,
-        // require attached-descriptor and retained-ABI agreement, then
-        // retire both rows through the ordinary removal (which re-validates
-        // marker, side and binding, scrubs, deletes and settles the lease).
-        // Query plus retire is the drain: a monolithic native drain nests
-        // too deep for return's 512-byte call-chain budget (see
+        // Slice D activation: query the validated side row and require
+        // ready phase, attached-descriptor and retained-ABI agreement.
+        // The drain retire moves after emission below: the side row must
+        // stay alive while the 608-byte record is reserved and filled.
+        // Query plus retire stays the drain (a monolithic native drain
+        // nests too deep for return's 512-byte call-chain budget; see
         // object_producer_compiled_frames_are_bounded). Any failure
         // discards the record: no ring reservation, no facts.
         let layout_code = match layout {
@@ -3526,20 +3905,18 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
             LinuxLayout::Ilp32 => u32::from(OBJECT_LAYOUT_ILP32),
         };
         let descriptor = cookie_descriptor(cookie_of(&ctx));
-        // H7 adapters tail: return-fill after the required=1 ready query,
-        // before the drain. A fill refusal joins the drain verdict below so
-        // the single ordinary removal retires (query plus retire stays the
-        // drain) and the single fault arm fires before any target read.
-        let ready = unsafe { p11_object_side_get(&key, descriptor, 1).as_mut() };
-        let filled = object_fill_return(&ctx, ready, layout);
+        let ready = unsafe { p11_object_side_get(&key, descriptor, 1).as_ref() };
+        if ready.is_none() {
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+            return 0;
+        }
         let side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
-        let agreed = filled
-            && side.is_some_and(|row| {
-                row.descriptor_index == descriptor
-                    && (row.layout == 0 || u32::from(row.layout) == layout_code)
-            });
-        let retired = owned_start_remove(&key, true).is_ok();
-        if !agreed || !retired {
+        let agreed = side.is_some_and(|row| {
+            row.descriptor_index == descriptor
+                && (row.layout == 0 || u32::from(row.layout) == layout_code)
+        });
+        if !agreed {
             unsafe { p11_object_fault() };
             bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
             return 0;
@@ -3577,6 +3954,12 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
     }
 
     if flags & FLAG_POLICY_AGGREGATE != 0 {
+        // Aggregate records nothing: retire the object side row (its
+        // retire moved after emission) before the early return.
+        if start.object_required != 0 && owned_start_remove(&key, true).is_err() {
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+        }
         return 0;
     }
 
@@ -3668,6 +4051,56 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         child_image: ImageIdentity::default(),
         root_affiliation: unsafe { p11_root_current_tag() },
     };
+    if start.object_required != 0 {
+        // Slice D emission: reserve the complete 608-byte record BEFORE
+        // any result/attribute read. Reservation failure performs no new
+        // reads: disclose loss, clean ownership, keep the aggregate
+        // return/RV accounting recorded above, and return.
+        let descriptor = cookie_descriptor(cookie_of(&ctx));
+        let rv = normalize_target_word(ctx.ret(), layout);
+        let Some(mut entry) = EVENTS.reserve::<ObjectEventRecord>(0) else {
+            if owned_start_remove(&key, true).is_err() {
+                unsafe { p11_object_fault() };
+            }
+            bump_evidence(EVIDENCE_RING_LOSS);
+            return 0;
+        };
+        // Populate in place under ownership: return-phase result reads
+        // first (with the S1 return-time mechanism evidence the return
+        // body just captured), then the tail sections, then the base
+        // event and continuity. Any refusal discards: no facts.
+        let raw = entry.as_mut_ptr();
+        let tail = unsafe { core::ptr::addr_of_mut!((*raw).object) };
+        let ready = unsafe { p11_object_side_get(&key, descriptor, 1).as_mut() };
+        let filled = object_fill_return(
+            &ctx,
+            ready,
+            layout,
+            capture_flags & capture::MECHANISM_MASK,
+            mechanism,
+        );
+        // Each emission level re-queries its side row like the entry
+        // adapters: the helpers stay leaf-flat (no nested native query)
+        // so their 64-byte frames fit the 512-byte return chain.
+        let tail_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
+        let tailed = filled && object_tail_fill(tail, tail_side, descriptor);
+        let find_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
+        let emitted = tailed && object_emit_find(tail, find_side, descriptor, layout, rv);
+        unsafe {
+            core::ptr::write(core::ptr::addr_of_mut!((*raw).base.event), ev);
+            let _ = p11_instance_return(&key, core::ptr::addr_of_mut!((*raw).base.continuity));
+        }
+        // Submit the completed ring record only after successful
+        // removal; otherwise discard it and fault.
+        if !emitted || owned_start_remove(&key, true).is_err() {
+            entry.discard(0);
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+            return 0;
+        }
+        entry.submit(0);
+        return 0;
+    }
     match EVENTS.reserve::<EventRecord>(0) {
         Some(mut e) => {
             let raw = e.as_mut_ptr();

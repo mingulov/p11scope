@@ -130,11 +130,15 @@ fn object_producer_missing_side_state_faults_before_return() {
     let object = embedded_object(directory.path());
     let report = run_object_checker(&object, "return-fault");
     println!("{report}");
-    // The terminal drain settles before any new target read: query plus
-    // retire, with agreement and fault all preceding the first userspace
-    // memory read in the return root. A monolithic native drain would nest
-    // one level deeper than the 512-byte call-chain budget allows, so its
-    // name must stay out of the drain.
+    // Missing/mismatched side state permits no new target read and no
+    // successful object tail: the ready/agreement queries fault before
+    // the 608-byte reservation, and emission reads only run between a
+    // successful reservation and the drain retire. Query plus retire
+    // stays the drain: a monolithic native drain would nest one level
+    // deeper than the 512-byte call-chain budget allows, so its name
+    // must stay out of the drain. (Slice D moves the retire after
+    // emission; the pre-read fault arms keep their position ahead of
+    // every target read.)
     let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF return root");
     let returned = source_between(
         &source,
@@ -154,17 +158,14 @@ fn object_producer_missing_side_state_faults_before_return() {
     let abi = returned
         .find("row.layout == 0 || u32::from(row.layout) == layout_code")
         .expect("drain must check retained-ABI agreement");
-    let retire = returned
-        .find("owned_start_remove(&key, true)")
-        .expect("return must retire object custody through the ordinary removal");
     assert_eq!(
         returned.matches("owned_start_remove(&key, true)").count(),
-        2,
-        "ordinary and drain arms each retire through the ordinary removal"
+        4,
+        "ordinary, aggregate, reserve-failure and emission arms each retire"
     );
     let drain_retire = returned
         .rfind("owned_start_remove(&key, true)")
-        .expect("drain arm retires");
+        .expect("emission arm retires");
     assert!(
         query < drain_retire,
         "drain must query before retiring (retire deletes the row)"
@@ -172,41 +173,26 @@ fn object_producer_missing_side_state_faults_before_return() {
     let fault = returned
         .find("p11_object_fault()")
         .expect("failed settle must fault");
-    let first_read = returned
-        .find("read_word(")
-        .expect("return reads target words");
-    for (name, site) in [
-        ("query", query),
-        ("agree", agree),
-        ("abi", abi),
-        ("retire", retire),
-        ("fault", fault),
-    ] {
-        assert!(
-            site < first_read,
-            "{name} must precede the first target read"
-        );
-    }
-    let gate = returned
-        .find("if !agreed || !retired")
-        .expect("drain must gate on agreement and retire");
+    let reserve = returned
+        .find("reserve::<ObjectEventRecord>")
+        .expect("slice D reserves the complete object record");
+    let fill = returned
+        .find("object_fill_return(")
+        .expect("emission fills after the reservation");
     assert!(
-        gate < first_read,
-        "drain gate must precede the first target read"
+        query < reserve && agree < reserve && abi < reserve && fault < reserve,
+        "queries, agreement and fault must precede the object reservation"
     );
     assert!(
-        returned[gate..first_read].contains("p11_object_fault()"),
-        "failed drain must fault before any target read"
+        reserve < fill && fill < drain_retire,
+        "emission reads run between reservation and retire"
     );
-    // Slice B retains custody only: no completed object tail is emitted.
-    assert!(
-        !source.contains("ObjectCallWire {"),
-        "slice B must not construct an object tail"
-    );
+    // Slice D emits the completed tail behind the required-object
+    // marker: ordinary calls keep their single 368-byte reservation.
     assert_eq!(
         returned.matches("EVENTS.reserve").count(),
-        1,
-        "return keeps its single ring reservation"
+        2,
+        "return reserves exactly the ordinary and the object record forms"
     );
 }
 

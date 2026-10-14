@@ -41,15 +41,15 @@ fn embedded_object(directory: &Path) -> PathBuf {
 #[test]
 fn object_producer_emission_recomputes_pair_from_retained_pointers() {
     let source = bpf_source();
-    let returned = source_between(
+    // The outlined return fill reads the second retained result pointer
+    // (pair second slot) instead of trusting slot-0 alone.
+    let fill = source_between(
         &source,
-        "fn p11_return_impl(ctx: RetProbeContext) -> u32 {",
-        "pub extern \"C\" fn p11_link_fork_allowed",
+        "fn object_fill_return(",
+        "fn owned_start_discard(key: &StartKey) {",
     );
-    // The return path reads the second retained result pointer (pair
-    // second slot) instead of trusting slot-0 alone.
     assert!(
-        returned.contains("result_ptrs[1]"),
+        fill.contains("result_ptrs[1]"),
         "return emission must read the retained second result pointer"
     );
     // The pair cross-checks run on the return path: overlap refuses the
@@ -57,7 +57,7 @@ fn object_producer_emission_recomputes_pair_from_retained_pointers() {
     // is explicitly partial.
     for marker in ["ALIAS", "DUPLICATE", "PARTIAL"] {
         assert!(
-            source.contains(marker),
+            fill.contains(marker),
             "return emission must compute the pair {marker} cross-check"
         );
     }
@@ -135,17 +135,26 @@ fn object_producer_derive_return_requires_s1_match() {
     let mechanism_read = returned
         .find("MECHANISM_VALUE")
         .expect("return must read S1 return-time mechanism evidence");
-    let retire = returned
-        .find("owned_start_remove(&key, true)")
-        .expect("drain arm retires");
+    let fill_site = returned
+        .find("object_fill_return(")
+        .expect("emission fills");
     assert!(
-        mechanism_read < retire,
-        "S1 mechanism evidence must precede the object drain retire"
+        mechanism_read < fill_site,
+        "S1 mechanism evidence must precede emission"
     );
-    // The Derive gate compares against the retained entry code; a bare
+    // The outlined Derive gate wires the full S1 match; a bare
     // entry-nonzero check no longer authorizes the result read.
+    let fill = source_between(
+        &source,
+        "fn object_fill_return(",
+        "fn owned_start_discard(key: &StartKey) {",
+    );
     assert!(
-        !returned.contains("side.derive != 0"),
+        fill.contains("authorize_derive_return"),
+        "Derive return must wire the full S1 mechanism match"
+    );
+    assert!(
+        !fill.contains("side.derive != 0"),
         "Derive return must not gate on entry evidence alone"
     );
 }
@@ -195,11 +204,14 @@ fn object_producer_publication_lifts_gate_only_on_attested_lane() {
 #[test]
 fn object_producer_tail_builds_no_model() {
     // Existence: the transport carries the tail end to end.
-    let capture =
-        std::fs::read_to_string("src/semantic_capture.rs").expect("read capture router");
+    let capture = std::fs::read_to_string("src/semantic_capture.rs").expect("read capture router");
     assert!(
-        capture.contains("object: Option<ValidatedObjectCall>"),
-        "RoutedCall must carry the private validated tail"
+        capture.contains("decoded: DecodedEventRecord"),
+        "RoutedCall must carry the decoded envelope with its tail"
+    );
+    assert!(
+        capture.contains("fn into_object_tail(self) -> Option<ValidatedObjectCall>"),
+        "RoutedCall must hand its tail move-only to the sole consumer"
     );
     let input = std::fs::read_to_string("src/discovery/caller_registry/instance_input.rs")
         .expect("read evidence adapter");
@@ -209,7 +221,10 @@ fn object_producer_tail_builds_no_model() {
     );
     // Absence: no model construction in the H7 transport windows.
     for (name, body) in [
-        ("events", std::fs::read_to_string("src/events.rs").expect("read events")),
+        (
+            "events",
+            std::fs::read_to_string("src/events.rs").expect("read events"),
+        ),
         ("capture", capture),
         ("evidence", input),
     ] {
@@ -248,16 +263,27 @@ fn object_producer_tail_builds_no_model() {
 /// Debug/Serialize anywhere on the H7 transport path.
 #[test]
 fn object_producer_tail_has_no_raw_debug_or_serialize() {
-    let wire = std::fs::read_to_string("crates/ebpf-common/src/object_wire.rs")
-        .expect("read object wire");
+    let wire =
+        std::fs::read_to_string("crates/ebpf-common/src/object_wire.rs").expect("read object wire");
     let validated = source_between(
         &wire,
         "pub struct ValidatedObjectCall {",
-        "pub enum StartMarkerVerdict {",
+        "/// Meaning of a START `object_required` marker word against the frozen",
     );
+    // No Debug derive/impl and no Serialize: only the doc comment names
+    // the deliberately absent Debug.
     assert!(
-        !validated.contains("Debug") && !validated.contains("Serialize"),
+        !validated.contains("Serialize")
+            && !validated.contains("Debug for ValidatedObjectCall")
+            && !validated.contains("derive("),
         "ValidatedObjectCall must stay Debug/Serialize-free"
+    );
+    let head = wire
+        .find("pub struct ValidatedObjectCall {")
+        .expect("validated tail struct");
+    assert!(
+        wire[head.saturating_sub(200)..head].contains("#[derive(Clone, Copy)]"),
+        "ValidatedObjectCall derives only Clone and Copy"
     );
     // Existence: the envelopes that must stay redacted.
     for (path, redacted) in [

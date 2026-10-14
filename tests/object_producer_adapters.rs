@@ -66,6 +66,18 @@ fn object_producer_adapters_entry_fill_shape() {
         );
     }
 
+    // The two slice-D emission levels are outlined like the adapters:
+    // one rounding quantum each, never inlined into the hot root frame.
+    for helper in ["fn object_tail_fill", "fn object_emit_find"] {
+        assert!(source.contains(helper), "missing emission helper {helper}");
+        let marker = source.find(helper).expect("emission helper");
+        let window = &source[marker.saturating_sub(400)..marker];
+        assert!(
+            window.contains("#[inline(never)]"),
+            "{helper} must be #[inline(never)]"
+        );
+    }
+
     // Entry: ABI record, then fill, then abandon on refusal.
     let entry = source_between(
         &source,
@@ -93,10 +105,14 @@ fn object_producer_adapters_entry_fill_shape() {
     );
     let _ = (abandon, fault);
 
-    // Slice tail emits nothing.
+    // Slice D lifts the gate on the return path only: entry fills
+    // side storage and never constructs a tail.
     assert!(
-        !source.contains("ObjectCallWire {"),
-        "adapters must not construct an object tail"
+        !entry.contains("ObjectCallWire")
+            && !entry.contains("ObjectEventRecord")
+            && !entry.contains("object_tail_fill")
+            && !entry.contains("object_emit_find"),
+        "entry must not construct an object tail"
     );
 }
 
@@ -108,56 +124,61 @@ fn object_producer_adapters_return_fill_shape() {
         "fn p11_return_impl(ctx: RetProbeContext) -> u32 {",
         "pub extern \"C\" fn p11_link_fork_allowed",
     );
-    // Return: required=1 ready query, then fill, then the drain retire.
+    // Return (slice D): ready/agreement queries, then the complete
+    // 608-byte reservation, then fill, tail and Find emission, then the
+    // drain retire, then submit (discard plus fault on failure). The
+    // reservation precedes every object read; the retire precedes the
+    // submit. (Slice C retired before reading; slice D lifts the gate
+    // and the side row must stay alive through emission.)
     let ready = returned
         .find("p11_object_side_get(&key, descriptor, 1)")
         .expect("return fill must query ready with required=1");
+    let reserve = returned
+        .find("reserve::<ObjectEventRecord>")
+        .expect("emission must reserve the complete object record");
     let fill = returned
         .find("object_fill_return(")
-        .expect("return must fill before draining");
+        .expect("return must fill after reserving");
+    let tail = returned
+        .find("object_tail_fill(")
+        .expect("return must fill the tail after filling results");
+    let find = returned
+        .find("object_emit_find(")
+        .expect("return must emit the Find section after the tail");
     let drain = returned
         .rfind("owned_start_remove(&key, true)")
-        .expect("drain arm retires");
+        .expect("emission arm retires");
     assert!(
-        ready < fill && fill < drain,
-        "return must query ready before filling before draining"
+        ready < reserve && reserve < fill && fill < tail && tail < find && find < drain,
+        "return must query ready, reserve, fill, tail, find, then retire"
     );
-    // The drain still queries (required=0, all sane phases) and gates on
-    // agreement plus retire before any target read in the return body. The
-    // fill itself is outlined, so its reads do not appear here.
+    let submit = returned.find("entry.submit(0)").expect("emission submits");
+    let discard = returned
+        .find("entry.discard(0)")
+        .expect("failed emission discards");
+    assert!(
+        drain < submit && drain < discard,
+        "the drain retire must precede submit and discard"
+    );
+    // The drain still queries (required=0, all sane phases) and the
+    // failed settle still faults; emission reads stay outlined.
     let query = returned
         .find("p11_object_side_get(&key, descriptor, 0)")
         .expect("drain must query the side row before retiring");
+    assert!(
+        query < reserve,
+        "the agreement query must precede the object reservation"
+    );
     let fault = returned
         .find("p11_object_fault()")
         .expect("failed settle must fault");
-    let first_read = returned
-        .find("read_word(")
-        .expect("return reads target words");
-    for (name, site) in [
-        ("ready", ready),
-        ("fill", fill),
-        ("query", query),
-        ("fault", fault),
-    ] {
-        assert!(
-            site < first_read,
-            "{name} must precede the first target read in the return body"
-        );
-    }
-    assert!(
-        drain < first_read,
-        "drain retire must precede the first target read in the return body"
-    );
-    // No emission yet.
-    assert!(
-        !source.contains("ObjectCallWire {"),
-        "adapters must not construct an object tail"
-    );
+    let _ = fault;
+    // Slice D emits behind the required-object marker: exactly the two
+    // record forms are reserved.
     assert_eq!(
         returned.matches("EVENTS.reserve").count(),
-        1,
-        "return keeps its single ring reservation"
+        2,
+        "return reserves exactly the ordinary and the object record forms"
     );
 }
 

@@ -25,6 +25,8 @@
 //! merge rules rather than two that can drift.
 
 use crate::discovery::identity::{PinnedObjectId, PinnedObjects, ReconciledModule};
+use crate::inventory_semantics::SemanticRefusal;
+use crate::kinds::AliasAgreement;
 pub use crate::discovery::scan::Skipped;
 use crate::discovery::scan::{
     ObjectExports, ScannedInterface, ScannedTable, TableEvidenceScore, export_agreement,
@@ -153,6 +155,21 @@ pub struct Slot {
     pub fork_safe: bool,
     /// Every module claiming this exact {object, offset}. Length >= 2 ⇒ ambiguous.
     pub module_ids: Vec<ModuleId>,
+}
+
+/// Per-slot object authority computed from the sealed plan: either the
+/// frozen cookie stays eligible, or the claim is refused with its reason
+/// and fresh alias verdict. Inactive in slice A.
+#[cfg_attr(not(test), allow(dead_code))] // Slices B/C admit markers from this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObjectSlotEligibility {
+    Eligible {
+        descriptor_index: u32,
+    },
+    Refused {
+        reason: SemanticRefusal,
+        agreement: AliasAgreement,
+    },
 }
 
 /// The presented name for a slot no authorized source named: an unlinked
@@ -751,6 +768,17 @@ pub struct AttachDelta {
 }
 
 impl AttachPlan {
+    /// Object authority for one slot of the sealed plan: the slot must be
+    /// current, single-owned, authorized, unambiguous and S1-consistent,
+    /// its names must freshly agree, and its frozen cookie must name a
+    /// canonical non-NONE object protocol whose function remains among the
+    /// slot's names. The frozen cookie is preserved, never reselected.
+    #[cfg_attr(not(test), allow(dead_code))] // Slices B/C admit markers from this.
+    pub(crate) fn object_slot_eligibility(&self, slot: u32) -> ObjectSlotEligibility {
+        let _ = slot;
+        todo!("H7 slice A: plan-scoped object slot eligibility")
+    }
+
     /// Initial subset only: retain descriptor decisions made with every rival
     /// claim still present, then allocate a fresh dense slot space.
     pub(crate) fn attested_subset(
@@ -3486,6 +3514,217 @@ mod tests {
         plan.modules = modules;
         plan.entries_seen = plan.slots.len();
         plan
+    }
+
+    fn object_slot(index: u32, names: &[&str], descriptor_index: u32) -> Slot {
+        Slot {
+            index,
+            descriptor_index,
+            object: PinnedObjectId(7),
+            object_path: "/opt/p11.so".into(),
+            file_offset: 0x1000 + u64::from(index),
+            names: names.iter().map(|name| name.to_string()).collect(),
+            aliased: names.len() >= 2,
+            semantics: crate::kinds::DESCRIPTORS[descriptor_index as usize],
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![ModuleId(0)],
+        }
+    }
+
+    fn object_plan(slots: Vec<Slot>) -> AttachPlan {
+        AttachPlan::from_slots_with_policy(slots, AdmissionPolicy::Detailed).unwrap()
+    }
+
+    #[test]
+    fn object_producer_plan_eligibility_requires_current_authority() {
+        use ObjectSlotEligibility::{Eligible, Refused};
+        let plan = object_plan(vec![object_slot(0, &["C_SignInit"], 43)]);
+        assert_eq!(
+            plan.object_slot_eligibility(0),
+            Eligible { descriptor_index: 43 }
+        );
+        // Missing slots and index/owner bookkeeping refuse without authority.
+        assert!(matches!(
+            plan.object_slot_eligibility(7),
+            Refused {
+                reason: SemanticRefusal::IncompleteProvider,
+                ..
+            }
+        ));
+        let mut moved = object_plan(vec![object_slot(0, &["C_SignInit"], 43)]);
+        moved.slots[0].index = 5;
+        assert!(matches!(
+            moved.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::IncompleteProvider,
+                ..
+            }
+        ));
+        let mut unowned = object_plan(vec![object_slot(0, &["C_SignInit"], 43)]);
+        unowned.slots[0].module_ids.clear();
+        assert!(matches!(
+            unowned.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::IncompleteProvider,
+                ..
+            }
+        ));
+        let mut rival = object_plan(vec![object_slot(0, &["C_SignInit"], 43)]);
+        rival.slots[0].module_ids.push(ModuleId(1));
+        assert!(matches!(
+            rival.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                ..
+            }
+        ));
+        // Attestation and S1 consistency gate before any protocol reading.
+        let mut unattested = object_plan(vec![object_slot(0, &["C_SignInit"], 43)]);
+        unattested.slots[0].semantic_authorized = false;
+        assert!(matches!(
+            unattested.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Unattested,
+                ..
+            }
+        ));
+        let mut vague = object_plan(vec![object_slot(0, &["C_SignInit"], 43)]);
+        vague.slots[0].semantic_ambiguous = true;
+        assert!(matches!(
+            vague.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                ..
+            }
+        ));
+        let mut drifted = object_plan(vec![object_slot(0, &["C_SignInit"], 43)]);
+        drifted.slots[0].semantics = SlotSemantics::COUNT_ONLY;
+        assert!(matches!(
+            drifted.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                ..
+            }
+        ));
+        let mut wild = object_plan(vec![object_slot(0, &["C_SignInit"], 43)]);
+        wild.slots[0].descriptor_index = 105;
+        assert!(matches!(
+            wild.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn object_producer_plan_eligibility_refuses_count_only_none_and_ambiguous() {
+        use ObjectSlotEligibility::{Eligible, Refused};
+        use crate::kinds::AliasAgreement;
+        // Eligible names never upgrade a frozen count-only slot.
+        let plan = object_plan(vec![object_slot(0, &["C_CreateObject"], 0)]);
+        assert!(matches!(
+            plan.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                agreement: AliasAgreement::Agree,
+            }
+        ));
+        // Ordinary functions carry no object protocol.
+        let plan = object_plan(vec![object_slot(0, &["C_Sign"], 44)]);
+        assert_eq!(
+            plan.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                agreement: AliasAgreement::Agree,
+            }
+        );
+        // S1 ambiguity, object disagreement and unknown names refuse.
+        let plan = object_plan(vec![object_slot(0, &["C_SignInit", "C_VerifyInit"], 43)]);
+        assert_eq!(
+            plan.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                agreement: AliasAgreement::S1Ambiguous,
+            }
+        );
+        let plan = object_plan(vec![object_slot(
+            0,
+            &["C_DestroyObject", "C_GetObjectSize"],
+            23,
+        )]);
+        assert_eq!(
+            plan.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                agreement: AliasAgreement::ObjectDisagree,
+            }
+        );
+        let plan = object_plan(vec![object_slot(0, &["C_Nonexistent"], 43)]);
+        assert_eq!(
+            plan.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                agreement: AliasAgreement::S1Ambiguous,
+            }
+        );
+        // Vacuous agreement on empty names grants nothing without a cookie.
+        let plan = object_plan(vec![object_slot(0, &[], 0)]);
+        assert!(matches!(
+            plan.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                agreement: AliasAgreement::Agree,
+            }
+        ));
+        // Control: the agreeing alias pair stays eligible.
+        let plan = object_plan(vec![object_slot(
+            0,
+            &["C_VerifyInit", "C_VerifySignatureInit"],
+            49,
+        )]);
+        assert_eq!(
+            plan.object_slot_eligibility(0),
+            Eligible { descriptor_index: 49 }
+        );
+    }
+
+    #[test]
+    fn object_producer_plan_eligibility_preserves_frozen_cookie_and_rechecks_extensions() {
+        use ObjectSlotEligibility::{Eligible, Refused};
+        use crate::kinds::AliasAgreement;
+        // An agreeing alias added by extension changes the lowest index,
+        // but eligibility keeps the frozen cookie.
+        let mut plan = object_plan(vec![object_slot(0, &["C_VerifySignatureInit"], 95)]);
+        assert_eq!(
+            plan.object_slot_eligibility(0),
+            Eligible { descriptor_index: 95 }
+        );
+        plan.slots[0].names.push("C_VerifyInit".into());
+        assert_eq!(
+            plan.object_slot_eligibility(0),
+            Eligible { descriptor_index: 95 }
+        );
+        // A disagreeing extension is rechecked and refused.
+        plan.slots[0].names.push("C_SignInit".into());
+        assert_eq!(
+            plan.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                agreement: AliasAgreement::S1Ambiguous,
+            }
+        );
+        // A cookie whose function left the names refuses.
+        let plan = object_plan(vec![object_slot(0, &["C_VerifyInit"], 95)]);
+        assert_eq!(
+            plan.object_slot_eligibility(0),
+            Refused {
+                reason: SemanticRefusal::Descriptor,
+                agreement: AliasAgreement::Agree,
+            }
+        );
     }
 
     #[test]

@@ -346,7 +346,7 @@ fn object_producer_start_marker_is_finite_and_required() {
 }
 
 #[test]
-fn object_producer_descriptor_publication_freezes_attested_rows() {
+fn object_producer_descriptor_publication_matches_closed_catalog() {
     let table = publish_object_descriptors();
     assert!(verify_object_descriptors(&table));
     assert_eq!(table[0], none_object_wire());

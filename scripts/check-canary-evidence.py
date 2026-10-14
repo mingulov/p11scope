@@ -76,7 +76,7 @@ EXPECTED_SENTINEL_FAMILIES = {
     "PIN", "KEY", "LABEL", "ID", "PLAINTEXT", "IV", "AAD", "BOOLLONG",
     "USERNAME", "CIPHERTEXT", "SIGNATURE", "WRAPPED", "RANDOM", "OUTPUT",
     "ARG7", "ARG8", "ARG9", "ASYNC", "INTERFACE", "UNTERMINATED",
-    "INTERFACEALIAS",
+    "INTERFACEALIAS", "OBJECT",
 }
 EXPECTED_SOURCE_FAMILIES = {
     "canary_workload.c": EXPECTED_SENTINEL_FAMILIES - {"ASYNC"},
@@ -140,23 +140,40 @@ OBJECT_ELIGIBLE_MARKERS = frozenset({
     60, 61, 62, 63, 64, 74, 79, 84, 89, 96,
 })
 # One EVENTS ring record: the 328-byte Event plus its private 40-byte
-# continuity tail (ebpf-common EventRecord, Task 3 Stage A).
+# continuity tail (ebpf-common EventRecord, Task 3 Stage A). H7 slice D
+# adds the 608-byte object form (the same base plus the private 240-byte
+# validated tail) for marker-bound CALLs on the attested allowlisted lane;
+# every other lane and call keeps the 368-byte form.
 EVENT_SIZE = 368
+OBJECT_EVENT_SIZE = 608
+OBJECT_TAIL_SIZE = 240
 DISCOVERY_RECORD_SIZE = 920
-# Every owned ringbuf, with the exact record length its mmap oracle accepts.
+# Every owned ringbuf, with the exact record lengths its mmap oracle accepts
+# (a tuple: EVENTS mixes both selected forms, each walked at its own stride).
 # Keyed by name only because a record layout is per-map; which maps are
 # ringbufs is decided by `type`, from the one checked-in BPF inventory.
 RING_RECORD_SIZES = {"EVENTS": EVENT_SIZE, "DISCOVERY": DISCOVERY_RECORD_SIZE}
+RING_RECORD_LENGTHS = {
+    "EVENTS": (EVENT_SIZE, OBJECT_EVENT_SIZE),
+    "DISCOVERY": (DISCOVERY_RECORD_SIZE,),
+}
 # What one record costs a ring's byte positions: the 8-byte record header
 # plus the payload rounded up to 8, exactly as `parse_ring_records` walks it.
 # `producer_pos` and `consumer_pos` are byte counters, so every claim about
-# how many records a ring carried is a claim about a multiple of this stride.
+# how many records a ring carried is a claim about the exact per-record
+# strides below; a mixed EVENTS span is never a multiple of one stride.
 RING_RECORD_STRIDES = {
     name: (8 + size + 7) & ~7 for name, size in RING_RECORD_SIZES.items()
 }
+
+
+def ring_stride(length):
+    return (8 + length + 7) & ~7
 START_SNAPSHOT_LANES = {
     "default-safe-start", "feature-safe-start", "feature-unsafe-fault",
+    "object-lp64-blocked", "object-ia32-blocked",
 }
+OBJECT_COMPLETION_LANES = {"object-lp64", "object-ia32"}
 OWNED_METRICS_LANES = {"owned-default-metrics", "owned-feature-metrics"}
 
 
@@ -645,10 +662,10 @@ def decode_start(raw):
 
 
 def decode_event(raw):
-    assert len(raw) == EVENT_SIZE
+    assert len(raw) in (EVENT_SIZE, OBJECT_EVENT_SIZE), len(raw)
     root_affiliation = u64(raw, 320)
     assert root_affiliation in (0, 1), f"invalid root affiliation {root_affiliation}"
-    return {
+    event = {
         "raw": raw, "pid_tgid": u64(raw, 16), "session": u64(raw, 32),
         "mechanism": u64(raw, 48), "p0": u64(raw, 72), "p1": u64(raw, 80),
         "p2": u64(raw, 88), "slot": u32(raw, 104), "target": u32(raw, 108),
@@ -661,6 +678,106 @@ def decode_event(raw):
         "capture": u32(raw, 280), "event_type": u32(raw, 284),
         "root_affiliation": root_affiliation,
     }
+    if len(raw) == OBJECT_EVENT_SIZE:
+        assert event["event_type"] == 0, "extended records are CALL-only"
+        event["object"] = decode_object_tail(raw[EVENT_SIZE:])
+    else:
+        event["object"] = None
+    return event
+
+
+# H7 slice D: descriptor indices with a request template pair (BPF marks
+# them uninspected; an unmarked all-zero first list would be a lie the
+# validator cannot see). Ordinals from the frozen standard catalog.
+OBJECT_TEMPLATE_INDICES = frozenset({21, 22, 59, 60, 63, 62, 25})
+OBJECT_GET_INDEX = 25
+OBJECT_FIND_ACTION = 10
+OBJECT_ACTION_MAX = 12
+
+
+def decode_object_tail(tail):
+    """Structural object-tail validation mirroring `validate_object_tail`.
+
+    Returns the decoded header facts. Descriptor-table agreement (which
+    positions are present) is enforced by BPF emission and userspace
+    decode; the oracle checks every table-free rule plus the canary
+    honesty rule that a template family's first request list is never
+    an unmarked all-zero list.
+    """
+    assert len(tail) == OBJECT_TAIL_SIZE, len(tail)
+    version, size = struct.unpack_from("<HH", tail, 0)
+    index, flags = struct.unpack_from("<II", tail, 4)
+    layout, action, entry_derive = tail[12], tail[13], tail[14]
+    assert (version, size) == (1, OBJECT_TAIL_SIZE), (version, size)
+    assert 1 <= index <= 104, index
+    assert index - 1 in {marker - 2 for marker in OBJECT_ELIGIBLE_MARKERS}, index
+    assert flags & ~0xFF == 0, flags
+    assert layout in (1, 2), layout
+    assert 1 <= action <= OBJECT_ACTION_MAX, action
+    assert entry_derive <= 4, entry_derive
+    assert tail[15] == 0 and tail[126] == 0 and tail[239] == 0, "tail padding"
+
+    def check_word(status, word, where):
+        assert status <= 10, (where, status)
+        if status == 1:
+            assert word != 0, (where, "zero VALUE word")
+        else:
+            assert word == 0, (where, status, word)
+
+    input_handles = struct.unpack_from("<2Q", tail, 16)
+    result_handles = struct.unpack_from("<2Q", tail, 32)
+    find_handles = struct.unpack_from("<8Q", tail, 48)
+    for position in range(2):
+        check_word(tail[112 + position], input_handles[position], f"input{position}")
+        check_word(tail[114 + position], result_handles[position], f"result{position}")
+    find_status = tail[116:124]
+    for position in range(8):
+        check_word(find_status[position], find_handles[position], f"find{position}")
+    find_len, find_flags, find_valid = tail[124], tail[125], tail[127]
+    assert find_len <= 8 and find_flags & ~0x3F == 0 and find_valid <= 1
+    if action == OBJECT_FIND_ACTION:
+        assert not (find_valid == 0 and find_len != 0), "refused Find keeps no length"
+        for position in range(find_len, 8):
+            assert find_status[position] == 0 and find_handles[position] == 0
+    else:
+        assert (find_handles == (0,) * 8 and find_status == bytes(8)
+                and (find_len, find_flags, find_valid) == (0, 0, 0)), "Find section"
+
+    def check_list(blob, where):
+        assert len(blob) == 36, where
+        inspected, list_flags = blob[32], blob[33]
+        assert blob[34] == 0 and blob[35] == 0, (where, "list padding")
+        assert list_flags & ~0x1F == 0, (where, list_flags)
+        if list_flags & 0x10:
+            assert (inspected, list_flags) == (0, 0x10) and blob[:32] == bytes(32), \
+                (where, "dishonest uninspected marker")
+            return
+        assert inspected <= 8, (where, inspected)
+        if inspected:
+            assert list_flags & 1, (where, "present bit")
+        if list_flags & 2:
+            assert inspected == 8, (where, "truncated short list")
+        for position in range(inspected, 8):
+            assert blob[4 * position:4 * position + 3] == bytes(3), (where, position)
+        for position in range(inspected):
+            kind, status = blob[4 * position], blob[4 * position + 1]
+            value = struct.unpack_from("<H", blob, 4 * position + 2)[0]
+            assert kind <= 6 and status <= 10, (where, position, kind, status)
+            if value:
+                assert status == 1, (where, position, value)
+
+    requested = [tail[128:164], tail[164:200]]
+    check_list(requested[0], "requested0")
+    check_list(requested[1], "requested1")
+    result_list = tail[200:236]
+    if action == 11:
+        check_list(result_list, "result")
+    else:
+        assert result_list == bytes(36), "non-Get result list"
+    if index in OBJECT_TEMPLATE_INDICES:
+        assert not (requested[0] == bytes(36)), \
+            "template family with unmarked all-zero first request list"
+    return {"index": index, "action": action, "layout": layout, "flags": flags}
 
 
 def zero_metadata(record):
@@ -779,8 +896,214 @@ def ring_raw_path(prefix, name):
     return Path(f"{prefix}.{name}.raw")
 
 
+# H7 slice D object cell: every named function in workload ledger order
+# with its completion session. Sessions are 0x601 plus the ledger
+# position; the blocked phase parks (Create, Pair, Find, Get) at
+# 0x501..0x504. Ordinals from the frozen standard catalog.
+OBJECT_LEDGER = (
+    (20, "C_CreateObject"), (21, "C_CopyObject"), (22, "C_DestroyObject"),
+    (23, "C_GetObjectSize"), (24, "C_GetAttributeValue"),
+    (25, "C_SetAttributeValue"), (27, "C_FindObjects"),
+    (29, "C_EncryptInit"), (33, "C_DecryptInit"), (40, "C_DigestKey"),
+    (42, "C_SignInit"), (46, "C_SignRecoverInit"), (48, "C_VerifyInit"),
+    (52, "C_VerifyRecoverInit"), (58, "C_GenerateKey"),
+    (59, "C_GenerateKeyPair"), (60, "C_WrapKey"), (61, "C_UnwrapKey"),
+    (62, "C_DeriveKey"), (17, "C_SetOperationState"),
+    (72, "C_MessageEncryptInit"), (77, "C_MessageDecryptInit"),
+    (82, "C_MessageSignInit"), (87, "C_MessageVerifyInit"),
+    (94, "C_VerifySignatureInit"),
+)
+OBJECT_RESULT_PRESETS = {
+    20: (0x0B1E0000 + 20,), 21: (0x0B1E0000 + 21,), 58: (0x0B1E0000 + 58,),
+    59: (0x0B1E0000 + 59, 0x0B1E1000 + 59),
+    62: (0x0B1E0000 + 62,), 61: (0x0B1E0000 + 61,),
+}
+OBJECT_FIND_PRESETS = tuple(0x0B1E2000 + position for position in range(8))
+OBJECT_INPUT_PRESETS = {
+    21: (0x221,), 22: (0x222,), 23: (0x223,), 24: (0x224,), 25: (0x225,),
+    27: (), 29: (0x229,), 33: (0x233,), 40: (0x240,), 42: (0x242,),
+    46: (0x246,), 48: (0x248,), 52: (0x252,), 58: (), 59: (),
+    60: (0x260, 0x261), 61: (0x261,), 62: (0x262,), 17: (0x263, 0x264),
+    72: (0x272,), 77: (0x277,), 82: (0x282,), 87: (0x287,), 94: (0x294,),
+    20: (),
+}
+OBJECT_BLOCKED_WORKERS = (
+    (20, 0x501, 21, 1), (59, 0x502, 60, 4), (27, 0x503, 28, 10), (24, 0x504, 25, 11),
+)
+
+
+def object_ledger_entries(workload_log):
+    """The independent call/result/readiness ledger, exactly 25 for 25."""
+    lines = [line.removeprefix("P11SCOPE_OBJECT ")
+             for line in Path(workload_log).read_text().splitlines()
+             if line.startswith("P11SCOPE_OBJECT ")]
+    assert len(lines) == 25, f"object ledger has {len(lines)} entries, expected 25"
+    entries = [json.loads(line) for line in lines]
+    assert [(entry["index"], entry["name"]) for entry in entries] == list(OBJECT_LEDGER)
+    for position, entry in enumerate(entries):
+        assert set(entry) == {"index", "name", "session", "rv", "ready"}, entry
+        assert (entry["session"], entry["rv"], entry["ready"]) == (0x601 + position, 0, 1), entry
+    return entries
+
+
+def assert_object_completion_records(raw_records, lane, workload_pid):
+    """All 25 named calls completed as validated 608-byte CALL records."""
+    assert len(raw_records) == 25, f"{lane}: {len(raw_records)} records, expected 25"
+    events = [decode_event(raw) for raw in raw_records]
+    assert all(len(event["raw"]) == OBJECT_EVENT_SIZE for event in events), lane
+    assert all(event["pid_tgid"] >> 32 == workload_pid for event in events)
+    assert all(event["event_type"] == 0 for event in events)
+    by_session = {event["session"]: event for event in events}
+    assert set(by_session) == {0x601 + position for position in range(25)}, \
+        {hex(session) for session in by_session}
+    for position, (ordinal, name) in enumerate(OBJECT_LEDGER):
+        tail = by_session[0x601 + position]["object"]
+        assert tail["index"] == ordinal + 1, (name, tail)
+        raw_tail = by_session[0x601 + position]["raw"][EVENT_SIZE:]
+        if ordinal in OBJECT_RESULT_PRESETS:
+            for slot, preset in enumerate(OBJECT_RESULT_PRESETS[ordinal]):
+                status = raw_tail[114 + slot]
+                word = struct.unpack_from("<Q", raw_tail, 32 + 8 * slot)[0]
+                assert (status, word) == (1, preset), (name, slot, status, hex(word))
+        if ordinal == 27:
+            assert raw_tail[124] == 8 and raw_tail[127] == 1, "Find length/valid"
+            for slot, preset in enumerate(OBJECT_FIND_PRESETS):
+                status = raw_tail[116 + slot]
+                word = struct.unpack_from("<Q", raw_tail, 48 + 8 * slot)[0]
+                assert (status, word) == (1, preset), ("C_FindObjects", slot)
+        for slot, preset in enumerate(OBJECT_INPUT_PRESETS[ordinal]):
+            status = raw_tail[112 + slot]
+            word = struct.unpack_from("<Q", raw_tail, 16 + 8 * slot)[0]
+            assert (status, word) == (1, preset), (name, slot, status, hex(word))
+
+
+def decode_object_start(raw):
+    assert len(raw) == 432, len(raw)
+    image = {"task_cookie": u64(raw, 0), "exec_id": u64(raw, 8)}
+    return {
+        "raw": raw, "image": image, "entry_ns": u64(raw, 16),
+        "descriptor_index": struct.unpack_from("<I", raw, 24)[0],
+        "layout": raw[28], "action": raw[29], "derive": raw[30], "phase": raw[31],
+        "inputs": struct.unpack_from("<2Q", raw, 32),
+        "result_ptrs": struct.unpack_from("<2Q", raw, 48),
+        "get_template_base": u64(raw, 64), "inspected_header_end": u64(raw, 72),
+        "find_capacity": u64(raw, 80), "find_count_ptr": u64(raw, 88),
+        "slots": raw[96:352], "requested": [raw[352:388], raw[388:424]],
+        "input_statuses": tuple(raw[424:426]),
+        "result_statuses": tuple(raw[426:428]),
+        "flags": struct.unpack_from("<H", raw, 428)[0],
+        "get_inspected": raw[430], "reserved": raw[431],
+    }
+
+
+def assert_object_starts(completed_manifest, blocked_manifest, completed_log,
+                         blocked_log, completed_pid, blocked_pid, target_bits):
+    """H7 slice D object-cell oracle: ledger, 608-byte records, stopped
+    offsets, sentinel absence and post-return cleanup."""
+    entries = object_ledger_entries(completed_log)
+    assert [entry["index"] for entry in entries] == [index for index, _ in OBJECT_LEDGER]
+    # Completed phase: 25 validated 608-byte records; side storage empty.
+    completed_events = ring_raw_records(completed_manifest, "object-completed")
+    assert_object_completion_records(
+        completed_events, "object-completed", completed_pid)
+    completed_side = manifest_map(completed_manifest, "OBJECT_START")
+    assert read_json(completed_side["file"]) == [], "completed OBJECT_START not empty"
+    # Blocked phase: four parked calls at exact offsets; nothing emitted.
+    blocked_events = ring_raw_records(blocked_manifest, "object-blocked")
+    assert blocked_events == [], f"blocked phase emitted {len(blocked_events)} records"
+    starts = {}
+    for entry in read_json(manifest_map(blocked_manifest, "START")["file"]):
+        key = bpftool_bytes(entry["key"], 16)
+        assert u64(key, 0) >> 32 == blocked_pid
+        starts[u64(key, 0) & 0xFFFFFFFF] = decode_start(
+            bpftool_bytes(entry["value"], CALL_START_SIZE))
+    assert {start["session"] for start in starts.values()} == {0x501, 0x502, 0x503, 0x504}
+    side_rows = []
+    for entry in read_json(manifest_map(blocked_manifest, "OBJECT_START")["file"]):
+        key = bpftool_bytes(entry["key"], 16)
+        assert u64(key, 0) >> 32 == blocked_pid
+        side_rows.append((key, decode_object_start(bpftool_bytes(entry["value"], 432))))
+    lines = [line.removeprefix("P11SCOPE_OBJECT_POINTERS ")
+             for line in Path(blocked_log).read_text().splitlines()
+             if line.startswith("P11SCOPE_OBJECT_POINTERS ")]
+    assert len(lines) == 1, lines
+    assert_object_side_rows(side_rows, starts, json.loads(lines[0]), target_bits)
+    # Sentinel absence on every object surface the oracle reads itself;
+    # the final all-lane scan covers the same artifacts globally.
+    for path in (completed_log, blocked_log):
+        assert sentinel_hits(Path(path).read_bytes()) == set(), path
+
+
+def assert_object_side_rows(side_rows, starts, pointers, target_bits):
+    layout = 1 if target_bits == 64 else 2
+    assert set(pointers) == {"template", "out_create", "out_pub", "out_priv",
+                             "found", "found_count"}, pointers
+    assert all(type(pointer) is int and pointer > 0 for pointer in pointers.values())
+    assert len(set(pointers.values())) == 6, pointers
+    assert len(side_rows) == 4, len(side_rows)
+    expect = {session: (index, action) for _, session, index, action in OBJECT_BLOCKED_WORKERS}
+    seen = set()
+    for key, row in side_rows:
+        tid = u64(key, 0) & 0xFFFFFFFF
+        assert tid in starts, hex(tid)
+        session = starts[tid]["session"]
+        assert session in expect and session not in seen, hex(session)
+        seen.add(session)
+        index, action = expect[session]
+        assert row["descriptor_index"] == index, (hex(session), row["descriptor_index"])
+        assert (row["layout"], row["action"], row["derive"], row["phase"]) == (
+            layout, action, 0, 2), (hex(session), row["layout"], row["action"])
+        assert row["image"]["task_cookie"] != 0 and row["entry_ns"] != 0
+        assert row["flags"] == 0 and row["get_inspected"] == 0 and row["reserved"] == 0
+        assert row["slots"] == bytes(256), hex(session)
+        assert row["requested"] == [bytes(36), bytes(36)], hex(session)
+        assert row["get_template_base"] == 0 and row["inspected_header_end"] == 0
+        # Neighbor and public positions stay zero: the same nonzero word
+        # anywhere here fails the cell, no blanket exemption.
+        if session == 0x501:
+            assert row["inputs"] == (0, 0) and row["input_statuses"] == (0, 0)
+            assert row["result_ptrs"] == (pointers["out_create"], 0)
+            assert row["result_statuses"] == (0, 0)
+            assert row["find_capacity"] == 0 and row["find_count_ptr"] == 0
+        elif session == 0x502:
+            assert row["inputs"] == (0, 0) and row["input_statuses"] == (0, 0)
+            assert row["result_ptrs"] == (pointers["out_pub"], pointers["out_priv"])
+            assert row["result_statuses"] == (0, 0)
+            assert row["find_capacity"] == 0 and row["find_count_ptr"] == 0
+        elif session == 0x503:
+            assert row["inputs"] == (0, 0) and row["input_statuses"] == (0, 0)
+            assert row["result_ptrs"] == (pointers["found"], 0)
+            assert row["result_statuses"] == (0, 0)
+            assert row["find_capacity"] == 8 and row["find_count_ptr"] == pointers["found_count"]
+        else:
+            assert row["inputs"] == (0x224, 0) and row["input_statuses"] == (1, 0)
+            assert row["result_ptrs"] == (0, 0)
+            assert row["result_statuses"] == (0, 0)
+            assert row["find_capacity"] == 0 and row["find_count_ptr"] == 0
+
+
+def ring_raw_records(manifest, lane):
+    """Framed ring payloads from a lane's EVENTS raw surface."""
+    manifest_path = Path(manifest)
+    prefix = manifest_path.parent / manifest_path.name.removeprefix(
+        "mapdump_manifest_").removesuffix(".json")
+    raw = ring_raw_path(str(prefix), "EVENTS").read_bytes()
+    records, offset = [], 0
+    while offset < len(raw):
+        assert len(raw) - offset >= 8, f"{lane}: raw surface ends mid-header"
+        length, flags = struct.unpack_from("<II", raw, offset)
+        assert flags == 0, f"{lane}: raw surface carries flags"
+        assert length in RING_RECORD_LENGTHS["EVENTS"], f"{lane}: size {length}"
+        assert len(raw) - offset - 8 >= length, f"{lane}: raw surface ends mid-record"
+        records.append(bytes(raw[offset + 8:offset + 8 + length]))
+        offset += 8 + length
+    return records
+
+
 def parse_ring_records(data, capacity, consumer_pos, producer_pos,
-                       record_length=EVENT_SIZE):
+                       record_lengths=(EVENT_SIZE,)):
+    if isinstance(record_lengths, int):
+        record_lengths = (record_lengths,)
     assert capacity >= mmap.PAGESIZE and capacity & (capacity - 1) == 0
     assert capacity % mmap.PAGESIZE == 0 and len(data) == 2 * capacity
     assert producer_pos >= consumer_pos, "ring position wrap cannot be proved"
@@ -793,8 +1116,9 @@ def parse_ring_records(data, capacity, consumer_pos, producer_pos,
         assert not header & (1 << 31), "BUSY ring record"
         assert not header & (1 << 30), "discarded ring record"
         length = header & ((1 << 30) - 1)
-        assert length == record_length, f"ring record size {length}, expected {record_length}"
-        record_size = (8 + length + 7) & ~7
+        assert length in record_lengths, \
+            f"ring record size {length}, expected one of {record_lengths}"
+        record_size = ring_stride(length)
         assert position + record_size <= producer_pos
         records.append(bytes(data[offset + 8:offset + 8 + length]))
         position += record_size
@@ -854,7 +1178,7 @@ class RetainedRingReader:
         page = mmap.PAGESIZE
         return parse_ring_records(
             self.producer[page:], self.item["max_entries"], *positions,
-            RING_RECORD_SIZES[self.item["name"]])
+            RING_RECORD_LENGTHS[self.item["name"]])
 
     def _close(self, *, preserve_error=False):
         cleanup_error = None
@@ -899,6 +1223,9 @@ def ring_records(manifest, name="EVENTS"):
 
 
 def assert_event_records(raw_records, lane, workload_pid):
+    if lane in OBJECT_COMPLETION_LANES:
+        assert_object_completion_records(raw_records, lane, workload_pid)
+        return
     expected = 0 if lane == "aggregate-only-metrics" or lane in OWNED_METRICS_LANES else 28
     assert len(raw_records) == expected, f"{lane}: {len(raw_records)} records, expected {expected}"
     if not raw_records:
@@ -949,13 +1276,15 @@ def assert_start_event_records(raw_records, lane):
     )
 
 
-def ring_position_fault(name, positions, record_count):
+def ring_position_fault(name, positions, records):
     """Why a ring's retained positions cannot describe its retained bytes.
 
     `None` when they can. The retained records are exactly the unconsumed tail
-    between the two kernel byte counters, so their count is fixed by the
-    positions and the record stride; anything else means the bytes on disk were
-    not read at the positions filed beside them.
+    between the two kernel byte counters, so the byte span is fixed by the
+    positions and the exact per-record strides; anything else means the bytes
+    on disk were not read at the positions filed beside them. `records` is
+    the retained record list (mixed 368/608-byte EVENTS forms each walk at
+    their own stride) or, for the single-stride DISCOVERY ring, a count.
     """
     if (not isinstance(positions, (list, tuple)) or len(positions) != 2
             or any(type(position) is not int or position < 0 for position in positions)):
@@ -963,10 +1292,16 @@ def ring_position_fault(name, positions, record_count):
     consumer, producer = positions
     if producer < consumer:
         return f"{name} producer {producer} precedes consumer {consumer}"
-    stride = RING_RECORD_STRIDES[name]
-    if producer - consumer != stride * record_count:
-        return (f"{name} retains {record_count} records but positions "
-                f"{consumer}..{producer} span {producer - consumer} bytes")
+    if isinstance(records, int):
+        records = [RING_RECORD_SIZES[name]] * records
+    lengths = [len(record) if isinstance(record, bytes) else record for record in records]
+    if any(length not in RING_RECORD_LENGTHS[name] for length in lengths):
+        return f"{name} retains a record outside {RING_RECORD_LENGTHS[name]}: {lengths}"
+    expected = sum(ring_stride(length) for length in lengths)
+    if producer - consumer != expected:
+        return (f"{name} retains {len(lengths)} records but positions "
+                f"{consumer}..{producer} span {producer - consumer} bytes, "
+                f"expected {expected}")
     return None
 
 
@@ -1002,8 +1337,9 @@ def assert_retained_ring_records(retained, lane, workload_pid, positions):
     for name, expected_size in RING_RECORD_SIZES.items():
         records = retained[name]
         assert isinstance(records, list), (name, type(records).__name__)
-        assert all(type(record) is bytes and len(record) == expected_size for record in records), name
-        fault = ring_position_fault(name, positions[name], len(records))
+        assert all(type(record) is bytes and len(record) in RING_RECORD_LENGTHS[name]
+                   for record in records), name
+        fault = ring_position_fault(name, positions[name], records)
         assert fault is None, f"{lane}: {fault}"
     if lane in START_SNAPSHOT_LANES:
         assert_start_event_records(retained["EVENTS"], lane)
@@ -1160,13 +1496,25 @@ def assert_stopped_snapshot(manifest, prefix):
                 # A drained ring retains nothing, so its bytes alone cannot say
                 # whether it ever carried a record. The positions can, and they
                 # are only evidence while they still account for those bytes.
-                record_size = RING_RECORD_SIZES[name]
-                require(len(raw) % record_size == 0, "ring surface is not whole records")
+                # The surface frames each record with its 8-byte ring header
+                # (length plus zero flags) so mixed 368/608-byte EVENTS forms
+                # split exactly; the kernel padding lives only in the stride.
+                ring_records = []
+                offset = 0
+                while offset < len(raw):
+                    require(len(raw) - offset >= 8, "ring surface ends mid-header")
+                    length, flags = struct.unpack_from("<II", raw, offset)
+                    require(flags == 0, "ring surface carries a busy/discarded record")
+                    require(length in RING_RECORD_LENGTHS[name],
+                            f"ring surface record size {length}")
+                    require(len(raw) - offset - 8 >= length, "ring surface ends mid-record")
+                    ring_records.append(bytes(raw[offset + 8:offset + 8 + length]))
+                    offset += 8 + length
                 positions = surface["positions"]
                 require(isinstance(positions, list) and len(positions) == 2
                         and all(uint(position) for position in positions),
                         "malformed ring positions")
-                require(ring_position_fault(name, positions, len(raw) // record_size) is None,
+                require(ring_position_fault(name, positions, ring_records) is None,
                         "ring positions contradict the retained ring bytes")
             if task_storage:
                 maps.append(metadata)
@@ -1370,6 +1718,10 @@ def main(argv=None):
         return 0
     if work == "--fault-starts":
         assert_fault_starts(argv[1], int(argv[2]))
+        return 0
+    if work == "--object-starts":
+        assert_object_starts(argv[1], argv[2], argv[3], argv[4], int(argv[5]),
+                             int(argv[6]), target_bits)
         return 0
 
 
@@ -2315,10 +2667,13 @@ def main(argv=None):
         lane: assert_exact_owned_map_inventory(work, lane, expected)
         for lane, expected in lanes.items()
     }
+    object_lane = "object-lp64" if target_bits == 64 else "object-ia32"
     additional_lanes = {
         "default-safe-start": SAFE_MAPS,
         "feature-safe-start": FEATURE_MAPS,
         "feature-unsafe-fault": FEATURE_MAPS,
+        object_lane: SAFE_MAPS,
+        f"{object_lane}-blocked": SAFE_MAPS,
     }
     lane_surfaces.update({
         lane: assert_exact_owned_map_inventory(work, lane, expected)
@@ -2328,7 +2683,8 @@ def main(argv=None):
                  "feature-safe-profile", "feature-safe-trace",
                  "aggregate-only-metrics", "owned-default-metrics",
                  "owned-feature-metrics",
-                 "feature-unsafe-profile", "feature-unsafe-trace"]:
+                 "feature-unsafe-profile", "feature-unsafe-trace",
+                 object_lane, f"{object_lane}-blocked"]:
         # The worker only: TAIL_CALLS slot 1 is retired and always reads back
         # empty; the pair continuation lives in PAIR_CALLS.
         assert len(read_json(f"{work}/mapdump_TAIL_CALLS_{lane}.json")) == 1
@@ -2377,6 +2733,7 @@ def main(argv=None):
 
     safe_lanes = (set(lanes) - {"feature-unsafe-profile", "feature-unsafe-trace"}) | {
         "default-safe-start", "feature-safe-start",
+        object_lane, f"{object_lane}-blocked",
     }
     for lane in safe_lanes:
         paths = final_lane_artifacts(

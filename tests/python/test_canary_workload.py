@@ -622,6 +622,7 @@ class CanaryWorkloadTests(unittest.TestCase):
             ("matrix", "canary_workload matrix: all calls CKR_OK"),
             ("blocked", "blocked hostile subset: all calls CKR_OK"),
             ("faults", "blocked template faults: all calls CKR_OK"),
+            ("object", "canary_workload object: all calls CKR_OK"),
         ):
             with self.subTest(mode=mode):
                 result = subprocess.run([str(self.workload), str(self.provider), mode], cwd=ROOT,
@@ -630,6 +631,12 @@ class CanaryWorkloadTests(unittest.TestCase):
                 self.assertIn(marker, result.stdout)
                 if mode == "matrix":
                     self.assertEqual(sum(line.endswith(" -> 0x0") for line in result.stdout.splitlines()), 25)
+                if mode == "object":
+                    ledger = [line for line in result.stdout.splitlines()
+                              if line.startswith("P11SCOPE_OBJECT ")]
+                    self.assertEqual(len(ledger), 25)
+                    self.assertTrue(all('"rv":0' in line and '"ready":1' in line
+                                        for line in ledger))
 
 
 def parse_args(argv):

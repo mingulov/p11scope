@@ -97,6 +97,20 @@ enum {
     I_WrapKeyAuthenticated = 102,
 };
 
+/* H7 slice D object-cell indices: every named object function from the
+ * frozen descriptor inventory (base ordinals plus the 3.0/3.2 message
+ * and verify-signature additions). */
+enum {
+    I_SetOperationState = 17,
+    I_DestroyObject = 22, I_GetObjectSize = 23, I_GetAttributeValue = 24,
+    I_FindObjects = 27, I_DigestKey = 40, I_SignRecoverInit = 46,
+    I_VerifyInit = 48, I_VerifyRecoverInit = 52, I_GenerateKey = 58,
+    I_GenerateKeyPair = 59, I_UnwrapKey = 61, I_DeriveKey = 62,
+    I_MessageEncryptInit = 72, I_MessageDecryptInit = 77,
+    I_MessageSignInit = 82, I_MessageVerifyInit = 87,
+    I_VerifySignatureInit = 94,
+};
+
 typedef CK_RV (*fn10)(CK_ULONG, CK_ULONG, CK_ULONG, CK_ULONG, CK_ULONG,
                       CK_ULONG, CK_ULONG, CK_ULONG, CK_ULONG, CK_ULONG);
 
@@ -121,6 +135,7 @@ static const char SENT_ARG7[]      = "CANARY_ARG7_b2747079a35f10aba729f83ff3285d
 static const char SENT_ARG8[]      = "CANARY_ARG8_1752403b4bb53924b6881d095e3e9198";
 static const char SENT_ARG9[]      = "CANARY_ARG9_8f119353c9e69ce4f2f3b9a4d2aa2fab";
 static const char SENT_INTERFACE[] = "CANARY_INTERFACE_1d81db70d53d4f4687632075b653f921";
+static const char SENT_OBJECT[] = "CANARY_OBJECT_3f7a1c9e5b2d4860a1f4e7c8d6b5a039";
 static const char SENT_UNTERMINATED[] = "CANARY_UNTERMINATED_713527eb86c54ad0bf40cfa7c399d440";
 static const char SENT_INTERFACEALIAS[] =
     "CANARY_INTERFACEALIAS_51bb6d171fdb45de985f29ee36bbab14"
@@ -807,16 +822,165 @@ static int run_faults(void *module, const char *ready, const char *gate)
     return status;
 }
 
+/* H7 slice D object cell: drive every named object function with
+ * sentinel-bearing templates and preset result words, printing the
+ * independent call/result/readiness ledger the object oracle replays
+ * against ring records and stopped side rows. */
+static int object_call(void **functions, unsigned index, const char *name,
+                       CK_ULONG session, const CK_ULONG args[10])
+{
+    CK_RV rv = ((fn10)functions[index])(args[0], args[1], args[2], args[3], args[4],
+                                       args[5], args[6], args[7], args[8], args[9]);
+    printf("P11SCOPE_OBJECT {\"index\":%u,\"name\":\"%s\",\"session\":%lu,"
+           "\"rv\":%lu,\"ready\":%d}\n",
+           index, name, session, rv, rv == CKR_OK);
+    return rv == 0 ? 0 : 1;
+}
+
+#define OBJECT_CALL(index, name, session, ...) do { \
+    failures += object_call(functions, (index), (name), (session), \
+                            (CK_ULONG[10]){__VA_ARGS__}); \
+} while (0)
+
+static int run_object(void *module, const char *ready, const char *gate,
+                      const char *done, const char *finish)
+{
+    void **functions = matrix_functions(module);
+    struct task_identity leader = {0};
+    if (!functions || wait_for_gate("object", ready, gate, done ? 30 : 10,
+                                    done ? &leader : NULL) != 0) return 1;
+    int failures = 0;
+    CK_ULONG session = 0x601;
+    CK_ULONG cls = CKO_SECRET_KEY, keytype = CKK_GENERIC_SECRET;
+    CK_ATTRIBUTE ordinary[] = {
+        {CKA_CLASS, &cls, sizeof(cls)},
+        {CKA_KEY_TYPE, &keytype, sizeof(keytype)},
+        {CKA_VALUE, (void *)SENT_OBJECT, sizeof(SENT_OBJECT) - 1},
+        {CKA_LABEL, (void *)SENT_LABEL, sizeof(SENT_LABEL) - 1},
+    };
+    CK_ULONG ordinary_count = sizeof(ordinary) / sizeof(ordinary[0]);
+    /* Preset result words: the fixture never writes results, so the
+     * emitted VALUE words must equal these ledgered presets exactly. */
+    CK_ULONG out0 = 0x0b1e0000 + 20, out1 = 0x0b1e0000 + 21;
+    CK_ULONG outg = 0x0b1e0000 + 58, outp0 = 0x0b1e0000 + 59, outp1 = 0x0b1e1000 + 59;
+    CK_ULONG outd = 0x0b1e0000 + 62, outu = 0x0b1e0000 + 61;
+    CK_ULONG found[8];
+    for (int i = 0; i < 8; i++) found[i] = 0x0b1e2000u + (CK_ULONG)i;
+    CK_ULONG found_capacity = 8, found_count = 8;
+    CK_ULONG get_size = 0;
+    CK_MECHANISM derive_mech = {0x393, NULL, 0};
+    CK_MECHANISM session_mech = {REGISTERED_MECHANISM_CONTROL, NULL, 0};
+
+    OBJECT_CALL(I_CreateObject, "C_CreateObject", session, session,
+                ptr(ordinary), ordinary_count, ptr(&out0));
+    OBJECT_CALL(I_CopyObject, "C_CopyObject", session + 1, session + 1, 0x221,
+                ptr(ordinary), ordinary_count, ptr(&out1));
+    OBJECT_CALL(I_DestroyObject, "C_DestroyObject", session + 2, session + 2, 0x222);
+    OBJECT_CALL(I_GetObjectSize, "C_GetObjectSize", session + 3, session + 3, 0x223,
+                ptr(&get_size));
+    OBJECT_CALL(I_GetAttributeValue, "C_GetAttributeValue", session + 4, session + 4, 0x224,
+                ptr(ordinary), ordinary_count);
+    OBJECT_CALL(I_SetAttributeValue, "C_SetAttributeValue", session + 5, session + 5, 0x225,
+                ptr(ordinary), ordinary_count);
+    OBJECT_CALL(I_FindObjects, "C_FindObjects", session + 6, session + 6,
+                ptr(found), found_capacity, ptr(&found_count));
+    OBJECT_CALL(I_EncryptInit, "C_EncryptInit", session + 7, session + 7,
+                ptr(&session_mech), 0x229);
+    OBJECT_CALL(I_DecryptInit, "C_DecryptInit", session + 8, session + 8,
+                ptr(&session_mech), 0x233);
+    OBJECT_CALL(I_DigestKey, "C_DigestKey", session + 9, session + 9, 0x240);
+    OBJECT_CALL(I_SignInit, "C_SignInit", session + 10, session + 10,
+                ptr(&session_mech), 0x242);
+    OBJECT_CALL(I_SignRecoverInit, "C_SignRecoverInit", session + 11, session + 11,
+                ptr(&session_mech), 0x246);
+    OBJECT_CALL(I_VerifyInit, "C_VerifyInit", session + 12, session + 12,
+                ptr(&session_mech), 0x248);
+    OBJECT_CALL(I_VerifyRecoverInit, "C_VerifyRecoverInit", session + 13, session + 13,
+                ptr(&session_mech), 0x252);
+    OBJECT_CALL(I_GenerateKey, "C_GenerateKey", session + 14, session + 14,
+                ptr(&session_mech), ptr(ordinary), ordinary_count, ptr(&outg));
+    OBJECT_CALL(I_GenerateKeyPair, "C_GenerateKeyPair", session + 15, session + 15,
+                ptr(&session_mech), ptr(ordinary), ordinary_count,
+                ptr(ordinary), ordinary_count, ptr(&outp0), ptr(&outp1));
+    OBJECT_CALL(I_WrapKey, "C_WrapKey", session + 16, session + 16,
+                ptr(&session_mech), 0x260, 0x261, ptr(SENT_OBJECT), ptr(&get_size));
+    OBJECT_CALL(I_UnwrapKey, "C_UnwrapKey", session + 17, session + 17,
+                ptr(&session_mech), 0x261, ptr(SENT_OBJECT), sizeof(SENT_OBJECT) - 1,
+                ptr(ordinary), ordinary_count, ptr(&outu));
+    OBJECT_CALL(I_DeriveKey, "C_DeriveKey", session + 18, session + 18,
+                ptr(&derive_mech), 0x262, ptr(ordinary), ordinary_count, ptr(&outd));
+    OBJECT_CALL(I_SetOperationState, "C_SetOperationState", session + 19, session + 19,
+                ptr(SENT_OBJECT), sizeof(SENT_OBJECT) - 1, 0x263, 0x264);
+    OBJECT_CALL(I_MessageEncryptInit, "C_MessageEncryptInit", session + 20, session + 20,
+                ptr(&session_mech), 0x272);
+    OBJECT_CALL(I_MessageDecryptInit, "C_MessageDecryptInit", session + 21, session + 21,
+                ptr(&session_mech), 0x277);
+    OBJECT_CALL(I_MessageSignInit, "C_MessageSignInit", session + 22, session + 22,
+                ptr(&session_mech), 0x282);
+    OBJECT_CALL(I_MessageVerifyInit, "C_MessageVerifyInit", session + 23, session + 23,
+                ptr(&session_mech), 0x287);
+    OBJECT_CALL(I_VerifySignatureInit, "C_VerifySignatureInit", session + 24, session + 24,
+                ptr(&session_mech), 0x294);
+
+    printf("canary_workload object: %s\n", failures == 0 ? "all calls CKR_OK" : "FAILED");
+    int output_failed = fflush(stdout) != 0;
+    if (ferror(stdout)) output_failed = 1;
+    if (done) {
+        struct timespec finish_deadline = deadline_after(60);
+        if (failures != 0 || output_failed ||
+            (finish_deadline.tv_sec == 0 && finish_deadline.tv_nsec == 0) ||
+            publish_done(&leader, done) != 0)
+            return 1;
+        return wait_for_finish(finish, &finish_deadline);
+    }
+    if (gate && raise(SIGSTOP) != 0) return 1;
+    return failures == 0 ? 0 : 1;
+}
+
+static int run_object_blocked(void *module, const char *ready, const char *gate)
+{
+    void **functions = matrix_functions(module);
+    if (!functions) return 1;
+    CK_ULONG cls = CKO_SECRET_KEY;
+    CK_ATTRIBUTE ordinary[] = {
+        {CKA_CLASS, &cls, sizeof(cls)},
+        {CKA_VALUE, (void *)SENT_OBJECT, sizeof(SENT_OBJECT) - 1},
+    };
+    CK_ULONG ordinary_count = sizeof(ordinary) / sizeof(ordinary[0]);
+    CK_ULONG out_create = 0, out_pub = 0, out_priv = 0;
+    CK_ULONG found[8] = {0};
+    CK_ULONG found_count = 0;
+    struct concurrent_call calls[] = {
+        {.function = (fn10)functions[I_CreateObject],
+         .args = {0x501, ptr(ordinary), ordinary_count, ptr(&out_create)}},
+        {.function = (fn10)functions[I_GenerateKeyPair],
+         .args = {0x502, 0, ptr(ordinary), ordinary_count,
+                  ptr(ordinary), ordinary_count, ptr(&out_pub), ptr(&out_priv)}},
+        {.function = (fn10)functions[I_FindObjects],
+         .args = {0x503, ptr(found), 8, ptr(&found_count)}},
+        {.function = (fn10)functions[I_GetAttributeValue],
+         .args = {0x504, 0x224, ptr(ordinary), ordinary_count}},
+    };
+    printf("P11SCOPE_OBJECT_POINTERS {\"template\":%lu,\"out_create\":%lu,"
+           "\"out_pub\":%lu,\"out_priv\":%lu,\"found\":%lu,\"found_count\":%lu}\n",
+           ptr(ordinary), ptr(&out_create), ptr(&out_pub), ptr(&out_priv),
+           ptr(found), ptr(&found_count));
+    fflush(stdout);
+    return run_concurrent(calls, sizeof(calls) / sizeof(calls[0]), "blocked object subset",
+                          "object-blocked", ready, gate);
+}
+
 #undef MATRIX_CALL
+#undef OBJECT_CALL
 
 int main(int argc, char **argv)
 {
     if (argc != 3 && argc != 5 && argc != 7) {
-        fprintf(stderr, "usage: %s /path/to/fixture.so matrix|blocked|faults [READY GO [DONE FINISH]]\n", argv[0]);
+        fprintf(stderr, "usage: %s /path/to/fixture.so matrix|blocked|faults|object|object-blocked [READY GO [DONE FINISH]]\n", argv[0]);
         return 2;
     }
-    if (argc == 7 && strcmp(argv[2], "matrix") != 0) {
-        fprintf(stderr, "the completed barrier is supported only for matrix mode\n");
+    if (argc == 7 && strcmp(argv[2], "matrix") != 0 && strcmp(argv[2], "object") != 0) {
+        fprintf(stderr, "the completed barrier is supported only for matrix and object modes\n");
         return 2;
     }
     const char *labels[] = {"READY", "GO", "DONE", "FINISH"};
@@ -843,6 +1007,13 @@ int main(int argc, char **argv)
         return run_matrix(h, argv[3], argv[4], argv[5], argv[6]);
     if (strcmp(argv[2], "blocked") == 0) return run_blocked(h, ready, gate);
     if (strcmp(argv[2], "faults") == 0) return run_faults(h, ready, gate);
-    fprintf(stderr, "usage: %s /path/to/fixture.so matrix|blocked|faults [READY GO [DONE FINISH]]\n", argv[0]);
+    if (strcmp(argv[2], "object") == 0 && argc == 3)
+        return run_object(h, NULL, NULL, NULL, NULL);
+    if (strcmp(argv[2], "object") == 0 && argc == 5)
+        return run_object(h, argv[3], argv[4], NULL, NULL);
+    if (strcmp(argv[2], "object") == 0 && argc == 7)
+        return run_object(h, argv[3], argv[4], argv[5], argv[6]);
+    if (strcmp(argv[2], "object-blocked") == 0) return run_object_blocked(h, ready, gate);
+    fprintf(stderr, "usage: %s /path/to/fixture.so matrix|blocked|faults|object|object-blocked [READY GO [DONE FINISH]]\n", argv[0]);
     return 2;
 }

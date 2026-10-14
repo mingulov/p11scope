@@ -11,7 +11,9 @@ use crate::discovery::instances::{
     CallFacts, EntryIp, InstanceId, InstanceRouter, MAX_INSTANCES, MAX_PENDING, ObserveOutcome,
     Route, RouterLimits, UnknownReason,
 };
+use crate::events::DecodedEventRecord;
 use crate::process::PidPin;
+use p11scope_ebpf_common::object_wire::ValidatedObjectCall;
 use p11scope_ebpf_common::{EventRecord, ImageIdentity, event_type};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -207,9 +209,11 @@ impl Default for TickLimits {
 }
 
 /// Opaque result of the actual audited router; raw inputs never render.
+/// Slice D carries the private validated object tail alongside the base
+/// record through the same owned call; S1 keeps reading the base.
 pub(crate) struct RoutedCall {
     domain: NativeDomainId,
-    record: EventRecord,
+    decoded: DecodedEventRecord,
     route: Route,
     endpoint: Option<Endpoint>,
     token: Option<u64>,
@@ -221,14 +225,14 @@ impl RoutedCall {
     #[cfg(test)]
     pub(crate) fn scripted(
         domain: NativeDomainId,
-        record: EventRecord,
+        decoded: DecodedEventRecord,
         route: Route,
         endpoint: Option<Endpoint>,
         token: Option<u64>,
     ) -> Self {
         Self {
             domain,
-            record,
+            decoded,
             route,
             endpoint,
             token,
@@ -245,10 +249,15 @@ impl RoutedCall {
         self.domain
     }
     pub(crate) fn record(&self) -> &EventRecord {
-        &self.record
+        &self.decoded.base
+    }
+    /// Move-only tail handoff to the sole consuming runtime adapter
+    /// (`CallEvidence::from_routed`): no borrower observes the tail.
+    pub(crate) fn into_object_tail(self) -> Option<ValidatedObjectCall> {
+        self.decoded.object
     }
     pub(crate) fn image(&self) -> ImageIdentity {
-        self.record.event.image
+        self.decoded.base.event.image
     }
     pub(crate) fn route(&self) -> Route {
         self.route
@@ -474,7 +483,7 @@ enum CollectionStatus {
     ReadError,
 }
 struct Collection {
-    records: Vec<EventRecord>,
+    records: Vec<DecodedEventRecord>,
     status: CollectionStatus,
 }
 
@@ -545,7 +554,7 @@ impl CaptureIo for SessionIo<'_> {
         Instant::now()
     }
     fn collect(&mut self, limit: usize) -> Collection {
-        let Ok(drain) = self.session.event_drain() else {
+        let Ok((drain, table)) = self.session.event_drain_with_object_table() else {
             return Collection {
                 records: Vec::new(),
                 status: CollectionStatus::ReadError,
@@ -553,10 +562,25 @@ impl CaptureIo for SessionIo<'_> {
         };
         let malformed = drain.malformed();
         let mut records = Vec::with_capacity(limit);
-        drain.poll_records(Some(limit), |record| {
-            records.push(record);
-            ControlFlow::Continue(())
-        });
+        // Only the attested allowlisted lane decodes 608-byte records;
+        // every other lane stays 368-byte-only through the same cursor.
+        match table {
+            Some(table) => {
+                drain.poll_object_records(Some(limit), table, |record| {
+                    records.push(record);
+                    ControlFlow::Continue(())
+                });
+            }
+            None => {
+                drain.poll_records(Some(limit), |record| {
+                    records.push(DecodedEventRecord {
+                        base: record,
+                        object: None,
+                    });
+                    ControlFlow::Continue(())
+                });
+            }
+        }
         let status = if drain.malformed() != malformed {
             CollectionStatus::Malformed
         } else {
@@ -630,7 +654,7 @@ impl CaptureIo for SessionIo<'_> {
 }
 
 struct Awaiting {
-    record: EventRecord,
+    record: DecodedEventRecord,
     endpoint: Option<Endpoint>,
 }
 struct TaskBinding {
@@ -1016,14 +1040,14 @@ impl SemanticCapture {
     fn emit(
         &self,
         token: Option<u64>,
-        record: EventRecord,
+        record: DecodedEventRecord,
         endpoint: Option<Endpoint>,
         route: Route,
         report: &mut TickReport,
     ) {
         report.outcomes.push(TickOutcome::Call(RoutedCall {
             domain: self.router.domain(),
-            record,
+            decoded: record,
             route,
             endpoint,
             token,
@@ -1111,11 +1135,11 @@ impl SemanticCapture {
         !self.image_failed && !self.exhausted && health.sticky == 0
     }
     fn pending_key(waiting: &Awaiting) -> (u64, u64, u32) {
-        let image = waiting.record.event.image;
+        let image = waiting.record.base.event.image;
         (
             image.task_cookie,
             image.exec_id,
-            u32::from(waiting.record.continuity.entry_stamp.file_slot_plus1).saturating_sub(1),
+            u32::from(waiting.record.base.continuity.entry_stamp.file_slot_plus1).saturating_sub(1),
         )
     }
     fn prune_jobs(&mut self) {
@@ -1363,16 +1387,16 @@ impl SemanticCapture {
         let _ = self.audit(io, &mut report);
         self.terminal_tasks(&mut report);
         for (position, record) in batch {
-            if record.event.event_type != event_type::CALL {
+            if record.base.event.event_type != event_type::CALL {
                 report.outcomes.push(TickOutcome::Other(OtherRecord {
                     domain: self.router.domain(),
-                    record,
+                    record: record.base,
                     position,
                 }));
                 continue;
             }
             report.collected_calls += 1;
-            let endpoint = io.endpoint(record.event.slot);
+            let endpoint = io.endpoint(record.base.event.slot);
             let Some(token) = position else {
                 self.emit(
                     None,
@@ -1384,7 +1408,7 @@ impl SemanticCapture {
                 continue;
             };
             if endpoint.is_none_or(|ep| {
-                u32::from(record.continuity.entry_stamp.file_slot_plus1) != ep.file_slot + 1
+                u32::from(record.base.continuity.entry_stamp.file_slot_plus1) != ep.file_slot + 1
             }) {
                 self.emit(
                     Some(token),
@@ -1398,37 +1422,37 @@ impl SemanticCapture {
             let facts = CallFacts {
                 token,
                 domain: self.router.domain(),
-                image: record.event.image,
-                entry: record.continuity.entry_stamp,
-                ret: record.continuity.return_stamp,
-                ip: EntryIp::new(record.continuity.entry_ip),
+                image: record.base.event.image,
+                entry: record.base.continuity.entry_stamp,
+                ret: record.base.continuity.return_stamp,
+                ip: EntryIp::new(record.base.continuity.entry_ip),
                 attached_offset: endpoint.map(|e| e.offset),
             };
             let route = self.router.route(facts);
             if route != Route::Pending {
                 if matches!(route, Route::Joined(_)) {
                     let endpoint = endpoint.expect("checked owned endpoint");
-                    let image = record.event.image;
+                    let image = record.base.event.image;
                     let key = (image.task_cookie, image.exec_id, endpoint.file_slot);
                     joined_interests.entry(key).or_insert((
                         image,
                         endpoint,
-                        record.event.slot,
-                        (record.event.pid_tgid >> 32) as u32,
+                        record.base.event.slot,
+                        (record.base.event.pid_tgid >> 32) as u32,
                     ));
                 }
                 self.emit(Some(token), record, endpoint, route, &mut report);
                 continue;
             }
             self.awaiting.insert(token, Awaiting { record, endpoint });
-            let image = record.event.image;
+            let image = record.base.event.image;
             if !self.bindings.contains_key(&image.task_cookie)
                 && self.bindings.len() >= self.limits.bindings
             {
                 self.refuse_binding(image, &mut report);
                 continue;
             }
-            let Some(pin) = io.target((record.event.pid_tgid >> 32) as u32) else {
+            let Some(pin) = io.target((record.base.event.pid_tgid >> 32) as u32) else {
                 self.expire(image, &mut report);
                 continue;
             };
@@ -1442,7 +1466,7 @@ impl SemanticCapture {
                 self.jobs.push_back(ScanJob {
                     image,
                     endpoint,
-                    slot: record.event.slot,
+                    slot: record.base.event.slot,
                     pin,
                     deadline,
                 });
@@ -1576,7 +1600,7 @@ impl SemanticCapture {
         let images: Vec<_> = self
             .awaiting
             .values()
-            .map(|w| w.record.event.image)
+            .map(|w| w.record.base.event.image)
             .collect();
         for image in images {
             self.expire(image, &mut report);
@@ -2240,7 +2264,13 @@ mod tests {
                 .unwrap();
             io.semantic_call("C_SignInit", 0, 0); // Completed, still unread EVENTS record.
             io.semantic_call("C_SignInit", 0, 0); // Entry was before the cut, return after it.
-            io.records.back_mut().unwrap().continuity.return_stamp.fault = 1;
+            io.records
+                .back_mut()
+                .unwrap()
+                .base
+                .continuity
+                .return_stamp
+                .fault = 1;
             let queued = io.records.len();
             let episode = gap(&capture);
             let cut = capture
@@ -2526,7 +2556,7 @@ mod tests {
     struct ScriptIo {
         domain: NativeDomainId,
         now: Instant,
-        records: VecDeque<EventRecord>,
+        records: VecDeque<DecodedEventRecord>,
         health: VecDeque<Result<Health, ()>>,
         last_health: Health,
         pin: Arc<PidPin>,
@@ -2609,7 +2639,7 @@ mod tests {
         }
         fn call_image(&mut self, cookie: u64, exec_id: u64, fault: u32) {
             self.call(cookie, fault);
-            self.records.back_mut().unwrap().event.image.exec_id = exec_id;
+            self.records.back_mut().unwrap().base.event.image.exec_id = exec_id;
         }
         fn call(&mut self, cookie: u64, fault: u32) {
             let stamp = InstanceStamp {
@@ -2619,21 +2649,24 @@ mod tests {
                 epoch: self.local,
                 global: 0,
             };
-            self.records.push_back(EventRecord {
-                event: p11scope_ebpf_common::Event {
-                    event_type: event_type::CALL,
-                    image: ImageIdentity {
-                        task_cookie: cookie,
-                        exec_id: 1,
+            self.records.push_back(DecodedEventRecord {
+                base: EventRecord {
+                    event: p11scope_ebpf_common::Event {
+                        event_type: event_type::CALL,
+                        image: ImageIdentity {
+                            task_cookie: cookie,
+                            exec_id: 1,
+                        },
+                        pid_tgid: u64::from(self.pin.pid()) << 32,
+                        ..Default::default()
                     },
-                    pid_tgid: u64::from(self.pin.pid()) << 32,
-                    ..Default::default()
+                    continuity: p11scope_ebpf_common::InstanceContinuity {
+                        entry_stamp: stamp,
+                        return_stamp: stamp,
+                        entry_ip: 0x2200,
+                    },
                 },
-                continuity: p11scope_ebpf_common::InstanceContinuity {
-                    entry_stamp: stamp,
-                    return_stamp: stamp,
-                    entry_ip: 0x2200,
-                },
+                object: None,
             });
         }
         fn semantic_call(&mut self, name: &str, file: u32, fault: u32) {
@@ -2646,10 +2679,10 @@ mod tests {
                 "C_Sign" => 1,
                 _ => panic!("fixture endpoint not retained"),
             };
-            record.event.slot = file * 2 + function_slot;
-            record.continuity.entry_stamp.file_slot_plus1 = (file + 1) as u16;
-            record.continuity.return_stamp.file_slot_plus1 = (file + 1) as u16;
-            record.continuity.entry_ip +=
+            record.base.event.slot = file * 2 + function_slot;
+            record.base.continuity.entry_stamp.file_slot_plus1 = (file + 1) as u16;
+            record.base.continuity.return_stamp.file_slot_plus1 = (file + 1) as u16;
+            record.base.continuity.entry_ip +=
                 u64::from(file) * 0x4000 + u64::from(function_slot) * 0x100;
         }
     }
@@ -2815,8 +2848,8 @@ mod tests {
             EventDrain, ScriptedRecords, decode, poll_object_records_to_position, record_bytes,
         };
         use p11scope_ebpf_common::object_wire::{
-            OBJECT_ACTION_CREATE, OBJECT_LAYOUT_LP64, ObjectAttributeListWire,
-            ObjectAttributeWire, ObjectCallWire, publish_object_descriptors,
+            OBJECT_ACTION_CREATE, OBJECT_LAYOUT_LP64, ObjectAttributeListWire, ObjectAttributeWire,
+            ObjectCallWire, publish_object_descriptors,
         };
 
         let descriptors = publish_object_descriptors();
@@ -2980,12 +3013,17 @@ mod tests {
         assert_eq!(capture.awaiting.len(), 2);
         io.fail_file = None;
         let resolved = capture.tick_with(&mut io).unwrap();
-        assert_eq!(resolved.collected_calls, 0, "the no-call tick collects none");
+        assert_eq!(
+            resolved.collected_calls, 0,
+            "the no-call tick collects none"
+        );
         let joined: Vec<_> = resolved.calls().collect();
         assert_eq!(joined.len(), 2, "both parked calls resolve once");
         let object = joined
             .iter()
-            .find(|call| call.record().event.event_type == event_type::CALL && call.token() == Some(3))
+            .find(|call| {
+                call.record().event.event_type == event_type::CALL && call.token() == Some(3)
+            })
             .expect("the object CALL resolves at its original position");
         assert_eq!(object.token(), Some(3));
         // A quiet tick emits nothing further: no duplicate delivery.
@@ -3007,7 +3045,10 @@ mod tests {
         let evidence = evidence.expect("object CALL converts to evidence");
         assert_eq!(evidence.token(), 3);
         assert_eq!(
-            evidence.object_tail().expect("evidence carries the tail").tail_bytes(),
+            evidence
+                .object_tail()
+                .expect("evidence carries the tail")
+                .tail_bytes(),
             &tail_bytes
         );
 
@@ -3016,7 +3057,9 @@ mod tests {
         io.call(1, 0);
         let failed = capture.tick_with(&mut io).unwrap();
         assert!(
-            failed.calls().all(|call| !matches!(call.route(), Route::Joined(_))),
+            failed
+                .calls()
+                .all(|call| !matches!(call.route(), Route::Joined(_))),
             "malformed collection forbids positive routes"
         );
 
@@ -3035,17 +3078,13 @@ mod tests {
         // The stop-time bounded cursor delivers the 608-byte form intact.
         let mut terminal = EventDrain::over(ScriptedRecords::records([full], 1));
         let mut terminal_decoded = Vec::new();
-        let (post_q, backlog) = poll_object_records_to_position(
-            &mut terminal,
-            usize::MAX,
-            None,
-            &descriptors,
-            |record| {
+        // The Q stop stands after the one record (8 scripted bytes).
+        let (post_q, backlog) =
+            poll_object_records_to_position(&mut terminal, 8, None, &descriptors, |record| {
                 terminal_decoded.push(record);
                 ControlFlow::Continue(())
-            },
-        )
-        .expect("bounded stop drain");
+            })
+            .expect("bounded stop drain");
         assert!(!post_q && !backlog);
         assert_eq!(terminal_decoded.len(), 1);
         assert_eq!(
@@ -3147,7 +3186,14 @@ mod tests {
             let stamp = InstanceStamp::default();
             TickOutcome::Call(RoutedCall::scripted(
                 domain,
-                event_record_with_routing(p11scope_ebpf_common::Event::default(), stamp, 0x2200),
+                DecodedEventRecord {
+                    base: event_record_with_routing(
+                        p11scope_ebpf_common::Event::default(),
+                        stamp,
+                        0x2200,
+                    ),
+                    object: None,
+                },
                 Route::Unknown(UnknownReason::PendingCapacity),
                 None,
                 Some(1),
@@ -3406,13 +3452,16 @@ mod tests {
         let mut capture = capture(&io);
         prime(&mut capture, &mut io);
         io.call(1, 0);
-        io.records.push_back(EventRecord {
-            event: p11scope_ebpf_common::Event {
-                event_type: u32::MAX,
-                session: 0xfeed_1234_5678_9abc,
+        io.records.push_back(DecodedEventRecord {
+            base: EventRecord {
+                event: p11scope_ebpf_common::Event {
+                    event_type: u32::MAX,
+                    session: 0xfeed_1234_5678_9abc,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
-            ..Default::default()
+            object: None,
         });
         io.collection_status = status;
         let report = capture.tick_with(&mut io).unwrap();
@@ -3716,17 +3765,20 @@ mod tests {
         fn noncall_record_is_preserved_in_the_single_private_stream() {
             let mut io = ScriptIo::new(NativeDomainId::mint());
             let mut capture = capture(&io);
-            io.records.push_back(EventRecord {
-                event: p11scope_ebpf_common::Event {
-                    event_type: u32::MAX,
-                    image: ImageIdentity {
-                        task_cookie: 9,
-                        exec_id: 99,
+            io.records.push_back(DecodedEventRecord {
+                base: EventRecord {
+                    event: p11scope_ebpf_common::Event {
+                        event_type: u32::MAX,
+                        image: ImageIdentity {
+                            task_cookie: 9,
+                            exec_id: 99,
+                        },
+                        session: 0xfeed_1234_5678_9abc,
+                        ..Default::default()
                     },
-                    session: 0xfeed_1234_5678_9abc,
                     ..Default::default()
                 },
-                ..Default::default()
+                object: None,
             });
             let report = capture.tick_with(&mut io).unwrap();
             let other = report
@@ -5079,9 +5131,9 @@ mod tests {
                 let mut h0 = H0TestIo::new(domain);
                 h0.io.output_image = Some(image);
                 h0.io.semantic_call("C_SignInit", 0, 0);
-                h0.io.records.back_mut().unwrap().event.image = image;
+                h0.io.records.back_mut().unwrap().base.event.image = image;
                 h0.io.semantic_call("C_Sign", 0, 0);
-                h0.io.records.back_mut().unwrap().event.image = image;
+                h0.io.records.back_mut().unwrap().base.event.image = image;
                 if prestashed {
                     // A quiet refresh proves the partition before the
                     // stop; its proof waits stashed for the pre-flush.

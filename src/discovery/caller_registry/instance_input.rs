@@ -13,6 +13,7 @@ use crate::discovery::instances::{InstanceId, Route};
 use crate::inventory_semantics::{AttestedSubset, LaneCoverage, LaneNegative};
 use crate::semantic_capture::{Endpoint, InvalidationScope, RoutedCall};
 use crate::semantics_edge::{EdgeSemantics, SemanticCall};
+use p11scope_ebpf_common::object_wire::ValidatedObjectCall;
 use p11scope_ebpf_common::{Event, ImageIdentity, SlotSemantics};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -129,13 +130,30 @@ enum ReductionPermission {
     HistoricalOnly(InstanceReason),
 }
 
-#[derive(Debug)]
 pub(crate) struct AdmittedInstanceCall {
     key: InstanceKey,
     caller: CallerId,
     position: SemanticPosition,
     facts: SemanticCall,
     permission: ReductionPermission,
+    /// Slice D: the private validated object tail, bound to the attested
+    /// slot descriptor at admission and dropped on mismatch. H9 consumes
+    /// it; no public object projection exists here.
+    object: Option<ValidatedObjectCall>,
+}
+
+impl fmt::Debug for AdmittedInstanceCall {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Presence only: raw tail words never render.
+        f.debug_struct("AdmittedInstanceCall")
+            .field("key", &self.key)
+            .field("caller", &self.caller)
+            .field("position", &self.position)
+            .field("facts", &self.facts)
+            .field("permission", &self.permission)
+            .field("object", &self.object.is_some())
+            .finish()
+    }
 }
 
 enum InstanceScope {
@@ -1088,6 +1106,9 @@ pub(crate) struct CallEvidence {
     router: InstanceId,
     endpoint: Option<Endpoint>,
     event: Event,
+    /// Slice D: the private validated object tail moved out of the owned
+    /// routed call. No raw-value Debug: the redacted `Debug` below stays.
+    object: Option<ValidatedObjectCall>,
 }
 
 impl std::fmt::Debug for CallEvidence {
@@ -1104,14 +1125,27 @@ impl CallEvidence {
             return None;
         };
         let token = call.token()?;
+        let domain = call.domain();
+        let image = call.image();
+        let endpoint = call.endpoint();
+        let event = call.record().event;
+        let object = call.into_object_tail();
         Some(Self {
-            domain: call.domain(),
-            image: call.image(),
+            domain,
+            image,
             token,
             router,
-            endpoint: call.endpoint(),
-            event: call.record().event,
+            endpoint,
+            event,
+            object,
         })
+    }
+
+    /// Tests-only observation of the moved tail: production reads it only
+    /// through the consuming admission in this module.
+    #[cfg(test)]
+    pub(crate) fn object_tail(&self) -> Option<&ValidatedObjectCall> {
+        self.object.as_ref()
     }
 
     #[cfg(test)]
@@ -1130,6 +1164,7 @@ impl CallEvidence {
             router,
             endpoint,
             event,
+            object: None,
         }
     }
 
@@ -1184,6 +1219,24 @@ impl ConversionRefusal {
     }
 }
 
+/// Slice D: bind one validated tail to its attested slot name. Only a
+/// tail whose descriptor is the slot function's ordinal + 1 survives;
+/// anything else (including unknown names) drops the tail while the
+/// base call is unaffected.
+fn bound_object_tail(
+    slot_name: &str,
+    tail: Option<ValidatedObjectCall>,
+) -> Option<ValidatedObjectCall> {
+    match tail {
+        Some(tail) => {
+            let bound = crate::kinds::function_id(slot_name)
+                .is_some_and(|id| tail.descriptor_index() == id + 1);
+            bound.then_some(tail)
+        }
+        None => None,
+    }
+}
+
 /// Convert one owned call: assemble the full key from proofs, decode the
 /// verbatim record facts, and decide current versus historical-only
 /// reduction. `barrier` is the narrowest staged loss ordinal covering
@@ -1235,6 +1288,11 @@ pub(crate) fn admit_call_from_evidence(
     {
         return Err(ConversionRefusal::Slot);
     }
+    // Slice D: the tail's descriptor must be the attested slot's
+    // descriptor (function ordinal + 1). A validated tail bound to the
+    // wrong descriptor is dropped: the base call is unaffected, and no
+    // misattributed object fact enters the admission result.
+    let object = bound_object_tail(&slot.names[0], evidence.object);
     let permission = match standing {
         CallStanding::Historical(reason) => ReductionPermission::HistoricalOnly(reason),
         CallStanding::Current(coverage) => {
@@ -1289,6 +1347,7 @@ pub(crate) fn admit_call_from_evidence(
             ts_ns: evidence.event.ts_ns,
         },
         permission,
+        object,
     })
 }
 
@@ -1563,6 +1622,7 @@ mod reference {
                 ReductionPermission::CurrentContinuity,
                 ReductionPermission::HistoricalOnly,
             ),
+            object: None,
         }
     }
     pub(crate) enum Scope {
@@ -1640,5 +1700,41 @@ mod reference {
             position,
             reason,
         }
+    }
+}
+
+#[cfg(test)]
+mod object_tail_binding_tests {
+    use super::*;
+    use p11scope_ebpf_common::object_wire::{
+        OBJECT_ACTION_CREATE, OBJECT_CALL_BYTES, OBJECT_CALL_VERSION, OBJECT_LAYOUT_LP64,
+        OBJECT_TAIL_BYTES, publish_object_descriptors,
+    };
+
+    fn create_tail() -> ValidatedObjectCall {
+        let table = publish_object_descriptors();
+        let mut tail = [0u8; OBJECT_TAIL_BYTES];
+        tail[0..2].copy_from_slice(&OBJECT_CALL_VERSION.to_le_bytes());
+        tail[2..4].copy_from_slice(&OBJECT_CALL_BYTES.to_le_bytes());
+        tail[4..8].copy_from_slice(&21u32.to_le_bytes());
+        tail[12] = OBJECT_LAYOUT_LP64;
+        tail[13] = OBJECT_ACTION_CREATE;
+        tail[32..40].copy_from_slice(&0x1234u64.to_le_bytes());
+        tail[114] = 1;
+        ValidatedObjectCall::validate(&tail, &table[21]).expect("scripted tail validates")
+    }
+
+    #[test]
+    fn object_producer_admission_binds_tail_to_attested_descriptor() {
+        let tail = create_tail();
+        assert_eq!(tail.descriptor_index(), 21);
+        // The attested Create slot keeps its exact tail bytes.
+        let kept = bound_object_tail("C_CreateObject", Some(tail)).expect("matching tail survives");
+        assert_eq!(kept.tail_bytes(), tail.tail_bytes());
+        // Any other slot (or none) drops the tail; the base call still
+        // admits through the unchanged path.
+        assert!(bound_object_tail("C_DestroyObject", Some(tail)).is_none());
+        assert!(bound_object_tail("C_NoSuchFunction", Some(tail)).is_none());
+        assert!(bound_object_tail("C_CreateObject", None).is_none());
     }
 }

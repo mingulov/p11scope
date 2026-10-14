@@ -179,22 +179,23 @@ impl HeldIo {
         self.script.call(image.task_cookie, fault);
         let ts_ns = 10 + self.script.records.len() as u64;
         let record = self.script.records.back_mut().unwrap();
-        record.event.image = image;
-        record.event.pid_tgid = u64::from(pid) << 32;
-        record.event.slot = slot;
-        record.event.session = 7;
-        record.event.mechanism = mechanism;
-        record.event.rv = rv;
-        record.event.capture = capture::OUTPUT_NON_NULL
+        record.base.event.image = image;
+        record.base.event.pid_tgid = u64::from(pid) << 32;
+        record.base.event.slot = slot;
+        record.base.event.session = 7;
+        record.base.event.mechanism = mechanism;
+        record.base.event.rv = rv;
+        record.base.event.capture = capture::OUTPUT_NON_NULL
             | if name == "C_SignInit" {
                 capture::MECHANISM_VALUE
             } else {
                 capture::MECHANISM_NONE
             };
-        record.event.ts_ns = ts_ns;
-        record.continuity.entry_stamp.file_slot_plus1 = (file + 1) as u16;
-        record.continuity.return_stamp.file_slot_plus1 = (file + 1) as u16;
-        record.continuity.entry_ip = 0x1000_0000 + u64::from(file) * 0x100_0000 + endpoint.offset;
+        record.base.event.ts_ns = ts_ns;
+        record.base.continuity.entry_stamp.file_slot_plus1 = (file + 1) as u16;
+        record.base.continuity.return_stamp.file_slot_plus1 = (file + 1) as u16;
+        record.base.continuity.entry_ip =
+            0x1000_0000 + u64::from(file) * 0x100_0000 + endpoint.offset;
     }
 
     fn scan_proof(

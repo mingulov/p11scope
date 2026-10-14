@@ -372,3 +372,52 @@ fn object_producer_descriptor_publication_matches_closed_catalog() {
         &[none_object_wire(); MAX_DESCRIPTORS as usize]
     ));
 }
+
+#[test]
+fn object_producer_uninspected_marker_is_honest_only() {
+    const UNINSPECTED: u8 = OBJECT_ATTR_LIST_UNINSPECTED;
+    assert_eq!(UNINSPECTED, 0x10);
+    assert_eq!(OBJECT_ATTR_LIST_FLAGS_MASK, 0x1F);
+    assert_eq!(
+        crate::object_capture::attr_list_flag::UNINSPECTED,
+        UNINSPECTED
+    );
+    let descriptor = create_descriptor();
+    // The marked never-inspected shape validates on a present pair.
+    let mut marked = valid_create_tail();
+    marked[128 + 33] = UNINSPECTED;
+    assert!(validate_object_tail(&marked, &descriptor));
+    // Every dishonest combination refuses: inspected counts, inspected
+    // bits, nonzero cells or reserved bytes alongside the marker.
+    for (offset, value) in [
+        (128 + 32, 1),
+        (128 + 33, UNINSPECTED | 1),
+        (128 + 33, UNINSPECTED | 8),
+        (128, 1),
+        (128 + 1, 1),
+        (128 + 31, 1),
+    ] {
+        let mut bad = marked;
+        bad[offset] = value;
+        assert!(
+            !validate_object_tail(&bad, &descriptor),
+            "offset {offset} value {value}"
+        );
+    }
+    // Reserved flag bits still refuse, with or without the marker.
+    for flags in [0x20u8, 0x40, 0x80, UNINSPECTED | 0x20] {
+        let mut bad = valid_create_tail();
+        bad[128 + 33] = flags;
+        assert!(!validate_object_tail(&bad, &descriptor), "flags {flags}");
+    }
+    // Inspected shapes are unchanged: inspected-empty still validates,
+    // and a classified inspected cell still validates.
+    assert!(validate_object_tail(&valid_create_tail(), &descriptor));
+    let mut inspected = valid_create_tail();
+    inspected[128] = 1;
+    inspected[128 + 1] = 1;
+    inspected[128 + 2] = 3;
+    inspected[128 + 32] = 1;
+    inspected[128 + 33] = 1;
+    assert!(validate_object_tail(&inspected, &descriptor));
+}

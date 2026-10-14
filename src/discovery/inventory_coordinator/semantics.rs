@@ -2310,20 +2310,23 @@ mod finalizer_history_tests {
         };
         let routed = RoutedCall::scripted(
             detailed,
-            crate::semantic_capture::event_record_with_routing(
-                Event {
-                    slot: init_slot,
-                    session: 7,
-                    mechanism: 0x000d,
-                    capture: capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL,
-                    rv: 0,
-                    ts_ns: 110,
-                    image,
-                    ..Default::default()
-                },
-                stamp,
-                0x2200,
-            ),
+            crate::events::DecodedEventRecord {
+                base: crate::semantic_capture::event_record_with_routing(
+                    Event {
+                        slot: init_slot,
+                        session: 7,
+                        mechanism: 0x000d,
+                        capture: capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL,
+                        rv: 0,
+                        ts_ns: 110,
+                        image,
+                        ..Default::default()
+                    },
+                    stamp,
+                    0x2200,
+                ),
+                object: None,
+            },
             Route::Joined(r0),
             Some(endpoint),
             Some(1),

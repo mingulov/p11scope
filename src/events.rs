@@ -1042,6 +1042,104 @@ pub(crate) fn poll_object_records_to_position<S: BoundedRecordSource>(
     }
 }
 
+/// `poll_object_records_to_position` dispatching journal forms (H8): the
+/// same proven-Q bounded drain over the same owned consumer, but each
+/// record goes to exactly one consumer by length — 368/608-byte forms
+/// through the existing object decoder to `ordinary`, journal forms
+/// through the frozen journal validators to `journal`. Same proven-Q
+/// contract, same malformed accounting, same single cursor. In
+/// particular a BUSY (Pending) record below no admitted writer stops the
+/// drain with the cursor held: the journal frontier cannot pass it.
+/// Activation-gated alongside the dispatch poll.
+#[allow(dead_code)]
+pub(crate) fn poll_dispatched_records_to_position<S: BoundedRecordSource>(
+    drain: &mut EventDrain<S>,
+    stop: usize,
+    quantum: Option<usize>,
+    descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+    mut ordinary: impl FnMut(DecodedEventRecord) -> ControlFlow<()>,
+    mut journal: impl FnMut(JournalRecord) -> ControlFlow<()>,
+) -> Result<(bool, bool)> {
+    use p11scope_ebpf_common::object_journal::{
+        JOURNAL_ABANDON_BYTES, JOURNAL_BEGIN_BYTES, JOURNAL_END_COMPACT_BYTES,
+        JOURNAL_END_FULL_BYTES,
+    };
+    let mut left = quantum;
+    loop {
+        if left == Some(0) {
+            return Ok((false, true));
+        }
+        // Decode to an owned outcome first: matching the borrowed item
+        // directly keeps the source borrow alive across the match,
+        // blocking the post-Reached positions read below.
+        enum Delivered {
+            Ordinary(DecodedEventRecord),
+            Journal(JournalRecord),
+            Malformed,
+        }
+        let record: BoundedRecord<Delivered> = match drain.source.bounded_record(stop) {
+            Ok(bounded) => match bounded {
+                BoundedRecord::Item(item) => BoundedRecord::Item(match item.len() {
+                    JOURNAL_BEGIN_BYTES
+                    | JOURNAL_END_FULL_BYTES
+                    | JOURNAL_END_COMPACT_BYTES
+                    | JOURNAL_ABANDON_BYTES => decode_journal_record(&item, descriptors)
+                        .map_or(Delivered::Malformed, Delivered::Journal),
+                    _ => decode_object_record(&item, descriptors)
+                        .map_or(Delivered::Malformed, Delivered::Ordinary),
+                }),
+                BoundedRecord::Reached => BoundedRecord::Reached,
+                BoundedRecord::Pending => BoundedRecord::Pending,
+            },
+            Err(error) => {
+                if let Some(tap) = &drain.trace_tap {
+                    tap.observe_failure();
+                }
+                return Ok((map_bounded_error(error)?, false));
+            }
+        };
+        match record {
+            BoundedRecord::Item(delivered) => {
+                if let Some(left) = left.as_mut() {
+                    *left -= 1;
+                }
+                match delivered {
+                    Delivered::Ordinary(record) => {
+                        if let Some(tap) = &drain.trace_tap {
+                            tap.observe_call(&record.base.event);
+                        }
+                        if ordinary(record).is_break() {
+                            return Ok((false, true));
+                        }
+                    }
+                    Delivered::Journal(record) => {
+                        if journal(record).is_break() {
+                            return Ok((false, true));
+                        }
+                    }
+                    Delivered::Malformed => {
+                        drain.malformed = drain.malformed.saturating_add(1);
+                        if let Some(tap) = &drain.trace_tap {
+                            tap.observe_failure();
+                        }
+                    }
+                }
+            }
+            BoundedRecord::Reached => {
+                let post_q_record = drain.source.positions().producer != stop;
+                return Ok((post_q_record, false));
+            }
+            BoundedRecord::Pending => {
+                let consumer = drain.source.consumer();
+                if consumer != stop {
+                    return Err(BoundedDrainError::UngatedWriterBeforeQ { consumer, stop }.into());
+                }
+                return Ok((false, false));
+            }
+        }
+    }
+}
+
 /// A ring standing in for the live one: it hands out the scripted records
 /// and fails the test outright once a poll takes one more than `bound`, so a
 /// missing quantum is a panic on a finite script, never a hang.

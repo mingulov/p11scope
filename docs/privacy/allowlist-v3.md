@@ -804,12 +804,18 @@ Ring records grow to 616 B with header for object CALLs only; the
 return chains stay <=512 B (roots 440/440 B;
 `object_fill_return` 64 B and `object_emit_find` 56 B as leaves,
 `object_tail_fill` 4 B over the single memset edge). Entry attribute
-inspection stays out of budget (measured, H7-E4): a one-slot retain
-probe fits (8 B), but the alias-checked eight-slot protocol needs
-~104 B live against the 32 B left under the mandatory ia32 nesting,
-and object-phase scalar diet frees nothing (the S1 phase owns the
-440 B root). The UNINSPECTED marking above therefore stands, and
-budgeted six-attribute capture remains an open requirement, not a
+inspection stays out of budget on the attempted constructions
+(measured stop, H7-E4): a one-slot retain probe fits (8 B), but the
+alias-checked eight-slot protocol needs ~104 B live against the 32 B
+left under the mandatory ia32 nesting, and object-phase scalar diet
+frees nothing (the S1 phase owns the 440 B root). That figure is
+estimated live state for the attempted single-program shape, not a
+compiled full-protocol frame: it omits register allocation, value
+lifetimes and staging, and it excludes neither an args-first
+construction with a separate scanner sharing no nested chain with the
+ia32 reader nor spill-reuse of scratch below the measured max frame.
+The UNINSPECTED marking above therefore stands pending a budgeted E4,
+and budgeted six-attribute capture remains an open requirement, not a
 weakened one.
 
 Required live qualification before release use: owned LP64/ia32

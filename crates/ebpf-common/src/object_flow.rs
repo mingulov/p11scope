@@ -102,6 +102,16 @@ pub fn adapter_derive_entry(
     true
 }
 
+/// H7-E4 wiring switch: false while attribute capture is unwired. The
+/// entry adapter returns after custody while false — fetching nothing,
+/// since the no-op seams consume nothing — so the unwired BPF path
+/// performs zero argument acquisition (no probe register/stack reads
+/// for zero attributes). A budgeted E4 flips this to true AND implements
+/// the seams below; G05 passes unmodified when it does. The unwired
+/// regression pins the false state explicitly, so a flipped switch with
+/// unimplemented seams fails loudly instead of silently fetching.
+pub const ATTRIBUTE_CAPTURE_WIRED: bool = false;
+
 /// Production entry attribute adapter body (H7-E4): inspect authorized
 /// creation-template pairs into the side row's request lists, or retain
 /// Get entry headers into the side row's Get fields. Returns false only
@@ -120,8 +130,10 @@ pub fn adapter_derive_entry(
 /// The entry store lives HERE: the seams populate production side state
 /// directly, so host tests observe wiring through this function — no
 /// caller hand-writes the inspected outcomes. While E4 is unwired the
-/// seams retain nothing and the side keeps its allocated-zero attribute
-/// state (as the live blocked oracle requires).
+/// adapter returns after custody without acquiring arguments (see
+/// `ATTRIBUTE_CAPTURE_WIRED`), the seams retain nothing and the side
+/// keeps its allocated-zero attribute state (as the live blocked oracle
+/// requires).
 #[inline(always)]
 // Closure plus scalar parameters map to the BPF wrapper's register-passed
 // arguments; bundling them into a struct would risk wrapper stack the
@@ -149,6 +161,14 @@ pub fn adapter_attributes_entry(
         || row.guard > OBJECT_GUARD_SCALAR_DERIVE
     {
         return false;
+    }
+    // Unwired: the seams below consume nothing, so acquire nothing. Every
+    // `fetch_arg` below this line evaporates while the switch is false
+    // (the BPF wrapper keeps only its descriptor lookup); the drivers
+    // assert zero acquisition while unwired, so reintroduced fetches fail
+    // the suite instead of silently costing probe reads.
+    if !ATTRIBUTE_CAPTURE_WIRED {
+        return true;
     }
     if row.action == OBJECT_ACTION_GET {
         let (ptr_arg, count_arg) = (row.template_args[0], row.template_args[1]);
@@ -879,8 +899,8 @@ pub fn emission_finalize(emitted: bool, remove: impl FnOnce() -> bool) -> Emissi
 /// allocated-zero state (as the live blocked oracle requires). Present
 /// pairs then carry the UNINSPECTED marking at emission (see
 /// `adapter_tail_fill`). A budgeted E4 implements the approved bounded
-/// in-place inspection HERE with this exact signature; G05 passes
-/// unmodified when it does.
+/// in-place inspection HERE with this exact signature and flips
+/// `ATTRIBUTE_CAPTURE_WIRED`; G05 passes unmodified when it does.
 #[inline(always)]
 pub fn production_inspect_request_template(
     template_ptr: u64,
@@ -910,8 +930,8 @@ pub fn production_inspect_request_template(
 /// TODAY (E4 unwired): retains nothing — performs zero reads, leaves the
 /// side row untouched (allocated-zero, as the live blocked oracle
 /// requires) and returns the zero verdict. A budgeted E4 retains the
-/// approved bounded header facts HERE with this exact signature; G05
-/// passes unmodified when it does.
+/// approved bounded header facts HERE with this exact signature and
+/// flips `ATTRIBUTE_CAPTURE_WIRED`; G05 passes unmodified when it does.
 ///
 /// Retained slots pack densely (`slots[0..count]` selected, the rest
 /// zero — the shared protocol only appends), so the return path derives
@@ -946,8 +966,8 @@ pub fn production_capture_get_entry(
 /// zero: the adapter runs after the tail zeroing, which the shared Find
 /// emission relies on too). A Get tail therefore still carries the
 /// honest marked-only result list. A budgeted E4 establishes the
-/// approved bounded results HERE with this exact signature; G05 passes
-/// unmodified when it does.
+/// approved bounded results HERE with this exact signature and flips
+/// `ATTRIBUTE_CAPTURE_WIRED`; G05 passes unmodified when it does.
 #[inline(always)]
 pub fn production_capture_get_return(
     side: &ObjectStart,

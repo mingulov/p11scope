@@ -493,10 +493,11 @@ fn harness_row(
 /// A READY (phase 2) caller-owned side row, as the required=1 return query
 /// hands it to the fill adapter.
 fn ready_side(descriptor: u32) -> p11scope_ebpf_common::object_wire::ObjectStart {
-    let mut side = p11scope_ebpf_common::object_wire::ObjectStart::default();
-    side.descriptor_index = descriptor;
-    side.phase = 2;
-    side
+    p11scope_ebpf_common::object_wire::ObjectStart {
+        descriptor_index: descriptor,
+        phase: 2,
+        ..Default::default()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1177,12 +1178,12 @@ fn object_return_gate_and_custody_refuse_without_reads() {
     }
 }
 
-/// H7-E4 production attribute paths (see `object_flow` seams). The tests
-/// below run the REAL shared protocol on each vector as the oracle (with
-/// independent literal expectations) and require the PRODUCTION path —
-/// same vectors, same readers — to match it cell for cell. RED while the
-/// production path is unwired (zero reads, zero cells); a budgeted E4
-/// implements the seams and flips these tests with no fixture change.
+// H7-E4 production attribute paths (see `object_flow` seams). The tests
+// below run the REAL shared protocol on each vector as the oracle (with
+// independent literal expectations) and require the PRODUCTION path —
+// same vectors, same readers — to match it cell for cell. RED while the
+// production path is unwired (zero reads, zero cells); a budgeted E4
+// implements the seams and flips these tests with no fixture change.
 
 fn program_attr_slot(
     target: &std::cell::RefCell<adapter::FakeTarget>,

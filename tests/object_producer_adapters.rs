@@ -323,9 +323,11 @@ fn derive_harness() -> (
     use p11scope_ebpf_common::object_wire::{
         OBJECT_ACTION_DERIVE, OBJECT_GUARD_NAMED, ObjectDescriptorWire, ObjectStart,
     };
-    let mut side = ObjectStart::default();
-    side.descriptor_index = 23;
-    side.phase = 1;
+    let side = ObjectStart {
+        descriptor_index: 23,
+        phase: 1,
+        ..Default::default()
+    };
     let row = ObjectDescriptorWire {
         function: 22,
         input_args: [ARG_NONE; 2],
@@ -474,11 +476,13 @@ fn object_ia32_derive_membership_precedes_arg5_read() {
             capture::MECHANISM_VALUE,
             code
         ));
-        let mut return_side = p11scope_ebpf_common::object_wire::ObjectStart::default();
-        return_side.descriptor_index = 23;
-        return_side.phase = 2;
-        return_side.derive = entry.code();
-        return_side.result_ptrs = [0x40000, 0];
+        let mut return_side = p11scope_ebpf_common::object_wire::ObjectStart {
+            descriptor_index: 23,
+            phase: 2,
+            derive: entry.code(),
+            result_ptrs: [0x40000, 0],
+            ..Default::default()
+        };
         let (reader, _) = adapter::readers(&phkey);
         let filled = adapter_fill_return(
             Some(&mut return_side),
@@ -613,11 +617,13 @@ fn object_ia32_derive_membership_precedes_arg5_read() {
             );
             let phkey = std::cell::RefCell::new(adapter::FakeTarget::new(w));
             phkey.borrow_mut().set_word(0x40000, 0x77);
-            let mut return_side = p11scope_ebpf_common::object_wire::ObjectStart::default();
-            return_side.descriptor_index = 23;
-            return_side.phase = 2;
-            return_side.derive = entry.code();
-            return_side.result_ptrs = [0x40000, 0];
+            let mut return_side = p11scope_ebpf_common::object_wire::ObjectStart {
+                descriptor_index: 23,
+                phase: 2,
+                derive: entry.code(),
+                result_ptrs: [0x40000, 0],
+                ..Default::default()
+            };
             let (reader, _) = adapter::readers(&phkey);
             let filled = adapter_fill_return(
                 Some(&mut return_side),
@@ -783,7 +789,8 @@ fn object_return_fill_matches_shared_core() {
         let w = layout.word_bytes() as u64;
         // (result args, pointers, words-or-None-per-slot, rv, action,
         // derive code, S1 status, S1 mechanism).
-        let vectors: [([u8; 2], [u64; 2], [Option<u64>; 2], u64, u8, u8, u32, u64); 8] = [
+        type FillVector = ([u8; 2], [u64; 2], [Option<u64>; 2], u64, u8, u8, u32, u64);
+        let vectors: [FillVector; 8] = [
             (
                 [5, ARG_NONE],
                 [0x10000, 0],
@@ -917,11 +924,13 @@ fn object_return_fill_matches_shared_core() {
             let (_, mut row) = derive_harness();
             row.action = action;
             row.result_args = result_args;
-            let mut side = p11scope_ebpf_common::object_wire::ObjectStart::default();
-            side.descriptor_index = 23;
-            side.phase = 2;
-            side.derive = derive;
-            side.result_ptrs = ptrs;
+            let mut side = p11scope_ebpf_common::object_wire::ObjectStart {
+                descriptor_index: 23,
+                phase: 2,
+                derive,
+                result_ptrs: ptrs,
+                ..Default::default()
+            };
             let (reader, _) = adapter::readers(&prod_target);
             let filled = adapter_fill_return(
                 Some(&mut side),

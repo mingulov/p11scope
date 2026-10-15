@@ -1257,10 +1257,61 @@ fn program_six_field_template(
         .set_bytes(values + 0x70, &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x23]);
 }
 
+/// Length of the raw (byte-)string literal opening at `i`, or `None`
+/// when position `i` does not open one. The `r`/`br` prefix counts only
+/// outside identifiers, and a raw identifier (`r#foo`) is not a string
+/// start. The literal runs to the closing quote plus exactly the opening
+/// hash count (backslashes are literal inside); an unterminated literal
+/// runs to end of input, so the pin fails closed.
+fn raw_string_len(bytes: &[u8], i: usize) -> Option<usize> {
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut j = i;
+    if bytes.get(j) == Some(&b'b') && bytes.get(j + 1) == Some(&b'r') {
+        if i > 0 && ident(bytes[i - 1]) {
+            return None;
+        }
+        j += 1;
+    }
+    if bytes.get(j) != Some(&b'r') {
+        return None;
+    }
+    if j == i && i > 0 && ident(bytes[i - 1]) {
+        return None;
+    }
+    j += 1;
+    let mut hashes = 0;
+    while bytes.get(j) == Some(&b'#') {
+        hashes += 1;
+        j += 1;
+    }
+    if bytes.get(j) != Some(&b'"') {
+        return None;
+    }
+    j += 1;
+    while j < bytes.len() {
+        if bytes[j] == b'"' {
+            let mut k = j + 1;
+            let mut seen = 0;
+            while seen < hashes && bytes.get(k) == Some(&b'#') {
+                seen += 1;
+                k += 1;
+            }
+            if seen == hashes && bytes.get(k) != Some(&b'#') {
+                return Some(k - i);
+            }
+        }
+        j += 1;
+    }
+    Some(bytes.len() - i)
+}
+
 /// Strip Rust line comments, (nested) block comments, string literals
-/// and character literals, so static pins count code tokens — never
-/// prose. A `'` only opens a character literal when its closing quote
-/// lands on the same line within four bytes, so lifetimes survive.
+/// (plain, byte, raw and raw byte forms) and character literals, so
+/// static pins count code tokens — never prose. A `'` only opens a
+/// character literal when exactly one plain character or escape plus
+/// the closing quote follows, so lifetimes survive; raw strings lex by
+/// delimiter count, so their content (quotes, comment markers, prose
+/// naming an adapter) never counts as code.
 fn strip_rust_prose(source: &str) -> String {
     let bytes = source.as_bytes();
     let mut out = String::with_capacity(source.len());
@@ -1287,6 +1338,9 @@ fn strip_rust_prose(source: &str) -> String {
                     i += 1;
                 }
             }
+        } else if let Some(len) = raw_string_len(bytes, i) {
+            i += len;
+            out.push(' ');
         } else if bytes[i] == b'"' {
             i += 1;
             while i < bytes.len() {
@@ -1301,12 +1355,28 @@ fn strip_rust_prose(source: &str) -> String {
             }
             out.push(' ');
         } else if bytes[i] == b'\'' {
-            let mut end = i + 1;
-            while end < bytes.len() && bytes[end] != b'\'' && bytes[end] != b'\n' && end - i <= 4 {
-                end += 1;
+            let mut j = i + 1;
+            if bytes.get(j) == Some(&b'\\') {
+                j += 1;
+                if bytes.get(j) == Some(&b'u') {
+                    j += 1;
+                    if bytes.get(j) == Some(&b'{') {
+                        j += 1;
+                        while j < bytes.len() && bytes[j] != b'}' && bytes[j] != b'\n' {
+                            j += 1;
+                        }
+                        if bytes.get(j) == Some(&b'}') {
+                            j += 1;
+                        }
+                    }
+                } else if j < bytes.len() && bytes[j] != b'\n' {
+                    j += 1;
+                }
+            } else if j < bytes.len() && bytes[j] != b'\'' && bytes[j] != b'\n' {
+                j += 1;
             }
-            if end < bytes.len() && bytes[end] == b'\'' && end - i <= 4 {
-                i = end + 1;
+            if j > i + 1 && bytes.get(j) == Some(&b'\'') {
+                i = j + 1;
                 out.push(' ');
             } else {
                 out.push('\'');
@@ -1365,13 +1435,119 @@ fn pin_attribute_wrappers_delegate_to_shared_adapters() {
     }
 }
 
+/// G05(b) regression: the prose stripper behind the delegation pin must
+/// lex every Rust prose form — line/block comments, plain/byte strings,
+/// raw strings (`r`, `r#`, `r##`, byte forms) and character literals —
+/// so prose naming an adapter never counts as a delegation call. Both
+/// directions, reviewer-style: the doctored body below (real delegation
+/// removed, the name only in line comments, a valid raw-string literal
+/// confusing naive stripping) must count ZERO code occurrences — the
+/// naive stripper falsely counted one — while the same prose next to a
+/// real delegation call must count exactly one.
+#[test]
+fn strip_rust_prose_handles_raw_string_prose() {
+    // Every prose form naming the adapter strips to zero on its own.
+    // (Outer literals use extra hashes so fixture delimiters survive.)
+    for (name, prose) in [
+        ("line comment", "// adapter_attributes_entry(\n"),
+        (
+            "line comment with quote",
+            "// \" adapter_attributes_entry(\n",
+        ),
+        ("block comment", "/* adapter_attributes_entry( */"),
+        (
+            "nested block comment",
+            "/* outer /* adapter_attributes_entry( */ still comment */",
+        ),
+        ("string", "\"adapter_attributes_entry(\""),
+        (
+            "string with escapes",
+            "\"quote \\\" adapter_attributes_entry(\"",
+        ),
+        ("raw string", "r\"adapter_attributes_entry(\""),
+        (
+            "raw string with quotes",
+            r##"r#"say "hi" adapter_attributes_entry(" y"#"##,
+        ),
+        (
+            "r-hash string with stray quote",
+            r##"r#"prefix " suffix"#"##,
+        ),
+        (
+            "r-double-hash string",
+            r###"r##"contains "# but adapter_attributes_entry(" inside"##"###,
+        ),
+        ("byte string", "b\"adapter_attributes_entry(\""),
+        (
+            "raw byte string",
+            r##"br#"adapter_attributes_entry(" with " quote"#"##,
+        ),
+        (
+            "block opener inside raw string",
+            r##"r#"/* adapter_attributes_entry(" */"#"##,
+        ),
+    ] {
+        let stripped = strip_rust_prose(prose);
+        assert!(
+            !stripped.contains("adapter_attributes_entry("),
+            "{name} must strip, got {stripped:?}"
+        );
+    }
+    // Characters strip; lifetimes and code survive.
+    assert_eq!(strip_rust_prose("'a'"), " ");
+    assert_eq!(strip_rust_prose("b'\\n'"), "b ");
+    assert_eq!(strip_rust_prose("'\\u{7}'"), " ");
+    assert_eq!(strip_rust_prose("x: &'a u8"), "x: &'a u8");
+    assert_eq!(
+        strip_rust_prose("fn g<'long>(x: &'long u8) -> bool { 'a' == 97 }"),
+        "fn g<'long>(x: &'long u8) -> bool {   == 97 }"
+    );
+    // RED direction: the reviewer-style doctored body — no delegation
+    // call, the name only in line comments, a valid raw string whose
+    // interior quote misaligns naive stripping — counts zero.
+    let doctored = concat!(
+        "fn object_entry_attributes(\n",
+        "    ctx: &ProbeContext,\n",
+        ") -> bool {\n",
+        "    // adapter_attributes_entry(\n",
+        "    let _cover = r#\"prefix \" suffix\"#;\n",
+        "    // \" adapter_attributes_entry(\n",
+        "    true\n",
+        "}\n",
+    );
+    assert_eq!(
+        strip_rust_prose(doctored)
+            .matches("adapter_attributes_entry(")
+            .count(),
+        0,
+        "the doctored body must count zero delegation calls"
+    );
+    // GREEN direction: the same prose next to a real delegation call
+    // counts exactly one.
+    let wired = doctored.replace(
+        "    true\n",
+        "    adapter_attributes_entry(side, descriptor);\n",
+    );
+    assert_eq!(
+        strip_rust_prose(&wired)
+            .matches("adapter_attributes_entry(")
+            .count(),
+        1,
+        "prose plus one real call must count exactly one delegation call"
+    );
+}
+
 /// Drive one creation-template vector through the PRODUCTION entry path:
 /// the shared `adapter_attributes_entry` the BPF entry adapter calls,
 /// programmed with the pair scalars at the row's template args — then the
-/// production tail emission from the stored side row. Returns the side
+/// COMPLETE production emission sequence the return root executes, in
+/// root order (tail fill, Find emission, Get emission). Returns the side
 /// row AFTER the production entry store plus the emitted tail. The
 /// harness never writes `side.requested` itself: a missing production
-/// entry-store operation observes zero cells here.
+/// entry-store operation observes zero cells here. G05(e): stopping
+/// after the tail fill would blind the harness to any E4 construction
+/// finalizing request state in a later stage, so the driver runs every
+/// stage (trivially true on request vectors while E4 is unwired).
 #[allow(clippy::type_complexity)]
 fn run_production_request_path(
     target: &std::cell::RefCell<adapter::FakeTarget>,
@@ -1384,7 +1560,9 @@ fn run_production_request_path(
     p11scope_ebpf_common::object_wire::ObjectCallWire,
 ) {
     use p11scope_ebpf_common::ARG_NONE;
-    use p11scope_ebpf_common::object_flow::{adapter_attributes_entry, adapter_tail_fill};
+    use p11scope_ebpf_common::object_flow::{
+        adapter_attributes_entry, adapter_emit_find, adapter_emit_get_attributes, adapter_tail_fill,
+    };
     use p11scope_ebpf_common::object_wire::{
         OBJECT_LAYOUT_ILP32, OBJECT_LAYOUT_LP64, ObjectCallWire,
     };
@@ -1399,7 +1577,11 @@ fn run_production_request_path(
         },
         ..Default::default()
     };
+    // Argument acquisition is counted at the seam: every call below is
+    // a probe register/stack read on BPF.
+    let mut fetches = 0u32;
     let mut fetch_arg = |arg: u8| {
+        fetches += 1;
         if arg == template_args[0] {
             Some(pairs[0].0)
         } else if arg == template_args[1] {
@@ -1425,6 +1607,15 @@ fn run_production_request_path(
         ),
         "{layout:?} production entry adapter accepts the vector"
     );
+    // Unwired, the no-op seams consume nothing, so the production path
+    // must acquire nothing: reintroduced argument fetches fail here on
+    // every vector (request and Get alike), before any store assert.
+    if !p11scope_ebpf_common::object_flow::ATTRIBUTE_CAPTURE_WIRED {
+        assert_eq!(
+            fetches, 0,
+            "{layout:?} unwired entry acquires zero arguments"
+        );
+    }
     // RETURNING arrival state (harness sequencing, as the fill adapter
     // would leave it); the inspected pair lists arrive only via the
     // production entry store above.
@@ -1432,15 +1623,58 @@ fn run_production_request_path(
     let mut tail = ObjectCallWire::default();
     let tailed = unsafe { adapter_tail_fill(&mut tail as *mut _, Some(&side), 23, Some(&row)) };
     assert!(tailed, "{layout:?} production tail fills");
+    // Root order continues: Find emission, then Get establishment — the
+    // same stage chain `run_production_return_arm` executes. Both succeed
+    // trivially on request vectors (non-Find, non-Get) with zero reads;
+    // they execute so any E4 construction finalizing request state in a
+    // later stage is observed, exactly as the root would emit it.
+    let (reader, _) = adapter::readers(target);
+    let find_emitted = tailed
+        && unsafe {
+            adapter_emit_find(
+                &mut tail as *mut _,
+                Some(&side),
+                23,
+                Some(&row),
+                layout,
+                adapter::rv_ok(),
+                true,
+                reader,
+            )
+        };
+    assert!(
+        find_emitted,
+        "{layout:?} production Find emission accepts the vector"
+    );
+    let (reader, bytes) = adapter::readers(target);
+    let emitted = find_emitted
+        && unsafe {
+            adapter_emit_get_attributes(
+                &mut tail as *mut _,
+                Some(&side),
+                23,
+                Some(&row),
+                layout,
+                adapter::rv_ok(),
+                true,
+                reader,
+                bytes,
+            )
+        };
+    assert!(
+        emitted,
+        "{layout:?} production Get emission accepts the vector"
+    );
     (side, tail)
 }
 
 /// Drive one Get vector through the PRODUCTION Get path: entry retention
 /// via the shared `adapter_attributes_entry` the BPF entry adapter
-/// calls, then return emission via the shared
-/// `adapter_emit_get_attributes` the BPF return path calls. Returns the
-/// side row after retention plus the emitted tail. The harness never
-/// writes the Get fields or the emitted list itself.
+/// calls, then the COMPLETE production emission sequence the return
+/// root executes, in root order (tail fill, Find emission, Get
+/// establishment). Returns the side row after retention plus the emitted
+/// tail. The harness never writes the Get fields or the emitted list
+/// itself.
 #[allow(clippy::type_complexity)]
 fn run_production_get_path(
     target: &std::cell::RefCell<adapter::FakeTarget>,
@@ -1453,7 +1687,7 @@ fn run_production_get_path(
 ) {
     use p11scope_ebpf_common::ARG_NONE;
     use p11scope_ebpf_common::object_flow::{
-        adapter_attributes_entry, adapter_emit_get_attributes, adapter_tail_fill,
+        adapter_attributes_entry, adapter_emit_find, adapter_emit_get_attributes, adapter_tail_fill,
     };
     use p11scope_ebpf_common::object_wire::{
         OBJECT_ACTION_GET, OBJECT_LAYOUT_ILP32, OBJECT_LAYOUT_LP64, ObjectCallWire,
@@ -1469,10 +1703,16 @@ fn run_production_get_path(
         },
         ..Default::default()
     };
-    let mut fetch_arg = |arg: u8| match arg {
-        2 => Some(template_base),
-        3 => Some(count),
-        _ => None,
+    // Argument acquisition is counted at the seam (see the request
+    // driver): every call below is a probe register/stack read on BPF.
+    let mut fetches = 0u32;
+    let mut fetch_arg = |arg: u8| {
+        fetches += 1;
+        match arg {
+            2 => Some(template_base),
+            3 => Some(count),
+            _ => None,
+        }
     };
     let (reader, bytes) = adapter::readers(target);
     assert!(
@@ -1487,12 +1727,41 @@ fn run_production_get_path(
         ),
         "{layout:?} production Get entry accepts the vector"
     );
+    // Unwired, the no-op seams consume nothing, so the production Get
+    // entry must acquire nothing either.
+    if !p11scope_ebpf_common::object_flow::ATTRIBUTE_CAPTURE_WIRED {
+        assert_eq!(
+            fetches, 0,
+            "{layout:?} unwired Get entry acquires zero arguments"
+        );
+    }
     // RETURNING arrival state (harness sequencing); retention arrives
     // only via the production entry store above.
     side.phase = 3;
     let mut tail = ObjectCallWire::default();
     let tailed = unsafe { adapter_tail_fill(&mut tail as *mut _, Some(&side), 23, Some(&row)) };
     assert!(tailed, "{layout:?} production Get tail fills");
+    // Root order: Find emission precedes Get establishment (trivially
+    // true on Get vectors with zero reads; executes for root fidelity,
+    // like the request driver's chain above).
+    let (reader, _) = adapter::readers(target);
+    let find_emitted = tailed
+        && unsafe {
+            adapter_emit_find(
+                &mut tail as *mut _,
+                Some(&side),
+                23,
+                Some(&row),
+                layout,
+                adapter::rv_ok(),
+                true,
+                reader,
+            )
+        };
+    assert!(
+        find_emitted,
+        "{layout:?} production Find emission accepts the vector"
+    );
     let (reader, bytes) = adapter::readers(target);
     assert!(
         unsafe {
@@ -1617,13 +1886,16 @@ fn object_attributes_uninspected_marking_is_production() {
 }
 
 /// Today's production entry attribute path (E4 unwired): the shared
-/// entry adapter accepts creation and Get vectors, performs zero target
-/// reads and stores zero attribute state — side request lists, Get
-/// fields and flags stay allocated-zero. The Get emission refuses before
-/// any read unless continuity joined, and keeps the UNINSPECTED marking
-/// on return values outside the Get acceptance set. E4 replaces the
-/// zero-store behavior with inspected retention; the refusal gates stay.
+/// entry adapter accepts creation and Get vectors, acquires zero
+/// arguments (counted at the acquisition seam by the drivers —
+/// reintroduced fetches fail there), performs zero target reads and
+/// stores zero attribute state — side request lists, Get fields and
+/// flags stay allocated-zero. The Get emission refuses before any read
+/// unless continuity joined, and keeps the UNINSPECTED marking on return
+/// values outside the Get acceptance set. E4 rewrites this test when it
+/// flips the switch with its seams; the refusal gates stay.
 #[test]
+#[allow(clippy::assertions_on_constants)]
 fn object_attributes_unwired_entry_stores_nothing() {
     use p11scope_ebpf_common::ARG_NONE;
     use p11scope_ebpf_common::LinuxLayout;
@@ -1635,6 +1907,14 @@ fn object_attributes_unwired_entry_stores_nothing() {
         OBJECT_ACTION_CREATE, OBJECT_ACTION_GET, OBJECT_ACTION_SET, ObjectAttributeListWire,
         ObjectAttributeSlot, ObjectCallWire,
     };
+    // This regression pins the UNWIRED path. A flipped switch with
+    // unimplemented seams fails here — never silently fetching. The
+    // constant assert is the tripwire itself (a runtime test failure,
+    // not a build break), so the lint is allowed on this test.
+    assert!(
+        !p11scope_ebpf_common::object_flow::ATTRIBUTE_CAPTURE_WIRED,
+        "unwired regression requires the unwired switch state"
+    );
     for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
         let w = layout.word_bytes() as u64;
         // Creation vector through the production entry adapter: accepted,
@@ -1796,10 +2076,15 @@ fn object_attributes_unwired_entry_stores_nothing() {
             plain_tail.result_attributes == ObjectAttributeListWire::default(),
             "{layout:?} non-Get result list stays all-zero"
         );
-        // Custody: the entry adapter refuses missing rows without reads.
+        // Custody: the entry adapter refuses missing rows without
+        // reads — and without acquiring arguments.
         let custody_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
         let create_row = harness_row(23, OBJECT_ACTION_CREATE, [5, ARG_NONE]);
-        let mut fetch_arg = |_: u8| None;
+        let mut custody_fetches = 0u32;
+        let mut fetch_arg = |_: u8| {
+            custody_fetches += 1;
+            None
+        };
         let (reader, bytes) = adapter::readers(&custody_target);
         assert!(
             !adapter_attributes_entry(
@@ -1826,6 +2111,12 @@ fn object_attributes_unwired_entry_stores_nothing() {
             ),
             "{layout:?} missing row refuses entry"
         );
+        if !p11scope_ebpf_common::object_flow::ATTRIBUTE_CAPTURE_WIRED {
+            assert_eq!(
+                custody_fetches, 0,
+                "{layout:?} entry custody acquires zero arguments"
+            );
+        }
         adapter::assert_no_target_reads(&custody_target, &format!("{layout:?} entry custody"));
     }
 }

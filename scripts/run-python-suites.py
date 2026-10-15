@@ -46,6 +46,7 @@ RUN = [
     ("test_e16_oracle.py", []),
     ("test_canary_evidence.py", ["--target-bits", "32"]),
     ("test_canary_evidence.py", ["--target-bits", "64"]),
+    ("test_canary_object.py", []),
     ("test_ci_dependency_selection.py", []),
     ("test_cgroup_replacement.py", []),
     ("test_cgroup_stop_acceptance.py", []),

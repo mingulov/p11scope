@@ -38,6 +38,10 @@ type InstanceKey = (u64, u64, u64, u64);
 enum CallKind {
     Object(ObjectAction),
     Lifecycle(u8),
+    /// Effect-neutral S1 operation: participates in ordering, overlap, loss
+    /// and replay, but applies no object, session-lifecycle or metadata
+    /// effect. See the frozen vocabulary in the journal child.
+    Neutral,
 }
 
 /// Terminal outcome classes. Never one overloaded "failure".
@@ -112,6 +116,9 @@ fn classify(rv: u64, kind: CallKind, malformed: bool) -> Outcome {
 fn call_kind(function: u32) -> Option<CallKind> {
     if let Some(descriptor) = object_descriptor(function) {
         return Some(CallKind::Object(descriptor.action));
+    }
+    if super::journal::is_neutral_function(function) {
+        return Some(CallKind::Neutral);
     }
     let name = pkcs11_module::function_name(function as usize)?;
     let slot = crate::kinds::descriptor(name)?;
@@ -265,7 +272,7 @@ impl PendingCall {
     fn action(&self) -> Option<ObjectAction> {
         match self.kind {
             CallKind::Object(action) => Some(action),
-            CallKind::Lifecycle(_) => None,
+            CallKind::Lifecycle(_) | CallKind::Neutral => None,
         }
     }
 
@@ -1162,6 +1169,10 @@ impl ModelState {
                 lifecycle::FINALIZE => self.apply_finalize(call, outcome, effects),
                 _ => {}
             },
+            // Neutral terminals apply no object effect: ordering, overlap
+            // and loss participation only. Session resolution above still
+            // runs, so an invalid acting session stays conservative.
+            CallKind::Neutral => {}
         }
     }
 

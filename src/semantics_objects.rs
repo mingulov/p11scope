@@ -27,6 +27,7 @@
 //! errors and the projection carry capture-local public IDs and finite facts.
 #![cfg_attr(not(test), allow(dead_code))]
 
+pub(crate) mod journal;
 mod state;
 
 use p11scope_ebpf_common::LinuxLayout;

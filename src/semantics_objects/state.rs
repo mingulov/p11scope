@@ -1285,9 +1285,16 @@ impl ModelState {
     }
 
     /// Overlapping calls (with known outcomes, guaranteed by the watermark)
-    /// that may alter what this call's joins rely on.
+    /// that may alter what this call's joins rely on. Neutral calls take
+    /// no part as either side: they apply no joins to protect, and they
+    /// apply no object effect that could alter another call's joins.
+    /// Their overlap participation is cut ordering (the watermark), which
+    /// the settlement path already enforces.
     fn interference(&self, token: CallToken) -> (Option<ObjectGap>, bool) {
         let x = &self.pending[&token];
+        if x.kind == CallKind::Neutral {
+            return (None, false);
+        }
         let Some(x_end) = x.end_cut() else {
             return (None, false);
         };
@@ -1320,6 +1327,9 @@ impl ModelState {
             }
             let y = &self.pending[&token_y];
             if y.fenced || y.begin >= x_end || y.end_cut().is_some_and(|end| end <= x.begin) {
+                continue;
+            }
+            if y.kind == CallKind::Neutral {
                 continue;
             }
             if let (Some(a), Some(b)) = (x.session_handle(), y.session_handle())

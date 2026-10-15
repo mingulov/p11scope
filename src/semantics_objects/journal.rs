@@ -134,6 +134,7 @@ pub(crate) fn abandon_disposition(reason: u32) -> Option<AbandonDisposition> {
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use p11scope_ebpf_common::MAX_DESCRIPTORS;
 use p11scope_ebpf_common::capture;
 use p11scope_ebpf_common::object_journal::{
     JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, JournalRecord, ValidatedJournalAbandon,
@@ -261,7 +262,6 @@ struct JournalDomainState {
 /// Finite checked-fault read failure. Any failure withholds proof; it never
 /// reads as a clean zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Slice C wires collection; the seal rules already consume it.
 pub(crate) enum FaultReadError {
     Unreadable,
     /// The cell exceeds the u32 domain: saturated, permanently disabling
@@ -272,7 +272,6 @@ pub(crate) enum FaultReadError {
 /// The checked-fault epoch reader the seal audits. Production reads the
 /// session's mmapable fault cell through the existing instance maps; tests
 /// script an equivalent cell. A read/CAS error is not a clean audit.
-#[allow(dead_code)] // Slice C wires collection.
 pub(crate) trait FaultEpoch {
     fn fault_epoch(&self) -> Result<u64, FaultReadError>;
 }
@@ -390,6 +389,7 @@ struct OpenEntry {
     abandon: Option<StagedAbandon>,
     corroborated_return: Option<u64>,
     converted_ticket: Option<CallToken>,
+    end_converted: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -565,6 +565,7 @@ impl JournalAdapter {
                 abandon: None,
                 corroborated_return: None,
                 converted_ticket: None,
+                end_converted: false,
             },
         );
         JournalDisposition::BeginAdmitted
@@ -1139,13 +1140,13 @@ fn attributes_of(action: u8, tail: &[u8; 240], absent: bool) -> Option<Attribute
 /// in scope. Private fields: only finalizer-typed evidence or the test
 /// script builds one.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Slice C proves H3 evidence; the seal rules already consume it.
+#[allow(dead_code)] // Activation-gated: the finalizer derives this per batch.
 pub(crate) enum H3DispositionEvidence {
     Clean { disposed_through: u64 },
     StagedLoss { barrier: u64 },
 }
 
-#[allow(dead_code)] // Slice C proves H3 evidence.
+#[allow(dead_code)] // Activation-gated: called from `finalize_batch`.
 impl H3DispositionEvidence {
     /// Production derivation from the finalizer's staged batch: any staged
     /// negative in scope is a loss barrier (a refused collection disposes
@@ -1216,7 +1217,37 @@ pub(crate) struct JournalAuditReceipt {
     closure_generation: u64,
 }
 
+/// One collection's audit evidence: per-form counts, the drain's
+/// malformed delta and the checked-fault pair bracketing the tick.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct JournalCollection {
+    pub(crate) ingested: u64,
+    pub(crate) ordinary: u64,
+    pub(crate) malformed_delta: u64,
+    pub(crate) fault_before: u64,
+    pub(crate) fault_after: u64,
+    pub(crate) fault_error: Option<FaultReadError>,
+}
+
 impl JournalAuditReceipt {
+    /// Production audit from one collection plus H3's disposition and the
+    /// live closure generation. The seal's check rules decide; this only
+    /// binds the evidence.
+    pub(crate) fn collect(
+        collection: &JournalCollection,
+        h3: H3DispositionEvidence,
+        closure_generation: u64,
+    ) -> Self {
+        Self {
+            fault_before: collection.fault_before,
+            fault_after: collection.fault_after,
+            fault_error: collection.fault_error,
+            malformed_delta: collection.malformed_delta,
+            h3,
+            closure_generation,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn scripted(
         fault_before: u64,
@@ -1649,6 +1680,14 @@ impl JournalAdapter {
                         RefCut::sealed(ConsumptionOrdinal(upper)),
                     ));
                     effects.effects.extend(lost.effects);
+                    // The model fences this upper too; the adapter keeps
+                    // its own copy so the bootstrap rule stays sufficient
+                    // on its own evidence.
+                    self.keys
+                        .get_mut(&key)
+                        .expect("sealed key")
+                        .bounded_uppers
+                        .push(upper);
                 }
                 None => {
                     self.keys.get_mut(&key).expect("sealed key").tainted = true;
@@ -1730,14 +1769,19 @@ impl JournalAdapter {
         }
         terminals.sort_by_key(|(_, ordinal)| *ordinal);
         for (native, _) in terminals {
-            let entry = self.open.get(&native).expect("staged terminal");
+            let entry = *self.open.get(&native).expect("staged terminal");
             let token = entry.converted_ticket.expect("converted begin");
             if let Some(staged) = entry.end
                 && staged.ordinal <= frontier
+                && !entry.end_converted
             {
                 let completed = completed_of(staged.ordinal, entry.function, &staged.end);
                 let applied = model.complete(token, completed);
                 effects.effects.extend(applied.effects);
+                self.open
+                    .get_mut(&native)
+                    .expect("staged terminal")
+                    .end_converted = true;
                 if let Some(summary) = settled.iter_mut().find(|summary| summary.ticket == token) {
                     summary.end_cut = Some(staged.ordinal);
                 }
@@ -1851,6 +1895,85 @@ impl JournalAdapter {
             }
             true
         });
+    }
+
+    /// Collect one quantum over the Session's retained drain: every
+    /// consumed record, journal or ordinary, takes the next checked
+    /// ordinal in delivery order through the one dispatch poll, with the
+    /// checked fault read before and after and the drain's malformed
+    /// delta. Collection stages wire truth only; the seal audits this
+    /// evidence before any model input.
+    ///
+    /// DISCARD observability: the patched Aya reader consumes
+    /// kernel-discarded reservations internally (see the ring-reader
+    /// patch: both `next` and `next_before` skip discarded records
+    /// without surfacing them), so per-reservation discard counts are
+    /// unavailable by construction. The selected mechanism is the fault
+    /// invariant instead: every discarded journal reservation raises the
+    /// checked fault before discard (native contract, activation-gated),
+    /// and every candidate seal audits the fault pair after consumption.
+    /// A changed fault therefore refuses the seal whether the cause was
+    /// a discard or any other native fault.
+    pub(crate) fn collect_from_drain<S: crate::events::RecordSource>(
+        &mut self,
+        drain: &mut crate::events::EventDrain<S>,
+        descriptors: &[p11scope_ebpf_common::object_wire::ObjectDescriptorWire;
+             MAX_DESCRIPTORS as usize],
+        quantum: Option<usize>,
+        fault: &impl FaultEpoch,
+    ) -> JournalCollection {
+        let fault_before = match fault.fault_epoch() {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                return JournalCollection {
+                    ingested: 0,
+                    ordinary: 0,
+                    malformed_delta: 0,
+                    fault_before: 0,
+                    fault_after: 0,
+                    fault_error: Some(error),
+                };
+            }
+        };
+        let malformed_before = drain.malformed();
+        // One ordered staging vec shared by both consumers: delivery
+        // order is ordinal order across forms.
+        let staged = std::cell::RefCell::new(Vec::new());
+        drain.poll_dispatched_records(
+            quantum,
+            descriptors,
+            |decoded| {
+                staged
+                    .borrow_mut()
+                    .push(JournalIngestItem::Ordinary(decoded));
+                std::ops::ControlFlow::Continue(())
+            },
+            |record| {
+                staged.borrow_mut().push(JournalIngestItem::Journal(record));
+                std::ops::ControlFlow::Continue(())
+            },
+        );
+        let mut ingested = 0;
+        let mut ordinary = 0;
+        for item in staged.take() {
+            match item {
+                JournalIngestItem::Journal(_) => ingested += 1,
+                JournalIngestItem::Ordinary(_) => ordinary += 1,
+            }
+            self.ingest_any(item);
+        }
+        let (fault_after, fault_error) = match fault.fault_epoch() {
+            Ok(epoch) => (epoch, None),
+            Err(error) => (fault_before, Some(error)),
+        };
+        JournalCollection {
+            ingested,
+            ordinary,
+            malformed_delta: drain.malformed().saturating_sub(malformed_before),
+            fault_before,
+            fault_after,
+            fault_error,
+        }
     }
 
     /// Stop: refuse all future ingest, seals and attestations; invalidate
@@ -2279,10 +2402,9 @@ mod tests {
             }
         }
 
-        /// One real admission: scripted routed call through the production
-        /// move-only conversion and the real descriptor/binding proofs,
-        /// historical standing (no coverage needed for key binding).
-        fn admit(&mut self) -> AdmittedInstanceCall {
+        /// One real routed evidence: scripted routed call through the
+        /// production move-only conversion, with its real H0 token.
+        fn evidence(&mut self) -> CallEvidence {
             self.next_token += 1;
             let token = self.next_token;
             let stamp = InstanceStamp {
@@ -2312,8 +2434,14 @@ mod tests {
                 Some(self.endpoint),
                 Some(token),
             );
-            let evidence =
-                CallEvidence::from_routed(routed).expect("joined call converts to evidence");
+            CallEvidence::from_routed(routed).expect("joined call converts to evidence")
+        }
+
+        /// One real admission: routed evidence through the real
+        /// descriptor/binding proofs, historical standing (no coverage
+        /// needed for key binding).
+        fn admit(&mut self) -> AdmittedInstanceCall {
+            let evidence = self.evidence();
             admit_call_from_evidence(
                 evidence,
                 &self.binding,
@@ -2337,10 +2465,14 @@ mod tests {
 
     impl Scene {
         fn new(image: ImageIdentity) -> Self {
+            Self::new_with_limits(image, JournalLimits::policy())
+        }
+
+        fn new_with_limits(image: ImageIdentity, limits: JournalLimits) -> Self {
             let descriptors = publish_object_descriptors();
             assert!(verify_object_descriptors(&descriptors));
             Self {
-                adapter: JournalAdapter::new(JournalLimits::policy()),
+                adapter: JournalAdapter::new(limits),
                 model: ObjectSemantics::new(),
                 descriptors,
                 fixture: AttestationFixture::new(image),
@@ -2392,6 +2524,189 @@ mod tests {
 
         fn bootstrap(&self, proof: JournalDomainProof, birth_cut: u64) -> BootstrapReceipt {
             BootstrapReceipt::scripted(proof, BirthKind::ExecMarker, birth_cut, 0)
+        }
+
+        /// One production collection over scripted ring bytes: the real
+        /// dispatch poll, real decode, real malformed accounting and the
+        /// scripted fault cell.
+        fn collect_records(
+            &mut self,
+            records: Vec<Vec<u8>>,
+            fault: &impl FaultEpoch,
+        ) -> JournalCollection {
+            let bound = records.len();
+            let mut drain = crate::events::EventDrain::over_test_domain(
+                crate::events::ScriptedRecords::records(records, bound),
+                7,
+            );
+            self.adapter
+                .collect_from_drain(&mut drain, &self.descriptors, Some(bound), fault)
+        }
+
+        /// One seal from a real collection: H3 disposition covers the
+        /// consumed frontier, closure generation zero.
+        fn seal_collected(
+            &mut self,
+            bootstrap: &BootstrapReceipt,
+            collection: &JournalCollection,
+        ) -> Result<SealSuccess, SealFailure> {
+            let h3 = H3DispositionEvidence::scripted_clean(self.adapter.consumed_through);
+            let audit = JournalAuditReceipt::collect(collection, h3, 0);
+            let frontier = self.adapter.consumed_frontier();
+            self.adapter
+                .seal(&mut self.model, &audit, bootstrap, frontier)
+        }
+
+        /// One bounded dispatch drain to a stop: the real proven-Q poll
+        /// with both consumers ingesting in delivery order.
+        fn drain_bounded_to<S: crate::events::BoundedRecordSource>(
+            &mut self,
+            drain: &mut crate::events::EventDrain<S>,
+            stop: usize,
+        ) -> anyhow::Result<(bool, bool)> {
+            let staged = std::cell::RefCell::new(Vec::new());
+            let outcome = crate::events::poll_dispatched_records_to_position(
+                drain,
+                stop,
+                None,
+                &self.descriptors,
+                |decoded| {
+                    staged
+                        .borrow_mut()
+                        .push(JournalIngestItem::Ordinary(decoded));
+                    std::ops::ControlFlow::Continue(())
+                },
+                |record| {
+                    staged.borrow_mut().push(JournalIngestItem::Journal(record));
+                    std::ops::ControlFlow::Continue(())
+                },
+            )?;
+            for item in staged.take() {
+                self.adapter.ingest_any(item);
+            }
+            Ok(outcome)
+        }
+    }
+
+    /// The scripted equivalent of the session's mmapable fault cell:
+    /// steady, sequenced (for mid-tick changes) or failing reads, with
+    /// the production saturation rule mirrored exactly.
+    struct ScriptedFaultCell {
+        values: Vec<u64>,
+        at: std::cell::Cell<usize>,
+        fail: bool,
+    }
+
+    impl ScriptedFaultCell {
+        fn steady(epoch: u64) -> Self {
+            Self {
+                values: vec![epoch],
+                at: std::cell::Cell::new(0),
+                fail: false,
+            }
+        }
+
+        fn sequence(values: Vec<u64>) -> Self {
+            Self {
+                values,
+                at: std::cell::Cell::new(0),
+                fail: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                values: vec![0],
+                at: std::cell::Cell::new(0),
+                fail: true,
+            }
+        }
+    }
+
+    impl FaultEpoch for ScriptedFaultCell {
+        fn fault_epoch(&self) -> Result<u64, FaultReadError> {
+            if self.fail {
+                return Err(FaultReadError::Unreadable);
+            }
+            let index = self.at.get().min(self.values.len() - 1);
+            self.at.set(self.at.get() + 1);
+            let epoch = self.values[index];
+            if epoch > u64::from(u32::MAX) {
+                return Err(FaultReadError::Saturated);
+            }
+            Ok(epoch)
+        }
+    }
+
+    /// A scripted ring that goes BUSY on schedule through the real reader
+    /// seams: `busy_after` injects one live-path stall (the poll ends with
+    /// the cursor held, like Aya's BUSY skip) after that many records,
+    /// and `pending_before` injects that many bounded-path Pending
+    /// outcomes before items flow.
+    struct BusyScript {
+        queue: std::collections::VecDeque<Vec<u8>>,
+        taken: usize,
+        busy_after: Option<usize>,
+        busy_done: bool,
+        pending_before: usize,
+    }
+
+    impl BusyScript {
+        fn new(records: Vec<Vec<u8>>) -> Self {
+            Self {
+                queue: records.into(),
+                taken: 0,
+                busy_after: None,
+                busy_done: false,
+                pending_before: 0,
+            }
+        }
+    }
+
+    impl crate::events::RecordSource for BusyScript {
+        fn next_record(&mut self) -> Option<impl std::ops::Deref<Target = [u8]> + '_> {
+            if !self.busy_done && self.busy_after == Some(self.taken) {
+                self.busy_done = true;
+                return None;
+            }
+            let item = self.queue.pop_front()?;
+            self.taken += 1;
+            Some(item)
+        }
+    }
+
+    impl crate::events::BoundedRecordSource for BusyScript {
+        fn positions(&self) -> aya::maps::ring_buf::RingBufPositions {
+            aya::maps::ring_buf::RingBufPositions {
+                consumer: self.taken * 8,
+                producer: (self.taken + self.queue.len()) * 8,
+                capacity: 4096,
+            }
+        }
+
+        fn consumer(&self) -> usize {
+            self.taken * 8
+        }
+
+        fn bounded_record(
+            &mut self,
+            stop: usize,
+        ) -> anyhow::Result<crate::events::BoundedRecord<impl std::ops::Deref<Target = [u8]> + '_>>
+        {
+            if self.pending_before > 0 {
+                self.pending_before -= 1;
+                return Ok(crate::events::BoundedRecord::Pending);
+            }
+            if self.taken * 8 == stop {
+                return Ok(crate::events::BoundedRecord::Reached);
+            }
+            match self.queue.pop_front() {
+                Some(item) => {
+                    self.taken += 1;
+                    Ok(crate::events::BoundedRecord::Item(item))
+                }
+                None => Ok(crate::events::BoundedRecord::Pending),
+            }
         }
     }
 
@@ -3108,5 +3423,606 @@ mod tests {
             let success = scene.seal(&bootstrap).expect("exact agreement seals");
             assert!(has_effect(&success.effects, "created"));
         }
+    }
+
+    #[test]
+    fn object_journal_busy_before_end() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        // A live-path BUSY stall ends the quantum with the cursor held:
+        // the frontier covers exactly the consumed prefix, and the rest
+        // flows on the next collection.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        let mut script = BusyScript::new(vec![begin.to_vec(), end.to_vec()]);
+        script.busy_after = Some(1);
+        let mut drain = crate::events::EventDrain::over_test_domain(script, 7);
+        let fault = ScriptedFaultCell::steady(7);
+        let first = scene
+            .adapter
+            .collect_from_drain(&mut drain, &scene.descriptors, None, &fault);
+        assert_eq!((first.ingested, first.ordinary), (1, 0));
+        assert_eq!(scene.adapter.consumed_through, 1);
+        let bootstrap = scene.bootstrap(proof, 1);
+        let held = scene
+            .seal_collected(&bootstrap, &first)
+            .expect("prefix frontier seals");
+        assert_eq!(held.prefix.open_keys().len(), 1);
+        let second = scene
+            .adapter
+            .collect_from_drain(&mut drain, &scene.descriptors, None, &fault);
+        assert_eq!((second.ingested, second.ordinary), (1, 0));
+        let bootstrap = scene.bootstrap(proof, 1);
+        let success = scene
+            .seal_collected(&bootstrap, &second)
+            .expect("completed frontier seals");
+        assert!(has_effect(&success.effects, "created"));
+
+        // A stall before the first record consumes nothing at all.
+        let mut scene = Scene::new(image_default());
+        let mut script = BusyScript::new(vec![begin.to_vec()]);
+        script.busy_after = Some(0);
+        let mut drain = crate::events::EventDrain::over_test_domain(script, 7);
+        let first = scene
+            .adapter
+            .collect_from_drain(&mut drain, &scene.descriptors, None, &fault);
+        assert_eq!((first.ingested, first.ordinary), (0, 0));
+        assert_eq!(scene.adapter.consumed_through, 0);
+
+        // The bounded path: Pending at the stop holds the frontier with
+        // nothing consumed; Pending below the stop is the ungated-writer
+        // error, also consuming nothing.
+        let mut scene = Scene::new(image_default());
+        let mut script = BusyScript::new(vec![begin.to_vec(), end.to_vec()]);
+        script.pending_before = 1;
+        let mut drain = crate::events::EventDrain::over_test_domain(script, 7);
+        let outcome = scene
+            .drain_bounded_to(&mut drain, 0)
+            .expect("pending at the stop is legal");
+        assert_eq!(outcome, (false, false));
+        assert_eq!(scene.adapter.consumed_through, 0);
+        let outcome = scene
+            .drain_bounded_to(&mut drain, 16)
+            .expect("bounded drain consumes to the stop");
+        assert_eq!(outcome, (false, false));
+        assert_eq!(scene.adapter.consumed_through, 2);
+
+        let mut scene = Scene::new(image_default());
+        let mut script = BusyScript::new(vec![begin.to_vec()]);
+        script.pending_before = 1;
+        let mut drain = crate::events::EventDrain::over_test_domain(script, 7);
+        let outcome = scene.drain_bounded_to(&mut drain, 8);
+        assert!(outcome.is_err(), "busy below the stop errors");
+        assert_eq!(scene.adapter.consumed_through, 0);
+    }
+
+    #[test]
+    fn object_journal_frontier_requires_complete_disposition() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        // A delayed seal proves exactly what prompt sealing proves.
+        let build = |delayed: bool| {
+            let mut scene = Scene::new(image_default());
+            let proof = scene.attest();
+            let create = function_id("C_CreateObject");
+            let first = begin_bytes(1, 1, create, 0);
+            scene.ingest(&first);
+            scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 40));
+            let held = scene.adapter.consumed_frontier();
+            let second = begin_bytes(1, 2, create, 0);
+            scene.ingest(&second);
+            scene.ingest(&end_bytes(&second, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+            let bootstrap = scene.bootstrap(proof, 1);
+            if !delayed {
+                let frontier = held;
+                let audit = scene.audit();
+                scene
+                    .adapter
+                    .seal(&mut scene.model, &audit, &bootstrap, frontier)
+                    .expect("prompt first seal passes");
+            }
+            let frontier = scene.adapter.consumed_frontier();
+            let audit = scene.audit();
+            scene
+                .adapter
+                .seal(&mut scene.model, &audit, &bootstrap, frontier)
+                .expect("final seal passes");
+            // Proved relationships only: the prompt run's second seal
+            // reuses the covered bootstrap and counts one expected
+            // BootstrapRefused gap the delayed run never takes.
+            let projection = scene.model.project();
+            format!(
+                "{:?}{:?}{:?}",
+                projection.objects, projection.sessions, projection.usage
+            )
+        };
+        assert_eq!(build(false), build(true));
+
+        // A frontier below the sealed-through cut regresses.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 40));
+        let held = scene.adapter.consumed_frontier();
+        let second = begin_bytes(1, 2, create, 0);
+        scene.ingest(&second);
+        scene.ingest(&end_bytes(&second, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        let bootstrap = scene.bootstrap(proof, 1);
+        scene.seal(&bootstrap).expect("first seal passes");
+        let audit = scene.audit();
+        let failure = scene
+            .adapter
+            .seal(&mut scene.model, &audit, &bootstrap, held)
+            .expect_err("regressed frontier refuses");
+        assert_eq!(failure.gap, JournalGap::FrontierRegression);
+
+        // Undisposed H3 history refuses without voiding: the same staged
+        // inputs seal once disposition covers them.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 1);
+        let frontier = scene.adapter.consumed_frontier();
+        let short = JournalAuditReceipt::scripted(
+            7,
+            7,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(frontier.cut() - 1),
+            0,
+        );
+        let failure = scene
+            .adapter
+            .seal(&mut scene.model, &short, &bootstrap, frontier)
+            .expect_err("undisposed H3 refuses");
+        assert_eq!(failure.gap, JournalGap::H3Pending);
+        let audit = scene.audit();
+        let success = scene
+            .adapter
+            .seal(&mut scene.model, &audit, &bootstrap, frontier)
+            .expect("covered disposition seals the kept inputs");
+        assert_eq!(success.prefix.settled().len(), 1);
+
+        // A staged H3 loss voids: the next clean seal settles nothing.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 1);
+        let frontier = scene.adapter.consumed_frontier();
+        let loss = JournalAuditReceipt::scripted(
+            7,
+            7,
+            None,
+            0,
+            H3DispositionEvidence::scripted_loss(2),
+            0,
+        );
+        let failure = scene
+            .adapter
+            .seal(&mut scene.model, &loss, &bootstrap, frontier)
+            .expect_err("H3 loss refuses");
+        assert_eq!(failure.gap, JournalGap::H3Loss);
+        let audit = scene.audit();
+        let success = scene
+            .adapter
+            .seal(&mut scene.model, &audit, &bootstrap, frontier)
+            .expect("clean seal after void passes");
+        assert!(success.prefix.settled().is_empty());
+    }
+
+    #[test]
+    fn object_journal_retained_cursor_discard_audit() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        // One malformed record in a real collection refuses the seal and
+        // voids the tick's staged inputs.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        let fault = ScriptedFaultCell::steady(7);
+        let collection =
+            scene.collect_records(vec![begin.to_vec(), vec![0u8; 100], end.to_vec()], &fault);
+        assert_eq!(collection.malformed_delta, 1);
+        assert_eq!((collection.ingested, collection.ordinary), (2, 0));
+        let bootstrap = scene.bootstrap(proof, 1);
+        let failure = scene
+            .seal_collected(&bootstrap, &collection)
+            .expect_err("malformed tick refuses");
+        assert_eq!(failure.gap, JournalGap::Malformed);
+        let clean = JournalCollection {
+            malformed_delta: 0,
+            ..collection
+        };
+        let success = scene
+            .seal_collected(&bootstrap, &clean)
+            .expect("clean seal after void passes");
+        assert!(success.prefix.settled().is_empty());
+
+        // A fault change across the tick refuses and voids, through the
+        // same collection evidence.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let begin = begin_bytes(1, 1, create, 0);
+        let fault = ScriptedFaultCell::sequence(vec![7, 8]);
+        let collection = scene.collect_records(vec![begin.to_vec()], &fault);
+        assert_eq!((collection.fault_before, collection.fault_after), (7, 8));
+        let bootstrap = scene.bootstrap(proof, 1);
+        let failure = scene
+            .seal_collected(&bootstrap, &collection)
+            .expect_err("changed fault refuses");
+        assert_eq!(failure.gap, JournalGap::FaultChanged);
+
+        // An unreadable fault stages nothing and refuses; a saturated
+        // fault stops the adapter permanently.
+        let mut scene = Scene::new(image_default());
+        let begin = begin_bytes(1, 1, create, 0);
+        let fault = ScriptedFaultCell::failing();
+        let collection = scene.collect_records(vec![begin.to_vec()], &fault);
+        assert_eq!((collection.ingested, collection.ordinary), (0, 0));
+        let proof = scene.attest();
+        let bootstrap = scene.bootstrap(proof, 1);
+        let failure = scene
+            .seal_collected(&bootstrap, &collection)
+            .expect_err("unreadable fault refuses");
+        assert_eq!(failure.gap, JournalGap::FaultUnreadable);
+        let fault = ScriptedFaultCell::sequence(vec![u64::MAX]);
+        let collection = scene.collect_records(vec![begin.to_vec()], &fault);
+        let failure = scene
+            .seal_collected(&bootstrap, &collection)
+            .expect_err("saturated fault refuses");
+        assert_eq!(failure.gap, JournalGap::FaultSaturated);
+        let readmitted = scene.fixture.admit();
+        assert_eq!(
+            scene.adapter.attest_key(&readmitted),
+            Err(AttestationRefusal::Stopped)
+        );
+
+        // A clean mixed collection counts every form and seals.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let begin = begin_bytes(1, 1, create, 0);
+        let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        let fault = ScriptedFaultCell::steady(7);
+        let collection = scene.collect_records(
+            vec![
+                begin.to_vec(),
+                crate::events::event_bytes(&pad),
+                end.to_vec(),
+            ],
+            &fault,
+        );
+        assert_eq!((collection.ingested, collection.ordinary), (2, 1));
+        assert_eq!(collection.malformed_delta, 0);
+        let bootstrap = scene.bootstrap(proof, 1);
+        let success = scene
+            .seal_collected(&bootstrap, &collection)
+            .expect("clean mixed tick seals");
+        assert!(has_effect(&success.effects, "created"));
+    }
+
+    #[test]
+    fn object_journal_pending_and_floor_capacity() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        // The 1,025th open call at the 1,024 policy bound records its
+        // refusal; a corroborated synchronous return bounds it and the
+        // seal clears the refusal without a bootstrap refusal.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        for sequence in 1..=1_024u64 {
+            let begin = begin_bytes(1, sequence, create, 0);
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        }
+        let mut refused = begin_bytes(1, 1_025, create, 0);
+        put_u32(&mut refused, 104, 77);
+        assert_eq!(
+            scene.ingest(&refused),
+            JournalDisposition::BeginRefusedCapacity
+        );
+        let bootstrap = scene.bootstrap(proof, 1);
+        let failure = scene.seal(&bootstrap).expect_err("unbounded refusal waits");
+        assert_eq!(failure.gap, JournalGap::BoundNotReady);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&refused, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let mut pad = ordinary_for(&refused, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 1_027);
+        let success = scene.seal(&bootstrap).expect("bounded refusal seals");
+        assert_eq!(success.prefix.open_keys().len(), 1_024);
+        assert!(
+            !success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: super::ObjectGap::BootstrapRefused
+                }
+            )),
+            "the lost-outcome bound cleared the refusal"
+        );
+
+        // Small injected bounds refuse overflow exactly: two opens, two
+        // refusals, then the third refusal overflows and taints.
+        let mut scene = Scene::new_with_limits(
+            image_default(),
+            JournalLimits {
+                open_calls: 2,
+                thread_floors: 8,
+                refused_begins: 2,
+                domain_keys: 4,
+            },
+        );
+        for sequence in 1..=2u64 {
+            let begin = begin_bytes(1, sequence, create, 0);
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        }
+        for sequence in 3..=4u64 {
+            let begin = begin_bytes(1, sequence, create, 0);
+            assert_eq!(
+                scene.ingest(&begin),
+                JournalDisposition::BeginRefusedCapacity
+            );
+        }
+        let begin = begin_bytes(1, 5, create, 0);
+        assert_eq!(
+            scene.ingest(&begin),
+            JournalDisposition::Contradiction(JournalContradiction::RefusedOverflow)
+        );
+        let admitted = scene.fixture.admit();
+        assert_eq!(
+            scene.adapter.attest_key(&admitted),
+            Err(AttestationRefusal::ImageTainted)
+        );
+
+        // The 16,449th thread at the 16,448 policy floor bound refuses
+        // with the image tainted; seals are refused before any model
+        // input for the overflow. Batches seal and prune so only floors
+        // accumulate.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let bootstrap = scene.bootstrap(proof, 1);
+        for batch in 0..64u64 {
+            for thread in 1..=256u64 {
+                let ticket = batch * 256 + thread;
+                let begin = begin_bytes(ticket, 1, create, 0);
+                assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+                scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+            }
+            scene.seal(&bootstrap).expect("batch seal prunes");
+        }
+        for thread in 16_384 + 1..=16_448u64 {
+            let begin = begin_bytes(thread, 1, create, 0);
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+            scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        }
+        scene.seal(&bootstrap).expect("final batch seals");
+        let begin = begin_bytes(16_449, 1, create, 0);
+        assert_eq!(
+            scene.ingest(&begin),
+            JournalDisposition::Contradiction(JournalContradiction::FloorExhausted)
+        );
+        let frontier = scene.adapter.consumed_frontier();
+        let audit = scene.audit();
+        let failure = scene
+            .adapter
+            .seal(&mut scene.model, &audit, &bootstrap, frontier)
+            .expect_err("tainted image never seals");
+        assert_eq!(failure.gap, JournalGap::ImageTainted);
+
+        // The domain-key table refuses past its injected bound.
+        let mut scene = Scene::new_with_limits(
+            image_default(),
+            JournalLimits {
+                open_calls: 8,
+                thread_floors: 8,
+                refused_begins: 8,
+                domain_keys: 1,
+            },
+        );
+        scene.attest();
+        let mut other = AttestationFixture::new(ImageIdentity {
+            task_cookie: COOKIE + 1,
+            exec_id: EXEC,
+        });
+        assert_eq!(
+            scene.adapter.attest_key(&other.admit()),
+            Err(AttestationRefusal::KeysExhausted)
+        );
+    }
+
+    #[test]
+    fn object_journal_neutral_s1_calls_close_prefix() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        // A neutral call holds the settlement watermark exactly like an
+        // object call: the completed creation below it applies only once
+        // the neutral call closes, and the neutral call itself contributes
+        // no object effect.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let sign = function_id("C_Sign");
+        let neutral = begin_bytes(1, 1, sign, 0);
+        scene.ingest(&neutral);
+        let begin = begin_bytes(1, 2, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 1);
+        let held = scene.seal(&bootstrap).expect("neutral-open prefix seals");
+        assert_eq!(held.prefix.settled().len(), 2);
+        assert_eq!(held.prefix.open_keys().len(), 1);
+        assert!(!has_effect(&held.effects, "created"));
+        assert!(scene.model.project().objects.is_empty());
+        scene.ingest(&end_bytes_absent(&neutral, 0, ENTRY_NS + 60));
+        let success = scene.seal(&bootstrap).expect("closed prefix seals");
+        assert!(has_effect(&success.effects, "created"));
+        // Each terminal converts once: the held creation completes
+        // without a duplicate-completion gap on the second seal.
+        assert!(
+            !success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: super::ObjectGap::DuplicateCompletion
+                }
+            )),
+            "no duplicate completion"
+        );
+        assert!(success.prefix.open_keys().is_empty());
+        assert_eq!(scene.model.project().objects.len(), 1);
+    }
+
+    #[test]
+    fn object_journal_sequence_scope_frontier() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        // A delayed first route retains its original BEGIN cut.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        scene.ingest_ordinary(pad);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        assert_eq!(scene.adapter.consumed_through, 4);
+        let bootstrap = scene.bootstrap(proof, 1);
+        let success = scene.seal(&bootstrap).expect("delayed seal passes");
+        assert_eq!(success.prefix.settled()[0].begin_cut, 1);
+
+        // One pending lease: a converted call never re-mints on a later
+        // seal; the second seal settles nothing new.
+        let second = scene.seal(&bootstrap).expect("second seal passes");
+        assert!(second.prefix.settled().is_empty());
+
+        // Settlement releases the lease: after a pruning seal the same
+        // small table admits new calls instead of refusing capacity.
+        let mut scene = Scene::new_with_limits(
+            image_default(),
+            JournalLimits {
+                open_calls: 2,
+                thread_floors: 8,
+                refused_begins: 8,
+                domain_keys: 4,
+            },
+        );
+        let proof = scene.attest();
+        for sequence in 1..=2u64 {
+            let begin = begin_bytes(1, sequence, create, 0);
+            scene.ingest(&begin);
+            scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        }
+        let bootstrap = scene.bootstrap(proof, 1);
+        scene.seal(&bootstrap).expect("pruning seal passes");
+        for sequence in 3..=4u64 {
+            let begin = begin_bytes(1, sequence, create, 0);
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+        }
+    }
+
+    #[test]
+    fn object_journal_h3_disposition_evidence() {
+        use crate::inventory_semantics::{LaneCollectionRefusal, LaneNegative};
+
+        let mut scene = Scene::new(image_default());
+        let genesis = H3DispositionEvidence::genesis();
+
+        // No negatives: disposition extends through the greatest staged
+        // token, monotonically over the previous evidence.
+        let clean = H3DispositionEvidence::from_finalizer_batch(
+            &[],
+            &[scene.fixture.evidence(), scene.fixture.evidence()],
+            &genesis,
+        );
+        assert!(matches!(
+            clean,
+            H3DispositionEvidence::Clean {
+                disposed_through: 2
+            }
+        ));
+        let chained =
+            H3DispositionEvidence::from_finalizer_batch(&[], &[scene.fixture.evidence()], &clean);
+        assert!(matches!(
+            chained,
+            H3DispositionEvidence::Clean {
+                disposed_through: 3
+            }
+        ));
+        let older =
+            H3DispositionEvidence::from_finalizer_batch(&[], &[scene.fixture.evidence()], &chained);
+        assert!(matches!(
+            older,
+            H3DispositionEvidence::Clean {
+                disposed_through: 4
+            }
+        ));
+        // Disposition never regresses below the previous evidence.
+        let held = H3DispositionEvidence::from_finalizer_batch(
+            &[],
+            &[scene.fixture.evidence()],
+            &H3DispositionEvidence::scripted_clean(10),
+        );
+        assert!(matches!(
+            held,
+            H3DispositionEvidence::Clean {
+                disposed_through: 10
+            }
+        ));
+
+        // Any staged negative is a loss barrier: the narrowest cut wins,
+        // and a refused collection disposes nothing.
+        let barrier = H3DispositionEvidence::from_finalizer_batch(
+            &[
+                LaneNegative::CutBarrier { ordinal: 5 },
+                LaneNegative::CutBarrier { ordinal: 3 },
+            ],
+            &[scene.fixture.evidence()],
+            &genesis,
+        );
+        assert!(matches!(
+            barrier,
+            H3DispositionEvidence::StagedLoss { barrier: 3 }
+        ));
+        for refusal in [
+            LaneCollectionRefusal::Backpressure,
+            LaneCollectionRefusal::CollectionFailed,
+        ] {
+            let refused = H3DispositionEvidence::from_finalizer_batch(
+                &[LaneNegative::CollectionRefused { reason: refusal }],
+                &[scene.fixture.evidence()],
+                &genesis,
+            );
+            assert!(matches!(
+                refused,
+                H3DispositionEvidence::StagedLoss { barrier: 0 }
+            ));
+        }
+
+        // A clean batch after a loss batch recovers disposition from its
+        // own staged tokens.
+        let recovered =
+            H3DispositionEvidence::from_finalizer_batch(&[], &[scene.fixture.evidence()], &barrier);
+        assert!(matches!(
+            recovered,
+            H3DispositionEvidence::Clean {
+                disposed_through: 9
+            }
+        ));
     }
 }

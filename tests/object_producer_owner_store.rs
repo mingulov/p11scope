@@ -103,8 +103,8 @@ fn object_producer_missing_side_state_faults_before_return() {
         .expect("drain must check retained-ABI agreement");
     assert_eq!(
         returned.matches("owned_start_remove(&key, true)").count(),
-        5,
-        "ordinary, aggregate, continuity-gate, reserve-failure and emission arms each retire"
+        8,
+        "ordinary, ready, agreement, aggregate, image, continuity-gate, reserve-failure and emission arms each retire"
     );
     let drain_retire = returned
         .rfind("owned_start_remove(&key, true)")
@@ -196,7 +196,6 @@ fn object_producer_cleanup_result_reaches_exec_exit_fault() {
 /// row, exactly settled lease, visible bookkeeping, foreign rows
 /// untouched, fail-closed successors and converging repeated cleanup.
 #[test]
-#[ignore = "RED: H7-E2 readback rollback pending"]
 fn object_owner_readback_failure_never_authorizes() {
     owner_fixture::run_object_subcommand(
         "object_producer_alloc_readback_failure_preserves_cleanup_authority",

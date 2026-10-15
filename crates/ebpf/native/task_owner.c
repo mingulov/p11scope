@@ -450,6 +450,15 @@ static __always_inline long object_side_alloc(struct owner_control *ctl,
     }
     side = owner_map_lookup(&OBJECT_START, key);
     if (!side) {
+        /* H7-E2: readback miss after a successful insert rolls the orphan
+         * side row back by this live transaction key (the held lease
+         * proves it) instead of wedging the key until teardown. The row
+         * still holds OBJECT_ZERO bytes (binding writes run after this
+         * lookup), so no scrub is needed; -2 only means the row is already
+         * gone. */
+        long orphan = owner_map_delete(&OBJECT_START, key);
+        if (orphan && orphan != -2)
+            poison(ctl, OWNER_STATE_DELETE_FAILED);
         object_rollback_insert(ctl, owner, key);
         bookkeeping(ctl, OWNER_OBJECT_MISMATCH);
         return -1;

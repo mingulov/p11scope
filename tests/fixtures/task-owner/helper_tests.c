@@ -1471,19 +1471,18 @@ static void object_producer_cleanup_result_reaches_exec_exit_fault(void)
     assert(deleted_side_seen && object_bytes_zeroed(deleted_side));
     puts("object custody cleanup result passed");
 }
-/* H7-E2 root-refusal mirror (RED state): replicates the CURRENT BPF return
- * root object arms (`p11_return_impl` at f8f7a7a7): the ready/agreement
- * exits fault without any removal; image refusal exits without removal or
- * fault; failed emission short-circuits (`!emitted ||`) past the removal.
- * Calls production functions only. The E2 fix retires on every arm in both
- * the root and this mirror; the Rust wrapper pins the root arms line for
- * line. Returns 1 on emission, 0 on any refusal. The reserve-failure and
- * healthy arms already retire and are GREEN guards, not RED. */
+/* H7-E2 root-refusal mirror: replicates the FIXED BPF return root object
+ * arms (`p11_return_impl`): every refusal arm attempts the checked removal
+ * before returning, image refusal faults, and the emission retirement is
+ * evaluated independently of emission success (no short-circuit past the
+ * removal). Calls production functions only. The Rust wrapper pins the
+ * root arms line for line. Returns 1 on emission, 0 on any refusal. */
 static unsigned root_return_mirror(const struct owner_start_key *key, u32 descriptor, u32 layout,
                                    int image_ok, int reserve_ok, int emit_ok)
 {
     const struct object_start *ready = p11_object_side_get(key, descriptor, 1);
     if (!ready) {
+        p11_owner_start_remove(key, 1);
         p11_object_fault();
         return 0;
     }
@@ -1491,19 +1490,25 @@ static unsigned root_return_mirror(const struct owner_start_key *key, u32 descri
     int agree = side != NULL && side->descriptor_index == descriptor &&
         (!side->layout || side->layout == layout);
     if (!agree) {
+        p11_owner_start_remove(key, 1);
         p11_object_fault();
         return 0;
     }
     if (!image_ok) {
+        p11_owner_start_remove(key, 1);
+        p11_object_fault();
         return 0;
     }
     if (!reserve_ok) {
         p11_owner_start_remove(key, 1);
         return 0;
     }
-    if (!emit_ok || p11_owner_start_remove(key, 1)) {
-        p11_object_fault();
-        return 0;
+    {
+        long retired = p11_owner_start_remove(key, 1);
+        if (!emit_ok || retired) {
+            p11_object_fault();
+            return 0;
+        }
     }
     return 1;
 }
@@ -1818,10 +1823,8 @@ int main(int argc, char **argv)
         lease_boundary(); classifier(); transactions(); directory(); lifecycle(); poisoned_reads(); capacity_collision(); ordinary_absence(); discovery_foreign_owner();
         object_producer_owner_terminal_matrix(); object_producer_side_state_n_and_n_plus_one();
         object_producer_missing_side_state_faults_before_return(); object_producer_cleanup_result_reaches_exec_exit_fault();
-        /* H7-E2 RED: the four new refusal/custody controls run
-         * subcommand-only until their fix lands; they join this full run
-         * in the E2 commit. (Two pin already-correct behavior and would
-         * pass here; two reproduce defects and abort until fixed.) */
+        object_producer_return_refusals_retire_owned_state(); object_producer_alloc_readback_failure_preserves_cleanup_authority();
+        object_producer_empty_lease_refund_failure_remains_visible(); object_owner_sweep_adjacent_lookup_preserves_custody();
     }
     puts("task-owner: actual helper classifier, transactions, directory and lifecycle controls passed");
 }

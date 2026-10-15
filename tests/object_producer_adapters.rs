@@ -633,7 +633,7 @@ fn pin_root_refusals_retire() {
         "the independent retirement must precede the emission gate"
     );
     let discard = returned
-        .find("entry.discard(0)")
+        .rfind("entry.discard(0)")
         .expect("failed emission discards");
     let tail_region = &returned[retire..discard];
     for forbidden in [
@@ -657,7 +657,6 @@ fn pin_root_refusals_retire() {
 /// ownership never authorizes forced deletion. The native fixture drives
 /// the real owner transactions; the pins bind the root arms line for line.
 #[test]
-#[ignore = "RED: H7-E2 refusal retirement pending"]
 fn object_root_refusal_always_attempts_owned_cleanup() {
     owner_fixture::run_object_subcommand(
         "object_producer_return_refusals_retire_owned_state",

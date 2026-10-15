@@ -153,6 +153,86 @@ impl ValidatedJournalBegin {
         journal_u64(&self.bytes, 48)
     }
 
+    /// Retained entry image evidence (task cookie, exec id).
+    pub fn image_cookie(&self) -> u64 {
+        journal_u64(&self.bytes, 32)
+    }
+
+    /// Retained entry image evidence (task cookie, exec id).
+    pub fn image_exec(&self) -> u64 {
+        journal_u64(&self.bytes, 40)
+    }
+
+    /// Retained entry probe-address evidence.
+    pub fn entry_ip(&self) -> u64 {
+        journal_u64(&self.bytes, 56)
+    }
+
+    /// The exact copied 16-byte entry stamp.
+    pub fn entry_stamp(&self) -> [u8; 16] {
+        let mut stamp = [0u8; 16];
+        stamp.copy_from_slice(&self.bytes[64..80]);
+        stamp
+    }
+
+    /// Retained session word and its finite handle status.
+    pub fn session_word(&self) -> u64 {
+        journal_u64(&self.bytes, 80)
+    }
+
+    /// Retained session word and its finite handle status.
+    pub fn session_status(&self) -> u8 {
+        self.bytes[125]
+    }
+
+    /// Retained input word and status for position 0 or 1.
+    pub fn input_word(&self, index: usize) -> u64 {
+        journal_u64(&self.bytes, 88 + 8 * (index & 1))
+    }
+
+    /// Retained input word and status for position 0 or 1.
+    pub fn input_status(&self, index: usize) -> u8 {
+        self.bytes[126 + (index & 1)]
+    }
+
+    /// Copied entry mechanism evidence.
+    pub fn entry_mechanism(&self) -> u64 {
+        journal_u64(&self.bytes, 112)
+    }
+
+    /// Copied finite capture word.
+    pub fn capture(&self) -> u32 {
+        journal_u32(&self.bytes, 120)
+    }
+
+    /// Validated layout code.
+    pub fn layout(&self) -> u8 {
+        self.bytes[124]
+    }
+
+    /// One exact 36-byte requested attribute list (pair 0 or 1).
+    pub fn requested_pair(&self, index: usize) -> [u8; 36] {
+        let mut list = [0u8; 36];
+        let base = 128 + 36 * (index & 1);
+        list.copy_from_slice(&self.bytes[base..base + 36]);
+        list
+    }
+
+    /// Retained slot identity evidence.
+    pub fn slot_id(&self) -> u64 {
+        journal_u64(&self.bytes, 200)
+    }
+
+    /// Copied call-flags evidence.
+    pub fn call_flags(&self) -> u64 {
+        journal_u64(&self.bytes, 208)
+    }
+
+    /// Copied user-type evidence.
+    pub fn user_type(&self) -> u32 {
+        journal_u32(&self.bytes, 216)
+    }
+
     /// The exact validated BEGIN bytes.
     pub fn bytes(&self) -> &[u8; JOURNAL_BEGIN_BYTES] {
         &self.bytes
@@ -198,6 +278,26 @@ impl ValidatedJournalEnd {
     /// The exact validated wire bytes of this END (either length).
     pub fn raw_bytes(&self) -> &[u8] {
         &self.raw[..self.raw_len]
+    }
+
+    /// The reconstructed base record (Event plus private continuity) of
+    /// the validated 608-byte payload, identical for both END forms.
+    pub fn payload_base(&self) -> crate::EventRecord {
+        let payload = self.payload_bytes();
+        let mut base = [0u8; 368];
+        base.copy_from_slice(&payload[..368]);
+        // SAFETY: exactly `EventRecord` bytes; the shared transport type
+        // is `repr(C)` and plain-old-data.
+        unsafe { core::ptr::read_unaligned(base.as_ptr().cast::<crate::EventRecord>()) }
+    }
+
+    /// The exact 240-byte object tail of the validated payload: the
+    /// carried H7 tail, or all zeros for the absent-tail form.
+    pub fn payload_tail(&self) -> [u8; OBJECT_TAIL_BYTES] {
+        let payload = self.payload_bytes();
+        let mut tail = [0u8; OBJECT_TAIL_BYTES];
+        tail.copy_from_slice(&payload[368..]);
+        tail
     }
 
     /// The reconstructed exact 608-byte H7 completed payload. For the full
@@ -252,6 +352,26 @@ impl ValidatedJournalAbandon {
     /// Finite abandonment reason code (1..=9).
     pub fn reason(&self) -> u32 {
         journal_u32(&self.bytes, 52)
+    }
+
+    /// Retained pid_tgid evidence.
+    pub fn pid_tgid(&self) -> u64 {
+        journal_u64(&self.bytes, 24)
+    }
+
+    /// Retained image evidence (task cookie, exec id).
+    pub fn image_cookie(&self) -> u64 {
+        journal_u64(&self.bytes, 32)
+    }
+
+    /// Retained image evidence (task cookie, exec id).
+    pub fn image_exec(&self) -> u64 {
+        journal_u64(&self.bytes, 40)
+    }
+
+    /// Retained entry timestamp evidence (nanoseconds).
+    pub fn entry_ns(&self) -> u64 {
+        journal_u64(&self.bytes, 56)
     }
 
     /// The exact validated ABANDON bytes.
@@ -469,6 +589,79 @@ pub fn pack_compact_end(
     bytes[JOURNAL_COMMON_BYTES + COMPACT_OMIT_START..]
         .copy_from_slice(&payload[COMPACT_OMIT_END..]);
     Some(bytes)
+}
+
+/// One decoded journal record in any of the four wire forms. The Session's
+/// retained decoder extends to these lengths alongside the existing
+/// 368/608-byte forms; every other length is malformed.
+#[derive(Clone, Copy)]
+#[allow(clippy::large_enum_variant)] // The frozen 632-byte END stays allocation-free in transfer.
+pub enum JournalRecord {
+    Begin(ValidatedJournalBegin),
+    End(ValidatedJournalEnd),
+    Abandon(ValidatedJournalAbandon),
+}
+
+impl core::fmt::Debug for JournalRecord {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Begin(_) => "JournalRecord::Begin(<private>)",
+            Self::End(_) => "JournalRecord::End(<private>)",
+            Self::Abandon(_) => "JournalRecord::Abandon(<private>)",
+        })
+    }
+}
+
+/// Decode one raw ring record into its validated journal form, or `None`
+/// when its length is not a journal form or its bytes refuse. Descriptor
+/// agreement mirrors the H7 decoder: the record's descriptor word selects
+/// the frozen receipt-bound row, and only a live object row takes the
+/// object path — anything else takes the structural no-row path, which
+/// the validators re-check. The prefix alone never validates.
+pub fn decode_journal_record(
+    bytes: &[u8],
+    descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+) -> Option<JournalRecord> {
+    match bytes.len() {
+        JOURNAL_BEGIN_BYTES => {
+            let index = journal_u32(bytes, 108);
+            validate_begin(bytes, live_row(index, descriptors)).map(JournalRecord::Begin)
+        }
+        JOURNAL_END_FULL_BYTES | JOURNAL_END_COMPACT_BYTES => {
+            if bytes[5] & JOURNAL_END_TAIL_ABSENT != 0 {
+                return validate_end(bytes, None).map(JournalRecord::End);
+            }
+            let index = if bytes.len() == JOURNAL_END_FULL_BYTES {
+                journal_u32(bytes, JOURNAL_COMMON_BYTES + 372)
+            } else {
+                journal_u32(bytes, compact_tail_index_offset())
+            };
+            validate_end(bytes, live_row(index, descriptors)).map(JournalRecord::End)
+        }
+        JOURNAL_ABANDON_BYTES => validate_abandon(bytes).map(JournalRecord::Abandon),
+        _ => None,
+    }
+}
+
+/// The frozen row for one descriptor word, or `None` when the word names
+/// no live object row (out of range, zero, or the NONE row). The caller
+/// still validates on the taken path; this only selects it.
+fn live_row(
+    index: u32,
+    descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+) -> Option<&ObjectDescriptorWire> {
+    if index == 0 || index >= MAX_DESCRIPTORS {
+        return None;
+    }
+    let row = &descriptors[index as usize];
+    (row.action != 0).then_some(row)
+}
+
+/// Offset of the tail descriptor word inside a compact END record: header
+/// plus the carried 120-byte prefix, 48-byte capture/identity span and
+/// 40-byte continuity, then the tail's own 4-byte header.
+const fn compact_tail_index_offset() -> usize {
+    JOURNAL_COMMON_BYTES + COMPACT_OMIT_START + 48 + 40 + 4
 }
 
 /// Exact version/length/kind, zero reserved word and nonzero identity.

@@ -690,6 +690,18 @@ impl ModelState {
         Ok(token)
     }
 
+    /// The journal adapter's consumed-but-unrepresentable begin: recorded
+    /// exactly like a model capacity refusal. The domain must be held;
+    /// an unheld domain counts its gap instead of recording.
+    pub(super) fn note_refused(&mut self, domain: ObjectDomain, cut: u64) {
+        if self.held(domain).is_err() {
+            self.gap(ObjectGap::UnknownDomain);
+            return;
+        }
+        self.refuse_unrepresented(domain, cut);
+        self.gap(ObjectGap::PendingCapacity);
+    }
+
     /// A refused call is unrepresented history that may still be running:
     /// proof in its domain ends, and no bootstrap is accepted until a
     /// lost-outcome fact bounds it. Existing tickets stay as fences.

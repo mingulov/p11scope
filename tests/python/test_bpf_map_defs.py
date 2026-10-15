@@ -54,8 +54,8 @@ class MapDefsTests(unittest.TestCase):
 
         BPF_OBJ_NAME_LEN truncates map names to 15 chars; the stopped
         canary compares those truncated names against FROZEN_INVENTORY.
-        Only the exact task-storage and private image-hash names have a
-        canonical remap, so every other frozen
+        Only the exact task-storage, private image-hash and object-array
+        names have a canonical remap, so every other frozen
         name must fit, and no two names in a flavor may share a prefix.
         """
         dumper = load_path(ROOT / "scripts/dump-owned-bpf-maps.py", "map_dumper")
@@ -65,7 +65,8 @@ class MapDefsTests(unittest.TestCase):
                 for name in maps:
                     if len(name) > 15:
                         canonical_type = ("task_storage" if maps[name]["type"] == 29 else
-                                          "hash" if maps[name]["type"] == 1 else "other")
+                                          "hash" if maps[name]["type"] == 1 else
+                                          "array" if maps[name]["type"] == 2 else "other")
                         self.assertEqual(name, dumper.canonical_map_name({"name": name[:15], "type": canonical_type}),
                                       f"{name} exceeds 15 chars without a canonical remap")
                     truncated = name[:15]

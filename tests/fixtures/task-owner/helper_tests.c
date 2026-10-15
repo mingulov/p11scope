@@ -1475,8 +1475,12 @@ static void object_producer_cleanup_result_reaches_exec_exit_fault(void)
  * arms (`p11_return_impl`): every refusal arm attempts the checked removal
  * before returning, image refusal faults, and the emission retirement is
  * evaluated independently of emission success (no short-circuit past the
- * removal). Calls production functions only. The Rust wrapper pins the
- * root arms line for line. Returns 1 on emission, 0 on any refusal. */
+ * removal). Models the object arm only: callers guarantee a required
+ * object call with a live START, exactly the state the root holds at the
+ * object-arm entry (ordinary calls leave at the aggregate arm; the Rust
+ * pin keeps their accounting-only image refusal). Calls production
+ * functions only. The Rust wrapper pins the root arms line for line.
+ * Returns 1 on emission, 0 on any refusal. */
 static unsigned root_return_mirror(const struct owner_start_key *key, u32 descriptor, u32 layout,
                                    int image_ok, int reserve_ok, int emit_ok)
 {
@@ -1591,8 +1595,9 @@ static void object_producer_return_refusals_retire_owned_state(void)
     assert(root_return_mirror(&key, 23, 1, 1, 1, 1));
     assert(!row(&OBJECT_START, &key) && !row(&START, &key));
     assert(!ctl.outstanding && !ctl.poison && !instance_counters_live.faults);
-    /* Unproved ownership never authorizes forced deletion: the refusal is
-     * attempted but production keeps every row. */
+    /* Unproved ownership never authorizes forced deletion (stale row
+     * under a recycled PID): the refusal is attempted but production
+     * keeps every row. */
     reset(); object_setup();
     key.pid_tgid = pid_tgid();
     memset(value, 0, sizeof(value)); object_write_start(value, 24);

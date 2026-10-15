@@ -760,7 +760,8 @@ decodes 608-byte records only against the receipt-bound frozen table
 stay 368-byte-only. The 16/32/36/240/432/608 B layouts are unchanged.
 
 Reviewed read sites (each under the marker, the frozen row, the
-accepted LP64/ia32 ABI and the live START owner):
+accepted LP64/ia32 ABI, the live START owner and, for return reads,
+the joined entry/return continuity):
 
 - Entry input scalars and null-cancel (BPF `object_fill_entry`).
 - Derive entry mechanism word plus arg 5 retention after exact
@@ -798,10 +799,18 @@ unread at registry apply. No production disk, log, error, map-dump
 or public output carries raw words; `ValidatedObjectCall`, the envelope, the
 evidence and the admission result have no raw-value Debug/Serialize.
 Ring records grow to 616 B with header for object CALLs only; the
-4 MiB ring and all caps are unchanged. Measured 2026-10-14: entry and
-return chains stay <=512 B (roots 440/448 B;
+4 MiB ring and all caps are unchanged. Measured 2026-10-15
+(H7-E1–E3; default, small-state and wide-2112 objects): entry and
+return chains stay <=512 B (roots 440/440 B;
 `object_fill_return` 64 B and `object_emit_find` 56 B as leaves,
-`object_tail_fill` 4 B over the single memset edge).
+`object_tail_fill` 4 B over the single memset edge). Entry attribute
+inspection stays out of budget (measured, H7-E4): a one-slot retain
+probe fits (8 B), but the alias-checked eight-slot protocol needs
+~104 B live against the 32 B left under the mandatory ia32 nesting,
+and object-phase scalar diet frees nothing (the S1 phase owns the
+440 B root). The UNINSPECTED marking above therefore stands, and
+budgeted six-attribute capture remains an open requirement, not a
+weakened one.
 
 Required live qualification before release use: owned LP64/ia32
 producer positives with independently expected nonempty facts,

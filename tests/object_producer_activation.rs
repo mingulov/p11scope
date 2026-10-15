@@ -637,6 +637,30 @@ fn object_return_continuity_refuses_before_reads() {
             [handle_status::UNREADABLE, handle_status::ABSENT]
         );
         assert_eq!(outcome.words, [0, 0]);
+        // Ordinary accounting stays truthful: joined stamps with a
+        // non-OK RV read nothing, keep the honest tail (unavailable
+        // cells, never values) and fault nothing.
+        let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        target.borrow_mut().set_word(0x10000, 0x42);
+        let (entry, ret) = clean_stamps();
+        let outcome = run_emission_mirror(
+            &target,
+            layout,
+            [true, false],
+            [true, false],
+            [0x10000, 0],
+            7,
+            entry,
+            ret,
+            None,
+        );
+        adapter::assert_no_target_reads(&target, &format!("{layout:?} result reads on RV 7"));
+        assert_eq!(
+            outcome.handles.statuses,
+            [handle_status::PROTOCOL_UNAVAILABLE, handle_status::ABSENT]
+        );
+        assert!(outcome.tail_emitted, "non-OK RV keeps its honest tail");
+        assert!(!outcome.fault_required, "non-OK RV faults nothing");
         // Every refusal: zero reads, no tail, visible fault, retired.
         for (name, entry, ret) in refused_stamp_pairs() {
             let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
@@ -716,6 +740,27 @@ fn object_find_continuity_refuses_before_reads() {
         );
         assert_eq!(outcome.find_words[..2], [0x51, 0x52]);
         assert!(outcome.tail_emitted, "healthy Find twin emits its tail");
+        // Ordinary accounting stays truthful: joined stamps with a
+        // non-OK RV read neither count nor elements, validate nothing
+        // and fault nothing, while the tail still emits.
+        let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        program_find(&target);
+        let (entry, ret) = clean_stamps();
+        let outcome = run_emission_mirror(
+            &target,
+            layout,
+            [false, false],
+            [false, false],
+            [0x20000, 0],
+            7,
+            entry,
+            ret,
+            Some((0x20000, 8, 0x21000)),
+        );
+        adapter::assert_no_target_reads(&target, &format!("{layout:?} Find reads on RV 7"));
+        assert!(!outcome.find.valid, "non-OK RV validates no Find batch");
+        assert!(outcome.tail_emitted, "non-OK RV keeps its honest tail");
+        assert!(!outcome.fault_required, "non-OK RV faults nothing");
         // Every refusal: the count word itself is unread.
         for (name, entry, ret) in refused_stamp_pairs() {
             let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));

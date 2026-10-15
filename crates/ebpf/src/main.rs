@@ -4132,9 +4132,9 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
             bump_evidence(EVIDENCE_RING_LOSS);
             return 0;
         };
-        // Populate in place under ownership: the base event and its
-        // continuity land in the reserved record FIRST, then the join
-        // gate runs before any object result read, then (with the S1
+        // H7-E1: populate in place under ownership with the base event
+        // and its continuity landing in the reserved record FIRST, then
+        // the join gate before any object result read, then (with the S1
         // return-time mechanism evidence the return body just captured)
         // the result fills and tail sections. Any refusal discards: no
         // facts. A found continuity entry is not a join: only the full

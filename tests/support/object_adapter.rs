@@ -3,7 +3,8 @@
 //! read-log assertions shared by the object-producer adapter regressions.
 //! Suite-local mirrors (continuity stamps, argument spies, root sequencing)
 //! live in the owning suite file so every helper here is used by every
-//! suite that includes it and `dead_code` stays armed.
+//! suite that includes it and `dead_code` stays armed, except the noted
+//! adapters-only `read_u32`.
 //!
 //! Every test built on this fixture calls REAL production protocol code
 //! (`p11scope_ebpf_common::object_capture`, `instance::stamp_joinable`,
@@ -128,8 +129,8 @@ pub fn rv_ok() -> u64 {
     CKR_OK
 }
 
-/// Fully authorized return authority (live owner, ready phase). The
-/// continuity conjunct arrives with the E1 fix.
+/// Fully authorized return authority (live owner, ready phase, joined
+/// continuity).
 pub fn owner_ready_authority() -> ReturnAuthority {
     ReturnAuthority::AUTHORIZED
 }

@@ -27,6 +27,7 @@ TASK_STORAGE_RECORD = 1
 TASK_STORAGE_EOF = 2
 TASK_STORAGE_NAMES = ("TASK_COOKIE", "THREAD_OWNER", "ROOT_AFFILIATION", "PROC_EPOCH")
 IMAGE_HASH_NAMES = ("IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS")
+OBJECT_ARRAY_NAMES = ("OBJECT_DESCRIPTORS",)
 # The frozen Task 2 D2 qualification surface: the seed fixture creates and
 # seeds exactly these three maps, and the reader serves it without PROC_EPOCH
 # (its iterator object then neither creates nor reads that map). Every owned
@@ -339,7 +340,8 @@ def canonical_map_name(item):
     if not isinstance(name, str):
         return name
     candidates = (TASK_STORAGE_NAMES if item.get("type") == "task_storage" else
-                  IMAGE_HASH_NAMES if item.get("type") == "hash" else ())
+                  IMAGE_HASH_NAMES if item.get("type") == "hash" else
+                  OBJECT_ARRAY_NAMES if item.get("type") == "array" else ())
     matches = [candidate for candidate in candidates if candidate[:15] == name]
     return matches[0] if len(matches) == 1 else name
 

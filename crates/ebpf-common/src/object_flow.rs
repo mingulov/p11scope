@@ -94,9 +94,9 @@ pub fn adapter_derive_entry(
     // SAFETY: a validated live map row on BPF (a caller-owned row on host);
     // these fields are ours.
     unsafe {
-        core::ptr::addr_of_mut!((*side).derive).write(derive.code());
-        core::ptr::addr_of_mut!((*side).result_ptrs[0]).write(retained.unwrap_or(0));
-        core::ptr::addr_of_mut!((*side).result_ptrs[1]).write(0);
+        core::ptr::addr_of_mut!(side.derive).write(derive.code());
+        core::ptr::addr_of_mut!(side.result_ptrs[0]).write(retained.unwrap_or(0));
+        core::ptr::addr_of_mut!(side.result_ptrs[1]).write(0);
     }
     true
 }
@@ -156,6 +156,10 @@ fn slot_word(
 /// alias/duplicate/partial rules below recompute both slots from the
 /// retained pointers; emission never trusts slot-0 as final.
 #[inline(always)]
+// Nine scalar parameters map 1:1 to the BPF wrapper's register-passed
+// arguments; bundling them into a struct would risk wrapper stack the
+// 512-byte return chain does not have.
+#[allow(clippy::too_many_arguments)]
 pub fn adapter_fill_return(
     side: Option<&mut ObjectStart>,
     descriptor: u32,
@@ -288,16 +292,16 @@ pub fn adapter_fill_return(
         // statuses), which emission reads; the cross-checks above already
         // consumed the retained pointers.
         unsafe {
-            core::ptr::addr_of_mut!((*side).result_ptrs).write([word0, word1]);
-            core::ptr::addr_of_mut!((*side).result_statuses).write([status0, status1]);
-            let old = core::ptr::addr_of!((*side).flags).read();
-            core::ptr::addr_of_mut!((*side).flags).write(old | flags as u16);
+            core::ptr::addr_of_mut!(side.result_ptrs).write([word0, word1]);
+            core::ptr::addr_of_mut!(side.result_statuses).write([status0, status1]);
+            let old = core::ptr::addr_of!(side.flags).read();
+            core::ptr::addr_of_mut!(side.flags).write(old | flags as u16);
         }
     }
     // SAFETY: a validated live map row on BPF (a caller-owned row on host);
     // the phase byte is ours.
     unsafe {
-        core::ptr::addr_of_mut!((*side).phase).write(3);
+        core::ptr::addr_of_mut!(side.phase).write(3);
     }
     true
 }
@@ -479,6 +483,10 @@ unsafe fn zero_find_cells(tail: *mut ObjectCallWire) {
 /// `tail` must be an exclusively owned writable tail (the reserved ring
 /// tail on BPF, a caller-owned row on host).
 #[inline(always)]
+// Eight scalar parameters map 1:1 to the BPF wrapper's register-passed
+// arguments; bundling them into a struct would risk wrapper stack the
+// 512-byte return chain does not have.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn adapter_emit_find(
     tail: *mut ObjectCallWire,
     side: Option<&ObjectStart>,

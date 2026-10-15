@@ -556,32 +556,48 @@ pub fn apply_null_mechanism_cancel(
     (out, out_words)
 }
 
-/// Derive entry guard: read exactly one target word at the arg-1 mechanism
-/// pointer and require full-width membership in the four scalar-result
-/// mechanisms before retaining arg 5. Null/invalid/unreadable/unlisted
-/// mechanisms retain nothing and authorize no template access. Neither
-/// `pParameter` nor `ulParameterLen` is addressed.
+/// Classify Derive membership from exactly one target word at the arg-1
+/// mechanism pointer, WITHOUT touching any other argument. Adapters must
+/// call this BEFORE acquiring the arg-5 result pointer, so refused
+/// mechanisms never read arg 5. Neither `pParameter` nor `ulParameterLen`
+/// is addressed.
+pub fn classify_derive_mechanism(
+    mechanism_ptr: u64,
+    layout: LinuxLayout,
+    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+) -> DeriveEntry {
+    if mechanism_ptr == 0 {
+        return DeriveEntry::Unavailable;
+    }
+    if target_word_end(mechanism_ptr, layout).is_none() {
+        return DeriveEntry::Unavailable;
+    }
+    let mechanism = match read_word(mechanism_ptr) {
+        Ok(word) => word,
+        Err(()) => return DeriveEntry::Unavailable,
+    };
+    match derive_result_protocol(mechanism) {
+        DeriveResultProtocol::ScalarHandle(accepted) => DeriveEntry::Accepted(accepted),
+        DeriveResultProtocol::Unavailable => DeriveEntry::Unavailable,
+    }
+}
+
+/// Derive entry guard: classify the mechanism word and retain the
+/// already-acquired arg-5 pointer only for the accepted mechanisms.
+/// Null/invalid/unreadable/unlisted mechanisms retain nothing and
+/// authorize no template access. Callers that have not acquired arg 5
+/// yet must gate that acquisition on the returned membership (see
+/// `classify_derive_mechanism`).
 pub fn capture_derive_entry(
     mechanism_ptr: u64,
     out5_ptr: u64,
     layout: LinuxLayout,
-    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    read_word: impl FnMut(u64) -> Result<u64, ()>,
 ) -> (DeriveEntry, Option<u64>) {
-    if mechanism_ptr == 0 {
-        return (DeriveEntry::Unavailable, None);
-    }
-    if target_word_end(mechanism_ptr, layout).is_none() {
-        return (DeriveEntry::Unavailable, None);
-    }
-    let mechanism = match read_word(mechanism_ptr) {
-        Ok(word) => word,
-        Err(()) => return (DeriveEntry::Unavailable, None),
-    };
-    match derive_result_protocol(mechanism) {
-        DeriveResultProtocol::ScalarHandle(accepted) => {
-            (DeriveEntry::Accepted(accepted), Some(out5_ptr))
-        }
-        DeriveResultProtocol::Unavailable => (DeriveEntry::Unavailable, None),
+    let entry = classify_derive_mechanism(mechanism_ptr, layout, read_word);
+    match entry {
+        DeriveEntry::Accepted(_) => (entry, Some(out5_ptr)),
+        DeriveEntry::Unavailable => (entry, None),
     }
 }
 

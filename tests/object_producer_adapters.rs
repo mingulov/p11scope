@@ -286,14 +286,13 @@ impl<'a> ArgSpy<'a> {
     }
 }
 
-/// H7-E3 Derive entry mirror. Replicates the CURRENT `object_entry_derive`
-/// acquisition order (main.rs `object_entry_derive` at f8f7a7a7): fetch
-/// the arg-1 mechanism pointer AND the arg-5 result pointer first, then
-/// classify through the REAL shared `capture_derive_entry`. RED state:
-/// refused mechanisms still fetch arg5 (on ia32 a stack word read
-/// through the real `read_ia32_arg_with` address). The E3 fix classifies
-/// the mechanism word first and fetches arg5 only on membership, in both
-/// the adapter and this mirror; the order pin below binds them.
+/// H7-E3 Derive entry mirror. Replicates the FIXED `object_entry_derive`
+/// acquisition order (main.rs `object_entry_derive`): fetch the arg-1
+/// mechanism pointer, classify through the REAL shared
+/// `classify_derive_mechanism`, then acquire arg5 only on membership.
+/// Refused mechanisms fetch arg5 zero times (on ia32, zero stack word
+/// reads through the real `read_ia32_arg_with` address). The order pin
+/// below binds the mirror to the adapter line for line.
 fn run_derive_entry_mirror(
     args: &mut ArgSpy<'_>,
     target: &std::cell::RefCell<adapter::FakeTarget>,
@@ -302,14 +301,19 @@ fn run_derive_entry_mirror(
     p11scope_ebpf_common::object_capture::DeriveEntry,
     Option<u64>,
 ) {
-    use p11scope_ebpf_common::object_capture::capture_derive_entry;
-    // Steps 1-2 (mirror of the two `arg_u64` fetches): both arguments
-    // are acquired before any membership check.
+    use p11scope_ebpf_common::object_capture::{DeriveEntry, classify_derive_mechanism};
+    // Step 1 (mirror of the arg-1 fetch plus the guard): classify the
+    // mechanism word before touching any other argument.
     let mechanism_ptr = args.fetch(1).unwrap_or(0);
-    let out5_ptr = args.fetch(5).unwrap_or(0);
-    // Step 3: the real shared guard classifies and retains.
     let (reader, _) = adapter::readers(target);
-    capture_derive_entry(mechanism_ptr, out5_ptr, layout, reader)
+    let entry = classify_derive_mechanism(mechanism_ptr, layout, reader);
+    // Step 2 (mirror of the gated arg-5 fetch): membership alone
+    // acquires the result pointer.
+    let retained = match entry {
+        DeriveEntry::Accepted(_) => args.fetch(5),
+        DeriveEntry::Unavailable => None,
+    };
+    (entry, retained)
 }
 
 fn pin_derive_guard_precedes_arg5() {
@@ -345,7 +349,6 @@ fn pin_derive_guard_precedes_arg5() {
 /// template access. A matching CKR_OK return reads phKey once;
 /// changed/missing S1 return evidence reads it zero times.
 #[test]
-#[ignore = "RED: H7-E3 derive guard pending"]
 fn object_ia32_derive_membership_precedes_arg5_read() {
     use p11scope_ebpf_common::LinuxLayout;
     use p11scope_ebpf_common::capture;
@@ -552,20 +555,28 @@ fn object_ia32_derive_membership_precedes_arg5_read() {
             assert_eq!(verdict.statuses[0], handle_status::PROTOCOL_UNAVAILABLE);
             adapter::assert_no_target_reads(&phkey, &format!("{layout:?} phKey on {name}"));
         }
-        // Arithmetic overflow: a valid mechanism with an overflowing
-        // ia32 stack performs zero stack reads.
+        // Arithmetic overflow: the arg-1 slot itself is readable here
+        // (sp+8) but unprogrammed, so entry is unavailable after exactly
+        // that one failed stack read. The arg-5 slot address overflows,
+        // so no arg-5 stack read can land.
         if layout == LinuxLayout::Ilp32 {
             let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
             target.borrow_mut().set_word(0x30000, 0x21);
             let sp = 0xffff_fff0u64;
             let mut args = ArgSpy::ia32(&target, sp);
-            // The mechanism pointer itself is unreadable here (its stack
-            // slot overflows too), so entry is unavailable without any
-            // stack read landing.
             let (entry, retained) = run_derive_entry_mirror(&mut args, &target, layout);
             assert_eq!(entry, DeriveEntry::Unavailable);
             assert_eq!(retained, None);
-            adapter::assert_no_target_reads(&target, "overflowing ia32 stack");
+            assert_eq!(
+                target.borrow().log(),
+                &[(adapter::READ_BYTES, sp + 8, 4)],
+                "only the failed arg-1 slot is read"
+            );
+            assert_eq!(
+                p11scope_ebpf_common::ia32_arg_address(sp, 5),
+                None,
+                "the arg-5 slot address overflows"
+            );
         }
     }
     pin_derive_guard_precedes_arg5();

@@ -25,8 +25,9 @@ class ManifestTests(unittest.TestCase):
         for row in self.manifest["cells"]:
             if "t7-static" not in row["required_for_claims"]:
                 continue
-            row.update({"outcome": "PASS", "test_ids": [row["id"] + "::test"],
-                        "command": ["observer", "--exact", row["id"] + "::test"],
+            tids = row["test_ids"] or [row["id"] + "::test"]
+            row.update({"outcome": "PASS", "test_ids": list(tids),
+                        "command": ["observer", "--exact", tids[0]],
                         "artifact_hashes": copy.deepcopy(artifact), "evidence_paths": ["observer"],
                         "receipt": row["id"] + ".json"})
             receipt = {"schema": "p11scope/test-execution/v1", "cell_id": row["id"],
@@ -187,44 +188,67 @@ class ManifestTests(unittest.TestCase):
         bounded = {identifier for identifier, policy in policies.items()
                    if "bounded-release" in policy["required_for_claims"]}
         # The bounded v0.4 claim is the full claim minus the 4h/24h
-        # soaks; the 30-minute meaningful-activity soak stays required.
-        self.assertEqual(system - bounded, {"soak.14400s", "soak.86400s"})
+        # soaks minus the placeholder-kernel cells no claim can close
+        # yet; the 30-minute meaningful-activity soak stays required.
+        placeholders = {identifier for identifier in system
+                        if policies[identifier]["kernel_profile"] == VERIFY["PLACEHOLDER_KERNEL"]}
+        self.assertTrue(placeholders)
+        self.assertEqual(system - bounded,
+                         {"soak.14400s", "soak.86400s"} | placeholders)
         self.assertIn("soak.1800s", bounded)
-        self.assertIn("R01.public", bounded)
+        # Public-contract cells stay out until concrete tests register.
+        self.assertNotIn("R01.public", bounded)
+        self.assertTrue(all(policies[identifier]["kernel_profile"] != VERIFY["PLACEHOLDER_KERNEL"]
+                            for identifier in bounded))
         self.assertTrue(any(identifier.startswith("T7.") for identifier in bounded))
         static = {identifier for identifier, policy in policies.items()
                   if "t7-static" in policy["required_for_claims"]}
         self.assertEqual(len(static), 7)
 
+    def pass_claim_row(self, row, artifact):
+        """Give a closable row passing evidence with a consistent receipt."""
+        tids = row["test_ids"] or [row["id"] + "::test"]
+        row.update({"outcome": "PASS", "test_ids": list(tids),
+                    "command": ["observer", "--exact", tids[0]],
+                    "artifact_hashes": copy.deepcopy(artifact),
+                    "evidence_paths": ["observer"],
+                    "receipt": row["id"].replace(":", "_") + ".json"})
+        if row["evidence_level"] in ("installed", "soak"):
+            row["artifact_hashes"]["installed"] = copy.deepcopy(artifact["observer"])
+        receipt = {"schema": "p11scope/test-execution/v1", "cell_id": row["id"],
+                   "subject": self.manifest["subject"], "evidence_level": row["evidence_level"],
+                   "entrypoint": VERIFY["ENTRYPOINTS"][row["evidence_level"]],
+                   "kernel_profile": row["kernel_profile"],
+                   "test_ids": row["test_ids"], "executed_test_ids": row["test_ids"],
+                   "command": row["command"], "exit_code": 0, "outcome": "PASS",
+                   "artifact_hashes": row["artifact_hashes"], "evidence_paths": row["evidence_paths"],
+                   "observed_behavior": row["expected_behavior"]}
+        if row["evidence_level"] in ("installed", "soak"):
+            receipt["installed_artifact_sha256"] = row["artifact_hashes"]["installed"]["sha256"]
+        if row["evidence_level"] == "soak":
+            receipt["start_mono_ns"] = 0
+            receipt["end_mono_ns"] = row["minimum_duration_s"] * 1_000_000_000
+        receipt_path = self.root / row["receipt"]
+        receipt_path.write_text(json.dumps(receipt))
+        row["receipt_sha256"] = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+
     def test_bounded_claim_cannot_pass_full_system_product(self):
-        # The t7-static cells alone satisfy neither the bounded nor the
-        # full claim; the new claim routes end to end.
-        with self.assertRaisesRegex(ValueError, "required cell"):
-            VERIFY["verify_manifest"](self.manifest, self.root, claim="bounded-release")
+        # A complete valid bounded fixture: every bounded-required cell
+        # carries passing evidence with a consistent receipt, so the
+        # bounded claim genuinely passes.
+        artifact = {"observer": {"path": "observer",
+                                 "sha256": hashlib.sha256(self.payload.read_bytes()).hexdigest()}}
+        for row in self.manifest["cells"]:
+            if "bounded-release" in row["required_for_claims"] and row["outcome"] != "PASS":
+                self.pass_claim_row(row, artifact)
+        report = VERIFY["verify_manifest"](self.manifest, self.root, claim="bounded-release")
+        self.assertEqual(report["verdict"], "PASS")
+        self.assertEqual(report["passed"], report["required"])
+        # The same evidence bundle cannot pass the full claim.
         with self.assertRaisesRegex(ValueError, "required cell"):
             VERIFY["verify_manifest"](self.manifest, self.root, claim="system-product")
         with self.assertRaisesRegex(ValueError, "unknown acceptance claim"):
             VERIFY["verify_manifest"](self.manifest, self.root, claim="bounded-plus")
-        # Passing the 30-minute soak still leaves the full claim open:
-        # the 4h/24h cells stay required there and unrequired here.
-        row = next(row for row in self.manifest["cells"] if row["id"] == "soak.1800s")
-        for field in ["test_ids", "command", "artifact_hashes", "evidence_paths", "outcome"]:
-            row[field] = copy.deepcopy(self.row[field])
-        row["receipt"] = "soak.json"
-        row["artifact_hashes"]["installed"] = copy.deepcopy(row["artifact_hashes"]["observer"])
-        receipt = json.loads((self.root / self.row["receipt"]).read_text())
-        receipt.update({"cell_id": row["id"], "evidence_level": "soak", "entrypoint": "installed-cli",
-                        "kernel_profile": row["kernel_profile"], "artifact_hashes": row["artifact_hashes"],
-                        "observed_behavior": row["expected_behavior"], "start_mono_ns": 0,
-                        "end_mono_ns": 1800_000_000_000,
-                        "installed_artifact_sha256": row["artifact_hashes"]["installed"]["sha256"]})
-        path = self.root / row["receipt"]
-        path.write_text(json.dumps(receipt))
-        row["receipt_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
-        with self.assertRaisesRegex(ValueError, "required cell"):
-            VERIFY["verify_manifest"](self.manifest, self.root, claim="bounded-release")
-        with self.assertRaisesRegex(ValueError, "required cell"):
-            VERIFY["verify_manifest"](self.manifest, self.root, claim="system-product")
         policies = VERIFY["catalog"]()
         self.assertNotIn("bounded-release",
                          policies["soak.14400s"]["required_for_claims"])
@@ -232,6 +256,43 @@ class ManifestTests(unittest.TestCase):
                          policies["soak.86400s"]["required_for_claims"])
         self.assertIn("system-product", policies["soak.14400s"]["required_for_claims"])
         self.assertIn("system-product", policies["soak.86400s"]["required_for_claims"])
+        # The only closable system cells without evidence are the omitted
+        # 4h/24h endurance cells (order-independent gap).
+        gap = sorted(row["id"] for row in self.manifest["cells"]
+                     if "system-product" in row["required_for_claims"]
+                     and policies[row["id"]]["kernel_profile"] != VERIFY["PLACEHOLDER_KERNEL"]
+                     and row["outcome"] != "PASS")
+        self.assertEqual(gap, ["soak.14400s", "soak.86400s"])
+        # The verifier reports the first gap in row order; with the
+        # endurance rows first the full-claim rejection names them.
+        ordered = copy.deepcopy(self.manifest)
+        soak = [row for row in ordered["cells"] if row["id"] in ("soak.14400s", "soak.86400s")]
+        rest = [row for row in ordered["cells"] if row["id"] not in ("soak.14400s", "soak.86400s")]
+        ordered["cells"] = soak + rest
+        with self.assertRaisesRegex(ValueError, r"required cell soak\.14400s: NOT_RUN"):
+            VERIFY["verify_manifest"](ordered, self.root, claim="system-product")
+        # Row order is not authority: bounded still passes reordered.
+        self.assertEqual(VERIFY["verify_manifest"](ordered, self.root,
+                                                   claim="bounded-release")["verdict"], "PASS")
+
+    def test_t7_selectors_survive_regeneration(self):
+        expected = {
+            "T7.default.inventory_n576_lp64": "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n576_lp64",
+            "T7.default.inventory_n1024_lp64": "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n1024_lp64",
+            "T7.default.inventory_n4097_lp64": "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n4097_lp64",
+            "T7.default.inventory_n6530_lp64": "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6530_lp64",
+            "T7.default.inventory_n8192_boundary_lp64": "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n8192_boundary_lp64",
+            "T7.default.detailed_hot_slot_third_rv_lp64": "attach::inventory::activation::privileged_tests::privileged_t7_detailed_hot_slot_third_rv_lp64",
+            "T7.wide.detailed_hot_slot_third_rv_lp64": "attach::inventory::activation::privileged_tests::privileged_t7_detailed_hot_slot_third_rv_lp64",
+        }
+        fresh = VERIFY["new_manifest"]()
+        seeded = {row["id"]: row["test_ids"] for row in fresh["cells"] if row["id"].startswith("T7.")}
+        self.assertEqual(seeded, {identifier: [selector] for identifier, selector in expected.items()})
+        # The checked-in open register is exactly the generator output:
+        # any silent regen drift (selectors, memberships, limitations)
+        # fails here instead of landing unnoticed.
+        checked_in = json.loads((ROOT / "tests/fixtures/system-qualification/system-test-manifest.json").read_text())
+        self.assertEqual(checked_in, fresh)
 
     def test_deferred_archive_gates_require_product_custody_not_agent_archives(self):
         deferred = json.loads(VERIFY["DEFERRED"].read_text())

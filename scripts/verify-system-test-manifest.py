@@ -24,11 +24,32 @@ ENTRYPOINTS = {"model": "unit-test", "artifact": "artifact-check",
                "installed": "installed-cli", "soak": "installed-cli"}
 REQUIREMENTS = {f"R{number:02}" for number in range(1, 11)}
 CLAIMS = {"system-product", "t7-static", "bounded-release"}
-# T1 reviewed policy: the bounded v0.4 release claim requires everything
-# the full system-product claim requires except the 4h/24h endurance
-# soaks. The 30-minute meaningful-activity soak stays required; longer
-# soaks need their corresponding claims and are never implied.
+# T1 fix policy: the bounded v0.4 release claim requires every closable
+# system-product cell except the 4h/24h endurance soaks. Cells still on
+# the placeholder final-supported-matrix kernel cannot close under any
+# claim (verify_pass rejects them until the catalog names concrete
+# kernels), so requiring them here would make bounded success unprovable;
+# they stay required for the full system-product claim only. The
+# 30-minute meaningful-activity soak stays required; longer soaks need
+# their corresponding claims and are never implied. Controller review
+# needed: this membership is a product-scope decision.
 BOUNDED_OMITS = {"soak.14400s", "soak.86400s"}
+PLACEHOLDER_KERNEL = "final-supported-matrix"
+# Registered T7 acceptance selectors: the generator seeds them so a
+# regeneration never silently drops concrete acceptance registration.
+# Rule: "T7.{profile}.{slug}" runs
+# "attach::inventory::activation::privileged_tests::privileged_t7_{slug}";
+# spelled out so a slug change fails loudly at regen review instead of
+# deriving a wrong ID.
+T7_SELECTORS = {
+    "T7.default.inventory_n576_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_inventory_n576_lp64"],
+    "T7.default.inventory_n1024_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_inventory_n1024_lp64"],
+    "T7.default.inventory_n4097_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_inventory_n4097_lp64"],
+    "T7.default.inventory_n6530_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6530_lp64"],
+    "T7.default.inventory_n8192_boundary_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_inventory_n8192_boundary_lp64"],
+    "T7.default.detailed_hot_slot_third_rv_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_detailed_hot_slot_third_rv_lp64"],
+    "T7.wide.detailed_hot_slot_third_rv_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_detailed_hot_slot_third_rv_lp64"],
+}
 
 
 def require(condition, message):
@@ -111,7 +132,9 @@ def catalog():
             "expected_behavior": "continuous-owned-workload", "minimum_duration_s": duration,
             "limitation": "Actual wall time with independent workload/loss and resource accounting required."}
     for identifier, policy in policies.items():
-        if "system-product" in policy["required_for_claims"] and identifier not in BOUNDED_OMITS:
+        if ("system-product" in policy["required_for_claims"]
+                and identifier not in BOUNDED_OMITS
+                and policy["kernel_profile"] != PLACEHOLDER_KERNEL):
             policy["required_for_claims"].append("bounded-release")
     return policies
 
@@ -119,7 +142,8 @@ def catalog():
 def new_manifest():
     cells = []
     for identifier, policy in catalog().items():
-        cells.append({"id": identifier, **policy, "test_ids": [], "command": [], "artifact_hashes": {},
+        cells.append({"id": identifier, **policy, "test_ids": list(T7_SELECTORS.get(identifier, [])),
+                      "command": [], "artifact_hashes": {},
                       "evidence_paths": [], "outcome": "NOT_RUN", "receipt": None, "receipt_sha256": None})
     return {"schema": SCHEMA, "ledger_sha256": digest(LEDGER), "deferred_sha256": digest(DEFERRED),
             "subject": None, "cells": cells}
@@ -136,7 +160,7 @@ def evidence_path(root, relative):
 
 def verify_pass(row, subject, root):
     label = row["id"]
-    require(row["kernel_profile"] != "final-supported-matrix",
+    require(row["kernel_profile"] != PLACEHOLDER_KERNEL,
             f"{label}: placeholder matrix must be replaced by concrete kernel/profile cells in the catalog")
     require(isinstance(subject, dict) and all(re.fullmatch(r"[0-9a-f]{40}", subject.get(key, ""))
             for key in ["revision", "tree"]), "PASS requires exact source subject")

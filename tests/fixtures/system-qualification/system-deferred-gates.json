@@ -7,9 +7,9 @@
     {
       "id": "U-01",
       "topic": "Evidence durability",
-      "review_disposition": "Keep required. This review moved its own frozen inputs out of TMPDIR. Historical evidence preservation still needs an inventory; the host has `/var/tmp` 30-day cleanup policy. Do not solve it by globally disabling cleanup.",
+      "review_disposition": "Keep required for product integrity. Current AGENTS supersedes routine agent-work retention bundles; verification-time checksum custody replaces durable bundles. The host keeps its `/var/tmp` 30-day cleanup policy. Do not solve it by globally disabling cleanup.",
       "owner_task": "T0/T13",
-      "gate": "T0/T13: copy only referenced evidence to a durable bundle, checksum/readback, retain raw red results",
+      "gate": "T0/T13: referenced product evidence checksum/readback validates at verification, raw red results diagnosed loudly, no routine retention bundle",
       "required": true,
       "evidence_level": "artifact"
     },
@@ -187,9 +187,9 @@
     {
       "id": "U-21",
       "topic": "Evidence/tool durability",
-      "review_disposition": "Required where it affects reproduction; otherwise maintenance.",
+      "review_disposition": "Required where it affects reproduction; otherwise maintenance. Verified work lives in commits per current AGENTS, not in a separate retention bundle.",
       "owner_task": "T0/T11/T13",
-      "gate": "T0/T11/T13: archived scripts and manifests, paths resolvable, hashes validated, stale path diagnosed loudly",
+      "gate": "T0/T11/T13: committed scripts and manifests, paths resolvable, hashes validated, stale path diagnosed loudly",
       "required": true,
       "evidence_level": "artifact"
     },

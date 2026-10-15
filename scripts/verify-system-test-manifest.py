@@ -23,7 +23,12 @@ ENTRYPOINTS = {"model": "unit-test", "artifact": "artifact-check",
                "live-mechanism": "private-live-test", "public-command": "public-cli",
                "installed": "installed-cli", "soak": "installed-cli"}
 REQUIREMENTS = {f"R{number:02}" for number in range(1, 11)}
-CLAIMS = {"system-product", "t7-static"}
+CLAIMS = {"system-product", "t7-static", "bounded-release"}
+# T1 reviewed policy: the bounded v0.4 release claim requires everything
+# the full system-product claim requires except the 4h/24h endurance
+# soaks. The 30-minute meaningful-activity soak stays required; longer
+# soaks need their corresponding claims and are never implied.
+BOUNDED_OMITS = {"soak.14400s", "soak.86400s"}
 
 
 def require(condition, message):
@@ -105,6 +110,9 @@ def catalog():
             "kernel_profile": "current/default", "required_for_claims": ["system-product"],
             "expected_behavior": "continuous-owned-workload", "minimum_duration_s": duration,
             "limitation": "Actual wall time with independent workload/loss and resource accounting required."}
+    for identifier, policy in policies.items():
+        if "system-product" in policy["required_for_claims"] and identifier not in BOUNDED_OMITS:
+            policy["required_for_claims"].append("bounded-release")
     return policies
 
 

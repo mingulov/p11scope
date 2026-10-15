@@ -43,6 +43,7 @@ static int installed[3], current_index;
 static u64 current_number[3];
 static struct owner_control ctl;
 static int miss_get, miss_get_skip, fail_create, delete_error, update_error, pair_delete_error;
+static int fail_start_delete;
 static int fail_current_task;
 static int gets, creates, deletes;
 static u64 expected_delete_debt;
@@ -159,6 +160,7 @@ static long pair_delete(void *map, const void *key)
 #ifndef P11SCOPE_INVENTORY_ONLY
     if (map == &OBJECT_START && fail_object_side_delete) return fail_object_side_delete;
 #endif
+    if (map == &START && fail_start_delete) return fail_start_delete;
     struct row *r = row(map, key);
     if (!r) return -2;
 #ifndef P11SCOPE_INVENTORY_ONLY
@@ -248,6 +250,7 @@ static void reset(void)
     memset(rows, 0, sizeof(rows)); memset(value, 0, sizeof(value));
     for (unsigned i = 0; i < 3; i++) current_number[i] = (42ULL << 32) | (100 + i);
     current_index = miss_get = miss_get_skip = fail_create = delete_error = update_error = pair_delete_error = 0;
+    fail_start_delete = 0;
     fail_current_task = 0;
     gets = creates = deletes = 0; expected_delete_debt = 0;
     cas_interference_cell = NULL; cas_failures_remaining = cas_attempts = 0;
@@ -1107,6 +1110,24 @@ static void object_producer_owner_terminal_matrix(void)
     assert(row(&START, &key) && owners[0].start_count == 1 && ctl.outstanding == 1);
     assert(ctl.poison & OWNER_STATE_DELETE_FAILED);
     pair_delete_error = 0;
+    assert(p11_owner_cleanup() == 1);
+    assert(!row(&START, &key) && !ctl.outstanding && ctl.abandoned_start == 1);
+    /* A failed START deletion on a healthy row keeps START, its count
+     * and its lease; the side row is already scrubbed and deleted.
+     * Teardown converges through the contradiction path once the error
+     * clears. */
+    reset(); object_setup();
+    key.pid_tgid = pid_tgid();
+    memset(value, 0, sizeof(value)); object_write_start(value, 24);
+    assert(!p11_owner_start_insert(&key, value));
+    fail_start_delete = -16;
+    deleted_side_seen = 0;
+    assert(p11_owner_start_remove(&key, 1));
+    assert(!row(&OBJECT_START, &key) && row(&START, &key));
+    assert(deleted_side_seen && object_bytes_zeroed(deleted_side));
+    assert(owners[0].start_count == 1 && ctl.outstanding == 1);
+    assert(ctl.poison & OWNER_STATE_DELETE_FAILED);
+    fail_start_delete = 0;
     assert(p11_owner_cleanup() == 1);
     assert(!row(&START, &key) && !ctl.outstanding && ctl.abandoned_start == 1);
     /* Wrong physical owner: a different live task, an unproven recycled

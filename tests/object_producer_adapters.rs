@@ -969,6 +969,41 @@ fn object_return_fill_matches_shared_core() {
     }
 }
 
+/// G03/E2: the production emission cleanup decision retires before
+/// gating. `emission_finalize` — the shared production function the BPF
+/// return root calls — attempts the injected removal on ALL four
+/// (emitted x retired) cells, never short-circuited by emission
+/// failure; it submits only when both hold and faults otherwise. The
+/// `emitted && remove()` mutant (skipped cleanup on emission failure)
+/// fails here: the emitted=false cells observe zero attempts.
+#[test]
+fn object_emission_finalize_always_attempts_removal() {
+    use p11scope_ebpf_common::object_flow::emission_finalize;
+    for emitted in [false, true] {
+        for retired in [false, true] {
+            let mut attempts = 0;
+            let outcome = emission_finalize(emitted, || {
+                attempts += 1;
+                retired
+            });
+            assert_eq!(
+                attempts, 1,
+                "emitted={emitted} retired={retired}: the removal is attempted exactly once"
+            );
+            assert_eq!(
+                outcome.submitted,
+                emitted && retired,
+                "emitted={emitted} retired={retired}: submit only on both"
+            );
+            assert_eq!(
+                outcome.faulted,
+                !(emitted && retired),
+                "emitted={emitted} retired={retired}: fault on either failure"
+            );
+        }
+    }
+}
+
 fn pin_root_refusals_retire() {
     let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF return root");
     let returned = source_between(
@@ -1013,27 +1048,42 @@ fn pin_root_refusals_retire() {
             "the image arm must retire object calls: missing {marker}"
         );
     }
-    // Emission retirement is independent of emission success: no
-    // short-circuit past the removal, and no read after a failed
+    // Emission cleanup is the shared production decision: the root
+    // calls `emission_finalize` exactly once with the checked removal,
+    // then gates on its verdict. No inline retirement may remain for a
+    // mutant to short-circuit, and no read may run after a failed
     // emission.
-    assert!(
-        !returned.contains("!emitted || owned_start_remove"),
-        "emission cleanup must not short-circuit past the removal"
+    assert_eq!(
+        returned.matches("emission_finalize(").count(),
+        1,
+        "emission must delegate its cleanup decision to the shared production function"
     );
-    let retire = returned
-        .find("owned_start_remove(&key, true).is_ok()")
-        .expect("emission must evaluate its retirement independently");
+    assert!(
+        !returned.contains("let retired = "),
+        "no inline retirement may bypass the shared decision"
+    );
+    let finalize = returned
+        .find("emission_finalize(emitted")
+        .expect("emission delegates with its chained stage result");
+    let stmt_end = returned[finalize..]
+        .find(';')
+        .expect("delegated call terminates");
+    let stmt = &returned[finalize..finalize + stmt_end];
+    assert!(
+        stmt.contains("owned_start_remove(&key, true)"),
+        "the delegated decision must carry the checked removal"
+    );
     let gate = returned
-        .find("if !emitted")
+        .find("if !outcome.submitted")
         .expect("emission keeps its success gate");
     assert!(
-        retire < gate,
-        "the independent retirement must precede the emission gate"
+        finalize < gate,
+        "the delegated decision must precede the emission gate"
     );
     let discard = returned
         .rfind("entry.discard(0)")
         .expect("failed emission discards");
-    let tail_region = &returned[retire..discard];
+    let tail_region = &returned[finalize..discard];
     for forbidden in [
         "p11_object_side_get",
         "object_fill_return(",
@@ -1053,7 +1103,11 @@ fn pin_root_refusals_retire() {
 /// and remove identifiable owned state, settle or explicitly fail the
 /// lease, emit no successful tail and fault before returning; unproved
 /// ownership never authorizes forced deletion. The native fixture drives
-/// the real owner transactions; the pins bind the root arms line for line.
+/// the real owner transactions; the emission cleanup decision itself is
+/// the shared production `emission_finalize` (executed by
+/// `object_emission_finalize_always_attempts_removal`, with the
+/// `emitted && remove()` mutant failing there); the pins bind the root
+/// arms and the single delegation call.
 #[test]
 fn object_root_refusal_always_attempts_owned_cleanup() {
     owner_fixture::run_object_subcommand(

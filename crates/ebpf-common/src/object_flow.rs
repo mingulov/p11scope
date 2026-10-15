@@ -647,6 +647,43 @@ pub unsafe fn adapter_emit_find(
     true
 }
 
+/// Production emission-finalize verdict: the reserved record submits
+/// only when emission succeeded AND the retirement settled; any failure
+/// discards and faults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmissionOutcome {
+    pub submitted: bool,
+    pub faulted: bool,
+}
+
+/// Production emission cleanup decision (H7-E2): the retirement runs
+/// INDEPENDENTLY of emission success — a failed fill/emission still
+/// retires owned state — and the record submits only when both hold.
+/// `remove` performs the checked ownership removal (true = retired).
+/// The BPF return root is a thin caller; the host G03 suite executes
+/// this same function with an instrumented removal. `#[inline(always)]`
+/// keeps the return call-chain frames identical (pinned by
+/// `object_producer_compiled_frames_are_bounded`).
+#[inline(always)]
+pub fn emission_finalize(emitted: bool, remove: impl FnOnce() -> bool) -> EmissionOutcome {
+    // H7-E2 enforcement inside the executed flow: no short-circuit past
+    // the removal. `emitted && remove()` would skip cleanup on emission
+    // failure; the G03 decision test fails that mutant (zero attempts on
+    // the emitted=false cells).
+    let retired = remove();
+    if !emitted || !retired {
+        EmissionOutcome {
+            submitted: false,
+            faulted: true,
+        }
+    } else {
+        EmissionOutcome {
+            submitted: true,
+            faulted: false,
+        }
+    }
+}
+
 /// Production entry attribute-inspection path (H7-E4 seam).
 ///
 /// TODAY (E4 unwired): inspects nothing — performs zero reads and returns

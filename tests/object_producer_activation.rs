@@ -514,6 +514,7 @@ fn run_production_return_arm(
 ) -> EmissionOutcome {
     use p11scope_ebpf_common::object_flow::{
         adapter_emit_find, adapter_fill_return, adapter_tail_fill, continuity_joins,
+        emission_finalize,
     };
     use p11scope_ebpf_common::object_wire::ObjectCallWire;
     let descriptor = side.descriptor_index;
@@ -550,14 +551,16 @@ fn run_production_return_arm(
                 reader,
             )
         };
-    // The fault decision is production's (`!emitted || !retired` after the
-    // gate); only the native `retire_ok` input is modeled here.
+    // The fault decision is production's `emission_finalize` (the same
+    // function the BPF return root calls); only the native `retire_ok`
+    // input is modeled here.
+    let outcome = emission_finalize(emitted, || retire_ok);
     EmissionOutcome {
         joined,
         filled,
         tailed,
         emitted,
-        fault_required: !joined || !emitted || !retire_ok,
+        fault_required: !joined || outcome.faulted,
         side,
         tail,
     }

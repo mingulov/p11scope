@@ -34,7 +34,7 @@ use p11scope_ebpf_common::object_capture::{handle_status, object_flag};
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_flow::{
     adapter_derive_entry, adapter_emit_find, adapter_fill_return, adapter_tail_fill,
-    continuity_joins,
+    continuity_joins, emission_finalize,
 };
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_wire::{
@@ -3692,12 +3692,12 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         let emitted =
             tailed && object_emit_find(tail, find_side, descriptor, layout, rv, joined);
         // Submit the completed ring record only after successful
-        // removal; otherwise discard it and fault. H7-E2: the retirement
-        // is evaluated independently of emission success, so a failed
-        // fill/emission still retires owned state and no read runs after
-        // either failure.
-        let retired = owned_start_remove(&key, true).is_ok();
-        if !emitted || !retired {
+        // removal; otherwise discard it and fault. H7-E2: the shared
+        // cleanup decision evaluates the retirement independently of
+        // emission success, so a failed fill/emission still retires owned
+        // state and no read runs after either failure.
+        let outcome = emission_finalize(emitted, || owned_start_remove(&key, true).is_ok());
+        if !outcome.submitted {
             entry.discard(0);
             unsafe { p11_object_fault() };
             bump_evidence(EVIDENCE_UNMATCHED_RETURNS);

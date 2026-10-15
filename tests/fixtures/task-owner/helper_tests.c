@@ -1472,16 +1472,21 @@ static void object_producer_cleanup_result_reaches_exec_exit_fault(void)
     puts("object custody cleanup result passed");
 }
 /* H7-E2 root-refusal mirror: replicates the FIXED BPF return root object
- * arms (`p11_return_impl`): every refusal arm attempts the checked removal
- * before returning, image refusal faults, the reserve arm faults exactly
- * when its cleanup fails, and the emission retirement is evaluated
- * independently of the per-stage (`fill/tail/find`) emission chain (no
- * short-circuit past the removal). Models the object arm only: callers
- * guarantee a required object call with a live START, exactly the state
- * the root holds at the object-arm entry (ordinary calls leave at the
- * aggregate arm; the Rust pin keeps their accounting-only image refusal).
- * Calls production functions only. The Rust wrapper pins the root arms
- * line for line. Returns 1 on emission, 0 on any refusal. */
+ * arms (`p11_return_impl`) through the real native owner transactions:
+ * every refusal arm attempts the checked removal before returning, image
+ * refusal faults, the reserve arm faults exactly when its cleanup fails,
+ * and the emission case retires through the real removal under each
+ * per-stage (`fill/tail/find`) outcome. Models the object arm only:
+ * callers guarantee a required object call with a live START, exactly
+ * the state the root holds at the object-arm entry (ordinary calls leave
+ * at the aggregate arm; the Rust pin keeps their accounting-only image
+ * refusal). Calls production functions only. The emission cleanup
+ * DECISION (attempt independence plus the submit/fault verdict) is the
+ * shared production `emission_finalize`, executed by the Rust G03
+ * decision test with the `emitted && remove()` mutant failing there;
+ * this mirror applies the same verdict shape to assert real-removal end
+ * states. The Rust wrapper pins the root arms plus the delegation call.
+ * Returns 1 on emission, 0 on any refusal. */
 static unsigned root_return_mirror(const struct owner_start_key *key, u32 descriptor, u32 layout,
                                    int image_ok, int reserve_ok, int fill_ok, int tail_ok,
                                    int find_ok)

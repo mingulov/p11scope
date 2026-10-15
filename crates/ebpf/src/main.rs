@@ -33,8 +33,8 @@ use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
 use p11scope_ebpf_common::instance::stamp_joinable;
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_capture::{
-    DeriveEntry, authorize_derive_return, capture_derive_entry, find_flag, handle_status,
-    object_flag, spans_overlap, validate_target_span,
+    DeriveEntry, authorize_derive_return, capture_derive_entry, classify_derive_mechanism,
+    find_flag, handle_status, object_flag, spans_overlap, validate_target_span,
 };
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_policy::ScalarDeriveMechanism;
@@ -2868,10 +2868,16 @@ fn object_entry_derive(
     if row.result_args != [5, ARG_NONE] {
         return false;
     }
+    // H7-E3: membership before acquisition. The mechanism word is read
+    // and classified first; the arg-5 result pointer is acquired only for
+    // the accepted mechanisms, so refused calls never read arg 5 (on
+    // ia32, never read its stack word).
     let mechanism_ptr = arg_u64(ctx, 1, layout).ok().unwrap_or(0);
-    let out5_ptr = arg_u64(ctx, 5, layout).ok().unwrap_or(0);
-    let (derive, retained) =
-        capture_derive_entry(mechanism_ptr, out5_ptr, layout, |addr| read_word(addr, layout));
+    let derive = classify_derive_mechanism(mechanism_ptr, layout, |addr| read_word(addr, layout));
+    let retained = match derive {
+        DeriveEntry::Accepted(_) => arg_u64(ctx, 5, layout).ok(),
+        DeriveEntry::Unavailable => None,
+    };
     // SAFETY: a validated live map row; these fields are ours.
     unsafe {
         core::ptr::addr_of_mut!((*side).derive).write(derive.code());

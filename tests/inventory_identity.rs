@@ -12,6 +12,9 @@
 //! proof-requiring btrfs fixture) or refuses with its named line before
 //! any sink exists; explicit selection outside `--system` is a usage
 //! error; `--pid` carries no identity key; stdout and `-o` bytes agree.
+//! The ignored `kernel_identity_positive_cell_rejects_refusal` runs the
+//! same sweep as a positive-required campaign cell: a refusal fails it,
+//! so test success there always means kernel-positive proof.
 //!
 //! System sweep fixtures run under `inventory-identity-observe.sh`,
 //! which execs the observer as their parent: under ptrace_scope=1
@@ -609,14 +612,125 @@ fn d3d_auto_without_proof_reports_userspace_null() {
     }
 }
 
+/// Forced-kernel sweep arguments over the owned provider fixture.
+fn forced_kernel_args(fixtures: &BuiltFixtures, cap: usize) -> Vec<String> {
+    vec![
+        "--system".to_string(),
+        "--capture".to_string(),
+        "scan".to_string(),
+        "--identity-backend".to_string(),
+        "kernel".to_string(),
+        "--module".to_string(),
+        fixtures.provider.to_str().unwrap().to_string(),
+        "--max-scan-pids".to_string(),
+        cap.to_string(),
+    ]
+}
+
+/// A sweep attempt qualifies when a selected supplier stays swept
+/// beside two unselected holders; otherwise a wider cap is tried.
+fn sweep_selection_qualifies(observed: &ObserveOutcome) -> bool {
+    let selected = observed
+        .holder_pids
+        .iter()
+        .filter(|pid| observed.selected.contains(pid))
+        .count();
+    selected >= 1 && observed.holder_pids.len() - selected >= 2
+}
+
+/// The one kernel-positive bar both forced-kernel tests share: exact
+/// three holder/provider edges, zero false edges over all enumerated
+/// module edges, both negatives un-edged, and per-range coverage of
+/// every owned requested exec range over a proof-requiring btrfs
+/// fixture. A successful empty capture never satisfies this gate.
+fn assert_forced_kernel_positive(fixtures: &BuiltFixtures, observed: &ObserveOutcome) {
+    // A kernel-positive claim needs a proof-requiring filesystem:
+    // no-proof fast paths cannot satisfy this gate.
+    assert!(
+        dir_is_btrfs(&fixtures.dir),
+        "kernel-positive cell requires its fixtures on btrfs; set \
+         P11SCOPE_IDENTITY_FIXTURE_DIR to a btrfs dir (got {})",
+        fixtures.dir.display()
+    );
+    let identity = &observed.doc["observation"]["identity"];
+    assert_eq!(identity["backend"], "kernel");
+    assert_eq!(
+        identity["fallback"],
+        Value::Null,
+        "a forced proof cell admits no fallback"
+    );
+    let module = module_for(&observed.doc, "id-k1.so");
+    let module_id = module["id"].as_str().unwrap();
+    // All module edges enumerated: every edge to the provider comes
+    // from a ledgered holder (zero false edges), and every holder
+    // keeps exactly one kernel edge.
+    let mut edge_callers = BTreeSet::new();
+    for edge in observed.doc["edges"].as_array().unwrap() {
+        if edge["module"] == module_id {
+            edge_callers.insert(edge["caller"].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(edge_callers.len(), 3, "complete expected edge set");
+    for pid in &observed.holder_pids {
+        let callers = callers_for(&observed.doc, u64::from(*pid));
+        assert_eq!(callers.len(), 1, "holder {pid} is one caller");
+        let caller_id = callers[0]["id"].as_str().unwrap();
+        assert!(
+            edge_callers.contains(caller_id),
+            "holder {pid} keeps its kernel edge"
+        );
+    }
+    for caller_id in &edge_callers {
+        let pid = observed.doc["callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|caller| caller["id"] == *caller_id)
+            .unwrap()["pid"]
+            .as_u64()
+            .unwrap() as u32;
+        assert!(
+            observed.holder_pids.contains(&pid),
+            "edge caller {caller_id} (pid {pid}) is a ledgered holder"
+        );
+    }
+    // Full ledger negatives: the byte-identical different file and
+    // the data-only mapping never edge to the original provider. The
+    // copy holder is inventoried (a nonempty caller set), so its
+    // negative is never vacuous.
+    assert!(
+        !callers_for(&observed.doc, u64::from(observed.copy_pid.unwrap())).is_empty(),
+        "copy holder is an inventoried caller"
+    );
+    for (pid, why) in [
+        (observed.copy_pid.unwrap(), "byte-identical different file"),
+        (observed.dataonly_pid.unwrap(), "data-only mapping"),
+    ] {
+        for caller in callers_for(&observed.doc, u64::from(pid)) {
+            let caller_id = caller["id"].as_str().unwrap();
+            assert!(
+                !edge_callers.contains(caller_id),
+                "{why} (pid {pid}) must not edge to the original provider"
+            );
+        }
+    }
+    // Per-range coverage: the ground-truth sets are established from
+    // /proc (nonempty, uniform), and all three holders edge — an edge
+    // is all caller ranges or nothing, so every owned requested exec
+    // range is covered.
+    let counts = ground_truth_range_counts(observed);
+    let total: usize = counts.iter().sum();
+    assert!(
+        total >= observed.holder_pids.len(),
+        "nonempty covered range set: {total}"
+    );
+}
+
 /// D3d forced kernel through the real command: either the kernel
 /// backend proves the full ledgered set on a proof-requiring btrfs
 /// fixture (privileged capable host) or the refusal names its finite
-/// reason before any sink exists (anything else). The positive arm
-/// asserts the exact three holder/provider edges, zero false edges over
-/// all enumerated module edges, both negatives un-edged, and per-range
-/// coverage of every owned requested exec range. A successful empty
-/// capture never satisfies this gate.
+/// reason before any sink exists (anything else). The positive arm is
+/// the shared [`assert_forced_kernel_positive`] bar.
 #[test]
 fn d3d_forced_kernel_proves_or_refuses_before_sinks() {
     let _guard = serial_guard();
@@ -627,17 +741,7 @@ fn d3d_forced_kernel_proves_or_refuses_before_sinks() {
             &fixtures,
             attempt,
             "sweep",
-            &[
-                "--system".to_string(),
-                "--capture".to_string(),
-                "scan".to_string(),
-                "--identity-backend".to_string(),
-                "kernel".to_string(),
-                "--module".to_string(),
-                fixtures.provider.to_str().unwrap().to_string(),
-                "--max-scan-pids".to_string(),
-                cap.to_string(),
-            ],
+            &forced_kernel_args(&fixtures, cap),
             cap,
             report_dir.path(),
         );
@@ -683,94 +787,46 @@ fn d3d_forced_kernel_proves_or_refuses_before_sinks() {
         };
         // Success: only a cap with a selected supplier and two swept
         // holders satisfies this gate; otherwise try a wider cap.
-        let selected_holders = observed
-            .holder_pids
-            .iter()
-            .filter(|pid| observed.selected.contains(pid))
-            .count();
-        if selected_holders < 1 || observed.holder_pids.len() - selected_holders < 2 {
+        if !sweep_selection_qualifies(&observed) {
             continue;
         }
-        // A kernel-positive claim needs a proof-requiring filesystem:
-        // no-proof fast paths cannot satisfy this gate.
-        assert!(
-            dir_is_btrfs(&fixtures.dir),
-            "kernel-positive cell requires its fixtures on btrfs; set \
-             P11SCOPE_IDENTITY_FIXTURE_DIR to a btrfs dir (got {})",
-            fixtures.dir.display()
+        assert_forced_kernel_positive(&fixtures, &observed);
+        return;
+    }
+    panic!("no cap left a selected supplier with two swept holders");
+}
+
+/// G28 positive-required campaign cell: the same forced-kernel sweep
+/// as [`d3d_forced_kernel_proves_or_refuses_before_sinks`], but an
+/// intentional refusal or fallback fails instead of satisfying the
+/// test. Test success here always means kernel-positive proof over the
+/// shared bar, never a classified refusal. Run explicitly in the
+/// privileged capable lane with btrfs fixtures.
+#[test]
+#[ignore = "privileged capable lane with btrfs fixtures; fails on any kernel refusal"]
+fn kernel_identity_positive_cell_rejects_refusal() {
+    let _guard = serial_guard();
+    let fixtures = build_fixtures("inventory-identity-forced", 42, "id-k1.so");
+    let report_dir = private_dir();
+    for (attempt, cap) in ["a", "b", "c"].into_iter().zip([8usize, 32, 128]) {
+        let observed = attempt_observe(
+            &fixtures,
+            attempt,
+            "sweep",
+            &forced_kernel_args(&fixtures, cap),
+            cap,
+            report_dir.path(),
         );
-        let identity = &observed.doc["observation"]["identity"];
-        assert_eq!(identity["backend"], "kernel");
-        assert_eq!(
-            identity["fallback"],
-            Value::Null,
-            "a forced proof cell admits no fallback"
-        );
-        let module = module_for(&observed.doc, "id-k1.so");
-        let module_id = module["id"].as_str().unwrap();
-        // All module edges enumerated: every edge to the provider comes
-        // from a ledgered holder (zero false edges), and every holder
-        // keeps exactly one kernel edge.
-        let mut edge_callers = BTreeSet::new();
-        for edge in observed.doc["edges"].as_array().unwrap() {
-            if edge["module"] == module_id {
-                edge_callers.insert(edge["caller"].as_str().unwrap().to_string());
-            }
+        let Some(observed) = observed else {
+            let stderr =
+                std::fs::read_to_string(fixtures.dir.join(format!("refused-{attempt}.txt")))
+                    .unwrap();
+            panic!("kernel-positive cell refused instead of proving: {stderr}");
+        };
+        if !sweep_selection_qualifies(&observed) {
+            continue;
         }
-        assert_eq!(edge_callers.len(), 3, "complete expected edge set");
-        for pid in &observed.holder_pids {
-            let callers = callers_for(&observed.doc, u64::from(*pid));
-            assert_eq!(callers.len(), 1, "holder {pid} is one caller");
-            let caller_id = callers[0]["id"].as_str().unwrap();
-            assert!(
-                edge_callers.contains(caller_id),
-                "holder {pid} keeps its kernel edge"
-            );
-        }
-        for caller_id in &edge_callers {
-            let pid = observed.doc["callers"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|caller| caller["id"] == *caller_id)
-                .unwrap()["pid"]
-                .as_u64()
-                .unwrap() as u32;
-            assert!(
-                observed.holder_pids.contains(&pid),
-                "edge caller {caller_id} (pid {pid}) is a ledgered holder"
-            );
-        }
-        // Full ledger negatives: the byte-identical different file and
-        // the data-only mapping never edge to the original provider. The
-        // copy holder is inventoried (a nonempty caller set), so its
-        // negative is never vacuous.
-        assert!(
-            !callers_for(&observed.doc, u64::from(observed.copy_pid.unwrap())).is_empty(),
-            "copy holder is an inventoried caller"
-        );
-        for (pid, why) in [
-            (observed.copy_pid.unwrap(), "byte-identical different file"),
-            (observed.dataonly_pid.unwrap(), "data-only mapping"),
-        ] {
-            for caller in callers_for(&observed.doc, u64::from(pid)) {
-                let caller_id = caller["id"].as_str().unwrap();
-                assert!(
-                    !edge_callers.contains(caller_id),
-                    "{why} (pid {pid}) must not edge to the original provider"
-                );
-            }
-        }
-        // Per-range coverage: the ground-truth sets are established from
-        // /proc (nonempty, uniform), and all three holders edge — an edge
-        // is all caller ranges or nothing, so every owned requested exec
-        // range is covered.
-        let counts = ground_truth_range_counts(&observed);
-        let total: usize = counts.iter().sum();
-        assert!(
-            total >= observed.holder_pids.len(),
-            "nonempty covered range set: {total}"
-        );
+        assert_forced_kernel_positive(&fixtures, &observed);
         return;
     }
     panic!("no cap left a selected supplier with two swept holders");

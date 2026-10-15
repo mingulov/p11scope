@@ -1669,6 +1669,84 @@ static void object_producer_alloc_readback_failure_preserves_cleanup_authority(v
     assert(!ctl.poison);
     puts("object custody alloc readback passed");
 }
+static void object_producer_orphan_delete_failure_keeps_cleanup_authority(void)
+{
+    struct owner_start_key key = { .pid_tgid = 0, .slot = 7 };
+    /* The readback-miss orphan sweep itself fails: the insert still fails
+     * explicitly and authorizes nothing, but START, its count and its
+     * lease are KEPT so a later cleanup can still reach the orphan. The
+     * old rollback deleted START and settled the lease here, stranding a
+     * permanent zeroed row with no retry route. */
+    reset(); object_setup();
+    key.pid_tgid = pid_tgid();
+    fail_object_side_lookup_once = 1;
+    fail_object_side_delete = -16;
+    memset(value, 0, sizeof(value)); object_write_start(value, 24);
+    assert(p11_owner_start_insert(&key, value));
+    assert(row(&START, &key));
+    assert(row(&OBJECT_START, &key));
+    assert(object_bytes_zeroed(row(&OBJECT_START, &key)->value));
+    assert(owners[0].start_count == 1 && ctl.outstanding == 1);
+    assert(!idle(0));
+    assert(ctl.poison & OWNER_STATE_DELETE_FAILED);
+    /* Kept rows authorize nothing: the zeroed side cannot bind, and the
+     * poisoned control refuses successors. */
+    assert(!p11_object_side_get(&key, 23, 0));
+    assert(!p11_object_side_get(&key, 23, 1));
+    memset(value, 0, sizeof(value)); object_write_start(value, 24);
+    assert(p11_owner_start_insert(&key, value));
+    assert(row(&START, &key) && row(&OBJECT_START, &key));
+    /* Repeated cleanup with the error still injected keeps both rows and
+     * the lease for a later retry. */
+    assert(p11_owner_cleanup() == 1);
+    assert(row(&START, &key) && row(&OBJECT_START, &key));
+    assert(owners[0].start_count == 1 && ctl.outstanding == 1);
+    assert(ctl.poison & OWNER_STATE_DELETE_FAILED);
+    /* Clearing the injected error lets teardown cleanup retire both rows
+     * and settle the lease; the poison stays visible (never cleared). */
+    fail_object_side_delete = 0;
+    deleted_side_seen = 0;
+    assert(p11_owner_cleanup() == 1);
+    assert(!row(&START, &key) && !row(&OBJECT_START, &key));
+    assert(!ctl.outstanding && idle(0));
+    assert(ctl.abandoned_start == 1);
+    assert(ctl.poison & OWNER_STATE_DELETE_FAILED);
+    assert(deleted_side_seen && object_bytes_zeroed(deleted_side));
+    /* Repeated attempts converge visibly: still failed, never refunded
+     * twice, nothing resurrected. */
+    assert(p11_owner_cleanup() == 1);
+    assert(!ctl.outstanding && (ctl.poison & OWNER_STATE_DELETE_FAILED));
+    assert(p11_owner_start_remove(&key, 1));
+    assert(!ctl.outstanding);
+    /* A sibling owner survives the failed key's whole arc with its rows
+     * and lease intact, and keeps them after the failed key settles. */
+    reset(); object_setup();
+    current_index = 1;
+    {
+        struct owner_start_key other = { .pid_tgid = pid_tgid(), .slot = 7 };
+        memset(value, 0, sizeof(value)); object_write_start(value, 24);
+        assert(!p11_owner_start_insert(&other, value));
+        current_index = 0;
+        key.pid_tgid = pid_tgid();
+        fail_object_side_lookup_once = 1;
+        fail_object_side_delete = -16;
+        memset(value, 0, sizeof(value)); object_write_start(value, 24);
+        assert(p11_owner_start_insert(&key, value));
+        assert(row(&START, &key) && row(&OBJECT_START, &key));
+        assert(row(&START, &other) && row(&OBJECT_START, &other));
+        assert(owners[0].start_count == 1 && owners[1].start_count == 1);
+        assert(ctl.outstanding == 2);
+        fail_object_side_delete = 0;
+        assert(p11_owner_cleanup() == 1);
+        assert(!row(&START, &key) && !row(&OBJECT_START, &key));
+        assert(row(&START, &other) && row(&OBJECT_START, &other));
+        assert(owners[1].start_count == 1 && ctl.outstanding == 1);
+        assert(p11_owner_cleanup() == 1);
+        assert(row(&START, &other) && owners[1].start_count == 1);
+        assert(ctl.outstanding == 1);
+    }
+    puts("object custody orphan delete failure passed");
+}
 static void object_producer_empty_lease_refund_failure_remains_visible(void)
 {
     /* Reconciles the historical "empty-lease settle" shorthand from the
@@ -1820,6 +1898,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "object_producer_cleanup_result_reaches_exec_exit_fault")) object_producer_cleanup_result_reaches_exec_exit_fault();
         else if (!strcmp(argv[1], "object_producer_return_refusals_retire_owned_state")) object_producer_return_refusals_retire_owned_state();
         else if (!strcmp(argv[1], "object_producer_alloc_readback_failure_preserves_cleanup_authority")) object_producer_alloc_readback_failure_preserves_cleanup_authority();
+        else if (!strcmp(argv[1], "object_producer_orphan_delete_failure_keeps_cleanup_authority")) object_producer_orphan_delete_failure_keeps_cleanup_authority();
         else if (!strcmp(argv[1], "object_producer_empty_lease_refund_failure_remains_visible")) object_producer_empty_lease_refund_failure_remains_visible();
         else if (!strcmp(argv[1], "object_owner_sweep_adjacent_lookup_preserves_custody")) object_owner_sweep_adjacent_lookup_preserves_custody();
         else assert(0);
@@ -1829,6 +1908,7 @@ int main(int argc, char **argv)
         object_producer_owner_terminal_matrix(); object_producer_side_state_n_and_n_plus_one();
         object_producer_missing_side_state_faults_before_return(); object_producer_cleanup_result_reaches_exec_exit_fault();
         object_producer_return_refusals_retire_owned_state(); object_producer_alloc_readback_failure_preserves_cleanup_authority();
+        object_producer_orphan_delete_failure_keeps_cleanup_authority();
         object_producer_empty_lease_refund_failure_remains_visible(); object_owner_sweep_adjacent_lookup_preserves_custody();
     }
     puts("task-owner: actual helper classifier, transactions, directory and lifecycle controls passed");

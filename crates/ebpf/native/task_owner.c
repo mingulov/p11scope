@@ -455,10 +455,16 @@ static __always_inline long object_side_alloc(struct owner_control *ctl,
          * proves it) instead of wedging the key until teardown. The row
          * still holds OBJECT_ZERO bytes (binding writes run after this
          * lookup), so no scrub is needed; -2 only means the row is already
-         * gone. */
+         * gone. A failed orphan deletion keeps START, its count and its
+         * lease (failed-deletion rows are always kept for retry, as in
+         * object_side_for_remove): rolling back here would strand a
+         * permanent zeroed row with its retry route settled away. */
         long orphan = owner_map_delete(&OBJECT_START, key);
-        if (orphan && orphan != -2)
+        if (orphan && orphan != -2) {
             poison(ctl, OWNER_STATE_DELETE_FAILED);
+            bookkeeping(ctl, OWNER_OBJECT_MISMATCH);
+            return -1;
+        }
         object_rollback_insert(ctl, owner, key);
         bookkeeping(ctl, OWNER_OBJECT_MISMATCH);
         return -1;

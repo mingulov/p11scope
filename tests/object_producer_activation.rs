@@ -43,13 +43,14 @@ fn embedded_object(directory: &Path) -> PathBuf {
 /// slot-0 as final.
 #[test]
 fn object_producer_emission_recomputes_pair_from_retained_pointers() {
-    let source = bpf_source();
-    // The outlined return fill reads the second retained result pointer
-    // (pair second slot) instead of trusting slot-0 alone.
+    // The executed shared return fill reads the second retained result
+    // pointer (pair second slot) instead of trusting slot-0 alone.
+    let flow = std::fs::read_to_string("crates/ebpf-common/src/object_flow.rs")
+        .expect("read shared adapter flow");
     let fill = source_between(
-        &source,
-        "fn object_fill_return(",
-        "fn owned_start_discard(key: &StartKey) {",
+        &flow,
+        "pub fn adapter_fill_return(",
+        "pub unsafe fn adapter_tail_fill(",
     );
     assert!(
         fill.contains("result_ptrs[1]"),
@@ -84,15 +85,17 @@ fn object_producer_find_emits_result_cell_not_array_base() {
         returned.contains("find_handles") || source.contains("fn object_emit_find"),
         "return emission must populate the Find section"
     );
+    let flow = std::fs::read_to_string("crates/ebpf-common/src/object_flow.rs")
+        .expect("read shared adapter flow");
     assert!(
-        source.contains("PROTOCOL_UNAVAILABLE"),
+        flow.contains("PROTOCOL_UNAVAILABLE"),
         "Find result cell must use the constant unavailable status"
     );
     // The array base word must never be stored as an observed handle.
     let fill = source_between(
-        &source,
-        "fn object_fill_return(",
-        "fn owned_start_discard(key: &StartKey) {",
+        &flow,
+        "pub fn adapter_fill_return(",
+        "pub unsafe fn adapter_tail_fill(",
     );
     assert!(
         !fill.contains("result_ptrs[0]).write(word"),
@@ -114,9 +117,10 @@ fn object_producer_uninspected_lists_carry_marker() {
         "the tail validator must name the uninspected list marker"
     );
     // BPF emission marks request lists it never inspected.
-    let source = bpf_source();
+    let flow = std::fs::read_to_string("crates/ebpf-common/src/object_flow.rs")
+        .expect("read shared adapter flow");
     assert!(
-        source.contains("UNINSPECTED"),
+        flow.contains("UNINSPECTED"),
         "BPF emission must mark uninspected attribute lists"
     );
 }
@@ -145,12 +149,14 @@ fn object_producer_derive_return_requires_s1_match() {
         mechanism_read < fill_site,
         "S1 mechanism evidence must precede emission"
     );
-    // The outlined Derive gate wires the full S1 match; a bare
+    // The shared Derive gate wires the full S1 match; a bare
     // entry-nonzero check no longer authorizes the result read.
+    let flow = std::fs::read_to_string("crates/ebpf-common/src/object_flow.rs")
+        .expect("read shared adapter flow");
     let fill = source_between(
-        &source,
-        "fn object_fill_return(",
-        "fn owned_start_discard(key: &StartKey) {",
+        &flow,
+        "pub fn adapter_fill_return(",
+        "pub unsafe fn adapter_tail_fill(",
     );
     assert!(
         fill.contains("authorize_derive_return"),
@@ -445,86 +451,126 @@ fn refused_stamp_pairs() -> Vec<(
     cases
 }
 
-/// H7-E1 return-emission mirror. Replicates the `p11_return_impl` object
-/// arm step order (reserve → continuity → join gate → fills → tail →
-/// retire → submit) and calls the REAL production protocol
-/// (`capture_return_handles`, `capture_find_return`,
-/// `ReturnAuthority::for_return`) with instrumented readers. The gate is
-/// evaluated before the fills run, exactly like the root; denied
-/// authority then performs zero reads by the shared guarantee (pinned by
-/// `object_producer_continuity_denied_authority_reads_nothing`), so the
-/// mirror's pass-through fills are observationally identical to the
-/// root's early return. The order pins below bind them line for line.
+/// H7-E1 return-arm harness. Executes the REAL production adapter bodies
+/// (`object_flow::{continuity_joins, adapter_fill_return, adapter_tail_fill,
+/// adapter_emit_find}` — the same functions the BPF wrappers call) in the
+/// root's order (gate → fill → tail → find, each `&&` short-circuiting like
+/// the root) with instrumented readers and a caller-owned side row. Every
+/// outcome below is computed by production code; the only modeled input is
+/// the native retirement result (the C fixture executes the real removal;
+/// see G03). The order pins below bind the harness sequence to the root.
 struct EmissionOutcome {
-    tail_emitted: bool,
+    joined: bool,
+    filled: bool,
+    tailed: bool,
+    emitted: bool,
     fault_required: bool,
-    retired: bool,
-    handles: p11scope_ebpf_common::object_capture::ReturnHandlesVerdict,
-    words: [u64; 2],
-    find: p11scope_ebpf_common::object_capture::FindVerdict,
-    find_words: [u64; 8],
+    side: p11scope_ebpf_common::object_wire::ObjectStart,
+    tail: p11scope_ebpf_common::object_wire::ObjectCallWire,
+}
+
+/// A frozen descriptor row for the harness: `descriptor` names function
+/// `descriptor - 1`, one result arg, no templates, valid action/guard.
+fn harness_row(
+    descriptor: u32,
+    action: u8,
+    result_args: [u8; 2],
+) -> p11scope_ebpf_common::object_wire::ObjectDescriptorWire {
+    use p11scope_ebpf_common::ARG_NONE;
+    use p11scope_ebpf_common::object_wire::{OBJECT_GUARD_NAMED, ObjectDescriptorWire};
+    ObjectDescriptorWire {
+        function: descriptor.wrapping_sub(1),
+        input_args: [ARG_NONE; 2],
+        result_args,
+        template_args: [ARG_NONE; 4],
+        find_capacity_arg: ARG_NONE,
+        find_count_arg: ARG_NONE,
+        action,
+        guard: OBJECT_GUARD_NAMED,
+    }
+}
+
+/// A READY (phase 2) caller-owned side row, as the required=1 return query
+/// hands it to the fill adapter.
+fn ready_side(descriptor: u32) -> p11scope_ebpf_common::object_wire::ObjectStart {
+    let mut side = p11scope_ebpf_common::object_wire::ObjectStart::default();
+    side.descriptor_index = descriptor;
+    side.phase = 2;
+    side
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_emission_mirror(
+fn run_production_return_arm(
     target: &std::cell::RefCell<adapter::FakeTarget>,
     layout: p11scope_ebpf_common::LinuxLayout,
-    present: [bool; 2],
-    authorized: [bool; 2],
-    result_ptrs: [u64; 2],
+    mut side: p11scope_ebpf_common::object_wire::ObjectStart,
+    row: &p11scope_ebpf_common::object_wire::ObjectDescriptorWire,
     rv: u64,
-    entry_stamp: p11scope_ebpf_common::InstanceStamp,
-    ret_stamp: p11scope_ebpf_common::InstanceStamp,
-    find: Option<(u64, u64, u64)>,
+    continuity: &p11scope_ebpf_common::InstanceContinuity,
+    mech_status: u32,
+    mech: u64,
+    retire_ok: bool,
 ) -> EmissionOutcome {
-    use p11scope_ebpf_common::object_capture::{
-        ReturnAuthority, capture_find_return, capture_return_handles,
+    use p11scope_ebpf_common::object_flow::{
+        adapter_emit_find, adapter_fill_return, adapter_tail_fill, continuity_joins,
     };
-    // Step 1 (mirror of the moved `p11_instance_return` site): the base
-    // event and its continuity land in the reserved record before any
-    // object read. (Data setup; the stamps arrive as parameters.)
-    // Step 2 (mirror of the join gate): authority conjoins continuity.
-    let authority = ReturnAuthority::for_return(true, true, entry_stamp, ret_stamp);
-    // Steps 3-4 (mirrors of the fill sites): fills run under the gated
-    // authority; denied authority performs zero reads.
+    use p11scope_ebpf_common::object_wire::ObjectCallWire;
+    let descriptor = side.descriptor_index;
+    // Gate: the production predicate on the reserved record's stamps.
+    let joined = continuity_joins(continuity);
+    // Fills in root order; each stage short-circuits like the root, so a
+    // refused fill runs no later adapter and touches no tail.
     let (reader, _) = adapter::readers(target);
-    let (handles, words) = capture_return_handles(
-        present,
-        authorized,
-        result_ptrs,
+    let filled = adapter_fill_return(
+        Some(&mut side),
+        descriptor,
+        Some(row),
         rv,
-        authority,
         layout,
+        mech_status,
+        mech,
+        joined,
         reader,
     );
-    let (find_verdict, find_words) = match find {
-        Some((array, capacity, count_ptr)) => {
-            let (reader, _) = adapter::readers(target);
-            capture_find_return(array, capacity, count_ptr, rv, authority, layout, reader)
-        }
-        None => (
-            p11scope_ebpf_common::object_capture::FindVerdict {
-                statuses: [0; 8],
-                len: 0,
-                valid: false,
-                flags: 0,
-                result_cell: (7, 0),
-            },
-            [0u64; 8],
-        ),
-    };
-    // Step 5 (mirror of the tail/retire/submit sites): the tail emits
-    // only under joined authority; refusal retires, discards and faults.
-    // Both arms retire, so `retired` holds either way.
-    let joined = authority.is_authorized();
+    let mut tail = ObjectCallWire::default();
+    let tailed = filled
+        && unsafe { adapter_tail_fill(&mut tail as *mut _, Some(&side), descriptor, Some(row)) };
+    let (reader, _) = adapter::readers(target);
+    let emitted = tailed
+        && unsafe {
+            adapter_emit_find(
+                &mut tail as *mut _,
+                Some(&side),
+                descriptor,
+                Some(row),
+                layout,
+                rv,
+                joined,
+                reader,
+            )
+        };
+    // The fault decision is production's (`!emitted || !retired` after the
+    // gate); only the native `retire_ok` input is modeled here.
     EmissionOutcome {
-        tail_emitted: joined,
-        fault_required: !joined,
-        retired: true,
-        handles,
-        words,
-        find: find_verdict,
-        find_words,
+        joined,
+        filled,
+        tailed,
+        emitted,
+        fault_required: !joined || !emitted || !retire_ok,
+        side,
+        tail,
+    }
+}
+
+/// Wrap an entry/return stamp pair the way the reserved record carries it.
+fn continuity_of(
+    entry: p11scope_ebpf_common::InstanceStamp,
+    ret: p11scope_ebpf_common::InstanceStamp,
+) -> p11scope_ebpf_common::InstanceContinuity {
+    p11scope_ebpf_common::InstanceContinuity {
+        entry_ip: 0,
+        entry_stamp: entry,
+        return_stamp: ret,
     }
 }
 
@@ -542,8 +588,8 @@ fn pin_continuity_gate_precedes_fills() {
         .find("p11_instance_return(&key,")
         .expect("return must fill continuity on the object arm");
     let gate = returned
-        .find("stamp_joinable")
-        .expect("return must gate object reads on the stamp join");
+        .find("continuity_joins(")
+        .expect("return must gate object reads on the shared stamp join");
     let fill = returned
         .find("object_fill_return(")
         .expect("emission fills after the gate");
@@ -565,46 +611,108 @@ fn pin_continuity_gate_precedes_fills() {
             "the refused gate arm must {marker} before any object read"
         );
     }
+    // The root threads its verdict into the fill adapters, which enforce
+    // it again inside the executed production flow.
+    let filled_call = source_between(returned, "let filled = object_fill_return(", ");");
+    assert!(
+        filled_call.contains("joined"),
+        "the result fill must receive the root continuity verdict"
+    );
+    let emitted_call = source_between(returned, "let emitted =", ";");
+    assert!(
+        emitted_call.contains("joined"),
+        "Find emission must receive the root continuity verdict"
+    );
+    // Delegation: the BPF wrappers bind BPF-local state and call the
+    // shared adapters the harness executes — no second inline copy.
+    for (wrapper, shared) in [
+        ("fn object_fill_return(", "adapter_fill_return("),
+        ("fn object_tail_fill(", "adapter_tail_fill("),
+        ("fn object_emit_find(", "adapter_emit_find("),
+    ] {
+        let body = source_between(&source, wrapper, "\n}\n");
+        assert_eq!(
+            body.matches(shared).count(),
+            1,
+            "{wrapper} must delegate to exactly one shared {shared}"
+        );
+    }
+    // Executed order: inside the shared fill, the continuity gate runs
+    // before any slot read.
+    let flow = std::fs::read_to_string("crates/ebpf-common/src/object_flow.rs")
+        .expect("read shared adapter flow");
+    let shared_fill = source_between(
+        &flow,
+        "pub fn adapter_fill_return(",
+        "pub unsafe fn adapter_tail_fill(",
+    );
+    let shared_gate = shared_fill
+        .find("if !joined")
+        .expect("the shared fill must gate on continuity");
+    let first_read = shared_fill
+        .find("slot_word(")
+        .expect("the shared fill reads result words");
+    assert!(
+        shared_gate < first_read,
+        "the executed fill must gate before its first read"
+    );
 }
 
 /// G02/E1: refused continuity performs zero result-handle reads. Healthy
 /// twin reads the exact expected result once and retains the joined
 /// stamps; every refusal (absent entry, straddled epoch/global/fault/
-/// file-slot, missing VALID, each blocking flag) reads nothing, emits no
-/// tail, faults visibly and retires through E2 without a success claim.
+/// file-slot, missing VALID, each blocking flag) reads nothing, runs no
+/// later adapter, leaves the tail zero and faults visibly. All fills run
+/// through the production adapters, so neutering the production gate
+/// fails this test.
 #[test]
 fn object_return_continuity_refuses_before_reads() {
+    use p11scope_ebpf_common::ARG_NONE;
     use p11scope_ebpf_common::LinuxLayout;
+    use p11scope_ebpf_common::capture;
     use p11scope_ebpf_common::object_capture::handle_status;
+    use p11scope_ebpf_common::object_wire::{OBJECT_ACTION_CREATE, ObjectCallWire};
     for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
         let w = layout.word_bytes() as u64;
+        let row = harness_row(23, OBJECT_ACTION_CREATE, [5, ARG_NONE]);
+        let healthy_side = || {
+            let mut side = ready_side(23);
+            side.result_ptrs = [0x10000, 0];
+            side
+        };
         // Healthy twin: one present result, CKR_OK, joined stamps.
         let target = adapter::FakeTarget::new(w);
         let target = std::cell::RefCell::new(target);
         target.borrow_mut().set_word(0x10000, 0x42);
         let (entry, ret) = clean_stamps();
-        let outcome = run_emission_mirror(
+        let outcome = run_production_return_arm(
             &target,
             layout,
-            [true, false],
-            [true, false],
-            [0x10000, 0],
+            healthy_side(),
+            &row,
             adapter::rv_ok(),
-            entry,
-            ret,
-            None,
+            &continuity_of(entry, ret),
+            capture::MECHANISM_VALUE,
+            0,
+            true,
         );
         assert_eq!(
             target.borrow().log(),
             &[(adapter::READ_WORD, 0x10000, w)],
             "{layout:?} healthy twin must read the exact result once"
         );
+        assert!(outcome.joined && outcome.filled && outcome.tailed && outcome.emitted);
         assert_eq!(
-            outcome.handles.statuses,
+            outcome.side.result_statuses,
             [handle_status::VALUE, handle_status::ABSENT]
         );
-        assert_eq!(outcome.words, [0x42, 0]);
-        assert!(outcome.tail_emitted, "healthy twin emits its tail");
+        assert_eq!(outcome.side.result_ptrs, [0x42, 0]);
+        assert_eq!(outcome.side.phase, 3);
+        assert_eq!(outcome.tail.result_handles, [0x42, 0]);
+        assert_eq!(
+            outcome.tail.result_status,
+            [handle_status::VALUE, handle_status::ABSENT]
+        );
         assert!(!outcome.fault_required, "healthy twin faults nothing");
         assert!(
             p11scope_ebpf_common::instance::stamp_joinable(entry, ret),
@@ -613,79 +721,117 @@ fn object_return_continuity_refuses_before_reads() {
         // Failed reads are distinct from refused reads: a joined call
         // whose result word is unreadable attempts the read once and
         // carries UNREADABLE, never VALUE and never zero-read silence.
+        // The finite failure still completes every stage.
         let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
         target.borrow_mut().set_fail(0x10000);
         let (entry, ret) = clean_stamps();
-        let outcome = run_emission_mirror(
+        let outcome = run_production_return_arm(
             &target,
             layout,
-            [true, false],
-            [true, false],
-            [0x10000, 0],
+            healthy_side(),
+            &row,
             adapter::rv_ok(),
-            entry,
-            ret,
-            None,
+            &continuity_of(entry, ret),
+            capture::MECHANISM_VALUE,
+            0,
+            true,
         );
         assert_eq!(
             target.borrow().log(),
             &[(adapter::READ_WORD, 0x10000, w)],
             "{layout:?} failed result word is attempted once"
         );
+        assert!(outcome.joined && outcome.filled && outcome.tailed && outcome.emitted);
         assert_eq!(
-            outcome.handles.statuses,
+            outcome.side.result_statuses,
             [handle_status::UNREADABLE, handle_status::ABSENT]
         );
-        assert_eq!(outcome.words, [0, 0]);
+        assert_eq!(outcome.side.result_ptrs, [0, 0]);
         // Ordinary accounting stays truthful: joined stamps with a
         // non-OK RV read nothing, keep the honest tail (unavailable
         // cells, never values) and fault nothing.
         let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
         target.borrow_mut().set_word(0x10000, 0x42);
         let (entry, ret) = clean_stamps();
-        let outcome = run_emission_mirror(
+        let outcome = run_production_return_arm(
             &target,
             layout,
-            [true, false],
-            [true, false],
-            [0x10000, 0],
+            healthy_side(),
+            &row,
             7,
-            entry,
-            ret,
-            None,
+            &continuity_of(entry, ret),
+            capture::MECHANISM_VALUE,
+            0,
+            true,
         );
         adapter::assert_no_target_reads(&target, &format!("{layout:?} result reads on RV 7"));
+        assert!(outcome.joined && outcome.filled && outcome.tailed && outcome.emitted);
         assert_eq!(
-            outcome.handles.statuses,
+            outcome.side.result_statuses,
             [handle_status::PROTOCOL_UNAVAILABLE, handle_status::ABSENT]
         );
-        assert!(outcome.tail_emitted, "non-OK RV keeps its honest tail");
+        assert_eq!(
+            outcome.tail.result_status,
+            [handle_status::PROTOCOL_UNAVAILABLE, handle_status::ABSENT]
+        );
         assert!(!outcome.fault_required, "non-OK RV faults nothing");
-        // Every refusal: zero reads, no tail, visible fault, retired.
+        // A failed native retirement faults even when every adapter
+        // stage succeeded (the native half is executed by the G03 C
+        // fixture; this input only threads its verdict).
+        let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        target.borrow_mut().set_word(0x10000, 0x42);
+        let (entry, ret) = clean_stamps();
+        let outcome = run_production_return_arm(
+            &target,
+            layout,
+            healthy_side(),
+            &row,
+            adapter::rv_ok(),
+            &continuity_of(entry, ret),
+            capture::MECHANISM_VALUE,
+            0,
+            false,
+        );
+        assert!(outcome.joined && outcome.filled && outcome.tailed && outcome.emitted);
+        assert!(
+            outcome.fault_required,
+            "{layout:?} failed retirement faults visibly"
+        );
+        // Every refusal: zero reads, no later adapter, zero tail, the
+        // retained pointers preserved, visible fault.
         for (name, entry, ret) in refused_stamp_pairs() {
             let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
             target.borrow_mut().set_word(0x10000, 0x42);
-            let outcome = run_emission_mirror(
+            let outcome = run_production_return_arm(
                 &target,
                 layout,
-                [true, false],
-                [true, false],
-                [0x10000, 0],
+                healthy_side(),
+                &row,
                 adapter::rv_ok(),
-                entry,
-                ret,
-                None,
+                &continuity_of(entry, ret),
+                capture::MECHANISM_VALUE,
+                0,
+                true,
             );
             adapter::assert_no_target_reads(&target, &format!("{layout:?} result reads on {name}"));
             assert!(
-                !outcome.tail_emitted,
-                "{layout:?} {name}: refused continuity emits no object tail"
+                !outcome.joined && !outcome.filled && !outcome.tailed && !outcome.emitted,
+                "{layout:?} {name}: refused continuity runs no adapter stage"
             );
+            assert!(
+                outcome.tail == ObjectCallWire::default(),
+                "{layout:?} {name}: refused continuity leaves the tail zero"
+            );
+            assert_eq!(
+                outcome.side.result_ptrs,
+                [0x10000, 0],
+                "{layout:?} {name}: refused continuity preserves retained pointers"
+            );
+            assert_eq!(outcome.side.phase, 2, "{layout:?} {name}: side stays READY");
             assert!(
                 outcome.fault_required,
                 "{layout:?} {name}: refused continuity faults visibly"
             );
-            assert!(outcome.retired, "{layout:?} {name}: refused arm retires");
         }
     }
     pin_continuity_gate_precedes_fills();
@@ -693,34 +839,45 @@ fn object_return_continuity_refuses_before_reads() {
 
 /// G02/E1: refused continuity performs zero Find reads: no count read,
 /// no element reads, no reread. Healthy twin streams the exact
-/// count/element/reread sequence; every refusal reads nothing and emits
-/// no Find section.
+/// count/element/reread sequence through the production Find adapter;
+/// every refusal reads nothing and streams no Find section.
 #[test]
 fn object_find_continuity_refuses_before_reads() {
+    use p11scope_ebpf_common::ARG_NONE;
     use p11scope_ebpf_common::LinuxLayout;
+    use p11scope_ebpf_common::capture;
     use p11scope_ebpf_common::object_capture::handle_status;
+    use p11scope_ebpf_common::object_wire::{OBJECT_ACTION_FIND, ObjectCallWire};
     for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
         let w = layout.word_bytes() as u64;
+        let row = harness_row(23, OBJECT_ACTION_FIND, [ARG_NONE, ARG_NONE]);
         let program_find = |target: &std::cell::RefCell<adapter::FakeTarget>| {
             let mut borrowed = target.borrow_mut();
             borrowed.set_word(0x21000, 2);
             borrowed.set_word(0x20000, 0x51);
             borrowed.set_word(0x20000 + w, 0x52);
         };
+        let healthy_side = || {
+            let mut side = ready_side(23);
+            side.result_ptrs = [0x20000, 0];
+            side.find_capacity = 8;
+            side.find_count_ptr = 0x21000;
+            side
+        };
         // Healthy twin: count read, two elements, count reread.
         let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
         program_find(&target);
         let (entry, ret) = clean_stamps();
-        let outcome = run_emission_mirror(
+        let outcome = run_production_return_arm(
             &target,
             layout,
-            [false, false],
-            [false, false],
-            [0x20000, 0],
+            healthy_side(),
+            &row,
             adapter::rv_ok(),
-            entry,
-            ret,
-            Some((0x20000, 8, 0x21000)),
+            &continuity_of(entry, ret),
+            capture::MECHANISM_VALUE,
+            0,
+            true,
         );
         assert_eq!(
             target.borrow().log(),
@@ -732,58 +889,67 @@ fn object_find_continuity_refuses_before_reads() {
             ],
             "{layout:?} healthy Find twin must stream count, elements, reread"
         );
-        assert!(outcome.find.valid, "healthy Find twin validates");
-        assert_eq!(outcome.find.len, 2);
+        assert!(outcome.joined && outcome.filled && outcome.tailed && outcome.emitted);
+        assert_eq!(outcome.tail.find_valid, 1, "healthy Find twin validates");
+        assert_eq!(outcome.tail.find_len, 2);
         assert_eq!(
-            outcome.find.statuses[..2],
+            outcome.tail.find_status[..2],
             [handle_status::VALUE, handle_status::VALUE]
         );
-        assert_eq!(outcome.find_words[..2], [0x51, 0x52]);
-        assert!(outcome.tail_emitted, "healthy Find twin emits its tail");
+        assert_eq!(outcome.tail.find_handles[..2], [0x51, 0x52]);
+        assert_eq!(
+            outcome.tail.result_status,
+            [handle_status::PROTOCOL_UNAVAILABLE, handle_status::ABSENT],
+            "{layout:?} Find result cell stays the constant unavailable cell"
+        );
+        assert!(!outcome.fault_required, "healthy Find twin faults nothing");
         // Ordinary accounting stays truthful: joined stamps with a
         // non-OK RV read neither count nor elements, validate nothing
-        // and fault nothing, while the tail still emits.
+        // and fault nothing, while every stage still completes.
         let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
         program_find(&target);
         let (entry, ret) = clean_stamps();
-        let outcome = run_emission_mirror(
+        let outcome = run_production_return_arm(
             &target,
             layout,
-            [false, false],
-            [false, false],
-            [0x20000, 0],
+            healthy_side(),
+            &row,
             7,
-            entry,
-            ret,
-            Some((0x20000, 8, 0x21000)),
+            &continuity_of(entry, ret),
+            capture::MECHANISM_VALUE,
+            0,
+            true,
         );
         adapter::assert_no_target_reads(&target, &format!("{layout:?} Find reads on RV 7"));
-        assert!(!outcome.find.valid, "non-OK RV validates no Find batch");
-        assert!(outcome.tail_emitted, "non-OK RV keeps its honest tail");
+        assert!(outcome.joined && outcome.filled && outcome.tailed && outcome.emitted);
+        assert_eq!(
+            outcome.tail.find_valid, 0,
+            "non-OK RV validates no Find batch"
+        );
         assert!(!outcome.fault_required, "non-OK RV faults nothing");
         // Every refusal: the count word itself is unread.
         for (name, entry, ret) in refused_stamp_pairs() {
             let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
             program_find(&target);
-            let outcome = run_emission_mirror(
+            let outcome = run_production_return_arm(
                 &target,
                 layout,
-                [false, false],
-                [false, false],
-                [0x20000, 0],
+                healthy_side(),
+                &row,
                 adapter::rv_ok(),
-                entry,
-                ret,
-                Some((0x20000, 8, 0x21000)),
+                &continuity_of(entry, ret),
+                capture::MECHANISM_VALUE,
+                0,
+                true,
             );
             adapter::assert_no_target_reads(&target, &format!("{layout:?} Find reads on {name}"));
             assert!(
-                !outcome.find.valid,
-                "{layout:?} {name}: refused continuity validates no Find batch"
+                !outcome.joined && !outcome.filled && !outcome.tailed && !outcome.emitted,
+                "{layout:?} {name}: refused continuity runs no adapter stage"
             );
             assert!(
-                !outcome.tail_emitted,
-                "{layout:?} {name}: refused continuity emits no object tail"
+                outcome.tail == ObjectCallWire::default(),
+                "{layout:?} {name}: refused continuity leaves the tail zero"
             );
             assert!(
                 outcome.fault_required,
@@ -792,6 +958,207 @@ fn object_find_continuity_refuses_before_reads() {
         }
     }
     pin_continuity_gate_precedes_fills();
+}
+
+/// Fix round 1 mutation control for the G02 probe: the production gate
+/// and adapter custody are load-bearing. Deleting `if !joined` from the
+/// shared adapters, or substituting one stamp for the other in
+/// `continuity_joins`, fails this test (verified by manual mutant during
+/// the fix round). Refused custody reads nothing on every adapter.
+#[test]
+fn object_return_gate_and_custody_refuse_without_reads() {
+    use p11scope_ebpf_common::ARG_NONE;
+    use p11scope_ebpf_common::LinuxLayout;
+    use p11scope_ebpf_common::capture;
+    use p11scope_ebpf_common::object_flow::{
+        adapter_derive_entry, adapter_emit_find, adapter_fill_return, adapter_tail_fill,
+        continuity_joins,
+    };
+    use p11scope_ebpf_common::object_wire::{
+        OBJECT_ACTION_CREATE, OBJECT_ACTION_DERIVE, ObjectCallWire,
+    };
+    // The shared predicate joins clean stamps and refuses every
+    // asymmetric pair.
+    let (entry, ret) = clean_stamps();
+    assert!(continuity_joins(&continuity_of(entry, ret)));
+    for (name, entry, ret) in refused_stamp_pairs() {
+        assert!(
+            !continuity_joins(&continuity_of(entry, ret)),
+            "{name} must not join"
+        );
+    }
+    // Substituting the current stamp for the retained one would join the
+    // absent-entry case: the predicate genuinely reads both fields, so a
+    // substitution mutant fails the refusal asserts above.
+    let (_, absent_entry, clean_ret) = refused_stamp_pairs()[0];
+    assert!(continuity_joins(&continuity_of(clean_ret, clean_ret)));
+    assert!(!continuity_joins(&continuity_of(absent_entry, clean_ret)));
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        let row = harness_row(23, OBJECT_ACTION_CREATE, [5, ARG_NONE]);
+        // `joined = false` refuses inside every reading adapter with
+        // zero reads, however the adapter was reached.
+        for gate in [true, false] {
+            let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+            target.borrow_mut().set_word(0x10000, 0x42);
+            let mut side = ready_side(23);
+            side.result_ptrs = [0x10000, 0];
+            let (reader, _) = adapter::readers(&target);
+            let filled = adapter_fill_return(
+                Some(&mut side),
+                23,
+                Some(&row),
+                adapter::rv_ok(),
+                layout,
+                capture::MECHANISM_VALUE,
+                0,
+                gate,
+                reader,
+            );
+            assert_eq!(filled, gate, "{layout:?} fill follows the gate");
+            if gate {
+                assert_eq!(
+                    target.borrow().log(),
+                    &[(adapter::READ_WORD, 0x10000, w)],
+                    "{layout:?} joined fill reads its result once"
+                );
+            } else {
+                adapter::assert_no_target_reads(&target, &format!("{layout:?} gated fill"));
+            }
+            // Find emission follows the same gate.
+            let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+            target.borrow_mut().set_word(0x21000, 1);
+            let mut side = ready_side(23);
+            side.phase = 3;
+            side.result_ptrs = [0x20000, 0];
+            side.find_capacity = 8;
+            side.find_count_ptr = 0x21000;
+            let mut tail = ObjectCallWire::default();
+            let (reader, _) = adapter::readers(&target);
+            let emitted = unsafe {
+                adapter_emit_find(
+                    &mut tail as *mut _,
+                    Some(&side),
+                    23,
+                    Some(&harness_row(
+                        23,
+                        p11scope_ebpf_common::object_wire::OBJECT_ACTION_FIND,
+                        [ARG_NONE, ARG_NONE],
+                    )),
+                    layout,
+                    adapter::rv_ok(),
+                    gate,
+                    reader,
+                )
+            };
+            assert_eq!(emitted, gate, "{layout:?} Find emission follows the gate");
+            if !gate {
+                adapter::assert_no_target_reads(&target, &format!("{layout:?} gated Find"));
+            }
+        }
+        // Custody failures refuse without reads: missing side, wrong
+        // phase, missing or mismatched row, null tail.
+        let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        target.borrow_mut().set_word(0x10000, 0x42);
+        let mut side = ready_side(23);
+        side.result_ptrs = [0x10000, 0];
+        let (reader, _) = adapter::readers(&target);
+        assert!(
+            !adapter_fill_return(
+                None,
+                23,
+                Some(&row),
+                adapter::rv_ok(),
+                layout,
+                capture::MECHANISM_VALUE,
+                0,
+                true,
+                reader,
+            ),
+            "{layout:?} missing side refuses the fill"
+        );
+        let mut wrong_phase = ready_side(23);
+        wrong_phase.phase = 1;
+        wrong_phase.result_ptrs = [0x10000, 0];
+        let (reader, _) = adapter::readers(&target);
+        assert!(
+            !adapter_fill_return(
+                Some(&mut wrong_phase),
+                23,
+                Some(&row),
+                adapter::rv_ok(),
+                layout,
+                capture::MECHANISM_VALUE,
+                0,
+                true,
+                reader,
+            ),
+            "{layout:?} non-READY phase refuses the fill"
+        );
+        let (reader, _) = adapter::readers(&target);
+        assert!(
+            !adapter_fill_return(
+                Some(&mut side),
+                23,
+                None,
+                adapter::rv_ok(),
+                layout,
+                capture::MECHANISM_VALUE,
+                0,
+                true,
+                reader,
+            ),
+            "{layout:?} missing row refuses the fill"
+        );
+        let bad_row = harness_row(24, OBJECT_ACTION_CREATE, [5, ARG_NONE]);
+        let (reader, _) = adapter::readers(&target);
+        assert!(
+            !adapter_fill_return(
+                Some(&mut side),
+                23,
+                Some(&bad_row),
+                adapter::rv_ok(),
+                layout,
+                capture::MECHANISM_VALUE,
+                0,
+                true,
+                reader,
+            ),
+            "{layout:?} mismatched row refuses the fill"
+        );
+        let mut tail = ObjectCallWire::default();
+        assert!(
+            !unsafe { adapter_tail_fill(core::ptr::null_mut(), Some(&side), 23, Some(&row),) },
+            "{layout:?} null tail refuses"
+        );
+        let (reader, _) = adapter::readers(&target);
+        assert!(
+            !unsafe {
+                adapter_emit_find(
+                    &mut tail as *mut _,
+                    None,
+                    23,
+                    Some(&row),
+                    layout,
+                    adapter::rv_ok(),
+                    true,
+                    reader,
+                )
+            },
+            "{layout:?} missing side refuses Find emission"
+        );
+        adapter::assert_no_target_reads(&target, &format!("{layout:?} custody refusals"));
+        // The Derive adapter needs no continuity gate (entry runs before
+        // any return stamp exists) but keeps its custody checks.
+        let derive_row = harness_row(23, OBJECT_ACTION_DERIVE, [5, ARG_NONE]);
+        let (reader, _) = adapter::readers(&target);
+        let mut fetch = |_: u8| None;
+        assert!(
+            !adapter_derive_entry(None, 23, Some(&derive_row), layout, &mut fetch, reader),
+            "{layout:?} missing side refuses Derive entry"
+        );
+        adapter::assert_no_target_reads(&target, &format!("{layout:?} Derive custody"));
+    }
 }
 
 /// H7-E4 BPF attribute-path mirror. The CURRENT BPF adapters inspect no

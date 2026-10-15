@@ -10,10 +10,14 @@ These files define the acceptance inputs used by
   explicitly optional groups.
 - `system-test-manifest.json`: a complete 214-cell register with every cell
   marked `NOT_RUN`. Seven cells retain their registered test selectors.
+- `system-bounded-scope.json`: explicit per-requirement disposition of every
+  system-product cell for the bounded-release claim (80 IN, 122 OUT with
+  reason, owning campaign and move-IN condition). Proposed for owner approval.
 
 The register is a test input, not a successful qualification receipt. Its
 `ledger_sha256` binds the JSON policy file; `deferred_sha256` binds the gate
-catalog. Historical identifiers and task labels are retained so moving
+catalog; `bounded_scope_sha256` binds the bounded-scope catalog. Historical
+identifiers and task labels are retained so moving
 internal campaign reports out of the public repository does not weaken or
 rename the acceptance requirements.
 

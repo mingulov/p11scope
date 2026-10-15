@@ -1,0 +1,944 @@
+{
+  "schema": "p11scope/system-bounded-scope/v1",
+  "claim": "bounded-release",
+  "status": "proposed-for-owner-approval",
+  "basis": "Explicit per-requirement disposition of every system-product cell for the bounded v0.4 release claim. Placeholder-kernel cells stay required for system-product; their bounded OUT status comes only from this catalog, never from metadata inference. No cell moves IN without a catalog edit plus owner approval.",
+  "in": [
+    "T7.default.detailed_hot_slot_third_rv_lp64",
+    "T7.default.inventory_n1024_lp64",
+    "T7.default.inventory_n4097_lp64",
+    "T7.default.inventory_n576_lp64",
+    "T7.default.inventory_n6530_lp64",
+    "T7.default.inventory_n8192_boundary_lp64",
+    "T7.wide.detailed_hot_slot_third_rv_lp64",
+    "finding:A-F8",
+    "finding:F-01",
+    "finding:F-02",
+    "finding:F-03",
+    "finding:F-04",
+    "finding:F-08",
+    "finding:F-09",
+    "finding:F-10",
+    "finding:F-11",
+    "finding:F-12",
+    "finding:F-13",
+    "finding:F-14",
+    "finding:F-15",
+    "finding:F-16a",
+    "finding:F-17",
+    "finding:F-20",
+    "finding:F-25",
+    "finding:F-26",
+    "finding:F-27",
+    "finding:F-28",
+    "finding:F-29",
+    "finding:F-30",
+    "finding:F-32",
+    "finding:F-38",
+    "finding:F-39",
+    "finding:F-40",
+    "finding:F-43",
+    "finding:F-44",
+    "finding:F-48",
+    "finding:F-50",
+    "finding:F-51",
+    "finding:F-52",
+    "finding:F-53",
+    "finding:F-57",
+    "finding:F-59",
+    "finding:F-60",
+    "finding:F-61b",
+    "finding:F-62",
+    "finding:F-63",
+    "finding:F-65",
+    "finding:F-67",
+    "finding:F-68",
+    "finding:F-69",
+    "finding:F-70",
+    "finding:F-71",
+    "finding:F-72",
+    "finding:F-73",
+    "finding:F-74",
+    "finding:F-75",
+    "finding:O-15",
+    "finding:R-01",
+    "finding:R-02",
+    "finding:R-03",
+    "finding:R-04",
+    "finding:R-05",
+    "finding:R-06",
+    "followup:G-13",
+    "followup:G-16",
+    "followup:U-01",
+    "followup:U-05",
+    "followup:U-06",
+    "followup:U-09",
+    "followup:U-12",
+    "followup:U-19",
+    "followup:U-20",
+    "followup:U-21",
+    "followup:U-22",
+    "followup:U-24",
+    "installed.current.default",
+    "installed.current.wide",
+    "installed.linux-5.15.default",
+    "installed.linux-5.15.wide",
+    "soak.1800s"
+  ],
+  "out": [
+    {
+      "id": "R01.public",
+      "reason_group": "public-contract-unregistered",
+      "reason": "Public-contract tests for R01 are unregistered; no public-command coverage for R01 is closable in bounded v0.4 (owning campaign T3/T10).",
+      "owner_task": "T3/T10",
+      "move_in": "Register concrete public-command tests for R01 and replace the placeholder final-supported-matrix kernel with concrete kernel/profile cells."
+    },
+    {
+      "id": "R02.public",
+      "reason_group": "public-contract-unregistered",
+      "reason": "Public-contract tests for R02 are unregistered; no public-command coverage for R02 is closable in bounded v0.4 (owning campaign T2/T10).",
+      "owner_task": "T2/T10",
+      "move_in": "Register concrete public-command tests for R02 and replace the placeholder final-supported-matrix kernel with concrete kernel/profile cells."
+    },
+    {
+      "id": "R03.public",
+      "reason_group": "public-contract-unregistered",
+      "reason": "Public-contract tests for R03 are unregistered; no public-command coverage for R03 is closable in bounded v0.4 (owning campaign T3/T4).",
+      "owner_task": "T3/T4",
+      "move_in": "Register concrete public-command tests for R03 and replace the placeholder final-supported-matrix kernel with concrete kernel/profile cells."
+    },
+    {
+      "id": "R04.public",
+      "reason_group": "public-contract-unregistered",
+      "reason": "Public-contract tests for R04 are unregistered; no public-command coverage for R04 is closable in bounded v0.4 (owning campaign T5/T12).",
+      "owner_task": "T5/T12",
+      "move_in": "Register concrete public-command tests for R04 and replace the placeholder final-supported-matrix kernel with concrete kernel/profile cells."
+    },
+    {
+      "id": "R05.public",
+      "reason_group": "public-contract-unregistered",
+      "reason": "Public-contract tests for R05 are unregistered; no public-command coverage for R05 is closable in bounded v0.4 (owning campaign T4/T6).",
+      "owner_task": "T4/T6",
+      "move_in": "Register concrete public-command tests for R05 and replace the placeholder final-supported-matrix kernel with concrete kernel/profile cells."
+    },
+    {
+      "id": "R06.public",
+      "reason_group": "public-contract-unregistered",
+      "reason": "Public-contract tests for R06 are unregistered; no public-command coverage for R06 is closable in bounded v0.4 (owning campaign T7).",
+      "owner_task": "T7",
+      "move_in": "Register concrete public-command tests for R06 and replace the placeholder final-supported-matrix kernel with concrete kernel/profile cells."
+    },
+    {
+      "id": "R07.public",
+      "reason_group": "public-contract-unregistered",
+      "reason": "Public-contract tests for R07 are unregistered; no public-command coverage for R07 is closable in bounded v0.4 (owning campaign T8/T9).",
+      "owner_task": "T8/T9",
+      "move_in": "Register concrete public-command tests for R07 and replace the placeholder final-supported-matrix kernel with concrete kernel/profile cells."
+    },
+    {
+      "id": "R08.public",
+      "reason_group": "public-contract-unregistered",
+      "reason": "Public-contract tests for R08 are unregistered; no public-command coverage for R08 is closable in bounded v0.4 (owning campaign T10/T12).",
+      "owner_task": "T10/T12",
+      "move_in": "Register concrete public-command tests for R08 and replace the placeholder final-supported-matrix kernel with concrete kernel/profile cells."
+    },
+    {
+      "id": "R09.public",
+      "reason_group": "public-contract-unregistered",
+      "reason": "Public-contract tests for R09 are unregistered; no public-command coverage for R09 is closable in bounded v0.4 (owning campaign T10).",
+      "owner_task": "T10",
+      "move_in": "Register concrete public-command tests for R09 and replace the placeholder final-supported-matrix kernel with concrete kernel/profile cells."
+    },
+    {
+      "id": "R10.public",
+      "reason_group": "public-contract-unregistered",
+      "reason": "Public-contract tests for R10 are unregistered; no public-command coverage for R10 is closable in bounded v0.4 (owning campaign T11/T12/T13).",
+      "owner_task": "T11/T12/T13",
+      "move_in": "Register concrete public-command tests for R10 and replace the placeholder final-supported-matrix kernel with concrete kernel/profile cells."
+    },
+    {
+      "id": "finding:A-F1",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T12 campaign has not recorded closable live-mechanism evidence for finding:A-F1.",
+      "owner_task": "T12",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:A-F1 and the T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:A-F2",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T12 campaign has not recorded closable live-mechanism evidence for finding:A-F2.",
+      "owner_task": "T12",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:A-F2 and the T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:A-F3",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T10 campaign has not recorded closable live-mechanism evidence for finding:A-F3.",
+      "owner_task": "T10",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:A-F3 and the T10 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:A-F4",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T10 campaign has not recorded closable live-mechanism evidence for finding:A-F4.",
+      "owner_task": "T10",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:A-F4 and the T10 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:A-F5",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T7 campaign has not recorded closable live-mechanism evidence for finding:A-F5.",
+      "owner_task": "T7",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:A-F5 and the T7 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:A-F6",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T12 campaign has not recorded closable live-mechanism evidence for finding:A-F6.",
+      "owner_task": "T12",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:A-F6 and the T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:A-F7",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T5 campaign has not recorded closable live-mechanism evidence for finding:A-F7.",
+      "owner_task": "T5",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:A-F7 and the T5 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:A-F9",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T2 campaign has not recorded closable live-mechanism evidence for finding:A-F9.",
+      "owner_task": "T2",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:A-F9 and the T2 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E01",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T12 campaign has not recorded closable live-mechanism evidence for finding:E01.",
+      "owner_task": "T12",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E01 and the T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E02",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T12 campaign has not recorded closable live-mechanism evidence for finding:E02.",
+      "owner_task": "T12",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E02 and the T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E03",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T12 campaign has not recorded closable live-mechanism evidence for finding:E03.",
+      "owner_task": "T12",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E03 and the T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E04",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T6 campaign has not recorded closable live-mechanism evidence for finding:E04.",
+      "owner_task": "T6",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E04 and the T6 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E05",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T7 campaign has not recorded closable live-mechanism evidence for finding:E05.",
+      "owner_task": "T7",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E05 and the T7 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E06",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T6 campaign has not recorded closable live-mechanism evidence for finding:E06.",
+      "owner_task": "T6",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E06 and the T6 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E07",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T6 campaign has not recorded closable live-mechanism evidence for finding:E07.",
+      "owner_task": "T6",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E07 and the T6 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E08",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T5 campaign has not recorded closable live-mechanism evidence for finding:E08.",
+      "owner_task": "T5",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E08 and the T5 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E09",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T6 campaign has not recorded closable live-mechanism evidence for finding:E09.",
+      "owner_task": "T6",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E09 and the T6 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E10",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T7 campaign has not recorded closable live-mechanism evidence for finding:E10.",
+      "owner_task": "T7",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E10 and the T7 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E11",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T7 campaign has not recorded closable live-mechanism evidence for finding:E11.",
+      "owner_task": "T7",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E11 and the T7 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E12",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T8 campaign has not recorded closable live-mechanism evidence for finding:E12.",
+      "owner_task": "T8",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E12 and the T8 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E13",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T2 campaign has not recorded closable live-mechanism evidence for finding:E13.",
+      "owner_task": "T2",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E13 and the T2 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E14",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T4 campaign has not recorded closable live-mechanism evidence for finding:E14.",
+      "owner_task": "T4",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E14 and the T4 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E15",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T5 campaign has not recorded closable live-mechanism evidence for finding:E15.",
+      "owner_task": "T5",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E15 and the T5 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E16",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T11 campaign has not recorded closable live-mechanism evidence for finding:E16.",
+      "owner_task": "T11",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E16 and the T11 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E17",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T10 campaign has not recorded closable live-mechanism evidence for finding:E17.",
+      "owner_task": "T10",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E17 and the T10 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E18",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T8 campaign has not recorded closable live-mechanism evidence for finding:E18.",
+      "owner_task": "T8",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E18 and the T8 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E19",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T9 campaign has not recorded closable live-mechanism evidence for finding:E19.",
+      "owner_task": "T9",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E19 and the T9 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E20",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T9 campaign has not recorded closable live-mechanism evidence for finding:E20.",
+      "owner_task": "T9",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E20 and the T9 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E21",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T12 campaign has not recorded closable live-mechanism evidence for finding:E21.",
+      "owner_task": "T12",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E21 and the T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E22",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T9 campaign has not recorded closable live-mechanism evidence for finding:E22.",
+      "owner_task": "T9",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E22 and the T9 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E23",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T12 campaign has not recorded closable live-mechanism evidence for finding:E23.",
+      "owner_task": "T12",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E23 and the T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E24",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T12 campaign has not recorded closable live-mechanism evidence for finding:E24.",
+      "owner_task": "T12",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E24 and the T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:E25",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T12 campaign has not recorded closable live-mechanism evidence for finding:E25.",
+      "owner_task": "T12",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:E25 and the T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-05",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T12 campaign has not recorded closable live-mechanism evidence for finding:F-05.",
+      "owner_task": "T12",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-05 and the T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-06",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T6 campaign has not recorded closable live-mechanism evidence for finding:F-06.",
+      "owner_task": "T6",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-06 and the T6 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-07",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T6 campaign has not recorded closable live-mechanism evidence for finding:F-07.",
+      "owner_task": "T6",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-07 and the T6 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-16b",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T7 campaign has not recorded closable live-mechanism evidence for finding:F-16b.",
+      "owner_task": "T7",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-16b and the T7 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-18",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T10 campaign has not recorded closable live-mechanism evidence for finding:F-18.",
+      "owner_task": "T10",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-18 and the T10 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-19",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T10 campaign has not recorded closable live-mechanism evidence for finding:F-19.",
+      "owner_task": "T10",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-19 and the T10 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-21",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T10 campaign has not recorded closable live-mechanism evidence for finding:F-21.",
+      "owner_task": "T10",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-21 and the T10 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-22",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T10 campaign has not recorded closable live-mechanism evidence for finding:F-22.",
+      "owner_task": "T10",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-22 and the T10 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-23",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T12 campaign has not recorded closable live-mechanism evidence for finding:F-23.",
+      "owner_task": "T12",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-23 and the T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-24",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T6 campaign has not recorded closable live-mechanism evidence for finding:F-24.",
+      "owner_task": "T6",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-24 and the T6 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-31",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T10 campaign has not recorded closable live-mechanism evidence for finding:F-31.",
+      "owner_task": "T10",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-31 and the T10 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-33",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T5/T13 campaign has not recorded closable live-mechanism evidence for finding:F-33.",
+      "owner_task": "T5/T13",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-33 and the T5/T13 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-34",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T8 campaign has not recorded closable live-mechanism evidence for finding:F-34.",
+      "owner_task": "T8",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-34 and the T8 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-35",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T3 campaign has not recorded closable live-mechanism evidence for finding:F-35.",
+      "owner_task": "T3",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-35 and the T3 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-36",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T5/T6 campaign has not recorded closable live-mechanism evidence for finding:F-36.",
+      "owner_task": "T5/T6",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-36 and the T5/T6 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-37",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T12 campaign has not recorded closable live-mechanism evidence for finding:F-37.",
+      "owner_task": "T12",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-37 and the T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-41",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T12 campaign has not recorded closable live-mechanism evidence for finding:F-41.",
+      "owner_task": "T12",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-41 and the T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-42",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T8 campaign has not recorded closable live-mechanism evidence for finding:F-42.",
+      "owner_task": "T8",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-42 and the T8 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-45",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T5 campaign has not recorded closable live-mechanism evidence for finding:F-45.",
+      "owner_task": "T5",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-45 and the T5 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-46",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T8 campaign has not recorded closable live-mechanism evidence for finding:F-46.",
+      "owner_task": "T8",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-46 and the T8 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-47",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T10 campaign has not recorded closable live-mechanism evidence for finding:F-47.",
+      "owner_task": "T10",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-47 and the T10 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-49",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T10 campaign has not recorded closable live-mechanism evidence for finding:F-49.",
+      "owner_task": "T10",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-49 and the T10 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-54",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T5/T8 campaign has not recorded closable live-mechanism evidence for finding:F-54.",
+      "owner_task": "T5/T8",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-54 and the T5/T8 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-55",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T10 campaign has not recorded closable live-mechanism evidence for finding:F-55.",
+      "owner_task": "T10",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-55 and the T10 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-56",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T5/T10 campaign has not recorded closable live-mechanism evidence for finding:F-56.",
+      "owner_task": "T5/T10",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-56 and the T5/T10 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-58-D7",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T10 campaign has not recorded closable live-mechanism evidence for finding:F-58-D7.",
+      "owner_task": "T10",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-58-D7 and the T10 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-58-D8",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T12 campaign has not recorded closable live-mechanism evidence for finding:F-58-D8.",
+      "owner_task": "T12",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-58-D8 and the T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-58-E4",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T3 campaign has not recorded closable live-mechanism evidence for finding:F-58-E4.",
+      "owner_task": "T3",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-58-E4 and the T3 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-58-I3",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T10 campaign has not recorded closable live-mechanism evidence for finding:F-58-I3.",
+      "owner_task": "T10",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-58-I3 and the T10 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-58-R2",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T8 campaign has not recorded closable live-mechanism evidence for finding:F-58-R2.",
+      "owner_task": "T8",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-58-R2 and the T8 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-58-R3",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T6 campaign has not recorded closable live-mechanism evidence for finding:F-58-R3.",
+      "owner_task": "T6",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-58-R3 and the T6 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-58-R5",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T10 campaign has not recorded closable live-mechanism evidence for finding:F-58-R5.",
+      "owner_task": "T10",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-58-R5 and the T10 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-58-T7",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T8 campaign has not recorded closable live-mechanism evidence for finding:F-58-T7.",
+      "owner_task": "T8",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-58-T7 and the T8 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-61a",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T10 campaign has not recorded closable live-mechanism evidence for finding:F-61a.",
+      "owner_task": "T10",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-61a and the T10 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:F-64",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T10 campaign has not recorded closable live-mechanism evidence for finding:F-64.",
+      "owner_task": "T10",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:F-64 and the T10 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:FB-F1",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T6 campaign has not recorded closable live-mechanism evidence for finding:FB-F1.",
+      "owner_task": "T6",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:FB-F1 and the T6 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:FB-F3",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T6 campaign has not recorded closable live-mechanism evidence for finding:FB-F3.",
+      "owner_task": "T6",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:FB-F3 and the T6 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:FB-F4",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T6 campaign has not recorded closable live-mechanism evidence for finding:FB-F4.",
+      "owner_task": "T6",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:FB-F4 and the T6 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:FB-F6",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T6 campaign has not recorded closable live-mechanism evidence for finding:FB-F6.",
+      "owner_task": "T6",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:FB-F6 and the T6 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:FB-F7",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T6 campaign has not recorded closable live-mechanism evidence for finding:FB-F7.",
+      "owner_task": "T6",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:FB-F7 and the T6 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:O-1",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T6 campaign has not recorded closable live-mechanism evidence for finding:O-1.",
+      "owner_task": "T6",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:O-1 and the T6 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:O-10",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T9 campaign has not recorded closable live-mechanism evidence for finding:O-10.",
+      "owner_task": "T9",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:O-10 and the T9 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:O-11",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T9 campaign has not recorded closable live-mechanism evidence for finding:O-11.",
+      "owner_task": "T9",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:O-11 and the T9 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:O-13",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T12 campaign has not recorded closable live-mechanism evidence for finding:O-13.",
+      "owner_task": "T12",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:O-13 and the T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:O-14",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T6 campaign has not recorded closable live-mechanism evidence for finding:O-14.",
+      "owner_task": "T6",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:O-14 and the T6 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:O-16",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T9 campaign has not recorded closable live-mechanism evidence for finding:O-16.",
+      "owner_task": "T9",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:O-16 and the T9 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:O-17",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T7 campaign has not recorded closable live-mechanism evidence for finding:O-17.",
+      "owner_task": "T7",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:O-17 and the T7 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "finding:O-6",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T8 campaign has not recorded closable live-mechanism evidence for finding:O-6.",
+      "owner_task": "T8",
+      "move_in": "Catalog names concrete kernel/profile cells for finding:O-6 and the T8 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "followup:G-01",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T12 campaign has not recorded closable live-mechanism evidence for followup:G-01.",
+      "owner_task": "T12",
+      "move_in": "Catalog names concrete kernel/profile cells for followup:G-01 and the T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "followup:G-02",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T4/T7/T12 campaign has not recorded closable live-mechanism evidence for followup:G-02.",
+      "owner_task": "T4/T7/T12",
+      "move_in": "Catalog names concrete kernel/profile cells for followup:G-02 and the T4/T7/T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "followup:G-03",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T6/T7 campaign has not recorded closable live-mechanism evidence for followup:G-03.",
+      "owner_task": "T6/T7",
+      "move_in": "Catalog names concrete kernel/profile cells for followup:G-03 and the T6/T7 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "followup:G-04",
+      "reason_group": "public-oracle-unregistered",
+      "reason": "Deferred gate G-04 requires public-command evidence that is not registered; bounded v0.4 cannot close it (owning campaign T3/T5/T10).",
+      "owner_task": "T3/T5/T10",
+      "move_in": "Register the G-04 public-oracle check and replace the placeholder final-supported-matrix kernel with concrete kernel/profile cells."
+    },
+    {
+      "id": "followup:G-05",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T4/T5/T12 campaign has not recorded closable live-mechanism evidence for followup:G-05.",
+      "owner_task": "T4/T5/T12",
+      "move_in": "Catalog names concrete kernel/profile cells for followup:G-05 and the T4/T5/T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "followup:G-06",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T1/T4/T11/T12 campaign has not recorded closable live-mechanism evidence for followup:G-06.",
+      "owner_task": "T1/T4/T11/T12",
+      "move_in": "Catalog names concrete kernel/profile cells for followup:G-06 and the T1/T4/T11/T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "followup:G-07",
+      "reason_group": "public-oracle-unregistered",
+      "reason": "Deferred gate G-07 requires public-command evidence that is not registered; bounded v0.4 cannot close it (owning campaign T4/T11).",
+      "owner_task": "T4/T11",
+      "move_in": "Register the G-07 public-oracle check and replace the placeholder final-supported-matrix kernel with concrete kernel/profile cells."
+    },
+    {
+      "id": "followup:G-08",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T7/T12 campaign has not recorded closable live-mechanism evidence for followup:G-08.",
+      "owner_task": "T7/T12",
+      "move_in": "Catalog names concrete kernel/profile cells for followup:G-08 and the T7/T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "followup:G-10",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T5/T6 campaign has not recorded closable live-mechanism evidence for followup:G-10.",
+      "owner_task": "T5/T6",
+      "move_in": "Catalog names concrete kernel/profile cells for followup:G-10 and the T5/T6 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "followup:G-11",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T5/T10/T12 campaign has not recorded closable live-mechanism evidence for followup:G-11.",
+      "owner_task": "T5/T10/T12",
+      "move_in": "Catalog names concrete kernel/profile cells for followup:G-11 and the T5/T10/T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "followup:G-12",
+      "reason_group": "public-oracle-unregistered",
+      "reason": "Deferred gate G-12 requires public-command evidence that is not registered; bounded v0.4 cannot close it (owning campaign T8/T9/T10/T12).",
+      "owner_task": "T8/T9/T10/T12",
+      "move_in": "Register the G-12 public-oracle check and replace the placeholder final-supported-matrix kernel with concrete kernel/profile cells."
+    },
+    {
+      "id": "followup:G-14",
+      "reason_group": "public-oracle-unregistered",
+      "reason": "Deferred gate G-14 requires public-command evidence that is not registered; bounded v0.4 cannot close it (owning campaign T2/T6/T12).",
+      "owner_task": "T2/T6/T12",
+      "move_in": "Register the G-14 public-oracle check and replace the placeholder final-supported-matrix kernel with concrete kernel/profile cells."
+    },
+    {
+      "id": "followup:G-15",
+      "reason_group": "public-oracle-unregistered",
+      "reason": "Deferred gate G-15 requires public-command evidence that is not registered; bounded v0.4 cannot close it (owning campaign T3/T7/T10).",
+      "owner_task": "T3/T7/T10",
+      "move_in": "Register the G-15 public-oracle check and replace the placeholder final-supported-matrix kernel with concrete kernel/profile cells."
+    },
+    {
+      "id": "followup:G-17",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T2/T5/T12 campaign has not recorded closable live-mechanism evidence for followup:G-17.",
+      "owner_task": "T2/T5/T12",
+      "move_in": "Catalog names concrete kernel/profile cells for followup:G-17 and the T2/T5/T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "followup:G-18",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T4/T7/T8/T12 campaign has not recorded closable live-mechanism evidence for followup:G-18.",
+      "owner_task": "T4/T7/T8/T12",
+      "move_in": "Catalog names concrete kernel/profile cells for followup:G-18 and the T4/T7/T8/T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "followup:G-19",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T4/T5/T6/T10/T12 campaign has not recorded closable live-mechanism evidence for followup:G-19.",
+      "owner_task": "T4/T5/T6/T10/T12",
+      "move_in": "Catalog names concrete kernel/profile cells for followup:G-19 and the T4/T5/T6/T10/T12 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "followup:U-02",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T11/T12/T13 campaign has not recorded closable live-mechanism evidence for followup:U-02.",
+      "owner_task": "T11/T12/T13",
+      "move_in": "Catalog names concrete kernel/profile cells for followup:U-02 and the T11/T12/T13 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "followup:U-03",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T11b campaign has not recorded closable live-mechanism evidence for followup:U-03.",
+      "owner_task": "T11b",
+      "move_in": "Catalog names concrete kernel/profile cells for followup:U-03 and the T11b campaign (T5-T11) records execution."
+    },
+    {
+      "id": "followup:U-04",
+      "reason_group": "public-oracle-unregistered",
+      "reason": "Deferred gate U-04 requires public-command evidence that is not registered; bounded v0.4 cannot close it (owning campaign T6/T10/T12).",
+      "owner_task": "T6/T10/T12",
+      "move_in": "Register the U-04 public-oracle check and replace the placeholder final-supported-matrix kernel with concrete kernel/profile cells."
+    },
+    {
+      "id": "followup:U-07",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T6 campaign has not recorded closable live-mechanism evidence for followup:U-07.",
+      "owner_task": "T6",
+      "move_in": "Catalog names concrete kernel/profile cells for followup:U-07 and the T6 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "followup:U-08",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T13 campaign has not recorded closable live-mechanism evidence for followup:U-08.",
+      "owner_task": "T13",
+      "move_in": "Catalog names concrete kernel/profile cells for followup:U-08 and the T13 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "followup:U-10",
+      "reason_group": "public-oracle-unregistered",
+      "reason": "Deferred gate U-10 requires public-command evidence that is not registered; bounded v0.4 cannot close it (owning campaign T3/T10/T12).",
+      "owner_task": "T3/T10/T12",
+      "move_in": "Register the U-10 public-oracle check and replace the placeholder final-supported-matrix kernel with concrete kernel/profile cells."
+    },
+    {
+      "id": "followup:U-11",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T6 campaign has not recorded closable live-mechanism evidence for followup:U-11.",
+      "owner_task": "T6",
+      "move_in": "Catalog names concrete kernel/profile cells for followup:U-11 and the T6 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "followup:U-13",
+      "reason_group": "public-oracle-unregistered",
+      "reason": "Deferred gate U-13 requires public-command evidence that is not registered; bounded v0.4 cannot close it (owning campaign T3/T10).",
+      "owner_task": "T3/T10",
+      "move_in": "Register the U-13 public-oracle check and replace the placeholder final-supported-matrix kernel with concrete kernel/profile cells."
+    },
+    {
+      "id": "followup:U-14",
+      "reason_group": "public-oracle-unregistered",
+      "reason": "Deferred gate U-14 requires public-command evidence that is not registered; bounded v0.4 cannot close it (owning campaign T7/T10).",
+      "owner_task": "T7/T10",
+      "move_in": "Register the U-14 public-oracle check and replace the placeholder final-supported-matrix kernel with concrete kernel/profile cells."
+    },
+    {
+      "id": "followup:U-15",
+      "reason_group": "public-oracle-unregistered",
+      "reason": "Deferred gate U-15 requires public-command evidence that is not registered; bounded v0.4 cannot close it (owning campaign T5/T10).",
+      "owner_task": "T5/T10",
+      "move_in": "Register the U-15 public-oracle check and replace the placeholder final-supported-matrix kernel with concrete kernel/profile cells."
+    },
+    {
+      "id": "followup:U-16",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T4/T5 campaign has not recorded closable live-mechanism evidence for followup:U-16.",
+      "owner_task": "T4/T5",
+      "move_in": "Catalog names concrete kernel/profile cells for followup:U-16 and the T4/T5 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "followup:U-17",
+      "reason_group": "public-oracle-unregistered",
+      "reason": "Deferred gate U-17 requires public-command evidence that is not registered; bounded v0.4 cannot close it (owning campaign T10/T13).",
+      "owner_task": "T10/T13",
+      "move_in": "Register the U-17 public-oracle check and replace the placeholder final-supported-matrix kernel with concrete kernel/profile cells."
+    },
+    {
+      "id": "followup:U-18",
+      "reason_group": "kernel-concretization-pending",
+      "reason": "Kernel/profile concretization pending (placeholder final-supported-matrix); the T5/T7/T8/T10/T13 campaign has not recorded closable live-mechanism evidence for followup:U-18.",
+      "owner_task": "T5/T7/T8/T10/T13",
+      "move_in": "Catalog names concrete kernel/profile cells for followup:U-18 and the T5/T7/T8/T10/T13 campaign (T5-T11) records execution."
+    },
+    {
+      "id": "soak.14400s",
+      "reason_group": "full-endurance",
+      "reason": "Full-endurance evidence (4h continuous owned workload) exceeds the bounded v0.4 scope; only the 30-minute meaningful-activity soak is bounded-required.",
+      "owner_task": "T12",
+      "move_in": "Record actual 4h soak evidence with independent workload/loss and resource accounting."
+    },
+    {
+      "id": "soak.86400s",
+      "reason_group": "full-endurance",
+      "reason": "Full-endurance evidence (24h continuous owned workload) exceeds the bounded v0.4 scope; only the 30-minute meaningful-activity soak is bounded-required.",
+      "owner_task": "T12",
+      "move_in": "Record actual 24h soak evidence with independent workload/loss and resource accounting."
+    }
+  ]
+}

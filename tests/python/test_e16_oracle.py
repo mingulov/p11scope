@@ -569,6 +569,8 @@ if mode == "hang":
 time.sleep(float(duration))
 rows, modules, skipped = [], [], []
 for member in spec:
+    if mode == "drop-proxy" and member["name"] == "proxy":
+        continue
     if member["expect"] in ("supported", "foreign"):
         endpoint = member["endpoint"]
         for line in open(f"/proc/{member['pid']}/maps"):
@@ -829,6 +831,52 @@ class SystemMixedCampaign(LifecycleBase):
                             for reason in cells["control"]["reasons"]))
         with self.assertRaises(Unknown):
             self.verify(record, files)
+
+    def test_system_mixed_requires_positive_control_and_proxy(self):
+        # Gap-shaped silence satisfies an unhinted-gap cell, never a
+        # supported one: both control and proxy need their exact counts.
+        silent = capture([])
+        self.assertEqual(judge(silent, expect="unhinted-gap", name="static",
+                               mode="system-unhinted", calls=3), [])
+        for name in ("control", "proxy"):
+            with self.subTest(name=name):
+                reasons = judge(silent, expect="supported", name=name,
+                                mode="system-unhinted", calls=3)
+                self.assertTrue(any("0 report rows" in reason for reason in reasons),
+                                reasons)
+        self.assertEqual(judge(capture([row(OWNED, OFFSET, 3)]), expect="supported",
+                               name="proxy", mode="system-unhinted", calls=3), [])
+        # Campaign level: an unrun proxy keeps its UNKNOWN while control
+        # and the expected gaps still pass, and no aggregate PASS hides
+        # the missing required positive.
+        _, record, files = self.campaign("system-mixed", mode="drop-proxy")
+        cells = {cell["name"]: cell for cell in record["cells"]}
+        self.assertEqual(cells["proxy"]["verdict"], "UNKNOWN")
+        self.assertTrue(any("0 report rows" in reason
+                            for reason in cells["proxy"]["reasons"]),
+                        cells["proxy"]["reasons"])
+        self.assertEqual(cells["control"]["verdict"], "PASS")
+        for name in E16.UNHINTED_GAPS:
+            self.assertEqual(cells[name]["verdict"], "PASS")
+        with self.assertRaisesRegex(Unknown, "cell proxy"):
+            self.verify(record, files)
+
+    def test_system_mixed_manifest_refuses_omitted_or_relabeled_cells(self):
+        _, record, files = self.campaign("system-mixed")
+        self.assertEqual(self.verify(record, files)["status"], "PASS")
+        good = copy.deepcopy(record)
+        mutations = (
+            lambda r: r["cells"].pop(1),
+            lambda r: r["cells"][1].update(expect="unhinted-gap"),
+            lambda r: r["cells"][0].update(name="proxy"),
+            lambda r: r["runs"][0]["participants"].pop(1),
+            lambda r: r.update(campaign="hinted"),
+        )
+        for index, mutate in enumerate(mutations):
+            mutated = copy.deepcopy(good)
+            mutate(mutated)
+            with self.subTest(index=index), self.assertRaisesRegex(Unknown, "campaign manifest"):
+                self.verify(mutated, files)
 
 
 class HintedRefusalBinding(LifecycleBase):

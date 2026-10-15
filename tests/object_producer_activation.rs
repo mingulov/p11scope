@@ -1257,16 +1257,20 @@ fn program_six_field_template(
         .set_bytes(values + 0x70, &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x23]);
 }
 
-/// Length of the raw (byte-)string literal opening at `i`, or `None`
-/// when position `i` does not open one. The `r`/`br` prefix counts only
-/// outside identifiers, and a raw identifier (`r#foo`) is not a string
-/// start. The literal runs to the closing quote plus exactly the opening
-/// hash count (backslashes are literal inside); an unterminated literal
-/// runs to end of input, so the pin fails closed.
+/// Length of the raw string literal opening at `i` (`r`, `br` or `cr`
+/// prefix, any hash count), or `None` when position `i` does not open
+/// one. The prefix counts only outside identifiers, and a raw
+/// identifier (`r#foo`) is not a string start. The literal closes at
+/// the first quote followed by at least the opening hash count and
+/// consumes exactly that many hashes — a further `#` is a new token,
+/// never part of the string (backslashes are literal inside); an
+/// unterminated literal runs to end of input, so the pin fails closed.
 fn raw_string_len(bytes: &[u8], i: usize) -> Option<usize> {
     let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let mut j = i;
-    if bytes.get(j) == Some(&b'b') && bytes.get(j + 1) == Some(&b'r') {
+    if (bytes.get(j) == Some(&b'b') || bytes.get(j) == Some(&b'c'))
+        && bytes.get(j + 1) == Some(&b'r')
+    {
         if i > 0 && ident(bytes[i - 1]) {
             return None;
         }
@@ -1292,12 +1296,12 @@ fn raw_string_len(bytes: &[u8], i: usize) -> Option<usize> {
         if bytes[j] == b'"' {
             let mut k = j + 1;
             let mut seen = 0;
-            while seen < hashes && bytes.get(k) == Some(&b'#') {
+            while bytes.get(k) == Some(&b'#') {
                 seen += 1;
                 k += 1;
             }
-            if seen == hashes && bytes.get(k) != Some(&b'#') {
-                return Some(k - i);
+            if seen >= hashes {
+                return Some(j + 1 + hashes - i);
             }
         }
         j += 1;
@@ -1306,12 +1310,12 @@ fn raw_string_len(bytes: &[u8], i: usize) -> Option<usize> {
 }
 
 /// Strip Rust line comments, (nested) block comments, string literals
-/// (plain, byte, raw and raw byte forms) and character literals, so
-/// static pins count code tokens — never prose. A `'` only opens a
-/// character literal when exactly one plain character or escape plus
-/// the closing quote follows, so lifetimes survive; raw strings lex by
-/// delimiter count, so their content (quotes, comment markers, prose
-/// naming an adapter) never counts as code.
+/// (plain, byte, C, raw, raw byte and raw C forms) and character
+/// literals, so static pins count code tokens — never prose. A `'`
+/// only opens a character literal when exactly one plain character or
+/// escape plus the closing quote follows, so lifetimes survive; raw
+/// strings lex by delimiter count, so their content (quotes, comment
+/// markers, prose naming an adapter) never counts as code.
 fn strip_rust_prose(source: &str) -> String {
     let bytes = source.as_bytes();
     let mut out = String::with_capacity(source.len());
@@ -1534,6 +1538,235 @@ fn strip_rust_prose_handles_raw_string_prose() {
             .count(),
         1,
         "prose plus one real call must count exactly one delegation call"
+    );
+}
+
+/// G05(b) round-5 regression: both reviewer-reproduced stripper
+/// bypasses. (1) The trailing-`#` macro case: `sink!(r""#)` is a
+/// COMPLETE raw string followed by a SEPARATE `#` token, at 0/1/2
+/// opening hashes; the lexer must match exactly N closing hashes and
+/// stop, so the quoted line comment after it still strips as a
+/// comment. (2) Raw C strings (`cr#"..."#`) lex as strings, not as
+/// prose misaligned by a missed prefix. Both directions: each
+/// doctored body (real delegation removed, the name only in prose)
+/// counts ZERO, while the same body next to a real delegation call
+/// counts exactly one.
+#[test]
+fn strip_rust_prose_rejects_trailing_hash_and_c_string_bypasses() {
+    // Bypass 1, the reviewer's own probe at 0/1/2 opening hashes.
+    // Each quoted comment carries exactly the opening hash count, so
+    // the N-hash closing delimiter a confused lexer hunts for lands
+    // inside the comment and the prose name leaks out as code.
+    for (name, literal, comment) in [
+        (
+            "trailing hash, 0 opening hashes",
+            "r\"\"#",
+            "// \" adapter_attributes_entry(",
+        ),
+        (
+            "trailing hash, 1 opening hash",
+            "r#\"\"##",
+            "// \"# adapter_attributes_entry(",
+        ),
+        (
+            "trailing hash, 2 opening hashes",
+            "r##\"\"###",
+            "// \"## adapter_attributes_entry(",
+        ),
+    ] {
+        let doctored = format!(
+            "fn object_entry_attributes(\n    let _ = (ctx, side, layout);\n    macro_rules! sink {{ ($($t:tt)*) => {{}}; }}\n    sink!({literal});\n    {comment}\n    true\n}}\n"
+        );
+        assert_eq!(
+            strip_rust_prose(&doctored)
+                .matches("adapter_attributes_entry(")
+                .count(),
+            0,
+            "{name}: doctored body must count zero delegation calls"
+        );
+        let wired = doctored.replace(
+            "    true\n",
+            "    adapter_attributes_entry(side, descriptor);\n",
+        );
+        assert_eq!(
+            strip_rust_prose(&wired)
+                .matches("adapter_attributes_entry(")
+                .count(),
+            1,
+            "{name}: prose plus one real call must count exactly one"
+        );
+    }
+    // Bypass 2: the name hidden in a raw C string whose interior
+    // quote misaligns prefix-blind stripping, plus a quoted comment.
+    let doctored = concat!(
+        "fn object_entry_attributes(\n",
+        "    let _cover = cr#\"prefix \" suffix\"#;\n",
+        "    // \" adapter_attributes_entry(\n",
+        "    true\n",
+        "}\n",
+    );
+    assert_eq!(
+        strip_rust_prose(doctored)
+            .matches("adapter_attributes_entry(")
+            .count(),
+        0,
+        "raw C string bypass must count zero delegation calls"
+    );
+    let wired = doctored.replace(
+        "    true\n",
+        "    adapter_attributes_entry(side, descriptor);\n",
+    );
+    assert_eq!(
+        strip_rust_prose(&wired)
+            .matches("adapter_attributes_entry(")
+            .count(),
+        1,
+        "raw C string prose plus one real call must count exactly one"
+    );
+    // The name directly inside a raw C string strips on its own.
+    assert!(
+        !strip_rust_prose(r##"cr#"adapter_attributes_entry("#"##)
+            .contains("adapter_attributes_entry("),
+        "raw C string content must strip"
+    );
+}
+
+/// G05(b) round-5 vectors: every string prefix (`"`, `b"`, `c"`,
+/// `r"`, `br"`, `cr"`, each raw form at 0/1/2 hashes), raw
+/// identifiers, char-vs-lifetime, nested block comments, escapes and
+/// unterminated literals (which run to end, failing closed).
+#[test]
+fn strip_rust_prose_lexes_every_prefix_and_edge() {
+    // Every prefix hides the adapter name behind an interior quote
+    // (where the form allows one) to catch naive lexing.
+    for (name, prose) in [
+        ("plain string", "\"adapter_attributes_entry(\""),
+        (
+            "plain string with escaped quotes",
+            "\"say \\\"hi\\\" adapter_attributes_entry(\"",
+        ),
+        ("byte string", "b\"adapter_attributes_entry(\""),
+        (
+            "byte string with escapes",
+            "b\"a\\\"b\\\\ adapter_attributes_entry(\"",
+        ),
+        ("c string", "c\"adapter_attributes_entry(\""),
+        (
+            "c string with escape",
+            "c\"a\\0b adapter_attributes_entry(\"",
+        ),
+        ("raw string", "r\"adapter_attributes_entry(\""),
+        (
+            "raw 1-hash string with quotes",
+            r##"r#"say "hi" adapter_attributes_entry(" y"#"##,
+        ),
+        (
+            "raw 2-hash string with quotes and hashes",
+            r###"r##"say "hi" adapter_attributes_entry("# still prose"##"###,
+        ),
+        ("raw byte string", "br\"adapter_attributes_entry(\""),
+        (
+            "raw byte 1-hash string with quote",
+            r##"br#"say "hi" adapter_attributes_entry("#"##,
+        ),
+        (
+            "raw byte 2-hash string with quote",
+            r###"br##"say "hi" adapter_attributes_entry("##"###,
+        ),
+        ("raw c string", "cr\"adapter_attributes_entry(\""),
+        (
+            "raw c 1-hash string with quote",
+            r##"cr#"say "hi" adapter_attributes_entry("#"##,
+        ),
+        (
+            "raw c 2-hash string with quote",
+            r###"cr##"say "hi" adapter_attributes_entry("##"###,
+        ),
+        (
+            "deeply nested block comment",
+            "/* a /* b /* adapter_attributes_entry( */ c */ d */",
+        ),
+        (
+            "block comment with strings inside",
+            "/* \"adapter_attributes_entry(\" r#\"x\"# */",
+        ),
+        (
+            "line comment after char slash",
+            "let c = '/'; // adapter_attributes_entry(\n",
+        ),
+    ] {
+        let stripped = strip_rust_prose(prose);
+        assert!(
+            !stripped.contains("adapter_attributes_entry("),
+            "{name} must strip, got {stripped:?}"
+        );
+    }
+    // Trailing-`#` macro cases: the literal strips to one space and
+    // the extra `#` survives as its own token.
+    assert_eq!(strip_rust_prose("sink!(r\"\"#);"), "sink!( #);");
+    assert_eq!(strip_rust_prose("sink!(r#\"\"##);"), "sink!( #);");
+    assert_eq!(strip_rust_prose("sink!(r##\"\"###);"), "sink!( #);");
+    // Adjacent literals each strip.
+    assert_eq!(strip_rust_prose("r#\"a\"#\"b\""), "  ");
+    assert_eq!(strip_rust_prose("br\"a\"cr\"b\""), "  ");
+    // Prefix-looking code that is NOT a string survives verbatim.
+    assert_eq!(strip_rust_prose("let r#type = 1;"), "let r#type = 1;");
+    assert_eq!(strip_rust_prose("let br = 1;"), "let br = 1;");
+    assert_eq!(strip_rust_prose("let cry = 1;"), "let cry = 1;");
+    assert_eq!(
+        strip_rust_prose("let r#match = adapter_attributes_entry(x);"),
+        "let r#match = adapter_attributes_entry(x);"
+    );
+    // Characters strip; lifetimes and `'static` survive.
+    assert_eq!(strip_rust_prose("'a'"), " ");
+    assert_eq!(strip_rust_prose("b'a'"), "b ");
+    assert_eq!(strip_rust_prose("'\\n'"), " ");
+    assert_eq!(strip_rust_prose("let q = '\"';"), "let q =  ;");
+    assert_eq!(strip_rust_prose("x: &'a u8"), "x: &'a u8");
+    assert_eq!(
+        strip_rust_prose("fn f<'a>(x: &'a u8) -> &'a u8"),
+        "fn f<'a>(x: &'a u8) -> &'a u8"
+    );
+    assert_eq!(strip_rust_prose("x: &'static str"), "x: &'static str");
+    // Escapes close cooked strings exactly: an escaped quote does not
+    // end the literal, an escaped backslash does not escape the quote.
+    assert_eq!(
+        strip_rust_prose("\"a\\\"b\" + adapter_attributes_entry(")
+            .matches("adapter_attributes_entry(")
+            .count(),
+        1
+    );
+    assert_eq!(
+        strip_rust_prose("\"a\\\\\" + adapter_attributes_entry(")
+            .matches("adapter_attributes_entry(")
+            .count(),
+        1
+    );
+    // Unterminated prose runs to end, failing closed: the name never
+    // counts as code.
+    assert_eq!(strip_rust_prose("\"adapter_attributes_entry("), " ");
+    assert_eq!(strip_rust_prose("r#\"adapter_attributes_entry("), " ");
+    assert_eq!(strip_rust_prose("/* adapter_attributes_entry("), "");
+}
+
+/// G05(b) round-5 stability: the stripped dump of the real BPF source
+/// is byte-identical before and after the lexer correction (baseline
+/// captured pre-fix: 114413 B, sha256 below). Re-baseline deliberately
+/// if `crates/ebpf/src/main.rs` legitimately changes.
+#[test]
+fn strip_rust_prose_real_bpf_source_dump_stable() {
+    use sha2::{Digest as _, Sha256};
+    let stripped = strip_rust_prose(&bpf_source());
+    assert_eq!(
+        stripped.len(),
+        114413,
+        "stripped BPF dump size must not drift"
+    );
+    let digest = Sha256::digest(stripped.as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(
+        hex, "dd06302f092bfe9a78d7ecdfc53368da8bd05bf7ce920727fb055906b307b6a4",
+        "stripped BPF dump must stay byte-identical"
     );
 }
 

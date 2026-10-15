@@ -159,12 +159,19 @@ fn object_producer_adapters_return_fill_shape() {
         "return must query ready, reserve, fill, tail, find, then retire"
     );
     let submit = returned.find("entry.submit(0)").expect("emission submits");
-    let discard = returned
-        .find("entry.discard(0)")
-        .expect("failed emission discards");
+    let discards: Vec<_> = returned.match_indices("entry.discard(0)").collect();
+    assert_eq!(
+        discards.len(),
+        2,
+        "the continuity-gate arm and the failed-emission arm each discard"
+    );
     assert!(
-        drain < submit && drain < discard,
-        "the drain retire must precede submit and discard"
+        discards[0].0 < fill,
+        "the gate arm must discard before any object read"
+    );
+    assert!(
+        drain < submit && drain < discards[1].0,
+        "the drain retire must precede submit and the emission discard"
     );
     // The drain still queries (required=0, all sane phases) and the
     // failed settle still faults; emission reads stay outlined.

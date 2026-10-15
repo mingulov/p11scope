@@ -36,7 +36,7 @@ use crate::object_wire::{
     ObjectAttributeListWire, ObjectAttributeWire, OBJECT_DERIVE_DH_PKCS, OBJECT_DERIVE_ECDH1,
     OBJECT_DERIVE_ECDH1_COFACTOR, OBJECT_DERIVE_SHA256, OBJECT_DERIVE_UNAVAILABLE,
 };
-use crate::{target_word_end, LinuxLayout, ARG_NONE};
+use crate::{instance, target_word_end, InstanceStamp, LinuxLayout, ARG_NONE};
 
 /// `CKR_OK`: the only RV that authorizes result-handle and Find reads.
 /// From `cryptoki-sys` 0.5.0 (`CK_RV = 0`).
@@ -216,22 +216,40 @@ pub const fn derive_mechanism_code(mechanism: ScalarDeriveMechanism) -> u64 {
     }
 }
 
-/// Ownership/phase authority for return processing, as data. Adapters derive
-/// this from the live START owner, side binding and phase; teardown passes a
+/// Ownership/phase/continuity authority for return processing, as data.
+/// Adapters derive this from the live START owner, side binding, phase and
+/// the existing instance-continuity join predicate; teardown passes a
 /// denied authority and this core then performs no reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReturnAuthority {
     pub owner_live: bool,
     pub phase_ready: bool,
+    pub continuity_joined: bool,
 }
 
 impl ReturnAuthority {
     pub const AUTHORIZED: Self = Self {
         owner_live: true,
         phase_ready: true,
+        continuity_joined: true,
     };
     pub const fn is_authorized(self) -> bool {
-        self.owner_live && self.phase_ready
+        self.owner_live && self.phase_ready && self.continuity_joined
+    }
+    /// Authority for one return: live owner, ready phase, and joinable
+    /// entry/return continuity stamps. A found entry alone authorizes
+    /// nothing; only the full join predicate does.
+    pub const fn for_return(
+        owner_live: bool,
+        phase_ready: bool,
+        entry: InstanceStamp,
+        ret: InstanceStamp,
+    ) -> Self {
+        Self {
+            owner_live,
+            phase_ready,
+            continuity_joined: instance::stamp_joinable(entry, ret),
+        }
     }
 }
 

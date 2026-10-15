@@ -103,8 +103,8 @@ fn object_producer_missing_side_state_faults_before_return() {
         .expect("drain must check retained-ABI agreement");
     assert_eq!(
         returned.matches("owned_start_remove(&key, true)").count(),
-        4,
-        "ordinary, aggregate, reserve-failure and emission arms each retire"
+        5,
+        "ordinary, aggregate, continuity-gate, reserve-failure and emission arms each retire"
     );
     let drain_retire = returned
         .rfind("owned_start_remove(&key, true)")

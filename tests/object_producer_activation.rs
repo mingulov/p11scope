@@ -446,13 +446,15 @@ fn refused_stamp_pairs() -> Vec<(
 }
 
 /// H7-E1 return-emission mirror. Replicates the `p11_return_impl` object
-/// arm step order (reserve → fills → continuity → retire → submit) and
-/// calls the REAL production protocol (`capture_return_handles`,
-/// `capture_find_return`, `instance::stamp_joinable`) with instrumented
-/// readers. RED state: authority ignores continuity exactly like the
-/// current root, so refused stamps still read and emit. The E1 fix moves
-/// the continuity fill plus the join gate ahead of the fills in both the
-/// root and this mirror; the order pins below bind them line for line.
+/// arm step order (reserve → continuity → join gate → fills → tail →
+/// retire → submit) and calls the REAL production protocol
+/// (`capture_return_handles`, `capture_find_return`,
+/// `ReturnAuthority::for_return`) with instrumented readers. The gate is
+/// evaluated before the fills run, exactly like the root; denied
+/// authority then performs zero reads by the shared guarantee (pinned by
+/// `object_producer_continuity_denied_authority_reads_nothing`), so the
+/// mirror's pass-through fills are observationally identical to the
+/// root's early return. The order pins below bind them line for line.
 struct EmissionOutcome {
     tail_emitted: bool,
     fault_required: bool,
@@ -475,11 +477,16 @@ fn run_emission_mirror(
     ret_stamp: p11scope_ebpf_common::InstanceStamp,
     find: Option<(u64, u64, u64)>,
 ) -> EmissionOutcome {
-    use p11scope_ebpf_common::instance;
-    use p11scope_ebpf_common::object_capture::{capture_find_return, capture_return_handles};
-    // Step 1 (mirror of the `object_fill_return` call site): reads run
-    // under owner/phase authority only. Continuity is not consulted.
-    let authority = adapter::owner_ready_authority();
+    use p11scope_ebpf_common::object_capture::{
+        ReturnAuthority, capture_find_return, capture_return_handles,
+    };
+    // Step 1 (mirror of the moved `p11_instance_return` site): the base
+    // event and its continuity land in the reserved record before any
+    // object read. (Data setup; the stamps arrive as parameters.)
+    // Step 2 (mirror of the join gate): authority conjoins continuity.
+    let authority = ReturnAuthority::for_return(true, true, entry_stamp, ret_stamp);
+    // Steps 3-4 (mirrors of the fill sites): fills run under the gated
+    // authority; denied authority performs zero reads.
     let (reader, _) = adapter::readers(target);
     let (handles, words) = capture_return_handles(
         present,
@@ -490,8 +497,6 @@ fn run_emission_mirror(
         layout,
         reader,
     );
-    // Step 2 (mirror of the `object_emit_find` call site): same
-    // continuity-blind authority.
     let (find_verdict, find_words) = match find {
         Some((array, capacity, count_ptr)) => {
             let (reader, _) = adapter::readers(target);
@@ -508,13 +513,13 @@ fn run_emission_mirror(
             [0u64; 8],
         ),
     };
-    // Step 3 (mirror of the `p11_instance_return` site): continuity is
-    // filled into the reserved record AFTER the reads and never gates
-    // them; the tail emits whenever the fills ran.
-    let _joined = instance::stamp_joinable(entry_stamp, ret_stamp);
+    // Step 5 (mirror of the tail/retire/submit sites): the tail emits
+    // only under joined authority; refusal retires, discards and faults.
+    // Both arms retire, so `retired` holds either way.
+    let joined = authority.is_authorized();
     EmissionOutcome {
-        tail_emitted: true,
-        fault_required: false,
+        tail_emitted: joined,
+        fault_required: !joined,
         retired: true,
         handles,
         words,
@@ -568,7 +573,6 @@ fn pin_continuity_gate_precedes_fills() {
 /// file-slot, missing VALID, each blocking flag) reads nothing, emits no
 /// tail, faults visibly and retires through E2 without a success claim.
 #[test]
-#[ignore = "RED: H7-E1 continuity gate pending"]
 fn object_return_continuity_refuses_before_reads() {
     use p11scope_ebpf_common::LinuxLayout;
     use p11scope_ebpf_common::object_capture::handle_status;
@@ -668,7 +672,6 @@ fn object_return_continuity_refuses_before_reads() {
 /// count/element/reread sequence; every refusal reads nothing and emits
 /// no Find section.
 #[test]
-#[ignore = "RED: H7-E1 continuity gate pending"]
 fn object_find_continuity_refuses_before_reads() {
     use p11scope_ebpf_common::LinuxLayout;
     use p11scope_ebpf_common::object_capture::handle_status;

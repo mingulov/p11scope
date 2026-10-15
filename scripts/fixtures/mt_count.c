@@ -13,11 +13,19 @@
  * that never ran, a failed session, a missing TOTAL) exits nonzero, so a
  * sample that did not run exactly as scripted can never count.
  *
+ * The gate flags are sequentially-consistent atomics, never volatile
+ * cross-thread communication (A:DR-T3A-14): every worker observes go/stop
+ * exactly once published. Each worker records every C_GenerateRandom
+ * attempt and every failed return separately; any failure aborts the
+ * sample before MT_COUNT, so an emitted ops total always equals attempts
+ * with failed=0 and the observer's entry-side count matches exactly.
+ *
  * PAD=1 strides the per-thread counters at one cache line each (the
  * t12-nolock cell: no false sharing); PAD=0 packs them like mt.c.
  * Main clocks the gate-open window with CLOCK_MONOTONIC and prints one
  * MT_COUNT line: ops (exact C_GenerateRandom total), wall_ns (measured
- * window), threads, pad. Per-call cost is threads*wall_ns/ops.
+ * window), threads, pad, attempts, failed. Per-call cost is
+ * threads*wall_ns/ops.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -33,12 +41,17 @@ typedef struct { void *c, *d, *l, *u; CK_FLAGS flags; void *r; } INITARGS;
 
 static void **fns;
 static CK_SLOT_ID slot;
-static volatile int go, stop;
+static int go, stop;
 static unsigned long packed[256];
+static unsigned long packed_failed[256];
 struct padline { unsigned long n; char pad[64 - sizeof(unsigned long)]; };
 static struct padline padded[256];
+static struct padline padded_failed[256];
 static int use_pad;
-static volatile int failures;
+static int failures;
+
+#define GO_ON() __atomic_load_n(&go, __ATOMIC_SEQ_CST)
+#define STOP_ON() __atomic_load_n(&stop, __ATOMIC_SEQ_CST)
 
 #define F(i, t) ((t)fns[i])
 
@@ -54,28 +67,32 @@ static void *worker(void *arg)
 	long id = (long)arg;
 	CK_SESSION_HANDLE s;
 	unsigned char b[16];
-	unsigned long local = 0;
+	unsigned long local = 0, local_failed = 0;
 
-	while (!go)
+	while (!GO_ON())
 		;
 	if (F(12, CK_RV(*)(CK_SLOT_ID, CK_ULONG, void *, void *, CK_SESSION_HANDLE *))(slot, 4 | 2, 0, 0, &s)) {
 		fprintf(stderr, "open fail\n");
 		__atomic_add_fetch(&failures, 1, __ATOMIC_SEQ_CST);
 		return 0;
 	}
-	while (!stop) {
-		if (F(64, CK_RV(*)(CK_SESSION_HANDLE, unsigned char *, CK_ULONG))(s, b, sizeof b) == 0)
-			local++;
+	while (!STOP_ON()) {
+		local++;
+		if (F(64, CK_RV(*)(CK_SESSION_HANDLE, unsigned char *, CK_ULONG))(s, b, sizeof b))
+			local_failed++;
 	}
 	if (F(13, CK_RV(*)(CK_SESSION_HANDLE))(s)) {
 		fprintf(stderr, "close fail\n");
 		__atomic_add_fetch(&failures, 1, __ATOMIC_SEQ_CST);
 		return 0;
 	}
-	if (use_pad)
+	if (use_pad) {
 		padded[id].n = local;
-	else
+		padded_failed[id].n = local_failed;
+	} else {
 		packed[id] = local;
+		packed_failed[id] = local_failed;
+	}
 	return 0;
 }
 
@@ -133,17 +150,22 @@ int main(int argc, char **argv)
 	while (access(gate, F_OK) != 0)
 		usleep(10000);
 	unsigned long long t0 = now_ns();
-	go = 1;
+	__atomic_store_n(&go, 1, __ATOMIC_SEQ_CST);
 	sleep((unsigned int)secs);
-	stop = 1;
+	__atomic_store_n(&stop, 1, __ATOMIC_SEQ_CST);
 	unsigned long long t1 = now_ns();
-	unsigned long tot = 0;
+	unsigned long tot = 0, tot_failed = 0;
 	for (int i = 0; i < n; i++) {
 		pthread_join(t[i], 0);
 		tot += use_pad ? padded[i].n : packed[i];
+		tot_failed += use_pad ? padded_failed[i].n : packed_failed[i];
 	}
 	if (__atomic_load_n(&failures, __ATOMIC_SEQ_CST)) {
 		fprintf(stderr, "worker failures\n");
+		return 1;
+	}
+	if (tot_failed) {
+		fprintf(stderr, "failed calls: %lu\n", tot_failed);
 		return 1;
 	}
 	F(1, CK_RV(*)(void *))(0);
@@ -151,6 +173,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "zero calls\n");
 		return 1;
 	}
-	printf("MT_COUNT ops=%lu wall_ns=%llu threads=%d pad=%d\n", tot, t1 - t0, n, use_pad);
+	printf("MT_COUNT ops=%lu wall_ns=%llu threads=%d pad=%d attempts=%lu failed=%lu\n",
+	       tot, t1 - t0, n, use_pad, tot, tot_failed);
 	return 0;
 }

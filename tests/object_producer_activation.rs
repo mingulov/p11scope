@@ -1238,6 +1238,68 @@ fn program_six_field_template(
         .set_bytes(values + 0x70, &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x23]);
 }
 
+/// G05/E4 production-wiring pin: each attribute seam must have at
+/// least one caller in PRODUCTION code (the BPF crate or the shared
+/// flow module). A seam body that merely forwards to the shared
+/// protocol — no production call edge, no adapter wiring — keeps G05
+/// RED here. (End-to-end entry-store liveness is qualified live by the
+/// nonempty U1/U2 positives; this pin requires the call edge to exist.)
+fn pin_attribute_seams_have_production_caller() {
+    let flow = std::fs::read_to_string("crates/ebpf-common/src/object_flow.rs")
+        .expect("read production flow module");
+    let root = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF root");
+    for seam in [
+        "production_inspect_request_template",
+        "production_capture_get_entry",
+        "production_capture_get_return",
+    ] {
+        let call = format!("{seam}(");
+        let def = format!("pub fn {seam}(");
+        let total = flow.matches(&call).count() + root.matches(&call).count();
+        let defs = flow.matches(&def).count() + root.matches(&def).count();
+        assert_eq!(defs, 1, "{seam} keeps its single production definition");
+        assert!(
+            total > defs,
+            "{seam} has no production caller: forwarding without adapter wiring must not green G05"
+        );
+    }
+}
+
+/// Route a request-inspection outcome through the PRODUCTION tail path:
+/// store it in the side row's present pair (as a wired entry adapter
+/// would) and emit through `adapter_tail_fill`. Returns the emitted
+/// pair-0 list; the absent pair must stay all-zero (transport never
+/// fabricates it).
+fn emit_request_list_through_production_tail(
+    layout: p11scope_ebpf_common::LinuxLayout,
+    outcome: p11scope_ebpf_common::object_capture::AttributeListOutcome,
+) -> p11scope_ebpf_common::object_wire::ObjectAttributeListWire {
+    use p11scope_ebpf_common::ARG_NONE;
+    use p11scope_ebpf_common::object_flow::adapter_tail_fill;
+    use p11scope_ebpf_common::object_wire::{
+        OBJECT_ACTION_CREATE, OBJECT_LAYOUT_ILP32, OBJECT_LAYOUT_LP64, ObjectAttributeListWire,
+        ObjectCallWire,
+    };
+    let mut row = harness_row(23, OBJECT_ACTION_CREATE, [5, ARG_NONE]);
+    row.template_args = [2, 3, ARG_NONE, ARG_NONE];
+    let mut side = ready_side(23);
+    side.phase = 3;
+    side.layout = if layout == p11scope_ebpf_common::LinuxLayout::Lp64 {
+        OBJECT_LAYOUT_LP64
+    } else {
+        OBJECT_LAYOUT_ILP32
+    };
+    side.requested[0] = outcome.to_wire();
+    let mut tail = ObjectCallWire::default();
+    let tailed = unsafe { adapter_tail_fill(&mut tail as *mut _, Some(&side), 23, Some(&row)) };
+    assert!(tailed, "{layout:?} production tail fills");
+    assert!(
+        tail.requested[1] == ObjectAttributeListWire::default(),
+        "{layout:?} absent pair stays all-zero"
+    );
+    tail.requested[0]
+}
+
 /// Today's production attribute transport, executed through the
 /// production tail adapter: entry leaves request state zero (no
 /// inspection runs), so present pairs carry the honest UNINSPECTED
@@ -1304,8 +1366,12 @@ fn object_attributes_uninspected_marking_is_production() {
 /// GetAttributeValue vectors on LP64/ia32 must yield nonempty finite
 /// cells for class, key type, token, value length, modulus bits and all
 /// three curves, with distinct pair templates and no promotion of
-/// requests to established results. RED while the production seams are
-/// unwired (zero reads, zero cells vs the oracle's VALUE cells).
+/// requests to established results. Three layers: the seams must match
+/// the oracle, the request outcome must EMIT as the oracle wire through
+/// the production tail, and production code must call the seams. RED
+/// while E4 is unwired (zero reads, zero cells vs the oracle's VALUE
+/// cells, UNINSPECTED transport, no production caller); forwarding the
+/// seams alone greens none of the transport/pin layers.
 #[test]
 #[ignore = "RED: H7-E4 budgeted attribute capture pending"]
 fn object_attributes_real_adapter_six_fields() {
@@ -1380,6 +1446,15 @@ fn object_attributes_real_adapter_six_fields() {
         assert_eq!(
             actual.inspected, expected.inspected,
             "{layout:?} the production entry path must report its inspection"
+        );
+        // Production transport: the seam outcome, stored as a wired
+        // entry adapter would store it, must EMIT as the oracle wire
+        // through the production tail. Forwarding the seam alone leaves
+        // the UNINSPECTED marking → RED at the flags.
+        let emitted = emit_request_list_through_production_tail(layout, actual);
+        assert!(
+            emitted == expected.to_wire(),
+            "{layout:?} production tail must emit the inspected request list, not UNINSPECTED"
         );
         // GetAttributeValue return: the production entry retains headers
         // and the production return establishes the same six fields.
@@ -1484,6 +1559,9 @@ fn object_attributes_real_adapter_six_fields() {
             );
         }
     }
+    // Production call edges: forwarding the seams without adapter
+    // wiring keeps this RED even if every comparison above passed.
+    pin_attribute_seams_have_production_caller();
 }
 
 /// G05/E4: the production attribute path refuses before unsafe reads.
@@ -1492,7 +1570,10 @@ fn object_attributes_real_adapter_six_fields() {
 /// survive; SetAttributeValue authorizes zero template reads under the
 /// approved policy. Contamination vectors are representable on their
 /// layout (a 64-bit-only vector cannot arrive through a four-byte read).
-/// RED while the production seams are unwired.
+/// Three layers like the six-fields test: seam silence/match, production
+/// tail emission of each outcome, production call edges. RED while E4
+/// is unwired; forwarding the seams alone greens none of the
+/// transport/pin layers.
 #[test]
 #[ignore = "RED: H7-E4 budgeted attribute capture pending"]
 fn object_attributes_refuse_before_unsafe_read() {
@@ -1575,6 +1656,13 @@ fn object_attributes_refuse_before_unsafe_read() {
                 actual.cells[0], expected.cells[0],
                 "{layout:?} {name}: the production path stays silent"
             );
+            // Production transport must emit the inspected refusal,
+            // not the UNINSPECTED marking.
+            let emitted = emit_request_list_through_production_tail(layout, actual);
+            assert!(
+                emitted == expected.to_wire(),
+                "{layout:?} {name}: production tail emits the inspected refusal"
+            );
         }
         // A rejected cell carries finite status while its usable
         // disjoint neighbor survives as VALUE. The production path must
@@ -1610,6 +1698,11 @@ fn object_attributes_refuse_before_unsafe_read() {
             actual.cells[0], expected.cells[0],
             "{layout:?} the production path must carry the finite rejection"
         );
+        let emitted = emit_request_list_through_production_tail(layout, actual);
+        assert!(
+            emitted == expected.to_wire(),
+            "{layout:?} production tail emits neighbor and rejection"
+        );
         // SetAttributeValue is an invalidation/control call: zero
         // template reads under the approved policy.
         let templates =
@@ -1620,4 +1713,7 @@ fn object_attributes_refuse_before_unsafe_read() {
             "{layout:?} Set authorizes no template"
         );
     }
+    // Production call edges: forwarding the seams without adapter
+    // wiring keeps this RED even if every comparison above passed.
+    pin_attribute_seams_have_production_caller();
 }

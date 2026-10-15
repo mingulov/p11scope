@@ -534,7 +534,7 @@ fn valid_find_section(tail: &[u8], action: u8, layout: u8) -> bool {
 /// the value status (scalar zero stays valid through its status). The
 /// uninspected marker accepts only the honest never-inspected shape:
 /// zero cells, zero inspected count and no inspected flag bits.
-fn valid_attribute_list(list: &[u8]) -> bool {
+pub(crate) fn valid_attribute_list(list: &[u8]) -> bool {
     let inspected = list[32];
     let flags = list[33];
     if inspected > 8 || list[34] != 0 || list[35] != 0 || flags & !OBJECT_ATTR_LIST_FLAGS_MASK != 0

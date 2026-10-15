@@ -690,7 +690,9 @@ pub fn emission_finalize(emitted: bool, remove: impl FnOnce() -> bool) -> Emissi
 /// the zero outcome. Present pairs then carry the UNINSPECTED marking (see
 /// `adapter_tail_fill`). A budgeted E4 implements the approved bounded
 /// in-place inspection HERE with this exact signature (same vectors, same
-/// readers); G05 passes unmodified when it does.
+/// readers); G05 passes unmodified when it does. G05 additionally
+/// requires production-tail emission of the outcome and a production
+/// call edge to this seam (forwarding alone stays RED).
 pub fn production_inspect_request_template(
     template_ptr: u64,
     count: u64,
@@ -709,7 +711,8 @@ pub fn production_inspect_request_template(
 /// TODAY (E4 unwired): retains nothing — performs zero reads, leaves
 /// `state` untouched and returns the zero verdict. A budgeted E4 retains
 /// selected headers HERE with this exact signature; G05 passes
-/// unmodified when it does.
+/// unmodified when it does. G05 additionally requires a production call
+/// edge to this seam (forwarding alone stays RED).
 pub fn production_capture_get_entry(
     template_ptr: u64,
     count: u64,
@@ -728,7 +731,8 @@ pub fn production_capture_get_entry(
 /// TODAY (E4 unwired): establishes nothing — performs zero reads and
 /// returns the zero outcome. A budgeted E4 establishes inspected results
 /// HERE with this exact signature (same retained state, same readers);
-/// G05 passes unmodified when it does.
+/// G05 passes unmodified when it does. G05 additionally requires a
+/// production call edge to this seam (forwarding alone stays RED).
 pub fn production_capture_get_return(
     state: &GetEntryState,
     rv: u64,

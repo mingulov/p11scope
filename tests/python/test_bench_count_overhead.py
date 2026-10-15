@@ -48,11 +48,26 @@ def bpf(ns=200000, cnt=1000):
     return {"bpf_ns": ns, "bpf_cnt": cnt}
 
 
+# Registered workload per cell name (threads, pad), mirroring
+# scripts/bench-count-overhead.sh run_call_sample/run_map_sample.
+WORKLOADS = {
+    "relevant-call-t1": (1, 0),
+    "relevant-call-t4": (4, 0),
+    "relevant-call-t12": (12, 0),
+    "relevant-call-t12-nolock": (12, 1),
+    "unrelated-mmap": (1, 0),
+}
+
+
 def campaign_log(cells=("relevant-call-t1",), rounds=10, wall_on=1010000,
-                 wall_off=1000000, threads=1, ops=1000):
-    """One exact ABBA/BAAB campaign: odd rounds on/off/off/on, even off/on/on/off."""
+                 wall_off=1000000, ops=1000):
+    """One exact ABBA/BAAB campaign: odd rounds on/off/off/on, even off/on/on/off.
+
+    Every cell runs its registered workload; ops stay measured per sample.
+    """
     log = "MACHINE kernel=7.0 test-cpu nproc=12\n"
     for cell in cells:
+        threads, pad = WORKLOADS[cell]
         mode = "mmap" if cell == "unrelated-mmap" else "call"
         for rnd in range(1, rounds + 1):
             arms = ("on", "off", "off", "on") if rnd % 2 else ("off", "on", "on", "off")
@@ -61,14 +76,17 @@ def campaign_log(cells=("relevant-call-t1",), rounds=10, wall_on=1010000,
                     edge = counted(threads, ops) if arm == "on" else witnessed()
                     log += sample(cell, arm, rnd, threads, ops,
                                   wall_on if arm == "on" else wall_off,
-                                  **edge, **bpf())
+                                  pad=pad, **edge, **bpf())
                 else:
-                    log += sample(cell, arm, rnd, 1, ops, wall_on if arm == "on" else wall_off,
-                                  mode="mmap", bpf_ns=0, bpf_cnt=0)
+                    log += sample(cell, arm, rnd, threads, ops,
+                                  wall_on if arm == "on" else wall_off,
+                                  pad=pad, mode="mmap", bpf_ns=0, bpf_cnt=0)
             if mode == "call":
-                log += sample(cell, "unobserved", rnd, threads, ops, 900000, lane="none")
+                log += sample(cell, "unobserved", rnd, threads, ops, 900000,
+                              pad=pad, lane="none")
             else:
-                log += sample(cell, "unobserved", rnd, 1, ops, 900000, lane="none", mode="mmap")
+                log += sample(cell, "unobserved", rnd, threads, ops, 900000,
+                              pad=pad, lane="none", mode="mmap")
     return log
 
 
@@ -126,9 +144,43 @@ class CountOverheadOracle(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["pairs"], 20)
         self.assertFalse(rows[0]["material"], "1% must read immaterial")
-        rows, problems = analyze_text(campaign_log(cells=M2_CELLS))
+        log = campaign_log(cells=M2_CELLS)
+        # The positive fixture carries each cell's registered workload.
+        for pin in ("cell=relevant-call-t4 arm=on round=1 threads=4",
+                    "cell=relevant-call-t12 arm=on round=1 threads=12",
+                    "cell=relevant-call-t12-nolock arm=on round=1 threads=12",
+                    "pad=1 mode=call"):
+            self.assertIn(pin, log)
+        rows, problems = analyze_text(log)
         self.assertEqual(problems, [])
         self.assertEqual({row["cell"] for row in rows}, set(M2_CELLS))
+
+    def test_count_overhead_binds_cell_names_to_workloads(self):
+        log = campaign_log(cells=M2_CELLS)
+        # Every call cell relabeled to the map workload proves nothing:
+        # zero counted samples must not pass the M2 gate.
+        _, problems = analyze_text(log.replace("mode=call", "mode=mmap"))
+        self.assertTrue(any("workload" in problem for problem in problems), problems)
+        # Wrong thread counts or padding for the cell name.
+        _, problems = analyze_text(log.replace("threads=4", "threads=1", 1))
+        self.assertTrue(any("workload" in problem for problem in problems), problems)
+        _, problems = analyze_text(log.replace("pad=1", "pad=0", 1))
+        self.assertTrue(any("workload" in problem for problem in problems), problems)
+        # The binding covers the unobserved baseline arm too.
+        bad_bare = log.replace("arm=unobserved round=1 threads=1",
+                               "arm=unobserved round=1 threads=2", 1)
+        _, problems = analyze_text(bad_bare)
+        self.assertTrue(any("workload" in problem for problem in problems), problems)
+
+    def test_count_overhead_recomputes_counts_from_the_workload(self):
+        log = campaign_log(rounds=10)
+        # Two agreeing log fields off the ops+2*threads+1 denominator fail.
+        for lie in ("edge_count=1 edge_expected=1",
+                    "edge_count=1002 edge_expected=1002"):
+            bad = log.replace("edge_count=1003 edge_expected=1003", lie, 1)
+            _, problems = analyze_text(bad, required_cells=("relevant-call-t1",))
+            self.assertTrue(any("workload denominator 1003" in problem
+                                for problem in problems), problems)
 
     def test_count_overhead_keeps_existing_failure_modes(self):
         log = campaign_log(rounds=10, cells=("relevant-call-t1",))
@@ -143,7 +195,8 @@ class CountOverheadOracle(unittest.TestCase):
         self.assertTrue(any("mixed lane" in problem for problem in problems), problems)
         bad_count = log.replace("edge_count=1003", "edge_count=1002", 1)
         _, problems = analyze_text(bad_count, required_cells=("relevant-call-t1",))
-        self.assertTrue(any("!= expected" in problem for problem in problems), problems)
+        self.assertTrue(any("workload denominator" in problem for problem in problems),
+                        problems)
 
 
 if __name__ == "__main__":

@@ -14,14 +14,17 @@ sample in log order (adjacent under the ABBA/BAAB round order). The M2 bar
 V1-BASE delta is at most 5% of the BASE observed call cost with the
 bootstrap 95% CI upper bound at most 10%, with 0 count errors. The
 campaign fails closed on any count mismatch already; the analysis
-re-verifies every on-arm edge count from the SAMPLE fields and refuses to
-pass otherwise.
+recomputes every on-arm expectation from the workload denominator
+(ops + 2*threads + 1) and refuses to pass unless both logged fields
+match it.
 
 Expected shape (A:DR-T3A-13): the log must hold exactly the five M2
-cells, each with contiguous rounds 1..R (R >= 10), each round in strict
-ABBA (odd) or BAAB (even) on/off order plus exactly one trailing
-unobserved baseline. Relevant on-arm counts must be non-null integers
-(None == None is not exactness); every observed arm carries its
+cells, each under its exact workload (mode, threads, padding bound to
+the cell name on every arm), each with contiguous rounds 1..R (R >= 10),
+each round in strict ABBA (odd) or BAAB (even) on/off order plus exactly
+one trailing unobserved baseline. Relevant on-arm counts must equal the
+recomputed denominator (None == None is not exactness, and neither is
+one log field agreeing with another); every observed arm carries its
 independent BPF corroboration, and unobserved samples carry no observed
 evidence at all. A reduced or reshaped log renders no verdict.
 --cells/--rounds override the required shape for explicitly non-M2 reuse;
@@ -33,10 +36,10 @@ Usage:
   scripts/bench-count-overhead-analyze.py --self-test
 
 Exit 0 prints the table and verdict. Exit 1 when the shape is not the
-required campaign (missing/unexpected cells, short/noncontiguous rounds,
-scrambled ABBA order), a cell cannot be compared (unpaired rounds, mixed
-attach mechanisms, a count mismatch, missing BPF corroboration) or the
-log holds no samples.
+required campaign (missing/unexpected cells, a cell off its workload,
+short/noncontiguous rounds, scrambled ABBA order), a cell cannot be
+compared (unpaired rounds, mixed attach mechanisms, a count mismatch,
+missing BPF corroboration) or the log holds no samples.
 """
 import random
 import statistics
@@ -47,6 +50,17 @@ BOOTSTRAP_REPS = 10000
 M2_CELLS = ("relevant-call-t1", "relevant-call-t4", "relevant-call-t12",
             "relevant-call-t12-nolock", "unrelated-mmap")
 M2_ROUNDS = 10
+# Exact workload each M2 cell name establishes (scripts/bench-count-overhead.sh
+# run_call_sample/run_map_sample): mode, worker threads and counter padding.
+# ops/wall_ns stay measured per sample; everything else about the workload is
+# pinned by the name on every arm.
+M2_WORKLOADS = {
+    "relevant-call-t1": {"mode": "call", "threads": 1, "pad": 0},
+    "relevant-call-t4": {"mode": "call", "threads": 4, "pad": 0},
+    "relevant-call-t12": {"mode": "call", "threads": 12, "pad": 0},
+    "relevant-call-t12-nolock": {"mode": "call", "threads": 12, "pad": 1},
+    "unrelated-mmap": {"mode": "mmap", "threads": 1, "pad": 0},
+}
 
 
 def parse_log(path):
@@ -200,11 +214,32 @@ def analyze(samples, rel_bar, ci_bar, required_cells=M2_CELLS, required_rounds=M
         return rows, problems
     for cell in cells:
         cell_samples = [s for s in samples if s["cell"] == cell]
-        modes = {s["mode"] for s in cell_samples}
-        if len(modes) != 1:
-            problems.append(f"cell {cell}: mixed modes {sorted(modes)}")
-            continue
-        mode = cell_samples[0]["mode"]
+        workload = M2_WORKLOADS.get(cell)
+        if workload is not None:
+            # A known cell name establishes its exact workload: mode,
+            # thread count and padding on every arm including the
+            # unobserved baseline. A relabeled or reshaped cell proves
+            # nothing about the M2 population.
+            reshaped = [s for s in cell_samples
+                        if s["mode"] != workload["mode"]
+                        or s["threads"] != workload["threads"]
+                        or s["pad"] != workload["pad"]]
+            if reshaped:
+                first = reshaped[0]
+                problems.append(
+                    f"cell {cell}: line {first['lineno']}: workload "
+                    f"mode={first['mode']} threads={first['threads']} "
+                    f"pad={first['pad']}, want mode={workload['mode']} "
+                    f"threads={workload['threads']} pad={workload['pad']}"
+                )
+                continue
+            mode = workload["mode"]
+        else:
+            modes = {s["mode"] for s in cell_samples}
+            if len(modes) != 1:
+                problems.append(f"cell {cell}: mixed modes {sorted(modes)}")
+                continue
+            mode = cell_samples[0]["mode"]
         # Campaign shape: contiguous rounds 1..R with R >= required,
         # each round in strict ABBA (odd) or BAAB (even) on/off order
         # plus exactly one trailing unobserved baseline.
@@ -237,11 +272,14 @@ def analyze(samples, rel_bar, ci_bar, required_cells=M2_CELLS, required_rounds=M
         if len(lanes) != 1 or lanes == {"none"}:
             problems.append(f"cell {cell}: mixed lane mechanisms {sorted(lanes)}")
             continue
-        # Count-exactness re-verification: every relevant on-sample edge
-        # count must be a non-null integer equal to its non-null
-        # expectation with state counted (None == None proves nothing);
-        # every relevant off-sample must read none/none witnessed; map
-        # cells and unobserved baselines must carry no observed evidence.
+        # Count-exactness re-verification: the on-arm expectation is
+        # recomputed from the independently recorded workload
+        # denominator (ops + 2*threads + 1, the campaign's exactness
+        # gate); both logged fields must equal it with state counted.
+        # Two agreeing log fields prove nothing by themselves, and
+        # None == None proves nothing either. Every relevant
+        # off-sample must read none/none witnessed; map cells and
+        # unobserved baselines must carry no observed evidence.
         for s in cell_samples:
             if s["arm"] == "unobserved":
                 if not (s["edge_state"] == "none" and s["edge_count"] is None
@@ -253,16 +291,17 @@ def analyze(samples, rel_bar, ci_bar, required_cells=M2_CELLS, required_rounds=M
                     )
                 continue
             if mode == "call":
-                if s["arm"] == "on" and not (
-                    s["edge_state"] == "counted" and type(s["edge_count"]) is int
-                    and type(s["edge_expected"]) is int
-                    and s["edge_count"] == s["edge_expected"]
-                    and s["edge_expected"] > 0
-                ):
-                    problems.append(
-                        f"cell {cell}: line {s['lineno']}: count {s['edge_count']} "
-                        f"!= expected {s['edge_expected']} ({s['edge_state']})"
-                    )
+                if s["arm"] == "on":
+                    want = s["ops"] + 2 * s["threads"] + 1
+                    if not (s["edge_state"] == "counted"
+                            and s["edge_count"] == want
+                            and s["edge_expected"] == want):
+                        problems.append(
+                            f"cell {cell}: line {s['lineno']}: on-arm count "
+                            f"{s['edge_count']} / expected {s['edge_expected']} != "
+                            f"workload denominator {want} (ops={s['ops']} "
+                            f"threads={s['threads']} {s['edge_state']})"
+                        )
                 if s["arm"] == "off" and not (
                     s["edge_state"] == "witnessed" and s["edge_count"] is None
                     and s["edge_expected"] is None
@@ -531,7 +570,10 @@ def self_test():
         text += "BINARY role=candidate path=/tmp/c sha256=aaa commit=c0ffee\n"
         text += "BINARY role=base path=/tmp/b sha256=bbb commit=ba5e\n"
         for cell in cells:
-            mmap = cell == "unrelated-mmap"
+            workload = M2_WORKLOADS[cell]
+            threads = workload["threads"]
+            pad = workload["pad"]
+            mmap = workload["mode"] == "mmap"
             for rnd in range(1, rounds + 1):
                 arms = ("on", "off", "off", "on") if rnd % 2 else ("off", "on", "on", "off")
                 for arm in arms:
@@ -544,16 +586,19 @@ def self_test():
                     elif rnd % 2 == 0:
                         wall = 1020000 if (hot and cell == "relevant-call-t1") else 1000000
                     if not mmap:
-                        edge = {"edge_count": 1003, "edge_expected": 1003,
+                        exact = 1000 + 2 * threads + 1
+                        edge = {"edge_count": exact, "edge_expected": exact,
                                 "edge_state": "counted"} if arm == "on" else {
                                     "edge_state": "witnessed"}
-                        text += sample(cell, arm, rnd, 1, 1000, wall, **edge,
+                        text += sample(cell, arm, rnd, threads, 1000, wall, pad=pad,
+                                       **edge,
                                        bpf_ns=200000 if arm == "on" else 150000,
                                        bpf_cnt=1000)
                     else:
-                        text += sample(cell, arm, rnd, 1, 1000, wall, mode="mmap",
-                                       bpf_ns=0, bpf_cnt=0)
-                text += sample(cell, "unobserved", rnd, 1, 1000, 900000, lane="none",
+                        text += sample(cell, arm, rnd, threads, 1000, wall, pad=pad,
+                                       mode="mmap", bpf_ns=0, bpf_cnt=0)
+                text += sample(cell, "unobserved", rnd, threads, 1000, 900000,
+                               pad=pad, lane="none",
                                **({"mode": "mmap"} if mmap else {}))
         return text
 
@@ -615,13 +660,13 @@ def self_test():
         assert any("mixed lane" in p for p in problems), problems
         bad_count = load(log.replace("edge_count=1003", "edge_count=1002", 1))
         _, problems = analyze(bad_count[1], 5.0, 10.0)
-        assert any("!= expected" in p for p in problems), problems
+        assert any("workload denominator" in p for p in problems), problems
         # A:DR-T3A-13 controls: None exactness, reduced rounds, scrambled
         # order, missing BPF, missing/extra cells, evidenced unobserved.
         none_count = load(log.replace("edge_count=1003", "edge_count=none", 1).replace(
             "edge_expected=1003", "edge_expected=none", 1))
         _, problems = analyze(none_count[1], 5.0, 10.0)
-        assert any("!= expected" in p for p in problems), problems
+        assert any("workload denominator" in p for p in problems), problems
         reduced = load(campaign(M2_CELLS, 2))
         _, problems = analyze(reduced[1], 5.0, 10.0)
         assert any("rounds" in p for p in problems), problems
@@ -650,6 +695,30 @@ def self_test():
             "bpf_ns=none bpf_cnt=none", 1))
         _, problems = analyze(evidenced_bare[1], 5.0, 10.0)
         assert any("unobserved" in p for p in problems), problems
+        # T1 fix controls: the cell name binds mode/threads/pad on every
+        # arm, and both count fields must equal the recomputed workload
+        # denominator (two agreeing log fields prove nothing).
+        mmap_all = load(log.replace("mode=call", "mode=mmap"))
+        _, problems = analyze(mmap_all[1], 5.0, 10.0)
+        assert any("workload mode=" in p for p in problems), problems
+        wrong_threads = load(log.replace("threads=4", "threads=1", 1))
+        _, problems = analyze(wrong_threads[1], 5.0, 10.0)
+        assert any("workload mode=" in p for p in problems), problems
+        wrong_pad = load(log.replace("pad=1", "pad=0", 1))
+        _, problems = analyze(wrong_pad[1], 5.0, 10.0)
+        assert any("workload mode=" in p for p in problems), problems
+        bare_threads = load(log.replace("arm=unobserved round=1 threads=1",
+                                        "arm=unobserved round=1 threads=2", 1))
+        _, problems = analyze(bare_threads[1], 5.0, 10.0)
+        assert any("workload mode=" in p for p in problems), problems
+        agreed_lie = load(log.replace("edge_count=1003 edge_expected=1003",
+                                      "edge_count=1 edge_expected=1", 1))
+        _, problems = analyze(agreed_lie[1], 5.0, 10.0)
+        assert any("workload denominator 1003" in p for p in problems), problems
+        near_lie = load(log.replace("edge_count=1003 edge_expected=1003",
+                                    "edge_count=1002 edge_expected=1002", 1))
+        _, problems = analyze(near_lie[1], 5.0, 10.0)
+        assert any("workload denominator 1003" in p for p in problems), problems
         _, _, bad = load("SAMPLE cell=x arm=maybe round=1 threads=1 ops=1 wall_ns=2 pad=0 mode=call parallel=1 lane=multi edge_count=none edge_expected=none edge_state=none bpf_ns=none bpf_cnt=none\n")
         assert bad, "a bad arm must be reported"
         _, empty, _ = load("MACHINE nothing here\n")

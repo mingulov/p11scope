@@ -180,6 +180,70 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "escape"):
             self.verify()
 
+    def test_bounded_release_claim_has_exact_membership(self):
+        policies = VERIFY["catalog"]()
+        system = {identifier for identifier, policy in policies.items()
+                  if "system-product" in policy["required_for_claims"]}
+        bounded = {identifier for identifier, policy in policies.items()
+                   if "bounded-release" in policy["required_for_claims"]}
+        # The bounded v0.4 claim is the full claim minus the 4h/24h
+        # soaks; the 30-minute meaningful-activity soak stays required.
+        self.assertEqual(system - bounded, {"soak.14400s", "soak.86400s"})
+        self.assertIn("soak.1800s", bounded)
+        self.assertIn("R01.public", bounded)
+        self.assertTrue(any(identifier.startswith("T7.") for identifier in bounded))
+        static = {identifier for identifier, policy in policies.items()
+                  if "t7-static" in policy["required_for_claims"]}
+        self.assertEqual(len(static), 7)
+
+    def test_bounded_claim_cannot_pass_full_system_product(self):
+        # The t7-static cells alone satisfy neither the bounded nor the
+        # full claim; the new claim routes end to end.
+        with self.assertRaisesRegex(ValueError, "required cell"):
+            VERIFY["verify_manifest"](self.manifest, self.root, claim="bounded-release")
+        with self.assertRaisesRegex(ValueError, "required cell"):
+            VERIFY["verify_manifest"](self.manifest, self.root, claim="system-product")
+        with self.assertRaisesRegex(ValueError, "unknown acceptance claim"):
+            VERIFY["verify_manifest"](self.manifest, self.root, claim="bounded-plus")
+        # Passing the 30-minute soak still leaves the full claim open:
+        # the 4h/24h cells stay required there and unrequired here.
+        row = next(row for row in self.manifest["cells"] if row["id"] == "soak.1800s")
+        for field in ["test_ids", "command", "artifact_hashes", "evidence_paths", "outcome"]:
+            row[field] = copy.deepcopy(self.row[field])
+        row["receipt"] = "soak.json"
+        row["artifact_hashes"]["installed"] = copy.deepcopy(row["artifact_hashes"]["observer"])
+        receipt = json.loads((self.root / self.row["receipt"]).read_text())
+        receipt.update({"cell_id": row["id"], "evidence_level": "soak", "entrypoint": "installed-cli",
+                        "kernel_profile": row["kernel_profile"], "artifact_hashes": row["artifact_hashes"],
+                        "observed_behavior": row["expected_behavior"], "start_mono_ns": 0,
+                        "end_mono_ns": 1800_000_000_000,
+                        "installed_artifact_sha256": row["artifact_hashes"]["installed"]["sha256"]})
+        path = self.root / row["receipt"]
+        path.write_text(json.dumps(receipt))
+        row["receipt_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        with self.assertRaisesRegex(ValueError, "required cell"):
+            VERIFY["verify_manifest"](self.manifest, self.root, claim="bounded-release")
+        with self.assertRaisesRegex(ValueError, "required cell"):
+            VERIFY["verify_manifest"](self.manifest, self.root, claim="system-product")
+        policies = VERIFY["catalog"]()
+        self.assertNotIn("bounded-release",
+                         policies["soak.14400s"]["required_for_claims"])
+        self.assertNotIn("bounded-release",
+                         policies["soak.86400s"]["required_for_claims"])
+        self.assertIn("system-product", policies["soak.14400s"]["required_for_claims"])
+        self.assertIn("system-product", policies["soak.86400s"]["required_for_claims"])
+
+    def test_deferred_archive_gates_require_product_custody_not_agent_archives(self):
+        deferred = json.loads(VERIFY["DEFERRED"].read_text())
+        gates = {group["id"]: group for group in deferred["gates"]}
+        for identifier in ("U-01", "U-21"):
+            with self.subTest(gate=identifier):
+                gate = gates[identifier]
+                self.assertTrue(gate["required"])
+                text = gate["gate"] + " " + gate["review_disposition"]
+                self.assertNotIn("archiv", text.lower())
+                self.assertTrue("hash" in text.lower() or "checksum" in text.lower())
+
     def test_structure_validation_does_not_qualify_an_open_manifest(self):
         report = VERIFY["verify_manifest"](VERIFY["new_manifest"](), self.root, structure_only=True)
         self.assertEqual(report["verdict"], "STRUCTURE_VALID")

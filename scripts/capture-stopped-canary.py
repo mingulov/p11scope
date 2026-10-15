@@ -60,6 +60,13 @@ OWNED_CHILD_WAIT_SECONDS = 5
 MAP_TYPES = {1: 'hash', 2: 'array', 3: 'prog_array', 5: 'percpu_hash',
              6: 'percpu_array', 8: 'cgroup_array', 9: 'lru_hash', 27: 'ringbuf',
              29: 'task_storage'}
+# G23/IMAGE: Linux reports only permanent map flags on the live map
+# object and moves WRONLY to the created FD (the product loader checks
+# the original owned FD separately). The pinned ELF policy still
+# declares 17 for these two private hashes; the live comparison below
+# expects exactly the kernel's report. No other map or field is
+# narrowed: any other live value still fails.
+LIVE_IMAGE_MAP_FLAGS = {"IMAGE_CONTINUITY": 1, "IMAGE_TGID_INDEX": 1}
 STOP_SECONDS = 30
 READY_SECONDS = 8
 RESUME_SECONDS = 5
@@ -464,8 +471,9 @@ def validate_inventory(maps, variant):
     for item in maps:
         dumper.snapshot_map_metadata(item)
         wanted = expected[item['name']]
+        live_flags = LIVE_IMAGE_MAP_FLAGS.get(item['name'], wanted['flags'])
         require((item['type'], item['bytes_key'], item['bytes_value'], item['max_entries'], item['map_flags'])
-                == (MAP_TYPES[wanted['type']], wanted['key_size'], wanted['value_size'], wanted['max_entries'], wanted['flags']),
+                == (MAP_TYPES[wanted['type']], wanted['key_size'], wanted['value_size'], wanted['max_entries'], live_flags),
                 f'map definition mismatch name={item["name"]}')
 
 

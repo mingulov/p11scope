@@ -166,7 +166,8 @@ class FakeMaps(capture.LiveMaps):
         self.maps = [capture.dumper.normalize_map_metadata({
             'id': index + 100, 'name': name, 'type': capture.MAP_TYPES[row['type']],
             'bytes_key': row['key_size'], 'bytes_value': row['value_size'],
-            'max_entries': row['max_entries'], 'flags': row['flags']}, index + 100)
+            'max_entries': row['max_entries'],
+            'flags': capture.LIVE_IMAGE_MAP_FLAGS.get(name, row['flags'])}, index + 100)
             for index, (name, row) in enumerate(sorted(definitions.items()))]
 
     def inventory(self, group, deadline):
@@ -1397,6 +1398,59 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
                         self.assertIn('close-input: OSError', message)
                     self.assertEqual(open_descriptors(), before)
 
+    def live_inventory(self):
+        """Live kernel metadata shaped from the pinned ELF policy.
+
+        Linux reports only permanent map flags on the map object and
+        moves WRONLY to the created FD, so the two private IMAGE hash
+        maps read live flags 1 (NO_PREALLOC) while the ELF still
+        declares 17; every other field stays exact.
+        """
+        rows = []
+        for index, (name, row) in enumerate(sorted(capture.definitions.SAFE_MAPS.items())):
+            flags = capture.LIVE_IMAGE_MAP_FLAGS.get(name, row['flags'])
+            rows.append(capture.dumper.normalize_map_metadata({
+                'id': index + 100, 'name': name, 'type': capture.MAP_TYPES[row['type']],
+                'bytes_key': row['key_size'], 'bytes_value': row['value_size'],
+                'max_entries': row['max_entries'], 'flags': flags}, index + 100))
+        return rows
+
+    def test_image_map_flag_validation_preserves_protection(self):
+        """G23: the live IMAGE expectation is narrowed, nothing else.
+
+        The pinned ELF policy still declares WRONLY (17); the live
+        comparison accepts exactly the kernel's permanent-flags report
+        (1) for the two private IMAGE hashes. Any other live value, any
+        other field drift, or any other map's flag drift still fails.
+        """
+        self.assertEqual(capture.definitions.SAFE_MAPS["IMAGE_CONTINUITY"]['flags'], 17)
+        self.assertEqual(capture.definitions.SAFE_MAPS["IMAGE_TGID_INDEX"]['flags'], 17)
+        capture.validate_inventory(self.live_inventory(), 'default')
+        for name in ("IMAGE_CONTINUITY", "IMAGE_TGID_INDEX"):
+            for flags in (0, 16, 17, 129, 1 | 128 | 256):
+                with self.subTest(name=name, flags=flags):
+                    maps = self.live_inventory()
+                    next(item for item in maps if item['name'] == name)['map_flags'] = flags
+                    with self.assertRaisesRegex(capture.CaptureError,
+                                                f'map definition mismatch name={name}'):
+                        capture.validate_inventory(maps, 'default')
+        for field, value in (("type", "array"), ("bytes_key", 4),
+                             ("bytes_value", 16), ("max_entries", 1024)):
+            with self.subTest(field=field):
+                maps = self.live_inventory()
+                item = next(item for item in maps if item['name'] == "IMAGE_CONTINUITY")
+                item[field] = value
+                if field == "type":
+                    item['oracle'] = 'dump'
+                with self.assertRaisesRegex(capture.CaptureError,
+                                            'map definition mismatch name=IMAGE_CONTINUITY'):
+                    capture.validate_inventory(maps, 'default')
+        maps = self.live_inventory()
+        next(item for item in maps if item['name'] == "CONFIG")['map_flags'] = 0
+        with self.assertRaisesRegex(capture.CaptureError,
+                                    'map definition mismatch name=CONFIG'):
+            capture.validate_inventory(maps, 'default')
+
     def test_inventory_requires_the_exact_cgroup_filter_definition(self):
         """The checked-in ELF map list is the authority for CGROUP_FILTER too.
 
@@ -1404,11 +1458,7 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
         an ordinary array is claiming a dump no cgroup_array can answer.
         """
         def inventory():
-            return [capture.dumper.normalize_map_metadata({
-                'id': index + 100, 'name': name, 'type': capture.MAP_TYPES[row['type']],
-                'bytes_key': row['key_size'], 'bytes_value': row['value_size'],
-                'max_entries': row['max_entries'], 'flags': row['flags']}, index + 100)
-                for index, (name, row) in enumerate(sorted(capture.definitions.SAFE_MAPS.items()))]
+            return self.live_inventory()
         maps = inventory()
         capture.validate_inventory(maps, 'default')
         self.assertEqual(next(item for item in maps if item['name'] == 'CGROUP_FILTER')['oracle'],

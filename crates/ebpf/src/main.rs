@@ -30,6 +30,8 @@ use core::mem::MaybeUninit;
 #[cfg(feature = "inventory-only")]
 use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
 #[cfg(not(feature = "inventory-only"))]
+use p11scope_ebpf_common::instance::stamp_joinable;
+#[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_capture::{
     DeriveEntry, authorize_derive_return, capture_derive_entry, find_flag, handle_status,
     object_flag, spans_overlap, validate_target_span,
@@ -4111,11 +4113,31 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
             bump_evidence(EVIDENCE_RING_LOSS);
             return 0;
         };
-        // Populate in place under ownership: return-phase result reads
-        // first (with the S1 return-time mechanism evidence the return
-        // body just captured), then the tail sections, then the base
-        // event and continuity. Any refusal discards: no facts.
+        // Populate in place under ownership: the base event and its
+        // continuity land in the reserved record FIRST, then the join
+        // gate runs before any object result read, then (with the S1
+        // return-time mechanism evidence the return body just captured)
+        // the result fills and tail sections. Any refusal discards: no
+        // facts. A found continuity entry is not a join: only the full
+        // stamp predicate authorizes result/Find/attribute reads.
         let raw = entry.as_mut_ptr();
+        unsafe {
+            core::ptr::write(core::ptr::addr_of_mut!((*raw).base.event), ev);
+            let _ = p11_instance_return(&key, core::ptr::addr_of_mut!((*raw).base.continuity));
+        }
+        let joined = unsafe {
+            stamp_joinable(
+                core::ptr::addr_of!((*raw).base.continuity.entry_stamp).read(),
+                core::ptr::addr_of!((*raw).base.continuity.return_stamp).read(),
+            )
+        };
+        if !joined {
+            let _ = owned_start_remove(&key, true);
+            entry.discard(0);
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
+            return 0;
+        }
         let tail = unsafe { core::ptr::addr_of_mut!((*raw).object) };
         let ready = unsafe { p11_object_side_get(&key, descriptor, 1).as_mut() };
         let filled = object_fill_return(
@@ -4132,10 +4154,6 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         let tailed = filled && object_tail_fill(tail, tail_side, descriptor);
         let find_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
         let emitted = tailed && object_emit_find(tail, find_side, descriptor, layout, rv);
-        unsafe {
-            core::ptr::write(core::ptr::addr_of_mut!((*raw).base.event), ev);
-            let _ = p11_instance_return(&key, core::ptr::addr_of_mut!((*raw).base.continuity));
-        }
         // Submit the completed ring record only after successful
         // removal; otherwise discard it and fault.
         if !emitted || owned_start_remove(&key, true).is_err() {

@@ -553,19 +553,23 @@ fn object_producer_object_family_matrix() {
                 assert_eq!(words, [0, 0], "{name} rv {rv:#x}");
                 assert_log(&target, &[]);
             }
-            // Denied ownership/phase reads nothing.
+            // Denied ownership/phase reads nothing. Continuity stays
+            // joined here: these cases deny on owner/phase only.
             for authority in [
                 ReturnAuthority {
                     owner_live: false,
                     phase_ready: true,
+                    continuity_joined: true,
                 },
                 ReturnAuthority {
                     owner_live: true,
                     phase_ready: false,
+                    continuity_joined: true,
                 },
                 ReturnAuthority {
                     owner_live: false,
                     phase_ready: false,
+                    continuity_joined: true,
                 },
             ] {
                 let target = fresh(w);
@@ -858,6 +862,7 @@ fn object_producer_object_family_matrix() {
             ReturnAuthority {
                 owner_live: false,
                 phase_ready: true,
+                continuity_joined: true,
             },
             layout,
             word_reader(&target),
@@ -1881,6 +1886,7 @@ fn object_producer_find_zero_eight_nine_and_races() {
             ReturnAuthority {
                 owner_live: true,
                 phase_ready: false,
+                continuity_joined: true,
             },
             layout,
             word_reader(&target),
@@ -2902,6 +2908,7 @@ fn object_producer_attributes_partial_alias_retry() {
         ReturnAuthority {
             owner_live: false,
             phase_ready: true,
+            continuity_joined: true,
         },
         LinuxLayout::Lp64,
         &mut read_word,
@@ -3566,4 +3573,110 @@ fn object_producer_attributes_partial_alias_retry() {
         "pair reads bounded: {}",
         both.borrow().log().len()
     );
+}
+
+// H7-E1: unjoined continuity denies every return read directly in the
+// shared core (no adapter mirror): result handles, Find and Get each
+// read zero words under `ReturnAuthority::for_return` with straddled,
+// absent or flagged stamps, while joined stamps authorize. This pins the
+// guarantee the return adapter's gate relies on.
+#[test]
+fn object_producer_continuity_denied_authority_reads_nothing() {
+    use crate::InstanceStamp;
+    let clean = InstanceStamp {
+        epoch: 7,
+        global: 9,
+        fault: 11,
+        file_slot_plus1: 3,
+        flags: crate::instance::STAMP_VALID,
+    };
+    let zero = InstanceStamp::default();
+    let mut moved = clean;
+    moved.epoch = moved.epoch.wrapping_add(1);
+    let mut flagged = clean;
+    flagged.flags |= crate::instance::STAMP_LOCAL_FAULT;
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        // Joined control: the same vectors read.
+        let target = fresh(w);
+        target.borrow_mut().set_word(0x10000, 0x42);
+        let (verdict, words) = capture_return_handles(
+            [true, false],
+            [true, false],
+            [0x10000, 0],
+            CKR_OK,
+            ReturnAuthority::for_return(true, true, clean, clean),
+            layout,
+            word_reader(&target),
+        );
+        assert_eq!(verdict.statuses[0], hst::VALUE);
+        assert_eq!(words[0], 0x42);
+        assert_eq!(target.borrow().log().len(), 1);
+        for (name, entry, ret) in [
+            ("absent", zero, clean),
+            ("straddled", clean, moved),
+            ("flagged", flagged, flagged),
+        ] {
+            let authority = ReturnAuthority::for_return(true, true, entry, ret);
+            assert!(!authority.is_authorized(), "{name} denies");
+            let target = fresh(w);
+            target.borrow_mut().set_word(0x10000, 0x42);
+            let (verdict, words) = capture_return_handles(
+                [true, false],
+                [true, false],
+                [0x10000, 0],
+                CKR_OK,
+                authority,
+                layout,
+                word_reader(&target),
+            );
+            assert_eq!(verdict.statuses[0], hst::PROTOCOL_UNAVAILABLE, "{name}");
+            assert_eq!(words, [0, 0]);
+            assert_log(&target, &[]);
+            let target = fresh(w);
+            target.borrow_mut().set_word(0x21000, 2);
+            target.borrow_mut().set_word(0x20000, 0x51);
+            let (verdict, _) = capture_find_return(
+                0x20000,
+                8,
+                0x21000,
+                CKR_OK,
+                authority,
+                layout,
+                word_reader(&target),
+            );
+            assert!(!verdict.valid, "{name}");
+            assert_log(&target, &[]);
+            let target = fresh(w);
+            let retained = GetSlot {
+                value_ptr: 0x50000,
+                entry_capacity: w,
+                kind: ak::CLASS,
+                slot_index: 0,
+            };
+            let mut slots = [GetSlot::default(); 8];
+            slots[0] = retained;
+            let state = GetEntryState {
+                template_base: 0x40000,
+                header_end: 0x40000 + 3 * w,
+                inspected: 1,
+                slot_count: 1,
+                slots,
+                ..Default::default()
+            };
+            prog_attr(&target, 0x40000, 0, w, SEL_CLASS, 0x50000, w);
+            target.borrow_mut().set_word(0x50000, 3);
+            let (mut read_word, mut read_bytes) = readers(&target);
+            let outcome = capture_get_return(
+                &state,
+                CKR_OK,
+                authority,
+                layout,
+                &mut read_word,
+                &mut read_bytes,
+            );
+            assert_eq!(outcome.inspected, 0, "{name}");
+            assert_log(&target, &[]);
+        }
+    }
 }

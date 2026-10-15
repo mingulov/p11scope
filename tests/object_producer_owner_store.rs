@@ -10,65 +10,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Compile the native owner fixture the way the repo builds it.
-fn compile_owner_fixture(directory: &Path, name: &str, small: bool) -> PathBuf {
-    let binary = directory.join(name);
-    let mut compiler = Command::new("clang-18");
-    compiler
-        .args([
-            "-O2",
-            "-g",
-            "-Wall",
-            "-Wextra",
-            "-Werror",
-            "-pthread",
-            "-I",
-            "crates/ebpf/native",
-            "tests/fixtures/task-owner/helper_tests.c",
-            "-o",
-        ])
-        .arg(&binary);
-    if small {
-        compiler.arg("-DP11SCOPE_SMALL_STATE_MAPS");
-    }
-    let output = compiler.output().expect("execute clang-18");
-    assert!(
-        output.status.success(),
-        "native owner compile: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    binary
-}
-
-fn run_fixture_subcommand(binary: &Path, subcommand: &str, marker: &str) {
-    let output = Command::new(binary)
-        .arg(subcommand)
-        .output()
-        .expect("execute native owner fixture");
-    assert!(
-        output.status.success(),
-        "fixture {subcommand}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains(marker),
-        "fixture {subcommand} missed its marker: {stdout:?}"
-    );
-}
-
-/// Run one object-custody fixture control under default and small-state maps.
-fn run_object_subcommand(subcommand: &str, marker: &str) {
-    let temporary = tempfile::tempdir().expect("native owner test directory");
-    for small in [false, true] {
-        let binary = compile_owner_fixture(
-            temporary.path(),
-            &format!("object-{subcommand}-small-{small}"),
-            small,
-        );
-        run_fixture_subcommand(&binary, subcommand, marker);
-    }
-}
+#[path = "support/object_owner_fixture.rs"]
+mod owner_fixture;
 
 fn embedded_object(directory: &Path) -> PathBuf {
     let object = directory.join("p11scope-ebpf");
@@ -106,7 +49,7 @@ fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
 
 #[test]
 fn object_producer_owner_terminal_matrix() {
-    run_object_subcommand(
+    owner_fixture::run_object_subcommand(
         "object_producer_owner_terminal_matrix",
         "object custody terminal matrix passed",
     );
@@ -114,7 +57,7 @@ fn object_producer_owner_terminal_matrix() {
 
 #[test]
 fn object_producer_side_state_n_and_n_plus_one() {
-    run_object_subcommand(
+    owner_fixture::run_object_subcommand(
         "object_producer_side_state_n_and_n_plus_one",
         "object custody side state passed",
     );
@@ -122,7 +65,7 @@ fn object_producer_side_state_n_and_n_plus_one() {
 
 #[test]
 fn object_producer_missing_side_state_faults_before_return() {
-    run_object_subcommand(
+    owner_fixture::run_object_subcommand(
         "object_producer_missing_side_state_faults_before_return",
         "object custody missing side state passed",
     );
@@ -198,7 +141,7 @@ fn object_producer_missing_side_state_faults_before_return() {
 
 #[test]
 fn object_producer_cleanup_result_reaches_exec_exit_fault() {
-    run_object_subcommand(
+    owner_fixture::run_object_subcommand(
         "object_producer_cleanup_result_reaches_exec_exit_fault",
         "object custody cleanup result passed",
     );
@@ -246,6 +189,42 @@ fn object_producer_cleanup_result_reaches_exec_exit_fault() {
             assert!(fault_at < site, "{root} must fault before {marker}");
         }
     }
+}
+
+/// G06/E2: side-insert success followed by a readback miss never
+/// authorizes ready storage: explicit failure, no publication, no orphan
+/// row, exactly settled lease, visible bookkeeping, foreign rows
+/// untouched, fail-closed successors and converging repeated cleanup.
+#[test]
+#[ignore = "RED: H7-E2 readback rollback pending"]
+fn object_owner_readback_failure_never_authorizes() {
+    owner_fixture::run_object_subcommand(
+        "object_producer_alloc_readback_failure_preserves_cleanup_authority",
+        "object custody alloc readback passed",
+    );
+}
+
+/// G06/E2: empty-lease refund failure stays visible: rows retire, the
+/// failure is never lost or double-refunded, repeats stay failed, and
+/// the sibling lease keeps its row, record and unit. Reconciles the
+/// historical empty-lease shorthand (no defect reproduced; pinned).
+#[test]
+fn object_owner_empty_refund_failure_faults() {
+    owner_fixture::run_object_subcommand(
+        "object_producer_empty_lease_refund_failure_remains_visible",
+        "object custody empty refund passed",
+    );
+}
+
+/// G06/E2: a sweep-adjacent side lookup miss preserves custody: the
+/// hidden orphan is kept intact (never deleted blindly) and later live
+/// work sweeps it exactly once with exact accounting and proven scrub.
+#[test]
+fn object_owner_sweep_adjacent_lookup_preserves_custody() {
+    owner_fixture::run_object_subcommand(
+        "object_owner_sweep_adjacent_lookup_preserves_custody",
+        "object custody sweep adjacent passed",
+    );
 }
 
 #[test]

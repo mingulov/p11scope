@@ -548,6 +548,67 @@ fn object_journal_wire_roundtrip_and_reject() {
     let _ = OBJECT_ATTR_LIST_UNINSPECTED;
 }
 
+#[test]
+fn object_journal_decode_dispatches_forms() {
+    use p11scope_ebpf_common::object_journal::{
+        JOURNAL_END_TAIL_ABSENT, JournalRecord, decode_journal_record,
+    };
+    use p11scope_ebpf_common::object_wire::{
+        OBJECT_ACTION_DESTROY, publish_object_descriptors, verify_object_descriptors,
+    };
+
+    let descriptors = publish_object_descriptors();
+    assert!(verify_object_descriptors(&descriptors));
+    let decode = |bytes: &[u8]| decode_journal_record(bytes, &descriptors);
+
+    // Each wire form decodes to its variant, including the no-row paths.
+    assert!(matches!(
+        decode(&valid_begin()),
+        Some(JournalRecord::Begin(_))
+    ));
+    assert!(matches!(
+        decode(&valid_neutral_begin()),
+        Some(JournalRecord::Begin(_))
+    ));
+    assert!(matches!(
+        decode(&valid_end_full()),
+        Some(JournalRecord::End(_))
+    ));
+    let mut absent = valid_end_full();
+    absent[5] = JOURNAL_END_TAIL_ABSENT;
+    absent[24 + 368..].fill(0);
+    assert!(matches!(decode(&absent), Some(JournalRecord::End(_))));
+    let payload = valid_full_payload();
+    let compact =
+        p11scope_ebpf_common::object_journal::pack_compact_end(THREAD, SEQUENCE, 0, &payload)
+            .expect("eligible payload packs");
+    assert!(matches!(decode(&compact), Some(JournalRecord::End(_))));
+    let mut abandon = [0u8; JOURNAL_ABANDON_BYTES];
+    header(&mut abandon, JOURNAL_KIND_ABANDON, JOURNAL_ABANDON_BYTES, 0);
+    put_u64(&mut abandon, 24, 0xAAAA_BBBB_CCCC_DDDD);
+    put_u64(&mut abandon, 32, 0x1010_1010_1010_1010);
+    put_u64(&mut abandon, 40, 0x2020_2020_2020_2020);
+    put_u32(&mut abandon, 48, 11);
+    put_u32(&mut abandon, 52, 1);
+    put_u64(&mut abandon, 56, 0x3030_3030_3030_3030);
+    assert!(matches!(decode(&abandon), Some(JournalRecord::Abandon(_))));
+
+    // Ordinary and unknown lengths are not journal records.
+    assert!(decode(&[0u8; 368]).is_none());
+    assert!(decode(&[0u8; 608]).is_none());
+    assert!(decode(&[0u8; 100]).is_none());
+    assert!(decode(&[]).is_none());
+
+    // The compact tail-index selection reads the real tail: corrupting
+    // the tail index or action inside a compact END refuses decode.
+    let mut bad_index = compact;
+    bad_index[236] ^= 0xFF;
+    assert!(decode(&bad_index).is_none());
+    let mut bad_action = compact;
+    bad_action[232 + 13] = OBJECT_ACTION_DESTROY;
+    assert!(decode(&bad_action).is_none());
+}
+
 /// Minimal valid neutral BEGIN: C_Sign descriptor on the no-row path with
 /// all-zero requested lists and a VALUE session.
 fn valid_neutral_begin() -> [u8; JOURNAL_BEGIN_BYTES] {

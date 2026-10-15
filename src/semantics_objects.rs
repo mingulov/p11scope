@@ -128,6 +128,31 @@ impl ObjectDomain {
         }
     }
 
+    /// Sealed production mint: only the journal child calls this, with a
+    /// domain proof it built from actual H3 admission evidence. No raw
+    /// words, ordinals or booleans mint a domain.
+    pub(in crate::semantics_objects) fn sealed(proof: &journal::JournalDomainProof) -> Self {
+        proof.domain()
+    }
+
+    /// Part-wise construction for the sealed proof above. Module-family
+    /// only; every production caller goes through the proof type.
+    pub(in crate::semantics_objects) fn from_sealed_parts(
+        caller: u64,
+        image: u64,
+        native_source: u64,
+        instance: u64,
+        init_era: u64,
+    ) -> Self {
+        Self {
+            caller,
+            image,
+            native_source,
+            instance,
+            init_era,
+        }
+    }
+
     /// The per-instance budget key (all fields but the initialization era).
     fn instance_key(&self) -> (u64, u64, u64, u64) {
         (self.caller, self.image, self.native_source, self.instance)
@@ -145,6 +170,13 @@ impl RefCut {
     pub(crate) fn reference(cut: u64) -> Self {
         Self(cut)
     }
+
+    /// Sealed production mint: only the journal child calls this, with a
+    /// consumption ordinal from the retained drain. No raw ordinal mints
+    /// a cut.
+    pub(in crate::semantics_objects) fn sealed(ordinal: journal::ConsumptionOrdinal) -> Self {
+        Self(ordinal.cut())
+    }
 }
 
 /// A stable logical-call key within one domain's reference history.
@@ -156,6 +188,13 @@ impl CallKey {
     #[cfg(test)]
     pub(crate) fn reference(key: u64) -> Self {
         Self(key)
+    }
+
+    /// Sealed production mint: only the journal child calls this, with a
+    /// checked nonrecycled ticket from its reservation owner. No raw
+    /// word mints a key.
+    pub(in crate::semantics_objects) fn sealed(ticket: journal::JournalTicket) -> Self {
+        Self(ticket.key())
     }
 }
 
@@ -439,6 +478,26 @@ impl AttrObservation {
         }
     }
 
+    /// A wire-classified cell from a validated journal attribute list: the
+    /// kind/status/value already passed the finite wire validator, so this
+    /// maps them onto model query truth without re-reading the target. A
+    /// `None` kind (absent selector) retains nothing, however the status
+    /// reads: an uninterpretable cell is excluded, never invented.
+    pub(crate) fn classified(
+        kind: Option<SafeAttributeKind>,
+        status: QueryStatus,
+        value: Option<FieldValue>,
+    ) -> Self {
+        match kind {
+            Some(kind) => Self {
+                kind: Some(kind),
+                status,
+                value,
+            },
+            None => Self::excluded(),
+        }
+    }
+
     pub(crate) fn status(&self) -> QueryStatus {
         self.status
     }
@@ -556,6 +615,29 @@ impl CompleteInputPrefix {
             frontier,
             open: open.to_vec(),
             bootstrap,
+        }
+    }
+
+    /// Sealed production mint: only the journal child calls this, with a
+    /// sealed prefix whose audit already passed. No raw ordinal list mints
+    /// a prefix.
+    pub(in crate::semantics_objects) fn sealed(prefix: &journal::SealedObjectPrefix) -> Self {
+        prefix.prefix()
+    }
+
+    /// Part-wise construction for the sealed prefix above. Module-family
+    /// only; every production caller goes through the sealed prefix.
+    pub(in crate::semantics_objects) fn from_sealed_parts(
+        domain: ObjectDomain,
+        frontier: u64,
+        open: &[CallKey],
+        bootstrap: u64,
+    ) -> Self {
+        Self {
+            domain,
+            frontier: RefCut(frontier),
+            open: open.to_vec(),
+            bootstrap: Some(RefCut(bootstrap)),
         }
     }
 }
@@ -917,6 +999,16 @@ impl ObjectSemantics {
     /// upper bound on where it could have taken effect.
     pub(crate) fn outcome_lost(&mut self, lost: LostOutcome) -> ObjectEffects {
         self.state.outcome_lost(lost)
+    }
+
+    /// Sealed production input: the journal adapter consumed a begin it
+    /// could not represent (reservation exhausted). Records the refusal
+    /// exactly like a model capacity refusal — bootstrap voided, fence
+    /// floor raised, no bootstrap until a lost-outcome bound — without
+    /// admitting a call the adapter cannot track. Only the journal child
+    /// calls this, with sealed domain and cut.
+    pub(crate) fn note_refused_begin(&mut self, domain: ObjectDomain, cut: RefCut) {
+        self.state.note_refused(domain, cut.0);
     }
 
     /// Register a domain identity before any fact names it. Idempotent

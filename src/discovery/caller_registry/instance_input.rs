@@ -156,6 +156,28 @@ impl fmt::Debug for AdmittedInstanceCall {
     }
 }
 
+impl AdmittedInstanceCall {
+    /// Journal domain binding (H8): the admitted call's exact native
+    /// domain, image, router and caller for sealed incarnation minting.
+    /// Only the journal child reads this; the values feed private model
+    /// keys and never render.
+    pub(crate) fn journal_binding(
+        &self,
+    ) -> (
+        crate::attach::capture::NativeDomainId,
+        p11scope_ebpf_common::ImageIdentity,
+        crate::discovery::instances::InstanceId,
+        crate::discovery::caller_registry::CallerId,
+    ) {
+        (
+            self.key.domain,
+            self.key.image,
+            self.key.router,
+            self.caller,
+        )
+    }
+}
+
 enum InstanceScope {
     Domain(NativeDomainId),
     Image(NativeDomainId, ImageIdentity),

@@ -450,6 +450,14 @@ impl NativeDomainId {
         mint_domain_from(&NEXT_DOMAIN)
     }
 
+    /// Opaque identity word for sealed journal-domain minting (H8): the
+    /// process-unique domain tag as the model domain's native-source word.
+    /// Equality only; never ordered or compared across domains beyond the
+    /// model key's own equality. Only the journal child may call this.
+    pub(crate) fn journal_tag(self) -> u64 {
+        self.0
+    }
+
     #[cfg(test)]
     pub(crate) fn mint() -> Self {
         Self::try_mint().expect("test domain allocation is not exhausted")

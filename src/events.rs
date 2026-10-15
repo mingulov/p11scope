@@ -8,6 +8,7 @@
 use anyhow::{Context as _, Result};
 use aya::Ebpf;
 use aya::maps::{Map, MapData};
+use p11scope_ebpf_common::object_journal::{JournalRecord, decode_journal_record};
 use p11scope_ebpf_common::object_wire::{
     OBJECT_TAIL_BYTES, ObjectDescriptorWire, ValidatedObjectCall,
 };
@@ -713,6 +714,62 @@ impl<S: RecordSource> EventDrain<S> {
                         tap.observe_call(&record.base.event);
                     }
                     if f(record).is_break() {
+                        return true;
+                    }
+                }
+                None => {
+                    self.malformed = self.malformed.saturating_add(1);
+                    if let Some(tap) = &self.trace_tap {
+                        tap.observe_failure();
+                    }
+                }
+            }
+        }
+    }
+
+    /// One-cursor dispatch poll (H8): each consumed record goes to exactly
+    /// one consumer by length — 368/608-byte forms through the existing
+    /// object decoder to `ordinary`, journal forms through the frozen
+    /// journal validators to `journal` — with the same quantum, malformed
+    /// counting and stop semantics as the single-consumer polls. No second
+    /// cursor and no decoded-count inference: consumption order is
+    /// reservation order for every form. Activation-gated: production H0/H3
+    /// call sites keep their polls until the producer wires.
+    #[allow(dead_code)]
+    pub(crate) fn poll_dispatched_records(
+        &mut self,
+        quantum: Option<usize>,
+        descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+        mut ordinary: impl FnMut(DecodedEventRecord) -> ControlFlow<()>,
+        mut journal: impl FnMut(JournalRecord) -> ControlFlow<()>,
+    ) -> bool {
+        use p11scope_ebpf_common::object_journal::{
+            JOURNAL_ABANDON_BYTES, JOURNAL_BEGIN_BYTES, JOURNAL_END_COMPACT_BYTES,
+            JOURNAL_END_FULL_BYTES,
+        };
+        let mut left = quantum;
+        loop {
+            if left == Some(0) {
+                return true;
+            }
+            let Some(item) = self.source.next_record() else {
+                return false;
+            };
+            if let Some(left) = left.as_mut() {
+                *left -= 1;
+            }
+            let delivered = match item.len() {
+                JOURNAL_BEGIN_BYTES
+                | JOURNAL_END_FULL_BYTES
+                | JOURNAL_END_COMPACT_BYTES
+                | JOURNAL_ABANDON_BYTES => {
+                    decode_journal_record(&item, descriptors).map(&mut journal)
+                }
+                _ => decode_object_record(&item, descriptors).map(&mut ordinary),
+            };
+            match delivered {
+                Some(flow) => {
+                    if flow.is_break() {
                         return true;
                     }
                 }

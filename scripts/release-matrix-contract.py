@@ -457,7 +457,9 @@ def boundary_outcome(text):
     The cell succeeds on three disjoint outcomes: the exact all-ID
     positive, a preflight envelope refusal, or a post-failure envelope
     refusal. Refusals keep an explicit non-positive classification;
-    missing, duplicate or contradictory branch evidence fails.
+    missing, duplicate, contradictory or malformed branch evidence fails.
+    Every marker occurrence must match its complete line: a stray or
+    extra-field duplicate is rejected, never silently ignored.
     """
     refusals = re.findall(r"T7_ENVELOPE_REFUSAL cell=(\S+) n=(\d+) phase=(\S+) verdict=\"([^\n]*)\"$",
                           text, re.M)
@@ -467,6 +469,10 @@ def boundary_outcome(text):
                          r"completed_calls=(\d+) first=(\d+) tail=(\d+)$", text, re.M)
     raw_maps = re.findall(r"(?:^|\.\.\. )TASK4_RAW_MAPS phase=after_go usage_positive=(\d+) "
                           r"exact_ids=(\d+)\.\.(\d+)$", text, re.M)
+    require(text.count("TASK4_LEDGER") == len(ledgers),
+            "malformed boundary ledger evidence")
+    require(text.count("TASK4_RAW_MAPS") == len(raw_maps),
+            "malformed boundary raw-map evidence")
     if refusals:
         require(len(refusals) == 1, "missing/duplicate boundary refusal branch")
         cell, count, phase, verdict = refusals[0]

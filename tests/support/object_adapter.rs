@@ -77,7 +77,16 @@ impl FakeTarget {
         if self.failing.contains(&addr) {
             return Err(());
         }
-        self.lookup_word(addr).ok_or(())
+        let word = self.lookup_word(addr).ok_or(())?;
+        // Width discipline, exactly like the production `read_word`
+        // (LP64 reads a u64, ia32 reads a u32 and zero-extends): a
+        // four-byte word never carries high bits, so unrepresentable
+        // contamination vectors cannot sneak through the fixture.
+        Ok(if self.word_len == 4 {
+            word & 0xffff_ffff
+        } else {
+            word
+        })
     }
 
     pub fn read_bytes(&mut self, addr: u64, buf: &mut [u8]) -> Result<(), ()> {

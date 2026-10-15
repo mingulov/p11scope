@@ -21,7 +21,8 @@
 use crate::instance;
 use crate::object_capture::{
     authorize_derive_return, classify_derive_mechanism, find_flag, handle_status, object_flag,
-    spans_overlap, validate_target_span, DeriveEntry,
+    spans_overlap, validate_target_span, AttributeListOutcome, DeriveEntry, GetEntryState,
+    GetEntryVerdict, ReturnAuthority,
 };
 use crate::object_policy::ScalarDeriveMechanism;
 use crate::object_wire::{
@@ -636,4 +637,62 @@ pub unsafe fn adapter_emit_find(
         core::ptr::addr_of_mut!((*tail).find_valid).write(1);
     }
     true
+}
+
+/// Production entry attribute-inspection path (H7-E4 seam).
+///
+/// TODAY (E4 unwired): inspects nothing — performs zero reads and returns
+/// the zero outcome. Present pairs then carry the UNINSPECTED marking (see
+/// `adapter_tail_fill`). A budgeted E4 implements the approved bounded
+/// in-place inspection HERE with this exact signature (same vectors, same
+/// readers); G05 passes unmodified when it does.
+pub fn production_inspect_request_template(
+    template_ptr: u64,
+    count: u64,
+    peer: Option<(u64, u64)>,
+    layout: LinuxLayout,
+    read_word: impl FnMut(u64) -> Result<u64, ()>,
+    read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
+) -> AttributeListOutcome {
+    let _ = (template_ptr, count, peer, layout);
+    let _ = (read_word, read_bytes);
+    AttributeListOutcome::default()
+}
+
+/// Production GetAttributeValue entry path (H7-E4 seam).
+///
+/// TODAY (E4 unwired): retains nothing — performs zero reads, leaves
+/// `state` untouched and returns the zero verdict. A budgeted E4 retains
+/// selected headers HERE with this exact signature; G05 passes
+/// unmodified when it does.
+pub fn production_capture_get_entry(
+    template_ptr: u64,
+    count: u64,
+    layout: LinuxLayout,
+    state: &mut GetEntryState,
+    read_word: impl FnMut(u64) -> Result<u64, ()>,
+) -> GetEntryVerdict {
+    let _ = (template_ptr, count, layout);
+    let _ = state;
+    let _ = read_word;
+    GetEntryVerdict::default()
+}
+
+/// Production GetAttributeValue return path (H7-E4 seam).
+///
+/// TODAY (E4 unwired): establishes nothing — performs zero reads and
+/// returns the zero outcome. A budgeted E4 establishes inspected results
+/// HERE with this exact signature (same retained state, same readers);
+/// G05 passes unmodified when it does.
+pub fn production_capture_get_return(
+    state: &GetEntryState,
+    rv: u64,
+    authority: ReturnAuthority,
+    layout: LinuxLayout,
+    read_word: impl FnMut(u64) -> Result<u64, ()>,
+    read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
+) -> AttributeListOutcome {
+    let _ = (state, rv, authority, layout);
+    let _ = (read_word, read_bytes);
+    AttributeListOutcome::default()
 }

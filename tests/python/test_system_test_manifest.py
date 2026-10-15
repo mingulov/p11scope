@@ -12,6 +12,217 @@ ROOT = Path(__file__).resolve().parents[2]
 VERIFY = runpy.run_path(str(ROOT / "scripts/verify-system-test-manifest.py"))
 
 
+# Independently pinned bounded-scope population: literal identities, never
+# derived from production metadata. Any membership change requires editing
+# these lists AND the checked-in scope catalog together.
+EXPECTED_BOUNDED_IN = frozenset({
+    "T7.default.detailed_hot_slot_third_rv_lp64",
+    "T7.default.inventory_n1024_lp64",
+    "T7.default.inventory_n4097_lp64",
+    "T7.default.inventory_n576_lp64",
+    "T7.default.inventory_n6530_lp64",
+    "T7.default.inventory_n8192_boundary_lp64",
+    "T7.wide.detailed_hot_slot_third_rv_lp64",
+    "finding:A-F8",
+    "finding:F-01",
+    "finding:F-02",
+    "finding:F-03",
+    "finding:F-04",
+    "finding:F-08",
+    "finding:F-09",
+    "finding:F-10",
+    "finding:F-11",
+    "finding:F-12",
+    "finding:F-13",
+    "finding:F-14",
+    "finding:F-15",
+    "finding:F-16a",
+    "finding:F-17",
+    "finding:F-20",
+    "finding:F-25",
+    "finding:F-26",
+    "finding:F-27",
+    "finding:F-28",
+    "finding:F-29",
+    "finding:F-30",
+    "finding:F-32",
+    "finding:F-38",
+    "finding:F-39",
+    "finding:F-40",
+    "finding:F-43",
+    "finding:F-44",
+    "finding:F-48",
+    "finding:F-50",
+    "finding:F-51",
+    "finding:F-52",
+    "finding:F-53",
+    "finding:F-57",
+    "finding:F-59",
+    "finding:F-60",
+    "finding:F-61b",
+    "finding:F-62",
+    "finding:F-63",
+    "finding:F-65",
+    "finding:F-67",
+    "finding:F-68",
+    "finding:F-69",
+    "finding:F-70",
+    "finding:F-71",
+    "finding:F-72",
+    "finding:F-73",
+    "finding:F-74",
+    "finding:F-75",
+    "finding:O-15",
+    "finding:R-01",
+    "finding:R-02",
+    "finding:R-03",
+    "finding:R-04",
+    "finding:R-05",
+    "finding:R-06",
+    "followup:G-13",
+    "followup:G-16",
+    "followup:U-01",
+    "followup:U-05",
+    "followup:U-06",
+    "followup:U-09",
+    "followup:U-12",
+    "followup:U-19",
+    "followup:U-20",
+    "followup:U-21",
+    "followup:U-22",
+    "followup:U-24",
+    "installed.current.default",
+    "installed.current.wide",
+    "installed.linux-5.15.default",
+    "installed.linux-5.15.wide",
+    "soak.1800s",
+})
+EXPECTED_BOUNDED_OUT = frozenset({
+    "R01.public",
+    "R02.public",
+    "R03.public",
+    "R04.public",
+    "R05.public",
+    "R06.public",
+    "R07.public",
+    "R08.public",
+    "R09.public",
+    "R10.public",
+    "finding:A-F1",
+    "finding:A-F2",
+    "finding:A-F3",
+    "finding:A-F4",
+    "finding:A-F5",
+    "finding:A-F6",
+    "finding:A-F7",
+    "finding:A-F9",
+    "finding:E01",
+    "finding:E02",
+    "finding:E03",
+    "finding:E04",
+    "finding:E05",
+    "finding:E06",
+    "finding:E07",
+    "finding:E08",
+    "finding:E09",
+    "finding:E10",
+    "finding:E11",
+    "finding:E12",
+    "finding:E13",
+    "finding:E14",
+    "finding:E15",
+    "finding:E16",
+    "finding:E17",
+    "finding:E18",
+    "finding:E19",
+    "finding:E20",
+    "finding:E21",
+    "finding:E22",
+    "finding:E23",
+    "finding:E24",
+    "finding:E25",
+    "finding:F-05",
+    "finding:F-06",
+    "finding:F-07",
+    "finding:F-16b",
+    "finding:F-18",
+    "finding:F-19",
+    "finding:F-21",
+    "finding:F-22",
+    "finding:F-23",
+    "finding:F-24",
+    "finding:F-31",
+    "finding:F-33",
+    "finding:F-34",
+    "finding:F-35",
+    "finding:F-36",
+    "finding:F-37",
+    "finding:F-41",
+    "finding:F-42",
+    "finding:F-45",
+    "finding:F-46",
+    "finding:F-47",
+    "finding:F-49",
+    "finding:F-54",
+    "finding:F-55",
+    "finding:F-56",
+    "finding:F-58-D7",
+    "finding:F-58-D8",
+    "finding:F-58-E4",
+    "finding:F-58-I3",
+    "finding:F-58-R2",
+    "finding:F-58-R3",
+    "finding:F-58-R5",
+    "finding:F-58-T7",
+    "finding:F-61a",
+    "finding:F-64",
+    "finding:FB-F1",
+    "finding:FB-F3",
+    "finding:FB-F4",
+    "finding:FB-F6",
+    "finding:FB-F7",
+    "finding:O-1",
+    "finding:O-10",
+    "finding:O-11",
+    "finding:O-13",
+    "finding:O-14",
+    "finding:O-16",
+    "finding:O-17",
+    "finding:O-6",
+    "followup:G-01",
+    "followup:G-02",
+    "followup:G-03",
+    "followup:G-04",
+    "followup:G-05",
+    "followup:G-06",
+    "followup:G-07",
+    "followup:G-08",
+    "followup:G-10",
+    "followup:G-11",
+    "followup:G-12",
+    "followup:G-14",
+    "followup:G-15",
+    "followup:G-17",
+    "followup:G-18",
+    "followup:G-19",
+    "followup:U-02",
+    "followup:U-03",
+    "followup:U-04",
+    "followup:U-07",
+    "followup:U-08",
+    "followup:U-10",
+    "followup:U-11",
+    "followup:U-13",
+    "followup:U-14",
+    "followup:U-15",
+    "followup:U-16",
+    "followup:U-17",
+    "followup:U-18",
+    "soak.14400s",
+    "soak.86400s",
+})
+
+
 class ManifestTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -187,23 +398,87 @@ class ManifestTests(unittest.TestCase):
                   if "system-product" in policy["required_for_claims"]}
         bounded = {identifier for identifier, policy in policies.items()
                    if "bounded-release" in policy["required_for_claims"]}
-        # The bounded v0.4 claim is the full claim minus the 4h/24h
-        # soaks minus the placeholder-kernel cells no claim can close
-        # yet; the 30-minute meaningful-activity soak stays required.
-        placeholders = {identifier for identifier in system
-                        if policies[identifier]["kernel_profile"] == VERIFY["PLACEHOLDER_KERNEL"]}
-        self.assertTrue(placeholders)
-        self.assertEqual(system - bounded,
-                         {"soak.14400s", "soak.86400s"} | placeholders)
+        # Independently pinned population: production membership must
+        # equal the literal lists, never a metadata derivation. Nothing
+        # here reads kernel_profile or any other production metadata.
+        self.assertEqual(len(EXPECTED_BOUNDED_IN), 80)
+        self.assertEqual(len(EXPECTED_BOUNDED_OUT), 122)
+        self.assertEqual(bounded, EXPECTED_BOUNDED_IN)
+        self.assertEqual(system - bounded, EXPECTED_BOUNDED_OUT)
+        self.assertEqual(system, EXPECTED_BOUNDED_IN | EXPECTED_BOUNDED_OUT)
+        scope = json.loads(Path(VERIFY["BOUNDED_SCOPE"]).read_text())
+        self.assertEqual(scope["claim"], "bounded-release")
+        self.assertEqual(scope["status"], "proposed-for-owner-approval")
+        self.assertEqual(set(scope["in"]), EXPECTED_BOUNDED_IN)
+        self.assertEqual({entry["id"] for entry in scope["out"]}, EXPECTED_BOUNDED_OUT)
+        # Every exclusion carries an auditable reason naming its owning
+        # campaign and the concrete condition that would move it IN.
+        groups = {}
+        for entry in scope["out"]:
+            for key in ("reason", "owner_task", "move_in"):
+                self.assertTrue(entry[key], f"{entry['id']}: empty {key}")
+            self.assertEqual(entry["owner_task"], policies[entry["id"]]["owner_task"])
+            groups[entry["reason_group"]] = groups.get(entry["reason_group"], 0) + 1
+        self.assertEqual(groups, {"kernel-concretization-pending": 99,
+                                 "public-oracle-unregistered": 11,
+                                 "public-contract-unregistered": 10,
+                                 "full-endurance": 2})
+        # Spot identities: the 30-minute soak stays required, the 4h/24h
+        # endurance soaks and the public-contract cells stay out.
         self.assertIn("soak.1800s", bounded)
-        # Public-contract cells stay out until concrete tests register.
-        self.assertNotIn("R01.public", bounded)
-        self.assertTrue(all(policies[identifier]["kernel_profile"] != VERIFY["PLACEHOLDER_KERNEL"]
-                            for identifier in bounded))
+        self.assertIn("soak.14400s", EXPECTED_BOUNDED_OUT)
+        self.assertIn("soak.86400s", EXPECTED_BOUNDED_OUT)
+        self.assertIn("R01.public", EXPECTED_BOUNDED_OUT)
         self.assertTrue(any(identifier.startswith("T7.") for identifier in bounded))
         static = {identifier for identifier, policy in policies.items()
                   if "t7-static" in policy["required_for_claims"]}
         self.assertEqual(len(static), 7)
+
+    def test_placeholder_flip_cannot_change_bounded_membership(self):
+        # Bounded membership comes only from the checked-in scope catalog:
+        # flipping a cell's kernel metadata must not move it IN or OUT.
+        # Only a catalog edit (pinned literally above) may do that.
+        module = VERIFY["catalog"].__globals__
+        old_ledger, old_deferred = module["LEDGER"], module["DEFERRED"]
+        self.addCleanup(module.update, {"LEDGER": old_ledger, "DEFERRED": old_deferred})
+
+        def recatalog():
+            return {identifier for identifier, policy in VERIFY["catalog"]().items()
+                    if "bounded-release" in policy["required_for_claims"]}
+
+        # IN -> placeholder kernel: the cell must stay IN.
+        ledger = json.loads(Path(old_ledger).read_text())
+        for finding in ledger["findings"]:
+            if finding["id"] == "A-F8":
+                finding["disposition"] = "required-open"
+        flipped = self.root / "ledger-flipped.json"
+        flipped.write_text(json.dumps(ledger))
+        module["LEDGER"] = flipped
+        self.assertEqual(recatalog(), EXPECTED_BOUNDED_IN)
+        module["LEDGER"] = old_ledger
+
+        # A second IN cell via the deferred gates: still IN.
+        gates = json.loads(Path(old_deferred).read_text())
+        for group in gates["gates"]:
+            if group["id"] == "U-01":
+                group["evidence_level"] = "live-mechanism"
+        flipped_gates = self.root / "deferred-flipped.json"
+        flipped_gates.write_text(json.dumps(gates))
+        module["DEFERRED"] = flipped_gates
+        self.assertEqual(recatalog(), EXPECTED_BOUNDED_IN)
+        module["DEFERRED"] = old_deferred
+
+        # OUT -> concrete kernel: the cell must stay OUT; only a scope
+        # catalog edit moves it IN.
+        ledger = json.loads(Path(old_ledger).read_text())
+        for finding in ledger["findings"]:
+            if finding["id"] == "F-05":
+                finding["disposition"] = "source-fixed"
+        flipped2 = self.root / "ledger-concrete.json"
+        flipped2.write_text(json.dumps(ledger))
+        module["LEDGER"] = flipped2
+        self.assertEqual(recatalog(), EXPECTED_BOUNDED_IN)
+        module["LEDGER"] = old_ledger
 
     def pass_claim_row(self, row, artifact):
         """Give a closable row passing evidence with a consistent receipt."""
@@ -256,13 +531,17 @@ class ManifestTests(unittest.TestCase):
                          policies["soak.86400s"]["required_for_claims"])
         self.assertIn("system-product", policies["soak.14400s"]["required_for_claims"])
         self.assertIn("system-product", policies["soak.86400s"]["required_for_claims"])
-        # The only closable system cells without evidence are the omitted
-        # 4h/24h endurance cells (order-independent gap).
-        gap = sorted(row["id"] for row in self.manifest["cells"]
-                     if "system-product" in row["required_for_claims"]
-                     and policies[row["id"]]["kernel_profile"] != VERIFY["PLACEHOLDER_KERNEL"]
-                     and row["outcome"] != "PASS")
-        self.assertEqual(gap, ["soak.14400s", "soak.86400s"])
+        # The full-claim gap is exactly the catalog's OUT population:
+        # all 122 bounded-excluded cells stay visible with their reasons
+        # (nothing filtered out silently), order-independent.
+        gap = {row["id"] for row in self.manifest["cells"]
+               if "system-product" in row["required_for_claims"]
+               and row["outcome"] != "PASS"}
+        self.assertEqual(len(gap), 122)
+        self.assertEqual(gap, EXPECTED_BOUNDED_OUT)
+        scope = json.loads(Path(VERIFY["BOUNDED_SCOPE"]).read_text())
+        reasons = {entry["id"]: entry["reason"] for entry in scope["out"]}
+        self.assertTrue(all(reasons[identifier] for identifier in gap))
         # The verifier reports the first gap in row order; with the
         # endurance rows first the full-claim rejection names them.
         ordered = copy.deepcopy(self.manifest)

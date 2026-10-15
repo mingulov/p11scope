@@ -2,6 +2,7 @@
   "schema": "p11scope/system-test-manifest/v1",
   "ledger_sha256": "7be02ab50d7daf4378c9121848840f4e0a6b39c49043b650f8a9a4fda6b1ecae",
   "deferred_sha256": "b4d79c724341bc850542f3777d2cc2ecc3b76b48a7411e7865637de2201e5750",
+  "bounded_scope_sha256": "54f78a962eac569b126088a2e2f9e1e2cbe953ecaba8a4ee51c69fdfc686b373",
   "subject": null,
   "cells": [
     {

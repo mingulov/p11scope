@@ -17,6 +17,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 LEDGER = ROOT / "tests/fixtures/system-qualification/closure-ledger.json"
 DEFERRED = ROOT / "tests/fixtures/system-qualification/system-deferred-gates.json"
+BOUNDED_SCOPE = ROOT / "tests/fixtures/system-qualification/system-bounded-scope.json"
 SCHEMA = "p11scope/system-test-manifest/v1"
 OUTCOMES = {"PASS", "FAIL", "INVALID", "NOT_RUN", "UNSUPPORTED", "BLOCKED"}
 ENTRYPOINTS = {"model": "unit-test", "artifact": "artifact-check",
@@ -24,16 +25,15 @@ ENTRYPOINTS = {"model": "unit-test", "artifact": "artifact-check",
                "installed": "installed-cli", "soak": "installed-cli"}
 REQUIREMENTS = {f"R{number:02}" for number in range(1, 11)}
 CLAIMS = {"system-product", "t7-static", "bounded-release"}
-# T1 fix policy: the bounded v0.4 release claim requires every closable
-# system-product cell except the 4h/24h endurance soaks. Cells still on
-# the placeholder final-supported-matrix kernel cannot close under any
-# claim (verify_pass rejects them until the catalog names concrete
-# kernels), so requiring them here would make bounded success unprovable;
-# they stay required for the full system-product claim only. The
-# 30-minute meaningful-activity soak stays required; longer soaks need
-# their corresponding claims and are never implied. Controller review
+# T1 fix policy: the bounded v0.4 release claim requires exactly the IN
+# list of the checked-in bounded-scope catalog (system-bounded-scope.json,
+# status proposed-for-owner-approval). Placeholder-kernel cells stay
+# required for system-product; their bounded OUT status comes only from
+# that catalog with a per-cell reason, never from metadata inference, so
+# flipping a cell's kernel metadata cannot silently change bounded
+# membership. The 30-minute meaningful-activity soak is IN; the 4h/24h
+# endurance soaks are OUT with full-endurance reasons. Controller review
 # needed: this membership is a product-scope decision.
-BOUNDED_OMITS = {"soak.14400s", "soak.86400s"}
 PLACEHOLDER_KERNEL = "final-supported-matrix"
 # Registered T7 acceptance selectors: the generator seeds them so a
 # regeneration never silently drops concrete acceptance registration.
@@ -131,11 +131,33 @@ def catalog():
             "kernel_profile": "current/default", "required_for_claims": ["system-product"],
             "expected_behavior": "continuous-owned-workload", "minimum_duration_s": duration,
             "limitation": "Actual wall time with independent workload/loss and resource accounting required."}
-    for identifier, policy in policies.items():
-        if ("system-product" in policy["required_for_claims"]
-                and identifier not in BOUNDED_OMITS
-                and policy["kernel_profile"] != PLACEHOLDER_KERNEL):
-            policy["required_for_claims"].append("bounded-release")
+    scope = json.loads(BOUNDED_SCOPE.read_text())
+    require(scope.get("schema") == "p11scope/system-bounded-scope/v1", "wrong bounded-scope schema")
+    require(scope.get("claim") == "bounded-release", "bounded-scope claim mismatch")
+    ins = scope.get("in")
+    require(isinstance(ins, list) and all(isinstance(identifier, str) for identifier in ins),
+            "bounded-scope IN list must pin explicit cell identities")
+    require(len(set(ins)) == len(ins), "duplicate bounded-scope IN identity")
+    outs = scope.get("out")
+    require(isinstance(outs, list), "bounded-scope OUT list must pin explicit exclusions")
+    out_ids = []
+    for entry in outs:
+        require(isinstance(entry, dict)
+                and all(isinstance(entry.get(key), str) and entry[key]
+                        for key in ("id", "reason", "owner_task", "move_in")),
+                "bounded-scope OUT entry needs id/reason/owner_task/move_in")
+        out_ids.append(entry["id"])
+        require(entry["id"] in policies, f"bounded-scope OUT identity unknown: {entry['id']}")
+        require(entry["owner_task"] == policies[entry["id"]]["owner_task"],
+                f"bounded-scope OUT owner drifted: {entry['id']}")
+    require(len(set(out_ids)) == len(out_ids), "duplicate bounded-scope OUT identity")
+    system = {identifier for identifier, policy in policies.items()
+              if "system-product" in policy["required_for_claims"]}
+    require(set(ins) <= set(policies), "bounded-scope IN identity unknown")
+    require(set(ins) | set(out_ids) == system and not (set(ins) & set(out_ids)),
+            "bounded scope must partition system-product exactly; edit the scope catalog")
+    for identifier in ins:
+        policies[identifier]["required_for_claims"].append("bounded-release")
     return policies
 
 
@@ -146,6 +168,7 @@ def new_manifest():
                       "command": [], "artifact_hashes": {},
                       "evidence_paths": [], "outcome": "NOT_RUN", "receipt": None, "receipt_sha256": None})
     return {"schema": SCHEMA, "ledger_sha256": digest(LEDGER), "deferred_sha256": digest(DEFERRED),
+            "bounded_scope_sha256": digest(BOUNDED_SCOPE),
             "subject": None, "cells": cells}
 
 
@@ -200,6 +223,7 @@ def verify_manifest(manifest, root, claim="system-product", structure_only=False
     require(manifest.get("schema") == SCHEMA, "wrong manifest schema")
     require(manifest.get("ledger_sha256") == digest(LEDGER), "closure ledger hash mismatch")
     require(manifest.get("deferred_sha256") == digest(DEFERRED), "deferred gate hash mismatch")
+    require(manifest.get("bounded_scope_sha256") == digest(BOUNDED_SCOPE), "bounded-scope catalog hash mismatch")
     require(claim in CLAIMS, "unknown acceptance claim")
     policies = catalog()
     rows = manifest.get("cells")

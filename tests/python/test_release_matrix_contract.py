@@ -6,6 +6,7 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import runpy
 import shutil
 import subprocess
 import sys
@@ -14,6 +15,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 CHECKER = ROOT / "scripts/release-matrix-contract.py"
+CHECKER_MOD = runpy.run_path(str(CHECKER))
 RUNNER = ROOT / "scripts/qualify-release-matrix.sh"
 LIB_A = "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n4097_lp64"
 LIB_B = "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6530_lp64"
@@ -218,6 +220,92 @@ class MatrixContract(unittest.TestCase):
                 row = next(r for r in json.loads(result.stdout)["rows"] if r["id"] == "lib:" + CHURN)
                 self.assertEqual(row["qualification"], "positive-coverage")
                 self.assertIn("rate100=lossless", row["detail"])
+
+    # G01/R7: the T7 8192 boundary cell deliberately succeeds while
+    # refusing the envelope (T7_ENVELOPE_REFUSAL, preflight or
+    # post-failure). That success is an expected refusal, never
+    # 8,192-endpoint positive coverage; only the exact all-ID ledger and
+    # raw-map evidence qualifies the positive.
+    BOUNDARY_REFUSALS = (
+        'T7_ENVELOPE_REFUSAL cell=inventory-t7-n8192-boundary n=8192 phase=preflight '
+        'verdict="T7 boundary cell out of envelope: 8192 endpoints need 8194 links '
+        '(8258 FDs lower bound with 64 reserve) but only 7000 FDs fit under '
+        'RLIMIT_NOFILE soft=8192 with 1192 open"',
+        'T7_ENVELOPE_REFUSAL cell=inventory-t7-n8192-boundary n=8192 '
+        'phase=post_failure_classification verdict="attach failed: Too many open files (os error 24)"',
+    )
+    BOUNDARY_POSITIVE = (
+        "TASK4_LEDGER phase=after_go physical_ids=8192 completed_calls=8192 first=0 tail=8191\n"
+        "TASK4_RAW_MAPS phase=after_go usage_positive=8192 exact_ids=0..8191"
+    )
+
+    def boundary_log(self, diagnostic):
+        return (f"running 1 test\ntest {LIB_C} ... {diagnostic}\nok\n"
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n")
+
+    def test_boundary_refusal_is_not_positive_coverage(self):
+        for diagnostic in self.BOUNDARY_REFUSALS:
+            with self.subTest(diagnostic=diagnostic[:80]):
+                # Direct classification through the actual module path.
+                CHECKER_MOD["exact_test"](self.boundary_log(diagnostic), LIB_C)
+                qualification, _ = CHECKER_MOD["lib_outcome"](LIB_C, self.boundary_log(diagnostic))
+                self.assertEqual(qualification, "expected-refusal")
+                # Full judge composition: a valid libtest PASS summary on
+                # the refusal-only log must not restore positive coverage.
+                self.selected_log(LIB_C, diagnostic)
+                result = self.judge()
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                row = next(r for r in json.loads(result.stdout)["rows"] if r["id"] == "lib:" + LIB_C)
+                self.assertEqual(row["qualification"], "expected-refusal")
+
+    def test_boundary_positive_requires_population(self):
+        # The nonempty all-ID positive still qualifies.
+        CHECKER_MOD["exact_test"](self.boundary_log(self.BOUNDARY_POSITIVE), LIB_C)
+        qualification, _ = CHECKER_MOD["lib_outcome"](LIB_C, self.boundary_log(self.BOUNDARY_POSITIVE))
+        self.assertEqual(qualification, "positive-coverage")
+        self.selected_log(LIB_C, self.BOUNDARY_POSITIVE)
+        result = self.judge()
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        row = next(r for r in json.loads(result.stdout)["rows"] if r["id"] == "lib:" + LIB_C)
+        self.assertEqual(row["qualification"], "positive-coverage")
+        # Missing population, or an 8,191 population relabeled 8,192,
+        # cannot satisfy the boundary's positive claim.
+        bad = (
+            "healthy",
+            "TASK4_LEDGER phase=after_go physical_ids=8192 completed_calls=8192 first=0 tail=8191",
+            "TASK4_RAW_MAPS phase=after_go usage_positive=8192 exact_ids=0..8191",
+            self.BOUNDARY_POSITIVE.replace("8192", "8191").replace("tail=8191", "tail=8190").replace("0..8191", "0..8190"),
+            self.BOUNDARY_POSITIVE.replace("0..8191", "0..8190"),
+        )
+        for diagnostic in bad:
+            with self.subTest(diagnostic=diagnostic[:60]):
+                with self.assertRaises(CHECKER_MOD["Invalid"]):
+                    CHECKER_MOD["lib_outcome"](LIB_C, self.boundary_log(diagnostic))
+                self.selected_log(LIB_C, diagnostic)
+                self.reject()
+
+    def test_boundary_conflicting_outcomes_fail(self):
+        ledger, raw = self.BOUNDARY_POSITIVE.split("\n")
+        conflicts = (
+            # Refusal and positive evidence together.
+            self.BOUNDARY_REFUSALS[0] + "\n" + self.BOUNDARY_POSITIVE,
+            self.BOUNDARY_REFUSALS[1] + "\n" + ledger,
+            # Duplicate or contradictory branches.
+            self.BOUNDARY_REFUSALS[0] + "\n" + self.BOUNDARY_REFUSALS[1],
+            ledger + "\n" + ledger + "\n" + raw,
+            ledger + "\n" + raw + "\n" + raw,
+            ledger + "\n" + raw + "\n" + ledger.replace("8192", "8191").replace("tail=8191", "tail=8190"),
+            # Malformed refusal marker.
+            "T7_ENVELOPE_REFUSAL cell=inventory-t7-n8192-boundary n=8192 phase=unknown verdict=\"x\"",
+            "T7_ENVELOPE_REFUSAL cell=inventory-t7-n8192-boundary n=8191 phase=preflight verdict=\"x\"",
+            "T7_ENVELOPE_REFUSAL cell=inventory-t7-n8192-boundary n=8192 phase=preflight",
+        )
+        for diagnostic in conflicts:
+            with self.subTest(diagnostic=diagnostic[:60]):
+                with self.assertRaises(CHECKER_MOD["Invalid"]):
+                    CHECKER_MOD["lib_outcome"](LIB_C, self.boundary_log(diagnostic))
+                self.selected_log(LIB_C, diagnostic)
+                self.reject()
 
     def test_branch_conflicts_and_invalid_counts_fail(self):
         for name, diagnostic in ((CAPTURE_MULTI, 'C3_PID_SCOPE backend=Multi target=321 foreign=432 rows=1'),

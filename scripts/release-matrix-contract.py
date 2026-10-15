@@ -106,6 +106,13 @@ DEFAULT_LIB_TESTS = (
 BREADTH = tuple("attach::inventory::activation::privileged_tests::" + name for name in (
     "privileged_t7_inventory_n4097_lp64", "privileged_t7_inventory_n6530_lp64",
     "privileged_t7_inventory_n8192_boundary_lp64"))
+# G01/R7: the 8192 boundary cell deliberately succeeds while refusing
+# the envelope. Only its exact refusal marker or its exact all-ID
+# positive evidence classifies it; test success alone never does.
+BOUNDARY = BREADTH[-1]
+BOUNDARY_CELL = "inventory-t7-n8192-boundary"
+BOUNDARY_N = 8192
+BOUNDARY_PHASES = ("preflight", "post_failure_classification")
 IDENTITY_POSITIVE = tuple("attach::identity_iter::tests::" + name for name in (
     "functional_probe_proves_hardlink_match_and_copy_none", "whole_system_run_covers_all_children",
     "wronly_anchor_fds_refuse_reads_with_eperm"))
@@ -210,7 +217,8 @@ def selection(lane, lib_tests=None, public_cells=None, scan=True):
                                  "retained_optins": "refuse", "lifecycle_loss_reported": "refuse"},
             "lib_outcomes": {name: "own-positive-or-pid-filter-refusal" if name in MULTI_OUTCOMES else
                              "rate100-lossless-and-rate1000-disclosed" if name == CHURN else
-                             "selected-admission-and-broad-no-spill-or-whole-module-refusal" if name == BROAD else "exact-success"
+                             "selected-admission-and-broad-no-spill-or-whole-module-refusal" if name == BROAD else
+                             "all-id-positive-or-envelope-refusal" if name == BOUNDARY else "exact-success"
                              for name in libs},
             "lib_argv": ["--include-long", *libs],
             "pid_backend": {"proven": ["uprobe-multi", "kernel-pid+bpf"],
@@ -438,7 +446,42 @@ def lib_outcome(name, text):
             return "expected-refusal", "selected admission slots=" + selected[0] + "; broad " + broad[0]
         require(re.fullmatch(r"\d+ module\(s\) \d+ table\(s\) \d+ slot\(s\) spill=0 refused=\d+", broad[0]), "invalid own broad no-spill assertion")
         return "positive-coverage", "selected admission slots=" + selected[0] + "; broad " + broad[0]
+    if name == BOUNDARY:
+        return boundary_outcome(text)
     return "positive-coverage", "exact ID once, exit0, one test passed"
+
+
+def boundary_outcome(text):
+    """Strict finite classification of the T7 8192 boundary cell (G01/R7).
+
+    The cell succeeds on three disjoint outcomes: the exact all-ID
+    positive, a preflight envelope refusal, or a post-failure envelope
+    refusal. Refusals keep an explicit non-positive classification;
+    missing, duplicate or contradictory branch evidence fails.
+    """
+    refusals = re.findall(r"T7_ENVELOPE_REFUSAL cell=(\S+) n=(\d+) phase=(\S+) verdict=\"([^\n]*)\"$",
+                          text, re.M)
+    require(text.count("T7_ENVELOPE_REFUSAL") == len(refusals),
+            "malformed boundary refusal marker")
+    ledgers = re.findall(r"(?:^|\.\.\. )TASK4_LEDGER phase=after_go physical_ids=(\d+) "
+                         r"completed_calls=(\d+) first=(\d+) tail=(\d+)$", text, re.M)
+    raw_maps = re.findall(r"(?:^|\.\.\. )TASK4_RAW_MAPS phase=after_go usage_positive=(\d+) "
+                          r"exact_ids=(\d+)\.\.(\d+)$", text, re.M)
+    if refusals:
+        require(len(refusals) == 1, "missing/duplicate boundary refusal branch")
+        cell, count, phase, verdict = refusals[0]
+        require(cell == BOUNDARY_CELL and count == str(BOUNDARY_N), "boundary refusal names another cell")
+        require(phase in BOUNDARY_PHASES, "boundary refusal phase is not a finite envelope branch")
+        require(verdict.strip(), "boundary refusal verdict is empty")
+        require(not ledgers and not raw_maps, "boundary refusal contradicts positive evidence")
+        return "expected-refusal", f"cell={cell} n={count} phase={phase}"
+    require(not ledgers or len(ledgers) == 1, "duplicate boundary ledger evidence")
+    require(not raw_maps or len(raw_maps) == 1, "duplicate boundary raw-map evidence")
+    require(len(ledgers) == len(raw_maps) == 1, "boundary positive requires all-ID population evidence")
+    require(ledgers[0] == (str(BOUNDARY_N), str(BOUNDARY_N), "0", str(BOUNDARY_N - 1))
+            and raw_maps[0] == (str(BOUNDARY_N), "0", str(BOUNDARY_N - 1)),
+            "boundary positive population is not the exact all-ID set")
+    return "positive-coverage", f"all {BOUNDARY_N} IDs latched: ledger and raw-map evidence agree"
 
 
 def verify_inputs(stage, contract_path):

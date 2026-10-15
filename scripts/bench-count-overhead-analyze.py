@@ -17,13 +17,26 @@ campaign fails closed on any count mismatch already; the analysis
 re-verifies every on-arm edge count from the SAMPLE fields and refuses to
 pass otherwise.
 
+Expected shape (A:DR-T3A-13): the log must hold exactly the five M2
+cells, each with contiguous rounds 1..R (R >= 10), each round in strict
+ABBA (odd) or BAAB (even) on/off order plus exactly one trailing
+unobserved baseline. Relevant on-arm counts must be non-null integers
+(None == None is not exactness); every observed arm carries its
+independent BPF corroboration, and unobserved samples carry no observed
+evidence at all. A reduced or reshaped log renders no verdict.
+--cells/--rounds override the required shape for explicitly non-M2 reuse;
+the report then names the custom shape instead of the M2 gate.
+
 Usage:
   scripts/bench-count-overhead-analyze.py LOG [--rel-pct 5.0] [--ci-pct 10.0]
+      [--cells a,b] [--rounds N]
   scripts/bench-count-overhead-analyze.py --self-test
 
-Exit 0 prints the table and verdict. Exit 1 when a cell cannot be compared
-(samples missing for an arm, unpaired rounds, mixed attach mechanisms, or
-a count mismatch) or the log holds no samples.
+Exit 0 prints the table and verdict. Exit 1 when the shape is not the
+required campaign (missing/unexpected cells, short/noncontiguous rounds,
+scrambled ABBA order), a cell cannot be compared (unpaired rounds, mixed
+attach mechanisms, a count mismatch, missing BPF corroboration) or the
+log holds no samples.
 """
 import random
 import statistics
@@ -31,6 +44,9 @@ import sys
 
 BOOTSTRAP_SEED = 20261008
 BOOTSTRAP_REPS = 10000
+M2_CELLS = ("relevant-call-t1", "relevant-call-t4", "relevant-call-t12",
+            "relevant-call-t12-nolock", "unrelated-mmap")
+M2_ROUNDS = 10
 
 
 def parse_log(path):
@@ -163,22 +179,51 @@ def bootstrap_median_ci(deltas, seed=BOOTSTRAP_SEED, reps=BOOTSTRAP_REPS):
     return lo, hi
 
 
-def analyze(samples, rel_bar, ci_bar):
+def analyze(samples, rel_bar, ci_bar, required_cells=M2_CELLS, required_rounds=M2_ROUNDS):
     """Per-cell comparison. Returns (rows, problems).
 
     rows holds one dict per cell with on/off/unobserved summaries, the
     paired median delta with its bootstrap CI, absolute + relative
     overhead, bpf corroboration and drift; problems lists cells that
-    cannot be compared or whose gates do not re-verify.
+    cannot be compared or whose gates do not re-verify. The log must
+    hold exactly the required cells in the required ABBA/BAAB shape;
+    anything less renders no verdict.
     """
     rows = []
     problems = []
     cells = sorted({sample["cell"] for sample in samples})
+    missing = [name for name in required_cells if name not in cells]
+    extra = [name for name in cells if name not in required_cells]
+    if missing or extra:
+        problems.append(f"expected cells {list(required_cells)}: missing {missing}, "
+                        f"unexpected {extra}")
+        return rows, problems
     for cell in cells:
         cell_samples = [s for s in samples if s["cell"] == cell]
         modes = {s["mode"] for s in cell_samples}
         if len(modes) != 1:
             problems.append(f"cell {cell}: mixed modes {sorted(modes)}")
+            continue
+        mode = cell_samples[0]["mode"]
+        # Campaign shape: contiguous rounds 1..R with R >= required,
+        # each round in strict ABBA (odd) or BAAB (even) on/off order
+        # plus exactly one trailing unobserved baseline.
+        present = sorted({s["round"] for s in cell_samples})
+        if present != list(range(1, len(present) + 1)):
+            problems.append(f"cell {cell}: rounds {present} are not contiguous from 1")
+            continue
+        if len(present) < required_rounds:
+            problems.append(f"cell {cell}: {len(present)} rounds, need >= {required_rounds}")
+            continue
+        shaped = True
+        for rnd in present:
+            order = [s["arm"] for s in cell_samples if s["round"] == rnd]
+            want = ["on", "off", "off", "on"] if rnd % 2 else ["off", "on", "on", "off"]
+            if order != want + ["unobserved"]:
+                problems.append(f"cell {cell}: round {rnd} order {order} is not "
+                                f"ABBA/BAAB plus one unobserved baseline")
+                shaped = False
+        if not shaped:
             continue
         on = [unit_ns(s) for s in cell_samples if s["arm"] == "on"]
         off = [unit_ns(s) for s in cell_samples if s["arm"] == "off"]
@@ -193,29 +238,64 @@ def analyze(samples, rel_bar, ci_bar):
             problems.append(f"cell {cell}: mixed lane mechanisms {sorted(lanes)}")
             continue
         # Count-exactness re-verification: every relevant on-sample edge
-        # count must equal its expectation with state counted; every
-        # relevant off-sample must read witnessed.
-        mode = cell_samples[0]["mode"]
+        # count must be a non-null integer equal to its non-null
+        # expectation with state counted (None == None proves nothing);
+        # every relevant off-sample must read none/none witnessed; map
+        # cells and unobserved baselines must carry no observed evidence.
         for s in cell_samples:
             if s["arm"] == "unobserved":
+                if not (s["edge_state"] == "none" and s["edge_count"] is None
+                        and s["edge_expected"] is None and s["lane"] == "none"
+                        and s["bpf_ns"] is None and s["bpf_cnt"] is None):
+                    problems.append(
+                        f"cell {cell}: line {s['lineno']}: unobserved sample carries "
+                        "observed evidence"
+                    )
                 continue
             if mode == "call":
-                if s["arm"] == "on" and (
-                    s["edge_state"] != "counted" or s["edge_count"] != s["edge_expected"]
+                if s["arm"] == "on" and not (
+                    s["edge_state"] == "counted" and type(s["edge_count"]) is int
+                    and type(s["edge_expected"]) is int
+                    and s["edge_count"] == s["edge_expected"]
+                    and s["edge_expected"] > 0
                 ):
                     problems.append(
                         f"cell {cell}: line {s['lineno']}: count {s['edge_count']} "
                         f"!= expected {s['edge_expected']} ({s['edge_state']})"
                     )
-                if s["arm"] == "off" and s["edge_state"] != "witnessed":
+                if s["arm"] == "off" and not (
+                    s["edge_state"] == "witnessed" and s["edge_count"] is None
+                    and s["edge_expected"] is None
+                ):
                     problems.append(
-                        f"cell {cell}: line {s['lineno']}: off-arm state "
-                        f"{s['edge_state']}, want witnessed"
+                        f"cell {cell}: line {s['lineno']}: off-arm edge "
+                        f"{s['edge_count']}/{s['edge_expected']} {s['edge_state']}, "
+                        "want none/none witnessed"
                     )
-            elif s["edge_state"] != "none":
+            elif not (s["edge_state"] == "none" and s["edge_count"] is None
+                      and s["edge_expected"] is None):
                 problems.append(
-                    f"cell {cell}: line {s['lineno']}: map-cell edge state "
-                    f"{s['edge_state']}, want none"
+                    f"cell {cell}: line {s['lineno']}: map-cell edge "
+                    f"{s['edge_count']}/{s['edge_expected']} {s['edge_state']}, want none"
+                )
+            # Independent BPF corroboration: every observed arm carries
+            # its run-time delta; a call window with no entry firings is
+            # vacuous, while the idle map anchor may read zero.
+            ns, cnt = s["bpf_ns"], s["bpf_cnt"]
+            if ns is None or cnt is None:
+                problems.append(
+                    f"cell {cell}: line {s['lineno']}: {s['arm']}-arm BPF "
+                    "corroboration missing"
+                )
+            elif mode == "call" and not (ns > 0 and cnt > 0):
+                problems.append(
+                    f"cell {cell}: line {s['lineno']}: {s['arm']}-arm BPF run-time "
+                    f"vacuous (ns={ns} cnt={cnt})"
+                )
+            elif mode == "mmap" and not (ns >= 0 and cnt >= 0):
+                problems.append(
+                    f"cell {cell}: line {s['lineno']}: {s['arm']}-arm BPF run-time "
+                    f"invalid (ns={ns} cnt={cnt})"
                 )
         if problems and problems[-1].startswith(f"cell {cell}: line"):
             continue
@@ -286,7 +366,8 @@ def analyze(samples, rel_bar, ci_bar):
     return rows, problems
 
 
-def report(headers, rows, rel_bar, ci_bar):
+def report(headers, rows, rel_bar, ci_bar, required_cells=M2_CELLS,
+           required_rounds=M2_ROUNDS):
     """Render the comparison table plus the verdict; returns the verdict."""
     lines = []
     if "MACHINE" in headers:
@@ -297,6 +378,8 @@ def report(headers, rows, rel_bar, ci_bar):
         f"m2 bar: paired median V1-BASE <= {rel_bar:g}% of BASE observed call "
         f"cost and bootstrap 95% CI upper <= {ci_bar:g}%, 0 count errors"
     )
+    lines.append(f"required shape: cells={list(required_cells)} rounds>={required_rounds} "
+                 "order=ABBA/BAAB plus one unobserved baseline per round")
     exact = 0
     for row in rows:
         on, off = row["on"], row["off"]
@@ -352,7 +435,9 @@ def report(headers, rows, rel_bar, ci_bar):
     else:
         lines.append("OVERALL: immaterial on every cell")
     gate = "FAIL" if material else "PASS"
-    lines.append(f"M2 gate: {gate} (0 count errors across {exact} counted on-arm samples)")
+    label = "M2 gate" if (tuple(required_cells) == M2_CELLS and required_rounds == M2_ROUNDS) \
+        else f"shape gate (cells={len(required_cells)} rounds>={required_rounds})"
+    lines.append(f"{label}: {gate} (0 count errors across {exact} counted on-arm samples)")
     return "\n".join(lines) + "\n"
 
 
@@ -365,6 +450,7 @@ def main(argv):
         self_test()
         return 0
     rel_bar, ci_bar, positional = 5.0, 10.0, []
+    required_cells, required_rounds = M2_CELLS, M2_ROUNDS
     index = 0
     while index < len(args):
         if args[index] == "--rel-pct" and index + 1 < len(args):
@@ -372,6 +458,22 @@ def main(argv):
             index += 2
         elif args[index] == "--ci-pct" and index + 1 < len(args):
             ci_bar = float(args[index + 1])
+            index += 2
+        elif args[index] == "--cells" and index + 1 < len(args):
+            required_cells = tuple(name for name in args[index + 1].split(",") if name)
+            if not required_cells or len(set(required_cells)) != len(required_cells):
+                print("usage: --cells needs a comma list of distinct cell names",
+                      file=sys.stderr)
+                return 2
+            index += 2
+        elif args[index] == "--rounds" and index + 1 < len(args):
+            try:
+                required_rounds = int(args[index + 1])
+            except ValueError:
+                required_rounds = 0
+            if required_rounds < 1:
+                print("usage: --rounds needs a positive integer", file=sys.stderr)
+                return 2
             index += 2
         elif args[index].startswith("--"):
             print(f"unknown flag {args[index]}", file=sys.stderr)
@@ -382,7 +484,7 @@ def main(argv):
     if len(positional) != 1:
         print(
             "usage: bench-count-overhead-analyze.py LOG "
-            "[--rel-pct PCT] [--ci-pct PCT]",
+            "[--rel-pct PCT] [--ci-pct PCT] [--cells a,b] [--rounds N]",
             file=sys.stderr,
         )
         return 2
@@ -394,12 +496,12 @@ def main(argv):
     if not samples:
         print("no samples in the log", file=sys.stderr)
         return 1
-    rows, problems = analyze(samples, rel_bar, ci_bar)
+    rows, problems = analyze(samples, rel_bar, ci_bar, required_cells, required_rounds)
     if problems:
         for problem in problems:
             print(f"cannot compare: {problem}", file=sys.stderr)
         return 1
-    sys.stdout.write(report(headers, rows, rel_bar, ci_bar))
+    sys.stdout.write(report(headers, rows, rel_bar, ci_bar, required_cells, required_rounds))
     return 0
 
 
@@ -424,56 +526,64 @@ def self_test():
             f"bpf_cnt={base['bpf_cnt']}\n"
         )
 
-    # ABBA round (on off off on) + BAAB round, 1 thread, 1000 ns/call base.
-    log = "MACHINE kernel=7.0 test-cpu nproc=12\n"
-    log += "BINARY role=candidate path=/tmp/c sha256=aaa commit=c0ffee\n"
-    log += "BINARY role=base path=/tmp/b sha256=bbb commit=ba5e\n"
-    # Round 1 ABBA: on=1100, off=1000, off=1000, on=1100 (counted exact).
-    log += sample("relevant-call-t1", "on", 1, 1, 1000, 1100000,
-                  edge_count=1003, edge_expected=1003, edge_state="counted",
-                  bpf_ns=200000, bpf_cnt=1000)
-    log += sample("relevant-call-t1", "off", 1, 1, 1000, 1000000,
-                  edge_state="witnessed", bpf_ns=150000, bpf_cnt=1000)
-    log += sample("relevant-call-t1", "off", 1, 1, 1000, 1000000,
-                  edge_state="witnessed", bpf_ns=150000, bpf_cnt=1000)
-    log += sample("relevant-call-t1", "on", 1, 1, 1000, 1100000,
-                  edge_count=1003, edge_expected=1003, edge_state="counted",
-                  bpf_ns=200000, bpf_cnt=1000)
-    # Round 2 BAAB: off=1020, on=1120, on=1120, off=1020.
-    log += sample("relevant-call-t1", "off", 2, 1, 1000, 1020000,
-                  edge_state="witnessed", bpf_ns=150000, bpf_cnt=1000)
-    log += sample("relevant-call-t1", "on", 2, 1, 1000, 1120000,
-                  edge_count=1003, edge_expected=1003, edge_state="counted",
-                  bpf_ns=200000, bpf_cnt=1000)
-    log += sample("relevant-call-t1", "on", 2, 1, 1000, 1120000,
-                  edge_count=1003, edge_expected=1003, edge_state="counted",
-                  bpf_ns=200000, bpf_cnt=1000)
-    log += sample("relevant-call-t1", "off", 2, 1, 1000, 1020000,
-                  edge_state="witnessed", bpf_ns=150000, bpf_cnt=1000)
-    log += sample("relevant-call-t1", "unobserved", 1, 1, 1000, 900000, lane="none")
-    log += sample("relevant-call-t1", "unobserved", 2, 1, 1000, 900000, lane="none")
+    def campaign(cells, rounds, hot=True):
+        text = "MACHINE kernel=7.0 test-cpu nproc=12\n"
+        text += "BINARY role=candidate path=/tmp/c sha256=aaa commit=c0ffee\n"
+        text += "BINARY role=base path=/tmp/b sha256=bbb commit=ba5e\n"
+        for cell in cells:
+            mmap = cell == "unrelated-mmap"
+            for rnd in range(1, rounds + 1):
+                arms = ("on", "off", "off", "on") if rnd % 2 else ("off", "on", "on", "off")
+                for arm in arms:
+                    wall = 1000000
+                    if arm == "on":
+                        if hot and cell == "relevant-call-t1":
+                            wall = 1100000 if rnd % 2 else 1120000
+                        else:
+                            wall = 1010000
+                    elif rnd % 2 == 0:
+                        wall = 1020000 if (hot and cell == "relevant-call-t1") else 1000000
+                    if not mmap:
+                        edge = {"edge_count": 1003, "edge_expected": 1003,
+                                "edge_state": "counted"} if arm == "on" else {
+                                    "edge_state": "witnessed"}
+                        text += sample(cell, arm, rnd, 1, 1000, wall, **edge,
+                                       bpf_ns=200000 if arm == "on" else 150000,
+                                       bpf_cnt=1000)
+                    else:
+                        text += sample(cell, arm, rnd, 1, 1000, wall, mode="mmap",
+                                       bpf_ns=0, bpf_cnt=0)
+                text += sample(cell, "unobserved", rnd, 1, 1000, 900000, lane="none",
+                               **({"mode": "mmap"} if mmap else {}))
+        return text
+
+    log = campaign(M2_CELLS, M2_ROUNDS)
     with tempfile.TemporaryDirectory(prefix="count-analyze-") as work:
         path = os.path.join(work, "campaign.log")
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(log)
-        headers, samples, errors = parse_log(path)
+
+        def load(text):
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            return parse_log(path)
+
+        headers, samples, errors = load(log)
         assert not errors, errors
-        assert len(samples) == 10, len(samples)
+        assert len(samples) == 5 * 10 * 5, len(samples)
         assert headers["BINARY:candidate"].endswith("commit=c0ffee")
         rows, problems = analyze(samples, 5.0, 10.0)
         assert not problems, problems
-        assert len(rows) == 1
-        row = rows[0]
-        # on median 1110, off median 1010 over 4 samples each.
+        assert len(rows) == 5, len(rows)
+        row = next(r for r in rows if r["cell"] == "relevant-call-t1")
+        # Hot t1: odd rounds on=1100/off=1000, even rounds on=1120/off=1020.
         assert row["on"]["median"] == 1110.0, row["on"]
         assert row["off"]["median"] == 1010.0, row["off"]
         assert row["absolute_ns"] == 100.0, row["absolute_ns"]
-        # Pairs: r1 (1100-1000)x2, r2 (1120-1020)x2 -> median 100.
-        assert row["pairs"] == 4, row["pairs"]
+        # Pairs: 10 rounds x 2, every delta 100 -> median 100.
+        assert row["pairs"] == 20, row["pairs"]
         assert row["paired_median_ns"] == 100.0, row["paired_median_ns"]
         assert abs(row["paired_rel_pct"] - 100.0 * 100.0 / 1010.0) < 1e-9
         # Bootstrap CI is deterministic and contains the median.
-        lo2, hi2 = bootstrap_median_ci([100.0] * 4)
+        lo2, hi2 = bootstrap_median_ci([100.0] * 20)
         assert (row["ci_lo_ns"], row["ci_hi_ns"]) == (lo2, hi2)
         assert row["ci_lo_ns"] <= 100.0 <= row["ci_hi_ns"]
         # 9.9% paired median over the 5% bar reads MATERIAL.
@@ -482,48 +592,67 @@ def self_test():
         assert row["bpf"]["on"]["ns_per_event"] == 200.0
         assert row["bpf"]["off"]["ns_per_event"] == 150.0
         assert row["bare"]["median"] == 900.0
+        assert all(not r["material"] for r in rows if r["cell"] != "relevant-call-t1")
         text = report(headers, rows, 5.0, 10.0)
         assert "OVERALL: MATERIAL (relevant-call-t1)" in text, text
-        assert "M2 gate: FAIL (0 count errors across 4 counted on-arm samples)" in text, text
+        assert "M2 gate: FAIL (0 count errors across 80 counted on-arm samples)" in text, text
         # A quiet log (1% delta) reads immaterial with gate PASS.
-        quiet = log.replace("wall_ns=1100000", "wall_ns=1010000").replace(
-            "wall_ns=1120000", "wall_ns=1030000"
-        )
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(quiet)
-        _, quiet_samples, quiet_errors = parse_log(path)
+        _, quiet_samples, quiet_errors = load(campaign(M2_CELLS, M2_ROUNDS, hot=False))
         assert not quiet_errors
-        quiet_rows, _ = analyze(quiet_samples, 5.0, 10.0)
-        assert not quiet_rows[0]["material"], "1% must read immaterial"
+        quiet_rows, quiet_problems = analyze(quiet_samples, 5.0, 10.0)
+        assert not quiet_problems, quiet_problems
+        assert not any(r["material"] for r in quiet_rows), "1% must read immaterial"
         assert "M2 gate: PASS" in report(headers, quiet_rows, 5.0, 10.0)
         # Failure modes fail, never pass quietly.
-        bad_pair = log + sample("relevant-call-t1", "on", 3, 1, 1000, 1100000,
+        bad_pair = log + sample("relevant-call-t1", "on", 11, 1, 1000, 1100000,
                                 edge_count=1003, edge_expected=1003,
-                                edge_state="counted")
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(bad_pair)
-        _, bad_samples, _ = parse_log(path)
+                                edge_state="counted", bpf_ns=200000, bpf_cnt=1000)
+        _, bad_samples, _ = load(bad_pair)
         _, problems = analyze(bad_samples, 5.0, 10.0)
-        assert any("do not pair" in p for p in problems), problems
-        bad_lane = log.replace("lane=multi", "lane=singles", 1)
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(bad_lane)
-        _, lane_samples, _ = parse_log(path)
-        _, problems = analyze(lane_samples, 5.0, 10.0)
+        assert any("ABBA" in p for p in problems), problems
+        bad_lane = load(log.replace("lane=multi", "lane=singles", 1))
+        _, problems = analyze(bad_lane[1], 5.0, 10.0)
         assert any("mixed lane" in p for p in problems), problems
-        bad_count = log.replace("edge_count=1003", "edge_count=1002", 1)
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(bad_count)
-        _, count_samples, _ = parse_log(path)
-        _, problems = analyze(count_samples, 5.0, 10.0)
+        bad_count = load(log.replace("edge_count=1003", "edge_count=1002", 1))
+        _, problems = analyze(bad_count[1], 5.0, 10.0)
         assert any("!= expected" in p for p in problems), problems
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write("SAMPLE cell=x arm=maybe round=1 threads=1 ops=1 wall_ns=2 pad=0 mode=call parallel=1 lane=multi edge_count=none edge_expected=none edge_state=none bpf_ns=none bpf_cnt=none\n")
-        _, _, bad = parse_log(path)
+        # A:DR-T3A-13 controls: None exactness, reduced rounds, scrambled
+        # order, missing BPF, missing/extra cells, evidenced unobserved.
+        none_count = load(log.replace("edge_count=1003", "edge_count=none", 1).replace(
+            "edge_expected=1003", "edge_expected=none", 1))
+        _, problems = analyze(none_count[1], 5.0, 10.0)
+        assert any("!= expected" in p for p in problems), problems
+        reduced = load(campaign(M2_CELLS, 2))
+        _, problems = analyze(reduced[1], 5.0, 10.0)
+        assert any("rounds" in p for p in problems), problems
+        missing_cell = load(campaign(M2_CELLS[:4], M2_ROUNDS))
+        _, problems = analyze(missing_cell[1], 5.0, 10.0)
+        assert any("unrelated-mmap" in p for p in problems), problems
+        extra_cell = load(log + sample("rogue", "on", 1, 1, 100, 100000,
+                                        edge_count=103, edge_expected=103,
+                                        edge_state="counted", bpf_ns=1, bpf_cnt=1))
+        _, problems = analyze(extra_cell[1], 5.0, 10.0)
+        assert any("rogue" in p for p in problems), problems
+        scrambled = log.replace("cell=relevant-call-t1 arm=on round=1",
+                                "cell=relevant-call-t1 arm=off round=1", 1)
+        _, problems = analyze(load(scrambled)[1], 5.0, 10.0)
+        assert any("ABBA" in p for p in problems), problems
+        no_bpf = load(log.replace("bpf_ns=200000 bpf_cnt=1000",
+                                  "bpf_ns=none bpf_cnt=none", 1))
+        _, problems = analyze(no_bpf[1], 5.0, 10.0)
+        assert any("BPF" in p for p in problems), problems
+        evidenced_bare = load(log.replace(
+            "arm=unobserved round=1 threads=1 ops=1000 wall_ns=900000 pad=0 mode=call "
+            "parallel=1 lane=none edge_count=none edge_expected=none edge_state=none "
+            "bpf_ns=none bpf_cnt=none",
+            "arm=unobserved round=1 threads=1 ops=1000 wall_ns=900000 pad=0 mode=call "
+            "parallel=1 lane=multi edge_count=none edge_expected=none edge_state=none "
+            "bpf_ns=none bpf_cnt=none", 1))
+        _, problems = analyze(evidenced_bare[1], 5.0, 10.0)
+        assert any("unobserved" in p for p in problems), problems
+        _, _, bad = load("SAMPLE cell=x arm=maybe round=1 threads=1 ops=1 wall_ns=2 pad=0 mode=call parallel=1 lane=multi edge_count=none edge_expected=none edge_state=none bpf_ns=none bpf_cnt=none\n")
         assert bad, "a bad arm must be reported"
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write("MACHINE nothing here\n")
-        _, empty, _ = parse_log(path)
+        _, empty, _ = load("MACHINE nothing here\n")
         assert not empty
     print("bench-count-overhead-analyze self-test: OK")
 

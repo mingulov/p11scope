@@ -46,9 +46,12 @@
 # a pass, so endpoint probes are attached), exact workload op count +
 # shape, observer exit 0, no "attach failed", no "count refresh:"
 # failures, BPF entry-program set identical across the window with
-# monotone run-time counters, and the count-exactness gate: the on-arm
-# edge reads counted with exactly TOTAL+2*THREADS+1 (0 error), the off-arm
-# edge reads witnessed. BPF run-time deltas (kernel.bpf_stats_enabled,
+# monotone run-time counters and strictly advancing entry firings on
+# call cells (the idle map anchor may read zero), and the
+# count-exactness gate: the on-arm edge reads counted non-lossy with
+# exactly TOTAL+2*THREADS+1 (0 error), the off-arm edge reads witnessed
+# with a null lossy flag, and every map-cell edge reads zero calls.
+# BPF run-time deltas (kernel.bpf_stats_enabled,
 # set for the campaign and restored after) corroborate the workload-side
 # numbers independently; the verdict math lives in
 # scripts/bench-count-overhead-analyze.py, which also runs standalone on
@@ -124,6 +127,88 @@ is_positive_int() {
     [ "$1" -gt 0 ]
 }
 
+# check_counted DIR OPS THREADS: the on-arm exactness gate. inventory.json
+# must hold exactly one SoftHSM2 edge reading counted with exactly
+# OPS+2*THREADS+1, explicitly non-lossy and unsaturated. Prints
+# "<count> counted".
+check_counted() {
+    python3 -I - "$1/inventory.json" "$2" "$3" <<'EOF'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+ops, threads = int(sys.argv[2]), int(sys.argv[3])
+lanes = doc.get("observation", {}).get("lane", None)
+if lanes != "native":
+    sys.exit(f"lane is {lanes!r}, want native")
+soft = [m.get("id") for m in doc.get("modules", [])
+        if any("softhsm" in str(p).lower() or "libsofthsm2" in str(p)
+               for p in m.get("paths", []))]
+if len(soft) != 1:
+    sys.exit(f"want exactly 1 softhsm module, have {len(soft)}")
+edges = [e for e in doc.get("edges", []) if e.get("module") == soft[0]]
+if len(edges) != 1:
+    sys.exit(f"want exactly 1 softhsm edge, have {len(edges)}")
+entries = edges[0].get("entries", {})
+coverage = entries.get("coverage", {})
+state = coverage.get("state")
+want = ops + 2 * threads + 1
+if state != "counted":
+    sys.exit(f"edge state is {state!r}, want counted")
+if coverage.get("lossy") is not False:
+    sys.exit(f"edge lossy is {coverage.get('lossy')!r}, want false")
+if entries.get("count") != want:
+    sys.exit(f"edge count {entries.get('count')} != {want} (ops={ops} threads={threads})")
+if entries.get("saturated"):
+    sys.exit("edge saturated")
+print(f"{want} counted")
+EOF
+}
+
+# check_witnessed DIR: the off-arm gate. Exactly one SoftHSM2 edge reading
+# witnessed with a null lossy flag (witnessed carries no count feed).
+# Prints "none witnessed".
+check_witnessed() {
+    python3 -I - "$1/inventory.json" <<'EOF'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+lanes = doc.get("observation", {}).get("lane", None)
+if lanes != "native":
+    sys.exit(f"lane is {lanes!r}, want native")
+soft = [m.get("id") for m in doc.get("modules", [])
+        if any("softhsm" in str(p).lower() or "libsofthsm2" in str(p)
+               for p in m.get("paths", []))]
+if len(soft) != 1:
+    sys.exit(f"want exactly 1 softhsm module, have {len(soft)}")
+edges = [e for e in doc.get("edges", []) if e.get("module") == soft[0]]
+if len(edges) != 1:
+    sys.exit(f"want exactly 1 softhsm edge, have {len(edges)}")
+entries = edges[0].get("entries", {})
+coverage = entries.get("coverage", {})
+state = coverage.get("state")
+if state != "witnessed":
+    sys.exit(f"edge state is {state!r}, want witnessed")
+if coverage.get("lossy") is not None:
+    sys.exit(f"edge lossy is {coverage.get('lossy')!r}, want null")
+print("none witnessed")
+EOF
+}
+
+# check_native_lane DIR: the unrelated-cell gate. The idle anchor makes no
+# calls, so the lane must be native and every edge must read zero calls.
+check_native_lane() {
+    python3 -I - "$1/inventory.json" <<'EOF'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+lanes = doc.get("observation", {}).get("lane", None)
+if lanes != "native":
+    sys.exit(f"lane is {lanes!r}, want native")
+for edge in doc.get("edges", []):
+    count = edge.get("entries", {}).get("count", 0)
+    if count != 0:
+        sys.exit(f"idle anchor edge {edge.get('module')} counted {count} calls")
+print("none none")
+EOF
+}
+
 if [ "${1-}" = "--self-test" ]; then
     [ "$#" -eq 1 ] || { echo "usage: $0 [--self-test]" >&2; exit 2; }
     # Unprivileged: fixture compiles + exact-count smokes + usage
@@ -148,9 +233,20 @@ if [ "${1-}" = "--self-test" ]; then
         for pad in 0 1; do
             ST_LINE=$("$SELF_TEST_WORK/mt_count" "$MODULE" 2 1 "$SELF_TEST_WORK/gate-open" "$pad") \
                 || { echo "self-test: mt_count pad=$pad failed" >&2; exit 1; }
-            case $ST_LINE in "READY pid="*"MT_COUNT ops="*" wall_ns="*" threads=2 pad=$pad") : ;; *)
+            case $ST_LINE in "READY pid="*"MT_COUNT ops="*" wall_ns="*" threads=2 pad=$pad"*) : ;; *)
                 echo "self-test: bad mt_count line: $ST_LINE" >&2; exit 1 ;;
             esac
+            printf '%s\n' "$ST_LINE" | python3 -I -c "
+import sys
+for line in sys.stdin:
+    if line.startswith('MT_COUNT '):
+        fields = dict(token.split('=', 1) for token in line.split()[1:])
+        assert int(fields['ops']) == int(fields['attempts']) > 0, fields
+        assert int(fields['failed']) == 0, fields
+        break
+else:
+    sys.exit('no MT_COUNT line')
+" || { echo "self-test: mt_count attempts/failed mismatch: $ST_LINE" >&2; exit 1; }
         done
         if "$SELF_TEST_WORK/mt_count" "$MODULE" 0 1 "$SELF_TEST_WORK/gate-open" 0 >/dev/null 2>&1; then
             echo "self-test: zero threads accepted" >&2; exit 1
@@ -168,6 +264,64 @@ if [ "${1-}" = "--self-test" ]; then
     case $ST_LINE in "MAP_CHURN ops=2000 wall_ns="*" mode=mmap") : ;; *)
         echo "self-test: bad mmap line: $ST_LINE" >&2; exit 1 ;;
     esac
+    # Deterministic gate controls over synthetic inventory.json
+    # fixtures: every gate passes its healthy shape and fails each
+    # corrupted one (A:DR-T3A-13 loss/BPF/map validity).
+    ST_GATE_OK=0
+    st_gate() {
+        # st_gate EXPECT NAME CMD... : EXPECT is pass or fail.
+        st_expect=$1; shift 2
+        if "$@" >"$SELF_TEST_WORK/gate.out" 2>&1; then st_rc=0; else st_rc=$?; fi
+        if { [ "$st_expect" = pass ] && [ "$st_rc" -eq 0 ]; } \
+            || { [ "$st_expect" = fail ] && [ "$st_rc" -ne 0 ]; }; then
+            ST_GATE_OK=$((ST_GATE_OK + 1))
+        else
+            echo "self-test: gate $* expected $st_expect, got rc=$st_rc:" >&2
+            cat "$SELF_TEST_WORK/gate.out" >&2; exit 1
+        fi
+    }
+    st_inventory() {
+        # st_inventory DIR STATE COUNT LOSSY LANE: one SoftHSM2 edge.
+        mkdir -p "$SELF_TEST_WORK/$1"
+        python3 -I - "$SELF_TEST_WORK/$1/inventory.json" "$2" "$3" "$4" "$5" <<'EOF'
+import json, sys
+path, state, count, lossy, lane = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+json.dump({"observation": {"lane": lane},
+           "modules": [{"id": "m0", "paths": ["/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"]}],
+           "edges": [{"module": "m0",
+                      "entries": {"count": int(count),
+                                  "saturated": False,
+                                  "coverage": {"state": state,
+                                               "lossy": {"true": True, "false": False,
+                                                         "null": None}[lossy]}}}]},
+          open(path, "w"))
+EOF
+    }
+    # check_counted: ops=100 threads=2 wants exactly 105.
+    st_inventory counted-ok counted 105 false native
+    st_gate pass counted-ok check_counted "$SELF_TEST_WORK/counted-ok" 100 2
+    for shape in "witnessed 105 false native" "counted 104 false native" \
+            "counted 105 true native" "counted 105 null native" \
+            "counted 105 false scan"; do
+        # shellcheck disable=SC2086
+        st_inventory counted-bad $shape
+        st_gate fail counted-bad check_counted "$SELF_TEST_WORK/counted-bad" 100 2
+    done
+    st_inventory witnessed-ok witnessed 0 null native
+    st_gate pass witnessed-ok check_witnessed "$SELF_TEST_WORK/witnessed-ok"
+    for shape in "counted 0 null native" "witnessed 0 false native" \
+            "witnessed 0 true native" "witnessed 0 null scan"; do
+        # shellcheck disable=SC2086
+        st_inventory witnessed-bad $shape
+        st_gate fail witnessed-bad check_witnessed "$SELF_TEST_WORK/witnessed-bad"
+    done
+    st_inventory anchor-ok unknown 0 null native
+    st_gate pass anchor-ok check_native_lane "$SELF_TEST_WORK/anchor-ok"
+    st_inventory anchor-bad counted 7 false native
+    st_gate fail anchor-bad check_native_lane "$SELF_TEST_WORK/anchor-bad"
+    st_inventory anchor-lane unknown 0 null scan
+    st_gate fail anchor-lane check_native_lane "$SELF_TEST_WORK/anchor-lane"
+    [ "$ST_GATE_OK" -eq 14 ] || { echo "self-test: ran $ST_GATE_OK gate controls, want 14" >&2; exit 1; }
     python3 -I scripts/bench-count-overhead-analyze.py --self-test \
         || { echo "self-test: analyzer self-test failed" >&2; exit 1; }
     echo "bench-count-overhead self-test: OK"
@@ -548,75 +702,6 @@ stop_observer() {
     reclaim_root_output "$so_dir/events.jsonl"
 }
 
-# check_counted DIR OPS THREADS: the on-arm exactness gate. inventory.json
-# must hold exactly one SoftHSM2 edge reading counted with exactly
-# OPS+2*THREADS+1 and unsaturated. Prints "<count> counted".
-check_counted() {
-    python3 -I - "$1/inventory.json" "$2" "$3" <<'EOF'
-import json, sys
-doc = json.load(open(sys.argv[1]))
-ops, threads = int(sys.argv[2]), int(sys.argv[3])
-lanes = doc.get("observation", {}).get("lane", None)
-if lanes != "native":
-    sys.exit(f"lane is {lanes!r}, want native")
-soft = [m.get("id") for m in doc.get("modules", [])
-        if any("softhsm" in str(p).lower() or "libsofthsm2" in str(p)
-               for p in m.get("paths", []))]
-if len(soft) != 1:
-    sys.exit(f"want exactly 1 softhsm module, have {len(soft)}")
-edges = [e for e in doc.get("edges", []) if e.get("module") == soft[0]]
-if len(edges) != 1:
-    sys.exit(f"want exactly 1 softhsm edge, have {len(edges)}")
-entries = edges[0].get("entries", {})
-state = entries.get("coverage", {}).get("state")
-want = ops + 2 * threads + 1
-if state != "counted":
-    sys.exit(f"edge state is {state!r}, want counted")
-if entries.get("count") != want:
-    sys.exit(f"edge count {entries.get('count')} != {want} (ops={ops} threads={threads})")
-if entries.get("saturated"):
-    sys.exit("edge saturated")
-print(f"{want} counted")
-EOF
-}
-
-# check_witnessed DIR: the off-arm gate. Exactly one SoftHSM2 edge reading
-# witnessed. Prints "none witnessed".
-check_witnessed() {
-    python3 -I - "$1/inventory.json" <<'EOF'
-import json, sys
-doc = json.load(open(sys.argv[1]))
-lanes = doc.get("observation", {}).get("lane", None)
-if lanes != "native":
-    sys.exit(f"lane is {lanes!r}, want native")
-soft = [m.get("id") for m in doc.get("modules", [])
-        if any("softhsm" in str(p).lower() or "libsofthsm2" in str(p)
-               for p in m.get("paths", []))]
-if len(soft) != 1:
-    sys.exit(f"want exactly 1 softhsm module, have {len(soft)}")
-edges = [e for e in doc.get("edges", []) if e.get("module") == soft[0]]
-if len(edges) != 1:
-    sys.exit(f"want exactly 1 softhsm edge, have {len(edges)}")
-state = edges[0].get("entries", {}).get("coverage", {}).get("state")
-if state != "witnessed":
-    sys.exit(f"edge state is {state!r}, want witnessed")
-print("none witnessed")
-EOF
-}
-
-# check_native_lane DIR: the unrelated-cell gate. The idle anchor makes no
-# calls, so no counted edge is owed; the lane must be native and clean.
-check_native_lane() {
-    python3 -I - "$1/inventory.json" <<'EOF'
-import json, sys
-doc = json.load(open(sys.argv[1]))
-lanes = doc.get("observation", {}).get("lane", None)
-if lanes != "native":
-    sys.exit(f"lane is {lanes!r}, want native")
-print("none none")
-EOF
-}
-
 # run_call_sample CELL ARM ROUND: one gated mt_count window under an
 # observed (on/off) or unobserved capture. Any gate failure fails the
 # campaign; only a persistently hot host refuses it (exit 3).
@@ -666,6 +751,10 @@ run_call_sample() {
         rs_bns1=${rs_bpf_after% *} rs_bcnt1=${rs_bpf_after#* }
         [ "$rs_bns1" -ge "$rs_bns0" ] && [ "$rs_bcnt1" -ge "$rs_bcnt0" ] \
             || { echo "bpf counters went backwards" >&2; return 1; }
+        # A call window ran thousands of observed calls: entry firings
+        # must strictly advance, or the corroboration is vacuous.
+        [ "$rs_bcnt1" -gt "$rs_bcnt0" ] \
+            || { echo "bpf entry firings did not advance over $rs_ops calls" >&2; return 1; }
         rs_bpf_ns=$((rs_bns1 - rs_bns0)) rs_bpf_cnt=$((rs_bcnt1 - rs_bcnt0))
         stop_observer "$S" || return 1
         if [ "$rs_arm" = on ]; then

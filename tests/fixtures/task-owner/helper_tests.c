@@ -1497,7 +1497,8 @@ static void object_producer_cleanup_result_reaches_exec_exit_fault(void)
  * every refusal arm attempts the checked removal before returning, image
  * refusal faults, the reserve arm faults exactly when its cleanup fails,
  * and the emission case retires through the real removal under each
- * per-stage (`fill/tail/find`) outcome. Models the object arm only:
+ * per-stage (`fill/tail/find`, plus the trivially-true Get stage on the
+ * non-Get rows used here) outcome. Models the object arm only:
  * callers guarantee a required object call with a live START, exactly
  * the state the root holds at the object-arm entry (ordinary calls leave
  * at the aggregate arm; the Rust pin keeps their accounting-only image
@@ -1539,10 +1540,13 @@ static unsigned root_return_mirror(const struct owner_start_key *key, u32 descri
         return 0;
     }
     {
-        /* Production chains the three emission stages (`filled && tailed
+        /* Production chains the four emission stages (`filled && tailed
          * && emitted`) and evaluates the retirement independently of the
          * chain: a failed stage still retires owned state, and any
-         * failure faults without a success claim. */
+         * failure faults without a success claim. The fourth stage (Get
+         * result establishment) succeeds trivially on every vector here
+         * (all rows are non-Get actions), so the three staged inputs
+         * below compute the exact chained verdict. */
         int emitted = fill_ok && tail_ok && find_ok;
         long retired = p11_owner_start_remove(key, 1);
         if (!emitted || retired) {

@@ -574,6 +574,22 @@ fn continuity_of(
     }
 }
 
+/// Every production attribute read must be a read the oracle also
+/// performs: the production path may read less (nothing, while E4 is
+/// unwired) but never more. Guards a wired E4 against over-reading.
+fn assert_reads_subset(
+    prod: &std::cell::RefCell<adapter::FakeTarget>,
+    oracle: &std::cell::RefCell<adapter::FakeTarget>,
+    what: &str,
+) {
+    for entry in prod.borrow().log().iter() {
+        assert!(
+            oracle.borrow().log().contains(entry),
+            "{what}: production read {entry:?} is outside the oracle set"
+        );
+    }
+}
+
 fn pin_continuity_gate_precedes_fills() {
     let source = bpf_source();
     let returned = source_between(
@@ -1161,27 +1177,12 @@ fn object_return_gate_and_custody_refuse_without_reads() {
     }
 }
 
-/// H7-E4 BPF attribute-path mirror. The CURRENT BPF adapters inspect no
-/// template (entry) and run no Get protocol (return): present pairs stay
-/// zero and `object_tail_fill` marks them UNINSPECTED (see
-/// `object_producer_uninspected_lists_carry_marker`, which pins that
-/// marking). This mirror reproduces that observable wire behavior; the
-/// tests below run the REAL shared protocol on the same vectors as the
-/// oracle and require the adapter path to match it cell for cell. RED
-/// while the adapters emit UNINSPECTED-only transport.
-fn run_bpf_attributes_mirror() -> p11scope_ebpf_common::object_capture::AttributeListOutcome {
-    use p11scope_ebpf_common::object_capture::{AttrCell, AttributeListOutcome, attr_list_flag};
-    AttributeListOutcome {
-        cells: [AttrCell {
-            kind: 0,
-            status: 0,
-            value: 0,
-        }; 8],
-        inspected: 0,
-        flags: attr_list_flag::UNINSPECTED,
-        object_flags: 0,
-    }
-}
+/// H7-E4 production attribute paths (see `object_flow` seams). The tests
+/// below run the REAL shared protocol on each vector as the oracle (with
+/// independent literal expectations) and require the PRODUCTION path —
+/// same vectors, same readers — to match it cell for cell. RED while the
+/// production path is unwired (zero reads, zero cells); a budgeted E4
+/// implements the seams and flips these tests with no fixture change.
 
 fn program_attr_slot(
     target: &std::cell::RefCell<adapter::FakeTarget>,
@@ -1233,12 +1234,74 @@ fn program_six_field_template(
         .set_bytes(values + 0x70, &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x23]);
 }
 
-/// G05/E4: the real adapter path captures all six attribute fields, not
-/// UNINSPECTED-only transport. Creation-request and GetAttributeValue
-/// vectors on LP64/ia32 must yield nonempty finite cells for class, key
-/// type, token, value length, modulus bits and all three curves, with
-/// distinct pair templates and no promotion of requests to established
-/// results.
+/// Today's production attribute transport, executed through the
+/// production tail adapter: entry leaves request state zero (no
+/// inspection runs), so present pairs carry the honest UNINSPECTED
+/// marking with zero cells, the Get result list is marked UNINSPECTED,
+/// and absent pairs stay all-zero. This pins the transport the G05 RED
+/// tests below require E4 to replace with inspected cells.
+#[test]
+fn object_attributes_uninspected_marking_is_production() {
+    use p11scope_ebpf_common::ARG_NONE;
+    use p11scope_ebpf_common::LinuxLayout;
+    use p11scope_ebpf_common::object_capture::attr_list_flag;
+    use p11scope_ebpf_common::object_flow::adapter_tail_fill;
+    use p11scope_ebpf_common::object_wire::{
+        OBJECT_ACTION_CREATE, OBJECT_ACTION_GET, OBJECT_LAYOUT_ILP32, OBJECT_LAYOUT_LP64,
+        ObjectAttributeListWire, ObjectCallWire,
+    };
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        // Present pair 0, absent pair 1: the entry leaves every
+        // request word zero (E4 unwired).
+        let mut row = harness_row(23, OBJECT_ACTION_CREATE, [5, ARG_NONE]);
+        row.template_args = [2, 3, ARG_NONE, ARG_NONE];
+        let mut side = ready_side(23);
+        side.phase = 3;
+        side.layout = if layout == LinuxLayout::Lp64 {
+            OBJECT_LAYOUT_LP64
+        } else {
+            OBJECT_LAYOUT_ILP32
+        };
+        let mut tail = ObjectCallWire::default();
+        let tailed = unsafe { adapter_tail_fill(&mut tail as *mut _, Some(&side), 23, Some(&row)) };
+        assert!(tailed, "{layout:?} production tail fills");
+        assert_eq!(tail.requested[0].flags, attr_list_flag::UNINSPECTED);
+        assert_eq!(tail.requested[0].inspected, 0);
+        assert!(
+            tail.requested[0].cells == [ObjectAttributeListWire::default().cells[0]; 8],
+            "{layout:?} present pair carries zero cells"
+        );
+        assert!(
+            tail.requested[1] == ObjectAttributeListWire::default(),
+            "{layout:?} absent pair stays all-zero"
+        );
+        // A Get tail marks its result list UNINSPECTED rather than
+        // claiming an inspected-empty result.
+        let get_row = harness_row(23, OBJECT_ACTION_GET, [ARG_NONE, ARG_NONE]);
+        let mut tail = ObjectCallWire::default();
+        let tailed =
+            unsafe { adapter_tail_fill(&mut tail as *mut _, Some(&side), 23, Some(&get_row)) };
+        assert!(tailed, "{layout:?} production Get tail fills");
+        assert_eq!(tail.result_attributes.flags, attr_list_flag::UNINSPECTED);
+        assert_eq!(tail.result_attributes.inspected, 0);
+        assert!(
+            tail.result_attributes
+                == ObjectAttributeListWire {
+                    flags: attr_list_flag::UNINSPECTED,
+                    ..ObjectAttributeListWire::default()
+                },
+            "{layout:?} Get result list is marked-only"
+        );
+    }
+}
+
+/// G05/E4: the production attribute path captures all six attribute
+/// fields, not UNINSPECTED-only transport. Creation-request and
+/// GetAttributeValue vectors on LP64/ia32 must yield nonempty finite
+/// cells for class, key type, token, value length, modulus bits and all
+/// three curves, with distinct pair templates and no promotion of
+/// requests to established results. RED while the production seams are
+/// unwired (zero reads, zero cells vs the oracle's VALUE cells).
 #[test]
 #[ignore = "RED: H7-E4 budgeted attribute capture pending"]
 fn object_attributes_real_adapter_six_fields() {
@@ -1247,13 +1310,19 @@ fn object_attributes_real_adapter_six_fields() {
         GetEntryState, attr_kind, attr_list_flag, attr_status, capture_get_entry,
         capture_get_return, inspect_request_template,
     };
+    use p11scope_ebpf_common::object_flow::{
+        production_capture_get_entry, production_capture_get_return,
+        production_inspect_request_template,
+    };
     for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
         let w = layout.word_bytes() as u64;
-        // Creation request: the oracle proves the vectors valid, then the
-        // adapter path must match the oracle cell for cell.
-        let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
-        program_six_field_template(&target, 0x40000, 0x50000, w);
-        let (reader, bytes) = adapter::readers(&target);
+        // Creation request: the oracle proves the vectors valid (with
+        // independent literal expectations) on its own target, then the
+        // PRODUCTION path on an identically programmed target must match
+        // the oracle cell for cell while reading only what it reads.
+        let oracle_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        program_six_field_template(&oracle_target, 0x40000, 0x50000, w);
+        let (reader, bytes) = adapter::readers(&oracle_target);
         let expected = inspect_request_template(0x40000, 8, None, layout, reader, bytes);
         assert_eq!(expected.inspected, 8, "{layout:?} oracle inspects eight");
         assert_eq!(
@@ -1291,27 +1360,50 @@ fn object_attributes_real_adapter_six_fields() {
             [3, 0x1f, 1, 32, 2048, 1, 2, 3],
             "{layout:?} oracle values are the finite codes"
         );
-        let actual = run_bpf_attributes_mirror();
+        let prod_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        program_six_field_template(&prod_target, 0x40000, 0x50000, w);
+        let (reader, bytes) = adapter::readers(&prod_target);
+        let actual = production_inspect_request_template(0x40000, 8, None, layout, reader, bytes);
+        assert_reads_subset(
+            &prod_target,
+            &oracle_target,
+            &format!("{layout:?} creation-request inspection"),
+        );
         assert_eq!(
             actual.cells, expected.cells,
-            "{layout:?} the entry adapter path must capture the six fields, not UNINSPECTED"
+            "{layout:?} the production entry path must capture the six fields, not UNINSPECTED"
         );
         assert_eq!(
             actual.inspected, expected.inspected,
-            "{layout:?} the entry adapter path must report its inspection"
+            "{layout:?} the production entry path must report its inspection"
         );
-        // GetAttributeValue return: entry retains headers, return
-        // establishes the same six fields.
-        let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
-        program_six_field_template(&target, 0x40000, 0x50000, w);
-        let mut state = GetEntryState::default();
-        let (reader, _) = adapter::readers(&target);
-        let entry = capture_get_entry(0x40000, 8, layout, &mut state, reader);
-        assert_eq!(entry.inspected, 8, "{layout:?} Get entry inspects eight");
-        assert_eq!(entry.slot_count, 8, "{layout:?} Get entry retains eight");
-        let (reader, bytes) = adapter::readers(&target);
+        // GetAttributeValue return: the production entry retains headers
+        // and the production return establishes the same six fields.
+        let oracle_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        program_six_field_template(&oracle_target, 0x40000, 0x50000, w);
+        let mut oracle_state = GetEntryState::default();
+        let (reader, _) = adapter::readers(&oracle_target);
+        let oracle_entry = capture_get_entry(0x40000, 8, layout, &mut oracle_state, reader);
+        assert_eq!(
+            oracle_entry.inspected, 8,
+            "{layout:?} Get oracle entry inspects eight"
+        );
+        assert_eq!(
+            oracle_entry.slot_count, 8,
+            "{layout:?} Get oracle entry retains eight"
+        );
+        let prod_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        program_six_field_template(&prod_target, 0x40000, 0x50000, w);
+        let mut prod_state = GetEntryState::default();
+        let (reader, _) = adapter::readers(&prod_target);
+        let prod_entry = production_capture_get_entry(0x40000, 8, layout, &mut prod_state, reader);
+        assert_eq!(
+            prod_entry, oracle_entry,
+            "{layout:?} the production Get entry must retain headers"
+        );
+        let (reader, bytes) = adapter::readers(&oracle_target);
         let expected = capture_get_return(
-            &state,
+            &oracle_state,
             adapter::rv_ok(),
             adapter::owner_ready_authority(),
             layout,
@@ -1326,10 +1418,23 @@ fn object_attributes_real_adapter_six_fields() {
                 "{layout:?} Get oracle cell {i} is VALUE"
             );
         }
-        let actual = run_bpf_attributes_mirror();
+        let (reader, bytes) = adapter::readers(&prod_target);
+        let actual = production_capture_get_return(
+            &prod_state,
+            adapter::rv_ok(),
+            adapter::owner_ready_authority(),
+            layout,
+            reader,
+            bytes,
+        );
+        assert_reads_subset(
+            &prod_target,
+            &oracle_target,
+            &format!("{layout:?} GetAttributeValue inspection"),
+        );
         assert_eq!(
             actual.cells, expected.cells,
-            "{layout:?} the Get return adapter path must establish the six fields"
+            "{layout:?} the production Get return must establish the six fields"
         );
         // Pair separation: a second template keeps its own cells while
         // the peer's headers (not values) are re-read for alias checks.
@@ -1377,11 +1482,13 @@ fn object_attributes_real_adapter_six_fields() {
     }
 }
 
-/// G05/E4: the real adapter path refuses before unsafe reads. Unknown
-/// and excluded selectors authorize no pointer/length reads; rejected
-/// cells carry finite status while usable disjoint neighbors survive;
-/// SetAttributeValue authorizes zero template reads under the approved
-/// policy.
+/// G05/E4: the production attribute path refuses before unsafe reads.
+/// Unknown and excluded selectors authorize no pointer/length reads;
+/// rejected cells carry finite status while usable disjoint neighbors
+/// survive; SetAttributeValue authorizes zero template reads under the
+/// approved policy. Contamination vectors are representable on their
+/// layout (a 64-bit-only vector cannot arrive through a four-byte read).
+/// RED while the production seams are unwired.
 #[test]
 #[ignore = "RED: H7-E4 budgeted attribute capture pending"]
 fn object_attributes_refuse_before_unsafe_read() {
@@ -1389,71 +1496,115 @@ fn object_attributes_refuse_before_unsafe_read() {
     use p11scope_ebpf_common::object_capture::{
         DeriveEntry, attr_kind, attr_status, authorize_entry_templates, inspect_request_template,
     };
+    use p11scope_ebpf_common::object_flow::production_inspect_request_template;
     let set_fn: u32 = pkcs11_module::FUNCTION_NAMES
         .iter()
         .position(|name| *name == "C_SetAttributeValue")
         .expect("C_SetAttributeValue exists") as u32;
     for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
         let w = layout.word_bytes() as u64;
+        // The fixture enforces target width: high bits programmed on a
+        // four-byte target never reach the reader.
+        if layout == LinuxLayout::Ilp32 {
+            let width = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+            width.borrow_mut().set_word(0x90000, 0x1_0000_0021);
+            assert_eq!(width.borrow_mut().read_word(0x90000), Ok(0x21));
+        }
         // Unknown and excluded selectors: no pointer/length reads, the
-        // secret sentinel behind them unread, all-zero cells.
+        // secret sentinel behind them unread, all-zero cells. The
+        // full-width vector is LP64-only; ia32 uses the representable
+        // high-bit refusal.
+        let contamination = if layout == LinuxLayout::Lp64 {
+            0x1_0000_0000u64
+        } else {
+            0x8000_0000u64
+        };
         for (name, selector) in [
             ("unknown selector", 0xdead_beefu64),
             ("excluded CKA_ID", 0x0102u64),
-            ("full-width contamination", 0x1_0000_0000u64),
+            ("full-width contamination", contamination),
         ] {
-            let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
-            program_attr_slot(&target, 0x40000, 0, w, selector, 0x50000, w);
-            target.borrow_mut().set_word(0x50000, 0x5ec4e7);
+            let oracle_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+            program_attr_slot(&oracle_target, 0x40000, 0, w, selector, 0x50000, w);
+            oracle_target.borrow_mut().set_word(0x50000, 0x5ec4e7);
             let slot = 0x40000;
-            let (reader, bytes) = adapter::readers(&target);
-            let outcome = inspect_request_template(0x40000, 1, None, layout, reader, bytes);
+            let (reader, bytes) = adapter::readers(&oracle_target);
+            let expected = inspect_request_template(0x40000, 1, None, layout, reader, bytes);
             assert_eq!(
                 (
-                    outcome.cells[0].kind,
-                    outcome.cells[0].status,
-                    outcome.cells[0].value
+                    expected.cells[0].kind,
+                    expected.cells[0].status,
+                    expected.cells[0].value
                 ),
                 (0, 0, 0),
                 "{layout:?} {name} leaves an all-zero cell"
             );
             assert_eq!(
-                target.borrow().reads_of(slot + w),
+                oracle_target.borrow().reads_of(slot + w),
                 0,
                 "{layout:?} {name} reads no pointer field"
             );
             assert_eq!(
-                target.borrow().reads_of(slot + 2 * w),
+                oracle_target.borrow().reads_of(slot + 2 * w),
                 0,
                 "{layout:?} {name} reads no length field"
             );
             assert_eq!(
-                target.borrow().reads_of(0x50000),
+                oracle_target.borrow().reads_of(0x50000),
                 0,
                 "{layout:?} {name} reads no secret value"
             );
+            // The production path agrees with the silent oracle here
+            // (and must keep agreeing once E4 wires it: no over-read).
+            let prod_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+            program_attr_slot(&prod_target, 0x40000, 0, w, selector, 0x50000, w);
+            prod_target.borrow_mut().set_word(0x50000, 0x5ec4e7);
+            let (reader, bytes) = adapter::readers(&prod_target);
+            let actual =
+                production_inspect_request_template(0x40000, 1, None, layout, reader, bytes);
+            assert_reads_subset(
+                &prod_target,
+                &oracle_target,
+                &format!("{layout:?} {name} inspection"),
+            );
+            assert_eq!(
+                actual.cells[0], expected.cells[0],
+                "{layout:?} {name}: the production path stays silent"
+            );
         }
         // A rejected cell carries finite status while its usable
-        // disjoint neighbor survives as VALUE.
-        let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
-        program_attr_slot(&target, 0x40000, 0, w, 0x0001, 0x50000, 2);
-        target.borrow_mut().set_bytes(0x50000, &[1, 0]);
-        program_attr_slot(&target, 0x40000, 1, w, 0x0000, 0x50010, w);
-        target.borrow_mut().set_word(0x50010, 4);
-        let (reader, bytes) = adapter::readers(&target);
+        // disjoint neighbor survives as VALUE. The production path must
+        // match the oracle on both.
+        let oracle_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        program_attr_slot(&oracle_target, 0x40000, 0, w, 0x0001, 0x50000, 2);
+        oracle_target.borrow_mut().set_bytes(0x50000, &[1, 0]);
+        program_attr_slot(&oracle_target, 0x40000, 1, w, 0x0000, 0x50010, w);
+        oracle_target.borrow_mut().set_word(0x50010, 4);
+        let (reader, bytes) = adapter::readers(&oracle_target);
         let expected = inspect_request_template(0x40000, 2, None, layout, reader, bytes);
         assert_eq!(expected.cells[0].kind, attr_kind::TOKEN);
         assert_eq!(expected.cells[0].status, attr_status::INVALID_LENGTH);
         assert_eq!(expected.cells[1].status, attr_status::VALUE);
         assert_eq!(expected.cells[1].value, 4);
-        let actual = run_bpf_attributes_mirror();
+        let prod_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        program_attr_slot(&prod_target, 0x40000, 0, w, 0x0001, 0x50000, 2);
+        prod_target.borrow_mut().set_bytes(0x50000, &[1, 0]);
+        program_attr_slot(&prod_target, 0x40000, 1, w, 0x0000, 0x50010, w);
+        prod_target.borrow_mut().set_word(0x50010, 4);
+        let (reader, bytes) = adapter::readers(&prod_target);
+        let actual = production_inspect_request_template(0x40000, 2, None, layout, reader, bytes);
+        assert_reads_subset(
+            &prod_target,
+            &oracle_target,
+            &format!("{layout:?} neighbor inspection"),
+        );
         assert_eq!(
             actual.cells[1], expected.cells[1],
-            "{layout:?} the adapter path must keep the usable neighbor"
+            "{layout:?} the production path must keep the usable neighbor"
         );
         assert_eq!(
             actual.cells[0], expected.cells[0],
-            "{layout:?} the adapter path must carry the finite rejection"
+            "{layout:?} the production path must carry the finite rejection"
         );
         // SetAttributeValue is an invalidation/control call: zero
         // template reads under the approved policy.

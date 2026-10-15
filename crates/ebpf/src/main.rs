@@ -3955,6 +3955,10 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         let descriptor = cookie_descriptor(cookie_of(&ctx));
         let ready = unsafe { p11_object_side_get(&key, descriptor, 1).as_ref() };
         if ready.is_none() {
+            // H7-E2: every refusal retires identifiable owned state
+            // through the checked removal before returning; the fault
+            // below fires whether or not the retire settles.
+            let _ = owned_start_remove(&key, true);
             unsafe { p11_object_fault() };
             bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
             return 0;
@@ -3965,6 +3969,8 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
                 && (row.layout == 0 || u32::from(row.layout) == layout_code)
         });
         if !agreed {
+            // H7-E2: retire before returning, as on every refusal arm.
+            let _ = owned_start_remove(&key, true);
             unsafe { p11_object_fault() };
             bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
             return 0;
@@ -4017,6 +4023,13 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
     if unsafe { p11_link_current_identity(&mut image) } != 1
         || !image_pair_matches(start.image, image)
     {
+        // H7-E2: image refusal retires held object calls with a fault;
+        // ordinary calls were already retired above and keep their
+        // accounting-only refusal.
+        if start.object_required != 0 {
+            let _ = owned_start_remove(&key, true);
+            unsafe { p11_object_fault() };
+        }
         bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
         return 0;
     }
@@ -4155,8 +4168,12 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         let find_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
         let emitted = tailed && object_emit_find(tail, find_side, descriptor, layout, rv);
         // Submit the completed ring record only after successful
-        // removal; otherwise discard it and fault.
-        if !emitted || owned_start_remove(&key, true).is_err() {
+        // removal; otherwise discard it and fault. H7-E2: the retirement
+        // is evaluated independently of emission success, so a failed
+        // fill/emission still retires owned state and no read runs after
+        // either failure.
+        let retired = owned_start_remove(&key, true).is_ok();
+        if !emitted || !retired {
             entry.discard(0);
             unsafe { p11_object_fault() };
             bump_evidence(EVIDENCE_UNMATCHED_RETURNS);

@@ -203,6 +203,18 @@ fn object_owner_readback_failure_never_authorizes() {
     );
 }
 
+/// G06/E2 fix round 1: a failed orphan sweep keeps START, its count
+/// and its lease instead of stranding a permanent zeroed row: explicit
+/// failure, no authorization, eventual teardown cleanup, converging
+/// repeats and an untouched sibling lease.
+#[test]
+fn object_owner_orphan_delete_failure_keeps_retry_route() {
+    owner_fixture::run_object_subcommand(
+        "object_producer_orphan_delete_failure_keeps_cleanup_authority",
+        "object custody orphan delete failure passed",
+    );
+}
+
 /// G06/E2: empty-lease refund failure stays visible: rows retire, the
 /// failure is never lost or double-refunded, repeats stay failed, and
 /// the sibling lease keeps its row, record and unit. Reconciles the

@@ -21,14 +21,15 @@
 use crate::instance;
 use crate::object_capture::{
     authorize_derive_return, classify_derive_mechanism, find_flag, handle_status, object_flag,
-    spans_overlap, validate_target_span, AttributeListOutcome, DeriveEntry, GetEntryState,
-    GetEntryVerdict, ReturnAuthority,
+    return_accepts_get_results, spans_overlap, validate_target_span, DeriveEntry, GetEntryVerdict,
+    ReturnAuthority,
 };
 use crate::object_policy::ScalarDeriveMechanism;
 use crate::object_wire::{
-    ObjectCallWire, ObjectDescriptorWire, ObjectStart, OBJECT_ACTION_DERIVE, OBJECT_ACTION_FIND,
-    OBJECT_ACTION_GET, OBJECT_ACTION_MAX, OBJECT_ACTION_NONE, OBJECT_ATTR_LIST_UNINSPECTED,
-    OBJECT_GUARD_NONE, OBJECT_GUARD_SCALAR_DERIVE,
+    ObjectAttributeListWire, ObjectCallWire, ObjectDescriptorWire, ObjectStart,
+    OBJECT_ACTION_DERIVE, OBJECT_ACTION_FIND, OBJECT_ACTION_GET, OBJECT_ACTION_MAX,
+    OBJECT_ACTION_NONE, OBJECT_ATTR_LIST_UNINSPECTED, OBJECT_DERIVE_UNAVAILABLE, OBJECT_GUARD_NONE,
+    OBJECT_GUARD_SCALAR_DERIVE,
 };
 use crate::{target_word_end, InstanceContinuity, LinuxLayout, ARG_NONE};
 
@@ -97,6 +98,101 @@ pub fn adapter_derive_entry(
         core::ptr::addr_of_mut!(side.derive).write(derive.code());
         core::ptr::addr_of_mut!(side.result_ptrs[0]).write(retained.unwrap_or(0));
         core::ptr::addr_of_mut!(side.result_ptrs[1]).write(0);
+    }
+    true
+}
+
+/// Production entry attribute adapter body (H7-E4): inspect authorized
+/// creation-template pairs into the side row's request lists, or retain
+/// Get entry headers into the side row's Get fields. Returns false only
+/// on custody/row failure; refused or unsupported templates are silent
+/// outcomes, never failures. `fetch_arg` supplies entry arguments (probe
+/// registers/stack on BPF, a spy on host).
+///
+/// Dispatch mirrors `authorize_entry_templates`: the Get family retains
+/// pair zero through the Get entry seam (never request-inspected);
+/// other families inspect each present pair through the request seam,
+/// with the pair-zero scalars as pair one's alias peer; Derive
+/// additionally requires accepted entry evidence (`side.derive`, set by
+/// the Derive adapter earlier in the entry chain). Absent pairs stay
+/// untouched. Inspection flag contributions merge into the side flags.
+///
+/// The entry store lives HERE: the seams populate production side state
+/// directly, so host tests observe wiring through this function — no
+/// caller hand-writes the inspected outcomes. While E4 is unwired the
+/// seams retain nothing and the side keeps its allocated-zero attribute
+/// state (as the live blocked oracle requires).
+#[inline(always)]
+// Closure plus scalar parameters map to the BPF wrapper's register-passed
+// arguments; bundling them into a struct would risk wrapper stack the
+// 512-byte entry chain does not have.
+#[allow(clippy::too_many_arguments)]
+pub fn adapter_attributes_entry(
+    side: Option<&mut ObjectStart>,
+    descriptor: u32,
+    row: Option<&ObjectDescriptorWire>,
+    layout: LinuxLayout,
+    fetch_arg: &mut impl FnMut(u8) -> Option<u64>,
+    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    mut read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
+) -> bool {
+    let Some(side) = side else {
+        return false;
+    };
+    let Some(row) = row else {
+        return false;
+    };
+    if row.function != descriptor.wrapping_sub(1)
+        || row.action == OBJECT_ACTION_NONE
+        || row.action > OBJECT_ACTION_MAX
+        || row.guard == OBJECT_GUARD_NONE
+        || row.guard > OBJECT_GUARD_SCALAR_DERIVE
+    {
+        return false;
+    }
+    if row.action == OBJECT_ACTION_GET {
+        let (ptr_arg, count_arg) = (row.template_args[0], row.template_args[1]);
+        if ptr_arg != ARG_NONE && count_arg != ARG_NONE {
+            let template_ptr = fetch_arg(ptr_arg).unwrap_or(0);
+            let count = fetch_arg(count_arg).unwrap_or(0);
+            let _ = production_capture_get_entry(template_ptr, count, layout, side, &mut read_word);
+        }
+        return true;
+    }
+    // Derive requires accepted entry evidence before any template access
+    // (the same finite guard as result-pointer retention).
+    if row.action == OBJECT_ACTION_DERIVE && side.derive == OBJECT_DERIVE_UNAVAILABLE {
+        return true;
+    }
+    let mut pair0: Option<(u64, u64)> = None;
+    let mut accumulated = 0u32;
+    let mut p = 0;
+    while p < 2 {
+        let (ptr_arg, count_arg) = (row.template_args[2 * p], row.template_args[2 * p + 1]);
+        if ptr_arg == ARG_NONE || count_arg == ARG_NONE {
+            p += 1;
+            continue;
+        }
+        let template_ptr = fetch_arg(ptr_arg).unwrap_or(0);
+        let count = fetch_arg(count_arg).unwrap_or(0);
+        let peer = if p == 0 { None } else { pair0 };
+        let contributed = production_inspect_request_template(
+            template_ptr,
+            count,
+            peer,
+            layout,
+            &mut side.requested[p],
+            &mut read_word,
+            &mut read_bytes,
+        );
+        accumulated |= contributed;
+        if p == 0 {
+            pair0 = Some((template_ptr, count));
+        }
+        p += 1;
+    }
+    if accumulated != 0 {
+        side.flags |= accumulated as u16;
     }
     true
 }
@@ -647,6 +743,90 @@ pub unsafe fn adapter_emit_find(
     true
 }
 
+/// Production Get emission adapter body (H7-E4): establish inspected Get
+/// results from the side row's retained entry state and stream them into
+/// the reserved tail's result list. Mirrors `adapter_emit_find`: refuse
+/// before any read unless continuity joined, then emit. Non-Get families
+/// succeed trivially (their result list stays zero); return values
+/// outside the Get acceptance set keep the tail's UNINSPECTED marking.
+/// The seam writes the list; its flag contributions merge into the tail
+/// flags.
+///
+/// # Safety
+///
+/// `tail` must be an exclusively owned writable tail (the reserved ring
+/// tail on BPF, a caller-owned row on host).
+#[inline(always)]
+// Closure plus scalar parameters map 1:1 to the BPF wrapper's
+// register-passed arguments (see `adapter_emit_find`).
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn adapter_emit_get_attributes(
+    tail: *mut ObjectCallWire,
+    side: Option<&ObjectStart>,
+    descriptor: u32,
+    row: Option<&ObjectDescriptorWire>,
+    layout: LinuxLayout,
+    rv: u64,
+    joined: bool,
+    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    mut read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
+) -> bool {
+    // H7-E1 enforcement inside the executed flow: refused continuity reads
+    // nothing, however the adapter was reached.
+    if !joined {
+        return false;
+    }
+    if tail.is_null() {
+        return false;
+    }
+    let Some(side) = side else {
+        return false;
+    };
+    if side.phase != 3 || side.descriptor_index != descriptor {
+        return false;
+    }
+    let Some(row) = row else {
+        return false;
+    };
+    if row.function != descriptor.wrapping_sub(1)
+        || row.action == OBJECT_ACTION_NONE
+        || row.action > OBJECT_ACTION_MAX
+        || row.guard == OBJECT_GUARD_NONE
+        || row.guard > OBJECT_GUARD_SCALAR_DERIVE
+    {
+        return false;
+    }
+    if row.action != OBJECT_ACTION_GET {
+        return true;
+    }
+    if !return_accepts_get_results(rv) {
+        return true;
+    }
+    // Authority from the adapter's own custody plus the threaded verdict:
+    // the side row is live, the fill advanced it to RETURNING, and the
+    // root joined continuity — the same trust the fill adapter places in
+    // `joined`.
+    let contributed = production_capture_get_return(
+        side,
+        rv,
+        ReturnAuthority::AUTHORIZED,
+        layout,
+        // SAFETY: `tail` is the exclusively owned reserved tail; the
+        // result list is ours (zeroed by the tail fill, marked for Get).
+        unsafe { &mut (*tail).result_attributes },
+        &mut read_word,
+        &mut read_bytes,
+    );
+    if contributed != 0 {
+        // SAFETY: `tail` is ours.
+        unsafe {
+            let old = core::ptr::addr_of!((*tail).flags).read();
+            core::ptr::addr_of_mut!((*tail).flags).write(old | contributed);
+        }
+    }
+    true
+}
+
 /// Production emission-finalize verdict: the reserved record submits
 /// only when emission succeeded AND the retirement settled; any failure
 /// discards and faults.
@@ -686,62 +866,100 @@ pub fn emission_finalize(emitted: bool, remove: impl FnOnce() -> bool) -> Emissi
 
 /// Production entry attribute-inspection path (H7-E4 seam).
 ///
-/// TODAY (E4 unwired): inspects nothing — performs zero reads and returns
-/// the zero outcome. Present pairs then carry the UNINSPECTED marking (see
+/// Inspects one authorized creation-template pair and populates `out`
+/// with the inspected list. Called by `adapter_attributes_entry`, which
+/// passes the side row's pair list, so the inspected outcome lands in
+/// production entry state — never hand-written by callers. The list is
+/// written in place (no 40-byte outcome crosses the BPF entry stack).
+/// Returns the inspection's `object_flag` contributions for the adapter
+/// to merge into the side flags.
+///
+/// TODAY (E4 unwired): inspects nothing — performs zero reads, leaves
+/// `*out` untouched and returns zero, so the side pair keeps its
+/// allocated-zero state (as the live blocked oracle requires). Present
+/// pairs then carry the UNINSPECTED marking at emission (see
 /// `adapter_tail_fill`). A budgeted E4 implements the approved bounded
-/// in-place inspection HERE with this exact signature (same vectors, same
-/// readers); G05 passes unmodified when it does. G05 additionally
-/// requires production-tail emission of the outcome and a production
-/// call edge to this seam (forwarding alone stays RED).
+/// in-place inspection HERE with this exact signature; G05 passes
+/// unmodified when it does.
+#[inline(always)]
 pub fn production_inspect_request_template(
     template_ptr: u64,
     count: u64,
     peer: Option<(u64, u64)>,
     layout: LinuxLayout,
+    out: &mut ObjectAttributeListWire,
     read_word: impl FnMut(u64) -> Result<u64, ()>,
     read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
-) -> AttributeListOutcome {
+) -> u32 {
     let _ = (template_ptr, count, peer, layout);
+    let _ = out;
     let _ = (read_word, read_bytes);
-    AttributeListOutcome::default()
+    0
 }
 
 /// Production GetAttributeValue entry path (H7-E4 seam).
 ///
-/// TODAY (E4 unwired): retains nothing — performs zero reads, leaves
-/// `state` untouched and returns the zero verdict. A budgeted E4 retains
-/// selected headers HERE with this exact signature; G05 passes
-/// unmodified when it does. G05 additionally requires a production call
-/// edge to this seam (forwarding alone stays RED).
+/// Retains selected entry-header facts directly into the side row
+/// (`get_template_base`, `inspected_header_end`, `slots`,
+/// `get_inspected`). Called by `adapter_attributes_entry` for the Get
+/// family. Retention writes go straight to the side row: the 216-byte
+/// `GetEntryState` never materializes on the BPF entry path (it cannot
+/// fit the 512 B chain), so the seam takes the side row itself. Host
+/// oracles keep using `GetEntryState`; the G05 sim bridges it.
+///
+/// TODAY (E4 unwired): retains nothing — performs zero reads, leaves the
+/// side row untouched (allocated-zero, as the live blocked oracle
+/// requires) and returns the zero verdict. A budgeted E4 retains the
+/// approved bounded header facts HERE with this exact signature; G05
+/// passes unmodified when it does.
+///
+/// Retained slots pack densely (`slots[0..count]` selected, the rest
+/// zero — the shared protocol only appends), so the return path derives
+/// the retained count as the leading selected-slot prefix. Entry list
+/// flags (truncation/header failure) have no side field today: E4 must
+/// pack them; the G05 vectors carry none.
+#[inline(always)]
 pub fn production_capture_get_entry(
     template_ptr: u64,
     count: u64,
     layout: LinuxLayout,
-    state: &mut GetEntryState,
+    side: &mut ObjectStart,
     read_word: impl FnMut(u64) -> Result<u64, ()>,
 ) -> GetEntryVerdict {
     let _ = (template_ptr, count, layout);
-    let _ = state;
+    let _ = side;
     let _ = read_word;
     GetEntryVerdict::default()
 }
 
 /// Production GetAttributeValue return path (H7-E4 seam).
 ///
-/// TODAY (E4 unwired): establishes nothing — performs zero reads and
-/// returns the zero outcome. A budgeted E4 establishes inspected results
-/// HERE with this exact signature (same retained state, same readers);
-/// G05 passes unmodified when it does. G05 additionally requires a
-/// production call edge to this seam (forwarding alone stays RED).
+/// Establishes inspected Get results from the side row's retained entry
+/// state and populates the emitted result list `out` (the reserved
+/// tail's list, via `adapter_emit_get_attributes`). The side row arrives
+/// by reference: no capture state is rebuilt on BPF. Returns the
+/// inspection's `object_flag` contributions for the adapter to merge
+/// into the tail flags.
+///
+/// TODAY (E4 unwired): establishes nothing — performs zero reads,
+/// returns zero, and marks `out` UNINSPECTED (cells/inspected already
+/// zero: the adapter runs after the tail zeroing, which the shared Find
+/// emission relies on too). A Get tail therefore still carries the
+/// honest marked-only result list. A budgeted E4 establishes the
+/// approved bounded results HERE with this exact signature; G05 passes
+/// unmodified when it does.
+#[inline(always)]
 pub fn production_capture_get_return(
-    state: &GetEntryState,
+    side: &ObjectStart,
     rv: u64,
     authority: ReturnAuthority,
     layout: LinuxLayout,
+    out: &mut ObjectAttributeListWire,
     read_word: impl FnMut(u64) -> Result<u64, ()>,
     read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
-) -> AttributeListOutcome {
-    let _ = (state, rv, authority, layout);
+) -> u32 {
+    let _ = (side, rv, authority, layout);
     let _ = (read_word, read_bytes);
-    AttributeListOutcome::default()
+    out.flags = OBJECT_ATTR_LIST_UNINSPECTED;
+    0
 }

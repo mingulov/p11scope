@@ -453,12 +453,13 @@ fn refused_stamp_pairs() -> Vec<(
 
 /// H7-E1 return-arm harness. Executes the REAL production adapter bodies
 /// (`object_flow::{continuity_joins, adapter_fill_return, adapter_tail_fill,
-/// adapter_emit_find}` — the same functions the BPF wrappers call) in the
-/// root's order (gate → fill → tail → find, each `&&` short-circuiting like
-/// the root) with instrumented readers and a caller-owned side row. Every
-/// outcome below is computed by production code; the only modeled input is
-/// the native retirement result (the C fixture executes the real removal;
-/// see G03). The order pins below bind the harness sequence to the root.
+/// adapter_emit_find, adapter_emit_get_attributes}` — the same functions the
+/// BPF wrappers call) in the root's order (gate → fill → tail → find → get,
+/// each `&&` short-circuiting like the root) with instrumented readers and
+/// a caller-owned side row. Every outcome below is computed by production
+/// code; the only modeled input is the native retirement result (the C
+/// fixture executes the real removal; see G03). The order pins below bind
+/// the harness sequence to the root.
 struct EmissionOutcome {
     joined: bool,
     filled: bool,
@@ -513,8 +514,8 @@ fn run_production_return_arm(
     retire_ok: bool,
 ) -> EmissionOutcome {
     use p11scope_ebpf_common::object_flow::{
-        adapter_emit_find, adapter_fill_return, adapter_tail_fill, continuity_joins,
-        emission_finalize,
+        adapter_emit_find, adapter_emit_get_attributes, adapter_fill_return, adapter_tail_fill,
+        continuity_joins, emission_finalize,
     };
     use p11scope_ebpf_common::object_wire::ObjectCallWire;
     let descriptor = side.descriptor_index;
@@ -549,6 +550,24 @@ fn run_production_return_arm(
                 rv,
                 joined,
                 reader,
+            )
+        };
+    // The root's fourth emission stage: Get result establishment. The G02
+    // vectors are all non-Get rows, so this stage succeeds trivially with
+    // zero reads here; it executes for root fidelity.
+    let (reader, bytes) = adapter::readers(target);
+    let emitted = emitted
+        && unsafe {
+            adapter_emit_get_attributes(
+                &mut tail as *mut _,
+                Some(&side),
+                descriptor,
+                Some(row),
+                layout,
+                rv,
+                joined,
+                reader,
+                bytes,
             )
         };
     // The fault decision is production's `emission_finalize` (the same
@@ -1238,80 +1257,285 @@ fn program_six_field_template(
         .set_bytes(values + 0x70, &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x23]);
 }
 
-/// G05/E4 production-wiring pin: each attribute seam must have at
-/// least one caller in PRODUCTION code (the BPF crate or the shared
-/// flow module). A seam body that merely forwards to the shared
-/// protocol — no production call edge, no adapter wiring — keeps G05
-/// RED here. (End-to-end entry-store liveness is qualified live by the
-/// nonempty U1/U2 positives; this pin requires the call edge to exist.)
-fn pin_attribute_seams_have_production_caller() {
-    let flow = std::fs::read_to_string("crates/ebpf-common/src/object_flow.rs")
-        .expect("read production flow module");
-    let root = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF root");
-    for seam in [
-        "production_inspect_request_template",
-        "production_capture_get_entry",
-        "production_capture_get_return",
+/// Strip Rust line comments, (nested) block comments, string literals
+/// and character literals, so static pins count code tokens — never
+/// prose. A `'` only opens a character literal when its closing quote
+/// lands on the same line within four bytes, so lifetimes survive.
+fn strip_rust_prose(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        if rest.starts_with(b"//") {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if rest.starts_with(b"/*") {
+            let mut depth = 0;
+            while i < bytes.len() {
+                if bytes[i..].starts_with(b"/*") {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i..].starts_with(b"*/") {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        } else if bytes[i] == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                } else {
+                    i += 1;
+                    if bytes[i - 1] == b'"' {
+                        break;
+                    }
+                }
+            }
+            out.push(' ');
+        } else if bytes[i] == b'\'' {
+            let mut end = i + 1;
+            while end < bytes.len() && bytes[end] != b'\'' && bytes[end] != b'\n' && end - i <= 4 {
+                end += 1;
+            }
+            if end < bytes.len() && bytes[end] == b'\'' && end - i <= 4 {
+                i = end + 1;
+                out.push(' ');
+            } else {
+                out.push('\'');
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// G05/E4 production-wiring pin: the BPF attribute wrappers must delegate
+/// to the shared adapters the suite executes — no second inline copy.
+/// Comment-proof: prose is stripped before counting, so comments (or
+/// strings) naming the adapters cannot satisfy it. The adapter-to-seam edge
+/// needs no pin: the G05 tests drive the adapters, so a missing seam
+/// call observes zero cells (the disconnect mutant keeps wired seams
+/// RED). The BPF wrapper-to-adapter edge itself is host-inexecutable, like
+/// every other BPF call edge — this pin requires it textually, and live
+/// populated transport (U10) qualifies it end to end.
+fn pin_attribute_wrappers_delegate_to_shared_adapters() {
+    let stripped = strip_rust_prose(&bpf_source());
+    for (wrapper, shared, end) in [
+        (
+            "fn object_entry_attributes(",
+            "adapter_attributes_entry(",
+            "fn object_fill_return(",
+        ),
+        (
+            "fn object_emit_get_attributes(",
+            "adapter_emit_get_attributes(",
+            "fn owned_start_discard(",
+        ),
     ] {
-        let call = format!("{seam}(");
-        let def = format!("pub fn {seam}(");
-        let total = flow.matches(&call).count() + root.matches(&call).count();
-        let defs = flow.matches(&def).count() + root.matches(&def).count();
-        assert_eq!(defs, 1, "{seam} keeps its single production definition");
+        let body = source_between(&stripped, wrapper, end);
+        assert_eq!(
+            body.matches(shared).count(),
+            1,
+            "{wrapper} must delegate to exactly one shared {shared}"
+        );
         assert!(
-            total > defs,
-            "{seam} has no production caller: forwarding without adapter wiring must not green G05"
+            !body.contains("production_"),
+            "{wrapper} must not bypass its adapter with a direct seam call"
+        );
+    }
+    // Exactly one production caller per wrapper: the definition plus the
+    // single root call site, counted over stripped code.
+    for wrapper in ["object_entry_attributes(", "object_emit_get_attributes("] {
+        assert_eq!(
+            stripped.matches(wrapper).count(),
+            2,
+            "{wrapper} keeps its single definition plus one root call site"
         );
     }
 }
 
-/// Route a request-inspection outcome through the PRODUCTION tail path:
-/// store it in the side row's present pair (as a wired entry adapter
-/// would) and emit through `adapter_tail_fill`. Returns the emitted
-/// pair-0 list; the absent pair must stay all-zero (transport never
-/// fabricates it).
-fn emit_request_list_through_production_tail(
+/// Drive one creation-template vector through the PRODUCTION entry path:
+/// the shared `adapter_attributes_entry` the BPF entry adapter calls,
+/// programmed with the pair scalars at the row's template args — then the
+/// production tail emission from the stored side row. Returns the side
+/// row AFTER the production entry store plus the emitted tail. The
+/// harness never writes `side.requested` itself: a missing production
+/// entry-store operation observes zero cells here.
+#[allow(clippy::type_complexity)]
+fn run_production_request_path(
+    target: &std::cell::RefCell<adapter::FakeTarget>,
     layout: p11scope_ebpf_common::LinuxLayout,
-    outcome: p11scope_ebpf_common::object_capture::AttributeListOutcome,
-) -> p11scope_ebpf_common::object_wire::ObjectAttributeListWire {
+    action: u8,
+    pairs: [(u64, u64); 2],
+    template_args: [u8; 4],
+) -> (
+    p11scope_ebpf_common::object_wire::ObjectStart,
+    p11scope_ebpf_common::object_wire::ObjectCallWire,
+) {
     use p11scope_ebpf_common::ARG_NONE;
-    use p11scope_ebpf_common::object_flow::adapter_tail_fill;
+    use p11scope_ebpf_common::object_flow::{adapter_attributes_entry, adapter_tail_fill};
     use p11scope_ebpf_common::object_wire::{
-        OBJECT_ACTION_CREATE, OBJECT_LAYOUT_ILP32, OBJECT_LAYOUT_LP64, ObjectAttributeListWire,
-        ObjectCallWire,
+        OBJECT_LAYOUT_ILP32, OBJECT_LAYOUT_LP64, ObjectCallWire,
     };
-    let mut row = harness_row(23, OBJECT_ACTION_CREATE, [5, ARG_NONE]);
-    row.template_args = [2, 3, ARG_NONE, ARG_NONE];
-    let mut side = ready_side(23);
+    let mut row = harness_row(23, action, [5, ARG_NONE]);
+    row.template_args = template_args;
+    let mut side = p11scope_ebpf_common::object_wire::ObjectStart {
+        descriptor_index: 23,
+        layout: if layout == p11scope_ebpf_common::LinuxLayout::Lp64 {
+            OBJECT_LAYOUT_LP64
+        } else {
+            OBJECT_LAYOUT_ILP32
+        },
+        ..Default::default()
+    };
+    let mut fetch_arg = |arg: u8| {
+        if arg == template_args[0] {
+            Some(pairs[0].0)
+        } else if arg == template_args[1] {
+            Some(pairs[0].1)
+        } else if arg == template_args[2] {
+            Some(pairs[1].0)
+        } else if arg == template_args[3] {
+            Some(pairs[1].1)
+        } else {
+            None
+        }
+    };
+    let (reader, bytes) = adapter::readers(target);
+    assert!(
+        adapter_attributes_entry(
+            Some(&mut side),
+            23,
+            Some(&row),
+            layout,
+            &mut fetch_arg,
+            reader,
+            bytes,
+        ),
+        "{layout:?} production entry adapter accepts the vector"
+    );
+    // RETURNING arrival state (harness sequencing, as the fill adapter
+    // would leave it); the inspected pair lists arrive only via the
+    // production entry store above.
     side.phase = 3;
-    side.layout = if layout == p11scope_ebpf_common::LinuxLayout::Lp64 {
-        OBJECT_LAYOUT_LP64
-    } else {
-        OBJECT_LAYOUT_ILP32
-    };
-    side.requested[0] = outcome.to_wire();
     let mut tail = ObjectCallWire::default();
     let tailed = unsafe { adapter_tail_fill(&mut tail as *mut _, Some(&side), 23, Some(&row)) };
     assert!(tailed, "{layout:?} production tail fills");
+    (side, tail)
+}
+
+/// Drive one Get vector through the PRODUCTION Get path: entry retention
+/// via the shared `adapter_attributes_entry` the BPF entry adapter
+/// calls, then return emission via the shared
+/// `adapter_emit_get_attributes` the BPF return path calls. Returns the
+/// side row after retention plus the emitted tail. The harness never
+/// writes the Get fields or the emitted list itself.
+#[allow(clippy::type_complexity)]
+fn run_production_get_path(
+    target: &std::cell::RefCell<adapter::FakeTarget>,
+    layout: p11scope_ebpf_common::LinuxLayout,
+    template_base: u64,
+    count: u64,
+) -> (
+    p11scope_ebpf_common::object_wire::ObjectStart,
+    p11scope_ebpf_common::object_wire::ObjectCallWire,
+) {
+    use p11scope_ebpf_common::ARG_NONE;
+    use p11scope_ebpf_common::object_flow::{
+        adapter_attributes_entry, adapter_emit_get_attributes, adapter_tail_fill,
+    };
+    use p11scope_ebpf_common::object_wire::{
+        OBJECT_ACTION_GET, OBJECT_LAYOUT_ILP32, OBJECT_LAYOUT_LP64, ObjectCallWire,
+    };
+    let mut row = harness_row(23, OBJECT_ACTION_GET, [ARG_NONE, ARG_NONE]);
+    row.template_args = [2, 3, ARG_NONE, ARG_NONE];
+    let mut side = p11scope_ebpf_common::object_wire::ObjectStart {
+        descriptor_index: 23,
+        layout: if layout == p11scope_ebpf_common::LinuxLayout::Lp64 {
+            OBJECT_LAYOUT_LP64
+        } else {
+            OBJECT_LAYOUT_ILP32
+        },
+        ..Default::default()
+    };
+    let mut fetch_arg = |arg: u8| match arg {
+        2 => Some(template_base),
+        3 => Some(count),
+        _ => None,
+    };
+    let (reader, bytes) = adapter::readers(target);
     assert!(
-        tail.requested[1] == ObjectAttributeListWire::default(),
-        "{layout:?} absent pair stays all-zero"
+        adapter_attributes_entry(
+            Some(&mut side),
+            23,
+            Some(&row),
+            layout,
+            &mut fetch_arg,
+            reader,
+            bytes,
+        ),
+        "{layout:?} production Get entry accepts the vector"
     );
-    tail.requested[0]
+    // RETURNING arrival state (harness sequencing); retention arrives
+    // only via the production entry store above.
+    side.phase = 3;
+    let mut tail = ObjectCallWire::default();
+    let tailed = unsafe { adapter_tail_fill(&mut tail as *mut _, Some(&side), 23, Some(&row)) };
+    assert!(tailed, "{layout:?} production Get tail fills");
+    let (reader, bytes) = adapter::readers(target);
+    assert!(
+        unsafe {
+            adapter_emit_get_attributes(
+                &mut tail as *mut _,
+                Some(&side),
+                23,
+                Some(&row),
+                layout,
+                adapter::rv_ok(),
+                true,
+                reader,
+                bytes,
+            )
+        },
+        "{layout:?} production Get emission accepts the vector"
+    );
+    (side, tail)
+}
+
+/// Retained Get slots pack densely (the shared protocol only appends),
+/// so the retained count is the leading selected-slot prefix.
+fn retained_get_prefix_count(side: &p11scope_ebpf_common::object_wire::ObjectStart) -> u8 {
+    let mut count = 0;
+    while count < 8 && side.slots[count as usize].kind != 0 {
+        count += 1;
+    }
+    count
 }
 
 /// Today's production attribute transport, executed through the
-/// production tail adapter: entry leaves request state zero (no
-/// inspection runs), so present pairs carry the honest UNINSPECTED
-/// marking with zero cells, the Get result list is marked UNINSPECTED,
-/// and absent pairs stay all-zero. This pins the transport the G05 RED
-/// tests below require E4 to replace with inspected cells.
+/// production tail and Get emission adapters: entry leaves request
+/// state zero (no inspection runs), so present pairs carry the honest
+/// UNINSPECTED marking with zero cells, the Get result list is marked
+/// UNINSPECTED through the full return path with zero reads, and absent
+/// pairs stay all-zero. This pins the transport the G05 RED tests below
+/// require E4 to replace with inspected cells.
 #[test]
 fn object_attributes_uninspected_marking_is_production() {
     use p11scope_ebpf_common::ARG_NONE;
     use p11scope_ebpf_common::LinuxLayout;
     use p11scope_ebpf_common::object_capture::attr_list_flag;
-    use p11scope_ebpf_common::object_flow::adapter_tail_fill;
+    use p11scope_ebpf_common::object_flow::{adapter_emit_get_attributes, adapter_tail_fill};
     use p11scope_ebpf_common::object_wire::{
         OBJECT_ACTION_CREATE, OBJECT_ACTION_GET, OBJECT_LAYOUT_ILP32, OBJECT_LAYOUT_LP64,
         ObjectAttributeListWire, ObjectCallWire,
@@ -1358,7 +1582,261 @@ fn object_attributes_uninspected_marking_is_production() {
                 },
             "{layout:?} Get result list is marked-only"
         );
+        // The production Get emission keeps the honest marking (E4
+        // unwired): it establishes nothing, reads nothing, and the
+        // emitted list stays marked-only rather than collapsing to an
+        // inspected-empty claim.
+        let target = std::cell::RefCell::new(adapter::FakeTarget::new(layout.word_bytes() as u64));
+        let (reader, bytes) = adapter::readers(&target);
+        assert!(
+            unsafe {
+                adapter_emit_get_attributes(
+                    &mut tail as *mut _,
+                    Some(&side),
+                    23,
+                    Some(&get_row),
+                    layout,
+                    adapter::rv_ok(),
+                    true,
+                    reader,
+                    bytes,
+                )
+            },
+            "{layout:?} production Get emission accepts"
+        );
+        assert!(
+            tail.result_attributes
+                == ObjectAttributeListWire {
+                    flags: attr_list_flag::UNINSPECTED,
+                    ..ObjectAttributeListWire::default()
+                },
+            "{layout:?} emitted Get list stays marked-only"
+        );
+        adapter::assert_no_target_reads(&target, &format!("{layout:?} unwired Get emission"));
     }
+}
+
+/// Today's production entry attribute path (E4 unwired): the shared
+/// entry adapter accepts creation and Get vectors, performs zero target
+/// reads and stores zero attribute state — side request lists, Get
+/// fields and flags stay allocated-zero. The Get emission refuses before
+/// any read unless continuity joined, and keeps the UNINSPECTED marking
+/// on return values outside the Get acceptance set. E4 replaces the
+/// zero-store behavior with inspected retention; the refusal gates stay.
+#[test]
+fn object_attributes_unwired_entry_stores_nothing() {
+    use p11scope_ebpf_common::ARG_NONE;
+    use p11scope_ebpf_common::LinuxLayout;
+    use p11scope_ebpf_common::object_capture::attr_list_flag;
+    use p11scope_ebpf_common::object_flow::{
+        adapter_attributes_entry, adapter_emit_get_attributes, adapter_tail_fill,
+    };
+    use p11scope_ebpf_common::object_wire::{
+        OBJECT_ACTION_CREATE, OBJECT_ACTION_GET, OBJECT_ACTION_SET, ObjectAttributeListWire,
+        ObjectAttributeSlot, ObjectCallWire,
+    };
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        // Creation vector through the production entry adapter: accepted,
+        // zero reads, zero stores.
+        let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        program_six_field_template(&target, 0x40000, 0x50000, w);
+        let (side, tail) = run_production_request_path(
+            &target,
+            layout,
+            OBJECT_ACTION_CREATE,
+            [(0x40000, 8), (0, 0)],
+            [2, 3, ARG_NONE, ARG_NONE],
+        );
+        adapter::assert_no_target_reads(&target, &format!("{layout:?} unwired entry"));
+        assert!(
+            side.requested == [ObjectAttributeListWire::default(); 2],
+            "{layout:?} unwired entry stores no request state"
+        );
+        assert_eq!(
+            side.flags, 0,
+            "{layout:?} unwired entry contributes no flags"
+        );
+        assert_eq!(
+            tail.requested[0].flags,
+            attr_list_flag::UNINSPECTED,
+            "{layout:?} unwired entry still emits the honest marking"
+        );
+        // Set authorizes no template: the adapter accepts the row and
+        // touches nothing (its pair ordinals are all absent).
+        let set_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        let (set_side, _) = run_production_request_path(
+            &set_target,
+            layout,
+            OBJECT_ACTION_SET,
+            [(0x40000, 8), (0, 0)],
+            [ARG_NONE, ARG_NONE, ARG_NONE, ARG_NONE],
+        );
+        adapter::assert_no_target_reads(&set_target, &format!("{layout:?} Set entry"));
+        assert!(
+            set_side.requested == [ObjectAttributeListWire::default(); 2],
+            "{layout:?} Set entry stores no request state"
+        );
+        // Get retention through the production entry adapter: accepted,
+        // zero reads, zero retained fields.
+        let get_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        program_six_field_template(&get_target, 0x40000, 0x50000, w);
+        let (get_side, get_tail) = run_production_get_path(&get_target, layout, 0x40000, 8);
+        adapter::assert_no_target_reads(&get_target, &format!("{layout:?} unwired Get path"));
+        assert_eq!(get_side.get_template_base, 0);
+        assert_eq!(get_side.inspected_header_end, 0);
+        assert_eq!(get_side.get_inspected, 0);
+        assert!(
+            get_side.slots == [ObjectAttributeSlot::default(); 8],
+            "{layout:?} unwired Get entry retains no slots"
+        );
+        assert_eq!(
+            get_tail.result_attributes.flags,
+            attr_list_flag::UNINSPECTED,
+            "{layout:?} unwired Get path emits the honest marking"
+        );
+        // The Get emission refuses before any read unless continuity
+        // joined, and keeps the marking on refused return values.
+        let get_row = harness_row(23, OBJECT_ACTION_GET, [ARG_NONE, ARG_NONE]);
+        let mut refused_tail = ObjectCallWire::default();
+        let mut refused_side = get_side;
+        refused_side.phase = 3;
+        let refused_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        let (reader, bytes) = adapter::readers(&refused_target);
+        assert!(
+            !unsafe {
+                adapter_emit_get_attributes(
+                    &mut refused_tail as *mut _,
+                    Some(&refused_side),
+                    23,
+                    Some(&get_row),
+                    layout,
+                    adapter::rv_ok(),
+                    false,
+                    reader,
+                    bytes,
+                )
+            },
+            "{layout:?} refused continuity refuses Get emission"
+        );
+        adapter::assert_no_target_reads(
+            &refused_target,
+            &format!("{layout:?} refused Get emission"),
+        );
+        let bad_rv_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        let mut bad_rv_tail = ObjectCallWire::default();
+        assert!(
+            unsafe {
+                adapter_tail_fill(
+                    &mut bad_rv_tail as *mut _,
+                    Some(&refused_side),
+                    23,
+                    Some(&get_row),
+                )
+            },
+            "{layout:?} production Get tail fills"
+        );
+        let (reader, bytes) = adapter::readers(&bad_rv_target);
+        assert!(
+            unsafe {
+                adapter_emit_get_attributes(
+                    &mut bad_rv_tail as *mut _,
+                    Some(&refused_side),
+                    23,
+                    Some(&get_row),
+                    layout,
+                    5,
+                    true,
+                    reader,
+                    bytes,
+                )
+            },
+            "{layout:?} refused RV keeps the Get list without failing emission"
+        );
+        assert_eq!(
+            bad_rv_tail.result_attributes.flags,
+            attr_list_flag::UNINSPECTED,
+            "{layout:?} refused RV keeps the UNINSPECTED marking"
+        );
+        adapter::assert_no_target_reads(&bad_rv_target, &format!("{layout:?} refused-RV Get"));
+        // Non-Get families leave the result list zero through the Get
+        // emission (their result list stays absent, never marked).
+        let create_row = harness_row(23, OBJECT_ACTION_CREATE, [5, ARG_NONE]);
+        let plain_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        let mut plain_tail = ObjectCallWire::default();
+        assert!(
+            unsafe {
+                adapter_tail_fill(
+                    &mut plain_tail as *mut _,
+                    Some(&refused_side),
+                    23,
+                    Some(&create_row),
+                )
+            },
+            "{layout:?} production tail fills"
+        );
+        let (reader, bytes) = adapter::readers(&plain_target);
+        assert!(
+            unsafe {
+                adapter_emit_get_attributes(
+                    &mut plain_tail as *mut _,
+                    Some(&refused_side),
+                    23,
+                    Some(&create_row),
+                    layout,
+                    adapter::rv_ok(),
+                    true,
+                    reader,
+                    bytes,
+                )
+            },
+            "{layout:?} non-Get emission succeeds trivially"
+        );
+        assert!(
+            plain_tail.result_attributes == ObjectAttributeListWire::default(),
+            "{layout:?} non-Get result list stays all-zero"
+        );
+        // Custody: the entry adapter refuses missing rows without reads.
+        let custody_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        let create_row = harness_row(23, OBJECT_ACTION_CREATE, [5, ARG_NONE]);
+        let mut fetch_arg = |_: u8| None;
+        let (reader, bytes) = adapter::readers(&custody_target);
+        assert!(
+            !adapter_attributes_entry(
+                None,
+                23,
+                Some(&create_row),
+                layout,
+                &mut fetch_arg,
+                reader,
+                bytes
+            ),
+            "{layout:?} missing side refuses entry"
+        );
+        let (reader, bytes) = adapter::readers(&custody_target);
+        assert!(
+            !adapter_attributes_entry(
+                Some(&mut refused_side),
+                23,
+                None,
+                layout,
+                &mut fetch_arg,
+                reader,
+                bytes,
+            ),
+            "{layout:?} missing row refuses entry"
+        );
+        adapter::assert_no_target_reads(&custody_target, &format!("{layout:?} entry custody"));
+    }
+}
+
+/// G05/E4 BPF delegation: the entry and Get emission wrappers bind
+/// BPF-local state and call the shared adapters the suite executes.
+/// Comment-proof (prose stripped before counting): comments or strings
+/// naming the adapters cannot satisfy this pin.
+#[test]
+fn object_attributes_bpf_wrappers_delegate_to_shared_adapters() {
+    pin_attribute_wrappers_delegate_to_shared_adapters();
 }
 
 /// G05/E4: the production attribute path captures all six attribute
@@ -1366,30 +1844,31 @@ fn object_attributes_uninspected_marking_is_production() {
 /// GetAttributeValue vectors on LP64/ia32 must yield nonempty finite
 /// cells for class, key type, token, value length, modulus bits and all
 /// three curves, with distinct pair templates and no promotion of
-/// requests to established results. Three layers: the seams must match
-/// the oracle, the request outcome must EMIT as the oracle wire through
-/// the production tail, and production code must call the seams. RED
-/// while E4 is unwired (zero reads, zero cells vs the oracle's VALUE
-/// cells, UNINSPECTED transport, no production caller); forwarding the
-/// seams alone greens none of the transport/pin layers.
+/// requests to established results. Both halves drive the PRODUCTION
+/// adapters the BPF programs call and assert on production side state
+/// plus the EMITTED wire lists. RED while E4 is unwired (zero cells vs
+/// the oracle's VALUE cells, UNINSPECTED transport); a budgeted E4 flips
+/// these tests with zero test changes.
 #[test]
 #[ignore = "RED: H7-E4 budgeted attribute capture pending"]
 fn object_attributes_real_adapter_six_fields() {
+    use p11scope_ebpf_common::ARG_NONE;
     use p11scope_ebpf_common::LinuxLayout;
     use p11scope_ebpf_common::object_capture::{
         GetEntryState, attr_kind, attr_list_flag, attr_status, capture_get_entry,
         capture_get_return, inspect_request_template,
     };
-    use p11scope_ebpf_common::object_flow::{
-        production_capture_get_entry, production_capture_get_return,
-        production_inspect_request_template,
+    use p11scope_ebpf_common::object_wire::{
+        OBJECT_ACTION_CREATE, OBJECT_ACTION_PAIR, ObjectAttributeListWire,
     };
     for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
         let w = layout.word_bytes() as u64;
         // Creation request: the oracle proves the vectors valid (with
         // independent literal expectations) on its own target, then the
-        // PRODUCTION path on an identically programmed target must match
-        // the oracle cell for cell while reading only what it reads.
+        // PRODUCTION entry adapter — the same shared function the BPF
+        // entry calls — runs on an identically programmed target and must
+        // store the oracle wire cell for cell while reading only what it
+        // reads. The harness never writes the side pair itself.
         let oracle_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
         program_six_field_template(&oracle_target, 0x40000, 0x50000, w);
         let (reader, bytes) = adapter::readers(&oracle_target);
@@ -1432,32 +1911,44 @@ fn object_attributes_real_adapter_six_fields() {
         );
         let prod_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
         program_six_field_template(&prod_target, 0x40000, 0x50000, w);
-        let (reader, bytes) = adapter::readers(&prod_target);
-        let actual = production_inspect_request_template(0x40000, 8, None, layout, reader, bytes);
+        let (prod_side, prod_tail) = run_production_request_path(
+            &prod_target,
+            layout,
+            OBJECT_ACTION_CREATE,
+            [(0x40000, 8), (0, 0)],
+            [2, 3, ARG_NONE, ARG_NONE],
+        );
         assert_reads_subset(
             &prod_target,
             &oracle_target,
             &format!("{layout:?} creation-request inspection"),
         );
-        assert_eq!(
-            actual.cells, expected.cells,
+        assert!(
+            prod_side.requested[0].cells == expected.to_wire().cells,
             "{layout:?} the production entry path must capture the six fields, not UNINSPECTED"
         );
         assert_eq!(
-            actual.inspected, expected.inspected,
+            prod_side.requested[0].inspected, expected.inspected,
             "{layout:?} the production entry path must report its inspection"
         );
-        // Production transport: the seam outcome, stored as a wired
-        // entry adapter would store it, must EMIT as the oracle wire
-        // through the production tail. Forwarding the seam alone leaves
-        // the UNINSPECTED marking → RED at the flags.
-        let emitted = emit_request_list_through_production_tail(layout, actual);
         assert!(
-            emitted == expected.to_wire(),
+            prod_side.requested[1] == ObjectAttributeListWire::default(),
+            "{layout:?} the absent pair stays all-zero in production side state"
+        );
+        // Production transport: the stored list must EMIT as the oracle
+        // wire through the production tail — UNINSPECTED stays RED at the
+        // flags until E4 wires inspected emission.
+        assert!(
+            prod_tail.requested[0] == expected.to_wire(),
             "{layout:?} production tail must emit the inspected request list, not UNINSPECTED"
         );
-        // GetAttributeValue return: the production entry retains headers
-        // and the production return establishes the same six fields.
+        assert!(
+            prod_tail.requested[1] == ObjectAttributeListWire::default(),
+            "{layout:?} absent pair stays all-zero"
+        );
+        // GetAttributeValue: the production entry retains headers into
+        // production side state and the production return emission
+        // establishes the same six fields on the EMITTED Get wire list.
         let oracle_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
         program_six_field_template(&oracle_target, 0x40000, 0x50000, w);
         let mut oracle_state = GetEntryState::default();
@@ -1473,13 +1964,42 @@ fn object_attributes_real_adapter_six_fields() {
         );
         let prod_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
         program_six_field_template(&prod_target, 0x40000, 0x50000, w);
-        let mut prod_state = GetEntryState::default();
-        let (reader, _) = adapter::readers(&prod_target);
-        let prod_entry = production_capture_get_entry(0x40000, 8, layout, &mut prod_state, reader);
+        let (prod_side, prod_tail) = run_production_get_path(&prod_target, layout, 0x40000, 8);
         assert_eq!(
-            prod_entry, oracle_entry,
-            "{layout:?} the production Get entry must retain headers"
+            prod_side.get_template_base, oracle_state.template_base,
+            "{layout:?} the production Get entry must retain the template base"
         );
+        assert_eq!(
+            prod_side.inspected_header_end, oracle_state.header_end,
+            "{layout:?} the production Get entry must retain the header end"
+        );
+        assert_eq!(
+            prod_side.get_inspected, oracle_state.inspected,
+            "{layout:?} the production Get entry must report its inspection"
+        );
+        assert_eq!(
+            retained_get_prefix_count(&prod_side),
+            oracle_state.slot_count,
+            "{layout:?} the production Get entry must retain eight headers"
+        );
+        for k in 0..8 {
+            assert_eq!(
+                prod_side.slots[k].value_ptr, oracle_state.slots[k].value_ptr,
+                "{layout:?} the production Get entry must retain slot {k} pointer"
+            );
+            assert_eq!(
+                prod_side.slots[k].entry_capacity, oracle_state.slots[k].entry_capacity,
+                "{layout:?} the production Get entry must retain slot {k} capacity"
+            );
+            assert_eq!(
+                prod_side.slots[k].kind, oracle_state.slots[k].kind,
+                "{layout:?} the production Get entry must retain slot {k} kind"
+            );
+            assert_eq!(
+                prod_side.slots[k].slot_index, oracle_state.slots[k].slot_index,
+                "{layout:?} the production Get entry must retain slot {k} index"
+            );
+        }
         let (reader, bytes) = adapter::readers(&oracle_target);
         let expected = capture_get_return(
             &oracle_state,
@@ -1497,51 +2017,86 @@ fn object_attributes_real_adapter_six_fields() {
                 "{layout:?} Get oracle cell {i} is VALUE"
             );
         }
-        let (reader, bytes) = adapter::readers(&prod_target);
-        let actual = production_capture_get_return(
-            &prod_state,
-            adapter::rv_ok(),
-            adapter::owner_ready_authority(),
-            layout,
-            reader,
-            bytes,
-        );
         assert_reads_subset(
             &prod_target,
             &oracle_target,
             &format!("{layout:?} GetAttributeValue inspection"),
         );
-        assert_eq!(
-            actual.cells, expected.cells,
-            "{layout:?} the production Get return must establish the six fields"
+        // The EMITTED Get wire list (cells plus flags) must equal the
+        // oracle wire: seam-outcome comparisons alone cannot observe Get
+        // transport, so this assert executes the production return-side
+        // emission. RED today (UNINSPECTED emitted vs VALUE expected).
+        assert!(
+            prod_tail.result_attributes == expected.to_wire(),
+            "{layout:?} production Get emission must establish the six fields, not UNINSPECTED"
         );
         // Pair separation: a second template keeps its own cells while
         // the peer's headers (not values) are re-read for alias checks.
-        let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
-        program_six_field_template(&target, 0x40000, 0x50000, w);
-        program_attr_slot(&target, 0x60000, 0, w, 0x0000, 0x70000, w);
-        target.borrow_mut().set_word(0x70000, 2);
-        let before = target.borrow().log().len();
-        let (reader, bytes) = adapter::readers(&target);
+        // The oracle proves the shape; the PRODUCTION entry adapter must
+        // then store both pairs (pair one with pair zero as its alias
+        // peer) and emit both as their oracle wires.
+        let oracle_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        program_six_field_template(&oracle_target, 0x40000, 0x50000, w);
+        program_attr_slot(&oracle_target, 0x60000, 0, w, 0x0000, 0x70000, w);
+        oracle_target.borrow_mut().set_word(0x70000, 2);
+        let (reader, bytes) = adapter::readers(&oracle_target);
+        let expected_pair0 = inspect_request_template(0x40000, 8, None, layout, reader, bytes);
+        let before = oracle_target.borrow().log().len();
+        let (reader, bytes) = adapter::readers(&oracle_target);
         let pair = inspect_request_template(0x60000, 1, Some((0x40000, 8)), layout, reader, bytes);
         assert_eq!(pair.cells[0].kind, attr_kind::CLASS);
         assert_eq!(pair.cells[0].status, attr_status::VALUE);
         assert_eq!(pair.cells[0].value, 2);
         assert!(
-            target.borrow().log()[before..]
+            oracle_target.borrow().log()[before..]
                 .iter()
                 .any(|(_, addr, _)| *addr == 0x40000),
             "{layout:?} pair inspection re-reads peer headers"
         );
         assert_eq!(
-            target.borrow().reads_of(0x50000),
+            oracle_target.borrow().log()[before..]
+                .iter()
+                .filter(|(_, addr, _)| *addr == 0x50000)
+                .count(),
             0,
             "{layout:?} pair inspection reads no peer value"
+        );
+        let prod_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        program_six_field_template(&prod_target, 0x40000, 0x50000, w);
+        program_attr_slot(&prod_target, 0x60000, 0, w, 0x0000, 0x70000, w);
+        prod_target.borrow_mut().set_word(0x70000, 2);
+        let (prod_side, prod_tail) = run_production_request_path(
+            &prod_target,
+            layout,
+            OBJECT_ACTION_PAIR,
+            [(0x40000, 8), (0x60000, 1)],
+            [2, 3, 4, 5],
+        );
+        assert_reads_subset(
+            &prod_target,
+            &oracle_target,
+            &format!("{layout:?} pair inspection"),
+        );
+        assert!(
+            prod_side.requested[0] == expected_pair0.to_wire(),
+            "{layout:?} the production entry path must capture pair zero"
+        );
+        assert!(
+            prod_side.requested[1] == pair.to_wire(),
+            "{layout:?} the production entry path must capture pair one with its peer"
+        );
+        assert!(
+            prod_tail.requested[0] == expected_pair0.to_wire(),
+            "{layout:?} production tail must emit pair zero"
+        );
+        assert!(
+            prod_tail.requested[1] == pair.to_wire(),
+            "{layout:?} production tail must emit pair one"
         );
         // No promotion: a fresh Get call without entry state establishes
         // nothing, however valid the creation request was.
         let fresh = GetEntryState::default();
-        let (reader, bytes) = adapter::readers(&target);
+        let (reader, bytes) = adapter::readers(&oracle_target);
         let unestablished = capture_get_return(
             &fresh,
             adapter::rv_ok(),
@@ -1559,9 +2114,6 @@ fn object_attributes_real_adapter_six_fields() {
             );
         }
     }
-    // Production call edges: forwarding the seams without adapter
-    // wiring keeps this RED even if every comparison above passed.
-    pin_attribute_seams_have_production_caller();
 }
 
 /// G05/E4: the production attribute path refuses before unsafe reads.
@@ -1570,18 +2122,18 @@ fn object_attributes_real_adapter_six_fields() {
 /// survive; SetAttributeValue authorizes zero template reads under the
 /// approved policy. Contamination vectors are representable on their
 /// layout (a 64-bit-only vector cannot arrive through a four-byte read).
-/// Three layers like the six-fields test: seam silence/match, production
-/// tail emission of each outcome, production call edges. RED while E4
-/// is unwired; forwarding the seams alone greens none of the
-/// transport/pin layers.
+/// Both layers drive the PRODUCTION entry adapter the BPF entry calls:
+/// the stored side pair plus the emitted wire list. RED while E4 is
+/// unwired; a budgeted E4 flips this test with zero test changes.
 #[test]
 #[ignore = "RED: H7-E4 budgeted attribute capture pending"]
 fn object_attributes_refuse_before_unsafe_read() {
+    use p11scope_ebpf_common::ARG_NONE;
     use p11scope_ebpf_common::LinuxLayout;
     use p11scope_ebpf_common::object_capture::{
         DeriveEntry, attr_kind, attr_status, authorize_entry_templates, inspect_request_template,
     };
-    use p11scope_ebpf_common::object_flow::production_inspect_request_template;
+    use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
     let set_fn: u32 = pkcs11_module::FUNCTION_NAMES
         .iter()
         .position(|name| *name == "C_SetAttributeValue")
@@ -1639,28 +2191,37 @@ fn object_attributes_refuse_before_unsafe_read() {
                 0,
                 "{layout:?} {name} reads no secret value"
             );
-            // The production path agrees with the silent oracle here
-            // (and must keep agreeing once E4 wires it: no over-read).
+            // The PRODUCTION entry adapter runs on the identically
+            // programmed target: its stored cells must agree with the
+            // silent oracle (and keep agreeing once E4 wires it), while
+            // the stored list and the emitted wire must carry the
+            // inspected refusal (PRESENT with silent cells), not the
+            // UNINSPECTED marking.
             let prod_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
             program_attr_slot(&prod_target, 0x40000, 0, w, selector, 0x50000, w);
             prod_target.borrow_mut().set_word(0x50000, 0x5ec4e7);
-            let (reader, bytes) = adapter::readers(&prod_target);
-            let actual =
-                production_inspect_request_template(0x40000, 1, None, layout, reader, bytes);
+            let (prod_side, prod_tail) = run_production_request_path(
+                &prod_target,
+                layout,
+                OBJECT_ACTION_CREATE,
+                [(0x40000, 1), (0, 0)],
+                [2, 3, ARG_NONE, ARG_NONE],
+            );
             assert_reads_subset(
                 &prod_target,
                 &oracle_target,
                 &format!("{layout:?} {name} inspection"),
             );
-            assert_eq!(
-                actual.cells[0], expected.cells[0],
+            assert!(
+                prod_side.requested[0].cells == expected.to_wire().cells,
                 "{layout:?} {name}: the production path stays silent"
             );
-            // Production transport must emit the inspected refusal,
-            // not the UNINSPECTED marking.
-            let emitted = emit_request_list_through_production_tail(layout, actual);
             assert!(
-                emitted == expected.to_wire(),
+                prod_side.requested[0] == expected.to_wire(),
+                "{layout:?} {name}: production entry stores the inspected refusal"
+            );
+            assert!(
+                prod_tail.requested[0] == expected.to_wire(),
                 "{layout:?} {name}: production tail emits the inspected refusal"
             );
         }
@@ -1683,24 +2244,28 @@ fn object_attributes_refuse_before_unsafe_read() {
         prod_target.borrow_mut().set_bytes(0x50000, &[1, 0]);
         program_attr_slot(&prod_target, 0x40000, 1, w, 0x0000, 0x50010, w);
         prod_target.borrow_mut().set_word(0x50010, 4);
-        let (reader, bytes) = adapter::readers(&prod_target);
-        let actual = production_inspect_request_template(0x40000, 2, None, layout, reader, bytes);
+        let (prod_side, prod_tail) = run_production_request_path(
+            &prod_target,
+            layout,
+            OBJECT_ACTION_CREATE,
+            [(0x40000, 2), (0, 0)],
+            [2, 3, ARG_NONE, ARG_NONE],
+        );
         assert_reads_subset(
             &prod_target,
             &oracle_target,
             &format!("{layout:?} neighbor inspection"),
         );
-        assert_eq!(
-            actual.cells[1], expected.cells[1],
+        assert!(
+            prod_side.requested[0].cells[1] == expected.cells[1].to_wire(),
             "{layout:?} the production path must keep the usable neighbor"
         );
-        assert_eq!(
-            actual.cells[0], expected.cells[0],
+        assert!(
+            prod_side.requested[0].cells[0] == expected.cells[0].to_wire(),
             "{layout:?} the production path must carry the finite rejection"
         );
-        let emitted = emit_request_list_through_production_tail(layout, actual);
         assert!(
-            emitted == expected.to_wire(),
+            prod_tail.requested[0] == expected.to_wire(),
             "{layout:?} production tail emits neighbor and rejection"
         );
         // SetAttributeValue is an invalidation/control call: zero
@@ -1713,7 +2278,4 @@ fn object_attributes_refuse_before_unsafe_read() {
             "{layout:?} Set authorizes no template"
         );
     }
-    // Production call edges: forwarding the seams without adapter
-    // wiring keeps this RED even if every comparison above passed.
-    pin_attribute_seams_have_production_caller();
 }

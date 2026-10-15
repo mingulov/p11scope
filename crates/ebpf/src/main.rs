@@ -30,11 +30,11 @@ use core::mem::MaybeUninit;
 #[cfg(feature = "inventory-only")]
 use p11scope_ebpf_common::INVENTORY_DISCOVERY_BYTES;
 #[cfg(not(feature = "inventory-only"))]
-use p11scope_ebpf_common::object_capture::{handle_status, object_flag};
+use p11scope_ebpf_common::object_capture::{handle_status, object_flag, validate_target_span};
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_flow::{
-    adapter_derive_entry, adapter_emit_find, adapter_fill_return, adapter_tail_fill,
-    continuity_joins, emission_finalize,
+    adapter_attributes_entry, adapter_derive_entry, adapter_emit_find, adapter_emit_get_attributes,
+    adapter_fill_return, adapter_tail_fill, continuity_joins, emission_finalize,
 };
 #[cfg(not(feature = "inventory-only"))]
 use p11scope_ebpf_common::object_wire::{
@@ -362,6 +362,13 @@ fn read_word(address: u64, layout: LinuxLayout) -> Result<u64, ()> {
             .map(u64::from)
             .map_err(|_| ()),
     }
+}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
+fn read_bytes_user(address: u64, buf: &mut [u8], layout: LinuxLayout) -> Result<(), ()> {
+    validate_target_span(address, buf.len() as u64, layout).ok_or(())?;
+    unsafe { helpers::bpf_probe_read_user_buf(address as *const u8, buf) }.map_err(|_| ())
 }
 
 #[inline(always)]
@@ -2951,6 +2958,40 @@ fn object_entry_find(
     true
 }
 
+// H7 adapters tail: entry attribute inspection and Get header retention.
+// Creation families inspect authorized template pairs into the side
+// row's request lists; Get retains entry headers into the side row's Get
+// fields; other families succeed trivially. Outlined after the Find
+// retention: each entry adapter re-queries its side row so the helpers
+// stay leaf-flat. Sequencing lives in the shared
+// `adapter_attributes_entry`, executed by host tests with injected
+// readers; this wrapper only binds BPF-local readers. While E4 is
+// unwired the seams retain nothing and the side keeps its allocated-zero
+// attribute state.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_entry_attributes(
+    ctx: &ProbeContext,
+    side: Option<&mut ObjectStart>,
+    layout: LinuxLayout,
+) -> bool {
+    // BPF-local: the descriptor lookup plus probe argument/word readers. All
+    // sequencing lives in the shared adapter, executed by host tests with
+    // injected readers.
+    let descriptor = side.as_ref().map_or(0, |s| s.descriptor_index);
+    let row = OBJECT_DESCRIPTORS.get(descriptor);
+    let mut fetch_arg = |index: u8| arg_u64(ctx, index, layout).ok();
+    adapter_attributes_entry(
+        side,
+        descriptor,
+        row,
+        layout,
+        &mut fetch_arg,
+        |addr| read_word(addr, layout),
+        |addr, buf| read_bytes_user(addr, buf, layout),
+    )
+}
+
 // H7 adapters tail: return-fill reads both result handles at their
 // retained pointers and advances READY to RETURNING. Sequencing lives in
 // the shared `adapter_fill_return` (slot gates included), executed by host
@@ -3015,6 +3056,43 @@ fn object_emit_find(
         adapter_emit_find(tail, side, descriptor, row, layout, rv, joined, |addr| {
             read_word(addr, layout)
         })
+    }
+}
+
+// Slice D emission: establish inspected Get results from retained entry
+// state into the reserved tail's result list. Outlined like the Find
+// emission: each emission level re-queries its side row so the helpers
+// stay leaf-flat. Sequencing lives in the shared
+// `adapter_emit_get_attributes`, executed by host tests with injected
+// readers; this wrapper only binds BPF-local state. While E4 is unwired
+// the seam marks the list UNINSPECTED and reads nothing.
+#[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn object_emit_get_attributes(
+    tail: *mut ObjectCallWire,
+    side: Option<&ObjectStart>,
+    descriptor: u32,
+    layout: LinuxLayout,
+    rv: u64,
+    joined: bool,
+) -> bool {
+    // BPF-local: the descriptor lookup plus the probe word/byte readers. All
+    // sequencing lives in the shared adapter, executed by host tests with
+    // injected readers. `joined` is the root's continuity verdict.
+    let row = OBJECT_DESCRIPTORS.get(descriptor);
+    // SAFETY: `tail` is the exclusively owned reserved tail by contract.
+    unsafe {
+        adapter_emit_get_attributes(
+            tail,
+            side,
+            descriptor,
+            row,
+            layout,
+            rv,
+            joined,
+            |addr| read_word(addr, layout),
+            |addr, buf| read_bytes_user(addr, buf, layout),
+        )
     }
 }
 
@@ -3365,6 +3443,14 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
             bump_evidence(EVIDENCE_START_INSERT_FAILURES);
             return 0;
         }
+        let attributes_side =
+            unsafe { p11_object_side_get(&key, (start.object_required - 1) as u32, 0).as_mut() };
+        if !object_entry_attributes(&ctx, attributes_side, layout) {
+            let _ = owned_start_remove(&key, true);
+            unsafe { p11_object_fault() };
+            bump_evidence(EVIDENCE_START_INSERT_FAILURES);
+            return 0;
+        }
     }
     #[cfg(feature = "unsafe-unvalidated-metadata")]
     if TEMPLATE_MODE == 3 {
@@ -3689,8 +3775,10 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         let tail_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
         let tailed = filled && object_tail_fill(tail, tail_side, descriptor);
         let find_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
-        let emitted =
-            tailed && object_emit_find(tail, find_side, descriptor, layout, rv, joined);
+        let get_side = unsafe { p11_object_side_get(&key, descriptor, 0).as_ref() };
+        let emitted = tailed
+            && object_emit_find(tail, find_side, descriptor, layout, rv, joined)
+            && object_emit_get_attributes(tail, get_side, descriptor, layout, rv, joined);
         // Submit the completed ring record only after successful
         // removal; otherwise discard it and fault. H7-E2: the shared
         // cleanup decision evaluates the retirement independently of

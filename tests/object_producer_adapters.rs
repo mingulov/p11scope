@@ -286,57 +286,94 @@ impl<'a> ArgSpy<'a> {
     }
 }
 
-/// H7-E3 Derive entry mirror. Replicates the FIXED `object_entry_derive`
-/// acquisition order (main.rs `object_entry_derive`): fetch the arg-1
-/// mechanism pointer, classify through the REAL shared
-/// `classify_derive_mechanism`, then acquire arg5 only on membership.
-/// Refused mechanisms fetch arg5 zero times (on ia32, zero stack word
-/// reads through the real `read_ia32_arg_with` address). The order pin
-/// below binds the mirror to the adapter line for line.
-fn run_derive_entry_mirror(
+/// H7-E3 Derive entry harness. Executes the REAL production adapter body
+/// (`object_flow::adapter_derive_entry` — the same function the BPF wrapper
+/// calls) with the argument spy as its fetcher and the instrumented target
+/// as its reader. Returns the adapter verdict; the caller-owned side row
+/// carries retention. Refused mechanisms fetch arg5 zero times (on ia32,
+/// zero stack word reads through the real `read_ia32_arg_with` address).
+fn run_production_derive_entry(
     args: &mut ArgSpy<'_>,
     target: &std::cell::RefCell<adapter::FakeTarget>,
     layout: p11scope_ebpf_common::LinuxLayout,
-) -> (
-    p11scope_ebpf_common::object_capture::DeriveEntry,
-    Option<u64>,
-) {
-    use p11scope_ebpf_common::object_capture::{DeriveEntry, classify_derive_mechanism};
-    // Step 1 (mirror of the arg-1 fetch plus the guard): classify the
-    // mechanism word before touching any other argument.
-    let mechanism_ptr = args.fetch(1).unwrap_or(0);
+    side: &mut p11scope_ebpf_common::object_wire::ObjectStart,
+    row: &p11scope_ebpf_common::object_wire::ObjectDescriptorWire,
+) -> bool {
+    use p11scope_ebpf_common::object_flow::adapter_derive_entry;
+    let descriptor = side.descriptor_index;
     let (reader, _) = adapter::readers(target);
-    let entry = classify_derive_mechanism(mechanism_ptr, layout, reader);
-    // Step 2 (mirror of the gated arg-5 fetch): membership alone
-    // acquires the result pointer.
-    let retained = match entry {
-        DeriveEntry::Accepted(_) => args.fetch(5),
-        DeriveEntry::Unavailable => None,
+    let mut fetch = |index: u8| args.fetch(index);
+    adapter_derive_entry(
+        Some(side),
+        descriptor,
+        Some(row),
+        layout,
+        &mut fetch,
+        reader,
+    )
+}
+
+/// A Derive harness pair: ENTRY-phase side row plus the frozen Derive row
+/// (descriptor 23, function 22, result arg 5, valid guard).
+fn derive_harness() -> (
+    p11scope_ebpf_common::object_wire::ObjectStart,
+    p11scope_ebpf_common::object_wire::ObjectDescriptorWire,
+) {
+    use p11scope_ebpf_common::ARG_NONE;
+    use p11scope_ebpf_common::object_wire::{
+        OBJECT_ACTION_DERIVE, OBJECT_GUARD_NAMED, ObjectDescriptorWire, ObjectStart,
     };
-    (entry, retained)
+    let mut side = ObjectStart::default();
+    side.descriptor_index = 23;
+    side.phase = 1;
+    let row = ObjectDescriptorWire {
+        function: 22,
+        input_args: [ARG_NONE; 2],
+        result_args: [5, ARG_NONE],
+        template_args: [ARG_NONE; 4],
+        find_capacity_arg: ARG_NONE,
+        find_count_arg: ARG_NONE,
+        action: OBJECT_ACTION_DERIVE,
+        guard: OBJECT_GUARD_NAMED,
+    };
+    (side, row)
 }
 
 fn pin_derive_guard_precedes_arg5() {
     let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("read BPF entry root");
-    let derive = source_between(
+    // Delegation: the BPF wrapper binds readers and calls the shared
+    // adapter the harness executes — no second inline copy.
+    let wrapper = source_between(
         &source,
         "fn object_entry_derive(",
         "fn object_entry_results(",
     );
-    // Membership classification precedes the arg-5 acquisition: the only
-    // arg-5 fetch in the adapter runs after the guard.
+    assert_eq!(
+        wrapper.matches("adapter_derive_entry(").count(),
+        1,
+        "the BPF wrapper must delegate to exactly one shared adapter_derive_entry"
+    );
+    assert!(
+        !wrapper.contains("classify_derive_mechanism"),
+        "the wrapper must not inline a second mechanism guard"
+    );
+    // Executed order: inside the shared adapter, membership
+    // classification precedes the single arg-5 fetch.
+    let flow = std::fs::read_to_string("crates/ebpf-common/src/object_flow.rs")
+        .expect("read shared adapter flow");
+    let derive = source_between(&flow, "pub fn adapter_derive_entry(", "fn slot_gate(");
     let guard = derive
         .find("classify_derive_mechanism")
         .expect("derive entry must classify the mechanism before acquiring arg5");
     let arg5 = derive
-        .find("arg_u64(ctx, 5, layout)")
+        .find("fetch_arg(5)")
         .expect("derive entry acquires arg5");
     assert!(
         guard < arg5,
         "the derive mechanism guard must precede the arg-5 fetch"
     );
     assert_eq!(
-        derive.matches("arg_u64(ctx, 5, layout)").count(),
+        derive.matches("fetch_arg(5)").count(),
         1,
         "derive entry fetches arg5 exactly once, after the guard"
     );
@@ -347,15 +384,18 @@ fn pin_derive_guard_precedes_arg5() {
 /// arg-5 fetch on each ABI; null, unreadable, unsupported and high-bit
 /// mechanisms fetch arg5 zero times, retain nothing and authorize no
 /// template access. A matching CKR_OK return reads phKey once;
-/// changed/missing S1 return evidence reads it zero times.
+/// changed/missing S1 return evidence reads it zero times. Entry and
+/// return both run through the production adapters, so an unconditional
+/// production arg-5 fetch fails this test.
 #[test]
 fn object_ia32_derive_membership_precedes_arg5_read() {
     use p11scope_ebpf_common::LinuxLayout;
     use p11scope_ebpf_common::capture;
     use p11scope_ebpf_common::object_capture::{
-        DeriveEntry, authorize_derive_return, authorize_entry_templates, capture_return_handles,
-        derive_mechanism_code, handle_status,
+        DeriveEntry, authorize_derive_return, authorize_entry_templates, derive_mechanism_code,
+        handle_status,
     };
+    use p11scope_ebpf_common::object_flow::adapter_fill_return;
     use p11scope_ebpf_common::object_policy::ScalarDeriveMechanism;
     let derive_fn: u32 = pkcs11_module::FUNCTION_NAMES
         .iter()
@@ -376,9 +416,13 @@ fn object_ia32_derive_membership_precedes_arg5_read() {
         let target = std::cell::RefCell::new(adapter::FakeTarget::new(8));
         target.borrow_mut().set_word(0x30000, code);
         let mut args = ArgSpy::lp64([None, Some(0x30000), None, None, None, Some(0x40000), None]);
-        let (entry, retained) = run_derive_entry_mirror(&mut args, &target, LinuxLayout::Lp64);
-        assert_eq!(entry, DeriveEntry::Accepted(expected));
-        assert_eq!(retained, Some(0x40000));
+        let (mut side, row) = derive_harness();
+        let ok =
+            run_production_derive_entry(&mut args, &target, LinuxLayout::Lp64, &mut side, &row);
+        let entry = DeriveEntry::Accepted(expected);
+        assert!(ok, "LP64 {code:#x} accepts");
+        assert_eq!(side.derive, entry.code());
+        assert_eq!(side.result_ptrs, [0x40000, 0]);
         assert_eq!(args.fetches_of(5), 1, "LP64 {code:#x} fetches arg5 once");
         assert_eq!(
             target.borrow().log(),
@@ -406,9 +450,13 @@ fn object_ia32_derive_membership_precedes_arg5_read() {
         }
         target.borrow_mut().set_word(0x30000, code);
         let mut args = ArgSpy::ia32(&target, sp);
-        let (entry, retained) = run_derive_entry_mirror(&mut args, &target, LinuxLayout::Ilp32);
-        assert_eq!(entry, DeriveEntry::Accepted(expected));
-        assert_eq!(retained, Some(0x40000));
+        let (mut side, row) = derive_harness();
+        let ok =
+            run_production_derive_entry(&mut args, &target, LinuxLayout::Ilp32, &mut side, &row);
+        let entry = DeriveEntry::Accepted(expected);
+        assert!(ok, "ia32 {code:#x} accepts");
+        assert_eq!(side.derive, entry.code());
+        assert_eq!(side.result_ptrs, [0x40000, 0]);
         assert_eq!(args.fetches_of(5), 1, "ia32 {code:#x} fetches arg5 once");
         let arg5_addr = p11scope_ebpf_common::ia32_arg_address(sp, 5).expect("arg5 stack address");
         assert_eq!(
@@ -416,7 +464,8 @@ fn object_ia32_derive_membership_precedes_arg5_read() {
             1,
             "ia32 {code:#x} reads the arg-5 stack word once"
         );
-        // Matching CKR_OK return reads phKey exactly once.
+        // Matching CKR_OK return reads phKey exactly once through the
+        // production fill.
         let phkey = std::cell::RefCell::new(adapter::FakeTarget::new(4));
         phkey.borrow_mut().set_word(0x40000, 0x77);
         assert!(authorize_derive_return(
@@ -425,18 +474,26 @@ fn object_ia32_derive_membership_precedes_arg5_read() {
             capture::MECHANISM_VALUE,
             code
         ));
+        let mut return_side = p11scope_ebpf_common::object_wire::ObjectStart::default();
+        return_side.descriptor_index = 23;
+        return_side.phase = 2;
+        return_side.derive = entry.code();
+        return_side.result_ptrs = [0x40000, 0];
         let (reader, _) = adapter::readers(&phkey);
-        let (verdict, words) = capture_return_handles(
-            [true, false],
-            [true, false],
-            [0x40000, 0],
+        let filled = adapter_fill_return(
+            Some(&mut return_side),
+            23,
+            Some(&row),
             adapter::rv_ok(),
-            adapter::owner_ready_authority(),
             LinuxLayout::Ilp32,
+            capture::MECHANISM_VALUE,
+            code,
+            true,
             reader,
         );
-        assert_eq!(verdict.statuses[0], handle_status::VALUE);
-        assert_eq!(words[0], 0x77);
+        assert!(filled, "ia32 {code:#x} matching return fills");
+        assert_eq!(return_side.result_statuses[0], handle_status::VALUE);
+        assert_eq!(return_side.result_ptrs[0], 0x77);
         assert_eq!(
             phkey.borrow().log(),
             &[(adapter::READ_WORD, 0x40000, 4)],
@@ -487,9 +544,11 @@ fn object_ia32_derive_membership_precedes_arg5_read() {
                 // The high-bit LP64-only refusal is covered on LP64; on
                 // ia32 the masked word is either unsupported or refused.
                 let mut args = ArgSpy::ia32(&target, sp);
-                let (entry, retained) = run_derive_entry_mirror(&mut args, &target, layout);
-                assert_eq!(entry, DeriveEntry::Unavailable, "{name}");
-                assert_eq!(retained, None, "{name} retains nothing");
+                let (mut side, row) = derive_harness();
+                let ok = run_production_derive_entry(&mut args, &target, layout, &mut side, &row);
+                assert!(ok, "{name} refuses without custody failure");
+                assert_eq!(side.derive, DeriveEntry::Unavailable.code(), "{name}");
+                assert_eq!(side.result_ptrs, [0, 0], "{name} retains nothing");
                 assert_eq!(
                     args.fetches_of(5),
                     0,
@@ -502,7 +561,11 @@ fn object_ia32_derive_membership_precedes_arg5_read() {
                     0,
                     "ia32 {name} reads the arg-5 stack word zero times"
                 );
-                let templates = authorize_entry_templates(derive_fn, [(0x50000, 2), (0, 0)], entry);
+                let templates = authorize_entry_templates(
+                    derive_fn,
+                    [(0x50000, 2), (0, 0)],
+                    DeriveEntry::Unavailable,
+                );
                 assert_eq!(templates, [None, None], "{name} authorizes no template");
             } else {
                 if let Some(word) = programmed {
@@ -512,19 +575,27 @@ fn object_ia32_derive_membership_precedes_arg5_read() {
                 }
                 let mut args =
                     ArgSpy::lp64([None, Some(mech_ptr), None, None, None, Some(0x40000), None]);
-                let (entry, retained) = run_derive_entry_mirror(&mut args, &target, layout);
-                assert_eq!(entry, DeriveEntry::Unavailable, "{name}");
-                assert_eq!(retained, None, "{name} retains nothing");
+                let (mut side, row) = derive_harness();
+                let ok = run_production_derive_entry(&mut args, &target, layout, &mut side, &row);
+                assert!(ok, "{name} refuses without custody failure");
+                assert_eq!(side.derive, DeriveEntry::Unavailable.code(), "{name}");
+                assert_eq!(side.result_ptrs, [0, 0], "{name} retains nothing");
                 assert_eq!(
                     args.fetches_of(5),
                     0,
                     "LP64 {name} performs zero arg-5 fetches"
                 );
-                let templates = authorize_entry_templates(derive_fn, [(0x50000, 2), (0, 0)], entry);
+                let templates = authorize_entry_templates(
+                    derive_fn,
+                    [(0x50000, 2), (0, 0)],
+                    DeriveEntry::Unavailable,
+                );
                 assert_eq!(templates, [None, None], "{name} authorizes no template");
             }
         }
-        // Changed/missing S1 return evidence reads phKey zero times.
+        // Changed/missing S1 return evidence reads phKey zero times
+        // through the production fill.
+        let (_, derive_row) = derive_harness();
         for (name, status, mechanism) in [
             ("changed evidence", capture::MECHANISM_VALUE, 0x393u64),
             ("missing evidence", capture::MECHANISM_UNREADABLE, 0x21u64),
@@ -542,17 +613,31 @@ fn object_ia32_derive_membership_precedes_arg5_read() {
             );
             let phkey = std::cell::RefCell::new(adapter::FakeTarget::new(w));
             phkey.borrow_mut().set_word(0x40000, 0x77);
+            let mut return_side = p11scope_ebpf_common::object_wire::ObjectStart::default();
+            return_side.descriptor_index = 23;
+            return_side.phase = 2;
+            return_side.derive = entry.code();
+            return_side.result_ptrs = [0x40000, 0];
             let (reader, _) = adapter::readers(&phkey);
-            let (verdict, _) = capture_return_handles(
-                [true, false],
-                [false, false],
-                [0x40000, 0],
-                adapter::rv_ok(),
-                adapter::owner_ready_authority(),
+            let filled = adapter_fill_return(
+                Some(&mut return_side),
+                23,
+                Some(&derive_row),
+                rv,
                 layout,
+                status,
+                mechanism,
+                true,
                 reader,
             );
-            assert_eq!(verdict.statuses[0], handle_status::PROTOCOL_UNAVAILABLE);
+            assert!(
+                filled,
+                "{layout:?} {name}: the finite refusal still completes"
+            );
+            assert_eq!(
+                return_side.result_statuses,
+                [handle_status::PROTOCOL_UNAVAILABLE, handle_status::ABSENT]
+            );
             adapter::assert_no_target_reads(&phkey, &format!("{layout:?} phKey on {name}"));
         }
         // Arithmetic overflow: the arg-1 slot itself is readable here
@@ -564,9 +649,11 @@ fn object_ia32_derive_membership_precedes_arg5_read() {
             target.borrow_mut().set_word(0x30000, 0x21);
             let sp = 0xffff_fff0u64;
             let mut args = ArgSpy::ia32(&target, sp);
-            let (entry, retained) = run_derive_entry_mirror(&mut args, &target, layout);
-            assert_eq!(entry, DeriveEntry::Unavailable);
-            assert_eq!(retained, None);
+            let (mut side, row) = derive_harness();
+            let ok = run_production_derive_entry(&mut args, &target, layout, &mut side, &row);
+            assert!(ok, "overflow refuses without custody failure");
+            assert_eq!(side.derive, DeriveEntry::Unavailable.code());
+            assert_eq!(side.result_ptrs, [0, 0]);
             assert_eq!(
                 target.borrow().log(),
                 &[(adapter::READ_BYTES, sp + 8, 4)],
@@ -580,6 +667,297 @@ fn object_ia32_derive_membership_precedes_arg5_read() {
         }
     }
     pin_derive_guard_precedes_arg5();
+}
+
+/// Fix round 1 mutation control for the G04 probe: the production
+/// acquisition order is load-bearing. Fetching arg5 unconditionally (or
+/// before classification) in the shared adapter fails this test
+/// (verified by manual mutant during the fix round). Non-Derive families
+/// and custody failures exercise the remaining adapter branches.
+#[test]
+fn object_derive_acquisition_guards_arg5_fetch() {
+    use p11scope_ebpf_common::ARG_NONE;
+    use p11scope_ebpf_common::LinuxLayout;
+    use p11scope_ebpf_common::object_flow::adapter_derive_entry;
+    use p11scope_ebpf_common::object_wire::{
+        OBJECT_ACTION_CREATE, OBJECT_DERIVE_UNAVAILABLE, ObjectDescriptorWire,
+    };
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        // A refused mechanism performs zero arg-5 fetches through the
+        // production adapter and retains the zero pointer.
+        let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        target.borrow_mut().set_word(0x30000, 0x1082);
+        let mut args = if layout == LinuxLayout::Lp64 {
+            ArgSpy::lp64([None, Some(0x30000), None, None, None, Some(0x40000), None])
+        } else {
+            let sp = 0x8000_0000u64;
+            target
+                .borrow_mut()
+                .set_bytes(sp + 8, &0x30000u32.to_le_bytes());
+            target
+                .borrow_mut()
+                .set_bytes(sp + 24, &0x40000u32.to_le_bytes());
+            ArgSpy::ia32(&target, sp)
+        };
+        let (mut side, row) = derive_harness();
+        let ok = run_production_derive_entry(&mut args, &target, layout, &mut side, &row);
+        assert!(ok, "{layout:?} refusal is not custody failure");
+        assert_eq!(side.derive, OBJECT_DERIVE_UNAVAILABLE);
+        assert_eq!(side.result_ptrs, [0, 0]);
+        assert_eq!(args.fetches_of(5), 0, "{layout:?} refused fetch count");
+        // A non-Derive family succeeds trivially with zero reads.
+        let target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+        let mut create_row = row;
+        create_row.action = OBJECT_ACTION_CREATE;
+        let (reader, _) = adapter::readers(&target);
+        let mut fetch = |_: u8| -> Option<u64> { panic!("no fetch on the trivial path") };
+        assert!(
+            adapter_derive_entry(
+                Some(&mut side),
+                23,
+                Some(&create_row),
+                layout,
+                &mut fetch,
+                reader,
+            ),
+            "{layout:?} non-Derive succeeds trivially"
+        );
+        adapter::assert_no_target_reads(&target, &format!("{layout:?} trivial path"));
+        // Custody failures refuse: missing side, missing row, a row that
+        // disagrees on the result ordinals.
+        let (reader, _) = adapter::readers(&target);
+        let mut fetch = |_: u8| None;
+        assert!(
+            !adapter_derive_entry(None, 23, Some(&row), layout, &mut fetch, reader),
+            "{layout:?} missing side refuses"
+        );
+        let (reader, _) = adapter::readers(&target);
+        let mut fetch = |_: u8| None;
+        assert!(
+            !adapter_derive_entry(Some(&mut side), 23, None, layout, &mut fetch, reader),
+            "{layout:?} missing row refuses"
+        );
+        let bad_row = ObjectDescriptorWire {
+            function: 22,
+            input_args: [ARG_NONE; 2],
+            result_args: [6, ARG_NONE],
+            template_args: [ARG_NONE; 4],
+            find_capacity_arg: ARG_NONE,
+            find_count_arg: ARG_NONE,
+            action: row.action,
+            guard: row.guard,
+        };
+        let (reader, _) = adapter::readers(&target);
+        let mut fetch = |_: u8| None;
+        assert!(
+            !adapter_derive_entry(
+                Some(&mut side),
+                23,
+                Some(&bad_row),
+                layout,
+                &mut fetch,
+                reader
+            ),
+            "{layout:?} disagreeing row refuses"
+        );
+        adapter::assert_no_target_reads(&target, &format!("{layout:?} Derive custody"));
+    }
+}
+
+/// The extracted production fill agrees with the reviewed shared core on
+/// a joined battery: identical statuses, words and flags, identical read
+/// sets. (Refused continuity is intentionally excluded: the core returns
+/// an unavailable verdict while the adapter refuses with `false`; G02
+/// covers the refused half through the production path.)
+#[test]
+fn object_return_fill_matches_shared_core() {
+    use p11scope_ebpf_common::ARG_NONE;
+    use p11scope_ebpf_common::LinuxLayout;
+    use p11scope_ebpf_common::capture;
+    use p11scope_ebpf_common::object_capture::{DeriveEntry, capture_return_handles};
+    use p11scope_ebpf_common::object_flow::adapter_fill_return;
+    use p11scope_ebpf_common::object_policy::ScalarDeriveMechanism;
+    use p11scope_ebpf_common::object_wire::{OBJECT_ACTION_CREATE, OBJECT_ACTION_DERIVE};
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        // (result args, pointers, words-or-None-per-slot, rv, action,
+        // derive code, S1 status, S1 mechanism).
+        let vectors: [([u8; 2], [u64; 2], [Option<u64>; 2], u64, u8, u8, u32, u64); 8] = [
+            (
+                [5, ARG_NONE],
+                [0x10000, 0],
+                [Some(0x42), None],
+                0,
+                OBJECT_ACTION_CREATE,
+                0,
+                capture::MECHANISM_VALUE,
+                0,
+            ),
+            (
+                [5, 6],
+                [0x10000, 0x10008],
+                [Some(0x42), Some(0x43)],
+                0,
+                OBJECT_ACTION_CREATE,
+                0,
+                capture::MECHANISM_VALUE,
+                0,
+            ),
+            // Alias: overlapping spans refuse both slots.
+            (
+                [5, 6],
+                [0x10000, 0x10000],
+                [Some(0x42), Some(0x42)],
+                0,
+                OBJECT_ACTION_CREATE,
+                0,
+                capture::MECHANISM_VALUE,
+                0,
+            ),
+            // Duplicate: equal words invalidate both slots.
+            (
+                [5, 6],
+                [0x10000, 0x10100],
+                [Some(0x42), Some(0x42)],
+                0,
+                OBJECT_ACTION_CREATE,
+                0,
+                capture::MECHANISM_VALUE,
+                0,
+            ),
+            // Partial: one value, one unreadable.
+            (
+                [5, 6],
+                [0x10000, 0x10100],
+                [Some(0x42), None],
+                0,
+                OBJECT_ACTION_CREATE,
+                0,
+                capture::MECHANISM_VALUE,
+                0,
+            ),
+            // Non-OK RV: unavailable cells, no reads.
+            (
+                [5, 6],
+                [0x10000, 0x10100],
+                [Some(0x42), Some(0x43)],
+                7,
+                OBJECT_ACTION_CREATE,
+                0,
+                capture::MECHANISM_VALUE,
+                0,
+            ),
+            // Derive match: accepted entry plus exact S1 reads phKey.
+            (
+                [5, ARG_NONE],
+                [0x10000, 0],
+                [Some(0x77), None],
+                0,
+                OBJECT_ACTION_DERIVE,
+                1,
+                capture::MECHANISM_VALUE,
+                0x21,
+            ),
+            // Derive mismatch: S1 disagreement reads nothing.
+            (
+                [5, ARG_NONE],
+                [0x10000, 0],
+                [Some(0x77), None],
+                0,
+                OBJECT_ACTION_DERIVE,
+                1,
+                capture::MECHANISM_VALUE,
+                0x393,
+            ),
+        ];
+        for (case, vector) in vectors.iter().enumerate() {
+            let (result_args, ptrs, words, rv, action, derive, status, mechanism) = *vector;
+            let program = |target: &std::cell::RefCell<adapter::FakeTarget>| {
+                for (slot, word) in words.iter().enumerate() {
+                    match word {
+                        Some(word) => target.borrow_mut().set_word(ptrs[slot], *word),
+                        None if ptrs[slot] != 0 => target.borrow_mut().set_fail(ptrs[slot]),
+                        None => {}
+                    }
+                }
+            };
+            // Shared-core oracle.
+            let core_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+            program(&core_target);
+            let present = [result_args[0] != ARG_NONE, result_args[1] != ARG_NONE];
+            let derive_entry = match derive {
+                1 => DeriveEntry::Accepted(ScalarDeriveMechanism::DhPkcs),
+                _ => DeriveEntry::Unavailable,
+            };
+            let authorized = if action == OBJECT_ACTION_DERIVE {
+                let ok = p11scope_ebpf_common::object_capture::authorize_derive_return(
+                    derive_entry,
+                    rv,
+                    status,
+                    mechanism,
+                );
+                [ok, ok]
+            } else {
+                [true, true]
+            };
+            let (reader, _) = adapter::readers(&core_target);
+            let (verdict, core_words) = capture_return_handles(
+                present,
+                authorized,
+                ptrs,
+                rv,
+                adapter::owner_ready_authority(),
+                layout,
+                reader,
+            );
+            // Production adapter on the identical vector.
+            let prod_target = std::cell::RefCell::new(adapter::FakeTarget::new(w));
+            program(&prod_target);
+            let (_, mut row) = derive_harness();
+            row.action = action;
+            row.result_args = result_args;
+            let mut side = p11scope_ebpf_common::object_wire::ObjectStart::default();
+            side.descriptor_index = 23;
+            side.phase = 2;
+            side.derive = derive;
+            side.result_ptrs = ptrs;
+            let (reader, _) = adapter::readers(&prod_target);
+            let filled = adapter_fill_return(
+                Some(&mut side),
+                23,
+                Some(&row),
+                rv,
+                layout,
+                status,
+                mechanism,
+                true,
+                reader,
+            );
+            assert!(
+                filled,
+                "{layout:?} case {case}: joined battery always fills"
+            );
+            assert_eq!(
+                side.result_statuses, verdict.statuses,
+                "{layout:?} case {case}: statuses match the core"
+            );
+            assert_eq!(
+                side.result_ptrs, core_words,
+                "{layout:?} case {case}: words match the core"
+            );
+            assert_eq!(
+                u32::from(side.flags),
+                verdict.object_flags,
+                "{layout:?} case {case}: flags match the core"
+            );
+            assert_eq!(
+                prod_target.borrow().log(),
+                core_target.borrow().log(),
+                "{layout:?} case {case}: read sets match the core"
+            );
+        }
+    }
 }
 
 fn pin_root_refusals_retire() {

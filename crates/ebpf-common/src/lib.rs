@@ -6,6 +6,7 @@
 
 pub mod inventory_callers;
 pub mod object_capture;
+pub mod object_flow;
 pub mod object_policy;
 pub mod object_wire;
 

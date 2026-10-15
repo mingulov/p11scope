@@ -1473,16 +1473,18 @@ static void object_producer_cleanup_result_reaches_exec_exit_fault(void)
 }
 /* H7-E2 root-refusal mirror: replicates the FIXED BPF return root object
  * arms (`p11_return_impl`): every refusal arm attempts the checked removal
- * before returning, image refusal faults, and the emission retirement is
- * evaluated independently of emission success (no short-circuit past the
- * removal). Models the object arm only: callers guarantee a required
- * object call with a live START, exactly the state the root holds at the
- * object-arm entry (ordinary calls leave at the aggregate arm; the Rust
- * pin keeps their accounting-only image refusal). Calls production
- * functions only. The Rust wrapper pins the root arms line for line.
- * Returns 1 on emission, 0 on any refusal. */
+ * before returning, image refusal faults, the reserve arm faults exactly
+ * when its cleanup fails, and the emission retirement is evaluated
+ * independently of the per-stage (`fill/tail/find`) emission chain (no
+ * short-circuit past the removal). Models the object arm only: callers
+ * guarantee a required object call with a live START, exactly the state
+ * the root holds at the object-arm entry (ordinary calls leave at the
+ * aggregate arm; the Rust pin keeps their accounting-only image refusal).
+ * Calls production functions only. The Rust wrapper pins the root arms
+ * line for line. Returns 1 on emission, 0 on any refusal. */
 static unsigned root_return_mirror(const struct owner_start_key *key, u32 descriptor, u32 layout,
-                                   int image_ok, int reserve_ok, int emit_ok)
+                                   int image_ok, int reserve_ok, int fill_ok, int tail_ok,
+                                   int find_ok)
 {
     const struct object_start *ready = p11_object_side_get(key, descriptor, 1);
     if (!ready) {
@@ -1504,12 +1506,20 @@ static unsigned root_return_mirror(const struct owner_start_key *key, u32 descri
         return 0;
     }
     if (!reserve_ok) {
-        p11_owner_start_remove(key, 1);
+        /* Production faults exactly when the reserve-path cleanup fails:
+         * a settled retire is quiet loss, a failed retire is corruption. */
+        if (p11_owner_start_remove(key, 1))
+            p11_object_fault();
         return 0;
     }
     {
+        /* Production chains the three emission stages (`filled && tailed
+         * && emitted`) and evaluates the retirement independently of the
+         * chain: a failed stage still retires owned state, and any
+         * failure faults without a success claim. */
+        int emitted = fill_ok && tail_ok && find_ok;
         long retired = p11_owner_start_remove(key, 1);
-        if (!emit_ok || retired) {
+        if (!emitted || retired) {
             p11_object_fault();
             return 0;
         }
@@ -1525,7 +1535,7 @@ static void object_producer_return_refusals_retire_owned_state(void)
     memset(value, 0, sizeof(value)); object_write_start(value, 24);
     assert(!p11_owner_start_insert(&key, value));
     assert(!pair_delete(&OBJECT_START, &key));
-    assert(!root_return_mirror(&key, 23, 1, 1, 1, 1));
+    assert(!root_return_mirror(&key, 23, 1, 1, 1, 1, 1, 1));
     assert(!row(&OBJECT_START, &key) && !row(&START, &key));
     assert(!ctl.outstanding && (ctl.poison & OWNER_OBJECT_MISMATCH));
     assert(instance_counters_live.faults == 1);
@@ -1534,7 +1544,7 @@ static void object_producer_return_refusals_retire_owned_state(void)
     key.pid_tgid = pid_tgid();
     memset(value, 0, sizeof(value)); object_write_start(value, 24);
     assert(!p11_owner_start_insert(&key, value));
-    assert(!root_return_mirror(&key, 23, 1, 1, 1, 1));
+    assert(!root_return_mirror(&key, 23, 1, 1, 1, 1, 1, 1));
     assert(!row(&OBJECT_START, &key) && !row(&START, &key));
     assert(!ctl.outstanding && !ctl.poison);
     assert(instance_counters_live.faults == 1);
@@ -1544,7 +1554,7 @@ static void object_producer_return_refusals_retire_owned_state(void)
     memset(value, 0, sizeof(value)); object_write_start(value, 24);
     assert(!p11_owner_start_insert(&key, value));
     row(&OBJECT_START, &key)->value[31] = 2;
-    assert(!root_return_mirror(&key, 21, 1, 1, 1, 1));
+    assert(!root_return_mirror(&key, 21, 1, 1, 1, 1, 1, 1));
     assert(!row(&OBJECT_START, &key) && !row(&START, &key));
     assert(!ctl.outstanding && instance_counters_live.faults == 1);
     /* Retained-ABI mismatch: retired with a fault verdict. */
@@ -1554,7 +1564,7 @@ static void object_producer_return_refusals_retire_owned_state(void)
     assert(!p11_owner_start_insert(&key, value));
     row(&OBJECT_START, &key)->value[31] = 2;
     row(&OBJECT_START, &key)->value[28] = 2;
-    assert(!root_return_mirror(&key, 23, 1, 1, 1, 1));
+    assert(!root_return_mirror(&key, 23, 1, 1, 1, 1, 1, 1));
     assert(!row(&OBJECT_START, &key) && !row(&START, &key));
     assert(!ctl.outstanding && instance_counters_live.faults == 1);
     /* Image refusal: retired with a fault, never silent. */
@@ -1563,19 +1573,41 @@ static void object_producer_return_refusals_retire_owned_state(void)
     memset(value, 0, sizeof(value)); object_write_start(value, 24);
     assert(!p11_owner_start_insert(&key, value));
     row(&OBJECT_START, &key)->value[31] = 2;
-    assert(!root_return_mirror(&key, 23, 1, 0, 1, 1));
+    assert(!root_return_mirror(&key, 23, 1, 0, 1, 1, 1, 1));
     assert(!row(&OBJECT_START, &key) && !row(&START, &key));
     assert(!ctl.outstanding && instance_counters_live.faults == 1);
-    /* Failed fill/emission: retired independently of emission success,
-     * faulted, no success claim and no later read surface. */
+    /* Failed fill/emission, each stage independently: retired
+     * independently of emission success, faulted, no success claim and
+     * no later read surface. */
+    for (unsigned stage = 0; stage < 3; stage++) {
+        int fill_ok = stage != 0, tail_ok = stage != 1, find_ok = stage != 2;
+        reset(); object_setup();
+        key.pid_tgid = pid_tgid();
+        memset(value, 0, sizeof(value)); object_write_start(value, 24);
+        assert(!p11_owner_start_insert(&key, value));
+        row(&OBJECT_START, &key)->value[31] = 2;
+        assert(!root_return_mirror(&key, 23, 1, 1, 1, fill_ok, tail_ok, find_ok));
+        assert(!row(&OBJECT_START, &key) && !row(&START, &key));
+        assert(!ctl.outstanding && instance_counters_live.faults == 1);
+    }
+    /* Successful emission with failing retirement: no success claim, a
+     * fault, and both rows kept (the side already scrubbed) for retry;
+     * clearing the error converges. */
     reset(); object_setup();
     key.pid_tgid = pid_tgid();
     memset(value, 0, sizeof(value)); object_write_start(value, 24);
     assert(!p11_owner_start_insert(&key, value));
     row(&OBJECT_START, &key)->value[31] = 2;
-    assert(!root_return_mirror(&key, 23, 1, 1, 1, 0));
+    fail_object_side_delete = -16;
+    assert(!root_return_mirror(&key, 23, 1, 1, 1, 1, 1, 1));
+    assert(row(&OBJECT_START, &key) && row(&START, &key));
+    assert(object_bytes_zeroed(row(&OBJECT_START, &key)->value));
+    assert(owners[0].start_count == 1 && ctl.outstanding == 1);
+    assert(instance_counters_live.faults == 1);
+    fail_object_side_delete = 0;
+    assert(p11_owner_cleanup() == 1);
     assert(!row(&OBJECT_START, &key) && !row(&START, &key));
-    assert(!ctl.outstanding && instance_counters_live.faults == 1);
+    assert(!ctl.outstanding && ctl.abandoned_start == 1);
     /* Ring-full twin: reserve failure retires with settled accounting and
      * no fault (loss, not corruption); no result read runs before it. */
     reset(); object_setup();
@@ -1583,16 +1615,33 @@ static void object_producer_return_refusals_retire_owned_state(void)
     memset(value, 0, sizeof(value)); object_write_start(value, 24);
     assert(!p11_owner_start_insert(&key, value));
     row(&OBJECT_START, &key)->value[31] = 2;
-    assert(!root_return_mirror(&key, 23, 1, 1, 0, 1));
+    assert(!root_return_mirror(&key, 23, 1, 1, 0, 1, 1, 1));
     assert(!row(&OBJECT_START, &key) && !row(&START, &key));
     assert(!ctl.outstanding && !ctl.poison && !instance_counters_live.faults);
+    /* Reserve failure with failing cleanup: production faults (the retire
+     * error is corruption, not quiet loss); rows and lease are kept for
+     * retry and converge once the error clears. */
+    reset(); object_setup();
+    key.pid_tgid = pid_tgid();
+    memset(value, 0, sizeof(value)); object_write_start(value, 24);
+    assert(!p11_owner_start_insert(&key, value));
+    row(&OBJECT_START, &key)->value[31] = 2;
+    fail_object_side_delete = -16;
+    assert(!root_return_mirror(&key, 23, 1, 1, 0, 1, 1, 1));
+    assert(row(&OBJECT_START, &key) && row(&START, &key));
+    assert(owners[0].start_count == 1 && ctl.outstanding == 1);
+    assert(instance_counters_live.faults == 1);
+    fail_object_side_delete = 0;
+    assert(p11_owner_cleanup() == 1);
+    assert(!row(&OBJECT_START, &key) && !row(&START, &key));
+    assert(!ctl.outstanding && ctl.abandoned_start == 1);
     /* Healthy positive: one record, one retirement, no fault. */
     reset(); object_setup();
     key.pid_tgid = pid_tgid();
     memset(value, 0, sizeof(value)); object_write_start(value, 24);
     assert(!p11_owner_start_insert(&key, value));
     row(&OBJECT_START, &key)->value[31] = 2;
-    assert(root_return_mirror(&key, 23, 1, 1, 1, 1));
+    assert(root_return_mirror(&key, 23, 1, 1, 1, 1, 1, 1));
     assert(!row(&OBJECT_START, &key) && !row(&START, &key));
     assert(!ctl.outstanding && !ctl.poison && !instance_counters_live.faults);
     /* Unproved ownership never authorizes forced deletion (stale row
@@ -1603,7 +1652,7 @@ static void object_producer_return_refusals_retire_owned_state(void)
     memset(value, 0, sizeof(value)); object_write_start(value, 24);
     assert(!p11_owner_start_insert(&key, value));
     current_index = 1;
-    assert(!root_return_mirror(&key, 23, 1, 1, 1, 1));
+    assert(!root_return_mirror(&key, 23, 1, 1, 1, 1, 1, 1));
     assert(row(&OBJECT_START, &key) && row(&START, &key));
     assert(owners[0].start_count == 1 && ctl.outstanding == 1);
     assert(instance_counters_live.faults == 1);

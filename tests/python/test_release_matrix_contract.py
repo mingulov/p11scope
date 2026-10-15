@@ -299,6 +299,14 @@ class MatrixContract(unittest.TestCase):
             "T7_ENVELOPE_REFUSAL cell=inventory-t7-n8192-boundary n=8192 phase=unknown verdict=\"x\"",
             "T7_ENVELOPE_REFUSAL cell=inventory-t7-n8192-boundary n=8191 phase=preflight verdict=\"x\"",
             "T7_ENVELOPE_REFUSAL cell=inventory-t7-n8192-boundary n=8192 phase=preflight",
+            # Malformed duplicate branch evidence beside a valid positive:
+            # an extra field, a contradictory relabeled line or a stray
+            # marker is rejected, never silently ignored.
+            self.BOUNDARY_POSITIVE + "\n" + ledger + " extra=1",
+            self.BOUNDARY_POSITIVE + "\n" + raw.replace("8192", "8191").replace(
+                "0..8191", "0..8190") + " rogue=1",
+            self.BOUNDARY_POSITIVE + "\nTASK4_LEDGER phase=after_go physical_ids=8192",
+            self.BOUNDARY_POSITIVE + "\nTASK4_RAW_MAPS phase=after_go usage_positive=8192",
         )
         for diagnostic in conflicts:
             with self.subTest(diagnostic=diagnostic[:60]):

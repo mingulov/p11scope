@@ -51,6 +51,7 @@ struct row { int used; void *map; unsigned char key[24]; unsigned char value[432
 static struct row rows[1024];
 #ifndef P11SCOPE_INVENTORY_ONLY
 static int fail_object_side_update, fail_object_side_delete, drop_zero_row, poison_zero_row;
+static int fail_object_side_lookup_once, hide_side_slot, zero_outstanding_on_delete;
 /* Pre-delete snapshot of the last removed subordinate value: every terminal
  * path must scrub before deleting. */
 static unsigned char deleted_side[432];
@@ -106,6 +107,13 @@ static void *lookup(void *map, const void *key)
     if (map == &OWNER_CTL) return &ctl;
 #ifndef P11SCOPE_INVENTORY_ONLY
     if (map == &OBJECT_ZERO && drop_zero_row) return NULL;
+    if (map == &OBJECT_START && fail_object_side_lookup_once) {
+        fail_object_side_lookup_once = 0;
+        return NULL;
+    }
+    if (map == &OBJECT_START && hide_side_slot >= 0 &&
+        ((const struct owner_start_key *)key)->slot == (u32)hide_side_slot)
+        return NULL;
 #endif
     struct row *r = row(map, key);
     return r ? r->value : NULL;
@@ -139,6 +147,15 @@ static long update(void *map, const void *key, const void *data, u64 flags)
 static long pair_delete(void *map, const void *key)
 {
     if (pair_delete_error) return pair_delete_error;
+    /* Models a concurrent lease-accounting loss landing mid-transaction:
+     * entry validation already passed with a live count, so only this
+     * mid-path corruption can reach the refund-failure line it guards. */
+#ifndef P11SCOPE_INVENTORY_ONLY
+    if (zero_outstanding_on_delete && map == &START) {
+        zero_outstanding_on_delete = 0;
+        ctl.outstanding = 0;
+    }
+#endif
 #ifndef P11SCOPE_INVENTORY_ONLY
     if (map == &OBJECT_START && fail_object_side_delete) return fail_object_side_delete;
 #endif
@@ -240,6 +257,7 @@ static void reset(void)
     owner_current_task = current_task; owner_pid_tgid = pid_tgid;
 #ifndef P11SCOPE_INVENTORY_ONLY
     fail_object_side_update = fail_object_side_delete = drop_zero_row = poison_zero_row = 0;
+    fail_object_side_lookup_once = 0; hide_side_slot = -1; zero_outstanding_on_delete = 0;
     deleted_side_seen = 0;
     memset(instance_gen, 0, sizeof(instance_gen));
     memset(&instance_counters_live, 0, sizeof(instance_counters_live));
@@ -1437,7 +1455,296 @@ static void object_producer_cleanup_result_reaches_exec_exit_fault(void)
     owners[0].flags = 0xFF;
     assert(p11_owner_cleanup() == 1);
     assert(ctl.poison & OWNER_BAD_RECORD);
+    /* Stop-with-held-calls native: a held object call carrying known
+     * private side bytes is scrubbed by teardown cleanup; the pre-delete
+     * snapshot proves those exact bytes were zeroed, not merely deleted. */
+    reset(); object_setup();
+    key.pid_tgid = pid_tgid();
+    memset(value, 0, sizeof(value)); object_write_start(value, 24);
+    assert(!p11_owner_start_insert(&key, value));
+    memset(row(&OBJECT_START, &key)->value + 32, 0xA5, 64);
+    memset(row(&OBJECT_START, &key)->value + 96, 0x5A, 64);
+    deleted_side_seen = 0;
+    assert(!p11_owner_cleanup());
+    assert(!row(&OBJECT_START, &key) && !row(&START, &key));
+    assert(!ctl.outstanding && ctl.abandoned_start == 1 && !ctl.poison);
+    assert(deleted_side_seen && object_bytes_zeroed(deleted_side));
     puts("object custody cleanup result passed");
+}
+/* H7-E2 root-refusal mirror (RED state): replicates the CURRENT BPF return
+ * root object arms (`p11_return_impl` at f8f7a7a7): the ready/agreement
+ * exits fault without any removal; image refusal exits without removal or
+ * fault; failed emission short-circuits (`!emitted ||`) past the removal.
+ * Calls production functions only. The E2 fix retires on every arm in both
+ * the root and this mirror; the Rust wrapper pins the root arms line for
+ * line. Returns 1 on emission, 0 on any refusal. The reserve-failure and
+ * healthy arms already retire and are GREEN guards, not RED. */
+static unsigned root_return_mirror(const struct owner_start_key *key, u32 descriptor, u32 layout,
+                                   int image_ok, int reserve_ok, int emit_ok)
+{
+    const struct object_start *ready = p11_object_side_get(key, descriptor, 1);
+    if (!ready) {
+        p11_object_fault();
+        return 0;
+    }
+    const struct object_start *side = p11_object_side_get(key, descriptor, 0);
+    int agree = side != NULL && side->descriptor_index == descriptor &&
+        (!side->layout || side->layout == layout);
+    if (!agree) {
+        p11_object_fault();
+        return 0;
+    }
+    if (!image_ok) {
+        return 0;
+    }
+    if (!reserve_ok) {
+        p11_owner_start_remove(key, 1);
+        return 0;
+    }
+    if (!emit_ok || p11_owner_start_remove(key, 1)) {
+        p11_object_fault();
+        return 0;
+    }
+    return 1;
+}
+static void object_producer_return_refusals_retire_owned_state(void)
+{
+    struct owner_start_key key = { .pid_tgid = 0, .slot = 7 };
+    /* Missing side row: retired, refunded, faulted, no success. */
+    reset(); object_setup();
+    key.pid_tgid = pid_tgid();
+    memset(value, 0, sizeof(value)); object_write_start(value, 24);
+    assert(!p11_owner_start_insert(&key, value));
+    assert(!pair_delete(&OBJECT_START, &key));
+    assert(!root_return_mirror(&key, 23, 1, 1, 1, 1));
+    assert(!row(&OBJECT_START, &key) && !row(&START, &key));
+    assert(!ctl.outstanding && (ctl.poison & OWNER_OBJECT_MISMATCH));
+    assert(instance_counters_live.faults == 1);
+    /* Non-ready (entry) phase: same retirement. */
+    reset(); object_setup();
+    key.pid_tgid = pid_tgid();
+    memset(value, 0, sizeof(value)); object_write_start(value, 24);
+    assert(!p11_owner_start_insert(&key, value));
+    assert(!root_return_mirror(&key, 23, 1, 1, 1, 1));
+    assert(!row(&OBJECT_START, &key) && !row(&START, &key));
+    assert(!ctl.outstanding && !ctl.poison);
+    assert(instance_counters_live.faults == 1);
+    /* Attached-descriptor mismatch: retired with a fault verdict. */
+    reset(); object_setup();
+    key.pid_tgid = pid_tgid();
+    memset(value, 0, sizeof(value)); object_write_start(value, 24);
+    assert(!p11_owner_start_insert(&key, value));
+    row(&OBJECT_START, &key)->value[31] = 2;
+    assert(!root_return_mirror(&key, 21, 1, 1, 1, 1));
+    assert(!row(&OBJECT_START, &key) && !row(&START, &key));
+    assert(!ctl.outstanding && instance_counters_live.faults == 1);
+    /* Retained-ABI mismatch: retired with a fault verdict. */
+    reset(); object_setup();
+    key.pid_tgid = pid_tgid();
+    memset(value, 0, sizeof(value)); object_write_start(value, 24);
+    assert(!p11_owner_start_insert(&key, value));
+    row(&OBJECT_START, &key)->value[31] = 2;
+    row(&OBJECT_START, &key)->value[28] = 2;
+    assert(!root_return_mirror(&key, 23, 1, 1, 1, 1));
+    assert(!row(&OBJECT_START, &key) && !row(&START, &key));
+    assert(!ctl.outstanding && instance_counters_live.faults == 1);
+    /* Image refusal: retired with a fault, never silent. */
+    reset(); object_setup();
+    key.pid_tgid = pid_tgid();
+    memset(value, 0, sizeof(value)); object_write_start(value, 24);
+    assert(!p11_owner_start_insert(&key, value));
+    row(&OBJECT_START, &key)->value[31] = 2;
+    assert(!root_return_mirror(&key, 23, 1, 0, 1, 1));
+    assert(!row(&OBJECT_START, &key) && !row(&START, &key));
+    assert(!ctl.outstanding && instance_counters_live.faults == 1);
+    /* Failed fill/emission: retired independently of emission success,
+     * faulted, no success claim and no later read surface. */
+    reset(); object_setup();
+    key.pid_tgid = pid_tgid();
+    memset(value, 0, sizeof(value)); object_write_start(value, 24);
+    assert(!p11_owner_start_insert(&key, value));
+    row(&OBJECT_START, &key)->value[31] = 2;
+    assert(!root_return_mirror(&key, 23, 1, 1, 1, 0));
+    assert(!row(&OBJECT_START, &key) && !row(&START, &key));
+    assert(!ctl.outstanding && instance_counters_live.faults == 1);
+    /* Ring-full twin: reserve failure retires with settled accounting and
+     * no fault (loss, not corruption); no result read runs before it. */
+    reset(); object_setup();
+    key.pid_tgid = pid_tgid();
+    memset(value, 0, sizeof(value)); object_write_start(value, 24);
+    assert(!p11_owner_start_insert(&key, value));
+    row(&OBJECT_START, &key)->value[31] = 2;
+    assert(!root_return_mirror(&key, 23, 1, 1, 0, 1));
+    assert(!row(&OBJECT_START, &key) && !row(&START, &key));
+    assert(!ctl.outstanding && !ctl.poison && !instance_counters_live.faults);
+    /* Healthy positive: one record, one retirement, no fault. */
+    reset(); object_setup();
+    key.pid_tgid = pid_tgid();
+    memset(value, 0, sizeof(value)); object_write_start(value, 24);
+    assert(!p11_owner_start_insert(&key, value));
+    row(&OBJECT_START, &key)->value[31] = 2;
+    assert(root_return_mirror(&key, 23, 1, 1, 1, 1));
+    assert(!row(&OBJECT_START, &key) && !row(&START, &key));
+    assert(!ctl.outstanding && !ctl.poison && !instance_counters_live.faults);
+    /* Unproved ownership never authorizes forced deletion: the refusal is
+     * attempted but production keeps every row. */
+    reset(); object_setup();
+    key.pid_tgid = pid_tgid();
+    memset(value, 0, sizeof(value)); object_write_start(value, 24);
+    assert(!p11_owner_start_insert(&key, value));
+    current_index = 1;
+    assert(!root_return_mirror(&key, 23, 1, 1, 1, 1));
+    assert(row(&OBJECT_START, &key) && row(&START, &key));
+    assert(owners[0].start_count == 1 && ctl.outstanding == 1);
+    assert(instance_counters_live.faults == 1);
+    puts("object custody return refusals passed");
+}
+static void object_producer_alloc_readback_failure_preserves_cleanup_authority(void)
+{
+    struct owner_start_key key = { .pid_tgid = 0, .slot = 7 };
+    /* Side NOEXIST succeeds, the following readback lookup fails:
+     * explicit failure, no publication, no orphan row, lease settled.
+     * The side initially contains OBJECT_ZERO bytes (binding writes run
+     * after the lookup), so this is a custody gap, never observed secret
+     * retention. A left-behind orphan would be permanent: rollback
+     * already refunded the lease, so no later cleanup-with-work can reach
+     * the orphan sweep for this key. */
+    reset(); object_setup();
+    key.pid_tgid = pid_tgid();
+    fail_object_side_lookup_once = 1;
+    memset(value, 0, sizeof(value)); object_write_start(value, 24);
+    assert(p11_owner_start_insert(&key, value));
+    assert(!row(&START, &key));
+    assert(!row(&OBJECT_START, &key));
+    assert(!p11_object_side_get(&key, 23, 0));
+    assert(!ctl.outstanding && idle(0));
+    assert(ctl.poison & OWNER_OBJECT_MISMATCH);
+    /* Fail-closed: a same-key successor is refused (nothing settles a
+     * poisoned control), and repeated cleanup converges visibly. */
+    memset(value, 0, sizeof(value)); object_write_start(value, 24);
+    assert(p11_owner_start_insert(&key, value));
+    assert(!row(&START, &key) && !row(&OBJECT_START, &key));
+    assert(p11_owner_cleanup() == 1 && p11_owner_cleanup() == 1);
+    assert(!ctl.outstanding && (ctl.poison & OWNER_OBJECT_MISMATCH));
+    /* The rollback deletes only this live transaction key: a foreign row
+     * under another live owner survives with its lease intact. */
+    reset(); object_setup();
+    current_index = 1;
+    {
+        struct owner_start_key other = { .pid_tgid = pid_tgid(), .slot = 7 };
+        memset(value, 0, sizeof(value)); object_write_start(value, 24);
+        assert(!p11_owner_start_insert(&other, value));
+        current_index = 0;
+        key.pid_tgid = pid_tgid();
+        fail_object_side_lookup_once = 1;
+        memset(value, 0, sizeof(value)); object_write_start(value, 24);
+        assert(p11_owner_start_insert(&key, value));
+        assert(!row(&START, &key) && !row(&OBJECT_START, &key));
+        assert(row(&START, &other) && row(&OBJECT_START, &other));
+        assert(owners[1].start_count == 1 && ctl.outstanding == 1);
+        assert(p11_owner_cleanup() == 1 && ctl.outstanding == 1);
+        assert(row(&START, &other) && row(&OBJECT_START, &other));
+    }
+    /* Normal allocation and repeated-cleanup positives. */
+    reset(); object_setup();
+    key.pid_tgid = pid_tgid();
+    memset(value, 0, sizeof(value)); object_write_start(value, 24);
+    assert(!p11_owner_start_insert(&key, value));
+    assert(drain_via_query(&key, 23, 1) == 1);
+    assert(!p11_owner_cleanup() && !ctl.outstanding && !ctl.poison);
+    assert(!p11_owner_cleanup());
+    memset(value, 0, sizeof(value)); object_write_start(value, 24);
+    assert(!p11_owner_start_insert(&key, value));
+    assert(drain_via_query(&key, 23, 1) == 1);
+    assert(!ctl.poison);
+    puts("object custody alloc readback passed");
+}
+static void object_producer_empty_lease_refund_failure_remains_visible(void)
+{
+    /* Reconciles the historical "empty-lease settle" shorthand from the
+     * slice-D completion review: that note named no concrete defect. This
+     * reproducer injects refund/control failure around release_empty and
+     * proves the CURRENT behavior fail-closed (no defect reproduced; the
+     * shorthand alone identifies none): rows retire, the failure stays
+     * visible, no lease is refunded twice, and the sibling lease is
+     * undamaged. Behavior pinned. */
+    struct owner_start_key key = { .pid_tgid = 0, .slot = 7 };
+    struct owner_start_key other = { .pid_tgid = 0, .slot = 3 };
+    reset(); object_setup();
+    key.pid_tgid = pid_tgid();
+    memset(value, 0, sizeof(value)); object_write_start(value, 24);
+    assert(!p11_owner_start_insert(&key, value));
+    current_index = 1;
+    other.pid_tgid = pid_tgid();
+    memset(value, 0, sizeof(value));
+    assert(!p11_owner_start_insert(&other, value));
+    current_index = 0;
+    /* The injection lands mid-transaction (see pair_delete): corrupting
+     * the count any earlier would rightly refuse at entry validation
+     * instead of reaching the refund line under test. */
+    zero_outstanding_on_delete = 1;
+    deleted_side_seen = 0;
+    assert(p11_owner_start_remove(&key, 1));
+    assert(!row(&START, &key) && !row(&OBJECT_START, &key));
+    assert(deleted_side_seen && object_bytes_zeroed(deleted_side));
+    assert(idle(0));
+    assert(ctl.poison & OWNER_REFUND_FAILED);
+    assert(ctl.outstanding == 0);
+    assert(row(&START, &other));
+    assert(owners[1].flags == OWNER_LEASED && owners[1].start_count == 1);
+    assert(p11_owner_cleanup() == 1);
+    assert(ctl.outstanding == 0 && (ctl.poison & OWNER_REFUND_FAILED));
+    assert(row(&START, &other) && owners[1].start_count == 1);
+    assert(p11_owner_start_remove(&key, 1));
+    assert(ctl.outstanding == 0 && (ctl.poison & OWNER_REFUND_FAILED));
+    /* The poisoned control refuses the healthy sibling too: designed
+     * fail-closed (its accounting is intact, only service is refused). */
+    assert(p11_owner_start_remove(&other, 1));
+    assert(row(&START, &other));
+    assert(owners[1].flags == OWNER_LEASED && owners[1].start_count == 1);
+    assert(ctl.outstanding == 0);
+    puts("object custody empty refund passed");
+}
+static void object_owner_sweep_adjacent_lookup_preserves_custody(void)
+{
+    struct owner_start_key key = { .pid_tgid = 0, .slot = 7 };
+    /* An orphaned side row hidden from the teardown sweep by a lookup miss
+     * is preserved intact, never deleted blindly: a NULL lookup is
+     * indistinguishable from absence, so the sweep cannot fault on it. In
+     * production the kernel lookup never spuriously misses; this pins the
+     * injected boundary. Later live work on the same owner sweeps the
+     * orphan exactly once with exact accounting. */
+    reset(); object_setup();
+    key.pid_tgid = pid_tgid();
+    memset(value, 0, sizeof(value)); object_write_start(value, 24);
+    assert(!p11_owner_start_insert(&key, value));
+    memset(row(&OBJECT_START, &key)->value + 32, 0xA5, 64);
+    assert(!pair_delete(&START, &key));
+    owners[0].start_count--;
+    hide_side_slot = 7;
+    deleted_side_seen = 0;
+    assert(!p11_owner_cleanup());
+    assert(row(&OBJECT_START, &key));
+    assert(!deleted_side_seen);
+    assert(!ctl.outstanding && idle(0) && !ctl.poison);
+    {
+        unsigned char expect[64];
+        memset(expect, 0xA5, sizeof(expect));
+        assert(!memcmp(row(&OBJECT_START, &key)->value + 32, expect, sizeof(expect)));
+    }
+    hide_side_slot = -1;
+    {
+        struct owner_start_key live = { .pid_tgid = pid_tgid(), .slot = 5 };
+        memset(value, 0, sizeof(value));
+        assert(!p11_owner_start_insert(&live, value));
+        deleted_side_seen = 0;
+        assert(!p11_owner_cleanup());
+        assert(!row(&OBJECT_START, &key) && !row(&START, &live));
+        assert(deleted_side_seen && object_bytes_zeroed(deleted_side));
+        assert(ctl.abandoned_start == 2);
+        assert(!ctl.outstanding && !ctl.poison);
+    }
+    puts("object custody sweep adjacent passed");
 }
 #endif
 #ifdef P11SCOPE_INVENTORY_ONLY
@@ -1501,12 +1808,20 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "object_producer_side_state_n_and_n_plus_one")) object_producer_side_state_n_and_n_plus_one();
         else if (!strcmp(argv[1], "object_producer_missing_side_state_faults_before_return")) object_producer_missing_side_state_faults_before_return();
         else if (!strcmp(argv[1], "object_producer_cleanup_result_reaches_exec_exit_fault")) object_producer_cleanup_result_reaches_exec_exit_fault();
+        else if (!strcmp(argv[1], "object_producer_return_refusals_retire_owned_state")) object_producer_return_refusals_retire_owned_state();
+        else if (!strcmp(argv[1], "object_producer_alloc_readback_failure_preserves_cleanup_authority")) object_producer_alloc_readback_failure_preserves_cleanup_authority();
+        else if (!strcmp(argv[1], "object_producer_empty_lease_refund_failure_remains_visible")) object_producer_empty_lease_refund_failure_remains_visible();
+        else if (!strcmp(argv[1], "object_owner_sweep_adjacent_lookup_preserves_custody")) object_owner_sweep_adjacent_lookup_preserves_custody();
         else assert(0);
     } else {
         cas_boundaries(); accounting_contention(); threaded_contention(); idle_owner_retention();
         lease_boundary(); classifier(); transactions(); directory(); lifecycle(); poisoned_reads(); capacity_collision(); ordinary_absence(); discovery_foreign_owner();
         object_producer_owner_terminal_matrix(); object_producer_side_state_n_and_n_plus_one();
         object_producer_missing_side_state_faults_before_return(); object_producer_cleanup_result_reaches_exec_exit_fault();
+        /* H7-E2 RED: the four new refusal/custody controls run
+         * subcommand-only until their fix lands; they join this full run
+         * in the E2 commit. (Two pin already-correct behavior and would
+         * pass here; two reproduce defects and abort until fixed.) */
     }
     puts("task-owner: actual helper classifier, transactions, directory and lifecycle controls passed");
 }

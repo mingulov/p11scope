@@ -42,6 +42,7 @@ use std::num::{NonZeroU32, NonZeroU64};
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) mod detailed_identity;
@@ -2018,11 +2019,12 @@ impl RetainedStaticTarget {
     }
 }
 
-/// Session-owned monotonic attachment generation: every successful
+/// Test-only interim attachment generation: every successful test
 /// sealing mints the next value, so the closure generation the
-/// journal observes always names a real sealed endpoint set. A
-/// process-wide counter is the interim mint; the H8 plan's mmapable
-/// generation array replaces it when the live attach path lands.
+/// journal observes always names a real sealed endpoint set. Fenced
+/// from production (which mints from the mmapable attach cell): the
+/// interim counter alone never feeds production authority.
+#[cfg(test)]
 static ATTACHMENT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Session-owned attachment authority. Fields and constructor stay private.
@@ -2053,11 +2055,45 @@ impl AttachedSemanticSet {
 }
 
 /// Seal one operator-attested subset into Session-owned attachment
-/// authority: the exact descriptors, retained static targets and owned
-/// sides are validated here, never trusted. Production calls this with
-/// live-built maps; host tests with fixture-built maps over the same
-/// validation. The sealed receipt is the successful-attachment
-/// evidence birth observation requires.
+/// authority with a NATIVE mint: validates exactly like the test
+/// sealer, then mints the generation from the mmapable attach cell
+/// (BPF stamps exec'ing records from it as `exec_attach_gen`), so the
+/// sealed generation always names a natively published endpoint set.
+/// A failed native mint refuses the sealing. Production seals here;
+/// the interim userspace counter never feeds production authority.
+pub(crate) fn seal_attached_subset_native(
+    ebpf: &Ebpf,
+    subset: crate::inventory_semantics::AttestedSubset,
+    domain: crate::attach::capture::NativeDomainId,
+    policy: CapturePolicy,
+    descriptors: Result<Vec<SlotSemantics>>,
+    retained: &BTreeMap<u32, RetainedStaticTarget>,
+    owned_sides: &BTreeSet<StaticEndpoint>,
+    watched: impl Fn(PinnedObjectId) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
+) -> std::result::Result<AttachedSemanticSet, crate::inventory_semantics::SemanticRefusal> {
+    let mut attached = AttachedSemanticSet {
+        domain,
+        subset,
+        generation: 0,
+    };
+    attached.validate_with(domain, policy, descriptors, retained, owned_sides, watched)?;
+    // Only a successful sealing mints, from native: the generation
+    // always names a complete validated endpoint set published to the
+    // attach cell, never a refused one or a bare counter value.
+    let maps = instance::InstanceMaps { ebpf };
+    attached.generation = maps
+        .mint_attach_generation()
+        .map_err(|_| crate::inventory_semantics::SemanticRefusal::Attachment)?;
+    Ok(attached)
+}
+
+/// Test-only seal over fixture-built maps through the same validation:
+/// host tests seal their successful-attachment evidence here (and via
+/// `seal_test_attachment`). Fenced from production, which seals
+/// through `seal_attached_subset_native` with a native mint. The
+/// sealed receipt is the successful-attachment evidence birth
+/// observation requires.
+#[cfg(test)]
 pub(crate) fn seal_attached_subset_with(
     subset: crate::inventory_semantics::AttestedSubset,
     domain: crate::attach::capture::NativeDomainId,
@@ -4068,7 +4104,8 @@ impl Session {
         let domain = session
             .native_domain()
             .context("Detailed image domain unavailable")?;
-        let attached = seal_attached_subset_with(
+        let attached = seal_attached_subset_native(
+            &session.ebpf,
             subset,
             domain,
             session.policy,

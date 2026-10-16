@@ -2569,7 +2569,11 @@ impl JournalAdapter {
         &mut self,
         grant: &SessionDrainGrant,
     ) -> Result<(), DrainBindRefusal> {
-        if !self.keys.keys().any(|key| key.domain_tag == grant.domain_tag) {
+        if !self
+            .keys
+            .keys()
+            .any(|key| key.domain_tag == grant.domain_tag)
+        {
             return Err(DrainBindRefusal::DomainUnattested);
         }
         match self.drain_pins.get(&grant.domain_tag) {
@@ -4876,7 +4880,9 @@ mod tests {
         /// tick's bind step. The domain must have attested first.
         fn bind_session_drain(&mut self) {
             let grant = self.mint_drain_grant();
-            self.adapter.bind_session_drain(&grant).expect("session drain binds");
+            self.adapter
+                .bind_session_drain(&grant)
+                .expect("session drain binds");
         }
 
         fn ingest(&mut self, bytes: &[u8]) -> JournalDisposition {

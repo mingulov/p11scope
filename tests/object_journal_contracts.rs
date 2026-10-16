@@ -876,8 +876,9 @@ fn object_journal_discards_are_root_side() {
             for candidate in lines[..index].iter().rev() {
                 if let Some(paren) = candidate.rfind('(') {
                     let before = candidate[..paren].trim_end();
-                    if let Some(name) =
-                        before.split(|c: char| !c.is_alphanumeric() && c != '_').last()
+                    if let Some(name) = before
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .last()
                     {
                         current = name.to_string();
                     }
@@ -905,7 +906,10 @@ fn object_journal_discards_are_root_side() {
             index + 1
         );
     }
-    assert!(sites >= 3, "expected root-side discard sites, found {sites}");
+    assert!(
+        sites >= 3,
+        "expected root-side discard sites, found {sites}"
+    );
 }
 
 /// Slice-A custody stays inactive: no live BPF root wires the journal

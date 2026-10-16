@@ -327,6 +327,19 @@ impl Invalidation {
     pub(crate) fn scope(&self) -> &InvalidationScope {
         &self.scope
     }
+
+    #[cfg(test)]
+    pub(crate) fn scripted(
+        domain: NativeDomainId,
+        scope: InvalidationScope,
+        position: Option<u64>,
+    ) -> Self {
+        Self {
+            domain,
+            scope,
+            position,
+        }
+    }
 }
 impl fmt::Debug for Invalidation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -377,6 +390,17 @@ impl TickOutcome {
     pub(crate) fn is_invalidation(&self) -> bool {
         matches!(self, TickOutcome::Invalidation(_))
     }
+
+    /// This outcome's H0 position, when the allocator issued one. A
+    /// missing position means allocator exhaustion, never a gap the
+    /// finalizer may skip.
+    pub(crate) fn position(&self) -> Option<u64> {
+        match self {
+            TickOutcome::Call(call) => call.token(),
+            TickOutcome::Invalidation(invalidation) => invalidation.position(),
+            TickOutcome::Other(other) => other.position(),
+        }
+    }
 }
 #[derive(Default, Debug)]
 pub(crate) struct TickReport {
@@ -386,6 +410,14 @@ pub(crate) struct TickReport {
     pub(crate) scans: usize,
     pub(crate) observations: Vec<ObserveOutcome>,
     pub(crate) scan_refusals: Vec<ImageQueryRefusal>,
+    /// H3 disposition inputs (H8): every position below the watermark
+    /// was allocated by this tick or earlier; the awaiting floor is the
+    /// minimum route-waiting position; the shed floor is the minimum
+    /// merge-shed position; exhaustion marks a dead allocator.
+    allocated_below: u64,
+    awaiting_floor: Option<u64>,
+    shed_floor: Option<u64>,
+    exhausted: bool,
 }
 impl TickReport {
     /// Tests-only report: finalizer and terminal tests script batches
@@ -431,24 +463,74 @@ impl TickReport {
     /// invalidation is H2's loss boundary, while a shed call is
     /// disclosed through the refusal count. Positions increase
     /// monotonically, so the oldest outcome still carries the minimum
-    /// barrier when only invalidations remain.
+    /// barrier when only invalidations remain. Sheds record their
+    /// minimum position for H3 disposition; a shed outcome without a
+    /// position records allocator exhaustion.
     pub(crate) fn merge_stashed_outcomes(&mut self, stashed: Vec<TickOutcome>) -> u64 {
         self.outcomes.extend(stashed);
         let mut shed = 0u64;
         while self.outcomes.len() > MAX_INSTANCES {
-            if let Some(at) = self
+            let at = self
                 .outcomes
                 .iter()
                 .position(|outcome| !outcome.is_invalidation())
-            {
-                self.outcomes.remove(at);
-            } else {
-                self.outcomes.remove(0);
+                .unwrap_or(0);
+            let dropped = self.outcomes.remove(at);
+            match dropped.position() {
+                Some(position) => {
+                    self.shed_floor = Some(
+                        self.shed_floor
+                            .map_or(position, |floor| floor.min(position)),
+                    );
+                }
+                None => self.exhausted = true,
             }
             shed += 1;
         }
         debug_assert!(self.outcomes.len() <= MAX_INSTANCES);
         shed
+    }
+
+    /// H3 disposition inputs for the finalizer: the allocation
+    /// watermark, route-waiting floor, shed floor, and exhaustion.
+    pub(crate) fn allocated_below(&self) -> u64 {
+        self.allocated_below
+    }
+    pub(crate) fn awaiting_floor(&self) -> Option<u64> {
+        self.awaiting_floor
+    }
+    pub(crate) fn shed_floor(&self) -> Option<u64> {
+        self.shed_floor
+    }
+    pub(crate) fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Absorb the lane stash's shed floor at merge time: shed positions
+    /// from stash overflow join this batch's own merge sheds. The stash
+    /// resets on handoff, so each shed reports exactly once.
+    pub(crate) fn absorb_shed_floor(&mut self, floor: Option<u64>) {
+        if let Some(floor) = floor {
+            self.shed_floor = Some(self.shed_floor.map_or(floor, |at| at.min(floor)));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted_with_disposition(
+        outcomes: Vec<TickOutcome>,
+        current: Vec<CurrentPartitionReceipt>,
+        awaiting_floor: Option<u64>,
+        shed_floor: Option<u64>,
+        exhausted: bool,
+    ) -> Self {
+        Self {
+            outcomes,
+            current,
+            awaiting_floor,
+            shed_floor,
+            exhausted,
+            ..Self::default()
+        }
     }
 
     pub(crate) fn into_outcomes(self) -> Vec<TickOutcome> {
@@ -975,6 +1057,27 @@ impl SemanticCapture {
         pin: Arc<PidPin>,
         slot: u32,
     ) -> anyhow::Result<TickReport> {
+        let mut report = self.refresh_with_inner(io, pin, slot)?;
+        self.stamp_disposition(&mut report);
+        Ok(report)
+    }
+
+    /// Stamp one tick's H3 disposition inputs: the allocation watermark
+    /// (every position below it was minted by this tick or earlier),
+    /// the route-waiting floor, and allocator exhaustion. The finalizer
+    /// carries these into disposition evidence.
+    fn stamp_disposition(&self, report: &mut TickReport) {
+        report.allocated_below = self.next_token;
+        report.awaiting_floor = self.awaiting.keys().next().copied();
+        report.exhausted = report.exhausted || self.exhausted;
+    }
+
+    fn refresh_with_inner(
+        &mut self,
+        io: &mut impl CaptureIo,
+        pin: Arc<PidPin>,
+        slot: u32,
+    ) -> anyhow::Result<TickReport> {
         anyhow::ensure!(
             io.domain() == Some(self.router.domain()),
             "foreign semantic Session"
@@ -1352,6 +1455,12 @@ impl SemanticCapture {
         }
     }
     fn tick_with(&mut self, io: &mut impl CaptureIo) -> anyhow::Result<TickReport> {
+        let mut report = self.tick_with_inner(io)?;
+        self.stamp_disposition(&mut report);
+        Ok(report)
+    }
+
+    fn tick_with_inner(&mut self, io: &mut impl CaptureIo) -> anyhow::Result<TickReport> {
         anyhow::ensure!(
             io.domain() == Some(self.router.domain()),
             "foreign semantic Session"
@@ -3218,6 +3327,86 @@ mod tests {
                 .any(|outcome| matches!(outcome, TickOutcome::Invalidation(_))),
             "the merged invalidation survives a full batch: a call sheds instead"
         );
+    }
+
+    #[test]
+    fn tick_report_carries_disposition_inputs() {
+        // C5: each tick stamps its allocation watermark and
+        // route-waiting floor for the finalizer's disposition evidence.
+        let mut io = ScriptIo::new(NativeDomainId::mint());
+        let mut capture = capture(&io);
+        io.semantic_call("C_SignInit", 0, 0);
+        io.semantic_call("C_Sign", 0, 0);
+        let report = capture.tick_with(&mut io).unwrap();
+        assert_eq!(report.calls().count(), 2);
+        assert_eq!(report.allocated_below(), capture.next_token);
+        assert!(capture.next_token > 1);
+        assert_eq!(report.awaiting_floor(), None);
+        assert_eq!(report.shed_floor(), None);
+        assert!(!report.exhausted());
+        // A scan-waiting call holds its allocated position in
+        // awaiting: the floor names it while the watermark advances
+        // past it.
+        capture.limits.scans = 1;
+        io.fail_file = Some(1);
+        io.semantic_call("C_SignInit", 1, 0);
+        let pending = capture.tick_with(&mut io).unwrap();
+        assert_eq!(capture.awaiting.len(), 1);
+        let token = *capture.awaiting.keys().next().unwrap();
+        assert_eq!(pending.awaiting_floor(), Some(token));
+        assert_eq!(pending.allocated_below(), capture.next_token);
+        assert!(capture.next_token > token);
+    }
+
+    #[test]
+    fn merge_stash_records_shed_floor_and_exhaustion() {
+        // C5: merged-overflow sheds record their minimum position; a
+        // shed outcome without a position records exhaustion.
+        let domain = NativeDomainId::mint();
+        let call = |token: Option<u64>| {
+            let stamp = InstanceStamp::default();
+            TickOutcome::Call(RoutedCall::scripted(
+                domain,
+                DecodedEventRecord {
+                    base: event_record_with_routing(
+                        p11scope_ebpf_common::Event::default(),
+                        stamp,
+                        0x2200,
+                    ),
+                    object: None,
+                },
+                Route::Unknown(UnknownReason::PendingCapacity),
+                None,
+                token,
+            ))
+        };
+        let mut report = TickReport::scripted(
+            (0..MAX_INSTANCES)
+                .map(|n| call(Some(100 + n as u64)))
+                .collect(),
+            Vec::new(),
+        );
+        assert_eq!(
+            report.merge_stashed_outcomes(vec![call(Some(200)), call(Some(201))]),
+            2
+        );
+        assert_eq!(report.shed_floor(), Some(100));
+        assert!(!report.exhausted());
+        // A full invalidation batch sheds the stashed positive: an
+        // unpositioned shed records exhaustion.
+        let invalidation = || {
+            TickOutcome::Invalidation(Invalidation {
+                domain,
+                scope: InvalidationScope::FaultEra,
+                position: Some(300),
+            })
+        };
+        let mut report = TickReport::scripted(
+            (0..MAX_INSTANCES).map(|_| invalidation()).collect(),
+            Vec::new(),
+        );
+        assert_eq!(report.merge_stashed_outcomes(vec![call(None)]), 1);
+        assert!(report.exhausted());
     }
     fn prime(capture: &mut SemanticCapture, io: &mut ScriptIo) -> Route {
         io.call(1, 0);

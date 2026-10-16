@@ -627,17 +627,19 @@ impl CompleteInputPrefix {
 
     /// Part-wise construction for the sealed prefix above. Module-family
     /// only; every production caller goes through the sealed prefix.
+    /// A continuation seal carries no bootstrap: the model keeps its
+    /// floor and no new authority is claimed or refused.
     pub(in crate::semantics_objects) fn from_sealed_parts(
         domain: ObjectDomain,
         frontier: u64,
         open: &[CallKey],
-        bootstrap: u64,
+        bootstrap: Option<u64>,
     ) -> Self {
         Self {
             domain,
             frontier: RefCut(frontier),
             open: open.to_vec(),
-            bootstrap: Some(RefCut(bootstrap)),
+            bootstrap: bootstrap.map(RefCut),
         }
     }
 }
@@ -1010,10 +1012,15 @@ impl ObjectSemantics {
     /// could not represent (reservation exhausted). Records the refusal
     /// exactly like a model capacity refusal — bootstrap voided, fence
     /// floor raised, no bootstrap until a lost-outcome bound — without
-    /// admitting a call the adapter cannot track. Only the journal child
-    /// calls this, with sealed domain and cut.
-    pub(crate) fn note_refused_begin(&mut self, domain: ObjectDomain, cut: RefCut) {
-        self.state.note_refused(domain, cut.0);
+    /// admitting a call the adapter cannot track. Returns the void's
+    /// invalidation effects for publication with the seal. Only the
+    /// journal child calls this, with sealed domain and cut.
+    pub(crate) fn note_refused_begin(
+        &mut self,
+        domain: ObjectDomain,
+        cut: RefCut,
+    ) -> ObjectEffects {
+        self.state.note_refused(domain, cut.0)
     }
 
     /// Register a domain identity before any fact names it. Idempotent
@@ -1050,6 +1057,15 @@ impl ObjectSemantics {
     /// Apply an explicit reference boundary to the affected scope.
     pub(crate) fn invalidate(&mut self, scope: AffectedScope, reason: ObjectGap) -> ObjectEffects {
         self.state.invalidate(scope, reason)
+    }
+
+    /// Sealed production input: unbounded abandonment disposes one
+    /// domain. Fencing and proof invalidation match a loss, and the
+    /// abandoned incarnation's call storage is released with its
+    /// custody; the incarnation stays refused. Only the journal's
+    /// permanent-refusal paths call this, with a sealed domain.
+    pub(crate) fn abandon_domain(&mut self, domain: ObjectDomain) -> ObjectEffects {
+        self.state.abandon_domain(domain)
     }
 
     pub(crate) fn project(&self) -> ObjectProjection {

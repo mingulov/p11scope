@@ -3754,8 +3754,8 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         let joined = unsafe { continuity_joins(&(*raw).base.continuity) };
         if !joined {
             let _ = owned_start_remove(&key, true);
-            entry.discard(0);
             unsafe { p11_object_fault() };
+            entry.discard(0);
             bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
             return 0;
         }
@@ -3786,8 +3786,8 @@ fn p11_return_impl(ctx: RetProbeContext) -> u32 {
         // state and no read runs after either failure.
         let outcome = emission_finalize(emitted, || owned_start_remove(&key, true).is_ok());
         if !outcome.submitted {
-            entry.discard(0);
             unsafe { p11_object_fault() };
+            entry.discard(0);
             bump_evidence(EVIDENCE_UNMATCHED_RETURNS);
             return 0;
         }

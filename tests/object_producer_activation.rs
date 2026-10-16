@@ -1753,6 +1753,8 @@ fn strip_rust_prose_lexes_every_prefix_and_edge() {
 /// is byte-identical before and after the lexer correction (baseline
 /// captured pre-fix: 114413 B, sha256 below). Re-baseline deliberately
 /// if `crates/ebpf/src/main.rs` legitimately changes.
+/// Re-baselined for the C6b fault-before-discard reorder (two swapped
+/// line pairs; size unchanged at 114413 B).
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -1765,7 +1767,7 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     let digest = Sha256::digest(stripped.as_bytes());
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(
-        hex, "dd06302f092bfe9a78d7ecdfc53368da8bd05bf7ce920727fb055906b307b6a4",
+        hex, "da03647a2565f10ad1570f04282ba18903af47af73ca19e70e7e627fe2307496",
         "stripped BPF dump must stay byte-identical"
     );
 }

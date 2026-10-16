@@ -233,6 +233,14 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// At most one ordinary semantic collection quantum, finalized after
     /// the commit tail and before registry publication.
     pending_semantic: Option<SemanticBatch>,
+    /// Latest H3 disposition evidence, derived by the actual finalizer
+    /// per batch (H8): the seal's H3 coverage proof.
+    h3_disposition: crate::semantics_objects::journal::H3DispositionEvidence,
+    /// Minimum position (plus exhaustion) of the latest dropped
+    /// semantic batch: refused/foreign batches never stage, so the next
+    /// derivation reports them as shed. Taken on use; each drop reports
+    /// exactly once.
+    pending_drop: Option<(u64, bool)>,
     /// Detailed domains whose semantic authority ended permanently
     /// (cut/writeback/counter failure): new batches refuse, broad
     /// Inventory continues.
@@ -410,6 +418,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             binder: NativeBinder::new(BinderLimits::default()),
             semantic_bindings: semantics::SemanticBindingSet::new(),
             pending_semantic: None,
+            h3_disposition: crate::semantics_objects::journal::H3DispositionEvidence::genesis(),
+            pending_drop: None,
             refused_semantic_domains: HashSet::new(),
             pending_adjudication: BTreeMap::new(),
             tail_uncertain: BTreeSet::new(),

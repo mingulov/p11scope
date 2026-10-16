@@ -243,11 +243,12 @@ use p11scope_ebpf_common::object_journal::{
 use p11scope_ebpf_common::object_policy::SafeAttributeKind;
 
 use super::{
-    AffectedScope, AttrObservation, AttributeList, CallKey, CallToken, CompleteInputPrefix,
-    CompletedFact, FieldValue, FindResult, HandleInput, MechanismEvidence, ObjectDomain,
-    ObjectEffect, ObjectEffects, ObjectGap, ObjectSemantics, OriginFact, QueryStatus, RefCut,
-    ResultSlot, SessionHandle,
+    AttrObservation, AttributeList, CallKey, CallToken, CompleteInputPrefix, CompletedFact,
+    FieldValue, FindResult, HandleInput, MechanismEvidence, ObjectDomain, ObjectEffect,
+    ObjectEffects, ObjectGap, ObjectSemantics, OriginFact, QueryStatus, RefCut, ResultSlot,
+    SessionHandle,
 };
+use crate::attach::capture::NativeDomainId;
 use crate::discovery::caller_registry::instance_input::AdmittedInstanceCall;
 
 // ---------------------------------------------------------------------------
@@ -333,6 +334,39 @@ pub(crate) struct JournalDomainProof {
     era: u64,
 }
 
+/// One admitted call's journal-attribution shape: the exact overlap
+/// between H3's admitted facts and a staged BEGIN's wire scalars (plus
+/// the image both sides bind). Return-time facts (rv, timestamps) are
+/// excluded: a BEGIN is entry truth. Two same-image instances whose
+/// calls share a fingerprint are indistinguishable on the wire, so a
+/// fingerprint claimed by two live keys attributes to neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct CallFingerprint {
+    pub(crate) image: (u64, u64),
+    pub(crate) function: u32,
+    pub(crate) session: u64,
+    pub(crate) mechanism: u64,
+    pub(crate) capture: u32,
+    pub(crate) slot_id: u64,
+    pub(crate) flags: u64,
+    pub(crate) user_type: u32,
+}
+
+/// One staged entry's attribution under a sealing key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallAttribution {
+    /// Sole live claim is this key (or this key is the sole live key
+    /// for the image, whose admission completeness the H3-disposition
+    /// gate covers): convertible here.
+    Mine,
+    /// Another key owns this entry (a live sibling's claim, or solely
+    /// dead claims): skipped by this seal, never converted here.
+    Sibling,
+    /// No claim names this entry, or two live keys collide on it:
+    /// the seal waits rather than attribute.
+    Unclaimed,
+}
+
 impl JournalDomainProof {
     pub(in crate::semantics_objects) fn domain(&self) -> ObjectDomain {
         ObjectDomain::from_sealed_parts(
@@ -371,7 +405,9 @@ struct JournalDomainState {
     era_ended: bool,
     sealed_through: u64,
     bootstraps: BTreeMap<u64, u64>,
-    bounded_uppers: Vec<u64>,
+    /// The maximum recorded bounded-loss upper for this key. The fence
+    /// needs the max alone, so no per-loss vector is retained.
+    bounded_upper: Option<u64>,
     void_fence: u64,
     model_registered: bool,
 }
@@ -497,6 +533,16 @@ pub(crate) enum JournalGap {
     DomainEnded,
     ClosureStale,
     Stopped,
+    /// The collection's Session drain is not the proof's: history
+    /// collected through one Session never seals under another's key.
+    /// A wiring refusal, not a loss: nothing is voided.
+    DrainMismatch,
+    /// The H0 allocator is exhausted: no future history can certify.
+    /// The adapter stops permanently.
+    H3Exhausted,
+    /// The retained reader consumed kernel-discarded reservations
+    /// during the collection: lost history voids the seal.
+    Discarded,
 }
 
 // ---------------------------------------------------------------------------
@@ -521,6 +567,7 @@ struct OpenEntry {
     abandon: Option<StagedAbandon>,
     corroborated_return: Option<u64>,
     converted_ticket: Option<CallToken>,
+    converted_for: Option<JournalDomainKey>,
     end_converted: bool,
 }
 
@@ -543,6 +590,8 @@ struct StagedAbandon {
 struct RefusedBegin {
     cut: u64,
     image: (u64, u64),
+    pid_tgid: u64,
+    function: u32,
     slot: u32,
     session: u64,
     mechanism: u64,
@@ -590,9 +639,30 @@ pub(crate) struct JournalAdapter {
     refused: Vec<RefusedBegin>,
     keys: BTreeMap<JournalDomainKey, JournalDomainState>,
     image_keys: BTreeMap<(u64, u64), Vec<JournalDomainKey>>,
+    /// Individually retained taints, capped at the sighting bound (the
+    /// same image population). Past the cap, `taint_overflow` latches
+    /// and every untracked image counts as tainted — the conservative
+    /// bounded fallback: no per-image retention, no silent admission.
     tainted_images: BTreeSet<(u64, u64)>,
+    taint_overflow: bool,
     sightings: BTreeMap<(u64, u64), ImageSighting>,
+    /// Per-call admission authority: each admitted modeled call's
+    /// fingerprint, claimed by its key with a multiset count. Conversion
+    /// consumes one count per staged call; total counts stay within the
+    /// staged-call bound (a void clears the store with the staging).
+    claims: BTreeMap<CallFingerprint, BTreeMap<JournalDomainKey, u64>>,
+    claim_counts: usize,
     last_audit_failure: Option<u64>,
+    /// H0 positions below this watermark were voided by an H3-loss
+    /// seal: re-presented barriers at or below it wait instead of
+    /// voiding twice. Monotone; H0's allocator ascends, so each new
+    /// loss lies above it.
+    h3_voided_below: u64,
+    /// Last sealed checked-fault epoch: the cumulative chain. Each
+    /// seal's collection must open at this epoch and the seal-time
+    /// re-read must still show the audited one; a move anywhere in
+    /// the chain voids and re-baselines.
+    last_fault: Option<u64>,
     invalidated: bool,
     stopped: bool,
     closure_generation: u64,
@@ -610,8 +680,13 @@ impl JournalAdapter {
             keys: BTreeMap::new(),
             image_keys: BTreeMap::new(),
             tainted_images: BTreeSet::new(),
+            taint_overflow: false,
             sightings: BTreeMap::new(),
+            claims: BTreeMap::new(),
+            claim_counts: 0,
             last_audit_failure: None,
+            h3_voided_below: 0,
+            last_fault: None,
             invalidated: false,
             stopped: false,
             closure_generation: 0,
@@ -698,7 +773,9 @@ impl JournalAdapter {
     /// Record one image observation: first-sighting and first-affecting
     /// ordinals only move earlier-or-equal, never later. A new image past
     /// the sighting bound is untrackable: report false so the caller
-    /// taints it and refuses the record.
+    /// taints it and refuses the record. Past taint saturation every
+    /// untracked image is untrackable even when the sighting table has
+    /// room: a taint that cannot be retained must still refuse.
     fn note_sighting(&mut self, image: (u64, u64), affecting: bool, ordinal: u64) -> bool {
         if let Some(sighting) = self.sightings.get_mut(&image) {
             sighting.first_seen = sighting.first_seen.min(ordinal);
@@ -710,6 +787,9 @@ impl JournalAdapter {
                 );
             }
             return true;
+        }
+        if self.taint_overflow {
+            return false;
         }
         if self.sightings.len() >= self.limits.image_sightings {
             return false;
@@ -744,7 +824,7 @@ impl JournalAdapter {
     fn ingest_begin(&mut self, ordinal: u64, begin: ValidatedJournalBegin) -> JournalDisposition {
         let key = (begin.thread(), begin.sequence());
         let image = Self::image_of_begin(&begin);
-        if self.tainted_images.contains(&image) {
+        if self.is_tainted(image) {
             return JournalDisposition::Refused;
         }
         // The frozen endpoint table is enforced here, before key
@@ -799,6 +879,7 @@ impl JournalAdapter {
                 abandon: None,
                 corroborated_return: None,
                 converted_ticket: None,
+                converted_for: None,
                 end_converted: false,
             },
         );
@@ -818,6 +899,8 @@ impl JournalAdapter {
         self.refused.push(RefusedBegin {
             cut: ordinal,
             image,
+            pid_tgid: begin.pid_tgid(),
+            function: begin.descriptor() - 1,
             slot: begin.slot(),
             session: begin.session_word(),
             mechanism: begin.entry_mechanism(),
@@ -837,7 +920,7 @@ impl JournalAdapter {
             self.taint_image(end_image(&end));
             return JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin);
         };
-        if self.tainted_images.contains(&entry.image) {
+        if self.is_tainted(entry.image) {
             return JournalDisposition::Refused;
         }
         if entry.end.is_some() || entry.abandon.is_some() {
@@ -877,7 +960,7 @@ impl JournalAdapter {
             self.taint_image((abandon.image_cookie(), abandon.image_exec()));
             return JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin);
         };
-        if self.tainted_images.contains(&entry.image) {
+        if self.is_tainted(entry.image) {
             return JournalDisposition::Refused;
         }
         if entry.end.is_some() || entry.abandon.is_some() {
@@ -968,11 +1051,38 @@ impl JournalAdapter {
         JournalDisposition::OrdinaryCounted
     }
 
+    /// Whether one image is refused future proof: individually
+    /// retained, or untracked past taint saturation (the conservative
+    /// bounded fallback — an image whose taint could not be recorded
+    /// is never silently admitted).
+    fn is_tainted(&self, image: (u64, u64)) -> bool {
+        self.tainted_images.contains(&image)
+            || (self.taint_overflow && !self.sightings.contains_key(&image))
+    }
+
     /// Taint one image permanently: attestation for it is refused, its keys'
     /// seals are refused, and its staged entries are disposed without proof.
     /// Retained history stays; only future proof for this image ends.
+    /// The retained set is capped at the sighting bound; past it, the
+    /// overflow latches, the image's sighting is dropped (future
+    /// attestation refuses it as unknown), and its existing keys are
+    /// tainted directly so their seals still refuse.
     fn taint_image(&mut self, image: (u64, u64)) {
-        self.tainted_images.insert(image);
+        if !self.tainted_images.contains(&image)
+            && self.tainted_images.len() >= self.limits.image_sightings
+        {
+            self.taint_overflow = true;
+            self.sightings.remove(&image);
+            if let Some(keys) = self.image_keys.get(&image).cloned() {
+                for key in keys {
+                    if let Some(state) = self.keys.get_mut(&key) {
+                        state.tainted = true;
+                    }
+                }
+            }
+        } else {
+            self.tainted_images.insert(image);
+        }
         self.open.retain(|_, entry| entry.image != image);
         self.refused.retain(|refused| refused.image != image);
     }
@@ -992,15 +1102,48 @@ fn end_image(end: &ValidatedJournalEnd) -> (u64, u64) {
     (base.event.image.task_cookie, base.event.image.exec_id)
 }
 
+/// One staged BEGIN's attribution shape: the same overlap the
+/// admission side claims, read from wire scalars.
+fn fingerprint_of_begin(begin: &ValidatedJournalBegin) -> CallFingerprint {
+    CallFingerprint {
+        image: (begin.image_cookie(), begin.image_exec()),
+        function: begin.descriptor() - 1,
+        session: begin.session_word(),
+        mechanism: begin.entry_mechanism(),
+        capture: begin.capture(),
+        slot_id: begin.slot_id(),
+        flags: begin.call_flags(),
+        user_type: begin.user_type(),
+    }
+}
+
+/// One refused BEGIN's attribution shape.
+fn fingerprint_of_refused(refused: &RefusedBegin) -> CallFingerprint {
+    CallFingerprint {
+        image: refused.image,
+        function: refused.function,
+        session: refused.session,
+        mechanism: refused.mechanism,
+        capture: refused.capture,
+        slot_id: refused.slot_id,
+        flags: refused.flags,
+        user_type: refused.user_type,
+    }
+}
+
 /// Whether a return value is still pending (provider-deferred): never a
 /// completed synchronous return, never a terminal witness.
 fn is_pending_rv(rv: u64) -> bool {
     pkcs11_types::CkRv(rv) == pkcs11_types::CkRv::PENDING
 }
 
-/// Whether one ordinary CALL record corroborates one open BEGIN: same
-/// seven-word call identity, strictly after the BEGIN, returned at or after
-/// entry, with a completed (non-pending) return value.
+/// Whether one ordinary CALL record corroborates one open BEGIN: the
+/// exact retained invocation — same image, same process, exact
+/// entry-time agreement plus the seven-word call identity — observed
+/// strictly after the BEGIN with a completed (non-pending) return
+/// value. Entry agreement is exact (`ts - duration`, the return path's
+/// own entry reconstruction): a merely later timestamp from another
+/// invocation never qualifies.
 fn ordinary_matches_begin(
     event: &p11scope_ebpf_common::Event,
     ordinal: u64,
@@ -1008,7 +1151,10 @@ fn ordinary_matches_begin(
     begin_ordinal: u64,
 ) -> bool {
     ordinal > begin_ordinal
-        && event.ts_ns >= begin.entry_ns()
+        && event.ts_ns.checked_sub(event.duration_ns) == Some(begin.entry_ns())
+        && event.pid_tgid == begin.pid_tgid()
+        && event.image.task_cookie == begin.image_cookie()
+        && event.image.exec_id == begin.image_exec()
         && event.slot == begin.slot()
         && event.session == begin.session_word()
         && event.mechanism == begin.entry_mechanism()
@@ -1018,14 +1164,18 @@ fn ordinary_matches_begin(
         && event.flags == begin.call_flags()
 }
 
-/// Whether one ordinary CALL record corroborates one refused BEGIN.
+/// Whether one ordinary CALL record corroborates one refused BEGIN:
+/// the same exact-invocation binding as an open BEGIN.
 fn ordinary_matches_refused(
     event: &p11scope_ebpf_common::Event,
     ordinal: u64,
     refused: &RefusedBegin,
 ) -> bool {
     ordinal > refused.cut
-        && event.ts_ns >= refused.entry_ns
+        && event.ts_ns.checked_sub(event.duration_ns) == Some(refused.entry_ns)
+        && event.pid_tgid == refused.pid_tgid
+        && event.image.task_cookie == refused.image.0
+        && event.image.exec_id == refused.image.1
         && event.slot == refused.slot
         && event.session == refused.session
         && event.mechanism == refused.mechanism
@@ -1368,71 +1518,122 @@ fn attributes_of(action: u8, tail: &[u8; 240], absent: bool) -> Option<Attribute
 // Audit and bootstrap receipts, the sealed prefix and the seal
 // ---------------------------------------------------------------------------
 
-/// H3's post-finalizer disposition for one seal frontier, derived from the
-/// finalizer's own staged batch state: either every collected outcome
-/// through a cut is disposed with no staged loss, or a loss barrier stands
-/// in scope. Private fields: only finalizer-typed evidence or the test
-/// script builds one.
+/// H3's post-finalizer disposition, minted only by the actual
+/// finalizer from its complete disposition state. All positions share
+/// H0's one immutable position authority (its checked allocation
+/// counter); the seal enforces coverage in that space against the
+/// collection's allocation watermark, never against journal ordinals.
+/// Private fields: only the finalizer derivation or the test script
+/// builds one.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Activation-gated: the finalizer derives this per batch.
 pub(crate) enum H3DispositionEvidence {
-    Clean { disposed_through: u64 },
+    /// Every H0 position at or below the staged maximum is disposed,
+    /// except positions at or above the pending floor (route-waiting,
+    /// unpublished or lane-stashed). The maximum is monotone over
+    /// previous evidence; the floor is always the current one.
+    Clean {
+        staged_max: u64,
+        pending_floor: Option<u64>,
+    },
+    /// A loss barrier stands at the cut: staged negatives, shed
+    /// positions or dropped batches. The seal voids once and forgives
+    /// the barrier on re-presentation.
     StagedLoss { barrier: u64 },
+    /// The H0 allocator is exhausted: no future position can certify.
+    /// Permanent; the seal stops the adapter.
+    Exhausted,
 }
 
-#[allow(dead_code)] // Activation-gated: called from `finalize_batch`.
 impl H3DispositionEvidence {
-    /// Production derivation from the finalizer's staged batch: any staged
-    /// negative in scope is a loss barrier (a refused collection disposes
-    /// nothing, so it barriers at zero); otherwise disposition extends
-    /// through the greatest staged token. Activation-gated: called from
-    /// `finalize_batch` once the producer wires; until then the audit
-    /// rules below are exercised with scripted evidence.
+    /// Production derivation from the finalizer's complete disposition
+    /// state: staged negatives, staged outcome positions (calls and
+    /// invalidations alike), the route-waiting floor, the shed floor,
+    /// the unpublished floor, and allocator exhaustion. Called from
+    /// the actual `finalize_batch`; the coordinator stores the result
+    /// as the seal's H3 evidence.
     pub(crate) fn from_finalizer_batch(
         negatives: &[crate::inventory_semantics::LaneNegative],
-        staged: &[crate::discovery::caller_registry::instance_input::CallEvidence],
+        staged: &[Option<u64>],
+        awaiting_floor: Option<u64>,
+        shed_floor: Option<u64>,
+        unpublished_floor: Option<u64>,
+        exhausted: bool,
         previous: &Self,
     ) -> Self {
         use crate::inventory_semantics::LaneNegative;
+        // Exhaustion sticks: an unpositioned outcome (or a dead
+        // previous) means the allocator can never certify again.
+        if matches!(previous, Self::Exhausted) || exhausted || staged.iter().any(Option::is_none) {
+            return Self::Exhausted;
+        }
         let mut barrier: Option<u64> = None;
-        for negative in negatives {
-            let cut = match negative {
-                LaneNegative::CutBarrier { ordinal } => *ordinal,
-                LaneNegative::CollectionRefused { .. } => 0,
-            };
+        let mut narrow = |cut: u64| {
             barrier = Some(barrier.map_or(cut, |at: u64| at.min(cut)));
+        };
+        for negative in negatives {
+            match negative {
+                LaneNegative::CutBarrier { ordinal } => narrow(*ordinal),
+                LaneNegative::CollectionRefused { .. } => narrow(0),
+            }
+        }
+        if let Some(shed) = shed_floor {
+            narrow(shed);
         }
         if let Some(barrier) = barrier {
             return Self::StagedLoss { barrier };
         }
-        let previous_through = match previous {
-            Self::Clean { disposed_through } => *disposed_through,
-            Self::StagedLoss { .. } => 0,
+        // The certified maximum is monotone over previous evidence; a
+        // loss barrier restarts it above itself (positions at or below
+        // the barrier were disposed as loss). The pending floor is the
+        // current minimum over route-waiting and unpublished positions.
+        let base = match previous {
+            Self::Clean { staged_max, .. } => *staged_max,
+            Self::StagedLoss { barrier } => *barrier,
+            Self::Exhausted => return Self::Exhausted,
         };
-        let mut through = previous_through;
-        for evidence in staged {
-            through = through.max(evidence.token());
+        let mut staged_max = base;
+        for position in staged.iter().flatten() {
+            staged_max = staged_max.max(*position);
         }
+        let pending_floor = awaiting_floor.into_iter().chain(unpublished_floor).min();
         Self::Clean {
-            disposed_through: through,
+            staged_max,
+            pending_floor,
         }
     }
 
-    /// Genesis evidence: nothing disposed, nothing lost.
+    /// Genesis evidence: nothing disposed, nothing lost, nothing pending.
     pub(crate) fn genesis() -> Self {
         Self::Clean {
-            disposed_through: 0,
+            staged_max: 0,
+            pending_floor: None,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn scripted_clean(disposed_through: u64) -> Self {
-        Self::Clean { disposed_through }
+    pub(crate) fn scripted_clean(staged_max: u64) -> Self {
+        Self::Clean {
+            staged_max,
+            pending_floor: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted_clean_pending(staged_max: u64, pending_floor: Option<u64>) -> Self {
+        Self::Clean {
+            staged_max,
+            pending_floor,
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn scripted_loss(barrier: u64) -> Self {
         Self::StagedLoss { barrier }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted_exhausted() -> Self {
+        Self::Exhausted
     }
 }
 
@@ -1447,20 +1648,28 @@ pub(crate) struct JournalAuditReceipt {
     fault_after: u64,
     fault_error: Option<FaultReadError>,
     malformed_delta: u64,
+    discarded_delta: u64,
     h3: H3DispositionEvidence,
+    h0_below: u64,
     closure_generation: u64,
+    session_domain: Option<NativeDomainId>,
 }
 
 /// One collection's audit evidence: per-form counts, the drain's
-/// malformed delta and the checked-fault pair bracketing the tick.
+/// malformed delta, the checked-fault pair bracketing the tick, the
+/// Session drain the quantum was collected through, and H0's allocation
+/// watermark below which every position was minted for this quantum.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct JournalCollection {
     pub(crate) ingested: u64,
     pub(crate) ordinary: u64,
     pub(crate) malformed_delta: u64,
+    pub(crate) discarded_delta: u64,
     pub(crate) fault_before: u64,
     pub(crate) fault_after: u64,
     pub(crate) fault_error: Option<FaultReadError>,
+    pub(crate) session_domain: NativeDomainId,
+    pub(crate) h0_allocated_below: u64,
 }
 
 impl JournalAuditReceipt {
@@ -1477,8 +1686,11 @@ impl JournalAuditReceipt {
             fault_after: collection.fault_after,
             fault_error: collection.fault_error,
             malformed_delta: collection.malformed_delta,
+            discarded_delta: collection.discarded_delta,
             h3,
+            h0_below: collection.h0_allocated_below,
             closure_generation,
+            session_domain: Some(collection.session_domain),
         }
     }
 
@@ -1491,22 +1703,60 @@ impl JournalAuditReceipt {
         h3: H3DispositionEvidence,
         closure_generation: u64,
     ) -> Self {
-        Self {
+        Self::scripted_h0(
             fault_before,
             fault_after,
             fault_error,
             malformed_delta,
             h3,
             closure_generation,
+            0,
+        )
+    }
+
+    /// Scripted audit with an explicit H0 allocation watermark: the H3
+    /// rules compare evidence to `h0_below`, never to the frontier. The
+    /// plain scripted form watermarks zero, which passes any staged
+    /// maximum; use this form to pin H3 strictness.
+    #[cfg(test)]
+    pub(crate) fn scripted_h0(
+        fault_before: u64,
+        fault_after: u64,
+        fault_error: Option<FaultReadError>,
+        malformed_delta: u64,
+        h3: H3DispositionEvidence,
+        closure_generation: u64,
+        h0_below: u64,
+    ) -> Self {
+        Self {
+            fault_before,
+            fault_after,
+            fault_error,
+            malformed_delta,
+            discarded_delta: 0,
+            h3,
+            h0_below,
+            closure_generation,
+            session_domain: None,
         }
     }
 
-    /// The audit rules: an unreadable or changed fault, any malformed
-    /// record, any H3 loss in scope, undisposed H3 history below the
-    /// frontier, or a stale closure each refuse the seal. The caller
-    /// voids staged proof on fault/malformed/loss; pending and stale
+    /// The audit rules: an unreadable or changed fault, a break in
+    /// the cumulative fault chain, any malformed record, any
+    /// reader-consumed discard, a seal-time fault move, undisposed or
+    /// lost H3 history below the collection's H0 allocation watermark
+    /// (compared in H0's own position space, never against the journal
+    /// frontier), or a stale closure each refuse the seal. The caller
+    /// voids staged proof on fault/malformed/discard/loss and stops on
+    /// exhaustion; pending, forgiven or above-watermark loss, and stale
     /// closures refuse without voiding.
-    fn check(&self, frontier: u64, current_closure: u64) -> Result<(), JournalGap> {
+    fn check(
+        &self,
+        last_fault: Option<u64>,
+        h3_voided_below: u64,
+        current_closure: u64,
+        seal_epoch: &Result<u64, FaultReadError>,
+    ) -> Result<(), JournalGap> {
         match self.fault_error {
             Some(FaultReadError::Unreadable) => return Err(JournalGap::FaultUnreadable),
             Some(FaultReadError::Saturated) => return Err(JournalGap::FaultSaturated),
@@ -1515,13 +1765,48 @@ impl JournalAuditReceipt {
         if self.fault_before != self.fault_after {
             return Err(JournalGap::FaultChanged);
         }
+        // Cumulative chain: this collection must open where the last
+        // seal closed. A move between collections voids like a move
+        // within one.
+        if last_fault.is_some_and(|last| self.fault_before != last) {
+            return Err(JournalGap::FaultChanged);
+        }
         if self.malformed_delta != 0 {
             return Err(JournalGap::Malformed);
         }
+        // Reader-consumed discards are lost history: the seal voids
+        // rather than certifying across them.
+        if self.discarded_delta != 0 {
+            return Err(JournalGap::Discarded);
+        }
+        // Seal-time native re-read: the cell must still show the
+        // audited epoch when the seal runs.
+        match seal_epoch {
+            Ok(epoch) if *epoch == self.fault_after => {}
+            Ok(_) => return Err(JournalGap::FaultChanged),
+            Err(FaultReadError::Unreadable) => return Err(JournalGap::FaultUnreadable),
+            Err(FaultReadError::Saturated) => return Err(JournalGap::FaultSaturated),
+        }
         match &self.h3 {
-            H3DispositionEvidence::StagedLoss { .. } => return Err(JournalGap::H3Loss),
-            H3DispositionEvidence::Clean { disposed_through } => {
-                if *disposed_through < frontier {
+            H3DispositionEvidence::Exhausted => return Err(JournalGap::H3Exhausted),
+            H3DispositionEvidence::StagedLoss { barrier } => {
+                // A loss below the watermark voids unless already
+                // voided; at or above the watermark it waits for clean
+                // evidence without voiding.
+                if *barrier < h3_voided_below || *barrier >= self.h0_below {
+                    return Err(JournalGap::H3Pending);
+                }
+                return Err(JournalGap::H3Loss);
+            }
+            H3DispositionEvidence::Clean {
+                staged_max,
+                pending_floor,
+            } => {
+                // Every H0 position below the watermark is disposed:
+                // staging reaches it and nothing pends below it.
+                if *staged_max < self.h0_below.saturating_sub(1)
+                    || pending_floor.is_some_and(|floor| floor < self.h0_below)
+                {
                     return Err(JournalGap::H3Pending);
                 }
             }
@@ -1534,13 +1819,11 @@ impl JournalAuditReceipt {
 }
 
 /// The genuine birth-witness kind behind a bootstrap: a real post-attach
-/// exec-marker publication (the image's entire observed life is above the
-/// cut) or a complete absence-then-appearance proof (the image lived
-/// observably at or below the cut with zero unfenced affecting evidence
-/// and a clean audit chain unbroken since the void fence, then its first
-/// unfenced affecting record appeared). The kind is stream-determined by
-/// [`BootstrapReceipt::attest`] and re-verified by the seal; tests script
-/// the receipt to pin the seal's structural rules.
+/// exec-marker publication or a complete absence-then-appearance proof,
+/// both Session-observed and carried by the birth grant. The kind is
+/// grant-determined at [`BootstrapReceipt::attest`], backstopped against
+/// retained sightings/audit truth, and re-verified by the seal; tests
+/// script the grant to pin the seal's structural rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BirthKind {
     ExecMarker,
@@ -1564,46 +1847,239 @@ pub(crate) enum BirthRefusal {
     /// unseen at the cut, unfenced affecting evidence sits at or below
     /// it, or an audit failure broke the clean chain since the fence.
     AbsenceUnproven,
+    /// The Session birth evidence does not authorize this claim: wrong
+    /// observed image, zero custody, a tripped admission latch, or a
+    /// marker word inconsistent with the claimed kind and exec id.
+    EvidenceMismatch,
 }
 
-/// One domain's bootstrap: its sealed proof, the verified birth kind and
-/// cut, and the closure generation it was attested under. Production
-/// attestation verifies genuine birth plus closure; the seal re-verifies
-/// both, so a chain break between attestation and seal still refuses.
+/// Session-observed native evidence behind a birth claim: the image
+/// bound by the same held-custody proof, the `journal_bootstrap`
+/// marker word read back with it, the admission-latch failure count,
+/// and the held-custody generation. Private fields: production
+/// observation mints only through the Session issuance capability;
+/// attestation checks the grant's evidence and the seal re-checks
+/// FRESH evidence, so native truth that moved between the two (a
+/// scope-dirtied marker, a tripped latch, lost custody) refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BootstrapReceipt {
+pub(crate) struct SessionBirthEvidence {
+    image: (u64, u64),
+    marker_word: u64,
+    admission_failed: u64,
+    custody: u64,
+}
+
+impl SessionBirthEvidence {
+    /// Production observation: only Session-owned attach code holds the
+    /// issuance token. Activation-gated: no observation site exists
+    /// until the H8-D native witnesses wire, so production birth fails
+    /// closed until then.
+    #[allow(dead_code)] // Activation-gated: see `SessionGrantToken`.
+    pub(crate) fn issue(
+        _token: &crate::attach::SessionGrantToken,
+        image: (u64, u64),
+        marker_word: u64,
+        admission_failed: u64,
+        custody: u64,
+    ) -> Self {
+        Self {
+            image,
+            marker_word,
+            admission_failed,
+            custody,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted(
+        image: (u64, u64),
+        marker_word: u64,
+        admission_failed: u64,
+        custody: u64,
+    ) -> Self {
+        Self {
+            image,
+            marker_word,
+            admission_failed,
+            custody,
+        }
+    }
+
+    /// Canonical valid evidence for one sealed receipt: the READY
+    /// marker naming the proof image's exec id, or the unmarked word
+    /// for absence; a clean latch and live custody.
+    #[cfg(test)]
+    pub(crate) fn scripted_for_receipt(receipt: &BootstrapReceipt) -> Self {
+        let proof = receipt.proof();
+        Self::scripted_canonical((proof.key.cookie, proof.key.exec), receipt.birth())
+    }
+
+    /// Canonical valid evidence for one image and birth kind: the READY
+    /// marker naming the image's exec id, or the unmarked word for
+    /// absence; a clean latch and live custody.
+    #[cfg(test)]
+    pub(crate) fn scripted_canonical(image: (u64, u64), birth: BirthKind) -> Self {
+        let marker_word = match birth {
+            BirthKind::ExecMarker => (image.1 << 32) | 1,
+            BirthKind::AbsenceAppearance => 0,
+        };
+        Self {
+            image,
+            marker_word,
+            admission_failed: 0,
+            custody: 1,
+        }
+    }
+}
+
+/// A Session-owned birth grant: the claimed proof, birth kind, cut and
+/// closure generation, plus the Session-observed native evidence the
+/// claim was attested under (exec marker publication/readback or
+/// held-custody absence/appearance). Production mint requires the
+/// Session issuance capability, so stream inference alone can never
+/// birth; the fields stay private, attestation checks the bundled
+/// evidence, and the seal re-checks fresh evidence against retained
+/// truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionBirthGrant {
     proof: JournalDomainProof,
     birth: BirthKind,
     birth_cut: u64,
     closure_generation: u64,
+    evidence: SessionBirthEvidence,
 }
 
-impl BootstrapReceipt {
-    /// Production birth attestation: verify the claimed kind against the
-    /// adapter's retained sightings and audit chain, under the live
-    /// closure generation. The seal re-verifies before converting.
-    pub(crate) fn attest(
-        adapter: &JournalAdapter,
+impl SessionBirthGrant {
+    /// Production mint: only Session-owned attach code holds the
+    /// issuance token. Activation-gated: no issuance site exists until
+    /// the H8-D native witnesses wire, so production attestation fails
+    /// closed until then.
+    #[allow(dead_code)] // Activation-gated: see `SessionGrantToken`.
+    pub(crate) fn issue(
+        _token: &crate::attach::SessionGrantToken,
         proof: JournalDomainProof,
         birth: BirthKind,
         birth_cut: u64,
         closure_generation: u64,
-    ) -> Result<Self, BirthRefusal> {
-        if closure_generation != adapter.closure_generation {
-            return Err(BirthRefusal::ClosureStale);
-        }
-        let fenced_through = adapter
-            .keys
-            .get(&proof.key)
-            .map(|state| state.void_fence)
-            .unwrap_or(0);
-        adapter.verify_birth(&proof, birth, birth_cut, fenced_through)?;
-        Ok(Self {
+        evidence: SessionBirthEvidence,
+    ) -> Self {
+        Self {
             proof,
             birth,
             birth_cut,
             closure_generation,
-        })
+            evidence,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted(
+        proof: JournalDomainProof,
+        birth: BirthKind,
+        birth_cut: u64,
+        closure_generation: u64,
+    ) -> Self {
+        let image = (proof.key.cookie, proof.key.exec);
+        Self {
+            proof,
+            birth,
+            birth_cut,
+            closure_generation,
+            evidence: SessionBirthEvidence::scripted_canonical(image, birth),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted_with_evidence(
+        proof: JournalDomainProof,
+        birth: BirthKind,
+        birth_cut: u64,
+        closure_generation: u64,
+        evidence: SessionBirthEvidence,
+    ) -> Self {
+        Self {
+            proof,
+            birth,
+            birth_cut,
+            closure_generation,
+            evidence,
+        }
+    }
+}
+
+/// A Session-owned closure grant: the live endpoint-set generation just
+/// installed by successful attachment/readback. Production mint requires
+/// the Session issuance capability; a supplied integer never advances
+/// the closure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionClosureGrant {
+    generation: u64,
+}
+
+impl SessionClosureGrant {
+    /// Production mint: only Session-owned attach code holds the
+    /// issuance token. Activation-gated like the birth grant.
+    #[allow(dead_code)] // Activation-gated: see `SessionGrantToken`.
+    pub(crate) fn issue(_token: &crate::attach::SessionGrantToken, generation: u64) -> Self {
+        Self { generation }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted(generation: u64) -> Self {
+        Self { generation }
+    }
+}
+
+/// One domain's bootstrap: its Session-issued birth grant, verified at
+/// attestation and re-verified by the seal, so a chain break between
+/// attestation and seal still refuses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BootstrapReceipt {
+    grant: SessionBirthGrant,
+}
+
+impl BootstrapReceipt {
+    /// Production birth attestation: the Session grant is the birth
+    /// authority; the adapter checks its bundled native evidence plus
+    /// the live closure generation and its retained sightings/audit
+    /// chain as a backstop (an inconsistent grant refuses). The seal
+    /// re-verifies with fresh evidence before converting.
+    pub(crate) fn attest(
+        adapter: &JournalAdapter,
+        grant: &SessionBirthGrant,
+    ) -> Result<Self, BirthRefusal> {
+        if grant.closure_generation != adapter.closure_generation {
+            return Err(BirthRefusal::ClosureStale);
+        }
+        let fenced_through = adapter
+            .keys
+            .get(&grant.proof.key)
+            .map(|state| state.void_fence)
+            .unwrap_or(0);
+        adapter.verify_birth(
+            &grant.proof,
+            grant.birth,
+            grant.birth_cut,
+            fenced_through,
+            &grant.evidence,
+        )?;
+        Ok(Self { grant: *grant })
+    }
+
+    pub(crate) fn proof(&self) -> JournalDomainProof {
+        self.grant.proof
+    }
+
+    pub(crate) fn birth(&self) -> BirthKind {
+        self.grant.birth
+    }
+
+    pub(crate) fn birth_cut(&self) -> u64 {
+        self.grant.birth_cut
+    }
+
+    pub(crate) fn closure_generation(&self) -> u64 {
+        self.grant.closure_generation
     }
 
     #[cfg(test)]
@@ -1614,10 +2090,7 @@ impl BootstrapReceipt {
         closure_generation: u64,
     ) -> Self {
         Self {
-            proof,
-            birth,
-            birth_cut,
-            closure_generation,
+            grant: SessionBirthGrant::scripted(proof, birth, birth_cut, closure_generation),
         }
     }
 }
@@ -1643,7 +2116,7 @@ pub(crate) struct SealedObjectPrefix {
     domain: ObjectDomain,
     frontier: u64,
     birth_cut: u64,
-    bootstrap: u64,
+    bootstrap: Option<u64>,
     settled: Vec<SealedCall>,
     open: Vec<CallKey>,
 }
@@ -1666,14 +2139,14 @@ impl SealedObjectPrefix {
         self.birth_cut
     }
 
-    /// The model's bootstrap fence derived for this seal: strictly above
-    /// the birth, the last sealed frontier, the void fence and every
-    /// recorded or pending loss bound, capped at the earliest held begin
-    /// so its application still qualifies. When held calls keep the fence
-    /// below the model's floors the model keeps a benign stale floor and
-    /// held calls still apply; the loss bounds live in the model's floor
-    /// either way. The model input, not the birth.
-    pub(crate) fn bootstrap_cut(&self) -> u64 {
+    /// The model's bootstrap authority for this seal, when the seal
+    /// claims any: strictly above the birth, the last sealed frontier,
+    /// the void fence and every recorded or pending loss bound. A seal
+    /// whose held calls pin below those floors claims nothing (`None`):
+    /// it continues under the model's existing floor instead of
+    /// presenting a bootstrap the model must refuse. The model input,
+    /// not the birth.
+    pub(crate) fn bootstrap_cut(&self) -> Option<u64> {
         self.bootstrap
     }
 
@@ -1719,25 +2192,58 @@ pub(crate) enum AttestationRefusal {
     ImageTainted,
     KeysExhausted,
     Stopped,
+    /// Another live key for this image already converted: calls
+    /// attributed under sole-key authority cannot be re-examined once
+    /// a sibling instance appears.
+    ImageSealed,
+    /// The per-call claim store is full: conversion must dispose
+    /// staged calls (or a void must clear them) before new admissions
+    /// claim authority.
+    ClaimsExhausted,
 }
 
 impl JournalAdapter {
-    /// Verify one birth claim against retained sightings and the audit
-    /// chain. Shared by production attestation and the seal's
-    /// re-verification, so a chain break between the two still refuses.
-    /// `fenced_through` is the key's void fence: absence requires zero
-    /// UNFENCED affecting evidence at or below the cut and a chain
-    /// unbroken since the fence. Exec-marker novelty stays strict: a
-    /// fenced past is still a past.
+    /// Verify one Session-granted birth claim: its native evidence
+    /// first, then the retained sightings/audit backstop. Shared by
+    /// production attestation (grant-bundled evidence) and the seal's
+    /// re-verification (fresh evidence), so native truth that moved
+    /// between the two still refuses. The evidence is the birth
+    /// authority; the backstop only refuses grants inconsistent with
+    /// retained truth — it never births on its own. `fenced_through`
+    /// is the key's void fence: absence requires zero UNFENCED
+    /// affecting evidence at or below the cut and a chain unbroken
+    /// since the fence. Exec-marker novelty stays strict: a fenced
+    /// past is still a past.
     fn verify_birth(
         &self,
         proof: &JournalDomainProof,
         birth: BirthKind,
         birth_cut: u64,
         fenced_through: u64,
+        evidence: &SessionBirthEvidence,
     ) -> Result<(), BirthRefusal> {
         let image = (proof.key.cookie, proof.key.exec);
-        if self.tainted_images.contains(&image) {
+        // Native evidence first: the observed image must be this one,
+        // custody must bind a live held proof, the admission latch must
+        // be clean, and the marker word must authorize the claimed kind:
+        // READY naming the image's exec id for an exec birth (the
+        // marker's high 32 bits carry the native exec id; the full
+        // 64-bit exec stays bound by the observed image), or the
+        // unmarked word for absence. Dirty, reserved, torn or
+        // mismatched states refuse; zero custody binds nothing.
+        if evidence.image != image || evidence.custody == 0 || evidence.admission_failed != 0 {
+            return Err(BirthRefusal::EvidenceMismatch);
+        }
+        let marker_state = evidence.marker_word as u32;
+        let marker_exec = (evidence.marker_word >> 32) as u32;
+        let marker_ok = match birth {
+            BirthKind::ExecMarker => marker_state == 1 && marker_exec == image.1 as u32,
+            BirthKind::AbsenceAppearance => marker_state == 0,
+        };
+        if !marker_ok {
+            return Err(BirthRefusal::EvidenceMismatch);
+        }
+        if self.is_tainted(image) {
             return Err(BirthRefusal::ImageTainted);
         }
         let Some(sighting) = self.sightings.get(&image) else {
@@ -1765,27 +2271,30 @@ impl JournalAdapter {
         Ok(())
     }
 
-    /// Advance the closure generation after an attachment change alters
-    /// the retained endpoint set. Monotonic: a regression is refused and
-    /// the generation stays. Existing receipts and audits under older
-    /// generations refuse as stale; only fresh attestation under the live
-    /// generation seals. Production caller: the attach path that changes
-    /// the retained set (wired when the producer activates); until then
-    /// the generation stays zero and the seal's stale rule is exercised
-    /// through this advancer.
-    pub(crate) fn advance_closure_generation(&mut self, generation: u64) -> bool {
-        if generation < self.closure_generation {
+    /// Install the closure generation from a Session-owned grant after
+    /// an attachment change alters the retained endpoint set. Monotonic:
+    /// a regression is refused and the generation stays. Existing
+    /// receipts and audits under older generations refuse as stale; only
+    /// fresh Session-granted attestation under the live generation
+    /// seals. A supplied integer never advances the closure: production
+    /// grants mint only through the Session issuance capability.
+    pub(crate) fn install_closure_grant(&mut self, grant: &SessionClosureGrant) -> bool {
+        if grant.generation < self.closure_generation {
             return false;
         }
-        self.closure_generation = generation;
+        self.closure_generation = grant.generation;
         true
     }
 
     /// Bind one H3-admitted call's incarnation to a journal key: the exact
     /// native domain, caller, image and router, plus the adapter-tracked
     /// era. Re-attestation after a fault-void returns the live key; a
-    /// tainted image or a full key table refuses. Birth and closure are
-    /// verified on top of this binding by [`BootstrapReceipt::attest`].
+    /// tainted image or a full key table refuses. A second live key for
+    /// an image whose key already converted refuses: sole-key
+    /// attributions cannot be re-examined. An admitted modeled call
+    /// also claims its fingerprint for per-call conversion authority.
+    /// Birth and closure are verified on top of this binding by
+    /// [`BootstrapReceipt::attest`].
     pub(crate) fn attest_key(
         &mut self,
         admitted: &AdmittedInstanceCall,
@@ -1801,8 +2310,16 @@ impl JournalAdapter {
             exec: image.exec_id,
             router: router.get(),
         };
-        if self.tainted_images.contains(&(key.cookie, key.exec)) {
+        if self.is_tainted((key.cookie, key.exec)) {
             return Err(AttestationRefusal::ImageTainted);
+        }
+        if !self.keys.contains_key(&key)
+            && let Some(siblings) = self.image_keys.get(&(key.cookie, key.exec))
+            && siblings.iter().any(|sibling| {
+                sibling != &key && self.key_is_live(*sibling) && self.keys[sibling].model_registered
+            })
+        {
+            return Err(AttestationRefusal::ImageSealed);
         }
         if !self.keys.contains_key(&key) {
             if self.keys.len() >= self.limits.domain_keys {
@@ -1814,23 +2331,158 @@ impl JournalAdapter {
                 .or_default()
                 .push(key);
         }
+        if let Some(fingerprint) = admitted.journal_call_fingerprint()
+            && endpoint_class(fingerprint.function) == Some(EndpointClass::ModeledAffecting)
+        {
+            self.claim_fingerprint(fingerprint, key)?;
+        }
         let era = self.keys[&key].era;
         Ok(JournalDomainProof { key, era })
     }
 
-    /// The plan's seal entry: audit, verify the birth, derive the
-    /// model's fence, then convert staged history at or below the
-    /// frontier, then settle. Validation precedes every model mutation; a
-    /// model surprise fails closed with the key tainted. Staged inputs
-    /// below a refused-but-recoverable seal are kept for a later seal;
-    /// fault, malformed and H3 loss fence the void explicitly and drop
-    /// staged proof.
+    /// Whether one key can still seal: bound, unrefused, untainted,
+    /// unterminated, on an untainted image.
+    fn key_is_live(&self, key: JournalDomainKey) -> bool {
+        self.keys
+            .get(&key)
+            .is_some_and(|state| !state.refused && !state.tainted && !state.era_ended)
+            && !self.is_tainted((key.cookie, key.exec))
+    }
+
+    /// Live keys bound for one image: the attribution set a seal
+    /// partitions staged calls over.
+    fn live_keys_for_image(&self, image: (u64, u64)) -> Vec<JournalDomainKey> {
+        self.image_keys
+            .get(&image)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|key| self.key_is_live(*key))
+            .collect()
+    }
+
+    /// Claim one admitted fingerprint for its key. Counts stay within
+    /// the staged-call bound; a full store first drops dead keys'
+    /// claims, then refuses the attestation.
+    fn claim_fingerprint(
+        &mut self,
+        fingerprint: CallFingerprint,
+        key: JournalDomainKey,
+    ) -> Result<(), AttestationRefusal> {
+        if self.claim_counts >= self.limits.open_calls + self.limits.refused_begins {
+            self.prune_dead_claims();
+            if self.claim_counts >= self.limits.open_calls + self.limits.refused_begins {
+                return Err(AttestationRefusal::ClaimsExhausted);
+            }
+        }
+        *self
+            .claims
+            .entry(fingerprint)
+            .or_default()
+            .entry(key)
+            .or_default() += 1;
+        self.claim_counts += 1;
+        Ok(())
+    }
+
+    /// Drop dead keys' claims: their seals refuse anyway, so their
+    /// authority is garbage. Solely-dead-claimed staged entries keep
+    /// their skip (never convert, never barrier the living).
+    fn prune_dead_claims(&mut self) {
+        let live: BTreeSet<JournalDomainKey> = self
+            .keys
+            .keys()
+            .copied()
+            .filter(|key| self.key_is_live(*key))
+            .collect();
+        self.claims.retain(|_, claimants| {
+            claimants.retain(|key, _| live.contains(key));
+            !claimants.is_empty()
+        });
+        self.claim_counts = self
+            .claims
+            .values()
+            .map(|m| m.values().sum::<u64>())
+            .sum::<u64>() as usize;
+    }
+
+    /// Consume one claim count for a converted call. Absent claims
+    /// (sole-key conversions of never-admitted shapes) convert without
+    /// touching the store: admission completeness there rides the
+    /// H3-disposition gate, not the claim counts.
+    fn consume_claim(&mut self, fingerprint: &CallFingerprint, key: JournalDomainKey) {
+        let mut vacated = false;
+        if let Some(claimants) = self.claims.get_mut(fingerprint) {
+            if let Some(count) = claimants.get_mut(&key)
+                && *count > 0
+            {
+                *count -= 1;
+                self.claim_counts -= 1;
+                if *count == 0 {
+                    claimants.remove(&key);
+                }
+            }
+            vacated = claimants.is_empty();
+        }
+        if vacated {
+            self.claims.remove(fingerprint);
+        }
+    }
+
+    /// Attribute one staged fingerprint under a sealing key. A sole
+    /// live key owns its image's staging outright; with siblings, only
+    /// a sole live claim converts here, a sibling's claim (or solely
+    /// dead claims) skips, and no claim — or a live collision — waits.
+    fn attribute_call(
+        &self,
+        key: JournalDomainKey,
+        fingerprint: &CallFingerprint,
+        live: &[JournalDomainKey],
+    ) -> CallAttribution {
+        if live.len() <= 1 {
+            debug_assert!(live.is_empty() || live == [key]);
+            return CallAttribution::Mine;
+        }
+        let mut mine = false;
+        let mut sibling = false;
+        let mut dead = false;
+        if let Some(claimants) = self.claims.get(fingerprint) {
+            for (claimant, count) in claimants {
+                if *count == 0 {
+                    continue;
+                }
+                if *claimant == key {
+                    mine = true;
+                } else if live.contains(claimant) {
+                    sibling = true;
+                } else {
+                    dead = true;
+                }
+            }
+        }
+        match (mine, sibling, dead) {
+            (true, false, _) => CallAttribution::Mine,
+            (false, true, _) | (false, false, true) => CallAttribution::Sibling,
+            _ => CallAttribution::Unclaimed,
+        }
+    }
+
+    /// The plan's seal entry: audit (with a seal-time native fault
+    /// re-read), re-verify the birth with fresh Session evidence,
+    /// derive the model's fence, then convert staged history at or below
+    /// the frontier, then settle. Validation precedes every model
+    /// mutation; a model surprise fails closed with the key tainted.
+    /// Staged inputs below a refused-but-recoverable seal are kept for
+    /// a later seal; fault, malformed and H3 loss fence the void
+    /// explicitly and drop staged proof.
     pub(crate) fn seal(
         &mut self,
         model: &mut ObjectSemantics,
         audit: &JournalAuditReceipt,
         bootstrap: &BootstrapReceipt,
         frontier: ConsumptionOrdinal,
+        fresh: &SessionBirthEvidence,
+        fault: &impl FaultEpoch,
     ) -> Result<SealSuccess, SealFailure> {
         let frontier = frontier.0;
         if self.stopped {
@@ -1842,7 +2494,13 @@ impl JournalAdapter {
         if frontier > self.consumed_through {
             return Err(self.failure(JournalGap::FrontierRegression));
         }
-        if let Err(gap) = audit.check(frontier, self.closure_generation) {
+        let seal_epoch = fault.fault_epoch();
+        if let Err(gap) = audit.check(
+            self.last_fault,
+            self.h3_voided_below,
+            self.closure_generation,
+            &seal_epoch,
+        ) {
             // Any audit failure breaks absence-appearance chains: the clean
             // coverage the witness requires is gone from this ordinal on.
             // Voids fence the loss explicitly before dropping staged
@@ -1855,27 +2513,67 @@ impl JournalAdapter {
                 JournalGap::FaultSaturated => {
                     self.stopped = true;
                 }
+                JournalGap::H3Exhausted => {
+                    // The H0 allocator is dead: no future history can
+                    // certify, so the adapter stops (invalidating tracked
+                    // keys) instead of waiting forever.
+                    effects = self.stop(model);
+                }
                 JournalGap::FaultChanged
                 | JournalGap::FaultUnreadable
                 | JournalGap::Malformed
+                | JournalGap::Discarded
                 | JournalGap::H3Loss => {
-                    effects = self.fence_void(model, self.consumed_through);
+                    // Irreversible refusals first: staged unbounded
+                    // abandonments refuse their incarnations permanently
+                    // BEFORE staged custody is dropped, so a void can
+                    // never erase them into a recoverable fence.
+                    effects = self.preserve_abandonment_refusals(model);
+                    effects
+                        .effects
+                        .extend(self.fence_void(model, self.consumed_through).effects);
                     self.void_staged();
+                    if gap == JournalGap::H3Loss {
+                        // Forgive the voided H0 interval: re-presented
+                        // barriers at or below it wait for clean
+                        // evidence instead of voiding twice.
+                        self.h3_voided_below = self.h3_voided_below.max(audit.h0_below);
+                    }
+                    if gap == JournalGap::FaultChanged {
+                        // Re-baseline the cumulative chain on the
+                        // freshest observed epoch: the audited close or
+                        // the seal-time re-read, whichever is newer.
+                        let freshest = audit
+                            .fault_after
+                            .max(seal_epoch.unwrap_or(audit.fault_after));
+                        self.last_fault = Some(freshest);
+                    }
                 }
                 JournalGap::H3Pending | JournalGap::ClosureStale => {}
                 _ => {}
             }
             return Err(SealFailure { gap, effects });
         }
-        let key = bootstrap.proof.key;
+        // The audit passed: pin the cumulative baseline. Past the first
+        // seal this is a no-op (the chain rule already equated them).
+        self.last_fault = Some(audit.fault_after);
+        let key = bootstrap.proof().key;
         let Some(state) = self.keys.get(&key) else {
             return Err(self.failure(JournalGap::BootstrapMismatch));
         };
         if state.refused || state.tainted {
             return Err(self.failure(JournalGap::DomainTainted));
         }
-        if self.tainted_images.contains(&(key.cookie, key.exec)) {
+        if self.is_tainted((key.cookie, key.exec)) {
             return Err(self.failure(JournalGap::ImageTainted));
+        }
+        // The collection's Session drain must be this proof's: one
+        // Session's history never seals under another's key. Scripted
+        // (test-only) audits carry no drain and skip this binding.
+        if let Some(session) = audit.session_domain
+            && session.journal_tag() != key.domain_tag
+        {
+            return Err(self.failure(JournalGap::DrainMismatch));
         }
         if state.era_ended {
             return Err(self.failure(JournalGap::DomainEnded));
@@ -1883,21 +2581,23 @@ impl JournalAdapter {
         // Era discipline: the proof carries the live era, or the next era
         // once the live one ended (handled below after the ended check can
         // observe it). Anything else is a mismatched bootstrap.
-        if bootstrap.proof.era != state.era {
+        if bootstrap.proof().era != state.era {
             return Err(self.failure(JournalGap::BootstrapMismatch));
         }
         // The receipt's own generation must be live: a birth verified
         // under a replaced endpoint set proves nothing under this one.
-        if bootstrap.closure_generation != self.closure_generation {
+        if bootstrap.closure_generation() != self.closure_generation {
             return Err(self.failure(JournalGap::ClosureStale));
         }
-        // Re-verify the birth against current retained truth: a chain
-        // break between attestation and seal still refuses.
+        // Re-verify the birth with fresh Session evidence against
+        // current retained truth: moved native evidence or a chain break
+        // between attestation and seal still refuses.
         if let Err(refusal) = self.verify_birth(
-            &bootstrap.proof,
-            bootstrap.birth,
-            bootstrap.birth_cut,
+            &bootstrap.proof(),
+            bootstrap.birth(),
+            bootstrap.birth_cut(),
             state.void_fence,
+            fresh,
         ) {
             // The receipt generation was checked above, so only taint
             // keeps its own gap here.
@@ -1910,50 +2610,82 @@ impl JournalAdapter {
         // The birth cut pins per key-era at first seal: a later seal for
         // the same era must carry the same cut. Rebirth above kept staged
         // history is refused — void first.
-        if let Some(pinned) = state.bootstraps.get(&bootstrap.proof.era)
-            && *pinned != bootstrap.birth_cut
+        if let Some(pinned) = state.bootstraps.get(&bootstrap.proof().era)
+            && *pinned != bootstrap.birth_cut()
         {
             return Err(self.failure(JournalGap::BootstrapMismatch));
         }
-        // The birth covers all retained staged history for the image:
+        // The birth covers all retained staged history for the key:
         // conversion proves staged begins, so a cut at or above any of
-        // them would certify history the birth excludes.
+        // them would certify history the birth excludes. A sibling
+        // key's staging belongs to its own birth.
         let image = (key.cookie, key.exec);
-        if !self.birth_covers_staged(image, bootstrap.birth_cut) {
+        let live = self.live_keys_for_image(image);
+        if !self.birth_covers_staged(key, &live, image, bootstrap.birth_cut()) {
             return Err(self.failure(JournalGap::BootstrapMismatch));
         }
         if frontier < state.sealed_through {
             return Err(self.failure(JournalGap::FrontierRegression));
         }
-        if bootstrap.birth_cut > frontier {
+        if bootstrap.birth_cut() > frontier {
             return Err(self.failure(JournalGap::BootstrapMismatch));
         }
         // Resumption below the void fence refuses: a fresh birth names
         // the fence it resumes at. At the fence is sound (the fenced
         // interval is explicitly lost, and conversion covers strictly
         // above the cut).
-        if bootstrap.birth_cut < state.void_fence {
+        if bootstrap.birth_cut() < state.void_fence {
             return Err(self.failure(JournalGap::BootstrapMismatch));
         }
-        // The model's bootstrap fence is derived, not supplied: strictly
-        // above the birth, the last sealed frontier, the void fence and
-        // every recorded or pending loss bound — but never above a held
-        // begin, whose application the floor would otherwise disqualify.
-        // The model refuses anything lower (a benign stale floor under
-        // which held calls still apply); only a fence past the frontier
-        // waits for more history. Staged inputs are kept for a later seal.
-        let mut fence = bootstrap
-            .birth_cut
-            .max(state.sealed_through.saturating_add(1));
-        fence = fence.max(state.void_fence.saturating_add(1));
-        for upper in &state.bounded_uppers {
-            fence = fence.max(upper.saturating_add(1));
+        // Unclaimed staged history barriers every seal past it: an
+        // entry no bound key can account for is never silently
+        // excluded. Only an explicit void drops it.
+        if self.has_unbound_staging(frontier) {
+            return Err(self.failure(JournalGap::BoundNotReady));
         }
-        // Pending loss bounds: staged bounded abandonments and refused
-        // begins with their corroborating returns in the frontier. Calls
-        // this seal removes never apply, so they leave the held cap alone.
+        // With sibling keys, every staged entry for this image needs
+        // its attribution: this key's entries convert, a sibling's
+        // wait for their own seal, and unclaimed shapes (or live
+        // collisions) hold the seal until admission authority names
+        // them.
+        if !self.attribution_ready(key, &live, frontier) {
+            return Err(self.failure(JournalGap::BoundNotReady));
+        }
+        // A fresh birth (no pinned cut for this era) must ground its
+        // authority in new staged history: naming the void fence with
+        // an advanced frontier but no convertible begin above the cut
+        // certifies nothing, so the seal waits instead of succeeding
+        // vacantly. Structural mismatches above keep priority: only a
+        // well-formed but history-less resumption waits.
+        if !state.bootstraps.contains_key(&bootstrap.proof().era)
+            && !self.has_staged_history(key, &live, bootstrap.birth_cut(), frontier)
+        {
+            return Err(self.failure(JournalGap::BoundNotReady));
+        }
+        // The model's bootstrap authority is derived, not supplied:
+        // strictly above the birth, the last sealed frontier, the void
+        // fence and every recorded or pending loss bound. Held calls
+        // pinning below those floors make the seal a continuation: it
+        // claims no new bootstrap (the model keeps its floor and held
+        // calls still apply under it) instead of presenting a fence the
+        // model must refuse. Only floors past the frontier wait for more
+        // history — a repeated seal at an unchanged frontier never
+        // succeeds vacuously. Staged inputs are kept for a later seal.
+        let mut floors = bootstrap
+            .birth_cut()
+            .saturating_add(1)
+            .max(state.sealed_through.saturating_add(1));
+        floors = floors.max(state.void_fence.saturating_add(1));
+        if let Some(upper) = state.bounded_upper {
+            floors = floors.max(upper.saturating_add(1));
+        }
+        // Pending loss bounds: this key's staged bounded abandonments
+        // and refused begins with their corroborating returns in the
+        // frontier. Calls this seal removes never apply, so they leave
+        // the held pin alone. A sibling key's bounds belong to its own
+        // fence.
         for entry in self.open.values() {
-            if entry.image == image
+            if self.converts_here(key, &live, entry)
                 && entry.begin_ordinal <= frontier
                 && let Some(staged) = entry.abandon
                 && staged.ordinal <= frontier
@@ -1961,26 +2693,29 @@ impl JournalAdapter {
                 && let Some(at) = entry.corroborated_return
                 && at <= frontier
             {
-                fence = fence.max(at.saturating_add(1));
+                floors = floors.max(at.saturating_add(1));
             }
         }
         for refused in &self.refused {
-            if refused.image == image
+            if self.refused_converts_here(key, &live, refused)
                 && refused.cut <= frontier
                 && let Some(at) = refused.corroborated_return
                 && at <= frontier
             {
-                fence = fence.max(at.saturating_add(1));
+                floors = floors.max(at.saturating_add(1));
             }
         }
-        // Held cap: the earliest staged begin this seal keeps. Bounded
+        // Held pin: the earliest staged begin this seal keeps. Bounded
         // losses removed below contribute their bound instead of their
-        // begin; everything else staged may still apply.
+        // begin; everything else convertible here may still apply. A
+        // sibling key's held calls pin its own fence, never this one. A
+        // pin below the floors continues without claiming; at or above
+        // them the seal claims the floors as new authority.
         let held = self
             .open
             .values()
             .filter(|entry| {
-                entry.image == image
+                (self.converts_here(key, &live, entry) || entry.converted_for == Some(key))
                     && !(entry.abandon.is_some_and(|staged| {
                         staged.ordinal <= frontier
                             && staged.abandon.reason() == JOURNAL_REASON_SYNC_RETURN_RESULT_LOST
@@ -1989,13 +2724,85 @@ impl JournalAdapter {
             })
             .map(|entry| entry.begin_ordinal)
             .min();
-        if let Some(held) = held {
-            fence = fence.min(held);
-        }
-        if fence > frontier {
+        if floors > frontier {
             return Err(self.failure(JournalGap::BoundNotReady));
         }
+        let fence = match held {
+            Some(pinned) if pinned < floors => None,
+            _ => Some(floors),
+        };
         self.seal_validated(model, key, bootstrap, frontier, fence)
+    }
+
+    /// Preserve staged unbounded abandonments across a void: each
+    /// one refuses its incarnation permanently (model invalidation
+    /// reported) before staged custody is dropped. A sole live key
+    /// takes its image's abandonments; with siblings, live claimants
+    /// of the abandoned call's fingerprint refuse; an abandonment no
+    /// live key can account for taints its image (unknown continuing
+    /// effects), as does a keyless one. Either way the void fence
+    /// never becomes replacement birth authority over continuing
+    /// provider effects.
+    fn preserve_abandonment_refusals(&mut self, model: &mut ObjectSemantics) -> ObjectEffects {
+        let mut effects = ObjectEffects::default();
+        let mut doomed: BTreeSet<JournalDomainKey> = BTreeSet::new();
+        let mut taint: BTreeSet<(u64, u64)> = BTreeSet::new();
+        for entry in self.open.values() {
+            if !entry.abandon.is_some_and(|staged| {
+                abandon_disposition(staged.abandon.reason())
+                    == Some(AbandonDisposition::UnboundedInvalidation)
+            }) {
+                continue;
+            }
+            let live = self.live_keys_for_image(entry.image);
+            match live.as_slice() {
+                [sole] => {
+                    doomed.insert(*sole);
+                }
+                [] if !self.image_keys.contains_key(&entry.image) => {
+                    taint.insert(entry.image);
+                }
+                [] => {}
+                _ => {
+                    let fingerprint = fingerprint_of_begin(&entry.begin);
+                    let claimants: Vec<JournalDomainKey> = self
+                        .claims
+                        .get(&fingerprint)
+                        .map(|m| {
+                            m.iter()
+                                .filter(|(key, count)| **count > 0 && live.contains(key))
+                                .map(|(key, _)| *key)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if claimants.is_empty() {
+                        taint.insert(entry.image);
+                    } else {
+                        doomed.extend(claimants);
+                    }
+                }
+            }
+        }
+        for image in taint {
+            self.taint_image(image);
+        }
+        for key in doomed {
+            if self.is_tainted((key.cookie, key.exec)) {
+                continue;
+            }
+            let (era, registered) = self
+                .keys
+                .get(&key)
+                .map(|state| (state.era, state.model_registered))
+                .expect("doomed key");
+            if registered {
+                let domain = ObjectDomain::sealed(&JournalDomainProof { key, era });
+                let refused = model.abandon_domain(domain);
+                effects.effects.extend(refused.effects);
+            }
+            self.keys.get_mut(&key).expect("doomed key").refused = true;
+        }
+        effects
     }
 
     /// Fence one void explicitly: every key's fence rises to the voided
@@ -2026,17 +2833,142 @@ impl JournalAdapter {
         effects
     }
 
+    /// Whether staged wire truth no bound key can account for sits at
+    /// or below a frontier: an open begin or refused begin whose image
+    /// was never attested. Such entries barrier every seal past them.
+    fn has_unbound_staging(&self, frontier: u64) -> bool {
+        self.open.values().any(|entry| {
+            entry.converted_ticket.is_none()
+                && entry.begin_ordinal <= frontier
+                && !self.image_keys.contains_key(&entry.image)
+        }) || self
+            .refused
+            .iter()
+            .any(|refused| refused.cut <= frontier && !self.image_keys.contains_key(&refused.image))
+    }
+
+    /// Whether every staged entry for one image at or below a frontier
+    /// is attributed under a sealing key: this key's entries, a
+    /// sibling's (left for their own seal), or solely dead claims. An
+    /// unclaimed shape or a live collision holds the seal; with
+    /// siblings, multiset claim counts must also cover this key's
+    /// staged entries.
+    fn attribution_ready(
+        &self,
+        key: JournalDomainKey,
+        live: &[JournalDomainKey],
+        frontier: u64,
+    ) -> bool {
+        let image = (key.cookie, key.exec);
+        let mut needs: BTreeMap<CallFingerprint, u64> = BTreeMap::new();
+        for entry in self.open.values() {
+            if entry.image != image
+                || entry.converted_ticket.is_some()
+                || entry.begin_ordinal > frontier
+            {
+                continue;
+            }
+            match self.attribute_call(key, &fingerprint_of_begin(&entry.begin), live) {
+                CallAttribution::Mine => {
+                    *needs.entry(fingerprint_of_begin(&entry.begin)).or_default() += 1;
+                }
+                CallAttribution::Sibling => {}
+                CallAttribution::Unclaimed => return false,
+            }
+        }
+        for refused in &self.refused {
+            if refused.image != image || refused.cut > frontier {
+                continue;
+            }
+            match self.attribute_call(key, &fingerprint_of_refused(refused), live) {
+                CallAttribution::Mine => {
+                    *needs.entry(fingerprint_of_refused(refused)).or_default() += 1;
+                }
+                CallAttribution::Sibling => {}
+                CallAttribution::Unclaimed => return false,
+            }
+        }
+        if live.len() <= 1 {
+            return true;
+        }
+        needs.into_iter().all(|(fingerprint, need)| {
+            self.claims
+                .get(&fingerprint)
+                .and_then(|claimants| claimants.get(&key))
+                .copied()
+                .unwrap_or(0)
+                >= need
+        })
+    }
+
+    /// Whether one staged open entry converts under a sealing key: its
+    /// image's, unconverted, and attributed here.
+    fn converts_here(
+        &self,
+        key: JournalDomainKey,
+        live: &[JournalDomainKey],
+        entry: &OpenEntry,
+    ) -> bool {
+        entry.image == (key.cookie, key.exec)
+            && entry.converted_ticket.is_none()
+            && self.attribute_call(key, &fingerprint_of_begin(&entry.begin), live)
+                == CallAttribution::Mine
+    }
+
+    /// Whether one staged refused begin converts under a sealing key.
+    fn refused_converts_here(
+        &self,
+        key: JournalDomainKey,
+        live: &[JournalDomainKey],
+        refused: &RefusedBegin,
+    ) -> bool {
+        refused.image == (key.cookie, key.exec)
+            && self.attribute_call(key, &fingerprint_of_refused(refused), live)
+                == CallAttribution::Mine
+    }
+
     /// Whether a birth cut covers all retained staged history for one
-    /// image: every staged begin and refused cut sits strictly above it.
-    /// Staged history for other images is irrelevant to this birth.
-    fn birth_covers_staged(&self, image: (u64, u64), birth_cut: u64) -> bool {
-        self.open
-            .values()
-            .all(|entry| entry.image != image || entry.begin_ordinal > birth_cut)
-            && self
-                .refused
-                .iter()
-                .all(|refused| refused.image != image || refused.cut > birth_cut)
+    /// key: every convertible-or-converted begin and refused cut sits
+    /// strictly above it. A sibling key's staging belongs to its own
+    /// birth, and other images are irrelevant to this one.
+    fn birth_covers_staged(
+        &self,
+        key: JournalDomainKey,
+        live: &[JournalDomainKey],
+        image: (u64, u64),
+        birth_cut: u64,
+    ) -> bool {
+        self.open.values().all(|entry| {
+            entry.image != image
+                || entry.begin_ordinal > birth_cut
+                || !(self.converts_here(key, live, entry) || entry.converted_for == Some(key))
+        }) && self.refused.iter().all(|refused| {
+            refused.image != image
+                || refused.cut > birth_cut
+                || !self.refused_converts_here(key, live, refused)
+        })
+    }
+
+    /// Whether convertible wire truth for one key sits strictly above a
+    /// cut at or below a frontier: an open begin or a refused begin
+    /// this seal would cover. A fresh birth needs one; an advanced
+    /// frontier alone certifies nothing.
+    fn has_staged_history(
+        &self,
+        key: JournalDomainKey,
+        live: &[JournalDomainKey],
+        birth_cut: u64,
+        frontier: u64,
+    ) -> bool {
+        self.open.values().any(|entry| {
+            self.converts_here(key, live, entry)
+                && entry.begin_ordinal > birth_cut
+                && entry.begin_ordinal <= frontier
+        }) || self.refused.iter().any(|refused| {
+            self.refused_converts_here(key, live, refused)
+                && refused.cut > birth_cut
+                && refused.cut <= frontier
+        })
     }
 
     /// Drop all staged wire truth and void every bootstrap after a fault,
@@ -2050,6 +2982,8 @@ impl JournalAdapter {
     fn void_staged(&mut self) {
         self.open.clear();
         self.refused.clear();
+        self.claims.clear();
+        self.claim_counts = 0;
         for state in self.keys.values_mut() {
             state.bootstraps.clear();
         }
@@ -2070,14 +3004,17 @@ impl JournalAdapter {
         key: JournalDomainKey,
         bootstrap: &BootstrapReceipt,
         frontier: u64,
-        model_fence: u64,
+        model_fence: Option<u64>,
     ) -> Result<SealSuccess, SealFailure> {
         let image = (key.cookie, key.exec);
-        // Unbounded abandonment staged at or below the frontier refuses
-        // this key permanently: invalidate its proof (reported), mark it,
-        // dispose its staged entries, and refuse the seal.
+        let live = self.live_keys_for_image(image);
+        // Unbounded abandonment of this key's calls staged at or below
+        // the frontier refuses this key permanently: invalidate its
+        // proof (reported), mark it, dispose its staged entries, and
+        // refuse the seal. A sibling's abandonment belongs to its own
+        // seal; unclaimed shapes barriered before conversion.
         let unbounded = self.open.values().any(|entry| {
-            entry.image == image
+            self.converts_here(key, &live, entry)
                 && entry.begin_ordinal <= frontier
                 && entry.abandon.is_some_and(|staged| {
                     staged.ordinal <= frontier
@@ -2086,20 +3023,37 @@ impl JournalAdapter {
                 })
         });
         if unbounded {
-            let domain = ObjectDomain::sealed(&bootstrap.proof);
-            let effects = model.invalidate(AffectedScope::Domain(domain), ObjectGap::Loss);
+            let domain = ObjectDomain::sealed(&bootstrap.proof());
+            let effects = model.abandon_domain(domain);
             self.keys.get_mut(&key).expect("sealed key").refused = true;
-            self.open.retain(|_, entry| entry.image != image);
-            self.refused.retain(|refused| refused.image != image);
+            let drop: BTreeSet<JournalNativeKey> = self
+                .open
+                .iter()
+                .filter(|(_, entry)| {
+                    entry.image == image
+                        && (self.converts_here(key, &live, entry)
+                            || entry.converted_for == Some(key))
+                })
+                .map(|(native, _)| *native)
+                .collect();
+            self.open.retain(|native, _| !drop.contains(native));
+            let mut kept = Vec::with_capacity(self.refused.len());
+            for refused in self.refused.iter() {
+                if !self.refused_converts_here(key, &live, refused) {
+                    kept.push(*refused);
+                }
+            }
+            self.refused = kept;
             return Err(SealFailure {
                 gap: JournalGap::DomainTainted,
                 effects,
             });
         }
-        // Bounded abandonment needs its corroborating return within the
-        // frontier; otherwise the bound is not ready and the seal waits.
+        // This key's bounded abandonments need their corroborating
+        // returns within the frontier; otherwise the bound is not ready
+        // and the seal waits.
         let unready = self.open.values().any(|entry| {
-            entry.image == image
+            self.converts_here(key, &live, entry)
                 && entry.begin_ordinal <= frontier
                 && entry.abandon.is_some_and(|staged| {
                     staged.ordinal <= frontier
@@ -2110,10 +3064,10 @@ impl JournalAdapter {
         if unready {
             return Err(self.failure(JournalGap::BoundNotReady));
         }
-        // Every refused begin at or below the frontier needs its bound
-        // within the frontier; otherwise the seal waits.
+        // Every refused begin of this key at or below the frontier needs
+        // its bound within the frontier; otherwise the seal waits.
         let refused_unready = self.refused.iter().any(|refused| {
-            refused.image == image
+            self.refused_converts_here(key, &live, refused)
                 && refused.cut <= frontier
                 && refused.corroborated_return.is_none_or(|at| at > frontier)
         });
@@ -2132,10 +3086,11 @@ impl JournalAdapter {
         key: JournalDomainKey,
         bootstrap: &BootstrapReceipt,
         frontier: u64,
-        model_fence: u64,
+        model_fence: Option<u64>,
     ) -> Result<SealSuccess, SealFailure> {
         let image = (key.cookie, key.exec);
-        let domain = ObjectDomain::sealed(&bootstrap.proof);
+        let live = self.live_keys_for_image(image);
+        let domain = ObjectDomain::sealed(&bootstrap.proof());
         let mut effects = ObjectEffects::default();
         if model.register_domain(domain).is_err() {
             self.keys.get_mut(&key).expect("sealed key").tainted = true;
@@ -2148,24 +3103,32 @@ impl JournalAdapter {
             .get_mut(&key)
             .expect("sealed key")
             .model_registered = true;
-        // Refused begins first: the model records each cut exactly like
-        // its own capacity refusal, then a single lost-outcome bound
-        // clears them once every refused begin is corroborated.
+        // This key's refused begins first: the model records each cut
+        // exactly like its own capacity refusal, then a single
+        // lost-outcome bound clears them once every refused begin is
+        // corroborated. Conversion consumes one claim count per
+        // refused begin; a sibling's refusals stay staged.
         let mut refused_cuts: Vec<u64> = self
             .refused
             .iter()
-            .filter(|refused| refused.image == image && refused.cut <= frontier)
+            .filter(|refused| {
+                refused.cut <= frontier && self.refused_converts_here(key, &live, refused)
+            })
             .map(|refused| refused.cut)
             .collect();
         refused_cuts.sort_unstable();
         for cut in &refused_cuts {
-            model.note_refused_begin(domain, RefCut::sealed(ConsumptionOrdinal(*cut)));
+            let refused_effects =
+                model.note_refused_begin(domain, RefCut::sealed(ConsumptionOrdinal(*cut)));
+            effects.effects.extend(refused_effects.effects);
         }
         if !refused_cuts.is_empty() {
             let upper = self
                 .refused
                 .iter()
-                .filter(|refused| refused.image == image && refused.cut <= frontier)
+                .filter(|refused| {
+                    refused.cut <= frontier && self.refused_converts_here(key, &live, refused)
+                })
                 .filter_map(|refused| refused.corroborated_return)
                 .max();
             match upper {
@@ -2176,13 +3139,11 @@ impl JournalAdapter {
                     ));
                     effects.effects.extend(lost.effects);
                     // The model fences this upper too; the adapter keeps
-                    // its own copy so the bootstrap rule stays sufficient
-                    // on its own evidence.
-                    self.keys
-                        .get_mut(&key)
-                        .expect("sealed key")
-                        .bounded_uppers
-                        .push(upper);
+                    // the running maximum so the bootstrap rule stays
+                    // sufficient on its own evidence.
+                    let retained = self.keys.get_mut(&key).expect("sealed key");
+                    retained.bounded_upper =
+                        Some(retained.bounded_upper.map_or(upper, |kept| kept.max(upper)));
                 }
                 None => {
                     self.keys.get_mut(&key).expect("sealed key").tainted = true;
@@ -2192,17 +3153,27 @@ impl JournalAdapter {
                     });
                 }
             }
-            self.refused
-                .retain(|refused| !(refused.image == image && refused.cut <= frontier));
+            let mut consumed = Vec::new();
+            let mut kept = Vec::with_capacity(self.refused.len());
+            for refused in self.refused.iter() {
+                if refused.cut <= frontier && self.refused_converts_here(key, &live, refused) {
+                    consumed.push(fingerprint_of_refused(refused));
+                } else {
+                    kept.push(*refused);
+                }
+            }
+            self.refused = kept;
+            for fingerprint in &consumed {
+                self.consume_claim(fingerprint, key);
+            }
         }
-        // Begins in cut order, then their terminals.
+        // This key's begins in cut order, then their terminals. A
+        // sibling's begins stay staged for their own seal.
         let mut begins: Vec<(JournalNativeKey, u64)> = self
             .open
             .iter()
             .filter(|(_, entry)| {
-                entry.image == image
-                    && entry.begin_ordinal <= frontier
-                    && entry.converted_ticket.is_none()
+                entry.begin_ordinal <= frontier && self.converts_here(key, &live, entry)
             })
             .map(|(key, entry)| (*key, entry.begin_ordinal))
             .collect();
@@ -2222,8 +3193,10 @@ impl JournalAdapter {
             let call_key = CallKey::sealed(ticket);
             match model.begin(origin) {
                 Ok(token) => {
+                    let fingerprint = fingerprint_of_begin(&entry.begin);
                     let entry = self.open.get_mut(&native).expect("staged begin");
                     entry.converted_ticket = Some(token);
+                    entry.converted_for = Some(key);
                     entry.call_key = Some(call_key);
                     settled.push(SealedCall {
                         ticket: token,
@@ -2233,6 +3206,7 @@ impl JournalAdapter {
                         end_cut: None,
                         abandoned: false,
                     });
+                    self.consume_claim(&fingerprint, key);
                 }
                 Err(_) => {
                     self.keys.get_mut(&key).expect("sealed key").tainted = true;
@@ -2243,11 +3217,12 @@ impl JournalAdapter {
                 }
             }
         }
-        // Terminals for converted begins: ends complete, bounded
-        // abandonments dispose through the lost-outcome bound.
+        // Terminals for this key's converted begins: ends complete,
+        // bounded abandonments dispose through the lost-outcome bound.
+        // A sibling's converted terminals belong to its own seal.
         let mut terminals: Vec<(JournalNativeKey, u64)> = Vec::new();
         for (native, entry) in &self.open {
-            if entry.image != image || entry.converted_ticket.is_none() {
+            if entry.converted_for != Some(key) {
                 continue;
             }
             if let Some(staged) = entry.end
@@ -2278,6 +3253,17 @@ impl JournalAdapter {
                     .end_converted = true;
                 if let Some(summary) = settled.iter_mut().find(|summary| summary.ticket == token) {
                     summary.end_cut = Some(staged.ordinal);
+                } else {
+                    // The BEGIN converted under an earlier seal: emit an
+                    // explicit terminal delta so H9 sees the close.
+                    settled.push(SealedCall {
+                        ticket: token,
+                        key: entry.call_key.expect("converted terminal has a key"),
+                        function: entry.function,
+                        begin_cut: entry.begin_ordinal,
+                        end_cut: Some(staged.ordinal),
+                        abandoned: false,
+                    });
                 }
             }
             if let Some(staged) = entry.abandon
@@ -2296,36 +3282,48 @@ impl JournalAdapter {
                     RefCut::sealed(ConsumptionOrdinal(at)),
                 ));
                 effects.effects.extend(lost.effects);
-                self.keys
-                    .get_mut(&key)
-                    .expect("sealed key")
-                    .bounded_uppers
-                    .push(at);
+                let retained = self.keys.get_mut(&key).expect("sealed key");
+                retained.bounded_upper =
+                    Some(retained.bounded_upper.map_or(at, |kept| kept.max(at)));
                 if let Some(summary) = settled.iter_mut().find(|summary| summary.ticket == token) {
                     summary.abandoned = true;
+                } else {
+                    // The BEGIN converted under an earlier seal: emit an
+                    // explicit terminal delta so H9 sees the bound.
+                    settled.push(SealedCall {
+                        ticket: token,
+                        key: entry.call_key.expect("converted terminal has a key"),
+                        function: entry.function,
+                        begin_cut: entry.begin_ordinal,
+                        end_cut: None,
+                        abandoned: true,
+                    });
                 }
             }
         }
         // Settle the covered history under this bootstrap. The open
-        // list is cumulative over retained staged entries, mirroring the
-        // model's rule exactly: converted calls with no terminal at or
-        // below the frontier. A per-seal list would omit calls held
-        // across seals and contradict the settlement.
+        // list is cumulative over this key's converted entries,
+        // mirroring the model's rule exactly: converted calls with no
+        // terminal at or below the frontier. A per-seal list would omit
+        // calls held across seals and contradict the settlement; a
+        // sibling's opens belong to its own prefix.
         let open: Vec<CallKey> = self
             .open
             .values()
             .filter(|entry| {
-                entry.image == image
-                    && entry.converted_ticket.is_some()
+                entry.converted_for == Some(key)
                     && entry.end.is_none_or(|staged| staged.ordinal > frontier)
                     && entry.abandon.is_none_or(|staged| staged.ordinal > frontier)
             })
             .map(|entry| entry.call_key.expect("converted open has a key"))
             .collect();
+        // Terminal deltas append after this seal's conversions; restore
+        // the begin-cut order the prefix promises H9.
+        settled.sort_by_key(|summary| summary.begin_cut);
         let prefix = SealedObjectPrefix {
             domain,
             frontier,
-            birth_cut: bootstrap.birth_cut,
+            birth_cut: bootstrap.birth_cut(),
             bootstrap: model_fence,
             settled: settled.clone(),
             open,
@@ -2339,6 +3337,19 @@ impl JournalAdapter {
                 }
             )
         });
+        // A seal whose required authority the model rejected is refused,
+        // never succeeded-with-rejection: no frontier advance, no pin,
+        // no pruning. The key is not tainted — staged inputs stay for a
+        // later seal once authority clears (new history can raise the
+        // floors past a moved model floor).
+        let rejected = applied.effects.iter().any(|effect| {
+            matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: ObjectGap::BootstrapRefused | ObjectGap::PrefixContradiction
+                }
+            )
+        });
         effects.effects.extend(applied.effects);
         if ended {
             self.keys.get_mut(&key).expect("sealed key").era_ended = true;
@@ -2347,29 +3358,34 @@ impl JournalAdapter {
                 effects,
             });
         }
+        if rejected {
+            return Err(SealFailure {
+                gap: JournalGap::ModelRefused,
+                effects,
+            });
+        }
         self.keys.get_mut(&key).expect("sealed key").sealed_through = frontier;
         self.keys
             .get_mut(&key)
             .expect("sealed key")
             .bootstraps
-            .insert(bootstrap.proof.era, bootstrap.birth_cut);
+            .insert(bootstrap.proof().era, bootstrap.birth_cut());
         self.prune_settled(key, frontier);
         Ok(SealSuccess { prefix, effects })
     }
 
-    /// Drop staged entries the settlement applied: completed ends at or
-    /// below the watermark (the model's own rule, mirrored on identical
-    /// staged data), bounded abandonments the lost-outcome bound removed,
-    /// and converted begins the model pruned. Staged inputs above the
-    /// watermark stay for the next seal.
+    /// Drop this key's staged entries the settlement applied:
+    /// completed ends at or below the watermark (the model's own rule,
+    /// mirrored on identical staged data), bounded abandonments the
+    /// lost-outcome bound removed, and converted begins the model
+    /// pruned. A sibling key's staging is never pruned here; staged
+    /// inputs above the watermark stay for the next seal.
     fn prune_settled(&mut self, key: JournalDomainKey, frontier: u64) {
-        let image = (key.cookie, key.exec);
         let earliest_open = self
             .open
             .values()
             .filter(|entry| {
-                entry.image == image
-                    && entry.converted_ticket.is_some()
+                entry.converted_for == Some(key)
                     && entry.end.is_none_or(|staged| staged.ordinal > frontier)
                     && entry.abandon.is_none()
             })
@@ -2384,7 +3400,7 @@ impl JournalAdapter {
             return;
         };
         self.open.retain(|_, entry| {
-            if entry.image != image {
+            if entry.converted_for != Some(key) {
                 return true;
             }
             if entry
@@ -2406,19 +3422,20 @@ impl JournalAdapter {
     /// consumed record, journal or ordinary, takes the next checked
     /// ordinal in delivery order through the one dispatch poll, with the
     /// checked fault read before and after and the drain's malformed
-    /// delta. Collection stages wire truth only; the seal audits this
-    /// evidence before any model input.
+    /// and discard deltas. The collecting Session names its drain (the
+    /// seal refuses any key attested under another Session) and H0's
+    /// post-quantum allocation watermark (the seal enforces H3 coverage
+    /// below it). Collection stages wire truth only; the seal audits
+    /// this evidence before any model input.
     ///
-    /// DISCARD observability: the patched Aya reader consumes
-    /// kernel-discarded reservations internally (see the ring-reader
-    /// patch: both `next` and `next_before` skip discarded records
-    /// without surfacing them), so per-reservation discard counts are
-    /// unavailable by construction. The selected mechanism is the fault
-    /// invariant instead: every discarded journal reservation raises the
-    /// checked fault before discard (native contract, activation-gated),
-    /// and every candidate seal audits the fault pair after consumption.
-    /// A changed fault therefore refuses the seal whether the cause was
-    /// a discard or any other native fault.
+    /// DISCARD observability: the patched Aya reader counts consumed
+    /// kernel-discarded reservations (see the ring-reader patch: both
+    /// `next` and `next_before` funnel discards through the counting
+    /// consume), and this collection audits the per-collection delta.
+    /// A spanned discard voids the seal directly; the fault invariant
+    /// (every discarded journal reservation raises the checked fault
+    /// before discard; native contract, activation-gated) stays as
+    /// defense in depth behind it.
     pub(crate) fn collect_from_drain<S: crate::events::RecordSource>(
         &mut self,
         drain: &mut crate::events::EventDrain<S>,
@@ -2426,6 +3443,8 @@ impl JournalAdapter {
              MAX_DESCRIPTORS as usize],
         quantum: Option<usize>,
         fault: &impl FaultEpoch,
+        session: NativeDomainId,
+        h0_allocated_below: u64,
     ) -> JournalCollection {
         let fault_before = match fault.fault_epoch() {
             Ok(epoch) => epoch,
@@ -2434,13 +3453,17 @@ impl JournalAdapter {
                     ingested: 0,
                     ordinary: 0,
                     malformed_delta: 0,
+                    discarded_delta: 0,
                     fault_before: 0,
                     fault_after: 0,
                     fault_error: Some(error),
+                    session_domain: session,
+                    h0_allocated_below,
                 };
             }
         };
         let malformed_before = drain.malformed();
+        let discarded_before = drain.discarded();
         // One ordered staging vec shared by both consumers: delivery
         // order is ordinal order across forms.
         let staged = std::cell::RefCell::new(Vec::new());
@@ -2471,13 +3494,25 @@ impl JournalAdapter {
             Ok(epoch) => (epoch, None),
             Err(error) => (fault_before, Some(error)),
         };
+        // The production joint tick passes H0's post-quantum allocation
+        // counter (never zero: the counter starts at one). A zero
+        // watermark is the test-only joint-quantum fiction: H0 minted
+        // exactly the consumed records, in order.
+        let h0_allocated_below = if h0_allocated_below == 0 {
+            self.consumed_through + 1
+        } else {
+            h0_allocated_below
+        };
         JournalCollection {
             ingested,
             ordinary,
             malformed_delta: drain.malformed().saturating_sub(malformed_before),
+            discarded_delta: drain.discarded().saturating_sub(discarded_before),
             fault_before,
             fault_after,
             fault_error,
+            session_domain: session,
+            h0_allocated_below,
         }
     }
 
@@ -2489,20 +3524,23 @@ impl JournalAdapter {
     pub(crate) fn stop(&mut self, model: &mut ObjectSemantics) -> ObjectEffects {
         self.stopped = true;
         let mut effects = ObjectEffects::default();
-        let live: Vec<JournalDomainKey> = self.keys.keys().copied().collect();
-        for key in live {
-            let tracked = self.open.values().any(|entry| {
-                entry.image == (key.cookie, key.exec) && entry.converted_ticket.is_some()
-            }) || self
-                .refused
-                .iter()
-                .any(|refused| refused.image == (key.cookie, key.exec));
+        let keys: Vec<JournalDomainKey> = self.keys.keys().copied().collect();
+        for key in keys {
+            let live = self.live_keys_for_image((key.cookie, key.exec));
+            let tracked = self
+                .open
+                .values()
+                .any(|entry| entry.converted_for == Some(key))
+                || self
+                    .refused
+                    .iter()
+                    .any(|refused| self.refused_converts_here(key, &live, refused));
             if !tracked {
                 continue;
             }
             let era = self.keys[&key].era;
             let domain = ObjectDomain::sealed(&JournalDomainProof { key, era });
-            let applied = model.invalidate(AffectedScope::Domain(domain), ObjectGap::Loss);
+            let applied = model.abandon_domain(domain);
             effects.effects.extend(applied.effects);
             self.keys.get_mut(&key).expect("stopped key").refused = true;
         }
@@ -2909,7 +3947,11 @@ mod tests {
 
         /// One real routed evidence: scripted routed call through the
         /// production move-only conversion, with its real H0 token.
-        fn evidence(&mut self) -> CallEvidence {
+        /// One routed evidence with a chosen session word, so two
+        /// same-image fixtures admit distinguishable calls. The
+        /// remaining scalars mirror `begin_bytes`: the admitted call
+        /// is the staged call's H3-routed return.
+        fn evidence(&mut self, session: u64) -> CallEvidence {
             self.next_token += 1;
             let token = self.next_token;
             let stamp = InstanceStamp {
@@ -2924,7 +3966,10 @@ mod tests {
                     base: crate::semantic_capture::event_record_with_routing(
                         Event {
                             slot: self.slot,
-                            session: SESSION,
+                            session,
+                            slot_id: SLOT_ID,
+                            flags: FLAGS,
+                            user_type: 1,
                             rv: 0,
                             ts_ns: 100 + token,
                             image: self.image,
@@ -2946,7 +3991,12 @@ mod tests {
         /// descriptor/binding proofs, historical standing (no coverage
         /// needed for key binding).
         fn admit(&mut self) -> AdmittedInstanceCall {
-            let evidence = self.evidence();
+            self.admit_session(SESSION)
+        }
+
+        /// One real admission for a chosen session word.
+        fn admit_session(&mut self, session: u64) -> AdmittedInstanceCall {
+            let evidence = self.evidence(session);
             admit_call_from_evidence(
                 evidence,
                 &self.binding,
@@ -3023,8 +4073,45 @@ mod tests {
         fn seal(&mut self, bootstrap: &BootstrapReceipt) -> Result<SealSuccess, SealFailure> {
             let frontier = self.adapter.consumed_frontier();
             let audit = self.audit();
+            let fresh = SessionBirthEvidence::scripted_for_receipt(bootstrap);
+            self.seal_explicit(&audit, bootstrap, frontier, &fresh)
+        }
+
+        /// One seal under an explicit fault epoch: for post-void
+        /// resumptions, whose cumulative baseline advanced past the
+        /// default steady epoch.
+        fn seal_at(
+            &mut self,
+            bootstrap: &BootstrapReceipt,
+            epoch: u64,
+        ) -> Result<SealSuccess, SealFailure> {
+            let frontier = self.adapter.consumed_frontier();
+            let audit = JournalAuditReceipt::scripted(
+                epoch,
+                epoch,
+                None,
+                0,
+                H3DispositionEvidence::scripted_clean(self.adapter.consumed_through),
+                0,
+            );
+            let fresh = SessionBirthEvidence::scripted_for_receipt(bootstrap);
+            self.seal_explicit(&audit, bootstrap, frontier, &fresh)
+        }
+
+        /// One seal against an explicit audit: the seal-time native
+        /// cell reads the audited epoch (a steady collection), so only
+        /// the audit's own evidence decides. Tests pinning seal-time
+        /// moves call the adapter directly with their own cell.
+        fn seal_explicit(
+            &mut self,
+            audit: &JournalAuditReceipt,
+            bootstrap: &BootstrapReceipt,
+            frontier: ConsumptionOrdinal,
+            fresh: &SessionBirthEvidence,
+        ) -> Result<SealSuccess, SealFailure> {
+            let cell = ScriptedFaultCell::steady(audit.fault_after);
             self.adapter
-                .seal(&mut self.model, &audit, bootstrap, frontier)
+                .seal(&mut self.model, audit, bootstrap, frontier, fresh, &cell)
         }
 
         fn bootstrap(&self, proof: JournalDomainProof, birth_cut: u64) -> BootstrapReceipt {
@@ -3044,8 +4131,15 @@ mod tests {
                 crate::events::ScriptedRecords::records(records, bound),
                 7,
             );
-            self.adapter
-                .collect_from_drain(&mut drain, &self.descriptors, Some(bound), fault)
+            let session = self.fixture.domain;
+            self.adapter.collect_from_drain(
+                &mut drain,
+                &self.descriptors,
+                Some(bound),
+                fault,
+                session,
+                0,
+            )
         }
 
         /// One seal from a real collection: H3 disposition covers the
@@ -3058,8 +4152,8 @@ mod tests {
             let h3 = H3DispositionEvidence::scripted_clean(self.adapter.consumed_through);
             let audit = JournalAuditReceipt::collect(collection, h3, 0);
             let frontier = self.adapter.consumed_frontier();
-            self.adapter
-                .seal(&mut self.model, &audit, bootstrap, frontier)
+            let fresh = SessionBirthEvidence::scripted_for_receipt(bootstrap);
+            self.seal_explicit(&audit, bootstrap, frontier, &fresh)
         }
 
         /// One bounded dispatch drain to a stop: the real proven-Q poll
@@ -3154,6 +4248,12 @@ mod tests {
         busy_after: Option<usize>,
         busy_done: bool,
         pending_before: usize,
+        discarded: u64,
+        /// (taken count, bump): when `taken` reaches the count mid-poll
+        /// the reader reports the bump as freshly consumed discards,
+        /// modelling the Aya reader's counting consume.
+        discard_bump: Option<(usize, u64)>,
+        discard_bumped: bool,
     }
 
     impl BusyScript {
@@ -3164,6 +4264,9 @@ mod tests {
                 busy_after: None,
                 busy_done: false,
                 pending_before: 0,
+                discarded: 0,
+                discard_bump: None,
+                discard_bumped: false,
             }
         }
     }
@@ -3176,7 +4279,18 @@ mod tests {
             }
             let item = self.queue.pop_front()?;
             self.taken += 1;
+            if !self.discard_bumped
+                && let Some((at, bump)) = self.discard_bump
+                && at == self.taken
+            {
+                self.discard_bumped = true;
+                self.discarded += bump;
+            }
             Some(item)
+        }
+
+        fn discarded(&self) -> u64 {
+            self.discarded
         }
     }
 
@@ -3567,8 +4681,12 @@ mod tests {
         let frontier = scene.adapter.consumed_frontier();
         let audit = scene.audit();
         let retry = scene
-            .adapter
-            .seal(&mut scene.model, &audit, &rebootstrap, frontier)
+            .seal_explicit(
+                &audit,
+                &rebootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&rebootstrap),
+            )
             .expect_err("refused key never reseals");
         assert_eq!(retry.gap, JournalGap::DomainTainted);
         // The outer provider frame resumes with a late END: terminal
@@ -3633,8 +4751,12 @@ mod tests {
         let frontier = scene.adapter.consumed_frontier();
         let audit = scene.audit();
         let retry = scene
-            .adapter
-            .seal(&mut scene.model, &audit, &bootstrap, frontier)
+            .seal_explicit(
+                &audit,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
             .expect_err("stopped adapter never seals");
         assert_eq!(retry.gap, JournalGap::Stopped);
         let readmitted = scene.fixture.admit();
@@ -3689,8 +4811,12 @@ mod tests {
         );
         let frontier = scene.adapter.consumed_frontier();
         let failure = scene
-            .adapter
-            .seal(&mut scene.model, &audit, &bootstrap_b, frontier)
+            .seal_explicit(
+                &audit,
+                &bootstrap_b,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap_b),
+            )
             .expect_err("fault change refuses");
         assert_eq!(failure.gap, JournalGap::FaultChanged);
         // The void is explicit: proved views retire and the loss counter
@@ -3710,11 +4836,9 @@ mod tests {
         ] {
             let rebootstrap =
                 BootstrapReceipt::scripted(reproof, BirthKind::AbsenceAppearance, cut, 0);
-            let frontier = scene.adapter.consumed_frontier();
-            let audit = scene.audit();
-            let outcome = scene
-                .adapter
-                .seal(&mut scene.model, &audit, &rebootstrap, frontier);
+            // The void advanced the cumulative baseline to 8: the
+            // resumption seals under the fresh epoch.
+            let outcome = scene.seal_at(&rebootstrap, 8);
             assert_eq!(outcome.expect_err("fence gates resumption").gap, gap);
         }
         // New history above the fence seals under the fresh birth.
@@ -3725,10 +4849,10 @@ mod tests {
         let rebootstrap =
             BootstrapReceipt::scripted(reproof, BirthKind::AbsenceAppearance, fence, 0);
         let success = scene
-            .seal(&rebootstrap)
+            .seal_at(&rebootstrap, 8)
             .expect("fresh attestation resumes above the fence");
         assert_eq!(success.prefix.birth_cut(), fence);
-        assert_eq!(success.prefix.bootstrap_cut(), fence + 1);
+        assert_eq!(success.prefix.bootstrap_cut(), Some(fence + 1));
         assert!(has_effect(&success.effects, "created"));
     }
 
@@ -3778,7 +4902,7 @@ mod tests {
         let bootstrap = scene.bootstrap(proof, 0);
         let success = scene.seal(&bootstrap).expect("bounded loss seals");
         assert_eq!(success.prefix.birth_cut(), 0);
-        assert_eq!(success.prefix.bootstrap_cut(), 6);
+        assert_eq!(success.prefix.bootstrap_cut(), Some(6));
         assert!(
             !success.effects.effects.iter().any(|effect| matches!(
                 effect,
@@ -3807,7 +4931,7 @@ mod tests {
         let bootstrap = scene.bootstrap(proof, 0);
         let success = scene.seal(&bootstrap).expect("later seal passes");
         assert_eq!(success.prefix.birth_cut(), 0);
-        assert_eq!(success.prefix.bootstrap_cut(), 8);
+        assert_eq!(success.prefix.bootstrap_cut(), Some(8));
         assert!(has_effect(&success.effects, "created"));
 
         // Without corroboration the bound is not ready: the seal waits
@@ -3843,7 +4967,7 @@ mod tests {
         let bootstrap = scene.bootstrap(proof, 0);
         let success = scene.seal(&bootstrap).expect("late corroboration seals");
         assert_eq!(success.prefix.birth_cut(), 0);
-        assert_eq!(success.prefix.bootstrap_cut(), 5);
+        assert_eq!(success.prefix.bootstrap_cut(), Some(5));
     }
 
     #[test]
@@ -3979,9 +5103,14 @@ mod tests {
         script.busy_after = Some(1);
         let mut drain = crate::events::EventDrain::over_test_domain(script, 7);
         let fault = ScriptedFaultCell::steady(7);
-        let first = scene
-            .adapter
-            .collect_from_drain(&mut drain, &scene.descriptors, None, &fault);
+        let first = scene.adapter.collect_from_drain(
+            &mut drain,
+            &scene.descriptors,
+            None,
+            &fault,
+            scene.fixture.domain,
+            0,
+        );
         assert_eq!((first.ingested, first.ordinary), (1, 0));
         assert_eq!(scene.adapter.consumed_through, 1);
         let bootstrap = scene.bootstrap(proof, 0);
@@ -3989,9 +5118,14 @@ mod tests {
             .seal_collected(&bootstrap, &first)
             .expect("prefix frontier seals");
         assert_eq!(held.prefix.open_keys().len(), 1);
-        let second = scene
-            .adapter
-            .collect_from_drain(&mut drain, &scene.descriptors, None, &fault);
+        let second = scene.adapter.collect_from_drain(
+            &mut drain,
+            &scene.descriptors,
+            None,
+            &fault,
+            scene.fixture.domain,
+            0,
+        );
         assert_eq!((second.ingested, second.ordinary), (1, 0));
         let bootstrap = scene.bootstrap(proof, 0);
         let success = scene
@@ -4004,9 +5138,14 @@ mod tests {
         let mut script = BusyScript::new(vec![begin.to_vec()]);
         script.busy_after = Some(0);
         let mut drain = crate::events::EventDrain::over_test_domain(script, 7);
-        let first = scene
-            .adapter
-            .collect_from_drain(&mut drain, &scene.descriptors, None, &fault);
+        let first = scene.adapter.collect_from_drain(
+            &mut drain,
+            &scene.descriptors,
+            None,
+            &fault,
+            scene.fixture.domain,
+            0,
+        );
         assert_eq!((first.ingested, first.ordinary), (0, 0));
         assert_eq!(scene.adapter.consumed_through, 0);
 
@@ -4058,15 +5197,23 @@ mod tests {
                 let frontier = held;
                 let audit = scene.audit();
                 scene
-                    .adapter
-                    .seal(&mut scene.model, &audit, &bootstrap, frontier)
+                    .seal_explicit(
+                        &audit,
+                        &bootstrap,
+                        frontier,
+                        &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                    )
                     .expect("prompt first seal passes");
             }
             let frontier = scene.adapter.consumed_frontier();
             let audit = scene.audit();
             scene
-                .adapter
-                .seal(&mut scene.model, &audit, &bootstrap, frontier)
+                .seal_explicit(
+                    &audit,
+                    &bootstrap,
+                    frontier,
+                    &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                )
                 .expect("final seal passes");
             // Proved relationships only: the prompt run's second seal
             // reuses the covered bootstrap and counts one expected
@@ -4094,8 +5241,12 @@ mod tests {
         scene.seal(&bootstrap).expect("first seal passes");
         let audit = scene.audit();
         let failure = scene
-            .adapter
-            .seal(&mut scene.model, &audit, &bootstrap, held)
+            .seal_explicit(
+                &audit,
+                &bootstrap,
+                held,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
             .expect_err("regressed frontier refuses");
         assert_eq!(failure.gap, JournalGap::FrontierRegression);
 
@@ -4108,23 +5259,32 @@ mod tests {
         scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
         let bootstrap = scene.bootstrap(proof, 0);
         let frontier = scene.adapter.consumed_frontier();
-        let short = JournalAuditReceipt::scripted(
+        let short = JournalAuditReceipt::scripted_h0(
             7,
             7,
             None,
             0,
             H3DispositionEvidence::scripted_clean(frontier.cut() - 1),
             0,
+            frontier.cut() + 1,
         );
         let failure = scene
-            .adapter
-            .seal(&mut scene.model, &short, &bootstrap, frontier)
+            .seal_explicit(
+                &short,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
             .expect_err("undisposed H3 refuses");
         assert_eq!(failure.gap, JournalGap::H3Pending);
         let audit = scene.audit();
         let success = scene
-            .adapter
-            .seal(&mut scene.model, &audit, &bootstrap, frontier)
+            .seal_explicit(
+                &audit,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
             .expect("covered disposition seals the kept inputs");
         assert_eq!(success.prefix.settled().len(), 1);
 
@@ -4137,17 +5297,22 @@ mod tests {
         scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
         let bootstrap = scene.bootstrap(proof, 0);
         let frontier = scene.adapter.consumed_frontier();
-        let loss = JournalAuditReceipt::scripted(
+        let loss = JournalAuditReceipt::scripted_h0(
             7,
             7,
             None,
             0,
             H3DispositionEvidence::scripted_loss(2),
             0,
+            3,
         );
         let failure = scene
-            .adapter
-            .seal(&mut scene.model, &loss, &bootstrap, frontier)
+            .seal_explicit(
+                &loss,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
             .expect_err("H3 loss refuses");
         assert_eq!(failure.gap, JournalGap::H3Loss);
         // Vacuous resumption at the fence waits for new history.
@@ -4156,8 +5321,12 @@ mod tests {
         let resume = BootstrapReceipt::scripted(proof, BirthKind::AbsenceAppearance, fence, 0);
         let audit = scene.audit();
         let waiting = scene
-            .adapter
-            .seal(&mut scene.model, &audit, &resume, frontier)
+            .seal_explicit(
+                &audit,
+                &resume,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&resume),
+            )
             .expect_err("empty resumption waits");
         assert_eq!(waiting.gap, JournalGap::BoundNotReady);
         // New history above the fence seals under the fresh birth.
@@ -4168,7 +5337,7 @@ mod tests {
             .seal(&resume)
             .expect("resumption seals above the fence");
         assert_eq!(success.prefix.birth_cut(), fence);
-        assert_eq!(success.prefix.bootstrap_cut(), fence + 1);
+        assert_eq!(success.prefix.bootstrap_cut(), Some(fence + 1));
         assert_eq!(success.prefix.settled().len(), 1);
         assert!(has_effect(&success.effects, "created"));
     }
@@ -4220,7 +5389,7 @@ mod tests {
             .seal_collected(&resume, &collection)
             .expect("resumption seals above the fence");
         assert_eq!(success.prefix.birth_cut(), fence);
-        assert_eq!(success.prefix.bootstrap_cut(), fence + 1);
+        assert_eq!(success.prefix.bootstrap_cut(), Some(fence + 1));
         assert_eq!(success.prefix.settled().len(), 1);
 
         // A fault change across the tick refuses and voids, through the
@@ -4319,11 +5488,11 @@ mod tests {
         scene.ingest_ordinary(pad);
         let bootstrap = scene.bootstrap(proof, 0);
         let success = scene.seal(&bootstrap).expect("bounded refusal seals");
-        // The held opens cap the derived fence at 1 so their later
-        // application still qualifies; the 1,026 bound lives in the
+        // The held opens pin below the floors, so the seal continues
+        // without claiming new authority; the 1,026 bound lives in the
         // model's floor, and the staged refusal is disposed.
         assert_eq!(success.prefix.birth_cut(), 0);
-        assert_eq!(success.prefix.bootstrap_cut(), 1);
+        assert_eq!(success.prefix.bootstrap_cut(), None);
         assert_eq!(success.prefix.open_keys().len(), 1_024);
         assert!(scene.adapter.refused.is_empty());
 
@@ -4391,8 +5560,12 @@ mod tests {
         let frontier = scene.adapter.consumed_frontier();
         let audit = scene.audit();
         let failure = scene
-            .adapter
-            .seal(&mut scene.model, &audit, &bootstrap, frontier)
+            .seal_explicit(
+                &audit,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
             .expect_err("tainted image never seals");
         assert_eq!(failure.gap, JournalGap::ImageTainted);
 
@@ -4515,96 +5688,6 @@ mod tests {
             let begin = begin_bytes(1, sequence, create, 0);
             assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
         }
-    }
-
-    #[test]
-    fn object_journal_h3_disposition_evidence() {
-        use crate::inventory_semantics::{LaneCollectionRefusal, LaneNegative};
-
-        let mut scene = Scene::new(image_default());
-        let genesis = H3DispositionEvidence::genesis();
-
-        // No negatives: disposition extends through the greatest staged
-        // token, monotonically over the previous evidence.
-        let clean = H3DispositionEvidence::from_finalizer_batch(
-            &[],
-            &[scene.fixture.evidence(), scene.fixture.evidence()],
-            &genesis,
-        );
-        assert!(matches!(
-            clean,
-            H3DispositionEvidence::Clean {
-                disposed_through: 2
-            }
-        ));
-        let chained =
-            H3DispositionEvidence::from_finalizer_batch(&[], &[scene.fixture.evidence()], &clean);
-        assert!(matches!(
-            chained,
-            H3DispositionEvidence::Clean {
-                disposed_through: 3
-            }
-        ));
-        let older =
-            H3DispositionEvidence::from_finalizer_batch(&[], &[scene.fixture.evidence()], &chained);
-        assert!(matches!(
-            older,
-            H3DispositionEvidence::Clean {
-                disposed_through: 4
-            }
-        ));
-        // Disposition never regresses below the previous evidence.
-        let held = H3DispositionEvidence::from_finalizer_batch(
-            &[],
-            &[scene.fixture.evidence()],
-            &H3DispositionEvidence::scripted_clean(10),
-        );
-        assert!(matches!(
-            held,
-            H3DispositionEvidence::Clean {
-                disposed_through: 10
-            }
-        ));
-
-        // Any staged negative is a loss barrier: the narrowest cut wins,
-        // and a refused collection disposes nothing.
-        let barrier = H3DispositionEvidence::from_finalizer_batch(
-            &[
-                LaneNegative::CutBarrier { ordinal: 5 },
-                LaneNegative::CutBarrier { ordinal: 3 },
-            ],
-            &[scene.fixture.evidence()],
-            &genesis,
-        );
-        assert!(matches!(
-            barrier,
-            H3DispositionEvidence::StagedLoss { barrier: 3 }
-        ));
-        for refusal in [
-            LaneCollectionRefusal::Backpressure,
-            LaneCollectionRefusal::CollectionFailed,
-        ] {
-            let refused = H3DispositionEvidence::from_finalizer_batch(
-                &[LaneNegative::CollectionRefused { reason: refusal }],
-                &[scene.fixture.evidence()],
-                &genesis,
-            );
-            assert!(matches!(
-                refused,
-                H3DispositionEvidence::StagedLoss { barrier: 0 }
-            ));
-        }
-
-        // A clean batch after a loss batch recovers disposition from its
-        // own staged tokens.
-        let recovered =
-            H3DispositionEvidence::from_finalizer_batch(&[], &[scene.fixture.evidence()], &barrier);
-        assert!(matches!(
-            recovered,
-            H3DispositionEvidence::Clean {
-                disposed_through: 9
-            }
-        ));
     }
 
     /// Frozen closure census: every catalog ordinal pins its class.
@@ -4750,8 +5833,12 @@ mod tests {
         let frontier = scene.adapter.consumed_frontier();
         let audit = scene.audit();
         let refused = scene
-            .adapter
-            .seal(&mut scene.model, &audit, &bootstrap, frontier)
+            .seal_explicit(
+                &audit,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
             .expect_err("invoked incarnation never seals");
         assert_eq!(refused.gap, JournalGap::ImageTainted);
         // Sealed history stays: the pre-invocation creation is retained.
@@ -4886,8 +5973,11 @@ mod tests {
         let create = function_id("C_CreateObject");
         let begin = begin_bytes(1, 1, create, 0);
         scene.ingest(&begin);
-        let birth = BootstrapReceipt::attest(&scene.adapter, proof, BirthKind::ExecMarker, 0, 0)
-            .expect("novel image births");
+        let birth = BootstrapReceipt::attest(
+            &scene.adapter,
+            &SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 0),
+        )
+        .expect("novel image births");
         scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
         scene.seal(&birth).expect("exec birth seals");
 
@@ -4903,15 +5993,23 @@ mod tests {
         seen.target_function = getinfo;
         scene.ingest_ordinary(seen);
         scene.ingest(&begin);
-        BootstrapReceipt::attest(&scene.adapter, proof, BirthKind::ExecMarker, 0, 0)
-            .expect("novel at cut zero");
+        BootstrapReceipt::attest(
+            &scene.adapter,
+            &SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 0),
+        )
+        .expect("novel at cut zero");
         assert_eq!(
-            BootstrapReceipt::attest(&scene.adapter, proof, BirthKind::ExecMarker, 1, 0),
+            BootstrapReceipt::attest(
+                &scene.adapter,
+                &SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 1, 0)
+            ),
             Err(BirthRefusal::NoveltyBroken)
         );
-        let absence =
-            BootstrapReceipt::attest(&scene.adapter, proof, BirthKind::AbsenceAppearance, 1, 0)
-                .expect("observed quiet life births as absence");
+        let absence = BootstrapReceipt::attest(
+            &scene.adapter,
+            &SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, 1, 0),
+        )
+        .expect("observed quiet life births as absence");
         scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
         let success = scene.seal(&absence).expect("absence birth seals");
         assert_eq!(success.prefix.settled().len(), 1);
@@ -4929,11 +6027,17 @@ mod tests {
         scene.ingest_ordinary(affecting);
         scene.ingest(&begin);
         assert_eq!(
-            BootstrapReceipt::attest(&scene.adapter, proof, BirthKind::ExecMarker, 1, 0),
+            BootstrapReceipt::attest(
+                &scene.adapter,
+                &SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 1, 0)
+            ),
             Err(BirthRefusal::NoveltyBroken)
         );
         assert_eq!(
-            BootstrapReceipt::attest(&scene.adapter, proof, BirthKind::AbsenceAppearance, 1, 0),
+            BootstrapReceipt::attest(
+                &scene.adapter,
+                &SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, 1, 0)
+            ),
             Err(BirthRefusal::AbsenceUnproven)
         );
 
@@ -4947,7 +6051,10 @@ mod tests {
         scene.ingest_ordinary(unknown);
         scene.ingest(&begin);
         assert_eq!(
-            BootstrapReceipt::attest(&scene.adapter, proof, BirthKind::AbsenceAppearance, 1, 0),
+            BootstrapReceipt::attest(
+                &scene.adapter,
+                &SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, 1, 0)
+            ),
             Err(BirthRefusal::AbsenceUnproven)
         );
 
@@ -4956,15 +6063,22 @@ mod tests {
         let mut scene = Scene::new(image_default());
         let proof = scene.attest();
         assert_eq!(
-            BootstrapReceipt::attest(&scene.adapter, proof, BirthKind::ExecMarker, 0, 0),
+            BootstrapReceipt::attest(
+                &scene.adapter,
+                &SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 0)
+            ),
             Err(BirthRefusal::ImageUnknown)
         );
         let bootstrap = scene.bootstrap(proof, 0);
         let frontier = scene.adapter.consumed_frontier();
         let audit = scene.audit();
         let refused = scene
-            .adapter
-            .seal(&mut scene.model, &audit, &bootstrap, frontier)
+            .seal_explicit(
+                &audit,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
             .expect_err("unknown image never seals");
         assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
     }
@@ -4987,23 +6101,31 @@ mod tests {
         scene.ingest_ordinary(seen);
         scene.ingest(&begin);
         scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
-        let pending = JournalAuditReceipt::scripted(
+        let pending = JournalAuditReceipt::scripted_h0(
             7,
             7,
             None,
             0,
             H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through - 1),
             0,
+            scene.adapter.consumed_through + 1,
         );
         let bootstrap = scene.bootstrap(proof, 0);
         let frontier = scene.adapter.consumed_frontier();
         let failure = scene
-            .adapter
-            .seal(&mut scene.model, &pending, &bootstrap, frontier)
+            .seal_explicit(
+                &pending,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
             .expect_err("undisposed H3 refuses");
         assert_eq!(failure.gap, JournalGap::H3Pending);
         assert_eq!(
-            BootstrapReceipt::attest(&scene.adapter, proof, BirthKind::AbsenceAppearance, 1, 0),
+            BootstrapReceipt::attest(
+                &scene.adapter,
+                &SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, 1, 0)
+            ),
             Err(BirthRefusal::AbsenceUnproven)
         );
 
@@ -5055,26 +6177,23 @@ mod tests {
         fork.child_image = child_image;
         scene.ingest_ordinary(fork);
         assert_eq!(
-            BootstrapReceipt::attest(&scene.adapter, child_proof, BirthKind::ExecMarker, 1, 0),
+            BootstrapReceipt::attest(
+                &scene.adapter,
+                &SessionBirthGrant::scripted(child_proof, BirthKind::ExecMarker, 1, 0)
+            ),
             Err(BirthRefusal::NoveltyBroken)
         );
         assert_eq!(
             BootstrapReceipt::attest(
                 &scene.adapter,
-                child_proof,
-                BirthKind::AbsenceAppearance,
-                1,
-                0
+                &SessionBirthGrant::scripted(child_proof, BirthKind::AbsenceAppearance, 1, 0)
             ),
             Err(BirthRefusal::AbsenceUnproven)
         );
         scene.ingest(&begin);
         BootstrapReceipt::attest(
             &scene.adapter,
-            parent_proof,
-            BirthKind::AbsenceAppearance,
-            1,
-            0,
+            &SessionBirthGrant::scripted(parent_proof, BirthKind::AbsenceAppearance, 1, 0),
         )
         .expect("parent quiet life births");
     }
@@ -5084,14 +6203,31 @@ mod tests {
         // Direct: the cover rule over staged begins, ignoring staged
         // history for other images and vacuous when nothing is staged.
         let mut scene = Scene::new(image_default());
-        scene.attest();
+        let proof = scene.attest();
         let create = function_id("C_CreateObject");
         let image = (COOKIE, EXEC);
-        assert!(scene.adapter.birth_covers_staged(image, 0));
+        let live = scene.adapter.live_keys_for_image(image);
+        assert!(
+            scene
+                .adapter
+                .birth_covers_staged(proof.key, &live, image, 0)
+        );
         scene.ingest(&begin_bytes(1, 1, create, 0));
-        assert!(scene.adapter.birth_covers_staged(image, 0));
-        assert!(!scene.adapter.birth_covers_staged(image, 1));
-        assert!(scene.adapter.birth_covers_staged((COOKIE + 1, EXEC), 1));
+        assert!(
+            scene
+                .adapter
+                .birth_covers_staged(proof.key, &live, image, 0)
+        );
+        assert!(
+            !scene
+                .adapter
+                .birth_covers_staged(proof.key, &live, image, 1)
+        );
+        assert!(
+            scene
+                .adapter
+                .birth_covers_staged(proof.key, &live, (COOKIE + 1, EXEC), 1)
+        );
 
         // Pinning: the birth pins per key-era at first seal. Another
         // image's record lands first, so the scene image is first
@@ -5115,10 +6251,20 @@ mod tests {
         let frontier = scene.adapter.consumed_frontier();
         let audit = scene.audit();
         let refused = scene
-            .adapter
-            .seal(&mut scene.model, &audit, &moved, frontier)
+            .seal_explicit(
+                &audit,
+                &moved,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&moved),
+            )
             .expect_err("moved birth refuses");
         assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
+        // A repeat at the unchanged frontier waits instead of
+        // succeeding vacuously; new history resumes progress under the
+        // same pinned birth.
+        let repeat = scene.seal(&first).expect_err("repeat waits");
+        assert_eq!(repeat.gap, JournalGap::BoundNotReady);
+        scene.ingest(&begin_bytes(1, 2, create, 0));
         scene.seal(&first).expect("pinned birth re-seals");
     }
 
@@ -5136,12 +6282,20 @@ mod tests {
         let bootstrap = scene.bootstrap(proof, 0);
         scene.seal(&bootstrap).expect("gen-zero seal passes");
         // Advancing the closure retires old audits and old receipts alike.
-        assert!(scene.adapter.advance_closure_generation(1));
+        assert!(
+            scene
+                .adapter
+                .install_closure_grant(&SessionClosureGrant::scripted(1))
+        );
         let frontier = scene.adapter.consumed_frontier();
         let stale_audit = scene.audit();
         let refused = scene
-            .adapter
-            .seal(&mut scene.model, &stale_audit, &bootstrap, frontier)
+            .seal_explicit(
+                &stale_audit,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
             .expect_err("stale audit refuses");
         assert_eq!(refused.gap, JournalGap::ClosureStale);
         let fresh_audit = JournalAuditReceipt::scripted(
@@ -5153,8 +6307,12 @@ mod tests {
             1,
         );
         let refused = scene
-            .adapter
-            .seal(&mut scene.model, &fresh_audit, &bootstrap, frontier)
+            .seal_explicit(
+                &fresh_audit,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
             .expect_err("stale receipt refuses");
         assert_eq!(refused.gap, JournalGap::ClosureStale);
         // Fresh production attestation under the live generation seals
@@ -5162,8 +6320,11 @@ mod tests {
         let next = begin_bytes(1, 2, create, 0);
         scene.ingest(&next);
         scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
-        let birth = BootstrapReceipt::attest(&scene.adapter, proof, BirthKind::ExecMarker, 0, 1)
-            .expect("live generation attests");
+        let birth = BootstrapReceipt::attest(
+            &scene.adapter,
+            &SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 1),
+        )
+        .expect("live generation attests");
         let frontier = scene.adapter.consumed_frontier();
         let fresh_audit = JournalAuditReceipt::scripted(
             7,
@@ -5174,16 +6335,31 @@ mod tests {
             1,
         );
         let success = scene
-            .adapter
-            .seal(&mut scene.model, &fresh_audit, &birth, frontier)
+            .seal_explicit(
+                &fresh_audit,
+                &birth,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&birth),
+            )
             .expect("live generation seals");
         assert_eq!(success.prefix.settled().len(), 1);
         // Regressions refuse; repeats are idempotent; stale attestation
         // refuses at the constructor.
-        assert!(!scene.adapter.advance_closure_generation(0));
-        assert!(scene.adapter.advance_closure_generation(1));
+        assert!(
+            !scene
+                .adapter
+                .install_closure_grant(&SessionClosureGrant::scripted(0))
+        );
+        assert!(
+            scene
+                .adapter
+                .install_closure_grant(&SessionClosureGrant::scripted(1))
+        );
         assert_eq!(
-            BootstrapReceipt::attest(&scene.adapter, proof, BirthKind::ExecMarker, 0, 0),
+            BootstrapReceipt::attest(
+                &scene.adapter,
+                &SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 0)
+            ),
             Err(BirthRefusal::ClosureStale)
         );
     }
@@ -5218,8 +6394,12 @@ mod tests {
         let frontier = scene.adapter.consumed_frontier();
         let audit = scene.audit();
         let refused = scene
-            .adapter
-            .seal(&mut scene.model, &audit, &bootstrap, frontier)
+            .seal_explicit(
+                &audit,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
             .expect_err("stopped adapter never seals");
         assert_eq!(refused.gap, JournalGap::Stopped);
         let readmitted = scene.fixture.admit();
@@ -5327,8 +6507,12 @@ mod tests {
             0,
         );
         let failure = scene
-            .adapter
-            .seal(&mut scene.model, &malformed, &bootstrap, frontier)
+            .seal_explicit(
+                &malformed,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
             .expect_err("malformed tick refuses");
         assert_eq!(failure.gap, JournalGap::Malformed);
         assert!(failure.effects.effects.is_empty());
@@ -5337,8 +6521,12 @@ mod tests {
         let below = BootstrapReceipt::scripted(proof, BirthKind::AbsenceAppearance, fence - 1, 0);
         let audit = scene.audit();
         let refused = scene
-            .adapter
-            .seal(&mut scene.model, &audit, &below, frontier)
+            .seal_explicit(
+                &audit,
+                &below,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&below),
+            )
             .expect_err("birth below the fence refuses");
         assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
 
@@ -5361,8 +6549,12 @@ mod tests {
         );
         let frontier = scene.adapter.consumed_frontier();
         let failure = scene
-            .adapter
-            .seal(&mut scene.model, &malformed, &bootstrap, frontier)
+            .seal_explicit(
+                &malformed,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
             .expect_err("first void refuses");
         assert_eq!(failure.gap, JournalGap::Malformed);
         assert!(has_effect(&failure.effects, "retired"));
@@ -5378,15 +6570,23 @@ mod tests {
         let frontier = scene.adapter.consumed_frontier();
         assert_eq!(scene.adapter.consumed_through, 3);
         let failure = scene
-            .adapter
-            .seal(&mut scene.model, &malformed, &bootstrap, frontier)
+            .seal_explicit(
+                &malformed,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
             .expect_err("second void refuses");
         assert_eq!(failure.gap, JournalGap::Malformed);
         let below = BootstrapReceipt::scripted(proof, BirthKind::AbsenceAppearance, 2, 0);
         let audit = scene.audit();
         let refused = scene
-            .adapter
-            .seal(&mut scene.model, &audit, &below, frontier)
+            .seal_explicit(
+                &audit,
+                &below,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&below),
+            )
             .expect_err("birth below the latest fence refuses");
         assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
         let fresh = begin_bytes(1, 9, create, 0);
@@ -5395,7 +6595,7 @@ mod tests {
         let resume = BootstrapReceipt::scripted(proof, BirthKind::AbsenceAppearance, 3, 0);
         let success = scene.seal(&resume).expect("resumption names the fence");
         assert_eq!(success.prefix.birth_cut(), 3);
-        assert_eq!(success.prefix.bootstrap_cut(), 4);
+        assert_eq!(success.prefix.bootstrap_cut(), Some(4));
         assert_eq!(success.prefix.settled().len(), 1);
     }
 
@@ -5414,8 +6614,11 @@ mod tests {
         let begin = begin_bytes(1, 1, create, 0);
         scene.ingest(&begin);
         scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
-        let birth = BootstrapReceipt::attest(&scene.adapter, proof, BirthKind::ExecMarker, 0, 0)
-            .expect("genuine birth attests");
+        let birth = BootstrapReceipt::attest(
+            &scene.adapter,
+            &SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 0),
+        )
+        .expect("genuine birth attests");
         let success = scene.seal(&birth).expect("genuine birth seals");
         assert_eq!(success.prefix.settled().len(), 1);
         assert_eq!(success.prefix.birth_cut(), 0);
@@ -5448,8 +6651,12 @@ mod tests {
         let frontier = scene.adapter.consumed_frontier();
         let audit = scene.audit();
         let refused = scene
-            .adapter
-            .seal(&mut scene.model, &audit, &receipt, frontier)
+            .seal_explicit(
+                &audit,
+                &receipt,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&receipt),
+            )
             .expect_err("foreign proof never binds");
         assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
 
@@ -5463,7 +6670,10 @@ mod tests {
             JournalDisposition::NegativeOnlyInvalidated
         );
         assert_eq!(
-            BootstrapReceipt::attest(&scene.adapter, proof, BirthKind::ExecMarker, 0, 0),
+            BootstrapReceipt::attest(
+                &scene.adapter,
+                &SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 0)
+            ),
             Err(BirthRefusal::ImageTainted)
         );
 
@@ -5473,9 +6683,16 @@ mod tests {
         let begin = begin_bytes(1, 1, create, 0);
         scene.ingest(&begin);
         scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
-        let birth = BootstrapReceipt::attest(&scene.adapter, proof, BirthKind::ExecMarker, 0, 0)
-            .expect("birth attests");
-        assert!(scene.adapter.advance_closure_generation(1));
+        let birth = BootstrapReceipt::attest(
+            &scene.adapter,
+            &SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 0),
+        )
+        .expect("birth attests");
+        assert!(
+            scene
+                .adapter
+                .install_closure_grant(&SessionClosureGrant::scripted(1))
+        );
         let frontier = scene.adapter.consumed_frontier();
         let audit = JournalAuditReceipt::scripted(
             7,
@@ -5486,8 +6703,12 @@ mod tests {
             1,
         );
         let refused = scene
-            .adapter
-            .seal(&mut scene.model, &audit, &birth, frontier)
+            .seal_explicit(
+                &audit,
+                &birth,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&birth),
+            )
             .expect_err("stale closure refuses");
         assert_eq!(refused.gap, JournalGap::ClosureStale);
     }
@@ -5537,6 +6758,156 @@ mod tests {
     }
 
     #[test]
+    fn object_journal_taint_set_is_bounded() {
+        // I5: the taint set is capped at the sighting bound. A hundred
+        // untrackable newcomers past a cap of four must not retain a
+        // hundred taints; their records refuse and the retention stays
+        // flat.
+        let create = function_id("C_CreateObject");
+        let mut scene = Scene::new_with_limits(
+            image_default(),
+            JournalLimits {
+                open_calls: 8,
+                thread_floors: 512,
+                refused_begins: 8,
+                domain_keys: 4,
+                image_sightings: 4,
+            },
+        );
+        let first = begin_bytes(1, 1, create, 0);
+        assert_eq!(scene.ingest(&first), JournalDisposition::BeginAdmitted);
+        // Three newcomers still fit the sighting table (each on its own
+        // thread); the remaining 97 are untrackable and refuse.
+        for (i, cookie) in (1000..1100u64).enumerate() {
+            let begin = begin_bytes_image(cookie, 1, create, 0, (cookie, EXEC));
+            if i < 3 {
+                assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+            } else {
+                assert_eq!(scene.ingest(&begin), JournalDisposition::Refused);
+            }
+        }
+        assert!(
+            scene.adapter.tainted_images.len() <= 4,
+            "taint set capped, got {}",
+            scene.adapter.tainted_images.len()
+        );
+        // The overflow latches; unrecorded newcomers still count as
+        // tainted and refuse, while tracked images keep working.
+        assert!(scene.adapter.taint_overflow);
+        assert!(scene.adapter.is_tainted((1050, EXEC)));
+        assert!(!scene.adapter.is_tainted((COOKIE, EXEC)));
+        assert!(!scene.adapter.is_tainted((1000, EXEC)));
+        let again = begin_bytes_image(1050, 2, create, 0, (1050, EXEC));
+        assert_eq!(scene.ingest(&again), JournalDisposition::Refused);
+        let tracked = begin_bytes_image(1000, 2, create, 0, (1000, EXEC));
+        assert_eq!(scene.ingest(&tracked), JournalDisposition::BeginAdmitted);
+    }
+
+    #[test]
+    fn object_journal_bounded_uppers_keep_max_only() {
+        // I5: only the maximum bounded-loss upper is retained. Two
+        // bounded losses across two seals must not grow a per-loss
+        // vector; the fence needs the max alone.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 40));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("first seal covers through 2");
+        for sequence in [2u64, 3] {
+            let begin = begin_bytes(1, sequence, create, 0);
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+            assert_eq!(
+                scene.ingest_ordinary(ordinary_for(&begin, 0)),
+                JournalDisposition::ReturnObserved
+            );
+            assert_eq!(
+                scene.ingest(&abandon_bytes(
+                    1,
+                    sequence,
+                    JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+                    (COOKIE, EXEC)
+                )),
+                JournalDisposition::AbandonStaged
+            );
+            let bootstrap = scene.bootstrap(proof, 0);
+            scene.seal(&bootstrap).expect("bounded loss seals");
+        }
+        let state = scene.adapter.keys.get(&proof.key).expect("sealed key");
+        // Return cuts 4 then 7: the retained max is 7, never a vector.
+        assert_eq!(state.bounded_upper, Some(7));
+    }
+
+    #[test]
+    fn object_journal_refused_begin_propagates_invalidation_effects() {
+        // I4: a capacity refusal retires live views; those retirement
+        // effects must reach the seal's effects, never a dropped local.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new_with_limits(
+            image_default(),
+            JournalLimits {
+                open_calls: 2,
+                thread_floors: 8,
+                refused_begins: 2,
+                domain_keys: 4,
+                image_sightings: 8,
+            },
+        );
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 40));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("creation seals");
+        assert_eq!(scene.model.project().objects.len(), 1);
+        // Fill the open table, then one capacity refusal with a
+        // corroborating return. The open begins carry distinct session
+        // words so the return witnesses only the refused begin.
+        let mut second = begin_bytes(1, 2, create, 0);
+        put_u64(&mut second, 80, 0x1111_1111_1111_1111);
+        let mut third = begin_bytes(1, 3, create, 0);
+        put_u64(&mut third, 80, 0x2222_2222_2222_2222);
+        assert_eq!(scene.ingest(&second), JournalDisposition::BeginAdmitted);
+        assert_eq!(scene.ingest(&third), JournalDisposition::BeginAdmitted);
+        let fourth = begin_bytes(1, 4, create, 0);
+        assert_eq!(
+            scene.ingest(&fourth),
+            JournalDisposition::BeginRefusedCapacity
+        );
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&fourth, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        // The frontier must cover the bound's authority before the seal
+        // claims it.
+        let mut pad = ordinary_for(&fourth, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let success = scene
+            .seal(&bootstrap)
+            .expect("refusal seals with its bound");
+        assert!(
+            success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Retired {
+                    reason: super::ObjectGap::PendingCapacity,
+                    ..
+                }
+            )),
+            "retirement reaches seal effects: {:?}",
+            success.effects.effects
+        );
+    }
+
+    #[test]
     fn object_journal_long_open_call_spans_seals() {
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
@@ -5575,5 +6946,1186 @@ mod tests {
         let closed = scene.seal(&bootstrap).expect("closing seal passes");
         assert!(closed.prefix.open_keys().is_empty());
         assert_eq!(scene.model.project().objects.len(), 50);
+    }
+
+    #[test]
+    fn object_journal_settle_bootstrap_rejection_fails_the_seal() {
+        // I1: a seal whose required bootstrap authority the model
+        // rejects fails (ModelRefused) instead of succeeding with the
+        // rejection riding along: no frontier advance, no pruning,
+        // staged inputs kept for a later seal.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 40));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("first seal passes");
+        assert!(scene.adapter.open.is_empty());
+        // A model-side refusal the adapter mirror never drove: an
+        // unbound refused begin fences the model's authority.
+        let domain = super::ObjectDomain::sealed(&proof);
+        let _ = scene
+            .model
+            .note_refused_begin(domain, super::RefCut::reference(99));
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        let failure = scene
+            .seal(&bootstrap)
+            .expect_err("rejected authority fails the seal");
+        assert_eq!(failure.gap, JournalGap::ModelRefused);
+        // Nothing advanced, nothing pruned, nothing tainted: the key
+        // can seal again once authority clears.
+        let state = scene.adapter.keys.get(&proof.key).expect("sealed key");
+        assert_eq!(state.sealed_through, 2);
+        assert!(!state.refused && !state.tainted);
+        assert!(!scene.adapter.open.is_empty());
+    }
+
+    #[test]
+    fn object_journal_settle_prefix_contradiction_fails_the_seal() {
+        // I1: a seal whose open alignment the model contradicts fails
+        // (ModelRefused) — including a continuation seal, which claims
+        // no new bootstrap but still requires the model's agreement on
+        // the listed opens.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let sign = function_id("C_Sign");
+        scene.ingest(&begin_bytes(1, 1, sign, 0));
+        let bootstrap = scene.bootstrap(proof, 0);
+        let held = scene.seal(&bootstrap).expect("open call seals held");
+        let ticket = held.prefix.settled()[0].ticket;
+        // The model's custody diverges behind the adapter's back: the
+        // ticket the adapter still lists as open is gone.
+        let _ = scene
+            .model
+            .outcome_lost(crate::semantics_objects::LostOutcome::Ticket(
+                ticket,
+                super::RefCut::reference(999),
+            ));
+        scene.ingest(&begin_bytes(1, 2, sign, 0));
+        let failure = scene
+            .seal(&bootstrap)
+            .expect_err("contradicted alignment fails the seal");
+        assert_eq!(failure.gap, JournalGap::ModelRefused);
+        let state = scene.adapter.keys.get(&proof.key).expect("sealed key");
+        assert_eq!(state.sealed_through, 1);
+        assert!(!state.refused && !state.tainted);
+    }
+
+    #[test]
+    fn object_journal_fence_is_strictly_above_birth() {
+        // I1: the derived fence strictly increments the birth. Absence
+        // births at cut 5 with history above; the seal claims 6, never 5.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let getinfo = function_id("C_GetInfo");
+        let template = begin_bytes(1, 1, create, 0);
+        for _ in 1..=5u64 {
+            let mut seen = ordinary_for(&template, 0);
+            seen.slot = 99;
+            seen.target_function = getinfo;
+            scene.ingest_ordinary(seen);
+        }
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let evidence = SessionBirthEvidence::scripted((COOKIE, EXEC), EXEC << 32, 0, 1);
+        let grant = SessionBirthGrant::scripted_with_evidence(
+            proof,
+            BirthKind::AbsenceAppearance,
+            5,
+            0,
+            evidence,
+        );
+        let birth = BootstrapReceipt::attest(&scene.adapter, &grant).expect("absence attests at 5");
+        let success = scene.seal(&birth).expect("birth seals");
+        assert_eq!(success.prefix.birth_cut(), 5);
+        assert_eq!(success.prefix.bootstrap_cut(), Some(6));
+    }
+
+    #[test]
+    fn object_journal_held_below_floors_continues_without_claim() {
+        // I1: held calls pinning below the floors make the seal a
+        // continuation: no new bootstrap is claimed (None), the model
+        // keeps its floor, and no doomed fence draws a refusal.
+        let mut scene = Scene::new_with_limits(
+            image_default(),
+            JournalLimits {
+                open_calls: 2,
+                thread_floors: 8,
+                refused_begins: 2,
+                domain_keys: 4,
+                image_sightings: 8,
+            },
+        );
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let mut first = begin_bytes(1, 1, create, 0);
+        put_u64(&mut first, 80, 0x1111_1111_1111_1111);
+        let mut second = begin_bytes(1, 2, create, 0);
+        put_u64(&mut second, 80, 0x2222_2222_2222_2222);
+        scene.ingest(&first);
+        scene.ingest(&second);
+        let third = begin_bytes(1, 3, create, 0);
+        assert_eq!(
+            scene.ingest(&third),
+            JournalDisposition::BeginRefusedCapacity
+        );
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&third, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let mut pad = ordinary_for(&third, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let success = scene.seal(&bootstrap).expect("continuation seals");
+        assert_eq!(success.prefix.bootstrap_cut(), None);
+        assert!(
+            !success.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Gap {
+                    reason: super::ObjectGap::BootstrapRefused
+                }
+            )),
+            "no doomed fence, no refusal: {:?}",
+            success.effects.effects
+        );
+        assert!(scene.adapter.refused.is_empty());
+    }
+
+    #[test]
+    fn object_journal_late_terminal_emits_delta() {
+        // I2: a terminal arriving after its BEGIN's first seal appears in
+        // the closing prefix as an explicit terminal delta — H9's
+        // delivery contract, not just the model result.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        // The held call is neutral (a slow operation), mirroring the
+        // long-open test: a held creation would genuinely collide.
+        let sign = function_id("C_Sign");
+        let begin = begin_bytes(1, 1, sign, 0);
+        scene.ingest(&begin);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let held = scene.seal(&bootstrap).expect("open call seals held");
+        assert_eq!(held.prefix.settled().len(), 1);
+        let ticket = held.prefix.settled()[0].ticket;
+        assert_eq!(held.prefix.settled()[0].end_cut, None);
+        assert_eq!(
+            scene.ingest(&end_bytes_absent(&begin, 0, ENTRY_NS + 90)),
+            JournalDisposition::EndStaged
+        );
+        let closed = scene.seal(&bootstrap).expect("closing seal passes");
+        assert!(closed.prefix.open_keys().is_empty());
+        let delta = closed
+            .prefix
+            .settled()
+            .iter()
+            .find(|summary| summary.ticket == ticket)
+            .expect("closing prefix carries the terminal delta");
+        assert_eq!(delta.begin_cut, 1);
+        assert_eq!(delta.end_cut, Some(scene.adapter.consumed_through));
+        assert!(!delta.abandoned);
+    }
+
+    #[test]
+    fn object_journal_production_birth_requires_session_evidence() {
+        // C1: the production constructor takes a Session-owned birth
+        // grant; there is no grantless stream-inference path (it does not
+        // compile). A grant consistent with retained truth attests and
+        // seals; inconsistent or stale grants refuse at the backstop.
+        // Production grants mint only through the Session issuance
+        // capability, which has no issuance site until the H8-D native
+        // witnesses wire — so production attestation fails closed.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        scene.ingest(&begin_bytes(1, 1, create, 0));
+        let grant = SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 0);
+        let birth =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("consistent grant attests");
+        scene.seal(&birth).expect("granted birth seals");
+        // The image was sighted at 1, so an exec claim at cut 1 refuses
+        // even with a grant in hand: the grant is checked, not trusted.
+        let inconsistent = SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 1, 0);
+        assert_eq!(
+            BootstrapReceipt::attest(&scene.adapter, &inconsistent),
+            Err(BirthRefusal::NoveltyBroken)
+        );
+        // A grant under a non-live generation refuses at the constructor.
+        let stale = SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 7);
+        assert_eq!(
+            BootstrapReceipt::attest(&scene.adapter, &stale),
+            Err(BirthRefusal::ClosureStale)
+        );
+    }
+
+    #[test]
+    fn object_journal_closure_reattest_requires_fresh_session_evidence() {
+        // C1: installing a new closure retires the old grant.
+        // Re-attesting with the old grant refuses; only a fresh grant
+        // under the live generation (fresh Session attachment evidence)
+        // attests.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        scene.ingest(&begin_bytes(1, 1, create, 0));
+        let old_grant = SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 0);
+        BootstrapReceipt::attest(&scene.adapter, &old_grant).expect("gen-zero grant attests");
+        assert!(
+            scene
+                .adapter
+                .install_closure_grant(&SessionClosureGrant::scripted(1))
+        );
+        assert_eq!(
+            BootstrapReceipt::attest(&scene.adapter, &old_grant),
+            Err(BirthRefusal::ClosureStale)
+        );
+        let fresh = SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 1);
+        BootstrapReceipt::attest(&scene.adapter, &fresh).expect("fresh grant attests");
+    }
+
+    #[test]
+    fn object_journal_birth_grant_evidence_is_checked() {
+        // C1: the grant's Session-observed native evidence is CHECKED at
+        // attestation, not just carried. Each corruption below refuses
+        // with EvidenceMismatch; canonical evidence attests.
+        fn marker(exec: u64, state: u64) -> u64 {
+            (exec << 32) | state
+        }
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let getinfo = function_id("C_GetInfo");
+        let begin = begin_bytes(1, 1, create, 0);
+        // Ordinal 1 observes the image without affecting it (proved
+        // irrelevant), so absence can birth at cut 1; the BEGIN at 2
+        // keeps exec novel only at cut 0.
+        let mut seen = ordinary_for(&begin, 0);
+        seen.slot = 99;
+        seen.target_function = getinfo;
+        scene.ingest_ordinary(seen);
+        scene.ingest(&begin);
+        let image = (COOKIE, EXEC);
+        let bad_exec = [
+            // Wrong observed image.
+            SessionBirthEvidence::scripted((COOKIE + 1, EXEC), marker(EXEC, 1), 0, 1),
+            // Zero custody binds nothing.
+            SessionBirthEvidence::scripted(image, marker(EXEC, 1), 0, 0),
+            // A tripped admission latch withholds birth.
+            SessionBirthEvidence::scripted(image, marker(EXEC, 1), 1, 1),
+            // Unmarked is not an exec publication.
+            SessionBirthEvidence::scripted(image, marker(EXEC, 0), 0, 1),
+            // A scope-dirtied marker is not an exec publication.
+            SessionBirthEvidence::scripted(image, marker(EXEC, 2), 0, 1),
+            // Reserved marker state refuses.
+            SessionBirthEvidence::scripted(image, marker(EXEC, 3), 0, 1),
+            // The marker names another exec id.
+            SessionBirthEvidence::scripted(image, marker(EXEC + 1, 1), 0, 1),
+        ];
+        for evidence in bad_exec {
+            let grant = SessionBirthGrant::scripted_with_evidence(
+                proof,
+                BirthKind::ExecMarker,
+                0,
+                0,
+                evidence,
+            );
+            assert_eq!(
+                BootstrapReceipt::attest(&scene.adapter, &grant),
+                Err(BirthRefusal::EvidenceMismatch)
+            );
+        }
+        // Absence requires an unmarked word: READY, dirty and reserved
+        // states all refuse as absence evidence.
+        for word in [marker(EXEC, 1), marker(EXEC, 2), marker(EXEC, 9)] {
+            let evidence = SessionBirthEvidence::scripted(image, word, 0, 1);
+            let grant = SessionBirthGrant::scripted_with_evidence(
+                proof,
+                BirthKind::AbsenceAppearance,
+                1,
+                0,
+                evidence,
+            );
+            assert_eq!(
+                BootstrapReceipt::attest(&scene.adapter, &grant),
+                Err(BirthRefusal::EvidenceMismatch)
+            );
+        }
+        // Canonical evidence attests both kinds.
+        for birth in [BirthKind::ExecMarker, BirthKind::AbsenceAppearance] {
+            let cut = u64::from(birth == BirthKind::AbsenceAppearance);
+            let grant = SessionBirthGrant::scripted(proof, birth, cut, 0);
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("canonical evidence attests");
+        }
+    }
+
+    #[test]
+    fn object_journal_void_preserves_unbounded_abandonment() {
+        // C2: BEGIN -> collision ABANDON -> fault audit. The void must
+        // preserve the staged unbounded abandonment as a permanent
+        // incarnation refusal: rebirth at the void fence (even via
+        // absence, which the fence would otherwise permit) never
+        // recovers, and new calls never produce positive effects while
+        // the abandoned provider frame remains capable.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let outer = begin_bytes(1, 1, create, 0);
+        scene.ingest(&outer);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_ENTRY_COLLISION, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let faulted = JournalAuditReceipt::scripted(
+            7,
+            8,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            0,
+        );
+        let failure = scene
+            .seal_explicit(
+                &faulted,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("fault audit voids");
+        assert_eq!(failure.gap, JournalGap::FaultChanged);
+        // The void fence would otherwise permit an absence rebirth; the
+        // preserved abandonment refuses the incarnation instead.
+        let fence = scene.adapter.consumed_through;
+        let readmitted = scene.fixture.admit();
+        let reproof = scene.adapter.attest_key(&readmitted).expect("key rebinds");
+        assert_eq!(reproof, proof);
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        let grant = SessionBirthGrant::scripted(reproof, BirthKind::AbsenceAppearance, fence, 0);
+        let rebirth =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        let retry = scene
+            .seal_at(&rebirth, 8)
+            .expect_err("abandoned incarnation never recovers");
+        assert_eq!(retry.gap, JournalGap::DomainTainted);
+        assert!(scene.model.project().objects.is_empty());
+    }
+
+    #[test]
+    fn object_journal_unbounded_abandonment_releases_model_calls() {
+        // I3: unbounded abandonment disposes model call storage (the
+        // shared pending budget is refunded) while the incarnation
+        // refusal sticks: proof for the abandoned frame never recovers.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let sign = function_id("C_Sign");
+        // One call converts (model holds its ticket); a second, never
+        // converted, is then abandoned unboundedly.
+        scene.ingest(&begin_bytes(1, 1, sign, 0));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("open converts");
+        assert_eq!(scene.model.project().usage.pending_calls, 1);
+        scene.ingest(&begin_bytes(1, 2, sign, 0));
+        let abandon = abandon_bytes(1, 2, JOURNAL_REASON_ENTRY_COLLISION, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let failure = scene
+            .seal(&bootstrap)
+            .expect_err("unbounded abandonment refuses");
+        assert_eq!(failure.gap, JournalGap::DomainTainted);
+        // Storage released, refusal retained.
+        assert_eq!(scene.model.project().usage.pending_calls, 0);
+        assert!(
+            scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .refused
+        );
+        let retry = scene
+            .seal(&bootstrap)
+            .expect_err("incarnation never recovers");
+        assert_eq!(retry.gap, JournalGap::DomainTainted);
+    }
+
+    #[test]
+    fn object_journal_empty_resumption_waits_for_history() {
+        // C2: a fault voids benign staged history; one unrelated
+        // ordinary record then advances the frontier. Naming the void
+        // fence with no new staged history certifies nothing, so the
+        // resumption waits (BoundNotReady) instead of succeeding; new
+        // staged history above the fence recovers.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let faulted = JournalAuditReceipt::scripted(
+            7,
+            8,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            0,
+        );
+        scene
+            .seal_explicit(
+                &faulted,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("fault audit voids");
+        let fence = scene.adapter.consumed_through;
+        let mut pad = ordinary_for(&begin, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let grant = SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, fence, 0);
+        let resume =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        let waiting = scene
+            .seal_at(&resume, 8)
+            .expect_err("empty resumption waits for history");
+        assert_eq!(waiting.gap, JournalGap::BoundNotReady);
+        // Genuinely new staged history above the fence recovers.
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        let recovered = scene.seal_at(&resume, 8).expect("new history recovers");
+        assert_eq!(recovered.prefix.settled().len(), 1);
+    }
+
+    #[test]
+    fn object_journal_return_witness_binds_exact_invocation() {
+        // C3: an ordinary CALL corroborates a staged BEGIN only for the
+        // exact retained invocation: same image, same process, exact
+        // entry-time agreement plus the scalar call identity. A foreign
+        // process/image or a different entry instant never becomes the
+        // bounded-loss upper cut.
+        let mut scene = Scene::new(image_default());
+        scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        let mut foreign_image = ordinary_for(&begin, 0);
+        foreign_image.image.task_cookie += 1;
+        assert_eq!(
+            scene.ingest_ordinary(foreign_image),
+            JournalDisposition::OrdinaryCounted
+        );
+        let mut foreign_process = ordinary_for(&begin, 0);
+        foreign_process.pid_tgid ^= 0xFFFF_FFFF_0000_0000;
+        assert_eq!(
+            scene.ingest_ordinary(foreign_process),
+            JournalDisposition::OrdinaryCounted
+        );
+        // Same return instant, different entry instant: not this call.
+        let mut foreign_entry = ordinary_for(&begin, 0);
+        foreign_entry.duration_ns = 50;
+        assert_eq!(
+            scene.ingest_ordinary(foreign_entry),
+            JournalDisposition::OrdinaryCounted
+        );
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&begin, 0)),
+            JournalDisposition::ReturnObserved
+        );
+
+        // The same binding guards refused begins, end to end: a foreign
+        // return leaves the bound unready instead of minting a
+        // LostOutcome upper cut from another invocation.
+        let mut scene = Scene::new_with_limits(
+            image_default(),
+            JournalLimits {
+                open_calls: 1,
+                thread_floors: 8,
+                refused_begins: 8,
+                domain_keys: 4,
+                image_sightings: 8,
+            },
+        );
+        let proof = scene.attest();
+        let mut first = begin_bytes(1, 1, create, 0);
+        put_u64(&mut first, 80, 0x1111_1111_1111_1111);
+        scene.ingest(&first);
+        let second = begin_bytes(1, 2, create, 0);
+        assert_eq!(
+            scene.ingest(&second),
+            JournalDisposition::BeginRefusedCapacity
+        );
+        let mut foreign = ordinary_for(&second, 0);
+        foreign.image.exec_id ^= 0x0F0F_0F0F_0F0F_0F0F;
+        assert_eq!(
+            scene.ingest_ordinary(foreign),
+            JournalDisposition::OrdinaryCounted
+        );
+        let bootstrap = scene.bootstrap(proof, 0);
+        let unready = scene
+            .seal(&bootstrap)
+            .expect_err("foreign witness leaves the bound unready");
+        assert_eq!(unready.gap, JournalGap::BoundNotReady);
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(&second, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        // The frontier must cover the bound's authority before the seal
+        // claims it.
+        let mut pad = ordinary_for(&second, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bound = scene.seal(&bootstrap).expect("exact witness bounds");
+        assert_eq!(bound.prefix.settled().len(), 1);
+    }
+
+    #[test]
+    fn object_journal_conversion_attributes_per_call_authority() {
+        // C4: two provider instances share one image. Each key converts
+        // only the calls its own admission authority names; a seal never
+        // attributes a sibling instance's calls to whichever key seals
+        // first.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        const OTHER_SESSION: u64 = 0x2222_2222_2222_2222;
+        let mut scene = Scene::new(image_default());
+        let proof_a = scene.attest();
+        let mut other = AttestationFixture::new(image_default());
+        let proof_b = scene
+            .adapter
+            .attest_key(&other.admit_session(OTHER_SESSION))
+            .expect("second key attests");
+        assert_ne!(proof_a, proof_b);
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        let mut second = begin_bytes(2, 1, create, 0);
+        put_u64(&mut second, 80, OTHER_SESSION);
+        scene.ingest(&second);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        scene.ingest(&end_bytes(&second, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        let bootstrap_a = scene.bootstrap(proof_a, 0);
+        let sealed_a = scene.seal(&bootstrap_a).expect("first key seals");
+        assert_eq!(sealed_a.prefix.settled().len(), 1);
+        assert_eq!(sealed_a.prefix.settled()[0].begin_cut, 1);
+        let bootstrap_b = scene.bootstrap(proof_b, 0);
+        let sealed_b = scene.seal(&bootstrap_b).expect("second key seals its call");
+        assert_eq!(sealed_b.prefix.settled().len(), 1);
+        assert_eq!(sealed_b.prefix.settled()[0].begin_cut, 2);
+    }
+
+    #[test]
+    fn object_journal_unknown_staged_entries_barrier_every_domain() {
+        // C4: a staged BEGIN for an image no key was attested for is not
+        // silently excluded: it barriers every seal past it, and only a
+        // void (which drops it explicitly) recovers the domain.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        let strange = begin_bytes_image(2, 1, create, 0, (COOKIE + 9, EXEC));
+        scene.ingest(&strange);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        let blocked = scene
+            .seal(&bootstrap)
+            .expect_err("unknown staged entries barrier");
+        assert_eq!(blocked.gap, JournalGap::BoundNotReady);
+        // A void drops the unknown history explicitly; the domain then
+        // resumes above the fence with genuinely new history.
+        let frontier = scene.adapter.consumed_frontier();
+        let faulted = JournalAuditReceipt::scripted(
+            7,
+            8,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            0,
+        );
+        scene
+            .seal_explicit(
+                &faulted,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("fault audit voids");
+        let fence = scene.adapter.consumed_through;
+        let next = begin_bytes(1, 2, create, 0);
+        scene.ingest(&next);
+        scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        let grant = SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, fence, 0);
+        let resume =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        scene.seal_at(&resume, 8).expect("post-void history seals");
+    }
+
+    #[test]
+    fn object_journal_unadmitted_shape_barriers_multi_key_seal() {
+        // C4: with two live keys on one image, a staged call no admission
+        // authority names barriers the seal; it is neither converted nor
+        // silently skipped.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        const OTHER_SESSION: u64 = 0x2222_2222_2222_2222;
+        const STRAY_SESSION: u64 = 0x3333_3333_3333_3333;
+        let mut scene = Scene::new(image_default());
+        let proof_a = scene.attest();
+        let mut other = AttestationFixture::new(image_default());
+        scene
+            .adapter
+            .attest_key(&other.admit_session(OTHER_SESSION))
+            .expect("second key attests");
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        let mut stray = begin_bytes(2, 1, create, 0);
+        put_u64(&mut stray, 80, STRAY_SESSION);
+        scene.ingest(&stray);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        scene.ingest(&end_bytes(&stray, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        let bootstrap_a = scene.bootstrap(proof_a, 0);
+        let blocked = scene
+            .seal(&bootstrap_a)
+            .expect_err("unadmitted shape barriers");
+        assert_eq!(blocked.gap, JournalGap::BoundNotReady);
+    }
+
+    #[test]
+    fn object_journal_late_attestation_after_conversion_refuses() {
+        // C4: a second key for an image whose live key already converted
+        // refuses attestation: calls converted under sole-key authority
+        // cannot be re-examined once a sibling instance appears.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("sole key seals");
+        let mut other = AttestationFixture::new(image_default());
+        assert_eq!(
+            scene.adapter.attest_key(&other.admit()),
+            Err(AttestationRefusal::ImageSealed)
+        );
+    }
+
+    #[test]
+    fn object_journal_collection_binds_drain_session() {
+        // C4: a collection through one Session's drain never seals under
+        // another Session's attested key.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let image_b = ImageIdentity {
+            task_cookie: COOKIE + 1,
+            exec_id: EXEC,
+        };
+        // Negative: B's history collected through A's drain refuses B's seal.
+        let mut scene = Scene::new(image_default());
+        scene.attest();
+        let mut other = AttestationFixture::new(image_b);
+        let proof_b = scene.adapter.attest_key(&other.admit()).expect("B attests");
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes_image(1, 1, create, 0, (COOKIE + 1, EXEC));
+        let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        let fault = ScriptedFaultCell::steady(7);
+        let collection = scene.collect_records(vec![begin.to_vec(), end.to_vec()], &fault);
+        let bootstrap_b = scene.bootstrap(proof_b, 0);
+        let refused = scene
+            .seal_collected(&bootstrap_b, &collection)
+            .expect_err("foreign drain refuses");
+        assert_eq!(refused.gap, JournalGap::DrainMismatch);
+        // Positive control: B's history through B's own drain seals.
+        let mut scene = Scene::new(image_b);
+        let proof = scene.attest();
+        let begin = begin_bytes_image(1, 1, create, 0, (COOKIE + 1, EXEC));
+        let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        let fault = ScriptedFaultCell::steady(7);
+        let collection = scene.collect_records(vec![begin.to_vec(), end.to_vec()], &fault);
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene
+            .seal_collected(&bootstrap, &collection)
+            .expect("own drain seals");
+    }
+
+    #[test]
+    fn object_journal_h3_disposition_requires_complete_disposition() {
+        // C5: H3 disposition is minted from the finalizer's complete
+        // state, never a maximum token. Staged positions certify only
+        // their batch's maximum; route-waiting, unpublished and shed
+        // positions ride along explicitly; negatives and exhaustion
+        // dispose as loss; and the seal enforces coverage in H0's own
+        // position space.
+        use crate::inventory_semantics::LaneNegative;
+
+        let genesis = H3DispositionEvidence::genesis();
+        // A later joined outcome while earlier routing pends: the
+        // batch maximum is 2 but position 1 is undisposed. The
+        // evidence carries both facts; it never claims 2 disposed.
+        let evidence = H3DispositionEvidence::from_finalizer_batch(
+            &[],
+            &[Some(2)],
+            Some(1),
+            None,
+            None,
+            false,
+            &genesis,
+        );
+        assert!(matches!(
+            evidence,
+            H3DispositionEvidence::Clean {
+                staged_max: 2,
+                pending_floor: Some(1),
+            }
+        ));
+        // The maximum is monotone over previous evidence; the pending
+        // floor is always the current one.
+        let next = H3DispositionEvidence::from_finalizer_batch(
+            &[],
+            &[Some(1), Some(3)],
+            None,
+            None,
+            None,
+            false,
+            &evidence,
+        );
+        assert!(matches!(
+            next,
+            H3DispositionEvidence::Clean {
+                staged_max: 3,
+                pending_floor: None,
+            }
+        ));
+        // Shed positions never certify: the minimum shed is a loss
+        // barrier, even above the staged maximum.
+        let shed = H3DispositionEvidence::from_finalizer_batch(
+            &[],
+            &[Some(4)],
+            None,
+            Some(9),
+            None,
+            false,
+            &genesis,
+        );
+        assert!(matches!(
+            shed,
+            H3DispositionEvidence::StagedLoss { barrier: 9 }
+        ));
+        // An unpositioned staged outcome means the H0 allocator is
+        // exhausted: permanent, not a waitable gap.
+        let dead = H3DispositionEvidence::from_finalizer_batch(
+            &[],
+            &[Some(4), None],
+            None,
+            None,
+            None,
+            false,
+            &genesis,
+        );
+        assert!(matches!(dead, H3DispositionEvidence::Exhausted));
+        // Staged negatives are loss barriers; a refused collection
+        // disposes nothing.
+        for (negatives, barrier) in [
+            (vec![LaneNegative::CutBarrier { ordinal: 5 }], 5),
+            (
+                vec![
+                    LaneNegative::CutBarrier { ordinal: 5 },
+                    LaneNegative::CutBarrier { ordinal: 3 },
+                ],
+                3,
+            ),
+        ] {
+            let loss = H3DispositionEvidence::from_finalizer_batch(
+                &negatives,
+                &[Some(9)],
+                None,
+                None,
+                None,
+                false,
+                &genesis,
+            );
+            assert!(
+                matches!(loss, H3DispositionEvidence::StagedLoss { barrier: b } if b == barrier)
+            );
+        }
+        // Exhaustion sticks: later batches cannot revive the allocator.
+        let after = H3DispositionEvidence::from_finalizer_batch(
+            &[],
+            &[Some(10)],
+            None,
+            None,
+            None,
+            false,
+            &dead,
+        );
+        assert!(matches!(after, H3DispositionEvidence::Exhausted));
+        // A loss barrier restarts the certified maximum above itself.
+        let recovered = H3DispositionEvidence::from_finalizer_batch(
+            &[],
+            &[Some(10)],
+            None,
+            None,
+            None,
+            false,
+            &shed,
+        );
+        assert!(matches!(
+            recovered,
+            H3DispositionEvidence::Clean {
+                staged_max: 10,
+                pending_floor: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn object_journal_seal_enforces_h3_quantum_coverage() {
+        // C5: the seal enforces H3 coverage in H0's position space
+        // against the collection's allocation watermark — never by
+        // comparing H0 tokens to journal ordinals. Short staging or
+        // pending below the watermark waits; a loss below it voids
+        // once and forgives on re-presentation; exhaustion stops.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        fn scene_with_history() -> (Scene, BootstrapReceipt) {
+            let mut scene = Scene::new(image_default());
+            let proof = scene.attest();
+            let create = function_id("C_CreateObject");
+            let begin = begin_bytes(1, 1, create, 0);
+            scene.ingest(&begin);
+            scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+            let bootstrap = scene.bootstrap(proof, 0);
+            (scene, bootstrap)
+        }
+        fn audit(h3: H3DispositionEvidence, h0_below: u64) -> JournalAuditReceipt {
+            JournalAuditReceipt::scripted_h0(7, 7, None, 0, h3, 0, h0_below)
+        }
+        // Staged short of the watermark waits.
+        let (mut scene, bootstrap) = scene_with_history();
+        let frontier = scene.adapter.consumed_frontier();
+        let short = audit(H3DispositionEvidence::scripted_clean(4), 6);
+        let failure = scene
+            .seal_explicit(
+                &short,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("short staging waits");
+        assert_eq!(failure.gap, JournalGap::H3Pending);
+        // Pending below the watermark waits even at full staging.
+        let pending = audit(H3DispositionEvidence::scripted_clean_pending(9, Some(5)), 6);
+        let failure = scene
+            .seal_explicit(
+                &pending,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("pending below the watermark waits");
+        assert_eq!(failure.gap, JournalGap::H3Pending);
+        // Full coverage seals.
+        let covered = audit(H3DispositionEvidence::scripted_clean_pending(9, Some(6)), 6);
+        scene
+            .seal_explicit(
+                &covered,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect("covered quantum seals");
+        // A loss below the watermark voids once...
+        let (mut scene, bootstrap) = scene_with_history();
+        let frontier = scene.adapter.consumed_frontier();
+        let loss = audit(H3DispositionEvidence::scripted_loss(2), 6);
+        let failure = scene
+            .seal_explicit(
+                &loss,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("loss below the watermark voids");
+        assert_eq!(failure.gap, JournalGap::H3Loss);
+        // ...is forgiven on re-presentation (the seal waits for clean
+        // evidence instead of voiding twice)...
+        let failure = scene
+            .seal_explicit(
+                &loss,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("forgiven loss waits");
+        assert_eq!(failure.gap, JournalGap::H3Pending);
+        // ...while a loss above the watermark waits without voiding.
+        let above = audit(H3DispositionEvidence::scripted_loss(9), 6);
+        let failure = scene
+            .seal_explicit(
+                &above,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("loss above the watermark waits");
+        assert_eq!(failure.gap, JournalGap::H3Pending);
+        // Exhaustion stops the adapter permanently.
+        let (mut scene, bootstrap) = scene_with_history();
+        let frontier = scene.adapter.consumed_frontier();
+        let dead = audit(H3DispositionEvidence::scripted_exhausted(), 6);
+        let failure = scene
+            .seal_explicit(
+                &dead,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("exhaustion stops");
+        assert_eq!(failure.gap, JournalGap::H3Exhausted);
+        let stopped = scene.seal(&bootstrap).expect_err("stopped adapter refuses");
+        assert_eq!(stopped.gap, JournalGap::Stopped);
+    }
+
+    #[test]
+    fn object_journal_fault_continuity_chains_across_collections() {
+        // C6: the checked fault chains cumulatively, not just within one
+        // collection. A fault that moves between collections (7,7 then
+        // 8,8) voids; the baseline catches up and later seals pass.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("first seal passes");
+        assert_eq!(scene.adapter.last_fault, Some(7));
+        let second = begin_bytes(1, 2, create, 0);
+        scene.ingest(&second);
+        scene.ingest(&end_bytes(&second, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        let frontier = scene.adapter.consumed_frontier();
+        let moved = JournalAuditReceipt::scripted(
+            8,
+            8,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            0,
+        );
+        let failure = scene
+            .seal_explicit(
+                &moved,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+            )
+            .expect_err("inter-collection fault move voids");
+        assert_eq!(failure.gap, JournalGap::FaultChanged);
+        assert_eq!(scene.adapter.last_fault, Some(8));
+        // The baseline caught up: new history above the fence seals
+        // under the fresh epoch.
+        let fence = scene.adapter.consumed_through;
+        let third = begin_bytes(1, 3, create, 0);
+        scene.ingest(&third);
+        scene.ingest(&end_bytes(&third, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
+        let grant = SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, fence, 0);
+        let resume =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        let frontier = scene.adapter.consumed_frontier();
+        let fresh = JournalAuditReceipt::scripted(
+            8,
+            8,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
+            0,
+        );
+        let recovered = scene
+            .seal_explicit(
+                &fresh,
+                &resume,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&resume),
+            )
+            .expect("post-void history seals");
+        assert_eq!(recovered.prefix.settled().len(), 1);
+    }
+
+    #[test]
+    fn object_journal_seal_rereads_fault_at_seal_time() {
+        // C6: the seal re-reads the native fault cell at seal time. A
+        // clean collection pair that moved before the seal voids; the
+        // fresh reading becomes the new baseline.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let audit = scene.audit();
+        let moved = ScriptedFaultCell::steady(8);
+        let failure = scene
+            .adapter
+            .seal(
+                &mut scene.model,
+                &audit,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                &moved,
+            )
+            .expect_err("seal-time fault move voids");
+        assert_eq!(failure.gap, JournalGap::FaultChanged);
+        assert_eq!(scene.adapter.last_fault, Some(8));
+        // The fresh baseline holds: the old epoch no longer chains.
+        let stale = scene
+            .adapter
+            .seal(
+                &mut scene.model,
+                &audit,
+                &bootstrap,
+                frontier,
+                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                &ScriptedFaultCell::steady(7),
+            )
+            .expect_err("stale epoch refuses");
+        assert_eq!(stale.gap, JournalGap::FaultChanged);
+    }
+
+    #[test]
+    fn object_journal_reader_discards_void_the_seal() {
+        // C6: the retained reader surfaces consumed discards, and a
+        // collection spanning one voids the seal (lost history is never
+        // silently skipped). A clean re-collection seals new history
+        // above the fence.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        let mut script = BusyScript::new(vec![begin.to_vec(), end.to_vec()]);
+        script.discard_bump = Some((1, 1));
+        let mut drain = crate::events::EventDrain::over_test_domain(script, 7);
+        let fault = ScriptedFaultCell::steady(7);
+        let session = scene.fixture.domain;
+        let collection = scene.adapter.collect_from_drain(
+            &mut drain,
+            &scene.descriptors,
+            None,
+            &fault,
+            session,
+            0,
+        );
+        assert_eq!(collection.discarded_delta, 1);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let failure = scene
+            .seal_collected(&bootstrap, &collection)
+            .expect_err("spanned discards void");
+        assert_eq!(failure.gap, JournalGap::Discarded);
+        // A clean re-collection seals genuinely new history above the
+        // fence.
+        let fence = scene.adapter.consumed_through;
+        let next = begin_bytes(1, 2, create, 0);
+        let next_end = end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60);
+        let script = BusyScript::new(vec![next.to_vec(), next_end.to_vec()]);
+        let mut drain = crate::events::EventDrain::over_test_domain(script, 7);
+        let collection = scene.adapter.collect_from_drain(
+            &mut drain,
+            &scene.descriptors,
+            None,
+            &fault,
+            session,
+            0,
+        );
+        assert_eq!(collection.discarded_delta, 0);
+        let grant = SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, fence, 0);
+        let resume =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        let recovered = scene
+            .seal_collected(&resume, &collection)
+            .expect("clean history seals");
+        assert_eq!(recovered.prefix.settled().len(), 1);
+    }
+
+    #[test]
+    fn object_journal_seal_rechecks_fresh_birth_evidence() {
+        // C1: the seal re-verifies FRESH Session birth evidence, not just
+        // the attest-time grant. Native truth that moved between
+        // attestation and seal (dirtied marker, tripped latch, lost
+        // custody, rebound image) refuses the seal even though the grant
+        // attested.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        fn sealed_scene() -> (Scene, BootstrapReceipt) {
+            let mut scene = Scene::new(image_default());
+            let proof = scene.attest();
+            let create = function_id("C_CreateObject");
+            let begin = begin_bytes(1, 1, create, 0);
+            scene.ingest(&begin);
+            scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+            let grant = SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 0);
+            let birth = BootstrapReceipt::attest(&scene.adapter, &grant).expect("grant attests");
+            (scene, birth)
+        }
+        fn marker(exec: u64, state: u64) -> u64 {
+            (exec << 32) | state
+        }
+        let image = (COOKIE, EXEC);
+        // Fresh evidence matching the grant seals.
+        let (mut scene, birth) = sealed_scene();
+        let frontier = scene.adapter.consumed_frontier();
+        let audit = scene.audit();
+        let fresh = SessionBirthEvidence::scripted(image, marker(EXEC, 1), 0, 1);
+        scene
+            .seal_explicit(&audit, &birth, frontier, &fresh)
+            .expect("fresh evidence seals");
+        // Each post-attestation corruption refuses the seal.
+        for fresh in [
+            SessionBirthEvidence::scripted(image, marker(EXEC, 2), 0, 1),
+            SessionBirthEvidence::scripted(image, marker(EXEC, 1), 1, 1),
+            SessionBirthEvidence::scripted(image, marker(EXEC, 1), 0, 0),
+            SessionBirthEvidence::scripted((COOKIE + 1, EXEC), marker(EXEC, 1), 0, 1),
+            SessionBirthEvidence::scripted(image, marker(EXEC, 0), 0, 1),
+        ] {
+            let (mut scene, birth) = sealed_scene();
+            let frontier = scene.adapter.consumed_frontier();
+            let audit = scene.audit();
+            let failure = scene
+                .seal_explicit(&audit, &birth, frontier, &fresh)
+                .expect_err("moved native truth refuses the seal");
+            assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
+        }
     }
 }

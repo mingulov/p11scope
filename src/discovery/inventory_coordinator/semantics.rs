@@ -1432,6 +1432,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .into(),
                 budget: None,
             });
+            self.record_semantic_drop(&batch);
             return;
         }
         if self.pending_semantic.is_some() {
@@ -1445,9 +1446,34 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .into(),
                 budget: None,
             });
+            self.record_semantic_drop(&batch);
             return;
         }
         self.pending_semantic = Some(batch);
+    }
+
+    /// Latest H3 disposition evidence for the seal path (H8): minted by
+    /// the actual finalizer per batch, genesis before the first. The
+    /// joint seal tick that reads this is later Task 3 work; until it
+    /// lands the finalizer side (mint + store) is exercised by tests.
+    #[allow(dead_code)]
+    pub(crate) fn h3_disposition_evidence(
+        &self,
+    ) -> crate::semantics_objects::journal::H3DispositionEvidence {
+        self.h3_disposition.clone()
+    }
+
+    /// Record one dropped semantic batch's disposition shadow: its
+    /// minimum outcome position (plus exhaustion) joins the next
+    /// derivation as shed, so dropped history never vanishes from H3
+    /// accounting. Later drops overwrite earlier ones: H0 positions
+    /// ascend, so the latest drop covers all previous ones.
+    fn record_semantic_drop(&mut self, batch: &crate::inventory_semantics::SemanticBatch) {
+        let floor = batch.min_outcome_position();
+        let exhausted = batch.exhausted();
+        if floor.is_some() || exhausted {
+            self.pending_drop = Some((floor.unwrap_or(0), exhausted));
+        }
     }
 
     /// The private semantic finalizer: consumes pending semantic batches,
@@ -1464,7 +1490,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // Tail bits drain uncut: the cut joins its own publication
                 // or not at all, never a later one.
                 std::mem::take(&mut self.tail_uncertain);
-                if self.pending_semantic.take().is_some() {
+                if let Some(dropped) = self.pending_semantic.take() {
                     self.registry.record_gap(RegistryGap {
                         caller: None,
                         module: None,
@@ -1475,6 +1501,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             .into(),
                         budget: None,
                     });
+                    self.record_semantic_drop(&dropped);
                 }
             }
             Some(lane) => self.finalize_with_lane(lane),
@@ -1688,6 +1715,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .into(),
                 budget: None,
             });
+            self.record_semantic_drop(&batch);
             return;
         }
         if domain != lane.domain() {
@@ -1701,9 +1729,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .into(),
                 budget: None,
             });
+            self.record_semantic_drop(&batch);
             return;
         }
         let observed_ns = batch.observed_ns();
+        let batch_awaiting = batch.awaiting_floor();
+        let batch_shed = batch.shed_floor();
+        let batch_exhausted = batch.exhausted();
         let (outcomes, current, negatives) = batch.into_parts();
         // Receipts: presence proves H0 association either way; only the
         // lane owner's validation admits coverage.
@@ -1774,18 +1806,39 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         let mut calls = Vec::new();
         let mut shed_calls = 0usize;
+        // H3 disposition inputs collected across staging: every outcome
+        // position this finalization disposes, the minimum shed
+        // position, and whether any outcome lacked a position.
+        let mut staged_positions: Vec<Option<u64>> = Vec::new();
+        let mut shed_min: Option<u64> = None;
+        let mut unpositioned = false;
         for outcome in outcomes.into_iter().chain(validation_outcomes) {
             match outcome {
                 TickOutcome::Call(call) => {
-                    if let Some(evidence) = CallEvidence::from_routed(call) {
-                        if calls.len() < MAX_INSTANCES {
-                            calls.push(evidence);
-                        } else {
-                            shed_calls += 1;
+                    let token = call.token();
+                    match CallEvidence::from_routed(call) {
+                        Some(evidence) => {
+                            if calls.len() < MAX_INSTANCES {
+                                staged_positions.push(Some(evidence.token()));
+                                calls.push(evidence);
+                            } else {
+                                shed_calls += 1;
+                                let at = evidence.token();
+                                shed_min = Some(shed_min.map_or(at, |floor| floor.min(at)));
+                            }
                         }
+                        // Unjoined routes never stage: their positions
+                        // are undisposable, so they shed.
+                        None => match token {
+                            Some(at) => {
+                                shed_min = Some(shed_min.map_or(at, |floor| floor.min(at)));
+                            }
+                            None => unpositioned = true,
+                        },
                     }
                 }
                 TickOutcome::Invalidation(invalidation) => {
+                    staged_positions.push(invalidation.position());
                     let image = match invalidation.scope() {
                         InvalidationScope::ImageRetired(image) => Some(*image),
                         InvalidationScope::File { image, .. } => Some(*image),
@@ -1822,7 +1875,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         Err(reason) => self.conversion_gap(None, reason),
                     }
                 }
-                TickOutcome::Other(_) => {}
+                TickOutcome::Other(other) => {
+                    // Non-call records carry no instance decision, but
+                    // finalization still disposes their positions.
+                    staged_positions.push(other.position());
+                }
             }
         }
         if shed_calls != 0 {
@@ -1888,6 +1945,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let subset = lane.subset();
         let staged: Vec<(
             Option<CallerId>,
+            u64,
             Result<
                 crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
                 ConversionRefusal,
@@ -1895,11 +1953,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         )> = calls
             .into_iter()
             .map(|evidence| {
+                let token = evidence.token();
                 let found = self
                     .semantic_bindings
                     .find_by_image(evidence.domain(), evidence.image());
                 let Some(binding) = found else {
-                    return (None, Err(ConversionRefusal::Custody));
+                    return (None, token, Err(ConversionRefusal::Custody));
                 };
                 let caller = binding.caller();
                 let coverage = coverages.iter().find(|coverage| {
@@ -1918,16 +1977,51 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 };
                 (
                     Some(caller),
+                    token,
                     admit_call_from_evidence(evidence, binding, subset, standing, barrier),
                 )
             })
             .collect();
-        for (caller, result) in staged {
+        for (caller, token, result) in staged {
             match result {
                 Ok(input) => self.registry.observe_instance_semantic(input),
-                Err(reason) => self.conversion_gap(caller, reason),
+                Err(reason) => {
+                    // A refused call never stages and never retries: its
+                    // position sheds rather than vanishing.
+                    shed_min = Some(shed_min.map_or(token, |floor| floor.min(token)));
+                    self.conversion_gap(caller, reason);
+                }
             }
         }
+        // H3 disposition (H8): mint completeness from this
+        // finalization's complete state and store it for the seal.
+        // Staged positions cover calls and invalidations alike; the
+        // pending floor joins the batch's route-waiting floor with
+        // unpublished and lane-stashed history; shed minima (batch,
+        // finalizer, dropped) barrier as loss.
+        if let Some((floor, exhausted)) = self.pending_drop.take() {
+            shed_min = Some(shed_min.map_or(floor, |at| at.min(floor)));
+            unpositioned = unpositioned || exhausted;
+        }
+        let unpublished = self
+            .pending_semantic
+            .as_ref()
+            .and_then(|batch| batch.min_outcome_position())
+            .into_iter()
+            .chain(lane.stash_pending_floor())
+            .min();
+        let shed_floor = batch_shed.into_iter().chain(shed_min).min();
+        let evidence =
+            crate::semantics_objects::journal::H3DispositionEvidence::from_finalizer_batch(
+                &negatives,
+                &staged_positions,
+                batch_awaiting,
+                shed_floor,
+                unpublished,
+                batch_exhausted || unpositioned,
+                &self.h3_disposition,
+            );
+        self.h3_disposition = evidence;
     }
 
     /// Finite conversion refusal through the audited path.
@@ -2383,5 +2477,104 @@ mod finalizer_history_tests {
             reasons.contains(&InstanceReason::SemanticLoss),
             "history-only admission discloses its reason: {reasons:?}"
         );
+    }
+
+    #[test]
+    fn finalizer_mints_h3_disposition_from_complete_state() {
+        // C5: the actual finalizer derives H3 disposition from staged
+        // outcomes plus route-waiting/unpublished floors — never a bare
+        // maximum token — and the coordinator stores it for the seal.
+        use crate::semantic_capture::Invalidation;
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+
+        let pid = std::process::id();
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::Pid(pid),
+            HookRegistry::builtin(),
+            Vec::new(),
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let fixture = HistoryFixture::new();
+        let mut lane =
+            AttestedSemanticLane::start(fixture.subset(), &Scope::Pid(pid), BackendSelection::Auto)
+                .expect("shell lane starts");
+        let detailed = lane.domain();
+        let commit = |coordinator: &mut InventoryCoordinator<OsProcessSource>,
+                      lane: &mut AttestedSemanticLane,
+                      report: TickReport| {
+            let batch = SemanticBatch::from_tick_report(detailed, report, Vec::new(), 130).unwrap();
+            coordinator.stage_semantic_batch(batch);
+            coordinator
+                .commit_batch_with_semantics(false, Some(lane))
+                .unwrap();
+            coordinator.h3_disposition_evidence()
+        };
+        let invalidation = |position: u64| {
+            TickOutcome::Invalidation(Invalidation::scripted(
+                detailed,
+                crate::semantic_capture::InvalidationScope::CoverageFailed,
+                Some(position),
+            ))
+        };
+        // A later staged outcome while earlier routing pends: the
+        // maximum is 2 but position 1 is undisposed, and the evidence
+        // says so instead of claiming 2 disposed.
+        let evidence = commit(
+            &mut coordinator,
+            &mut lane,
+            TickReport::scripted_with_disposition(
+                vec![invalidation(2)],
+                Vec::new(),
+                Some(1),
+                None,
+                false,
+            ),
+        );
+        assert!(matches!(
+            evidence,
+            H3DispositionEvidence::Clean {
+                staged_max: 2,
+                pending_floor: Some(1),
+            }
+        ));
+        // The maximum is monotone over previous evidence; the pending
+        // floor is always the current one.
+        let evidence = commit(
+            &mut coordinator,
+            &mut lane,
+            TickReport::scripted_with_disposition(
+                vec![invalidation(1)],
+                Vec::new(),
+                None,
+                None,
+                false,
+            ),
+        );
+        assert!(matches!(
+            evidence,
+            H3DispositionEvidence::Clean {
+                staged_max: 2,
+                pending_floor: None,
+            }
+        ));
+        // A shed position never certifies: the minimum shed is a loss
+        // barrier, even above the staged maximum.
+        let evidence = commit(
+            &mut coordinator,
+            &mut lane,
+            TickReport::scripted_with_disposition(
+                vec![invalidation(4)],
+                Vec::new(),
+                None,
+                Some(9),
+                false,
+            ),
+        );
+        assert!(matches!(
+            evidence,
+            H3DispositionEvidence::StagedLoss { barrier: 9 }
+        ));
     }
 }

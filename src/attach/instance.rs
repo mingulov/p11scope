@@ -732,7 +732,8 @@ pub(crate) struct SessionGrantToken(());
 /// both to [`BirthObservationRefusal::RowUnreadable`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BirthRowError {
-    /// The native row lookup failed (map error, detached object).
+    /// The native row lookup failed (map error, detached object) or
+    /// the row is absent (missing storage refuses; it is not zero).
     Unreadable,
     /// The row bytes are shorter than the native row (fixture
     /// corruption; native rows are always complete).
@@ -969,31 +970,61 @@ pub(crate) fn observe_absence_birth(
 }
 
 /// Production birth-row reader: live PROC_EPOCH and
-/// JOURNAL_MARKER_CTL reads through the session's instance maps. A
-/// never-mutated process has no PROC_EPOCH row, which reads back as
-/// the zero row (fresh kernel storage is zeroed). UNRUN: live map
-/// reads stay out of tests; the Session loop wires this when the
-/// journal activates.
+/// JOURNAL_MARKER_CTL reads through the session's instance maps,
+/// bound to the SAME custody the observation checks (constructed from
+/// the binding itself — never a separately supplied fd). A
+/// never-mutated process has no PROC_EPOCH row, which refuses (there
+/// is no admission to read back) rather than reading as zero. UNRUN:
+/// live map reads stay out of tests; the Session loop wires this when
+/// the journal activates.
+/// Custody gate for the production row reads: the SAME pin the
+/// observation checks yields the pidfd the maps read through. A
+/// pidfd-less (proc-fallback) pin refuses — rows are unreadable
+/// without the original pidfd, and no substituted fd is ever read.
+fn birth_rows_pidfd(
+    pin: &crate::process::PidPin,
+) -> std::result::Result<BorrowedFd<'_>, BirthRowError> {
+    pin.pidfd().map_err(|_| BirthRowError::Unreadable)
+}
+
 #[allow(dead_code)] // No Session-loop wire until live activation; tests drive fixtures.
-pub(crate) struct LiveBirthRows<'m, 'f> {
+pub(crate) struct LiveBirthRows<'m> {
     maps: &'m InstanceMaps<'m>,
-    pidfd: BorrowedFd<'f>,
+    pin: std::sync::Arc<crate::process::PidPin>,
 }
 
 #[allow(dead_code)] // As above.
-impl<'m, 'f> LiveBirthRows<'m, 'f> {
-    pub(crate) fn over(maps: &'m InstanceMaps<'m>, pidfd: BorrowedFd<'f>) -> Self {
-        Self { maps, pidfd }
+impl<'m> LiveBirthRows<'m> {
+    pub(crate) fn over(
+        maps: &'m InstanceMaps<'m>,
+        binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+    ) -> Self {
+        Self {
+            maps,
+            pin: binding.pin(),
+        }
     }
 }
 
+/// Missing-storage mapping for the production marker-row read (the
+/// live reader pulls `record()` through this; UNRUN under live maps).
+/// A missing row refuses: a process that never mutated a watched file
+/// has no admission to read back (missing/busy/unreadable is not
+/// clean zero) — the observation refuses instead of admitting a
+/// fabricated default.
+fn marker_row_or_refuse(row: Option<InstanceRecord>) -> std::result::Result<InstanceRecord, BirthRowError> {
+    row.ok_or(BirthRowError::Unreadable)
+}
+
 #[allow(dead_code)] // As above.
-impl BirthRowReader for LiveBirthRows<'_, '_> {
+impl BirthRowReader for LiveBirthRows<'_> {
     fn read_marker_row(&mut self) -> std::result::Result<InstanceRecord, BirthRowError> {
-        self.maps
-            .record(self.pidfd)
-            .map_err(|_| BirthRowError::Unreadable)
-            .map(|row| row.unwrap_or_default())
+        let pidfd = birth_rows_pidfd(&self.pin)?;
+        marker_row_or_refuse(
+            self.maps
+                .record(pidfd)
+                .map_err(|_| BirthRowError::Unreadable)?,
+        )
     }
 
     fn read_admission_control(
@@ -1164,7 +1195,7 @@ impl InstanceMaps<'_> {
     }
 
     /// The process record through its pidfd; `None` when it never mutated a
-    /// watched file (epoch 0).
+    /// watched file (callers refuse absence; it is not a zero admission).
     pub(crate) fn record(&self, pidfd: BorrowedFd<'_>) -> Result<Option<InstanceRecord>> {
         task_storage_lookup(self.ebpf, "PROC_EPOCH", pidfd)
     }
@@ -1198,6 +1229,19 @@ impl InstanceMaps<'_> {
             other => bail!("unexpected INSTANCE_GEN variant {other:?}"),
         };
         raise_mmapped_fault(data.fd().as_fd())
+    }
+
+    /// Mints one closure generation from the mmapable attach cell: the
+    /// production mint behind Session sealing (BPF stamps exec'ing
+    /// records from this cell as `exec_attach_gen`). UNRUN: live map
+    /// access stays out of tests; the CAS core and the mmapable
+    /// wrapper are pinned over local atomics and file-backed pages.
+    pub(crate) fn mint_attach_generation(&self) -> Result<u64> {
+        let data = match self.ebpf.map("INSTANCE_GEN").context("INSTANCE_GEN map")? {
+            aya::maps::Map::Array(data) => data,
+            other => bail!("unexpected INSTANCE_GEN variant {other:?}"),
+        };
+        fetch_add_mmapped_attach(data.fd().as_fd())
     }
 
     /// Full cells from this object's original pidfd and watched file. The
@@ -1277,6 +1321,57 @@ pub(super) fn raise_fault_cell(cell: &std::sync::atomic::AtomicU64) -> Result<u6
         }
     }
     bail!("instance fault generation contention")
+}
+
+/// Bounded checked fetch-add on the mmapable attach cell: production
+/// closure mints from native (the cell BPF stamps into exec'ing
+/// records as `exec_attach_gen`), never the interim userspace
+/// counter. Returns the minted generation (1, 2, ... from zero).
+pub(super) fn mint_attach_cell(cell: &std::sync::atomic::AtomicU64) -> Result<u64> {
+    use std::sync::atomic::Ordering;
+    let mut seen = cell.load(Ordering::SeqCst);
+    for _ in 0..8 {
+        let next = seen.checked_add(1).context("attach generation exhausted")?;
+        match cell.compare_exchange(seen, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return Ok(next),
+            Err(current) => seen = current,
+        }
+    }
+    bail!("attach generation contention")
+}
+
+/// Mint one closure generation through the mmapable attach cell: the
+/// production mint behind [`InstanceMaps::mint_attach_generation`].
+/// Userspace is the cell's sole writer (native only stamps FROM it at
+/// exec), so the bounded CAS cannot lose to a native writer.
+fn fetch_add_mmapped_attach(fd: BorrowedFd<'_>) -> Result<u64> {
+    use p11scope_ebpf_common::instance::GEN_ATTACH;
+    // SAFETY: a shared mapping of the BPF_F_MMAPABLE array's first page.
+    let address = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd.as_raw_fd(),
+            0,
+        )
+    };
+    ensure!(
+        address != libc::MAP_FAILED,
+        "mapping INSTANCE_GEN: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: the attach cell is an aligned u64 inside the mapped page.
+    let cell = unsafe {
+        &*((address as *const u8).add(
+            usize::try_from(GEN_ATTACH).expect("attach cell index") * 8,
+        ) as *const std::sync::atomic::AtomicU64)
+    };
+    let minted = mint_attach_cell(cell);
+    // SAFETY: exactly the mapping created above.
+    unsafe { libc::munmap(address, 4096) };
+    minted
 }
 
 #[cfg(test)]
@@ -1535,6 +1630,86 @@ pub(super) fn audit_image_hooks_with(
 #[cfg(test)]
 mod tests {
     use super::{exec_release_proto_is_exact, hooks_disabled_by_env_value, lto_enabled_in_config};
+
+    #[test]
+    fn missing_marker_storage_refuses_instead_of_defaulting() {
+        // N11: a missing marker row has no admission to read back
+        // (missing/busy/unreadable is not clean zero) — the
+        // production reader refuses it; a present row passes through.
+        assert!(matches!(
+            super::marker_row_or_refuse(None),
+            Err(super::BirthRowError::Unreadable)
+        ));
+        let row = p11scope_ebpf_common::InstanceRecord {
+            slot_plus1: [1, 0, 0, 0, 0, 0, 0, 0],
+            epoch: [0; 8],
+            flags: 0,
+            exec_attach_gen: 0,
+            journal_bootstrap: 0,
+        };
+        let back = super::marker_row_or_refuse(Some(row)).expect("present row passes");
+        assert_eq!(back.slot_plus1[0], 1);
+        assert_eq!(back.exec_attach_gen, 0);
+    }
+
+    #[test]
+    fn attach_mint_is_native_monotonic_and_exact() {
+        // C1: production closure mints from the mmapable attach cell
+        // (the cell BPF stamps into exec records), never the interim
+        // userspace counter. The CAS core mints 1, 2, ... from zero
+        // and races exactly under contention.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let cell = AtomicU64::new(0);
+        assert_eq!(super::mint_attach_cell(&cell).unwrap(), 1);
+        assert_eq!(super::mint_attach_cell(&cell).unwrap(), 2);
+        assert_eq!(cell.load(Ordering::SeqCst), 2);
+        let cell = std::sync::Arc::new(AtomicU64::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let shared = cell.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut minted = Vec::new();
+                for _ in 0..250 {
+                    minted.push(super::mint_attach_cell(&shared).unwrap());
+                }
+                minted
+            }));
+        }
+        let mut all = Vec::new();
+        for handle in handles {
+            all.extend(handle.join().unwrap());
+        }
+        all.sort_unstable();
+        assert_eq!(all, (1..=1000).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn attach_mint_maps_the_mmapable_cell() {
+        // C1: the mmapable wrapper mints through a shared mapping at
+        // the attach cell (a file-backed page stands in for the BPF
+        // array; only the fd source is live-only).
+        use std::os::fd::AsFd;
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(4096).unwrap();
+        let first = super::fetch_add_mmapped_attach(file.as_fd()).unwrap();
+        let second = super::fetch_add_mmapped_attach(file.as_fd()).unwrap();
+        assert_eq!((first, second), (1, 2));
+    }
+
+    #[test]
+    fn birth_row_reads_share_the_checked_custody() {
+        // C1: the production row source reads through the SAME pin the
+        // observation checks — a live pin yields its pidfd, while a
+        // pidfd-less (proc-fallback) pin refuses instead of reading
+        // through any substituted fd.
+        let live = crate::process::PidPin::open(std::process::id()).unwrap();
+        assert!(super::birth_rows_pidfd(&live).is_ok());
+        let fallback = crate::process::PidPin::test_proc_only(std::process::id());
+        assert!(matches!(
+            super::birth_rows_pidfd(&fallback),
+            Err(super::BirthRowError::Unreadable)
+        ));
+    }
 
     fn healthy_hook_stats() -> Vec<(&'static str, super::HookStats)> {
         super::INSTANCE_PROGRAMS

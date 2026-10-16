@@ -9,9 +9,13 @@ privacy scan. Drives a provider child through READY validation, GO release
 and an owned-child deadline. The ledger file is bound once per run and
 every comparison checks the observed output against those exact bytes;
 --run binds output freshness to the current run (a nonce the child must
-echo; pre-existing or foreign output fails) and verifies execution with
-controller-observed timing and population, never child timestamps; an
-empty observation set always fails.
+echo; pre-existing or foreign output fails) and verifies execution from
+controller-observed delivery timing — the child streams one progress line
+per observation on stdout, timestamped here at delivery and ACKed back so
+controller delay can only spread arrivals, never compress them — plus the
+required population/duration, never child timestamps; total child lifetime
+never substitutes for paced delivery; an empty observation set always
+fails.
 
 Live BPF measurements stay UNRUN: this round executes only --plan-only,
 --check and --run against the repository stub provider. A privileged
@@ -20,11 +24,11 @@ Exit codes: 0 pass, 1 oracle rejection, 2 usage, 3 harness failure."""
 import argparse
 import hashlib
 import json
-import queue
+import os
 import secrets
+import selectors
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -37,6 +41,7 @@ PROFILE_SECONDS = 60
 DEADLINE_SECONDS = 90
 READY_SECONDS = 10
 KEY_SENTINEL = "PRIVATE-KEY-MATERIAL"
+PROGRESS_FLOOD_CAP = 65536
 
 
 def fail(message):
@@ -69,27 +74,80 @@ def well_formed_profile(profile):
     )
 
 
-def check_pace_measured(reasons, observed, rate, duration, measured):
-    """Verify EXECUTION with controller-observed timing and population:
-    the child ran `measured` seconds wall-clock (GO release to exit, timed
-    here, never from child stamps) and produced this many observations.
-    Producing n observations at rate/s takes at least (n-1)/rate seconds;
-    the floor is half that to absorb scheduling jitter while still
-    catching all-at-once output with synthetic timestamps. The run must
-    also fit its duration budget plus dump/exit slack. Child profile and
-    stamp claims are ignored here: measurement decides."""
+def check_pace_measured(reasons, observed, rate, duration, measured, arrivals):
+    """Verify EXECUTION from controller-observed delivery timing: every
+    observation must arrive as a progress line on the child's stdout
+    (timestamped here at delivery, never from child stamps), the streamed
+    population must equal the file's observations exactly, and every
+    consecutive inter-arrival gap must meet the paced floor (half the
+    nominal gap, absorbing scheduling jitter while catching bursty
+    delivery). The driver ACKs each line, so controller-side delay can
+    only spread arrivals, never compress them: a sub-floor gap proves
+    bursty delivery. Total child lifetime never substitutes for paced
+    delivery — but the run must still fit its duration budget plus
+    dump/exit slack. Child profile and stamp claims are ignored here:
+    measurement decides."""
     calls = observed.get("invocations", [])
     records = observed.get("records", [])
     population = len(calls) + len(records)
     if population == 0:
         # No observations at all: the empty-observation rule owns this.
         return
-    floor = (population - 1) / rate / 2
-    if measured < floor:
+    progress = []
+    for line, stamp_ns in arrivals:
+        try:
+            document = json.loads(line)
+        except ValueError:
+            reasons.append(
+                f"STREAM_MALFORMED: progress line {len(progress) + 1} is not JSON"
+            )
+            return
+        if not isinstance(document, dict):
+            reasons.append(
+                f"STREAM_MALFORMED: progress line {len(progress) + 1} is not an object"
+            )
+            return
+        kind = document.get("progress")
+        if kind == "call" and type(document.get("seq")) is int:
+            progress.append(("call", document["seq"], stamp_ns))
+        elif kind == "record" and type(document.get("ordinal")) is int:
+            progress.append(("record", document["ordinal"], stamp_ns))
+        else:
+            reasons.append(
+                f"STREAM_MALFORMED: progress line {len(progress) + 1} "
+                "names no call/record observation"
+            )
+            return
+    streamed_calls = sorted(
+        (identity for kind, identity, _ in progress if kind == "call"), key=repr
+    )
+    streamed_records = sorted(
+        (identity for kind, identity, _ in progress if kind == "record"), key=repr
+    )
+    file_calls = sorted(
+        (call.get("seq") for call in calls if isinstance(call, dict)), key=repr
+    )
+    file_records = sorted(
+        (record.get("ordinal") for record in records if isinstance(record, dict)),
+        key=repr,
+    )
+    if streamed_calls != file_calls or streamed_records != file_records:
         reasons.append(
-            f"PACING_TOO_FAST: controller measured {measured:.3f}s for "
-            f"{population} observations at {rate}/s (floor {floor:.3f}s)"
+            f"STREAM_POPULATION_MISMATCH: streamed {len(progress)} progress "
+            f"observations, file holds {population} (calls "
+            f"{len(streamed_calls)}/{len(file_calls)}, records "
+            f"{len(streamed_records)}/{len(file_records)})"
         )
+        return
+    floor = 1_000_000_000 // rate // 2
+    for earlier, later in zip(progress, progress[1:]):
+        gap = later[2] - earlier[2]
+        if gap < floor:
+            reasons.append(
+                f"PACING_TOO_FAST: controller-observed inter-arrival {gap}ns "
+                f"below floor {floor}ns at {rate}/s"
+            )
+            break
     budget = duration + max(10.0, 0.25 * duration)
     if measured > budget:
         reasons.append(
@@ -153,10 +211,11 @@ def compare(observed, ledger, observed_raw, ledger_raw, run=None):
     `ledger_raw` is the exact frozen bytes the comparison binds to: the
     observed output must carry their digest, so output produced against
     any other ledger fails here. `run` is None for a standalone
-    comparison, or a (rate, duration, measured, token) tuple for a
-    driven run: the output must echo this run's nonce (freshness binds
-    to the current invocation; pre-existing or foreign output fails),
-    and pace is controller-measured from `measured`, never from child
+    comparison, or a (rate, duration, measured, token, arrivals) tuple
+    for a driven run: the output must echo this run's nonce (freshness
+    binds to the current invocation; pre-existing or foreign output
+    fails), and pace is controller-measured from the streamed progress
+    `arrivals` (line text plus delivery timestamp), never from child
     timestamps."""
     reasons = []
     if not isinstance(observed, dict) or observed.get("schema") != LEDGER_SCHEMA:
@@ -254,7 +313,7 @@ def compare(observed, ledger, observed_raw, ledger_raw, run=None):
     if run is None:
         check_pace(reasons, observed)
     else:
-        check_pace_measured(reasons, observed, run[0], run[1], run[2])
+        check_pace_measured(reasons, observed, run[0], run[1], run[2], run[4])
     return reasons
 
 
@@ -391,21 +450,54 @@ def run_profile(args):
         print(f"harness: cannot spawn provider: {error}", file=sys.stderr)
         return 3
     assert child.stdout is not None and child.stdin is not None
-    lines: queue.Queue = queue.Queue()
+    # One nonblocking line pump over the child's stdout serves READY and
+    # the paced progress stream: each complete line is timestamped
+    # (monotonic_ns) as its newline arrives and ACKed back on stdin, so
+    # an honest child paces itself against the controller's reads —
+    # controller-side delay can only spread arrivals, never compress
+    # them. Bytes the child sent before GO (hostile pre-printing) stay
+    # buffered and timestamp late, clustering correctly as unpaced.
+    fd = child.stdout.fileno()
+    os.set_blocking(fd, False)
+    sel = selectors.DefaultSelector()
+    sel.register(fd, selectors.EVENT_READ)
+    buf = bytearray()
 
-    def pump():
+    def read_chunk(deadline_at):
+        """One select-bounded nonblocking read. Returns b"" on EOF and
+        raises TimeoutError on deadline."""
+        remaining = deadline_at - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        if not sel.select(timeout=remaining):
+            raise TimeoutError
         try:
-            lines.put(child.stdout.readline())
-        except Exception:
-            lines.put("")
+            return os.read(fd, 65536)
+        except BlockingIOError:
+            return None
 
-    watcher = threading.Thread(target=pump, daemon=True)
-    watcher.start()
+    def next_line(deadline_at):
+        """Next complete stdout line, or None on EOF. Raises TimeoutError
+        on deadline."""
+        nonlocal buf
+        while True:
+            newline = buf.find(b"\n")
+            if newline >= 0:
+                raw_line = bytes(buf[:newline])
+                del buf[: newline + 1]
+                return raw_line.decode("utf-8", errors="replace")
+            chunk = read_chunk(deadline_at)
+            if chunk is None:
+                continue
+            if chunk == b"":
+                return None
+            buf += chunk
+
     try:
-        ready = lines.get(timeout=min(READY_SECONDS, deadline))
-    except queue.Empty:
-        ready = ""
-    if not ready:
+        ready = next_line(time.monotonic() + min(READY_SECONDS, deadline))
+    except TimeoutError:
+        ready = None
+    if ready is None:
         child.kill()
         print("harness: READY timeout", file=sys.stderr)
         return 3
@@ -421,8 +513,47 @@ def run_profile(args):
         print("harness: provider exited before GO", file=sys.stderr)
         return 3
     go_at = time.monotonic()
+    deadline_at = go_at + deadline
+    arrivals = []
+    ack_dead = False
+    flooded = False
+    while True:
+        if len(arrivals) >= PROGRESS_FLOOD_CAP:
+            flooded = True
+            break
+        try:
+            line = next_line(deadline_at)
+        except TimeoutError:
+            child.kill()
+            child.communicate()
+            print(f"harness: provider deadline after {deadline}s", file=sys.stderr)
+            return 3
+        if line is None:
+            break
+        arrivals.append((line, time.monotonic_ns()))
+        if not ack_dead:
+            try:
+                child.stdin.write("ACK\n")
+                child.stdin.flush()
+            except (BrokenPipeError, OSError):
+                # The child stopped reading ACKs (or exited): keep
+                # draining its stdout — lines already in flight still
+                # count — but stop writing.
+                ack_dead = True
+    if flooded:
+        child.kill()
+        child.communicate()
+        print(
+            f"harness: progress flood over {PROGRESS_FLOOD_CAP} lines", file=sys.stderr
+        )
+        return 3
+    if buf:
+        # A dangling fragment without its newline is malformed progress,
+        # never a silently dropped observation.
+        arrivals.append((bytes(buf).decode("utf-8", errors="replace"), time.monotonic_ns()))
+    os.set_blocking(fd, True)
     try:
-        _, stderr = child.communicate(timeout=deadline)
+        _, stderr = child.communicate(timeout=max(0.0, deadline_at - time.monotonic()))
     except subprocess.TimeoutExpired:
         child.kill()
         child.communicate()
@@ -437,7 +568,7 @@ def run_profile(args):
         f"measured={measured:.3f}s provider={args.provider}"
     )
     return check_bound(
-        args.out, ledger_raw, (rate, duration, measured, run_token), True
+        args.out, ledger_raw, (rate, duration, measured, run_token, arrivals), True
     )
 
 

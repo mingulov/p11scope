@@ -109,6 +109,157 @@ print(json.dumps({"schema": "p11scope/object-journal-ready/v1",
 assert sys.stdin.readline().strip() == "GO"
 """
 
+BURST_CHILD = """#!/usr/bin/env python3
+import argparse, hashlib, json, os, sys, time
+parser = argparse.ArgumentParser()
+parser.add_argument("--ledger", required=True)
+parser.add_argument("--out", required=True)
+parser.add_argument("--rate", default=None)
+parser.add_argument("--duration", default=None)
+parser.add_argument("--run-token", default=None)
+args = parser.parse_args()
+raw = open(args.ledger, "rb").read()
+ledger = json.loads(raw.decode("utf-8"))
+print(json.dumps({"schema": "p11scope/object-journal-ready/v1",
+                  "provider": "burst-child", "pid": os.getpid(),
+                  "abi": ledger["provider"]["abi"],
+                  "ledger_digest": hashlib.sha256(raw).hexdigest()}), flush=True)
+assert sys.stdin.readline().strip() == "GO"
+time.sleep(0.2)
+observed = json.loads(json.dumps(ledger))
+observed["key_material"] = None
+observed["ledger_digest"] = hashlib.sha256(raw).hexdigest()
+observed["run_token"] = args.run_token
+observed["profile"] = {"rate": int(args.rate), "duration": int(args.duration)}
+observed.pop("trace", None)
+open(args.out, "w").write(json.dumps(observed, sort_keys=True))
+"""
+
+PACED_CHILD = """#!/usr/bin/env python3
+import argparse, hashlib, json, os, sys, time
+parser = argparse.ArgumentParser()
+parser.add_argument("--ledger", required=True)
+parser.add_argument("--out", required=True)
+parser.add_argument("--rate", default=None)
+parser.add_argument("--duration", default=None)
+parser.add_argument("--run-token", default=None)
+args = parser.parse_args()
+raw = open(args.ledger, "rb").read()
+ledger = json.loads(raw.decode("utf-8"))
+print(json.dumps({"schema": "p11scope/object-journal-ready/v1",
+                  "provider": "paced-child", "pid": os.getpid(),
+                  "abi": ledger["provider"]["abi"],
+                  "ledger_digest": hashlib.sha256(raw).hexdigest()}), flush=True)
+assert sys.stdin.readline().strip() == "GO"
+rate = int(args.rate)
+first = True
+for call in ledger["invocations"]:
+    if not first:
+        time.sleep(1.0 / rate)
+    first = False
+    print(json.dumps({"progress": "call", "seq": call["seq"]}), flush=True)
+    assert sys.stdin.readline().strip() == "ACK"
+for record in ledger["records"]:
+    time.sleep(1.0 / rate)
+    print(json.dumps({"progress": "record", "ordinal": record["ordinal"]}), flush=True)
+    assert sys.stdin.readline().strip() == "ACK"
+observed = json.loads(json.dumps(ledger))
+observed["key_material"] = None
+observed["ledger_digest"] = hashlib.sha256(raw).hexdigest()
+observed["run_token"] = args.run_token
+observed["profile"] = {"rate": 1, "duration": 60}
+observed.pop("trace", None)
+open(args.out, "w").write(json.dumps(observed, sort_keys=True))
+"""
+
+PARTIAL_CHILD = """#!/usr/bin/env python3
+import argparse, hashlib, json, os, sys
+parser = argparse.ArgumentParser()
+parser.add_argument("--ledger", required=True)
+parser.add_argument("--out", required=True)
+parser.add_argument("--rate", default=None)
+parser.add_argument("--duration", default=None)
+parser.add_argument("--run-token", default=None)
+args = parser.parse_args()
+raw = open(args.ledger, "rb").read()
+ledger = json.loads(raw.decode("utf-8"))
+print(json.dumps({"schema": "p11scope/object-journal-ready/v1",
+                  "provider": "partial-child", "pid": os.getpid(),
+                  "abi": ledger["provider"]["abi"],
+                  "ledger_digest": hashlib.sha256(raw).hexdigest()}), flush=True)
+assert sys.stdin.readline().strip() == "GO"
+for call in ledger["invocations"][:3]:
+    print(json.dumps({"progress": "call", "seq": call["seq"]}), flush=True)
+observed = json.loads(json.dumps(ledger))
+observed["key_material"] = None
+observed["ledger_digest"] = hashlib.sha256(raw).hexdigest()
+observed["run_token"] = args.run_token
+observed.pop("trace", None)
+open(args.out, "w").write(json.dumps(observed, sort_keys=True))
+"""
+
+GARBAGE_CHILD = """#!/usr/bin/env python3
+import argparse, hashlib, json, os, sys
+parser = argparse.ArgumentParser()
+parser.add_argument("--ledger", required=True)
+parser.add_argument("--out", required=True)
+parser.add_argument("--rate", default=None)
+parser.add_argument("--duration", default=None)
+parser.add_argument("--run-token", default=None)
+args = parser.parse_args()
+raw = open(args.ledger, "rb").read()
+ledger = json.loads(raw.decode("utf-8"))
+print(json.dumps({"schema": "p11scope/object-journal-ready/v1",
+                  "provider": "garbage-child", "pid": os.getpid(),
+                  "abi": ledger["provider"]["abi"],
+                  "ledger_digest": hashlib.sha256(raw).hexdigest()}), flush=True)
+assert sys.stdin.readline().strip() == "GO"
+print("NOT-A-PROGRESS-LINE", flush=True)
+observed = json.loads(json.dumps(ledger))
+observed["key_material"] = None
+observed["ledger_digest"] = hashlib.sha256(raw).hexdigest()
+observed["run_token"] = args.run_token
+observed.pop("trace", None)
+open(args.out, "w").write(json.dumps(observed, sort_keys=True))
+"""
+
+TWOBURST_CHILD = """#!/usr/bin/env python3
+import argparse, hashlib, json, os, sys, time
+parser = argparse.ArgumentParser()
+parser.add_argument("--ledger", required=True)
+parser.add_argument("--out", required=True)
+parser.add_argument("--rate", default=None)
+parser.add_argument("--duration", default=None)
+parser.add_argument("--run-token", default=None)
+args = parser.parse_args()
+raw = open(args.ledger, "rb").read()
+ledger = json.loads(raw.decode("utf-8"))
+print(json.dumps({"schema": "p11scope/object-journal-ready/v1",
+                  "provider": "twoburst-child", "pid": os.getpid(),
+                  "abi": ledger["provider"]["abi"],
+                  "ledger_digest": hashlib.sha256(raw).hexdigest()}), flush=True)
+assert sys.stdin.readline().strip() == "GO"
+lines = (
+    [{"progress": "call", "seq": call["seq"]} for call in ledger["invocations"][:3]]
+    + [{"progress": "record", "ordinal": record["ordinal"]}
+       for record in ledger["records"][:4]]
+    + [{"progress": "call", "seq": call["seq"]} for call in ledger["invocations"][3:]]
+    + [{"progress": "record", "ordinal": record["ordinal"]}
+       for record in ledger["records"][4:]]
+)
+for line in lines[:7]:
+    print(json.dumps(line), flush=True)
+time.sleep(1.0)
+for line in lines[7:]:
+    print(json.dumps(line), flush=True)
+observed = json.loads(json.dumps(ledger))
+observed["key_material"] = None
+observed["ledger_digest"] = hashlib.sha256(raw).hexdigest()
+observed["run_token"] = args.run_token
+observed.pop("trace", None)
+open(args.out, "w").write(json.dumps(observed, sort_keys=True))
+"""
+
 NO_TOKEN_CHILD = """#!/usr/bin/env python3
 import argparse, hashlib, json, os, sys
 parser = argparse.ArgumentParser()
@@ -459,7 +610,7 @@ class PacingTests(unittest.TestCase):
                 "100",
             )
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-            self.assertIn("PACING_TOO_FAST", proc.stdout)
+            self.assertIn("STREAM_POPULATION_MISMATCH", proc.stdout)
 
     def crafted(self, tmp, profile, stamps):
         ledger = json.loads(LEDGER.read_bytes())
@@ -825,7 +976,7 @@ class FreshnessTests(unittest.TestCase):
                 "60",
             )
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-            self.assertIn("PACING_TOO_FAST", proc.stdout)
+            self.assertIn("STREAM_POPULATION_MISMATCH", proc.stdout)
 
     def test_missing_token_echo_fails_run(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -847,31 +998,101 @@ class FreshnessTests(unittest.TestCase):
     def test_run_ignores_child_profile_claim(self):
         with tempfile.TemporaryDirectory() as temp:
             # An honestly paced provider passes even while its echoed
-            # profile claim lies: measurement, not the child's word, decides.
-            fake = Path(temp) / "fake-provider.py"
-            fake.write_text(FAKE_PROVIDER)
+            # profile claim lies: controller measurement, not the child's
+            # word, decides. (The old sleep-then-dump premise encoded the
+            # idle-substitute defect; honest pacing now streams progress.)
+            paced = Path(temp) / "paced-child.py"
+            paced.write_text(PACED_CHILD)
             out = str(Path(temp) / "observed.json")
             proc, _ = run_profiled(
                 temp,
                 sys.executable,
-                [
-                    str(fake),
-                    "--ledger",
-                    str(LEDGER),
-                    "--out",
-                    out,
-                    "--fake-profile",
-                    "1,60",
-                    "--fake-sleep",
-                    "2.0",
-                ],
+                [str(paced), "--ledger", str(LEDGER), "--out", out],
                 "--rate",
                 "10",
                 "--duration",
                 "60",
+                "--deadline-seconds",
+                "10",
             )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("PASS", proc.stdout)
+
+
+class PaceStreamingTests(unittest.TestCase):
+    """Carryover 6: pacing comes from controller-observed delivery timing
+    (inter-arrival times of streamed progress at the controller) plus the
+    required population/duration — total child lifetime never substitutes
+    for paced delivery."""
+
+    def test_burst_after_sleep_fails_run(self):
+        with tempfile.TemporaryDirectory() as temp:
+            child = Path(temp) / "burst-child.py"
+            child.write_text(BURST_CHILD)
+            out = str(Path(temp) / "observed.json")
+            proc, _ = run_profiled(
+                temp,
+                sys.executable,
+                [str(child), "--ledger", str(LEDGER), "--out", out],
+                "--rate",
+                "100",
+                "--duration",
+                "60",
+            )
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("STREAM_POPULATION_MISMATCH", proc.stdout)
+            self.assertNotIn("PASS", proc.stdout)
+
+    def test_partial_progress_fails_run(self):
+        with tempfile.TemporaryDirectory() as temp:
+            child = Path(temp) / "partial-child.py"
+            child.write_text(PARTIAL_CHILD)
+            out = str(Path(temp) / "observed.json")
+            proc, _ = run_profiled(
+                temp,
+                sys.executable,
+                [str(child), "--ledger", str(LEDGER), "--out", out],
+                "--rate",
+                "100",
+                "--duration",
+                "60",
+            )
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("STREAM_POPULATION_MISMATCH", proc.stdout)
+
+    def test_malformed_progress_fails_run(self):
+        with tempfile.TemporaryDirectory() as temp:
+            child = Path(temp) / "garbage-child.py"
+            child.write_text(GARBAGE_CHILD)
+            out = str(Path(temp) / "observed.json")
+            proc, _ = run_profiled(
+                temp,
+                sys.executable,
+                [str(child), "--ledger", str(LEDGER), "--out", out],
+                "--rate",
+                "100",
+                "--duration",
+                "60",
+            )
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("STREAM_MALFORMED", proc.stdout)
+
+    def test_two_bursts_fail_run(self):
+        with tempfile.TemporaryDirectory() as temp:
+            child = Path(temp) / "twoburst-child.py"
+            child.write_text(TWOBURST_CHILD)
+            out = str(Path(temp) / "observed.json")
+            proc, _ = run_profiled(
+                temp,
+                sys.executable,
+                [str(child), "--ledger", str(LEDGER), "--out", out],
+                "--rate",
+                "100",
+                "--duration",
+                "60",
+            )
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("PACING_TOO_FAST", proc.stdout)
 
 
 if __name__ == "__main__":

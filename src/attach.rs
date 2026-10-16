@@ -98,7 +98,7 @@ pub(crate) fn semantic_receipt_query_refusal_test(
 }
 #[allow(unused_imports)]
 pub(crate) use instance::{
-    HookStats, INSTANCE_PROGRAMS, InstanceMaps, InstanceTracking, WatchedFile,
+    HookStats, INSTANCE_PROGRAMS, InstanceMaps, InstanceTracking, SessionGrantToken, WatchedFile,
 };
 mod cleanup_worker;
 pub mod identity_iter;

@@ -231,11 +231,22 @@ pub(crate) enum DiscoveryItem {
 /// than an `Iterator`; the scripted test source hands out owned bytes.
 pub trait RecordSource {
     fn next_record(&mut self) -> Option<impl Deref<Target = [u8]> + '_>;
+
+    /// Kernel-discarded reservations this source's reader has consumed
+    /// so far. The retained Aya reader counts them; scripted sources
+    /// report none unless a test says otherwise.
+    fn discarded(&self) -> u64 {
+        0
+    }
 }
 
 impl RecordSource for aya::maps::RingBuf<MapData> {
     fn next_record(&mut self) -> Option<impl Deref<Target = [u8]> + '_> {
         self.next()
+    }
+
+    fn discarded(&self) -> u64 {
+        self.discarded()
     }
 }
 
@@ -786,6 +797,13 @@ impl<S: RecordSource> EventDrain<S> {
     /// Records rejected by the size or affiliation check so far.
     pub fn malformed(&self) -> u64 {
         self.malformed
+    }
+
+    /// Kernel-discarded reservations the retained reader consumed so
+    /// far. Drains audit the per-collection delta and refuse seals
+    /// that span unaccounted discards.
+    pub fn discarded(&self) -> u64 {
+        self.source.discarded()
     }
 
     /// Malformed records since the last delta was taken, advancing the

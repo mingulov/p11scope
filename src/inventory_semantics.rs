@@ -131,6 +131,11 @@ pub(crate) struct SemanticBatch {
     current: Vec<CurrentPartitionReceipt>,
     negatives: Vec<LaneNegative>,
     observed_ns: u64,
+    /// H3 disposition inputs carried from the tick report: the
+    /// route-waiting floor, the merge-shed floor, and exhaustion.
+    awaiting_floor: Option<u64>,
+    shed_floor: Option<u64>,
+    exhausted: bool,
 }
 
 /// Lane negatives per batch: one cut barrier plus bounded collection
@@ -156,6 +161,9 @@ impl SemanticBatch {
         negatives: Vec<LaneNegative>,
         observed_ns: u64,
     ) -> Result<Self, SemanticRefusal> {
+        let awaiting_floor = report.awaiting_floor();
+        let shed_floor = report.shed_floor();
+        let exhausted = report.exhausted();
         let (outcomes, current) = report.into_parts();
         if outcomes.len() > crate::discovery::instances::MAX_INSTANCES
             || current.len() > crate::discovery::instances::MAX_INSTANCES
@@ -169,6 +177,9 @@ impl SemanticBatch {
             current,
             negatives,
             observed_ns,
+            awaiting_floor,
+            shed_floor,
+            exhausted,
         })
     }
 
@@ -188,6 +199,34 @@ impl SemanticBatch {
 
     pub(crate) fn observed_ns(&self) -> u64 {
         self.observed_ns
+    }
+
+    /// H3 disposition inputs for the finalizer derivation.
+    pub(crate) fn awaiting_floor(&self) -> Option<u64> {
+        self.awaiting_floor
+    }
+    pub(crate) fn shed_floor(&self) -> Option<u64> {
+        self.shed_floor
+    }
+    pub(crate) fn exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Minimum outcome position without consuming: the unpublished
+    /// floor for a staged-but-unfinalized batch. An empty batch
+    /// constrains nothing; an unpositioned outcome floors at zero
+    /// (undisposed, never skipped).
+    pub(crate) fn min_outcome_position(&self) -> Option<u64> {
+        if self.outcomes.is_empty() {
+            return None;
+        }
+        Some(
+            self.outcomes
+                .iter()
+                .map(|outcome| outcome.position().unwrap_or(0))
+                .min()
+                .unwrap_or(0),
+        )
     }
 
     /// Current receipts must reach validation promptly, preserving
@@ -428,6 +467,10 @@ pub(crate) struct RefreshReceiptStash {
     stashed: std::collections::VecDeque<CurrentPartitionReceipt>,
     outcomes: std::collections::VecDeque<TickOutcome>,
     shed: u64,
+    /// Minimum shed outcome position: stash overflow drops positioned
+    /// history, so the next merge carries it as a loss barrier. Taken
+    /// on handoff; each shed reports exactly once.
+    shed_floor: Option<u64>,
 }
 
 impl RefreshReceiptStash {
@@ -456,19 +499,45 @@ impl RefreshReceiptStash {
         }
         self.outcomes.extend(outcomes);
         while self.outcomes.len() > MAX_STASHED_REFRESH_RECEIPTS {
-            if let Some(at) = self
+            let dropped = if let Some(at) = self
                 .outcomes
                 .iter()
                 .position(|outcome| !outcome.is_invalidation())
             {
-                self.outcomes.remove(at);
+                self.outcomes.remove(at)
             } else {
-                self.outcomes.pop_front();
+                self.outcomes.pop_front()
+            };
+            if let Some(outcome) = dropped
+                && let Some(position) = outcome.position()
+            {
+                self.shed_floor = Some(self.shed_floor.map_or(position, |at| at.min(position)));
             }
             shed += 1;
         }
         self.shed = self.shed.saturating_add(shed);
         shed
+    }
+
+    /// Take the stash's shed floor for one merge handoff, resetting it.
+    pub(crate) fn take_shed_floor(&mut self) -> Option<u64> {
+        self.shed_floor.take()
+    }
+
+    /// Minimum stashed outcome position without consuming: undisposed
+    /// history awaiting the next merge. An empty stash constrains
+    /// nothing; an unpositioned outcome floors at zero.
+    pub(crate) fn min_outcome_position(&self) -> Option<u64> {
+        if self.outcomes.is_empty() {
+            return None;
+        }
+        Some(
+            self.outcomes
+                .iter()
+                .map(|outcome| outcome.position().unwrap_or(0))
+                .min()
+                .unwrap_or(0),
+        )
     }
 
     /// Whether the stash holds nothing to merge.
@@ -529,7 +598,9 @@ pub(crate) fn merge_stash_into_report(
     report: &mut TickReport,
 ) -> u64 {
     let shed = report.merge_stashed_current(stash.take());
-    shed.saturating_add(report.merge_stashed_outcomes(stash.take_outcomes()))
+    let shed = shed.saturating_add(report.merge_stashed_outcomes(stash.take_outcomes()));
+    report.absorb_shed_floor(stash.take_shed_floor());
+    shed
 }
 
 /// The custody Arc H0 actually retained for a refresh report: the
@@ -615,6 +686,16 @@ impl AttestedSemanticLane {
             #[cfg(test)]
             last_conversion_barrier: None,
         })
+    }
+
+    /// Lane-stash pending floor for the finalizer's disposition: the
+    /// minimum stashed (undisposed, awaiting merge) outcome position. A
+    /// shell lane stashes nothing. Stash overflow sheds ride the merged
+    /// report's shed floor instead (taken at merge handoff).
+    pub(crate) fn stash_pending_floor(&self) -> Option<u64> {
+        self.live
+            .as_ref()
+            .and_then(|live| live.stashed_refresh.min_outcome_position())
     }
 
     /// Live startup over two subset mints from the same retained accepted

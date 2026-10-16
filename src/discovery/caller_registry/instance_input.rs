@@ -176,6 +176,31 @@ impl AdmittedInstanceCall {
             self.caller,
         )
     }
+
+    /// Journal per-call authority (H8): this admitted call's
+    /// attribution shape for staged-BEGIN matching. `None` when the
+    /// call cannot name its instance (unattributable) or names no
+    /// catalog function: such admissions bind the key but authorize no
+    /// staged call. Only the journal child reads this.
+    pub(crate) fn journal_call_fingerprint(
+        &self,
+    ) -> Option<crate::semantics_objects::journal::CallFingerprint> {
+        use crate::semantics_objects::journal::CallFingerprint;
+        if !self.facts.attributable {
+            return None;
+        }
+        let function = crate::kinds::function_id(&self.facts.function)?;
+        Some(CallFingerprint {
+            image: (self.key.image.task_cookie, self.key.image.exec_id),
+            function,
+            session: self.facts.session,
+            mechanism: self.facts.mechanism,
+            capture: self.facts.capture,
+            slot_id: self.facts.slot_id,
+            flags: self.facts.flags,
+            user_type: self.facts.user_type,
+        })
+    }
 }
 
 enum InstanceScope {

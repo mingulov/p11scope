@@ -608,7 +608,9 @@ fn native_semantic_resource_final_types_pinned() {
     // Final H3 Task5 types, pinned like Edge360/Pending144. Compiler and
     // target ABI are guarded by resources.rs; these pins catch layout drift
     // before SYSTEM activation. Measured on Rust 1.98.1 x86-64 Linux.
-    assert_eq!(size_of::<crate::inventory_semantics::SemanticBatch>(), 88);
+    // SemanticBatch carries the H3 disposition inputs C5 requires
+    // (awaiting/shed floors plus exhaustion: +40 B over the 88 B base).
+    assert_eq!(size_of::<crate::inventory_semantics::SemanticBatch>(), 128);
     assert_eq!(size_of::<crate::inventory_semantics::LaneNegative>(), 16);
     assert_eq!(
         size_of::<crate::inventory_semantics::LaneCollectionRefusal>(),
@@ -624,7 +626,9 @@ fn native_semantic_resource_final_types_pinned() {
     // (+248 each, measured 680 on Rust 1.98.1 x86-64 Linux). The pins
     // keep catching any further drift before SYSTEM activation.
     assert_eq!(size_of::<crate::semantic_capture::TickOutcome>(), 680);
-    assert_eq!(size_of::<crate::semantic_capture::TickReport>(), 112);
+    // TickReport carries the H0 disposition watermarks C5 requires
+    // (allocated floor, awaiting/shed floors, exhaustion: +48 B).
+    assert_eq!(size_of::<crate::semantic_capture::TickReport>(), 160);
     assert_eq!(size_of::<crate::semantic_capture::RoutedCall>(), 680);
     // H6 retains the calibrated mapped-file identity in the watched target.
     assert_eq!(

@@ -8,8 +8,10 @@ from API calls, the bootstrap witness, loss markers and a private-key
 privacy scan. Drives a provider child through READY validation, GO release
 and an owned-child deadline. The ledger file is bound once per run and
 every comparison checks the observed output against those exact bytes;
---run paces the provider at the requested profile rate and verifies the
-observed pace, and an empty observation set always fails.
+--run binds output freshness to the current run (a nonce the child must
+echo; pre-existing or foreign output fails) and verifies execution with
+controller-observed timing and population, never child timestamps; an
+empty observation set always fails.
 
 Live BPF measurements stay UNRUN: this round executes only --plan-only,
 --check and --run against the repository stub provider. A privileged
@@ -19,9 +21,11 @@ import argparse
 import hashlib
 import json
 import queue
+import secrets
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 LEDGER_SCHEMA = "p11scope/object-journal-ledger/v1"
@@ -65,32 +69,50 @@ def well_formed_profile(profile):
     )
 
 
-def check_pace(reasons, observed, expected):
-    """Verify the observed pace: the profile the provider ran under must
-    be the requested one (when the run requested one), every observation
-    carries its stamp, consecutive stamps respect the rate floor, and
-    the observed span fits the duration. Integer nanoseconds throughout;
-    the rate floor is half the nominal pace to absorb scheduling jitter
-    while still catching unpaced (all-at-once) output."""
-    profile = observed.get("profile")
-    if expected is not None:
-        if profile is None:
-            reasons.append("PACING_MISSING: provider ran unpaced under a paced run")
-            return
-        if profile != {"rate": expected[0], "duration": expected[1]}:
-            reasons.append(
-                f"PROFILE_MISMATCH: provider ran {profile!r}, "
-                f"run requested rate={expected[0]}/s duration={expected[1]}s"
-            )
-            return
-        rate, duration = expected
-    elif well_formed_profile(profile):
-        rate, duration = profile["rate"], profile["duration"]
-    elif profile is None:
+def check_pace_measured(reasons, observed, rate, duration, measured):
+    """Verify EXECUTION with controller-observed timing and population:
+    the child ran `measured` seconds wall-clock (GO release to exit, timed
+    here, never from child stamps) and produced this many observations.
+    Producing n observations at rate/s takes at least (n-1)/rate seconds;
+    the floor is half that to absorb scheduling jitter while still
+    catching all-at-once output with synthetic timestamps. The run must
+    also fit its duration budget plus dump/exit slack. Child profile and
+    stamp claims are ignored here: measurement decides."""
+    calls = observed.get("invocations", [])
+    records = observed.get("records", [])
+    population = len(calls) + len(records)
+    if population == 0:
+        # No observations at all: the empty-observation rule owns this.
         return
-    else:
+    floor = (population - 1) / rate / 2
+    if measured < floor:
+        reasons.append(
+            f"PACING_TOO_FAST: controller measured {measured:.3f}s for "
+            f"{population} observations at {rate}/s (floor {floor:.3f}s)"
+        )
+    budget = duration + max(10.0, 0.25 * duration)
+    if measured > budget:
+        reasons.append(
+            f"PACING_SPAN_EXCEEDED: controller measured {measured:.3f}s over "
+            f"{duration}s (budget {budget:.3f}s)"
+        )
+
+
+def check_pace(reasons, observed):
+    """Standalone (--check) stamp self-consistency: when the file carries
+    a well-formed profile, every observation carries its stamp,
+    consecutive stamps respect the rate floor, and the stamp span fits
+    the duration. This checks the FILE's internal consistency only; it
+    proves nothing about execution. --run never calls this: execution
+    pace there is controller-measured (see check_pace_measured), and
+    child profile/stamp claims are untrusted."""
+    profile = observed.get("profile")
+    if profile is None:
+        return
+    if not well_formed_profile(profile):
         reasons.append("PACING_INCOMPLETE: observed profile is malformed")
         return
+    rate, duration = profile["rate"], profile["duration"]
     stamps = []
     for call in observed.get("invocations", []):
         stamp = call.get("observed_at") if isinstance(call, dict) else None
@@ -125,16 +147,24 @@ def check_pace(reasons, observed, expected):
         )
 
 
-def compare(observed, ledger, observed_raw, ledger_raw, expected_profile):
+def compare(observed, ledger, observed_raw, ledger_raw, run=None):
     """The rejection rules. Returns a list of FAIL reason tags (empty passes).
 
     `ledger_raw` is the exact frozen bytes the comparison binds to: the
     observed output must carry their digest, so output produced against
-    any other ledger fails here. `expected_profile` is the (rate,
-    duration) the run requested, or None for a standalone comparison."""
+    any other ledger fails here. `run` is None for a standalone
+    comparison, or a (rate, duration, measured, token) tuple for a
+    driven run: the output must echo this run's nonce (freshness binds
+    to the current invocation; pre-existing or foreign output fails),
+    and pace is controller-measured from `measured`, never from child
+    timestamps."""
     reasons = []
     if not isinstance(observed, dict) or observed.get("schema") != LEDGER_SCHEMA:
         return ["SCHEMA_MISMATCH: observed schema is not " + LEDGER_SCHEMA]
+    if run is not None and observed.get("run_token") != run[3]:
+        reasons.append(
+            "RUN_TOKEN_MISMATCH: observed output does not echo this run's nonce"
+        )
     if observed.get("ledger_digest") != hashlib.sha256(ledger_raw).hexdigest():
         reasons.append("LEDGER_UNBOUND: observed output was not produced against this ledger")
     want_bootstrap = ledger.get("bootstrap") or {}
@@ -201,14 +231,25 @@ def compare(observed, ledger, observed_raw, ledger_raw, expected_profile):
         reasons.append("KEY_MATERIAL_LEAK: observed output carries key material")
     if KEY_SENTINEL in observed_raw:
         reasons.append("KEY_MATERIAL_LEAK: observed bytes contain the key sentinel")
-    check_pace(reasons, observed, expected_profile)
+    if run is None:
+        check_pace(reasons, observed)
+    else:
+        check_pace_measured(reasons, observed, run[0], run[1], run[2])
     return reasons
 
 
-def check_bound(observed_path, ledger_raw, expected_profile):
-    """Compare one observed file against already-bound ledger bytes."""
+def check_bound(observed_path, ledger_raw, run=None, missing_is_stale=False):
+    """Compare one observed file against already-bound ledger bytes. A
+    driven run passes missing_is_stale: its output file was deleted
+    before the child spawned, so a missing/unreadable file after a
+    clean child exit means the child produced no fresh output — a
+    qualification FAIL, never an inheritance of stale bytes."""
     observed, error = load_json(observed_path, "observed output")
     if error:
+        if missing_is_stale:
+            print("FAIL object-journal qualification")
+            print(f"FAIL STALE_OUTPUT: no fresh output from this run ({error})")
+            return 1
         return fail(error)
     try:
         ledger = json.loads(ledger_raw.decode("utf-8"))
@@ -216,7 +257,7 @@ def check_bound(observed_path, ledger_raw, expected_profile):
         return fail(f"cannot parse ledger: {error}")
     raw = Path(observed_path).read_text(encoding="utf-8", errors="replace")
     reasons = compare(
-        observed, ledger, raw, ledger_raw, expected_profile,
+        observed, ledger, raw, ledger_raw, run,
     )
     if reasons:
         print("FAIL object-journal qualification")
@@ -232,7 +273,7 @@ def run_check(args):
         ledger_raw = Path(args.ledger).read_bytes()
     except OSError as error:
         return fail(f"cannot read ledger {args.ledger}: {error}")
-    return check_bound(args.observed, ledger_raw, None)
+    return check_bound(args.observed, ledger_raw)
 
 
 def run_plan(args):
@@ -296,9 +337,18 @@ def run_profile(args):
     except OSError as error:
         print(f"harness: cannot bind ledger {args.ledger}: {error}", file=sys.stderr)
         return 3
-    # The requested pace rides along last so a smuggled provider-side
-    # --rate/--duration cannot quiet the run's profile: later argparse
-    # options win, and the comparison verifies the observed pace.
+    # Freshness binds to THIS invocation: a random nonce the child must
+    # echo, plus deletion of any pre-existing output before the spawn,
+    # so stale bytes can neither pass nor be inherited.
+    run_token = secrets.token_hex(16)
+    try:
+        Path(args.out).unlink()
+    except OSError:
+        pass
+    # The requested pace and nonce ride along last so smuggled
+    # provider-side --rate/--duration/--run-token cannot quiet the
+    # run's profile: later argparse options win, and the comparison
+    # verifies the echoed nonce plus controller-measured execution.
     command = [
         args.provider,
         *(args.provider_arg or []),
@@ -306,6 +356,8 @@ def run_profile(args):
         str(rate),
         "--duration",
         str(duration),
+        "--run-token",
+        run_token,
     ]
     try:
         child = subprocess.Popen(
@@ -348,6 +400,7 @@ def run_profile(args):
     except BrokenPipeError:
         print("harness: provider exited before GO", file=sys.stderr)
         return 3
+    go_at = time.monotonic()
     try:
         _, stderr = child.communicate(timeout=deadline)
     except subprocess.TimeoutExpired:
@@ -355,11 +408,17 @@ def run_profile(args):
         child.communicate()
         print(f"harness: provider deadline after {deadline}s", file=sys.stderr)
         return 3
+    measured = time.monotonic() - go_at
     if child.returncode != 0:
         print(f"harness: provider exited {child.returncode}: {stderr.strip()}", file=sys.stderr)
         return 3
-    print(f"profile complete: rate={rate}/s duration={duration}s provider={args.provider}")
-    return check_bound(args.out, ledger_raw, (rate, duration))
+    print(
+        f"profile complete: rate={rate}/s duration={duration}s "
+        f"measured={measured:.3f}s provider={args.provider}"
+    )
+    return check_bound(
+        args.out, ledger_raw, (rate, duration, measured, run_token), True
+    )
 
 
 def parse_args(argv):

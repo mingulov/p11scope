@@ -190,6 +190,26 @@ def compare(observed, ledger, observed_raw, ledger_raw, run=None):
             f"INVOCATION_COUNT_MISMATCH: observed {len(got_calls)} calls, "
             f"ledger holds {len(want_calls)}"
         )
+    # Duplicate observed identities reject explicitly (equality-based:
+    # unhashable hostile fields still compare, never crash the oracle).
+    seen_seqs = []
+    for call in got_calls:
+        seq = call.get("seq") if isinstance(call, dict) else None
+        if seq in seen_seqs:
+            reasons.append(
+                f"DUPLICATE_INVOCATION: observed invocations repeat seq {seq!r}"
+            )
+            break
+        seen_seqs.append(seq)
+    seen_ordinals = []
+    for record in got_records:
+        ordinal = record.get("ordinal") if isinstance(record, dict) else None
+        if ordinal in seen_ordinals:
+            reasons.append(
+                f"DUPLICATE_RECORD: observed journal records repeat ordinal {ordinal!r}"
+            )
+            break
+        seen_ordinals.append(ordinal)
     for want, got in zip(want_calls, got_calls):
         if not isinstance(got, dict):
             reasons.append(f"INVOCATION_MISMATCH seq={want.get('seq')}: not an object")

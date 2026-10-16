@@ -1012,7 +1012,9 @@ impl<'m> LiveBirthRows<'m> {
 /// has no admission to read back (missing/busy/unreadable is not
 /// clean zero) — the observation refuses instead of admitting a
 /// fabricated default.
-fn marker_row_or_refuse(row: Option<InstanceRecord>) -> std::result::Result<InstanceRecord, BirthRowError> {
+fn marker_row_or_refuse(
+    row: Option<InstanceRecord>,
+) -> std::result::Result<InstanceRecord, BirthRowError> {
     row.ok_or(BirthRowError::Unreadable)
 }
 
@@ -1364,9 +1366,8 @@ fn fetch_add_mmapped_attach(fd: BorrowedFd<'_>) -> Result<u64> {
     );
     // SAFETY: the attach cell is an aligned u64 inside the mapped page.
     let cell = unsafe {
-        &*((address as *const u8).add(
-            usize::try_from(GEN_ATTACH).expect("attach cell index") * 8,
-        ) as *const std::sync::atomic::AtomicU64)
+        &*((address as *const u8).add(usize::try_from(GEN_ATTACH).expect("attach cell index") * 8)
+            as *const std::sync::atomic::AtomicU64)
     };
     let minted = mint_attach_cell(cell);
     // SAFETY: exactly the mapping created above.

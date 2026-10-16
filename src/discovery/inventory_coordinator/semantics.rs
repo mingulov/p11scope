@@ -1464,7 +1464,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &mut self,
     ) -> crate::semantics_objects::journal::H3DispositionEvidence {
         use crate::semantics_objects::journal::H3DispositionEvidence;
-        self.h3_pending.take().unwrap_or_else(H3DispositionEvidence::genesis)
+        self.h3_pending
+            .take()
+            .unwrap_or_else(H3DispositionEvidence::genesis)
     }
 
     /// The seal's H3-loss acknowledgement: H0 positions below
@@ -1472,6 +1474,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// corresponding loss evidence, so barriers there release the next
     /// mint into Clean. Monotone; the joint seal tick forwards the
     /// seal failure's void report here.
+    #[allow(dead_code)] // No production caller until the joint seal tick lands.
     pub(crate) fn acknowledge_h3_void(&mut self, voided_below: u64) {
         self.h3_acked_below = self.h3_acked_below.max(voided_below);
     }
@@ -2055,9 +2058,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 impl crate::semantics_objects::journal::H3EvidenceSource
     for InventoryCoordinator<crate::discovery::caller_registry::OsProcessSource>
 {
-    fn take_h3_disposition(
-        &mut self,
-    ) -> crate::semantics_objects::journal::H3DispositionEvidence {
+    fn take_h3_disposition(&mut self) -> crate::semantics_objects::journal::H3DispositionEvidence {
         InventoryCoordinator::take_h3_disposition(self)
     }
 }
@@ -2671,10 +2672,7 @@ mod finalizer_history_tests {
             ),
         );
         assert!(
-            matches!(
-                still,
-                H3DispositionEvidence::StagedLoss { barrier: 9 }
-            ),
+            matches!(still, H3DispositionEvidence::StagedLoss { barrier: 9 }),
             "unconsumed loss survives a clean batch: {still:?}"
         );
         // The seal's void acknowledgement releases the next mint into

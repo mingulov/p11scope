@@ -98,7 +98,8 @@ pub(crate) fn semantic_receipt_query_refusal_test(
 }
 #[allow(unused_imports)]
 pub(crate) use instance::{
-    HookStats, INSTANCE_PROGRAMS, InstanceMaps, InstanceTracking, SessionGrantToken, WatchedFile,
+    BirthObservationRefusal, HookStats, INSTANCE_PROGRAMS, InstanceMaps, InstanceTracking,
+    SessionGrantToken, WatchedFile, observe_absence_birth, observe_exec_birth,
 };
 mod cleanup_worker;
 pub mod identity_iter;
@@ -1547,12 +1548,12 @@ pub(crate) enum ProducerProgram {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum ProbeSide {
+pub(crate) enum ProbeSide {
     Return,
     Entry,
 }
 
-type StaticEndpoint = (u32, ProbeSide);
+pub(crate) type StaticEndpoint = (u32, ProbeSide);
 
 fn current_static_sides_from(links: &[RegisteredLink]) -> BTreeSet<StaticEndpoint> {
     links
@@ -1899,7 +1900,7 @@ fn entry_program(
 }
 
 #[derive(Debug)]
-struct AttachOutcome {
+pub(crate) struct AttachOutcome {
     successful: BTreeSet<StaticEndpoint>,
     failures: Vec<(u32, String)>,
     completed: Vec<SlotCompletion>,
@@ -1991,7 +1992,7 @@ struct StaticGroup {
 /// multi-group rebuild can reattach surviving siblings without re-deriving
 /// identity; facts survive exactly while a link does.
 #[derive(Debug)]
-struct RetainedStaticTarget {
+pub(crate) struct RetainedStaticTarget {
     slot: Slot,
     path: PathBuf,
     abi: ElfAbi,
@@ -2027,7 +2028,20 @@ impl std::fmt::Debug for AttachedSemanticSet {
     }
 }
 
-fn seal_attached_subset_with(
+impl AttachedSemanticSet {
+    /// The native identity domain this attachment was sealed under.
+    pub(crate) fn domain(&self) -> crate::attach::capture::NativeDomainId {
+        self.domain
+    }
+}
+
+/// Seal one operator-attested subset into Session-owned attachment
+/// authority: the exact descriptors, retained static targets and owned
+/// sides are validated here, never trusted. Production calls this with
+/// live-built maps; host tests with fixture-built maps over the same
+/// validation. The sealed receipt is the successful-attachment
+/// evidence birth observation requires.
+pub(crate) fn seal_attached_subset_with(
     subset: crate::inventory_semantics::AttestedSubset,
     domain: crate::attach::capture::NativeDomainId,
     policy: CapturePolicy,
@@ -2039,6 +2053,58 @@ fn seal_attached_subset_with(
     let attached = AttachedSemanticSet { domain, subset };
     attached.validate_with(domain, policy, descriptors, retained, owned_sides, watched)?;
     Ok(attached)
+}
+
+/// Test-only sealed attachment over a fixture subset: actual attach
+/// scheduling and retention through the Session seams; only link I/O
+/// is scripted. Birth observation tests seal their
+/// successful-attachment evidence here.
+#[cfg(test)]
+pub(crate) fn seal_test_attachment(
+    subset: crate::inventory_semantics::AttestedSubset,
+    domain: crate::attach::capture::NativeDomainId,
+    pins: &crate::discovery::identity::PinnedObjects,
+) -> AttachedSemanticSet {
+    let outcome = attach_targets_with(
+        subset.plan().slots.as_slice(),
+        CapturePolicy::Allowlisted,
+        false,
+        |slot| Ok(subset.pins().abi_for(slot.object).unwrap()),
+        |_, _, _| Ok(()),
+        |_| Some(1),
+    )
+    .unwrap();
+    let targets = subset
+        .plan()
+        .slots
+        .iter()
+        .map(|slot| {
+            (
+                slot.index,
+                (
+                    subset.pins().attach_path_for(slot.object).unwrap(),
+                    subset.pins().abi_for(slot.object).unwrap(),
+                ),
+            )
+        })
+        .collect();
+    let mut retained = BTreeMap::new();
+    retain_from_successful(
+        &mut retained,
+        &subset.plan().slots,
+        &targets,
+        &outcome.successful,
+    );
+    seal_attached_subset_with(
+        subset,
+        domain,
+        CapturePolicy::Allowlisted,
+        Ok(crate::kinds::DESCRIPTORS.to_vec()),
+        &retained,
+        &outcome.successful,
+        |id| pins.retain_inventory_target(id).ok(),
+    )
+    .expect("fixture attachment seals")
 }
 
 fn semantic_receipt_readback(
@@ -2229,7 +2295,9 @@ mod inventory_semantics_tests;
 /// Retains exact reattach facts for every requested slot that gained a
 /// link. Reattach overwrites: a replacement's new descriptor supersedes
 /// the frozen one the rebuild pruned.
-fn retain_from_successful(
+/// Retain the successfully attached static targets. Production and host
+/// tests share this retention over their own attach outcomes.
+pub(crate) fn retain_from_successful(
     retained: &mut BTreeMap<u32, RetainedStaticTarget>,
     targets: &[Slot],
     attach_targets: &BTreeMap<u32, (PathBuf, ElfAbi)>,
@@ -2887,7 +2955,10 @@ fn static_attach_error(
 }
 
 #[cfg(test)]
-fn attach_targets_with(
+/// Attach scheduling and retention over injected link I/O: production
+/// passes the live linker, host tests a scripted one. The scheduling,
+/// pairing and completion rules are identical either way.
+pub(crate) fn attach_targets_with(
     slots: &[Slot],
     policy: CapturePolicy,
     object_has_unsafe: bool,

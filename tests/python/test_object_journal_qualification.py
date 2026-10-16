@@ -51,13 +51,16 @@ def run_profiled(tmp, provider, provider_args, *oracle_args, timeout=60):
 
 
 FAKE_PROVIDER = """#!/usr/bin/env python3
-import argparse, hashlib, json, os, sys
+import argparse, hashlib, json, os, sys, time
 parser = argparse.ArgumentParser()
 parser.add_argument("--ledger", required=True)
 parser.add_argument("--out", required=True)
 parser.add_argument("--rate", default=None)
 parser.add_argument("--duration", default=None)
+parser.add_argument("--run-token", default=None)
 parser.add_argument("--fake-profile", default=None)
+parser.add_argument("--fake-stamps", default=None)
+parser.add_argument("--fake-sleep", type=float, default=0.0)
 args = parser.parse_args()
 raw = open(args.ledger, "rb").read()
 ledger = json.loads(raw.decode("utf-8"))
@@ -66,14 +69,97 @@ print(json.dumps({"schema": "p11scope/object-journal-ready/v1",
                   "abi": ledger["provider"]["abi"],
                   "ledger_digest": hashlib.sha256(raw).hexdigest()}), flush=True)
 assert sys.stdin.readline().strip() == "GO"
+if args.fake_sleep:
+    time.sleep(args.fake_sleep)
 observed = json.loads(json.dumps(ledger))
 observed["key_material"] = None
 observed["ledger_digest"] = hashlib.sha256(raw).hexdigest()
+observed["run_token"] = args.run_token
+observed.pop("trace", None)
 if args.fake_profile:
     rate, duration = (int(part) for part in args.fake_profile.split(","))
     observed["profile"] = {"rate": rate, "duration": duration}
+if args.fake_stamps:
+    start, step = (int(part) for part in args.fake_stamps.split(","))
+    stamp = start
+    for call in observed["invocations"]:
+        call["observed_at"] = stamp
+        stamp += step
+    for record in observed["records"]:
+        record["observed_at"] = stamp
+        stamp += step
 open(args.out, "w").write(json.dumps(observed, sort_keys=True))
 """
+
+EMPTY_CHILD = """#!/usr/bin/env python3
+import argparse, hashlib, json, os, sys
+parser = argparse.ArgumentParser()
+parser.add_argument("--ledger", required=True)
+parser.add_argument("--out", required=True)
+parser.add_argument("--rate", default=None)
+parser.add_argument("--duration", default=None)
+parser.add_argument("--run-token", default=None)
+args = parser.parse_args()
+raw = open(args.ledger, "rb").read()
+ledger = json.loads(raw.decode("utf-8"))
+print(json.dumps({"schema": "p11scope/object-journal-ready/v1",
+                  "provider": "empty-child", "pid": os.getpid(),
+                  "abi": ledger["provider"]["abi"],
+                  "ledger_digest": hashlib.sha256(raw).hexdigest()}), flush=True)
+assert sys.stdin.readline().strip() == "GO"
+"""
+
+NO_TOKEN_CHILD = """#!/usr/bin/env python3
+import argparse, hashlib, json, os, sys
+parser = argparse.ArgumentParser()
+parser.add_argument("--ledger", required=True)
+parser.add_argument("--out", required=True)
+parser.add_argument("--rate", default=None)
+parser.add_argument("--duration", default=None)
+parser.add_argument("--run-token", default=None)
+args = parser.parse_args()
+raw = open(args.ledger, "rb").read()
+ledger = json.loads(raw.decode("utf-8"))
+print(json.dumps({"schema": "p11scope/object-journal-ready/v1",
+                  "provider": "no-token-child", "pid": os.getpid(),
+                  "abi": ledger["provider"]["abi"],
+                  "ledger_digest": hashlib.sha256(raw).hexdigest()}), flush=True)
+assert sys.stdin.readline().strip() == "GO"
+observed = json.loads(json.dumps(ledger))
+observed["key_material"] = None
+observed["ledger_digest"] = hashlib.sha256(raw).hexdigest()
+observed.pop("trace", None)
+rate = int(args.rate)
+observed["profile"] = {"rate": rate, "duration": int(args.duration)}
+stamp = 1_000_000_000
+step = 1_000_000_000 // rate
+for call in observed["invocations"]:
+    call["observed_at"] = stamp
+    stamp += step
+for record in observed["records"]:
+    record["observed_at"] = stamp
+    stamp += step
+open(args.out, "w").write(json.dumps(observed, sort_keys=True))
+"""
+
+
+def canonical(observed):
+    """Observed output with run-volatile fields stripped: two replays of
+    the same trace compare equal iff the stub computed the same
+    semantics."""
+
+    def strip(value):
+        if isinstance(value, dict):
+            return {
+                key: strip(item)
+                for key, item in value.items()
+                if key not in ("observed_at", "sampled_at", "run_id", "ledger_digest")
+            }
+        if isinstance(value, list):
+            return [strip(item) for item in value]
+        return value
+
+    return strip(observed)
 
 
 class LedgerTests(unittest.TestCase):
@@ -373,24 +459,7 @@ class PacingTests(unittest.TestCase):
                 "100",
             )
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-            self.assertIn("PACING_MISSING", proc.stdout)
-
-    def test_wrong_profile_fails_run(self):
-        with tempfile.TemporaryDirectory() as temp:
-            fake = Path(temp) / "fake-provider.py"
-            fake.write_text(FAKE_PROVIDER)
-            out = str(Path(temp) / "observed.json")
-            proc, _ = run_profiled(
-                temp,
-                sys.executable,
-                [str(fake), "--ledger", str(LEDGER), "--out", out, "--fake-profile", "1,60"],
-                "--rate",
-                "100",
-                "--duration",
-                "5",
-            )
-            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-            self.assertIn("PROFILE_MISMATCH", proc.stdout)
+            self.assertIn("PACING_TOO_FAST", proc.stdout)
 
     def crafted(self, tmp, profile, stamps):
         ledger = json.loads(LEDGER.read_bytes())
@@ -483,6 +552,210 @@ class EmptyTests(unittest.TestCase):
             proc = run_oracle("--check", "--observed", observed_path, "--ledger", str(ledger_path))
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
             self.assertIn("EMPTY_OBSERVATION_SET", proc.stdout)
+
+
+class TraceReplayTests(unittest.TestCase):
+    """Carryover 8: the stub replays the trace/request stream into
+    observations it computes itself; it never copies the ledger's
+    expected semantic fields."""
+
+    def replay(self, tmp, ledger_dict):
+        ledger_path = Path(tmp) / "ledger.json"
+        ledger_path.write_text(json.dumps(ledger_dict, sort_keys=True))
+        out = str(Path(tmp) / "observed.json")
+        proc = run_stub(ledger_path, out)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return json.loads(Path(out).read_bytes())
+
+    def test_trace_mutations_are_detectable_in_observations(self):
+        frozen = json.loads(LEDGER.read_bytes())
+        with tempfile.TemporaryDirectory() as temp:
+            base = self.replay(temp, frozen)
+            # (a) Flip a return's rv in the trace: the derived terminal flips.
+            mutated = json.loads(json.dumps(frozen))
+            for event in mutated["trace"]:
+                if event["op"] == "return" and event["seq"] == 1:
+                    event["rv"] = "GENERAL_ERROR"
+            observed = self.replay(temp, mutated)
+            base_terminals = [call["terminal"] for call in base["invocations"]]
+            mutated_terminals = [call["terminal"] for call in observed["invocations"]]
+            self.assertEqual(base_terminals[0], "success")
+            self.assertEqual(mutated_terminals[0], "error")
+            # (b) Drop a record event: the journal observation shrinks with
+            # recomputed ordinals.
+            mutated = json.loads(json.dumps(frozen))
+            for index, event in enumerate(mutated["trace"]):
+                if event["op"] == "record" and event["kind"] == "BEGIN":
+                    del mutated["trace"][index]
+                    break
+            observed = self.replay(temp, mutated)
+            self.assertEqual(len(observed["records"]), len(base["records"]) - 1)
+            self.assertEqual(
+                [record["ordinal"] for record in observed["records"]],
+                list(range(1, len(base["records"]))),
+            )
+            # (c) Equalize the probe's bracketed epochs: the derived
+            # witness stops proving absence.
+            mutated = json.loads(json.dumps(frozen))
+            mutated["trace"][0]["epoch"] = [42, 42]
+            observed = self.replay(temp, mutated)
+            self.assertEqual(base["bootstrap"]["witness"], "absence-appearance")
+            self.assertNotEqual(observed["bootstrap"]["witness"], "absence-appearance")
+            # End to end: trace-mutated output fails against the frozen ledger.
+            import hashlib
+
+            observed["ledger_digest"] = hashlib.sha256(LEDGER.read_bytes()).hexdigest()
+            path = str(Path(temp) / "mutated.json")
+            Path(path).write_text(json.dumps(observed))
+            proc = run_oracle("--check", "--observed", path, "--ledger", str(LEDGER))
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("BOOTSTRAP_MISMATCH", proc.stdout)
+
+    def test_stub_ignores_expected_answer_fields(self):
+        frozen = json.loads(LEDGER.read_bytes())
+        with tempfile.TemporaryDirectory() as temp:
+            base = self.replay(temp, frozen)
+            # Mutate ONLY the expected answer fields; the trace is untouched.
+            mutated = json.loads(json.dumps(frozen))
+            mutated["invocations"][0]["terminal"] = "error"
+            mutated["records"][0]["seq"] = 7
+            mutated["bootstrap"]["cut"] = 999
+            observed = self.replay(temp, mutated)
+            self.assertEqual(
+                canonical(observed),
+                canonical(base),
+                "trace-identical replays agree semantically",
+            )
+            # ... so the replayed output fails against the mutated ledger:
+            # the stub did not follow the expected fields.
+            ledger_path = Path(temp) / "ledger-mut.json"
+            ledger_path.write_text(json.dumps(mutated, sort_keys=True))
+            out = str(Path(temp) / "replayed.json")
+            Path(out).write_text(json.dumps(observed))
+            proc = run_oracle("--check", "--observed", out, "--ledger", str(ledger_path))
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("INVOCATION_MISMATCH", proc.stdout)
+
+
+class FreshnessTests(unittest.TestCase):
+    """Carryover 14: output freshness binds to the current run via a nonce
+    the child must echo, and pace is controller-measured, never trusted
+    from child timestamps."""
+
+    def test_empty_child_on_stale_output_fails(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = str(Path(temp) / "observed.json")
+            # A known-passing stale file sits at the output path: a full
+            # paced run's output, left behind by an earlier invocation.
+            stale_run, _ = run_profiled(
+                temp, STUB, ["--ledger", str(LEDGER), "--out", out], "--rate", "100"
+            )
+            self.assertEqual(stale_run.returncode, 0, stale_run.stdout + stale_run.stderr)
+            stale = run_oracle("--check", "--observed", out, "--ledger", str(LEDGER))
+            self.assertEqual(stale.returncode, 0, stale.stdout + stale.stderr)
+            # An empty READY/GO child that writes nothing must FAIL, never
+            # inherit the stale PASS.
+            empty = Path(temp) / "empty-child.py"
+            empty.write_text(EMPTY_CHILD)
+            proc = run_oracle(
+                "--run",
+                "--provider",
+                sys.executable,
+                "--provider-arg",
+                str(empty),
+                "--provider-arg=--ledger",
+                "--provider-arg",
+                str(LEDGER),
+                "--provider-arg=--out",
+                "--provider-arg",
+                out,
+                "--ledger",
+                str(LEDGER),
+                "--out",
+                out,
+                "--rate",
+                "100",
+            )
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("STALE_OUTPUT", proc.stdout)
+
+    def test_synthetic_timestamps_fail_run(self):
+        with tempfile.TemporaryDirectory() as temp:
+            fake = Path(temp) / "fake-provider.py"
+            fake.write_text(FAKE_PROVIDER)
+            out = str(Path(temp) / "observed.json")
+            # Fresh output echoing this run's token, written after 0.2 s
+            # with stamps spanning 14 s: the old timestamp arithmetic
+            # passed this; controller measurement must fail it.
+            proc, _ = run_profiled(
+                temp,
+                sys.executable,
+                [
+                    str(fake),
+                    "--ledger",
+                    str(LEDGER),
+                    "--out",
+                    out,
+                    "--fake-profile",
+                    "1,60",
+                    "--fake-stamps",
+                    "1000000000,1000000000",
+                    "--fake-sleep",
+                    "0.2",
+                ],
+                "--rate",
+                "1",
+                "--duration",
+                "60",
+            )
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("PACING_TOO_FAST", proc.stdout)
+
+    def test_missing_token_echo_fails_run(self):
+        with tempfile.TemporaryDirectory() as temp:
+            child = Path(temp) / "no-token-child.py"
+            child.write_text(NO_TOKEN_CHILD)
+            out = str(Path(temp) / "observed.json")
+            proc, _ = run_profiled(
+                temp,
+                sys.executable,
+                [str(child), "--ledger", str(LEDGER), "--out", out],
+                "--rate",
+                "100",
+                "--duration",
+                "5",
+            )
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("RUN_TOKEN_MISMATCH", proc.stdout)
+
+    def test_run_ignores_child_profile_claim(self):
+        with tempfile.TemporaryDirectory() as temp:
+            # An honestly paced provider passes even while its echoed
+            # profile claim lies: measurement, not the child's word, decides.
+            fake = Path(temp) / "fake-provider.py"
+            fake.write_text(FAKE_PROVIDER)
+            out = str(Path(temp) / "observed.json")
+            proc, _ = run_profiled(
+                temp,
+                sys.executable,
+                [
+                    str(fake),
+                    "--ledger",
+                    str(LEDGER),
+                    "--out",
+                    out,
+                    "--fake-profile",
+                    "1,60",
+                    "--fake-sleep",
+                    "2.0",
+                ],
+                "--rate",
+                "10",
+                "--duration",
+                "60",
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("PASS", proc.stdout)
 
 
 if __name__ == "__main__":

@@ -1474,7 +1474,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// corresponding loss evidence, so barriers there release the next
     /// mint into Clean. Monotone; the joint seal tick forwards the
     /// seal failure's void report here.
-    #[allow(dead_code)] // No production caller until the joint seal tick lands.
     pub(crate) fn acknowledge_h3_void(&mut self, voided_below: u64) {
         self.h3_acked_below = self.h3_acked_below.max(voided_below);
     }
@@ -2060,6 +2059,14 @@ impl crate::semantics_objects::journal::H3EvidenceSource
 {
     fn take_h3_disposition(&mut self) -> crate::semantics_objects::journal::H3DispositionEvidence {
         InventoryCoordinator::take_h3_disposition(self)
+    }
+}
+
+impl crate::semantics_objects::journal::H3FinalizerPort
+    for InventoryCoordinator<crate::discovery::caller_registry::OsProcessSource>
+{
+    fn acknowledge_h3_void(&mut self, voided_below: u64) {
+        InventoryCoordinator::acknowledge_h3_void(self, voided_below)
     }
 }
 

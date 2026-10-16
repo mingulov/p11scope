@@ -253,7 +253,7 @@ class FakeMaps(capture.LiveMaps):
                 elif item['name'] == 'TASK_COOKIE' and task['role'] == 'leader' and self.config.mode != 'metrics':
                     raw = struct.pack('<Q', 1)
                 elif item['name'] == 'THREAD_OWNER' and task['role'] == 'worker':
-                    raw = bytearray(544)
+                    raw = bytearray(560)
                     struct.pack_into('<Q', raw, 0, (task['pid'] << 32) | task['tid'])
                     struct.pack_into('<QQII', raw, 520, 0, 0, 1, 1)
                 else:
@@ -586,13 +586,13 @@ def coordinator_case(pid, directory, case):
             # likewise exclude it or the replay's byte count mismatches.
             owner_id = next(item['id'] for item in source.maps if item['name'] == 'THREAD_OWNER')
             return (capture.dumper.TASK_STORAGE_HEADER.pack(capture.dumper.TASK_STORAGE_MAGIC, 1,
-                    owner_id, pid, pid, 544) + bytes(544) + raw)
+                    owner_id, pid, pid, 560) + bytes(560) + raw)
         if kind == 'binding' and detail == 'owner_count':
             raw = bytearray(raw)
             offset = 0
             while offset < len(raw):
                 header = capture.dumper.TASK_STORAGE_HEADER.unpack_from(raw, offset)
-                if header[5] == 544:
+                if header[5] in (544, 560):
                     struct.pack_into('<I', raw, offset + capture.dumper.TASK_STORAGE_HEADER.size + 536, 2)
                 offset += capture.dumper.TASK_STORAGE_HEADER.size + header[5]
             return bytes(raw)
@@ -959,7 +959,7 @@ def owned_case(pid, directory, case, program, provider):
             struct.pack_into('<Q', raw, header.size, 0x100000001)
             return bytes(raw)
         if case in ('cookie', 'owner'):
-            name, size = ('TASK_COOKIE', 8) if case == 'cookie' else ('THREAD_OWNER', 544)
+            name, size = ('TASK_COOKIE', 8) if case == 'cookie' else ('THREAD_OWNER', 560)
             item = next(item for item in source.maps if item['name'] == name)
             value = struct.pack('<Q', 1) + bytes(size - 8)
             return header.pack(capture.dumper.TASK_STORAGE_MAGIC, 1, item['id'], config.workload_pid,

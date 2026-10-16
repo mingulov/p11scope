@@ -2052,7 +2052,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 }
 
-impl crate::semantics_objects::journal::H3EvidenceSource for InventoryCoordinator<OsProcessSource> {
+impl crate::semantics_objects::journal::H3EvidenceSource
+    for InventoryCoordinator<crate::discovery::caller_registry::OsProcessSource>
+{
     fn take_h3_disposition(
         &mut self,
     ) -> crate::semantics_objects::journal::H3DispositionEvidence {

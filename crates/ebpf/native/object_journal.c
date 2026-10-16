@@ -124,25 +124,26 @@ __attribute__((noinline)) int p11_journal_side_remove(void *map,
 
 /* Write one validated 24 B common header. Native little-endian x86-64;
  * every combination this accepts the Rust validators accept too. */
-__attribute__((noinline)) int p11_journal_header_init(void *record, u64 bytes, u64 kind,
-                                                      u64 flags, u64 thread, u64 sequence)
+__attribute__((noinline)) int p11_journal_header_init(void *record,
+                                                      const struct journal_header_spec *spec)
 {
     unsigned char *out;
-    if (!record)
+    if (!record || !spec)
         return -1;
-    if (!journal_header_valid(bytes, kind, flags, 0, thread, sequence))
+    if (!journal_header_valid(spec->bytes, spec->kind, spec->flags, 0, spec->thread,
+                              spec->sequence))
         return -1;
     out = record;
     out[0] = JOURNAL_VERSION & 0xff;
     out[1] = (JOURNAL_VERSION >> 8) & 0xff;
-    out[2] = bytes & 0xff;
-    out[3] = (bytes >> 8) & 0xff;
-    out[4] = kind & 0xff;
-    out[5] = flags & 0xff;
+    out[2] = spec->bytes & 0xff;
+    out[3] = (spec->bytes >> 8) & 0xff;
+    out[4] = spec->kind & 0xff;
+    out[5] = spec->flags & 0xff;
     out[6] = 0;
     out[7] = 0;
-    __builtin_memcpy(out + 8, &thread, 8);
-    __builtin_memcpy(out + 16, &sequence, 8);
+    __builtin_memcpy(out + 8, &spec->thread, 8);
+    __builtin_memcpy(out + 16, &spec->sequence, 8);
     return 0;
 }
 

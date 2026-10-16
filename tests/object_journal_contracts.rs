@@ -934,9 +934,7 @@ fn object_journal_transaction_ordering_matrix() {
         );
         let stores: Vec<usize> = body
             .iter()
-            .filter(|(_, text)| {
-                text.contains("*txn->fault_out =") && !text.contains("==")
-            })
+            .filter(|(_, text)| text.contains("*txn->fault_out =") && !text.contains("=="))
             .map(|(number, _)| *number)
             .collect();
         for handoff in &handoffs {

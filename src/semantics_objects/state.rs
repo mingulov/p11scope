@@ -608,15 +608,27 @@ impl ModelState {
     // -----------------------------------------------------------------------
 
     pub(super) fn begin(&mut self, origin: OriginFact) -> Result<CallToken, ObjectGap> {
+        // Reference/tests entry: production conversion uses
+        // `begin_with_effects` so refusal invalidations publish.
+        self.begin_with_effects(origin).0
+    }
+
+    /// Admission with its refusal effects: capacity and contradiction
+    /// invalidations ride alongside the token, so the production
+    /// conversion path publishes them before further publication
+    /// instead of dropping them in a local.
+    pub(super) fn begin_with_effects(
+        &mut self,
+        origin: OriginFact,
+    ) -> (Result<CallToken, ObjectGap>, ObjectEffects) {
         let (domain, cut) = (origin.domain, origin.cut.0);
-        let result = self.admit(origin);
+        let (result, mut effects) = self.admit_with_effects(origin);
         match result {
             Err(reason @ (ObjectGap::ClosedFrontier | ObjectGap::MalformedFact)) => {
                 // Unrepresentable history: a begin the model can no longer
                 // order. Proof ends and the fence floor rises above it.
                 // It is still a real call that may be running: like a
                 // capacity refusal, it blocks bootstrap until bounded.
-                let mut effects = ObjectEffects::default();
                 self.contradict(domain, reason, Some(cut), &mut effects);
                 if let Some(state) = self.domains.get_mut(&domain) {
                     state.refused_in_flight = max_opt(state.refused_in_flight, Some(cut));
@@ -625,44 +637,59 @@ impl ModelState {
             Err(reason) => self.gap(reason),
             Ok(_) => {}
         }
-        result
+        (result, effects)
     }
 
     fn admit(&mut self, origin: OriginFact) -> Result<CallToken, ObjectGap> {
+        self.admit_with_effects(origin).0
+    }
+
+    /// Admission with its capacity-refusal effects: a refused begin is
+    /// unrepresented history that may still be running, and its
+    /// invalidation effects are observable, never local.
+    fn admit_with_effects(
+        &mut self,
+        origin: OriginFact,
+    ) -> (Result<CallToken, ObjectGap>, ObjectEffects) {
         let domain = origin.domain;
-        self.held(domain)?;
-        if self.domains[&domain].ended.is_some() {
-            return Err(ObjectGap::DomainEnded);
+        let refused = |reason: ObjectGap| (Err(reason), ObjectEffects::default());
+        if let Err(reason) = self.held(domain) {
+            return refused(reason);
         }
-        let kind = call_kind(origin.function).ok_or(ObjectGap::UnsupportedFunction)?;
+        if self.domains[&domain].ended.is_some() {
+            return refused(ObjectGap::DomainEnded);
+        }
+        let Some(kind) = call_kind(origin.function) else {
+            return refused(ObjectGap::UnsupportedFunction);
+        };
         let cut = origin.cut.0;
         let state = &self.domains[&domain];
         if let Some(token) = state.keys.get(&origin.key) {
             // An exact re-delivery of an admitted begin is a no-op; the same
             // key at another cut is malformed.
-            return if self.pending[token].begin == cut {
-                Err(ObjectGap::DuplicateCall)
+            return refused(if self.pending[token].begin == cut {
+                ObjectGap::DuplicateCall
             } else {
-                Err(ObjectGap::MalformedFact)
-            };
+                ObjectGap::MalformedFact
+            });
         }
         if state.covered.is_some_and(|covered| cut <= covered) {
-            return Err(ObjectGap::ClosedFrontier);
+            return refused(ObjectGap::ClosedFrontier);
         }
         if state.cuts.contains(&cut) {
-            return Err(ObjectGap::MalformedFact);
+            return refused(ObjectGap::MalformedFact);
         }
         if self.pending.len() >= self.limits.pending_calls {
-            self.refuse_unrepresented(domain, cut);
-            return Err(ObjectGap::PendingCapacity);
+            let effects = self.refuse_unrepresented(domain, cut);
+            return (Err(ObjectGap::PendingCapacity), effects);
         }
         let Some(next) = self
             .next_token
             .checked_add(1)
             .filter(|next| *next <= self.limits.max_call_token)
         else {
-            self.refuse_unrepresented(domain, cut);
-            return Err(ObjectGap::IdExhausted);
+            let effects = self.refuse_unrepresented(domain, cut);
+            return (Err(ObjectGap::IdExhausted), effects);
         };
         self.next_token = next;
         let token = CallToken(next);
@@ -693,7 +720,7 @@ impl ModelState {
         state.keys.insert(origin.key, token);
         state.cuts.insert(cut);
         self.pending.insert(token, call);
-        Ok(token)
+        (Ok(token), ObjectEffects::default())
     }
 
     /// The journal adapter's consumed-but-unrepresentable begin: recorded

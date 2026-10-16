@@ -1583,6 +1583,7 @@ impl H3DispositionEvidence {
     /// the actual `finalize_batch`; the coordinator stores the result
     /// as the seal's H3 evidence. `acked_below` is the seal's H3-loss
     /// acknowledgement: H0 positions below it were voided by a seal.
+    #[allow(clippy::too_many_arguments)] // The finalizer's exact disposition facts plus the seal's ack.
     pub(crate) fn from_finalizer_batch(
         negatives: &[crate::inventory_semantics::LaneNegative],
         staged: &[Option<u64>],
@@ -1926,6 +1927,8 @@ pub(crate) enum BirthRefusal {
     /// The Session birth evidence does not authorize this claim: wrong
     /// observed image, zero custody, a tripped admission latch, or a
     /// marker word inconsistent with the claimed kind and exec id.
+    /// The seal reports the same refusal when fresh evidence moved
+    /// since attestation.
     EvidenceMismatch,
 }
 
@@ -1947,10 +1950,11 @@ pub(crate) struct SessionBirthEvidence {
 
 impl SessionBirthEvidence {
     /// Production observation: only Session-owned attach code holds the
-    /// issuance token. Activation-gated: no observation site exists
-    /// until the H8-D native witnesses wire, so production birth fails
-    /// closed until then.
-    #[allow(dead_code)] // Activation-gated: see `SessionGrantToken`.
+    /// issuance token, and only the birth observation sites
+    /// (`observe_exec_birth` / `observe_absence_birth`) call this, with
+    /// words they read or derived from genuine Session producers. The
+    /// joint seal tick that observes in production is later Task 3 work.
+    #[allow(dead_code)] // No production caller until the joint seal tick lands.
     pub(crate) fn issue(
         _token: &crate::attach::SessionGrantToken,
         image: (u64, u64),
@@ -1981,6 +1985,28 @@ impl SessionBirthEvidence {
         }
     }
 
+    /// Observed words, read back by tests pinning that observation
+    /// carries the producers' words rather than supplied ones.
+    #[cfg(test)]
+    pub(crate) fn image(&self) -> (u64, u64) {
+        self.image
+    }
+
+    #[cfg(test)]
+    pub(crate) fn marker_word(&self) -> u64 {
+        self.marker_word
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admission_failed(&self) -> u64 {
+        self.admission_failed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn custody(&self) -> u64 {
+        self.custody
+    }
+
     /// Canonical valid evidence for one sealed receipt: the READY
     /// marker naming the proof image's exec id, or the unmarked word
     /// for absence; a clean latch and live custody.
@@ -1991,12 +2017,12 @@ impl SessionBirthEvidence {
     }
 
     /// Canonical valid evidence for one image and birth kind: the READY
-    /// marker naming the image's exec id, or the unmarked word for
-    /// absence; a clean latch and live custody.
+    /// marker naming the image's exec id (real native encoding), or the
+    /// unmarked word for absence; a clean latch and live custody.
     #[cfg(test)]
     pub(crate) fn scripted_canonical(image: (u64, u64), birth: BirthKind) -> Self {
         let marker_word = match birth {
-            BirthKind::ExecMarker => (image.1 << 32) | 1,
+            BirthKind::ExecMarker => p11scope_ebpf_common::journal_marker::ready_word(image.1),
             BirthKind::AbsenceAppearance => 0,
         };
         Self {
@@ -2027,10 +2053,11 @@ pub(crate) struct SessionBirthGrant {
 
 impl SessionBirthGrant {
     /// Production mint: only Session-owned attach code holds the
-    /// issuance token. Activation-gated: no issuance site exists until
-    /// the H8-D native witnesses wire, so production attestation fails
-    /// closed until then.
-    #[allow(dead_code)] // Activation-gated: see `SessionGrantToken`.
+    /// issuance token, minted solely by the birth observation sites.
+    /// The joint seal tick that issues in production is later Task 3
+    /// work; until it lands the observation/issue path is exercised by
+    /// tests.
+    #[allow(dead_code)] // No production caller until the joint seal tick lands.
     pub(crate) fn issue(
         _token: &crate::attach::SessionGrantToken,
         proof: JournalDomainProof,
@@ -2094,8 +2121,10 @@ pub(crate) struct SessionClosureGrant {
 
 impl SessionClosureGrant {
     /// Production mint: only Session-owned attach code holds the
-    /// issuance token. Activation-gated like the birth grant.
-    #[allow(dead_code)] // Activation-gated: see `SessionGrantToken`.
+    /// issuance token, minted solely by the birth observation sites.
+    /// The joint seal tick that issues in production is later Task 3
+    /// work.
+    #[allow(dead_code)] // No production caller until the joint seal tick lands.
     pub(crate) fn issue(_token: &crate::attach::SessionGrantToken, generation: u64) -> Self {
         Self { generation }
     }
@@ -2309,20 +2338,20 @@ impl JournalAdapter {
         let image = (proof.key.cookie, proof.key.exec);
         // Native evidence first: the observed image must be this one,
         // custody must bind a live held proof, the admission latch must
-        // be clean, and the marker word must authorize the claimed kind:
-        // READY naming the image's exec id for an exec birth (the
-        // marker's high 32 bits carry the native exec id; the full
-        // 64-bit exec stays bound by the observed image), or the
-        // unmarked word for absence. Dirty, reserved, torn or
-        // mismatched states refuse; zero custody binds nothing.
+        // be clean, and the marker word must authorize the claimed kind
+        // under the real native encoding: READY naming the image's full
+        // exec id for an exec birth, or the exactly unmarked word for
+        // absence. Dirty, invalid or mismatched states refuse; zero
+        // custody binds nothing.
         if evidence.image != image || evidence.custody == 0 || evidence.admission_failed != 0 {
             return Err(BirthRefusal::EvidenceMismatch);
         }
-        let marker_state = evidence.marker_word as u32;
-        let marker_exec = (evidence.marker_word >> 32) as u32;
         let marker_ok = match birth {
-            BirthKind::ExecMarker => marker_state == 1 && marker_exec == image.1 as u32,
-            BirthKind::AbsenceAppearance => marker_state == 0,
+            BirthKind::ExecMarker => {
+                p11scope_ebpf_common::journal_marker::read_word(evidence.marker_word)
+                    == p11scope_ebpf_common::journal_marker::MarkerRead::Ready(image.1)
+            }
+            BirthKind::AbsenceAppearance => evidence.marker_word == 0,
         };
         if !marker_ok {
             return Err(BirthRefusal::EvidenceMismatch);
@@ -3567,7 +3596,10 @@ impl JournalAdapter {
         // adapter; a foreign drain consumes nothing (its audit refuses
         // at seal). No caller label names the domain.
         let drain_domain = drain.domain_id();
-        if self.pinned_drain.is_some_and(|pinned| pinned != drain_domain) {
+        if self
+            .pinned_drain
+            .is_some_and(|pinned| pinned != drain_domain)
+        {
             // A refused collect still reports its fault read honestly:
             // an unreadable cell voids at seal like any other tick.
             let (fault_before, fault_error) = match fault.fault_epoch() {
@@ -3920,12 +3952,11 @@ mod tests {
     struct AttestationFixture {
         _dir: tempfile::TempDir,
         subset: Option<AttestedSubset>,
+        pins: crate::discovery::identity::PinnedObjects,
         binding: crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
         domain: NativeDomainId,
         image: ImageIdentity,
         router: InstanceId,
-        slot: u32,
-        endpoint: Endpoint,
         functions: BTreeMap<String, (u32, Endpoint)>,
         next_token: u64,
     }
@@ -4095,7 +4126,6 @@ mod tests {
                     ),
                 );
             }
-            let (slot, endpoint) = functions["C_CreateObject"];
             let pin = pins.pinned().next().unwrap();
             let module = ModuleKey::physical(
                 pin.key.device.major,
@@ -4119,12 +4149,11 @@ mod tests {
             Self {
                 _dir: dir,
                 subset: Some(subset),
+                pins,
                 binding,
                 domain,
                 image,
                 router,
-                slot,
-                endpoint,
                 functions,
                 next_token: 0,
             }
@@ -4186,7 +4215,7 @@ mod tests {
 
         /// One real admission for a chosen session word and function.
         fn admit_session_function(&mut self, session: u64, name: &str) -> AdmittedInstanceCall {
-            let (slot, endpoint) = self.functions[name].clone();
+            let (slot, endpoint) = self.functions[name];
             self.next_token += 1;
             let token = self.next_token;
             let stamp = InstanceStamp {
@@ -4235,6 +4264,14 @@ mod tests {
         /// fixture keeps its binding/router for further admissions.
         fn take_subset(&mut self) -> AttestedSubset {
             self.subset.take().expect("subset held")
+        }
+
+        /// One sealed successful attachment over this fixture's subset
+        /// and domain, through the Session's test sealing seam.
+        /// Consumes the move-only subset, so admit first, then seal.
+        fn seal_attachment(&mut self) -> crate::attach::AttachedSemanticSet {
+            let subset = self.subset.take().expect("subset held");
+            crate::attach::seal_test_attachment(subset, self.domain, &self.pins)
         }
     }
 
@@ -4396,13 +4433,8 @@ mod tests {
                 crate::events::ScriptedRecords::records(records, bound),
                 7,
             );
-            self.adapter.collect_from_drain(
-                &mut drain,
-                &self.descriptors,
-                Some(bound),
-                fault,
-                0,
-            )
+            self.adapter
+                .collect_from_drain(&mut drain, &self.descriptors, Some(bound), fault, 0)
         }
 
         /// One seal from a real collection: H3 disposition covers the
@@ -5368,13 +5400,10 @@ mod tests {
         script.busy_after = Some(1);
         let mut drain = crate::events::EventDrain::over_test_domain(script, 7);
         let fault = ScriptedFaultCell::steady(7);
-        let first = scene.adapter.collect_from_drain(
-            &mut drain,
-            &scene.descriptors,
-            None,
-            &fault,
-            0,
-        );
+        let first =
+            scene
+                .adapter
+                .collect_from_drain(&mut drain, &scene.descriptors, None, &fault, 0);
         assert_eq!((first.ingested, first.ordinary), (1, 0));
         assert_eq!(scene.adapter.consumed_through, 1);
         let bootstrap = scene.bootstrap(proof, 0);
@@ -5382,13 +5411,10 @@ mod tests {
             .seal_collected(&bootstrap, &first)
             .expect("prefix frontier seals");
         assert_eq!(held.prefix.open_keys().len(), 1);
-        let second = scene.adapter.collect_from_drain(
-            &mut drain,
-            &scene.descriptors,
-            None,
-            &fault,
-            0,
-        );
+        let second =
+            scene
+                .adapter
+                .collect_from_drain(&mut drain, &scene.descriptors, None, &fault, 0);
         assert_eq!((second.ingested, second.ordinary), (1, 0));
         let bootstrap = scene.bootstrap(proof, 0);
         let success = scene
@@ -5401,13 +5427,10 @@ mod tests {
         let mut script = BusyScript::new(vec![begin.to_vec()]);
         script.busy_after = Some(0);
         let mut drain = crate::events::EventDrain::over_test_domain(script, 7);
-        let first = scene.adapter.collect_from_drain(
-            &mut drain,
-            &scene.descriptors,
-            None,
-            &fault,
-            0,
-        );
+        let first =
+            scene
+                .adapter
+                .collect_from_drain(&mut drain, &scene.descriptors, None, &fault, 0);
         assert_eq!((first.ingested, first.ordinary), (0, 0));
         assert_eq!(scene.adapter.consumed_through, 0);
 
@@ -7327,7 +7350,12 @@ mod tests {
         let begin = begin_bytes(1, 1, create, 0);
         scene.ingest(&begin);
         scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
-        let evidence = SessionBirthEvidence::scripted((COOKIE, EXEC), EXEC << 32, 0, 1);
+        let evidence = SessionBirthEvidence::scripted(
+            (COOKIE, EXEC),
+            p11scope_ebpf_common::journal_marker::MARKER_UNPUBLISHED,
+            0,
+            1,
+        );
         let grant = SessionBirthGrant::scripted_with_evidence(
             proof,
             BirthKind::AbsenceAppearance,
@@ -7513,10 +7541,9 @@ mod tests {
     fn object_journal_birth_grant_evidence_is_checked() {
         // C1: the grant's Session-observed native evidence is CHECKED at
         // attestation, not just carried. Each corruption below refuses
-        // with EvidenceMismatch; canonical evidence attests.
-        fn marker(exec: u64, state: u64) -> u64 {
-            (exec << 32) | state
-        }
+        // with EvidenceMismatch; canonical evidence attests. Marker
+        // words use the real native encoding (low two bits state).
+        use p11scope_ebpf_common::journal_marker::{MARKER_DIRTY, MARKER_UNPUBLISHED, ready_word};
         let mut scene = Scene::new(image_default());
         let proof = scene.attest();
         let create = function_id("C_CreateObject");
@@ -7531,21 +7558,22 @@ mod tests {
         scene.ingest_ordinary(seen);
         scene.ingest(&begin);
         let image = (COOKIE, EXEC);
+        let ready = ready_word(EXEC);
         let bad_exec = [
             // Wrong observed image.
-            SessionBirthEvidence::scripted((COOKIE + 1, EXEC), marker(EXEC, 1), 0, 1),
+            SessionBirthEvidence::scripted((COOKIE + 1, EXEC), ready, 0, 1),
             // Zero custody binds nothing.
-            SessionBirthEvidence::scripted(image, marker(EXEC, 1), 0, 0),
+            SessionBirthEvidence::scripted(image, ready, 0, 0),
             // A tripped admission latch withholds birth.
-            SessionBirthEvidence::scripted(image, marker(EXEC, 1), 1, 1),
-            // Unmarked is not an exec publication.
-            SessionBirthEvidence::scripted(image, marker(EXEC, 0), 0, 1),
+            SessionBirthEvidence::scripted(image, ready, 1, 1),
+            // Unpublished is not an exec publication.
+            SessionBirthEvidence::scripted(image, MARKER_UNPUBLISHED, 0, 1),
             // A scope-dirtied marker is not an exec publication.
-            SessionBirthEvidence::scripted(image, marker(EXEC, 2), 0, 1),
-            // Reserved marker state refuses.
-            SessionBirthEvidence::scripted(image, marker(EXEC, 3), 0, 1),
+            SessionBirthEvidence::scripted(image, MARKER_DIRTY, 0, 1),
+            // An invalid marker word refuses.
+            SessionBirthEvidence::scripted(image, ready | 1, 0, 1),
             // The marker names another exec id.
-            SessionBirthEvidence::scripted(image, marker(EXEC + 1, 1), 0, 1),
+            SessionBirthEvidence::scripted(image, ready_word(EXEC + 1), 0, 1),
         ];
         for evidence in bad_exec {
             let grant = SessionBirthGrant::scripted_with_evidence(
@@ -7560,9 +7588,9 @@ mod tests {
                 Err(BirthRefusal::EvidenceMismatch)
             );
         }
-        // Absence requires an unmarked word: READY, dirty and reserved
-        // states all refuse as absence evidence.
-        for word in [marker(EXEC, 1), marker(EXEC, 2), marker(EXEC, 9)] {
+        // Absence requires the unmarked word: READY, dirty and
+        // invalid words all refuse as absence evidence.
+        for word in [ready, MARKER_DIRTY, ready | 1] {
             let evidence = SessionBirthEvidence::scripted(image, word, 0, 1);
             let grant = SessionBirthGrant::scripted_with_evidence(
                 proof,
@@ -7582,6 +7610,276 @@ mod tests {
             let grant = SessionBirthGrant::scripted(proof, birth, cut, 0);
             BootstrapReceipt::attest(&scene.adapter, &grant).expect("canonical evidence attests");
         }
+    }
+
+    #[test]
+    fn object_journal_session_exec_birth_observes_genuine_producers() {
+        // C1: Session-owned exec-marker birth end to end with zero
+        // scripted birth constructors. Observation reads the genuine
+        // producers (READY marker naming the admitted exec, clean
+        // admission latch, live held custody, sealed successful
+        // attachment, admitted image); the issued grant attests; fresh
+        // re-observation at seal converts.
+        use crate::attach::observe_exec_birth;
+        use crate::process::PidPin;
+        use p11scope_ebpf_common::journal_marker::ready_word;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        use p11scope_ebpf_common::{InstanceRecord, JournalAdmissionControl};
+
+        let mut scene = Scene::new(image_default());
+        let admitted = scene.fixture.admit();
+        let proof = scene.adapter.attest_key(&admitted).expect("key attests");
+        let attachment = scene.fixture.seal_attachment();
+        let custody = PidPin::open(std::process::id()).unwrap();
+        let record = InstanceRecord {
+            journal_bootstrap: ready_word(EXEC),
+            ..InstanceRecord::default()
+        };
+        let control = JournalAdmissionControl::default();
+        let (token, evidence) =
+            observe_exec_birth(&record, &control, &custody, &attachment, &admitted)
+                .expect("genuine producers observe");
+        assert_eq!(evidence.image(), (COOKIE, EXEC));
+        assert_eq!(evidence.marker_word(), ready_word(EXEC));
+        assert_eq!(evidence.admission_failed(), 0);
+        assert_eq!(evidence.custody(), custody.start_time().unwrap());
+        let grant = SessionBirthGrant::issue(&token, proof, BirthKind::ExecMarker, 0, 0, evidence);
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        let birth =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("observed grant attests");
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let (_, fresh) = observe_exec_birth(&record, &control, &custody, &attachment, &admitted)
+            .expect("fresh words re-observe");
+        let frontier = scene.adapter.consumed_frontier();
+        let audit = scene.audit();
+        scene
+            .seal_explicit(&audit, &birth, frontier, &fresh)
+            .expect("observed birth seals");
+    }
+
+    #[test]
+    fn object_journal_session_birth_observation_refuses_per_producer() {
+        // C1: every genuine producer gates observation with its own
+        // finite refusal; nothing mints on any failure.
+        use crate::attach::{BirthObservationRefusal, observe_absence_birth, observe_exec_birth};
+        use crate::process::PidPin;
+        use p11scope_ebpf_common::journal_marker::{
+            MARKER_ADMIT_CAP, MARKER_DIRTY, MARKER_UNPUBLISHED, ready_word,
+        };
+        use p11scope_ebpf_common::{InstanceRecord, JournalAdmissionControl};
+
+        let mut scene = Scene::new(image_default());
+        let admitted = scene.fixture.admit();
+        scene.adapter.attest_key(&admitted).expect("key attests");
+        let attachment = scene.fixture.seal_attachment();
+        let custody = PidPin::open(std::process::id()).unwrap();
+        let control = JournalAdmissionControl::default();
+        let record = |word: u64| InstanceRecord {
+            journal_bootstrap: word,
+            ..InstanceRecord::default()
+        };
+        // Marker readback: unpublished, dirty and foreign-exec words
+        // are not this birth's publication.
+        for word in [MARKER_UNPUBLISHED, MARKER_DIRTY, ready_word(EXEC + 1)] {
+            assert_eq!(
+                observe_exec_birth(&record(word), &control, &custody, &attachment, &admitted),
+                Err(BirthObservationRefusal::MarkerNotReady)
+            );
+        }
+        // Admission control: a tripped latch withholds birth, and the
+        // spent bound refuses at the cap but admits below it.
+        let latched = JournalAdmissionControl {
+            spent: 0,
+            failed: 1,
+        };
+        assert_eq!(
+            observe_exec_birth(
+                &record(ready_word(EXEC)),
+                &latched,
+                &custody,
+                &attachment,
+                &admitted
+            ),
+            Err(BirthObservationRefusal::LatchTripped)
+        );
+        let spent = JournalAdmissionControl {
+            spent: MARKER_ADMIT_CAP,
+            failed: 0,
+        };
+        assert_eq!(
+            observe_exec_birth(
+                &record(ready_word(EXEC)),
+                &spent,
+                &custody,
+                &attachment,
+                &admitted
+            ),
+            Err(BirthObservationRefusal::SpentExhausted)
+        );
+        let nearly_spent = JournalAdmissionControl {
+            spent: MARKER_ADMIT_CAP - 1,
+            failed: 0,
+        };
+        observe_exec_birth(
+            &record(ready_word(EXEC)),
+            &nearly_spent,
+            &custody,
+            &attachment,
+            &admitted,
+        )
+        .expect("below-cap control observes");
+        // Custody: a reaped process no longer pins the birth.
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let dead = PidPin::open(child.id()).unwrap();
+        child.wait().unwrap();
+        assert_eq!(
+            observe_exec_birth(
+                &record(ready_word(EXEC)),
+                &control,
+                &dead,
+                &attachment,
+                &admitted
+            ),
+            Err(BirthObservationRefusal::CustodyLost)
+        );
+        // Attachment: a seal under another domain is not this
+        // admission's successful attachment.
+        let mut foreign = Scene::new(image_default());
+        let foreign_attachment = foreign.fixture.seal_attachment();
+        assert_eq!(
+            observe_exec_birth(
+                &record(ready_word(EXEC)),
+                &control,
+                &custody,
+                &foreign_attachment,
+                &admitted
+            ),
+            Err(BirthObservationRefusal::AttachmentMismatch)
+        );
+        // Absence: only the unmarked word observes; any publication or
+        // poisoning refuses.
+        let (_, absence) = observe_absence_birth(
+            &record(MARKER_UNPUBLISHED),
+            &control,
+            &custody,
+            &attachment,
+            &admitted,
+        )
+        .expect("unmarked row observes absence");
+        assert_eq!(absence.marker_word(), 0);
+        assert_eq!(absence.image(), (COOKIE, EXEC));
+        for word in [ready_word(EXEC), MARKER_DIRTY] {
+            assert_eq!(
+                observe_absence_birth(&record(word), &control, &custody, &attachment, &admitted),
+                Err(BirthObservationRefusal::MarkerPublished)
+            );
+        }
+    }
+
+    #[test]
+    fn object_journal_session_absence_birth_seals_on_quiet_history() {
+        // C1: absence observation over an unmarked real row issues; the
+        // grant attests an absence birth over quiet history and seals
+        // on fresh re-observation.
+        use crate::attach::observe_absence_birth;
+        use crate::process::PidPin;
+        use p11scope_ebpf_common::journal_marker::MARKER_UNPUBLISHED;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        use p11scope_ebpf_common::{InstanceRecord, JournalAdmissionControl};
+
+        let mut scene = Scene::new(image_default());
+        let admitted = scene.fixture.admit();
+        let proof = scene.adapter.attest_key(&admitted).expect("key attests");
+        let attachment = scene.fixture.seal_attachment();
+        let custody = PidPin::open(std::process::id()).unwrap();
+        let control = JournalAdmissionControl::default();
+        let unmarked = InstanceRecord {
+            journal_bootstrap: MARKER_UNPUBLISHED,
+            ..InstanceRecord::default()
+        };
+        let (token, evidence) =
+            observe_absence_birth(&unmarked, &control, &custody, &attachment, &admitted)
+                .expect("unmarked row observes");
+        let grant =
+            SessionBirthGrant::issue(&token, proof, BirthKind::AbsenceAppearance, 1, 0, evidence);
+        let create = function_id("C_CreateObject");
+        let getinfo = function_id("C_GetInfo");
+        let template = begin_bytes(1, 1, create, 0);
+        let mut seen = ordinary_for(&template, 0);
+        seen.slot = 99;
+        seen.target_function = getinfo;
+        scene.ingest_ordinary(seen);
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        let birth =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("quiet life attests absence");
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let (_, fresh) =
+            observe_absence_birth(&unmarked, &control, &custody, &attachment, &admitted)
+                .expect("fresh words re-observe");
+        let frontier = scene.adapter.consumed_frontier();
+        let audit = scene.audit();
+        scene
+            .seal_explicit(&audit, &birth, frontier, &fresh)
+            .expect("observed absence seals");
+    }
+
+    #[test]
+    fn object_journal_session_birth_grant_binds_observed_words() {
+        // C1: the grant binds the observed evidence, and the seal
+        // re-checks fresh words: native truth that moved between
+        // observation and seal (a scope-dirtied marker) refuses the
+        // seal even though the grant attested. Fresh observation
+        // itself refuses the dirtied row; the seal must refuse the
+        // dirtied words however they arrive.
+        use crate::attach::{BirthObservationRefusal, observe_exec_birth};
+        use crate::process::PidPin;
+        use p11scope_ebpf_common::journal_marker::{MARKER_DIRTY, ready_word};
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        use p11scope_ebpf_common::{InstanceRecord, JournalAdmissionControl};
+
+        let mut scene = Scene::new(image_default());
+        let admitted = scene.fixture.admit();
+        let proof = scene.adapter.attest_key(&admitted).expect("key attests");
+        let attachment = scene.fixture.seal_attachment();
+        let custody = PidPin::open(std::process::id()).unwrap();
+        let control = JournalAdmissionControl::default();
+        let published = InstanceRecord {
+            journal_bootstrap: ready_word(EXEC),
+            ..InstanceRecord::default()
+        };
+        let (token, evidence) =
+            observe_exec_birth(&published, &control, &custody, &attachment, &admitted)
+                .expect("genuine producers observe");
+        let grant = SessionBirthGrant::issue(&token, proof, BirthKind::ExecMarker, 0, 0, evidence);
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        let birth =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("observed grant attests");
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let dirtied = InstanceRecord {
+            journal_bootstrap: MARKER_DIRTY,
+            ..InstanceRecord::default()
+        };
+        assert_eq!(
+            observe_exec_birth(&dirtied, &control, &custody, &attachment, &admitted),
+            Err(BirthObservationRefusal::MarkerNotReady)
+        );
+        let moved = SessionBirthEvidence::scripted(
+            (COOKIE, EXEC),
+            MARKER_DIRTY,
+            0,
+            custody.start_time().unwrap(),
+        );
+        let frontier = scene.adapter.consumed_frontier();
+        let audit = scene.audit();
+        let failure = scene
+            .seal_explicit(&audit, &birth, frontier, &moved)
+            .expect_err("dirtied marker refuses the seal");
+        assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
     }
 
     #[test]
@@ -7728,12 +8026,8 @@ mod tests {
             scene.ingest(&begin);
             let bootstrap = scene.bootstrap(proof, 0);
             scene.seal(&bootstrap).expect("open converts");
-            let abandon = abandon_bytes(
-                1,
-                1,
-                JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
-                (COOKIE, EXEC),
-            );
+            let abandon =
+                abandon_bytes(1, 1, JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, (COOKIE, EXEC));
             assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
             if corroborated {
                 scene.ingest_ordinary(ordinary_for(&begin, 0));
@@ -8135,19 +8429,15 @@ mod tests {
             crate::events::ScriptedRecords::records(vec![foreign.to_vec()], 1),
             9,
         );
-        let refused = scene.adapter.collect_from_drain(
-            &mut drain,
-            &scene.descriptors,
-            None,
-            &fault,
-            0,
-        );
+        let refused =
+            scene
+                .adapter
+                .collect_from_drain(&mut drain, &scene.descriptors, None, &fault, 0);
         assert_eq!((refused.ingested, refused.ordinary), (0, 0));
         assert_eq!(refused.drain_domain, 9);
         assert_eq!(scene.adapter.consumed_through, 2);
         // Its audit refuses the seal without voiding staged proof.
-        let mut source =
-            ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(2));
+        let mut source = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(2));
         let audit = JournalAuditReceipt::collect(&refused, &mut source, 0);
         let frontier = scene.adapter.consumed_frontier();
         let fresh = SessionBirthEvidence::scripted_for_receipt(&bootstrap);
@@ -8377,9 +8667,7 @@ mod tests {
         use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
         use crate::discovery::hooks::HookRegistry;
         use crate::inventory_semantics::{AttestedSemanticLane, SemanticBatch};
-        use crate::semantic_capture::{
-            Invalidation, InvalidationScope, TickOutcome, TickReport,
-        };
+        use crate::semantic_capture::{Invalidation, InvalidationScope, TickOutcome, TickReport};
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
         let mut scene = Scene::new(image_default());
@@ -8738,13 +9026,10 @@ mod tests {
         script.discard_bump = Some((1, 1));
         let mut drain = crate::events::EventDrain::over_test_domain(script, 7);
         let fault = ScriptedFaultCell::steady(7);
-        let collection = scene.adapter.collect_from_drain(
-            &mut drain,
-            &scene.descriptors,
-            None,
-            &fault,
-            0,
-        );
+        let collection =
+            scene
+                .adapter
+                .collect_from_drain(&mut drain, &scene.descriptors, None, &fault, 0);
         assert_eq!(collection.discarded_delta, 1);
         let bootstrap = scene.bootstrap(proof, 0);
         let failure = scene
@@ -8759,13 +9044,10 @@ mod tests {
         let next_end = end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60);
         let script = BusyScript::new(vec![next.to_vec(), next_end.to_vec()]);
         let mut drain = crate::events::EventDrain::over_test_domain(script, 7);
-        let collection = scene.adapter.collect_from_drain(
-            &mut drain,
-            &scene.descriptors,
-            None,
-            &fault,
-            0,
-        );
+        let collection =
+            scene
+                .adapter
+                .collect_from_drain(&mut drain, &scene.descriptors, None, &fault, 0);
         assert_eq!(collection.discarded_delta, 0);
         let grant = SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, fence, 0);
         let resume =
@@ -8796,25 +9078,24 @@ mod tests {
             let birth = BootstrapReceipt::attest(&scene.adapter, &grant).expect("grant attests");
             (scene, birth)
         }
-        fn marker(exec: u64, state: u64) -> u64 {
-            (exec << 32) | state
-        }
+        use p11scope_ebpf_common::journal_marker::{MARKER_DIRTY, MARKER_UNPUBLISHED, ready_word};
         let image = (COOKIE, EXEC);
+        let ready = ready_word(EXEC);
         // Fresh evidence matching the grant seals.
         let (mut scene, birth) = sealed_scene();
         let frontier = scene.adapter.consumed_frontier();
         let audit = scene.audit();
-        let fresh = SessionBirthEvidence::scripted(image, marker(EXEC, 1), 0, 1);
+        let fresh = SessionBirthEvidence::scripted(image, ready, 0, 1);
         scene
             .seal_explicit(&audit, &birth, frontier, &fresh)
             .expect("fresh evidence seals");
         // Each post-attestation corruption refuses the seal.
         for fresh in [
-            SessionBirthEvidence::scripted(image, marker(EXEC, 2), 0, 1),
-            SessionBirthEvidence::scripted(image, marker(EXEC, 1), 1, 1),
-            SessionBirthEvidence::scripted(image, marker(EXEC, 1), 0, 0),
-            SessionBirthEvidence::scripted((COOKIE + 1, EXEC), marker(EXEC, 1), 0, 1),
-            SessionBirthEvidence::scripted(image, marker(EXEC, 0), 0, 1),
+            SessionBirthEvidence::scripted(image, MARKER_DIRTY, 0, 1),
+            SessionBirthEvidence::scripted(image, ready, 1, 1),
+            SessionBirthEvidence::scripted(image, ready, 0, 0),
+            SessionBirthEvidence::scripted((COOKIE + 1, EXEC), ready, 0, 1),
+            SessionBirthEvidence::scripted(image, MARKER_UNPUBLISHED, 0, 1),
         ] {
             let (mut scene, birth) = sealed_scene();
             let frontier = scene.adapter.consumed_frontier();

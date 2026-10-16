@@ -721,13 +721,145 @@ fn map_file_identity(
 
 /// Issuance capability for H8 birth/closure grants. Only Session-owned
 /// attach code can mint one (private field, constructed solely by the
-/// future issuance site in this module once the native exec-marker /
-/// held-custody witnesses wire). Until then production grants are
-/// unmintable and birth attestation fails closed; tests mint scripted
-/// grants through the journal child's `cfg(test)` seams.
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // Activation-gated: no issuance site until H8-D native witnesses wire.
+/// birth observation sites in this module). The joint seal tick that
+/// observes in production is later Task 3 work; until it lands the
+/// observation sites are exercised by tests, and scripted grants cover
+/// the journal child's other tests through its `cfg(test)` seams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // No production caller until the joint seal tick lands.
 pub(crate) struct SessionGrantToken(());
+
+/// Finite birth-observation refusal: which genuine Session producer
+/// failed. Observation refuses; nothing is minted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BirthObservationRefusal {
+    /// The PROC_EPOCH marker readback is not READY naming the admitted
+    /// image's exec id (unpublished, DIRTY, invalid, or another exec).
+    MarkerNotReady,
+    /// The admission control row trips the failed latch.
+    LatchTripped,
+    /// The admission control row spent its permit cap.
+    SpentExhausted,
+    /// The held pidfd no longer pins the birth's process
+    /// (exited/reused), or never had a start-time basis to bind.
+    CustodyLost,
+    /// The sealed attachment names another domain than the admission.
+    AttachmentMismatch,
+    /// The marker word is not unmarked: something published (READY)
+    /// or poisoned (DIRTY) this birth's marker, so absence is unproven.
+    MarkerPublished,
+}
+
+/// Shared birth producers: the admitted domain and image, held-pidfd
+/// custody liveness with a start-time basis, and the admission control
+/// row's latch and spent bound. Every word is read or derived here;
+/// nothing is supplied.
+fn common_birth_words(
+    control: &p11scope_ebpf_common::JournalAdmissionControl,
+    custody: &crate::process::PidPin,
+    attachment: &super::AttachedSemanticSet,
+    admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+) -> Result<((u64, u64), u64), BirthObservationRefusal> {
+    let (domain, image, _router, _caller) = admitted.journal_binding();
+    if attachment.domain() != domain {
+        return Err(BirthObservationRefusal::AttachmentMismatch);
+    }
+    match custody.original_generation_state() {
+        Ok(crate::process::OriginalGenerationState::Current) => {}
+        _ => return Err(BirthObservationRefusal::CustodyLost),
+    }
+    let custody_word = custody
+        .start_time()
+        .ok_or(BirthObservationRefusal::CustodyLost)?;
+    if control.failed != 0 {
+        return Err(BirthObservationRefusal::LatchTripped);
+    }
+    if control.spent >= p11scope_ebpf_common::journal_marker::MARKER_ADMIT_CAP {
+        return Err(BirthObservationRefusal::SpentExhausted);
+    }
+    Ok(((image.task_cookie, image.exec_id), custody_word))
+}
+
+/// Session-owned exec-marker birth observation. The producers are
+/// genuine Session observations: the PROC_EPOCH marker word read back
+/// from a real row (READY naming the admitted image's exec id), the
+/// admission control row's latch and spent bound, held-pidfd custody
+/// liveness, sealed successful attachment for the admitted domain, and
+/// the admitted image itself. Returns the issuance token with the
+/// observed evidence; only this path and its absence twin mint
+/// production birth grants. The seal re-checks fresh evidence against
+/// the grant, so native truth that moved between the two refuses.
+///
+/// Live map reads stay UNRUN: production passes rows read through
+/// `InstanceMaps::record`; host tests pass rows the real native
+/// publication logic produced in fixtures.
+#[allow(dead_code)] // No production caller until the joint seal tick lands.
+pub(crate) fn observe_exec_birth(
+    record: &InstanceRecord,
+    control: &p11scope_ebpf_common::JournalAdmissionControl,
+    custody: &crate::process::PidPin,
+    attachment: &super::AttachedSemanticSet,
+    admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+) -> Result<
+    (
+        SessionGrantToken,
+        crate::semantics_objects::journal::SessionBirthEvidence,
+    ),
+    BirthObservationRefusal,
+> {
+    use p11scope_ebpf_common::journal_marker::{MarkerRead, read_word};
+    let (image, custody_word) = common_birth_words(control, custody, attachment, admitted)?;
+    match read_word(record.journal_bootstrap) {
+        MarkerRead::Ready(exec) if exec == image.1 => {
+            let token = SessionGrantToken(());
+            let evidence = crate::semantics_objects::journal::SessionBirthEvidence::issue(
+                &token,
+                image,
+                record.journal_bootstrap,
+                control.failed,
+                custody_word,
+            );
+            Ok((token, evidence))
+        }
+        _ => Err(BirthObservationRefusal::MarkerNotReady),
+    }
+}
+
+/// Session-owned absence-appearance birth observation: the shared
+/// producers plus the real marker word read back unmarked — absence
+/// births never publish, so any publication (READY) or poisoning
+/// (DIRTY) refuses. The journal's retained sightings/audit chain is
+/// the complete-absence backstop at attestation and seal; custody and
+/// latch re-check with fresh words there. Live map reads stay UNRUN:
+/// production passes rows read through `InstanceMaps::record`.
+#[allow(dead_code)] // No production caller until the joint seal tick lands.
+pub(crate) fn observe_absence_birth(
+    record: &InstanceRecord,
+    control: &p11scope_ebpf_common::JournalAdmissionControl,
+    custody: &crate::process::PidPin,
+    attachment: &super::AttachedSemanticSet,
+    admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+) -> Result<
+    (
+        SessionGrantToken,
+        crate::semantics_objects::journal::SessionBirthEvidence,
+    ),
+    BirthObservationRefusal,
+> {
+    let (image, custody_word) = common_birth_words(control, custody, attachment, admitted)?;
+    if record.journal_bootstrap != 0 {
+        return Err(BirthObservationRefusal::MarkerPublished);
+    }
+    let token = SessionGrantToken(());
+    let evidence = crate::semantics_objects::journal::SessionBirthEvidence::issue(
+        &token,
+        image,
+        0,
+        control.failed,
+        custody_word,
+    );
+    Ok((token, evidence))
+}
 
 /// Readers over the session's instance maps.
 pub(crate) struct InstanceMaps<'a> {

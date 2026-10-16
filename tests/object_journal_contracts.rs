@@ -722,6 +722,9 @@ fn object_journal_leaves_are_inactive() {
             "JOURNAL_START",
             "journal_thread",
             "journal_sequence",
+            "journal_bootstrap",
+            "journal_marker",
+            "JOURNAL_MARKER_CTL",
             "object_journal",
         ] {
             assert!(
@@ -730,4 +733,45 @@ fn object_journal_leaves_are_inactive() {
             );
         }
     }
+}
+
+/// H8-D atomic birth marker: the native publication/dirty/readback/
+/// admission implementation compiles and its actual fixture passes
+/// unprivileged. The producer that would call this stays inactive: no
+/// live root wires these leaves.
+#[test]
+fn object_journal_birth_marker() {
+    use std::process::Command;
+
+    let temporary = tempfile::tempdir().expect("native marker test directory");
+    let binary = temporary.path().join("journal-marker");
+    let output = Command::new("clang-18")
+        .args([
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pthread",
+            "-I",
+            "crates/ebpf/native",
+            "tests/fixtures/object-journal/journal_marker_tests.c",
+            "-o",
+        ])
+        .arg(&binary)
+        .output()
+        .expect("execute clang-18");
+    assert!(
+        output.status.success(),
+        "native marker compile: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new(binary)
+        .output()
+        .expect("execute native marker test");
+    assert!(
+        output.status.success(),
+        "native marker test: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

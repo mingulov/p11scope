@@ -710,6 +710,60 @@ fn object_journal_physical_thread_identity() {
     }
 }
 
+/// N4: the journal unit's BPF-subprogram call shape is covered, not
+/// just its host behavior. The real pipeline compiles native units
+/// with `-emit-llvm` (no backend), which cannot see the BPF
+/// five-scalar-argument limit — a six-argument noinline leaf passed
+/// both the real build and the host suite. Full backend codegen per
+/// object flavor fails such leaves here instead. task_owner.c stays
+/// out: its standalone backend stack estimate is stricter than the
+/// real -emit-llvm pipeline it ships through (pre-existing,
+/// unrelated to this restriction).
+#[test]
+fn object_journal_bpf_call_shape() {
+    use std::process::Command;
+
+    let temporary = tempfile::tempdir().expect("native BPF shape directory");
+    let matrix: &[(&str, &[&str])] = &[
+        ("default", &[]),
+        ("small", &["-DP11SCOPE_SMALL_STATE_MAPS"]),
+        ("wide", &["-DP11SCOPE_OWNER_SLOT_BOUND=2112"]),
+        ("inventory", &["-DP11SCOPE_INVENTORY_ONLY"]),
+        (
+            "small-inventory",
+            &["-DP11SCOPE_SMALL_STATE_MAPS", "-DP11SCOPE_INVENTORY_ONLY"],
+        ),
+    ];
+    for (name, defines) in matrix {
+        let object = temporary
+            .path()
+            .join(format!("object-journal-{name}.o"));
+        let mut compiler = Command::new("clang-18");
+        compiler
+            .args([
+                "-target",
+                "bpf",
+                "-O2",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-c",
+                "-I",
+                "crates/ebpf/native",
+                "crates/ebpf/native/object_journal.c",
+                "-o",
+            ])
+            .arg(&object)
+            .args(*defines);
+        let output = compiler.output().expect("execute clang-18");
+        assert!(
+            output.status.success(),
+            "native BPF codegen [{name}]: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 /// Slice-A custody stays inactive: no live BPF root wires the journal
 /// leaves until slice B authorizes the transactions.
 #[test]

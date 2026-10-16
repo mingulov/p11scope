@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* H8 slice-A inactive custody fixture: executes the actual production
  * lifetime-mint, side-map and ring-leaf implementation from
  * crates/ebpf/native/object_journal.{c,h} plus the owner lease/cleanup

@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* H8-D atomic birth marker fixture: executes the actual production
  * publication/dirty/readback/admission implementation from
  * crates/ebpf/native/journal_marker.{c,h} over real instance_record

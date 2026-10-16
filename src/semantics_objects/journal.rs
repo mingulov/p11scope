@@ -2181,6 +2181,52 @@ impl SessionClosureGrant {
     }
 }
 
+/// A Session-owned drain↔domain association: the native domain tag
+/// from an admission the Session's authority minted, bound to the
+/// EVENTS-map identity of the Session's own retained EVENTS domain.
+/// Mints only through [`SessionDrainGrant::observe`] from those two
+/// Session-owned producers — there is deliberately no scripted seam,
+/// so a bare integer or a presented drain's claim can never become
+/// binding authority. The joint tick mints this from its retained
+/// domain per Session before the first collection; tests traverse the
+/// same mint with their retained test domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionDrainGrant {
+    domain_tag: u64,
+    events_id: u64,
+}
+
+impl SessionDrainGrant {
+    /// Mint the association from the Session's own producers: its
+    /// retained EVENTS domain (fd-backed in production, so the identity
+    /// cannot be reused or forged) and an admission its authority
+    /// minted. Neither side is trusted alone: the tag always comes
+    /// from the admission's journal binding and the EVENTS identity
+    /// always from the retained domain — never from a presented drain.
+    pub(crate) fn observe(
+        drain_domain: &crate::events::EventsDomain,
+        admitted: &AdmittedInstanceCall,
+    ) -> Self {
+        let (domain, _image, _router, _caller) = admitted.journal_binding();
+        Self {
+            domain_tag: domain.journal_tag(),
+            events_id: drain_domain.id(),
+        }
+    }
+
+    /// The associated native domain tag, from the admission.
+    #[cfg(test)]
+    pub(crate) fn domain_tag(&self) -> u64 {
+        self.domain_tag
+    }
+
+    /// The associated EVENTS-map identity, from the retained domain.
+    #[cfg(test)]
+    pub(crate) fn events_id(&self) -> u64 {
+        self.events_id
+    }
+}
+
 /// One domain's bootstrap: its Session-issued birth grant, verified at
 /// attestation and re-verified by the seal, so a chain break between
 /// attestation and seal still refuses.
@@ -2507,32 +2553,30 @@ impl JournalAdapter {
         Ok(JournalDomainProof { key, era })
     }
 
-    /// Bind the Session drain serving one attested native domain: the
-    /// drain's EVENTS-map identity (read from the drain object itself)
-    /// to the admission's native domain tag (read from the admitted
-    /// call's journal binding). The joint seal tick calls this once per
-    /// Session from its own producers before the first collection; the
-    /// collection and seal paths only ever CHECK the binding, so a
-    /// foreign drain presented first refuses instead of becoming
-    /// authority. The domain must have attested (pins stay within the
-    /// key table), and the first binding wins: a conflicting rebind
-    /// refuses loudly. Repeating the same pair is idempotent.
-    pub(crate) fn bind_session_drain<S: crate::events::RecordSource>(
+    /// Bind the Session drain serving one attested native domain from
+    /// the Session-minted association: the grant's EVENTS-map identity
+    /// (minted from the Session's retained EVENTS domain) to its native
+    /// domain tag (minted from the Session's admission). No drain
+    /// object is read here at all — a presented drain is only ever
+    /// CHECKED against the pin at collection, so a foreign drain
+    /// presented first refuses instead of becoming authority. The joint
+    /// seal tick calls this once per Session from its own producers
+    /// before the first collection. The domain must have attested
+    /// (pins stay within the key table), and the first binding wins: a
+    /// conflicting rebind refuses loudly. Repeating the same grant is
+    /// idempotent.
+    pub(crate) fn bind_session_drain(
         &mut self,
-        drain: &crate::events::EventDrain<S>,
-        admitted: &AdmittedInstanceCall,
+        grant: &SessionDrainGrant,
     ) -> Result<(), DrainBindRefusal> {
-        let (domain, _image, _router, _caller) = admitted.journal_binding();
-        let tag = domain.journal_tag();
-        if !self.keys.keys().any(|key| key.domain_tag == tag) {
+        if !self.keys.keys().any(|key| key.domain_tag == grant.domain_tag) {
             return Err(DrainBindRefusal::DomainUnattested);
         }
-        let events = drain.domain_id();
-        match self.drain_pins.get(&tag) {
-            Some(pinned) if *pinned == events => Ok(()),
+        match self.drain_pins.get(&grant.domain_tag) {
+            Some(pinned) if *pinned == grant.events_id => Ok(()),
             Some(_) => Err(DrainBindRefusal::DrainConflict),
             None => {
-                self.drain_pins.insert(tag, events);
+                self.drain_pins.insert(grant.domain_tag, grant.events_id);
                 Ok(())
             }
         }
@@ -4483,6 +4527,10 @@ mod tests {
         descriptors:
             [p11scope_ebpf_common::object_wire::ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
         fixture: AttestationFixture,
+        /// The Session's retained EVENTS domain (fd-backed in
+        /// production): the drain-side producer behind every drain
+        /// grant this scene mints. One Session retains one domain.
+        retained_events: crate::events::EventsDomain,
     }
 
     impl Scene {
@@ -4498,6 +4546,7 @@ mod tests {
                 model: ObjectSemantics::new(),
                 descriptors,
                 fixture: AttestationFixture::new(image),
+                retained_events: crate::events::EventsDomain::test_standin(7),
             };
             // The Session sealed before journal work: the adapter
             // starts under the observed closure.
@@ -4565,19 +4614,20 @@ mod tests {
             self.adapter.attest_key(&admitted).expect("key attests")
         }
 
-        /// Session authority binds this scene's drain (one EVENTS-map
-        /// identity) to the attested native domain, before any
-        /// collection: the joint tick's bind step. The domain must have
-        /// attested first.
-        fn bind_session_drain(&mut self, events_id: u64) {
+        /// Mint the Session's drain↔domain association from its own
+        /// producers: the retained EVENTS domain plus an admission. The
+        /// joint tick calls the same mint in production.
+        fn mint_drain_grant(&mut self) -> SessionDrainGrant {
             let admitted = self.fixture.admit();
-            let drain = crate::events::EventDrain::over_test_domain(
-                crate::events::ScriptedRecords::records(Vec::new(), 0),
-                events_id,
-            );
-            self.adapter
-                .bind_session_drain(&drain, &admitted)
-                .expect("session drain binds");
+            SessionDrainGrant::observe(&self.retained_events, &admitted)
+        }
+
+        /// Session authority binds this scene's retained drain to the
+        /// attested native domain, before any collection: the joint
+        /// tick's bind step. The domain must have attested first.
+        fn bind_session_drain(&mut self) {
+            let grant = self.mint_drain_grant();
+            self.adapter.bind_session_drain(&grant).expect("session drain binds");
         }
 
         fn ingest(&mut self, bytes: &[u8]) -> JournalDisposition {
@@ -4688,10 +4738,7 @@ mod tests {
                 crate::events::ScriptedRecords::records(records, bound),
                 7,
             );
-            let admitted = self.fixture.admit();
-            self.adapter
-                .bind_session_drain(&drain, &admitted)
-                .expect("scene drain binds");
+            self.bind_session_drain();
             self.adapter
                 .collect_from_drain(&mut drain, &self.descriptors, Some(bound), fault, 0)
         }
@@ -5661,7 +5708,7 @@ mod tests {
         // flows on the next collection.
         let mut scene = Scene::new(image_default());
         let proof = scene.attest();
-        scene.bind_session_drain(7);
+        scene.bind_session_drain();
         let create = function_id("C_CreateObject");
         let begin = begin_bytes(1, 1, create, 0);
         let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
@@ -5696,7 +5743,7 @@ mod tests {
         // unbound-drain refusal.)
         let mut scene = Scene::new(image_default());
         scene.attest();
-        scene.bind_session_drain(7);
+        scene.bind_session_drain();
         let mut script = BusyScript::new(vec![begin.to_vec()]);
         script.busy_after = Some(0);
         let mut drain = crate::events::EventDrain::over_test_domain(script, 7);
@@ -9367,27 +9414,24 @@ mod tests {
 
     #[test]
     fn object_journal_collection_binds_drain_session() {
-        // C2/C4: the drain's EVENTS-map identity is bound to the attested
-        // key's native domain by Session authority BEFORE any
-        // collection; presentation never pins. A foreign drain presented
-        // FIRST refuses and consumes nothing (it never becomes accepted
-        // authority); the bound Session drain then collects and seals; a
-        // foreign drain presented after still refuses. Binding an
-        // unattested domain, or rebinding a bound one, refuses loudly.
+        // C2: the drain↔domain association mints from the SESSION's own
+        // producers (its retained EVENTS domain plus an admission its
+        // authority minted) — a presented drain is checked, never
+        // trusted. A foreign drain presented FIRST, with no setup at
+        // all, refuses and consumes nothing (no association covers
+        // it); the Session-minted grant then binds; the bound Session
+        // drain collects and seals; a foreign drain presented after
+        // still refuses. Binding an unattested domain, or rebinding a
+        // bound one to a rotated identity, refuses loudly.
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
         let mut scene = Scene::new(image_default());
         let proof = scene.attest();
-        // Session authority binds the Session drain (EVENTS 7) to the
-        // attested native domain; no drain has been presented yet. The
-        // same pair rebinds idempotently.
-        scene.bind_session_drain(7);
-        scene.bind_session_drain(7);
         let create = function_id("C_CreateObject");
         let fault = ScriptedFaultCell::steady(7);
         let bootstrap = scene.bootstrap(proof, 0);
-        // FOREIGN FIRST: EVENTS 9 presented before the Session drain ever
-        // collects refuses and consumes nothing.
+        // FOREIGN FIRST with no setup at all: EVENTS 9 presented before
+        // any grant mints refuses and consumes nothing.
         let foreign = begin_bytes(1, 2, create, 0);
         let mut drain = crate::events::EventDrain::over_test_domain(
             crate::events::ScriptedRecords::records(vec![foreign.to_vec()], 1),
@@ -9409,6 +9453,14 @@ mod tests {
             .seal_explicit(&audit, &bootstrap, frontier, fresh)
             .expect_err("first-presented foreign drain refuses");
         assert_eq!(failure.gap, JournalGap::DrainMismatch);
+        // Session authority mints the association from its retained
+        // EVENTS domain (7) plus the admission: the grant carries the
+        // producers' identities, and binding it is idempotent.
+        let grant = scene.mint_drain_grant();
+        assert_eq!(grant.domain_tag(), proof.key.domain_tag);
+        assert_eq!(grant.events_id(), 7);
+        scene.bind_session_drain();
+        scene.bind_session_drain();
         // THE SESSION DRAIN collects and seals.
         let begin = begin_bytes(1, 1, create, 0);
         let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
@@ -9429,26 +9481,22 @@ mod tests {
         assert_eq!((refused.ingested, refused.ordinary), (0, 0));
         assert_eq!(scene.adapter.consumed_through, 2);
         // Bind discipline: an unattested domain binds nothing, and a
-        // bound domain never rebinds to another EVENTS identity.
+        // bound domain never rebinds to a rotated EVENTS identity
+        // (another Session incarnation's retained domain).
         let mut stranger = Scene::new(image_default());
-        let admitted = stranger.fixture.admit();
-        let drain = crate::events::EventDrain::over_test_domain(
-            crate::events::ScriptedRecords::records(Vec::new(), 0),
-            11,
-        );
+        let grant = stranger.mint_drain_grant();
         assert_eq!(
-            stranger.adapter.bind_session_drain(&drain, &admitted),
+            stranger.adapter.bind_session_drain(&grant),
             Err(DrainBindRefusal::DomainUnattested)
         );
         stranger.attest();
-        stranger.bind_session_drain(11);
-        let conflict = crate::events::EventDrain::over_test_domain(
-            crate::events::ScriptedRecords::records(Vec::new(), 0),
-            13,
+        stranger.bind_session_drain();
+        let rotated = SessionDrainGrant::observe(
+            &crate::events::EventsDomain::test_standin(13),
+            &stranger.fixture.admit(),
         );
-        let admitted = stranger.fixture.admit();
         assert_eq!(
-            stranger.adapter.bind_session_drain(&conflict, &admitted),
+            stranger.adapter.bind_session_drain(&rotated),
             Err(DrainBindRefusal::DrainConflict)
         );
     }
@@ -9719,7 +9767,7 @@ mod tests {
         let fault = ScriptedFaultCell::steady(7);
         // The Session drain holds both quanta; the tick consumes two
         // records per quantum through the real dispatch poll.
-        scene.bind_session_drain(7);
+        scene.bind_session_drain();
         let first = begin_bytes(1, 1, create, 0);
         let next = begin_bytes(1, 2, create, 0);
         let mut drain = crate::events::EventDrain::over_test_domain(
@@ -9856,7 +9904,7 @@ mod tests {
 
         let mut scene = Scene::new(image_default());
         let proof = scene.attest();
-        scene.bind_session_drain(7);
+        scene.bind_session_drain();
         let create = function_id("C_CreateObject");
         let fault = ScriptedFaultCell::steady(7);
         let first = begin_bytes(1, 1, create, 0);
@@ -10188,7 +10236,7 @@ mod tests {
 
         let mut scene = Scene::new(image_default());
         let proof = scene.attest();
-        scene.bind_session_drain(7);
+        scene.bind_session_drain();
         let create = function_id("C_CreateObject");
         let begin = begin_bytes(1, 1, create, 0);
         let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);

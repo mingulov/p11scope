@@ -1044,6 +1044,17 @@ impl ObjectSemantics {
         self.state.begin(origin)
     }
 
+    /// Sealed production input: admission with its refusal effects. The
+    /// journal conversion path calls this (never `begin`) so
+    /// capacity-refusal invalidations publish to the seal's effects
+    /// before further publication.
+    pub(crate) fn begin_with_effects(
+        &mut self,
+        origin: OriginFact,
+    ) -> (Result<CallToken, ObjectGap>, ObjectEffects) {
+        self.state.begin_with_effects(origin)
+    }
+
     /// Stage one matched completion privately; publishes no object claim.
     pub(crate) fn complete(&mut self, token: CallToken, result: CompletedFact) -> ObjectEffects {
         self.state.complete(token, result)

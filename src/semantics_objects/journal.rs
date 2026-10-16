@@ -3235,7 +3235,9 @@ impl JournalAdapter {
             let origin = origin_of(domain, entry.begin_ordinal, ticket, &entry.begin);
             let function = entry.function;
             let call_key = CallKey::sealed(ticket);
-            match model.begin(origin) {
+            let (admitted, begin_effects) = model.begin_with_effects(origin);
+            effects.effects.extend(begin_effects.effects);
+            match admitted {
                 Ok(token) => {
                     let fingerprint = fingerprint_of_begin(&entry.begin);
                     let entry = self.open.get_mut(&native).expect("staged begin");
@@ -7513,6 +7515,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn object_journal_conversion_capacity_refusal_propagates_effects() {
+        // Carryover 10: a capacity refusal on the production conversion
+        // path (model.begin inside the seal) publishes its invalidation
+        // effects to the seal failure before anything further — admit()
+        // must not drop them.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        // Shrink ONLY the model: the journal stages every begin, the
+        // model holds two pending calls.
+        scene.model = ObjectSemantics::with_limits(crate::semantics_objects::ObjectLimits {
+            pending_calls: 2,
+            ..crate::semantics_objects::ObjectLimits::policy()
+        });
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        // One creation settles first: its live view is what the later
+        // refusal retires.
+        let first = begin_bytes(1, 1, create, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 40));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("creation seals");
+        assert_eq!(scene.model.project().usage.pending_calls, 0);
+        // Three opens convert into two model slots: the third begin
+        // refuses capacity on the conversion path.
+        scene.ingest(&begin_bytes(1, 2, create, 0));
+        scene.ingest(&begin_bytes(1, 3, create, 0));
+        scene.ingest(&begin_bytes(1, 4, create, 0));
+        let bootstrap = scene.bootstrap(proof, 0);
+        let failure = scene
+            .seal(&bootstrap)
+            .expect_err("model capacity refuses the seal");
+        assert_eq!(failure.gap, JournalGap::ModelRefused);
+        assert!(
+            failure.effects.effects.iter().any(|effect| matches!(
+                effect,
+                ObjectEffect::Retired {
+                    reason: super::ObjectGap::PendingCapacity,
+                    ..
+                }
+            )),
+            "conversion refusal reaches seal effects: {:?}",
+            failure.effects.effects
+        );
     }
 
     #[test]

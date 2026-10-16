@@ -2208,34 +2208,51 @@ impl SessionClosureGrant {
 /// A Session-owned drain↔domain association: the native domain tag
 /// from an admission the Session's authority minted, bound to the
 /// EVENTS-map identity of the Session's own retained EVENTS domain.
-/// Mints only through [`SessionDrainGrant::observe`] from those two
-/// Session-owned producers — there is deliberately no scripted seam,
-/// so a bare integer or a presented drain's claim can never become
-/// binding authority. The joint tick mints this from its retained
-/// domain per Session before the first collection; tests traverse the
-/// same mint with their retained test domain.
+/// Mints only through [`SessionDrainGrant::observe`] from the
+/// Session's retained producer pair — there is deliberately no
+/// scripted seam, so a bare integer, a presented drain's claim, or a
+/// spliced foreign admission can never become binding authority. The
+/// joint tick mints this from its retained producers per Session and
+/// binds it before collecting; tests traverse the same mint with
+/// their retained test producers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SessionDrainGrant {
     domain_tag: u64,
     events_id: u64,
 }
 
+/// Finite Session-drain-mint refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrainMintRefusal {
+    /// The admission names another native domain than the Session
+    /// retaining the EVENTS identity: a spliced foreign pair mints
+    /// nothing.
+    ForeignAdmission,
+}
+
 impl SessionDrainGrant {
-    /// Mint the association from the Session's own producers: its
-    /// retained EVENTS domain (fd-backed in production, so the identity
-    /// cannot be reused or forged) and an admission its authority
-    /// minted. Neither side is trusted alone: the tag always comes
-    /// from the admission's journal binding and the EVENTS identity
-    /// always from the retained domain — never from a presented drain.
+    /// Mint the association through the Session retaining both the
+    /// native and EVENTS identities: the admission is checked against
+    /// THAT Session (its native domain must equal the retained one),
+    /// and the EVENTS identity always comes from the retained domain
+    /// — never from a presented drain, never from an independently
+    /// supplied half. A spliced foreign pair refuses at mint.
     pub(crate) fn observe(
-        drain_domain: &crate::events::EventsDomain,
+        producers: &crate::attach::SessionDrainProducers,
         admitted: &AdmittedInstanceCall,
-    ) -> Self {
+    ) -> Result<Self, DrainMintRefusal> {
         let (domain, _image, _router, _caller) = admitted.journal_binding();
-        Self {
-            domain_tag: domain.journal_tag(),
-            events_id: drain_domain.id(),
+        // Common ownership: the admission must name the retained
+        // native domain — the Session that retains the EVENTS
+        // identity it binds. A spliced foreign admission mints
+        // nothing.
+        if domain != producers.native_domain() {
+            return Err(DrainMintRefusal::ForeignAdmission);
         }
+        Ok(Self {
+            domain_tag: domain.journal_tag(),
+            events_id: producers.events_id(),
+        })
     }
 
     /// The associated native domain tag, from the admission.
@@ -3922,6 +3939,7 @@ pub(crate) struct JointSealTick<'a, S, F, H> {
     fault: &'a F,
     finalizer: &'a mut H,
     attachment: &'a crate::attach::AttachedSemanticSet,
+    producers: &'a crate::attach::SessionDrainProducers,
 }
 
 #[allow(dead_code)] // As above.
@@ -3932,8 +3950,9 @@ where
     H: H3FinalizerPort,
 {
     /// Wire one Session's journal quantum: its adapter, model, retained
-    /// drain, frozen descriptors, fault cell, H3 finalizer and sealed
-    /// attachment (the closure generation's observed source).
+    /// drain, frozen descriptors, fault cell, H3 finalizer, sealed
+    /// attachment (the closure generation's observed source) and
+    /// retained drain producers (the grant's observed source).
     pub(crate) fn wire(
         adapter: &'a mut JournalAdapter,
         model: &'a mut ObjectSemantics,
@@ -3943,6 +3962,7 @@ where
         fault: &'a F,
         finalizer: &'a mut H,
         attachment: &'a crate::attach::AttachedSemanticSet,
+        producers: &'a crate::attach::SessionDrainProducers,
     ) -> Self {
         Self {
             adapter,
@@ -3952,27 +3972,46 @@ where
             fault,
             finalizer,
             attachment,
+            producers,
         }
     }
 
-    /// One joint quantum: install the observed closure, collect, take,
-    /// audit, seal (pulling one fresh birth observation), then forward
-    /// the seal's void report (if any) to the finalizer before
-    /// returning. The closure generation is observed from the sealed
-    /// attachment for both the install and the audit — never
-    /// supplied. `h0_allocated_below` is H0's post-quantum allocation
+    /// One joint quantum: install the observed closure, mint and bind
+    /// the Session drain grant, collect, take, audit, seal (pulling
+    /// one fresh birth observation), then forward the seal's void
+    /// report (if any) to the finalizer before returning. The closure
+    /// generation is observed from the sealed attachment for both the
+    /// install and the audit — never supplied. `admitted` is the
+    /// Session loop's H3-admitted call for this quantum: the grant
+    /// mints from the retained producers plus this admission, so a
+    /// foreign admission refuses the quantum before anything is
+    /// collected. `h0_allocated_below` is H0's post-quantum allocation
     /// counter (production; tests pass the joint-quantum fiction 0).
     pub(crate) fn tick(
         &mut self,
         quantum: Option<usize>,
         h0_allocated_below: u64,
         bootstrap: &BootstrapReceipt,
+        admitted: &AdmittedInstanceCall,
         births: &mut impl BirthEvidenceSource,
     ) -> Result<SealSuccess, SealFailure> {
         let observed = self.attachment.generation();
         let _ = self
             .adapter
             .install_closure_grant(&SessionClosureGrant::observe(self.attachment));
+        // The joint-tick mint: the grant mints from the Session's
+        // retained producers plus this quantum's admission, and binds
+        // before the first collection. A foreign admission, an
+        // unattested domain, or a conflicting rebind refuses the
+        // quantum here — one Session's history never collects, let
+        // alone seals, under another's key.
+        let grant = match SessionDrainGrant::observe(self.producers, admitted) {
+            Ok(grant) => grant,
+            Err(_) => return Err(self.adapter.failure(JournalGap::DrainMismatch)),
+        };
+        if self.adapter.bind_session_drain(&grant).is_err() {
+            return Err(self.adapter.failure(JournalGap::DrainMismatch));
+        }
         let collection = self.adapter.collect_from_drain(
             self.drain,
             self.descriptors,
@@ -4639,6 +4678,12 @@ mod tests {
             }
         }
 
+        /// The fixture's minted native domain: the Session-side
+        /// native identity its admissions name.
+        fn domain(&self) -> NativeDomainId {
+            self.domain
+        }
+
         /// The happy-path binding, genuinely bound: read back from the
         /// coordinator's stored proof.
         fn binding(
@@ -4902,12 +4947,22 @@ mod tests {
             self.adapter.attest_key(&admitted).expect("key attests")
         }
 
+        /// This scene's retained drain producers: its fixture's
+        /// minted native domain plus its retained test EVENTS domain.
+        fn producers(&self) -> crate::attach::SessionDrainProducers {
+            crate::attach::SessionDrainProducers::test_pair(
+                self.fixture.domain(),
+                self.retained_events.clone(),
+            )
+        }
+
         /// Mint the Session's drain↔domain association from its own
-        /// producers: the retained EVENTS domain plus an admission. The
-        /// joint tick calls the same mint in production.
+        /// retained producer pair plus an admission. The joint tick
+        /// calls the same mint in production.
         fn mint_drain_grant(&mut self) -> SessionDrainGrant {
             let admitted = self.fixture.admit();
-            SessionDrainGrant::observe(&self.retained_events, &admitted)
+            SessionDrainGrant::observe(&self.producers(), &admitted)
+                .expect("the scene's own admission mints")
         }
 
         /// Session authority binds this scene's retained drain to the
@@ -5017,7 +5072,8 @@ mod tests {
         /// One production collection over scripted ring bytes: the real
         /// dispatch poll, real decode, real malformed accounting and the
         /// scripted fault cell. Binds the scene drain first (the joint
-        /// tick's bind step; idempotent across collections).
+        /// tick's bind step; idempotent across collections). The drain
+        /// runs over this scene's own retained EVENTS identity.
         fn collect_records(
             &mut self,
             records: Vec<Vec<u8>>,
@@ -5026,7 +5082,7 @@ mod tests {
             let bound = records.len();
             let mut drain = crate::events::EventDrain::over_test_domain(
                 crate::events::ScriptedRecords::records(records, bound),
-                7,
+                self.retained_events.id(),
             );
             self.bind_session_drain();
             self.adapter
@@ -10102,14 +10158,53 @@ mod tests {
         );
         stranger.attest();
         stranger.bind_session_drain();
-        let rotated = SessionDrainGrant::observe(
-            &crate::events::EventsDomain::test_standin(13),
-            &stranger.fixture.admit(),
+        let rotated_producers = crate::attach::SessionDrainProducers::test_pair(
+            stranger.fixture.domain(),
+            crate::events::EventsDomain::test_standin(13),
         );
+        let rotated = SessionDrainGrant::observe(&rotated_producers, &stranger.fixture.admit())
+            .expect("the stranger's own admission mints");
         assert_eq!(
             stranger.adapter.bind_session_drain(&rotated),
             Err(DrainBindRefusal::DrainConflict)
         );
+    }
+
+    #[test]
+    fn object_journal_drain_grant_refuses_spliced_foreign_pair() {
+        // C2: the grant mints through the Session retaining BOTH the
+        // native and EVENTS identities: one Session's producers paired
+        // with another Session's admission refuse at mint — BEFORE any
+        // valid binding exists, with no assumed-correct setup on the
+        // foreign-first path. Each Session's own pair still mints.
+        let mut scene_a = Scene::new(image_default());
+        let mut scene_b = Scene::new(image_default());
+        scene_b.retained_events = crate::events::EventsDomain::test_standin(11);
+        let proof_a = scene_a.attest();
+        let proof_b = scene_b.attest();
+        assert_ne!(
+            proof_a.key.domain_tag, proof_b.key.domain_tag,
+            "scenes own distinct native domains"
+        );
+        let admitted_a = scene_a.fixture.admit();
+        let admitted_b = scene_b.fixture.admit();
+        let producers_a = scene_a.producers();
+        let producers_b = scene_b.producers();
+        assert_eq!(producers_a.events_id(), 7);
+        assert_eq!(producers_b.events_id(), 11);
+        // SPLICED FOREIGN FIRST in both directions: neither adapter
+        // holds a binding yet, and the mint still refuses.
+        assert_eq!(
+            SessionDrainGrant::observe(&producers_b, &admitted_a),
+            Err(DrainMintRefusal::ForeignAdmission)
+        );
+        assert_eq!(
+            SessionDrainGrant::observe(&producers_a, &admitted_b),
+            Err(DrainMintRefusal::ForeignAdmission)
+        );
+        // Each Session's own pair mints and binds.
+        scene_a.bind_session_drain();
+        scene_b.bind_session_drain();
     }
 
     #[test]
@@ -10377,8 +10472,9 @@ mod tests {
         let create = function_id("C_CreateObject");
         let fault = ScriptedFaultCell::steady(7);
         // The Session drain holds both quanta; the tick consumes two
-        // records per quantum through the real dispatch poll.
-        scene.bind_session_drain();
+        // records per quantum through the real dispatch poll. The tick
+        // performs the first bind itself (no manual pre-bind).
+        let producers = scene.producers();
         let first = begin_bytes(1, 1, create, 0);
         let next = begin_bytes(1, 2, create, 0);
         let mut drain = crate::events::EventDrain::over_test_domain(
@@ -10410,6 +10506,7 @@ mod tests {
         let bootstrap = scene.bootstrap(proof, 0);
         let mut births =
             ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(&bootstrap));
+        let admitted = scene.fixture.admit();
         let failure = {
             let mut tick = JointSealTick::wire(
                 &mut scene.adapter,
@@ -10419,8 +10516,9 @@ mod tests {
                 &fault,
                 &mut coordinator,
                 scene.fixture.attachment(),
+                &producers,
             );
-            tick.tick(Some(2), 0, &bootstrap, &mut births)
+            tick.tick(Some(2), 0, &bootstrap, &admitted, &mut births)
                 .expect_err("taken loss voids")
         };
         assert_eq!(failure.gap, JournalGap::H3Loss);
@@ -10454,6 +10552,7 @@ mod tests {
             BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
         let mut births =
             ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(&resume));
+        let admitted = scene.fixture.admit();
         let recovered = {
             let mut tick = JointSealTick::wire(
                 &mut scene.adapter,
@@ -10463,8 +10562,9 @@ mod tests {
                 &fault,
                 &mut coordinator,
                 scene.fixture.attachment(),
+                &producers,
             );
-            tick.tick(Some(2), 0, &resume, &mut births)
+            tick.tick(Some(2), 0, &resume, &admitted, &mut births)
                 .expect("acknowledged history seals")
         };
         assert_eq!(recovered.prefix.settled().len(), 1);
@@ -10472,6 +10572,7 @@ mod tests {
         // waits for coverage instead of certifying across a gap.
         let mut births =
             ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(&resume));
+        let admitted = scene.fixture.admit();
         let failure = {
             let mut tick = JointSealTick::wire(
                 &mut scene.adapter,
@@ -10481,8 +10582,9 @@ mod tests {
                 &fault,
                 &mut coordinator,
                 scene.fixture.attachment(),
+                &producers,
             );
-            tick.tick(Some(2), 0, &resume, &mut births)
+            tick.tick(Some(2), 0, &resume, &admitted, &mut births)
                 .expect_err("stale evidence waits")
         };
         assert_eq!(failure.gap, JournalGap::H3Pending);
@@ -10515,7 +10617,8 @@ mod tests {
 
         let mut scene = Scene::new(image_default());
         let proof = scene.attest();
-        scene.bind_session_drain();
+        // The tick performs the first bind itself (no manual pre-bind).
+        let producers = scene.producers();
         let create = function_id("C_CreateObject");
         let fault = ScriptedFaultCell::steady(7);
         let first = begin_bytes(1, 1, create, 0);
@@ -10540,6 +10643,7 @@ mod tests {
         let bootstrap = scene.bootstrap(proof, 0);
         let mut births =
             ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(&bootstrap));
+        let admitted = scene.fixture.admit();
         let failure = {
             let mut tick = JointSealTick::wire(
                 &mut scene.adapter,
@@ -10549,8 +10653,9 @@ mod tests {
                 &fault,
                 &mut finalizer,
                 scene.fixture.attachment(),
+                &producers,
             );
-            tick.tick(Some(2), 0, &bootstrap, &mut births)
+            tick.tick(Some(2), 0, &bootstrap, &admitted, &mut births)
                 .expect_err("taken loss voids")
         };
         assert_eq!(failure.gap, JournalGap::H3Loss);
@@ -10576,6 +10681,7 @@ mod tests {
             BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
         let mut births =
             ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(&resume));
+        let admitted = scene.fixture.admit();
         let mut tick = JointSealTick::wire(
             &mut scene.adapter,
             &mut scene.model,
@@ -10584,10 +10690,70 @@ mod tests {
             &fault,
             &mut finalizer,
             scene.fixture.attachment(),
+            &producers,
         );
-        tick.tick(Some(2), 0, &resume, &mut births)
+        tick.tick(Some(2), 0, &resume, &admitted, &mut births)
             .expect("clean history seals");
         assert!(finalizer.acked.is_empty(), "clean seals ack nothing");
+    }
+
+    #[test]
+    fn object_journal_joint_tick_refuses_foreign_admission() {
+        // C2: the joint tick mints from its retained producers plus
+        // the quantum's admission, so a foreign admission refuses the
+        // quantum with DrainMismatch before anything is collected —
+        // one Session's history never collects under another's key.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let producers = scene.producers();
+        let mut stranger = Scene::new(image_default());
+        stranger.attest();
+        let foreign = stranger.fixture.admit();
+        let create = function_id("C_CreateObject");
+        let fault = ScriptedFaultCell::steady(7);
+        let first = begin_bytes(1, 1, create, 0);
+        let mut drain = crate::events::EventDrain::over_test_domain(
+            crate::events::ScriptedRecords::records(
+                vec![
+                    first.to_vec(),
+                    end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50).to_vec(),
+                ],
+                2,
+            ),
+            7,
+        );
+        let bootstrap = scene.bootstrap(proof, 0);
+        let mut births =
+            ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(&bootstrap));
+        struct RefusingFinalizer;
+        impl H3EvidenceSource for RefusingFinalizer {
+            fn take_h3_disposition(&mut self) -> H3DispositionEvidence {
+                H3DispositionEvidence::genesis()
+            }
+        }
+        impl H3FinalizerPort for RefusingFinalizer {
+            fn acknowledge_h3_void(&mut self, _voided_below: u64) {
+                unreachable!("the foreign quantum refuses before any void report");
+            }
+        }
+        let mut finalizer = RefusingFinalizer;
+        let mut tick = JointSealTick::wire(
+            &mut scene.adapter,
+            &mut scene.model,
+            &mut drain,
+            &scene.descriptors,
+            &fault,
+            &mut finalizer,
+            scene.fixture.attachment(),
+            &producers,
+        );
+        let failure = tick
+            .tick(Some(2), 0, &bootstrap, &foreign, &mut births)
+            .expect_err("foreign admission refuses the quantum");
+        assert_eq!(failure.gap, JournalGap::DrainMismatch);
+        assert_eq!(scene.adapter.consumed_through, 0, "nothing collected");
     }
 
     #[test]

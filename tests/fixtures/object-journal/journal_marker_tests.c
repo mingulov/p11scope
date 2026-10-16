@@ -115,6 +115,124 @@ static void check_admit(void)
     EXPECT(ctl.failed == 1, "garbage trips the latch");
 }
 
+struct admit_race_arg {
+    struct journal_admission_control *ctl;
+    u64 marker;
+    u64 exec;
+    unsigned attempts;
+    unsigned won;
+};
+
+static pthread_barrier_t admit_gate;
+
+static void *race_admit(void *arg)
+{
+    struct admit_race_arg *race = arg;
+    unsigned i;
+
+    /* The gate releases every racer into the admission window
+     * together, so the critical sections genuinely overlap. */
+    pthread_barrier_wait(&admit_gate);
+    for (i = 0; i < race->attempts; i++)
+        race->won += (unsigned)p11_journal_marker_admit(race->ctl, race->marker, race->exec);
+    return 0;
+}
+
+static void check_admit_race(void)
+{
+    /* N7: admission at the bound is an atomic reservation with a
+     * failure latch. Two CPUs observing 16,383 must not both admit:
+     * exactly the remaining permits win, spent never exceeds the cap,
+     * and the over-admission attempt fails loudly (failed latched),
+     * never silently. */
+    static struct journal_admission_control ctl;
+    u64 ready7 = (7ULL << 2) | 2ULL;
+    struct admit_race_arg args[8];
+    pthread_t threads[8];
+    unsigned t, i, won;
+    int round;
+
+    /* Tight race at the last permit: 2 threads x 5000 rounds from
+     * spent=16383 admit exactly once per round. */
+    won = 0;
+    assert(pthread_barrier_init(&admit_gate, 0, 2) == 0);
+    for (round = 0; round < 5000; round++) {
+        ctl.spent = 16383;
+        ctl.failed = 0;
+        for (t = 0; t < 2; t++) {
+            args[t].ctl = &ctl;
+            args[t].marker = ready7;
+            args[t].exec = 7;
+            args[t].attempts = 1;
+            args[t].won = 0;
+            assert(pthread_create(&threads[t], 0, race_admit, &args[t]) == 0);
+        }
+        assert(pthread_join(threads[0], 0) == 0);
+        assert(pthread_join(threads[1], 0) == 0);
+        won += args[0].won + args[1].won;
+        if (args[0].won + args[1].won != 1)
+            break;
+        EXPECT(ctl.spent == 16384, "round %d: spent is 16384, got %llu", round,
+               (unsigned long long)ctl.spent);
+        EXPECT(ctl.failed == 1, "round %d: the loser trips the latch", round);
+        if (ctl.spent != 16384 || ctl.failed != 1)
+            break;
+    }
+    EXPECT(won == 5000, "last-permit race admits exactly once per round, won %u/5000", won);
+    assert(pthread_barrier_destroy(&admit_gate) == 0);
+    /* Wide race from zero: 8 threads x 3000 attempts admit exactly
+     * the 16384 permits, then refuse loudly. */
+    ctl.spent = 0;
+    ctl.failed = 0;
+    assert(pthread_barrier_init(&admit_gate, 0, 8) == 0);
+    for (t = 0; t < 8; t++) {
+        args[t].ctl = &ctl;
+        args[t].marker = ready7;
+        args[t].exec = 7;
+        args[t].attempts = 3000;
+        args[t].won = 0;
+        assert(pthread_create(&threads[t], 0, race_admit, &args[t]) == 0);
+    }
+    for (t = 0; t < 8; t++)
+        assert(pthread_join(threads[t], 0) == 0);
+    won = 0;
+    for (i = 0; i < 8; i++)
+        won += args[i].won;
+    /* Contention never latches, so saturation still wins exactly
+     * the full cap (every win spent exactly one permit — no lost
+     * updates) and only genuine bound-exceed trips the latch. */
+    EXPECT(won == 16384, "wide race admits exactly the cap, won %u", won);
+    EXPECT(won == ctl.spent, "wide race accounts every win, won %u spent %llu", won,
+           (unsigned long long)ctl.spent);
+    EXPECT(ctl.spent == 16384, "wide race spends exactly the cap, spent %llu",
+           (unsigned long long)ctl.spent);
+    EXPECT(ctl.failed == 1, "wide race over-admission trips the latch");
+    assert(pthread_barrier_destroy(&admit_gate) == 0);
+    /* Medium race: 4 threads x 5000 attempts from zero admit exactly
+     * the full cap under realistic contention, then refuse loudly. */
+    ctl.spent = 0;
+    ctl.failed = 0;
+    assert(pthread_barrier_init(&admit_gate, 0, 4) == 0);
+    for (t = 0; t < 4; t++) {
+        args[t].ctl = &ctl;
+        args[t].marker = ready7;
+        args[t].exec = 7;
+        args[t].attempts = 5000;
+        args[t].won = 0;
+        assert(pthread_create(&threads[t], 0, race_admit, &args[t]) == 0);
+    }
+    for (t = 0; t < 4; t++)
+        assert(pthread_join(threads[t], 0) == 0);
+    won = 0;
+    for (i = 0; i < 4; i++)
+        won += args[i].won;
+    EXPECT(won == 16384, "medium race admits exactly the cap, won %u", won);
+    EXPECT(ctl.spent == 16384, "medium race spends exactly the cap, spent %llu",
+           (unsigned long long)ctl.spent);
+    EXPECT(ctl.failed == 1, "medium race over-admission trips the latch");
+    assert(pthread_barrier_destroy(&admit_gate) == 0);
+}
+
 static void check_null_closed(void)
 {
     u64 exec = 0;
@@ -191,6 +309,7 @@ int main(void)
     check_publish_and_read();
     check_dirty_sticks();
     check_admit();
+    check_admit_race();
     check_null_closed();
     check_publish_race();
     if (!failures)

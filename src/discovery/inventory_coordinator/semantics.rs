@@ -1452,15 +1452,28 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.pending_semantic = Some(batch);
     }
 
-    /// Latest H3 disposition evidence for the seal path (H8): minted by
-    /// the actual finalizer per batch, genesis before the first. The
-    /// joint seal tick that reads this is later Task 3 work; until it
-    /// lands the finalizer side (mint + store) is exercised by tests.
-    #[allow(dead_code)]
-    pub(crate) fn h3_disposition_evidence(
-        &self,
+    /// Take the latest H3 disposition evidence for one seal audit
+    /// (H8): minted by the actual finalizer per batch, genesis before
+    /// the first or when no batch minted since the last take (the seal
+    /// then waits for coverage). Taking consumes the pending slot; a
+    /// loss barrier persists across takes until the seal voids it (see
+    /// `acknowledge_h3_void`). The seal audit constructor calls this
+    /// through [`H3EvidenceSource`](crate::semantics_objects::journal::H3EvidenceSource),
+    /// so the seal never audits caller-supplied H3 evidence.
+    pub(crate) fn take_h3_disposition(
+        &mut self,
     ) -> crate::semantics_objects::journal::H3DispositionEvidence {
-        self.h3_disposition.clone()
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        self.h3_pending.take().unwrap_or_else(H3DispositionEvidence::genesis)
+    }
+
+    /// The seal's H3-loss acknowledgement: H0 positions below
+    /// `voided_below` were voided by a seal that consumed the
+    /// corresponding loss evidence, so barriers there release the next
+    /// mint into Clean. Monotone; the joint seal tick forwards the
+    /// seal failure's void report here.
+    pub(crate) fn acknowledge_h3_void(&mut self, voided_below: u64) {
+        self.h3_acked_below = self.h3_acked_below.max(voided_below);
     }
 
     /// Record one dropped semantic batch's disposition shadow: its
@@ -2019,9 +2032,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 shed_floor,
                 unpublished,
                 batch_exhausted || unpositioned,
-                &self.h3_disposition,
+                &self.h3_last,
+                self.h3_acked_below,
             );
-        self.h3_disposition = evidence;
+        self.h3_last = evidence.clone();
+        self.h3_pending = Some(evidence);
     }
 
     /// Finite conversion refusal through the audited path.
@@ -2034,6 +2049,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             reason: reason.code().into(),
             budget: None,
         });
+    }
+}
+
+impl crate::semantics_objects::journal::H3EvidenceSource for InventoryCoordinator<OsProcessSource> {
+    fn take_h3_disposition(
+        &mut self,
+    ) -> crate::semantics_objects::journal::H3DispositionEvidence {
+        InventoryCoordinator::take_h3_disposition(self)
     }
 }
 
@@ -2509,7 +2532,7 @@ mod finalizer_history_tests {
             coordinator
                 .commit_batch_with_semantics(false, Some(lane))
                 .unwrap();
-            coordinator.h3_disposition_evidence()
+            coordinator.take_h3_disposition()
         };
         let invalidation = |position: u64| {
             TickOutcome::Invalidation(Invalidation::scripted(
@@ -2576,5 +2599,105 @@ mod finalizer_history_tests {
             evidence,
             H3DispositionEvidence::StagedLoss { barrier: 9 }
         ));
+    }
+
+    #[test]
+    fn finalizer_loss_persists_until_seal_acknowledges() {
+        // Carryover 5 + N1: a minted loss barrier is never overwritten
+        // by a later clean batch before the seal consumes it; only the
+        // seal's explicit void acknowledgement releases the next mint
+        // into Clean.
+        use crate::semantic_capture::Invalidation;
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+
+        let pid = std::process::id();
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::Pid(pid),
+            HookRegistry::builtin(),
+            Vec::new(),
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let fixture = HistoryFixture::new();
+        let mut lane =
+            AttestedSemanticLane::start(fixture.subset(), &Scope::Pid(pid), BackendSelection::Auto)
+                .expect("shell lane starts");
+        let detailed = lane.domain();
+        let commit = |coordinator: &mut InventoryCoordinator<OsProcessSource>,
+                      lane: &mut AttestedSemanticLane,
+                      report: TickReport| {
+            let batch = SemanticBatch::from_tick_report(detailed, report, Vec::new(), 130).unwrap();
+            coordinator.stage_semantic_batch(batch);
+            coordinator
+                .commit_batch_with_semantics(false, Some(lane))
+                .unwrap();
+            coordinator.take_h3_disposition()
+        };
+        let invalidation = |position: u64| {
+            TickOutcome::Invalidation(Invalidation::scripted(
+                detailed,
+                crate::semantic_capture::InvalidationScope::CoverageFailed,
+                Some(position),
+            ))
+        };
+        let loss = commit(
+            &mut coordinator,
+            &mut lane,
+            TickReport::scripted_with_disposition(
+                vec![invalidation(4)],
+                Vec::new(),
+                None,
+                Some(9),
+                false,
+            ),
+        );
+        assert!(matches!(
+            loss,
+            H3DispositionEvidence::StagedLoss { barrier: 9 }
+        ));
+        // A later clean batch must not overwrite the unconsumed loss.
+        let still = commit(
+            &mut coordinator,
+            &mut lane,
+            TickReport::scripted_with_disposition(
+                vec![invalidation(10)],
+                Vec::new(),
+                None,
+                None,
+                false,
+            ),
+        );
+        assert!(
+            matches!(
+                still,
+                H3DispositionEvidence::StagedLoss { barrier: 9 }
+            ),
+            "unconsumed loss survives a clean batch: {still:?}"
+        );
+        // The seal's void acknowledgement releases the next mint into
+        // Clean, restarting the maximum above the voided barrier.
+        coordinator.acknowledge_h3_void(10);
+        let released = commit(
+            &mut coordinator,
+            &mut lane,
+            TickReport::scripted_with_disposition(
+                vec![invalidation(11)],
+                Vec::new(),
+                None,
+                None,
+                false,
+            ),
+        );
+        assert!(
+            matches!(
+                released,
+                H3DispositionEvidence::Clean {
+                    staged_max: 11,
+                    pending_floor: None,
+                }
+            ),
+            "acknowledged loss releases into Clean: {released:?}"
+        );
     }
 }

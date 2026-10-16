@@ -2,18 +2,27 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """READY/GO stub provider for the object-journal qualification oracle.
 
-Replays the frozen provider ledger with no BPF, no privilege and no live
-measurement: the oracle driver path (READY validation, GO release,
-deadline kill, observed comparison) runs against this stub in tests.
-Observations are rebuilt field by field through an independent path --
-resampled bootstrap witness, fresh per-observation timestamps, recomputed
-counts -- never a ledger copy, so a PASS proves observation-plus-
-comparison agreement rather than a serialization round-trip.
---mutate injects exactly one scripted fault so the oracle's rejection
-cells stay honest; --stall holds the run past the driver's deadline;
---ready garbage breaks the READY document on purpose.
---rate/--duration pace the replayed observations; an infeasible pace
-refuses before emitting anything."""
+Replays the frozen provider ledger's TRACE (the raw request stream:
+one birth probe, call/return pairs, journal record events) with no
+BPF, no privilege and no live measurement: the oracle driver path
+(READY validation, GO release, deadline kill, observed comparison)
+runs against this stub in tests.
+
+Observations are COMPUTED from the trace by this stub, never copied
+from the ledger's expected semantic fields (`bootstrap`,
+`invocations`, `records`): invocations pair call/return events by
+seq, terminals derive from the return rv, loss derives from an
+ABANDON scan, record ordinals derive from replay position, and the
+bootstrap witness/cut derive from the birth probe. Mutations in the
+trace are therefore detectable in the observations, while mutations
+of the expected fields alone change nothing here (pinned by test).
+--mutate injects exactly one scripted fault into the REPLAYED
+observations so the oracle's rejection cells stay honest; --stall
+holds the run past the driver's deadline; --ready garbage breaks the
+READY document on purpose. --rate/--duration pace the replayed
+observations; an infeasible pace refuses before emitting anything.
+--run-token (appended by the oracle driver) is echoed so the run
+binds this output's freshness to the current invocation."""
 import argparse
 import hashlib
 import json
@@ -42,42 +51,100 @@ def parse_args(argv):
     parser.add_argument("--ready", choices=("good", "garbage"), default="good")
     parser.add_argument("--rate", default=None)
     parser.add_argument("--duration", default=None)
+    parser.add_argument("--run-token", default=None)
     return parser.parse_args(argv)
 
 
-def sample_bootstrap(ledger):
-    """Resample the bootstrap witness: the same underlying truth the
-    ledger froze, rebuilt through the observation path with a fresh
-    sample stamp rather than copied."""
-    frozen = ledger["bootstrap"]
+def sample_bootstrap(probe):
+    """Derive the birth observation from the trace's birth probe: an
+    empty-mappings probe bracketed by a strictly changed epoch proves
+    an absence-appearance birth; a marker reading proves an exec-marker
+    birth; anything else is unproven. The cut is the probe's raw
+    prior-records counter, not the ledger's expected cut."""
+    epoch = probe.get("epoch")
+    if (
+        isinstance(probe.get("mappings"), list)
+        and probe["mappings"] == []
+        and isinstance(epoch, list)
+        and len(epoch) == 2
+        and epoch[0] != epoch[1]
+    ):
+        witness = "absence-appearance"
+    elif probe.get("marker") is not None:
+        witness = "exec-marker"
+    else:
+        witness = "unproven"
     return {
-        "witness": frozen["witness"],
-        "cut": frozen["cut"],
+        "witness": witness,
+        "cut": probe.get("prior_records", 0),
         "sampled_at": time.monotonic_ns(),
     }
 
 
-def observe_invocation(call, observed_at):
-    return {
+def observe_invocation(call, ret, loss, observed_at):
+    """Pair one call/return by seq: the terminal derives from the raw
+    return rv, loss from the journal ABANDON scan."""
+    observed = {
         "seq": call["seq"],
         "function": call["function"],
-        "rv": call["rv"],
-        "terminal": call["terminal"],
-        "effects": list(call.get("effects", [])),
-        **({"loss": call["loss"]} if "loss" in call else {}),
+        "rv": ret["rv"],
+        "terminal": "success" if ret["rv"] == "OK" else "error",
+        "effects": list(ret.get("effects", [])),
         "observed_at": observed_at,
     }
+    if loss is not None:
+        observed["loss"] = loss
+    return observed
 
 
-def observe_record(record, observed_at):
+def observe_record(event, ordinal, observed_at):
+    """One journal observation: the ordinal derives from replay
+    position, never from an expected field."""
     return {
-        "ordinal": record["ordinal"],
-        "kind": record["kind"],
-        "seq": record["seq"],
-        "thread": record["thread"],
-        "sequence": record["sequence"],
+        "ordinal": ordinal,
+        "kind": event["kind"],
+        "seq": event["seq"],
+        "thread": event["thread"],
+        "sequence": event["sequence"],
         "observed_at": observed_at,
     }
+
+
+def replay_trace(trace):
+    """Replay the raw request stream into computed observations. Strict:
+    unknown events, missing probes and unpaired calls fail closed."""
+    if not isinstance(trace, list):
+        raise ValueError("trace is not an event list")
+    probes = [event for event in trace if event.get("op") == "probe"]
+    if len(probes) != 1:
+        raise ValueError(f"trace holds {len(probes)} birth probes, want exactly 1")
+    calls = {}
+    returns = {}
+    record_events = []
+    for event in trace:
+        op = event.get("op")
+        if op == "probe":
+            continue
+        elif op == "call":
+            calls[event["seq"]] = event
+        elif op == "return":
+            returns[event["seq"]] = event
+        elif op == "record":
+            record_events.append(event)
+        else:
+            raise ValueError(f"unknown trace op {op!r}")
+    if set(calls) != set(returns):
+        raise ValueError(
+            f"unpaired trace calls: calls {sorted(calls)} returns {sorted(returns)}"
+        )
+    abandoned = {
+        event["seq"] for event in record_events if event.get("kind") == "ABANDON"
+    }
+    invocations = [
+        (calls[seq], returns[seq], "bounded" if seq in abandoned else None)
+        for seq in sorted(calls)
+    ]
+    return probes[0], invocations, record_events
 
 
 def apply_mutation(observed, mode):
@@ -129,12 +196,15 @@ def main(argv):
     if (args.rate is not None and rate is None) or (args.duration is not None and duration is None):
         print("rate and duration must be positive integers", file=sys.stderr)
         return 2
+    try:
+        probe, paired, record_events = replay_trace(ledger.get("trace"))
+    except (ValueError, KeyError, TypeError) as error:
+        print(f"trace replay refused: {error}", file=sys.stderr)
+        return 2
     paced = rate is not None and duration is not None
-    calls = ledger["invocations"]
-    records = ledger["records"]
-    if paced and len(calls) + len(records) > rate * duration:
+    if paced and len(paired) + len(record_events) > rate * duration:
         print(
-            f"pace infeasible: {len(calls) + len(records)} observations "
+            f"pace infeasible: {len(paired) + len(record_events)} observations "
             f"at {rate}/s over {duration}s",
             file=sys.stderr,
         )
@@ -143,22 +213,23 @@ def main(argv):
     observed_calls = []
     observed_records = []
     first = True
-    for call in calls:
+    for call, ret, loss in paired:
         if paced and not first:
             time.sleep(1.0 / rate)
         first = False
-        observed_calls.append(observe_invocation(call, time.monotonic_ns()))
-    for record in records:
+        observed_calls.append(observe_invocation(call, ret, loss, time.monotonic_ns()))
+    for ordinal, event in enumerate(record_events, start=1):
         if paced and not first:
             time.sleep(1.0 / rate)
         first = False
-        observed_records.append(observe_record(record, time.monotonic_ns()))
+        observed_records.append(observe_record(event, ordinal, time.monotonic_ns()))
     observed = {
         "schema": ledger["schema"],
         "provider": dict(ledger["provider"]),
         "run_id": f"stub-provider-{os.getpid()}-{t0}",
+        "run_token": args.run_token,
         "ledger_digest": digest,
-        "bootstrap": sample_bootstrap(ledger),
+        "bootstrap": sample_bootstrap(probe),
         "invocations": observed_calls,
         "records": observed_records,
         "counts": {

@@ -2061,6 +2061,9 @@ impl AttachedSemanticSet {
 /// sealed generation always names a natively published endpoint set.
 /// A failed native mint refuses the sealing. Production seals here;
 /// the interim userspace counter never feeds production authority.
+/// (Too many arguments is the honest shape: every seal input is
+/// injected, none supplied.)
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn seal_attached_subset_native(
     ebpf: &Ebpf,
     subset: crate::inventory_semantics::AttestedSubset,

@@ -878,7 +878,7 @@ fn object_journal_discards_are_root_side() {
                     let before = candidate[..paren].trim_end();
                     if let Some(name) = before
                         .split(|c: char| !c.is_alphanumeric() && c != '_')
-                        .last()
+                        .next_back()
                     {
                         current = name.to_string();
                     }

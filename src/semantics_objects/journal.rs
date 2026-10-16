@@ -1695,6 +1695,15 @@ pub(crate) trait H3EvidenceSource {
     fn take_h3_disposition(&mut self) -> H3DispositionEvidence;
 }
 
+/// The joint tick's H3 finalizer: the actual finalizer takes (consumes)
+/// dispositions and accepts the seal's void acknowledgements through
+/// one port, so the acknowledgement flows to the finalizer through
+/// production code. Production wires the live coordinator; tests wire
+/// the real coordinator over a scripted lane.
+pub(crate) trait H3FinalizerPort: H3EvidenceSource {
+    fn acknowledge_h3_void(&mut self, voided_below: u64);
+}
+
 /// Test-only H3 evidence source: yields one scripted disposition, then
 /// genesis (the seal then waits for coverage), mirroring the
 /// finalizer's take semantics.
@@ -2297,9 +2306,6 @@ pub(crate) struct SealFailure {
     /// voided by this seal. The joint tick forwards it to the H3
     /// finalizer (`acknowledge_h3_void`); `None` when this seal voided
     /// no H3 loss.
-    // The production joint tick that forwards this is later Task 3
-    // work; until it lands the report channel is exercised by tests.
-    #[allow(dead_code)]
     pub(crate) h3_voided: Option<u64>,
 }
 
@@ -3772,6 +3778,88 @@ impl JournalAdapter {
         self.open.clear();
         self.refused.clear();
         effects
+    }
+}
+
+/// The production joint seal tick (H8): Session-owned orchestration of
+/// one journal quantum. Each tick collects through the Session drain,
+/// takes the H3 disposition from the actual finalizer, audits, seals,
+/// and forwards the seal's void report back to the finalizer — the
+/// acknowledgement flows through this production path, never through
+/// test orchestration. All I/O is injected: production wires the live
+/// drain, fault cell and finalizer (privileged execution stays UNRUN);
+/// tests wire scripted ones. Construct once per Session; tick per
+/// quantum.
+#[allow(dead_code)] // No Session-loop caller until live activation; tests drive it.
+pub(crate) struct JointSealTick<'a, S, F, H> {
+    adapter: &'a mut JournalAdapter,
+    model: &'a mut ObjectSemantics,
+    drain: &'a mut crate::events::EventDrain<S>,
+    descriptors:
+        &'a [p11scope_ebpf_common::object_wire::ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+    fault: &'a F,
+    finalizer: &'a mut H,
+}
+
+#[allow(dead_code)] // As above.
+impl<'a, S, F, H> JointSealTick<'a, S, F, H>
+where
+    S: crate::events::RecordSource,
+    F: FaultEpoch,
+    H: H3FinalizerPort,
+{
+    /// Wire one Session's journal quantum: its adapter, model, retained
+    /// drain, frozen descriptors, fault cell and H3 finalizer.
+    pub(crate) fn wire(
+        adapter: &'a mut JournalAdapter,
+        model: &'a mut ObjectSemantics,
+        drain: &'a mut crate::events::EventDrain<S>,
+        descriptors: &'a [p11scope_ebpf_common::object_wire::ObjectDescriptorWire;
+                MAX_DESCRIPTORS as usize],
+        fault: &'a F,
+        finalizer: &'a mut H,
+    ) -> Self {
+        Self {
+            adapter,
+            model,
+            drain,
+            descriptors,
+            fault,
+            finalizer,
+        }
+    }
+
+    /// One joint quantum: collect, take, audit, seal, then forward the
+    /// seal's void report (if any) to the finalizer before returning.
+    /// `h0_allocated_below` is H0's post-quantum allocation counter
+    /// (production; tests pass the joint-quantum fiction 0) and
+    /// `closure_generation` the live attachment generation.
+    pub(crate) fn tick(
+        &mut self,
+        quantum: Option<usize>,
+        h0_allocated_below: u64,
+        closure_generation: u64,
+        bootstrap: &BootstrapReceipt,
+        fresh: &SessionBirthEvidence,
+    ) -> Result<SealSuccess, SealFailure> {
+        let collection = self.adapter.collect_from_drain(
+            self.drain,
+            self.descriptors,
+            quantum,
+            self.fault,
+            h0_allocated_below,
+        );
+        let audit = JournalAuditReceipt::collect(&collection, self.finalizer, closure_generation);
+        let frontier = self.adapter.consumed_frontier();
+        let outcome = self
+            .adapter
+            .seal(self.model, &audit, bootstrap, frontier, fresh, self.fault);
+        if let Err(failure) = &outcome
+            && let Some(voided) = failure.h3_voided
+        {
+            self.finalizer.acknowledge_h3_void(voided);
+        }
+        outcome
     }
 }
 
@@ -8776,12 +8864,14 @@ mod tests {
 
     #[test]
     fn object_journal_seal_acknowledges_h3_loss_through_finalizer() {
-        // Carryover 5 + N1: the wired joint path through the ACTUAL H3
-        // finalizer. The finalizer mints a loss; the seal audit takes it
-        // (never caller-supplied); the seal voids and reports the
-        // voided watermark; the tick forwards it; the next mint
-        // releases into Clean so genuinely new history seals. A seal
-        // with no fresh batch waits on genesis evidence.
+        // C3 (+carryover 5 + N1): the PRODUCTION joint tick drives the
+        // wired path through the ACTUAL H3 finalizer. The finalizer
+        // mints a loss; the tick takes it (never caller-supplied),
+        // audits, seals, voids and forwards the voided watermark to the
+        // finalizer through production code — the test never touches
+        // collect/audit/seal/acknowledge. The next mint releases into
+        // Clean so genuinely new history seals. A tick with no fresh
+        // batch waits on genesis evidence.
         use crate::attach::{BackendSelection, Scope};
         use crate::discovery::caller_registry::{OsProcessSource, RegistryLimits};
         use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
@@ -8829,17 +8919,26 @@ mod tests {
         };
         let create = function_id("C_CreateObject");
         let fault = ScriptedFaultCell::steady(7);
-        // Quantum 1: journal history plus a finalizer loss barrier below
-        // the collection watermark. The seal takes the loss, voids, and
-        // reports the voided watermark.
+        // The Session drain holds both quanta; the tick consumes two
+        // records per quantum through the real dispatch poll.
+        scene.bind_session_drain(7);
         let first = begin_bytes(1, 1, create, 0);
-        let collection = scene.collect_records(
-            vec![
-                first.to_vec(),
-                end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50).to_vec(),
-            ],
-            &fault,
+        let next = begin_bytes(1, 2, create, 0);
+        let mut drain = crate::events::EventDrain::over_test_domain(
+            crate::events::ScriptedRecords::records(
+                vec![
+                    first.to_vec(),
+                    end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50).to_vec(),
+                    next.to_vec(),
+                    end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60).to_vec(),
+                ],
+                4,
+            ),
+            7,
         );
+        // Quantum 1: journal history plus a finalizer loss barrier below
+        // the collection watermark. The tick takes the loss, voids,
+        // reports the voided watermark and forwards it to the finalizer.
         commit(
             &mut coordinator,
             &mut lane,
@@ -8852,19 +8951,27 @@ mod tests {
             ),
         );
         let bootstrap = scene.bootstrap(proof, 0);
-        let audit = JournalAuditReceipt::collect(&collection, &mut coordinator, 0);
-        let frontier = scene.adapter.consumed_frontier();
         let fresh = SessionBirthEvidence::scripted_for_receipt(&bootstrap);
-        let failure = scene
-            .seal_explicit(&audit, &bootstrap, frontier, &fresh)
-            .expect_err("taken loss voids");
+        let failure = {
+            let mut tick = JointSealTick::wire(
+                &mut scene.adapter,
+                &mut scene.model,
+                &mut drain,
+                &scene.descriptors,
+                &fault,
+                &mut coordinator,
+            );
+            tick.tick(Some(2), 0, 0, &bootstrap, &fresh)
+                .expect_err("taken loss voids")
+        };
         assert_eq!(failure.gap, JournalGap::H3Loss);
         assert_eq!(failure.h3_voided, Some(3));
-        coordinator.acknowledge_h3_void(failure.h3_voided.expect("void report"));
         // Quantum 2: a clean finalizer batch releases into Clean past
         // the acknowledged barrier, and genuinely new journal history
         // seals above the void fence. The void cleared admission
-        // claims: re-attest for the new history.
+        // claims: re-attest for the new history. No manual
+        // acknowledgement anywhere: the tick forwarded quantum 1's
+        // report through production code.
         scene.attest();
         commit(
             &mut coordinator,
@@ -8878,33 +8985,132 @@ mod tests {
             ),
         );
         let fence = scene.adapter.consumed_through;
-        let next = begin_bytes(1, 2, create, 0);
-        let collection = scene.collect_records(
-            vec![
-                next.to_vec(),
-                end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60).to_vec(),
-            ],
-            &fault,
-        );
         let grant = SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, fence, 0);
         let resume =
             BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
-        let audit = JournalAuditReceipt::collect(&collection, &mut coordinator, 0);
-        let frontier = scene.adapter.consumed_frontier();
         let fresh = SessionBirthEvidence::scripted_for_receipt(&resume);
-        let recovered = scene
-            .seal_explicit(&audit, &resume, frontier, &fresh)
-            .expect("acknowledged history seals");
+        let recovered = {
+            let mut tick = JointSealTick::wire(
+                &mut scene.adapter,
+                &mut scene.model,
+                &mut drain,
+                &scene.descriptors,
+                &fault,
+                &mut coordinator,
+            );
+            tick.tick(Some(2), 0, 0, &resume, &fresh)
+                .expect("acknowledged history seals")
+        };
         assert_eq!(recovered.prefix.settled().len(), 1);
-        // No fresh batch minted: the take yields genesis and the seal
+        // No fresh batch minted: the take yields genesis and the tick
         // waits for coverage instead of certifying across a gap.
-        let audit = JournalAuditReceipt::collect(&collection, &mut coordinator, 0);
-        let frontier = scene.adapter.consumed_frontier();
         let fresh = SessionBirthEvidence::scripted_for_receipt(&resume);
-        let failure = scene
-            .seal_explicit(&audit, &resume, frontier, &fresh)
-            .expect_err("stale evidence waits");
+        let failure = {
+            let mut tick = JointSealTick::wire(
+                &mut scene.adapter,
+                &mut scene.model,
+                &mut drain,
+                &scene.descriptors,
+                &fault,
+                &mut coordinator,
+            );
+            tick.tick(Some(2), 0, 0, &resume, &fresh)
+                .expect_err("stale evidence waits")
+        };
         assert_eq!(failure.gap, JournalGap::H3Pending);
+    }
+
+    #[test]
+    fn object_journal_joint_tick_forwards_void_report() {
+        // C3: the production tick forwards the seal's void report to
+        // the finalizer exactly once, and only on a voiding seal. A
+        // recording fake finalizer takes scripted evidence and records
+        // every acknowledgement.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        struct RecordingFinalizer {
+            next: H3DispositionEvidence,
+            acked: Vec<u64>,
+        }
+
+        impl H3EvidenceSource for RecordingFinalizer {
+            fn take_h3_disposition(&mut self) -> H3DispositionEvidence {
+                std::mem::replace(&mut self.next, H3DispositionEvidence::genesis())
+            }
+        }
+
+        impl H3FinalizerPort for RecordingFinalizer {
+            fn acknowledge_h3_void(&mut self, voided_below: u64) {
+                self.acked.push(voided_below);
+            }
+        }
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        scene.bind_session_drain(7);
+        let create = function_id("C_CreateObject");
+        let fault = ScriptedFaultCell::steady(7);
+        let first = begin_bytes(1, 1, create, 0);
+        let next = begin_bytes(1, 2, create, 0);
+        let mut drain = crate::events::EventDrain::over_test_domain(
+            crate::events::ScriptedRecords::records(
+                vec![
+                    first.to_vec(),
+                    end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50).to_vec(),
+                    next.to_vec(),
+                    end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60).to_vec(),
+                ],
+                4,
+            ),
+            7,
+        );
+        // A voiding seal forwards its report exactly once.
+        let mut finalizer = RecordingFinalizer {
+            next: H3DispositionEvidence::scripted_loss(1),
+            acked: Vec::new(),
+        };
+        let bootstrap = scene.bootstrap(proof, 0);
+        let fresh = SessionBirthEvidence::scripted_for_receipt(&bootstrap);
+        let failure = {
+            let mut tick = JointSealTick::wire(
+                &mut scene.adapter,
+                &mut scene.model,
+                &mut drain,
+                &scene.descriptors,
+                &fault,
+                &mut finalizer,
+            );
+            tick.tick(Some(2), 0, 0, &bootstrap, &fresh)
+                .expect_err("taken loss voids")
+        };
+        assert_eq!(failure.gap, JournalGap::H3Loss);
+        assert_eq!(
+            finalizer.acked,
+            vec![failure.h3_voided.expect("void report")]
+        );
+        // A clean seal acknowledges nothing. The clean evidence covers
+        // the post-quantum watermark (fence + 2 records).
+        let fence = scene.adapter.consumed_through;
+        let mut finalizer = RecordingFinalizer {
+            next: H3DispositionEvidence::scripted_clean(fence + 2),
+            acked: Vec::new(),
+        };
+        scene.attest();
+        let grant = SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, fence, 0);
+        let resume =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        let fresh = SessionBirthEvidence::scripted_for_receipt(&resume);
+        let mut tick = JointSealTick::wire(
+            &mut scene.adapter,
+            &mut scene.model,
+            &mut drain,
+            &scene.descriptors,
+            &fault,
+            &mut finalizer,
+        );
+        tick.tick(Some(2), 0, 0, &resume, &fresh)
+            .expect("clean history seals");
+        assert!(finalizer.acked.is_empty(), "clean seals ack nothing");
     }
 
     #[test]

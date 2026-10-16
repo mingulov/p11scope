@@ -42,6 +42,7 @@ use std::num::{NonZeroU32, NonZeroU64};
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) mod detailed_identity;
 mod ended_pid_retirement;
@@ -98,8 +99,9 @@ pub(crate) fn semantic_receipt_query_refusal_test(
 }
 #[allow(unused_imports)]
 pub(crate) use instance::{
-    BirthObservationRefusal, HookStats, INSTANCE_PROGRAMS, InstanceMaps, InstanceTracking,
-    SessionGrantToken, WatchedFile, observe_absence_birth, observe_exec_birth,
+    AbsenceBirthSource, BirthObservationRefusal, BirthRowError, BirthRowReader, ExecBirthSource,
+    HookStats, INSTANCE_PROGRAMS, InstanceMaps, InstanceTracking, LiveBirthRows, SessionGrantToken,
+    WatchedFile, observe_absence_birth, observe_exec_birth,
 };
 mod cleanup_worker;
 pub mod identity_iter;
@@ -2016,10 +2018,18 @@ impl RetainedStaticTarget {
     }
 }
 
+/// Session-owned monotonic attachment generation: every successful
+/// sealing mints the next value, so the closure generation the
+/// journal observes always names a real sealed endpoint set. A
+/// process-wide counter is the interim mint; the H8 plan's mmapable
+/// generation array replaces it when the live attach path lands.
+static ATTACHMENT_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// Session-owned attachment authority. Fields and constructor stay private.
 pub(crate) struct AttachedSemanticSet {
     domain: crate::attach::capture::NativeDomainId,
     subset: crate::inventory_semantics::AttestedSubset,
+    generation: u64,
 }
 
 impl std::fmt::Debug for AttachedSemanticSet {
@@ -2032,6 +2042,13 @@ impl AttachedSemanticSet {
     /// The native identity domain this attachment was sealed under.
     pub(crate) fn domain(&self) -> crate::attach::capture::NativeDomainId {
         self.domain
+    }
+
+    /// The attachment's sealing generation: minted only by a
+    /// successful sealing, observed (never supplied) by the journal's
+    /// closure install, grant and audit.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -2050,8 +2067,15 @@ pub(crate) fn seal_attached_subset_with(
     owned_sides: &BTreeSet<StaticEndpoint>,
     watched: impl Fn(PinnedObjectId) -> Option<crate::discovery::identity::RetainedInventoryTarget>,
 ) -> std::result::Result<AttachedSemanticSet, crate::inventory_semantics::SemanticRefusal> {
-    let attached = AttachedSemanticSet { domain, subset };
+    let mut attached = AttachedSemanticSet {
+        domain,
+        subset,
+        generation: 0,
+    };
     attached.validate_with(domain, policy, descriptors, retained, owned_sides, watched)?;
+    // Only a successful sealing mints: the generation always names a
+    // complete validated endpoint set, never a refused one.
+    attached.generation = ATTACHMENT_GENERATION.fetch_add(1, Ordering::SeqCst);
     Ok(attached)
 }
 

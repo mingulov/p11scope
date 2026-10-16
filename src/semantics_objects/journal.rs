@@ -1704,6 +1704,44 @@ pub(crate) trait H3FinalizerPort: H3EvidenceSource {
     fn acknowledge_h3_void(&mut self, voided_below: u64);
 }
 
+/// Production birth-evidence source: the seal pulls one fresh
+/// observation per seal through this, never receiving a reusable
+/// evidence value. Each take re-runs the birth observation against
+/// live native state; a failed take refuses the seal and the next
+/// tick takes again. Production wires the Session attach side (live
+/// map reads, UNRUN); tests wire single-shot scripted evidence or
+/// the real observation.
+pub(crate) trait BirthEvidenceSource {
+    fn take_birth_evidence(
+        &mut self,
+    ) -> Result<SessionBirthEvidence, crate::attach::BirthObservationRefusal>;
+}
+
+/// Tests-only single-shot birth source: yields its evidence once, then
+/// panics — a second take would reuse evidence, the exact failure the
+/// take pattern forbids. Tests build one source per seal.
+#[cfg(test)]
+pub(crate) struct ScriptedBirthSource(Option<SessionBirthEvidence>);
+
+#[cfg(test)]
+impl ScriptedBirthSource {
+    pub(crate) fn once(evidence: SessionBirthEvidence) -> Self {
+        Self(Some(evidence))
+    }
+}
+
+#[cfg(test)]
+impl BirthEvidenceSource for ScriptedBirthSource {
+    fn take_birth_evidence(
+        &mut self,
+    ) -> Result<SessionBirthEvidence, crate::attach::BirthObservationRefusal> {
+        Ok(self
+            .0
+            .take()
+            .expect("birth evidence is single-shot: one source per seal"))
+    }
+}
+
 /// Test-only H3 evidence source: yields one scripted disposition, then
 /// genesis (the seal then waits for coverage), mirroring the
 /// finalizer's take semantics.
@@ -2124,27 +2162,22 @@ impl SessionBirthGrant {
 }
 
 /// A Session-owned closure grant: the live endpoint-set generation just
-/// installed by successful attachment/readback. Production mint requires
-/// the Session issuance capability; a supplied integer never advances
-/// the closure.
+/// installed by successful attachment/readback. Observed from the
+/// sealed attachment, never supplied: only a real sealing mints a
+/// generation, so a supplied integer cannot advance the closure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SessionClosureGrant {
     generation: u64,
 }
 
 impl SessionClosureGrant {
-    /// Production mint: only Session-owned attach code holds the
-    /// issuance token, minted solely by the birth observation sites.
-    /// The joint seal tick that issues in production is later Task 3
-    /// work.
-    #[allow(dead_code)] // No production caller until the joint seal tick lands.
-    pub(crate) fn issue(_token: &crate::attach::SessionGrantToken, generation: u64) -> Self {
-        Self { generation }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn scripted(generation: u64) -> Self {
-        Self { generation }
+    /// Observe the sealed attachment's generation: the joint tick
+    /// installs this per quantum, so the installed closure always
+    /// names a real sealed endpoint set.
+    pub(crate) fn observe(attachment: &crate::attach::AttachedSemanticSet) -> Self {
+        Self {
+            generation: attachment.generation(),
+        }
     }
 }
 
@@ -2643,7 +2676,7 @@ impl JournalAdapter {
         audit: &JournalAuditReceipt,
         bootstrap: &BootstrapReceipt,
         frontier: ConsumptionOrdinal,
-        fresh: &SessionBirthEvidence,
+        births: &mut impl BirthEvidenceSource,
         fault: &impl FaultEpoch,
     ) -> Result<SealSuccess, SealFailure> {
         let frontier = frontier.0;
@@ -2762,6 +2795,12 @@ impl JournalAdapter {
         if bootstrap.closure_generation() != self.closure_generation {
             return Err(self.failure(JournalGap::ClosureStale));
         }
+        // Pull one fresh birth observation: the seal never receives a
+        // reusable evidence value. A failed take refuses (the next tick
+        // takes again), exactly like moved native evidence.
+        let Ok(fresh) = births.take_birth_evidence() else {
+            return Err(self.failure(JournalGap::BootstrapMismatch));
+        };
         // Re-verify the birth with fresh Session evidence against
         // current retained truth: moved native evidence or a chain break
         // between attestation and seal still refuses.
@@ -2770,7 +2809,7 @@ impl JournalAdapter {
             bootstrap.birth(),
             bootstrap.birth_cut(),
             state.void_fence,
-            fresh,
+            &fresh,
         ) {
             // The receipt generation was checked above, so only taint
             // keeps its own gap here.
@@ -3799,6 +3838,7 @@ pub(crate) struct JointSealTick<'a, S, F, H> {
         &'a [p11scope_ebpf_common::object_wire::ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
     fault: &'a F,
     finalizer: &'a mut H,
+    attachment: &'a crate::attach::AttachedSemanticSet,
 }
 
 #[allow(dead_code)] // As above.
@@ -3809,7 +3849,8 @@ where
     H: H3FinalizerPort,
 {
     /// Wire one Session's journal quantum: its adapter, model, retained
-    /// drain, frozen descriptors, fault cell and H3 finalizer.
+    /// drain, frozen descriptors, fault cell, H3 finalizer and sealed
+    /// attachment (the closure generation's observed source).
     pub(crate) fn wire(
         adapter: &'a mut JournalAdapter,
         model: &'a mut ObjectSemantics,
@@ -3818,6 +3859,7 @@ where
                 MAX_DESCRIPTORS as usize],
         fault: &'a F,
         finalizer: &'a mut H,
+        attachment: &'a crate::attach::AttachedSemanticSet,
     ) -> Self {
         Self {
             adapter,
@@ -3826,22 +3868,28 @@ where
             descriptors,
             fault,
             finalizer,
+            attachment,
         }
     }
 
-    /// One joint quantum: collect, take, audit, seal, then forward the
-    /// seal's void report (if any) to the finalizer before returning.
-    /// `h0_allocated_below` is H0's post-quantum allocation counter
-    /// (production; tests pass the joint-quantum fiction 0) and
-    /// `closure_generation` the live attachment generation.
+    /// One joint quantum: install the observed closure, collect, take,
+    /// audit, seal (pulling one fresh birth observation), then forward
+    /// the seal's void report (if any) to the finalizer before
+    /// returning. The closure generation is observed from the sealed
+    /// attachment for both the install and the audit — never
+    /// supplied. `h0_allocated_below` is H0's post-quantum allocation
+    /// counter (production; tests pass the joint-quantum fiction 0).
     pub(crate) fn tick(
         &mut self,
         quantum: Option<usize>,
         h0_allocated_below: u64,
-        closure_generation: u64,
         bootstrap: &BootstrapReceipt,
-        fresh: &SessionBirthEvidence,
+        births: &mut impl BirthEvidenceSource,
     ) -> Result<SealSuccess, SealFailure> {
+        let observed = self.attachment.generation();
+        let _ = self
+            .adapter
+            .install_closure_grant(&SessionClosureGrant::observe(self.attachment));
         let collection = self.adapter.collect_from_drain(
             self.drain,
             self.descriptors,
@@ -3849,11 +3897,11 @@ where
             self.fault,
             h0_allocated_below,
         );
-        let audit = JournalAuditReceipt::collect(&collection, self.finalizer, closure_generation);
+        let audit = JournalAuditReceipt::collect(&collection, self.finalizer, observed);
         let frontier = self.adapter.consumed_frontier();
         let outcome = self
             .adapter
-            .seal(self.model, &audit, bootstrap, frontier, fresh, self.fault);
+            .seal(self.model, &audit, bootstrap, frontier, births, self.fault);
         if let Err(failure) = &outcome
             && let Some(voided) = failure.h3_voided
         {
@@ -4092,13 +4140,13 @@ mod tests {
     struct AttestationFixture {
         _dir: tempfile::TempDir,
         subset: Option<AttestedSubset>,
-        pins: crate::discovery::identity::PinnedObjects,
         binding: crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
         domain: NativeDomainId,
         image: ImageIdentity,
         router: InstanceId,
         functions: BTreeMap<String, (u32, Endpoint)>,
         next_token: u64,
+        attachment: crate::attach::AttachedSemanticSet,
     }
 
     impl AttestationFixture {
@@ -4235,7 +4283,7 @@ mod tests {
             let prepared =
                 crate::discovery::engine::inventory_coordinator::semantics::prepare_attested_subset(
                     &engine,
-                    &[operator],
+                    std::slice::from_ref(&operator),
                 );
             let subset = prepared.subset.expect("nonempty validated operator subset");
             let mut functions = BTreeMap::new();
@@ -4286,16 +4334,28 @@ mod tests {
                     std::sync::Arc::new(crate::process::PidPin::test_proc_only(pid)),
                 );
             let router = Self::route(domain, image);
+            // Seal this fixture's attachment from its attested subset,
+            // then re-attest a working subset for admissions from the
+            // same authority: both envelopes are genuinely attested, so
+            // admits and the sealed attachment share one domain without
+            // ordering constraints.
+            let attachment = crate::attach::seal_test_attachment(subset, domain, &pins);
+            let prepared =
+                crate::discovery::engine::inventory_coordinator::semantics::prepare_attested_subset(
+                    &engine,
+                    &[operator],
+                );
+            let subset = prepared.subset.expect("re-attested working subset");
             Self {
                 _dir: dir,
                 subset: Some(subset),
-                pins,
                 binding,
                 domain,
                 image,
                 router,
                 functions,
                 next_token: 0,
+                attachment,
             }
         }
 
@@ -4406,12 +4466,12 @@ mod tests {
             self.subset.take().expect("subset held")
         }
 
-        /// One sealed successful attachment over this fixture's subset
-        /// and domain, through the Session's test sealing seam.
-        /// Consumes the move-only subset, so admit first, then seal.
-        fn seal_attachment(&mut self) -> crate::attach::AttachedSemanticSet {
-            let subset = self.subset.take().expect("subset held");
-            crate::attach::seal_test_attachment(subset, self.domain, &self.pins)
+        /// This fixture's sealed attachment: sealed from its attested
+        /// subset at construction (a working subset was re-attested
+        /// for admissions), so admits and sealing share one domain
+        /// without ordering constraints.
+        fn attachment(&self) -> &crate::attach::AttachedSemanticSet {
+            &self.attachment
         }
     }
 
@@ -4433,17 +4493,41 @@ mod tests {
         fn new_with_limits(image: ImageIdentity, limits: JournalLimits) -> Self {
             let descriptors = publish_object_descriptors();
             assert!(verify_object_descriptors(&descriptors));
-            Self {
+            let mut scene = Self {
                 adapter: JournalAdapter::new(limits),
                 model: ObjectSemantics::new(),
                 descriptors,
                 fixture: AttestationFixture::new(image),
-            }
+            };
+            // The Session sealed before journal work: the adapter
+            // starts under the observed closure.
+            scene.install_observed_closure();
+            scene
         }
 
         fn attest(&mut self) -> JournalDomainProof {
             let admitted = self.fixture.admit();
             self.adapter.attest_key(&admitted).expect("key attests")
+        }
+
+        /// This scene's sealed attachment: the closure generation's
+        /// observed source for installs, grants and audits.
+        fn attachment(&self) -> &crate::attach::AttachedSemanticSet {
+            self.fixture.attachment()
+        }
+
+        /// The observed closure generation all scene seals run under.
+        fn closure_generation(&self) -> u64 {
+            self.attachment().generation()
+        }
+
+        /// Install the observed closure grant: every seal helper runs
+        /// under the sealed attachment's generation, never a supplied
+        /// integer. Best-effort (a newer installed generation stays:
+        /// stale-closure tests rely on the refusal that follows).
+        fn install_observed_closure(&mut self) {
+            let grant = SessionClosureGrant::observe(self.attachment());
+            let _ = self.adapter.install_closure_grant(&grant);
         }
 
         /// Attest `n` admissions for one key: every staged call needs
@@ -4523,15 +4607,16 @@ mod tests {
                 None,
                 0,
                 H3DispositionEvidence::scripted_clean(self.adapter.consumed_through),
-                0,
+                self.closure_generation(),
             )
         }
 
         fn seal(&mut self, bootstrap: &BootstrapReceipt) -> Result<SealSuccess, SealFailure> {
+            self.install_observed_closure();
             let frontier = self.adapter.consumed_frontier();
             let audit = self.audit();
             let fresh = SessionBirthEvidence::scripted_for_receipt(bootstrap);
-            self.seal_explicit(&audit, bootstrap, frontier, &fresh)
+            self.seal_explicit(&audit, bootstrap, frontier, fresh)
         }
 
         /// One seal under an explicit fault epoch: for post-void
@@ -4542,6 +4627,7 @@ mod tests {
             bootstrap: &BootstrapReceipt,
             epoch: u64,
         ) -> Result<SealSuccess, SealFailure> {
+            self.install_observed_closure();
             let frontier = self.adapter.consumed_frontier();
             let audit = JournalAuditReceipt::scripted(
                 epoch,
@@ -4549,10 +4635,10 @@ mod tests {
                 None,
                 0,
                 H3DispositionEvidence::scripted_clean(self.adapter.consumed_through),
-                0,
+                self.closure_generation(),
             );
             let fresh = SessionBirthEvidence::scripted_for_receipt(bootstrap);
-            self.seal_explicit(&audit, bootstrap, frontier, &fresh)
+            self.seal_explicit(&audit, bootstrap, frontier, fresh)
         }
 
         /// One seal against an explicit audit: the seal-time native
@@ -4564,15 +4650,28 @@ mod tests {
             audit: &JournalAuditReceipt,
             bootstrap: &BootstrapReceipt,
             frontier: ConsumptionOrdinal,
-            fresh: &SessionBirthEvidence,
+            fresh: SessionBirthEvidence,
         ) -> Result<SealSuccess, SealFailure> {
+            self.install_observed_closure();
             let cell = ScriptedFaultCell::steady(audit.fault_after);
-            self.adapter
-                .seal(&mut self.model, audit, bootstrap, frontier, fresh, &cell)
+            let mut births = ScriptedBirthSource::once(fresh);
+            self.adapter.seal(
+                &mut self.model,
+                audit,
+                bootstrap,
+                frontier,
+                &mut births,
+                &cell,
+            )
         }
 
         fn bootstrap(&self, proof: JournalDomainProof, birth_cut: u64) -> BootstrapReceipt {
-            BootstrapReceipt::scripted(proof, BirthKind::ExecMarker, birth_cut, 0)
+            BootstrapReceipt::scripted(
+                proof,
+                BirthKind::ExecMarker,
+                birth_cut,
+                self.closure_generation(),
+            )
         }
 
         /// One production collection over scripted ring bytes: the real
@@ -4598,7 +4697,7 @@ mod tests {
         }
 
         /// One seal from a real collection: H3 disposition covers the
-        /// consumed frontier, closure generation zero.
+        /// consumed frontier, closure observed from the attachment.
         fn seal_collected(
             &mut self,
             bootstrap: &BootstrapReceipt,
@@ -4606,10 +4705,11 @@ mod tests {
         ) -> Result<SealSuccess, SealFailure> {
             let h3 = H3DispositionEvidence::scripted_clean(self.adapter.consumed_through);
             let mut source = ScriptedH3Source::once(h3);
-            let audit = JournalAuditReceipt::collect(collection, &mut source, 0);
+            let audit =
+                JournalAuditReceipt::collect(collection, &mut source, self.closure_generation());
             let frontier = self.adapter.consumed_frontier();
             let fresh = SessionBirthEvidence::scripted_for_receipt(bootstrap);
-            self.seal_explicit(&audit, bootstrap, frontier, &fresh)
+            self.seal_explicit(&audit, bootstrap, frontier, fresh)
         }
 
         /// One bounded dispatch drain to a stop: the real proven-Q poll
@@ -5142,7 +5242,7 @@ mod tests {
                 &audit,
                 &rebootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&rebootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&rebootstrap),
             )
             .expect_err("refused key never reseals");
         assert_eq!(retry.gap, JournalGap::DomainTainted);
@@ -5212,7 +5312,7 @@ mod tests {
                 &audit,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("stopped adapter never seals");
         assert_eq!(retry.gap, JournalGap::Stopped);
@@ -5264,7 +5364,7 @@ mod tests {
             None,
             0,
             H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
-            0,
+            scene.closure_generation(),
         );
         let frontier = scene.adapter.consumed_frontier();
         let failure = scene
@@ -5272,7 +5372,7 @@ mod tests {
                 &audit,
                 &bootstrap_b,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap_b),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap_b),
             )
             .expect_err("fault change refuses");
         assert_eq!(failure.gap, JournalGap::FaultChanged);
@@ -5291,8 +5391,12 @@ mod tests {
             (fence - 1, JournalGap::BootstrapMismatch),
             (fence, JournalGap::BoundNotReady),
         ] {
-            let rebootstrap =
-                BootstrapReceipt::scripted(reproof, BirthKind::AbsenceAppearance, cut, 0);
+            let rebootstrap = BootstrapReceipt::scripted(
+                reproof,
+                BirthKind::AbsenceAppearance,
+                cut,
+                scene.closure_generation(),
+            );
             // The void advanced the cumulative baseline to 8: the
             // resumption seals under the fresh epoch.
             let outcome = scene.seal_at(&rebootstrap, 8);
@@ -5303,8 +5407,12 @@ mod tests {
         let healthy = begin_bytes_image(3, 1, create, 0, (COOKIE + 1, EXEC));
         scene.ingest(&healthy);
         scene.ingest(&end_bytes(&healthy, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
-        let rebootstrap =
-            BootstrapReceipt::scripted(reproof, BirthKind::AbsenceAppearance, fence, 0);
+        let rebootstrap = BootstrapReceipt::scripted(
+            reproof,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
         let success = scene
             .seal_at(&rebootstrap, 8)
             .expect("fresh attestation resumes above the fence");
@@ -5651,7 +5759,7 @@ mod tests {
                         &audit,
                         &bootstrap,
                         frontier,
-                        &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                        SessionBirthEvidence::scripted_for_receipt(&bootstrap),
                     )
                     .expect("prompt first seal passes");
             }
@@ -5662,7 +5770,7 @@ mod tests {
                     &audit,
                     &bootstrap,
                     frontier,
-                    &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                    SessionBirthEvidence::scripted_for_receipt(&bootstrap),
                 )
                 .expect("final seal passes");
             // Proved relationships only: the prompt run's second seal
@@ -5695,7 +5803,7 @@ mod tests {
                 &audit,
                 &bootstrap,
                 held,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("regressed frontier refuses");
         assert_eq!(failure.gap, JournalGap::FrontierRegression);
@@ -5715,7 +5823,7 @@ mod tests {
             None,
             0,
             H3DispositionEvidence::scripted_clean(frontier.cut() - 1),
-            0,
+            scene.closure_generation(),
             frontier.cut() + 1,
         );
         let failure = scene
@@ -5723,7 +5831,7 @@ mod tests {
                 &short,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("undisposed H3 refuses");
         assert_eq!(failure.gap, JournalGap::H3Pending);
@@ -5733,7 +5841,7 @@ mod tests {
                 &audit,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect("covered disposition seals the kept inputs");
         assert_eq!(success.prefix.settled().len(), 1);
@@ -5753,7 +5861,7 @@ mod tests {
             None,
             0,
             H3DispositionEvidence::scripted_loss(2),
-            0,
+            scene.closure_generation(),
             3,
         );
         let failure = scene
@@ -5761,21 +5869,26 @@ mod tests {
                 &loss,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("H3 loss refuses");
         assert_eq!(failure.gap, JournalGap::H3Loss);
         // Vacuous resumption at the fence waits for new history.
         let fence = scene.adapter.consumed_through;
         assert_eq!(fence, 2);
-        let resume = BootstrapReceipt::scripted(proof, BirthKind::AbsenceAppearance, fence, 0);
+        let resume = BootstrapReceipt::scripted(
+            proof,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
         let audit = scene.audit();
         let waiting = scene
             .seal_explicit(
                 &audit,
                 &resume,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&resume),
+                SessionBirthEvidence::scripted_for_receipt(&resume),
             )
             .expect_err("empty resumption waits");
         assert_eq!(waiting.gap, JournalGap::BoundNotReady);
@@ -5819,7 +5932,12 @@ mod tests {
         // and new history above it seals under the fresh birth.
         let fence = scene.adapter.consumed_through;
         assert_eq!(fence, 2);
-        let resume = BootstrapReceipt::scripted(proof, BirthKind::AbsenceAppearance, fence, 0);
+        let resume = BootstrapReceipt::scripted(
+            proof,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
         let clean = JournalCollection {
             malformed_delta: 0,
             ..collection
@@ -6022,7 +6140,7 @@ mod tests {
                 &audit,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("tainted image never seals");
         assert_eq!(failure.gap, JournalGap::ImageTainted);
@@ -6296,7 +6414,7 @@ mod tests {
                 &audit,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("invoked incarnation never seals");
         assert_eq!(refused.gap, JournalGap::ImageTainted);
@@ -6445,7 +6563,12 @@ mod tests {
         scene.ingest(&begin);
         let birth = BootstrapReceipt::attest(
             &scene.adapter,
-            &SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 0),
+            &SessionBirthGrant::scripted(
+                proof,
+                BirthKind::ExecMarker,
+                0,
+                scene.closure_generation(),
+            ),
         )
         .expect("novel image births");
         scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
@@ -6465,19 +6588,34 @@ mod tests {
         scene.ingest(&begin);
         BootstrapReceipt::attest(
             &scene.adapter,
-            &SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 0),
+            &SessionBirthGrant::scripted(
+                proof,
+                BirthKind::ExecMarker,
+                0,
+                scene.closure_generation(),
+            ),
         )
         .expect("novel at cut zero");
         assert_eq!(
             BootstrapReceipt::attest(
                 &scene.adapter,
-                &SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 1, 0)
+                &SessionBirthGrant::scripted(
+                    proof,
+                    BirthKind::ExecMarker,
+                    1,
+                    scene.closure_generation()
+                )
             ),
             Err(BirthRefusal::NoveltyBroken)
         );
         let absence = BootstrapReceipt::attest(
             &scene.adapter,
-            &SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, 1, 0),
+            &SessionBirthGrant::scripted(
+                proof,
+                BirthKind::AbsenceAppearance,
+                1,
+                scene.closure_generation(),
+            ),
         )
         .expect("observed quiet life births as absence");
         scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
@@ -6499,14 +6637,24 @@ mod tests {
         assert_eq!(
             BootstrapReceipt::attest(
                 &scene.adapter,
-                &SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 1, 0)
+                &SessionBirthGrant::scripted(
+                    proof,
+                    BirthKind::ExecMarker,
+                    1,
+                    scene.closure_generation()
+                )
             ),
             Err(BirthRefusal::NoveltyBroken)
         );
         assert_eq!(
             BootstrapReceipt::attest(
                 &scene.adapter,
-                &SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, 1, 0)
+                &SessionBirthGrant::scripted(
+                    proof,
+                    BirthKind::AbsenceAppearance,
+                    1,
+                    scene.closure_generation()
+                )
             ),
             Err(BirthRefusal::AbsenceUnproven)
         );
@@ -6523,7 +6671,12 @@ mod tests {
         assert_eq!(
             BootstrapReceipt::attest(
                 &scene.adapter,
-                &SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, 1, 0)
+                &SessionBirthGrant::scripted(
+                    proof,
+                    BirthKind::AbsenceAppearance,
+                    1,
+                    scene.closure_generation()
+                )
             ),
             Err(BirthRefusal::AbsenceUnproven)
         );
@@ -6535,7 +6688,12 @@ mod tests {
         assert_eq!(
             BootstrapReceipt::attest(
                 &scene.adapter,
-                &SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 0)
+                &SessionBirthGrant::scripted(
+                    proof,
+                    BirthKind::ExecMarker,
+                    0,
+                    scene.closure_generation()
+                )
             ),
             Err(BirthRefusal::ImageUnknown)
         );
@@ -6547,7 +6705,7 @@ mod tests {
                 &audit,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("unknown image never seals");
         assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
@@ -6577,7 +6735,7 @@ mod tests {
             None,
             0,
             H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through - 1),
-            0,
+            scene.closure_generation(),
             scene.adapter.consumed_through + 1,
         );
         let bootstrap = scene.bootstrap(proof, 0);
@@ -6587,14 +6745,19 @@ mod tests {
                 &pending,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("undisposed H3 refuses");
         assert_eq!(failure.gap, JournalGap::H3Pending);
         assert_eq!(
             BootstrapReceipt::attest(
                 &scene.adapter,
-                &SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, 1, 0)
+                &SessionBirthGrant::scripted(
+                    proof,
+                    BirthKind::AbsenceAppearance,
+                    1,
+                    scene.closure_generation()
+                )
             ),
             Err(BirthRefusal::AbsenceUnproven)
         );
@@ -6649,21 +6812,36 @@ mod tests {
         assert_eq!(
             BootstrapReceipt::attest(
                 &scene.adapter,
-                &SessionBirthGrant::scripted(child_proof, BirthKind::ExecMarker, 1, 0)
+                &SessionBirthGrant::scripted(
+                    child_proof,
+                    BirthKind::ExecMarker,
+                    1,
+                    scene.closure_generation()
+                )
             ),
             Err(BirthRefusal::NoveltyBroken)
         );
         assert_eq!(
             BootstrapReceipt::attest(
                 &scene.adapter,
-                &SessionBirthGrant::scripted(child_proof, BirthKind::AbsenceAppearance, 1, 0)
+                &SessionBirthGrant::scripted(
+                    child_proof,
+                    BirthKind::AbsenceAppearance,
+                    1,
+                    scene.closure_generation()
+                )
             ),
             Err(BirthRefusal::AbsenceUnproven)
         );
         scene.ingest(&begin);
         BootstrapReceipt::attest(
             &scene.adapter,
-            &SessionBirthGrant::scripted(parent_proof, BirthKind::AbsenceAppearance, 1, 0),
+            &SessionBirthGrant::scripted(
+                parent_proof,
+                BirthKind::AbsenceAppearance,
+                1,
+                scene.closure_generation(),
+            ),
         )
         .expect("parent quiet life births");
     }
@@ -6725,7 +6903,7 @@ mod tests {
                 &audit,
                 &moved,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&moved),
+                SessionBirthEvidence::scripted_for_receipt(&moved),
             )
             .expect_err("moved birth refuses");
         assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
@@ -6742,7 +6920,7 @@ mod tests {
     fn object_journal_closure_generation_binds_seal() {
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
-        // Healthy history seals under generation zero.
+        // Healthy history seals under the observed sealing generation.
         let mut scene = Scene::new(image_default());
         let proof = scene.attest_calls(2);
         let create = function_id("C_CreateObject");
@@ -6750,12 +6928,22 @@ mod tests {
         scene.ingest(&begin);
         scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
         let bootstrap = scene.bootstrap(proof, 0);
-        scene.seal(&bootstrap).expect("gen-zero seal passes");
-        // Advancing the closure retires old audits and old receipts alike.
+        scene
+            .seal(&bootstrap)
+            .expect("observed-closure seal passes");
+        // A later sealing advances the closure: both envelopes are
+        // genuinely sealed, so the newer generation is strictly
+        // greater. Advancing retires old audits and old receipts alike.
+        let aux = AttestationFixture::new(image_default());
+        let advanced = aux.attachment().generation();
+        assert!(
+            advanced > scene.closure_generation(),
+            "later sealings mint strictly greater generations"
+        );
         assert!(
             scene
                 .adapter
-                .install_closure_grant(&SessionClosureGrant::scripted(1))
+                .install_closure_grant(&SessionClosureGrant::observe(aux.attachment()))
         );
         let frontier = scene.adapter.consumed_frontier();
         let stale_audit = scene.audit();
@@ -6764,7 +6952,7 @@ mod tests {
                 &stale_audit,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("stale audit refuses");
         assert_eq!(refused.gap, JournalGap::ClosureStale);
@@ -6774,14 +6962,14 @@ mod tests {
             None,
             0,
             H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
-            1,
+            advanced,
         );
         let refused = scene
             .seal_explicit(
                 &fresh_audit,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("stale receipt refuses");
         assert_eq!(refused.gap, JournalGap::ClosureStale);
@@ -6792,7 +6980,7 @@ mod tests {
         scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
         let birth = BootstrapReceipt::attest(
             &scene.adapter,
-            &SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 1),
+            &SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, advanced),
         )
         .expect("live generation attests");
         let frontier = scene.adapter.consumed_frontier();
@@ -6802,14 +6990,14 @@ mod tests {
             None,
             0,
             H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
-            1,
+            advanced,
         );
         let success = scene
             .seal_explicit(
                 &fresh_audit,
                 &birth,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&birth),
+                SessionBirthEvidence::scripted_for_receipt(&birth),
             )
             .expect("live generation seals");
         assert_eq!(success.prefix.settled().len(), 1);
@@ -6818,17 +7006,22 @@ mod tests {
         assert!(
             !scene
                 .adapter
-                .install_closure_grant(&SessionClosureGrant::scripted(0))
+                .install_closure_grant(&SessionClosureGrant::observe(scene.attachment()))
         );
         assert!(
             scene
                 .adapter
-                .install_closure_grant(&SessionClosureGrant::scripted(1))
+                .install_closure_grant(&SessionClosureGrant::observe(aux.attachment()))
         );
         assert_eq!(
             BootstrapReceipt::attest(
                 &scene.adapter,
-                &SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 0)
+                &SessionBirthGrant::scripted(
+                    proof,
+                    BirthKind::ExecMarker,
+                    0,
+                    scene.closure_generation()
+                )
             ),
             Err(BirthRefusal::ClosureStale)
         );
@@ -6868,7 +7061,7 @@ mod tests {
                 &audit,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("stopped adapter never seals");
         assert_eq!(refused.gap, JournalGap::Stopped);
@@ -6974,28 +7167,33 @@ mod tests {
             None,
             1,
             H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
-            0,
+            scene.closure_generation(),
         );
         let failure = scene
             .seal_explicit(
                 &malformed,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("malformed tick refuses");
         assert_eq!(failure.gap, JournalGap::Malformed);
         assert!(failure.effects.effects.is_empty());
         let fence = scene.adapter.consumed_through;
         assert_eq!(fence, 2);
-        let below = BootstrapReceipt::scripted(proof, BirthKind::AbsenceAppearance, fence - 1, 0);
+        let below = BootstrapReceipt::scripted(
+            proof,
+            BirthKind::AbsenceAppearance,
+            fence - 1,
+            scene.closure_generation(),
+        );
         let audit = scene.audit();
         let refused = scene
             .seal_explicit(
                 &audit,
                 &below,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&below),
+                SessionBirthEvidence::scripted_for_receipt(&below),
             )
             .expect_err("birth below the fence refuses");
         assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
@@ -7015,7 +7213,7 @@ mod tests {
             None,
             1,
             H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
-            0,
+            scene.closure_generation(),
         );
         let frontier = scene.adapter.consumed_frontier();
         let failure = scene
@@ -7023,7 +7221,7 @@ mod tests {
                 &malformed,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("first void refuses");
         assert_eq!(failure.gap, JournalGap::Malformed);
@@ -7035,7 +7233,7 @@ mod tests {
             None,
             1,
             H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
-            0,
+            scene.closure_generation(),
         );
         let frontier = scene.adapter.consumed_frontier();
         assert_eq!(scene.adapter.consumed_through, 3);
@@ -7044,18 +7242,23 @@ mod tests {
                 &malformed,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("second void refuses");
         assert_eq!(failure.gap, JournalGap::Malformed);
-        let below = BootstrapReceipt::scripted(proof, BirthKind::AbsenceAppearance, 2, 0);
+        let below = BootstrapReceipt::scripted(
+            proof,
+            BirthKind::AbsenceAppearance,
+            2,
+            scene.closure_generation(),
+        );
         let audit = scene.audit();
         let refused = scene
             .seal_explicit(
                 &audit,
                 &below,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&below),
+                SessionBirthEvidence::scripted_for_receipt(&below),
             )
             .expect_err("birth below the latest fence refuses");
         assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
@@ -7064,7 +7267,12 @@ mod tests {
         scene.ingest(&end_bytes(&fresh, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
         // The voids cleared admission claims: re-attest for the new history.
         scene.attest();
-        let resume = BootstrapReceipt::scripted(proof, BirthKind::AbsenceAppearance, 3, 0);
+        let resume = BootstrapReceipt::scripted(
+            proof,
+            BirthKind::AbsenceAppearance,
+            3,
+            scene.closure_generation(),
+        );
         let success = scene.seal(&resume).expect("resumption names the fence");
         assert_eq!(success.prefix.birth_cut(), 3);
         assert_eq!(success.prefix.bootstrap_cut(), Some(4));
@@ -7088,7 +7296,12 @@ mod tests {
         scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
         let birth = BootstrapReceipt::attest(
             &scene.adapter,
-            &SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 0),
+            &SessionBirthGrant::scripted(
+                proof,
+                BirthKind::ExecMarker,
+                0,
+                scene.closure_generation(),
+            ),
         )
         .expect("genuine birth attests");
         let success = scene.seal(&birth).expect("genuine birth seals");
@@ -7119,7 +7332,12 @@ mod tests {
         scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
         let mut foreign = Scene::new(image_default());
         let foreign_proof = foreign.attest();
-        let receipt = BootstrapReceipt::scripted(foreign_proof, BirthKind::ExecMarker, 0, 0);
+        let receipt = BootstrapReceipt::scripted(
+            foreign_proof,
+            BirthKind::ExecMarker,
+            0,
+            scene.closure_generation(),
+        );
         let frontier = scene.adapter.consumed_frontier();
         let audit = scene.audit();
         let refused = scene
@@ -7127,7 +7345,7 @@ mod tests {
                 &audit,
                 &receipt,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&receipt),
+                SessionBirthEvidence::scripted_for_receipt(&receipt),
             )
             .expect_err("foreign proof never binds");
         assert_eq!(refused.gap, JournalGap::BootstrapMismatch);
@@ -7144,7 +7362,12 @@ mod tests {
         assert_eq!(
             BootstrapReceipt::attest(
                 &scene.adapter,
-                &SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 0)
+                &SessionBirthGrant::scripted(
+                    proof,
+                    BirthKind::ExecMarker,
+                    0,
+                    scene.closure_generation()
+                )
             ),
             Err(BirthRefusal::ImageTainted)
         );
@@ -7157,13 +7380,19 @@ mod tests {
         scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
         let birth = BootstrapReceipt::attest(
             &scene.adapter,
-            &SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 0),
+            &SessionBirthGrant::scripted(
+                proof,
+                BirthKind::ExecMarker,
+                0,
+                scene.closure_generation(),
+            ),
         )
         .expect("birth attests");
+        let aux = AttestationFixture::new(image_default());
         assert!(
             scene
                 .adapter
-                .install_closure_grant(&SessionClosureGrant::scripted(1))
+                .install_closure_grant(&SessionClosureGrant::observe(aux.attachment()))
         );
         let frontier = scene.adapter.consumed_frontier();
         let audit = JournalAuditReceipt::scripted(
@@ -7179,7 +7408,7 @@ mod tests {
                 &audit,
                 &birth,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&birth),
+                SessionBirthEvidence::scripted_for_receipt(&birth),
             )
             .expect_err("stale closure refuses");
         assert_eq!(refused.gap, JournalGap::ClosureStale);
@@ -7525,7 +7754,7 @@ mod tests {
             proof,
             BirthKind::AbsenceAppearance,
             5,
-            0,
+            scene.closure_generation(),
             evidence,
         );
         let birth = BootstrapReceipt::attest(&scene.adapter, &grant).expect("absence attests at 5");
@@ -7658,19 +7887,36 @@ mod tests {
         let proof = scene.attest();
         let create = function_id("C_CreateObject");
         scene.ingest(&begin_bytes(1, 1, create, 0));
-        let grant = SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 0);
+        scene.install_observed_closure();
+        let grant = SessionBirthGrant::scripted(
+            proof,
+            BirthKind::ExecMarker,
+            0,
+            scene.closure_generation(),
+        );
         let birth =
             BootstrapReceipt::attest(&scene.adapter, &grant).expect("consistent grant attests");
         scene.seal(&birth).expect("granted birth seals");
         // The image was sighted at 1, so an exec claim at cut 1 refuses
         // even with a grant in hand: the grant is checked, not trusted.
-        let inconsistent = SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 1, 0);
+        let inconsistent = SessionBirthGrant::scripted(
+            proof,
+            BirthKind::ExecMarker,
+            1,
+            scene.closure_generation(),
+        );
         assert_eq!(
             BootstrapReceipt::attest(&scene.adapter, &inconsistent),
             Err(BirthRefusal::NoveltyBroken)
         );
         // A grant under a non-live generation refuses at the constructor.
-        let stale = SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 7);
+        let aux = AttestationFixture::new(image_default());
+        let stale = SessionBirthGrant::scripted(
+            proof,
+            BirthKind::ExecMarker,
+            0,
+            aux.attachment().generation(),
+        );
         assert_eq!(
             BootstrapReceipt::attest(&scene.adapter, &stale),
             Err(BirthRefusal::ClosureStale)
@@ -7687,18 +7933,30 @@ mod tests {
         let proof = scene.attest();
         let create = function_id("C_CreateObject");
         scene.ingest(&begin_bytes(1, 1, create, 0));
-        let old_grant = SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 0);
-        BootstrapReceipt::attest(&scene.adapter, &old_grant).expect("gen-zero grant attests");
+        scene.install_observed_closure();
+        let old_grant = SessionBirthGrant::scripted(
+            proof,
+            BirthKind::ExecMarker,
+            0,
+            scene.closure_generation(),
+        );
+        BootstrapReceipt::attest(&scene.adapter, &old_grant).expect("observed grant attests");
+        let aux = AttestationFixture::new(image_default());
         assert!(
             scene
                 .adapter
-                .install_closure_grant(&SessionClosureGrant::scripted(1))
+                .install_closure_grant(&SessionClosureGrant::observe(aux.attachment()))
         );
         assert_eq!(
             BootstrapReceipt::attest(&scene.adapter, &old_grant),
             Err(BirthRefusal::ClosureStale)
         );
-        let fresh = SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 1);
+        let fresh = SessionBirthGrant::scripted(
+            proof,
+            BirthKind::ExecMarker,
+            0,
+            aux.attachment().generation(),
+        );
         BootstrapReceipt::attest(&scene.adapter, &fresh).expect("fresh grant attests");
     }
 
@@ -7745,7 +8003,7 @@ mod tests {
                 proof,
                 BirthKind::ExecMarker,
                 0,
-                0,
+                scene.closure_generation(),
                 evidence,
             );
             assert_eq!(
@@ -7761,7 +8019,7 @@ mod tests {
                 proof,
                 BirthKind::AbsenceAppearance,
                 1,
-                0,
+                scene.closure_generation(),
                 evidence,
             );
             assert_eq!(
@@ -7772,203 +8030,516 @@ mod tests {
         // Canonical evidence attests both kinds.
         for birth in [BirthKind::ExecMarker, BirthKind::AbsenceAppearance] {
             let cut = u64::from(birth == BirthKind::AbsenceAppearance);
-            let grant = SessionBirthGrant::scripted(proof, birth, cut, 0);
+            let grant = SessionBirthGrant::scripted(proof, birth, cut, scene.closure_generation());
             BootstrapReceipt::attest(&scene.adapter, &grant).expect("canonical evidence attests");
         }
+    }
+
+    /// C1 genuine-producer rig: the birth-row publisher fixture runs
+    /// the REAL marker leaves over real rows and dumps native bytes.
+    /// Only the argv parameters are injected; every dumped byte comes
+    /// from the production publication/dirty/admission
+    /// implementation. See
+    /// `tests/fixtures/object-journal/birth_row_publisher.c`.
+    struct NativePublisher {
+        _dir: tempfile::TempDir,
+        binary: std::path::PathBuf,
+    }
+
+    impl NativePublisher {
+        fn build() -> Self {
+            let dir = tempfile::tempdir().expect("publisher directory");
+            let binary = dir.path().join("birth-row-publisher");
+            let output = std::process::Command::new("clang-18")
+                .args([
+                    "-O2",
+                    "-g",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-I",
+                    "crates/ebpf/native",
+                    "tests/fixtures/object-journal/birth_row_publisher.c",
+                    "-o",
+                ])
+                .arg(&binary)
+                .output()
+                .expect("execute clang-18");
+            assert!(
+                output.status.success(),
+                "publisher compile: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Self { _dir: dir, binary }
+        }
+
+        /// Run the publisher and parse the ROW/CTL hex dumps into the
+        /// native structs (little-endian u64 cells, matching the C
+        /// layouts byte for byte). Returns the row, the control row,
+        /// and the native win count.
+        fn publish(
+            &self,
+            args: &[&str],
+        ) -> (
+            p11scope_ebpf_common::InstanceRecord,
+            p11scope_ebpf_common::JournalAdmissionControl,
+            u64,
+        ) {
+            let output = std::process::Command::new(&self.binary)
+                .args(args)
+                .output()
+                .expect("execute publisher");
+            assert!(
+                output.status.success(),
+                "publisher [{}]: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8(output.stdout).expect("publisher utf8");
+            let mut row = None;
+            let mut control = None;
+            let mut wins = None;
+            for line in stdout.lines() {
+                if let Some(hex) = line.strip_prefix("ROW ") {
+                    row = Some(parse_published_row(hex));
+                } else if let Some(hex) = line.strip_prefix("CTL ") {
+                    control = Some(parse_published_control(hex));
+                } else if let Some(count) = line.strip_prefix("WINS ") {
+                    wins = Some(count.parse::<u64>().expect("wins integer"));
+                }
+            }
+            (
+                row.expect("ROW dump"),
+                control.expect("CTL dump"),
+                wins.expect("WINS dump"),
+            )
+        }
+    }
+
+    /// Parse one publisher hex dump (bytes in memory order) into
+    /// little-endian u64 cells.
+    fn parse_hex_cells(hex: &str, cells: usize, what: &str) -> Vec<u64> {
+        assert_eq!(hex.len(), cells * 16, "{what} hex length");
+        let bytes: Vec<u8> = (0..hex.len() / 2)
+            .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("hex byte"))
+            .collect();
+        bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|chunk| u64::from_le_bytes(*chunk))
+            .collect()
+    }
+
+    /// 8 slot_plus1 + 8 epoch + flags + exec_attach_gen + marker.
+    fn parse_published_row(hex: &str) -> p11scope_ebpf_common::InstanceRecord {
+        let cells = parse_hex_cells(hex, 19, "ROW");
+        p11scope_ebpf_common::InstanceRecord {
+            slot_plus1: cells[0..8].try_into().expect("slots"),
+            epoch: cells[8..16].try_into().expect("epochs"),
+            flags: cells[16],
+            exec_attach_gen: cells[17],
+            journal_bootstrap: cells[18],
+        }
+    }
+
+    fn parse_published_control(hex: &str) -> p11scope_ebpf_common::JournalAdmissionControl {
+        let cells = parse_hex_cells(hex, 2, "CTL");
+        p11scope_ebpf_common::JournalAdmissionControl {
+            spent: cells[0],
+            failed: cells[1],
+        }
+    }
+
+    /// Birth-row reader over one publisher dump: the rows a real
+    /// native publication left behind.
+    struct NativeBirthRows {
+        row: p11scope_ebpf_common::InstanceRecord,
+        control: p11scope_ebpf_common::JournalAdmissionControl,
+    }
+
+    impl crate::attach::BirthRowReader for NativeBirthRows {
+        fn read_marker_row(
+            &mut self,
+        ) -> Result<p11scope_ebpf_common::InstanceRecord, crate::attach::BirthRowError> {
+            Ok(self.row)
+        }
+
+        fn read_admission_control(
+            &mut self,
+        ) -> Result<p11scope_ebpf_common::JournalAdmissionControl, crate::attach::BirthRowError>
+        {
+            Ok(self.control)
+        }
+    }
+
+    /// Failure-injecting reader: a missing side reads back unreadable
+    /// (map error, short buffer). Only the ERROR is injected; a
+    /// present side carries real published bytes.
+    struct FaultyRows {
+        row: Option<p11scope_ebpf_common::InstanceRecord>,
+        control: Option<p11scope_ebpf_common::JournalAdmissionControl>,
+    }
+
+    impl crate::attach::BirthRowReader for FaultyRows {
+        fn read_marker_row(
+            &mut self,
+        ) -> Result<p11scope_ebpf_common::InstanceRecord, crate::attach::BirthRowError> {
+            self.row.ok_or(crate::attach::BirthRowError::Unreadable)
+        }
+
+        fn read_admission_control(
+            &mut self,
+        ) -> Result<p11scope_ebpf_common::JournalAdmissionControl, crate::attach::BirthRowError>
+        {
+            self.control.ok_or(crate::attach::BirthRowError::Unreadable)
+        }
+    }
+
+    /// A live custody binding for a real admission: the admitted
+    /// domain/image/caller with the fixture's real module and a REAL
+    /// held pin (never the fixture's proc-only pin: custody must be a
+    /// live pidfd with a start-time basis).
+    fn live_binding(
+        scene: &Scene,
+        admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+        pin: std::sync::Arc<crate::process::PidPin>,
+    ) -> crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding {
+        let (domain, image, _, caller) = admitted.journal_binding();
+        crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding::scripted(
+            caller,
+            scene.fixture.binding.module().clone(),
+            domain,
+            image,
+            pin,
+        )
+    }
+
+    /// One watched-file load through the PRODUCTION scan protocol.
+    /// The I/O values enter through `acquire_test_scan` (the same
+    /// seam every router test uses: no userspace-runnable producer
+    /// exists for BPF map scans — the live path is `scan_image`,
+    /// UNRUN here), and the proof still passes all of `scan_with`'s
+    /// checks before the real router joins it.
+    const SCAN_FILE: u32 = 3;
+    const SCAN_BASE: u64 = 0x8000_0000;
+
+    fn scan_ranges_full() -> Vec<crate::discovery::instances::MapRange> {
+        use crate::discovery::instances::MapRange;
+        vec![
+            MapRange::new(SCAN_BASE, SCAN_BASE + 0x1000, 0, false),
+            MapRange::new(SCAN_BASE + 0x1000, SCAN_BASE + 0x2000, 0x1000, true),
+            MapRange::new(SCAN_BASE + 0x2000, SCAN_BASE + 0x3000, 0x2000, false),
+        ]
+    }
+
+    fn scan_proof(
+        domain: NativeDomainId,
+        cookie: u64,
+        file_slot: u32,
+        local: u64,
+        ranges: Vec<crate::discovery::instances::MapRange>,
+        fence: u64,
+    ) -> crate::attach::image_query::ImageScanProof {
+        crate::attach::image_query::acquire_test_scan(
+            domain,
+            ImageIdentity {
+                task_cookie: cookie,
+                exec_id: EXEC,
+            },
+            file_slot,
+            crate::attach::image_query::CompleteEpochs {
+                local,
+                global: 0,
+                fault: 0,
+                sticky: 0,
+                record_flags: 0,
+            },
+            ranges,
+            fence,
+        )
+        .expect("stable scan seals")
+    }
+
+    fn scan_router(domain: NativeDomainId) -> crate::discovery::instances::InstanceRouter {
+        crate::discovery::instances::InstanceRouter::new(
+            domain,
+            crate::discovery::instances::RouterLimits::default(),
+        )
     }
 
     #[test]
     fn object_journal_session_exec_birth_observes_genuine_producers() {
         // C1: Session-owned exec-marker birth end to end with zero
-        // scripted birth constructors. Observation reads the genuine
-        // producers (READY marker naming the admitted exec, clean
-        // admission latch, live held custody, sealed successful
-        // attachment, admitted image); the issued grant attests; fresh
-        // re-observation at seal converts.
+        // scripted birth constructors. Observation pulls the genuine
+        // producers (a natively published READY marker naming the
+        // admitted exec, a real admission control row, live held
+        // custody, the sealed successful attachment, the admitted
+        // image); the issued grant attests; a FRESH publisher run at
+        // seal re-observes and converts.
         use crate::attach::observe_exec_birth;
         use crate::process::PidPin;
         use p11scope_ebpf_common::journal_marker::ready_word;
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
-        use p11scope_ebpf_common::{InstanceRecord, JournalAdmissionControl};
 
+        let publisher = NativePublisher::build();
         let mut scene = Scene::new(image_default());
         let admitted = scene.fixture.admit();
         let proof = scene.adapter.attest_key(&admitted).expect("key attests");
-        let attachment = scene.fixture.seal_attachment();
-        let custody = PidPin::open(std::process::id()).unwrap();
-        let record = InstanceRecord {
-            journal_bootstrap: ready_word(EXEC),
-            ..InstanceRecord::default()
-        };
-        let control = JournalAdmissionControl::default();
+        let pin = std::sync::Arc::new(PidPin::open(std::process::id()).unwrap());
+        let binding = live_binding(&scene, &admitted, pin.clone());
+        let (row, control, wins) = publisher.publish(&["0", "1"]);
+        assert_eq!(wins, 1, "one real admission wins");
+        let mut rows = NativeBirthRows { row, control };
         let (token, evidence) =
-            observe_exec_birth(&record, &control, &custody, &attachment, &admitted)
+            observe_exec_birth(&mut rows, &binding, scene.fixture.attachment(), &admitted)
                 .expect("genuine producers observe");
         assert_eq!(evidence.image(), (COOKIE, EXEC));
         assert_eq!(evidence.marker_word(), ready_word(EXEC));
         assert_eq!(evidence.admission_failed(), 0);
-        assert_eq!(evidence.custody(), custody.start_time().unwrap());
-        let grant = SessionBirthGrant::issue(&token, proof, BirthKind::ExecMarker, 0, 0, evidence);
+        assert_eq!(evidence.custody(), pin.start_time().unwrap());
+        let grant = SessionBirthGrant::issue(
+            &token,
+            proof,
+            BirthKind::ExecMarker,
+            0,
+            scene.closure_generation(),
+            evidence,
+        );
         let create = function_id("C_CreateObject");
         let begin = begin_bytes(1, 1, create, 0);
         scene.ingest(&begin);
         let birth =
             BootstrapReceipt::attest(&scene.adapter, &grant).expect("observed grant attests");
         scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
-        let (_, fresh) = observe_exec_birth(&record, &control, &custody, &attachment, &admitted)
-            .expect("fresh words re-observe");
+        // Fresh native bytes at seal: a second publisher run, pulled
+        // through a new reader — never the first run's words.
+        let (fresh_row, fresh_control, _) = publisher.publish(&["0", "1"]);
+        let mut fresh_rows = NativeBirthRows {
+            row: fresh_row,
+            control: fresh_control,
+        };
+        let (_, fresh) = observe_exec_birth(
+            &mut fresh_rows,
+            &binding,
+            scene.fixture.attachment(),
+            &admitted,
+        )
+        .expect("fresh words re-observe");
         let frontier = scene.adapter.consumed_frontier();
         let audit = scene.audit();
         scene
-            .seal_explicit(&audit, &birth, frontier, &fresh)
+            .seal_explicit(&audit, &birth, frontier, fresh)
             .expect("observed birth seals");
     }
 
     #[test]
     fn object_journal_session_birth_observation_refuses_per_producer() {
         // C1: every genuine producer gates observation with its own
-        // finite refusal; nothing mints on any failure.
-        use crate::attach::{BirthObservationRefusal, observe_absence_birth, observe_exec_birth};
+        // finite refusal; nothing mints on any failure. Every row
+        // below is natively published (only the publisher argv varies);
+        // only the row-read ERRORS are injected.
+        use crate::attach::{BirthObservationRefusal, observe_exec_birth};
         use crate::process::PidPin;
-        use p11scope_ebpf_common::journal_marker::{
-            MARKER_ADMIT_CAP, MARKER_DIRTY, MARKER_UNPUBLISHED, ready_word,
-        };
-        use p11scope_ebpf_common::{InstanceRecord, JournalAdmissionControl};
+        use p11scope_ebpf_common::journal_marker::MARKER_ADMIT_CAP;
 
+        let publisher = NativePublisher::build();
         let mut scene = Scene::new(image_default());
         let admitted = scene.fixture.admit();
         scene.adapter.attest_key(&admitted).expect("key attests");
-        let attachment = scene.fixture.seal_attachment();
-        let custody = PidPin::open(std::process::id()).unwrap();
-        let control = JournalAdmissionControl::default();
-        let record = |word: u64| InstanceRecord {
-            journal_bootstrap: word,
-            ..InstanceRecord::default()
-        };
-        // Marker readback: unpublished, dirty and foreign-exec words
-        // are not this birth's publication.
-        for word in [MARKER_UNPUBLISHED, MARKER_DIRTY, ready_word(EXEC + 1)] {
+        let pin = std::sync::Arc::new(PidPin::open(std::process::id()).unwrap());
+        let binding = live_binding(&scene, &admitted, pin.clone());
+        // Marker readback: unpublished, dirty and foreign-exec native
+        // words are not this birth's publication. (The admitted exec
+        // is 0, so exec 1 is foreign.)
+        for args in [
+            &["0", "0", "0", "0", "1"][..],
+            &["0", "0", "1"][..],
+            &["1"][..],
+        ] {
+            let (row, control, _) = publisher.publish(args);
+            let mut rows = NativeBirthRows { row, control };
             assert_eq!(
-                observe_exec_birth(&record(word), &control, &custody, &attachment, &admitted),
-                Err(BirthObservationRefusal::MarkerNotReady)
+                observe_exec_birth(&mut rows, &binding, scene.fixture.attachment(), &admitted),
+                Err(BirthObservationRefusal::MarkerNotReady),
+                "publisher [{:?}]",
+                args
             );
         }
-        // Admission control: a tripped latch withholds birth, and the
-        // spent bound refuses at the cap but admits below it.
-        let latched = JournalAdmissionControl {
-            spent: 0,
-            failed: 1,
+        // Admission control, all natively produced: an admit/exec
+        // mismatch trips the failed latch; 16384 real admits spend
+        // the cap exactly (failed still clear); 16383 admits observe.
+        let (ready_row, _, _) = publisher.publish(&["0", "1"]);
+        let (_, latched, latched_wins) = publisher.publish(&["0", "1", "0", "1"]);
+        assert_eq!(latched_wins, 0, "mismatch admits nothing");
+        assert_eq!(latched.failed, 1, "mismatch trips the latch natively");
+        let mut rows = NativeBirthRows {
+            row: ready_row,
+            control: latched,
         };
         assert_eq!(
-            observe_exec_birth(
-                &record(ready_word(EXEC)),
-                &latched,
-                &custody,
-                &attachment,
-                &admitted
-            ),
+            observe_exec_birth(&mut rows, &binding, scene.fixture.attachment(), &admitted),
             Err(BirthObservationRefusal::LatchTripped)
         );
-        let spent = JournalAdmissionControl {
-            spent: MARKER_ADMIT_CAP,
-            failed: 0,
+        let (ready_row, spent, spent_wins) = publisher.publish(&["0", "16384"]);
+        assert_eq!(spent_wins, MARKER_ADMIT_CAP);
+        assert_eq!((spent.spent, spent.failed), (MARKER_ADMIT_CAP, 0));
+        let mut rows = NativeBirthRows {
+            row: ready_row,
+            control: spent,
         };
         assert_eq!(
-            observe_exec_birth(
-                &record(ready_word(EXEC)),
-                &spent,
-                &custody,
-                &attachment,
-                &admitted
-            ),
+            observe_exec_birth(&mut rows, &binding, scene.fixture.attachment(), &admitted),
             Err(BirthObservationRefusal::SpentExhausted)
         );
-        let nearly_spent = JournalAdmissionControl {
-            spent: MARKER_ADMIT_CAP - 1,
-            failed: 0,
+        let (ready_row, nearly, nearly_wins) = publisher.publish(&["0", "16383"]);
+        assert_eq!(nearly_wins, MARKER_ADMIT_CAP - 1);
+        let mut rows = NativeBirthRows {
+            row: ready_row,
+            control: nearly,
         };
-        observe_exec_birth(
-            &record(ready_word(EXEC)),
-            &nearly_spent,
-            &custody,
-            &attachment,
-            &admitted,
-        )
-        .expect("below-cap control observes");
+        observe_exec_birth(&mut rows, &binding, scene.fixture.attachment(), &admitted)
+            .expect("below-cap control observes");
         // Custody: a reaped process no longer pins the birth.
         let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
-        let dead = PidPin::open(child.id()).unwrap();
+        let dead = std::sync::Arc::new(PidPin::open(child.id()).unwrap());
         child.wait().unwrap();
+        let dead_binding = live_binding(&scene, &admitted, dead);
+        let (ready_row, control, _) = publisher.publish(&["0", "1"]);
+        let mut rows = NativeBirthRows {
+            row: ready_row,
+            control,
+        };
         assert_eq!(
             observe_exec_birth(
-                &record(ready_word(EXEC)),
-                &control,
-                &dead,
-                &attachment,
+                &mut rows,
+                &dead_binding,
+                scene.fixture.attachment(),
                 &admitted
             ),
             Err(BirthObservationRefusal::CustodyLost)
         );
         // Attachment: a seal under another domain is not this
         // admission's successful attachment.
-        let mut foreign = Scene::new(image_default());
-        let foreign_attachment = foreign.fixture.seal_attachment();
+        let foreign_scene = Scene::new(image_default());
+        let (ready_row, control, _) = publisher.publish(&["0", "1"]);
+        let mut rows = NativeBirthRows {
+            row: ready_row,
+            control,
+        };
         assert_eq!(
             observe_exec_birth(
-                &record(ready_word(EXEC)),
-                &control,
-                &custody,
-                &foreign_attachment,
+                &mut rows,
+                &binding,
+                foreign_scene.fixture.attachment(),
                 &admitted
             ),
             Err(BirthObservationRefusal::AttachmentMismatch)
         );
-        // Absence: only the unmarked word observes; any publication or
-        // poisoning refuses.
-        let (_, absence) = observe_absence_birth(
-            &record(MARKER_UNPUBLISHED),
-            &control,
-            &custody,
-            &attachment,
-            &admitted,
-        )
-        .expect("unmarked row observes absence");
-        assert_eq!(absence.marker_word(), 0);
-        assert_eq!(absence.image(), (COOKIE, EXEC));
-        for word in [ready_word(EXEC), MARKER_DIRTY] {
+        // Binding: the held pin must be bound to the admitted
+        // domain/image/caller — any other naming refuses.
+        use crate::discovery::caller_registry::CallerId;
+        let (domain, image, _, caller) = admitted.journal_binding();
+        let module = scene.fixture.binding.module().clone();
+        for misnamed in [
+            crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding::scripted(
+                CallerId(caller.0.wrapping_add(1)),
+                module.clone(),
+                domain,
+                image,
+                pin.clone(),
+            ),
+            crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding::scripted(
+                caller,
+                module.clone(),
+                NativeDomainId::mint(),
+                image,
+                pin.clone(),
+            ),
+            crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding::scripted(
+                caller,
+                module.clone(),
+                domain,
+                ImageIdentity {
+                    task_cookie: image.task_cookie,
+                    exec_id: image.exec_id + 1,
+                },
+                pin.clone(),
+            ),
+        ] {
+            let (ready_row, control, _) = publisher.publish(&["0", "1"]);
+            let mut rows = NativeBirthRows {
+                row: ready_row,
+                control,
+            };
             assert_eq!(
-                observe_absence_birth(&record(word), &control, &custody, &attachment, &admitted),
-                Err(BirthObservationRefusal::MarkerPublished)
+                observe_exec_birth(&mut rows, &misnamed, scene.fixture.attachment(), &admitted),
+                Err(BirthObservationRefusal::BindingMismatch)
             );
         }
+        // Row reads: an unreadable marker or control row refuses (the
+        // present side of each pair is real published bytes).
+        let (ready_row, control, _) = publisher.publish(&["0", "1"]);
+        let mut rows = FaultyRows {
+            row: None,
+            control: Some(control),
+        };
+        assert_eq!(
+            observe_exec_birth(&mut rows, &binding, scene.fixture.attachment(), &admitted),
+            Err(BirthObservationRefusal::RowUnreadable)
+        );
+        let mut rows = FaultyRows {
+            row: Some(ready_row),
+            control: None,
+        };
+        assert_eq!(
+            observe_exec_birth(&mut rows, &binding, scene.fixture.attachment(), &admitted),
+            Err(BirthObservationRefusal::RowUnreadable)
+        );
     }
 
     #[test]
     fn object_journal_session_absence_birth_seals_on_quiet_history() {
-        // C1: absence observation over an unmarked real row issues; the
-        // grant attests an absence birth over quiet history and seals
-        // on fresh re-observation.
+        // C1: absence observation over a natively unmarked row issues;
+        // the grant attests an absence birth over quiet history and
+        // seals on fresh re-observation (fresh native bytes, fresh
+        // scans, a fresh router — never the first pass's words).
         use crate::attach::observe_absence_birth;
         use crate::process::PidPin;
-        use p11scope_ebpf_common::journal_marker::MARKER_UNPUBLISHED;
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
-        use p11scope_ebpf_common::{InstanceRecord, JournalAdmissionControl};
 
+        let publisher = NativePublisher::build();
         let mut scene = Scene::new(image_default());
         let admitted = scene.fixture.admit();
         let proof = scene.adapter.attest_key(&admitted).expect("key attests");
-        let attachment = scene.fixture.seal_attachment();
-        let custody = PidPin::open(std::process::id()).unwrap();
-        let control = JournalAdmissionControl::default();
-        let unmarked = InstanceRecord {
-            journal_bootstrap: MARKER_UNPUBLISHED,
-            ..InstanceRecord::default()
-        };
-        let (token, evidence) =
-            observe_absence_birth(&unmarked, &control, &custody, &attachment, &admitted)
-                .expect("unmarked row observes");
-        let grant =
-            SessionBirthGrant::issue(&token, proof, BirthKind::AbsenceAppearance, 1, 0, evidence);
+        let pin = std::sync::Arc::new(PidPin::open(std::process::id()).unwrap());
+        let binding = live_binding(&scene, &admitted, pin.clone());
+        let (domain, _, _, _) = admitted.journal_binding();
+        let full = scan_ranges_full();
+        let mut router = scan_router(domain);
+        let (row, control, _) = publisher.publish(&["0", "0", "0", "0", "1"]);
+        let mut rows = NativeBirthRows { row, control };
+        let (token, evidence) = observe_absence_birth(
+            &mut rows,
+            scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
+            scan_proof(domain, COOKIE, SCAN_FILE, 1, full[..2].to_vec(), 0),
+            &mut router,
+            &binding,
+            scene.fixture.attachment(),
+            &admitted,
+        )
+        .expect("unmarked row observes");
+        assert_eq!(evidence.marker_word(), 0);
+        assert_eq!(evidence.image(), (COOKIE, EXEC));
+        assert_eq!(evidence.custody(), pin.start_time().unwrap());
+        let grant = SessionBirthGrant::issue(
+            &token,
+            proof,
+            BirthKind::AbsenceAppearance,
+            1,
+            scene.closure_generation(),
+            evidence,
+        );
         let create = function_id("C_CreateObject");
         let getinfo = function_id("C_GetInfo");
         let template = begin_bytes(1, 1, create, 0);
@@ -7981,14 +8552,212 @@ mod tests {
         let birth =
             BootstrapReceipt::attest(&scene.adapter, &grant).expect("quiet life attests absence");
         scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
-        let (_, fresh) =
-            observe_absence_birth(&unmarked, &control, &custody, &attachment, &admitted)
-                .expect("fresh words re-observe");
+        let (fresh_row, fresh_control, _) = publisher.publish(&["0", "0", "0", "0", "1"]);
+        let mut fresh_rows = NativeBirthRows {
+            row: fresh_row,
+            control: fresh_control,
+        };
+        let mut fresh_router = scan_router(domain);
+        let (_, fresh) = observe_absence_birth(
+            &mut fresh_rows,
+            scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
+            scan_proof(domain, COOKIE, SCAN_FILE, 1, full[..2].to_vec(), 0),
+            &mut fresh_router,
+            &binding,
+            scene.fixture.attachment(),
+            &admitted,
+        )
+        .expect("fresh words re-observe");
         let frontier = scene.adapter.consumed_frontier();
         let audit = scene.audit();
         scene
-            .seal_explicit(&audit, &birth, frontier, &fresh)
+            .seal_explicit(&audit, &birth, frontier, fresh)
             .expect("observed absence seals");
+    }
+
+    #[test]
+    fn object_journal_session_absence_birth_refuses_per_producer() {
+        // C1: every absence producer gates observation with its own
+        // finite refusal; nothing mints on any failure. Rows are
+        // natively published; scans pass the production protocol; the
+        // router is real.
+        use crate::attach::{BirthObservationRefusal, observe_absence_birth};
+        use crate::process::PidPin;
+
+        let publisher = NativePublisher::build();
+        let mut scene = Scene::new(image_default());
+        let admitted = scene.fixture.admit();
+        scene.adapter.attest_key(&admitted).expect("key attests");
+        let pin = std::sync::Arc::new(PidPin::open(std::process::id()).unwrap());
+        let binding = live_binding(&scene, &admitted, pin.clone());
+        let (domain, _, _, _) = admitted.journal_binding();
+        let full = scan_ranges_full();
+        // Marker: only the unmarked native word observes; a READY
+        // publication or a DIRTY poisoning refuses.
+        for args in [&["0", "1"][..], &["0", "0", "1"][..]] {
+            let (row, control, _) = publisher.publish(args);
+            let mut rows = NativeBirthRows { row, control };
+            let mut router = scan_router(domain);
+            assert_eq!(
+                observe_absence_birth(
+                    &mut rows,
+                    scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
+                    scan_proof(domain, COOKIE, SCAN_FILE, 1, full[..2].to_vec(), 0),
+                    &mut router,
+                    &binding,
+                    scene.fixture.attachment(),
+                    &admitted,
+                ),
+                Err(BirthObservationRefusal::MarkerPublished),
+                "publisher [{:?}]",
+                args
+            );
+        }
+        // Appearance continuity: a scan of another process, another
+        // domain, or another file is not this birth's appearance —
+        // whether the baseline or the appearance side drifts.
+        let (row, control, _) = publisher.publish(&["0", "0", "0", "0", "1"]);
+        for (prior_cookie, appearance_cookie) in [(COOKIE, COOKIE + 1), (COOKIE + 1, COOKIE + 1)] {
+            let mut rows = NativeBirthRows { row, control };
+            let mut router = scan_router(domain);
+            assert_eq!(
+                observe_absence_birth(
+                    &mut rows,
+                    scan_proof(domain, prior_cookie, SCAN_FILE, 0, full.clone(), 0),
+                    scan_proof(
+                        domain,
+                        appearance_cookie,
+                        SCAN_FILE,
+                        1,
+                        full[..2].to_vec(),
+                        0
+                    ),
+                    &mut router,
+                    &binding,
+                    scene.fixture.attachment(),
+                    &admitted,
+                ),
+                Err(BirthObservationRefusal::AppearanceForeign),
+                "prior {prior_cookie} appearance {appearance_cookie}"
+            );
+        }
+        let mut rows = NativeBirthRows { row, control };
+        let mut router = scan_router(domain);
+        assert_eq!(
+            observe_absence_birth(
+                &mut rows,
+                scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
+                scan_proof(domain, COOKIE, SCAN_FILE + 1, 1, full[..2].to_vec(), 0),
+                &mut router,
+                &binding,
+                scene.fixture.attachment(),
+                &admitted,
+            ),
+            Err(BirthObservationRefusal::AppearanceForeign)
+        );
+        let mut rows = NativeBirthRows { row, control };
+        let mut router = scan_router(domain);
+        assert_eq!(
+            observe_absence_birth(
+                &mut rows,
+                scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
+                scan_proof(
+                    NativeDomainId::mint(),
+                    COOKIE,
+                    SCAN_FILE,
+                    1,
+                    full[..2].to_vec(),
+                    0
+                ),
+                &mut router,
+                &binding,
+                scene.fixture.attachment(),
+                &admitted,
+            ),
+            Err(BirthObservationRefusal::AppearanceForeign)
+        );
+        // Advancement: unchanged counters are a re-presentation, not
+        // an absence.
+        let mut rows = NativeBirthRows { row, control };
+        let mut router = scan_router(domain);
+        assert_eq!(
+            observe_absence_birth(
+                &mut rows,
+                scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
+                scan_proof(domain, COOKIE, SCAN_FILE, 0, full[..2].to_vec(), 0),
+                &mut router,
+                &binding,
+                scene.fixture.attachment(),
+                &admitted,
+            ),
+            Err(BirthObservationRefusal::AppearanceNotAdvanced)
+        );
+        // Teardown only: a range the baseline never held is a hook
+        // gap, never an absence.
+        let mut grown = full.clone();
+        grown.push(crate::discovery::instances::MapRange::new(
+            SCAN_BASE + 0x9000,
+            SCAN_BASE + 0xA000,
+            0x9000,
+            false,
+        ));
+        let mut rows = NativeBirthRows { row, control };
+        let mut router = scan_router(domain);
+        assert_eq!(
+            observe_absence_birth(
+                &mut rows,
+                scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
+                scan_proof(domain, COOKIE, SCAN_FILE, 1, grown, 0),
+                &mut router,
+                &binding,
+                scene.fixture.attachment(),
+                &admitted,
+            ),
+            Err(BirthObservationRefusal::AppearanceGrew)
+        );
+        // Baseline seal: a scan the router refuses (a fenced-out
+        // era here) leaves no baseline to measure against.
+        let mut rows = NativeBirthRows { row, control };
+        let mut router = scan_router(domain);
+        assert_eq!(
+            observe_absence_birth(
+                &mut rows,
+                scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 9),
+                scan_proof(domain, COOKIE, SCAN_FILE, 1, full[..2].to_vec(), 0),
+                &mut router,
+                &binding,
+                scene.fixture.attachment(),
+                &admitted,
+            ),
+            Err(BirthObservationRefusal::PriorScanRejected)
+        );
+        // New appearance: epochs the router already holds are not an
+        // absence (pre-seal both scans, then re-present).
+        let mut router = scan_router(domain);
+        let mut rows = NativeBirthRows { row, control };
+        observe_absence_birth(
+            &mut rows,
+            scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
+            scan_proof(domain, COOKIE, SCAN_FILE, 1, full[..2].to_vec(), 0),
+            &mut router,
+            &binding,
+            scene.fixture.attachment(),
+            &admitted,
+        )
+        .expect("first presentation births");
+        let mut rows = NativeBirthRows { row, control };
+        assert_eq!(
+            observe_absence_birth(
+                &mut rows,
+                scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
+                scan_proof(domain, COOKIE, SCAN_FILE, 1, full[..2].to_vec(), 0),
+                &mut router,
+                &binding,
+                scene.fixture.attachment(),
+                &admitted,
+            ),
+            Err(BirthObservationRefusal::AppearanceRejected)
+        );
     }
 
     #[test]
@@ -7997,52 +8766,66 @@ mod tests {
         // re-checks fresh words: native truth that moved between
         // observation and seal (a scope-dirtied marker) refuses the
         // seal even though the grant attested. Fresh observation
-        // itself refuses the dirtied row; the seal must refuse the
-        // dirtied words however they arrive.
+        // itself refuses the natively dirtied row; the seal must
+        // refuse the dirtied words however they arrive.
         use crate::attach::{BirthObservationRefusal, observe_exec_birth};
         use crate::process::PidPin;
-        use p11scope_ebpf_common::journal_marker::{MARKER_DIRTY, ready_word};
+        use p11scope_ebpf_common::journal_marker::MARKER_DIRTY;
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
-        use p11scope_ebpf_common::{InstanceRecord, JournalAdmissionControl};
 
+        let publisher = NativePublisher::build();
         let mut scene = Scene::new(image_default());
         let admitted = scene.fixture.admit();
         let proof = scene.adapter.attest_key(&admitted).expect("key attests");
-        let attachment = scene.fixture.seal_attachment();
-        let custody = PidPin::open(std::process::id()).unwrap();
-        let control = JournalAdmissionControl::default();
-        let published = InstanceRecord {
-            journal_bootstrap: ready_word(EXEC),
-            ..InstanceRecord::default()
-        };
+        let pin = std::sync::Arc::new(PidPin::open(std::process::id()).unwrap());
+        let binding = live_binding(&scene, &admitted, pin.clone());
+        let (row, control, _) = publisher.publish(&["0", "1"]);
+        let mut rows = NativeBirthRows { row, control };
         let (token, evidence) =
-            observe_exec_birth(&published, &control, &custody, &attachment, &admitted)
+            observe_exec_birth(&mut rows, &binding, scene.fixture.attachment(), &admitted)
                 .expect("genuine producers observe");
-        let grant = SessionBirthGrant::issue(&token, proof, BirthKind::ExecMarker, 0, 0, evidence);
+        let grant = SessionBirthGrant::issue(
+            &token,
+            proof,
+            BirthKind::ExecMarker,
+            0,
+            scene.closure_generation(),
+            evidence,
+        );
         let create = function_id("C_CreateObject");
         let begin = begin_bytes(1, 1, create, 0);
         scene.ingest(&begin);
         let birth =
             BootstrapReceipt::attest(&scene.adapter, &grant).expect("observed grant attests");
         scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
-        let dirtied = InstanceRecord {
-            journal_bootstrap: MARKER_DIRTY,
-            ..InstanceRecord::default()
+        // Native truth moved: a fresh run dirties the marker through
+        // the real dirty() leaf (no admits: an admit after dirty
+        // would trip the latch natively); fresh observation refuses it.
+        let (dirty_row, dirty_control, _) = publisher.publish(&["0", "0", "1"]);
+        assert_eq!(dirty_row.journal_bootstrap, MARKER_DIRTY);
+        let mut dirty_rows = NativeBirthRows {
+            row: dirty_row,
+            control: dirty_control,
         };
         assert_eq!(
-            observe_exec_birth(&dirtied, &control, &custody, &attachment, &admitted),
+            observe_exec_birth(
+                &mut dirty_rows,
+                &binding,
+                scene.fixture.attachment(),
+                &admitted
+            ),
             Err(BirthObservationRefusal::MarkerNotReady)
         );
         let moved = SessionBirthEvidence::scripted(
             (COOKIE, EXEC),
             MARKER_DIRTY,
             0,
-            custody.start_time().unwrap(),
+            pin.start_time().unwrap(),
         );
         let frontier = scene.adapter.consumed_frontier();
         let audit = scene.audit();
         let failure = scene
-            .seal_explicit(&audit, &birth, frontier, &moved)
+            .seal_explicit(&audit, &birth, frontier, moved)
             .expect_err("dirtied marker refuses the seal");
         assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
     }
@@ -8073,14 +8856,14 @@ mod tests {
             None,
             0,
             H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
-            0,
+            scene.closure_generation(),
         );
         let failure = scene
             .seal_explicit(
                 &faulted,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("fault audit voids");
         assert_eq!(failure.gap, JournalGap::FaultChanged);
@@ -8093,7 +8876,12 @@ mod tests {
         let next = begin_bytes(1, 2, create, 0);
         scene.ingest(&next);
         scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
-        let grant = SessionBirthGrant::scripted(reproof, BirthKind::AbsenceAppearance, fence, 0);
+        let grant = SessionBirthGrant::scripted(
+            reproof,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
         let rebirth =
             BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
         let retry = scene
@@ -8293,21 +9081,26 @@ mod tests {
             None,
             0,
             H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
-            0,
+            scene.closure_generation(),
         );
         scene
             .seal_explicit(
                 &faulted,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("fault audit voids");
         let fence = scene.adapter.consumed_through;
         let mut pad = ordinary_for(&begin, 0);
         pad.slot = 99;
         scene.ingest_ordinary(pad);
-        let grant = SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, fence, 0);
+        let grant = SessionBirthGrant::scripted(
+            proof,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
         let resume =
             BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
         let waiting = scene
@@ -8471,14 +9264,14 @@ mod tests {
             None,
             0,
             H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
-            0,
+            scene.closure_generation(),
         );
         scene
             .seal_explicit(
                 &faulted,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("fault audit voids");
         let fence = scene.adapter.consumed_through;
@@ -8487,7 +9280,12 @@ mod tests {
         let next = begin_bytes(1, 2, create, 0);
         scene.ingest(&next);
         scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
-        let grant = SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, fence, 0);
+        let grant = SessionBirthGrant::scripted(
+            proof,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
         let resume =
             BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
         scene.seal_at(&resume, 8).expect("post-void history seals");
@@ -8604,11 +9402,11 @@ mod tests {
         assert_eq!(scene.adapter.consumed_through, 0);
         // Its audit refuses the seal without voiding staged proof.
         let mut source = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(0));
-        let audit = JournalAuditReceipt::collect(&refused, &mut source, 0);
+        let audit = JournalAuditReceipt::collect(&refused, &mut source, scene.closure_generation());
         let frontier = scene.adapter.consumed_frontier();
         let fresh = SessionBirthEvidence::scripted_for_receipt(&bootstrap);
         let failure = scene
-            .seal_explicit(&audit, &bootstrap, frontier, &fresh)
+            .seal_explicit(&audit, &bootstrap, frontier, fresh)
             .expect_err("first-presented foreign drain refuses");
         assert_eq!(failure.gap, JournalGap::DrainMismatch);
         // THE SESSION DRAIN collects and seals.
@@ -8951,7 +9749,8 @@ mod tests {
             ),
         );
         let bootstrap = scene.bootstrap(proof, 0);
-        let fresh = SessionBirthEvidence::scripted_for_receipt(&bootstrap);
+        let mut births =
+            ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(&bootstrap));
         let failure = {
             let mut tick = JointSealTick::wire(
                 &mut scene.adapter,
@@ -8960,8 +9759,9 @@ mod tests {
                 &scene.descriptors,
                 &fault,
                 &mut coordinator,
+                scene.fixture.attachment(),
             );
-            tick.tick(Some(2), 0, 0, &bootstrap, &fresh)
+            tick.tick(Some(2), 0, &bootstrap, &mut births)
                 .expect_err("taken loss voids")
         };
         assert_eq!(failure.gap, JournalGap::H3Loss);
@@ -8985,10 +9785,16 @@ mod tests {
             ),
         );
         let fence = scene.adapter.consumed_through;
-        let grant = SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, fence, 0);
+        let grant = SessionBirthGrant::scripted(
+            proof,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
         let resume =
             BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
-        let fresh = SessionBirthEvidence::scripted_for_receipt(&resume);
+        let mut births =
+            ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(&resume));
         let recovered = {
             let mut tick = JointSealTick::wire(
                 &mut scene.adapter,
@@ -8997,14 +9803,16 @@ mod tests {
                 &scene.descriptors,
                 &fault,
                 &mut coordinator,
+                scene.fixture.attachment(),
             );
-            tick.tick(Some(2), 0, 0, &resume, &fresh)
+            tick.tick(Some(2), 0, &resume, &mut births)
                 .expect("acknowledged history seals")
         };
         assert_eq!(recovered.prefix.settled().len(), 1);
         // No fresh batch minted: the take yields genesis and the tick
         // waits for coverage instead of certifying across a gap.
-        let fresh = SessionBirthEvidence::scripted_for_receipt(&resume);
+        let mut births =
+            ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(&resume));
         let failure = {
             let mut tick = JointSealTick::wire(
                 &mut scene.adapter,
@@ -9013,8 +9821,9 @@ mod tests {
                 &scene.descriptors,
                 &fault,
                 &mut coordinator,
+                scene.fixture.attachment(),
             );
-            tick.tick(Some(2), 0, 0, &resume, &fresh)
+            tick.tick(Some(2), 0, &resume, &mut births)
                 .expect_err("stale evidence waits")
         };
         assert_eq!(failure.gap, JournalGap::H3Pending);
@@ -9070,7 +9879,8 @@ mod tests {
             acked: Vec::new(),
         };
         let bootstrap = scene.bootstrap(proof, 0);
-        let fresh = SessionBirthEvidence::scripted_for_receipt(&bootstrap);
+        let mut births =
+            ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(&bootstrap));
         let failure = {
             let mut tick = JointSealTick::wire(
                 &mut scene.adapter,
@@ -9079,8 +9889,9 @@ mod tests {
                 &scene.descriptors,
                 &fault,
                 &mut finalizer,
+                scene.fixture.attachment(),
             );
-            tick.tick(Some(2), 0, 0, &bootstrap, &fresh)
+            tick.tick(Some(2), 0, &bootstrap, &mut births)
                 .expect_err("taken loss voids")
         };
         assert_eq!(failure.gap, JournalGap::H3Loss);
@@ -9096,10 +9907,16 @@ mod tests {
             acked: Vec::new(),
         };
         scene.attest();
-        let grant = SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, fence, 0);
+        let grant = SessionBirthGrant::scripted(
+            proof,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
         let resume =
             BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
-        let fresh = SessionBirthEvidence::scripted_for_receipt(&resume);
+        let mut births =
+            ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(&resume));
         let mut tick = JointSealTick::wire(
             &mut scene.adapter,
             &mut scene.model,
@@ -9107,8 +9924,9 @@ mod tests {
             &scene.descriptors,
             &fault,
             &mut finalizer,
+            scene.fixture.attachment(),
         );
-        tick.tick(Some(2), 0, 0, &resume, &fresh)
+        tick.tick(Some(2), 0, &resume, &mut births)
             .expect("clean history seals");
         assert!(finalizer.acked.is_empty(), "clean seals ack nothing");
     }
@@ -9132,53 +9950,69 @@ mod tests {
             let bootstrap = scene.bootstrap(proof, 0);
             (scene, bootstrap)
         }
-        fn audit(h3: H3DispositionEvidence, h0_below: u64) -> JournalAuditReceipt {
-            JournalAuditReceipt::scripted_h0(7, 7, None, 0, h3, 0, h0_below)
+        fn audit(scene: &Scene, h3: H3DispositionEvidence, h0_below: u64) -> JournalAuditReceipt {
+            JournalAuditReceipt::scripted_h0(
+                7,
+                7,
+                None,
+                0,
+                h3,
+                scene.closure_generation(),
+                h0_below,
+            )
         }
         // Staged short of the watermark waits.
         let (mut scene, bootstrap) = scene_with_history();
         let frontier = scene.adapter.consumed_frontier();
-        let short = audit(H3DispositionEvidence::scripted_clean(4), 6);
+        let short = audit(&scene, H3DispositionEvidence::scripted_clean(4), 6);
         let failure = scene
             .seal_explicit(
                 &short,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("short staging waits");
         assert_eq!(failure.gap, JournalGap::H3Pending);
         // Pending below the watermark waits even at full staging.
-        let pending = audit(H3DispositionEvidence::scripted_clean_pending(9, Some(5)), 6);
+        let pending = audit(
+            &scene,
+            H3DispositionEvidence::scripted_clean_pending(9, Some(5)),
+            6,
+        );
         let failure = scene
             .seal_explicit(
                 &pending,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("pending below the watermark waits");
         assert_eq!(failure.gap, JournalGap::H3Pending);
         // Full coverage seals.
-        let covered = audit(H3DispositionEvidence::scripted_clean_pending(9, Some(6)), 6);
+        let covered = audit(
+            &scene,
+            H3DispositionEvidence::scripted_clean_pending(9, Some(6)),
+            6,
+        );
         scene
             .seal_explicit(
                 &covered,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect("covered quantum seals");
         // A loss below the watermark voids once...
         let (mut scene, bootstrap) = scene_with_history();
         let frontier = scene.adapter.consumed_frontier();
-        let loss = audit(H3DispositionEvidence::scripted_loss(2), 6);
+        let loss = audit(&scene, H3DispositionEvidence::scripted_loss(2), 6);
         let failure = scene
             .seal_explicit(
                 &loss,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("loss below the watermark voids");
         assert_eq!(failure.gap, JournalGap::H3Loss);
@@ -9189,31 +10023,31 @@ mod tests {
                 &loss,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("forgiven loss waits");
         assert_eq!(failure.gap, JournalGap::H3Pending);
         // ...while a loss above the watermark waits without voiding.
-        let above = audit(H3DispositionEvidence::scripted_loss(9), 6);
+        let above = audit(&scene, H3DispositionEvidence::scripted_loss(9), 6);
         let failure = scene
             .seal_explicit(
                 &above,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("loss above the watermark waits");
         assert_eq!(failure.gap, JournalGap::H3Pending);
         // Exhaustion stops the adapter permanently.
         let (mut scene, bootstrap) = scene_with_history();
         let frontier = scene.adapter.consumed_frontier();
-        let dead = audit(H3DispositionEvidence::scripted_exhausted(), 6);
+        let dead = audit(&scene, H3DispositionEvidence::scripted_exhausted(), 6);
         let failure = scene
             .seal_explicit(
                 &dead,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("exhaustion stops");
         assert_eq!(failure.gap, JournalGap::H3Exhausted);
@@ -9247,14 +10081,14 @@ mod tests {
             None,
             0,
             H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
-            0,
+            scene.closure_generation(),
         );
         let failure = scene
             .seal_explicit(
                 &moved,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                SessionBirthEvidence::scripted_for_receipt(&bootstrap),
             )
             .expect_err("inter-collection fault move voids");
         assert_eq!(failure.gap, JournalGap::FaultChanged);
@@ -9267,7 +10101,12 @@ mod tests {
         let third = begin_bytes(1, 3, create, 0);
         scene.ingest(&third);
         scene.ingest(&end_bytes(&third, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
-        let grant = SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, fence, 0);
+        let grant = SessionBirthGrant::scripted(
+            proof,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
         let resume =
             BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
         let frontier = scene.adapter.consumed_frontier();
@@ -9277,14 +10116,14 @@ mod tests {
             None,
             0,
             H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through),
-            0,
+            scene.closure_generation(),
         );
         let recovered = scene
             .seal_explicit(
                 &fresh,
                 &resume,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&resume),
+                SessionBirthEvidence::scripted_for_receipt(&resume),
             )
             .expect("post-void history seals");
         assert_eq!(recovered.prefix.settled().len(), 1);
@@ -9314,7 +10153,9 @@ mod tests {
                 &audit,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                &mut ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(
+                    &bootstrap,
+                )),
                 &moved,
             )
             .expect_err("seal-time fault move voids");
@@ -9328,7 +10169,9 @@ mod tests {
                 &audit,
                 &bootstrap,
                 frontier,
-                &SessionBirthEvidence::scripted_for_receipt(&bootstrap),
+                &mut ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(
+                    &bootstrap,
+                )),
                 &ScriptedFaultCell::steady(7),
             )
             .expect_err("stale epoch refuses");
@@ -9376,13 +10219,64 @@ mod tests {
                 .adapter
                 .collect_from_drain(&mut drain, &scene.descriptors, None, &fault, 0);
         assert_eq!(collection.discarded_delta, 0);
-        let grant = SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, fence, 0);
+        let grant = SessionBirthGrant::scripted(
+            proof,
+            BirthKind::AbsenceAppearance,
+            fence,
+            scene.closure_generation(),
+        );
         let resume =
             BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
         let recovered = scene
             .seal_collected(&resume, &collection)
             .expect("clean history seals");
         assert_eq!(recovered.prefix.settled().len(), 1);
+    }
+
+    #[test]
+    fn object_journal_failed_birth_take_refuses_without_void() {
+        // C1: the seal pulls one fresh birth observation per seal; a
+        // failed take refuses without voiding (the next tick takes
+        // again), exactly like unverified native evidence.
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        struct FailingBirthSource;
+
+        impl BirthEvidenceSource for FailingBirthSource {
+            fn take_birth_evidence(
+                &mut self,
+            ) -> Result<SessionBirthEvidence, crate::attach::BirthObservationRefusal> {
+                Err(crate::attach::BirthObservationRefusal::CustodyLost)
+            }
+        }
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let audit = scene.audit();
+        let cell = ScriptedFaultCell::steady(audit.fault_after);
+        let mut failing = FailingBirthSource;
+        let failure = scene
+            .adapter
+            .seal(
+                &mut scene.model,
+                &audit,
+                &bootstrap,
+                frontier,
+                &mut failing,
+                &cell,
+            )
+            .expect_err("failed take refuses");
+        assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
+        assert_eq!(failure.h3_voided, None);
+        // Nothing voided: a fresh take seals the same staged history.
+        let success = scene.seal(&bootstrap).expect("fresh take seals");
+        assert_eq!(success.prefix.settled().len(), 1);
     }
 
     #[test]
@@ -9401,7 +10295,12 @@ mod tests {
             let begin = begin_bytes(1, 1, create, 0);
             scene.ingest(&begin);
             scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
-            let grant = SessionBirthGrant::scripted(proof, BirthKind::ExecMarker, 0, 0);
+            let grant = SessionBirthGrant::scripted(
+                proof,
+                BirthKind::ExecMarker,
+                0,
+                scene.closure_generation(),
+            );
             let birth = BootstrapReceipt::attest(&scene.adapter, &grant).expect("grant attests");
             (scene, birth)
         }
@@ -9414,7 +10313,7 @@ mod tests {
         let audit = scene.audit();
         let fresh = SessionBirthEvidence::scripted(image, ready, 0, 1);
         scene
-            .seal_explicit(&audit, &birth, frontier, &fresh)
+            .seal_explicit(&audit, &birth, frontier, fresh)
             .expect("fresh evidence seals");
         // Each post-attestation corruption refuses the seal.
         for fresh in [
@@ -9428,7 +10327,7 @@ mod tests {
             let frontier = scene.adapter.consumed_frontier();
             let audit = scene.audit();
             let failure = scene
-                .seal_explicit(&audit, &birth, frontier, &fresh)
+                .seal_explicit(&audit, &birth, frontier, fresh)
                 .expect_err("moved native truth refuses the seal");
             assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
         }

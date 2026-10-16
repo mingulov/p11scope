@@ -6,7 +6,14 @@
  * algorithm. Inactive: no live root calls these leaves. */
 #define P11SCOPE_JOURNAL_MARKER_NO_MAPS
 #include "journal_marker.h"
+/* CAS-loss injection for the exhaustion probe below: only atomic
+ * interference is injected; there is no second admission algorithm. */
+static u64 *cas_victim;
+static unsigned cas_losses_remaining;
+static u64 admit_controlled_cas(u64 *cell, u64 old, u64 replacement);
+#define __sync_val_compare_and_swap admit_controlled_cas
 #include "journal_marker.c"
+#undef __sync_val_compare_and_swap
 #include <assert.h>
 #include <pthread.h>
 #include <stddef.h>
@@ -14,6 +21,18 @@
 #include <string.h>
 
 static int failures;
+
+static u64 admit_controlled_cas(u64 *cell, u64 old, u64 replacement)
+{
+    if (cell == cas_victim && cas_losses_remaining) {
+        /* Another CPU won the race: the cell advances past our
+         * observed word, so our compare fails. */
+        cas_losses_remaining--;
+        *cell = old + 1;
+        return old + 1;
+    }
+    return __sync_val_compare_and_swap(cell, old, replacement);
+}
 
 #define EXPECT(cond, ...)                                                                          \
     do {                                                                                           \
@@ -180,8 +199,59 @@ static void check_admit_race(void)
     }
     EXPECT(won == 5000, "last-permit race admits exactly once per round, won %u/5000", won);
     assert(pthread_barrier_destroy(&admit_gate) == 0);
-    /* Wide race from zero: 8 threads x 3000 attempts admit exactly
-     * the 16384 permits, then refuse loudly. */
+    /* Sequential fill: one thread admits exactly the full cap with
+     * no latch, and the 16385th attempt refuses loudly. Deterministic
+     * exact-cap proof without contention. */
+    ctl.spent = 0;
+    ctl.failed = 0;
+    won = 0;
+    for (i = 0; i < 16384; i++)
+        won += (unsigned)p11_journal_marker_admit(&ctl, ready7, 7);
+    EXPECT(won == 16384, "sequential fill admits exactly the cap, won %u", won);
+    EXPECT(ctl.spent == 16384, "sequential fill spends exactly the cap, spent %llu",
+           (unsigned long long)ctl.spent);
+    EXPECT(ctl.failed == 0, "sequential fill trips no latch");
+    EXPECT(p11_journal_marker_admit(&ctl, ready7, 7) == 0, "permit 16385 refuses");
+    EXPECT(ctl.failed == 1, "cap refusal trips the failed latch");
+    /* Single-shot contention: 2048 rounds of an 8-way single-attempt
+     * race admit exactly the full cap with no latch. Each round is an
+     * isolated race (joined before the next starts), and a single-shot
+     * attempt can lose at most one race per rival win — 7 losses max,
+     * so 32-retry exhaustion is impossible by construction while every
+     * round still exercises genuine atomic contention. */
+    ctl.spent = 0;
+    ctl.failed = 0;
+    won = 0;
+    assert(pthread_barrier_init(&admit_gate, 0, 8) == 0);
+    for (round = 0; round < 2048; round++) {
+        for (t = 0; t < 8; t++) {
+            args[t].ctl = &ctl;
+            args[t].marker = ready7;
+            args[t].exec = 7;
+            args[t].attempts = 1;
+            args[t].won = 0;
+            assert(pthread_create(&threads[t], 0, race_admit, &args[t]) == 0);
+        }
+        for (t = 0; t < 8; t++)
+            assert(pthread_join(threads[t], 0) == 0);
+        for (t = 0; t < 8; t++)
+            won += args[t].won;
+        if (ctl.failed != 0)
+            break;
+    }
+    EXPECT(won == 16384, "single-shot contention admits exactly the cap, won %u", won);
+    EXPECT(ctl.spent == 16384, "single-shot contention spends exactly the cap, spent %llu",
+           (unsigned long long)ctl.spent);
+    EXPECT(ctl.failed == 0, "single-shot contention trips no latch");
+    assert(pthread_barrier_destroy(&admit_gate) == 0);
+    /* Saturated hammer: 8 threads x 3000 attempts. Under saturation an
+     * attempt CAN exhaust 32 consecutive races, and the H8 failure
+     * protocol latches on exhaustion — so saturation may strand
+     * below-cap permits (the plan's finite availability cost,
+     * disclosed and measured, never silent). Safety still holds
+     * exactly: every win spent exactly one permit (no lost updates,
+     * no phantom wins), spent never exceeds the cap (never
+     * over-admits), and the latch explains any shortfall. */
     ctl.spent = 0;
     ctl.failed = 0;
     assert(pthread_barrier_init(&admit_gate, 0, 8) == 0);
@@ -198,39 +268,35 @@ static void check_admit_race(void)
     won = 0;
     for (i = 0; i < 8; i++)
         won += args[i].won;
-    /* Contention never latches, so saturation still wins exactly
-     * the full cap (every win spent exactly one permit — no lost
-     * updates) and only genuine bound-exceed trips the latch. */
-    EXPECT(won == 16384, "wide race admits exactly the cap, won %u", won);
-    EXPECT(won == ctl.spent, "wide race accounts every win, won %u spent %llu", won,
+    EXPECT(won == ctl.spent, "hammer accounts every win, won %u spent %llu", won,
            (unsigned long long)ctl.spent);
-    EXPECT(ctl.spent == 16384, "wide race spends exactly the cap, spent %llu",
+    EXPECT(ctl.spent <= 16384, "hammer never over-admits, spent %llu",
            (unsigned long long)ctl.spent);
-    EXPECT(ctl.failed == 1, "wide race over-admission trips the latch");
+    EXPECT(ctl.failed == 1, "hammer trips the latch");
     assert(pthread_barrier_destroy(&admit_gate) == 0);
-    /* Medium race: 4 threads x 5000 attempts from zero admit exactly
-     * the full cap under realistic contention, then refuse loudly. */
-    ctl.spent = 0;
-    ctl.failed = 0;
-    assert(pthread_barrier_init(&admit_gate, 0, 4) == 0);
-    for (t = 0; t < 4; t++) {
-        args[t].ctl = &ctl;
-        args[t].marker = ready7;
-        args[t].exec = 7;
-        args[t].attempts = 5000;
-        args[t].won = 0;
-        assert(pthread_create(&threads[t], 0, race_admit, &args[t]) == 0);
-    }
-    for (t = 0; t < 4; t++)
-        assert(pthread_join(threads[t], 0) == 0);
-    won = 0;
-    for (i = 0; i < 4; i++)
-        won += args[i].won;
-    EXPECT(won == 16384, "medium race admits exactly the cap, won %u", won);
-    EXPECT(ctl.spent == 16384, "medium race spends exactly the cap, spent %llu",
+}
+
+static void check_admit_exhaustion_latches(void)
+{
+    /* C7 remainder: the H8 failure protocol latches `failed`
+     * permanently on exhausted admission CAS — the mint precedent's
+     * unlatched contention refusal does not apply here. Mirrors the
+     * reviewer's injected 32-loss probe: 32 consecutive lost races
+     * refuse with spent advanced and the latch set. */
+    struct journal_admission_control ctl = {0, 0};
+    u64 ready7 = (7ULL << 2) | 2ULL;
+    cas_victim = &ctl.spent;
+    cas_losses_remaining = 32;
+    EXPECT(p11_journal_marker_admit(&ctl, ready7, 7) == 0, "exhausted admission refuses");
+    EXPECT(ctl.spent == 32, "32 lost races advanced spent, got %llu",
            (unsigned long long)ctl.spent);
-    EXPECT(ctl.failed == 1, "medium race over-admission trips the latch");
-    assert(pthread_barrier_destroy(&admit_gate) == 0);
+    EXPECT(ctl.failed == 1, "exhaustion latches failed permanently, got %llu",
+           (unsigned long long)ctl.failed);
+    cas_victim = NULL;
+    /* The latch sticks: later admissions refuse without spending. */
+    EXPECT(p11_journal_marker_admit(&ctl, ready7, 7) == 0, "latched control refuses");
+    EXPECT(ctl.spent == 32, "latched refusal spends nothing, spent %llu",
+           (unsigned long long)ctl.spent);
 }
 
 static void check_null_closed(void)
@@ -310,6 +376,7 @@ int main(void)
     check_dirty_sticks();
     check_admit();
     check_admit_race();
+    check_admit_exhaustion_latches();
     check_null_closed();
     check_publish_race();
     if (!failures)

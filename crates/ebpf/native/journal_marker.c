@@ -92,11 +92,14 @@ int p11_journal_marker_admit(struct journal_admission_control *ctl, u64 marker, 
      * the permit is spent by compare-exchange, so two CPUs observing
      * the last permit cannot both win. Genuine bound-exceed trips the
      * latch and refuses loudly; concurrent admission beyond the bound
-     * never over-admits silently. Mere CAS contention retries
-     * boundedly and then refuses THIS attempt unlatched (the mint
-     * precedent: contention counts against the caller, the latch is
-     * for bound-exceed and corruption), so below-bound permits stay
-     * winnable and the caller raises per-call fault. */
+     * never over-admits silently. CAS contention retries boundedly;
+     * EXHAUSTED retries latch `failed` permanently and refuse (the
+     * binding H8 failure protocol: N+1, counter corruption/exhaustion
+     * and failed admission CAS all latch — the mint precedent's
+     * unlatched contention refusal does not apply here). The caller
+     * raises the checked fault; later admissions refuse on the latch
+     * without spending. The NULL-control path cannot latch (no row
+     * exists to latch); it allocates nothing, satisfying that half. */
     for (tries = 0; tries < 32; tries++) {
         observed = __sync_fetch_and_add(&ctl->spent, 0);
         if (observed >= P11_JOURNAL_MARKER_ADMIT_CAP) {
@@ -106,5 +109,6 @@ int p11_journal_marker_admit(struct journal_admission_control *ctl, u64 marker, 
         if (__sync_val_compare_and_swap(&ctl->spent, observed, observed + 1) == observed)
             return 1;
     }
+    __sync_lock_test_and_set(&ctl->failed, 1);
     return 0;
 }

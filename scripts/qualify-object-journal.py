@@ -12,9 +12,12 @@ every comparison checks the observed output against those exact bytes;
 echo; pre-existing or foreign output fails) and verifies execution from
 controller-observed delivery timing — the child streams one progress line
 per observation on stdout, timestamped here at delivery and ACKed back so
-controller delay can only spread arrivals, never compress them — never
-child timestamps; total child lifetime never substitutes for paced
-delivery; an empty observation set always fails. A plain --run is a
+controller delay can only spread arrivals, never compress them; ACKs are
+nonblocking with drop-on-full, so a child that stopped reading wedges
+its own pipe while the owned-child deadline still fires and the child is
+reaped here — never child timestamps; total child lifetime never
+substitutes for paced delivery; an empty observation set always fails. A
+plain --run is a
 fixture pacing check (mechanics only, never a profile PASS);
 --run --qualify-profile additionally requires the profile's full
 rate*duration workload population delivered across its full duration
@@ -543,6 +546,11 @@ def run_profile(args):
     except BrokenPipeError:
         print("harness: provider exited before GO", file=sys.stderr)
         return 3
+    # ACKs ride the raw stdin fd nonblocking from here on (the text
+    # wrapper above is never touched again): a child that stopped
+    # reading wedges its own pipe, never the deadline loop.
+    ack_fd = child.stdin.fileno()
+    os.set_blocking(ack_fd, False)
     go_at = time.monotonic()
     deadline_at = go_at + deadline
     arrivals = []
@@ -564,12 +572,14 @@ def run_profile(args):
         arrivals.append((line, time.monotonic_ns()))
         if not ack_dead:
             try:
-                child.stdin.write("ACK\n")
-                child.stdin.flush()
-            except (BrokenPipeError, OSError):
-                # The child stopped reading ACKs (or exited): keep
-                # draining its stdout — lines already in flight still
-                # count — but stop writing.
+                os.write(ack_fd, b"ACK\n")
+            except OSError:
+                # The child stopped reading ACKs (a full pipe can only
+                # mean no reader: 4 bytes always fit for one awaiting
+                # its ACK) or exited: keep draining its stdout — lines
+                # already in flight still count, the deadline still
+                # fires — but stop writing. Dropping here is what keeps
+                # the deadline loop unblockable.
                 ack_dead = True
     if flooded:
         child.kill()
@@ -583,6 +593,7 @@ def run_profile(args):
         # never a silently dropped observation.
         arrivals.append((bytes(buf).decode("utf-8", errors="replace"), time.monotonic_ns()))
     os.set_blocking(fd, True)
+    os.set_blocking(ack_fd, True)
     try:
         _, stderr = child.communicate(timeout=max(0.0, deadline_at - time.monotonic()))
     except subprocess.TimeoutExpired:

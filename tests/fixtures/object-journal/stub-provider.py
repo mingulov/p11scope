@@ -112,7 +112,9 @@ def observe_record(event, ordinal, observed_at):
 
 def replay_trace(trace):
     """Replay the raw request stream into computed observations. Strict:
-    unknown events, missing probes and unpaired calls fail closed."""
+    unknown events, missing probes, duplicate call/return sequences,
+    unpaired calls and misordered (return-before-call) pairs fail
+    closed — identities are never collapsed."""
     if not isinstance(trace, list):
         raise ValueError("trace is not an event list")
     probes = [event for event in trace if event.get("op") == "probe"]
@@ -120,15 +122,23 @@ def replay_trace(trace):
         raise ValueError(f"trace holds {len(probes)} birth probes, want exactly 1")
     calls = {}
     returns = {}
+    call_pos = {}
+    return_pos = {}
     record_events = []
-    for event in trace:
+    for index, event in enumerate(trace):
         op = event.get("op")
         if op == "probe":
             continue
         elif op == "call":
+            if event["seq"] in calls:
+                raise ValueError(f"duplicate trace call seq {event['seq']!r}")
             calls[event["seq"]] = event
+            call_pos[event["seq"]] = index
         elif op == "return":
+            if event["seq"] in returns:
+                raise ValueError(f"duplicate trace return seq {event['seq']!r}")
             returns[event["seq"]] = event
+            return_pos[event["seq"]] = index
         elif op == "record":
             record_events.append(event)
         else:
@@ -137,6 +147,9 @@ def replay_trace(trace):
         raise ValueError(
             f"unpaired trace calls: calls {sorted(calls)} returns {sorted(returns)}"
         )
+    for seq in calls:
+        if return_pos[seq] < call_pos[seq]:
+            raise ValueError(f"misordered trace pair: return before call for seq {seq!r}")
     abandoned = {
         event["seq"] for event in record_events if event.get("kind") == "ABANDON"
     }

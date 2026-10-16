@@ -637,6 +637,122 @@ class TraceReplayTests(unittest.TestCase):
             self.assertIn("INVOCATION_MISMATCH", proc.stdout)
 
 
+class TraceIdentityTests(unittest.TestCase):
+    """N12: duplicate trace identities and invalid pairing/order refuse
+    loudly rather than collapsing; the oracle fails such traces."""
+
+    def ledger_with_trace(self, tmp, trace):
+        ledger = json.loads(LEDGER.read_bytes())
+        ledger["trace"] = trace
+        path = Path(tmp) / "ledger.json"
+        path.write_text(json.dumps(ledger, sort_keys=True))
+        return path
+
+    def test_duplicate_call_seq_refused(self):
+        frozen = json.loads(LEDGER.read_bytes())
+        with tempfile.TemporaryDirectory() as temp:
+            trace = list(frozen["trace"])
+            dup = next(event for event in trace if event["op"] == "call")
+            trace.append(dict(dup))
+            ledger_path = self.ledger_with_trace(temp, trace)
+            out = str(Path(temp) / "observed.json")
+            proc = run_stub(ledger_path, out)
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+            self.assertIn("duplicate", proc.stderr)
+
+    def test_duplicate_return_seq_refused(self):
+        frozen = json.loads(LEDGER.read_bytes())
+        with tempfile.TemporaryDirectory() as temp:
+            trace = list(frozen["trace"])
+            dup = next(event for event in trace if event["op"] == "return")
+            trace.append(dict(dup))
+            ledger_path = self.ledger_with_trace(temp, trace)
+            out = str(Path(temp) / "observed.json")
+            proc = run_stub(ledger_path, out)
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+            self.assertIn("duplicate", proc.stderr)
+
+    def test_misordered_pair_refused(self):
+        frozen = json.loads(LEDGER.read_bytes())
+        with tempfile.TemporaryDirectory() as temp:
+            trace = list(frozen["trace"])
+            call_index = next(
+                index for index, event in enumerate(trace) if event["op"] == "call"
+            )
+            ret_index = next(
+                index for index, event in enumerate(trace) if event["op"] == "return"
+            )
+            trace[call_index], trace[ret_index] = trace[ret_index], trace[call_index]
+            ledger_path = self.ledger_with_trace(temp, trace)
+            out = str(Path(temp) / "observed.json")
+            proc = run_stub(ledger_path, out)
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+            self.assertIn("misordered", proc.stderr)
+
+    def test_unpaired_return_refused(self):
+        frozen = json.loads(LEDGER.read_bytes())
+        with tempfile.TemporaryDirectory() as temp:
+            trace = list(frozen["trace"])
+            trace.append({"op": "return", "seq": 99, "rv": "OK", "effects": []})
+            ledger_path = self.ledger_with_trace(temp, trace)
+            out = str(Path(temp) / "observed.json")
+            proc = run_stub(ledger_path, out)
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+            self.assertIn("unpaired", proc.stderr)
+
+    def test_duplicate_trace_fails_run(self):
+        frozen = json.loads(LEDGER.read_bytes())
+        with tempfile.TemporaryDirectory() as temp:
+            trace = list(frozen["trace"])
+            dup = next(event for event in trace if event["op"] == "call")
+            trace.append(dict(dup))
+            ledger_path = self.ledger_with_trace(temp, trace)
+            out = str(Path(temp) / "observed.json")
+            proc = run_oracle(
+                "--run",
+                "--provider",
+                str(STUB),
+                "--provider-arg=--ledger",
+                "--provider-arg",
+                str(ledger_path),
+                "--provider-arg=--out",
+                "--provider-arg",
+                out,
+                "--ledger",
+                str(ledger_path),
+                "--out",
+                out,
+                "--rate",
+                "100",
+            )
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertNotIn("PASS", proc.stdout)
+
+    def test_duplicate_invocation_seq_fails_check(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = str(Path(temp) / "observed.json")
+            stub = run_stub(LEDGER, out)
+            self.assertEqual(stub.returncode, 0, stub.stderr)
+            observed = json.loads(Path(out).read_bytes())
+            observed["invocations"][2]["seq"] = observed["invocations"][1]["seq"]
+            Path(out).write_text(json.dumps(observed))
+            proc = run_oracle("--check", "--observed", out, "--ledger", str(LEDGER))
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("DUPLICATE_INVOCATION", proc.stdout)
+
+    def test_duplicate_record_ordinal_fails_check(self):
+        with tempfile.TemporaryDirectory() as temp:
+            out = str(Path(temp) / "observed.json")
+            stub = run_stub(LEDGER, out)
+            self.assertEqual(stub.returncode, 0, stub.stderr)
+            observed = json.loads(Path(out).read_bytes())
+            observed["records"][3]["ordinal"] = observed["records"][1]["ordinal"]
+            Path(out).write_text(json.dumps(observed))
+            proc = run_oracle("--check", "--observed", out, "--ledger", str(LEDGER))
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("DUPLICATE_RECORD", proc.stdout)
+
+
 class FreshnessTests(unittest.TestCase):
     """Carryover 14: output freshness binds to the current run via a nonce
     the child must echo, and pace is controller-measured, never trusted

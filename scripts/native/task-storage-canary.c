@@ -32,7 +32,7 @@ struct bpf_program;
 enum {
     MAP_COUNT = 3,
     LOG_LIMIT = 8192,
-    SEED_SIZE = 560,
+    SEED_SIZE = 576,
     READY_LIMIT = 1024,
     PROGRAM_LIMIT = 64,
     OBJECT_MAP_LIMIT = 64,
@@ -49,8 +49,8 @@ enum {
 static const char *const map_names[MAP_COUNT] = {
     "TASK_COOKIE", "THREAD_OWNER", "ROOT_AFFILIATION",
 };
-static const uint32_t map_value_sizes[MAP_COUNT] = {8, 544, 8};
-static const uint32_t seed_offsets[MAP_COUNT] = {0, 8, 552};
+static const uint32_t map_value_sizes[MAP_COUNT] = {8, 560, 8};
+static const uint32_t seed_offsets[MAP_COUNT] = {0, 8, 568};
 
 struct map_spec {
     const char *name;
@@ -228,7 +228,7 @@ static int read_seed(const char *path, unsigned char *seed)
         }
         if (count == 0) {
             close(fd);
-            fail("SEED is shorter than the fixed 560-byte layout");
+            fail("SEED is shorter than the fixed 576-byte layout");
             return -1;
         }
         used += (size_t)count;
@@ -242,7 +242,7 @@ static int read_seed(const char *path, unsigned char *seed)
     if (count != 0) {
         close(fd);
         fail(count < 0 ? "SEED read failed" :
-                         "SEED is longer than the fixed 560-byte layout");
+                         "SEED is longer than the fixed 576-byte layout");
         return -1;
     }
     if (close(fd)) {
@@ -1050,7 +1050,7 @@ static int exact_map_self_test(void)
     struct map_spec specs[MAP_COUNT];
     struct bpf_map_info info;
     struct map_spec spec = {
-        .name = "THREAD_OWNER", .id = 42, .key_size = 4, .value_size = 544,
+        .name = "THREAD_OWNER", .id = 42, .key_size = 4, .value_size = 560,
         .max_entries = 0, .map_flags = BPF_F_NO_PREALLOC, .fd = -1, .map = NULL,
     };
     size_t index;
@@ -1058,7 +1058,7 @@ static int exact_map_self_test(void)
     info.id = 42;
     info.type = BPF_MAP_TYPE_TASK_STORAGE;
     info.key_size = 4;
-    info.value_size = 544;
+    info.value_size = 560;
     info.max_entries = 0;
     info.map_flags = BPF_F_NO_PREALLOC;
     memcpy(info.name, spec.name, strlen(spec.name) + 1);
@@ -1123,9 +1123,9 @@ static int seed_layout_self_test(void)
             return fail("self-test seed slice overruns the fixed layout");
         total += map_value_sizes[index];
     }
-    if (total != SEED_SIZE || map_value_sizes[0] != 8 || map_value_sizes[1] != 544 ||
+    if (total != SEED_SIZE || map_value_sizes[0] != 8 || map_value_sizes[1] != 560 ||
         map_value_sizes[2] != 8)
-        return fail("self-test seed layout is not 8/544/8 over 560 bytes");
+        return fail("self-test seed layout is not 8/560/8 over 576 bytes");
     puts("task-storage-canary seed layout self-test: OK");
     return 0;
 }
@@ -1139,7 +1139,7 @@ static int ready_document_self_test(void)
         "\"maps\":[{\"name\":\"TASK_COOKIE\",\"id\":40,\"type\":\"task_storage\","
         "\"bytes_key\":4,\"bytes_value\":8,\"max_entries\":0,\"map_flags\":1},"
         "{\"name\":\"THREAD_OWNER\",\"id\":41,\"type\":\"task_storage\","
-        "\"bytes_key\":4,\"bytes_value\":544,\"max_entries\":0,\"map_flags\":1},"
+        "\"bytes_key\":4,\"bytes_value\":560,\"max_entries\":0,\"map_flags\":1},"
         "{\"name\":\"ROOT_AFFILIATION\",\"id\":42,\"type\":\"task_storage\","
         "\"bytes_key\":4,\"bytes_value\":8,\"max_entries\":0,\"map_flags\":1}]}\n";
     struct identity identity = {.pid = 4321, .tid = 4321, .generation = 987654321};

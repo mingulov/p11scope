@@ -36,6 +36,10 @@ TASK_STORAGE_QUALIFICATION_NAMES = TASK_STORAGE_NAMES[:3]
 TASK_STORAGE_VALUE_SIZES = {
     "TASK_COOKIE": 8, "THREAD_OWNER": 544, "ROOT_AFFILIATION": 8, "PROC_EPOCH": 144,
 }
+# H8 slice A: Detailed THREAD_OWNER rows carry two trailing lifetime
+# words (560 B); Inventory-only rows stay 544 B. Both ABIs are live,
+# so the decoder accepts either exact size (never anything else).
+THREAD_OWNER_VALUE_SIZES = (544, 560)
 # Task 3 Stage A per-process mutation record (`struct instance_record`,
 # crates/ebpf/native/instance_epoch.h): u64 slot_plus1[8], u64 epoch[8],
 # u64 flags, u64 exec_attach_gen. Kernel metadata counters only.
@@ -52,10 +56,19 @@ def idle_owner_value(raw):
     """A retained THREAD_OWNER between calls: storage kept, lease returned.
 
     The native owner keeps each thread's storage after its first call and
-    clears every field when it returns the lease, so an idle owner is exactly
-    544 zero bytes. It holds no lease, START row or directory cell.
+    clears the lease state when it returns the lease. An idle Inventory
+    row is exactly 544 zero bytes; an idle Detailed row is 560 bytes
+    whose first 544 are zero while the trailing lifetime words persist
+    (H8 slice A). Either way it holds no lease, START row or directory
+    cell.
     """
-    return type(raw) is bytes and len(raw) == 544 and not any(raw)
+    if type(raw) is not bytes:
+        return False
+    if len(raw) == 544:
+        return not any(raw)
+    if len(raw) == 560:
+        return not any(raw[:544])
+    return False
 TASK_STORAGE_MAX_RECORDS = 131072
 TASK_STORAGE_MAX_BYTES = 64 * 1024 * 1024
 TASK_STORAGE_TIMEOUT_SECONDS = 8
@@ -695,7 +708,10 @@ def task_storage_specs(maps):
             item.get("type"), item.get("bytes_key"), item.get("bytes_value"),
             item.get("max_entries"), item.get("map_flags"),
         )
-        expected = ("task_storage", 4, TASK_STORAGE_VALUE_SIZES[item["name"]], 0, 1)
+        pinned = TASK_STORAGE_VALUE_SIZES[item["name"]]
+        if item["name"] == "THREAD_OWNER" and actual[2] in THREAD_OWNER_VALUE_SIZES:
+            pinned = actual[2]
+        expected = ("task_storage", 4, pinned, 0, 1)
         if actual != expected:
             raise RuntimeError(
                 f"task-storage map id={item['id']} name={item['name']} metadata mismatch: "

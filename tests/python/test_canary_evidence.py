@@ -295,7 +295,7 @@ class TaskStorageInventoryTests(unittest.TestCase):
              "key_size": 4, "value_size": 8, "max_entries": 0,
              "oracle": dumper.map_oracle({"name": "TASK_COOKIE", "type": "task_storage"})},
             {"name": "THREAD_OWNER", "id": 102, "type": "task_storage",
-             "key_size": 4, "value_size": 544, "max_entries": 0,
+             "key_size": 4, "value_size": 560, "max_entries": 0,
              "oracle": dumper.map_oracle({"name": "THREAD_OWNER", "type": "task_storage"})},
             {"name": "ROOT_AFFILIATION", "id": 103, "type": "task_storage",
              "key_size": 4, "value_size": 8, "max_entries": 0,
@@ -331,7 +331,7 @@ class TaskStorageReaderTests(unittest.TestCase):
          "oracle": "task-storage", "bytes_key": 4, "bytes_value": 8,
          "max_entries": 0, "map_flags": 1},
         {"name": "THREAD_OWNER", "id": 102, "type": "task_storage",
-         "oracle": "task-storage", "bytes_key": 4, "bytes_value": 544,
+         "oracle": "task-storage", "bytes_key": 4, "bytes_value": 560,
          "max_entries": 0, "map_flags": 1},
         {"name": "ROOT_AFFILIATION", "id": 103, "type": "task_storage",
          "oracle": "task-storage", "bytes_key": 4, "bytes_value": 8,
@@ -350,8 +350,8 @@ class TaskStorageReaderTests(unittest.TestCase):
         ) + value
 
     def complete_stream(self):
-        owner = bytearray(544)
-        owner[536:] = b"LATEBYTE"
+        owner = bytearray(560)
+        owner[552:] = b"LATEBYTE"
         return b"".join([
             self.frame(1, 101, 7001, 7001, b"COOKIE01"),
             self.frame(1, 102, 7001, 7002, bytes(owner)),
@@ -505,7 +505,7 @@ class TaskStorageReaderTests(unittest.TestCase):
             obj.write_bytes(b"object")
             cases = (
                 (1, 8, 9.25, self.frame(1, 101, 7001, 7001, b"COOKIE01") + self.frame(2)),
-                (3, 560, 8.5, self.complete_stream()),
+                (3, 576, 8.5, self.complete_stream()),
                 (131072, 64 * 1024 * 1024, 60, self.frame(2)),
             )
             for maximum_records, maximum_bytes, timeout, stream in cases:
@@ -528,7 +528,7 @@ class TaskStorageReaderTests(unittest.TestCase):
                         str(obj), "4294967295", str(maximum_records), str(maximum_bytes),
                         str(int(timeout * 1000)),
                         "TASK_COOKIE:101:task_storage:4:8:0:1",
-                        "THREAD_OWNER:102:task_storage:4:544:0:1",
+                        "THREAD_OWNER:102:task_storage:4:560:0:1",
                         "ROOT_AFFILIATION:103:task_storage:4:8:0:1",
                         "PROC_EPOCH:111:task_storage:4:144:0:1",
                     ])
@@ -536,7 +536,7 @@ class TaskStorageReaderTests(unittest.TestCase):
                         actual, self.MAPS, max_records=maximum_records, max_bytes=maximum_bytes)
                     self.assertEqual(len(parsed), 0 if maximum_records == 131072 else maximum_records)
                     if maximum_records == 3:
-                        self.assertEqual(parsed[1]["value"][536:], b"LATEBYTE")
+                        self.assertEqual(parsed[1]["value"][552:], b"LATEBYTE")
                     if maximum_records < 4:
                         self.assertEqual(len(actual), maximum_bytes + (maximum_records + 1) * 28)
 
@@ -682,13 +682,13 @@ class TaskStorageReaderTests(unittest.TestCase):
             self.complete_stream(), self.MAPS, max_records=8, max_bytes=4096
         )
         self.assertEqual(len(records), 3)
-        self.assertEqual(len(records[1]["value"]), 544)
-        self.assertEqual(records[1]["value"][536:], b"LATEBYTE")
+        self.assertEqual(len(records[1]["value"]), 560)
+        self.assertEqual(records[1]["value"][552:], b"LATEBYTE")
         with tempfile.TemporaryDirectory() as directory:
             paths = dumper.publish_task_storage_surfaces(
                 Path(directory), "case", self.MAPS, records
             )
-            self.assertEqual(Path(paths["THREAD_OWNER"]).read_bytes()[536:], b"LATEBYTE")
+            self.assertEqual(Path(paths["THREAD_OWNER"]).read_bytes()[552:], b"LATEBYTE")
             self.assertTrue(all((Path(path).stat().st_mode & 0o777) == 0o600
                                 for path in paths.values()))
 
@@ -1853,7 +1853,7 @@ class StoppedPopulationTests(unittest.TestCase):
                     continue
                 value = struct.pack("<Q", 3 if flag == "cookie" else 1)
                 if flag == "owner":
-                    value = bytearray(544)
+                    value = bytearray(560)
                     struct.pack_into("<Q", value, 0, (task["pid"] << 32) | task["tid"])
                     # Valid production discovery directory and both late fields.
                     struct.pack_into("<Q", value, 8, 47)
@@ -1978,11 +1978,12 @@ class StoppedPopulationTests(unittest.TestCase):
 
     def test_idle_owner_storage_is_leaseless_and_roster_bound(self):
         # The native owner keeps a thread's storage after its first call and
-        # clears it when the lease returns: 544 zero bytes, no lease. It may
-        # belong to any stopped in-process task that is not expected to hold
-        # a lease, and never counts toward OWNER_CTL outstanding.
+        # clears the lease state when the lease returns: 560 zero bytes (an
+        # idle Detailed row; Inventory rows stay 544 zero bytes), no lease.
+        # It may belong to any stopped in-process task that is not expected
+        # to hold a lease, and never counts toward OWNER_CTL outstanding.
         idle = {"map_id": 102, "pid": 7001, "tid": 7001, "generation": 900,
-                "value": bytes(544)}
+                "value": bytes(560)}
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             manifest, receipt, records, controls = self.fixture(root)
@@ -2001,7 +2002,7 @@ class StoppedPopulationTests(unittest.TestCase):
                     records[:] = [r for r in records if not (r["map_id"] == 102 and r["tid"] == 7002)]
                     row.update(tid=7002, generation=901)
                 elif case == "not-zero":
-                    value = bytearray(544)
+                    value = bytearray(560)
                     struct.pack_into("<Q", value, 0, (7001 << 32) | 7001)
                     row["value"] = bytes(value)
                 else:
@@ -2010,6 +2011,16 @@ class StoppedPopulationTests(unittest.TestCase):
                 self.publish_fixture(root, manifest, receipt, records, controls)
                 with self.assertRaisesRegex(AssertionError, "stopped"):
                     self.check(root, manifest)
+        # H8 slice A: an idle Detailed row keeps nonzero lifetime words
+        # past its zeroed lease prefix, and still counts as idle.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest, receipt, records, controls = self.fixture(root)
+            row = dict(idle)
+            row["value"] = bytes(544) + struct.pack("<QQ", 7, 3)
+            records.append(row)
+            self.publish_fixture(root, manifest, receipt, records, controls)
+            self.assertEqual(len(self.check(root, manifest)), 11)
 
     def test_idle_owner_first_does_not_shadow_affiliated_records(self):
         # An idle THREAD_OWNER for a task must not collide with that same
@@ -2019,7 +2030,7 @@ class StoppedPopulationTests(unittest.TestCase):
         dumper = load_dumper()
         manifest, receipt, records, values = self.fixture(Path("/unused"), owned=True)
         records.insert(0, {"map_id": 102, "pid": 7001, "tid": 7001,
-                           "generation": 900, "value": bytes(544)})
+                           "generation": 900, "value": bytes(560)})
         controls = {}
         for item in manifest:
             if item["name"] in values:
@@ -2604,7 +2615,7 @@ class StartRingSurfaceIntegrationTests(unittest.TestCase):
             if not ring:
                 suffix = "bin" if task_storage else "json"
                 path = root / f"mapdump_{name}_{lane}.{suffix}"
-                path.write_bytes(bytes(544) if task_storage else b"[]\n")
+                path.write_bytes(bytes(definition["value_size"]) if task_storage else b"[]\n")
                 item["file"] = str(path)
             manifest.append(item)
         manifest_path = root / f"mapdump_manifest_{lane}.json"

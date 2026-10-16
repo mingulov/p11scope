@@ -41,13 +41,14 @@ SCHEMA = 'p11scope/task-storage-canary/v1'
 ABI = 'x86-64'
 TARGET_BITS = 64
 CASES = ('baseline', 'early', 'late')
-# The fixture's fixed 560-byte seed: name, offset and value size, in order.
-MAP_LAYOUT = (('TASK_COOKIE', 0, 8), ('THREAD_OWNER', 8, 544), ('ROOT_AFFILIATION', 552, 8))
+# The fixture's fixed 576-byte seed: name, offset and value size, in order.
+# H8 slice A: the Detailed owner row is 560 B (Inventory: 544 B).
+MAP_LAYOUT = (('TASK_COOKIE', 0, 8), ('THREAD_OWNER', 8, 560), ('ROOT_AFFILIATION', 568, 8))
 OWNER_NAME = 'THREAD_OWNER'
-SEED_SIZE = 560
-OWNER_SIZE = 544
+SEED_SIZE = 576
+OWNER_SIZE = 560
 EARLY_OFFSET = 0
-LATE_OFFSET = 535
+LATE_OFFSET = 551
 COOKIE_CONTROL = b'SEEDCKVA'
 ROOT_CONTROL = b'SEEDRTVA'
 READY_FIELDS = frozenset(('schema', 'abi', 'pid', 'tid', 'generation', 'tasks', 'maps'))
@@ -81,7 +82,7 @@ def is_uint(value, *, positive=False):
 
 
 def owner_baseline():
-    """A known safe 544-byte value the real final-artifact scanner accepts."""
+    """A known safe 560-byte value the real final-artifact scanner accepts."""
     return bytes(0x41 + (index % 26) for index in range(OWNER_SIZE))
 
 
@@ -95,7 +96,7 @@ def control_values(case):
         owner[EARLY_OFFSET:EARLY_OFFSET + len(marker)] = marker
     elif case == 'late':
         owner[LATE_OFFSET:LATE_OFFSET + len(marker)] = marker
-        require(LATE_OFFSET + len(marker) == OWNER_SIZE, 'late control does not end at 544')
+        require(LATE_OFFSET + len(marker) == OWNER_SIZE, 'late control does not end at 560')
     values = {'TASK_COOKIE': COOKIE_CONTROL, OWNER_NAME: bytes(owner),
               'ROOT_AFFILIATION': ROOT_CONTROL}
     for name, _, size in MAP_LAYOUT:
@@ -106,7 +107,7 @@ def control_values(case):
 
 def seed_bytes(case):
     raw = b''.join(control_values(case)[name] for name, _, _ in MAP_LAYOUT)
-    require(len(raw) == SEED_SIZE, 'seed is not the fixed 560-byte layout')
+    require(len(raw) == SEED_SIZE, 'seed is not the fixed 576-byte layout')
     return raw
 
 

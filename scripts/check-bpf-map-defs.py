@@ -1561,7 +1561,9 @@ SAFE_MAPS = {
         "OBJECT_ZERO": (2, 4, 432, 1, 128),
         "TASK_COOKIE": (29, 4, 8, 0, 1),
         "COOKIE_CTL": (2, 4, 40, 1),
-        "THREAD_OWNER": (29, 4, 544, 0, 1),
+        # H8 slice A: Detailed rows carry two trailing lifetime words
+        # (560 B); Inventory-only objects stay 544 B (overridden below).
+        "THREAD_OWNER": (29, 4, 560, 0, 1),
         "OWNER_CTL": (2, 4, 56, 1),
         "ROOT_AFFILIATION": (29, 4, 8, 0, 1),
         "ROOT_CTL": (2, 4, 64, 1),
@@ -1630,6 +1632,8 @@ INVENTORY_MAPS = {name: SAFE_MAPS[name] for name in (
     "CONFIG", "PID_FILTER", "CGROUP_FILTER", "TAIL_CALLS", "STACK_GUARD", "EVIDENCE",
     "COUNTERS", "DISCOVERY_STATE", "THREAD_OWNER", "OWNER_CTL",
 )} | {
+    # Inventory-only objects carry no journal words: 544 B, not 560 B.
+    "THREAD_OWNER": map_def(29, 4, 544, 0, 1),
     # The Inventory lifecycle ring is 2 MiB (Detailed keeps 64 KiB in
     # SAFE_MAPS); tracks ebpf-common INVENTORY_DISCOVERY_BYTES.
     "DISCOVERY": map_def(27, 0, 0, 2 * 1024 * 1024),

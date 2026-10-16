@@ -6,6 +6,7 @@ All live BPF measurements stay UNRUN: the driver path runs only against the
 repository stub provider, which replays the frozen ledger with scripted
 faults. Each oracle mutation (fabricated bootstrap, removed BEGIN, erased
 loss, leaked private key) must fail closed."""
+import importlib.util
 import json
 import subprocess
 import sys
@@ -41,13 +42,50 @@ def run_stub(ledger_path, out_path, *extra, stdin_text="GO\n", timeout=60):
     )
 
 
-def run_profiled(tmp, provider, provider_args, *oracle_args, timeout=60):
+def run_profiled(tmp, provider, provider_args, *oracle_args, timeout=60, ledger=LEDGER):
     out = str(Path(tmp) / "observed.json")
     argv = ["--run", "--provider", str(provider)]
     for arg in provider_args:
         argv.append(f"--provider-arg={arg}")
-    argv += ["--ledger", str(LEDGER), "--out", out, *oracle_args]
+    argv += ["--ledger", str(ledger), "--out", out, *oracle_args]
     return run_oracle(*argv, timeout=timeout), out
+
+
+def stub_module():
+    """The stub provider's pure observation builders, for generating a
+    consistent bigger ledger (the oracle still independently verifies
+    every field, count and delivery)."""
+    spec = importlib.util.spec_from_file_location("stub_provider", STUB)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def write_full_window_ledger(tmp, rate, duration):
+    """A ledger holding exactly rate*duration observations: the stock
+    15 plus whole call/BEGIN/END/return quads (3 observations each)."""
+    total = rate * duration
+    assert total > 15 and (total - 15) % 3 == 0, "whole quads past the stock 15"
+    ledger = json.loads(LEDGER.read_bytes())
+    stub = stub_module()
+    calls = max(event["seq"] for event in ledger["trace"] if event.get("op") == "call")
+    records = len(ledger["records"])
+    for _ in range((total - 15) // 3):
+        calls += 1
+        call = {"op": "call", "seq": calls, "function": "C_CreateObject"}
+        begun = {"op": "record", "kind": "BEGIN", "seq": calls, "thread": 11, "sequence": 1}
+        ended = {"op": "record", "kind": "END", "seq": calls, "thread": 11, "sequence": 2}
+        ret = {"op": "return", "seq": calls, "rv": "OK", "effects": ["created"]}
+        ledger["trace"] += [call, begun, ended, ret]
+        ledger["invocations"].append(stub.observe_invocation(call, ret, None, 0))
+        for event in (begun, ended):
+            records += 1
+            ledger["records"].append(stub.observe_record(event, records, 0))
+    ledger["counts"] = {"api_calls": len(ledger["invocations"]), "journal_records": len(ledger["records"])}
+    assert len(ledger["invocations"]) + len(ledger["records"]) == total
+    path = Path(tmp) / "ledger-full.json"
+    path.write_text(json.dumps(ledger, sort_keys=True))
+    return path
 
 
 FAKE_PROVIDER = """#!/usr/bin/env python3
@@ -575,6 +613,7 @@ class PacingTests(unittest.TestCase):
             provider_args, out = self.stub_args(temp)
             proc, _ = run_profiled(temp, STUB, provider_args, "--rate", "100", "--duration", "5")
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("not a qualified profile", proc.stdout)
             observed = json.loads(Path(out).read_bytes())
             self.assertEqual(observed["profile"], {"rate": 100, "duration": 5})
             stamps = [call["observed_at"] for call in observed["invocations"]]
@@ -656,6 +695,42 @@ class PacingTests(unittest.TestCase):
             proc = run_oracle("--check", "--observed", path, "--ledger", str(LEDGER))
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
             self.assertIn("PACING_INCOMPLETE", proc.stdout)
+
+    def test_short_replay_fails_qualified_profile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            provider_args, _ = self.stub_args(temp)
+            proc, _ = run_profiled(
+                temp,
+                STUB,
+                provider_args,
+                "--rate",
+                "100",
+                "--duration",
+                "60",
+                "--qualify-profile",
+            )
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("PROFILE_POPULATION_MISMATCH", proc.stdout)
+            self.assertIn("PROFILE_WINDOW_SHORT", proc.stdout)
+            self.assertNotIn("profile complete", proc.stdout)
+
+    def test_paced_full_window_passes_qualified_profile(self):
+        with tempfile.TemporaryDirectory() as temp:
+            ledger = write_full_window_ledger(temp, 10, 3)
+            out = str(Path(temp) / "observed.json")
+            proc, _ = run_profiled(
+                temp,
+                STUB,
+                ["--ledger", str(ledger), "--out", out],
+                "--rate",
+                "10",
+                "--duration",
+                "3",
+                "--qualify-profile",
+                ledger=ledger,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("profile complete", proc.stdout)
 
 
 class EmptyTests(unittest.TestCase):
@@ -1093,7 +1168,6 @@ class PaceStreamingTests(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
             self.assertIn("PACING_TOO_FAST", proc.stdout)
-
 
 if __name__ == "__main__":
     unittest.main()

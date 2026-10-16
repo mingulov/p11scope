@@ -698,26 +698,31 @@ impl ModelState {
 
     /// The journal adapter's consumed-but-unrepresentable begin: recorded
     /// exactly like a model capacity refusal. The domain must be held;
-    /// an unheld domain counts its gap instead of recording.
-    pub(super) fn note_refused(&mut self, domain: ObjectDomain, cut: u64) {
+    /// an unheld domain counts its gap instead of recording. Returns the
+    /// void's invalidation effects (retired views and sessions) so the
+    /// caller publishes them; they are observable, never local.
+    pub(super) fn note_refused(&mut self, domain: ObjectDomain, cut: u64) -> ObjectEffects {
         if self.held(domain).is_err() {
             self.gap(ObjectGap::UnknownDomain);
-            return;
+            return ObjectEffects::default();
         }
-        self.refuse_unrepresented(domain, cut);
+        let effects = self.refuse_unrepresented(domain, cut);
         self.gap(ObjectGap::PendingCapacity);
+        effects
     }
 
     /// A refused call is unrepresented history that may still be running:
     /// proof in its domain ends, and no bootstrap is accepted until a
     /// lost-outcome fact bounds it. Existing tickets stay as fences.
-    fn refuse_unrepresented(&mut self, domain: ObjectDomain, cut: u64) {
+    /// Returns the void's invalidation effects for publication.
+    fn refuse_unrepresented(&mut self, domain: ObjectDomain, cut: u64) -> ObjectEffects {
         let mut effects = ObjectEffects::default();
         self.void_bootstrap(domain, ObjectGap::PendingCapacity, &mut effects);
         if let Some(state) = self.domains.get_mut(&domain) {
             state.fence_floor = max_opt(state.fence_floor, Some(cut));
             state.refused_in_flight = max_opt(state.refused_in_flight, Some(cut));
         }
+        effects
     }
 
     pub(super) fn complete(&mut self, token: CallToken, result: CompletedFact) -> ObjectEffects {
@@ -821,6 +826,13 @@ impl ModelState {
         }
         if !self.prefix_consistent(domain, frontier, &prefix.open) {
             self.contradict(domain, ObjectGap::PrefixContradiction, None, &mut effects);
+            // Surface the rejection to the seal: contradict counted it;
+            // the effect (pushed, not counted twice) lets the caller
+            // refuse a seal whose required alignment was rejected
+            // instead of succeeding with the contradiction inside.
+            effects.push(ObjectEffect::Gap {
+                reason: ObjectGap::PrefixContradiction,
+            });
             return effects;
         }
         if let Some(bootstrap) = prefix.bootstrap {
@@ -3015,6 +3027,30 @@ impl ModelState {
                 self.void_bootstrap(domain, reason, effects);
             }
         }
+    }
+
+    /// Unbounded-abandonment disposal for one domain: the specified
+    /// abandonment-disposal path (S2). Conservative fencing is retained
+    /// (every pending ticket fenced, views/sessions retired, bootstrap
+    /// voided) and call storage is then released — unlike plain
+    /// invalidation, which keeps fenced tickets against late terminals
+    /// the abandoned frame will never deliver. Emits no disposal-bound
+    /// effect: the incarnation stays refused, never rebootstrap'd above
+    /// an invented cut. The journal's permanent-refusal paths call this
+    /// wherever adapter custody is deleted with the refusal.
+    pub(super) fn abandon_domain(&mut self, domain: ObjectDomain) -> ObjectEffects {
+        let mut effects = ObjectEffects::default();
+        self.gap(ObjectGap::Loss);
+        if let Err(unheld) = self.held(domain) {
+            self.gap_effect(&mut effects, unheld);
+            return effects;
+        }
+        self.clear_domain(domain, ObjectGap::Loss, &mut effects);
+        for token in self.domain_calls(domain) {
+            self.remove_call(token);
+        }
+        self.void_bootstrap(domain, ObjectGap::Loss, &mut effects);
+        effects
     }
 
     // -----------------------------------------------------------------------

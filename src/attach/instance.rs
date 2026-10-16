@@ -719,6 +719,16 @@ fn map_file_identity(
     })
 }
 
+/// Issuance capability for H8 birth/closure grants. Only Session-owned
+/// attach code can mint one (private field, constructed solely by the
+/// future issuance site in this module once the native exec-marker /
+/// held-custody witnesses wire). Until then production grants are
+/// unmintable and birth attestation fails closed; tests mint scripted
+/// grants through the journal child's `cfg(test)` seams.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // Activation-gated: no issuance site until H8-D native witnesses wire.
+pub(crate) struct SessionGrantToken(());
+
 /// Readers over the session's instance maps.
 pub(crate) struct InstanceMaps<'a> {
     pub(crate) ebpf: &'a Ebpf,

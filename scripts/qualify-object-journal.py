@@ -12,10 +12,13 @@ every comparison checks the observed output against those exact bytes;
 echo; pre-existing or foreign output fails) and verifies execution from
 controller-observed delivery timing — the child streams one progress line
 per observation on stdout, timestamped here at delivery and ACKed back so
-controller delay can only spread arrivals, never compress them — plus the
-required population/duration, never child timestamps; total child lifetime
-never substitutes for paced delivery; an empty observation set always
-fails.
+controller delay can only spread arrivals, never compress them — never
+child timestamps; total child lifetime never substitutes for paced
+delivery; an empty observation set always fails. A plain --run is a
+fixture pacing check (mechanics only, never a profile PASS);
+--run --qualify-profile additionally requires the profile's full
+rate*duration workload population delivered across its full duration
+window, both controller-observed.
 
 Live BPF measurements stay UNRUN: this round executes only --plan-only,
 --check and --run against the repository stub provider. A privileged
@@ -74,7 +77,7 @@ def well_formed_profile(profile):
     )
 
 
-def check_pace_measured(reasons, observed, rate, duration, measured, arrivals):
+def check_pace_measured(reasons, observed, rate, duration, measured, arrivals, qualified):
     """Verify EXECUTION from controller-observed delivery timing: every
     observation must arrive as a progress line on the child's stdout
     (timestamped here at delivery, never from child stamps), the streamed
@@ -86,7 +89,16 @@ def check_pace_measured(reasons, observed, rate, duration, measured, arrivals):
     bursty delivery. Total child lifetime never substitutes for paced
     delivery — but the run must still fit its duration budget plus
     dump/exit slack. Child profile and stamp claims are ignored here:
-    measurement decides."""
+    measurement decides.
+
+    A fixture run (qualified=False) checks pacing MECHANICS only; it
+    never qualifies a profile, whatever its rate/duration budget. A
+    qualified run (qualified=True) additionally requires the profile's
+    full workload population delivered across its full window, both
+    controller-observed: exactly rate*duration progress deliveries
+    (counts do not jitter) spanning at least three quarters of the
+    duration (scheduling slack only compresses the edges). A short
+    replay at the right rate fails here, never a profile PASS."""
     calls = observed.get("invocations", [])
     records = observed.get("records", [])
     population = len(calls) + len(records)
@@ -154,6 +166,23 @@ def check_pace_measured(reasons, observed, rate, duration, measured, arrivals):
             f"PACING_SPAN_EXCEEDED: controller measured {measured:.3f}s over "
             f"{duration}s (budget {budget:.3f}s)"
         )
+    if not qualified:
+        return
+    expected = rate * duration
+    if len(progress) != expected:
+        reasons.append(
+            f"PROFILE_POPULATION_MISMATCH: controller observed {len(progress)} "
+            f"progress deliveries, the {rate}/s {duration}s profile needs {expected}"
+        )
+    stamps = [stamp for _, _, stamp in progress]
+    span = max(stamps) - min(stamps) if len(stamps) >= 2 else 0
+    window = duration * 750_000_000
+    if span < window:
+        reasons.append(
+            f"PROFILE_WINDOW_SHORT: controller-observed delivery window "
+            f"{span / 1_000_000_000:.3f}s under {duration}s "
+            f"(needs {window / 1_000_000_000:.3f}s)"
+        )
 
 
 def check_pace(reasons, observed):
@@ -211,12 +240,14 @@ def compare(observed, ledger, observed_raw, ledger_raw, run=None):
     `ledger_raw` is the exact frozen bytes the comparison binds to: the
     observed output must carry their digest, so output produced against
     any other ledger fails here. `run` is None for a standalone
-    comparison, or a (rate, duration, measured, token, arrivals) tuple
-    for a driven run: the output must echo this run's nonce (freshness
-    binds to the current invocation; pre-existing or foreign output
-    fails), and pace is controller-measured from the streamed progress
-    `arrivals` (line text plus delivery timestamp), never from child
-    timestamps."""
+    comparison, or a (rate, duration, measured, token, arrivals,
+    qualified) tuple for a driven run: the output must echo this run's
+    nonce (freshness binds to the current invocation; pre-existing or
+    foreign output fails), and pace is controller-measured from the
+    streamed progress `arrivals` (line text plus delivery timestamp),
+    never from child timestamps. `qualified` selects a qualified
+    profile run (full population across the full window) over a
+    fixture pacing check (mechanics only)."""
     reasons = []
     if not isinstance(observed, dict) or observed.get("schema") != LEDGER_SCHEMA:
         return ["SCHEMA_MISMATCH: observed schema is not " + LEDGER_SCHEMA]
@@ -313,7 +344,7 @@ def compare(observed, ledger, observed_raw, ledger_raw, run=None):
     if run is None:
         check_pace(reasons, observed)
     else:
-        check_pace_measured(reasons, observed, run[0], run[1], run[2], run[4])
+        check_pace_measured(reasons, observed, run[0], run[1], run[2], run[4], run[5])
     return reasons
 
 
@@ -563,13 +594,25 @@ def run_profile(args):
     if child.returncode != 0:
         print(f"harness: provider exited {child.returncode}: {stderr.strip()}", file=sys.stderr)
         return 3
-    print(
-        f"profile complete: rate={rate}/s duration={duration}s "
-        f"measured={measured:.3f}s provider={args.provider}"
+    qualified = bool(args.qualify_profile)
+    outcome = check_bound(
+        args.out, ledger_raw, (rate, duration, measured, run_token, arrivals, qualified), True
     )
-    return check_bound(
-        args.out, ledger_raw, (rate, duration, measured, run_token, arrivals), True
-    )
+    if outcome == 0:
+        # The completion line reports a PASS, never a finished-but-failed
+        # run: fixture passes say fixture (never profile), qualified
+        # passes say profile.
+        if qualified:
+            print(
+                f"profile complete: rate={rate}/s duration={duration}s "
+                f"measured={measured:.3f}s provider={args.provider}"
+            )
+        else:
+            print(
+                f"fixture pacing check complete (not a qualified profile): rate={rate}/s "
+                f"duration={duration}s measured={measured:.3f}s provider={args.provider}"
+            )
+    return outcome
 
 
 def parse_args(argv):
@@ -588,6 +631,14 @@ def parse_args(argv):
     parser.add_argument("--duration", default=None)
     parser.add_argument("--deadline-seconds", default=str(DEADLINE_SECONDS))
     parser.add_argument("--abi", default=None)
+    parser.add_argument(
+        "--qualify-profile",
+        action="store_true",
+        help="qualify the profile: require the full rate*duration workload "
+        "population delivered across the full duration window, both "
+        "controller-observed (without it the run is a fixture pacing "
+        "check only, never a profile PASS)",
+    )
     return parser.parse_args(argv)
 
 

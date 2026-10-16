@@ -3959,10 +3959,10 @@ where
 mod tests {
     use super::*;
     use crate::attach::capture::NativeDomainId;
+    use crate::discovery::caller_registry::ModuleKey;
     use crate::discovery::caller_registry::instance_input::{
         AdmittedInstanceCall, CallEvidence, CallStanding, InstanceReason, admit_call_from_evidence,
     };
-    use crate::discovery::caller_registry::{CallerId, ModuleKey};
     use crate::discovery::instances::{
         CallFacts, EntryIp, EpochReading, InstanceId, InstanceRouter, MapRange, Route,
         RouterLimits, StableObservation,
@@ -4181,16 +4181,189 @@ mod tests {
         "C_DestroyObject",
     ];
 
+    /// Genuine-bind identity answers: the cookie queries the bind
+    /// proof makes against the Detailed domain.
+    #[derive(Default)]
+    struct BindIdentity {
+        answers:
+            std::collections::HashMap<(u32, NativeDomainId), crate::attach::capture::CookieQuery>,
+    }
+
+    impl crate::discovery::native_binding::NativeIdentity<crate::process::PidPin> for BindIdentity {
+        fn owner_image(&mut self, _pid: u32) -> Option<ImageIdentity> {
+            None
+        }
+
+        fn query_cookie(
+            &mut self,
+            domain: NativeDomainId,
+            pin: &crate::process::PidPin,
+        ) -> crate::attach::capture::CookieQuery {
+            self.answers
+                .get(&(pin.pid(), domain))
+                .cloned()
+                .unwrap_or(crate::attach::capture::CookieQuery::NoCookie)
+        }
+    }
+
+    std::thread_local! {
+        static BIND_SIGHT_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(1_005) };
+    }
+
+    fn bind_sight_clock() -> Option<u64> {
+        BIND_SIGHT_NS.with(|clock| Some(clock.get()))
+    }
+
+    /// One genuine bind through the coordinator's real proof: admit the
+    /// pid, map the module completely, answer the identity query, prove
+    /// the image to the domain, duplicate the live pin and run the bind
+    /// proof. Returns the bound caller; the binding reads back from the
+    /// coordinator. Mirrors the custody-chain scene's proven shape.
+    #[allow(clippy::too_many_arguments)]
+    fn genuine_bind(
+        coordinator: &mut crate::discovery::engine::inventory_coordinator::InventoryCoordinator<
+            crate::discovery::caller_registry::OsProcessSource,
+        >,
+        identity: &mut BindIdentity,
+        pid: u32,
+        module: &crate::discovery::caller_registry::ModuleKey,
+        domain: NativeDomainId,
+        image: ImageIdentity,
+    ) -> crate::discovery::caller_registry::CallerId {
+        use crate::attach::capture::{
+            CaptureHealth, CapturePhase, CookieQuery, DiscoveryBatch, DomainCookie, ScopeCustody,
+            WitnessBatch, WitnessRow,
+        };
+        use crate::discovery::caller_registry::{AdmissionState, ImageAuthority, ModuleInfo};
+        use crate::discovery::engine::inventory_coordinator::NativeBatch;
+        use crate::discovery::inventory_attach_set::{AttachObjectId, EndpointId};
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let info = ModuleInfo {
+            path: "/task3/provider.so".into(),
+            key: module.clone(),
+            double_loaded: false,
+            build_id: None,
+            identity_source: Some("task3".into()),
+            admission: AdmissionState::Admitted,
+            admission_class: Some("exact".into()),
+            admission_endpoints: Some(1),
+            admission_reasons: Vec::new(),
+        };
+        coordinator
+            .registry_mut()
+            .note_mapping(caller, pid, info, 60);
+        coordinator.commit_batch(false).unwrap();
+        identity.answers.insert(
+            (pid, domain),
+            CookieQuery::Cookie(DomainCookie::scripted(domain, image.task_cookie)),
+        );
+        let witness = |domain: NativeDomainId, rows: Vec<WitnessRow>, at_ns: u64| WitnessBatch {
+            domain,
+            phase: CapturePhase::Active,
+            rows,
+            integrity: Vec::new(),
+            integrity_total: 0,
+            visited: 0,
+            sweep_completed: true,
+            sweeps_completed: 1,
+            row_bound_reached: false,
+            deadline_reached: false,
+            read_failures: Vec::new(),
+            unrecorded_rows: 0,
+            sweep_gaps: false,
+            counts: Vec::new(),
+            refresh_sweep_completed: true,
+            refresh_sweep_gaps: false,
+            refresh_deadline_reached: false,
+            refresh_sweeps_completed: 1,
+            seen_rows: 0,
+            pair_limit: 65_536,
+            health: CaptureHealth {
+                discovery_counters: Some([0; 5]),
+                ..CaptureHealth::default()
+            },
+            health_regression: None,
+            health_unproven: None,
+            health_baseline_ns: 0,
+            health_read_ns: at_ns,
+            rows_anchor_ns: at_ns + 1,
+            rows_read_ns: at_ns + 1,
+            counts_read_ns: at_ns + 1,
+            changed_objects: Vec::new(),
+            custody: ScopeCustody::System,
+            custody_proven_ns: None,
+            lifecycle_proven_ns: u64::MAX,
+            lifecycle_loss: None,
+            unsettled: false,
+        };
+        let rows = vec![WitnessRow::scripted(
+            domain,
+            image.task_cookie,
+            image.exec_id,
+            AttachObjectId::scripted(0),
+            EndpointId(0),
+            pid,
+            100,
+        )];
+        coordinator.stage_native(
+            NativeBatch::Witness(Box::new(witness(domain, rows, 1_000))),
+            identity,
+            1_002,
+        );
+        coordinator.stage_native(
+            NativeBatch::Lifecycle(DiscoveryBatch::scripted(domain, Vec::new(), 1_010)),
+            identity,
+            1_011,
+        );
+        coordinator.stage_native(
+            NativeBatch::Witness(Box::new(witness(domain, Vec::new(), 1_020))),
+            identity,
+            1_022,
+        );
+        coordinator.commit_batch(false).unwrap();
+        let pin = std::sync::Arc::new(
+            coordinator
+                .adapter()
+                .live_pin(pid)
+                .and_then(|(_, pin)| pin.try_clone().ok())
+                .unwrap(),
+        );
+        coordinator
+            .bind_semantic_caller_with_pin(caller, module.clone(), domain, image, identity, pin)
+            .unwrap_or_else(|refusal| {
+                panic!("genuine_bind pid={pid} domain={domain:?} image={image:?}: {refusal:?}")
+            });
+        caller
+    }
+
     struct AttestationFixture {
         _dir: tempfile::TempDir,
         subset: Option<AttestedSubset>,
-        binding: crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
+        coordinator: crate::discovery::engine::inventory_coordinator::InventoryCoordinator<
+            crate::discovery::caller_registry::OsProcessSource,
+        >,
+        identity: BindIdentity,
+        primary: crate::discovery::caller_registry::CallerId,
         domain: NativeDomainId,
         image: ImageIdentity,
         router: InstanceId,
         functions: BTreeMap<String, (u32, Endpoint)>,
         next_token: u64,
         attachment: crate::attach::AttachedSemanticSet,
+        /// The fixture's bound incarnation: a live sleeper the
+        /// primary binding pins. Owned so custody tests can reap
+        /// the exact pin the binding holds (drop reaps).
+        child: std::process::Child,
+    }
+
+    impl Drop for AttestationFixture {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 
     impl AttestationFixture {
@@ -4367,16 +4540,37 @@ mod tests {
                 pin.path,
             );
             let domain = NativeDomainId::mint();
-            let pid = std::process::id();
-            let caller = CallerId(1);
-            let binding =
-                crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding::scripted(
-                    caller,
-                    module,
-                    domain,
-                    image,
-                    std::sync::Arc::new(crate::process::PidPin::test_proc_only(pid)),
-                );
+            // The bound incarnation is an owned sleeper, not the test
+            // process: custody tests reap the exact pin the primary
+            // binding holds, and the drop above reaps every spawn.
+            let child = std::process::Command::new("/bin/sleep")
+                .arg("120")
+                .spawn()
+                .unwrap();
+            let pid = child.id();
+            // The happy-path binding traverses the coordinator's real
+            // bind proof (live incarnation, original pin, established
+            // mapping, bracketed sightings) — never scripted. The
+            // extend receipt activates roots exactly as in production
+            // scenes; the bind below proves this domain's image.
+            let mut coordinator =
+                crate::discovery::engine::inventory_coordinator::InventoryCoordinator::new(
+                    crate::attach::Scope::Pid(pid),
+                    crate::discovery::hooks::HookRegistry::builtin(),
+                    Vec::new(),
+                    crate::discovery::caller_registry::OsProcessSource,
+                    crate::discovery::caller_registry::RegistryLimits::default_limits(),
+                )
+                .unwrap();
+            coordinator.note_extend_receipt(&crate::attach::capture::ExtendReceipt {
+                activated_roots: true,
+                exec_coverage: Some(crate::attach::capture::ExecCoverage::scripted(domain, 0)),
+                ..crate::attach::capture::ExtendReceipt::default()
+            });
+            coordinator.set_semantic_binding_clock(bind_sight_clock);
+            let mut identity = BindIdentity::default();
+            let primary =
+                genuine_bind(&mut coordinator, &mut identity, pid, &module, domain, image);
             let router = Self::route(domain, image);
             // Seal this fixture's attachment from its attested subset,
             // then re-attest a working subset for admissions from the
@@ -4393,14 +4587,69 @@ mod tests {
             Self {
                 _dir: dir,
                 subset: Some(subset),
-                binding,
+                coordinator,
+                identity,
+                primary,
                 domain,
                 image,
                 router,
                 functions,
                 next_token: 0,
                 attachment,
+                child,
             }
+        }
+
+        /// The happy-path binding, genuinely bound: read back from the
+        /// coordinator's stored proof.
+        fn binding(
+            &self,
+        ) -> &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding
+        {
+            self.binding_for(self.primary)
+        }
+
+        /// Read back one genuinely bound caller.
+        fn binding_for(
+            &self,
+            caller: crate::discovery::caller_registry::CallerId,
+        ) -> &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding
+        {
+            self.coordinator
+                .semantic_bindings()
+                .get(caller)
+                .expect("caller genuinely bound")
+        }
+
+        /// Genuinely bind one more caller through the same proof (for
+        /// refusal crosses): any pid/domain/image, same module. The
+        /// cross's domain/exec gets the same extend receipt the
+        /// fixture's own domain got at construction, so the bind
+        /// proof evaluates the cross's real naming.
+        fn bind_extra(
+            &mut self,
+            pid: u32,
+            domain: NativeDomainId,
+            image: ImageIdentity,
+        ) -> crate::discovery::caller_registry::CallerId {
+            self.coordinator
+                .note_extend_receipt(&crate::attach::capture::ExtendReceipt {
+                    activated_roots: true,
+                    exec_coverage: Some(crate::attach::capture::ExecCoverage::scripted(
+                        domain,
+                        image.exec_id,
+                    )),
+                    ..crate::attach::capture::ExtendReceipt::default()
+                });
+            let module = self.binding().module().clone();
+            genuine_bind(
+                &mut self.coordinator,
+                &mut self.identity,
+                pid,
+                &module,
+                domain,
+                image,
+            )
         }
 
         fn route(domain: NativeDomainId, image: ImageIdentity) -> InstanceId {
@@ -4496,7 +4745,7 @@ mod tests {
                 CallEvidence::from_routed(routed).expect("joined call converts to evidence");
             admit_call_from_evidence(
                 evidence,
-                &self.binding,
+                self.binding(),
                 self.subset.as_ref().expect("subset held"),
                 CallStanding::Historical(InstanceReason::SemanticLoss),
                 None,
@@ -8243,25 +8492,6 @@ mod tests {
         }
     }
 
-    /// A live custody binding for a real admission: the admitted
-    /// domain/image/caller with the fixture's real module and a REAL
-    /// held pin (never the fixture's proc-only pin: custody must be a
-    /// live pidfd with a start-time basis).
-    fn live_binding(
-        scene: &Scene,
-        admitted: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
-        pin: std::sync::Arc<crate::process::PidPin>,
-    ) -> crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding {
-        let (domain, image, _, caller) = admitted.journal_binding();
-        crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding::scripted(
-            caller,
-            scene.fixture.binding.module().clone(),
-            domain,
-            image,
-            pin,
-        )
-    }
-
     /// One watched-file load through the PRODUCTION scan protocol.
     /// The I/O values enter through `acquire_test_scan` (the same
     /// seam every router test uses: no userspace-runnable producer
@@ -8316,6 +8546,23 @@ mod tests {
     }
 
     #[test]
+    fn object_journal_session_bindings_are_genuine() {
+        // C1: no scripted() binding constructors anywhere in this
+        // module — happy-path bindings traverse the coordinator's real
+        // bind proof, and refusal crosses are genuine bindings paired
+        // against foreign admissions (never fabricated namings).
+        let source = std::fs::read_to_string("src/semantics_objects/journal.rs")
+            .expect("read journal module");
+        // The needle is assembled so this probe does not trip on its
+        // own mention of the constructor it forbids.
+        let needle = ["SemanticCallerBinding", "scripted"].join("::");
+        assert!(
+            !source.contains(&needle),
+            "scripted bindings remain in journal.rs"
+        );
+    }
+
+    #[test]
     fn object_journal_session_exec_birth_observes_genuine_producers() {
         // C1: Session-owned exec-marker birth end to end with zero
         // scripted birth constructors. Observation pulls the genuine
@@ -8325,7 +8572,6 @@ mod tests {
         // image); the issued grant attests; a FRESH publisher run at
         // seal re-observes and converts.
         use crate::attach::observe_exec_birth;
-        use crate::process::PidPin;
         use p11scope_ebpf_common::journal_marker::ready_word;
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
@@ -8333,18 +8579,23 @@ mod tests {
         let mut scene = Scene::new(image_default());
         let admitted = scene.fixture.admit();
         let proof = scene.adapter.attest_key(&admitted).expect("key attests");
-        let pin = std::sync::Arc::new(PidPin::open(std::process::id()).unwrap());
-        let binding = live_binding(&scene, &admitted, pin.clone());
         let (row, control, wins) = publisher.publish(&["0", "1"]);
         assert_eq!(wins, 1, "one real admission wins");
         let mut rows = NativeBirthRows { row, control };
-        let (token, evidence) =
-            observe_exec_birth(&mut rows, &binding, scene.fixture.attachment(), &admitted)
-                .expect("genuine producers observe");
+        let (token, evidence) = observe_exec_birth(
+            &mut rows,
+            scene.fixture.binding(),
+            scene.fixture.attachment(),
+            &admitted,
+        )
+        .expect("genuine producers observe");
         assert_eq!(evidence.image(), (COOKIE, EXEC));
         assert_eq!(evidence.marker_word(), ready_word(EXEC));
         assert_eq!(evidence.admission_failed(), 0);
-        assert_eq!(evidence.custody(), pin.start_time().unwrap());
+        assert_eq!(
+            evidence.custody(),
+            scene.fixture.binding().pin().start_time().unwrap()
+        );
         let grant = SessionBirthGrant::issue(
             &token,
             proof,
@@ -8368,7 +8619,7 @@ mod tests {
         };
         let (_, fresh) = observe_exec_birth(
             &mut fresh_rows,
-            &binding,
+            scene.fixture.binding(),
             scene.fixture.attachment(),
             &admitted,
         )
@@ -8387,15 +8638,12 @@ mod tests {
         // below is natively published (only the publisher argv varies);
         // only the row-read ERRORS are injected.
         use crate::attach::{BirthObservationRefusal, observe_exec_birth};
-        use crate::process::PidPin;
         use p11scope_ebpf_common::journal_marker::MARKER_ADMIT_CAP;
 
         let publisher = NativePublisher::build();
         let mut scene = Scene::new(image_default());
         let admitted = scene.fixture.admit();
         scene.adapter.attest_key(&admitted).expect("key attests");
-        let pin = std::sync::Arc::new(PidPin::open(std::process::id()).unwrap());
-        let binding = live_binding(&scene, &admitted, pin.clone());
         // Marker readback: unpublished, dirty and foreign-exec native
         // words are not this birth's publication. (The admitted exec
         // is 0, so exec 1 is foreign.)
@@ -8407,7 +8655,12 @@ mod tests {
             let (row, control, _) = publisher.publish(args);
             let mut rows = NativeBirthRows { row, control };
             assert_eq!(
-                observe_exec_birth(&mut rows, &binding, scene.fixture.attachment(), &admitted),
+                observe_exec_birth(
+                    &mut rows,
+                    scene.fixture.binding(),
+                    scene.fixture.attachment(),
+                    &admitted
+                ),
                 Err(BirthObservationRefusal::MarkerNotReady),
                 "publisher [{:?}]",
                 args
@@ -8425,7 +8678,12 @@ mod tests {
             control: latched,
         };
         assert_eq!(
-            observe_exec_birth(&mut rows, &binding, scene.fixture.attachment(), &admitted),
+            observe_exec_birth(
+                &mut rows,
+                scene.fixture.binding(),
+                scene.fixture.attachment(),
+                &admitted
+            ),
             Err(BirthObservationRefusal::LatchTripped)
         );
         let (ready_row, spent, spent_wins) = publisher.publish(&["0", "16384"]);
@@ -8436,7 +8694,12 @@ mod tests {
             control: spent,
         };
         assert_eq!(
-            observe_exec_birth(&mut rows, &binding, scene.fixture.attachment(), &admitted),
+            observe_exec_birth(
+                &mut rows,
+                scene.fixture.binding(),
+                scene.fixture.attachment(),
+                &admitted
+            ),
             Err(BirthObservationRefusal::SpentExhausted)
         );
         let (ready_row, nearly, nearly_wins) = publisher.publish(&["0", "16383"]);
@@ -8445,27 +8708,13 @@ mod tests {
             row: ready_row,
             control: nearly,
         };
-        observe_exec_birth(&mut rows, &binding, scene.fixture.attachment(), &admitted)
-            .expect("below-cap control observes");
-        // Custody: a reaped process no longer pins the birth.
-        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
-        let dead = std::sync::Arc::new(PidPin::open(child.id()).unwrap());
-        child.wait().unwrap();
-        let dead_binding = live_binding(&scene, &admitted, dead);
-        let (ready_row, control, _) = publisher.publish(&["0", "1"]);
-        let mut rows = NativeBirthRows {
-            row: ready_row,
-            control,
-        };
-        assert_eq!(
-            observe_exec_birth(
-                &mut rows,
-                &dead_binding,
-                scene.fixture.attachment(),
-                &admitted
-            ),
-            Err(BirthObservationRefusal::CustodyLost)
-        );
+        observe_exec_birth(
+            &mut rows,
+            scene.fixture.binding(),
+            scene.fixture.attachment(),
+            &admitted,
+        )
+        .expect("below-cap control observes");
         // Attachment: a seal under another domain is not this
         // admission's successful attachment.
         let foreign_scene = Scene::new(image_default());
@@ -8477,52 +8726,69 @@ mod tests {
         assert_eq!(
             observe_exec_birth(
                 &mut rows,
-                &binding,
+                scene.fixture.binding(),
                 foreign_scene.fixture.attachment(),
                 &admitted
             ),
             Err(BirthObservationRefusal::AttachmentMismatch)
         );
         // Binding: the held pin must be bound to the admitted
-        // domain/image/caller — any other naming refuses.
-        use crate::discovery::caller_registry::CallerId;
-        let (domain, image, _, caller) = admitted.journal_binding();
-        let module = scene.fixture.binding.module().clone();
-        for misnamed in [
-            crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding::scripted(
-                CallerId(caller.0.wrapping_add(1)),
-                module.clone(),
-                domain,
-                image,
-                pin.clone(),
-            ),
-            crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding::scripted(
-                caller,
-                module.clone(),
-                NativeDomainId::mint(),
-                image,
-                pin.clone(),
-            ),
-            crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding::scripted(
-                caller,
-                module.clone(),
+        // domain/image/caller — any other naming refuses. Each cross
+        // is genuinely bound under its own name and live pid, then
+        // crossed against the admitted call. One image has one
+        // holder, so a genuine cross always differs in caller too;
+        // each cross below differs in caller plus the named
+        // dimension (image, domain, image again).
+        let (domain, image, _, _) = admitted.journal_binding();
+        let mut crossed_children = Vec::new();
+        let mut crossed = Vec::new();
+        for (cross_domain, cross_image) in [
+            (
                 domain,
                 ImageIdentity {
                     task_cookie: image.task_cookie,
                     exec_id: image.exec_id + 1,
                 },
-                pin.clone(),
+            ),
+            (NativeDomainId::mint(), image),
+            (
+                domain,
+                ImageIdentity {
+                    task_cookie: image.task_cookie,
+                    exec_id: image.exec_id + 2,
+                },
             ),
         ] {
+            let child = std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            crossed.push(
+                scene
+                    .fixture
+                    .bind_extra(child.id(), cross_domain, cross_image),
+            );
+            crossed_children.push(child);
+        }
+        for misnamed in crossed {
             let (ready_row, control, _) = publisher.publish(&["0", "1"]);
             let mut rows = NativeBirthRows {
                 row: ready_row,
                 control,
             };
             assert_eq!(
-                observe_exec_birth(&mut rows, &misnamed, scene.fixture.attachment(), &admitted),
+                observe_exec_birth(
+                    &mut rows,
+                    scene.fixture.binding_for(misnamed),
+                    scene.fixture.attachment(),
+                    &admitted
+                ),
                 Err(BirthObservationRefusal::BindingMismatch)
             );
+        }
+        for mut child in crossed_children {
+            child.kill().unwrap();
+            child.wait().unwrap();
         }
         // Row reads: an unreadable marker or control row refuses (the
         // present side of each pair is real published bytes).
@@ -8532,7 +8798,12 @@ mod tests {
             control: Some(control),
         };
         assert_eq!(
-            observe_exec_birth(&mut rows, &binding, scene.fixture.attachment(), &admitted),
+            observe_exec_birth(
+                &mut rows,
+                scene.fixture.binding(),
+                scene.fixture.attachment(),
+                &admitted
+            ),
             Err(BirthObservationRefusal::RowUnreadable)
         );
         let mut rows = FaultyRows {
@@ -8540,8 +8811,32 @@ mod tests {
             control: None,
         };
         assert_eq!(
-            observe_exec_birth(&mut rows, &binding, scene.fixture.attachment(), &admitted),
+            observe_exec_birth(
+                &mut rows,
+                scene.fixture.binding(),
+                scene.fixture.attachment(),
+                &admitted
+            ),
             Err(BirthObservationRefusal::RowUnreadable)
+        );
+        // Custody, last: reaping the fixture's own incarnation kills
+        // the exact pin the primary binding holds. The binding still
+        // names the admitted triple, so custody — not naming — refuses.
+        scene.fixture.child.kill().unwrap();
+        scene.fixture.child.wait().unwrap();
+        let (ready_row, control, _) = publisher.publish(&["0", "1"]);
+        let mut rows = NativeBirthRows {
+            row: ready_row,
+            control,
+        };
+        assert_eq!(
+            observe_exec_birth(
+                &mut rows,
+                scene.fixture.binding(),
+                scene.fixture.attachment(),
+                &admitted
+            ),
+            Err(BirthObservationRefusal::CustodyLost)
         );
     }
 
@@ -8552,15 +8847,12 @@ mod tests {
         // seals on fresh re-observation (fresh native bytes, fresh
         // scans, a fresh router — never the first pass's words).
         use crate::attach::observe_absence_birth;
-        use crate::process::PidPin;
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
         let publisher = NativePublisher::build();
         let mut scene = Scene::new(image_default());
         let admitted = scene.fixture.admit();
         let proof = scene.adapter.attest_key(&admitted).expect("key attests");
-        let pin = std::sync::Arc::new(PidPin::open(std::process::id()).unwrap());
-        let binding = live_binding(&scene, &admitted, pin.clone());
         let (domain, _, _, _) = admitted.journal_binding();
         let full = scan_ranges_full();
         let mut router = scan_router(domain);
@@ -8571,14 +8863,17 @@ mod tests {
             scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
             scan_proof(domain, COOKIE, SCAN_FILE, 1, full[..2].to_vec(), 0),
             &mut router,
-            &binding,
+            scene.fixture.binding(),
             scene.fixture.attachment(),
             &admitted,
         )
         .expect("unmarked row observes");
         assert_eq!(evidence.marker_word(), 0);
         assert_eq!(evidence.image(), (COOKIE, EXEC));
-        assert_eq!(evidence.custody(), pin.start_time().unwrap());
+        assert_eq!(
+            evidence.custody(),
+            scene.fixture.binding().pin().start_time().unwrap()
+        );
         let grant = SessionBirthGrant::issue(
             &token,
             proof,
@@ -8610,7 +8905,7 @@ mod tests {
             scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
             scan_proof(domain, COOKIE, SCAN_FILE, 1, full[..2].to_vec(), 0),
             &mut fresh_router,
-            &binding,
+            scene.fixture.binding(),
             scene.fixture.attachment(),
             &admitted,
         )
@@ -8629,14 +8924,11 @@ mod tests {
         // natively published; scans pass the production protocol; the
         // router is real.
         use crate::attach::{BirthObservationRefusal, observe_absence_birth};
-        use crate::process::PidPin;
 
         let publisher = NativePublisher::build();
         let mut scene = Scene::new(image_default());
         let admitted = scene.fixture.admit();
         scene.adapter.attest_key(&admitted).expect("key attests");
-        let pin = std::sync::Arc::new(PidPin::open(std::process::id()).unwrap());
-        let binding = live_binding(&scene, &admitted, pin.clone());
         let (domain, _, _, _) = admitted.journal_binding();
         let full = scan_ranges_full();
         // Marker: only the unmarked native word observes; a READY
@@ -8651,7 +8943,7 @@ mod tests {
                     scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
                     scan_proof(domain, COOKIE, SCAN_FILE, 1, full[..2].to_vec(), 0),
                     &mut router,
-                    &binding,
+                    scene.fixture.binding(),
                     scene.fixture.attachment(),
                     &admitted,
                 ),
@@ -8680,7 +8972,7 @@ mod tests {
                         0
                     ),
                     &mut router,
-                    &binding,
+                    scene.fixture.binding(),
                     scene.fixture.attachment(),
                     &admitted,
                 ),
@@ -8696,7 +8988,7 @@ mod tests {
                 scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
                 scan_proof(domain, COOKIE, SCAN_FILE + 1, 1, full[..2].to_vec(), 0),
                 &mut router,
-                &binding,
+                scene.fixture.binding(),
                 scene.fixture.attachment(),
                 &admitted,
             ),
@@ -8717,7 +9009,7 @@ mod tests {
                     0
                 ),
                 &mut router,
-                &binding,
+                scene.fixture.binding(),
                 scene.fixture.attachment(),
                 &admitted,
             ),
@@ -8733,7 +9025,7 @@ mod tests {
                 scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
                 scan_proof(domain, COOKIE, SCAN_FILE, 0, full[..2].to_vec(), 0),
                 &mut router,
-                &binding,
+                scene.fixture.binding(),
                 scene.fixture.attachment(),
                 &admitted,
             ),
@@ -8756,7 +9048,7 @@ mod tests {
                 scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
                 scan_proof(domain, COOKIE, SCAN_FILE, 1, grown, 0),
                 &mut router,
-                &binding,
+                scene.fixture.binding(),
                 scene.fixture.attachment(),
                 &admitted,
             ),
@@ -8772,7 +9064,7 @@ mod tests {
                 scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 9),
                 scan_proof(domain, COOKIE, SCAN_FILE, 1, full[..2].to_vec(), 0),
                 &mut router,
-                &binding,
+                scene.fixture.binding(),
                 scene.fixture.attachment(),
                 &admitted,
             ),
@@ -8787,7 +9079,7 @@ mod tests {
             scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
             scan_proof(domain, COOKIE, SCAN_FILE, 1, full[..2].to_vec(), 0),
             &mut router,
-            &binding,
+            scene.fixture.binding(),
             scene.fixture.attachment(),
             &admitted,
         )
@@ -8799,7 +9091,7 @@ mod tests {
                 scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
                 scan_proof(domain, COOKIE, SCAN_FILE, 1, full[..2].to_vec(), 0),
                 &mut router,
-                &binding,
+                scene.fixture.binding(),
                 scene.fixture.attachment(),
                 &admitted,
             ),
@@ -8816,7 +9108,6 @@ mod tests {
         // itself refuses the natively dirtied row; the seal must
         // refuse the dirtied words however they arrive.
         use crate::attach::{BirthObservationRefusal, observe_exec_birth};
-        use crate::process::PidPin;
         use p11scope_ebpf_common::journal_marker::MARKER_DIRTY;
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
@@ -8824,13 +9115,15 @@ mod tests {
         let mut scene = Scene::new(image_default());
         let admitted = scene.fixture.admit();
         let proof = scene.adapter.attest_key(&admitted).expect("key attests");
-        let pin = std::sync::Arc::new(PidPin::open(std::process::id()).unwrap());
-        let binding = live_binding(&scene, &admitted, pin.clone());
         let (row, control, _) = publisher.publish(&["0", "1"]);
         let mut rows = NativeBirthRows { row, control };
-        let (token, evidence) =
-            observe_exec_birth(&mut rows, &binding, scene.fixture.attachment(), &admitted)
-                .expect("genuine producers observe");
+        let (token, evidence) = observe_exec_birth(
+            &mut rows,
+            scene.fixture.binding(),
+            scene.fixture.attachment(),
+            &admitted,
+        )
+        .expect("genuine producers observe");
         let grant = SessionBirthGrant::issue(
             &token,
             proof,
@@ -8857,7 +9150,7 @@ mod tests {
         assert_eq!(
             observe_exec_birth(
                 &mut dirty_rows,
-                &binding,
+                scene.fixture.binding(),
                 scene.fixture.attachment(),
                 &admitted
             ),
@@ -8867,7 +9160,7 @@ mod tests {
             (COOKIE, EXEC),
             MARKER_DIRTY,
             0,
-            pin.start_time().unwrap(),
+            scene.fixture.binding().pin().start_time().unwrap(),
         );
         let frontier = scene.adapter.consumed_frontier();
         let audit = scene.audit();

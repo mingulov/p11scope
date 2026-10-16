@@ -2054,6 +2054,41 @@ impl AttachedSemanticSet {
     }
 }
 
+/// One Session's retained drain producers: its native identity
+/// domain plus its retained EVENTS domain. Private fields:
+/// production builds one only through [`Session::drain_producers`]
+/// (which retains both); the drain grant mints through the pair, so
+/// a spliced foreign admission refuses at mint instead of pairing.
+#[derive(Clone)]
+pub(crate) struct SessionDrainProducers {
+    native: crate::attach::capture::NativeDomainId,
+    events: events::EventsDomain,
+}
+
+impl SessionDrainProducers {
+    /// The retained native domain the admission is checked against.
+    pub(crate) fn native_domain(&self) -> crate::attach::capture::NativeDomainId {
+        self.native
+    }
+
+    /// The retained EVENTS-map identity the grant binds.
+    pub(crate) fn events_id(&self) -> u64 {
+        self.events.id()
+    }
+
+    /// Pair one scene's genuine test producers: its fixture's minted
+    /// native domain plus its retained test EVENTS domain. The
+    /// common-owner check still runs at mint — this pairs values, it
+    /// never authorizes a splice.
+    #[cfg(test)]
+    pub(crate) fn test_pair(
+        native: crate::attach::capture::NativeDomainId,
+        events: events::EventsDomain,
+    ) -> Self {
+        Self { native, events }
+    }
+}
+
 /// Seal one operator-attested subset into Session-owned attachment
 /// authority with a NATIVE mint: validates exactly like the test
 /// sealer, then mints the generation from the mmapable attach cell
@@ -6036,6 +6071,20 @@ impl Session {
 
     pub(crate) fn events_domain(&self) -> events::EventsDomain {
         self.events_domain.clone()
+    }
+
+    /// The Session's retained drain producers: its native identity
+    /// domain plus its retained EVENTS domain. The drain grant mints
+    /// through this pair (never through two independently supplied
+    /// halves), so the admission is always checked against the
+    /// Session retaining the EVENTS identity it binds. `None` while
+    /// the Session retains no native domain.
+    #[allow(dead_code)] // No Session-loop wire until live activation; tests pair via test_pair.
+    pub(crate) fn drain_producers(&self) -> Option<SessionDrainProducers> {
+        Some(SessionDrainProducers {
+            native: self.native_domain()?,
+            events: self.events_domain(),
+        })
     }
 
     /// The session's single retained `EVENTS` consumer, with exclusive

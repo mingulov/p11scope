@@ -34,7 +34,7 @@ OBJECT_ARRAY_NAMES = ("OBJECT_DESCRIPTORS",)
 # capture uses the full TASK_STORAGE_NAMES inventory; reconcile requires it.
 TASK_STORAGE_QUALIFICATION_NAMES = TASK_STORAGE_NAMES[:3]
 TASK_STORAGE_VALUE_SIZES = {
-    "TASK_COOKIE": 8, "THREAD_OWNER": 544, "ROOT_AFFILIATION": 8, "PROC_EPOCH": 144,
+    "TASK_COOKIE": 8, "THREAD_OWNER": 544, "ROOT_AFFILIATION": 8, "PROC_EPOCH": 152,
 }
 # H8 slice A: Detailed THREAD_OWNER rows carry two trailing lifetime
 # words (560 B); Inventory-only rows stay 544 B. Both ABIs are live,
@@ -42,7 +42,8 @@ TASK_STORAGE_VALUE_SIZES = {
 THREAD_OWNER_VALUE_SIZES = (544, 560)
 # Task 3 Stage A per-process mutation record (`struct instance_record`,
 # crates/ebpf/native/instance_epoch.h): u64 slot_plus1[8], u64 epoch[8],
-# u64 flags, u64 exec_attach_gen. Kernel metadata counters only.
+# u64 flags, u64 exec_attach_gen, u64 journal_bootstrap. Kernel metadata
+# counters only.
 PROC_EPOCH_RECORD = struct.Struct("<8Q8QQQ")
 PROC_EPOCH_RECORD_SLOTS = 8
 PROC_EPOCH_FILE_SLOTS = 1024

@@ -101,6 +101,11 @@ struct instance_record {
     u64 epoch[INST_RECORD_SLOTS];
     u64 flags;
     u64 exec_attach_gen;
+    /* H8-D atomic birth marker (journal_marker.h encoding): 0
+     * unpublished, 1 DIRTY, else READY naming an exec generation.
+     * Fresh storage is kernel-zeroed; the init path below writes 0
+     * explicitly. 64-bit cell: CAS-lowered (F1). */
+    u64 journal_bootstrap;
 };
 struct instance_file_key {
     u64 dev;
@@ -133,10 +138,11 @@ _Static_assert(sizeof(struct instance_start_key) == 16, "start key ABI");
 _Static_assert(sizeof(struct instance_entry) == 24, "entry ABI");
 _Static_assert(sizeof(struct instance_continuity) == 40, "continuity ABI");
 _Static_assert(__builtin_offsetof(struct instance_continuity, return_stamp) == 24, "continuity ret");
-_Static_assert(sizeof(struct instance_record) == 144, "record ABI");
+_Static_assert(sizeof(struct instance_record) == 152, "record ABI");
 _Static_assert(__builtin_offsetof(struct instance_record, epoch) == 64, "record epoch");
 _Static_assert(__builtin_offsetof(struct instance_record, flags) == 128, "record flags");
 _Static_assert(__builtin_offsetof(struct instance_record, exec_attach_gen) == 136, "record gen");
+_Static_assert(__builtin_offsetof(struct instance_record, journal_bootstrap) == 144, "record marker");
 _Static_assert(sizeof(struct instance_file_key) == 16, "key ABI");
 _Static_assert(sizeof(struct instance_calib) == 40, "calib ABI");
 _Static_assert(sizeof(struct instance_counters) == 80, "counters ABI");

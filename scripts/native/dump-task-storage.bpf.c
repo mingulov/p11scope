@@ -30,7 +30,7 @@ struct thread_owner_value {
 
 /* Task 3 Stage A `struct instance_record` (crates/ebpf/native/instance_epoch.h). */
 struct proc_epoch_value {
-    unsigned char bytes[144];
+    unsigned char bytes[152];
 };
 
 struct {
@@ -152,7 +152,7 @@ int dump_task_storage_epoch(struct bpf_iter__task *ctx)
         return 0;
     if (emit(ctx->meta->seq, task, &ROOT_AFFILIATION, 2, 8))
         return 0;
-    if (emit(ctx->meta->seq, task, &PROC_EPOCH, 3, 144))
+    if (emit(ctx->meta->seq, task, &PROC_EPOCH, 3, 152))
         return 0;
     return 0;
 }

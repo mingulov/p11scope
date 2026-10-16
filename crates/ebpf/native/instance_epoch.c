@@ -480,6 +480,7 @@ __attribute__((noinline)) u32 p11_instance_fork(struct task_struct *child, u64 c
         INST_PUT(init.epoch[i], 0);
     }
     INST_PUT(init.exec_attach_gen, 0);
+    INST_PUT(init.journal_bootstrap, 0);
     INST_PUT(init.flags, INST_RECORD_SHARED_MM);
     rec = child ? inst_storage_get(&PROC_EPOCH, child, &init, 1) : 0;
     if (!rec || !inst_set_flags(rec, INST_RECORD_SHARED_MM)) {

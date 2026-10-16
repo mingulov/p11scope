@@ -94,12 +94,6 @@ impl MapRange {
     fn contains(&self, ip: u64) -> bool {
         self.start <= ip && ip < self.end
     }
-
-    /// The address bounds, for absence-witness disjointness: the
-    /// appearance must overlap no baseline range.
-    pub(crate) fn span(&self) -> (u64, u64) {
-        (self.start, self.end)
-    }
 }
 
 impl fmt::Debug for MapRange {

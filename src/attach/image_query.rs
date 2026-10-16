@@ -390,6 +390,48 @@ impl super::Session {
         };
         scan_with(&mut source, domain, file_slot, original_fence)
     }
+
+    /// Seal one provider-free interval for one watched file through
+    /// retained proc custody and the same complete
+    /// full-image/epoch/health brackets as [`Session::scan_image`],
+    /// plus the live attach cell. `original_fence` is preserved
+    /// exactly; the consumer must still compare it to its real
+    /// current router fence. UNRUN: live acquisition stays out of
+    /// tests; the birth tests seal through `acquire_test_absence`.
+    #[allow(dead_code)] // No Session-loop wire until live activation.
+    pub(crate) fn prove_image_absence(
+        &mut self,
+        pin: &crate::process::PidPin,
+        object: crate::discovery::identity::PinnedObjectId,
+        window: ReadWindow,
+        original_fence: u64,
+        current_fence: impl Fn() -> u64,
+    ) -> Result<ImageAbsenceProof, ImageQueryRefusal> {
+        if !self.policy.wants_instance_hooks() {
+            return Err(ImageQueryRefusal::Policy);
+        }
+        check_deadline(window.deadline())?;
+        let watched = self
+            .instance
+            .watched(object)
+            .cloned()
+            .ok_or(ImageQueryRefusal::Coverage)?;
+        let domain = self.native_domain().ok_or(ImageQueryRefusal::Coverage)?;
+        let proc = pin
+            .open_proc_dir()
+            .map_err(|_| ImageQueryRefusal::Custody)?;
+        check_deadline(window.deadline())?;
+        let file_slot = watched.file_slot;
+        let mut source = LiveImageScan {
+            session: self,
+            pin,
+            proc,
+            watched,
+            window,
+            current_fence,
+        };
+        prove_absence_with(&mut source, domain, file_slot, original_fence)
+    }
 }
 
 struct LiveImageScan<'a, F> {
@@ -472,6 +514,58 @@ impl<F: Fn() -> u64> ScanSource for LiveImageScan<'_, F> {
     }
 }
 
+impl<F: Fn() -> u64> AbsenceScanSource for LiveImageScan<'_, F> {
+    fn watched_keys(&self) -> &[p11scope_manifest::maps::ObjectKey] {
+        &self.watched.maps_keys
+    }
+    fn watched_identity(&self) -> crate::discovery::instances::MappedFileIdentity {
+        self.watched.identity
+    }
+    fn entries(&mut self) -> Result<Vec<p11scope_manifest::maps::MapEntry>, ImageQueryRefusal> {
+        read_parsed_maps_with(&self.proc, self.window.deadline(), 8 * 1024 * 1024, || {})
+    }
+    fn attach_generation(&mut self) -> Result<u64, ImageQueryRefusal> {
+        self.budget()?;
+        self.session
+            .instance_maps()
+            .attach_cell()
+            .map_err(|_| ImageQueryRefusal::Coverage)
+    }
+    fn confirm(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<crate::discovery::instances::MappedFileIdentity, ImageQueryRefusal> {
+        // The positive path's exact confirmation: the VMA's own file
+        // through its map_files link.
+        self.proc
+            .mapped_file_identity(start, end, self.window.deadline())
+            .map_err(|_| ImageQueryRefusal::Custody)
+    }
+}
+
+/// The complete retained maps read plus full parse, shared by the
+/// positive scan and the absence enumeration. No identity decision:
+/// both seals select/confirm from these entries through the same
+/// `ranges_for`/`confirm_identity` functions.
+fn read_parsed_maps_with(
+    proc: &crate::process::ProcPin<'_>,
+    deadline: Instant,
+    max_bytes: usize,
+    after_maps: impl FnOnce(),
+) -> Result<Vec<p11scope_manifest::maps::MapEntry>, ImageQueryRefusal> {
+    let bytes = proc
+        .read_maps(deadline, max_bytes)
+        .map_err(|_| ImageQueryRefusal::Custody)?;
+    if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
+        return Err(ImageQueryRefusal::Stream);
+    }
+    let entries =
+        p11scope_manifest::maps::parse_maps(&bytes).map_err(|_| ImageQueryRefusal::Stream)?;
+    after_maps();
+    Ok(entries)
+}
+
 /// Actual retained maps/read/relative-stat path shared by LiveImageScan and
 /// bounded I/O controls. No parser or identity decision is reimplemented.
 fn read_confirmed_ranges_with(
@@ -482,15 +576,7 @@ fn read_confirmed_ranges_with(
     max_bytes: usize,
     after_maps: impl FnOnce(),
 ) -> Result<Vec<MapRange>, ImageQueryRefusal> {
-    let bytes = proc
-        .read_maps(deadline, max_bytes)
-        .map_err(|_| ImageQueryRefusal::Custody)?;
-    if !bytes.is_empty() && bytes.last() != Some(&b'\n') {
-        return Err(ImageQueryRefusal::Stream);
-    }
-    let entries =
-        p11scope_manifest::maps::parse_maps(&bytes).map_err(|_| ImageQueryRefusal::Stream)?;
-    after_maps();
+    let entries = read_parsed_maps_with(proc, deadline, max_bytes, after_maps)?;
     let mut ranges = Vec::new();
     for key in maps_keys {
         ranges.extend(crate::discovery::instances::ranges_for(
@@ -701,6 +787,9 @@ pub(crate) enum ImageQueryRefusal {
     Unstable,
     Empty,
     Fence,
+    /// The absence seal found a confirmed watched-provider mapping:
+    /// the interval is not provider-free.
+    Present,
 }
 
 /// Private map results; equality is meaningful only in the owning domain.
@@ -757,6 +846,49 @@ impl ImageScanProof {
     }
 }
 
+/// A sealed provider-free interval: a COMPLETE process-maps
+/// enumeration (bracketed exactly like a positive scan: custody,
+/// stable image, stable epochs, audits, fence) that contains ZERO
+/// confirmed watched-provider mappings, plus the attach-cell
+/// generation observed live inside the brackets (which ties the
+/// enumeration to after that closure's publication). The negative
+/// absence witness: distinct from the positive [`ImageScanProof`],
+/// which cannot represent absence (the acquisition protocol refuses
+/// empty positives). Constructor remains private to the acquisition
+/// owner; only [`prove_absence_with`] seals one.
+pub(crate) struct ImageAbsenceProof {
+    domain: NativeDomainId,
+    image: ImageIdentity,
+    file_slot: u32,
+    epochs: CompleteEpochs,
+    attach_generation: u64,
+    total_entries: usize,
+    fence: u64,
+}
+impl ImageAbsenceProof {
+    pub(crate) fn domain(&self) -> NativeDomainId {
+        self.domain
+    }
+    pub(crate) fn image(&self) -> ImageIdentity {
+        self.image
+    }
+    pub(crate) fn file_slot(&self) -> u32 {
+        self.file_slot
+    }
+    pub(crate) fn epochs(&self) -> CompleteEpochs {
+        self.epochs
+    }
+    pub(crate) fn attach_generation(&self) -> u64 {
+        self.attach_generation
+    }
+    pub(crate) fn total_entries(&self) -> usize {
+        self.total_entries
+    }
+    pub(crate) fn fence(&self) -> u64 {
+        self.fence
+    }
+}
+
 trait ScanSource {
     fn budget(&self) -> Result<(), ImageQueryRefusal>;
     fn audit(&mut self) -> Result<(), ImageQueryRefusal>;
@@ -764,6 +896,24 @@ trait ScanSource {
     fn epochs(&mut self) -> Result<CompleteEpochs, ImageQueryRefusal>;
     fn ranges(&mut self) -> Result<Vec<MapRange>, ImageQueryRefusal>;
     fn fence(&self, original: u64) -> bool;
+}
+
+/// The absence seal's I/O beneath the same bracket protocol: the
+/// watched identity the enumeration must be free of, the complete
+/// parsed maps entries, the live attach cell, and the per-candidate
+/// map_files confirmation (mirroring the positive path exactly: a
+/// colliding file's ranges drop, an unreadable identity refuses the
+/// whole seal).
+trait AbsenceScanSource: ScanSource {
+    fn watched_keys(&self) -> &[p11scope_manifest::maps::ObjectKey];
+    fn watched_identity(&self) -> crate::discovery::instances::MappedFileIdentity;
+    fn entries(&mut self) -> Result<Vec<p11scope_manifest::maps::MapEntry>, ImageQueryRefusal>;
+    fn attach_generation(&mut self) -> Result<u64, ImageQueryRefusal>;
+    fn confirm(
+        &mut self,
+        start: u64,
+        end: u64,
+    ) -> Result<crate::discovery::instances::MappedFileIdentity, ImageQueryRefusal>;
 }
 
 fn scan_with(
@@ -819,6 +969,101 @@ fn scan_with(
     Err(ImageQueryRefusal::Unstable)
 }
 
+/// Seal one provider-free interval: the same bracket protocol as
+/// [`scan_with`] (budget/audit, image query, epoch brackets, audits,
+/// fence, stability, coverage) over a COMPLETE maps enumeration, then
+/// the negative rule — zero CONFIRMED watched-provider mappings —
+/// instead of the positive non-empty rule. Candidate selection
+/// (`ranges_for` per watched key) and map_files confirmation are the
+/// positive path's exact functions: a moved mapping (same identity,
+/// disjoint addresses) still confirms, so an `mremap`'d provider
+/// refuses here with [`ImageQueryRefusal::Present`]; a colliding
+/// file's ranges drop; an unreadable identity refuses the whole seal.
+/// The live attach cell read inside the brackets ties the enumeration
+/// to after that closure's publication (the observer compares it to
+/// the claimed closure). A deliberately separate mirror of
+/// `scan_with`, not a shared flag: absence is a different statement,
+/// and the positive seal stays byte-identical.
+fn prove_absence_with(
+    source: &mut impl AbsenceScanSource,
+    domain: NativeDomainId,
+    file_slot: u32,
+    fence: u64,
+) -> Result<ImageAbsenceProof, ImageQueryRefusal> {
+    for _ in 0..3 {
+        source.budget()?;
+        source.audit()?;
+        let image = source.query()?;
+        if image.task_cookie == 0 {
+            return Err(ImageQueryRefusal::Unknown);
+        }
+        let epochs = source.epochs()?;
+        let entries = source.entries()?;
+        let attach_generation = source.attach_generation()?;
+        let after_epochs = source.epochs()?;
+        let after_image = source.query()?;
+        source.audit()?;
+        source.budget()?;
+        if !source.fence(fence) {
+            return Err(ImageQueryRefusal::Fence);
+        }
+        if image != after_image || epochs != after_epochs {
+            continue;
+        }
+        if epochs.sticky != 0
+            || epochs.record_flags != 0
+            || [epochs.local, epochs.global, epochs.fault]
+                .into_iter()
+                .any(|cell| cell > u64::from(u32::MAX))
+        {
+            return Err(ImageQueryRefusal::Coverage);
+        }
+        // The enumeration itself must be complete and non-trivial: a
+        // live process always maps something, so an empty listing is a
+        // corrupt read, never a witness. (The ban on empty POSITIVES
+        // is untouched: this type carries provider-freedom of a
+        // complete scan, never an empty scan as absence.)
+        if entries.is_empty() {
+            return Err(ImageQueryRefusal::Stream);
+        }
+        let mut candidates = Vec::new();
+        for key in source.watched_keys() {
+            candidates.extend(crate::discovery::instances::ranges_for(
+                &entries,
+                key.device.major,
+                key.device.minor,
+                key.inode,
+            ));
+        }
+        if candidates.len() > 16_384 {
+            return Err(ImageQueryRefusal::Capacity);
+        }
+        let confirmed = crate::discovery::instances::confirm_identity(
+            candidates,
+            source.watched_identity(),
+            |start, end| {
+                source
+                    .confirm(start, end)
+                    .map_err(|refusal| format!("{refusal:?}"))
+            },
+        )
+        .map_err(|_| ImageQueryRefusal::Custody)?;
+        if !confirmed.is_empty() {
+            return Err(ImageQueryRefusal::Present);
+        }
+        return Ok(ImageAbsenceProof {
+            domain,
+            image,
+            file_slot,
+            epochs,
+            attach_generation,
+            total_entries: entries.len(),
+            fence,
+        });
+    }
+    Err(ImageQueryRefusal::Unstable)
+}
+
 /// Script only the I/O beneath the owning acquisition protocol. Router
 /// regressions still obtain their seal through all of `scan_with`'s checks;
 /// they cannot construct a proof or replace its fence after acquisition.
@@ -862,6 +1107,98 @@ pub(crate) fn acquire_test_scan(
             image,
             epochs,
             ranges,
+            fence,
+        },
+        domain,
+        file_slot,
+        fence,
+    )
+}
+
+/// Script only the I/O beneath the owning absence protocol: the full
+/// maps enumeration, the attach cell and the per-candidate
+/// confirmation. Absence tests still obtain their witness through all
+/// of `prove_absence_with`'s checks; they cannot construct a proof or
+/// replace its fence after acquisition. (Many arguments is the honest
+/// shape: every sealed input is injected, none supplied.)
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn acquire_test_absence(
+    domain: NativeDomainId,
+    image: ImageIdentity,
+    file_slot: u32,
+    epochs: CompleteEpochs,
+    entries: Vec<p11scope_manifest::maps::MapEntry>,
+    attach_generation: u64,
+    keys: Vec<p11scope_manifest::maps::ObjectKey>,
+    identity: crate::discovery::instances::MappedFileIdentity,
+    mut confirm: impl FnMut(u64, u64) -> Result<crate::discovery::instances::MappedFileIdentity, ImageQueryRefusal>,
+    fence: u64,
+) -> Result<ImageAbsenceProof, ImageQueryRefusal> {
+    struct Reads<F> {
+        image: ImageIdentity,
+        epochs: CompleteEpochs,
+        entries: Vec<p11scope_manifest::maps::MapEntry>,
+        attach_generation: u64,
+        keys: Vec<p11scope_manifest::maps::ObjectKey>,
+        identity: crate::discovery::instances::MappedFileIdentity,
+        confirm: F,
+        fence: u64,
+    }
+    impl<F: FnMut(u64, u64) -> Result<crate::discovery::instances::MappedFileIdentity, ImageQueryRefusal>>
+        ScanSource for Reads<F>
+    {
+        fn budget(&self) -> Result<(), ImageQueryRefusal> {
+            Ok(())
+        }
+        fn audit(&mut self) -> Result<(), ImageQueryRefusal> {
+            Ok(())
+        }
+        fn query(&mut self) -> Result<ImageIdentity, ImageQueryRefusal> {
+            Ok(self.image)
+        }
+        fn epochs(&mut self) -> Result<CompleteEpochs, ImageQueryRefusal> {
+            Ok(self.epochs)
+        }
+        fn ranges(&mut self) -> Result<Vec<MapRange>, ImageQueryRefusal> {
+            Ok(Vec::new())
+        }
+        fn fence(&self, original: u64) -> bool {
+            original == self.fence
+        }
+    }
+    impl<F: FnMut(u64, u64) -> Result<crate::discovery::instances::MappedFileIdentity, ImageQueryRefusal>>
+        AbsenceScanSource for Reads<F>
+    {
+        fn watched_keys(&self) -> &[p11scope_manifest::maps::ObjectKey] {
+            &self.keys
+        }
+        fn watched_identity(&self) -> crate::discovery::instances::MappedFileIdentity {
+            self.identity
+        }
+        fn entries(&mut self) -> Result<Vec<p11scope_manifest::maps::MapEntry>, ImageQueryRefusal> {
+            Ok(self.entries.clone())
+        }
+        fn attach_generation(&mut self) -> Result<u64, ImageQueryRefusal> {
+            Ok(self.attach_generation)
+        }
+        fn confirm(
+            &mut self,
+            start: u64,
+            end: u64,
+        ) -> Result<crate::discovery::instances::MappedFileIdentity, ImageQueryRefusal> {
+            (self.confirm)(start, end)
+        }
+    }
+    prove_absence_with(
+        &mut Reads {
+            image,
+            epochs,
+            entries,
+            attach_generation,
+            keys,
+            identity,
+            confirm: &mut confirm,
             fence,
         },
         domain,
@@ -1498,5 +1835,227 @@ mod tests {
                 assert!(result.is_err(), "mixed old maps/new map_files sealed");
             }
         }
+    }
+
+    fn absence_entry(
+        start: u64,
+        end: u64,
+        major: u64,
+        minor: u64,
+        inode: u64,
+    ) -> p11scope_manifest::maps::MapEntry {
+        p11scope_manifest::maps::MapEntry {
+            start,
+            end,
+            file_offset: 0,
+            permissions: [b'r', b'-', b'x', b'p'],
+            device: p11scope_manifest::maps::Device { major, minor },
+            inode,
+            raw_path: None,
+        }
+    }
+    fn absence_free_entries() -> Vec<p11scope_manifest::maps::MapEntry> {
+        // A complete process enumeration with no watched-provider
+        // mapping: exe/libc/stack-style entries under unrelated
+        // identities.
+        vec![
+            absence_entry(0x400000, 0x401000, 8, 2, 1001),
+            absence_entry(0x7f00_0000, 0x7f00_1000, 8, 2, 2002),
+            absence_entry(0x7fff_0000, 0x7fff_1000, 0, 0, 0),
+        ]
+    }
+    fn watched_key() -> p11scope_manifest::maps::ObjectKey {
+        p11scope_manifest::maps::ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 999,
+        }
+    }
+    fn watched_identity() -> crate::discovery::instances::MappedFileIdentity {
+        crate::discovery::instances::MappedFileIdentity {
+            dev: 0x801,
+            ino: 999,
+        }
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ConfirmMode {
+        Match,
+        Mismatch,
+        Error,
+    }
+    struct AbsenceScript {
+        script: Script,
+        keys: Vec<p11scope_manifest::maps::ObjectKey>,
+        identity: crate::discovery::instances::MappedFileIdentity,
+        entries: Vec<p11scope_manifest::maps::MapEntry>,
+        attach: u64,
+        confirm_mode: ConfirmMode,
+        confirms: usize,
+    }
+    impl ScanSource for AbsenceScript {
+        fn budget(&self) -> Result<(), ImageQueryRefusal> {
+            self.script.budget()
+        }
+        fn audit(&mut self) -> Result<(), ImageQueryRefusal> {
+            self.script.audit()
+        }
+        fn query(&mut self) -> Result<ImageIdentity, ImageQueryRefusal> {
+            self.script.query()
+        }
+        fn epochs(&mut self) -> Result<CompleteEpochs, ImageQueryRefusal> {
+            self.script.epochs()
+        }
+        fn ranges(&mut self) -> Result<Vec<MapRange>, ImageQueryRefusal> {
+            Ok(Vec::new())
+        }
+        fn fence(&self, original: u64) -> bool {
+            self.script.fence(original)
+        }
+    }
+    impl AbsenceScanSource for AbsenceScript {
+        fn watched_keys(&self) -> &[p11scope_manifest::maps::ObjectKey] {
+            &self.keys
+        }
+        fn watched_identity(&self) -> crate::discovery::instances::MappedFileIdentity {
+            self.identity
+        }
+        fn entries(&mut self) -> Result<Vec<p11scope_manifest::maps::MapEntry>, ImageQueryRefusal> {
+            Ok(self.entries.clone())
+        }
+        fn attach_generation(&mut self) -> Result<u64, ImageQueryRefusal> {
+            Ok(self.attach)
+        }
+        fn confirm(
+            &mut self,
+            _start: u64,
+            _end: u64,
+        ) -> Result<crate::discovery::instances::MappedFileIdentity, ImageQueryRefusal> {
+            self.confirms += 1;
+            match self.confirm_mode {
+                ConfirmMode::Match => Ok(self.identity),
+                ConfirmMode::Mismatch => Ok(crate::discovery::instances::MappedFileIdentity {
+                    dev: 0x802,
+                    ino: 1001,
+                }),
+                ConfirmMode::Error => Err(ImageQueryRefusal::Custody),
+            }
+        }
+    }
+    fn absence_script() -> AbsenceScript {
+        AbsenceScript {
+            script: script(0),
+            keys: vec![watched_key()],
+            identity: watched_identity(),
+            entries: absence_free_entries(),
+            attach: 7,
+            confirm_mode: ConfirmMode::Match,
+            confirms: 0,
+        }
+    }
+
+    #[test]
+    fn absence_seal_requires_provider_free_complete_enumeration() {
+        // C1a(b): a complete enumeration with zero watched mappings
+        // seals, carrying the bracketed attach cell; the seal
+        // consulted no candidate at all.
+        let owner = domain();
+        let mut source = absence_script();
+        let proof = prove_absence_with(&mut source, owner, 3, 4).unwrap();
+        assert_eq!(proof.domain(), owner);
+        assert_eq!(
+            proof.image(),
+            ImageIdentity {
+                task_cookie: 7,
+                exec_id: 0
+            }
+        );
+        assert_eq!(proof.file_slot(), 3);
+        assert!(proof.epochs() == source.script.epoch);
+        assert_eq!(proof.attach_generation(), 7);
+        assert_eq!(proof.total_entries(), 3);
+        assert_eq!(proof.fence(), 4);
+        assert_eq!(source.confirms, 0, "no candidate consulted");
+        assert_eq!(source.script.audits, 2);
+    }
+
+    #[test]
+    fn absence_seal_refuses_moved_mapping_by_identity() {
+        // C1a(b): the mremap shape — the SAME file-backed watched
+        // mapping moved to disjoint addresses — refuses with Present.
+        // Identity decides, never addresses: the moved range confirms
+        // as the watched file.
+        let mut source = absence_script();
+        source.entries.push(absence_entry(
+            0x9000_0000,
+            0x9000_1000,
+            8,
+            1,
+            999,
+        ));
+        assert!(matches!(
+            prove_absence_with(&mut source, domain(), 3, 4),
+            Err(ImageQueryRefusal::Present)
+        ));
+        assert_eq!(source.confirms, 1, "the moved range was confirmed");
+    }
+
+    #[test]
+    fn absence_seal_drops_collisions_but_refuses_unreadable() {
+        // C1a(b): the positive path's exact confirmation rule — a
+        // colliding file's ranges drop (absence still seals), while an
+        // unreadable identity refuses the whole seal.
+        let mut dropped = absence_script();
+        dropped.entries.push(absence_entry(
+            0xa000_0000,
+            0xa000_1000,
+            8,
+            1,
+            999,
+        ));
+        dropped.confirm_mode = ConfirmMode::Mismatch;
+        let proof = prove_absence_with(&mut dropped, domain(), 3, 4).unwrap();
+        assert_eq!(proof.total_entries(), 4);
+        assert_eq!(dropped.confirms, 1, "the collision was confirmed away");
+        let mut unreadable = absence_script();
+        unreadable.entries.push(absence_entry(
+            0xa000_0000,
+            0xa000_1000,
+            8,
+            1,
+            999,
+        ));
+        unreadable.confirm_mode = ConfirmMode::Error;
+        assert!(matches!(
+            prove_absence_with(&mut unreadable, domain(), 3, 4),
+            Err(ImageQueryRefusal::Custody)
+        ));
+    }
+
+    #[test]
+    fn absence_seal_rejects_empty_unstable_and_fence() {
+        // C1a(b): the negative seal keeps every bracket — an empty
+        // listing is a corrupt read (never a witness), moved epochs
+        // refuse, and a changed fence refuses the entire seal.
+        let mut empty = absence_script();
+        empty.entries.clear();
+        assert!(matches!(
+            prove_absence_with(&mut empty, domain(), 3, 4),
+            Err(ImageQueryRefusal::Stream)
+        ));
+        let mut moved = absence_script();
+        moved.script.images = VecDeque::from(vec![moved.script.images[0]; 6]);
+        let mut changed = moved.script.epoch;
+        changed.global = 1;
+        moved.script.epoch_changes = VecDeque::from([moved.script.epoch, changed].repeat(3));
+        assert!(matches!(
+            prove_absence_with(&mut moved, domain(), 3, 4),
+            Err(ImageQueryRefusal::Unstable)
+        ));
+        assert!(prove_absence_with(&mut absence_script(), domain(), 3, 9).is_err());
+        let mut sticky = absence_script();
+        sticky.script.epoch.sticky = 1;
+        assert!(matches!(
+            prove_absence_with(&mut sticky, domain(), 3, 4),
+            Err(ImageQueryRefusal::Coverage)
+        ));
     }
 }

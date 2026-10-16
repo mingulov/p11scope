@@ -130,6 +130,21 @@ __attribute__((noinline)) u32 p11_owner_refund(void)
     return refund_local(ctl);
 }
 
+/* The current task's owner row for key-binding by the journal
+ * transactions: roots cannot name task storage, so this one global
+ * boundary reads it. Returns the row (leased or idle) or NULL when
+ * the task is gone or holds no row; callers validate before use
+ * (never trusted, never consumed across probes). A returned task-
+ * storage pointer is what map helpers return, so verifiers track it;
+ * the body stays one task lookup plus one storage get. */
+__attribute__((noinline)) struct thread_owner *p11_owner_current(void)
+{
+    struct task_struct *task = owner_current_task();
+    if (!task)
+        return (void *)0;
+    return owner_storage_get(&THREAD_OWNER, task, (void *)0, 0);
+}
+
 static __always_inline int valid_owner(struct owner_control *ctl, struct thread_owner *owner)
 {
     if (!*(volatile u64 *)&ctl->outstanding ||

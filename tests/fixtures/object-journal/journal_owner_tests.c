@@ -41,7 +41,7 @@ struct row {
     int used;
     void *map;
     unsigned char key[24];
-    unsigned char value[288] __attribute__((aligned(8)));
+    unsigned char value[432] __attribute__((aligned(8)));
 };
 static struct row rows[256];
 
@@ -53,6 +53,13 @@ static unsigned ring_log_len;
 static unsigned ring_submits, ring_discards;
 static unsigned char ring_arena[4096] __attribute__((aligned(8)));
 static unsigned ring_arena_used;
+/* Scrub-before-release order proof: the last deleted journal value's
+ * bytes, plus an armed assertion that the journal row is already gone
+ * when its START row deletes. */
+static unsigned char last_journal_deleted[24];
+static int last_journal_deleted_seen;
+static const struct owner_start_key *order_key;
+static int order_checked;
 #endif
 
 static int failures;
@@ -89,6 +96,8 @@ static size_t key_size(void *map)
         return 16;
     if (map == &START || map == &OBJECT_START)
         return 16;
+    if (map == &OBJECT_DESCRIPTORS || map == &OBJECT_ZERO)
+        return 4;
 #else
     (void)map;
 #endif
@@ -154,6 +163,12 @@ static long update(void *map, const void *key, const void *data, u64 flags)
         width = 288;
     else if (map == &JOURNAL_START_MAP)
         width = 24;
+    else if (map == &OBJECT_START)
+        width = 432;
+    else if (map == &OBJECT_DESCRIPTORS)
+        width = 16;
+    else if (map == &OBJECT_ZERO)
+        width = 432;
 #endif
     memcpy(r->value, data, width);
     return 0;
@@ -164,6 +179,17 @@ static long pair_delete(void *map, const void *key)
     struct row *r = row(map, key);
     if (!r)
         return -2;
+#ifndef P11SCOPE_INVENTORY_ONLY
+    if (map == &JOURNAL_START_MAP) {
+        memcpy(last_journal_deleted, r->value, 24);
+        last_journal_deleted_seen = 1;
+    }
+    if (order_key && map == &START && !memcmp(key, order_key, key_size(map))) {
+        /* Scrub-before-release order proof: the journal row for this
+         * key is already gone when its START row deletes. */
+        order_checked = (row(&JOURNAL_START_MAP, key) == NULL);
+    }
+#endif
     r->used = 0;
     return 0;
 }
@@ -267,6 +293,10 @@ static void reset(void)
     fail_reserve = 0;
     ring_log_len = ring_submits = ring_discards = 0;
     ring_arena_used = 0;
+    memset(last_journal_deleted, 0, sizeof(last_journal_deleted));
+    last_journal_deleted_seen = 0;
+    order_key = NULL;
+    order_checked = 0;
     journal_ring_reserve = ring_reserve;
     journal_ring_submit = ring_submit;
     journal_ring_discard = ring_discard;
@@ -720,7 +750,10 @@ static void journal_transaction_refusals(void)
     EXPECT(p11_journal_remove(&owners[0], &JOURNAL_START_MAP, &key, 1) == -1,
            "released owner never removes");
     /* Re-lease and settle the leftover row so later sections start
-     * clean; settlement still works after the release cycle. */
+     * clean; settlement still works after the release cycle. This pins
+     * leg-after-release refusal only — the scrub-before-release
+     * ordering proof lives in combined_scrub_before_release, which
+     * scrubs and releases in ONE call. */
     EXPECT(p11_owner_lease() == 1, "re-lease");
     EXPECT(p11_journal_mark_begun(&JOURNAL_START_MAP, &key, 1, 1) == 0, "leftover begun");
     EXPECT(p11_journal_return(&owners[0], &JOURNAL_START_MAP, &key, 1, 1) == 0, "leftover return");
@@ -898,6 +931,598 @@ static void mint_contention_unique(void)
     EXPECT(journal_ctl.poison == 0, "no poison under contention");
 }
 
+/* Seed the OBJECT_START subordinate path: descriptor row 1 (marker
+ * 2 selects it) and the zero row allocation copies. */
+static void seed_object_tables(void)
+{
+    struct object_descriptor_row desc;
+    static u64 zero[OBJECT_START_WORDS];
+    u32 one = 1, zero_key = 0;
+    memset(&desc, 0, sizeof(desc));
+    desc.function = 0;
+    desc.action = 1;
+    desc.guard = 1;
+    EXPECT(owner_map_update(&OBJECT_DESCRIPTORS, &one, &desc, 0) == 0, "descriptor seeds");
+    EXPECT(owner_map_update(&OBJECT_ZERO, &zero_key, zero, 0) == 0, "zero seeds");
+}
+
+/* A required-marker START value: entry time, marker 2 at the marker
+ * word, image words for the side binding. */
+static void required_start_value(unsigned char *out)
+{
+    u64 ts = 777, marker = 2, cookie = 0xc0ffee, exec = 0xe;
+    memset(out, 0, 288);
+    memcpy(out + OBJECT_CALL_START_TS_OFF, &ts, 8);
+    memcpy(out + OBJECT_CALL_START_MARKER_OFF, &marker, 8);
+    memcpy(out + OBJECT_CALL_START_IMAGE_OFF, &cookie, 8);
+    memcpy(out + OBJECT_CALL_START_IMAGE_OFF + 8, &exec, 8);
+}
+
+static int body_is_zero(const unsigned char *record, u64 bytes)
+{
+    u64 i;
+    for (i = JOURNAL_COMMON_BYTES; i < bytes; i++)
+        if (record[i])
+            return 0;
+    return 1;
+}
+
+static void check_submitted(unsigned index, u64 bytes, u64 kind, u64 flags, u64 thread,
+                            u64 sequence, const char *what)
+{
+    const unsigned char *record = ring_log[index];
+    u64 got_bytes = (u64)record[2] | ((u64)record[3] << 8);
+    EXPECT(got_bytes == bytes, "%s length %llu, got %llu", what, (unsigned long long)bytes,
+           (unsigned long long)got_bytes);
+    EXPECT(record[0] == 1 && record[1] == 0, "%s version is exact", what);
+    EXPECT((u64)record[4] == kind && (u64)record[5] == flags, "%s kind/flags are exact", what);
+    EXPECT(record[6] == 0 && record[7] == 0, "%s reserved stays zero", what);
+    EXPECT(memcmp(record + 8, &thread, 8) == 0, "%s thread word is exact", what);
+    EXPECT(memcmp(record + 16, &sequence, 8) == 0, "%s sequence word is exact", what);
+    EXPECT(body_is_zero(record, bytes), "%s prototype body is zero", what);
+}
+
+static void combined_entry_publishes_begin(void)
+{
+    struct owner_start_key key;
+    struct journal_start_value *found;
+    struct journal_header_spec begin = {JOURNAL_BEGIN_BYTES, JOURNAL_KIND_BEGIN, 0, 0, 0};
+    struct journal_txn txn;
+    struct object_start *side;
+    u64 fault = 0;
+    reset();
+    seed_object_tables();
+    key.pid_tgid = pid_tgid();
+    key.slot = 5;
+    key.pad = 0;
+    required_start_value(start_value);
+    memset(&txn, 0, sizeof(txn));
+    txn.jctl = &journal_ctl;
+    txn.journal_map = &JOURNAL_START_MAP;
+    txn.ring = &JOURNAL_RING;
+    txn.key = &key;
+    txn.start_value = start_value;
+    txn.spec = &begin;
+    txn.fault_out = &fault;
+    EXPECT(p11_journal_combined_entry(&txn) == 0, "combined entry settles");
+    EXPECT(fault == JOURNAL_FAULT_NONE, "no fault, got %llu", (unsigned long long)fault);
+    /* All three legs landed: START row, OBJECT_START subordinate with
+     * its immutable binding, journal row committed to BEGUN. */
+    EXPECT(owner_map_lookup(&START, &key) != NULL, "START row present");
+    side = owner_map_lookup(&OBJECT_START, &key);
+    EXPECT(side != NULL, "OBJECT_START subordinate allocated");
+    EXPECT(side->descriptor_index == 1 && side->action == 1, "subordinate carries index/action");
+    EXPECT(side->task_cookie == 0xc0ffee && side->exec_id == 0xe && side->entry_ns == 777,
+           "subordinate binding matches the START row");
+    EXPECT(side->phase == OBJECT_PHASE_ENTRY, "subordinate phase is entry");
+    found = p11_journal_side_lookup(&JOURNAL_START_MAP, &key);
+    EXPECT(found != NULL && found->thread == 1 && found->sequence == 1 &&
+               found->phase == JOURNAL_PHASE_BEGUN,
+           "journal row is BEGUN(1,1)");
+    /* The BEGIN published exactly once with the row's own words. */
+    EXPECT(ring_submits == 1 && ring_discards == 0, "one submit, no discard");
+    check_submitted(0, JOURNAL_BEGIN_BYTES, JOURNAL_KIND_BEGIN, 0, 1, 1, "BEGIN");
+}
+
+static void combined_return_publishes_end(void)
+{
+    struct owner_start_key key;
+    struct journal_start_value *found;
+    struct journal_header_spec begin = {JOURNAL_BEGIN_BYTES, JOURNAL_KIND_BEGIN, 0, 0, 0};
+    struct journal_header_spec end;
+    struct journal_txn txn;
+    u64 fault = 0;
+    reset();
+    seed_object_tables();
+    key.pid_tgid = pid_tgid();
+    key.slot = 5;
+    key.pad = 0;
+    required_start_value(start_value);
+    memset(&txn, 0, sizeof(txn));
+    txn.jctl = &journal_ctl;
+    txn.journal_map = &JOURNAL_START_MAP;
+    txn.ring = &JOURNAL_RING;
+    txn.key = &key;
+    txn.start_value = start_value;
+    txn.spec = &begin;
+    txn.fault_out = &fault;
+    EXPECT(p11_journal_combined_entry(&txn) == 0, "entry settles");
+    /* Return publishes END and advances; START and its subordinate
+     * stay until removal. */
+    end.bytes = JOURNAL_END_FULL_BYTES;
+    end.kind = JOURNAL_KIND_END;
+    end.flags = 0;
+    end.thread = 1;
+    end.sequence = 1;
+    txn.spec = &end;
+    txn.thread = 1;
+    txn.sequence = 1;
+    EXPECT(p11_journal_combined_return(&txn) == 0, "combined return settles");
+    EXPECT(fault == JOURNAL_FAULT_NONE, "no fault, got %llu", (unsigned long long)fault);
+    found = p11_journal_side_lookup(&JOURNAL_START_MAP, &key);
+    EXPECT(found != NULL && found->phase == JOURNAL_PHASE_RETURNING, "row is RETURNING");
+    EXPECT(ring_submits == 2 && ring_discards == 0, "BEGIN then END submitted");
+    check_submitted(1, JOURNAL_END_FULL_BYTES, JOURNAL_KIND_END, 0, 1, 1, "END");
+    EXPECT(owner_map_lookup(&START, &key) != NULL, "START stays until removal");
+    EXPECT(owner_map_lookup(&OBJECT_START, &key) != NULL, "subordinate stays until removal");
+    /* Removal retires silently: the END was the disposition, so no
+     * ABANDON follows (one original key disposition). */
+    txn.spec = NULL;
+    txn.required = 1;
+    EXPECT(p11_journal_combined_remove(&txn) == 0, "combined remove settles");
+    EXPECT(fault == JOURNAL_FAULT_NONE, "no fault, got %llu", (unsigned long long)fault);
+    EXPECT(ring_submits == 2, "no ABANDON after END");
+    EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &key) == NULL, "journal row retired");
+    EXPECT(owner_map_lookup(&START, &key) == NULL, "START row retired");
+    EXPECT(owner_map_lookup(&OBJECT_START, &key) == NULL, "subordinate retired");
+    EXPECT(owners[0].flags == 0, "emptied lease released");
+    /* The compact END shape publishes too. */
+    key.slot = 6;
+    txn.spec = &begin;
+    txn.required = 0;
+    txn.thread = 0;
+    txn.sequence = 0;
+    EXPECT(p11_journal_combined_entry(&txn) == 0, "second entry settles");
+    end.bytes = JOURNAL_END_COMPACT_BYTES;
+    end.thread = 1;
+    end.sequence = 2;
+    txn.spec = &end;
+    txn.thread = 1;
+    txn.sequence = 2;
+    EXPECT(p11_journal_combined_return(&txn) == 0, "compact END settles");
+    check_submitted(3, JOURNAL_END_COMPACT_BYTES, JOURNAL_KIND_END, 0, 1, 2, "compact END");
+}
+
+static void combined_remove_abandons_unsettled(void)
+{
+    struct owner_start_key key;
+    struct journal_header_spec begin = {JOURNAL_BEGIN_BYTES, JOURNAL_KIND_BEGIN, 0, 0, 0};
+    struct journal_header_spec abandon = {JOURNAL_ABANDON_BYTES, JOURNAL_KIND_ABANDON, 0, 1, 1};
+    struct journal_txn txn;
+    u64 fault = 0;
+    reset();
+    seed_object_tables();
+    key.pid_tgid = pid_tgid();
+    key.slot = 5;
+    key.pad = 0;
+    required_start_value(start_value);
+    memset(&txn, 0, sizeof(txn));
+    txn.jctl = &journal_ctl;
+    txn.journal_map = &JOURNAL_START_MAP;
+    txn.ring = &JOURNAL_RING;
+    txn.key = &key;
+    txn.start_value = start_value;
+    txn.spec = &begin;
+    txn.fault_out = &fault;
+    EXPECT(p11_journal_combined_entry(&txn) == 0, "entry settles");
+    /* Exit cleanup without a return: the unsettled row publishes
+     * ABANDON, then every leg retires in one call. */
+    txn.spec = &abandon;
+    txn.thread = 1;
+    txn.sequence = 1;
+    txn.required = 1;
+    EXPECT(p11_journal_combined_remove(&txn) == 0, "abandoning remove settles");
+    EXPECT(fault == JOURNAL_FAULT_NONE, "no fault, got %llu", (unsigned long long)fault);
+    EXPECT(ring_submits == 2, "BEGIN then ABANDON submitted");
+    check_submitted(1, JOURNAL_ABANDON_BYTES, JOURNAL_KIND_ABANDON, 0, 1, 1, "ABANDON");
+    EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &key) == NULL, "journal row retired");
+    EXPECT(owner_map_lookup(&START, &key) == NULL, "START row retired");
+    EXPECT(owner_map_lookup(&OBJECT_START, &key) == NULL, "subordinate retired");
+    EXPECT(owners[0].flags == 0, "emptied lease released");
+}
+
+static void combined_scrub_before_release(void)
+{
+    struct owner_start_key key;
+    struct journal_start_value *found;
+    struct journal_header_spec begin = {JOURNAL_BEGIN_BYTES, JOURNAL_KIND_BEGIN, 0, 0, 0};
+    struct journal_txn txn;
+    u64 fault = 0;
+    unsigned i;
+    int scrubbed;
+    reset();
+    seed_object_tables();
+    key.pid_tgid = pid_tgid();
+    key.slot = 5;
+    key.pad = 0;
+    required_start_value(start_value);
+    memset(&txn, 0, sizeof(txn));
+    txn.jctl = &journal_ctl;
+    txn.journal_map = &JOURNAL_START_MAP;
+    txn.ring = &JOURNAL_RING;
+    txn.key = &key;
+    txn.start_value = start_value;
+    txn.spec = &begin;
+    txn.fault_out = &fault;
+    EXPECT(p11_journal_combined_entry(&txn) == 0, "entry settles");
+    found = p11_journal_side_lookup(&JOURNAL_START_MAP, &key);
+    EXPECT(found != NULL, "row present to contradict");
+    found->phase = 9;
+    /* One call: the contradicted row is scrubbed BEFORE the lease is
+     * released — no release-then-reacquire-to-remove. The START-delete
+     * stub asserts the journal row is already gone. */
+    order_key = &key;
+    order_checked = 0;
+    last_journal_deleted_seen = 0;
+    txn.spec = NULL;
+    txn.thread = 1;
+    txn.sequence = 1;
+    txn.required = 1;
+    EXPECT(p11_journal_combined_remove(&txn) == -1, "contradicted remove reports loss");
+    EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted, got %llu",
+           (unsigned long long)fault);
+    EXPECT(last_journal_deleted_seen, "journal deletion observed");
+    scrubbed = 1;
+    for (i = 0; i < 24; i++)
+        scrubbed = scrubbed && (last_journal_deleted[i] == 0);
+    EXPECT(scrubbed, "contradicted bytes scrubbed before deletion");
+    EXPECT(order_checked, "journal row gone before its START row deleted");
+    EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &key) == NULL, "journal row retired");
+    EXPECT(owner_map_lookup(&START, &key) == NULL, "START row retired");
+    EXPECT(owner_map_lookup(&OBJECT_START, &key) == NULL, "subordinate retired");
+    EXPECT(owners[0].flags == 0, "lease released in the same call");
+    EXPECT(ring_submits == 1, "no ABANDON for contradicted rows: the fault is the disposition");
+    order_key = NULL;
+}
+
+static void combined_collision_lifecycle(void)
+{
+    struct owner_start_key key;
+    struct journal_start_value *found;
+    struct journal_header_spec begin = {JOURNAL_BEGIN_BYTES, JOURNAL_KIND_BEGIN, 0, 0, 0};
+    struct journal_header_spec end = {JOURNAL_END_FULL_BYTES, JOURNAL_KIND_END, 0, 1, 1};
+    struct journal_header_spec abandon = {JOURNAL_ABANDON_BYTES, JOURNAL_KIND_ABANDON, 0, 1, 1};
+    struct journal_txn txn;
+    u64 fault = 0;
+    reset();
+    seed_object_tables();
+    key.pid_tgid = pid_tgid();
+    key.slot = 5;
+    key.pad = 0;
+    required_start_value(start_value);
+    memset(&txn, 0, sizeof(txn));
+    txn.jctl = &journal_ctl;
+    txn.journal_map = &JOURNAL_START_MAP;
+    txn.ring = &JOURNAL_RING;
+    txn.key = &key;
+    txn.start_value = start_value;
+    txn.spec = &begin;
+    txn.fault_out = &fault;
+    EXPECT(p11_journal_combined_entry(&txn) == 0, "first entry settles");
+    /* A second entry on the same key collides in the START leg, which
+     * unwinds the first call's START row; the first call's journal row
+     * stays intact (never joined, never clobbered). */
+    EXPECT(p11_journal_combined_entry(&txn) == -1, "colliding entry refuses");
+    EXPECT(fault == JOURNAL_FAULT_START_LEG, "START leg faulted, got %llu",
+           (unsigned long long)fault);
+    EXPECT(owner_map_lookup(&START, &key) == NULL, "collision unwound the START row");
+    found = p11_journal_side_lookup(&JOURNAL_START_MAP, &key);
+    EXPECT(found != NULL && found->thread == 1 && found->sequence == 1 &&
+               found->phase == JOURNAL_PHASE_BEGUN,
+           "first journal row intact");
+    EXPECT(owners[0].flags == 0, "collision unwind released the lease");
+    /* Exit cleanup abandons the orphaned row (BEGIN then ABANDON);
+     * the already-gone START retires as healthy optional absence, so
+     * no H7 poison sticks and the key stays reusable. */
+    txn.spec = &abandon;
+    txn.thread = 1;
+    txn.sequence = 1;
+    txn.required = 0;
+    EXPECT(p11_journal_combined_remove(&txn) == 0, "orphan cleanup settles");
+    EXPECT(fault == JOURNAL_FAULT_NONE, "no fault, got %llu", (unsigned long long)fault);
+    EXPECT(ring_submits == 2, "orphan published ABANDON exactly once");
+    check_submitted(1, JOURNAL_ABANDON_BYTES, JOURNAL_KIND_ABANDON, 0, 1, 1, "orphan ABANDON");
+    EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &key) == NULL, "orphan row retired");
+    /* The key is reusable after full retirement; the failed entry
+     * minted no sequence. */
+    txn.spec = &begin;
+    txn.thread = 0;
+    txn.sequence = 0;
+    EXPECT(p11_journal_combined_entry(&txn) == 0, "reused key enters");
+    found = p11_journal_side_lookup(&JOURNAL_START_MAP, &key);
+    EXPECT(found != NULL && found->thread == 1 && found->sequence == 2 &&
+               found->phase == JOURNAL_PHASE_BEGUN,
+           "reused key continues the sequence");
+    /* Retire the reused call, then the orphan-return case runs
+     * alone (also under the small limit). */
+    txn.spec = &end;
+    end.thread = 1;
+    end.sequence = 2;
+    txn.thread = 1;
+    txn.sequence = 2;
+    EXPECT(p11_journal_combined_return(&txn) == 0, "reused return settles");
+    txn.spec = NULL;
+    txn.required = 1;
+    EXPECT(p11_journal_combined_remove(&txn) == 0, "reused remove settles");
+    /* A return whose START row vanished refuses through the START
+     * leg: the journal row stays intact and publishes nothing. Setup
+     * deletes the START row directly (the checked START-presence leg
+     * still runs for real); H7 bookkeeping poison sticks, so this
+     * closes the section. */
+    {
+        struct owner_start_key orphan = key;
+        unsigned submits_before;
+        orphan.slot = 7;
+        txn.key = &orphan;
+        txn.spec = &begin;
+        txn.required = 0;
+        txn.thread = 0;
+        txn.sequence = 0;
+        EXPECT(p11_journal_combined_entry(&txn) == 0, "orphan-setup entry settles");
+        EXPECT(owner_map_delete(&START, &orphan) == 0, "START row vanishes");
+        submits_before = ring_submits;
+        txn.spec = &end;
+        end.thread = 1;
+        end.sequence = 3;
+        txn.thread = 1;
+        txn.sequence = 3;
+        EXPECT(p11_journal_combined_return(&txn) == -1, "orphaned return refuses");
+        EXPECT(fault == JOURNAL_FAULT_START_LEG, "START leg faulted, got %llu",
+               (unsigned long long)fault);
+        found = p11_journal_side_lookup(&JOURNAL_START_MAP, &orphan);
+        EXPECT(found != NULL && found->phase == JOURNAL_PHASE_BEGUN, "orphan row intact");
+        EXPECT(ring_submits == submits_before, "no END without its START");
+    }
+}
+
+static void combined_fault_paths(void)
+{
+    struct owner_start_key key;
+    struct journal_start_value *found;
+    struct journal_header_spec begin = {JOURNAL_BEGIN_BYTES, JOURNAL_KIND_BEGIN, 0, 0, 0};
+    struct journal_header_spec end = {JOURNAL_END_FULL_BYTES, JOURNAL_KIND_END, 0, 1, 1};
+    struct journal_header_spec abandon = {JOURNAL_ABANDON_BYTES, JOURNAL_KIND_ABANDON, 0, 1, 1};
+    struct journal_txn txn, bad;
+    u64 fault = 0;
+    reset();
+    seed_object_tables();
+    key.pid_tgid = pid_tgid();
+    key.slot = 5;
+    key.pad = 0;
+    required_start_value(start_value);
+    memset(&txn, 0, sizeof(txn));
+    txn.jctl = &journal_ctl;
+    txn.journal_map = &JOURNAL_START_MAP;
+    txn.ring = &JOURNAL_RING;
+    txn.key = &key;
+    txn.start_value = start_value;
+    txn.spec = &begin;
+    txn.fault_out = &fault;
+    /* NULL wiring refuses before effects. */
+    EXPECT(p11_journal_combined_entry(NULL) == -1, "NULL txn refuses");
+    EXPECT(p11_journal_combined_return(NULL) == -1, "NULL return refuses");
+    EXPECT(p11_journal_combined_remove(NULL) == -1, "NULL remove refuses");
+    memset(&bad, 0, sizeof(bad));
+    EXPECT(p11_journal_combined_entry(&bad) == -1, "NULL fault cell refuses");
+    bad = txn;
+    bad.fault_out = NULL;
+    EXPECT(p11_journal_combined_entry(&bad) == -1, "missing fault cell refuses");
+    bad = txn;
+    bad.jctl = NULL;
+    EXPECT(p11_journal_combined_entry(&bad) == -1, "NULL control refuses");
+    EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted");
+    bad = txn;
+    bad.journal_map = NULL;
+    EXPECT(p11_journal_combined_entry(&bad) == -1, "NULL journal map refuses");
+    bad = txn;
+    bad.ring = NULL;
+    EXPECT(p11_journal_combined_entry(&bad) == -1, "NULL ring refuses");
+    bad = txn;
+    bad.key = NULL;
+    EXPECT(p11_journal_combined_entry(&bad) == -1, "NULL key refuses");
+    bad = txn;
+    bad.start_value = NULL;
+    EXPECT(p11_journal_combined_entry(&bad) == -1, "NULL START value refuses");
+    bad = txn;
+    bad.spec = NULL;
+    EXPECT(p11_journal_combined_entry(&bad) == -1, "NULL spec refuses");
+    EXPECT(owners[0].flags == 0, "no lease from refused entries");
+    EXPECT(owner_map_lookup(&START, &key) == NULL, "no START row from refused entries");
+    EXPECT(ring_submits == 0 && ring_discards == 0, "no ring use from refused entries");
+    /* A template smuggling identity refuses before effects. */
+    {
+        struct journal_header_spec smuggled = begin;
+        smuggled.thread = 9;
+        bad = txn;
+        bad.spec = &smuggled;
+        EXPECT(p11_journal_combined_entry(&bad) == -1, "smuggled identity refuses");
+        EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted, got %llu",
+               (unsigned long long)fault);
+        EXPECT(owner_map_lookup(&START, &key) == NULL, "smuggling leaves no START row");
+    }
+    /* Reserve failure unwinds every leg: fault set, nothing kept. */
+    fail_reserve = 1;
+    EXPECT(p11_journal_combined_entry(&txn) == -1, "reserve failure refuses");
+    EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted, got %llu",
+           (unsigned long long)fault);
+    EXPECT(ring_submits == 0 && ring_discards == 0, "nothing reserved, nothing discarded");
+    EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &key) == NULL, "journal leg unwound");
+    EXPECT(owner_map_lookup(&START, &key) == NULL, "START leg unwound");
+    EXPECT(owners[0].flags == 0, "unwind released the lease");
+    fail_reserve = 0;
+    /* A bad header faults, discards (fault before discard), unwinds. */
+    {
+        struct journal_header_spec bad_kind = begin;
+        bad_kind.kind = 9;
+        bad = txn;
+        bad.spec = &bad_kind;
+        EXPECT(p11_journal_combined_entry(&bad) == -1, "bad header refuses");
+        EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted, got %llu",
+               (unsigned long long)fault);
+        EXPECT(ring_submits == 0 && ring_discards == 1, "one discard, no submit");
+        EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &key) == NULL, "journal leg unwound");
+        EXPECT(owner_map_lookup(&START, &key) == NULL, "START leg unwound");
+    }
+    /* A poisoned control refuses before effects; the START leg
+     * rewinds and no sequence mints. */
+    {
+        u64 sequence_before = owners[0].journal_sequence;
+        journal_ctl.poison = 1;
+        EXPECT(p11_journal_combined_entry(&txn) == -1, "poisoned entry refuses");
+        EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted");
+        EXPECT(owner_map_lookup(&START, &key) == NULL, "START rewound past poison");
+        EXPECT(owners[0].journal_sequence == sequence_before, "poison mints no sequence");
+        journal_ctl.poison = 0;
+    }
+    /* A wrapped sequence consumes its ticket but refuses; START rewinds. */
+    EXPECT(p11_owner_lease() == 1, "lease");
+    owners[0].journal_sequence = ~0ULL;
+    EXPECT(p11_journal_combined_entry(&txn) == -1, "wrapped sequence refuses");
+    EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted");
+    EXPECT(owners[0].journal_thread == 1, "refused ticket still consumed");
+    EXPECT(owner_map_lookup(&START, &key) == NULL, "START rewound past wrap");
+    owners[0].journal_sequence = 0;
+    /* A healthy entry then a wrong-facts return: refused, row intact,
+     * nothing published. */
+    EXPECT(p11_journal_combined_entry(&txn) == 0, "entry settles");
+    txn.spec = &end;
+    txn.thread = 2;
+    txn.sequence = 1;
+    EXPECT(p11_journal_combined_return(&txn) == -1, "wrong-facts return refuses");
+    EXPECT(fault == JOURNAL_FAULT_PUBLISH, "spec mismatch faults publish, got %llu",
+           (unsigned long long)fault);
+    txn.thread = 1;
+    txn.sequence = 1;
+    {
+        struct journal_header_spec wrong = end;
+        wrong.sequence = 2;
+        txn.spec = &wrong;
+        EXPECT(p11_journal_combined_return(&txn) == -1, "spec/facts mismatch refuses");
+        EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted");
+        txn.spec = &end;
+    }
+    found = p11_journal_side_lookup(&JOURNAL_START_MAP, &key);
+    EXPECT(found != NULL && found->phase == JOURNAL_PHASE_BEGUN, "row still BEGUN");
+    EXPECT(ring_submits == 1, "BEGIN only");
+    /* Return reserve failure: forward-only — the row stays RETURNING
+     * and retires silently (the faulted END is the disposition, never
+     * a later ABANDON). */
+    fail_reserve = 1;
+    EXPECT(p11_journal_combined_return(&txn) == -1, "reserve-failed return refuses");
+    EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted");
+    fail_reserve = 0;
+    found = p11_journal_side_lookup(&JOURNAL_START_MAP, &key);
+    EXPECT(found != NULL && found->phase == JOURNAL_PHASE_RETURNING, "row stays RETURNING");
+    txn.spec = NULL;
+    txn.required = 1;
+    EXPECT(p11_journal_combined_remove(&txn) == 0, "RETURNING retires silently");
+    EXPECT(ring_submits == 1, "no ABANDON after the faulted END");
+    EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &key) == NULL, "journal row retired");
+    /* Missing required rows are loss on both legs (H7 bookkeeping
+     * poison sticks, so later healthy-control cases reset first). */
+    key.slot = 6;
+    txn.thread = 0;
+    txn.sequence = 0;
+    EXPECT(p11_journal_combined_remove(&txn) == -1, "missing required is loss");
+    EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted first");
+    reset();
+    seed_object_tables();
+    required_start_value(start_value);
+    txn.key = &key;
+    txn.spec = NULL;
+    txn.required = 0;
+    EXPECT(p11_journal_combined_remove(&txn) == -2, "missing optional is absence");
+    EXPECT(fault == JOURNAL_FAULT_NONE, "healthy absence faults nothing");
+    txn.required = 7;
+    EXPECT(p11_journal_combined_remove(&txn) == -1, "non-bit required refuses");
+    /* A lost task with an orphaned row still retires forward: ABANDON
+     * publishes exactly once, the START leg reports, and a retry with
+     * the task back settles the START leg without republishing. */
+    reset();
+    seed_object_tables();
+    required_start_value(start_value);
+    key.slot = 5;
+    txn.key = &key;
+    txn.required = 1;
+    txn.spec = &begin;
+    txn.thread = 0;
+    txn.sequence = 0;
+    EXPECT(p11_journal_combined_entry(&txn) == 0, "entry settles");
+    {
+        unsigned submits_before;
+        fail_current_task = 1;
+        txn.spec = &abandon;
+        txn.thread = 1;
+        txn.sequence = 1;
+        submits_before = ring_submits;
+        EXPECT(p11_journal_combined_remove(&txn) == -1, "taskless remove reports START");
+        EXPECT(fault == JOURNAL_FAULT_START_LEG, "START leg faulted, got %llu",
+               (unsigned long long)fault);
+        EXPECT(ring_submits == submits_before + 1, "ABANDON published exactly once");
+        EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &key) == NULL, "journal row retired");
+        fail_current_task = 0;
+        EXPECT(p11_journal_combined_remove(&txn) == -1, "retry reports the missing journal row");
+        EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted first");
+        EXPECT(ring_submits == submits_before + 1, "retry republishes nothing");
+        /* H7 poison is capture-terminal: the poisoned control refuses
+         * the retry's START leg, so its row stays with its lease. */
+        EXPECT(owner_map_lookup(&START, &key) != NULL, "poisoned START leg keeps its row");
+        EXPECT(owners[0].flags != 0, "poisoned lease stays held");
+    }
+    /* The taskless retry's START leg succeeded on a poisoned control;
+     * later healthy-control cases reset first. */
+    reset();
+    seed_object_tables();
+    required_start_value(start_value);
+    txn.key = &key;
+#ifdef P11SCOPE_SMALL_STATE_MAPS
+    {
+        /* At limit 1 the second key's journal leg refuses and its
+         * START leg rewinds; the first call is intact. */
+        struct owner_start_key second = key;
+        second.slot = 7;
+        key.slot = 5;
+        txn.required = 0;
+        txn.spec = &begin;
+        txn.thread = 0;
+        txn.sequence = 0;
+        EXPECT(p11_journal_combined_entry(&txn) == 0, "small first entry settles");
+        txn.key = &second;
+        EXPECT(p11_journal_combined_entry(&txn) == -1, "small second entry refuses at limit 1");
+        EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted");
+        EXPECT(owner_map_lookup(&START, &second) == NULL, "second START rewound");
+        EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &key) != NULL,
+               "first row intact");
+    }
+#else
+    {
+        /* Wider maps hold a second concurrent key. */
+        struct owner_start_key second = key;
+        second.slot = 7;
+        key.slot = 5;
+        txn.required = 0;
+        txn.spec = &begin;
+        txn.thread = 0;
+        txn.sequence = 0;
+        EXPECT(p11_journal_combined_entry(&txn) == 0, "first entry settles");
+        txn.key = &second;
+        EXPECT(p11_journal_combined_entry(&txn) == 0, "second entry settles");
+        EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &second) != NULL,
+               "second row present");
+    }
+#endif
+}
+
 #endif /* P11SCOPE_INVENTORY_ONLY */
 
 #ifdef P11SCOPE_INVENTORY_ONLY
@@ -945,6 +1570,12 @@ int main(void)
     ring_header_matrix();
     ring_reserve_submit_discard();
     mint_contention_unique();
+    combined_entry_publishes_begin();
+    combined_return_publishes_end();
+    combined_remove_abandons_unsettled();
+    combined_scrub_before_release();
+    combined_collision_lifecycle();
+    combined_fault_paths();
 #endif
     if (!failures)
         fprintf(stderr, "journal owner fixture: all checks passed\n");

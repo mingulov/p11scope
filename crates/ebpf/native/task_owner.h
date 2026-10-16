@@ -202,6 +202,10 @@ extern unsigned char OBJECT_DESCRIPTORS;
 extern unsigned char OBJECT_ZERO;
 #endif
 extern unsigned char DISCOVERY_STATE;
+/* The current task's owner row, or NULL when the task is gone or holds
+ * none (task_owner.c; the journal transactions key-bind it before
+ * their legs run). */
+struct thread_owner *p11_owner_current(void);
 static void *(*owner_map_lookup)(void *, const void *) = (void *)1;
 static long (*owner_map_update)(void *, const void *, const void *, u64) = (void *)2;
 static long (*owner_map_delete)(void *, const void *) = (void *)3;

@@ -778,6 +778,10 @@ pub(crate) enum BirthObservationRefusal {
     /// domain/image/caller: the held pidfd is not bound to the
     /// admitted image.
     BindingMismatch,
+    /// The row's observed `exec_attach_gen` is not the sealed
+    /// closure's minted generation: the exec did not happen under
+    /// this closure.
+    GenerationMismatch,
     /// The router refused the baseline scan: no sealed appearance to
     /// measure the new one against.
     PriorScanRejected,
@@ -839,14 +843,16 @@ fn common_birth_words(
 /// Session-owned exec-marker birth observation. The producers are
 /// genuine Session observations end to end: the PROC_EPOCH marker row
 /// and admission control row pulled through the birth-row reader (the
-/// marker read back READY naming the admitted image's exec id), the
-/// admission authority's custody binding (the held pidfd bound to the
-/// admitted image), the sealed successful attachment for the admitted
-/// domain, and the admitted image itself. No caller-provided
-/// record/control structs on this path. Returns the issuance token
-/// with the observed evidence; only this path and its absence twin
-/// mint production birth grants. The seal pulls fresh evidence again,
-/// so native truth that moved between the two refuses.
+/// marker read back READY naming the admitted image's exec id, the
+/// row's `exec_attach_gen` equal to the sealed closure's minted
+/// generation), the admission authority's custody binding (the held
+/// pidfd bound to the admitted image), the sealed successful
+/// attachment for the admitted domain, and the admitted image itself.
+/// No caller-provided record/control structs on this path. Returns
+/// the issuance token with the observed evidence; only this path and
+/// its absence twin mint production birth grants. The seal pulls
+/// fresh evidence again, so native truth that moved between the two
+/// refuses.
 ///
 /// Live map reads stay UNRUN: production wires [`LiveBirthRows`];
 /// host tests read fixture bytes the real native leaves published.
@@ -871,19 +877,27 @@ pub(crate) fn observe_exec_birth(
         .map_err(|_| BirthObservationRefusal::RowUnreadable)?;
     let (image, custody_word) = common_birth_words(&control, binding, attachment, admitted)?;
     match read_word(record.journal_bootstrap) {
-        MarkerRead::Ready(exec) if exec == image.1 => {
-            let token = SessionGrantToken(());
-            let evidence = crate::semantics_objects::journal::SessionBirthEvidence::issue(
-                &token,
-                image,
-                record.journal_bootstrap,
-                control.failed,
-                custody_word,
-            );
-            Ok((token, evidence))
-        }
-        _ => Err(BirthObservationRefusal::MarkerNotReady),
+        MarkerRead::Ready(exec) if exec == image.1 => {}
+        _ => return Err(BirthObservationRefusal::MarkerNotReady),
     }
+    // READY plus matching image/generation: the row's observed
+    // exec_attach_gen must equal the sealed closure's minted
+    // generation — an exec stamped under another closure (or never
+    // stamped) is not this closure's birth. Checked after the marker
+    // readback so a doubly-bad row reports its marker state first.
+    if record.exec_attach_gen != attachment.generation() {
+        return Err(BirthObservationRefusal::GenerationMismatch);
+    }
+    let token = SessionGrantToken(());
+    let evidence = crate::semantics_objects::journal::SessionBirthEvidence::issue(
+        &token,
+        image,
+        record.journal_bootstrap,
+        control.failed,
+        record.exec_attach_gen,
+        custody_word,
+    );
+    Ok((token, evidence))
 }
 
 /// Session-owned absence-appearance birth observation: the shared
@@ -975,6 +989,7 @@ pub(crate) fn observe_absence_birth(
         image,
         0,
         control.failed,
+        record.exec_attach_gen,
         custody_word,
     );
     Ok((token, evidence))

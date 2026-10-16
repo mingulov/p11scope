@@ -735,9 +735,7 @@ fn object_journal_bpf_call_shape() {
         ),
     ];
     for (name, defines) in matrix {
-        let object = temporary
-            .path()
-            .join(format!("object-journal-{name}.o"));
+        let object = temporary.path().join(format!("object-journal-{name}.o"));
         let mut compiler = Command::new("clang-18");
         compiler
             .args([

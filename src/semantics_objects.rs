@@ -971,6 +971,11 @@ pub(crate) enum LostOutcome {
     Ticket(CallToken, RefCut),
     /// Begins refused for capacity in this domain are all over by the cut.
     Refused(ObjectDomain, RefCut),
+    /// Domain history through the cut is void (fault, malformed record or
+    /// H3 loss): proof for the interval ends, the fence floor rises, and
+    /// later proof resumes at or above the cut. Only the journal child
+    /// reports this, with a sealed domain and cut.
+    Voided(ObjectDomain, RefCut),
 }
 
 impl ObjectSemantics {

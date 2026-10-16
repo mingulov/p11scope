@@ -618,3 +618,39 @@ fn valid_neutral_begin() -> [u8; JOURNAL_BEGIN_BYTES] {
     bytes[128..200].fill(0);
     bytes
 }
+
+#[test]
+fn object_journal_ilp32_abi_layout() {
+    use p11scope_ebpf_common::object_journal::{validate_begin, validate_end};
+    use p11scope_ebpf_common::object_wire::OBJECT_LAYOUT_ILP32;
+
+    let descriptor = create_descriptor();
+    // A 32-bit BEGIN with narrow handle words validates.
+    let mut ilp32 = valid_begin();
+    ilp32[124] = OBJECT_LAYOUT_ILP32;
+    put_u64(&mut ilp32, 80, 0x5050_5050);
+    assert!(validate_begin(&ilp32, Some(&descriptor)).is_some());
+    // High bits on any handle word reject under ilp32.
+    let mut wide_session = ilp32;
+    put_u64(&mut wide_session, 80, 0x1_0000_0000);
+    assert!(validate_begin(&wide_session, Some(&descriptor)).is_none());
+    let mut wide_input = ilp32;
+    put_u64(&mut wide_input, 88, 0x1_0000_0000);
+    wide_input[126] = 1;
+    assert!(validate_begin(&wide_input, Some(&descriptor)).is_none());
+    let mut narrow_input = ilp32;
+    put_u64(&mut narrow_input, 88, 0x1111_1111);
+    narrow_input[126] = 1;
+    assert!(validate_begin(&narrow_input, Some(&descriptor)).is_some());
+    // The 32-bit END tail enforces the same width rule on result words.
+    let mut end = valid_end_full();
+    end[JOURNAL_COMMON_BYTES + 368 + 12] = OBJECT_LAYOUT_ILP32;
+    put_u64(&mut end, JOURNAL_COMMON_BYTES + 368 + 32, 0x9090_9090);
+    assert!(validate_end(&end, Some(&descriptor)).is_some());
+    put_u64(
+        &mut end,
+        JOURNAL_COMMON_BYTES + 368 + 32,
+        0x9090_9090_9090_9090,
+    );
+    assert!(validate_end(&end, Some(&descriptor)).is_none());
+}

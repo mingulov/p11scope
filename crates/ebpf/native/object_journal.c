@@ -440,9 +440,11 @@ static __always_inline u64 txn_fill_end(unsigned char *record, const void *paylo
 
 /* Fill one reserved record: the validated header plus the kind's gated
  * body. Returns JOURNAL_FAULT_NONE filled, or the fault code. Never
- * touches the fault cell and never discards or submits: the combined
- * function (root) raises the returned fault BEFORE discarding the
- * retained reservation (fault-then-discard, root-side). */
+ * touches the fault cell, never submits, never discards: on a fault
+ * the combined function reports the fault cell and hands the
+ * uncommitted reservation back to the REAL ROOT (`uncommitted`), which
+ * raises the checked fault BEFORE discarding it. Nothing at or below
+ * the combined level discards. */
 static __always_inline u64 txn_fill(void *record, const struct journal_txn *txn, u64 thread,
                                     u64 sequence)
 {
@@ -483,14 +485,18 @@ __attribute__((noinline)) int p11_journal_combined_entry(struct journal_txn *txn
     if (*txn->fault_out != JOURNAL_FAULT_NONE)
         return -1;
     *txn->fault_out = JOURNAL_FAULT_NONE;
+    txn->uncommitted = (void *)0;
     if (!txn->jctl || !txn->journal_map || !txn->ring || !txn->key || !txn->start_value ||
         !txn->spec || !txn->begin) {
         *txn->fault_out = JOURNAL_FAULT_JOURNAL_LEG;
         return -1;
     }
     /* The template carries kind/bytes/flags only: identity comes from
-     * the inserted row, never smuggled in. */
-    if (txn->spec->thread || txn->spec->sequence) {
+     * the inserted row, never smuggled in. Operation-specific kinds:
+     * entry publishes BEGIN only — an END or ABANDON template refuses
+     * before effects, never a cross-operation publication. */
+    if (txn->spec->thread || txn->spec->sequence ||
+        txn->spec->kind != JOURNAL_KIND_BEGIN) {
         *txn->fault_out = JOURNAL_FAULT_PUBLISH;
         return -1;
     }
@@ -524,11 +530,12 @@ __attribute__((noinline)) int p11_journal_combined_entry(struct journal_txn *txn
         return -1;
     }
     /* BEGIN publication from the inserted row's own words: reserve,
-     * fill, submit, then commit. A readback miss or fill failure
-     * raises the fault root-side, discards the retained reservation
-     * and unwinds the legs (a H7-side key/row mismatch here cannot
-     * smuggle identity into the ring, and post-pre-check any present
-     * row is ours). */
+     * fill, submit, then commit. A readback miss leaves no reservation
+     * (nothing to hand back); a fill failure reports the fault cell
+     * and hands the uncommitted reservation back to the root — the
+     * root raises the checked fault BEFORE discarding it — then unwinds
+     * the legs (a H7-side key/row mismatch here cannot smuggle identity
+     * into the ring, and post-pre-check any present row is ours). */
     row = p11_journal_side_lookup(txn->journal_map, txn->key);
     if (!row) {
         *txn->fault_out = JOURNAL_FAULT_JOURNAL_LEG;
@@ -540,7 +547,7 @@ __attribute__((noinline)) int p11_journal_combined_entry(struct journal_txn *txn
     fault = txn_fill(record, txn, row->thread, row->sequence);
     if (fault != JOURNAL_FAULT_NONE) {
         *txn->fault_out = fault;
-        p11_journal_discard(record);
+        txn->uncommitted = record;
         goto unwind;
     }
     p11_journal_submit(record);
@@ -573,12 +580,16 @@ __attribute__((noinline)) int p11_journal_combined_return(struct journal_txn *tx
     if (*txn->fault_out != JOURNAL_FAULT_NONE)
         return -1;
     *txn->fault_out = JOURNAL_FAULT_NONE;
+    txn->uncommitted = (void *)0;
     if (!txn->journal_map || !txn->ring || !txn->key || !txn->spec || !txn->end_payload) {
         *txn->fault_out = JOURNAL_FAULT_JOURNAL_LEG;
         return -1;
     }
-    /* The spec must name the retained call exactly. */
-    if (txn->spec->thread != txn->thread || txn->spec->sequence != txn->sequence) {
+    /* The spec must name the retained call exactly, and the operation
+     * publishes END only — a BEGIN or ABANDON template refuses before
+     * effects, never a cross-operation publication. */
+    if (txn->spec->kind != JOURNAL_KIND_END || txn->spec->thread != txn->thread ||
+        txn->spec->sequence != txn->sequence) {
         *txn->fault_out = JOURNAL_FAULT_PUBLISH;
         return -1;
     }
@@ -590,15 +601,17 @@ __attribute__((noinline)) int p11_journal_combined_return(struct journal_txn *tx
         return -1;
     }
     /* Reserve and fill the END before the advance commits: a publish
-     * failure leaves the row BEGUN for exit cleanup (BEGIN then
-     * ABANDON), never a faulted END. */
+     * failure reports the fault, hands the uncommitted reservation back
+     * to the root (checked fault raises before its discard), and leaves
+     * the row BEGUN for exit cleanup (BEGIN then ABANDON), never a
+     * faulted END. */
     record = txn_reserve(txn->ring, txn->spec->bytes, txn->fault_out);
     if (!record)
         return -1;
     fault = txn_fill(record, txn, txn->thread, txn->sequence);
     if (fault != JOURNAL_FAULT_NONE) {
         *txn->fault_out = fault;
-        p11_journal_discard(record);
+        txn->uncommitted = record;
         return -1;
     }
     /* The required cleanup commits: advance, then retire START with
@@ -613,12 +626,12 @@ __attribute__((noinline)) int p11_journal_combined_return(struct journal_txn *tx
                p11_journal_return(owner, txn->journal_map, txn->key, txn->thread,
                                   txn->sequence)) {
         *txn->fault_out = JOURNAL_FAULT_JOURNAL_LEG;
-        p11_journal_discard(record);
+        txn->uncommitted = record;
         return -1;
     }
     if (p11_owner_start_remove(txn->key, 1)) {
         *txn->fault_out = JOURNAL_FAULT_START_LEG;
-        p11_journal_discard(record);
+        txn->uncommitted = record;
         return -1;
     }
     /* Cleanup committed: submit the terminal exactly once, on the
@@ -635,17 +648,20 @@ __attribute__((noinline)) int p11_journal_combined_remove(struct journal_txn *tx
     int journal_rc;
     int start_ok;
     int start_optional = 0;
+    int journal_deleted = 0;
     int tainted;
-    void *record;
+    void *record = (void *)0;
     u64 fault;
     if (!txn || !txn->fault_out)
         return -1;
     /* A tainted cell stays tainted: cleanup still settles forward
      * below, but the report preserves the earlier fault instead of
-     * success — cleanup never erases a prior failure. */
+     * success — cleanup never erases a prior failure. The handoff is
+     * an out-field: always cleared on entry. */
     tainted = (*txn->fault_out != JOURNAL_FAULT_NONE);
     if (!tainted)
         *txn->fault_out = JOURNAL_FAULT_NONE;
+    txn->uncommitted = (void *)0;
     if (!txn->journal_map || !txn->ring || !txn->key || (txn->required != 0 && txn->required != 1)) {
         if (!tainted)
             *txn->fault_out = JOURNAL_FAULT_JOURNAL_LEG;
@@ -684,12 +700,15 @@ __attribute__((noinline)) int p11_journal_combined_remove(struct journal_txn *tx
         goto start_leg;
     }
     if (row->phase != JOURNAL_PHASE_RETURNING) {
-        /* Unsettled: reserve the ABANDON, delete the row (the required
-         * cleanup commits), then submit the terminal. A bad template
-         * faults but still retires (cleanup settles forward-only). */
-        record = 0;
-        if (!txn->spec || !txn->abandon || txn->spec->thread != txn->thread ||
-            txn->spec->sequence != txn->sequence) {
+        /* Unsettled: reserve the ABANDON (ABANDON kind only — a wrong-kind
+         * template faults PUBLISH but still retires, submitting
+         * nothing), delete the journal row, run the START leg, and only
+         * then submit: the terminal submits after ALL required cleanup
+         * commits. A fill failure reports the fault and hands the
+         * reservation back to the root; the row still deletes and the
+         * START leg still runs (cleanup settles forward-only). */
+        if (!txn->spec || !txn->abandon || txn->spec->kind != JOURNAL_KIND_ABANDON ||
+            txn->spec->thread != txn->thread || txn->spec->sequence != txn->sequence) {
             if (!tainted)
                 *txn->fault_out = JOURNAL_FAULT_PUBLISH;
         } else {
@@ -699,23 +718,24 @@ __attribute__((noinline)) int p11_journal_combined_remove(struct journal_txn *tx
                 if (fault != JOURNAL_FAULT_NONE) {
                     if (!tainted)
                         *txn->fault_out = fault;
-                    p11_journal_discard(record);
+                    txn->uncommitted = record;
                     record = 0;
                 }
             }
         }
         if (p11_journal_side_remove(txn->journal_map, txn->key)) {
-            /* The cleanup failed: discard the uncommitted reservation
-             * (the fault is already raised — first wins) and keep the
-             * lease for retry; the ABANDON never submits twice. */
-            if (record)
-                p11_journal_discard(record);
-            if (!tainted)
+            /* The journal cleanup failed: report the fault FIRST (first
+             * fault wins — a fill failure already reported stays), hand
+             * the uncommitted reservation back to the root, and keep
+             * the lease for retry; the START leg must not orphan the
+             * row under a release, and the ABANDON never submits. */
+            if (*txn->fault_out == JOURNAL_FAULT_NONE)
                 *txn->fault_out = JOURNAL_FAULT_JOURNAL_LEG;
+            if (record)
+                txn->uncommitted = record;
             return -1;
         }
-        if (record)
-            p11_journal_submit(record);
+        journal_deleted = 1;
         journal_rc = (*txn->fault_out == JOURNAL_FAULT_NONE) ? 0 : -1;
         goto start_leg;
     }
@@ -739,6 +759,20 @@ start_leg:
     else
         start_rc = p11_owner_start_remove(txn->key, txn->required);
     start_ok = (start_rc == 0) || (start_rc == -2 && (!txn->required || start_optional));
+    /* The terminal submits only after ALL required cleanup commits —
+     * the journal row deleted above plus this START leg. Otherwise the
+     * fault reports (first wins) and the reservation returns to the
+     * root WITHOUT publishing. */
+    if (record) {
+        if (journal_deleted && start_ok) {
+            p11_journal_submit(record);
+        } else {
+            if (*txn->fault_out == JOURNAL_FAULT_NONE)
+                *txn->fault_out =
+                    journal_deleted ? JOURNAL_FAULT_START_LEG : JOURNAL_FAULT_JOURNAL_LEG;
+            txn->uncommitted = record;
+        }
+    }
     if (tainted)
         return -1;
     if (journal_rc == -2 && !txn->required && start_rc == -2)

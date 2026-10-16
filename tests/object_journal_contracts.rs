@@ -798,8 +798,8 @@ fn object_journal_combined_transactions_publish_valid_wire_records() {
             None => unreachable!(),
         }
     }
-    assert_eq!(files.len(), 22, "dumped record count");
-    assert_eq!(begins, 15, "BEGIN count");
+    assert_eq!(files.len(), 24, "dumped record count");
+    assert_eq!(begins, 17, "BEGIN count");
     assert_eq!(ends, 4, "END count");
     assert_eq!(compacts, 1, "compact END count");
     assert_eq!(abandons, 3, "ABANDON count");
@@ -857,12 +857,17 @@ fn object_journal_bpf_call_shape() {
     }
 }
 
-/// N8: fault-then-discard is root-side — no helper below the combined
-/// transactions discards a reservation. Every `p11_journal_discard`
-/// call site must live in a combined function, which raises the
-/// checked fault (its own fault-cell store) before the discard commits.
+/// N8/C4/N9: the reserve/fault/cleanup/submit matrix is pinned by
+/// ORDERING, not names. Nothing at or below the combined level
+/// discards (the only discard call in this file is the leaf's own ring
+/// delegation; the root — outside this file — raises the checked fault
+/// before every discard, proven at runtime by the fixture's
+/// checked-generation hooks). Each combined transaction instead reports
+/// its fault cell BEFORE handing its uncommitted reservation back;
+/// terminals submit only after their required cleanup commits; and
+/// each operation accepts only its own publication kind.
 #[test]
-fn object_journal_discards_are_root_side() {
+fn object_journal_transaction_ordering_matrix() {
     let source = std::fs::read_to_string("crates/ebpf/native/object_journal.c")
         .expect("read native journal transactions");
     let lines: Vec<&str> = source.lines().collect();
@@ -870,7 +875,8 @@ fn object_journal_discards_are_root_side() {
     // braces stay same-line): the nearest signature above a lone `{`
     // names the enclosing function.
     let mut current = String::from("none");
-    let mut sites = 0;
+    let mut functions: std::collections::HashMap<String, Vec<(usize, &str)>> =
+        std::collections::HashMap::new();
     for (index, line) in lines.iter().enumerate() {
         if line.trim() == "{" {
             for candidate in lines[..index].iter().rev() {
@@ -887,29 +893,114 @@ fn object_journal_discards_are_root_side() {
             }
             continue;
         }
-        let trimmed = line.trim_start();
-        if !(trimmed.starts_with("p11_journal_discard(")
-            || trimmed.starts_with("journal_ring_discard("))
-        {
-            continue;
+        functions
+            .entry(current.clone())
+            .or_default()
+            .push((index + 1, line.trim_start()));
+    }
+    // N8: no discard call site anywhere below the root. The leaf's own
+    // ring delegation is the single exception; every other function —
+    // combined or helper — must hold zero.
+    for (name, body) in &functions {
+        for (number, text) in body {
+            if !(text.starts_with("p11_journal_discard(")
+                || text.starts_with("journal_ring_discard("))
+            {
+                continue;
+            }
+            assert_eq!(
+                name, "p11_journal_discard",
+                "discard site in {name} (line {number}): nothing below the root discards",
+            );
         }
-        if current == "p11_journal_discard" {
-            // The leaf's own body delegating to the ring helper.
-            continue;
-        }
-        sites += 1;
+    }
+    for operation in [
+        "p11_journal_combined_entry",
+        "p11_journal_combined_return",
+        "p11_journal_combined_remove",
+    ] {
+        let body = functions.get(operation).expect("combined body present");
+        // N8: the fault cell reports BEFORE every handoff: each
+        // `uncommitted = record` line has a fault-cell store above it
+        // in the same body.
+        let handoffs: Vec<usize> = body
+            .iter()
+            .filter(|(_, text)| text.contains("uncommitted = record"))
+            .map(|(number, _)| *number)
+            .collect();
         assert!(
-            current == "p11_journal_combined_entry"
-                || current == "p11_journal_combined_return"
-                || current == "p11_journal_combined_remove",
-            "discard site in {current} (line {}) must live in a combined transaction",
-            index + 1
+            !handoffs.is_empty(),
+            "{operation} must hand its reservation back to the root"
+        );
+        let stores: Vec<usize> = body
+            .iter()
+            .filter(|(_, text)| {
+                text.contains("*txn->fault_out =") && !text.contains("==")
+            })
+            .map(|(number, _)| *number)
+            .collect();
+        for handoff in &handoffs {
+            assert!(
+                stores.iter().any(|store| store < handoff),
+                "{operation} line {handoff}: handoff without a fault store above it"
+            );
+        }
+    }
+    // N9: END submits only after the START leg commits; ABANDON only
+    // after the START leg runs (past the `start_leg` label).
+    let body = functions
+        .get("p11_journal_combined_return")
+        .expect("return body present");
+    let submit = body
+        .iter()
+        .find(|(_, text)| text.starts_with("p11_journal_submit("))
+        .map(|(number, _)| *number)
+        .expect("return submits its terminal");
+    let retired = body
+        .iter()
+        .find(|(_, text)| text.contains("p11_owner_start_remove"))
+        .map(|(number, _)| *number)
+        .expect("return retires its START leg");
+    assert!(
+        retired < submit,
+        "return submits END (line {submit}) before its START leg commits (line {retired})"
+    );
+    let body = functions
+        .get("p11_journal_combined_remove")
+        .expect("remove body present");
+    let submit = body
+        .iter()
+        .filter(|(_, text)| text.starts_with("p11_journal_submit("))
+        .map(|(number, _)| *number)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        submit.len(),
+        1,
+        "remove holds exactly one terminal submit, found {submit:?}"
+    );
+    let leg = body
+        .iter()
+        .find(|(_, text)| text.starts_with("start_leg:"))
+        .map(|(number, _)| *number)
+        .expect("remove sequences its START leg");
+    assert!(
+        leg < submit[0],
+        "remove submits ABANDON (line {}) before its START leg (line {leg})",
+        submit[0]
+    );
+    // C4: each operation gates its own publication kind at its entry
+    // point — a wrong-kind template never reaches the shared fill.
+    for (operation, kind) in [
+        ("p11_journal_combined_entry", "JOURNAL_KIND_BEGIN"),
+        ("p11_journal_combined_return", "JOURNAL_KIND_END"),
+        ("p11_journal_combined_remove", "JOURNAL_KIND_ABANDON"),
+    ] {
+        let body = functions.get(operation).expect("combined body present");
+        assert!(
+            body.iter().any(|(_, text)| text.contains(kind)),
+            "{operation} must gate its {kind} publication kind"
         );
     }
-    assert!(
-        sites >= 3,
-        "expected root-side discard sites, found {sites}"
-    );
 }
 
 /// Slice-A custody stays inactive: no live BPF root wires the journal

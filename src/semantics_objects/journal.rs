@@ -688,11 +688,15 @@ pub(crate) struct JournalAdapter {
     /// re-read must still show the audited one; a move anywhere in
     /// the chain voids and re-baselines.
     last_fault: Option<u64>,
-    /// The Session drain this adapter serves, pinned from the drain
-    /// itself at first collection: drain-obtained authority, never a
-    /// caller label. Collections through another drain consume
-    /// nothing, and their audits refuse at seal.
-    pinned_drain: Option<u64>,
+    /// The Session drains this adapter serves, one EVENTS-map identity
+    /// per attested native domain, bound exclusively by Session
+    /// authority ([`JournalAdapter::bind_session_drain`]) before any
+    /// collection. Presentation never pins: a drain whose EVENTS-map
+    /// identity is not bound to an attested domain consumes nothing
+    /// even when presented first, and a seal under a key whose domain
+    /// binds another EVENTS identity refuses. Bounded by the attested
+    /// domains (a subset of the key table).
+    drain_pins: BTreeMap<u64, u64>,
     invalidated: bool,
     stopped: bool,
     closure_generation: u64,
@@ -717,7 +721,7 @@ impl JournalAdapter {
             last_audit_failure: None,
             h3_voided_below: 0,
             last_fault: None,
-            pinned_drain: None,
+            drain_pins: BTreeMap::new(),
             invalidated: false,
             stopped: false,
             closure_generation: 0,
@@ -2315,6 +2319,17 @@ pub(crate) enum AttestationRefusal {
     ClaimsExhausted,
 }
 
+/// Finite Session-drain-bind refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrainBindRefusal {
+    /// The admission's native domain attested no key on this adapter:
+    /// only attested domains bind drains.
+    DomainUnattested,
+    /// The domain already binds another EVENTS-map identity: the first
+    /// Session binding wins, never a rebind.
+    DrainConflict,
+}
+
 impl JournalAdapter {
     /// Verify one Session-granted birth claim: its native evidence
     /// first, then the retained sightings/audit backstop. Shared by
@@ -2451,6 +2466,37 @@ impl JournalAdapter {
         }
         let era = self.keys[&key].era;
         Ok(JournalDomainProof { key, era })
+    }
+
+    /// Bind the Session drain serving one attested native domain: the
+    /// drain's EVENTS-map identity (read from the drain object itself)
+    /// to the admission's native domain tag (read from the admitted
+    /// call's journal binding). The joint seal tick calls this once per
+    /// Session from its own producers before the first collection; the
+    /// collection and seal paths only ever CHECK the binding, so a
+    /// foreign drain presented first refuses instead of becoming
+    /// authority. The domain must have attested (pins stay within the
+    /// key table), and the first binding wins: a conflicting rebind
+    /// refuses loudly. Repeating the same pair is idempotent.
+    pub(crate) fn bind_session_drain<S: crate::events::RecordSource>(
+        &mut self,
+        drain: &crate::events::EventDrain<S>,
+        admitted: &AdmittedInstanceCall,
+    ) -> Result<(), DrainBindRefusal> {
+        let (domain, _image, _router, _caller) = admitted.journal_binding();
+        let tag = domain.journal_tag();
+        if !self.keys.keys().any(|key| key.domain_tag == tag) {
+            return Err(DrainBindRefusal::DomainUnattested);
+        }
+        let events = drain.domain_id();
+        match self.drain_pins.get(&tag) {
+            Some(pinned) if *pinned == events => Ok(()),
+            Some(_) => Err(DrainBindRefusal::DrainConflict),
+            None => {
+                self.drain_pins.insert(tag, events);
+                Ok(())
+            }
+        }
     }
 
     /// Whether one key can still seal: bound, unrefused, untainted,
@@ -2685,13 +2731,14 @@ impl JournalAdapter {
         if self.is_tainted((key.cookie, key.exec)) {
             return Err(self.failure(JournalGap::ImageTainted));
         }
-        // The collection's drain must be this adapter's pinned drain:
-        // one Session's history never seals under another's key. The
-        // pin comes from the drain itself at first collection, never a
-        // caller label. Scripted (test-only) audits carry no drain and
-        // skip this binding.
+        // The collection's drain must be the EVENTS-map identity the
+        // Session bound to this proof's native domain: one Session's
+        // history never seals under another's key. The binding comes
+        // from Session authority before any collection, never from
+        // presentation or a caller label. Scripted (test-only) audits
+        // carry no drain and skip this binding.
         if let Some(drained) = audit.drain_domain
-            && Some(drained) != self.pinned_drain
+            && self.drain_pins.get(&key.domain_tag) != Some(&drained)
         {
             return Err(self.failure(JournalGap::DrainMismatch));
         }
@@ -3569,11 +3616,13 @@ impl JournalAdapter {
     /// ordinal in delivery order through the one dispatch poll, with the
     /// checked fault read before and after and the drain's malformed
     /// and discard deltas. The collection's drain domain is read from
-    /// the drain itself (the adapter pins it at first collection; the
-    /// seal refuses foreign-drain audits), and H0's post-quantum
+    /// the drain itself and CHECKED against the Session binding (an
+    /// unbound drain consumes nothing, even presented first; the seal
+    /// refuses foreign-drain audits per key), and H0's post-quantum
     /// allocation watermark rides along for H3 coverage. Collection
     /// stages wire truth only; the seal audits this evidence before
-    /// any model input.
+    /// any model input. Collection never pins: only
+    /// [`JournalAdapter::bind_session_drain`] establishes bindings.
     ///
     /// DISCARD observability: the patched Aya reader counts consumed
     /// kernel-discarded reservations (see the ring-reader patch: both
@@ -3592,13 +3641,17 @@ impl JournalAdapter {
         fault: &impl FaultEpoch,
         h0_allocated_below: u64,
     ) -> JournalCollection {
-        // Drain-obtained authority: the first presented drain pins the
-        // adapter; a foreign drain consumes nothing (its audit refuses
-        // at seal). No caller label names the domain.
+        // Session-bound authority: the drain's EVENTS-map identity
+        // must be bound to an attested domain before this collection;
+        // an unbound drain consumes nothing (its audit refuses at
+        // seal), even when presented first. Collection checks the
+        // binding but never establishes it. No caller label names the
+        // domain.
         let drain_domain = drain.domain_id();
-        if self
-            .pinned_drain
-            .is_some_and(|pinned| pinned != drain_domain)
+        if !self
+            .drain_pins
+            .values()
+            .any(|pinned| *pinned == drain_domain)
         {
             // A refused collect still reports its fault read honestly:
             // an unreadable cell voids at seal like any other tick.
@@ -3618,7 +3671,6 @@ impl JournalAdapter {
                 h0_allocated_below,
             };
         }
-        self.pinned_drain = Some(drain_domain);
         let fault_before = match fault.fault_epoch() {
             Ok(epoch) => epoch,
             Err(error) => {
@@ -4341,6 +4393,21 @@ mod tests {
             self.adapter.attest_key(&admitted).expect("key attests")
         }
 
+        /// Session authority binds this scene's drain (one EVENTS-map
+        /// identity) to the attested native domain, before any
+        /// collection: the joint tick's bind step. The domain must have
+        /// attested first.
+        fn bind_session_drain(&mut self, events_id: u64) {
+            let admitted = self.fixture.admit();
+            let drain = crate::events::EventDrain::over_test_domain(
+                crate::events::ScriptedRecords::records(Vec::new(), 0),
+                events_id,
+            );
+            self.adapter
+                .bind_session_drain(&drain, &admitted)
+                .expect("session drain binds");
+        }
+
         fn ingest(&mut self, bytes: &[u8]) -> JournalDisposition {
             use p11scope_ebpf_common::object_journal::decode_journal_record;
             let record =
@@ -4422,7 +4489,8 @@ mod tests {
 
         /// One production collection over scripted ring bytes: the real
         /// dispatch poll, real decode, real malformed accounting and the
-        /// scripted fault cell.
+        /// scripted fault cell. Binds the scene drain first (the joint
+        /// tick's bind step; idempotent across collections).
         fn collect_records(
             &mut self,
             records: Vec<Vec<u8>>,
@@ -4433,6 +4501,10 @@ mod tests {
                 crate::events::ScriptedRecords::records(records, bound),
                 7,
             );
+            let admitted = self.fixture.admit();
+            self.adapter
+                .bind_session_drain(&drain, &admitted)
+                .expect("scene drain binds");
             self.adapter
                 .collect_from_drain(&mut drain, &self.descriptors, Some(bound), fault, 0)
         }
@@ -5393,6 +5465,7 @@ mod tests {
         // flows on the next collection.
         let mut scene = Scene::new(image_default());
         let proof = scene.attest();
+        scene.bind_session_drain(7);
         let create = function_id("C_CreateObject");
         let begin = begin_bytes(1, 1, create, 0);
         let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
@@ -5423,7 +5496,11 @@ mod tests {
         assert!(has_effect(&success.effects, "created"));
 
         // A stall before the first record consumes nothing at all.
+        // (Bound, so the zero-consumption proves the BUSY stall, not an
+        // unbound-drain refusal.)
         let mut scene = Scene::new(image_default());
+        scene.attest();
+        scene.bind_session_drain(7);
         let mut script = BusyScript::new(vec![begin.to_vec()]);
         script.busy_after = Some(0);
         let mut drain = crate::events::EventDrain::over_test_domain(script, 7);
@@ -5698,11 +5775,11 @@ mod tests {
         // An unreadable fault stages nothing and refuses; a saturated
         // fault stops the adapter permanently.
         let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
         let begin = begin_bytes(1, 1, create, 0);
         let fault = ScriptedFaultCell::failing();
         let collection = scene.collect_records(vec![begin.to_vec()], &fault);
         assert_eq!((collection.ingested, collection.ordinary), (0, 0));
-        let proof = scene.attest();
         let bootstrap = scene.bootstrap(proof, 0);
         let failure = scene
             .seal_collected(&bootstrap, &collection)
@@ -8404,26 +8481,27 @@ mod tests {
 
     #[test]
     fn object_journal_collection_binds_drain_session() {
-        // C4: the collection's drain domain is drain-obtained authority,
-        // never a caller label. The first presented drain pins the
-        // adapter; a foreign drain consumes nothing, and its audit
-        // refuses at seal as a wiring refusal. The adapter's own drain
-        // seals.
+        // C2/C4: the drain's EVENTS-map identity is bound to the attested
+        // key's native domain by Session authority BEFORE any
+        // collection; presentation never pins. A foreign drain presented
+        // FIRST refuses and consumes nothing (it never becomes accepted
+        // authority); the bound Session drain then collects and seals; a
+        // foreign drain presented after still refuses. Binding an
+        // unattested domain, or rebinding a bound one, refuses loudly.
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
         let mut scene = Scene::new(image_default());
         let proof = scene.attest();
+        // Session authority binds the Session drain (EVENTS 7) to the
+        // attested native domain; no drain has been presented yet. The
+        // same pair rebinds idempotently.
+        scene.bind_session_drain(7);
+        scene.bind_session_drain(7);
         let create = function_id("C_CreateObject");
-        let begin = begin_bytes(1, 1, create, 0);
-        let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
         let fault = ScriptedFaultCell::steady(7);
-        let collection = scene.collect_records(vec![begin.to_vec(), end.to_vec()], &fault);
-        assert_eq!(collection.drain_domain, 7);
         let bootstrap = scene.bootstrap(proof, 0);
-        scene
-            .seal_collected(&bootstrap, &collection)
-            .expect("own drain seals");
-        // A foreign drain consumes nothing past the pin.
+        // FOREIGN FIRST: EVENTS 9 presented before the Session drain ever
+        // collects refuses and consumes nothing.
         let foreign = begin_bytes(1, 2, create, 0);
         let mut drain = crate::events::EventDrain::over_test_domain(
             crate::events::ScriptedRecords::records(vec![foreign.to_vec()], 1),
@@ -8435,16 +8513,58 @@ mod tests {
                 .collect_from_drain(&mut drain, &scene.descriptors, None, &fault, 0);
         assert_eq!((refused.ingested, refused.ordinary), (0, 0));
         assert_eq!(refused.drain_domain, 9);
-        assert_eq!(scene.adapter.consumed_through, 2);
+        assert_eq!(scene.adapter.consumed_through, 0);
         // Its audit refuses the seal without voiding staged proof.
-        let mut source = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(2));
+        let mut source = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(0));
         let audit = JournalAuditReceipt::collect(&refused, &mut source, 0);
         let frontier = scene.adapter.consumed_frontier();
         let fresh = SessionBirthEvidence::scripted_for_receipt(&bootstrap);
         let failure = scene
             .seal_explicit(&audit, &bootstrap, frontier, &fresh)
-            .expect_err("foreign drain refuses");
+            .expect_err("first-presented foreign drain refuses");
         assert_eq!(failure.gap, JournalGap::DrainMismatch);
+        // THE SESSION DRAIN collects and seals.
+        let begin = begin_bytes(1, 1, create, 0);
+        let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        let collection = scene.collect_records(vec![begin.to_vec(), end.to_vec()], &fault);
+        assert_eq!(collection.drain_domain, 7);
+        scene
+            .seal_collected(&bootstrap, &collection)
+            .expect("own drain seals");
+        // FOREIGN AFTER: still refuses and consumes nothing.
+        let mut drain = crate::events::EventDrain::over_test_domain(
+            crate::events::ScriptedRecords::records(vec![foreign.to_vec()], 1),
+            9,
+        );
+        let refused =
+            scene
+                .adapter
+                .collect_from_drain(&mut drain, &scene.descriptors, None, &fault, 0);
+        assert_eq!((refused.ingested, refused.ordinary), (0, 0));
+        assert_eq!(scene.adapter.consumed_through, 2);
+        // Bind discipline: an unattested domain binds nothing, and a
+        // bound domain never rebinds to another EVENTS identity.
+        let mut stranger = Scene::new(image_default());
+        let admitted = stranger.fixture.admit();
+        let drain = crate::events::EventDrain::over_test_domain(
+            crate::events::ScriptedRecords::records(Vec::new(), 0),
+            11,
+        );
+        assert_eq!(
+            stranger.adapter.bind_session_drain(&drain, &admitted),
+            Err(DrainBindRefusal::DomainUnattested)
+        );
+        stranger.attest();
+        stranger.bind_session_drain(11);
+        let conflict = crate::events::EventDrain::over_test_domain(
+            crate::events::ScriptedRecords::records(Vec::new(), 0),
+            13,
+        );
+        let admitted = stranger.fixture.admit();
+        assert_eq!(
+            stranger.adapter.bind_session_drain(&conflict, &admitted),
+            Err(DrainBindRefusal::DrainConflict)
+        );
     }
 
     #[test]
@@ -9019,6 +9139,7 @@ mod tests {
 
         let mut scene = Scene::new(image_default());
         let proof = scene.attest();
+        scene.bind_session_drain(7);
         let create = function_id("C_CreateObject");
         let begin = begin_bytes(1, 1, create, 0);
         let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);

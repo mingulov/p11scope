@@ -778,24 +778,17 @@ pub(crate) enum BirthObservationRefusal {
     /// domain/image/caller: the held pidfd is not bound to the
     /// admitted image.
     BindingMismatch,
-    /// The row's observed `exec_attach_gen` is not the sealed
-    /// closure's minted generation: the exec did not happen under
-    /// this closure.
+    /// The observed attach generation is not the sealed closure's
+    /// minted generation: the row's `exec_attach_gen` (exec birth)
+    /// or the negative scan's attach cell (absence birth) ran under
+    /// another closure.
     GenerationMismatch,
-    /// The router refused the baseline scan: no sealed appearance to
-    /// measure the new one against.
-    PriorScanRejected,
-    /// The appearance names another process, domain, or file than the
-    /// baseline: not this birth's appearance.
+    /// The negative witness or the appearance names another process,
+    /// domain, or file: not this birth's witness pair.
     AppearanceForeign,
     /// The appearance epochs did not strictly advance past the
-    /// baseline: no un-journaled exec to backfill.
+    /// negative: no un-journaled exec to backfill.
     AppearanceNotAdvanced,
-    /// The appearance retains baseline mappings: absence is the
-    /// prior mappings completely gone at a changed epoch with a full
-    /// new mapping — any retained or overlapping range is
-    /// continuation (or teardown), never rebirth.
-    MappingsRetained,
     /// The real router refused the appearance (already observed at
     /// these epochs, stale era, retired): no accepted mapping.
     AppearanceRejected,
@@ -901,19 +894,22 @@ pub(crate) fn observe_exec_birth(
 }
 
 /// Session-owned absence-appearance birth observation: the shared
-/// producers plus a router-joined re-observation at advanced epochs.
-/// The marker row reads back unmarked (absence births never publish,
-/// so any publication or poisoning refuses); the baseline scan seals
-/// through the real router; and the appearance — same process,
-/// domain, and file, strictly advanced epochs, and a full mapping
-/// disjoint from the baseline (the prior mappings completely gone —
-/// a teardown, continuation or shrink-in-place is not absence) —
-/// joins as a router-accepted new observation. No caller-provided
+/// producers plus a committed negative witness followed by a
+/// router-joined appearance at advanced epochs. The marker row reads
+/// back unmarked (absence births never publish, so any publication
+/// or poisoning refuses); the sealed provider-free interval names
+/// this birth's process and ran after the sealed closure (its attach
+/// cell equals the closure's minted generation); and the appearance
+/// — same process, domain, and file, strictly advanced epochs past
+/// the negative, a full accepted mapping — joins as a
+/// router-accepted new observation. The positive stays withheld
+/// until the negative commits: every negative check passes before
+/// the appearance joins the router. No caller-provided
 /// record/control structs on this path. Live map reads stay UNRUN:
 /// production wires [`LiveBirthRows`] and live scans.
 pub(crate) fn observe_absence_birth(
     rows: &mut impl BirthRowReader,
-    prior: crate::attach::image_query::ImageScanProof,
+    absence: crate::attach::image_query::ImageAbsenceProof,
     appearance: crate::attach::image_query::ImageScanProof,
     router: &mut crate::discovery::instances::InstanceRouter,
     binding: &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
@@ -936,49 +932,37 @@ pub(crate) fn observe_absence_birth(
     if record.journal_bootstrap != 0 {
         return Err(BirthObservationRefusal::MarkerPublished);
     }
-    // Same birth's appearance: the baseline scans the admitted
-    // process, and the appearance continues that process, domain,
-    // and file. Anything else is not this birth's appearance.
-    if prior.image().task_cookie != image.0
-        || appearance.image().task_cookie != prior.image().task_cookie
-        || appearance.domain() != prior.domain()
-        || appearance.file_slot() != prior.file_slot()
+    // The negative commits first: the sealed provider-free interval
+    // scans the admitted process, and its attach cell is the sealed
+    // closure's minted generation — the enumeration ran after this
+    // closure's publication. A scan of another process, or one that
+    // ran under another closure, is not this birth's witness.
+    if absence.image().task_cookie != image.0 {
+        return Err(BirthObservationRefusal::AppearanceForeign);
+    }
+    if absence.attach_generation() != attachment.generation() {
+        return Err(BirthObservationRefusal::GenerationMismatch);
+    }
+    // Same birth's appearance: it continues the negative's process,
+    // domain, and file. Anything else is not this birth's
+    // appearance.
+    if appearance.image().task_cookie != absence.image().task_cookie
+        || appearance.domain() != absence.domain()
+        || appearance.file_slot() != absence.file_slot()
     {
         return Err(BirthObservationRefusal::AppearanceForeign);
     }
-    // Strictly advanced epochs: the un-journaled exec the birth
-    // backfills. Unchanged counters are a re-presentation, not an
-    // absence.
-    let before = prior.epochs();
+    // Strictly advanced epochs past the negative: the un-journaled
+    // exec the birth backfills. Unchanged counters are a
+    // re-presentation, not an appearance.
+    let before = absence.epochs();
     let after = appearance.epochs();
     if (after.local, after.global) <= (before.local, before.global) {
         return Err(BirthObservationRefusal::AppearanceNotAdvanced);
     }
-    // Complete mapping absence: the prior mappings must be
-    // completely gone — no appearance range may overlap any baseline
-    // range — at the changed epoch, with a full new mapping. A
-    // teardown (retained ranges), a continuation (same ranges, new
-    // epochs) or a shrink-in-place (overlapping bounds) never proves
-    // non-existence. Sealed scans are never empty (the acquisition
-    // protocol refuses empties), so disjointness — not zero ranges —
-    // carries the absence; the plan forbids empty scans as absence.
-    let retained = appearance.ranges().iter().any(|after| {
-        prior.ranges().iter().any(|before| {
-            let (a, b) = (after.span(), before.span());
-            a.0 < b.1 && b.0 < a.1
-        })
-    });
-    if retained {
-        return Err(BirthObservationRefusal::MappingsRetained);
-    }
-    // The baseline seals through the real router first (newly or as a
-    // continued re-observation); then the appearance must join as a
+    // The negative committed: the appearance must join as a
     // genuinely new observation. Anything else refuses.
     use crate::discovery::instances::ObserveOutcome;
-    match router.observe(prior).0 {
-        ObserveOutcome::New | ObserveOutcome::Continued => {}
-        _ => return Err(BirthObservationRefusal::PriorScanRejected),
-    }
     match router.observe(appearance).0 {
         ObserveOutcome::New => {}
         _ => return Err(BirthObservationRefusal::AppearanceRejected),
@@ -989,7 +973,7 @@ pub(crate) fn observe_absence_birth(
         image,
         0,
         control.failed,
-        record.exec_attach_gen,
+        absence.attach_generation(),
         custody_word,
     );
     Ok((token, evidence))
@@ -1111,13 +1095,13 @@ impl<R: BirthRowReader> crate::semantics_objects::journal::BirthEvidenceSource
 }
 
 /// Production absence-appearance birth source: each take re-runs the
-/// absence observation (router-sealed baseline, advanced-epoch
+/// absence observation (committed negative witness, advanced-epoch
 /// appearance) against live native state. UNRUN: the Session loop
 /// wires live scans when the journal activates.
 #[allow(dead_code)] // No Session-loop wire until live activation; tests drive fixtures.
 pub(crate) struct AbsenceBirthSource<'a, R> {
     rows: R,
-    prior: Option<crate::attach::image_query::ImageScanProof>,
+    absence: Option<crate::attach::image_query::ImageAbsenceProof>,
     appearance: Option<crate::attach::image_query::ImageScanProof>,
     router: &'a mut crate::discovery::instances::InstanceRouter,
     binding: &'a crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
@@ -1127,14 +1111,14 @@ pub(crate) struct AbsenceBirthSource<'a, R> {
 
 #[allow(dead_code)] // As above.
 impl<'a, R: BirthRowReader> AbsenceBirthSource<'a, R> {
-    /// Wire one absence birth: live rows, the sealed baseline scan,
-    /// the appearance, and the real router that must accept both.
-    /// (Too many arguments is the honest shape: every producer is
-    /// injected, none supplied.)
+    /// Wire one absence birth: live rows, the sealed negative
+    /// witness, the appearance, and the real router the appearance
+    /// must join. (Too many arguments is the honest shape: every
+    /// producer is injected, none supplied.)
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn over(
         rows: R,
-        prior: crate::attach::image_query::ImageScanProof,
+        absence: crate::attach::image_query::ImageAbsenceProof,
         appearance: crate::attach::image_query::ImageScanProof,
         router: &'a mut crate::discovery::instances::InstanceRouter,
         binding: &'a crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
@@ -1143,7 +1127,7 @@ impl<'a, R: BirthRowReader> AbsenceBirthSource<'a, R> {
     ) -> Self {
         Self {
             rows,
-            prior: Some(prior),
+            absence: Some(absence),
             appearance: Some(appearance),
             router,
             binding,
@@ -1163,22 +1147,22 @@ impl<R: BirthRowReader> crate::semantics_objects::journal::BirthEvidenceSource
         crate::semantics_objects::journal::SessionBirthEvidence,
         BirthObservationRefusal,
     > {
-        // The scans are single-shot: the first take consumes the
-        // source's pair, so a reused appearance cannot birth twice.
-        // (A second take would need a fresh acquisition; the seal
-        // pulls exactly one birth per grant.) Takes after the first
-        // fail closed on the consumed scans.
-        let prior = self
-            .prior
+        // The witness pair is single-shot: the first take consumes
+        // the source's scans, so a reused appearance cannot birth
+        // twice. (A second take would need a fresh acquisition; the
+        // seal pulls exactly one birth per grant.) Takes after the
+        // first fail closed on the consumed scans.
+        let absence = self
+            .absence
             .take()
-            .ok_or(BirthObservationRefusal::PriorScanRejected)?;
+            .ok_or(BirthObservationRefusal::AppearanceRejected)?;
         let appearance = self
             .appearance
             .take()
             .ok_or(BirthObservationRefusal::AppearanceRejected)?;
         observe_absence_birth(
             &mut self.rows,
-            prior,
+            absence,
             appearance,
             self.router,
             self.binding,
@@ -1211,6 +1195,14 @@ impl InstanceMaps<'_> {
 
     pub(crate) fn sticky(&self) -> Result<u64> {
         self.array_u64("INSTANCE_GEN", instance::GEN_STICKY)
+    }
+
+    /// The live attach cell (`INSTANCE_GEN[GEN_ATTACH]`): the closure
+    /// generation native stamps exec'ing records from. The absence
+    /// seal reads it inside its brackets; the observer compares it to
+    /// the claimed closure. UNRUN: live map access stays out of tests.
+    pub(crate) fn attach_cell(&self) -> Result<u64> {
+        self.array_u64("INSTANCE_GEN", instance::GEN_ATTACH)
     }
 
     pub(crate) fn counters(&self) -> Result<InstanceCounters> {

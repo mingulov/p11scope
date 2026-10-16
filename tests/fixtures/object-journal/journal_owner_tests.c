@@ -556,11 +556,19 @@ static void side_map_rejects_bad_shapes(void)
 #endif
 }
 
+static int init_header(unsigned char *record, u64 bytes, u64 kind, u64 flags, u64 thread,
+                       u64 sequence)
+{
+    struct journal_header_spec spec = {bytes, kind, flags, thread, sequence};
+    return p11_journal_header_init(record, &spec);
+}
+
 static void ring_header_matrix(void)
 {
     unsigned char record[32];
     reset();
-    EXPECT(p11_journal_header_init(record, JOURNAL_BEGIN_BYTES, JOURNAL_KIND_BEGIN, 0, 7, 3) == 0,
+    EXPECT(sizeof(struct journal_header_spec) == 40, "header spec is 40 B");
+    EXPECT(init_header(record, JOURNAL_BEGIN_BYTES, JOURNAL_KIND_BEGIN, 0, 7, 3) == 0,
            "valid BEGIN header writes");
     EXPECT(record[0] == 1 && record[1] == 0, "version bytes are exact");
     EXPECT(record[2] == 224 && record[3] == 0, "BEGIN length bytes are exact");
@@ -569,39 +577,40 @@ static void ring_header_matrix(void)
     EXPECT(record[6] == 0 && record[7] == 0, "reserved stays zero");
     EXPECT(memcmp(record + 8, &(u64){7}, 8) == 0, "thread word is exact");
     EXPECT(memcmp(record + 16, &(u64){3}, 8) == 0, "sequence word is exact");
-    EXPECT(p11_journal_header_init(
+    EXPECT(init_header(
                record, JOURNAL_BEGIN_BYTES, JOURNAL_KIND_BEGIN, JOURNAL_FLAG_NO_END, 7,
                3) == 0,
            "BEGIN admits NO_END");
-    EXPECT(p11_journal_header_init(
+    EXPECT(init_header(
                record, JOURNAL_END_FULL_BYTES, JOURNAL_KIND_END, JOURNAL_FLAG_ABSENT_TAIL, 7,
                3) == 0,
            "END admits absent-tail");
-    EXPECT(p11_journal_header_init(
+    EXPECT(init_header(
                record, JOURNAL_END_COMPACT_BYTES, JOURNAL_KIND_END, 0, 7, 3) == 0,
            "compact END admits");
-    EXPECT(p11_journal_header_init(record, JOURNAL_ABANDON_BYTES, JOURNAL_KIND_ABANDON, 0, 7, 3) ==
+    EXPECT(init_header(record, JOURNAL_ABANDON_BYTES, JOURNAL_KIND_ABANDON, 0, 7, 3) ==
                0,
            "ABANDON admits");
-    EXPECT(p11_journal_header_init(record, JOURNAL_BEGIN_BYTES, JOURNAL_KIND_BEGIN, 2, 7, 3) == -1,
+    EXPECT(init_header(record, JOURNAL_BEGIN_BYTES, JOURNAL_KIND_BEGIN, 2, 7, 3) == -1,
            "BEGIN rejects bit1");
-    EXPECT(p11_journal_header_init(record, JOURNAL_BEGIN_BYTES, JOURNAL_KIND_BEGIN, 0, 0, 3) == -1,
+    EXPECT(init_header(record, JOURNAL_BEGIN_BYTES, JOURNAL_KIND_BEGIN, 0, 0, 3) == -1,
            "zero thread refuses");
-    EXPECT(p11_journal_header_init(record, JOURNAL_BEGIN_BYTES, JOURNAL_KIND_BEGIN, 0, 7, 0) == -1,
+    EXPECT(init_header(record, JOURNAL_BEGIN_BYTES, JOURNAL_KIND_BEGIN, 0, 7, 0) == -1,
            "zero sequence refuses");
-    EXPECT(p11_journal_header_init(record, 100, JOURNAL_KIND_BEGIN, 0, 7, 3) == -1,
+    EXPECT(init_header(record, 100, JOURNAL_KIND_BEGIN, 0, 7, 3) == -1,
            "wrong BEGIN length refuses");
-    EXPECT(p11_journal_header_init(record, JOURNAL_END_FULL_BYTES, JOURNAL_KIND_END, 1, 7, 3) == -1,
+    EXPECT(init_header(record, JOURNAL_END_FULL_BYTES, JOURNAL_KIND_END, 1, 7, 3) == -1,
            "END rejects NO_END");
-    EXPECT(p11_journal_header_init(record, 100, JOURNAL_KIND_END, 0, 7, 3) == -1,
+    EXPECT(init_header(record, 100, JOURNAL_KIND_END, 0, 7, 3) == -1,
            "wrong END length refuses");
-    EXPECT(p11_journal_header_init(record, JOURNAL_ABANDON_BYTES, JOURNAL_KIND_ABANDON, 1, 7, 3) ==
+    EXPECT(init_header(record, JOURNAL_ABANDON_BYTES, JOURNAL_KIND_ABANDON, 1, 7, 3) ==
                -1,
            "ABANDON rejects flags");
-    EXPECT(p11_journal_header_init(record, JOURNAL_BEGIN_BYTES, 9, 0, 7, 3) == -1,
+    EXPECT(init_header(record, JOURNAL_BEGIN_BYTES, 9, 0, 7, 3) == -1,
            "unknown kind refuses");
-    EXPECT(p11_journal_header_init(NULL, JOURNAL_BEGIN_BYTES, JOURNAL_KIND_BEGIN, 0, 7, 3) == -1,
+    EXPECT(init_header(NULL, JOURNAL_BEGIN_BYTES, JOURNAL_KIND_BEGIN, 0, 7, 3) == -1,
            "NULL record refuses");
+    EXPECT(p11_journal_header_init(record, NULL) == -1, "NULL spec refuses");
     EXPECT(!journal_header_valid(224, 1, 0, 1, 7, 3), "nonzero reserved refuses");
 }
 

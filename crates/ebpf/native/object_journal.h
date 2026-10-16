@@ -110,6 +110,19 @@ static void *(*journal_ring_reserve)(void *, u64, u64) = (void *)131;
 static void (*journal_ring_submit)(void *, u64) = (void *)132;
 static void (*journal_ring_discard)(void *, u64) = (void *)133;
 
+/* Header-init words in one struct: a BPF subprogram takes at most
+ * five scalar arguments, so the six header words cross as one
+ * pointer. */
+struct journal_header_spec {
+    u64 bytes;
+    u64 kind;
+    u64 flags;
+    u64 thread;
+    u64 sequence;
+};
+
+_Static_assert(sizeof(struct journal_header_spec) == 40, "header spec ABI");
+
 /* Skeleton leaves. 0/-1 status; nonzero ticket/sequence on success, 0
  * on refusal (caller raises loss before provider execution or
  * discard). */
@@ -120,8 +133,7 @@ int p11_journal_side_insert(void *map, const struct journal_start_key *key,
                             const struct journal_start_value *value);
 void *p11_journal_side_lookup(void *map, const struct journal_start_key *key);
 int p11_journal_side_remove(void *map, const struct journal_start_key *key);
-int p11_journal_header_init(void *record, u64 bytes, u64 kind, u64 flags, u64 thread,
-                            u64 sequence);
+int p11_journal_header_init(void *record, const struct journal_header_spec *spec);
 void *p11_journal_reserve(void *ring, u64 bytes);
 void p11_journal_submit(void *record);
 void p11_journal_discard(void *record);

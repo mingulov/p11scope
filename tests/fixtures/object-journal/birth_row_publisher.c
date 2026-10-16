@@ -7,7 +7,7 @@
  * publication/dirty/admission implementation. Inactive: no live root
  * calls these leaves.
  *
- * Usage: birth_row_publisher <exec> [admit-count] [dirty] [admit-exec] [nopub]
+ * Usage: birth_row_publisher <exec> [admit-count] [dirty] [admit-exec] [nopub] [gen]
  *   exec:        publication exec id (0 allowed: READY(0) is word 2)
  *   admit-count: admission attempts (each a real admit() call)
  *   dirty:       nonzero runs the real dirty() leaf after publication
@@ -15,6 +15,11 @@
  *                mismatch trips the failed latch natively)
  *   nopub:       nonzero skips publication (dumps the unmarked row;
  *                dirty still applies, so nopub+dirty dumps DIRTY)
+ *   gen:         exec_attach_gen word to stamp (default 0). Argv-settled:
+ *                it models the BPF exec-stamp from the attach cell (the
+ *                stamp itself is covered in instance_epoch); what the
+ *                Rust observation tests pin is the generation comparison,
+ *                not this word's provenance.
  * Output:
  *   ROW <152 bytes as hex>
  *   CTL <16 bytes as hex>
@@ -40,9 +45,11 @@ int main(int argc, char **argv)
     static struct instance_record rec;
     static struct journal_admission_control ctl;
     unsigned long exec, admits, dirty, admit_exec, nopub, i, wins;
+    unsigned long long gen;
 
-    if (argc < 2 || argc > 6) {
-        fprintf(stderr, "usage: %s <exec> [admit-count] [dirty] [admit-exec] [nopub]\n",
+    if (argc < 2 || argc > 7) {
+        fprintf(stderr,
+                "usage: %s <exec> [admit-count] [dirty] [admit-exec] [nopub] [gen]\n",
                 argv[0]);
         return 2;
     }
@@ -51,10 +58,13 @@ int main(int argc, char **argv)
     dirty = (argc > 3) ? strtoul(argv[3], 0, 0) : 0;
     admit_exec = (argc > 4) ? strtoul(argv[4], 0, 0) : exec;
     nopub = (argc > 5) ? strtoul(argv[5], 0, 0) : 0;
+    gen = (argc > 6) ? strtoull(argv[6], 0, 0) : 0;
     if (exec > 0x3fffffffffffffffUL || admit_exec > 0x3fffffffffffffffUL)
         return 2;
     memset(&rec, 0, sizeof(rec));
     memset(&ctl, 0, sizeof(ctl));
+    /* The argv-settled exec stamp (see the header comment). */
+    rec.exec_attach_gen = (u64)gen;
     if (!nopub && !p11_journal_marker_publish(&rec, (u64)exec)) {
         fprintf(stderr, "publish refused\n");
         return 1;

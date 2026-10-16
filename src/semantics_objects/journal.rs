@@ -1986,16 +1986,20 @@ pub(crate) enum BirthRefusal {
 /// Session-observed native evidence behind a birth claim: the image
 /// bound by the same held-custody proof, the `journal_bootstrap`
 /// marker word read back with it, the admission-latch failure count,
-/// and the held-custody generation. Private fields: production
-/// observation mints only through the Session issuance capability;
-/// attestation checks the grant's evidence and the seal re-checks
-/// FRESH evidence, so native truth that moved between the two (a
-/// scope-dirtied marker, a tripped latch, lost custody) refuses.
+/// the observed attach generation (the row's `exec_attach_gen` for an
+/// exec birth, the negative scan's attach cell for absence), and the
+/// held-custody generation. Private fields: production observation
+/// mints only through the Session issuance capability; attestation
+/// checks the grant's evidence and the seal re-checks FRESH evidence,
+/// so native truth that moved between the two (a scope-dirtied
+/// marker, a tripped latch, lost custody, a generation that moved
+/// past the closure) refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SessionBirthEvidence {
     image: (u64, u64),
     marker_word: u64,
     admission_failed: u64,
+    attach_generation: u64,
     custody: u64,
 }
 
@@ -2011,12 +2015,14 @@ impl SessionBirthEvidence {
         image: (u64, u64),
         marker_word: u64,
         admission_failed: u64,
+        attach_generation: u64,
         custody: u64,
     ) -> Self {
         Self {
             image,
             marker_word,
             admission_failed,
+            attach_generation,
             custody,
         }
     }
@@ -2026,12 +2032,14 @@ impl SessionBirthEvidence {
         image: (u64, u64),
         marker_word: u64,
         admission_failed: u64,
+        attach_generation: u64,
         custody: u64,
     ) -> Self {
         Self {
             image,
             marker_word,
             admission_failed,
+            attach_generation,
             custody,
         }
     }
@@ -2054,24 +2062,39 @@ impl SessionBirthEvidence {
     }
 
     #[cfg(test)]
+    pub(crate) fn attach_generation(&self) -> u64 {
+        self.attach_generation
+    }
+
+    #[cfg(test)]
     pub(crate) fn custody(&self) -> u64 {
         self.custody
     }
 
     /// Canonical valid evidence for one sealed receipt: the READY
     /// marker naming the proof image's exec id, or the unmarked word
-    /// for absence; a clean latch and live custody.
+    /// for absence; a clean latch, the receipt's closure generation,
+    /// and live custody.
     #[cfg(test)]
     pub(crate) fn scripted_for_receipt(receipt: &BootstrapReceipt) -> Self {
         let proof = receipt.proof();
-        Self::scripted_canonical((proof.key.cookie, proof.key.exec), receipt.birth())
+        Self::scripted_canonical(
+            (proof.key.cookie, proof.key.exec),
+            receipt.birth(),
+            receipt.closure_generation(),
+        )
     }
 
-    /// Canonical valid evidence for one image and birth kind: the READY
-    /// marker naming the image's exec id (real native encoding), or the
-    /// unmarked word for absence; a clean latch and live custody.
+    /// Canonical valid evidence for one image, birth kind and closure
+    /// generation: the READY marker naming the image's exec id (real
+    /// native encoding), or the unmarked word for absence; a clean
+    /// latch, the closure's generation, and live custody.
     #[cfg(test)]
-    pub(crate) fn scripted_canonical(image: (u64, u64), birth: BirthKind) -> Self {
+    pub(crate) fn scripted_canonical(
+        image: (u64, u64),
+        birth: BirthKind,
+        closure_generation: u64,
+    ) -> Self {
         let marker_word = match birth {
             BirthKind::ExecMarker => p11scope_ebpf_common::journal_marker::ready_word(image.1),
             BirthKind::AbsenceAppearance => 0,
@@ -2080,6 +2103,7 @@ impl SessionBirthEvidence {
             image,
             marker_word,
             admission_failed: 0,
+            attach_generation: closure_generation,
             custody: 1,
         }
     }
@@ -2139,7 +2163,7 @@ impl SessionBirthGrant {
             birth,
             birth_cut,
             closure_generation,
-            evidence: SessionBirthEvidence::scripted_canonical(image, birth),
+            evidence: SessionBirthEvidence::scripted_canonical(image, birth, closure_generation),
         }
     }
 
@@ -2259,6 +2283,7 @@ impl BootstrapReceipt {
             grant.birth_cut,
             fenced_through,
             &grant.evidence,
+            grant.closure_generation,
         )?;
         Ok(Self { grant: *grant })
     }
@@ -2426,7 +2451,12 @@ impl JournalAdapter {
     /// is the key's void fence: absence requires zero UNFENCED
     /// affecting evidence at or below the cut and a chain unbroken
     /// since the fence. Exec-marker novelty stays strict: a fenced
-    /// past is still a past.
+    /// past is still a past. `closure_generation` is the live closure
+    /// the birth is claimed under: an exec birth's observed attach
+    /// generation must equal it (the exec happened under this
+    /// closure). Absence binds its generation separately (the negative
+    /// scan's attach cell); until that lands the row word is carried
+    /// but unchecked for absence births.
     fn verify_birth(
         &self,
         proof: &JournalDomainProof,
@@ -2434,6 +2464,7 @@ impl JournalAdapter {
         birth_cut: u64,
         fenced_through: u64,
         evidence: &SessionBirthEvidence,
+        closure_generation: u64,
     ) -> Result<(), BirthRefusal> {
         let image = (proof.key.cookie, proof.key.exec);
         // Native evidence first: the observed image must be this one,
@@ -2444,6 +2475,9 @@ impl JournalAdapter {
         // absence. Dirty, invalid or mismatched states refuse; zero
         // custody binds nothing.
         if evidence.image != image || evidence.custody == 0 || evidence.admission_failed != 0 {
+            return Err(BirthRefusal::EvidenceMismatch);
+        }
+        if birth == BirthKind::ExecMarker && evidence.attach_generation != closure_generation {
             return Err(BirthRefusal::EvidenceMismatch);
         }
         let marker_ok = match birth {
@@ -2858,6 +2892,7 @@ impl JournalAdapter {
             bootstrap.birth_cut(),
             state.void_fence,
             &fresh,
+            self.closure_generation,
         ) {
             // The receipt generation was checked above, so only taint
             // keeps its own gap here.
@@ -8050,6 +8085,7 @@ mod tests {
             (COOKIE, EXEC),
             p11scope_ebpf_common::journal_marker::MARKER_UNPUBLISHED,
             0,
+            scene.closure_generation(),
             1,
         );
         let grant = SessionBirthGrant::scripted_with_evidence(
@@ -8284,21 +8320,24 @@ mod tests {
         scene.ingest(&begin);
         let image = (COOKIE, EXEC);
         let ready = ready_word(EXEC);
+        let closure = scene.closure_generation();
         let bad_exec = [
             // Wrong observed image.
-            SessionBirthEvidence::scripted((COOKIE + 1, EXEC), ready, 0, 1),
+            SessionBirthEvidence::scripted((COOKIE + 1, EXEC), ready, 0, closure, 1),
             // Zero custody binds nothing.
-            SessionBirthEvidence::scripted(image, ready, 0, 0),
+            SessionBirthEvidence::scripted(image, ready, 0, closure, 0),
             // A tripped admission latch withholds birth.
-            SessionBirthEvidence::scripted(image, ready, 1, 1),
+            SessionBirthEvidence::scripted(image, ready, 1, closure, 1),
             // Unpublished is not an exec publication.
-            SessionBirthEvidence::scripted(image, MARKER_UNPUBLISHED, 0, 1),
+            SessionBirthEvidence::scripted(image, MARKER_UNPUBLISHED, 0, closure, 1),
             // A scope-dirtied marker is not an exec publication.
-            SessionBirthEvidence::scripted(image, MARKER_DIRTY, 0, 1),
+            SessionBirthEvidence::scripted(image, MARKER_DIRTY, 0, closure, 1),
             // An invalid marker word refuses.
-            SessionBirthEvidence::scripted(image, ready | 1, 0, 1),
+            SessionBirthEvidence::scripted(image, ready | 1, 0, closure, 1),
             // The marker names another exec id.
-            SessionBirthEvidence::scripted(image, ready_word(EXEC + 1), 0, 1),
+            SessionBirthEvidence::scripted(image, ready_word(EXEC + 1), 0, closure, 1),
+            // The exec did not happen under this closure.
+            SessionBirthEvidence::scripted(image, ready, 0, closure.wrapping_add(1), 1),
         ];
         for evidence in bad_exec {
             let grant = SessionBirthGrant::scripted_with_evidence(
@@ -8316,7 +8355,7 @@ mod tests {
         // Absence requires the unmarked word: READY, dirty and
         // invalid words all refuse as absence evidence.
         for word in [ready, MARKER_DIRTY, ready | 1] {
-            let evidence = SessionBirthEvidence::scripted(image, word, 0, 1);
+            let evidence = SessionBirthEvidence::scripted(image, word, 0, closure, 1);
             let grant = SessionBirthGrant::scripted_with_evidence(
                 proof,
                 BirthKind::AbsenceAppearance,
@@ -8415,6 +8454,28 @@ mod tests {
                 control.expect("CTL dump"),
                 wins.expect("WINS dump"),
             )
+        }
+
+        /// Run the publisher with the `exec_attach_gen` word stamped:
+        /// the argv-settled exec stamp the generation comparison pins.
+        /// Short argv pads with zeros through `nopub` so the stamp
+        /// always lands in the sixth slot.
+        fn publish_stamped(
+            &self,
+            args: &[&str],
+            stamp: u64,
+        ) -> (
+            p11scope_ebpf_common::InstanceRecord,
+            p11scope_ebpf_common::JournalAdmissionControl,
+            u64,
+        ) {
+            let stamp_arg = stamp.to_string();
+            let mut full: Vec<&str> = args.to_vec();
+            while full.len() < 5 {
+                full.push("0");
+            }
+            full.push(&stamp_arg);
+            self.publish(&full)
         }
     }
 
@@ -8597,7 +8658,8 @@ mod tests {
         let mut scene = Scene::new(image_default());
         let admitted = scene.fixture.admit();
         let proof = scene.adapter.attest_key(&admitted).expect("key attests");
-        let (row, control, wins) = publisher.publish(&["0", "1"]);
+        let (row, control, wins) =
+            publisher.publish_stamped(&["0", "1"], scene.closure_generation());
         assert_eq!(wins, 1, "one real admission wins");
         let mut rows = NativeBirthRows { row, control };
         let (token, evidence) = observe_exec_birth(
@@ -8610,6 +8672,7 @@ mod tests {
         assert_eq!(evidence.image(), (COOKIE, EXEC));
         assert_eq!(evidence.marker_word(), ready_word(EXEC));
         assert_eq!(evidence.admission_failed(), 0);
+        assert_eq!(evidence.attach_generation(), scene.closure_generation());
         assert_eq!(
             evidence.custody(),
             scene.fixture.binding().pin().start_time().unwrap()
@@ -8630,7 +8693,8 @@ mod tests {
         scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
         // Fresh native bytes at seal: a second publisher run, pulled
         // through a new reader — never the first run's words.
-        let (fresh_row, fresh_control, _) = publisher.publish(&["0", "1"]);
+        let (fresh_row, fresh_control, _) =
+            publisher.publish_stamped(&["0", "1"], scene.closure_generation());
         let mut fresh_rows = NativeBirthRows {
             row: fresh_row,
             control: fresh_control,
@@ -8647,6 +8711,51 @@ mod tests {
         scene
             .seal_explicit(&audit, &birth, frontier, fresh)
             .expect("observed birth seals");
+    }
+
+    #[test]
+    fn object_journal_session_exec_birth_checks_generation() {
+        // C1a(a): the exec witness requires READY plus matching
+        // image/generation: the observed row's exec_attach_gen must
+        // equal the sealed closure's minted generation, and the
+        // evidence carries the observed word. Sweep native generations
+        // under the fixed sealed closure: every non-equal value
+        // refuses, only the equal one observes.
+        use crate::attach::{BirthObservationRefusal, observe_exec_birth};
+
+        let publisher = NativePublisher::build();
+        let mut scene = Scene::new(image_default());
+        let admitted = scene.fixture.admit();
+        scene.adapter.attest_key(&admitted).expect("key attests");
+        let closure = scene.closure_generation();
+        let mut sweep = vec![0u64, 1, 99, closure, closure.wrapping_add(1)];
+        sweep.sort_unstable();
+        sweep.dedup();
+        assert!(sweep.len() >= 2, "the sweep brackets the closure");
+        for native_gen in sweep {
+            let (row, control, _) = publisher.publish_stamped(&["0", "1"], native_gen);
+            assert_eq!(
+                row.exec_attach_gen, native_gen,
+                "the publisher stamps the swept word"
+            );
+            let mut rows = NativeBirthRows { row, control };
+            let outcome = observe_exec_birth(
+                &mut rows,
+                scene.fixture.binding(),
+                scene.fixture.attachment(),
+                &admitted,
+            );
+            if native_gen == closure {
+                let (_, evidence) = outcome.expect("the equal generation observes");
+                assert_eq!(evidence.attach_generation(), closure);
+            } else {
+                assert_eq!(
+                    outcome,
+                    Err(BirthObservationRefusal::GenerationMismatch),
+                    "native gen {native_gen} under closure {closure} refuses"
+                );
+            }
+        }
     }
 
     #[test]
@@ -8720,7 +8829,8 @@ mod tests {
             ),
             Err(BirthObservationRefusal::SpentExhausted)
         );
-        let (ready_row, nearly, nearly_wins) = publisher.publish(&["0", "16383"]);
+        let (ready_row, nearly, nearly_wins) =
+            publisher.publish_stamped(&["0", "16383"], scene.closure_generation());
         assert_eq!(nearly_wins, MARKER_ADMIT_CAP - 1);
         let mut rows = NativeBirthRows {
             row: ready_row,
@@ -9158,7 +9268,8 @@ mod tests {
         let mut scene = Scene::new(image_default());
         let admitted = scene.fixture.admit();
         let proof = scene.adapter.attest_key(&admitted).expect("key attests");
-        let (row, control, _) = publisher.publish(&["0", "1"]);
+        let (row, control, _) =
+            publisher.publish_stamped(&["0", "1"], scene.closure_generation());
         let mut rows = NativeBirthRows { row, control };
         let (token, evidence) = observe_exec_birth(
             &mut rows,
@@ -9203,6 +9314,7 @@ mod tests {
             (COOKIE, EXEC),
             MARKER_DIRTY,
             0,
+            scene.closure_generation(),
             scene.fixture.binding().pin().start_time().unwrap(),
         );
         let frontier = scene.adapter.consumed_frontier();
@@ -10668,8 +10780,8 @@ mod tests {
         // C1: the seal re-verifies FRESH Session birth evidence, not just
         // the attest-time grant. Native truth that moved between
         // attestation and seal (dirtied marker, tripped latch, lost
-        // custody, rebound image) refuses the seal even though the grant
-        // attested.
+        // custody, rebound image, generation moved past the closure)
+        // refuses the seal even though the grant attested.
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
         fn sealed_scene() -> (Scene, BootstrapReceipt) {
@@ -10695,19 +10807,24 @@ mod tests {
         let (mut scene, birth) = sealed_scene();
         let frontier = scene.adapter.consumed_frontier();
         let audit = scene.audit();
-        let fresh = SessionBirthEvidence::scripted(image, ready, 0, 1);
+        let fresh = SessionBirthEvidence::scripted(image, ready, 0, scene.closure_generation(), 1);
         scene
             .seal_explicit(&audit, &birth, frontier, fresh)
             .expect("fresh evidence seals");
-        // Each post-attestation corruption refuses the seal.
-        for fresh in [
-            SessionBirthEvidence::scripted(image, MARKER_DIRTY, 0, 1),
-            SessionBirthEvidence::scripted(image, ready, 1, 1),
-            SessionBirthEvidence::scripted(image, ready, 0, 0),
-            SessionBirthEvidence::scripted((COOKIE + 1, EXEC), ready, 0, 1),
-            SessionBirthEvidence::scripted(image, MARKER_UNPUBLISHED, 0, 1),
-        ] {
+        // Each post-attestation corruption refuses the seal (each
+        // scene seals under its own closure, so the fresh words are
+        // built against that scene's generation).
+        for corrupt in 0..6 {
             let (mut scene, birth) = sealed_scene();
+            let closure = scene.closure_generation();
+            let fresh = match corrupt {
+                0 => SessionBirthEvidence::scripted(image, MARKER_DIRTY, 0, closure, 1),
+                1 => SessionBirthEvidence::scripted(image, ready, 1, closure, 1),
+                2 => SessionBirthEvidence::scripted(image, ready, 0, closure, 0),
+                3 => SessionBirthEvidence::scripted((COOKIE + 1, EXEC), ready, 0, closure, 1),
+                4 => SessionBirthEvidence::scripted(image, MARKER_UNPUBLISHED, 0, closure, 1),
+                _ => SessionBirthEvidence::scripted(image, ready, 0, closure.wrapping_add(1), 1),
+            };
             let frontier = scene.adapter.consumed_frontier();
             let audit = scene.audit();
             let failure = scene

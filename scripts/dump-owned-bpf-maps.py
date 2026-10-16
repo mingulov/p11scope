@@ -44,7 +44,7 @@ THREAD_OWNER_VALUE_SIZES = (544, 560)
 # crates/ebpf/native/instance_epoch.h): u64 slot_plus1[8], u64 epoch[8],
 # u64 flags, u64 exec_attach_gen, u64 journal_bootstrap. Kernel metadata
 # counters only.
-PROC_EPOCH_RECORD = struct.Struct("<8Q8QQQ")
+PROC_EPOCH_RECORD = struct.Struct("<8Q8QQQQ")
 PROC_EPOCH_RECORD_SLOTS = 8
 PROC_EPOCH_FILE_SLOTS = 1024
 PROC_EPOCH_SHARED_MM = 1 << 2
@@ -1103,10 +1103,10 @@ def self_test():
     else:
         raise AssertionError("EVENTS built as a non-ringbuf was accepted")
     print("EVENTS ringbuf build guard: OK")
-    def epoch(slots=(), epochs=(), flags=0, exec_gen=0):
+    def epoch(slots=(), epochs=(), flags=0, exec_gen=0, marker=0):
         cells = list(slots) + [0] * (PROC_EPOCH_RECORD_SLOTS - len(slots))
         counts = list(epochs) + [0] * (PROC_EPOCH_RECORD_SLOTS - len(epochs))
-        return PROC_EPOCH_RECORD.pack(*cells, *counts, flags, exec_gen)
+        return PROC_EPOCH_RECORD.pack(*cells, *counts, flags, exec_gen, marker)
     for value in (epoch(), epoch((3,), (7,)), epoch((1024, 1), (1, 0), PROC_EPOCH_SHARED_MM, 9),
                   epoch(range(1, 9), (1,) * 8, PROC_EPOCH_OVERFLOW | PROC_EPOCH_LOCAL_FAULT)):
         assert proc_epoch_value_valid(value)

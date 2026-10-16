@@ -229,14 +229,17 @@ long p11_owner_start_remove(const struct owner_start_key *key, u32 required);
 void *p11_owner_start_get(const struct owner_start_key *key, u32 required);
 
 /* Combined-transaction fault propagation: the leg that failed, written
- * to the transaction's fault cell BEFORE any unwind, discard or
- * return, so the root raises the checked fault before provider
+ * to the transaction's fault cell BEFORE any unwind, custody handoff
+ * or return, so the root raises the checked fault before provider
  * execution/return/discard even when the unwind itself fails. First
  * fault wins; 0 means no fault. Cells are caller-owned and sticky: a
  * transaction never clears a nonzero incoming cell (a fresh probe
  * passes a fresh cell). Entry and return refuse before effects on a
  * tainted cell; remove still settles forward but reports the earlier
- * fault instead of success — cleanup never erases a prior failure. */
+ * fault instead of success — cleanup never erases a prior failure.
+ * The cell reports the fault; the checked RAISE (and any discard) is
+ * the root's act — nothing below the root discards (see `uncommitted`
+ * below). */
 #define JOURNAL_FAULT_NONE 0U
 #define JOURNAL_FAULT_START_LEG 1U
 #define JOURNAL_FAULT_JOURNAL_LEG 2U
@@ -269,9 +272,18 @@ struct journal_txn {
     const struct journal_begin_facts *begin; /* entry: BEGIN body facts */
     const void *end_payload; /* return: 608 B H7 completed payload */
     const struct journal_abandon_facts *abandon; /* remove: ABANDON facts */
+    void *uncommitted; /* out: the uncommitted reservation, returned to
+                        * the REAL ROOT. Nothing below the root discards:
+                        * on any path holding a reservation it will not
+                        * submit, the transaction reports the fault, hands
+                        * the reservation back here, unwinds/settles its
+                        * legs and returns -1. The root then raises the
+                        * checked fault BEFORE discarding it. NULL when
+                        * nothing is outstanding (roots zero the
+                        * workspace; each transaction clears it on entry). */
 };
 
-_Static_assert(sizeof(struct journal_txn) == 104, "txn ABI");
+_Static_assert(sizeof(struct journal_txn) == 112, "txn ABI");
 
 /* Inactive COMBINED START/OBJECT_START transactions: one call sequences
  * the H7 START leg (which retires the OBJECT_START subordinate beside
@@ -286,10 +298,16 @@ _Static_assert(sizeof(struct journal_txn) == 104, "txn ABI");
  * (stamp, descriptor, layout, capture, handle, reason, END base and
  * compact eligibility); the Rust validators accept every submitted
  * record (pinned by test). Publication reserves first and submits
- * only after the required cleanup commits; fill failures return the
- * retained reservation for ROOT-SIDE fault-then-discard (the combined
- * function raises the checked fault BEFORE the discard commits — no
- * helper below the combined level discards).
+ * only after the required cleanup commits; fill failures hand the
+ * uncommitted reservation back to the root (`uncommitted` above) for
+ * ROOT-SIDE fault-then-discard — no helper at or below the combined
+ * level discards.
+ *
+ * Operation-specific kinds at the entry points: entry accepts only a
+ * BEGIN template, return only END, remove only ABANDON when it
+ * publishes (a wrong-kind template faults PUBLISH — entry and return
+ * refuse before effects; forward-only remove still retires but
+ * submits nothing).
  *
  * Entry refuses before effects on a busy key (an occupant in START or
  * the journal side map ends the call with a START/JOURNAL leg fault
@@ -317,13 +335,16 @@ _Static_assert(sizeof(struct journal_txn) == 104, "txn ABI");
  * the journal row settles BEFORE the START leg runs, so a
  * contradicted row is scrubbed (zeroed in place, then deleted)
  * BEFORE the lease is released. Unsettled (PREPARING/BEGUN) rows
- * reserve ABANDON, delete the row (the required cleanup commits),
- * and only then submit — one original key disposition: END xor
- * ABANDON. RETURNING rows retire silently (their END published, or
- * its loss faulted) with the START leg optional (return already
- * retired it; its absence is healthy, never loss or poison).
- * Forward-only: cleanup always settles; a failed journal deletion
- * keeps the lease for retry instead of orphaning the row. */
+ * reserve ABANDON, delete the journal row, run the START leg, and
+ * only then submit — the terminal submits after ALL required cleanup
+ * commits (every leg, including START); otherwise the fault raises
+ * and the reservation returns to the root WITHOUT publishing. One
+ * original key disposition: END xor ABANDON. RETURNING rows retire
+ * silently (their END published, or its loss faulted) with the START
+ * leg optional (return already retired it; its absence is healthy,
+ * never loss or poison). Forward-only: cleanup always settles; a
+ * failed journal deletion keeps the lease for retry instead of
+ * orphaning the row. */
 int p11_journal_combined_entry(struct journal_txn *txn);
 int p11_journal_combined_return(struct journal_txn *txn);
 int p11_journal_combined_remove(struct journal_txn *txn);

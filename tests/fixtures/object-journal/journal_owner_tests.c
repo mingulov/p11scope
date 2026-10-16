@@ -49,6 +49,7 @@ static struct row rows[256];
 #ifndef P11SCOPE_INVENTORY_ONLY
 static struct journal_control journal_ctl;
 static int fail_reserve;
+static int fail_journal_delete;
 static void *ring_log[64];
 static unsigned ring_log_len;
 static unsigned ring_submits, ring_discards;
@@ -69,9 +70,22 @@ static const struct owner_start_key *end_order_key;
 static int end_order_checked;
 static const struct owner_start_key *abandon_order_key;
 static int abandon_order_checked;
-/* Fault-then-discard proof: when armed (pointing at the live fault
- * cell), the discard hook asserts the checked fault is already raised. */
-static u64 *discard_fault_cell;
+/* Fault-then-discard proof: the CHECKED generation advances only in
+ * the root's raise, and every discard hook observes it — never the
+ * transaction's local report cell. Nothing below the root discards:
+ * the transactions hand their uncommitted reservation back, and the
+ * root raises the checked fault (covering that exact reservation)
+ * BEFORE discarding it. The reserve hook stamps each reservation with
+ * the generation at reserve time; the discard hook (armed by the root
+ * around its own discard) asserts a raise covered this reservation
+ * after its reserve. `raise_armed` is NULL for raw ring-leaf use. */
+static u64 checked_generation;
+static u64 checked_fault;
+static const void *checked_ptr;
+static const void *raise_armed;
+static void *reserve_ptr[64];
+static u64 reserve_gen[64];
+static unsigned reserve_len;
 /* Submitted-record dump for the Rust wire oracle: when armed (an output
  * directory), every combined-transaction submit writes its exact bytes
  * to record-%03u.bin. Armed once the combined sections start (the raw
@@ -196,6 +210,10 @@ static long update(void *map, const void *key, const void *data, u64 flags)
 static long pair_delete(void *map, const void *key)
 {
     struct row *r = row(map, key);
+#ifndef P11SCOPE_INVENTORY_ONLY
+    if (map == &JOURNAL_START_MAP && fail_journal_delete)
+        return -1;
+#endif
     if (!r)
         return -2;
 #ifndef P11SCOPE_INVENTORY_ONLY
@@ -263,6 +281,10 @@ static void *ring_reserve(void *ring, u64 bytes, u64 flags)
         return NULL;
     slot = ring_arena + ring_arena_used;
     ring_arena_used += (unsigned)bytes;
+    assert(reserve_len < 64);
+    reserve_ptr[reserve_len] = slot;
+    reserve_gen[reserve_len] = checked_generation;
+    reserve_len++;
     return slot;
 }
 
@@ -283,8 +305,12 @@ static void ring_submit(void *record, u64 flags)
                              found->phase == JOURNAL_PHASE_RETURNING);
     }
     if (abandon_order_key && bytes[4] == JOURNAL_KIND_ABANDON) {
-        /* N9: the ABANDON submits only after its row deleted. */
-        abandon_order_checked = (lookup(&JOURNAL_START_MAP, abandon_order_key) == NULL);
+        /* N9: the ABANDON submits only after ALL required cleanup
+         * commits — the journal row deleted AND the START leg (START +
+         * OBJECT_START) retired. */
+        abandon_order_checked = (lookup(&JOURNAL_START_MAP, abandon_order_key) == NULL &&
+                                 lookup(&START, abandon_order_key) == NULL &&
+                                 lookup(&OBJECT_START, abandon_order_key) == NULL);
     }
     if (dump_armed && dump_dir) {
         /* The record's own header carries its length. */
@@ -308,9 +334,24 @@ static void ring_discard(void *record, u64 flags)
     assert(ring_log_len < 64);
     ring_log[ring_log_len++] = record;
     ring_discards++;
-    if (discard_fault_cell)
-        EXPECT(*discard_fault_cell != JOURNAL_FAULT_NONE,
-               "checked fault raised before the discard commits");
+    if (raise_armed) {
+        /* The root's discard: a checked raise covered THIS reservation
+         * after its reserve — generation order, not a local shadow. */
+        unsigned i;
+        int covered = 0;
+        EXPECT(record == raise_armed, "root discards its armed reservation");
+        EXPECT(checked_ptr == record && checked_fault != JOURNAL_FAULT_NONE,
+               "checked fault raised for the discarded reservation");
+        for (i = 0; i < reserve_len; i++)
+            if (reserve_ptr[i] == record)
+                EXPECT(checked_generation > reserve_gen[i],
+                       "raise generation %llu past reserve generation %llu",
+                       (unsigned long long)checked_generation,
+                       (unsigned long long)reserve_gen[i]);
+        for (i = 0; i < reserve_len; i++)
+            covered = covered || (reserve_ptr[i] == record);
+        EXPECT(covered, "discarded reservation was reserved");
+    }
 }
 #endif
 
@@ -339,8 +380,14 @@ static void reset(void)
 #ifndef P11SCOPE_INVENTORY_ONLY
     memset(&journal_ctl, 0, sizeof(journal_ctl));
     fail_reserve = 0;
+    fail_journal_delete = 0;
     ring_log_len = ring_submits = ring_discards = 0;
     ring_arena_used = 0;
+    checked_generation = 0;
+    checked_fault = JOURNAL_FAULT_NONE;
+    checked_ptr = NULL;
+    raise_armed = NULL;
+    reserve_len = 0;
     memset(last_journal_deleted, 0, sizeof(last_journal_deleted));
     last_journal_deleted_seen = 0;
     order_key = NULL;
@@ -349,7 +396,6 @@ static void reset(void)
     end_order_checked = 0;
     abandon_order_key = NULL;
     abandon_order_checked = 0;
-    discard_fault_cell = NULL;
     journal_ring_reserve = ring_reserve;
     journal_ring_submit = ring_submit;
     journal_ring_discard = ring_discard;
@@ -357,6 +403,54 @@ static void reset(void)
 }
 
 #ifndef P11SCOPE_INVENTORY_ONLY
+
+/* The REAL ROOT: the only discarder. Every combined call runs through
+ * these wrappers, which prove nothing discarded during the call, then
+ * settle any handed-back reservation with a checked raise BEFORE its
+ * discard (the discard hook observes the checked generation). A
+ * handoff without a reported fault, or a settled call handing back a
+ * reservation, fails here. */
+static void root_raise(u64 fault, void *reservation)
+{
+    checked_fault = fault;
+    checked_ptr = reservation;
+    checked_generation++;
+}
+
+static int root_settle(struct journal_txn *txn, int rc, unsigned discards_before)
+{
+    EXPECT(ring_discards == discards_before, "nothing below the root discards");
+    if (rc != 0 && txn->uncommitted != NULL) {
+        EXPECT(*txn->fault_out != JOURNAL_FAULT_NONE,
+               "every handoff carries a reported fault");
+        root_raise(*txn->fault_out, txn->uncommitted);
+        raise_armed = txn->uncommitted;
+        p11_journal_discard(txn->uncommitted);
+        raise_armed = NULL;
+        txn->uncommitted = NULL;
+    } else {
+        EXPECT(txn->uncommitted == NULL, "settled calls hand back nothing");
+    }
+    return rc;
+}
+
+static int root_entry(struct journal_txn *txn)
+{
+    unsigned discards_before = ring_discards;
+    return root_settle(txn, p11_journal_combined_entry(txn), discards_before);
+}
+
+static int root_return(struct journal_txn *txn)
+{
+    unsigned discards_before = ring_discards;
+    return root_settle(txn, p11_journal_combined_return(txn), discards_before);
+}
+
+static int root_remove(struct journal_txn *txn)
+{
+    unsigned discards_before = ring_discards;
+    return root_settle(txn, p11_journal_combined_remove(txn), discards_before);
+}
 
 /* Slice-A RED matrix, per object: idle/release/reacquire, nested slots,
  * migration, TID reuse, exec cleanup, zero/wrap/CAS contention and
@@ -1188,7 +1282,7 @@ static void combined_entry_publishes_begin(void)
     txn.spec = &begin;
     txn.fault_out = &fault;
     txn.begin = &facts;
-    EXPECT(p11_journal_combined_entry(&txn) == 0, "combined entry settles");
+    EXPECT(root_entry(&txn) == 0, "combined entry settles");
     EXPECT(fault == JOURNAL_FAULT_NONE, "no fault, got %llu", (unsigned long long)fault);
     /* All three legs landed: START row, OBJECT_START subordinate with
      * its immutable binding, journal row committed to BEGUN. */
@@ -1236,7 +1330,7 @@ static void combined_return_publishes_end(void)
     txn.fault_out = &fault;
     txn.begin = &facts;
     txn.end_payload = end_payload;
-    EXPECT(p11_journal_combined_entry(&txn) == 0, "entry settles");
+    EXPECT(root_entry(&txn) == 0, "entry settles");
     /* Return advances, retires START with its subordinate, and only
      * then submits END: the terminal submits after the required
      * cleanup commits. The submit hook proves the order. */
@@ -1250,7 +1344,7 @@ static void combined_return_publishes_end(void)
     txn.sequence = 1;
     end_order_key = &key;
     end_order_checked = 0;
-    EXPECT(p11_journal_combined_return(&txn) == 0, "combined return settles");
+    EXPECT(root_return(&txn) == 0, "combined return settles");
     EXPECT(fault == JOURNAL_FAULT_NONE, "no fault, got %llu", (unsigned long long)fault);
     EXPECT(end_order_checked, "START custody retired before END submission");
     end_order_key = NULL;
@@ -1266,7 +1360,7 @@ static void combined_return_publishes_end(void)
      * disposition); the already-retired START is healthy absence. */
     txn.spec = NULL;
     txn.required = 1;
-    EXPECT(p11_journal_combined_remove(&txn) == 0, "combined remove settles");
+    EXPECT(root_remove(&txn) == 0, "combined remove settles");
     EXPECT(fault == JOURNAL_FAULT_NONE, "no fault, got %llu", (unsigned long long)fault);
     EXPECT(ring_submits == 2, "no ABANDON after END");
     EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &key) == NULL, "journal row retired");
@@ -1277,7 +1371,7 @@ static void combined_return_publishes_end(void)
     txn.required = 0;
     txn.thread = 0;
     txn.sequence = 0;
-    EXPECT(p11_journal_combined_entry(&txn) == 0, "second entry settles");
+    EXPECT(root_entry(&txn) == 0, "second entry settles");
     end.bytes = JOURNAL_END_COMPACT_BYTES;
     end.thread = 1;
     end.sequence = 2;
@@ -1286,7 +1380,7 @@ static void combined_return_publishes_end(void)
     txn.sequence = 2;
     end_order_key = &key;
     end_order_checked = 0;
-    EXPECT(p11_journal_combined_return(&txn) == 0, "compact END settles");
+    EXPECT(root_return(&txn) == 0, "compact END settles");
     EXPECT(end_order_checked, "START custody retired before compact END");
     end_order_key = NULL;
     check_submitted(3, JOURNAL_END_COMPACT_BYTES, JOURNAL_KIND_END, 0, 1, 2, "compact END");
@@ -1319,7 +1413,7 @@ static void combined_remove_abandons_unsettled(void)
     txn.fault_out = &fault;
     txn.begin = &facts;
     txn.abandon = &afacts;
-    EXPECT(p11_journal_combined_entry(&txn) == 0, "entry settles");
+    EXPECT(root_entry(&txn) == 0, "entry settles");
     /* Exit cleanup without a return: the unsettled row deletes (the
      * required cleanup commits), then ABANDON submits, then the START
      * leg retires — one call, terminal last. */
@@ -1329,8 +1423,8 @@ static void combined_remove_abandons_unsettled(void)
     txn.required = 1;
     abandon_order_key = &key;
     abandon_order_checked = 0;
-    EXPECT(p11_journal_combined_remove(&txn) == 0, "abandoning remove settles");
-    EXPECT(abandon_order_checked, "journal row deleted before ABANDON submission");
+    EXPECT(root_remove(&txn) == 0, "abandoning remove settles");
+    EXPECT(abandon_order_checked, "full cleanup before ABANDON submission");
     abandon_order_key = NULL;
     EXPECT(fault == JOURNAL_FAULT_NONE, "no fault, got %llu", (unsigned long long)fault);
     EXPECT(ring_submits == 2, "BEGIN then ABANDON submitted");
@@ -1367,7 +1461,7 @@ static void combined_scrub_before_release(void)
     txn.spec = &begin;
     txn.fault_out = &fault;
     txn.begin = &facts;
-    EXPECT(p11_journal_combined_entry(&txn) == 0, "entry settles");
+    EXPECT(root_entry(&txn) == 0, "entry settles");
     found = p11_journal_side_lookup(&JOURNAL_START_MAP, &key);
     EXPECT(found != NULL, "row present to contradict");
     found->phase = 9;
@@ -1381,7 +1475,7 @@ static void combined_scrub_before_release(void)
     txn.thread = 1;
     txn.sequence = 1;
     txn.required = 1;
-    EXPECT(p11_journal_combined_remove(&txn) == -1, "contradicted remove reports loss");
+    EXPECT(root_remove(&txn) == -1, "contradicted remove reports loss");
     EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted, got %llu",
            (unsigned long long)fault);
     EXPECT(last_journal_deleted_seen, "journal deletion observed");
@@ -1426,13 +1520,13 @@ static void combined_collision_lifecycle(void)
     txn.fault_out = &fault;
     txn.begin = &facts;
     txn.end_payload = end_payload;
-    EXPECT(p11_journal_combined_entry(&txn) == 0, "first entry settles");
+    EXPECT(root_entry(&txn) == 0, "first entry settles");
     /* A second entry on the same key refuses BEFORE effects: the busy
      * key never reaches the H7 insert, so nothing unwinds — the first
      * call keeps its START row, its journal row and its lease. Never
      * release-then-reacquire under a retained journal row. */
     fault = 0;
-    EXPECT(p11_journal_combined_entry(&txn) == -1, "colliding entry refuses");
+    EXPECT(root_entry(&txn) == -1, "colliding entry refuses");
     EXPECT(fault == JOURNAL_FAULT_START_LEG, "START leg faulted, got %llu",
            (unsigned long long)fault);
     EXPECT(owner_map_lookup(&START, &key) != NULL, "first START row intact");
@@ -1449,18 +1543,18 @@ static void combined_collision_lifecycle(void)
     txn.spec = &end;
     txn.thread = 1;
     txn.sequence = 1;
-    EXPECT(p11_journal_combined_return(&txn) == 0, "first return settles");
+    EXPECT(root_return(&txn) == 0, "first return settles");
     fault = 0;
     txn.spec = NULL;
     txn.required = 1;
-    EXPECT(p11_journal_combined_remove(&txn) == 0, "first remove settles");
+    EXPECT(root_remove(&txn) == 0, "first remove settles");
     /* The key is reusable after full retirement; the refused entry
      * minted nothing. */
     fault = 0;
     txn.spec = &begin;
     txn.thread = 0;
     txn.sequence = 0;
-    EXPECT(p11_journal_combined_entry(&txn) == 0, "reused key enters");
+    EXPECT(root_entry(&txn) == 0, "reused key enters");
     found = p11_journal_side_lookup(&JOURNAL_START_MAP, &key);
     EXPECT(found != NULL && found->thread == 1 && found->sequence == 2 &&
                found->phase == JOURNAL_PHASE_BEGUN,
@@ -1473,11 +1567,11 @@ static void combined_collision_lifecycle(void)
     end.sequence = 2;
     txn.thread = 1;
     txn.sequence = 2;
-    EXPECT(p11_journal_combined_return(&txn) == 0, "reused return settles");
+    EXPECT(root_return(&txn) == 0, "reused return settles");
     fault = 0;
     txn.spec = NULL;
     txn.required = 1;
-    EXPECT(p11_journal_combined_remove(&txn) == 0, "reused remove settles");
+    EXPECT(root_remove(&txn) == 0, "reused remove settles");
     /* A return whose START row vanished refuses quietly through the
      * START leg: the journal row stays intact and publishes nothing.
      * Setup deletes the START row directly; the raw presence check
@@ -1495,7 +1589,7 @@ static void combined_collision_lifecycle(void)
         txn.thread = 0;
         txn.sequence = 0;
         fault = 0;
-        EXPECT(p11_journal_combined_entry(&txn) == 0, "orphan-setup entry settles");
+        EXPECT(root_entry(&txn) == 0, "orphan-setup entry settles");
         EXPECT(owner_map_delete(&START, &orphan) == 0, "START row vanishes");
         submits_before = ring_submits;
         txn.spec = &end;
@@ -1504,7 +1598,7 @@ static void combined_collision_lifecycle(void)
         txn.thread = 1;
         txn.sequence = 3;
         fault = 0;
-        EXPECT(p11_journal_combined_return(&txn) == -1, "orphaned return refuses");
+        EXPECT(root_return(&txn) == -1, "orphaned return refuses");
         EXPECT(fault == JOURNAL_FAULT_START_LEG, "START leg faulted, got %llu",
                (unsigned long long)fault);
         found = p11_journal_side_lookup(&JOURNAL_START_MAP, &orphan);
@@ -1555,49 +1649,49 @@ static void combined_fault_paths(void)
     EXPECT(p11_journal_combined_return(NULL) == -1, "NULL return refuses");
     EXPECT(p11_journal_combined_remove(NULL) == -1, "NULL remove refuses");
     memset(&bad, 0, sizeof(bad));
-    EXPECT(p11_journal_combined_entry(&bad) == -1, "NULL fault cell refuses");
+    EXPECT(root_entry(&bad) == -1, "NULL fault cell refuses");
     bad = txn;
     bad.fault_out = NULL;
-    EXPECT(p11_journal_combined_entry(&bad) == -1, "missing fault cell refuses");
+    EXPECT(root_entry(&bad) == -1, "missing fault cell refuses");
     bad = txn;
     bad.jctl = NULL;
     fault = 0;
-    EXPECT(p11_journal_combined_entry(&bad) == -1, "NULL control refuses");
+    EXPECT(root_entry(&bad) == -1, "NULL control refuses");
     EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted");
     bad = txn;
     bad.journal_map = NULL;
     fault = 0;
-    EXPECT(p11_journal_combined_entry(&bad) == -1, "NULL journal map refuses");
+    EXPECT(root_entry(&bad) == -1, "NULL journal map refuses");
     EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted");
     bad = txn;
     bad.ring = NULL;
     fault = 0;
-    EXPECT(p11_journal_combined_entry(&bad) == -1, "NULL ring refuses");
+    EXPECT(root_entry(&bad) == -1, "NULL ring refuses");
     EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted");
     bad = txn;
     bad.key = NULL;
     fault = 0;
-    EXPECT(p11_journal_combined_entry(&bad) == -1, "NULL key refuses");
+    EXPECT(root_entry(&bad) == -1, "NULL key refuses");
     EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted");
     bad = txn;
     bad.start_value = NULL;
     fault = 0;
-    EXPECT(p11_journal_combined_entry(&bad) == -1, "NULL START value refuses");
+    EXPECT(root_entry(&bad) == -1, "NULL START value refuses");
     EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted");
     bad = txn;
     bad.spec = NULL;
     fault = 0;
-    EXPECT(p11_journal_combined_entry(&bad) == -1, "NULL spec refuses");
+    EXPECT(root_entry(&bad) == -1, "NULL spec refuses");
     EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted");
     bad = txn;
     bad.begin = NULL;
     fault = 0;
-    EXPECT(p11_journal_combined_entry(&bad) == -1, "NULL BEGIN facts refuse");
+    EXPECT(root_entry(&bad) == -1, "NULL BEGIN facts refuse");
     EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted");
     bad = txn;
     bad.end_payload = NULL;
     fault = 0;
-    EXPECT(p11_journal_combined_return(&bad) == -1, "NULL END payload refuses");
+    EXPECT(root_return(&bad) == -1, "NULL END payload refuses");
     EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted");
     EXPECT(owners[0].flags == 0, "no lease from refused entries");
     EXPECT(owner_map_lookup(&START, &key) == NULL, "no START row from refused entries");
@@ -1609,7 +1703,7 @@ static void combined_fault_paths(void)
         bad = txn;
         bad.spec = &smuggled;
         fault = 0;
-        EXPECT(p11_journal_combined_entry(&bad) == -1, "smuggled identity refuses");
+        EXPECT(root_entry(&bad) == -1, "smuggled identity refuses");
         EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted, got %llu",
                (unsigned long long)fault);
         EXPECT(owner_map_lookup(&START, &key) == NULL, "smuggling leaves no START row");
@@ -1617,14 +1711,15 @@ static void combined_fault_paths(void)
     /* A tainted cell refuses entry before effects: the earlier fault
      * is the report, and nothing is touched. */
     fault = JOURNAL_FAULT_PUBLISH;
-    EXPECT(p11_journal_combined_entry(&txn) == -1, "tainted entry refuses");
+    EXPECT(root_entry(&txn) == -1, "tainted entry refuses");
     EXPECT(fault == JOURNAL_FAULT_PUBLISH, "earlier fault preserved");
     EXPECT(owners[0].flags == 0, "tainted entry leases nothing");
     EXPECT(owner_map_lookup(&START, &key) == NULL, "tainted entry inserts nothing");
     EXPECT(ring_submits == 0 && ring_discards == 0, "tainted entry reserves nothing");
     /* Invalid BEGIN facts refuse with unwind: bad layout, zero stamp,
      * zero descriptor, slot/pid confusion. Each reserves, fails the
-     * finite gate, raises the fault root-side, discards, unwinds. */
+     * finite gate, reports the fault, hands back, unwinds; the root
+     * raises and discards each handoff. */
     {
         unsigned discards_before = ring_discards;
         bad = txn;
@@ -1632,27 +1727,27 @@ static void combined_fault_paths(void)
         bad_facts.layout = 9;
         bad.begin = &bad_facts;
         fault = 0;
-        EXPECT(p11_journal_combined_entry(&bad) == -1, "bad layout refuses");
+        EXPECT(root_entry(&bad) == -1, "bad layout refuses");
         EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted");
         bad_facts = facts;
         memset(bad_facts.entry_stamp, 0, sizeof(bad_facts.entry_stamp));
         fault = 0;
-        EXPECT(p11_journal_combined_entry(&bad) == -1, "zero stamp refuses");
+        EXPECT(root_entry(&bad) == -1, "zero stamp refuses");
         EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted");
         bad_facts = facts;
         bad_facts.descriptor = 0;
         fault = 0;
-        EXPECT(p11_journal_combined_entry(&bad) == -1, "zero descriptor refuses");
+        EXPECT(root_entry(&bad) == -1, "zero descriptor refuses");
         EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted");
         bad_facts = facts;
         bad_facts.slot = 6;
         fault = 0;
-        EXPECT(p11_journal_combined_entry(&bad) == -1, "slot-confused facts refuse");
+        EXPECT(root_entry(&bad) == -1, "slot-confused facts refuse");
         EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted");
         bad_facts = facts;
         bad_facts.pid_tgid = 1;
         fault = 0;
-        EXPECT(p11_journal_combined_entry(&bad) == -1, "pid-confused facts refuse");
+        EXPECT(root_entry(&bad) == -1, "pid-confused facts refuse");
         EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted");
         EXPECT(ring_discards == discards_before + 5, "each bad-facts entry discarded once");
         EXPECT(ring_submits == 0, "bad facts submit nothing");
@@ -1663,7 +1758,7 @@ static void combined_fault_paths(void)
     /* Reserve failure unwinds every leg: fault set, nothing kept. */
     fail_reserve = 1;
     fault = 0;
-    EXPECT(p11_journal_combined_entry(&txn) == -1, "reserve failure refuses");
+    EXPECT(root_entry(&txn) == -1, "reserve failure refuses");
     EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted, got %llu",
            (unsigned long long)fault);
     EXPECT(ring_submits == 0 && ring_discards == 5, "nothing reserved, nothing discarded");
@@ -1671,20 +1766,20 @@ static void combined_fault_paths(void)
     EXPECT(owner_map_lookup(&START, &key) == NULL, "START leg unwound");
     EXPECT(owners[0].flags == 0, "unwind released the lease");
     fail_reserve = 0;
-    /* A bad header faults, discards root-side (the discard hook proves
-     * the fault was raised first), unwinds. */
+    /* A bad header kind refuses before effects (operation-specific
+     * kinds): no reserve, no discard, no legs touched. Every root call
+     * below proves nothing discarded during the call and settles any
+     * handed-back reservation with a checked raise before its discard. */
     {
         struct journal_header_spec bad_kind = begin;
         bad_kind.kind = 9;
         bad = txn;
         bad.spec = &bad_kind;
         fault = 0;
-        discard_fault_cell = &fault;
-        EXPECT(p11_journal_combined_entry(&bad) == -1, "bad header refuses");
+        EXPECT(root_entry(&bad) == -1, "bad header refuses");
         EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted, got %llu",
                (unsigned long long)fault);
-        discard_fault_cell = NULL;
-        EXPECT(ring_submits == 0 && ring_discards == 6, "one more discard, no submit");
+        EXPECT(ring_submits == 0 && ring_discards == 5, "kind refusal reserves nothing");
         EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &key) == NULL, "journal leg unwound");
         EXPECT(owner_map_lookup(&START, &key) == NULL, "START leg unwound");
     }
@@ -1694,7 +1789,7 @@ static void combined_fault_paths(void)
         u64 sequence_before = owners[0].journal_sequence;
         journal_ctl.poison = 1;
         fault = 0;
-        EXPECT(p11_journal_combined_entry(&txn) == -1, "poisoned entry refuses");
+        EXPECT(root_entry(&txn) == -1, "poisoned entry refuses");
         EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted");
         EXPECT(owner_map_lookup(&START, &key) == NULL, "START rewound past poison");
         EXPECT(owners[0].journal_sequence == sequence_before, "poison mints no sequence");
@@ -1704,7 +1799,7 @@ static void combined_fault_paths(void)
     EXPECT(p11_owner_lease() == 1, "lease");
     owners[0].journal_sequence = ~0ULL;
     fault = 0;
-    EXPECT(p11_journal_combined_entry(&txn) == -1, "wrapped sequence refuses");
+    EXPECT(root_entry(&txn) == -1, "wrapped sequence refuses");
     EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted");
     EXPECT(owners[0].journal_thread == 1, "refused ticket still consumed");
     EXPECT(owner_map_lookup(&START, &key) == NULL, "START rewound past wrap");
@@ -1712,12 +1807,12 @@ static void combined_fault_paths(void)
     /* A healthy entry then a wrong-facts return: refused, row intact,
      * nothing published. */
     fault = 0;
-    EXPECT(p11_journal_combined_entry(&txn) == 0, "entry settles");
+    EXPECT(root_entry(&txn) == 0, "entry settles");
     txn.spec = &end;
     txn.thread = 2;
     txn.sequence = 1;
     fault = 0;
-    EXPECT(p11_journal_combined_return(&txn) == -1, "wrong-facts return refuses");
+    EXPECT(root_return(&txn) == -1, "wrong-facts return refuses");
     EXPECT(fault == JOURNAL_FAULT_PUBLISH, "spec mismatch faults publish, got %llu",
            (unsigned long long)fault);
     txn.thread = 1;
@@ -1727,7 +1822,7 @@ static void combined_fault_paths(void)
         wrong.sequence = 2;
         txn.spec = &wrong;
         fault = 0;
-        EXPECT(p11_journal_combined_return(&txn) == -1, "spec/facts mismatch refuses");
+        EXPECT(root_return(&txn) == -1, "spec/facts mismatch refuses");
         EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted");
         txn.spec = &end;
     }
@@ -1737,15 +1832,15 @@ static void combined_fault_paths(void)
     /* A tainted cell refuses return before effects: the BEGUN row
      * waits for exit cleanup, and the earlier fault is the report. */
     fault = JOURNAL_FAULT_JOURNAL_LEG;
-    EXPECT(p11_journal_combined_return(&txn) == -1, "tainted return refuses");
+    EXPECT(root_return(&txn) == -1, "tainted return refuses");
     EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "earlier fault preserved");
     found = p11_journal_side_lookup(&JOURNAL_START_MAP, &key);
     EXPECT(found != NULL && found->phase == JOURNAL_PHASE_BEGUN, "row still BEGUN");
     EXPECT(ring_submits == 1, "tainted return published nothing");
     /* Invalid END payloads refuse before the advance commits: a bad
      * event type and a compact-ineligible payload with a compact spec.
-     * The row stays BEGUN with START intact; the faulted reservation
-     * discards root-side. */
+     * The row stays BEGUN with START intact; each faulted reservation
+     * hands back for a root raise-then-discard. */
     {
         struct journal_header_spec compact = end;
         u32 w = 99;
@@ -1754,16 +1849,14 @@ static void combined_fault_paths(void)
         bad = txn;
         bad.end_payload = bad_payload;
         fault = 0;
-        discard_fault_cell = &fault;
-        EXPECT(p11_journal_combined_return(&bad) == -1, "bad event type refuses");
+        EXPECT(root_return(&bad) == -1, "bad event type refuses");
         EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted");
-        discard_fault_cell = NULL;
         memcpy(bad_payload, end_payload, sizeof(bad_payload));
         bad_payload[120] = 1;
         compact.bytes = JOURNAL_END_COMPACT_BYTES;
         bad.spec = &compact;
         fault = 0;
-        EXPECT(p11_journal_combined_return(&bad) == -1, "compact-ineligible refuses");
+        EXPECT(root_return(&bad) == -1, "compact-ineligible refuses");
         EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted");
         found = p11_journal_side_lookup(&JOURNAL_START_MAP, &key);
         EXPECT(found != NULL && found->phase == JOURNAL_PHASE_BEGUN, "row still BEGUN");
@@ -1776,7 +1869,7 @@ static void combined_fault_paths(void)
      * reports the earlier fault, never success (N10). */
     fail_reserve = 1;
     fault = 0;
-    EXPECT(p11_journal_combined_return(&txn) == -1, "reserve-failed return refuses");
+    EXPECT(root_return(&txn) == -1, "reserve-failed return refuses");
     EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted");
     fail_reserve = 0;
     found = p11_journal_side_lookup(&JOURNAL_START_MAP, &key);
@@ -1786,7 +1879,7 @@ static void combined_fault_paths(void)
     {
         /* Discards share the ring log: capture the ABANDON's index. */
         unsigned abandon_index = ring_log_len;
-        EXPECT(p11_journal_combined_remove(&txn) == -1,
+        EXPECT(root_remove(&txn) == -1,
                "tainted cleanup reports the earlier fault");
         EXPECT(fault == JOURNAL_FAULT_PUBLISH, "earlier fault preserved");
         EXPECT(ring_submits == 2, "BEGIN then ABANDON");
@@ -1803,7 +1896,7 @@ static void combined_fault_paths(void)
     txn.spec = &begin;
     txn.thread = 0;
     txn.sequence = 0;
-    EXPECT(p11_journal_combined_entry(&txn) == 0, "entry settles");
+    EXPECT(root_entry(&txn) == 0, "entry settles");
     bad = txn;
     bad_afacts = afacts;
     bad_afacts.reason = 0;
@@ -1812,20 +1905,20 @@ static void combined_fault_paths(void)
     bad.thread = 1;
     bad.sequence = 2;
     fault = 0;
-    EXPECT(p11_journal_combined_remove(&bad) == -1, "bad reason faults");
+    EXPECT(root_remove(&bad) == -1, "bad reason faults");
     EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted");
     EXPECT(ring_submits == 3, "faulted ABANDON submits nothing");
     EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &key) == NULL, "journal row retired");
     EXPECT(owner_map_lookup(&START, &key) == NULL, "START row retired");
     fault = 0;
-    EXPECT(p11_journal_combined_entry(&txn) == 0, "entry settles again");
+    EXPECT(root_entry(&txn) == 0, "entry settles again");
     bad = txn;
     bad.spec = NULL;
     bad.abandon = NULL;
     bad.thread = 1;
     bad.sequence = 3;
     fault = 0;
-    EXPECT(p11_journal_combined_remove(&bad) == -1, "missing template faults");
+    EXPECT(root_remove(&bad) == -1, "missing template faults");
     EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted");
     EXPECT(ring_submits == 4, "missing template submits nothing");
     EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &key) == NULL, "journal row retired");
@@ -1836,7 +1929,7 @@ static void combined_fault_paths(void)
     txn.thread = 0;
     txn.sequence = 0;
     fault = 0;
-    EXPECT(p11_journal_combined_remove(&txn) == -1, "missing required is loss");
+    EXPECT(root_remove(&txn) == -1, "missing required is loss");
     EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted first");
     reset();
     seed_object_tables();
@@ -1845,14 +1938,15 @@ static void combined_fault_paths(void)
     txn.key = &key;
     txn.spec = NULL;
     txn.required = 0;
-    EXPECT(p11_journal_combined_remove(&txn) == -2, "missing optional is absence");
+    EXPECT(root_remove(&txn) == -2, "missing optional is absence");
     EXPECT(fault == JOURNAL_FAULT_NONE, "healthy absence faults nothing");
     txn.required = 7;
     fault = 0;
-    EXPECT(p11_journal_combined_remove(&txn) == -1, "non-bit required refuses");
-    /* A lost task with an orphaned row still retires forward: ABANDON
-     * publishes exactly once, the START leg reports, and a retry with
-     * the task back settles the START leg without republishing. */
+    EXPECT(root_remove(&txn) == -1, "non-bit required refuses");
+    /* A lost task with an orphaned row retires its journal leg but
+     * publishes nothing: the START leg reports, and the ABANDON waits
+     * for cleanup that never commits. A retry with the task back still
+     * reports the missing journal row and republishes nothing. */
     reset();
     seed_object_tables();
     required_start_value(start_value);
@@ -1865,29 +1959,32 @@ static void combined_fault_paths(void)
     txn.spec = &begin;
     txn.thread = 0;
     txn.sequence = 0;
-    EXPECT(p11_journal_combined_entry(&txn) == 0, "entry settles");
+    EXPECT(root_entry(&txn) == 0, "entry settles");
     {
+        /* N9: the START leg fails, so the terminal never publishes —
+         * the reservation returns to the root (which raises and
+         * discards it) WITHOUT submitting. The journal row already
+         * deleted; the START row stays with its lease for retry. */
         unsigned submits_before;
+        unsigned discards_before;
         fail_current_task = 1;
         txn.spec = &abandon;
         txn.thread = 1;
         txn.sequence = 1;
         submits_before = ring_submits;
+        discards_before = ring_discards;
         fault = 0;
-        abandon_order_key = &key;
-        abandon_order_checked = 0;
-        EXPECT(p11_journal_combined_remove(&txn) == -1, "taskless remove reports START");
+        EXPECT(root_remove(&txn) == -1, "taskless remove reports START");
         EXPECT(fault == JOURNAL_FAULT_START_LEG, "START leg faulted, got %llu",
                (unsigned long long)fault);
-        EXPECT(abandon_order_checked, "ABANDON submitted after its row deleted");
-        abandon_order_key = NULL;
-        EXPECT(ring_submits == submits_before + 1, "ABANDON published exactly once");
+        EXPECT(ring_submits == submits_before, "failed START leg publishes no ABANDON");
+        EXPECT(ring_discards == discards_before + 1, "the root settled the handoff");
         EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &key) == NULL, "journal row retired");
         fail_current_task = 0;
         fault = 0;
-        EXPECT(p11_journal_combined_remove(&txn) == -1, "retry reports the missing journal row");
+        EXPECT(root_remove(&txn) == -1, "retry reports the missing journal row");
         EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted first");
-        EXPECT(ring_submits == submits_before + 1, "retry republishes nothing");
+        EXPECT(ring_submits == submits_before, "retry republishes nothing");
         /* H7 poison is capture-terminal: the poisoned control refuses
          * the retry's START leg, so its row stays with its lease. */
         EXPECT(owner_map_lookup(&START, &key) != NULL, "poisoned START leg keeps its row");
@@ -1916,11 +2013,11 @@ static void combined_fault_paths(void)
         txn.thread = 0;
         txn.sequence = 0;
         fault = 0;
-        EXPECT(p11_journal_combined_entry(&txn) == 0, "small first entry settles");
+        EXPECT(root_entry(&txn) == 0, "small first entry settles");
         txn.key = &second;
         txn.begin = &facts2;
         fault = 0;
-        EXPECT(p11_journal_combined_entry(&txn) == -1, "small second entry refuses at limit 1");
+        EXPECT(root_entry(&txn) == -1, "small second entry refuses at limit 1");
         EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted");
         EXPECT(owner_map_lookup(&START, &second) == NULL, "second START rewound");
         txn.key = &key;
@@ -1942,11 +2039,11 @@ static void combined_fault_paths(void)
         txn.thread = 0;
         txn.sequence = 0;
         fault = 0;
-        EXPECT(p11_journal_combined_entry(&txn) == 0, "first entry settles");
+        EXPECT(root_entry(&txn) == 0, "first entry settles");
         txn.key = &second;
         txn.begin = &facts2;
         fault = 0;
-        EXPECT(p11_journal_combined_entry(&txn) == 0, "second entry settles");
+        EXPECT(root_entry(&txn) == 0, "second entry settles");
         EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &second) != NULL,
                "second row present");
     }
@@ -1970,7 +2067,7 @@ static void combined_fault_paths(void)
     txn.thread = 0;
     txn.sequence = 0;
     txn.required = 1;
-    EXPECT(p11_journal_combined_entry(&txn) == 0, "entry settles");
+    EXPECT(root_entry(&txn) == 0, "entry settles");
     {
         struct object_start *side = owner_map_lookup(&OBJECT_START, &key);
         unsigned submits_before = ring_submits;
@@ -1980,17 +2077,187 @@ static void combined_fault_paths(void)
         txn.thread = 1;
         txn.sequence = 1;
         fault = 0;
-        EXPECT(p11_journal_combined_return(&txn) == -1, "START-failed return refuses");
+        EXPECT(root_return(&txn) == -1, "START-failed return refuses");
         EXPECT(fault == JOURNAL_FAULT_START_LEG, "START leg faulted");
         EXPECT(ring_submits == submits_before, "failed cleanup submits no END");
         found = p11_journal_side_lookup(&JOURNAL_START_MAP, &key);
         EXPECT(found != NULL && found->phase == JOURNAL_PHASE_RETURNING, "row stays RETURNING");
         txn.spec = NULL;
-        EXPECT(p11_journal_combined_remove(&txn) == -1, "tainted cleanup reports START fault");
+        EXPECT(root_remove(&txn) == -1, "tainted cleanup reports START fault");
         EXPECT(fault == JOURNAL_FAULT_START_LEG, "earlier fault preserved");
         EXPECT(ring_submits == submits_before, "silent retirement publishes nothing");
         EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &key) == NULL, "journal row retired");
     }
+}
+
+/* C4: operation-specific kinds at the transaction entry points. Entry
+ * publishes BEGIN only, return END only, remove ABANDON only — a
+ * wrong-kind template faults PUBLISH. Entry and return refuse before
+ * effects; forward-only remove still retires but submits nothing. */
+static void combined_operation_kinds(void)
+{
+    struct owner_start_key key;
+    struct journal_header_spec begin = {JOURNAL_BEGIN_BYTES, JOURNAL_KIND_BEGIN, 0, 0, 0};
+    struct journal_header_spec end = {JOURNAL_END_FULL_BYTES, JOURNAL_KIND_END, 0, 0, 0};
+    struct journal_header_spec abandon = {JOURNAL_ABANDON_BYTES, JOURNAL_KIND_ABANDON, 0, 0, 0};
+    struct journal_header_spec named;
+    struct journal_txn txn, bad;
+    struct journal_begin_facts facts;
+    struct journal_abandon_facts afacts;
+    unsigned char end_payload[JOURNAL_END_PAYLOAD_BYTES];
+    unsigned submits_before;
+    u64 fault = 0;
+    reset();
+    seed_object_tables();
+    key.pid_tgid = pid_tgid();
+    key.slot = 5;
+    key.pad = 0;
+    required_start_value(start_value);
+    make_begin_facts(&key, &facts);
+    make_abandon_facts(&key, &afacts);
+    build_end_payload(end_payload);
+    memset(&txn, 0, sizeof(txn));
+    txn.jctl = &journal_ctl;
+    txn.journal_map = &JOURNAL_START_MAP;
+    txn.ring = &JOURNAL_RING;
+    txn.key = &key;
+    txn.start_value = start_value;
+    txn.spec = &begin;
+    txn.fault_out = &fault;
+    txn.begin = &facts;
+    txn.end_payload = end_payload;
+    txn.abandon = &afacts;
+    /* Entry with an END template (zero identity, so only the kind
+     * refuses) and with an ABANDON template: both refuse before
+     * effects — no reserve, no rows, no lease. */
+    bad = txn;
+    bad.spec = &end;
+    fault = 0;
+    EXPECT(root_entry(&bad) == -1, "END through entry refuses");
+    EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted, got %llu",
+           (unsigned long long)fault);
+    bad.spec = &abandon;
+    fault = 0;
+    EXPECT(root_entry(&bad) == -1, "ABANDON through entry refuses");
+    EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted, got %llu",
+           (unsigned long long)fault);
+    EXPECT(owner_map_lookup(&START, &key) == NULL, "wrong-kind entry inserts no START");
+    EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &key) == NULL,
+           "wrong-kind entry inserts no journal row");
+    EXPECT(owners[0].flags == 0, "wrong-kind entry leases nothing");
+    EXPECT(ring_submits == 0 && ring_discards == 0, "wrong-kind entry reserves nothing");
+    /* Return with a BEGIN or ABANDON template naming the retained call
+     * exactly (so only the kind refuses): both refuse before effects,
+     * ahead of even the START lookup. */
+    named = begin;
+    named.thread = 1;
+    named.sequence = 1;
+    bad = txn;
+    bad.spec = &named;
+    bad.thread = 1;
+    bad.sequence = 1;
+    fault = 0;
+    EXPECT(root_return(&bad) == -1, "BEGIN through return refuses");
+    EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted, got %llu",
+           (unsigned long long)fault);
+    named = abandon;
+    named.thread = 1;
+    named.sequence = 1;
+    bad.spec = &named;
+    fault = 0;
+    EXPECT(root_return(&bad) == -1, "ABANDON through return refuses");
+    EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted, got %llu",
+           (unsigned long long)fault);
+    EXPECT(ring_submits == 0 && ring_discards == 0, "wrong-kind return reserves nothing");
+    /* Remove with an END template on an unsettled row: the template
+     * faults PUBLISH but cleanup still retires forward — journal row
+     * gone, START leg retired, lease released, nothing submitted. */
+    fault = 0;
+    EXPECT(root_entry(&txn) == 0, "entry settles");
+    submits_before = ring_submits;
+    named = end;
+    named.thread = 1;
+    named.sequence = 1;
+    bad = txn;
+    bad.spec = &named;
+    bad.thread = 1;
+    bad.sequence = 1;
+    bad.required = 1;
+    fault = 0;
+    EXPECT(root_remove(&bad) == -1, "END through remove faults");
+    EXPECT(fault == JOURNAL_FAULT_PUBLISH, "publish faulted, got %llu",
+           (unsigned long long)fault);
+    EXPECT(ring_submits == submits_before, "wrong-kind remove submits nothing");
+    EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &key) == NULL, "journal row retired");
+    EXPECT(owner_map_lookup(&START, &key) == NULL, "START row retired");
+    EXPECT(owner_map_lookup(&OBJECT_START, &key) == NULL, "subordinate retired");
+    EXPECT(owners[0].flags == 0, "emptied lease released");
+}
+
+/* N8: a failed journal deletion reports the fault FIRST, hands the
+ * uncommitted reservation back to the root (checked raise before its
+ * discard), keeps the lease for retry and publishes nothing — never a
+ * discard ahead of the report. The healed retry then settles with the
+ * ABANDON after full cleanup. */
+static void combined_journal_delete_failure(void)
+{
+    struct owner_start_key key;
+    struct journal_header_spec begin = {JOURNAL_BEGIN_BYTES, JOURNAL_KIND_BEGIN, 0, 0, 0};
+    struct journal_header_spec abandon = {JOURNAL_ABANDON_BYTES, JOURNAL_KIND_ABANDON, 0, 1, 1};
+    struct journal_txn txn;
+    struct journal_begin_facts facts;
+    struct journal_abandon_facts afacts;
+    unsigned submits_before, discards_before;
+    u64 fault = 0;
+    reset();
+    seed_object_tables();
+    key.pid_tgid = pid_tgid();
+    key.slot = 5;
+    key.pad = 0;
+    required_start_value(start_value);
+    make_begin_facts(&key, &facts);
+    make_abandon_facts(&key, &afacts);
+    memset(&txn, 0, sizeof(txn));
+    txn.jctl = &journal_ctl;
+    txn.journal_map = &JOURNAL_START_MAP;
+    txn.ring = &JOURNAL_RING;
+    txn.key = &key;
+    txn.start_value = start_value;
+    txn.spec = &begin;
+    txn.fault_out = &fault;
+    txn.begin = &facts;
+    txn.abandon = &afacts;
+    EXPECT(root_entry(&txn) == 0, "entry settles");
+    txn.spec = &abandon;
+    txn.thread = 1;
+    txn.sequence = 1;
+    txn.required = 1;
+    submits_before = ring_submits;
+    discards_before = ring_discards;
+    fault = 0;
+    fail_journal_delete = 1;
+    EXPECT(root_remove(&txn) == -1, "failed deletion reports loss");
+    EXPECT(fault == JOURNAL_FAULT_JOURNAL_LEG, "journal leg faulted, got %llu",
+           (unsigned long long)fault);
+    EXPECT(ring_submits == submits_before, "failed cleanup publishes nothing");
+    EXPECT(ring_discards == discards_before + 1, "the root settled the handoff");
+    EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &key) != NULL,
+           "failed deletion keeps its row for retry");
+    EXPECT(owner_map_lookup(&START, &key) != NULL, "failed cleanup keeps START");
+    EXPECT(owners[0].flags != 0, "failed cleanup keeps the lease");
+    fail_journal_delete = 0;
+    fault = 0;
+    abandon_order_key = &key;
+    abandon_order_checked = 0;
+    EXPECT(root_remove(&txn) == 0, "healed retry settles");
+    EXPECT(abandon_order_checked, "retry ABANDON after full cleanup");
+    abandon_order_key = NULL;
+    EXPECT(fault == JOURNAL_FAULT_NONE, "no fault, got %llu", (unsigned long long)fault);
+    EXPECT(ring_submits == submits_before + 1, "retry publishes the ABANDON once");
+    EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &key) == NULL, "journal row retired");
+    EXPECT(owner_map_lookup(&START, &key) == NULL, "START row retired");
+    EXPECT(owner_map_lookup(&OBJECT_START, &key) == NULL, "subordinate retired");
+    EXPECT(owners[0].flags == 0, "emptied lease released");
 }
 
 #endif /* P11SCOPE_INVENTORY_ONLY */
@@ -2046,6 +2313,8 @@ int main(void)
     combined_scrub_before_release();
     combined_collision_lifecycle();
     combined_fault_paths();
+    combined_operation_kinds();
+    combined_journal_delete_failure();
 #endif
     if (!failures)
         fprintf(stderr, "journal owner fixture: all checks passed\n");

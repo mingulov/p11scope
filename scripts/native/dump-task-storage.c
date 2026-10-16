@@ -30,8 +30,12 @@ static const char *const map_names[MAP_COUNT] = {
  * accepted below). H8 slice D: PROC_EPOCH rows are 152 B (144 B plus
  * the journal_bootstrap birth marker word). */
 static const uint32_t map_sizes[MAP_COUNT] = {8, 560, 8, 152};
-static const char qualification_program[] = "dump_task_storage";
-static const char inventory_program[] = "dump_task_storage_epoch";
+/* One iterator program per (surface, THREAD_OWNER ABI) pair; the
+ * reader selects by requested surface and reused row size. */
+static const char qualification_program_544[] = "dump_task_storage_544";
+static const char qualification_program_560[] = "dump_task_storage_560";
+static const char inventory_program_544[] = "dump_task_storage_epoch_544";
+static const char inventory_program_560[] = "dump_task_storage_epoch_560";
 static const unsigned char raw_magic[8] = {'P', '1', '1', 'T', 'S', 'R', '1', 0};
 static const unsigned char output_magic[8] = {'P', '1', '1', 'T', 'S', 'V', '1', 0};
 
@@ -262,28 +266,52 @@ static int write_all(int fd, const void *buffer, size_t length)
     return 0;
 }
 
-/* Selects the iterator program for the requested surface before load. The
- * full inventory loads only the four-map program. The qualification surface
- * loads only the three-map program and never creates PROC_EPOCH, so the
- * reader still creates no map of its own on either path. */
+/* Selects the iterator program for the requested surface and reused
+ * THREAD_OWNER row size before load. The full inventory loads only
+ * the four-map program for its ABI. The qualification surface loads
+ * only the three-map program for its ABI and never creates PROC_EPOCH,
+ * so the reader still creates no map of its own on any path. A program
+ * only ever runs against rows of its own length; any other size
+ * refuses before load. */
 static struct bpf_program *select_surface(const struct api *api, struct bpf_object *object,
-                                          size_t count)
+                                          size_t count, uint32_t owner_size)
 {
-    struct bpf_program *qualification;
-    struct bpf_program *inventory;
+    struct bpf_program *wanted;
+    struct bpf_program *others[3];
     struct bpf_map *epoch;
+    const char *names[4];
+    size_t index, other;
     if (count != MAP_COUNT && count != QUALIFICATION_MAPS)
         return NULL;
-    qualification = api->object_find_program(object, qualification_program);
-    inventory = api->object_find_program(object, inventory_program);
+    if (owner_size != 544 && owner_size != 560)
+        return NULL;
+    if (count == MAP_COUNT) {
+        names[0] = owner_size == 544 ? inventory_program_544 : inventory_program_560;
+        names[1] = qualification_program_544;
+        names[2] = qualification_program_560;
+        names[3] = owner_size == 544 ? inventory_program_560 : inventory_program_544;
+    } else {
+        names[0] = owner_size == 544 ? qualification_program_544 : qualification_program_560;
+        names[1] = owner_size == 544 ? qualification_program_560 : qualification_program_544;
+        names[2] = inventory_program_544;
+        names[3] = inventory_program_560;
+    }
+    wanted = api->object_find_program(object, names[0]);
+    for (index = 0; index < 3; index++) {
+        others[index] = api->object_find_program(object, names[index + 1]);
+        if (!others[index])
+            return NULL;
+    }
     epoch = api->object_find_map(object, map_names[MAP_COUNT - 1]);
-    if (!qualification || !inventory || !epoch || qualification == inventory)
+    if (!wanted || !epoch)
         return NULL;
-    if (count == MAP_COUNT)
-        return api->program_set_autoload(qualification, false) ? NULL : inventory;
-    if (api->program_set_autoload(inventory, false) || api->map_set_autocreate(epoch, false))
+    for (other = 0; other < 3; other++) {
+        if (others[other] == wanted || api->program_set_autoload(others[other], false))
+            return NULL;
+    }
+    if (count != MAP_COUNT && api->map_set_autocreate(epoch, false))
         return NULL;
-    return qualification;
+    return wanted;
 }
 
 static int acquire_reuse_load(const struct api *api, const struct kernel_api *kernel,
@@ -456,8 +484,7 @@ static void reset_lifecycle(struct map_spec specs[MAP_COUNT])
 }
 
 struct surface_state {
-    int qualification_disabled;
-    int inventory_disabled;
+    int disabled[4];
     int epoch_autocreate_disabled;
     int missing_epoch;
     int autoload_failure;
@@ -468,23 +495,23 @@ static struct surface_state surface;
 static struct bpf_program *fake_find_program(const struct bpf_object *object, const char *name)
 {
     (void)object;
-    if (!strcmp(name, qualification_program))
+    if (!strcmp(name, qualification_program_544))
         return (struct bpf_program *)(uintptr_t)1;
-    if (!strcmp(name, inventory_program))
+    if (!strcmp(name, qualification_program_560))
         return (struct bpf_program *)(uintptr_t)2;
+    if (!strcmp(name, inventory_program_544))
+        return (struct bpf_program *)(uintptr_t)3;
+    if (!strcmp(name, inventory_program_560))
+        return (struct bpf_program *)(uintptr_t)4;
     return NULL;
 }
 
 static int fake_set_autoload(struct bpf_program *program, bool autoload)
 {
-    if (autoload || surface.autoload_failure)
+    uintptr_t index = (uintptr_t)program;
+    if (autoload || surface.autoload_failure || index < 1 || index > 4)
         return -1;
-    if (program == (struct bpf_program *)(uintptr_t)1)
-        surface.qualification_disabled++;
-    else if (program == (struct bpf_program *)(uintptr_t)2)
-        surface.inventory_disabled++;
-    else
-        return -1;
+    surface.disabled[index - 1]++;
     return 0;
 }
 
@@ -508,34 +535,57 @@ static int surface_self_test(void)
 {
     struct api api;
     struct bpf_object *object = (struct bpf_object *)(uintptr_t)1;
+    /* (surface, ABI) matrix: wanted program id, whether PROC_EPOCH
+     * creation is disabled, and the expected disabled-others mask. */
+    static const struct {
+        size_t count;
+        uint32_t owner_size;
+        int wanted;
+        int disables_epoch;
+    } matrix[] = {
+        {MAP_COUNT, 544, 3, 0},
+        {MAP_COUNT, 560, 4, 0},
+        {QUALIFICATION_MAPS, 544, 1, 1},
+        {QUALIFICATION_MAPS, 560, 2, 1},
+    };
+    size_t case_index;
+    int program;
     memset(&api, 0, sizeof(api));
     api.object_find_program = fake_find_program;
     api.program_set_autoload = fake_set_autoload;
     api.object_find_map = fake_surface_map;
     api.map_set_autocreate = fake_set_autocreate;
 
+    for (case_index = 0; case_index < sizeof(matrix) / sizeof(matrix[0]); case_index++) {
+        memset(&surface, 0, sizeof(surface));
+        if (select_surface(&api, object, matrix[case_index].count,
+                           matrix[case_index].owner_size) !=
+                (struct bpf_program *)(uintptr_t)matrix[case_index].wanted ||
+            surface.epoch_autocreate_disabled != matrix[case_index].disables_epoch)
+            return fail("self-test selected the wrong iterator program");
+        for (program = 1; program <= 4; program++) {
+            int expect_disabled = program != matrix[case_index].wanted;
+            if (surface.disabled[program - 1] != expect_disabled)
+                return fail("self-test left a foreign iterator program loaded");
+        }
+    }
     memset(&surface, 0, sizeof(surface));
-    if (select_surface(&api, object, MAP_COUNT) != (struct bpf_program *)(uintptr_t)2 ||
-        surface.qualification_disabled != 1 || surface.inventory_disabled ||
-        surface.epoch_autocreate_disabled)
-        return fail("self-test full inventory did not select only the four-map program");
-    memset(&surface, 0, sizeof(surface));
-    if (select_surface(&api, object, QUALIFICATION_MAPS) != (struct bpf_program *)(uintptr_t)1 ||
-        surface.qualification_disabled || surface.inventory_disabled != 1 ||
-        surface.epoch_autocreate_disabled != 1)
-        return fail("self-test qualification surface would create or read PROC_EPOCH");
-    memset(&surface, 0, sizeof(surface));
-    if (select_surface(&api, object, QUALIFICATION_MAPS - 1) ||
-        select_surface(&api, object, MAP_COUNT + 1))
+    if (select_surface(&api, object, QUALIFICATION_MAPS - 1, 560) ||
+        select_surface(&api, object, MAP_COUNT + 1, 560))
         return fail("self-test accepted a partial or oversized map surface");
+    if (select_surface(&api, object, MAP_COUNT, 543) ||
+        select_surface(&api, object, MAP_COUNT, 561) ||
+        select_surface(&api, object, MAP_COUNT, 0) ||
+        select_surface(&api, object, QUALIFICATION_MAPS, 543))
+        return fail("self-test selected a program for a foreign row size");
     surface.missing_epoch = 1;
-    if (select_surface(&api, object, MAP_COUNT) ||
-        select_surface(&api, object, QUALIFICATION_MAPS))
+    if (select_surface(&api, object, MAP_COUNT, 560) ||
+        select_surface(&api, object, QUALIFICATION_MAPS, 544))
         return fail("self-test accepted an object without PROC_EPOCH");
     memset(&surface, 0, sizeof(surface));
     surface.autoload_failure = 1;
-    if (select_surface(&api, object, MAP_COUNT) ||
-        select_surface(&api, object, QUALIFICATION_MAPS))
+    if (select_surface(&api, object, MAP_COUNT, 560) ||
+        select_surface(&api, object, QUALIFICATION_MAPS, 544))
         return fail("self-test ignored a failed autoload change");
     puts("dump-task-storage surface selection mutation self-test: OK");
     return 0;
@@ -732,7 +782,10 @@ int main(int argc, char **argv)
         fail("cannot open iterator object");
         goto cleanup;
     }
-    program = select_surface(&api, object, count);
+    /* THREAD_OWNER is the second spec on both surfaces; its parsed
+     * row size (544 or 560, validated above) selects the matching
+     * iterator program. */
+    program = select_surface(&api, object, count, specs[1].value_size);
     if (!program) {
         fail("iterator program or surface selection is missing");
         goto cleanup;

@@ -7421,6 +7421,59 @@ fn task_storage_canary_seed_lifecycle() {
     assert_clean_python_suite(&report, "TaskStorageCanaryTests", 34);
 }
 
+/// N5: the task-storage iterator emits the live THREAD_OWNER ABI.
+/// The reader accepts 544 B (Inventory) and 560 B (Detailed) rows and
+/// rejects any frame whose length disagrees with the reused map, so
+/// the iterator carries one program per (surface, ABI) pair with a
+/// verifier-visible constant length each. This pins the real emitted
+/// constants in the real object: each program's disassembly carries
+/// its own ABI length and never the other's.
+#[test]
+fn task_storage_iterator_dual_abi() {
+    let directory = tempfile::tempdir().unwrap();
+    let reader_build = directory.path().join("task-storage-reader");
+    let reader_build_text = reader_build.to_str().unwrap();
+    run_ok(
+        "sh",
+        &["scripts/build-task-storage-reader.sh", reader_build_text],
+    );
+    let iterator = reader_build.join("dump-task-storage.bpf.o");
+    let iterator_disassembly = run_ok(
+        "llvm-objdump",
+        &["-d", "--print-imm-hex", iterator.to_str().unwrap()],
+    );
+    for (program, own, foreign) in [
+        ("dump_task_storage_544", "0x220", "0x230"),
+        ("dump_task_storage_560", "0x230", "0x220"),
+        ("dump_task_storage_epoch_544", "0x220", "0x230"),
+        ("dump_task_storage_epoch_560", "0x230", "0x220"),
+    ] {
+        let label = format!("<{program}>:");
+        let start = iterator_disassembly.find(&label).unwrap_or_else(|| {
+            panic!("iterator object lacks program {program}: {iterator_disassembly}")
+        });
+        // Programs end at the next program label (label lines lead
+        // with an address, so match the bare `<name` prefix); local
+        // block labels (`<LBB..>:`) stay inside the chunk.
+        let rest = &iterator_disassembly[start + label.len()..];
+        let end = rest
+            .find("<dump_task_storage")
+            .map(|at| start + label.len() + at);
+        let chunk = match end {
+            Some(end) => &iterator_disassembly[start..end],
+            None => &iterator_disassembly[start..],
+        };
+        assert!(
+            chunk.contains(own),
+            "{program} must emit its {own} ABI length: {chunk}"
+        );
+        assert!(
+            !chunk.contains(foreign),
+            "{program} must never emit the foreign {foreign} length: {chunk}"
+        );
+    }
+}
+
 #[test]
 fn metadata_canary_matrix() {
     let canaries = read("scripts/verify-canaries.sh");

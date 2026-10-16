@@ -24,8 +24,13 @@ struct bpf_iter__task {
     struct task_struct *task;
 };
 
+/* THREAD_OWNER row: the current 560 B Detailed ABI. Map reuse binds
+ * the live map (544 B Inventory or 560 B Detailed) by fd; the reader
+ * selects the iterator program matching the live row, so every
+ * program's emit length is a verifier-visible constant that can
+ * never over-read its rows. */
 struct thread_owner_value {
-    unsigned char bytes[544];
+    unsigned char bytes[560];
 };
 
 /* Task 3 Stage A `struct instance_record` (crates/ebpf/native/instance_epoch.h). */
@@ -106,55 +111,68 @@ static __attribute__((always_inline)) int emit(struct seq_file *seq,
     return 0;
 }
 
-SEC("iter/task")
-int dump_task_storage(struct bpf_iter__task *ctx)
+/* A bpf_iter program may return only 0 or 1, and the verifier rejects the
+ * whole object otherwise (-EINVAL, "At program exit the register R0 ...
+ * should have been in [0, 1]"). The two values are not success/failure:
+ * 0 keeps this task's written bytes, 1 DISCARDS them and declines the
+ * retry. So 0 is correct on every path here, including the one emit()
+ * reports nonzero.
+ *
+ * emit() only returns nonzero when bpf_seq_write() overflowed, which is
+ * backpressure rather than an error: the kernel drops this task's partial
+ * output and runs the program again for the SAME task on the next read()
+ * (see bpf_seq_write in linux/bpf.h -- "The same object will be tried
+ * again"). Returning early merely stops writing bytes the kernel is
+ * already discarding; returning 1 would turn that retry into permanent
+ * data loss, and returning -1 stopped the object loading at all.
+ *
+ * Always inlined with constant arguments: every program below carries
+ * its ABI length as a verifier-visible constant, never a variable a
+ * wrong-size row could slip past.
+ */
+static __attribute__((always_inline)) int dump_common(struct bpf_iter__task *ctx,
+                                                      u32 owner_len, int with_epoch)
 {
     struct task_struct *task = ctx->task;
 
     if (!task)
         return 0;
-    /* A bpf_iter program may return only 0 or 1, and the verifier rejects the
-     * whole object otherwise (-EINVAL, "At program exit the register R0 ...
-     * should have been in [0, 1]"). The two values are not success/failure:
-     * 0 keeps this task's written bytes, 1 DISCARDS them and declines the
-     * retry. So 0 is correct on every path here, including the one emit()
-     * reports nonzero.
-     *
-     * emit() only returns nonzero when bpf_seq_write() overflowed, which is
-     * backpressure rather than an error: the kernel drops this task's partial
-     * output and runs the program again for the SAME task on the next read()
-     * (see bpf_seq_write in linux/bpf.h -- "The same object will be tried
-     * again"). Returning early merely stops writing bytes the kernel is
-     * already discarding; returning 1 would turn that retry into permanent
-     * data loss, and returning -1 stopped the object loading at all.
-     */
     if (emit(ctx->meta->seq, task, &TASK_COOKIE, 0, 8))
         return 0;
-    if (emit(ctx->meta->seq, task, &THREAD_OWNER, 1, 544))
+    if (emit(ctx->meta->seq, task, &THREAD_OWNER, 1, owner_len))
         return 0;
     if (emit(ctx->meta->seq, task, &ROOT_AFFILIATION, 2, 8))
+        return 0;
+    if (with_epoch && emit(ctx->meta->seq, task, &PROC_EPOCH, 3, 152))
         return 0;
     return 0;
 }
 
-/* The full owned inventory: the same three maps, then PROC_EPOCH. Same 0-only
- * return contract as dump_task_storage above. */
+/* One program per (surface, THREAD_OWNER ABI) pair. The reader selects
+ * by requested surface and reused row size; a program only ever runs
+ * against rows of its own length. */
 SEC("iter/task")
-int dump_task_storage_epoch(struct bpf_iter__task *ctx)
+int dump_task_storage_544(struct bpf_iter__task *ctx)
 {
-    struct task_struct *task = ctx->task;
+    return dump_common(ctx, 544, 0);
+}
 
-    if (!task)
-        return 0;
-    if (emit(ctx->meta->seq, task, &TASK_COOKIE, 0, 8))
-        return 0;
-    if (emit(ctx->meta->seq, task, &THREAD_OWNER, 1, 544))
-        return 0;
-    if (emit(ctx->meta->seq, task, &ROOT_AFFILIATION, 2, 8))
-        return 0;
-    if (emit(ctx->meta->seq, task, &PROC_EPOCH, 3, 152))
-        return 0;
-    return 0;
+SEC("iter/task")
+int dump_task_storage_560(struct bpf_iter__task *ctx)
+{
+    return dump_common(ctx, 560, 0);
+}
+
+SEC("iter/task")
+int dump_task_storage_epoch_544(struct bpf_iter__task *ctx)
+{
+    return dump_common(ctx, 544, 1);
+}
+
+SEC("iter/task")
+int dump_task_storage_epoch_560(struct bpf_iter__task *ctx)
+{
+    return dump_common(ctx, 560, 1);
 }
 
 char LICENSE[] SEC("license") = "GPL";

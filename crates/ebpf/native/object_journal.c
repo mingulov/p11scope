@@ -270,4 +270,231 @@ __attribute__((noinline)) void p11_journal_discard(void *record)
     journal_ring_discard(record, 0);
 }
 
+/* The current task's leased owner, key-bound for the journal legs.
+ * Roots cannot obtain this pointer; the transactions derive it from
+ * task storage after the START leg guarantees (entry) or beside the
+ * START row they retire (return/remove). */
+static __always_inline struct thread_owner *txn_owner(const struct owner_start_key *key)
+{
+    struct thread_owner *owner;
+    if (!side_key_valid(key))
+        return (void *)0;
+    owner = p11_owner_current();
+    if (!side_owner_binds(owner, key))
+        return (void *)0;
+    return owner;
+}
+
+/* Publish one record: reserve, validated header, zeroed body, submit.
+ * 0 submitted; -1 with the fault cell set (before discard) on
+ * reserve/header failure, the reservation discarded. */
+static __always_inline int txn_publish(void *ring, const struct journal_header_spec *spec,
+                                       u64 *fault_out)
+{
+    unsigned char *record;
+    u64 i;
+    if (!ring || !spec) {
+        if (fault_out)
+            *fault_out = JOURNAL_FAULT_PUBLISH;
+        return -1;
+    }
+    if (!fault_out)
+        return -1;
+    record = p11_journal_reserve(ring, spec->bytes);
+    if (!record) {
+        *fault_out = JOURNAL_FAULT_PUBLISH;
+        return -1;
+    }
+    if (p11_journal_header_init(record, spec)) {
+        *fault_out = JOURNAL_FAULT_PUBLISH;
+        p11_journal_discard(record);
+        return -1;
+    }
+    /* The header gate constrained bytes to a valid length; zero the
+     * remaining prototype body. */
+    for (i = JOURNAL_COMMON_BYTES; i < spec->bytes; i++)
+        record[i] = 0;
+    p11_journal_submit(record);
+    return 0;
+}
+
+__attribute__((noinline)) int p11_journal_combined_entry(struct journal_txn *txn)
+{
+    struct thread_owner *owner;
+    struct journal_start_value *row;
+    struct journal_header_spec spec;
+    if (!txn || !txn->fault_out)
+        return -1;
+    *txn->fault_out = JOURNAL_FAULT_NONE;
+    if (!txn->jctl || !txn->journal_map || !txn->ring || !txn->key || !txn->start_value ||
+        !txn->spec) {
+        *txn->fault_out = JOURNAL_FAULT_JOURNAL_LEG;
+        return -1;
+    }
+    /* The template carries kind/bytes/flags only: identity comes from
+     * the inserted row, never smuggled in. */
+    if (txn->spec->thread || txn->spec->sequence) {
+        *txn->fault_out = JOURNAL_FAULT_PUBLISH;
+        return -1;
+    }
+    /* START leg first (with its OBJECT_START subordinate); it unwinds
+     * itself on failure and the journal is untouched yet. */
+    if (p11_owner_start_insert(txn->key, txn->start_value)) {
+        *txn->fault_out = JOURNAL_FAULT_START_LEG;
+        return -1;
+    }
+    owner = txn_owner(txn->key);
+    if (!owner || p11_journal_entry(owner, txn->jctl, txn->journal_map, txn->key)) {
+        *txn->fault_out = JOURNAL_FAULT_JOURNAL_LEG;
+        p11_owner_start_remove(txn->key, 1);
+        return -1;
+    }
+    /* BEGIN publication from the inserted row's own words. */
+    row = p11_journal_side_lookup(txn->journal_map, txn->key);
+    if (!row) {
+        *txn->fault_out = JOURNAL_FAULT_JOURNAL_LEG;
+        goto unwind;
+    }
+    spec.bytes = txn->spec->bytes;
+    spec.kind = txn->spec->kind;
+    spec.flags = txn->spec->flags;
+    spec.thread = row->thread;
+    spec.sequence = row->sequence;
+    if (txn_publish(txn->ring, &spec, txn->fault_out))
+        goto unwind;
+    /* The published BEGIN is valid: commit to BEGUN. A failed commit
+     * faults with the row PREPARING; exit cleanup abandons it (BEGIN
+     * then ABANDON is the coherent pair, not two terminals). */
+    if (p11_journal_mark_begun(txn->journal_map, txn->key, row->thread, row->sequence)) {
+        *txn->fault_out = JOURNAL_FAULT_JOURNAL_LEG;
+        return -1;
+    }
+    return 0;
+unwind:
+    /* Journal row first, then START; a failed journal unwind keeps
+     * both rows for exit cleanup instead of orphaning the journal
+     * row under a released lease. */
+    if (p11_journal_side_remove(txn->journal_map, txn->key))
+        return -1;
+    p11_owner_start_remove(txn->key, 1);
+    return -1;
+}
+
+__attribute__((noinline)) int p11_journal_combined_return(struct journal_txn *txn)
+{
+    struct thread_owner *owner;
+    if (!txn || !txn->fault_out)
+        return -1;
+    *txn->fault_out = JOURNAL_FAULT_NONE;
+    if (!txn->journal_map || !txn->ring || !txn->key || !txn->spec) {
+        *txn->fault_out = JOURNAL_FAULT_JOURNAL_LEG;
+        return -1;
+    }
+    /* The spec must name the retained call exactly. */
+    if (txn->spec->thread != txn->thread || txn->spec->sequence != txn->sequence) {
+        *txn->fault_out = JOURNAL_FAULT_PUBLISH;
+        return -1;
+    }
+    /* The live START row must still hold this call: a collided-away
+     * START never returns through its orphaned journal row. */
+    if (!p11_owner_start_get(txn->key, 1)) {
+        *txn->fault_out = JOURNAL_FAULT_START_LEG;
+        return -1;
+    }
+    owner = txn_owner(txn->key);
+    if (!owner ||
+        p11_journal_return(owner, txn->journal_map, txn->key, txn->thread, txn->sequence)) {
+        *txn->fault_out = JOURNAL_FAULT_JOURNAL_LEG;
+        return -1;
+    }
+    /* Forward-only: the advance committed; a publish failure faults
+     * (covering the lost END) and the row stays RETURNING for silent
+     * retirement. */
+    if (txn_publish(txn->ring, txn->spec, txn->fault_out))
+        return -1;
+    return 0;
+}
+
+__attribute__((noinline)) int p11_journal_combined_remove(struct journal_txn *txn)
+{
+    struct journal_start_value *row;
+    long start_rc;
+    int journal_rc;
+    int start_ok;
+    if (!txn || !txn->fault_out)
+        return -1;
+    *txn->fault_out = JOURNAL_FAULT_NONE;
+    if (!txn->journal_map || !txn->ring || !txn->key || (txn->required != 0 && txn->required != 1)) {
+        *txn->fault_out = JOURNAL_FAULT_JOURNAL_LEG;
+        return -1;
+    }
+    /* Journal row settles BEFORE the START leg runs: cleanup ordering.
+     * A contradicted row (bad words, bad phase, or identity against
+     * the retained facts) is scrubbed in place, then deleted — the
+     * scrub lands before the lease is released. */
+    row = p11_journal_side_lookup(txn->journal_map, txn->key);
+    if (!row) {
+        if (txn->required) {
+            *txn->fault_out = JOURNAL_FAULT_JOURNAL_LEG;
+            journal_rc = -1;
+        } else {
+            journal_rc = -2;
+        }
+        goto start_leg;
+    }
+    if (!row->thread || !row->sequence || !journal_phase_valid(row->phase) ||
+        row->thread != txn->thread || row->sequence != txn->sequence) {
+        row->thread = 0;
+        row->sequence = 0;
+        row->phase = 0;
+        if (p11_journal_side_remove(txn->journal_map, txn->key)) {
+            /* The scrubbed row stays with its lease for retry; the
+             * START leg must not orphan it under a release. */
+            *txn->fault_out = JOURNAL_FAULT_JOURNAL_LEG;
+            return -1;
+        }
+        *txn->fault_out = JOURNAL_FAULT_JOURNAL_LEG;
+        journal_rc = -1;
+        goto start_leg;
+    }
+    if (row->phase != JOURNAL_PHASE_RETURNING) {
+        /* Unsettled: publish ABANDON for exactly this row. The spec
+         * must match the retained facts; a bad spec faults but still
+         * retires (cleanup settles forward-only). */
+        if (!txn->spec || txn->spec->thread != txn->thread ||
+            txn->spec->sequence != txn->sequence) {
+            *txn->fault_out = JOURNAL_FAULT_PUBLISH;
+        } else if (txn_publish(txn->ring, txn->spec, txn->fault_out)) {
+            /* Fault set by publish; fall through to retire. */
+        }
+        if (p11_journal_side_remove(txn->journal_map, txn->key)) {
+            *txn->fault_out = JOURNAL_FAULT_JOURNAL_LEG;
+            return -1;
+        }
+        journal_rc = (*txn->fault_out == JOURNAL_FAULT_NONE) ? 0 : -1;
+        goto start_leg;
+    }
+    /* RETURNING: the END published (or its loss faulted); retire
+     * silently — never a second disposition. */
+    if (p11_journal_side_remove(txn->journal_map, txn->key)) {
+        *txn->fault_out = JOURNAL_FAULT_JOURNAL_LEG;
+        return -1;
+    }
+    journal_rc = 0;
+start_leg:
+    /* The START leg retires OBJECT_START beside START and releases an
+     * emptied lease. First fault wins; -2 only when both sides are
+     * healthily absent under an optional removal. */
+    start_rc = p11_owner_start_remove(txn->key, txn->required);
+    start_ok = (start_rc == 0) || (!txn->required && start_rc == -2);
+    if (journal_rc == -2 && !txn->required && start_rc == -2)
+        return -2;
+    if (journal_rc == -1 || !start_ok) {
+        if (*txn->fault_out == JOURNAL_FAULT_NONE)
+            *txn->fault_out = JOURNAL_FAULT_START_LEG;
+        return -1;
+    }
+    return 0;
+}
+
 #endif /* P11SCOPE_INVENTORY_ONLY */

@@ -640,10 +640,6 @@ impl ModelState {
         (result, effects)
     }
 
-    fn admit(&mut self, origin: OriginFact) -> Result<CallToken, ObjectGap> {
-        self.admit_with_effects(origin).0
-    }
-
     /// Admission with its capacity-refusal effects: a refused begin is
     /// unrepresented history that may still be running, and its
     /// invalidation effects are observable, never local.

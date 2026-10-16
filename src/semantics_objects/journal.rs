@@ -1576,7 +1576,8 @@ impl H3DispositionEvidence {
     /// invalidations alike), the route-waiting floor, the shed floor,
     /// the unpublished floor, and allocator exhaustion. Called from
     /// the actual `finalize_batch`; the coordinator stores the result
-    /// as the seal's H3 evidence.
+    /// as the seal's H3 evidence. `acked_below` is the seal's H3-loss
+    /// acknowledgement: H0 positions below it were voided by a seal.
     pub(crate) fn from_finalizer_batch(
         negatives: &[crate::inventory_semantics::LaneNegative],
         staged: &[Option<u64>],
@@ -1585,6 +1586,7 @@ impl H3DispositionEvidence {
         unpublished_floor: Option<u64>,
         exhausted: bool,
         previous: &Self,
+        acked_below: u64,
     ) -> Self {
         use crate::inventory_semantics::LaneNegative;
         // Exhaustion sticks: an unpositioned outcome (or a dead
@@ -1608,10 +1610,20 @@ impl H3DispositionEvidence {
         if let Some(barrier) = barrier {
             return Self::StagedLoss { barrier };
         }
+        // An unacknowledged loss barrier persists: only the seal's
+        // explicit void (positions below `acked_below`) releases the
+        // next mint into Clean. A clean batch never overwrites a loss
+        // the seal has not consumed.
+        if let Self::StagedLoss { barrier } = previous
+            && *barrier >= acked_below
+        {
+            return Self::StagedLoss { barrier: *barrier };
+        }
         // The certified maximum is monotone over previous evidence; a
-        // loss barrier restarts it above itself (positions at or below
-        // the barrier were disposed as loss). The pending floor is the
-        // current minimum over route-waiting and unpublished positions.
+        // voided loss barrier restarts it above itself (positions at or
+        // below the barrier were disposed as loss). The pending floor
+        // is the current minimum over route-waiting and unpublished
+        // positions.
         let base = match previous {
             Self::Clean { staged_max, .. } => *staged_max,
             Self::StagedLoss { barrier } => *barrier,
@@ -1663,6 +1675,36 @@ impl H3DispositionEvidence {
     }
 }
 
+/// The seal's H3 evidence source: the actual H3 finalizer. The audit
+/// constructor takes (consumes) the latest minted disposition through
+/// this trait, so the seal never audits caller-supplied H3 evidence.
+/// Loss barriers persist across takes until the seal voids them; the
+/// joint tick forwards the seal's void report to the finalizer's
+/// acknowledgement.
+pub(crate) trait H3EvidenceSource {
+    fn take_h3_disposition(&mut self) -> H3DispositionEvidence;
+}
+
+/// Test-only H3 evidence source: yields one scripted disposition, then
+/// genesis (the seal then waits for coverage), mirroring the
+/// finalizer's take semantics.
+#[cfg(test)]
+pub(crate) struct ScriptedH3Source(Option<H3DispositionEvidence>);
+
+#[cfg(test)]
+impl ScriptedH3Source {
+    pub(crate) fn once(evidence: H3DispositionEvidence) -> Self {
+        Self(Some(evidence))
+    }
+}
+
+#[cfg(test)]
+impl H3EvidenceSource for ScriptedH3Source {
+    fn take_h3_disposition(&mut self) -> H3DispositionEvidence {
+        self.0.take().unwrap_or_else(H3DispositionEvidence::genesis)
+    }
+}
+
 /// One seal's post-consumption audit: the fault pair bracketing the tick,
 /// the drain's malformed delta, H3's disposition and the closure
 /// generation the bootstrap must match. Validity is established by
@@ -1699,12 +1741,14 @@ pub(crate) struct JournalCollection {
 }
 
 impl JournalAuditReceipt {
-    /// Production audit from one collection plus H3's disposition and the
-    /// live closure generation. The seal's check rules decide; this only
+    /// Production audit from one collection plus the actual H3
+    /// finalizer's latest disposition (taken through
+    /// [`H3EvidenceSource`], never caller-supplied) and the live
+    /// closure generation. The seal's check rules decide; this only
     /// binds the evidence.
     pub(crate) fn collect(
         collection: &JournalCollection,
-        h3: H3DispositionEvidence,
+        source: &mut impl H3EvidenceSource,
         closure_generation: u64,
     ) -> Self {
         Self {
@@ -1713,7 +1757,7 @@ impl JournalAuditReceipt {
             fault_error: collection.fault_error,
             malformed_delta: collection.malformed_delta,
             discarded_delta: collection.discarded_delta,
-            h3,
+            h3: source.take_h3_disposition(),
             h0_below: collection.h0_allocated_below,
             closure_generation,
             session_domain: Some(collection.session_domain),
@@ -2210,6 +2254,14 @@ pub(crate) struct SealSuccess {
 pub(crate) struct SealFailure {
     pub(crate) gap: JournalGap,
     pub(crate) effects: ObjectEffects,
+    /// H3-loss acknowledgement: H0 positions below this watermark were
+    /// voided by this seal. The joint tick forwards it to the H3
+    /// finalizer (`acknowledge_h3_void`); `None` when this seal voided
+    /// no H3 loss.
+    // The production joint tick that forwards this is later Task 3
+    // work; until it lands the report channel is exercised by tests.
+    #[allow(dead_code)]
+    pub(crate) h3_voided: Option<u64>,
 }
 
 /// Finite attestation refusal.
@@ -2535,6 +2587,7 @@ impl JournalAdapter {
             // reported with the refusal.
             self.last_audit_failure = Some(self.consumed_through);
             let mut effects = ObjectEffects::default();
+            let mut h3_voided = None;
             match gap {
                 JournalGap::FaultSaturated => {
                     self.stopped = true;
@@ -2562,8 +2615,11 @@ impl JournalAdapter {
                     if gap == JournalGap::H3Loss {
                         // Forgive the voided H0 interval: re-presented
                         // barriers at or below it wait for clean
-                        // evidence instead of voiding twice.
+                        // evidence instead of voiding twice. The void
+                        // report acknowledges the consumed barrier to
+                        // the finalizer through the joint tick.
                         self.h3_voided_below = self.h3_voided_below.max(audit.h0_below);
+                        h3_voided = Some(self.h3_voided_below);
                     }
                     if gap == JournalGap::FaultChanged {
                         // Re-baseline the cumulative chain on the
@@ -2578,7 +2634,11 @@ impl JournalAdapter {
                 JournalGap::H3Pending | JournalGap::ClosureStale => {}
                 _ => {}
             }
-            return Err(SealFailure { gap, effects });
+            return Err(SealFailure {
+                gap,
+                effects,
+                h3_voided,
+            });
         }
         // The audit passed: pin the cumulative baseline. Past the first
         // seal this is a no-op (the chain rule already equated them).
@@ -3034,6 +3094,7 @@ impl JournalAdapter {
         SealFailure {
             gap,
             effects: ObjectEffects::default(),
+            h3_voided: None,
         }
     }
 
@@ -3090,6 +3151,7 @@ impl JournalAdapter {
             return Err(SealFailure {
                 gap: JournalGap::DomainTainted,
                 effects,
+                h3_voided: None,
             });
         }
         // This key's bounded abandonments need their corroborating
@@ -3141,6 +3203,7 @@ impl JournalAdapter {
             return Err(SealFailure {
                 gap: JournalGap::ModelRefused,
                 effects,
+                h3_voided: None,
             });
         }
         self.keys
@@ -3194,6 +3257,7 @@ impl JournalAdapter {
                     return Err(SealFailure {
                         gap: JournalGap::ModelRefused,
                         effects,
+                        h3_voided: None,
                     });
                 }
             }
@@ -3229,6 +3293,7 @@ impl JournalAdapter {
                 return Err(SealFailure {
                     gap: JournalGap::ModelRefused,
                     effects,
+                    h3_voided: None,
                 });
             };
             let entry = *self.open.get(&native).expect("staged begin");
@@ -3259,6 +3324,7 @@ impl JournalAdapter {
                     return Err(SealFailure {
                         gap: JournalGap::ModelRefused,
                         effects,
+                        h3_voided: None,
                     });
                 }
             }
@@ -3321,6 +3387,7 @@ impl JournalAdapter {
                     return Err(SealFailure {
                         gap: JournalGap::ModelRefused,
                         effects,
+                        h3_voided: None,
                     });
                 };
                 let lost = model.outcome_lost(super::LostOutcome::Ticket(
@@ -3402,12 +3469,14 @@ impl JournalAdapter {
             return Err(SealFailure {
                 gap: JournalGap::DomainEnded,
                 effects,
+                h3_voided: None,
             });
         }
         if rejected {
             return Err(SealFailure {
                 gap: JournalGap::ModelRefused,
                 effects,
+                h3_voided: None,
             });
         }
         self.keys.get_mut(&key).expect("sealed key").sealed_through = frontier;
@@ -3809,7 +3878,7 @@ mod tests {
     /// only the ring bytes and fault cell are scripted.
     struct AttestationFixture {
         _dir: tempfile::TempDir,
-        subset: AttestedSubset,
+        subset: Option<AttestedSubset>,
         binding: crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding,
         domain: NativeDomainId,
         image: ImageIdentity,
@@ -3945,7 +4014,7 @@ mod tests {
             let router = Self::route(domain, image);
             Self {
                 _dir: dir,
-                subset,
+                subset: Some(subset),
                 binding,
                 domain,
                 image,
@@ -4046,11 +4115,17 @@ mod tests {
             admit_call_from_evidence(
                 evidence,
                 &self.binding,
-                &self.subset,
+                self.subset.as_ref().expect("subset held"),
                 CallStanding::Historical(InstanceReason::SemanticLoss),
                 None,
             )
             .expect("scripted evidence admits")
+        }
+
+        /// Move the attested subset out (for a semantic lane): the
+        /// fixture keeps its binding/router for further admissions.
+        fn take_subset(&mut self) -> AttestedSubset {
+            self.subset.take().expect("subset held")
         }
     }
 
@@ -4196,7 +4271,8 @@ mod tests {
             collection: &JournalCollection,
         ) -> Result<SealSuccess, SealFailure> {
             let h3 = H3DispositionEvidence::scripted_clean(self.adapter.consumed_through);
-            let audit = JournalAuditReceipt::collect(collection, h3, 0);
+            let mut source = ScriptedH3Source::once(h3);
+            let audit = JournalAuditReceipt::collect(collection, &mut source, 0);
             let frontier = self.adapter.consumed_frontier();
             let fresh = SessionBirthEvidence::scripted_for_receipt(bootstrap);
             self.seal_explicit(&audit, bootstrap, frontier, &fresh)
@@ -7896,6 +7972,7 @@ mod tests {
             None,
             false,
             &genesis,
+            0,
         );
         assert!(matches!(
             evidence,
@@ -7914,6 +7991,7 @@ mod tests {
             None,
             false,
             &evidence,
+            0,
         );
         assert!(matches!(
             next,
@@ -7932,6 +8010,7 @@ mod tests {
             None,
             false,
             &genesis,
+            0,
         );
         assert!(matches!(
             shed,
@@ -7947,6 +8026,7 @@ mod tests {
             None,
             false,
             &genesis,
+            0,
         );
         assert!(matches!(dead, H3DispositionEvidence::Exhausted));
         // Staged negatives are loss barriers; a refused collection
@@ -7969,6 +8049,7 @@ mod tests {
                 None,
                 false,
                 &genesis,
+                0,
             );
             assert!(
                 matches!(loss, H3DispositionEvidence::StagedLoss { barrier: b } if b == barrier)
@@ -7983,9 +8064,27 @@ mod tests {
             None,
             false,
             &dead,
+            0,
         );
         assert!(matches!(after, H3DispositionEvidence::Exhausted));
-        // A loss barrier restarts the certified maximum above itself.
+        // An unacknowledged loss barrier persists across a clean
+        // batch: only the seal's explicit void releases the next mint
+        // into Clean, restarting the certified maximum above the voided
+        // barrier.
+        let unacked = H3DispositionEvidence::from_finalizer_batch(
+            &[],
+            &[Some(10)],
+            None,
+            None,
+            None,
+            false,
+            &shed,
+            0,
+        );
+        assert!(matches!(
+            unacked,
+            H3DispositionEvidence::StagedLoss { barrier: 9 }
+        ));
         let recovered = H3DispositionEvidence::from_finalizer_batch(
             &[],
             &[Some(10)],
@@ -7994,6 +8093,7 @@ mod tests {
             None,
             false,
             &shed,
+            10,
         );
         assert!(matches!(
             recovered,
@@ -8002,6 +8102,189 @@ mod tests {
                 pending_floor: None,
             }
         ));
+    }
+
+    #[test]
+    fn object_journal_h3_loss_acknowledgement_gates_clean_transition() {
+        // N1: loss at position 1, then a clean batch through 2. Without
+        // the seal's acknowledgement the barrier persists (never a
+        // silent Clean); the acknowledged twin transitions.
+        let genesis = H3DispositionEvidence::genesis();
+        let loss = H3DispositionEvidence::from_finalizer_batch(
+            &[],
+            &[Some(1)],
+            None,
+            Some(1),
+            None,
+            false,
+            &genesis,
+            0,
+        );
+        assert!(matches!(
+            loss,
+            H3DispositionEvidence::StagedLoss { barrier: 1 }
+        ));
+        let unacked = H3DispositionEvidence::from_finalizer_batch(
+            &[],
+            &[Some(2)],
+            None,
+            None,
+            None,
+            false,
+            &loss,
+            0,
+        );
+        assert!(
+            matches!(unacked, H3DispositionEvidence::StagedLoss { barrier: 1 }),
+            "unacknowledged loss persists: {unacked:?}"
+        );
+        let acked = H3DispositionEvidence::from_finalizer_batch(
+            &[],
+            &[Some(2)],
+            None,
+            None,
+            None,
+            false,
+            &loss,
+            2,
+        );
+        assert!(matches!(
+            acked,
+            H3DispositionEvidence::Clean {
+                staged_max: 2,
+                pending_floor: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn object_journal_seal_acknowledges_h3_loss_through_finalizer() {
+        // Carryover 5 + N1: the wired joint path through the ACTUAL H3
+        // finalizer. The finalizer mints a loss; the seal audit takes it
+        // (never caller-supplied); the seal voids and reports the
+        // voided watermark; the tick forwards it; the next mint
+        // releases into Clean so genuinely new history seals. A seal
+        // with no fresh batch waits on genesis evidence.
+        use crate::attach::{BackendSelection, Scope};
+        use crate::discovery::caller_registry::{OsProcessSource, RegistryLimits};
+        use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
+        use crate::discovery::hooks::HookRegistry;
+        use crate::inventory_semantics::{AttestedSemanticLane, SemanticBatch};
+        use crate::semantic_capture::{
+            Invalidation, InvalidationScope, TickOutcome, TickReport,
+        };
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let pid = std::process::id();
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::Pid(pid),
+            HookRegistry::builtin(),
+            Vec::new(),
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let mut lane = AttestedSemanticLane::start(
+            scene.fixture.take_subset(),
+            &Scope::Pid(pid),
+            BackendSelection::Auto,
+        )
+        .expect("shell lane starts");
+        let detailed = lane.domain();
+        let commit = |coordinator: &mut InventoryCoordinator<OsProcessSource>,
+                      lane: &mut AttestedSemanticLane,
+                      report: TickReport| {
+            let batch = SemanticBatch::from_tick_report(detailed, report, Vec::new(), 130).unwrap();
+            coordinator.stage_semantic_batch(batch);
+            coordinator
+                .commit_batch_with_semantics(false, Some(lane))
+                .unwrap();
+        };
+        let invalidation = |position: u64| {
+            TickOutcome::Invalidation(Invalidation::scripted(
+                detailed,
+                InvalidationScope::CoverageFailed,
+                Some(position),
+            ))
+        };
+        let create = function_id("C_CreateObject");
+        let fault = ScriptedFaultCell::steady(7);
+        // Quantum 1: journal history plus a finalizer loss barrier below
+        // the collection watermark. The seal takes the loss, voids, and
+        // reports the voided watermark.
+        let first = begin_bytes(1, 1, create, 0);
+        let collection = scene.collect_records(
+            vec![
+                first.to_vec(),
+                end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50).to_vec(),
+            ],
+            &fault,
+        );
+        commit(
+            &mut coordinator,
+            &mut lane,
+            TickReport::scripted_with_disposition(
+                vec![invalidation(2)],
+                Vec::new(),
+                None,
+                Some(1),
+                false,
+            ),
+        );
+        let bootstrap = scene.bootstrap(proof, 0);
+        let audit = JournalAuditReceipt::collect(&collection, &mut coordinator, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let fresh = SessionBirthEvidence::scripted_for_receipt(&bootstrap);
+        let failure = scene
+            .seal_explicit(&audit, &bootstrap, frontier, &fresh)
+            .expect_err("taken loss voids");
+        assert_eq!(failure.gap, JournalGap::H3Loss);
+        assert_eq!(failure.h3_voided, Some(3));
+        coordinator.acknowledge_h3_void(failure.h3_voided.expect("void report"));
+        // Quantum 2: a clean finalizer batch releases into Clean past
+        // the acknowledged barrier, and genuinely new journal history
+        // seals above the void fence.
+        commit(
+            &mut coordinator,
+            &mut lane,
+            TickReport::scripted_with_disposition(
+                vec![invalidation(4)],
+                Vec::new(),
+                None,
+                None,
+                false,
+            ),
+        );
+        let fence = scene.adapter.consumed_through;
+        let next = begin_bytes(1, 2, create, 0);
+        let collection = scene.collect_records(
+            vec![
+                next.to_vec(),
+                end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60).to_vec(),
+            ],
+            &fault,
+        );
+        let grant = SessionBirthGrant::scripted(proof, BirthKind::AbsenceAppearance, fence, 0);
+        let resume =
+            BootstrapReceipt::attest(&scene.adapter, &grant).expect("fence absence attests");
+        let audit = JournalAuditReceipt::collect(&collection, &mut coordinator, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let fresh = SessionBirthEvidence::scripted_for_receipt(&resume);
+        let recovered = scene
+            .seal_explicit(&audit, &resume, frontier, &fresh)
+            .expect("acknowledged history seals");
+        assert_eq!(recovered.prefix.settled().len(), 1);
+        // No fresh batch minted: the take yields genesis and the seal
+        // waits for coverage instead of certifying across a gap.
+        let audit = JournalAuditReceipt::collect(&collection, &mut coordinator, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let fresh = SessionBirthEvidence::scripted_for_receipt(&resume);
+        let failure = scene
+            .seal_explicit(&audit, &resume, frontier, &fresh)
+            .expect_err("stale evidence waits");
+        assert_eq!(failure.gap, JournalGap::H3Pending);
     }
 
     #[test]

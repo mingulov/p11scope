@@ -114,6 +114,72 @@ struct journal_header_spec {
 
 _Static_assert(sizeof(struct journal_header_spec) == 40, "header spec ABI");
 
+/* Finite wire gates mirrored from the Rust validators (the oracle):
+ * layouts (object_wire OBJECT_LAYOUT_*), descriptor bound
+ * (MAX_DESCRIPTORS, exclusive), handle statuses (VALUE plus the finite
+ * max; VALUE requires a nonzero word, every other status a zero word),
+ * entry-stamp bits (STAMP_VALID plus the five finite condition bits),
+ * capture bits (mechanism/output masks plus the three finite bits),
+ * the H7 CALL event type and the finite ABANDON reason range. Deep
+ * checks (attribute lists, the H7 object tail, the function catalog)
+ * stay userspace: the oracle proves them over every published record. */
+#define JOURNAL_LAYOUT_LP64 1U
+#define JOURNAL_LAYOUT_ILP32 2U
+#define JOURNAL_DESCRIPTOR_MAX 105U
+#define JOURNAL_HANDLE_VALUE 1U
+#define JOURNAL_HANDLE_STATUS_MAX 9U
+#define JOURNAL_STAMP_VALID 0x8000U
+#define JOURNAL_STAMP_MASK 0x801FU
+#define JOURNAL_CAPTURE_MASK 0x7FU
+#define JOURNAL_EVENT_CALL 0U
+#define JOURNAL_REASON_MIN 1U
+#define JOURNAL_REASON_MAX 9U
+/* The 608-byte H7 completed payload behind an END, and the compact
+ * form's omitted zero span (Event bytes 120..280). */
+#define JOURNAL_END_PAYLOAD_BYTES 608U
+#define JOURNAL_COMPACT_OMIT_START 120U
+#define JOURNAL_COMPACT_OMIT_END 280U
+
+/* Root-supplied BEGIN facts: the entry evidence the BEGIN body
+ * carries, retained by the root from the entry probe. Identity
+ * (thread/sequence) is NOT here: it comes from the inserted row, and
+ * the slot/pid words must exactly match the transaction key (a
+ * confused root's facts never frame another key's call). Byte-exact
+ * with the Rust ValidatedJournalBegin layout. */
+struct journal_begin_facts {
+    u64 pid_tgid;
+    u64 image_cookie;
+    u64 image_exec;
+    u64 entry_ns;
+    u64 entry_ip;
+    unsigned char entry_stamp[16];
+    u64 session_word;
+    u64 input_words[2];
+    u32 slot;
+    u32 descriptor;
+    u64 entry_mechanism;
+    u32 capture;
+    unsigned char layout;
+    unsigned char session_status;
+    unsigned char input_status[2];
+    unsigned char requested[2][36];
+    u64 slot_id;
+    u64 call_flags;
+    u32 user_type;
+};
+
+/* Root-supplied ABANDON facts: the retained BEGIN evidence the
+ * ABANDON body carries. Identity comes from the retained facts; the
+ * slot/pid words must exactly match the transaction key. */
+struct journal_abandon_facts {
+    u64 pid_tgid;
+    u64 image_cookie;
+    u64 image_exec;
+    u64 entry_ns;
+    u32 slot;
+    u32 reason;
+};
+
 /* Leaves. 0/-1 status; nonzero ticket/sequence on success, 0 on
  * refusal (caller raises loss before provider execution or
  * discard). */
@@ -166,17 +232,21 @@ void *p11_owner_start_get(const struct owner_start_key *key, u32 required);
  * to the transaction's fault cell BEFORE any unwind, discard or
  * return, so the root raises the checked fault before provider
  * execution/return/discard even when the unwind itself fails. First
- * fault wins; 0 means no fault. */
+ * fault wins; 0 means no fault. Cells are caller-owned and sticky: a
+ * transaction never clears a nonzero incoming cell (a fresh probe
+ * passes a fresh cell). Entry and return refuse before effects on a
+ * tainted cell; remove still settles forward but reports the earlier
+ * fault instead of success — cleanup never erases a prior failure. */
 #define JOURNAL_FAULT_NONE 0U
 #define JOURNAL_FAULT_START_LEG 1U
 #define JOURNAL_FAULT_JOURNAL_LEG 2U
 #define JOURNAL_FAULT_PUBLISH 3U
 
 /* One combined transaction's workspace: the legs' maps and rows plus
- * the publication template, the retained BEGIN facts and the fault
- * cell. Roots fill the fields their operation documents. A BPF
- * subprogram takes at most five arguments, so each transaction takes
- * this one pointer. */
+ * the publication template, the root-supplied record facts, the
+ * retained BEGIN facts and the fault cell. Roots fill the fields
+ * their operation documents. A BPF subprogram takes at most five
+ * arguments, so each transaction takes this one pointer. */
 struct journal_txn {
     struct journal_control *jctl; /* entry: mint control */
     void *journal_map; /* all: JOURNAL_START side map */
@@ -196,9 +266,12 @@ struct journal_txn {
     u64 thread; /* return/remove: retained BEGIN facts for exact match */
     u64 sequence; /* return/remove: retained BEGIN facts */
     u32 required; /* remove: the frozen per-slot required bit */
+    const struct journal_begin_facts *begin; /* entry: BEGIN body facts */
+    const void *end_payload; /* return: 608 B H7 completed payload */
+    const struct journal_abandon_facts *abandon; /* remove: ABANDON facts */
 };
 
-_Static_assert(sizeof(struct journal_txn) == 80, "txn ABI");
+_Static_assert(sizeof(struct journal_txn) == 104, "txn ABI");
 
 /* Inactive COMBINED START/OBJECT_START transactions: one call sequences
  * the H7 START leg (which retires the OBJECT_START subordinate beside
@@ -207,33 +280,50 @@ _Static_assert(sizeof(struct journal_txn) == 80, "txn ABI");
  * derived from current task storage inside the transaction (roots
  * cannot obtain the pointer otherwise) and key-bound before the
  * journal legs run. 0 settled, -1 loss/refusal (fault cell set),
- * remove-only -2 healthy absence (no fault). Publication reserves the
- * spec's bytes, writes the validated 24 B common header, zeroes the
- * remaining body (prototype: fact fill is future-root work) and
- * submits; failures fault BEFORE discard and unwind.
+ * remove-only -2 healthy absence (no fault). Every published record
+ * is a VALID wire transaction: the validated 24 B common header plus
+ * a body framed from the root's facts behind the finite native gates
+ * (stamp, descriptor, layout, capture, handle, reason, END base and
+ * compact eligibility); the Rust validators accept every submitted
+ * record (pinned by test). Publication reserves first and submits
+ * only after the required cleanup commits; fill failures return the
+ * retained reservation for ROOT-SIDE fault-then-discard (the combined
+ * function raises the checked fault BEFORE the discard commits — no
+ * helper below the combined level discards).
  *
- * Entry inserts START (with its OBJECT_START subordinate), inserts the
- * PREPARING journal row, publishes BEGIN and commits the row to
+ * Entry refuses before effects on a busy key (an occupant in START or
+ * the journal side map ends the call with a START/JOURNAL leg fault
+ * and nothing unwound — never a collide-unwind that releases the
+ * owner under a retained journal row), inserts START (with its
+ * OBJECT_START subordinate), inserts the PREPARING journal row,
+ * reserves and fills BEGIN, submits it, and commits the row to
  * BEGUN. Any leg failure unwinds the earlier legs (journal row first,
  * then START) and reports -1 before provider execution; a failed
  * journal unwind keeps both rows for exit cleanup instead of
  * orphaning the journal row under a released lease.
  *
- * Return verifies the live START row, advances the exactly-matching
- * BEGUN row to RETURNING and publishes END. Forward-only: once the
- * advance commits, a publish failure faults (covering the lost END)
- * and the row stays RETURNING for silent retirement — never a second
- * disposition, never a rollback.
+ * Return verifies the live START row, reserves and fills END,
+ * advances the exactly-matching BEGUN row to RETURNING (an already
+ * RETURNING match resumes without re-advancing, so a retry after a
+ * failed START removal never double-advances), retires START with
+ * its OBJECT_START subordinate, and only then submits END: the
+ * terminal submits after the required cleanup commits, never while
+ * custody is still owned. Forward-only: a failure after the advance
+ * faults and the row stays RETURNING for silent retirement — the END
+ * submits exactly once, on the attempt whose cleanup commits; never
+ * a second disposition, never a rollback.
  *
  * Remove retires one call for START removal with cleanup ordering:
  * the journal row settles BEFORE the START leg runs, so a
  * contradicted row is scrubbed (zeroed in place, then deleted)
  * BEFORE the lease is released. Unsettled (PREPARING/BEGUN) rows
- * publish ABANDON first — one original key disposition: END xor
- * ABANDON; RETURNING rows retire silently (their END published, or
- * its loss faulted). Forward-only: cleanup always settles; a failed
- * journal deletion keeps the lease for retry instead of orphaning
- * the row. */
+ * reserve ABANDON, delete the row (the required cleanup commits),
+ * and only then submit — one original key disposition: END xor
+ * ABANDON. RETURNING rows retire silently (their END published, or
+ * its loss faulted) with the START leg optional (return already
+ * retired it; its absence is healthy, never loss or poison).
+ * Forward-only: cleanup always settles; a failed journal deletion
+ * keeps the lease for retry instead of orphaning the row. */
 int p11_journal_combined_entry(struct journal_txn *txn);
 int p11_journal_combined_return(struct journal_txn *txn);
 int p11_journal_combined_remove(struct journal_txn *txn);

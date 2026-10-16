@@ -787,9 +787,11 @@ pub(crate) enum BirthObservationRefusal {
     /// The appearance epochs did not strictly advance past the
     /// baseline: no un-journaled exec to backfill.
     AppearanceNotAdvanced,
-    /// The appearance grew ranges past the baseline: a hook gap, not
-    /// a teardown (ranges may only disappear at a re-observation).
-    AppearanceGrew,
+    /// The appearance retains baseline mappings: absence is the
+    /// prior mappings completely gone at a changed epoch with a full
+    /// new mapping — any retained or overlapping range is
+    /// continuation (or teardown), never rebirth.
+    MappingsRetained,
     /// The real router refused the appearance (already observed at
     /// these epochs, stale era, retired): no accepted mapping.
     AppearanceRejected,
@@ -889,9 +891,10 @@ pub(crate) fn observe_exec_birth(
 /// The marker row reads back unmarked (absence births never publish,
 /// so any publication or poisoning refuses); the baseline scan seals
 /// through the real router; and the appearance — same process,
-/// domain, and file, strictly advanced epochs, ranges within the
-/// baseline (a grown range is a hook gap, never a teardown) — joins
-/// as a router-accepted new observation. No caller-provided
+/// domain, and file, strictly advanced epochs, and a full mapping
+/// disjoint from the baseline (the prior mappings completely gone —
+/// a teardown, continuation or shrink-in-place is not absence) —
+/// joins as a router-accepted new observation. No caller-provided
 /// record/control structs on this path. Live map reads stay UNRUN:
 /// production wires [`LiveBirthRows`] and live scans.
 pub(crate) fn observe_absence_birth(
@@ -937,14 +940,22 @@ pub(crate) fn observe_absence_birth(
     if (after.local, after.global) <= (before.local, before.global) {
         return Err(BirthObservationRefusal::AppearanceNotAdvanced);
     }
-    // Ranges within the baseline: teardown only. A range the baseline
-    // never held is a hook gap, mirroring the router's own rule.
-    if appearance
-        .ranges()
-        .iter()
-        .any(|range| !prior.ranges().contains(range))
-    {
-        return Err(BirthObservationRefusal::AppearanceGrew);
+    // Complete mapping absence: the prior mappings must be
+    // completely gone — no appearance range may overlap any baseline
+    // range — at the changed epoch, with a full new mapping. A
+    // teardown (retained ranges), a continuation (same ranges, new
+    // epochs) or a shrink-in-place (overlapping bounds) never proves
+    // non-existence. Sealed scans are never empty (the acquisition
+    // protocol refuses empties), so disjointness — not zero ranges —
+    // carries the absence; the plan forbids empty scans as absence.
+    let retained = appearance.ranges().iter().any(|after| {
+        prior.ranges().iter().any(|before| {
+            let (a, b) = (after.span(), before.span());
+            a.0 < b.1 && b.0 < a.1
+        })
+    });
+    if retained {
+        return Err(BirthObservationRefusal::MappingsRetained);
     }
     // The baseline seals through the real router first (newly or as a
     // continued re-observation); then the appearance must join as a

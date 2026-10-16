@@ -6,7 +6,10 @@ Compares observer output against the READY/GO controlled provider ledger:
 every API invocation and terminal, every journal record counted separately
 from API calls, the bootstrap witness, loss markers and a private-key
 privacy scan. Drives a provider child through READY validation, GO release
-and an owned-child deadline.
+and an owned-child deadline. The ledger file is bound once per run and
+every comparison checks the observed output against those exact bytes;
+--run paces the provider at the requested profile rate and verifies the
+observed pace, and an empty observation set always fails.
 
 Live BPF measurements stay UNRUN: this round executes only --plan-only,
 --check and --run against the repository stub provider. A privileged
@@ -52,18 +55,106 @@ def is_uint(value):
     return type(value) is int and value >= 0
 
 
-def compare(observed, ledger, observed_raw):
-    """The rejection rules. Returns a list of FAIL reason tags (empty passes)."""
+def well_formed_profile(profile):
+    return (
+        isinstance(profile, dict)
+        and type(profile.get("rate")) is int
+        and profile["rate"] > 0
+        and type(profile.get("duration")) is int
+        and profile["duration"] > 0
+    )
+
+
+def check_pace(reasons, observed, expected):
+    """Verify the observed pace: the profile the provider ran under must
+    be the requested one (when the run requested one), every observation
+    carries its stamp, consecutive stamps respect the rate floor, and
+    the observed span fits the duration. Integer nanoseconds throughout;
+    the rate floor is half the nominal pace to absorb scheduling jitter
+    while still catching unpaced (all-at-once) output."""
+    profile = observed.get("profile")
+    if expected is not None:
+        if profile is None:
+            reasons.append("PACING_MISSING: provider ran unpaced under a paced run")
+            return
+        if profile != {"rate": expected[0], "duration": expected[1]}:
+            reasons.append(
+                f"PROFILE_MISMATCH: provider ran {profile!r}, "
+                f"run requested rate={expected[0]}/s duration={expected[1]}s"
+            )
+            return
+        rate, duration = expected
+    elif well_formed_profile(profile):
+        rate, duration = profile["rate"], profile["duration"]
+    elif profile is None:
+        return
+    else:
+        reasons.append("PACING_INCOMPLETE: observed profile is malformed")
+        return
+    stamps = []
+    for call in observed.get("invocations", []):
+        stamp = call.get("observed_at") if isinstance(call, dict) else None
+        if type(stamp) is not int:
+            reasons.append("PACING_INCOMPLETE: an invocation lacks its stamp")
+            return
+        stamps.append(("call", stamp))
+    for record in observed.get("records", []):
+        stamp = record.get("observed_at") if isinstance(record, dict) else None
+        if type(stamp) is not int:
+            reasons.append("PACING_INCOMPLETE: a journal record lacks its stamp")
+            return
+        stamps.append(("record", stamp))
+    if not stamps:
+        # No observations at all: the empty-observation rule owns this.
+        return
+    floor = 1_000_000_000 // rate // 2
+    call_stamps = [stamp for kind, stamp in stamps if kind == "call"]
+    record_stamps = [stamp for kind, stamp in stamps if kind == "record"]
+    for series in (call_stamps, record_stamps):
+        for earlier, later in zip(series, series[1:]):
+            if later - earlier < floor:
+                reasons.append(
+                    f"PACING_TOO_FAST: stamps {later - earlier}ns apart "
+                    f"at {rate}/s (floor {floor}ns)"
+                )
+                break
+    span = max(stamp for _, stamp in stamps) - min(stamp for _, stamp in stamps)
+    if span > duration * 1_000_000_000:
+        reasons.append(
+            f"PACING_SPAN_EXCEEDED: observed span {span}ns over {duration}s"
+        )
+
+
+def compare(observed, ledger, observed_raw, ledger_raw, expected_profile):
+    """The rejection rules. Returns a list of FAIL reason tags (empty passes).
+
+    `ledger_raw` is the exact frozen bytes the comparison binds to: the
+    observed output must carry their digest, so output produced against
+    any other ledger fails here. `expected_profile` is the (rate,
+    duration) the run requested, or None for a standalone comparison."""
     reasons = []
     if not isinstance(observed, dict) or observed.get("schema") != LEDGER_SCHEMA:
         return ["SCHEMA_MISMATCH: observed schema is not " + LEDGER_SCHEMA]
-    if observed.get("bootstrap") != ledger.get("bootstrap"):
+    if observed.get("ledger_digest") != hashlib.sha256(ledger_raw).hexdigest():
+        reasons.append("LEDGER_UNBOUND: observed output was not produced against this ledger")
+    want_bootstrap = ledger.get("bootstrap") or {}
+    got_bootstrap = observed.get("bootstrap") or {}
+    if got_bootstrap.get("witness") != want_bootstrap.get("witness") or got_bootstrap.get(
+        "cut"
+    ) != want_bootstrap.get("cut"):
         reasons.append("BOOTSTRAP_MISMATCH: witness or cut differs from the ledger")
-        witness = (observed.get("bootstrap") or {}).get("witness")
+        witness = got_bootstrap.get("witness")
         if witness not in WITNESSES:
             reasons.append(f"BOOTSTRAP_UNPROVEN: witness {witness!r} is not genuine")
     want_calls = ledger.get("invocations", [])
     got_calls = observed.get("invocations", [])
+    want_records = ledger.get("records", [])
+    got_records = observed.get("records", [])
+    if not got_calls or not got_records:
+        reasons.append(
+            "EMPTY_OBSERVATION_SET: observed output holds "
+            f"{len(got_calls)} calls and {len(got_records)} journal records"
+        )
     if len(got_calls) != len(want_calls):
         reasons.append(
             f"INVOCATION_COUNT_MISMATCH: observed {len(got_calls)} calls, "
@@ -86,8 +177,6 @@ def compare(observed, ledger, observed_raw):
                 f"INVOCATION_MISMATCH seq={want.get('seq')}: loss marker "
                 f"{got.get('loss')!r} != {want.get('loss')!r}"
             )
-    want_records = ledger.get("records", [])
-    got_records = observed.get("records", [])
     if len(got_records) != len(want_records):
         reasons.append(
             f"JOURNAL_COUNT_MISMATCH: observed {len(got_records)} journal records, "
@@ -112,18 +201,23 @@ def compare(observed, ledger, observed_raw):
         reasons.append("KEY_MATERIAL_LEAK: observed output carries key material")
     if KEY_SENTINEL in observed_raw:
         reasons.append("KEY_MATERIAL_LEAK: observed bytes contain the key sentinel")
+    check_pace(reasons, observed, expected_profile)
     return reasons
 
 
-def run_check(args):
-    observed, error = load_json(args.observed, "observed output")
+def check_bound(observed_path, ledger_raw, expected_profile):
+    """Compare one observed file against already-bound ledger bytes."""
+    observed, error = load_json(observed_path, "observed output")
     if error:
         return fail(error)
-    ledger, error = load_json(args.ledger, "ledger")
-    if error:
-        return fail(error)
-    raw = Path(args.observed).read_text(encoding="utf-8", errors="replace")
-    reasons = compare(observed, ledger, raw)
+    try:
+        ledger = json.loads(ledger_raw.decode("utf-8"))
+    except ValueError as error:
+        return fail(f"cannot parse ledger: {error}")
+    raw = Path(observed_path).read_text(encoding="utf-8", errors="replace")
+    reasons = compare(
+        observed, ledger, raw, ledger_raw, expected_profile,
+    )
     if reasons:
         print("FAIL object-journal qualification")
         for reason in reasons:
@@ -131,6 +225,14 @@ def run_check(args):
         return 1
     print("PASS object-journal qualification: ledger and observed output agree")
     return 0
+
+
+def run_check(args):
+    try:
+        ledger_raw = Path(args.ledger).read_bytes()
+    except OSError as error:
+        return fail(f"cannot read ledger {args.ledger}: {error}")
+    return check_bound(args.observed, ledger_raw, None)
 
 
 def run_plan(args):
@@ -152,7 +254,7 @@ def positive_int(text, name):
     return value if value > 0 else None
 
 
-def validate_ready(line, child_pid, abi, ledger_path):
+def validate_ready(line, child_pid, abi, ledger_raw):
     try:
         document = json.loads(line)
     except ValueError:
@@ -167,11 +269,7 @@ def validate_ready(line, child_pid, abi, ledger_path):
         return None, f"READY pid {document['pid']!r} is not the owned child {child_pid}"
     if abi is not None and document["abi"] != abi:
         return None, f"READY abi {document['abi']!r} != {abi!r}"
-    try:
-        digest = hashlib.sha256(Path(ledger_path).read_bytes()).hexdigest()
-    except OSError as error:
-        return None, f"cannot digest ledger: {error}"
-    if document["ledger_digest"] != digest:
+    if document["ledger_digest"] != hashlib.sha256(ledger_raw).hexdigest():
         return None, "READY ledger digest does not match the frozen ledger"
     return document, None
 
@@ -179,7 +277,12 @@ def validate_ready(line, child_pid, abi, ledger_path):
 def run_profile(args):
     if args.profile is not None and args.profile not in PROFILES:
         return fail(f"unknown profile {args.profile!r} (want one of {sorted(PROFILES)})")
-    rate = positive_int(args.rate, "rate") if args.rate is not None else PROFILES["1k"]
+    if args.rate is not None:
+        rate = positive_int(args.rate, "rate")
+    elif args.profile is not None:
+        rate = PROFILES[args.profile]
+    else:
+        rate = PROFILES["1k"]
     duration = positive_int(args.duration, "duration") if args.duration is not None else 60
     deadline = positive_int(args.deadline_seconds, "deadline")
     if rate is None:
@@ -188,7 +291,22 @@ def run_profile(args):
         return fail("duration must be a positive integer")
     if deadline is None:
         return fail("deadline must be a positive integer of seconds")
-    command = [args.provider, *(args.provider_arg or [])]
+    try:
+        ledger_raw = Path(args.ledger).read_bytes()
+    except OSError as error:
+        print(f"harness: cannot bind ledger {args.ledger}: {error}", file=sys.stderr)
+        return 3
+    # The requested pace rides along last so a smuggled provider-side
+    # --rate/--duration cannot quiet the run's profile: later argparse
+    # options win, and the comparison verifies the observed pace.
+    command = [
+        args.provider,
+        *(args.provider_arg or []),
+        "--rate",
+        str(rate),
+        "--duration",
+        str(duration),
+    ]
     try:
         child = subprocess.Popen(
             command,
@@ -219,7 +337,7 @@ def run_profile(args):
         child.kill()
         print("harness: READY timeout", file=sys.stderr)
         return 3
-    _, error = validate_ready(ready, child.pid, args.abi, args.ledger)
+    _, error = validate_ready(ready, child.pid, args.abi, ledger_raw)
     if error:
         child.kill()
         print(f"harness: invalid READY: {error}", file=sys.stderr)
@@ -241,8 +359,7 @@ def run_profile(args):
         print(f"harness: provider exited {child.returncode}: {stderr.strip()}", file=sys.stderr)
         return 3
     print(f"profile complete: rate={rate}/s duration={duration}s provider={args.provider}")
-    check_args = argparse.Namespace(observed=args.out, ledger=args.ledger)
-    return run_check(check_args)
+    return check_bound(args.out, ledger_raw, (rate, duration))
 
 
 def parse_args(argv):

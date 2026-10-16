@@ -337,7 +337,7 @@ class TaskStorageReaderTests(unittest.TestCase):
          "oracle": "task-storage", "bytes_key": 4, "bytes_value": 8,
          "max_entries": 0, "map_flags": 1},
         {"name": "PROC_EPOCH", "id": 111, "type": "task_storage",
-         "oracle": "task-storage", "bytes_key": 4, "bytes_value": 144,
+         "oracle": "task-storage", "bytes_key": 4, "bytes_value": 152,
          "max_entries": 0, "map_flags": 1},
     ]
     # The frozen Task 2 D2 seeded surface the qualification canary reads.
@@ -530,7 +530,7 @@ class TaskStorageReaderTests(unittest.TestCase):
                         "TASK_COOKIE:101:task_storage:4:8:0:1",
                         "THREAD_OWNER:102:task_storage:4:560:0:1",
                         "ROOT_AFFILIATION:103:task_storage:4:8:0:1",
-                        "PROC_EPOCH:111:task_storage:4:144:0:1",
+                        "PROC_EPOCH:111:task_storage:4:152:0:1",
                     ])
                     parsed = dumper.parse_task_storage_frames(
                         actual, self.MAPS, max_records=maximum_records, max_bytes=maximum_bytes)
@@ -1799,10 +1799,10 @@ class StoppedPopulationTests(unittest.TestCase):
     """Valid EOF and byte counts cannot substitute for exact stopped owners."""
 
     @staticmethod
-    def epoch_value(slots=(1, 6), epochs=(2, 1), flags=0, exec_gen=3):
+    def epoch_value(slots=(1, 6), epochs=(2, 1), flags=0, exec_gen=3, marker=0):
         cells = list(slots) + [0] * (8 - len(slots))
         counts = list(epochs) + [0] * (8 - len(epochs))
-        return struct.pack("<18Q", *cells, *counts, flags, exec_gen)
+        return struct.pack("<19Q", *cells, *counts, flags, exec_gen, marker)
 
     def fixture(self, root, *, owned=False, empty=False):
         tasks = [

@@ -8516,6 +8516,18 @@ mod tests {
         ]
     }
 
+    /// A full mapping disjoint from [`scan_ranges_full`]: the
+    /// post-exec re-mapping a genuine absence appearance shows — no
+    /// address survives the epoch change.
+    fn scan_ranges_moved() -> Vec<crate::discovery::instances::MapRange> {
+        use crate::discovery::instances::MapRange;
+        vec![
+            MapRange::new(SCAN_BASE + 0x10000, SCAN_BASE + 0x11000, 0, false),
+            MapRange::new(SCAN_BASE + 0x11000, SCAN_BASE + 0x12000, 0x1000, true),
+            MapRange::new(SCAN_BASE + 0x12000, SCAN_BASE + 0x13000, 0x2000, false),
+        ]
+    }
+
     fn scan_proof(
         domain: NativeDomainId,
         cookie: u64,
@@ -8851,7 +8863,10 @@ mod tests {
         // C1: absence observation over a natively unmarked row issues;
         // the grant attests an absence birth over quiet history and
         // seals on fresh re-observation (fresh native bytes, fresh
-        // scans, a fresh router — never the first pass's words).
+        // scans, a fresh router — never the first pass's words). The
+        // witness is complete mapping absence plus a changed epoch:
+        // the prior mappings completely gone, a full disjoint mapping
+        // at advanced epochs — never a teardown of retained ranges.
         use crate::attach::observe_absence_birth;
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
@@ -8861,13 +8876,14 @@ mod tests {
         let proof = scene.adapter.attest_key(&admitted).expect("key attests");
         let (domain, _, _, _) = admitted.journal_binding();
         let full = scan_ranges_full();
+        let moved = scan_ranges_moved();
         let mut router = scan_router(domain);
         let (row, control, _) = publisher.publish(&["0", "0", "0", "0", "1"]);
         let mut rows = NativeBirthRows { row, control };
         let (token, evidence) = observe_absence_birth(
             &mut rows,
             scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
-            scan_proof(domain, COOKIE, SCAN_FILE, 1, full[..2].to_vec(), 0),
+            scan_proof(domain, COOKIE, SCAN_FILE, 1, moved.clone(), 0),
             &mut router,
             scene.fixture.binding(),
             scene.fixture.attachment(),
@@ -8909,7 +8925,7 @@ mod tests {
         let (_, fresh) = observe_absence_birth(
             &mut fresh_rows,
             scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
-            scan_proof(domain, COOKIE, SCAN_FILE, 1, full[..2].to_vec(), 0),
+            scan_proof(domain, COOKIE, SCAN_FILE, 1, moved.clone(), 0),
             &mut fresh_router,
             scene.fixture.binding(),
             scene.fixture.attachment(),
@@ -8937,6 +8953,7 @@ mod tests {
         scene.adapter.attest_key(&admitted).expect("key attests");
         let (domain, _, _, _) = admitted.journal_binding();
         let full = scan_ranges_full();
+        let moved = scan_ranges_moved();
         // Marker: only the unmarked native word observes; a READY
         // publication or a DIRTY poisoning refuses.
         for args in [&["0", "1"][..], &["0", "0", "1"][..]] {
@@ -9037,8 +9054,12 @@ mod tests {
             ),
             Err(BirthObservationRefusal::AppearanceNotAdvanced)
         );
-        // Teardown only: a range the baseline never held is a hook
-        // gap, never an absence.
+        // Complete mapping absence: the prior mappings must be
+        // completely gone at the changed epoch. A teardown (the old
+        // positive: shedding ranges), a continuation (same ranges,
+        // new epochs), a shrink-in-place (overlapping bounds) and a
+        // superset (retained plus grown) all refuse — any surviving
+        // address is continuation, never rebirth.
         let mut grown = full.clone();
         grown.push(crate::discovery::instances::MapRange::new(
             SCAN_BASE + 0x9000,
@@ -9046,20 +9067,36 @@ mod tests {
             0x9000,
             false,
         ));
-        let mut rows = NativeBirthRows { row, control };
-        let mut router = scan_router(domain);
-        assert_eq!(
-            observe_absence_birth(
-                &mut rows,
-                scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
-                scan_proof(domain, COOKIE, SCAN_FILE, 1, grown, 0),
-                &mut router,
-                scene.fixture.binding(),
-                scene.fixture.attachment(),
-                &admitted,
+        let shrunk = vec![
+            crate::discovery::instances::MapRange::new(SCAN_BASE, SCAN_BASE + 0x800, 0, false),
+            crate::discovery::instances::MapRange::new(
+                SCAN_BASE + 0x10000,
+                SCAN_BASE + 0x11000,
+                0,
+                false,
             ),
-            Err(BirthObservationRefusal::AppearanceGrew)
-        );
+        ];
+        for (prior_ranges, appearance_ranges) in [
+            (full.clone(), full[..2].to_vec()),
+            (full.clone(), full.clone()),
+            (full.clone(), shrunk),
+            (full.clone(), grown),
+        ] {
+            let mut rows = NativeBirthRows { row, control };
+            let mut router = scan_router(domain);
+            assert_eq!(
+                observe_absence_birth(
+                    &mut rows,
+                    scan_proof(domain, COOKIE, SCAN_FILE, 0, prior_ranges, 0),
+                    scan_proof(domain, COOKIE, SCAN_FILE, 1, appearance_ranges, 0),
+                    &mut router,
+                    scene.fixture.binding(),
+                    scene.fixture.attachment(),
+                    &admitted,
+                ),
+                Err(BirthObservationRefusal::MappingsRetained)
+            );
+        }
         // Baseline seal: a scan the router refuses (a fenced-out
         // era here) leaves no baseline to measure against.
         let mut rows = NativeBirthRows { row, control };
@@ -9068,7 +9105,7 @@ mod tests {
             observe_absence_birth(
                 &mut rows,
                 scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 9),
-                scan_proof(domain, COOKIE, SCAN_FILE, 1, full[..2].to_vec(), 0),
+                scan_proof(domain, COOKIE, SCAN_FILE, 1, moved.clone(), 0),
                 &mut router,
                 scene.fixture.binding(),
                 scene.fixture.attachment(),
@@ -9083,7 +9120,7 @@ mod tests {
         observe_absence_birth(
             &mut rows,
             scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
-            scan_proof(domain, COOKIE, SCAN_FILE, 1, full[..2].to_vec(), 0),
+            scan_proof(domain, COOKIE, SCAN_FILE, 1, moved.clone(), 0),
             &mut router,
             scene.fixture.binding(),
             scene.fixture.attachment(),
@@ -9095,7 +9132,7 @@ mod tests {
             observe_absence_birth(
                 &mut rows,
                 scan_proof(domain, COOKIE, SCAN_FILE, 0, full.clone(), 0),
-                scan_proof(domain, COOKIE, SCAN_FILE, 1, full[..2].to_vec(), 0),
+                scan_proof(domain, COOKIE, SCAN_FILE, 1, moved.clone(), 0),
                 &mut router,
                 scene.fixture.binding(),
                 scene.fixture.attachment(),

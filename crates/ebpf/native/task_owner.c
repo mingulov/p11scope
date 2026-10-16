@@ -171,10 +171,11 @@ __attribute__((noinline)) u32 p11_owner_lease(void)
         return 0;
     if (!owner) {
         /* First call of this thread: NULL initialization requests
-         * kernel-zeroed map storage, not a 544-byte stack argument. A failed
-         * CREATE installed no new value for this lease. The storage is then
-         * retained idle between calls, so this allocation (and its RCU-deferred
-         * free) never recurs per call, where it could run the allocator dry. */
+         * kernel-zeroed map storage, not a whole-struct stack argument. A
+         * failed CREATE installed no new value for this lease. The storage
+         * is then retained idle between calls, so this allocation (and its
+         * RCU-deferred free) never recurs per call, where it could run the
+         * allocator dry. */
         owner = owner_storage_get(&THREAD_OWNER, task, (void *)0, 1);
         if (!owner) {
             count(&ctl->admission_failures);
@@ -189,8 +190,12 @@ __attribute__((noinline)) u32 p11_owner_lease(void)
                 return 0;
             return healthy(ctl);
         }
+        /* Fresh storage only: the whole row, lease and journal lifetime
+         * words alike, starts zero (unminted). Idle, poison and exec/exit
+         * paths never run this loop; they clear lease state through
+         * release_empty while the lifetime words persist. */
         volatile u64 *words = (volatile u64 *)owner;
-        for (u32 i = 0; i < 68; i++)
+        for (u32 i = 0; i < sizeof(struct thread_owner) / 8; i++)
             words[i] = 0;
     }
     /* A fresh or idle owner: current-task-only writers and frozen userspace

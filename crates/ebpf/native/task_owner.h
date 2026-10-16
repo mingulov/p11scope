@@ -53,6 +53,16 @@ struct thread_owner {
     u64 selection_domains;
     u32 start_count;
     u32 flags;
+#ifndef P11SCOPE_INVENTORY_ONLY
+    /* H8 slice-A inactive custody: physical-task lifetime identity for the
+     * object journal. Minted once per retained task-storage row (zero
+     * means unminted), never recycled, preserved across idle and
+     * exec/exit cleanup while lease state clears. Inactive: no live
+     * root reads or writes these yet. Inventory-only objects carry no
+     * journal words. */
+    u64 journal_thread;
+    u64 journal_sequence;
+#endif
 };
 /* A thread's owner task storage is created once and retained. flags ==
  * OWNER_LEASED while it holds a lease (START rows or discovery state); flags
@@ -71,7 +81,13 @@ struct owner_control {
 };
 struct owner_start_key { u64 pid_tgid; u32 slot; u32 pad; };
 struct owner_discovery_key { u64 pid_tgid; u64 cookie; u64 domain; };
+#ifdef P11SCOPE_INVENTORY_ONLY
 _Static_assert(sizeof(struct thread_owner) == 544, "owner ABI");
+#else
+_Static_assert(sizeof(struct thread_owner) == 560, "owner ABI");
+_Static_assert(__builtin_offsetof(struct thread_owner, journal_thread) == 544, "journal thread");
+_Static_assert(__builtin_offsetof(struct thread_owner, journal_sequence) == 552, "journal sequence");
+#endif
 _Static_assert(__builtin_offsetof(struct thread_owner, discovery_cookies) == 8, "cookies");
 _Static_assert(__builtin_offsetof(struct thread_owner, occupied) == 520, "occupied");
 _Static_assert(__builtin_offsetof(struct thread_owner, selection_domains) == 528, "domains");

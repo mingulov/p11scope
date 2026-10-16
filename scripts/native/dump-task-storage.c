@@ -26,7 +26,9 @@ enum { MAP_COUNT = 4, QUALIFICATION_MAPS = 3, HEADER_SIZE = 28, LOG_LIMIT = 8192
 static const char *const map_names[MAP_COUNT] = {
     "TASK_COOKIE", "THREAD_OWNER", "ROOT_AFFILIATION", "PROC_EPOCH",
 };
-static const uint32_t map_sizes[MAP_COUNT] = {8, 544, 8, 144};
+/* H8 slice A: Detailed THREAD_OWNER rows are 560 B (Inventory: 544 B,
+ * accepted below). */
+static const uint32_t map_sizes[MAP_COUNT] = {8, 560, 8, 144};
 static const char qualification_program[] = "dump_task_storage";
 static const char inventory_program[] = "dump_task_storage_epoch";
 static const unsigned char raw_magic[8] = {'P', '1', '1', 'T', 'S', 'R', '1', 0};
@@ -177,8 +179,13 @@ static int parse_spec(char *argument, struct map_spec *spec, const char *expecte
         parse_u32(fields[5], &spec->max_entries) ||
         parse_u32(fields[6], &spec->map_flags))
         return -1;
-    if (spec->key_size != 4 || spec->value_size != expected_value ||
-        spec->max_entries != 0 || spec->map_flags != BPF_F_NO_PREALLOC)
+    /* Both live THREAD_OWNER ABIs decode (actual size preserved for the
+     * read path); anything else refuses. */
+    int value_ok = spec->value_size == expected_value;
+    if (!strcmp(expected_name, "THREAD_OWNER"))
+        value_ok = spec->value_size == 544 || spec->value_size == 560;
+    if (spec->key_size != 4 || !value_ok || spec->max_entries != 0 ||
+        spec->map_flags != BPF_F_NO_PREALLOC)
         return -1;
     return 0;
 }
@@ -656,14 +663,14 @@ int main(int argc, char **argv)
     if (argc == 2 && !strcmp(argv[1], "--self-test")) {
         struct bpf_map_info info;
         struct map_spec spec = {
-            .name = "THREAD_OWNER", .id = 42, .key_size = 4, .value_size = 544,
+            .name = "THREAD_OWNER", .id = 42, .key_size = 4, .value_size = 560,
             .max_entries = 0, .map_flags = BPF_F_NO_PREALLOC, .fd = -1,
         };
         memset(&info, 0, sizeof(info));
         info.id = 42;
         info.type = BPF_MAP_TYPE_TASK_STORAGE;
         info.key_size = 4;
-        info.value_size = 544;
+        info.value_size = 560;
         info.max_entries = 0;
         info.map_flags = BPF_F_NO_PREALLOC;
         memcpy(info.name, spec.name, strlen(spec.name) + 1);

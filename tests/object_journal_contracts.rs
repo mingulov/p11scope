@@ -654,3 +654,80 @@ fn object_journal_ilp32_abi_layout() {
     );
     assert!(validate_end(&end, Some(&descriptor)).is_none());
 }
+
+/// Slice-A inactive custody: the native lifetime words, JOURNAL_START
+/// side-map and ring-leaf skeleton compile for every object flavor and
+/// the actual native-owner fixture passes unprivileged. The producer
+/// that would call this stays inactive: no live root wires these
+/// leaves.
+#[test]
+fn object_journal_physical_thread_identity() {
+    use std::process::Command;
+
+    let temporary = tempfile::tempdir().expect("native journal test directory");
+    let matrix: &[(&str, &[&str])] = &[
+        ("default", &[]),
+        ("small", &["-DP11SCOPE_SMALL_STATE_MAPS"]),
+        ("wide", &["-DP11SCOPE_OWNER_SLOT_BOUND=2112"]),
+        ("inventory", &["-DP11SCOPE_INVENTORY_ONLY"]),
+        (
+            "small-inventory",
+            &["-DP11SCOPE_SMALL_STATE_MAPS", "-DP11SCOPE_INVENTORY_ONLY"],
+        ),
+    ];
+    for (name, defines) in matrix {
+        let binary = temporary.path().join(format!("journal-owner-{name}"));
+        let mut compiler = Command::new("clang-18");
+        compiler
+            .args([
+                "-O2",
+                "-g",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-pthread",
+                "-I",
+                "crates/ebpf/native",
+                "tests/fixtures/object-journal/journal_owner_tests.c",
+                "-o",
+            ])
+            .arg(&binary)
+            .args(*defines);
+        let output = compiler.output().expect("execute clang-18");
+        assert!(
+            output.status.success(),
+            "native compile [{name}]: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new(binary)
+            .output()
+            .expect("execute native journal test");
+        assert!(
+            output.status.success(),
+            "native journal test [{name}]: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// Slice-A custody stays inactive: no live BPF root wires the journal
+/// leaves until slice B authorizes the transactions.
+#[test]
+fn object_journal_leaves_are_inactive() {
+    for program in ["main.rs", "inventory.rs", "inventory_callers.rs"] {
+        let path = format!("crates/ebpf/src/{program}");
+        let source = std::fs::read_to_string(&path).expect("read BPF program");
+        for symbol in [
+            "p11_journal_",
+            "JOURNAL_START",
+            "journal_thread",
+            "journal_sequence",
+            "object_journal",
+        ] {
+            assert!(
+                !source.contains(symbol),
+                "{program} must not wire inactive journal custody ({symbol})"
+            );
+        }
+    }
+}

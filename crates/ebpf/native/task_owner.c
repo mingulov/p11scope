@@ -190,13 +190,26 @@ __attribute__((noinline)) u32 p11_owner_lease(void)
                 return 0;
             return healthy(ctl);
         }
-        /* Fresh storage only: the whole row, lease and journal lifetime
-         * words alike, starts zero (unminted). Idle, poison and exec/exit
-         * paths never run this loop; they clear lease state through
-         * release_empty while the lifetime words persist. */
+        /* CREATE after a missed lookup can return existing idle
+         * storage, which BPF cannot distinguish from fresh storage:
+         * both read flags == 0 here. The zero loop below must clear
+         * lease state either way, so the journal lifetime words are
+         * stashed first and restored after: fresh storage restores
+         * zeros (unminted), existing idle storage keeps its minted
+         * words. Idle, poison and exec/exit paths never run this
+         * loop; they clear lease state through release_empty while
+         * the lifetime words persist. */
+#ifndef P11SCOPE_INVENTORY_ONLY
+        u64 journal_thread = owner->journal_thread;
+        u64 journal_sequence = owner->journal_sequence;
+#endif
         volatile u64 *words = (volatile u64 *)owner;
         for (u32 i = 0; i < sizeof(struct thread_owner) / 8; i++)
             words[i] = 0;
+#ifndef P11SCOPE_INVENTORY_ONLY
+        owner->journal_thread = journal_thread;
+        owner->journal_sequence = journal_sequence;
+#endif
     }
     /* A fresh or idle owner: current-task-only writers and frozen userspace
      * mutation are prerequisites. Idle means every field was cleared by the

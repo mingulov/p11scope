@@ -355,6 +355,31 @@ static void idle_release_preserves_and_reacquires(void)
     EXPECT(journal_ctl.next_thread == 1, "counter untouched by idle");
 }
 
+static void missed_lookup_preserves_idle_words(void)
+{
+    reset();
+    EXPECT(p11_owner_lease() == 1, "lease");
+    EXPECT(p11_journal_thread(&owners[0], &journal_ctl) == 1, "mint 1");
+    EXPECT(p11_journal_next_sequence(&owners[0]) == 1, "sequence 1");
+    /* Release to idle: the words persist while lease state clears. */
+    {
+        struct owner_discovery_key dkey = {pid_tgid(), 9, 1};
+        EXPECT(p11_owner_discovery_insert(&dkey, start_value, 1) == 0, "discovery inserts");
+        EXPECT(p11_owner_discovery_remove(&dkey, 1) == 0, "discovery releases");
+    }
+    EXPECT(owners[0].flags == 0, "row is idle");
+    /* A busy initial probe misses, then CREATE returns the existing
+     * idle storage: the lifetime words must survive the reacquire. */
+    miss_get = 1;
+    EXPECT(p11_owner_lease() == 1, "re-lease after missed lookup");
+    EXPECT(owners[0].journal_thread == 1 && owners[0].journal_sequence == 1,
+           "missed lookup preserves lifetime words, saw %llu/%llu",
+           (unsigned long long)owners[0].journal_thread,
+           (unsigned long long)owners[0].journal_sequence);
+    EXPECT(p11_journal_thread(&owners[0], &journal_ctl) == 1, "no re-mint after miss");
+    EXPECT(p11_journal_next_sequence(&owners[0]) == 2, "sequence continues after miss");
+}
+
 static void loader_row_mints_on_first_use(void)
 {
     reset();
@@ -681,6 +706,7 @@ int main(void)
     fresh_row_mints_once();
     second_row_never_recycles();
     idle_release_preserves_and_reacquires();
+    missed_lookup_preserves_idle_words();
     loader_row_mints_on_first_use();
     cleanup_preserves_words();
     tid_reuse_mints_fresh();

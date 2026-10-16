@@ -1132,7 +1132,13 @@ pub(crate) fn acquire_test_absence(
     attach_generation: u64,
     keys: Vec<p11scope_manifest::maps::ObjectKey>,
     identity: crate::discovery::instances::MappedFileIdentity,
-    mut confirm: impl FnMut(u64, u64) -> Result<crate::discovery::instances::MappedFileIdentity, ImageQueryRefusal>,
+    mut confirm: impl FnMut(
+        u64,
+        u64,
+    ) -> Result<
+        crate::discovery::instances::MappedFileIdentity,
+        ImageQueryRefusal,
+    >,
     fence: u64,
 ) -> Result<ImageAbsenceProof, ImageQueryRefusal> {
     struct Reads<F> {
@@ -1145,8 +1151,13 @@ pub(crate) fn acquire_test_absence(
         confirm: F,
         fence: u64,
     }
-    impl<F: FnMut(u64, u64) -> Result<crate::discovery::instances::MappedFileIdentity, ImageQueryRefusal>>
-        ScanSource for Reads<F>
+    impl<
+        F: FnMut(
+            u64,
+            u64,
+        )
+            -> Result<crate::discovery::instances::MappedFileIdentity, ImageQueryRefusal>,
+    > ScanSource for Reads<F>
     {
         fn budget(&self) -> Result<(), ImageQueryRefusal> {
             Ok(())
@@ -1167,8 +1178,13 @@ pub(crate) fn acquire_test_absence(
             original == self.fence
         }
     }
-    impl<F: FnMut(u64, u64) -> Result<crate::discovery::instances::MappedFileIdentity, ImageQueryRefusal>>
-        AbsenceScanSource for Reads<F>
+    impl<
+        F: FnMut(
+            u64,
+            u64,
+        )
+            -> Result<crate::discovery::instances::MappedFileIdentity, ImageQueryRefusal>,
+    > AbsenceScanSource for Reads<F>
     {
         fn watched_keys(&self) -> &[p11scope_manifest::maps::ObjectKey] {
             &self.keys
@@ -1984,13 +2000,9 @@ mod tests {
         // Identity decides, never addresses: the moved range confirms
         // as the watched file.
         let mut source = absence_script();
-        source.entries.push(absence_entry(
-            0x9000_0000,
-            0x9000_1000,
-            8,
-            1,
-            999,
-        ));
+        source
+            .entries
+            .push(absence_entry(0x9000_0000, 0x9000_1000, 8, 1, 999));
         assert!(matches!(
             prove_absence_with(&mut source, domain(), 3, 4),
             Err(ImageQueryRefusal::Present)
@@ -2004,25 +2016,17 @@ mod tests {
         // colliding file's ranges drop (absence still seals), while an
         // unreadable identity refuses the whole seal.
         let mut dropped = absence_script();
-        dropped.entries.push(absence_entry(
-            0xa000_0000,
-            0xa000_1000,
-            8,
-            1,
-            999,
-        ));
+        dropped
+            .entries
+            .push(absence_entry(0xa000_0000, 0xa000_1000, 8, 1, 999));
         dropped.confirm_mode = ConfirmMode::Mismatch;
         let proof = prove_absence_with(&mut dropped, domain(), 3, 4).unwrap();
         assert_eq!(proof.total_entries(), 4);
         assert_eq!(dropped.confirms, 1, "the collision was confirmed away");
         let mut unreadable = absence_script();
-        unreadable.entries.push(absence_entry(
-            0xa000_0000,
-            0xa000_1000,
-            8,
-            1,
-            999,
-        ));
+        unreadable
+            .entries
+            .push(absence_entry(0xa000_0000, 0xa000_1000, 8, 1, 999));
         unreadable.confirm_mode = ConfirmMode::Error;
         assert!(matches!(
             prove_absence_with(&mut unreadable, domain(), 3, 4),

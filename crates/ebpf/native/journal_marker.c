@@ -76,21 +76,35 @@ int p11_journal_marker_read(const struct instance_record *rec, u64 *exec_out)
 
 int p11_journal_marker_admit(struct journal_admission_control *ctl, u64 marker, u64 exec)
 {
-    u64 ready;
+    u64 ready, observed;
+    int tries;
 
     if (!ctl)
         return 0;
-    if (ctl->failed != 0)
+    if (__sync_fetch_and_add(&ctl->failed, 0) != 0)
         return 0;
     ready = (exec << 2) | P11_JOURNAL_MARKER_READY_STATE;
     if (marker != ready) {
-        ctl->failed = 1;
+        __sync_lock_test_and_set(&ctl->failed, 1);
         return 0;
     }
-    if (ctl->spent >= P11_JOURNAL_MARKER_ADMIT_CAP) {
-        ctl->failed = 1;
-        return 0;
+    /* Bounded ATOMIC reservation with the failure-latch protocol:
+     * the permit is spent by compare-exchange, so two CPUs observing
+     * the last permit cannot both win. Genuine bound-exceed trips the
+     * latch and refuses loudly; concurrent admission beyond the bound
+     * never over-admits silently. Mere CAS contention retries
+     * boundedly and then refuses THIS attempt unlatched (the mint
+     * precedent: contention counts against the caller, the latch is
+     * for bound-exceed and corruption), so below-bound permits stay
+     * winnable and the caller raises per-call fault. */
+    for (tries = 0; tries < 32; tries++) {
+        observed = __sync_fetch_and_add(&ctl->spent, 0);
+        if (observed >= P11_JOURNAL_MARKER_ADMIT_CAP) {
+            __sync_lock_test_and_set(&ctl->failed, 1);
+            return 0;
+        }
+        if (__sync_val_compare_and_swap(&ctl->spent, observed, observed + 1) == observed)
+            return 1;
     }
-    ctl->spent++;
-    return 1;
+    return 0;
 }

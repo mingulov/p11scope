@@ -2704,7 +2704,7 @@ impl JournalAdapter {
         // fence.
         let mut pending_bounds = Vec::new();
         for entry in self.open.values() {
-            if self.converts_here(key, &live, entry)
+            if self.abandons_here(key, &live, entry)
                 && entry.begin_ordinal <= frontier
                 && let Some(staged) = entry.abandon
                 && staged.ordinal <= frontier
@@ -2954,6 +2954,20 @@ impl JournalAdapter {
                 == CallAttribution::Mine
     }
 
+    /// Whether one staged open entry's abandonment disposes under a
+    /// sealing key: converting here, or already converted for it. An
+    /// abandonment staged on an already-converted call refuses and
+    /// disposes exactly like one on a converting call — conversion
+    /// never outruns abandonment authority.
+    fn abandons_here(
+        &self,
+        key: JournalDomainKey,
+        live: &[JournalDomainKey],
+        entry: &OpenEntry,
+    ) -> bool {
+        self.converts_here(key, live, entry) || entry.converted_for == Some(key)
+    }
+
     /// Whether a birth cut covers all retained staged history for one
     /// key: every convertible-or-converted begin and refused cut sits
     /// strictly above it. A sibling key's staging belongs to its own
@@ -3038,10 +3052,12 @@ impl JournalAdapter {
         // Unbounded abandonment of this key's calls staged at or below
         // the frontier refuses this key permanently: invalidate its
         // proof (reported), mark it, dispose its staged entries, and
-        // refuse the seal. A sibling's abandonment belongs to its own
-        // seal; unclaimed shapes barriered before conversion.
+        // refuse the seal. Already-converted calls count: their
+        // abandonments refuse and dispose here, never prune silently.
+        // A sibling's abandonment belongs to its own seal; unclaimed
+        // shapes barriered before conversion.
         let unbounded = self.open.values().any(|entry| {
-            self.converts_here(key, &live, entry)
+            self.abandons_here(key, &live, entry)
                 && entry.begin_ordinal <= frontier
                 && entry.abandon.is_some_and(|staged| {
                     staged.ordinal <= frontier
@@ -3078,9 +3094,10 @@ impl JournalAdapter {
         }
         // This key's bounded abandonments need their corroborating
         // returns within the frontier; otherwise the bound is not ready
-        // and the seal waits.
+        // and the seal waits. Already-converted calls wait here too,
+        // instead of tainting as a model surprise below.
         let unready = self.open.values().any(|entry| {
-            self.converts_here(key, &live, entry)
+            self.abandons_here(key, &live, entry)
                 && entry.begin_ordinal <= frontier
                 && entry.abandon.is_some_and(|staged| {
                     staged.ordinal <= frontier
@@ -7412,6 +7429,90 @@ mod tests {
             .seal(&bootstrap)
             .expect_err("incarnation never recovers");
         assert_eq!(retry.gap, JournalGap::DomainTainted);
+    }
+
+    #[test]
+    fn object_journal_converted_abandonment_refuses_and_disposes() {
+        // Carryover 9 + N2: an unbounded abandonment staged on an
+        // already-CONVERTED call refuses permanently and disposes its
+        // model storage exactly like one on a converting call —
+        // conversion never outruns abandonment authority, and settle
+        // never succeeds across it.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let sign = function_id("C_Sign");
+        scene.ingest(&begin_bytes(1, 1, sign, 0));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).expect("open converts");
+        assert_eq!(scene.model.project().usage.pending_calls, 1);
+        let abandon = abandon_bytes(1, 1, JOURNAL_REASON_ENTRY_COLLISION, (COOKIE, EXEC));
+        assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+        let failure = scene
+            .seal(&bootstrap)
+            .expect_err("converted abandonment refuses");
+        assert_eq!(failure.gap, JournalGap::DomainTainted);
+        assert_eq!(scene.model.project().usage.pending_calls, 0);
+        assert!(
+            scene
+                .adapter
+                .keys
+                .get(&proof.key)
+                .expect("sealed key")
+                .refused
+        );
+    }
+
+    #[test]
+    fn object_journal_converted_bounded_abandonment_waits_for_its_bound() {
+        // Carryover 9 + N2: a converted call's bounded abandonment
+        // without its corroborating return in the frontier waits
+        // (BoundNotReady) instead of tainting as a model surprise;
+        // the corroborated twin then seals with the bounded loss.
+        use p11scope_ebpf_common::object_journal::JOURNAL_REASON_SYNC_RETURN_RESULT_LOST;
+
+        for corroborated in [false, true] {
+            let mut scene = Scene::new(image_default());
+            let proof = scene.attest();
+            let create = function_id("C_CreateObject");
+            let begin = begin_bytes(1, 1, create, 0);
+            scene.ingest(&begin);
+            let bootstrap = scene.bootstrap(proof, 0);
+            scene.seal(&bootstrap).expect("open converts");
+            let abandon = abandon_bytes(
+                1,
+                1,
+                JOURNAL_REASON_SYNC_RETURN_RESULT_LOST,
+                (COOKIE, EXEC),
+            );
+            assert_eq!(scene.ingest(&abandon), JournalDisposition::AbandonStaged);
+            if corroborated {
+                scene.ingest_ordinary(ordinary_for(&begin, 0));
+                // The fence sits strictly above the corroborated bound,
+                // so the frontier must cover it: one pad record.
+                let mut pad = ordinary_for(&begin, 0);
+                pad.slot = 99;
+                scene.ingest_ordinary(pad);
+            }
+            if corroborated {
+                let success = scene.seal(&bootstrap).expect("corroborated bound seals");
+                assert!(success.prefix.settled().iter().any(|call| call.abandoned));
+            } else {
+                let failure = scene
+                    .seal(&bootstrap)
+                    .expect_err("uncorroborated converted bound waits");
+                assert_eq!(failure.gap, JournalGap::BoundNotReady);
+                assert!(
+                    !scene
+                        .adapter
+                        .keys
+                        .get(&proof.key)
+                        .expect("sealed key")
+                        .tainted
+                );
+            }
+        }
     }
 
     #[test]

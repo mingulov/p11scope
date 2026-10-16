@@ -113,6 +113,12 @@ fn classify(rv: u64, kind: CallKind, malformed: bool) -> Outcome {
     Outcome::Failed
 }
 
+/// Whether the model accepts a canonical function ordinal at all
+/// (object, lifecycle or neutral): the journal's modeled-affecting test.
+pub(super) fn is_modeled_function(function: u32) -> bool {
+    call_kind(function).is_some()
+}
+
 fn call_kind(function: u32) -> Option<CallKind> {
     if let Some(descriptor) = object_descriptor(function) {
         return Some(CallKind::Object(descriptor.action));
@@ -3059,6 +3065,16 @@ impl ModelState {
                 if state.refused_in_flight.is_some_and(|cut| upper.0 >= cut) {
                     state.refused_in_flight = None;
                 }
+                (domain, upper.0)
+            }
+            LostOutcome::Voided(domain, upper) => {
+                if let Err(unheld) = self.held(domain) {
+                    self.gap_effect(&mut effects, unheld);
+                    return effects;
+                }
+                // The void proves the interval lost, not over: in-flight
+                // refusals stay until a covering bound arrives.
+                self.void_bootstrap(domain, ObjectGap::OutcomeLost, &mut effects);
                 (domain, upper.0)
             }
         };

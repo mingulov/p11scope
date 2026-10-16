@@ -11,6 +11,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -298,6 +299,27 @@ observed.pop("trace", None)
 open(args.out, "w").write(json.dumps(observed, sort_keys=True))
 """
 
+FLOOD_CHILD = """#!/usr/bin/env python3
+import argparse, hashlib, json, os, sys, time
+parser = argparse.ArgumentParser()
+parser.add_argument("--ledger", required=True)
+parser.add_argument("--out", required=True)
+parser.add_argument("--rate", default=None)
+parser.add_argument("--duration", default=None)
+parser.add_argument("--run-token", default=None)
+args = parser.parse_args()
+raw = open(args.ledger, "rb").read()
+ledger = json.loads(raw.decode("utf-8"))
+print(json.dumps({"schema": "p11scope/object-journal-ready/v1",
+                  "provider": "flood-child", "pid": os.getpid(),
+                  "abi": ledger["provider"]["abi"],
+                  "ledger_digest": hashlib.sha256(raw).hexdigest()}), flush=True)
+assert sys.stdin.readline().strip() == "GO"
+for seq in range(1, 60001):
+    print(json.dumps({"progress": "call", "seq": seq}), flush=True)
+time.sleep(30)
+"""
+
 NO_TOKEN_CHILD = """#!/usr/bin/env python3
 import argparse, hashlib, json, os, sys
 parser = argparse.ArgumentParser()
@@ -508,6 +530,30 @@ class ReadyGoTests(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 3)
             self.assertIn("deadline", proc.stderr)
+
+    def test_flood_without_ack_reads_hits_deadline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            child = Path(temp) / "flood-child.py"
+            child.write_text(FLOOD_CHILD)
+            out = str(Path(temp) / "observed.json")
+            start = time.monotonic()
+            proc, _ = run_profiled(
+                temp,
+                sys.executable,
+                [str(child), "--ledger", str(LEDGER), "--out", out],
+                "--rate",
+                "100",
+                "--duration",
+                "60",
+                "--deadline-seconds",
+                "1",
+            )
+            elapsed = time.monotonic() - start
+            self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+            self.assertIn("provider deadline", proc.stderr)
+            self.assertLess(
+                elapsed, 15, "the controller enforced its deadline with no outer kill"
+            )
 
 
 class CompareTests(unittest.TestCase):

@@ -9256,8 +9256,7 @@ mod tests {
         // appearance of another process, domain, or file, is not this
         // birth's witness pair — whichever side drifts.
         let (row, control, _) = publisher.publish(&["0", "0", "0", "0", "1"]);
-        for (negative_cookie, appearance_cookie) in
-            [(COOKIE + 1, COOKIE + 1), (COOKIE, COOKIE + 1)]
+        for (negative_cookie, appearance_cookie) in [(COOKIE + 1, COOKIE + 1), (COOKIE, COOKIE + 1)]
         {
             let mut rows = NativeBirthRows { row, control };
             let mut router = scan_router(domain);
@@ -9273,14 +9272,7 @@ mod tests {
                         absence_entries_free(),
                         0
                     ),
-                    scan_proof(
-                        domain,
-                        appearance_cookie,
-                        SCAN_FILE,
-                        1,
-                        full.clone(),
-                        0
-                    ),
+                    scan_proof(domain, appearance_cookie, SCAN_FILE, 1, full.clone(), 0),
                     &mut router,
                     scene.fixture.binding(),
                     scene.fixture.attachment(),
@@ -9402,7 +9394,7 @@ mod tests {
                 0,
                 closure,
                 absence_entries_free(),
-                0
+                0,
             ),
             scan_proof(domain, COOKIE, SCAN_FILE, 1, full.clone(), 0),
             &mut router,
@@ -9487,8 +9479,7 @@ mod tests {
         let mut scene = Scene::new(image_default());
         let admitted = scene.fixture.admit();
         let proof = scene.adapter.attest_key(&admitted).expect("key attests");
-        let (row, control, _) =
-            publisher.publish_stamped(&["0", "1"], scene.closure_generation());
+        let (row, control, _) = publisher.publish_stamped(&["0", "1"], scene.closure_generation());
         let mut rows = NativeBirthRows { row, control };
         let (token, evidence) = observe_exec_birth(
             &mut rows,

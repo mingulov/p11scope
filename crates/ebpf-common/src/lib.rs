@@ -1456,6 +1456,65 @@ pub struct InstanceRecord {
     pub epoch: [u64; instance::RECORD_SLOTS],
     pub flags: u64,
     pub exec_attach_gen: u64,
+    /// H8-D atomic birth marker (`journal_marker.h` encoding): 0
+    /// unpublished, 1 DIRTY, else READY naming an exec generation.
+    pub journal_bootstrap: u64,
+}
+
+/// H8-D atomic birth marker encoding (mirrors
+/// `crates/ebpf/native/journal_marker.h`; pinned by layout test).
+pub mod journal_marker {
+    /// Unpublished marker word: fresh storage.
+    pub const MARKER_UNPUBLISHED: u64 = 0;
+    /// DIRTY marker word: a scope gap poisoned the marker path.
+    pub const MARKER_DIRTY: u64 = 1;
+    /// Low two bits carry the marker state.
+    pub const MARKER_STATE_MASK: u64 = 3;
+    /// READY state bits.
+    pub const MARKER_READY_STATE: u64 = 2;
+    /// Admission control cap: spent permits before the failed latch trips.
+    pub const MARKER_ADMIT_CAP: u64 = 16384;
+
+    /// A validated marker readback.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum MarkerRead {
+        /// Fresh storage: nothing was ever published.
+        Unpublished,
+        /// READY naming this exec generation.
+        Ready(u64),
+        /// A scope gap poisoned the marker path.
+        Dirty,
+        /// Not a marker word: fails closed.
+        Invalid,
+    }
+
+    /// Encode READY naming `exec`.
+    pub const fn ready_word(exec: u64) -> u64 {
+        (exec << 2) | MARKER_READY_STATE
+    }
+
+    /// Validate one marker word read back from a PROC_EPOCH row.
+    pub const fn read_word(word: u64) -> MarkerRead {
+        if word == MARKER_UNPUBLISHED {
+            MarkerRead::Unpublished
+        } else if word == MARKER_DIRTY {
+            MarkerRead::Dirty
+        } else if word & MARKER_STATE_MASK == MARKER_READY_STATE {
+            MarkerRead::Ready(word >> 2)
+        } else {
+            MarkerRead::Invalid
+        }
+    }
+}
+
+/// `JOURNAL_MARKER_CTL[0]`: Detailed-only admission control row, spent
+/// permits plus the failed latch. Initialized once (zero) before
+/// links; userspace never writes it.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct JournalAdmissionControl {
+    pub spent: u64,
+    pub failed: u64,
 }
 
 /// `WATCHED_FILES` key: the kernel's `vm_file->f_inode` identity
@@ -2032,11 +2091,35 @@ mod tests {
         assert_eq!(offset_of!(InstanceStamp, fault), 8);
         assert_eq!(offset_of!(InstanceStamp, file_slot_plus1), 12);
         assert_eq!(offset_of!(InstanceStamp, flags), 14);
-        assert_eq!(size_of::<InstanceRecord>(), 144);
+        assert_eq!(size_of::<InstanceRecord>(), 152);
         assert_eq!(offset_of!(InstanceRecord, slot_plus1), 0);
         assert_eq!(offset_of!(InstanceRecord, epoch), 64);
         assert_eq!(offset_of!(InstanceRecord, flags), 128);
         assert_eq!(offset_of!(InstanceRecord, exec_attach_gen), 136);
+        assert_eq!(offset_of!(InstanceRecord, journal_bootstrap), 144);
+        assert_eq!(size_of::<JournalAdmissionControl>(), 16);
+        assert_eq!(offset_of!(JournalAdmissionControl, spent), 0);
+        assert_eq!(offset_of!(JournalAdmissionControl, failed), 8);
+        assert_eq!(
+            journal_marker::read_word(0),
+            journal_marker::MarkerRead::Unpublished
+        );
+        assert_eq!(
+            journal_marker::read_word(1),
+            journal_marker::MarkerRead::Dirty
+        );
+        assert_eq!(
+            journal_marker::read_word(journal_marker::ready_word(7)),
+            journal_marker::MarkerRead::Ready(7)
+        );
+        assert_eq!(
+            journal_marker::read_word(3),
+            journal_marker::MarkerRead::Invalid
+        );
+        assert_eq!(
+            journal_marker::read_word(4),
+            journal_marker::MarkerRead::Invalid
+        );
         assert_eq!(size_of::<InstanceFileKey>(), 16);
         assert_eq!(size_of::<InstanceCalib>(), 40);
         assert_eq!(offset_of!(InstanceCalib, vm_start), 8);

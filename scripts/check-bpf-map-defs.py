@@ -1574,7 +1574,7 @@ SAFE_MAPS = {
         # Task 3 Stage A continuity witness (native instance_epoch.c).
         "WATCHED_FILES": (1, 16, 4, 1_024, 128),
         "SLOT_FILE": (2, 4, 4, 512, 128),
-        "PROC_EPOCH": (29, 4, 144, 0, 1),
+        "PROC_EPOCH": (29, 4, 152, 0, 1),
         "G_EPOCH": (2, 4, 8, 1_024),
         "INSTANCE_GEN": (2, 4, 8, 4, 1024),
         "IMAGE_CONTINUITY": (1, 8, 24, 16_384, 17),

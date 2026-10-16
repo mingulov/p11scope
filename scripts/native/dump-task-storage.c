@@ -27,8 +27,9 @@ static const char *const map_names[MAP_COUNT] = {
     "TASK_COOKIE", "THREAD_OWNER", "ROOT_AFFILIATION", "PROC_EPOCH",
 };
 /* H8 slice A: Detailed THREAD_OWNER rows are 560 B (Inventory: 544 B,
- * accepted below). */
-static const uint32_t map_sizes[MAP_COUNT] = {8, 560, 8, 144};
+ * accepted below). H8 slice D: PROC_EPOCH rows are 152 B (144 B plus
+ * the journal_bootstrap birth marker word). */
+static const uint32_t map_sizes[MAP_COUNT] = {8, 560, 8, 152};
 static const char qualification_program[] = "dump_task_storage";
 static const char inventory_program[] = "dump_task_storage_epoch";
 static const unsigned char raw_magic[8] = {'P', '1', '1', 'T', 'S', 'R', '1', 0};

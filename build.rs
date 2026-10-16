@@ -97,6 +97,8 @@ fn main() {
     println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/object_journal.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/object_journal.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/journal_marker.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/journal_marker.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/exec_task.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/exec_task.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/root_affiliation.c");

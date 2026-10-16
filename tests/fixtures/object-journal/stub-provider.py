@@ -21,6 +21,9 @@ observations so the oracle's rejection cells stay honest; --stall
 holds the run past the driver's deadline; --ready garbage breaks the
 READY document on purpose. --rate/--duration pace the replayed
 observations; an infeasible pace refuses before emitting anything.
+A paced run also streams one progress line per observation on stdout
+(flushed, ACKed by the driver) so the controller measures delivery
+timing itself; unpaced runs stay silent after READY.
 --run-token (appended by the oracle driver) is echoed so the run
 binds this output's freshness to the current invocation."""
 import argparse
@@ -222,6 +225,15 @@ def main(argv):
             file=sys.stderr,
         )
         return 2
+    def announce(document):
+        """Stream one paced observation for controller timestamping and
+        wait for its ACK: delivery timing is measured by the driver, and
+        an ACK-less controller (gone away) ends the run, never hangs it."""
+        print(json.dumps(document), flush=True)
+        if sys.stdin.readline() == "":
+            print("controller went away", file=sys.stderr)
+            sys.exit(3)
+
     t0 = time.monotonic_ns()
     observed_calls = []
     observed_records = []
@@ -231,11 +243,15 @@ def main(argv):
             time.sleep(1.0 / rate)
         first = False
         observed_calls.append(observe_invocation(call, ret, loss, time.monotonic_ns()))
+        if paced:
+            announce({"progress": "call", "seq": call["seq"]})
     for ordinal, event in enumerate(record_events, start=1):
         if paced and not first:
             time.sleep(1.0 / rate)
         first = False
         observed_records.append(observe_record(event, ordinal, time.monotonic_ns()))
+        if paced:
+            announce({"progress": "record", "ordinal": ordinal})
     observed = {
         "schema": ledger["schema"],
         "provider": dict(ledger["provider"]),

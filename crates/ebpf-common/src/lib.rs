@@ -1571,6 +1571,8 @@ unsafe impl aya::Pod for InstanceFileKey {}
 unsafe impl aya::Pod for InstanceCalib {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for InstanceCounters {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for JournalAdmissionControl {}
 
 /// What the entry probe stashes until the matching return. Replaces the
 /// bare timestamp Phase 1b stored.

@@ -710,6 +710,101 @@ fn object_journal_physical_thread_identity() {
     }
 }
 
+/// C4: every record the combined transactions submit is a VALID wire
+/// transaction — the existing validators (the oracle) accept each one.
+/// The fixture dumps its submitted records; this test decodes all of
+/// them, pins the per-kind counts (no missing or extra dispositions)
+/// and the first BEGIN's framed identity.
+#[test]
+fn object_journal_combined_transactions_publish_valid_wire_records() {
+    use p11scope_ebpf_common::object_journal::{JournalRecord, decode_journal_record};
+    use p11scope_ebpf_common::object_wire::{
+        publish_object_descriptors, verify_object_descriptors,
+    };
+    use std::process::Command;
+
+    let temporary = tempfile::tempdir().expect("native journal dump directory");
+    let binary = temporary.path().join("journal-owner-dump");
+    let dump = temporary.path().join("dump");
+    std::fs::create_dir(&dump).expect("create dump directory");
+    let mut compiler = Command::new("clang-18");
+    compiler
+        .args([
+            "-O2",
+            "-g",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pthread",
+            "-I",
+            "crates/ebpf/native",
+            "tests/fixtures/object-journal/journal_owner_tests.c",
+            "-o",
+        ])
+        .arg(&binary);
+    let output = compiler.output().expect("execute clang-18");
+    assert!(
+        output.status.success(),
+        "native compile [dump]: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new(&binary)
+        .env("P11_JOURNAL_DUMP_DIR", &dump)
+        .output()
+        .expect("execute native journal test");
+    // The dump carries the verdict here (exit status is pinned by the
+    // physical-thread-identity test): every submitted record must
+    // decode, whatever the fixture's own asserts say.
+    let _ = output.status;
+    let descriptors = publish_object_descriptors();
+    assert!(verify_object_descriptors(&descriptors));
+    let mut files: Vec<_> = std::fs::read_dir(&dump)
+        .expect("read dump directory")
+        .map(|entry| entry.expect("dump entry").path())
+        .collect();
+    files.sort();
+    let mut begins = 0;
+    let mut ends = 0;
+    let mut compacts = 0;
+    let mut abandons = 0;
+    for (index, path) in files.iter().enumerate() {
+        let bytes = std::fs::read(path).expect("read dumped record");
+        let record = decode_journal_record(&bytes, &descriptors);
+        assert!(
+            record.is_some(),
+            "record {index} ({} bytes) validates",
+            bytes.len()
+        );
+        match record {
+            Some(JournalRecord::Begin(begin)) => {
+                begins += 1;
+                if index == 0 {
+                    assert_eq!(begin.thread(), 1);
+                    assert_eq!(begin.sequence(), 1);
+                    assert_eq!(begin.descriptor(), 21);
+                    assert_eq!(begin.slot(), 5);
+                }
+            }
+            Some(JournalRecord::End(end)) => {
+                ends += 1;
+                if end.compact() {
+                    compacts += 1;
+                }
+            }
+            Some(JournalRecord::Abandon(abandon)) => {
+                abandons += 1;
+                assert_eq!(abandon.reason(), 6, "cleanup abandonment reason");
+            }
+            None => unreachable!(),
+        }
+    }
+    assert_eq!(files.len(), 22, "dumped record count");
+    assert_eq!(begins, 15, "BEGIN count");
+    assert_eq!(ends, 4, "END count");
+    assert_eq!(compacts, 1, "compact END count");
+    assert_eq!(abandons, 3, "ABANDON count");
+}
+
 /// N4: the journal unit's BPF-subprogram call shape is covered, not
 /// just its host behavior. The real pipeline compiles native units
 /// with `-emit-llvm` (no backend), which cannot see the BPF
@@ -760,6 +855,57 @@ fn object_journal_bpf_call_shape() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+/// N8: fault-then-discard is root-side — no helper below the combined
+/// transactions discards a reservation. Every `p11_journal_discard`
+/// call site must live in a combined function, which raises the
+/// checked fault (its own fault-cell store) before the discard commits.
+#[test]
+fn object_journal_discards_are_root_side() {
+    let source = std::fs::read_to_string("crates/ebpf/native/object_journal.c")
+        .expect("read native journal transactions");
+    let lines: Vec<&str> = source.lines().collect();
+    // This file opens every function body with a lone `{` (control-flow
+    // braces stay same-line): the nearest signature above a lone `{`
+    // names the enclosing function.
+    let mut current = String::from("none");
+    let mut sites = 0;
+    for (index, line) in lines.iter().enumerate() {
+        if line.trim() == "{" {
+            for candidate in lines[..index].iter().rev() {
+                if let Some(paren) = candidate.rfind('(') {
+                    let before = candidate[..paren].trim_end();
+                    if let Some(name) =
+                        before.split(|c: char| !c.is_alphanumeric() && c != '_').last()
+                    {
+                        current = name.to_string();
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+        let trimmed = line.trim_start();
+        if !(trimmed.starts_with("p11_journal_discard(")
+            || trimmed.starts_with("journal_ring_discard("))
+        {
+            continue;
+        }
+        if current == "p11_journal_discard" {
+            // The leaf's own body delegating to the ring helper.
+            continue;
+        }
+        sites += 1;
+        assert!(
+            current == "p11_journal_combined_entry"
+                || current == "p11_journal_combined_return"
+                || current == "p11_journal_combined_remove",
+            "discard site in {current} (line {}) must live in a combined transaction",
+            index + 1
+        );
+    }
+    assert!(sites >= 3, "expected root-side discard sites, found {sites}");
 }
 
 /// Slice-A custody stays inactive: no live BPF root wires the journal

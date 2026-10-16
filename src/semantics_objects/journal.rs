@@ -248,7 +248,6 @@ use super::{
     ObjectEffects, ObjectGap, ObjectSemantics, OriginFact, QueryStatus, RefCut, ResultSlot,
     SessionHandle,
 };
-use crate::attach::capture::NativeDomainId;
 use crate::discovery::caller_registry::instance_input::AdmittedInstanceCall;
 
 // ---------------------------------------------------------------------------
@@ -689,6 +688,11 @@ pub(crate) struct JournalAdapter {
     /// re-read must still show the audited one; a move anywhere in
     /// the chain voids and re-baselines.
     last_fault: Option<u64>,
+    /// The Session drain this adapter serves, pinned from the drain
+    /// itself at first collection: drain-obtained authority, never a
+    /// caller label. Collections through another drain consume
+    /// nothing, and their audits refuse at seal.
+    pinned_drain: Option<u64>,
     invalidated: bool,
     stopped: bool,
     closure_generation: u64,
@@ -713,6 +717,7 @@ impl JournalAdapter {
             last_audit_failure: None,
             h3_voided_below: 0,
             last_fault: None,
+            pinned_drain: None,
             invalidated: false,
             stopped: false,
             closure_generation: 0,
@@ -1720,13 +1725,14 @@ pub(crate) struct JournalAuditReceipt {
     h3: H3DispositionEvidence,
     h0_below: u64,
     closure_generation: u64,
-    session_domain: Option<NativeDomainId>,
+    drain_domain: Option<u64>,
 }
 
 /// One collection's audit evidence: per-form counts, the drain's
 /// malformed delta, the checked-fault pair bracketing the tick, the
-/// Session drain the quantum was collected through, and H0's allocation
-/// watermark below which every position was minted for this quantum.
+/// Session drain the quantum was collected through (read from the
+/// drain itself, never a caller label), and H0's allocation watermark
+/// below which every position was minted for this quantum.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct JournalCollection {
     pub(crate) ingested: u64,
@@ -1736,7 +1742,7 @@ pub(crate) struct JournalCollection {
     pub(crate) fault_before: u64,
     pub(crate) fault_after: u64,
     pub(crate) fault_error: Option<FaultReadError>,
-    pub(crate) session_domain: NativeDomainId,
+    pub(crate) drain_domain: u64,
     pub(crate) h0_allocated_below: u64,
 }
 
@@ -1760,7 +1766,7 @@ impl JournalAuditReceipt {
             h3: source.take_h3_disposition(),
             h0_below: collection.h0_allocated_below,
             closure_generation,
-            session_domain: Some(collection.session_domain),
+            drain_domain: Some(collection.drain_domain),
         }
     }
 
@@ -1807,7 +1813,7 @@ impl JournalAuditReceipt {
             h3,
             h0_below,
             closure_generation,
-            session_domain: None,
+            drain_domain: None,
         }
     }
 
@@ -2484,10 +2490,9 @@ impl JournalAdapter {
             .sum::<u64>() as usize;
     }
 
-    /// Consume one claim count for a converted call. Absent claims
-    /// (sole-key conversions of never-admitted shapes) convert without
-    /// touching the store: admission completeness there rides the
-    /// H3-disposition gate, not the claim counts.
+    /// Consume one claim count for a converted call. Every conversion
+    /// holds a claim (attribution requires it, and coverage is checked
+    /// before conversion), so the store always has the count.
     fn consume_claim(&mut self, fingerprint: &CallFingerprint, key: JournalDomainKey) {
         let mut vacated = false;
         if let Some(claimants) = self.claims.get_mut(fingerprint) {
@@ -2507,20 +2512,18 @@ impl JournalAdapter {
         }
     }
 
-    /// Attribute one staged fingerprint under a sealing key. A sole
-    /// live key owns its image's staging outright; with siblings, only
-    /// a sole live claim converts here, a sibling's claim (or solely
-    /// dead claims) skips, and no claim — or a live collision — waits.
+    /// Attribute one staged fingerprint under a sealing key. Every
+    /// staged call converts only under its key's admission claim —
+    /// including under a sole live key, which does not prove a sole
+    /// provider instance. A sole live claim converts here, a sibling's
+    /// claim (or solely dead claims) skips, and no claim — or a live
+    /// collision — waits.
     fn attribute_call(
         &self,
         key: JournalDomainKey,
         fingerprint: &CallFingerprint,
         live: &[JournalDomainKey],
     ) -> CallAttribution {
-        if live.len() <= 1 {
-            debug_assert!(live.is_empty() || live == [key]);
-            return CallAttribution::Mine;
-        }
         let mut mine = false;
         let mut sibling = false;
         let mut dead = false;
@@ -2653,11 +2656,13 @@ impl JournalAdapter {
         if self.is_tainted((key.cookie, key.exec)) {
             return Err(self.failure(JournalGap::ImageTainted));
         }
-        // The collection's Session drain must be this proof's: one
-        // Session's history never seals under another's key. Scripted
-        // (test-only) audits carry no drain and skip this binding.
-        if let Some(session) = audit.session_domain
-            && session.journal_tag() != key.domain_tag
+        // The collection's drain must be this adapter's pinned drain:
+        // one Session's history never seals under another's key. The
+        // pin comes from the drain itself at first collection, never a
+        // caller label. Scripted (test-only) audits carry no drain and
+        // skip this binding.
+        if let Some(drained) = audit.drain_domain
+            && Some(drained) != self.pinned_drain
         {
             return Err(self.failure(JournalGap::DrainMismatch));
         }
@@ -2937,9 +2942,9 @@ impl JournalAdapter {
     /// Whether every staged entry for one image at or below a frontier
     /// is attributed under a sealing key: this key's entries, a
     /// sibling's (left for their own seal), or solely dead claims. An
-    /// unclaimed shape or a live collision holds the seal; with
-    /// siblings, multiset claim counts must also cover this key's
-    /// staged entries.
+    /// unclaimed shape or a live collision holds the seal; multiset
+    /// claim counts must cover this key's staged entries — including
+    /// under a sole live key.
     fn attribution_ready(
         &self,
         key: JournalDomainKey,
@@ -2974,9 +2979,6 @@ impl JournalAdapter {
                 CallAttribution::Sibling => {}
                 CallAttribution::Unclaimed => return false,
             }
-        }
-        if live.len() <= 1 {
-            return true;
         }
         needs.into_iter().all(|(fingerprint, need)| {
             self.claims
@@ -3537,11 +3539,12 @@ impl JournalAdapter {
     /// consumed record, journal or ordinary, takes the next checked
     /// ordinal in delivery order through the one dispatch poll, with the
     /// checked fault read before and after and the drain's malformed
-    /// and discard deltas. The collecting Session names its drain (the
-    /// seal refuses any key attested under another Session) and H0's
-    /// post-quantum allocation watermark (the seal enforces H3 coverage
-    /// below it). Collection stages wire truth only; the seal audits
-    /// this evidence before any model input.
+    /// and discard deltas. The collection's drain domain is read from
+    /// the drain itself (the adapter pins it at first collection; the
+    /// seal refuses foreign-drain audits), and H0's post-quantum
+    /// allocation watermark rides along for H3 coverage. Collection
+    /// stages wire truth only; the seal audits this evidence before
+    /// any model input.
     ///
     /// DISCARD observability: the patched Aya reader counts consumed
     /// kernel-discarded reservations (see the ring-reader patch: both
@@ -3558,9 +3561,32 @@ impl JournalAdapter {
              MAX_DESCRIPTORS as usize],
         quantum: Option<usize>,
         fault: &impl FaultEpoch,
-        session: NativeDomainId,
         h0_allocated_below: u64,
     ) -> JournalCollection {
+        // Drain-obtained authority: the first presented drain pins the
+        // adapter; a foreign drain consumes nothing (its audit refuses
+        // at seal). No caller label names the domain.
+        let drain_domain = drain.domain_id();
+        if self.pinned_drain.is_some_and(|pinned| pinned != drain_domain) {
+            // A refused collect still reports its fault read honestly:
+            // an unreadable cell voids at seal like any other tick.
+            let (fault_before, fault_error) = match fault.fault_epoch() {
+                Ok(epoch) => (epoch, None),
+                Err(error) => (0, Some(error)),
+            };
+            return JournalCollection {
+                ingested: 0,
+                ordinary: 0,
+                malformed_delta: 0,
+                discarded_delta: 0,
+                fault_before,
+                fault_after: fault_before,
+                fault_error,
+                drain_domain,
+                h0_allocated_below,
+            };
+        }
+        self.pinned_drain = Some(drain_domain);
         let fault_before = match fault.fault_epoch() {
             Ok(epoch) => epoch,
             Err(error) => {
@@ -3572,7 +3598,7 @@ impl JournalAdapter {
                     fault_before: 0,
                     fault_after: 0,
                     fault_error: Some(error),
-                    session_domain: session,
+                    drain_domain,
                     h0_allocated_below,
                 };
             }
@@ -3626,7 +3652,7 @@ impl JournalAdapter {
             fault_before,
             fault_after,
             fault_error,
-            session_domain: session,
+            drain_domain,
             h0_allocated_below,
         }
     }
@@ -3876,6 +3902,21 @@ mod tests {
     /// prepared subset, a real routed instance id and real admission. The
     /// journal key binding traverses actual Session/admission authority;
     /// only the ring bytes and fault cell are scripted.
+    /// Functions the attestation fixture resolves in its provider
+    /// manifest: every modeled function journal tests stage needs an
+    /// admittable plan slot, since each staged call converts only
+    /// under its own H3 admission claim.
+    const ADMITTABLE_FUNCTIONS: [&str; 8] = [
+        "C_CreateObject",
+        "C_GetAttributeValue",
+        "C_SignInit",
+        "C_Sign",
+        "C_VerifyInit",
+        "C_Verify",
+        "C_SignMessage",
+        "C_DestroyObject",
+    ];
+
     struct AttestationFixture {
         _dir: tempfile::TempDir,
         subset: Option<AttestedSubset>,
@@ -3885,6 +3926,7 @@ mod tests {
         router: InstanceId,
         slot: u32,
         endpoint: Endpoint,
+        functions: BTreeMap<String, (u32, Endpoint)>,
         next_token: u64,
     }
 
@@ -3901,10 +3943,10 @@ mod tests {
             let start = inspected
                 .executable_ranges
                 .iter()
-                .find(|(a, b)| b - a > 2)
+                .find(|(a, b)| b - a > ADMITTABLE_FUNCTIONS.len() as u64)
                 .unwrap()
                 .0;
-            let functions =
+            let functions: Vec<FunctionRecord> =
                 match pkcs11_module::tables_for(pkcs11_module::Surface::LegacyFunctionList {
                     version: cryptoki_sys::CK_VERSION {
                         major: 2,
@@ -3915,13 +3957,14 @@ mod tests {
                         .iter()
                         .flat_map(|span| span.fields())
                         .map(|field| {
-                            let resolution = match field.name {
-                                "C_CreateObject" => Resolution::Resolved {
+                            let resolution = ADMITTABLE_FUNCTIONS
+                                .iter()
+                                .position(|name| *name == field.name)
+                                .map(|index| Resolution::Resolved {
                                     object: 0,
-                                    file_offset: start,
-                                },
-                                _ => Resolution::NullPointer,
-                            };
+                                    file_offset: start + index as u64,
+                                })
+                                .unwrap_or(Resolution::NullPointer);
                             FunctionRecord {
                                 name: field.name.into(),
                                 resolution,
@@ -3929,6 +3972,33 @@ mod tests {
                         })
                         .collect(),
                     _ => panic!("2.40 is a full standard table"),
+                };
+            // The v3 message functions ride no legacy table: resolve
+            // the one the neutral history stages on a v3 interface
+            // surface (canonical V3_0 walk order).
+            let message_functions: Vec<FunctionRecord> =
+                match pkcs11_module::tables_for(pkcs11_module::Surface::StandardInterface {
+                    version: cryptoki_sys::CK_VERSION { major: 3, minor: 0 },
+                }) {
+                    pkcs11_module::TableSet::Walk(spans) => spans
+                        .iter()
+                        .flat_map(|span| span.fields())
+                        .map(|field| {
+                            let resolution = if field.name == "C_SignMessage" {
+                                Resolution::Resolved {
+                                    object: 0,
+                                    file_offset: start + 8,
+                                }
+                            } else {
+                                Resolution::NullPointer
+                            };
+                            FunctionRecord {
+                                name: field.name.into(),
+                                resolution,
+                            }
+                        })
+                        .collect(),
+                    _ => panic!("3.0 is a full standard table"),
                 };
             let path = path.to_str().unwrap().to_string();
             let manifest = Manifest {
@@ -3946,22 +4016,39 @@ mod tests {
                     inode: mapping.inode,
                     identity: inspected.identity,
                 }],
-                interface_list: Acquisition::Absent,
-                surfaces: vec![SurfaceRecord {
-                    source: SurfaceSource::LegacyFunctionList,
-                    acquisition: Acquisition::Ok,
-                    version: Some(Version {
-                        major: 2,
-                        minor: 40,
-                    }),
-                    walk: WalkOutcome::Full,
-                    functions,
-                }],
+                interface_list: Acquisition::Ok,
+                surfaces: vec![
+                    SurfaceRecord {
+                        source: SurfaceSource::LegacyFunctionList,
+                        acquisition: Acquisition::Ok,
+                        version: Some(Version {
+                            major: 2,
+                            minor: 40,
+                        }),
+                        walk: WalkOutcome::Full,
+                        functions,
+                    },
+                    SurfaceRecord {
+                        source: SurfaceSource::Interface {
+                            index: 0,
+                            raw_name_hex: Some("504b4353203131".into()),
+                            name_lossy: Some("PKCS 11".into()),
+                            name_error: None,
+                            flags: 0,
+                            classification: InterfaceClassification::ExactStandard,
+                        },
+                        acquisition: Acquisition::Ok,
+                        version: Some(Version { major: 3, minor: 0 }),
+                        walk: WalkOutcome::Full,
+                        functions: message_functions,
+                    },
+                ],
                 vendor_interfaces: Vec::new(),
                 alias_groups: Vec::new(),
                 selection_evidence: Default::default(),
             };
-            assert!(crate::manifest_input::validate_structure(&manifest).is_empty());
+            let problems = crate::manifest_input::validate_structure(&manifest);
+            assert!(problems.is_empty(), "fixture manifest: {problems:?}");
             let pinning =
                 crate::discovery::identity::pin_manifest_objects_deferred(&manifest).unwrap();
             assert!(pinning.stale.is_empty());
@@ -3980,18 +4067,35 @@ mod tests {
                     &[operator],
                 );
             let subset = prepared.subset.expect("nonempty validated operator subset");
-            let slot = subset
-                .plan()
-                .slots
-                .iter()
-                .find(|slot| slot.names.len() == 1 && slot.names[0] == "C_CreateObject")
-                .expect("create slot");
-            let endpoint = Endpoint {
-                object: slot.object,
-                file_slot: 0,
-                offset: slot.file_offset,
-            };
-            let slot = slot.index;
+            let mut functions = BTreeMap::new();
+            for name in ADMITTABLE_FUNCTIONS {
+                let slot = subset
+                    .plan()
+                    .slots
+                    .iter()
+                    .find(|slot| slot.names.len() == 1 && slot.names[0] == name)
+                    .unwrap_or_else(|| {
+                        let names: Vec<_> = subset
+                            .plan()
+                            .slots
+                            .iter()
+                            .map(|slot| slot.names.clone())
+                            .collect();
+                        panic!("{name} slot; have {names:?}")
+                    });
+                functions.insert(
+                    name.to_string(),
+                    (
+                        slot.index,
+                        Endpoint {
+                            object: slot.object,
+                            file_slot: 0,
+                            offset: slot.file_offset,
+                        },
+                    ),
+                );
+            }
+            let (slot, endpoint) = functions["C_CreateObject"];
             let pin = pins.pinned().next().unwrap();
             let module = ModuleKey::physical(
                 pin.key.device.major,
@@ -4021,6 +4125,7 @@ mod tests {
                 router,
                 slot,
                 endpoint,
+                functions,
                 next_token: 0,
             }
         }
@@ -4060,13 +4165,28 @@ mod tests {
             }
         }
 
-        /// One real routed evidence: scripted routed call through the
-        /// production move-only conversion, with its real H0 token.
-        /// One routed evidence with a chosen session word, so two
-        /// same-image fixtures admit distinguishable calls. The
-        /// remaining scalars mirror `begin_bytes`: the admitted call
-        /// is the staged call's H3-routed return.
-        fn evidence(&mut self, session: u64) -> CallEvidence {
+        /// One real admission: routed evidence through the real
+        /// descriptor/binding proofs, historical standing (no coverage
+        /// needed for key binding).
+        fn admit(&mut self) -> AdmittedInstanceCall {
+            self.admit_session(SESSION)
+        }
+
+        /// One real admission for a chosen session word.
+        fn admit_session(&mut self, session: u64) -> AdmittedInstanceCall {
+            self.admit_session_function(session, "C_CreateObject")
+        }
+
+        /// One real admission for a chosen function: routed evidence
+        /// against that function's plan slot, through the real
+        /// descriptor/binding proofs.
+        fn admit_function(&mut self, name: &str) -> AdmittedInstanceCall {
+            self.admit_session_function(SESSION, name)
+        }
+
+        /// One real admission for a chosen session word and function.
+        fn admit_session_function(&mut self, session: u64, name: &str) -> AdmittedInstanceCall {
+            let (slot, endpoint) = self.functions[name].clone();
             self.next_token += 1;
             let token = self.next_token;
             let stamp = InstanceStamp {
@@ -4080,7 +4200,7 @@ mod tests {
                 crate::events::DecodedEventRecord {
                     base: crate::semantic_capture::event_record_with_routing(
                         Event {
-                            slot: self.slot,
+                            slot,
                             session,
                             slot_id: SLOT_ID,
                             flags: FLAGS,
@@ -4096,22 +4216,11 @@ mod tests {
                     object: None,
                 },
                 Route::Joined(self.router),
-                Some(self.endpoint),
+                Some(endpoint),
                 Some(token),
             );
-            CallEvidence::from_routed(routed).expect("joined call converts to evidence")
-        }
-
-        /// One real admission: routed evidence through the real
-        /// descriptor/binding proofs, historical standing (no coverage
-        /// needed for key binding).
-        fn admit(&mut self) -> AdmittedInstanceCall {
-            self.admit_session(SESSION)
-        }
-
-        /// One real admission for a chosen session word.
-        fn admit_session(&mut self, session: u64) -> AdmittedInstanceCall {
-            let evidence = self.evidence(session);
+            let evidence =
+                CallEvidence::from_routed(routed).expect("joined call converts to evidence");
             admit_call_from_evidence(
                 evidence,
                 &self.binding,
@@ -4157,6 +4266,41 @@ mod tests {
 
         fn attest(&mut self) -> JournalDomainProof {
             let admitted = self.fixture.admit();
+            self.adapter.attest_key(&admitted).expect("key attests")
+        }
+
+        /// Attest `n` admissions for one key: every staged call needs
+        /// its H3 admission claim, and counts accumulate per
+        /// fingerprint. Each admission carries a distinct H0 token.
+        fn attest_calls(&mut self, n: usize) -> JournalDomainProof {
+            assert!(n > 0, "attest at least one call");
+            let mut proof = self.attest();
+            for _ in 1..n {
+                proof = self.attest();
+            }
+            proof
+        }
+
+        /// Attest one admission for a chosen function: the staged
+        /// call's H3-routed return for that function's fingerprint.
+        fn attest_function(&mut self, name: &str) -> JournalDomainProof {
+            let admitted = self.fixture.admit_function(name);
+            self.adapter.attest_key(&admitted).expect("key attests")
+        }
+
+        /// Attest `n` admissions for a chosen function.
+        fn attest_function_n(&mut self, name: &str, n: usize) -> JournalDomainProof {
+            assert!(n > 0, "attest at least one call");
+            let mut proof = self.attest_function(name);
+            for _ in 1..n {
+                proof = self.attest_function(name);
+            }
+            proof
+        }
+
+        /// Attest one admission for a chosen session word and function.
+        fn attest_session_function(&mut self, session: u64, name: &str) -> JournalDomainProof {
+            let admitted = self.fixture.admit_session_function(session, name);
             self.adapter.attest_key(&admitted).expect("key attests")
         }
 
@@ -4252,13 +4396,11 @@ mod tests {
                 crate::events::ScriptedRecords::records(records, bound),
                 7,
             );
-            let session = self.fixture.domain;
             self.adapter.collect_from_drain(
                 &mut drain,
                 &self.descriptors,
                 Some(bound),
                 fault,
-                session,
                 0,
             )
         }
@@ -4635,6 +4777,7 @@ mod tests {
         {
             let mut scene = Scene::new(image_default());
             let proof = scene.attest();
+            scene.attest_function("C_DestroyObject");
             let create = function_id("C_CreateObject");
             let destroy = function_id("C_DestroyObject");
             let begin = begin_bytes(1, 1, create, 0);
@@ -4661,7 +4804,7 @@ mod tests {
         // object effect: ordering only.
         {
             let mut scene = Scene::new(image_default());
-            let proof = scene.attest();
+            let proof = scene.attest_function("C_Sign");
             let sign = function_id("C_Sign");
             let begin = begin_bytes(1, 1, sign, 0);
             assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
@@ -4778,7 +4921,7 @@ mod tests {
         // handle. No terminal, rescan or rebootstrap recovers the
         // incarnation's object proof.
         let mut scene = Scene::new(image_default());
-        let proof = scene.attest();
+        let proof = scene.attest_calls(2);
         let create = function_id("C_CreateObject");
         let outer = begin_bytes(1, 1, create, 0);
         let inner = begin_bytes(1, 2, create, 0);
@@ -4988,7 +5131,7 @@ mod tests {
         // covers through 2; the derived fence lands strictly above the
         // pending bound at 6, which the model accepts.
         let mut scene = Scene::new(image_default());
-        let proof = scene.attest();
+        let proof = scene.attest_calls(3);
         let create = function_id("C_CreateObject");
         let first = begin_bytes(1, 1, create, 0);
         scene.ingest(&first);
@@ -5230,7 +5373,6 @@ mod tests {
             &scene.descriptors,
             None,
             &fault,
-            scene.fixture.domain,
             0,
         );
         assert_eq!((first.ingested, first.ordinary), (1, 0));
@@ -5245,7 +5387,6 @@ mod tests {
             &scene.descriptors,
             None,
             &fault,
-            scene.fixture.domain,
             0,
         );
         assert_eq!((second.ingested, second.ordinary), (1, 0));
@@ -5265,7 +5406,6 @@ mod tests {
             &scene.descriptors,
             None,
             &fault,
-            scene.fixture.domain,
             0,
         );
         assert_eq!((first.ingested, first.ordinary), (0, 0));
@@ -5305,7 +5445,7 @@ mod tests {
         // A delayed seal proves exactly what prompt sealing proves.
         let build = |delayed: bool| {
             let mut scene = Scene::new(image_default());
-            let proof = scene.attest();
+            let proof = scene.attest_calls(2);
             let create = function_id("C_CreateObject");
             let first = begin_bytes(1, 1, create, 0);
             scene.ingest(&first);
@@ -5350,7 +5490,7 @@ mod tests {
 
         // A frontier below the sealed-through cut regresses.
         let mut scene = Scene::new(image_default());
-        let proof = scene.attest();
+        let proof = scene.attest_calls(2);
         let create = function_id("C_CreateObject");
         let first = begin_bytes(1, 1, create, 0);
         scene.ingest(&first);
@@ -5451,7 +5591,9 @@ mod tests {
             )
             .expect_err("empty resumption waits");
         assert_eq!(waiting.gap, JournalGap::BoundNotReady);
-        // New history above the fence seals under the fresh birth.
+        // New history above the fence seals under the fresh birth. The
+        // void cleared admission claims: re-attest for the new history.
+        scene.attest();
         let again = begin_bytes(1, 2, create, 0);
         scene.ingest(&again);
         scene.ingest(&end_bytes(&again, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
@@ -5498,6 +5640,8 @@ mod tests {
             .seal_collected(&resume, &clean)
             .expect_err("empty resumption waits");
         assert_eq!(waiting.gap, JournalGap::BoundNotReady);
+        // The void cleared admission claims: re-attest for the new history.
+        scene.attest();
         let again = begin_bytes(1, 2, create, 0);
         let collection = scene.collect_records(
             vec![
@@ -5586,7 +5730,7 @@ mod tests {
         // refusal; a corroborated synchronous return bounds it and the
         // seal clears the refusal without a bootstrap refusal.
         let mut scene = Scene::new(image_default());
-        let proof = scene.attest();
+        let proof = scene.attest_calls(1_025);
         let create = function_id("C_CreateObject");
         for sequence in 1..=1_024u64 {
             let begin = begin_bytes(1, sequence, create, 0);
@@ -5657,10 +5801,13 @@ mod tests {
         // input for the overflow. Batches seal and prune so only floors
         // accumulate.
         let mut scene = Scene::new(image_default());
+        // H3 admits each call before its batch seals; conversions
+        // consume as they go (one in-flight admission stays ahead).
         let proof = scene.attest();
         let bootstrap = scene.bootstrap(proof, 0);
         for batch in 0..64u64 {
             for thread in 1..=256u64 {
+                scene.attest();
                 let ticket = batch * 256 + thread;
                 let begin = begin_bytes(ticket, 1, create, 0);
                 assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
@@ -5669,6 +5816,7 @@ mod tests {
             scene.seal(&bootstrap).expect("batch seal prunes");
         }
         for thread in 16_384 + 1..=16_448u64 {
+            scene.attest();
             let begin = begin_bytes(thread, 1, create, 0);
             assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
             scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
@@ -5723,6 +5871,7 @@ mod tests {
         // no object effect.
         let mut scene = Scene::new(image_default());
         let proof = scene.attest();
+        scene.attest_function("C_Sign");
         let create = function_id("C_CreateObject");
         let sign = function_id("C_Sign");
         let neutral = begin_bytes(1, 1, sign, 0);
@@ -5760,7 +5909,7 @@ mod tests {
 
         // A delayed first route retains its original BEGIN cut.
         let mut scene = Scene::new(image_default());
-        let proof = scene.attest();
+        let proof = scene.attest_calls(2);
         let create = function_id("C_CreateObject");
         let begin = begin_bytes(1, 1, create, 0);
         scene.ingest(&begin);
@@ -5798,7 +5947,7 @@ mod tests {
                 image_sightings: 8,
             },
         );
-        let proof = scene.attest();
+        let proof = scene.attest_calls(2);
         for sequence in 1..=2u64 {
             let begin = begin_bytes(1, sequence, create, 0);
             scene.ingest(&begin);
@@ -6015,6 +6164,17 @@ mod tests {
         // only the creation establishes an object.
         let mut scene = Scene::new(image_default());
         let proof = scene.attest();
+        for name in [
+            "C_GetAttributeValue",
+            "C_SignInit",
+            "C_Sign",
+            "C_VerifyInit",
+            "C_Verify",
+            "C_SignMessage",
+            "C_DestroyObject",
+        ] {
+            scene.attest_function(name);
+        }
         let create = function_id("C_CreateObject");
         let getattr = function_id("C_GetAttributeValue");
         let sign_init = function_id("C_SignInit");
@@ -6356,7 +6516,7 @@ mod tests {
         // sighted at 2 and both cuts 0 and 1 verify as exec-novel; the
         // moved birth still refuses on the pin alone.
         let mut scene = Scene::new(image_default());
-        let proof = scene.attest();
+        let proof = scene.attest_calls(2);
         let anchor = begin_bytes(1, 1, create, 0);
         let mut foreign = ordinary_for(&anchor, 0);
         foreign.slot = 99;
@@ -6396,7 +6556,7 @@ mod tests {
 
         // Healthy history seals under generation zero.
         let mut scene = Scene::new(image_default());
-        let proof = scene.attest();
+        let proof = scene.attest_calls(2);
         let create = function_id("C_CreateObject");
         let begin = begin_bytes(1, 1, create, 0);
         scene.ingest(&begin);
@@ -6493,7 +6653,7 @@ mod tests {
         // One creation seals, one call stays held, then stop invalidates
         // the tracked incarnation and reports it.
         let mut scene = Scene::new(image_default());
-        let proof = scene.attest();
+        let proof = scene.attest_calls(2);
         let create = function_id("C_CreateObject");
         let begin = begin_bytes(1, 1, create, 0);
         scene.ingest(&begin);
@@ -6714,6 +6874,8 @@ mod tests {
         let fresh = begin_bytes(1, 9, create, 0);
         scene.ingest(&fresh);
         scene.ingest(&end_bytes(&fresh, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
+        // The voids cleared admission claims: re-attest for the new history.
+        scene.attest();
         let resume = BootstrapReceipt::scripted(proof, BirthKind::AbsenceAppearance, 3, 0);
         let success = scene.seal(&resume).expect("resumption names the fence");
         assert_eq!(success.prefix.birth_cut(), 3);
@@ -6842,10 +7004,13 @@ mod tests {
         // recycle); then 1,024 opens fill the table on one live thread
         // and the 1,025th is refused for capacity, never dropped.
         let mut scene = Scene::new(image_default());
-        let proof = scene.attest();
+        // H3 admits each call before its batch seals; conversions
+        // consume as they go (one in-flight admission stays ahead).
+        let proof = scene.attest_function("C_Sign");
         let sign = function_id("C_Sign");
         let bootstrap = scene.bootstrap(proof, 0);
         for thread in 1..=16_448u64 {
+            scene.attest_function("C_Sign");
             let begin = begin_bytes(thread, 1, sign, 0);
             scene.ingest(&begin);
             scene.ingest(&end_bytes_absent(&begin, 0, ENTRY_NS + 50));
@@ -6934,7 +7099,7 @@ mod tests {
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
         let mut scene = Scene::new(image_default());
-        let proof = scene.attest();
+        let proof = scene.attest_calls(3);
         let create = function_id("C_CreateObject");
         let first = begin_bytes(1, 1, create, 0);
         scene.ingest(&first);
@@ -6981,7 +7146,9 @@ mod tests {
                 image_sightings: 8,
             },
         );
-        let proof = scene.attest();
+        let proof = scene.attest_calls(2);
+        scene.attest_session_function(0x1111_1111_1111_1111, "C_CreateObject");
+        scene.attest_session_function(0x2222_2222_2222_2222, "C_CreateObject");
         let create = function_id("C_CreateObject");
         let first = begin_bytes(1, 1, create, 0);
         scene.ingest(&first);
@@ -7040,7 +7207,8 @@ mod tests {
         // operation), since a held creation would genuinely collide with
         // everything inside its span.
         let mut scene = Scene::new(image_default());
-        let proof = scene.attest();
+        let proof = scene.attest_calls(50);
+        scene.attest_function("C_Sign");
         let create = function_id("C_CreateObject");
         let sign = function_id("C_Sign");
         let held = begin_bytes(1, 1, sign, 0);
@@ -7079,7 +7247,7 @@ mod tests {
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
         let mut scene = Scene::new(image_default());
-        let proof = scene.attest();
+        let proof = scene.attest_calls(2);
         let create = function_id("C_CreateObject");
         let first = begin_bytes(1, 1, create, 0);
         scene.ingest(&first);
@@ -7115,7 +7283,7 @@ mod tests {
         // no new bootstrap but still requires the model's agreement on
         // the listed opens.
         let mut scene = Scene::new(image_default());
-        let proof = scene.attest();
+        let proof = scene.attest_function_n("C_Sign", 2);
         let sign = function_id("C_Sign");
         scene.ingest(&begin_bytes(1, 1, sign, 0));
         let bootstrap = scene.bootstrap(proof, 0);
@@ -7213,6 +7381,8 @@ mod tests {
             },
         );
         let proof = scene.attest();
+        scene.attest_session_function(0x1111_1111_1111_1111, "C_CreateObject");
+        scene.attest_session_function(0x2222_2222_2222_2222, "C_CreateObject");
         let create = function_id("C_CreateObject");
         let mut first = begin_bytes(1, 1, create, 0);
         put_u64(&mut first, 80, 0x1111_1111_1111_1111);
@@ -7254,7 +7424,7 @@ mod tests {
         // the closing prefix as an explicit terminal delta — H9's
         // delivery contract, not just the model result.
         let mut scene = Scene::new(image_default());
-        let proof = scene.attest();
+        let proof = scene.attest_function("C_Sign");
         // The held call is neutral (a slow operation), mirroring the
         // long-open test: a held creation would genuinely collide.
         let sign = function_id("C_Sign");
@@ -7478,7 +7648,7 @@ mod tests {
         use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
 
         let mut scene = Scene::new(image_default());
-        let proof = scene.attest();
+        let proof = scene.attest_function_n("C_Sign", 2);
         let sign = function_id("C_Sign");
         // One call converts (model holds its ticket); a second, never
         // converted, is then abandoned unboundedly.
@@ -7519,7 +7689,7 @@ mod tests {
         use p11scope_ebpf_common::object_journal::JOURNAL_REASON_ENTRY_COLLISION;
 
         let mut scene = Scene::new(image_default());
-        let proof = scene.attest();
+        let proof = scene.attest_function("C_Sign");
         let sign = function_id("C_Sign");
         scene.ingest(&begin_bytes(1, 1, sign, 0));
         let bootstrap = scene.bootstrap(proof, 0);
@@ -7608,7 +7778,7 @@ mod tests {
             pending_calls: 2,
             ..crate::semantics_objects::ObjectLimits::policy()
         });
-        let proof = scene.attest();
+        let proof = scene.attest_calls(4);
         let create = function_id("C_CreateObject");
         // One creation settles first: its live view is what the later
         // refusal retires.
@@ -7685,7 +7855,9 @@ mod tests {
             .seal_at(&resume, 8)
             .expect_err("empty resumption waits for history");
         assert_eq!(waiting.gap, JournalGap::BoundNotReady);
-        // Genuinely new staged history above the fence recovers.
+        // Genuinely new staged history above the fence recovers. The
+        // void cleared admission claims: re-attest for the new history.
+        scene.attest();
         let next = begin_bytes(1, 2, create, 0);
         scene.ingest(&next);
         scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
@@ -7743,6 +7915,7 @@ mod tests {
             },
         );
         let proof = scene.attest();
+        scene.attest_session_function(0x1111_1111_1111_1111, "C_CreateObject");
         let mut first = begin_bytes(1, 1, create, 0);
         put_u64(&mut first, 80, 0x1111_1111_1111_1111);
         scene.ingest(&first);
@@ -7850,6 +8023,8 @@ mod tests {
             )
             .expect_err("fault audit voids");
         let fence = scene.adapter.consumed_through;
+        // The void cleared admission claims: re-attest for the new history.
+        scene.attest();
         let next = begin_bytes(1, 2, create, 0);
         scene.ingest(&next);
         scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
@@ -7913,41 +8088,73 @@ mod tests {
     }
 
     #[test]
+    fn object_journal_sole_key_requires_admission_claim() {
+        // Carryover 4: a sole KNOWN key does not prove a sole provider
+        // instance. Staged calls convert only under an admission claim
+        // — even with no sibling keys. An unclaimed staged call waits;
+        // its H3 admission then lets the seal convert it.
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        scene.ingest(&begin_bytes(1, 1, create, 0));
+        scene.ingest(&begin_bytes(1, 2, create, 0));
+        let bootstrap = scene.bootstrap(proof, 0);
+        let blocked = scene
+            .seal(&bootstrap)
+            .expect_err("unclaimed staged call waits");
+        assert_eq!(blocked.gap, JournalGap::BoundNotReady);
+        scene.attest();
+        let success = scene.seal(&bootstrap).expect("claimed calls seal");
+        assert_eq!(success.prefix.settled().len(), 2);
+    }
+
+    #[test]
     fn object_journal_collection_binds_drain_session() {
-        // C4: a collection through one Session's drain never seals under
-        // another Session's attested key.
+        // C4: the collection's drain domain is drain-obtained authority,
+        // never a caller label. The first presented drain pins the
+        // adapter; a foreign drain consumes nothing, and its audit
+        // refuses at seal as a wiring refusal. The adapter's own drain
+        // seals.
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
-        let image_b = ImageIdentity {
-            task_cookie: COOKIE + 1,
-            exec_id: EXEC,
-        };
-        // Negative: B's history collected through A's drain refuses B's seal.
         let mut scene = Scene::new(image_default());
-        scene.attest();
-        let mut other = AttestationFixture::new(image_b);
-        let proof_b = scene.adapter.attest_key(&other.admit()).expect("B attests");
-        let create = function_id("C_CreateObject");
-        let begin = begin_bytes_image(1, 1, create, 0, (COOKIE + 1, EXEC));
-        let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
-        let fault = ScriptedFaultCell::steady(7);
-        let collection = scene.collect_records(vec![begin.to_vec(), end.to_vec()], &fault);
-        let bootstrap_b = scene.bootstrap(proof_b, 0);
-        let refused = scene
-            .seal_collected(&bootstrap_b, &collection)
-            .expect_err("foreign drain refuses");
-        assert_eq!(refused.gap, JournalGap::DrainMismatch);
-        // Positive control: B's history through B's own drain seals.
-        let mut scene = Scene::new(image_b);
         let proof = scene.attest();
-        let begin = begin_bytes_image(1, 1, create, 0, (COOKIE + 1, EXEC));
+        let create = function_id("C_CreateObject");
+        let begin = begin_bytes(1, 1, create, 0);
         let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
         let fault = ScriptedFaultCell::steady(7);
         let collection = scene.collect_records(vec![begin.to_vec(), end.to_vec()], &fault);
+        assert_eq!(collection.drain_domain, 7);
         let bootstrap = scene.bootstrap(proof, 0);
         scene
             .seal_collected(&bootstrap, &collection)
             .expect("own drain seals");
+        // A foreign drain consumes nothing past the pin.
+        let foreign = begin_bytes(1, 2, create, 0);
+        let mut drain = crate::events::EventDrain::over_test_domain(
+            crate::events::ScriptedRecords::records(vec![foreign.to_vec()], 1),
+            9,
+        );
+        let refused = scene.adapter.collect_from_drain(
+            &mut drain,
+            &scene.descriptors,
+            None,
+            &fault,
+            0,
+        );
+        assert_eq!((refused.ingested, refused.ordinary), (0, 0));
+        assert_eq!(refused.drain_domain, 9);
+        assert_eq!(scene.adapter.consumed_through, 2);
+        // Its audit refuses the seal without voiding staged proof.
+        let mut source =
+            ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(2));
+        let audit = JournalAuditReceipt::collect(&refused, &mut source, 0);
+        let frontier = scene.adapter.consumed_frontier();
+        let fresh = SessionBirthEvidence::scripted_for_receipt(&bootstrap);
+        let failure = scene
+            .seal_explicit(&audit, &bootstrap, frontier, &fresh)
+            .expect_err("foreign drain refuses");
+        assert_eq!(failure.gap, JournalGap::DrainMismatch);
     }
 
     #[test]
@@ -8186,8 +8393,11 @@ mod tests {
             RegistryLimits::default_limits(),
         )
         .unwrap();
+        // The lane runs on its own attested subset; the scene keeps
+        // its fixture for admission claims across the void.
+        let mut lane_fixture = AttestationFixture::new(image_default());
         let mut lane = AttestedSemanticLane::start(
-            scene.fixture.take_subset(),
+            lane_fixture.take_subset(),
             &Scope::Pid(pid),
             BackendSelection::Auto,
         )
@@ -8245,7 +8455,9 @@ mod tests {
         coordinator.acknowledge_h3_void(failure.h3_voided.expect("void report"));
         // Quantum 2: a clean finalizer batch releases into Clean past
         // the acknowledged barrier, and genuinely new journal history
-        // seals above the void fence.
+        // seals above the void fence. The void cleared admission
+        // claims: re-attest for the new history.
+        scene.attest();
         commit(
             &mut coordinator,
             &mut lane,
@@ -8434,8 +8646,10 @@ mod tests {
         assert_eq!(failure.gap, JournalGap::FaultChanged);
         assert_eq!(scene.adapter.last_fault, Some(8));
         // The baseline caught up: new history above the fence seals
-        // under the fresh epoch.
+        // under the fresh epoch. The void cleared admission claims:
+        // re-attest for the new history.
         let fence = scene.adapter.consumed_through;
+        scene.attest();
         let third = begin_bytes(1, 3, create, 0);
         scene.ingest(&third);
         scene.ingest(&end_bytes(&third, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
@@ -8524,13 +8738,11 @@ mod tests {
         script.discard_bump = Some((1, 1));
         let mut drain = crate::events::EventDrain::over_test_domain(script, 7);
         let fault = ScriptedFaultCell::steady(7);
-        let session = scene.fixture.domain;
         let collection = scene.adapter.collect_from_drain(
             &mut drain,
             &scene.descriptors,
             None,
             &fault,
-            session,
             0,
         );
         assert_eq!(collection.discarded_delta, 1);
@@ -8540,8 +8752,9 @@ mod tests {
             .expect_err("spanned discards void");
         assert_eq!(failure.gap, JournalGap::Discarded);
         // A clean re-collection seals genuinely new history above the
-        // fence.
+        // fence. The void cleared admission claims: re-attest.
         let fence = scene.adapter.consumed_through;
+        scene.attest();
         let next = begin_bytes(1, 2, create, 0);
         let next_end = end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60);
         let script = BusyScript::new(vec![next.to_vec(), next_end.to_vec()]);
@@ -8551,7 +8764,6 @@ mod tests {
             &scene.descriptors,
             None,
             &fault,
-            session,
             0,
         );
         assert_eq!(collection.discarded_delta, 0);

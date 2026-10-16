@@ -543,6 +543,32 @@ pub(crate) enum JournalGap {
     /// The retained reader consumed kernel-discarded reservations
     /// during the collection: lost history voids the seal.
     Discarded,
+    /// A required strict cut increment overflowed the cut space:
+    /// `u64::MAX` has no successor, so no fence above it can be
+    /// derived. The seal refuses explicitly instead of saturating
+    /// into a vacuous re-seal; staged inputs are kept.
+    CutExhausted,
+}
+
+/// The model's bootstrap floor: strictly above the birth, the last
+/// sealed frontier, the void fence and every recorded or pending loss
+/// bound. The maximum of strict successors is the strict successor of
+/// the maximum, so one checked increment derives the whole floor.
+fn derive_model_floors(
+    birth_cut: u64,
+    sealed_through: u64,
+    void_fence: u64,
+    bounded_upper: Option<u64>,
+    pending_bounds: &[u64],
+) -> Result<u64, JournalGap> {
+    let mut bound = birth_cut.max(sealed_through).max(void_fence);
+    if let Some(upper) = bounded_upper {
+        bound = bound.max(upper);
+    }
+    for at in pending_bounds {
+        bound = bound.max(*at);
+    }
+    bound.checked_add(1).ok_or(JournalGap::CutExhausted)
 }
 
 // ---------------------------------------------------------------------------
@@ -2671,19 +2697,12 @@ impl JournalAdapter {
         // model must refuse. Only floors past the frontier wait for more
         // history — a repeated seal at an unchanged frontier never
         // succeeds vacuously. Staged inputs are kept for a later seal.
-        let mut floors = bootstrap
-            .birth_cut()
-            .saturating_add(1)
-            .max(state.sealed_through.saturating_add(1));
-        floors = floors.max(state.void_fence.saturating_add(1));
-        if let Some(upper) = state.bounded_upper {
-            floors = floors.max(upper.saturating_add(1));
-        }
         // Pending loss bounds: this key's staged bounded abandonments
         // and refused begins with their corroborating returns in the
         // frontier. Calls this seal removes never apply, so they leave
         // the held pin alone. A sibling key's bounds belong to its own
         // fence.
+        let mut pending_bounds = Vec::new();
         for entry in self.open.values() {
             if self.converts_here(key, &live, entry)
                 && entry.begin_ordinal <= frontier
@@ -2693,7 +2712,7 @@ impl JournalAdapter {
                 && let Some(at) = entry.corroborated_return
                 && at <= frontier
             {
-                floors = floors.max(at.saturating_add(1));
+                pending_bounds.push(at);
             }
         }
         for refused in &self.refused {
@@ -2702,9 +2721,17 @@ impl JournalAdapter {
                 && let Some(at) = refused.corroborated_return
                 && at <= frontier
             {
-                floors = floors.max(at.saturating_add(1));
+                pending_bounds.push(at);
             }
         }
+        let floors = derive_model_floors(
+            bootstrap.birth_cut(),
+            state.sealed_through,
+            state.void_fence,
+            state.bounded_upper,
+            &pending_bounds,
+        )
+        .map_err(|gap| self.failure(gap))?;
         // Held pin: the earliest staged begin this seal keeps. Bounded
         // losses removed below contribute their bound instead of their
         // begin; everything else convertible here may still apply. A
@@ -7049,6 +7076,30 @@ mod tests {
         let success = scene.seal(&birth).expect("birth seals");
         assert_eq!(success.prefix.birth_cut(), 5);
         assert_eq!(success.prefix.bootstrap_cut(), Some(6));
+    }
+
+    #[test]
+    fn object_journal_model_floors_refuse_cut_exhaustion() {
+        // Carryover 7: the derived floor is strictly above every
+        // authority bound, and cut-space exhaustion refuses explicitly
+        // instead of saturating (an unchanged MAX frontier must never
+        // pass again). The seal's floor inputs never exceed the
+        // consumed frontier, so exhaustion is unreachable end to end;
+        // this pins the real derivation helper the seal calls.
+        assert_eq!(derive_model_floors(5, 3, 0, None, &[]), Ok(6));
+        assert_eq!(derive_model_floors(5, 9, 7, Some(4), &[6]), Ok(10));
+        assert_eq!(
+            derive_model_floors(5, 9, 7, Some(u64::MAX), &[]),
+            Err(JournalGap::CutExhausted)
+        );
+        assert_eq!(
+            derive_model_floors(u64::MAX, 0, 0, None, &[]),
+            Err(JournalGap::CutExhausted)
+        );
+        assert_eq!(
+            derive_model_floors(0, 0, 0, None, &[u64::MAX]),
+            Err(JournalGap::CutExhausted)
+        );
     }
 
     #[test]

@@ -86,7 +86,7 @@ static size_t key_size(void *map)
 {
 #ifndef P11SCOPE_INVENTORY_ONLY
     if (map == &JOURNAL_START_MAP)
-        return 24;
+        return 16;
     if (map == &START || map == &OBJECT_START)
         return 16;
 #else
@@ -153,7 +153,7 @@ static long update(void *map, const void *key, const void *data, u64 flags)
     if (map == &START)
         width = 288;
     else if (map == &JOURNAL_START_MAP)
-        width = 16;
+        width = 24;
 #endif
     memcpy(r->value, data, width);
     return 0;
@@ -286,8 +286,13 @@ static void abi_layout(void)
            (unsigned)sizeof(struct thread_owner));
     EXPECT(__builtin_offsetof(struct thread_owner, journal_thread) == 544, "thread word at 544");
     EXPECT(__builtin_offsetof(struct thread_owner, journal_sequence) == 552, "sequence word at 552");
-    EXPECT(sizeof(struct journal_start_key) == 24, "side key is 24 B");
-    EXPECT(sizeof(struct journal_start_value) == 16, "side value is 16 B");
+    /* H8 plan StartKey-to-identity/phase contract: the side map is
+     * keyed by the existing 16 B START key, and the 24 B value
+     * carries identity/phase. */
+    EXPECT(sizeof(struct owner_start_key) == 16, "side key is the 16 B StartKey");
+    EXPECT(sizeof(struct journal_start_value) == 24, "side value is 24 B identity/phase");
+    EXPECT(__builtin_offsetof(struct journal_start_value, sequence) == 8, "value sequence at 8");
+    EXPECT(__builtin_offsetof(struct journal_start_value, phase) == 16, "value phase at 16");
     EXPECT(sizeof(struct journal_control) == 24, "journal control is 24 B");
 #ifdef P11SCOPE_SMALL_STATE_MAPS
     EXPECT(JOURNAL_START_LIMIT == 1U, "small side limit is 1");
@@ -501,13 +506,18 @@ static void storage_failure_mints_nothing(void)
 
 static void side_map_lifecycle(void)
 {
-    struct journal_start_key key = {7, 3, JOURNAL_PHASE_BEGUN};
-    struct journal_start_value value = {9, 0};
+    struct owner_start_key key;
+    struct journal_start_value value = {7, 3, JOURNAL_PHASE_BEGUN};
     struct journal_start_value *found;
     reset();
+    key.pid_tgid = pid_tgid();
+    key.slot = 9;
+    key.pad = 0;
     EXPECT(p11_journal_side_insert(&JOURNAL_START_MAP, &key, &value) == 0, "side insert");
     found = p11_journal_side_lookup(&JOURNAL_START_MAP, &key);
-    EXPECT(found != NULL && found->slot == 9 && found->flags == 0, "side lookup hits");
+    EXPECT(found != NULL && found->thread == 7 && found->sequence == 3 &&
+               found->phase == JOURNAL_PHASE_BEGUN,
+           "side lookup hits");
     EXPECT(p11_journal_side_insert(&JOURNAL_START_MAP, &key, &value) == -1,
            "duplicate insert refuses (NOEXIST)");
     EXPECT(p11_journal_side_remove(&JOURNAL_START_MAP, &key) == 0, "side remove");
@@ -517,42 +527,246 @@ static void side_map_lifecycle(void)
 
 static void side_map_rejects_bad_shapes(void)
 {
-    struct journal_start_key key = {7, 3, JOURNAL_PHASE_BEGUN};
-    struct journal_start_value value = {9, 0};
-    struct journal_start_key bad = key;
-    struct journal_start_value bad_value = value;
+    struct owner_start_key key;
+    struct journal_start_value value = {7, 3, JOURNAL_PHASE_BEGUN};
+    struct owner_start_key bad;
+    struct journal_start_value bad_value;
     reset();
-    bad.thread = 0;
-    EXPECT(p11_journal_side_insert(&JOURNAL_START_MAP, &bad, &value) == -1, "zero thread refuses");
+    key.pid_tgid = pid_tgid();
+    key.slot = 9;
+    key.pad = 0;
     bad = key;
-    bad.sequence = 0;
+    bad.pid_tgid = 0;
     EXPECT(p11_journal_side_insert(&JOURNAL_START_MAP, &bad, &value) == -1,
-           "zero sequence refuses");
+           "zero carrier refuses");
     bad = key;
-    bad.phase = 0;
-    EXPECT(p11_journal_side_insert(&JOURNAL_START_MAP, &bad, &value) == -1, "phase 0 refuses");
-    bad.phase = 9;
-    EXPECT(p11_journal_side_insert(&JOURNAL_START_MAP, &bad, &value) == -1, "phase 9 refuses");
-    bad_value.slot = P11SCOPE_OWNER_SLOT_BOUND;
-    EXPECT(p11_journal_side_insert(&JOURNAL_START_MAP, &key, &bad_value) == -1,
-           "wild slot refuses");
+    bad.slot = P11SCOPE_OWNER_SLOT_BOUND;
+    EXPECT(p11_journal_side_insert(&JOURNAL_START_MAP, &bad, &value) == -1, "wild slot refuses");
+    bad = key;
+    bad.pad = 1;
+    EXPECT(p11_journal_side_insert(&JOURNAL_START_MAP, &bad, &value) == -1,
+           "nonzero pad refuses");
     bad_value = value;
-    bad_value.flags = 1;
+    bad_value.thread = 0;
     EXPECT(p11_journal_side_insert(&JOURNAL_START_MAP, &key, &bad_value) == -1,
-           "reserved value flags refuse");
+           "zero thread refuses");
+    bad_value = value;
+    bad_value.sequence = 0;
+    EXPECT(p11_journal_side_insert(&JOURNAL_START_MAP, &key, &bad_value) == -1,
+           "zero sequence refuses");
+    bad_value = value;
+    bad_value.phase = 0;
+    EXPECT(p11_journal_side_insert(&JOURNAL_START_MAP, &key, &bad_value) == -1, "phase 0 refuses");
+    bad_value.phase = 9;
+    EXPECT(p11_journal_side_insert(&JOURNAL_START_MAP, &key, &bad_value) == -1, "phase 9 refuses");
     EXPECT(p11_journal_side_insert(NULL, &key, &value) == -1, "NULL map refuses");
     EXPECT(p11_journal_side_insert(&JOURNAL_START_MAP, NULL, &value) == -1, "NULL key refuses");
+    EXPECT(p11_journal_side_insert(&JOURNAL_START_MAP, &key, NULL) == -1, "NULL value refuses");
     EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &bad) == NULL, "bad key looks up nothing");
     EXPECT(p11_journal_side_remove(&JOURNAL_START_MAP, &bad) == -1, "bad key removes nothing");
 #ifdef P11SCOPE_SMALL_STATE_MAPS
     EXPECT(p11_journal_side_insert(&JOURNAL_START_MAP, &key, &value) == 0, "small row one fits");
-    key.sequence = 4;
+    key.slot = 10;
     EXPECT(p11_journal_side_insert(&JOURNAL_START_MAP, &key, &value) == -1,
            "small row two refuses at limit 1");
 #else
     EXPECT(p11_journal_side_insert(&JOURNAL_START_MAP, &key, &value) == 0, "default row fits");
-    key.sequence = 4;
+    key.slot = 10;
     EXPECT(p11_journal_side_insert(&JOURNAL_START_MAP, &key, &value) == 0, "default row two fits");
+#endif
+}
+
+static void journal_transaction_matrix(void)
+{
+    struct owner_start_key key, nested;
+    struct journal_start_value *found;
+    reset();
+    EXPECT(p11_owner_lease() == 1, "lease");
+    key.pid_tgid = pid_tgid();
+    key.slot = 5;
+    key.pad = 0;
+    /* Entry mints the call's words and inserts its PREPARING row. */
+    EXPECT(p11_journal_entry(&owners[0], &journal_ctl, &JOURNAL_START_MAP, &key) == 0,
+           "entry inserts");
+    EXPECT(owners[0].journal_thread == 1 && owners[0].journal_sequence == 1,
+           "entry minted 1/1");
+    found = p11_journal_side_lookup(&JOURNAL_START_MAP, &key);
+    EXPECT(found != NULL && found->thread == 1 && found->sequence == 1 &&
+               found->phase == JOURNAL_PHASE_PREPARING,
+           "row is PREPARING");
+    /* A nested call on another slot shares the thread ticket with a
+     * continuing sequence; both rows live side by side. Limit 1
+     * holds a single row, so the nested entry refuses there until
+     * the first row settles. */
+    nested = key;
+    nested.slot = 6;
+#ifdef P11SCOPE_SMALL_STATE_MAPS
+    EXPECT(p11_journal_entry(&owners[0], &journal_ctl, &JOURNAL_START_MAP, &nested) == -1,
+           "small nested entry refuses at limit 1");
+#else
+    EXPECT(p11_journal_entry(&owners[0], &journal_ctl, &JOURNAL_START_MAP, &nested) == 0,
+           "nested entry inserts");
+    found = p11_journal_side_lookup(&JOURNAL_START_MAP, &nested);
+    EXPECT(found != NULL && found->thread == 1 && found->sequence == 2 &&
+               found->phase == JOURNAL_PHASE_PREPARING,
+           "nested row shares the ticket");
+#endif
+    /* Same-key re-entry collides: refused, old row intact. The failed
+     * entry consumed its minted sequence (tickets never recycle). */
+    EXPECT(p11_journal_entry(&owners[0], &journal_ctl, &JOURNAL_START_MAP, &key) == -1,
+           "same-key entry collides");
+    found = p11_journal_side_lookup(&JOURNAL_START_MAP, &key);
+    EXPECT(found != NULL && found->sequence == 1 && found->phase == JOURNAL_PHASE_PREPARING,
+           "collision keeps the old row");
+    EXPECT(owners[0].journal_sequence == 3, "failed entry consumed its sequence");
+    /* Return before begun refuses; begun demands the exact words. */
+    EXPECT(p11_journal_return(&owners[0], &JOURNAL_START_MAP, &key, 1, 1) == -1,
+           "return before begun refuses");
+    EXPECT(p11_journal_mark_begun(&JOURNAL_START_MAP, &key, 1, 3) == -1,
+           "begun with live words refuses");
+    EXPECT(p11_journal_mark_begun(&JOURNAL_START_MAP, &key, 2, 1) == -1,
+           "begun with wrong thread refuses");
+    EXPECT(p11_journal_mark_begun(&JOURNAL_START_MAP, &key, 1, 1) == 0, "begun commits");
+    EXPECT(p11_journal_mark_begun(&JOURNAL_START_MAP, &key, 1, 1) == -1, "double begun refuses");
+    /* Return advances the exactly-matching BEGUN row to RETURNING. */
+    EXPECT(p11_journal_return(&owners[0], &JOURNAL_START_MAP, &key, 1, 3) == -1,
+           "return with live words refuses");
+    EXPECT(p11_journal_return(&owners[0], &JOURNAL_START_MAP, &key, 1, 1) == 0,
+           "return advances");
+    found = p11_journal_side_lookup(&JOURNAL_START_MAP, &key);
+    EXPECT(found != NULL && found->phase == JOURNAL_PHASE_RETURNING, "row is RETURNING");
+    EXPECT(p11_journal_return(&owners[0], &JOURNAL_START_MAP, &key, 1, 1) == -1,
+           "double return refuses");
+    /* Removal settles the row; a missing required row is loss, a
+     * missing optional row is healthy absence. */
+    EXPECT(p11_journal_remove(&owners[0], &JOURNAL_START_MAP, &key, 1) == 0,
+           "required removal settles");
+    EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &key) == NULL, "removed row is gone");
+    EXPECT(p11_journal_remove(&owners[0], &JOURNAL_START_MAP, &key, 1) == -1,
+           "required missing is loss");
+    EXPECT(p11_journal_remove(&owners[0], &JOURNAL_START_MAP, &key, 0) == -2,
+           "optional missing is absence");
+    /* The nested row settles independently through its own words;
+     * at limit 1 it enters only after the first row retired. */
+#ifdef P11SCOPE_SMALL_STATE_MAPS
+    EXPECT(p11_journal_entry(&owners[0], &journal_ctl, &JOURNAL_START_MAP, &nested) == 0,
+           "small nested entry reuses the freed row");
+    {
+        u64 seq = owners[0].journal_sequence;
+        found = p11_journal_side_lookup(&JOURNAL_START_MAP, &nested);
+        EXPECT(found != NULL && found->thread == 1 && found->sequence == seq,
+               "freed row continues the sequence");
+        EXPECT(p11_journal_mark_begun(&JOURNAL_START_MAP, &nested, 1, seq) == 0,
+               "small nested begun");
+        EXPECT(p11_journal_return(&owners[0], &JOURNAL_START_MAP, &nested, 1, seq) == 0,
+               "small nested return");
+        EXPECT(p11_journal_remove(&owners[0], &JOURNAL_START_MAP, &nested, 1) == 0,
+               "small nested removal");
+    }
+#else
+    EXPECT(p11_journal_mark_begun(&JOURNAL_START_MAP, &nested, 1, 2) == 0, "nested begun");
+    EXPECT(p11_journal_return(&owners[0], &JOURNAL_START_MAP, &nested, 1, 2) == 0,
+           "nested return");
+    EXPECT(p11_journal_remove(&owners[0], &JOURNAL_START_MAP, &nested, 1) == 0,
+           "nested removal");
+#endif
+}
+
+static void journal_transaction_refusals(void)
+{
+    struct owner_start_key key, bad;
+    struct journal_start_value *found;
+    reset();
+    EXPECT(p11_owner_lease() == 1, "lease");
+    key.pid_tgid = pid_tgid();
+    key.slot = 5;
+    key.pad = 0;
+    /* NULL legs refuse everywhere. */
+    EXPECT(p11_journal_entry(NULL, &journal_ctl, &JOURNAL_START_MAP, &key) == -1,
+           "entry with NULL owner refuses");
+    EXPECT(p11_journal_entry(&owners[0], NULL, &JOURNAL_START_MAP, &key) == -1,
+           "entry with NULL control refuses");
+    EXPECT(p11_journal_entry(&owners[0], &journal_ctl, NULL, &key) == -1,
+           "entry with NULL map refuses");
+    EXPECT(p11_journal_entry(&owners[0], &journal_ctl, &JOURNAL_START_MAP, NULL) == -1,
+           "entry with NULL key refuses");
+    /* A key for another owner, or a misshapen one, never enters. */
+    bad = key;
+    bad.pid_tgid = key.pid_tgid + 1;
+    EXPECT(p11_journal_entry(&owners[0], &journal_ctl, &JOURNAL_START_MAP, &bad) == -1,
+           "foreign-carrier entry refuses");
+    bad = key;
+    bad.slot = P11SCOPE_OWNER_SLOT_BOUND;
+    EXPECT(p11_journal_entry(&owners[0], &journal_ctl, &JOURNAL_START_MAP, &bad) == -1,
+           "wild-slot entry refuses");
+    bad = key;
+    bad.pad = 1;
+    EXPECT(p11_journal_entry(&owners[0], &journal_ctl, &JOURNAL_START_MAP, &bad) == -1,
+           "padded entry refuses");
+    /* A released owner holds no rows: entry, return and removal all
+     * refuse after its lease clears. */
+    {
+        struct owner_discovery_key dkey = {pid_tgid(), 9, 1};
+        EXPECT(p11_journal_entry(&owners[0], &journal_ctl, &JOURNAL_START_MAP, &key) == 0,
+               "entry inserts");
+        EXPECT(p11_owner_discovery_insert(&dkey, start_value, 1) == 0, "discovery inserts");
+        EXPECT(p11_owner_discovery_remove(&dkey, 1) == 0, "discovery releases");
+    }
+    EXPECT(owners[0].flags == 0, "owner released");
+    EXPECT(p11_journal_entry(&owners[0], &journal_ctl, &JOURNAL_START_MAP, &key) == -1,
+           "released owner never enters");
+    EXPECT(p11_journal_return(&owners[0], &JOURNAL_START_MAP, &key, 1, 1) == -1,
+           "released owner never returns");
+    EXPECT(p11_journal_remove(&owners[0], &JOURNAL_START_MAP, &key, 1) == -1,
+           "released owner never removes");
+    /* Re-lease and settle the leftover row so later sections start
+     * clean; settlement still works after the release cycle. */
+    EXPECT(p11_owner_lease() == 1, "re-lease");
+    EXPECT(p11_journal_mark_begun(&JOURNAL_START_MAP, &key, 1, 1) == 0, "leftover begun");
+    EXPECT(p11_journal_return(&owners[0], &JOURNAL_START_MAP, &key, 1, 1) == 0, "leftover return");
+    EXPECT(p11_journal_remove(&owners[0], &JOURNAL_START_MAP, &key, 1) == 0, "leftover removal");
+    /* A poisoned control and a wrapped sequence mint nothing. Poison
+     * refuses before any effect, even with a minted ticket. */
+    journal_ctl.poison = 1;
+    EXPECT(p11_journal_entry(&owners[0], &journal_ctl, &JOURNAL_START_MAP, &key) == -1,
+           "poisoned control refuses entry");
+    EXPECT(owners[0].journal_sequence == 1, "poison refuses before effects");
+    journal_ctl.poison = 0;
+    owners[0].journal_sequence = ~0ULL;
+    EXPECT(p11_journal_entry(&owners[0], &journal_ctl, &JOURNAL_START_MAP, &key) == -1,
+           "wrapped sequence refuses entry");
+    /* A contradicted row retires scrubbed but reports loss, never an
+     * orphan and never success. */
+    owners[0].journal_sequence = 1;
+    EXPECT(p11_journal_entry(&owners[0], &journal_ctl, &JOURNAL_START_MAP, &key) == 0,
+           "entry inserts");
+    found = p11_journal_side_lookup(&JOURNAL_START_MAP, &key);
+    EXPECT(found != NULL, "row present to contradict");
+    found->phase = 9;
+    EXPECT(p11_journal_remove(&owners[0], &JOURNAL_START_MAP, &key, 1) == -1,
+           "contradicted removal reports loss");
+    EXPECT(p11_journal_side_lookup(&JOURNAL_START_MAP, &key) == NULL,
+           "contradicted row still retires");
+    EXPECT(p11_journal_remove(&owners[0], &JOURNAL_START_MAP, &key, 7) == -1,
+           "non-bit required refuses");
+#ifdef P11SCOPE_SMALL_STATE_MAPS
+    {
+        struct owner_start_key second = key;
+        second.slot = 6;
+        EXPECT(p11_journal_entry(&owners[0], &journal_ctl, &JOURNAL_START_MAP, &key) == 0,
+               "small entry one fits");
+        EXPECT(p11_journal_entry(&owners[0], &journal_ctl, &JOURNAL_START_MAP, &second) == -1,
+               "small entry two refuses at limit 1");
+    }
+#else
+    {
+        struct owner_start_key second = key;
+        second.slot = 6;
+        EXPECT(p11_journal_entry(&owners[0], &journal_ctl, &JOURNAL_START_MAP, &key) == 0,
+               "default entry one fits");
+        EXPECT(p11_journal_entry(&owners[0], &journal_ctl, &JOURNAL_START_MAP, &second) == 0,
+               "default entry two fits");
+    }
 #endif
 }
 
@@ -726,6 +940,8 @@ int main(void)
     storage_failure_mints_nothing();
     side_map_lifecycle();
     side_map_rejects_bad_shapes();
+    journal_transaction_matrix();
+    journal_transaction_refusals();
     ring_header_matrix();
     ring_reserve_submit_discard();
     mint_contention_unique();

@@ -2,13 +2,11 @@
 #ifndef P11SCOPE_OBJECT_JOURNAL_H
 #define P11SCOPE_OBJECT_JOURNAL_H
 
-/* H8 slice-A inactive custody: the object journal's native side-map,
- * lifetime mint and ring-leaf skeleton. Inactive: no live root calls
- * any leaf below yet; the host fixture in
- * tests/fixtures/object-journal/ executes this exact code. Slice B
- * wires the entry/return/exit transactions; until then these leaves
- * prove ABI, layout and failure-closure only. Inventory-only objects
- * carry no journal maps, hooks or reads. */
+/* H8 inactive custody: the object journal's native side-map,
+ * lifetime mint, ring leaves and entry/return/exit transactions.
+ * Inactive: no live root calls anything below yet; the host fixture
+ * in tests/fixtures/object-journal/ executes this exact code.
+ * Inventory-only objects carry no journal maps, hooks or reads. */
 #include "task_owner.h"
 
 #ifndef P11SCOPE_INVENTORY_ONLY
@@ -37,21 +35,15 @@ static __always_inline int journal_phase_valid(u64 phase)
         phase == JOURNAL_PHASE_RETURNING;
 }
 
-/* Non-LRU side row keyed by the exact native call identity plus phase.
- * A phase advance is a delete plus an insert; the side row never moves
- * under its own key. */
-struct journal_start_key {
+/* Non-LRU JOURNAL_START side map: the H8 plan StartKey-to-
+ * identity/phase contract. Keyed by the existing 16 B START key
+ * (pid_tgid plus slot); the 24 B value carries the call's journal
+ * identity and finite phase. A phase advance updates the value under
+ * its stable START key; the side row never moves. */
+struct journal_start_value {
     u64 thread;
     u64 sequence;
     u64 phase;
-};
-
-/* Side row value (16 B): the START slot this row shadows plus reserved
- * flags. Slice B fills transaction semantics; the ABI shape is frozen
- * here so map payload stays reviewable. */
-struct journal_start_value {
-    u64 slot;
-    u64 flags;
 };
 
 struct journal_control {
@@ -60,12 +52,11 @@ struct journal_control {
     u64 admission_failures;
 };
 
-_Static_assert(sizeof(struct journal_start_key) == 24, "journal key ABI");
-_Static_assert(sizeof(struct journal_start_value) == 16, "journal value ABI");
+_Static_assert(sizeof(struct owner_start_key) == 16, "journal key ABI");
+_Static_assert(sizeof(struct journal_start_value) == 24, "journal value ABI");
 _Static_assert(sizeof(struct journal_control) == 24, "journal control ABI");
-_Static_assert(__builtin_offsetof(struct journal_start_key, sequence) == 8, "journal seq");
-_Static_assert(__builtin_offsetof(struct journal_start_key, phase) == 16, "journal phase");
-_Static_assert(__builtin_offsetof(struct journal_start_value, flags) == 8, "journal vflags");
+_Static_assert(__builtin_offsetof(struct journal_start_value, sequence) == 8, "journal seq");
+_Static_assert(__builtin_offsetof(struct journal_start_value, phase) == 16, "journal phase");
 _Static_assert(JOURNAL_START_LIMIT == 16384U || JOURNAL_START_LIMIT == 1U, "journal limit");
 
 /* Prototype wire header shared with object_journal.rs: exact
@@ -123,20 +114,47 @@ struct journal_header_spec {
 
 _Static_assert(sizeof(struct journal_header_spec) == 40, "header spec ABI");
 
-/* Skeleton leaves. 0/-1 status; nonzero ticket/sequence on success, 0
- * on refusal (caller raises loss before provider execution or
+/* Leaves. 0/-1 status; nonzero ticket/sequence on success, 0 on
+ * refusal (caller raises loss before provider execution or
  * discard). */
 u64 p11_journal_mint_thread(struct journal_control *ctl);
 u64 p11_journal_thread(struct thread_owner *owner, struct journal_control *ctl);
 u64 p11_journal_next_sequence(struct thread_owner *owner);
-int p11_journal_side_insert(void *map, const struct journal_start_key *key,
+int p11_journal_side_insert(void *map, const struct owner_start_key *key,
                             const struct journal_start_value *value);
-void *p11_journal_side_lookup(void *map, const struct journal_start_key *key);
-int p11_journal_side_remove(void *map, const struct journal_start_key *key);
+void *p11_journal_side_lookup(void *map, const struct owner_start_key *key);
+int p11_journal_side_remove(void *map, const struct owner_start_key *key);
 int p11_journal_header_init(void *record, const struct journal_header_spec *spec);
 void *p11_journal_reserve(void *ring, u64 bytes);
 void p11_journal_submit(void *record);
 void p11_journal_discard(void *record);
+
+/* Inactive entry/return/exit transactions over one physical owner's
+ * side row. The future roots call these beside the START and
+ * OBJECT_START legs of the same owner transaction; every failure
+ * returns to the root, which raises loss (transactions never emit a
+ * fault call themselves, so cleanup stays a flat sequence).
+ *
+ * Entry validates the leased owner against the START key, mints the
+ * call's thread/sequence words, and NOEXIST-inserts the PREPARING
+ * row. A failed insert consumes the minted words (tickets never
+ * recycle) and reports -1 before provider execution. Mark-begun
+ * commits the row to BEGUN once its BEGIN is valid; return advances
+ * an exactly-matching BEGUN row to RETURNING; removal deletes the
+ * settled row. Thread/sequence arguments are the caller's retained
+ * BEGIN facts, never the owner's live words (which already advanced
+ * past this call): a later equal numeric key never joins. Removal
+ * takes the frozen per-slot policy's required bit: a missing
+ * required row is loss (-1), a missing optional row is healthy
+ * absence (-2). */
+int p11_journal_entry(struct thread_owner *owner, struct journal_control *ctl, void *map,
+                      const struct owner_start_key *key);
+int p11_journal_mark_begun(void *map, const struct owner_start_key *key, u64 thread,
+                           u64 sequence);
+int p11_journal_return(struct thread_owner *owner, void *map,
+                       const struct owner_start_key *key, u64 thread, u64 sequence);
+int p11_journal_remove(struct thread_owner *owner, void *map,
+                       const struct owner_start_key *key, u32 required);
 
 #endif /* P11SCOPE_INVENTORY_ONLY */
 #endif

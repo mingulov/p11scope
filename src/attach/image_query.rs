@@ -1864,7 +1864,7 @@ mod tests {
             start,
             end,
             file_offset: 0,
-            permissions: [b'r', b'-', b'x', b'p'],
+            permissions: *b"r-xp",
             device: p11scope_manifest::maps::Device { major, minor },
             inode,
             raw_path: None,

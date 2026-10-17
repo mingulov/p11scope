@@ -613,10 +613,14 @@ impl ModelState {
     // begin / complete
     // -----------------------------------------------------------------------
 
-    pub(super) fn begin(&mut self, origin: OriginFact) -> Result<CallToken, ObjectGap> {
+    pub(super) fn begin(
+        &mut self,
+        origin: OriginFact,
+        ledger: &mut super::journal::StagingLedger,
+    ) -> Result<CallToken, ObjectGap> {
         // Reference/tests entry: production conversion uses
         // `begin_with_effects` so refusal invalidations publish.
-        self.begin_with_effects(origin).0
+        self.begin_with_effects(origin, ledger).0
     }
 
     /// Admission with its refusal effects: capacity and contradiction
@@ -626,16 +630,17 @@ impl ModelState {
     pub(super) fn begin_with_effects(
         &mut self,
         origin: OriginFact,
+        ledger: &mut super::journal::StagingLedger,
     ) -> (Result<CallToken, ObjectGap>, ObjectEffects) {
         let (domain, cut) = (origin.domain, origin.cut.0);
-        let (result, mut effects) = self.admit_with_effects(origin);
+        let (result, mut effects) = self.admit_with_effects(origin, ledger);
         match result {
             Err(reason @ (ObjectGap::ClosedFrontier | ObjectGap::MalformedFact)) => {
                 // Unrepresentable history: a begin the model can no longer
                 // order. Proof ends and the fence floor rises above it.
                 // It is still a real call that may be running: like a
                 // capacity refusal, it blocks bootstrap until bounded.
-                self.contradict(domain, reason, Some(cut), &mut effects);
+                self.contradict(domain, reason, Some(cut), &mut effects, ledger);
                 if let Some(state) = self.domains.get_mut(&domain) {
                     state.refused_in_flight = max_opt(state.refused_in_flight, Some(cut));
                 }
@@ -652,6 +657,7 @@ impl ModelState {
     fn admit_with_effects(
         &mut self,
         origin: OriginFact,
+        ledger: &mut super::journal::StagingLedger,
     ) -> (Result<CallToken, ObjectGap>, ObjectEffects) {
         let domain = origin.domain;
         let refused = |reason: ObjectGap| (Err(reason), ObjectEffects::default());
@@ -682,7 +688,7 @@ impl ModelState {
             return refused(ObjectGap::MalformedFact);
         }
         if self.pending.len() >= self.limits.pending_calls {
-            let effects = self.refuse_unrepresented(domain, cut);
+            let effects = self.refuse_unrepresented(domain, cut, ledger);
             return (Err(ObjectGap::PendingCapacity), effects);
         }
         let Some(next) = self
@@ -690,9 +696,20 @@ impl ModelState {
             .checked_add(1)
             .filter(|next| *next <= self.limits.max_call_token)
         else {
-            let effects = self.refuse_unrepresented(domain, cut);
+            let effects = self.refuse_unrepresented(domain, cut, ledger);
             return (Err(ObjectGap::IdExhausted), effects);
         };
+        // One shared reservation owner (N1c): the model pending
+        // call takes its ticket before the token is consumed, so a
+        // refusal burns no token. A full shared census refuses
+        // exactly like a full pending table.
+        if ledger
+            .charge_model(next, size_of::<PendingCall>() as u64)
+            .is_err()
+        {
+            let effects = self.refuse_unrepresented(domain, cut, ledger);
+            return (Err(ObjectGap::PendingCapacity), effects);
+        }
         self.next_token = next;
         let token = CallToken(next);
         let derive_protocol = match origin.entry_mechanism {
@@ -730,12 +747,17 @@ impl ModelState {
     /// an unheld domain counts its gap instead of recording. Returns the
     /// void's invalidation effects (retired views and sessions) so the
     /// caller publishes them; they are observable, never local.
-    pub(super) fn note_refused(&mut self, domain: ObjectDomain, cut: u64) -> ObjectEffects {
+    pub(super) fn note_refused(
+        &mut self,
+        domain: ObjectDomain,
+        cut: u64,
+        ledger: &mut super::journal::StagingLedger,
+    ) -> ObjectEffects {
         if self.held(domain).is_err() {
             self.gap(ObjectGap::UnknownDomain);
             return ObjectEffects::default();
         }
-        let effects = self.refuse_unrepresented(domain, cut);
+        let effects = self.refuse_unrepresented(domain, cut, ledger);
         self.gap(ObjectGap::PendingCapacity);
         effects
     }
@@ -744,9 +766,14 @@ impl ModelState {
     /// proof in its domain ends, and no bootstrap is accepted until a
     /// lost-outcome fact bounds it. Existing tickets stay as fences.
     /// Returns the void's invalidation effects for publication.
-    fn refuse_unrepresented(&mut self, domain: ObjectDomain, cut: u64) -> ObjectEffects {
+    fn refuse_unrepresented(
+        &mut self,
+        domain: ObjectDomain,
+        cut: u64,
+        ledger: &mut super::journal::StagingLedger,
+    ) -> ObjectEffects {
         let mut effects = ObjectEffects::default();
-        self.void_bootstrap(domain, ObjectGap::PendingCapacity, &mut effects);
+        self.void_bootstrap(domain, ObjectGap::PendingCapacity, &mut effects, ledger);
         if let Some(state) = self.domains.get_mut(&domain) {
             state.fence_floor = max_opt(state.fence_floor, Some(cut));
             state.refused_in_flight = max_opt(state.refused_in_flight, Some(cut));
@@ -754,7 +781,12 @@ impl ModelState {
         effects
     }
 
-    pub(super) fn complete(&mut self, token: CallToken, result: CompletedFact) -> ObjectEffects {
+    pub(super) fn complete(
+        &mut self,
+        token: CallToken,
+        result: CompletedFact,
+        ledger: &mut super::journal::StagingLedger,
+    ) -> ObjectEffects {
         let mut effects = ObjectEffects::default();
         let Some(call) = self.pending.get(&token) else {
             self.gap_effect(&mut effects, ObjectGap::StaleToken);
@@ -767,7 +799,7 @@ impl ModelState {
             if let Some(state) = self.domains.get_mut(&domain) {
                 state.fence_floor = max_opt(state.fence_floor, Some(cut));
             }
-            self.remove_call(token);
+            self.remove_call(token, ledger);
             return effects;
         }
         if call.completion.is_some() {
@@ -783,8 +815,8 @@ impl ModelState {
             } else {
                 ObjectGap::MalformedFact
             };
-            self.remove_call(token);
-            self.contradict(domain, reason, Some(cut), &mut effects);
+            self.remove_call(token, ledger);
+            self.contradict(domain, reason, Some(cut), &mut effects, ledger);
             return effects;
         }
         let malformed = result.end_ns < call.entry_ns;
@@ -811,14 +843,17 @@ impl ModelState {
         effects
     }
 
-    fn remove_call(&mut self, token: CallToken) {
-        if let Some(call) = self.pending.remove(&token)
-            && let Some(state) = self.domains.get_mut(&call.domain)
-        {
-            state.keys.remove(&call.key);
-            state.cuts.remove(&call.begin);
-            if let Some(end) = call.end_cut() {
-                state.cuts.remove(&end);
+    fn remove_call(&mut self, token: CallToken, ledger: &mut super::journal::StagingLedger) {
+        if let Some(call) = self.pending.remove(&token) {
+            // The pending ticket returns with its record (N1c). Tokens
+            // never recycle, so a removed ticket is never recharged.
+            ledger.release_model(token.0);
+            if let Some(state) = self.domains.get_mut(&call.domain) {
+                state.keys.remove(&call.key);
+                state.cuts.remove(&call.begin);
+                if let Some(end) = call.end_cut() {
+                    state.cuts.remove(&end);
+                }
             }
         }
     }
@@ -834,7 +869,11 @@ impl ModelState {
     // settle
     // -----------------------------------------------------------------------
 
-    pub(super) fn settle(&mut self, prefix: CompleteInputPrefix) -> ObjectEffects {
+    pub(super) fn settle(
+        &mut self,
+        prefix: CompleteInputPrefix,
+        ledger: &mut super::journal::StagingLedger,
+    ) -> ObjectEffects {
         let mut effects = ObjectEffects::default();
         let domain = prefix.domain;
         if let Err(reason) = self.held(domain) {
@@ -854,7 +893,13 @@ impl ModelState {
             return effects;
         }
         if !self.prefix_consistent(domain, frontier, &prefix.open) {
-            self.contradict(domain, ObjectGap::PrefixContradiction, None, &mut effects);
+            self.contradict(
+                domain,
+                ObjectGap::PrefixContradiction,
+                None,
+                &mut effects,
+                ledger,
+            );
             // Surface the rejection to the seal: contradict counted it;
             // the effect (pushed, not counted twice) lets the caller
             // refuse a seal whose required alignment was rejected
@@ -911,7 +956,7 @@ impl ModelState {
                     continue;
                 }
                 if is_end {
-                    self.apply_end(token, &mut effects);
+                    self.apply_end(token, &mut effects, ledger);
                 } else {
                     self.apply_begin(token);
                 }
@@ -922,7 +967,7 @@ impl ModelState {
             let state = self.domains.get_mut(&domain).expect("registered domain");
             state.applied = max_opt(state.applied, Some(watermark));
         }
-        self.prune(domain);
+        self.prune(domain, ledger);
         effects
     }
 
@@ -980,7 +1025,7 @@ impl ModelState {
         }
     }
 
-    fn prune(&mut self, domain: ObjectDomain) {
+    fn prune(&mut self, domain: ObjectDomain, ledger: &mut super::journal::StagingLedger) {
         let tokens = self.domain_calls(domain);
         let min_unapplied = tokens
             .iter()
@@ -1004,7 +1049,7 @@ impl ModelState {
             })
             .collect();
         for token in doomed {
-            self.remove_call(token);
+            self.remove_call(token, ledger);
         }
     }
 
@@ -1053,7 +1098,12 @@ impl ModelState {
         call.begin_applied = true;
     }
 
-    fn apply_end(&mut self, token: CallToken, effects: &mut ObjectEffects) {
+    fn apply_end(
+        &mut self,
+        token: CallToken,
+        effects: &mut ObjectEffects,
+        ledger: &mut super::journal::StagingLedger,
+    ) {
         let call = {
             let call = self.pending.get_mut(&token).expect("pending call");
             call.end_applied = true;
@@ -1067,7 +1117,13 @@ impl ModelState {
         // the removal escalations below, this only retires, ends or
         // contradicts, so it applies even to an unqualified end.
         if !completion.malformed && rv == CkRv::CRYPTOKI_NOT_INITIALIZED {
-            self.contradict(call.domain, ObjectGap::UnseenFinalize, None, effects);
+            self.contradict(
+                call.domain,
+                ObjectGap::UnseenFinalize,
+                None,
+                effects,
+                ledger,
+            );
             return;
         }
         let scope = self.call_scope(&call);
@@ -1078,7 +1134,7 @@ impl ModelState {
             || call.snapshot.generation != self.domains[&call.domain].generation
         {
             self.gap_effect(effects, ObjectGap::BootstrapUnproven);
-        } else if !self.apply_qualified_end(token, &call, &completion, outcome, effects) {
+        } else if !self.apply_qualified_end(token, &call, &completion, outcome, effects, ledger) {
             return;
         }
 
@@ -1105,6 +1161,7 @@ impl ModelState {
         completion: &Completion,
         outcome: Outcome,
         effects: &mut ObjectEffects,
+        ledger: &mut super::journal::StagingLedger,
     ) -> bool {
         // Init null-mechanism cancellation precedes object association.
         if outcome == Outcome::Ok
@@ -1119,7 +1176,7 @@ impl ModelState {
             }
             return false;
         }
-        self.apply_action(token, call, outcome, effects);
+        self.apply_action(token, call, outcome, effects, ledger);
         true
     }
 
@@ -1143,6 +1200,7 @@ impl ModelState {
         call: &PendingCall,
         outcome: Outcome,
         effects: &mut ObjectEffects,
+        ledger: &mut super::journal::StagingLedger,
     ) {
         let (interference, metadata_interference) = self.interference(token);
 
@@ -1225,7 +1283,7 @@ impl ModelState {
                     self.apply_close_all(token, call, outcome, effects)
                 }
                 lifecycle::LOGOUT => self.apply_logout(call, outcome, session, effects),
-                lifecycle::FINALIZE => self.apply_finalize(call, outcome, effects),
+                lifecycle::FINALIZE => self.apply_finalize(call, outcome, effects, ledger),
                 _ => {}
             },
             // Neutral terminals apply no object effect: ordering, overlap
@@ -2833,6 +2891,7 @@ impl ModelState {
         call: &PendingCall,
         outcome: Outcome,
         effects: &mut ObjectEffects,
+        ledger: &mut super::journal::StagingLedger,
     ) {
         if !outcome.may_affect() {
             return;
@@ -2845,7 +2904,7 @@ impl ModelState {
         for id in self.live_views(call.domain) {
             self.end_view(id, lifetime, effects);
         }
-        self.end_domain(call.domain, ObjectGap::Finalize, effects);
+        self.end_domain(call.domain, ObjectGap::Finalize, effects, ledger);
     }
 
     // -----------------------------------------------------------------------
@@ -2855,10 +2914,16 @@ impl ModelState {
     /// End every live session/view of a domain. An ended domain admits
     /// nothing further, so its tickets are released: any late completion is
     /// a stale token and cannot join.
-    fn end_domain(&mut self, domain: ObjectDomain, reason: ObjectGap, effects: &mut ObjectEffects) {
+    fn end_domain(
+        &mut self,
+        domain: ObjectDomain,
+        reason: ObjectGap,
+        effects: &mut ObjectEffects,
+        ledger: &mut super::journal::StagingLedger,
+    ) {
         self.clear_domain(domain, reason, effects);
         for token in self.domain_calls(domain) {
-            self.remove_call(token);
+            self.remove_call(token, ledger);
         }
         let state = self.domains.get_mut(&domain).expect("domain");
         state.ended = Some(reason);
@@ -2913,6 +2978,7 @@ impl ModelState {
         domain: ObjectDomain,
         reason: ObjectGap,
         effects: &mut ObjectEffects,
+        ledger: &mut super::journal::StagingLedger,
     ) {
         if !self.domains.contains_key(&domain) {
             return;
@@ -2943,7 +3009,7 @@ impl ModelState {
         // Never wrap: a reused generation could revive a stale snapshot.
         let Some(next) = state.generation.checked_add(1) else {
             self.gap(ObjectGap::IdExhausted);
-            self.end_domain(domain, ObjectGap::IdExhausted, effects);
+            self.end_domain(domain, ObjectGap::IdExhausted, effects, ledger);
             return;
         };
         state.generation = next;
@@ -2959,6 +3025,7 @@ impl ModelState {
         reason: ObjectGap,
         cut: Option<u64>,
         effects: &mut ObjectEffects,
+        ledger: &mut super::journal::StagingLedger,
     ) {
         self.gap(reason);
         let ids: Vec<ObjectId> = self
@@ -2976,23 +3043,28 @@ impl ModelState {
         for token in self.domain_calls(domain) {
             self.fence(token);
         }
-        self.void_bootstrap(domain, reason, effects);
+        self.void_bootstrap(domain, reason, effects, ledger);
         let state = self.domains.get_mut(&domain).expect("domain");
         state.fence_floor = max_opt(state.fence_floor, cut);
     }
 
-    pub(super) fn invalidate(&mut self, scope: AffectedScope, reason: ObjectGap) -> ObjectEffects {
+    pub(super) fn invalidate(
+        &mut self,
+        scope: AffectedScope,
+        reason: ObjectGap,
+        ledger: &mut super::journal::StagingLedger,
+    ) -> ObjectEffects {
         let mut effects = ObjectEffects::default();
         self.gap(reason);
         match scope {
             AffectedScope::Capture => {
                 let domains: Vec<ObjectDomain> = self.domains.keys().copied().collect();
                 for domain in domains {
-                    self.invalidate_domain(domain, reason, &mut effects);
+                    self.invalidate_domain(domain, reason, &mut effects, ledger);
                 }
             }
             AffectedScope::Domain(domain) => match self.held(domain) {
-                Ok(()) => self.invalidate_domain(domain, reason, &mut effects),
+                Ok(()) => self.invalidate_domain(domain, reason, &mut effects, ledger),
                 Err(unheld) => self.gap_effect(&mut effects, unheld),
             },
             AffectedScope::Session(domain, handle) => {
@@ -3021,7 +3093,7 @@ impl ModelState {
                                     .is_some_and(|d| d.session_out == HandleInput::Value(handle)))
                     })
                     .collect();
-                self.fence_and_void(domain, affected, reason, &mut effects);
+                self.fence_and_void(domain, affected, reason, &mut effects, ledger);
             }
             AffectedScope::Slot(domain, slot_scope) => {
                 if let Err(unheld) = self.held(domain) {
@@ -3039,7 +3111,7 @@ impl ModelState {
                                 || c.scope.compatible(slot_scope))
                     })
                     .collect();
-                self.fence_and_void(domain, affected, reason, &mut effects);
+                self.fence_and_void(domain, affected, reason, &mut effects, ledger);
             }
         }
         effects
@@ -3051,6 +3123,7 @@ impl ModelState {
         affected: Vec<CallToken>,
         reason: ObjectGap,
         effects: &mut ObjectEffects,
+        ledger: &mut super::journal::StagingLedger,
     ) {
         if affected.is_empty() {
             return;
@@ -3060,7 +3133,7 @@ impl ModelState {
         }
         // A lost ticket may have affected any compatible scope at an unknown
         // time: proof in the whole domain ends until a new bootstrap.
-        self.void_bootstrap(domain, reason, effects);
+        self.void_bootstrap(domain, reason, effects, ledger);
     }
 
     fn invalidate_domain(
@@ -3068,14 +3141,15 @@ impl ModelState {
         domain: ObjectDomain,
         reason: ObjectGap,
         effects: &mut ObjectEffects,
+        ledger: &mut super::journal::StagingLedger,
     ) {
         match reason {
             ObjectGap::Exec | ObjectGap::Fork | ObjectGap::Unload | ObjectGap::Finalize => {
-                self.end_domain(domain, reason, effects);
+                self.end_domain(domain, reason, effects, ledger);
             }
             _ => {
                 self.clear_domain(domain, reason, effects);
-                self.void_bootstrap(domain, reason, effects);
+                self.void_bootstrap(domain, reason, effects, ledger);
             }
         }
     }
@@ -3089,7 +3163,11 @@ impl ModelState {
     /// effect: the incarnation stays refused, never rebootstrap'd above
     /// an invented cut. The journal's permanent-refusal paths call this
     /// wherever adapter custody is deleted with the refusal.
-    pub(super) fn abandon_domain(&mut self, domain: ObjectDomain) -> ObjectEffects {
+    pub(super) fn abandon_domain(
+        &mut self,
+        domain: ObjectDomain,
+        ledger: &mut super::journal::StagingLedger,
+    ) -> ObjectEffects {
         let mut effects = ObjectEffects::default();
         self.gap(ObjectGap::Loss);
         if let Err(unheld) = self.held(domain) {
@@ -3098,9 +3176,9 @@ impl ModelState {
         }
         self.clear_domain(domain, ObjectGap::Loss, &mut effects);
         for token in self.domain_calls(domain) {
-            self.remove_call(token);
+            self.remove_call(token, ledger);
         }
-        self.void_bootstrap(domain, ObjectGap::Loss, &mut effects);
+        self.void_bootstrap(domain, ObjectGap::Loss, &mut effects, ledger);
         effects
     }
 
@@ -3120,7 +3198,11 @@ impl ModelState {
         }
     }
 
-    pub(super) fn outcome_lost(&mut self, lost: LostOutcome) -> ObjectEffects {
+    pub(super) fn outcome_lost(
+        &mut self,
+        lost: LostOutcome,
+        ledger: &mut super::journal::StagingLedger,
+    ) -> ObjectEffects {
         let mut effects = ObjectEffects::default();
         let (domain, upper) = match lost {
             LostOutcome::Ticket(token, upper) => {
@@ -3137,9 +3219,9 @@ impl ModelState {
                 let (domain, fenced) = (call.domain, call.fenced);
                 let scope = self.call_scope(call);
                 if !fenced {
-                    self.void_bootstrap(domain, ObjectGap::OutcomeLost, &mut effects);
+                    self.void_bootstrap(domain, ObjectGap::OutcomeLost, &mut effects, ledger);
                 }
-                self.remove_call(token);
+                self.remove_call(token, ledger);
                 self.retire_scope(domain, scope, ObjectGap::OutcomeLost, &mut effects);
                 (domain, upper.0)
             }
@@ -3161,7 +3243,7 @@ impl ModelState {
                 }
                 // The void proves the interval lost, not over: in-flight
                 // refusals stay until a covering bound arrives.
-                self.void_bootstrap(domain, ObjectGap::OutcomeLost, &mut effects);
+                self.void_bootstrap(domain, ObjectGap::OutcomeLost, &mut effects, ledger);
                 (domain, upper.0)
             }
         };

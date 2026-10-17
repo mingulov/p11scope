@@ -1629,6 +1629,7 @@ fn key_operation_fallback_invalidates_before_replay() {
     let effects = scene.model.invalidate(
         crate::semantics_objects::AffectedScope::Capture,
         crate::semantics_objects::ObjectGap::Loss,
+        scene.adapter.ledger_mut(),
     );
     assert!(
         effects.effects.iter().any(|effect| matches!(
@@ -1863,6 +1864,7 @@ fn key_operation_n3_held_failure_paths_apply_invalidations() {
     let effects = scene.model.invalidate(
         crate::semantics_objects::AffectedScope::Capture,
         crate::semantics_objects::ObjectGap::Loss,
+        scene.adapter.ledger_mut(),
     );
     assert!(
         effects.effects.iter().any(|effect| matches!(
@@ -1977,6 +1979,7 @@ fn key_operation_n3_held_failure_paths_apply_invalidations() {
     let effects = scene.model.invalidate(
         crate::semantics_objects::AffectedScope::Capture,
         crate::semantics_objects::ObjectGap::Loss,
+        scene.adapter.ledger_mut(),
     );
     let failure = SealFailure {
         gap: JournalGap::H3Pending,
@@ -4951,7 +4954,6 @@ fn first_pos_of(seal: &SealSuccess) -> u64 {
 /// gates retirement); a completed use's definite history stands
 /// while the object row shows destroyed. S1 records the destroy
 /// without inventing an operation.
-#[test]
 #[test]
 fn key_operation_n1c_shared_owner_unsettled_census() {
     // N1(c): H8 open begins and staged H9 payloads share ONE

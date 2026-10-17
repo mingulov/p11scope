@@ -2337,7 +2337,8 @@ mod tests {
                     )
                 };
                 assert_ne!(target, libc::MAP_FAILED, "reserve the move target");
-                assert_eq!(unsafe { libc::munmap(target, 4096) }, 0);
+                // MREMAP_FIXED over the HELD reservation: no munmap
+                // hole another thread could grab in between.
                 let moved = unsafe {
                     libc::mremap(
                         self.old as *mut libc::c_void,

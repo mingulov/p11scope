@@ -1344,6 +1344,15 @@ impl CallerRegistry {
         reason: InstanceReason,
         retire: bool,
     ) {
+        // Joint accounting is active for this feed's S1 (same latch
+        // as the reduce path): its starts teed, so its loss
+        // terminals must tee too — else opens stick active (C5).
+        let joint_accounting = {
+            let state = &self.instance_state.semantics[&id];
+            state.feed.mode() == FeedMode::Joint
+                || self.joint_feeds > 0
+                || self.key_projection.is_some()
+        };
         let state = self
             .instance_state
             .semantics
@@ -1354,8 +1363,27 @@ impl CallerRegistry {
         }
         state.lossy = true;
         state.reasons.insert(reason);
-        if let Some(reducer) = state.semantics.as_mut() {
-            reducer.invalidate();
+        // C5: dispose/notify the owned feed in order, before
+        // publication, once per payload/terminal. Staged payloads at
+        // or below the barrier dispose as history (releases pend: no
+        // ledger on this path — the ledger-bearing publish flushes);
+        // above-barrier staging stays queued for its seals. Live S1
+        // invalidates with terminals teed into shared key-use while
+        // Joint accounting is active, else plainly as before.
+        // Completed history stands; siblings untouched; repeats
+        // no-op (empty staging, no live machines).
+        let (feed, reducer_slot) = (&mut state.feed, &mut state.semantics);
+        if feed.mode() == FeedMode::Joint {
+            feed.dispose_below_barrier(boundary, None);
+        }
+        if let Some(reducer) = reducer_slot.as_mut() {
+            if joint_accounting {
+                let mut outer = NoSink;
+                let mut tee = KeyUseTee::new(&mut outer, &mut self.joint_keyuse, id);
+                reducer.invalidate_with_effects(&mut tee);
+            } else {
+                reducer.invalidate();
+            }
         }
         let record = self
             .instance_state
@@ -1548,6 +1576,17 @@ impl CallerRegistry {
                 },
                 retire,
             );
+        }
+    }
+
+    /// Flush every feed's pended ledger releases (C4/C5): called at
+    /// the end of ledger-bearing publishes, before publication.
+    pub(super) fn flush_staging_releases(
+        &mut self,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+    ) {
+        for record in self.instance_state.semantics.values_mut() {
+            record.feed.flush_pending_releases(ledger);
         }
     }
 

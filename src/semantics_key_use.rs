@@ -561,13 +561,40 @@ impl JointStaging {
     }
 
     /// Flush ledger-less fallback releases on ledger contact (C4).
-    fn flush_pending_releases(
+    pub(crate) fn flush_pending_releases(
         &mut self,
         ledger: &mut crate::semantics_objects::journal::StagingLedger,
     ) {
         for (ticket, bytes) in self.pending_releases.drain(..) {
             ledger.release(ticket, bytes);
         }
+    }
+
+    /// Dispose staged payloads at or below `barrier` as history-only
+    /// (C5): counted, frontier-advanced, never reduced, never
+    /// re-staged. Payloads above the barrier stay queued for their
+    /// seals. `None` (a barrier-less exhaustion void) disposes
+    /// everything: nothing above an unknown void is provable.
+    /// Releases go to the ledger when present, else pend for the
+    /// next ledger contact. Returns the disposed count.
+    pub(crate) fn dispose_below_barrier(
+        &mut self,
+        barrier: Option<u64>,
+        mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) -> usize {
+        let mut disposed = 0;
+        while let Some(front) = self.staged.front() {
+            if !barrier.is_none_or(|at| front.position <= at) {
+                break;
+            }
+            let head = self.staged.pop_front().expect("front verified above");
+            let bytes = head.charged_bytes();
+            self.release_or_pend(ledger.as_deref_mut(), head.position, bytes);
+            self.frontier = self.frontier.max(head.position);
+            self.history_disposed = self.history_disposed.saturating_add(1);
+            disposed += 1;
+        }
+        disposed
     }
 
     /// Release one popped head's ticket and bytes to the ledger when

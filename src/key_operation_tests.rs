@@ -7967,3 +7967,300 @@ fn key_operation_c4_unsealable_with_queued_calls_falls_back_in_order() {
         "fallback releases tickets"
     );
 }
+
+/// C5: registry loss disposes staged Joint custody and bars late
+/// delivery. The queued Init disposes as history (shared tickets
+/// released before publication); its late seal holds — no live
+/// machine below the barrier. Definite completed history stands.
+#[test]
+fn key_operation_c5_loss_disposes_staged_and_bars_late_delivery() {
+    use crate::discovery::caller_registry::instance_input::{
+        InstanceReason, Scope, loss, position,
+    };
+
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(joint_key.clone(), bootstrap);
+    let (_, joint_id) = guarded.register(1);
+
+    // Definite history: one completed Sign through Joint seals.
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    // One more Init staged and queued below the coming barrier.
+    let (facts, staged_at) = guarded.admit_shape(&init);
+    guarded.observe(&joint_key, staged_at, facts);
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    assert_eq!(guarded.scene.ledger.staged(), 1, "one queued call charged");
+    // The loss barrier sits above the queued call.
+    let barrier = guarded
+        .scene
+        .fixture
+        .admit_function("C_SignInit")
+        .h0_ordinal();
+    assert!(barrier > staged_at, "non-vacuous: barrier above the queue");
+    guarded.registry.note_instance_semantic_loss(loss(
+        Scope::Exact(joint_key.clone()),
+        position(guarded.domain, barrier),
+        InstanceReason::SemanticLoss,
+    ));
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    assert_eq!(
+        guarded.scene.ledger.staged(),
+        0,
+        "loss disposes and releases shared custody"
+    );
+    // Late seal for the disposed call: inert, no live machine below
+    // the barrier.
+    ingest_call(&mut guarded.scene, &init);
+    let seal = guarded.scene.seal().expect("init quantum seals");
+    assert_eq!(
+        guarded.registry.deliver_joint_seal(
+            joint_id,
+            &seal,
+            &guarded.scene.model,
+            &mut guarded.scene.ledger,
+        ),
+        SealApplyOutcome::Held,
+        "calls below the loss barrier are disposed history"
+    );
+    assert_eq!(
+        (
+            guarded.edge_calls(joint_id),
+            guarded.edge_started(joint_id),
+            guarded.edge_completed(joint_id)
+        ),
+        (2, 1, 1),
+        "definite completed history stands; nothing replayed below the barrier"
+    );
+}
+
+/// C5: registry loss tees invalidation terminals and spares healthy
+/// siblings. A's live machine ends Unknown with its key-use open
+/// closed (never stuck active); completed history stands; B's live
+/// machine continues and completes afterwards.
+#[test]
+fn key_operation_c5_loss_tees_terminals_and_spares_siblings() {
+    use crate::discovery::caller_registry::instance_input::{
+        InstanceReason, Scope, loss, position,
+    };
+
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let a_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(a_key.clone(), bootstrap);
+    let (_, a_id) = guarded.register(1);
+    let (b_key, _) = guarded.register(2);
+
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    // A's definite history plus one live machine; B live alongside.
+    assert_eq!(
+        guarded.drive_joint(&a_key, a_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&a_key, a_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&a_key, a_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    guarded.drive_s1only(&b_key, &init);
+    let barrier = guarded
+        .scene
+        .fixture
+        .admit_function("C_SignInit")
+        .h0_ordinal();
+    guarded.registry.note_instance_semantic_loss(loss(
+        Scope::Exact(a_key.clone()),
+        position(guarded.domain, barrier),
+        InstanceReason::SemanticLoss,
+    ));
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    // A's live machine ended Unknown; its open closed (teed); B live.
+    // (A's Joint uses carry receipts without established metadata, so
+    // they aggregate metadata_unknown; B's receipt-less direct use is
+    // unbound.)
+    let observations = guarded.registry.joint_observations(13);
+    let proved = observations
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "metadata_unknown")
+        .expect("Joint evidence retained");
+    assert_eq!(
+        (proved.completed, proved.unknown, proved.active),
+        (1, 1, 0),
+        "history stands and loss closes its open (teed)"
+    );
+    let sibling = observations
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "unbound")
+        .expect("sibling S1 accounted");
+    assert_eq!(
+        (sibling.completed, sibling.active),
+        (0, 1),
+        "sibling stays live"
+    );
+    // The healthy sibling continues and completes afterwards.
+    guarded.drive_s1only(&b_key, &sign);
+    let observations = guarded.registry.joint_observations(14);
+    let row = observations
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "unbound")
+        .expect("Joint evidence retained");
+    assert_eq!((row.completed, row.active), (1, 0));
+}
+
+/// C5: above-barrier staging survives loss; retirement disposes the
+/// rest. A (below) disposes while B (above) stays queued for its
+/// seal; A's seal mismatches B's head and holds. Retirement then
+/// disposes the new queue and ends live S1 with terminals teed.
+#[test]
+fn key_operation_c5_above_barrier_survives_and_retirement_disposes() {
+    use crate::discovery::caller_registry::instance_input::{
+        InstanceReason, Retirement, Scope, loss, position, retirement,
+    };
+
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(joint_key.clone(), bootstrap);
+    let (_, joint_id) = guarded.register(1);
+
+    // Two queued Inits on distinct sessions with an ordinal gap.
+    let mut init_a = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    init_a.session = Some(7);
+    let mut init_b = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    init_b.session = Some(8);
+    let (facts_a, pos_a) = guarded.admit_shape(&init_a);
+    guarded.observe(&joint_key, pos_a, facts_a);
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    let gap = guarded
+        .scene
+        .fixture
+        .admit_function("C_SignInit")
+        .h0_ordinal();
+    let (facts_b, pos_b) = guarded.admit_shape(&init_b);
+    guarded.observe(&joint_key, pos_b, facts_b);
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    assert!(pos_a < gap && gap < pos_b, "non-vacuous ordinal gap");
+    assert_eq!(guarded.scene.ledger.staged(), 2);
+    // Loss at the gap: A disposes, B stays queued.
+    guarded.registry.note_instance_semantic_loss(loss(
+        Scope::Exact(joint_key.clone()),
+        position(guarded.domain, gap),
+        InstanceReason::SemanticLoss,
+    ));
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    assert_eq!(
+        guarded.scene.ledger.staged(),
+        1,
+        "below-barrier disposes; above-barrier stays queued"
+    );
+    // A's seal mismatches B's head (distinct sessions) and holds;
+    // B's seal replays its own head.
+    ingest_call(&mut guarded.scene, &init_a);
+    let seal_a = guarded.scene.seal().expect("A quantum seals");
+    assert_eq!(
+        guarded.registry.deliver_joint_seal(
+            joint_id,
+            &seal_a,
+            &guarded.scene.model,
+            &mut guarded.scene.ledger,
+        ),
+        SealApplyOutcome::Held,
+        "disposed calls never replay against later heads"
+    );
+    ingest_call(&mut guarded.scene, &init_b);
+    let seal_b = guarded.scene.seal().expect("B quantum seals");
+    assert_eq!(
+        guarded.registry.deliver_joint_seal(
+            joint_id,
+            &seal_b,
+            &guarded.scene.model,
+            &mut guarded.scene.ledger,
+        ),
+        SealApplyOutcome::ReplayedOne,
+        "above-barrier calls keep their seals"
+    );
+    assert_eq!(guarded.edge_started(joint_id), 1, "B's machine live");
+    // Retirement disposes a fresh queue and ends live S1 teed.
+    let (facts_c, pos_c) = guarded.admit_shape(&init_a);
+    guarded.observe(&joint_key, pos_c, facts_c);
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    assert_eq!(guarded.scene.ledger.staged(), 1, "C queued");
+    let retire_at = guarded
+        .scene
+        .fixture
+        .admit_function("C_SignInit")
+        .h0_ordinal();
+    assert!(retire_at > pos_c, "non-vacuous: retirement above the queue");
+    guarded.registry.retire_instance(retirement(
+        Retirement::Exact(joint_key.clone()),
+        position(guarded.domain, retire_at),
+        InstanceReason::InstanceRetired,
+    ));
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    assert_eq!(
+        guarded.scene.ledger.staged(),
+        0,
+        "retirement disposes the owned queue"
+    );
+    ingest_call(&mut guarded.scene, &init_a);
+    let seal_c = guarded.scene.seal().expect("C quantum seals");
+    assert_eq!(
+        guarded.registry.deliver_joint_seal(
+            joint_id,
+            &seal_c,
+            &guarded.scene.model,
+            &mut guarded.scene.ledger,
+        ),
+        SealApplyOutcome::Held,
+        "retired queues never replay"
+    );
+    let observations = guarded.registry.joint_observations(15);
+    let row = observations
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "metadata_unknown")
+        .expect("Joint evidence retained");
+    assert_eq!(
+        (row.unknown, row.active),
+        (1, 0),
+        "retirement ends live S1 with terminals teed"
+    );
+}

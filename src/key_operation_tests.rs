@@ -2524,6 +2524,96 @@ fn key_operation_row_retention_bounds() {
     );
 }
 
+/// C1: the key-use join namespaces reducer-local operation IDs by
+/// exact instance: concurrent equal-ordinal starts on two instances
+/// stay partitioned, reversed terminals close their own custody
+/// (never a sibling's), refused starts are namespaced too, and an
+/// exact duplicate start refuses loudly instead of overwriting
+/// unrelated custody.
+#[test]
+fn key_operation_cross_instance_operation_identity() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+    let a = RegistryInstanceId::from_raw(10);
+    let b = RegistryInstanceId::from_raw(11);
+    let mut ea = EdgeSemantics::default();
+    let mut eb = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    // Concurrent equal-ordinal starts: Sign on i10, Verify on i11.
+    let mut sink = Vec::new();
+    let c = init("C_SignInit", 7, RSA_PKCS, 100);
+    let origin = EffectOrigin::from(&c);
+    ea.observe_joint(&c, &origin, &[], &mut sink);
+    let start_a = sink.last().cloned().unwrap();
+    let c = init("C_VerifyInit", 7, AES_GCM, 100);
+    let origin = EffectOrigin::from(&c);
+    eb.observe_joint(&c, &origin, &[], &mut sink);
+    let start_b = sink.last().cloned().unwrap();
+    assert_eq!(started(&start_a).0, started(&start_b).0, "equal ordinals collide");
+    keyuse.observe_effect(a, &start_a);
+    keyuse.observe_effect(b, &start_b);
+    assert_eq!((ea.started(), eb.started()), (1, 1));
+    assert_eq!(keyuse.open().len(), 2, "both custodies retained");
+    // Reversed terminals: i11's Verify first, then i10's Sign.
+    let c = op("C_Verify", 7, 200);
+    let origin = EffectOrigin::from(&c);
+    eb.observe_with_effects(&c, &origin, &mut sink);
+    keyuse.observe_effect(b, sink.last().unwrap());
+    let c = op("C_Sign", 7, 300);
+    let origin = EffectOrigin::from(&c);
+    ea.observe_with_effects(&c, &origin, &mut sink);
+    keyuse.observe_effect(a, sink.last().unwrap());
+    assert!(keyuse.open().is_empty());
+    let rows = keyuse.rows();
+    assert_eq!(rows.len(), 2);
+    assert_eq!((rows[0].instance, rows[0].category), (b, "verify"));
+    assert_eq!((rows[1].instance, rows[1].category), (a, "sign"));
+
+    // Refused starts are namespaced: i11's N+1 start cannot evict
+    // i10's open, and i10's terminal closes i10's custody.
+    let mut ea = EdgeSemantics::default();
+    let mut eb = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::with_capacity(1);
+    let mut sink = Vec::new();
+    let c = init("C_SignInit", 7, RSA_PKCS, 100);
+    let origin = EffectOrigin::from(&c);
+    ea.observe_joint(&c, &origin, &[], &mut sink);
+    keyuse.observe_effect(a, sink.last().unwrap());
+    let c = init("C_VerifyInit", 7, AES_GCM, 100);
+    let origin = EffectOrigin::from(&c);
+    eb.observe_joint(&c, &origin, &[], &mut sink);
+    keyuse.observe_effect(b, sink.last().unwrap());
+    assert_eq!(keyuse.open().len(), 1);
+    assert_eq!(keyuse.refused_opens().len(), 1);
+    let c = op("C_Sign", 7, 200);
+    let origin = EffectOrigin::from(&c);
+    ea.observe_with_effects(&c, &origin, &mut sink);
+    keyuse.observe_effect(a, sink.last().unwrap());
+    let rows = keyuse.rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].instance, rows[0].category), (a, "sign"));
+    let c = op("C_Verify", 7, 300);
+    let origin = EffectOrigin::from(&c);
+    eb.observe_with_effects(&c, &origin, &mut sink);
+    keyuse.observe_effect(b, sink.last().unwrap());
+    assert_eq!(keyuse.rows().len(), 1, "refused terminals row nothing");
+    assert_eq!(keyuse.evidence().refused_terminals, 1);
+
+    // An exact duplicate start refuses loudly; the original custody
+    // stands, never overwritten.
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let c = init("C_SignInit", 7, RSA_PKCS, 100);
+    let origin = EffectOrigin::from(&c);
+    edge.observe_joint(&c, &origin, &[], &mut sink);
+    let start = sink.last().cloned().unwrap();
+    keyuse.observe_effect(a, &start);
+    keyuse.observe_effect(a, &start);
+    assert_eq!(keyuse.open().len(), 1);
+    assert_eq!(keyuse.evidence().duplicate_starts, 1);
+    assert_eq!(keyuse.rows().len(), 0);
+}
+
 // ==================== Checkbox 4: one projection, three consumers ====================
 
 use crate::discovery::caller_registry::RegistryLimits;

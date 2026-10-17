@@ -461,11 +461,57 @@ fn key_operation_identity_never_wraps() {
     let (end_id, _, outcome, origin) = ended(&effects[0]);
     assert_eq!((end_id, outcome), (id, OperationOutcome::Completed));
     assert_eq!(
-        origin.function, "C_Sign",
-        "completion carries the ORIGINAL call identity"
+        (origin.function.as_str(), origin.session, origin.ts_ns),
+        ("C_Sign", 7, 200),
+        "completion carries the FULL original call identity, not the completion's time"
     );
     assert_eq!(edge.completed(), 1);
     assert_eq!(FUNCTION_NONE, p11scope_ebpf_common::FUNCTION_NONE);
+}
+
+/// N8: a joined async completion preserves the ORIGINAL consumed
+/// call identity in its effects — the completion's session and time
+/// are receiver custody, never the origin.
+#[test]
+fn key_operation_async_completion_preserves_origin_identity() {
+    let mut edge = EdgeSemantics::default();
+    let mut sink = Vec::new();
+    feed(
+        &mut edge,
+        &mut sink,
+        &call("C_OpenSession", 7, CkRv::OK.0, 90),
+    );
+    feed(
+        &mut edge,
+        &mut sink,
+        &call("C_OpenSession", 8, CkRv::OK.0, 95),
+    );
+    // The original call is consumed on session 7 at ts 100, then
+    // detached and joined by session 8.
+    let mut pending = op("C_GenerateKey", 7, 100);
+    pending.rv = CkRv::PENDING.0;
+    feed(&mut edge, &mut sink, &pending);
+    let target = crate::kinds::function_id("C_GenerateKey").unwrap();
+    let mut get_id = call("C_AsyncGetID", 7, CkRv::OK.0, 120);
+    get_id.target_function = target;
+    get_id.async_value = 42;
+    feed(&mut edge, &mut sink, &get_id);
+    let mut join = call("C_AsyncJoin", 8, CkRv::OK.0, 170);
+    join.target_function = target;
+    join.async_value = 42;
+    feed(&mut edge, &mut sink, &join);
+    // Session 8 completes at ts 400: the replayed completion still
+    // names the original (7, 100) call.
+    let mut complete = call("C_AsyncComplete", 8, CkRv::OK.0, 400);
+    complete.target_function = target;
+    let effects = feed(&mut edge, &mut sink, &complete);
+    assert_eq!(effects.len(), 1, "the joined completion replays its call");
+    let (_, _, _, origin) = direct(&effects[0]);
+    assert_eq!(
+        (origin.function.as_str(), origin.session, origin.ts_ns),
+        ("C_GenerateKey", 7, 100),
+        "the replayed effect carries the original call identity"
+    );
 }
 
 // ==================== Checkbox 1B: the single S1 feed ====================

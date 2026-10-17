@@ -361,6 +361,11 @@ struct ViewRecord {
     attribution: Attribution,
     references: u64,
     key_uses: u64,
+    /// Inline retention from key history (N6): set when a key use
+    /// references this record, never cleared — retained key rows
+    /// name this object for the capture, so pruning must keep it
+    /// and capacity pressure must refuse the newcomer instead.
+    key_retained: bool,
     requested: [FieldState; METADATA_FIELDS],
     established: [FieldState; METADATA_FIELDS],
     queries: [QueryStatus; METADATA_FIELDS],
@@ -1556,6 +1561,7 @@ impl ModelState {
                 attribution: Attribution::Valid,
                 references: 0,
                 key_uses: 0,
+                key_retained: false,
                 requested,
                 established: [FieldState::Unknown; METADATA_FIELDS],
                 queries: [QueryStatus::NotQueried; METADATA_FIELDS],
@@ -1740,12 +1746,12 @@ impl ModelState {
     /// settle/invalidate and the closed frontier excludes re-entry"). A
     /// retired view, ended session or cleared tombstone charge is removed and
     /// refunded only when replay has passed the position at which it ended,
-    /// no unsettled ticket began at or before that position, and no pending
-    /// origin snapshot references it. Live views, live sessions and live
-    /// tombstones are never pruned. Every record of an ended domain is
-    /// eligible. Pruning runs lazily, only under capacity pressure, so the
-    /// projection keeps retired history until a budget needs the room. IDs
-    /// are never reused.
+    /// no unsettled ticket began at or before that position, no pending
+    /// origin snapshot references it, and no key-history retention holds
+    /// it. Live views, live sessions and live tombstones are never
+    /// pruned. Every record of an ended domain is eligible. Pruning runs
+    /// lazily, only under capacity pressure, so the projection keeps
+    /// retired history until a budget needs the room. IDs are never reused.
     fn prune_records(&mut self, domain: ObjectDomain) {
         let Some(state) = self.domains.get(&domain) else {
             return;
@@ -1782,7 +1788,12 @@ impl ModelState {
 
         let mut keep_views = Vec::new();
         for (id, at) in views {
-            if !eligible(at) || views_ref.contains(&id) {
+            // A key-history retention holds the referent inline:
+            // capacity pressure keeps the pinned original and the
+            // newcomer refuses visibly (ObjectCapacity), never the
+            // reverse.
+            let key_retained = self.objects.get(&id).is_some_and(|view| view.key_retained);
+            if !eligible(at) || views_ref.contains(&id) || key_retained {
                 keep_views.push((id, at));
                 continue;
             }
@@ -2004,6 +2015,7 @@ impl ModelState {
             view.references = view.references.saturating_add(1);
             if key_use {
                 view.key_uses = view.key_uses.saturating_add(1);
+                view.key_retained = true;
             }
             effects.push(ObjectEffect::Referenced {
                 call: token,

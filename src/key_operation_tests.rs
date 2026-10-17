@@ -618,6 +618,8 @@ struct ShapedS1 {
     mechanism: u64,
     capture: u32,
     flags: u64,
+    /// Session word override (`None` = the shared fixture session).
+    session: Option<u64>,
     /// Input words as (word, status): `Some` overrides the
     /// per-function default (`None` = absent).
     input0: Option<(u64, u8)>,
@@ -644,6 +646,7 @@ impl ShapedS1 {
             mechanism,
             capture,
             flags: FLAGS,
+            session: None,
             input0,
             input1: None,
             result: None,
@@ -673,7 +676,7 @@ fn attest_and_stage(
     call: &ShapedS1,
 ) -> (SemanticCall, u64) {
     let admitted = scene.fixture.admit_shaped(
-        SESSION,
+        call.session.unwrap_or(SESSION),
         call.name,
         call.rv,
         call.mechanism,
@@ -694,7 +697,7 @@ fn attest_and_stage(
 /// never staged.
 fn attest_and_ingest(scene: &mut JointScene, call: &ShapedS1) {
     let admitted = scene.fixture.admit_shaped(
-        SESSION,
+        call.session.unwrap_or(SESSION),
         call.name,
         call.rv,
         call.mechanism,
@@ -715,7 +718,7 @@ fn ingest_call(scene: &mut JointScene, call: &ShapedS1) {
         fid,
         0,
         (COOKIE, EXEC),
-        SESSION,
+        call.session.unwrap_or(SESSION),
         call.mechanism,
         call.capture,
         call.input0,
@@ -1496,6 +1499,184 @@ fn key_operation_abandoned_quantum_replays_s1() {
 
 /// G29/H9-§2: the S1 matrix (failed Init, size query, too-small
 /// retry, multipart, message context, cancellation) holds
+/// C2: a seal binds its EXACT staged call and consumes the claim
+/// once. Re-applying the same single-call seal refuses (Held) even
+/// when another same-function call stages; foreign, delayed,
+/// reordered and differently-shaped applications refuse without
+/// replaying or consuming anything.
+#[test]
+fn key_operation_seal_binds_exact_call_once() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+
+    let instance = RegistryInstanceId::from_raw(3);
+    // Repeated seal: the same seal applied to a second same-function
+    // staged call refuses — the first replay consumed the claim.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let shaped = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    prepare_call(&mut scene, &mut staging, &shaped);
+    let seal = scene.seal().expect("init quantum seals");
+    let (outcome, _) = staging.apply_seal(
+        &seal,
+        &scene.model,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
+    assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
+    let staged_before = joint.started();
+    prepare_call(&mut scene, &mut staging, &shaped);
+    let (outcome, _) = staging.apply_seal(
+        &seal,
+        &scene.model,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
+    assert_eq!(
+        outcome,
+        SealApplyOutcome::Held,
+        "a consumed seal never replays"
+    );
+    assert_eq!(joint.started(), staged_before, "nothing replays on refusal");
+    assert_eq!(staging.correlation_refusals(), 1);
+
+    // Foreign session: the staged head and the sealed call name
+    // different sessions — refusal leaves staging intact.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let foreign_staged = ShapedS1 {
+        session: Some(SESSION + 100),
+        ..ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture())
+    };
+    attest_and_stage(&mut scene, &mut staging, &foreign_staged);
+    let foreign_sealed = ShapedS1 {
+        session: Some(SESSION + 200),
+        ..ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture())
+    };
+    attest_and_ingest(&mut scene, &foreign_sealed);
+    let seal = scene.seal().expect("foreign quantum seals");
+    let (outcome, _) = staging.apply_seal(
+        &seal,
+        &scene.model,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
+    assert_eq!(
+        outcome,
+        SealApplyOutcome::Held,
+        "foreign seals never replay"
+    );
+    assert_eq!(staging.staged_len(), 1, "the head stays staged");
+    assert_eq!(joint.started(), 0);
+
+    // Differently-shaped mechanism: VALUE staged, NULL sealed.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let shaped_value = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    attest_and_stage(&mut scene, &mut staging, &shaped_value);
+    let shaped_null = ShapedS1 {
+        mechanism: 0,
+        capture: capture::MECHANISM_NULL | capture::OUTPUT_NON_NULL,
+        ..ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture())
+    };
+    attest_and_ingest(&mut scene, &shaped_null);
+    let seal = scene.seal().expect("reshaped quantum seals");
+    let (outcome, _) = staging.apply_seal(
+        &seal,
+        &scene.model,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
+    assert_eq!(
+        outcome,
+        SealApplyOutcome::Held,
+        "reshaped seals never replay"
+    );
+    assert_eq!(staging.staged_len(), 1);
+
+    // Delayed/reordered: the seal names the second staged call while
+    // the head is a different call — refusal, no skip-ahead.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let first = ShapedS1 {
+        session: Some(SESSION + 300),
+        ..ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture())
+    };
+    let second = ShapedS1 {
+        session: Some(SESSION + 400),
+        ..ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture())
+    };
+    attest_and_stage(&mut scene, &mut staging, &first);
+    attest_and_stage(&mut scene, &mut staging, &second);
+    attest_and_ingest(&mut scene, &second);
+    let seal = scene.seal().expect("reordered quantum seals");
+    let (outcome, _) = staging.apply_seal(
+        &seal,
+        &scene.model,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
+    assert_eq!(outcome, SealApplyOutcome::Held, "seals never skip the head");
+    assert_eq!(staging.staged_len(), 2);
+}
+
 /// identically through S1Only-direct and Joint replay; S2/S3
 /// close/destroy/session scope appears only in Joint; fallback
 /// preserves S1 without inventing object facts.

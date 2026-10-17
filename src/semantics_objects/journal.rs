@@ -1461,6 +1461,24 @@ fn origin_of(
     }
 }
 
+/// One staged BEGIN to its H9 correlation fingerprint: the sealed
+/// session and mechanism class, mirroring [`origin_of`] exactly.
+fn sealed_fingerprint(
+    begin: &ValidatedJournalBegin,
+) -> (
+    super::HandleInput<super::SessionHandle>,
+    super::state::MechClass,
+) {
+    (
+        handle_input(
+            begin.session_status(),
+            begin.session_word(),
+            super::SessionHandle::new,
+        ),
+        super::state::MechClass::of(mechanism_evidence(begin.capture(), begin.entry_mechanism())),
+    )
+}
+
 /// One staged END to its sealed completion fact. Session outputs are never
 /// observed (no session-result protocol exists): session-creating lifecycle
 /// calls report their output unreadable, honestly unknown rather than
@@ -2352,6 +2370,45 @@ pub(crate) struct SealedCall {
     pub(crate) begin_cut: u64,
     pub(crate) end_cut: Option<u64>,
     pub(crate) abandoned: bool,
+    /// Correlation fingerprint (H9 exact binding): the sealed
+    /// session and mechanism class, mirroring the call's origin
+    /// fact. The staged head must match exactly (see
+    /// [`SealedCall::matches_head`]).
+    pub(crate) session: super::HandleInput<super::SessionHandle>,
+    pub(crate) mechanism: super::state::MechClass,
+}
+
+impl SealedCall {
+    /// Whether this sealed call IS the staged head's call (H9 exact
+    /// correlation): the same catalog function, the same session,
+    /// and the same mechanism capture shape. Value words are never
+    /// compared (only the finite class crosses); an unreadable
+    /// sealed session never matches; a session-less staged head
+    /// matches only a session-less sealed call.
+    pub(crate) fn matches_head(&self, function: u32, session: u64, mechanism_capture: u32) -> bool {
+        if self.function != function {
+            return false;
+        }
+        let session_ok = match self.session {
+            super::HandleInput::Value(handle) => handle.0 == session,
+            super::HandleInput::Absent => session == p11scope_ebpf_common::SESSION_NONE,
+            super::HandleInput::Unreadable => false,
+        };
+        if !session_ok {
+            return false;
+        }
+        let bits = mechanism_capture & capture::MECHANISM_MASK;
+        let class = if bits == capture::MECHANISM_VALUE {
+            super::state::MechClass::Value
+        } else if bits == capture::MECHANISM_NULL {
+            super::state::MechClass::Null
+        } else if bits == capture::MECHANISM_UNREADABLE {
+            super::state::MechClass::Unreadable
+        } else {
+            super::state::MechClass::NotCaptured
+        };
+        self.mechanism == class
+    }
 }
 
 /// The sealed prefix H9 consumes: the proven domain, frontier, birth
@@ -3536,6 +3593,7 @@ impl JournalAdapter {
             match admitted {
                 Ok(token) => {
                     let fingerprint = fingerprint_of_begin(&entry.begin);
+                    let (session, mechanism) = sealed_fingerprint(&entry.begin);
                     let entry = self.open.get_mut(&native).expect("staged begin");
                     entry.converted_ticket = Some(token);
                     entry.converted_for = Some(key);
@@ -3547,6 +3605,8 @@ impl JournalAdapter {
                         begin_cut: entry.begin_ordinal,
                         end_cut: None,
                         abandoned: false,
+                        session,
+                        mechanism,
                     });
                     self.consume_claim(&fingerprint, key);
                 }
@@ -3599,6 +3659,7 @@ impl JournalAdapter {
                 } else {
                     // The BEGIN converted under an earlier seal: emit an
                     // explicit terminal delta so H9 sees the close.
+                    let (session, mechanism) = sealed_fingerprint(&entry.begin);
                     settled.push(SealedCall {
                         ticket: token,
                         key: entry.call_key.expect("converted terminal has a key"),
@@ -3606,6 +3667,8 @@ impl JournalAdapter {
                         begin_cut: entry.begin_ordinal,
                         end_cut: Some(staged.ordinal),
                         abandoned: false,
+                        session,
+                        mechanism,
                     });
                 }
             }
@@ -3634,6 +3697,7 @@ impl JournalAdapter {
                 } else {
                     // The BEGIN converted under an earlier seal: emit an
                     // explicit terminal delta so H9 sees the bound.
+                    let (session, mechanism) = sealed_fingerprint(&entry.begin);
                     settled.push(SealedCall {
                         ticket: token,
                         key: entry.call_key.expect("converted terminal has a key"),
@@ -3641,6 +3705,8 @@ impl JournalAdapter {
                         begin_cut: entry.begin_ordinal,
                         end_cut: None,
                         abandoned: true,
+                        session,
+                        mechanism,
                     });
                 }
             }

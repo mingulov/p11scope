@@ -184,9 +184,10 @@ const EMPTY_SNAPSHOT: Snapshot = Snapshot {
     inputs: [OriginState::Absent; 2],
 };
 
-/// Mechanism evidence class without the raw word.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MechClass {
+/// Mechanism evidence class without the raw word. Shared
+/// crate-internally for the seal's H9 correlation fingerprint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MechClass {
     NotCaptured,
     Null,
     Unreadable,
@@ -194,7 +195,7 @@ enum MechClass {
 }
 
 impl MechClass {
-    fn of(evidence: MechanismEvidence) -> Self {
+    pub(crate) fn of(evidence: MechanismEvidence) -> Self {
         match evidence {
             MechanismEvidence::NotCaptured => Self::NotCaptured,
             MechanismEvidence::Null => Self::Null,

@@ -1365,7 +1365,7 @@ impl CallerRegistry {
         input: &AdmittedInstanceCall,
         module: ModuleId,
         refusal: crate::semantics_edge::resources::SemanticResourceRefusal,
-        mut shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
         self.instance_state.semantic_refused =
             self.instance_state.semantic_refused.saturating_add(1);
@@ -1394,7 +1394,7 @@ impl CallerRegistry {
         boundary: Option<u64>,
         reason: InstanceReason,
         retire: bool,
-        mut shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
         // Joint accounting is active for this feed's S1 (same latch
         // as the reduce path): its starts teed, so its loss

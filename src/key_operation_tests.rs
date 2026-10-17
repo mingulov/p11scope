@@ -4945,6 +4945,645 @@ fn first_pos_of(seal: &SealSuccess) -> u64 {
     seal.prefix.settled()[0].key.admission()
 }
 
+/// G29 (N1b): cross-session destroy through Joint. A live use from
+/// session 7 destroyed from session 8 loses its join (session never
+/// gates retirement); a completed use's definite history stands
+/// while the object row shows destroyed. S1 records the destroy
+/// without inventing an operation.
+#[test]
+fn key_operation_g29_cross_session_destroy() {
+    // --- Open use + cross-session destroy: the join is lost. ---
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    let (started, completed) = (joint.started(), joint.completed());
+    let mut destroy = ShapedS1::shaped("C_DestroyObject", CkRv::OK.0, 0, 0);
+    destroy.session = Some(8);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &destroy,
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("the live use stands");
+    assert_eq!(
+        (row.active, row.key_join_lost),
+        (0, 1),
+        "cross-session destroy loses the open join"
+    );
+    let key = sink
+        .iter()
+        .find_map(|effect| match effect {
+            OperationEffect::Started { key_receipt, .. } => *key_receipt,
+            _ => None,
+        })
+        .expect("init start carries its receipt")
+        .key;
+    let object = committed
+        .objects
+        .iter()
+        .find(|row| row.object == key.as_u64())
+        .expect("the use's object row stands");
+    assert_eq!(
+        object.lifetime, "retired",
+        "S3 d1: the possibly-shared view retires uncertain, never destroyed"
+    );
+    assert!(
+        committed
+            .objects
+            .iter()
+            .any(|row| row.lifetime == "destroyed"),
+        "the cross-session destroy takes effect"
+    );
+    assert_eq!(
+        (joint.started(), joint.completed()),
+        (started, completed),
+        "S1 records the destroy without inventing an operation"
+    );
+
+    // --- Completed history + cross-session destroy: history stands. ---
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let mut destroy = ShapedS1::shaped("C_DestroyObject", CkRv::OK.0, 0, 0);
+    destroy.session = Some(8);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &destroy,
+    );
+    let committed = commit(2, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("definite history stands");
+    assert_eq!(
+        (row.started, row.completed, row.active, row.key_join_lost),
+        (1, 1, 0, 0),
+        "a later destroy never rewrites a completed use"
+    );
+    let key = sink
+        .iter()
+        .find_map(|effect| match effect {
+            OperationEffect::Started { key_receipt, .. } => *key_receipt,
+            _ => None,
+        })
+        .expect("init start carries its receipt")
+        .key;
+    let object = committed
+        .objects
+        .iter()
+        .find(|row| row.object == key.as_u64())
+        .expect("the use's object row stands");
+    assert_eq!(
+        object.lifetime, "retired",
+        "S3 d1: the possibly-shared view retires uncertain, never destroyed"
+    );
+    assert!(
+        committed
+            .objects
+            .iter()
+            .any(|row| row.lifetime == "destroyed"),
+        "the cross-session destroy takes effect"
+    );
+}
+
+/// G29 (N1b): a failed close changes nothing through Joint. The
+/// FUNCTION_FAILED close leaves the session live (S3), its machines
+/// live (S1), its key use live (H9) and its object live.
+#[test]
+fn key_operation_g29_failed_close_changes_nothing() {
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    assert!(joint.has_live_operations(), "precondition: live machine");
+    let close = ShapedS1::shaped("C_CloseSession", CkRv::FUNCTION_FAILED.0, 0, 0);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &close,
+    );
+    assert!(joint.has_live_operations(), "failed close ends no machine");
+    assert_eq!(
+        (joint.cancelled(), joint.completed()),
+        (0, 0),
+        "failed close routes no terminal"
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("the live use stands");
+    assert_eq!(
+        (row.active, row.key_join_lost),
+        (1, 0),
+        "failed close retires no binding"
+    );
+    let key = sink
+        .iter()
+        .find_map(|effect| match effect {
+            OperationEffect::Started { key_receipt, .. } => *key_receipt,
+            _ => None,
+        })
+        .expect("init start carries its receipt")
+        .key;
+    let object = committed
+        .objects
+        .iter()
+        .find(|row| row.object == key.as_u64())
+        .expect("the object row stands");
+    assert_eq!(object.lifetime, "live", "failed close destroys nothing");
+}
+
+/// G29 (N1b): uncertain concurrent same-session overlap through
+/// Joint matches the S1Only twin exactly. Whatever S1 decides for
+/// the overlapping second Init, Joint replays it identically —
+/// equivalence, never invented S1.
+#[test]
+fn key_operation_g29_concurrent_overlap_matches_s1only_twin() {
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let mut twin = EdgeSemantics::default();
+    let mut twin_sink = Vec::new();
+    // Two overlapping Inits on one session, same key and mechanism.
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    for _ in 0..2 {
+        let (facts, position) = prepare_call(&mut scene, &mut staging, &init);
+        let _ = position;
+        let origin = EffectOrigin::from(&facts);
+        twin.observe_with_effects(&facts, &origin, &mut twin_sink);
+        let seal = scene.seal().expect("quantum seals");
+        assert_eq!(seal.prefix.settled().len(), 1);
+        use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+        let (outcome, _) = staging.apply_seal(
+            &seal,
+            &scene.model,
+            &mut scene.ledger,
+            &mut joint,
+            &mut keyuse,
+            RegistryInstanceId::from_raw(3),
+            &mut sink,
+        );
+        assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
+    }
+    assert_s1_equal(&joint, &twin);
+    assert_eq!(joint.calls(), 2, "both overlapping calls reduce once");
+}
+
+/// G29 (N1b): ambiguous destroy widens uncertainty without inventing
+/// destruction. The GENERAL_ERROR cross-session destroy retires
+/// (never destroys); definite completed history stands; S1 records
+/// the call without inventing an operation.
+#[test]
+fn key_operation_g29_ambiguous_destroy_widens_without_destroying() {
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let (started, completed) = (joint.started(), joint.completed());
+    let mut destroy = ShapedS1::shaped("C_DestroyObject", CkRv::GENERAL_ERROR.0, 0, 0);
+    destroy.session = Some(8);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &destroy,
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("definite history stands");
+    assert_eq!(
+        (row.started, row.completed, row.active, row.key_join_lost),
+        (1, 1, 0, 0),
+        "ambiguity never rewrites a completed use"
+    );
+    assert!(
+        committed
+            .objects
+            .iter()
+            .all(|row| row.lifetime != "destroyed"),
+        "never synthesize destruction from failure (S3)"
+    );
+    assert_eq!(
+        (joint.started(), joint.completed()),
+        (started, completed),
+        "S1 records the call without inventing an operation"
+    );
+}
+
+/// G29 (N1b): creator close versus accessor view through Joint. The
+/// creator session's close destroys its objects (S3) and cancels its
+/// live S1 machines; the accessor session's machines stay live and
+/// its views retire uncertain (never destroyed).
+#[test]
+fn key_operation_g29_creator_close_vs_accessor_view() {
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    // Open both sessions first (S3 close needs opened sessions).
+    for session in [7u64, 8u64] {
+        let mut open = ShapedS1::shaped("C_OpenSession", CkRv::OK.0, 0, 0);
+        open.session = Some(session);
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &open,
+        );
+    }
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    // Creator use on session 7, accessor use of the same key on 8.
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    let mut accessor = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    accessor.session = Some(8);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &accessor,
+    );
+    assert_eq!(joint.started(), 2, "precondition: both machines live");
+    let close = ShapedS1::shaped("C_CloseSession", CkRv::OK.0, 0, 0);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &close,
+    );
+    // S1: the creator session's machine cancels; the accessor's stays
+    // live.
+    assert_eq!(joint.cancelled(), 1, "creator close cancels its machine");
+    assert!(joint.has_live_operations(), "accessor machine stays live");
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    // H9: the creator's proved use loses its join (session retired)
+    // and its cancelled terminal routes to key_join_lost; the
+    // accessor's use stays live on its own live session.
+    let creator = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("the creator use stands");
+    assert_eq!(
+        (creator.active, creator.key_join_lost),
+        (0, 1),
+        "creator close retires its session's joins"
+    );
+    let routed = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "key_join_lost")
+        .expect("the cancelled terminal routes once");
+    assert_eq!(routed.cancelled, 1);
+    let accessor = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "metadata_unknown")
+        .expect("the accessor use stands");
+    assert_eq!(accessor.active, 1, "accessor session stays live");
+}
+
+/// G29 (N1b): delivery/equivalence matrix through the registry.
+/// Seal delivery replays S1-identical to the direct twin; proof-only
+/// fallback preserves S1 while exposing no invented object/key facts
+/// (unknown rows only, never proved); real loss preserves definite
+/// completed history.
+#[test]
+fn key_operation_g29_delivery_equivalence_matrix() {
+    // --- Seal delivery == direct twin. ---
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(joint_key.clone(), bootstrap);
+    let (_, joint_id) = guarded.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    let mut twin = EdgeSemantics::default();
+    let mut twin_sink = Vec::new();
+    for shape in [&init, &sign] {
+        let (facts, position) = guarded.admit_shape(shape);
+        let origin = EffectOrigin::from(&facts);
+        twin.observe_with_effects(&facts, &origin, &mut twin_sink);
+        guarded.observe(&joint_key, position, facts);
+        guarded
+            .registry
+            .publish_with_ledger(&mut guarded.scene.ledger);
+        ingest_call(&mut guarded.scene, shape);
+        let seal = guarded.scene.seal().expect("quantum seals");
+        assert_eq!(
+            guarded.registry.deliver_joint_seal(
+                joint_id,
+                &seal,
+                &guarded.scene.model,
+                &mut guarded.scene.ledger,
+            ),
+            SealApplyOutcome::ReplayedOne
+        );
+    }
+    let edge = guarded
+        .registry
+        .instance_semantic_edges()
+        .find(|record| record.id == joint_id)
+        .expect("edge retained")
+        .semantics
+        .as_ref()
+        .expect("materialized");
+    assert_s1_equal(edge, &twin);
+
+    // --- Proof-only fallback: S1 preserved, nothing invented. ---
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(joint_key.clone(), bootstrap);
+    let (_, joint_id) = guarded.register(1);
+    let (facts, position) = guarded.admit_shape(&init);
+    let mut twin = EdgeSemantics::default();
+    let mut twin_sink = Vec::new();
+    let origin = EffectOrigin::from(&facts);
+    twin.observe_with_effects(&facts, &origin, &mut twin_sink);
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    let failure = SealFailure {
+        gap: JournalGap::ClosureStale,
+        effects: crate::semantics_objects::ObjectEffects::default(),
+        h3_voided: None,
+    };
+    let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    assert_eq!(
+        guarded.registry.deliver_joint_failure(
+            joint_id,
+            &failure,
+            &mut clean,
+            &guarded.scene.model,
+            &mut guarded.scene.ledger,
+        ),
+        FailureApplyOutcome::FellBack { replayed: 1 }
+    );
+    let edge = guarded
+        .registry
+        .instance_semantic_edges()
+        .find(|record| record.id == joint_id)
+        .expect("edge retained")
+        .semantics
+        .as_ref()
+        .expect("materialized");
+    assert_s1_equal(edge, &twin);
+    let observations = guarded.registry.joint_observations(16);
+    assert!(
+        observations.key_operations.is_empty(),
+        "fallback exposes no invented object/key facts"
+    );
+    assert!(
+        !observations.unknown_key_operations.is_empty(),
+        "definite S1 still accounts unknown-key"
+    );
+
+    // --- Real loss: definite completed history stands. ---
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(joint_key.clone(), bootstrap);
+    let (_, joint_id) = guarded.register(1);
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    let failure = SealFailure {
+        gap: JournalGap::FaultChanged,
+        effects: crate::semantics_objects::ObjectEffects::default(),
+        h3_voided: None,
+    };
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    assert_eq!(
+        guarded.registry.deliver_joint_failure(
+            joint_id,
+            &failure,
+            &mut h3,
+            &guarded.scene.model,
+            &mut guarded.scene.ledger,
+        ),
+        FailureApplyOutcome::Degraded { disposed: 0 }
+    );
+    assert_eq!(
+        (
+            guarded.edge_calls(joint_id),
+            guarded.edge_started(joint_id),
+            guarded.edge_completed(joint_id)
+        ),
+        (2, 1, 1),
+        "real loss preserves definite completed S1 history"
+    );
+}
+
 /// N9: emitter digest tracking is bounded by the current
 /// publication: churning single-object publications (each object
 /// pruned before the next arrives) never accumulates tracking for

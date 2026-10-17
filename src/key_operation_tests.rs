@@ -521,14 +521,15 @@ use crate::semantics_key_use::{
 };
 use crate::semantics_objects::ObjectSemantics;
 use crate::semantics_objects::journal::tests::{
-    AttestationFixture, COOKIE, ENTRY_NS, EXEC, FLAGS, SESSION, abandon_bytes, begin_bytes_shaped,
-    end_bytes, end_bytes_absent, end_bytes_getattr, end_bytes_result, ordinary_for,
+    AttestationFixture, COOKIE, ENTRY_NS, EXEC, FLAGS, NativeBirthRows, NativePublisher, SESSION,
+    abandon_bytes, begin_bytes, begin_bytes_shaped, end_bytes, end_bytes_absent, end_bytes_getattr,
+    end_bytes_result, function_id, ordinary_for,
 };
 use crate::semantics_objects::journal::{
     BirthKind, BootstrapReceipt, FaultEpoch, FaultReadError, H3DispositionEvidence, JournalAdapter,
     JournalAuditReceipt, JournalDisposition, JournalDomainProof, JournalGap, JournalIngestItem,
     JournalLimits, ScriptedBirthSource, ScriptedH3Source, SealFailure, SealSuccess,
-    SessionBirthEvidence, SessionClosureGrant, StagingLedger,
+    SessionBirthEvidence, SessionBirthGrant, SessionClosureGrant, StagingLedger,
 };
 use p11scope_ebpf_common::object_journal::{
     JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, decode_journal_record,
@@ -4950,6 +4951,107 @@ fn first_pos_of(seal: &SealSuccess) -> u64 {
 /// gates retirement); a completed use's definite history stands
 /// while the object row shows destroyed. S1 records the destroy
 /// without inventing an operation.
+#[test]
+#[test]
+fn key_operation_n1_genuine_birth_bootstrap() {
+    // N1(a): H9 Joint bootstrap needs no scripted birth receipt. The
+    // same genuine-producer chain T3 pins (a natively published READY
+    // marker naming the admitted exec, a real admission control row,
+    // live held custody) observes, the issued grant attests, and the
+    // Joint path replays on top of the observed receipt.
+    use crate::attach::observe_exec_birth;
+    use p11scope_ebpf_common::journal_marker::ready_word;
+
+    let publisher = NativePublisher::build();
+    let mut scene = JointScene::new();
+    let admitted = scene.fixture.admit_function("C_CreateObject");
+    let proof = scene
+        .adapter
+        .attest_key(&admitted)
+        .expect("sighting call attests");
+    let generation = scene.fixture.attachment().generation();
+    let (row, control, wins) = publisher.publish_stamped(&["0", "1"], generation);
+    assert_eq!(wins, 1, "one real admission wins");
+    let mut rows = NativeBirthRows { row, control };
+    let (token, evidence) = observe_exec_birth(
+        &mut rows,
+        scene.fixture.binding(),
+        scene.fixture.attachment(),
+        &admitted,
+    )
+    .expect("genuine producers observe");
+    assert_eq!(evidence.image(), (COOKIE, EXEC));
+    assert_eq!(evidence.marker_word(), ready_word(EXEC));
+    let grant = SessionBirthGrant::issue(
+        &token,
+        proof,
+        BirthKind::ExecMarker,
+        0,
+        generation,
+        evidence,
+    );
+    // The sighting ingest T3 runs before attesting, on a spare
+    // thread so the Joint flow's own sequencing stays untouched.
+    let create = function_id("C_CreateObject");
+    let begin = begin_bytes(9, 1, create, 0);
+    scene.ingest(&begin);
+    scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+    let birth = BootstrapReceipt::attest(&scene.adapter, &grant).expect("observed grant attests");
+    // Settle the sighting pair on its own seal so each Joint
+    // quantum below settles exactly its own call.
+    let pre = scene.seal().expect("sighting pair seals");
+    assert_eq!(pre.prefix.settled().len(), 1, "sighting pair settles alone");
+    let mut staging = JointStaging::select_joint(Some(&birth));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    assert_eq!(joint.started(), 1, "joint replays on observed birth");
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("the open use stands");
+    assert_eq!((row.active, row.key_join_lost), (1, 0));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    assert_eq!((joint.started(), joint.completed()), (1, 1));
+}
+
 #[test]
 fn key_operation_g29_cross_session_destroy() {
     // --- Open use + cross-session destroy: the join is lost. ---

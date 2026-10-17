@@ -882,8 +882,12 @@ pub(crate) mod producer {
             ))
         });
         let mut unknown_rows = Vec::new();
+        let ever_live = keyuse.unknown_ever_live();
         for (index, counters) in keyuse.unknown_counters().iter().enumerate() {
-            if !counters.is_live() {
+            // Live summaries emit; drained summaries emit their
+            // zero-active replacement iff the cumulative consumer
+            // already saw them live (N9) — never stale activity.
+            if !counters.is_live() && !ever_live[index] {
                 continue;
             }
             let category = UNKNOWN_CATEGORIES[index / UNKNOWN_REASONS.len()];

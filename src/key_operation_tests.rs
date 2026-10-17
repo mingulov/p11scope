@@ -656,6 +656,39 @@ impl JointScene {
             &cell,
         )
     }
+
+    /// One seal over a genuinely observed birth (N1a): the caller
+    /// supplies the attested receipt plus FRESH re-observed birth
+    /// evidence (a second producer run, never the first run's
+    /// words), mirroring T3's re-observation at seal. The audit/H3
+    /// receipts stay the scene's scripted ones (H8 seal machinery,
+    /// T3-pinned); the birth side is fully observed.
+    fn seal_with_birth(
+        &mut self,
+        bootstrap: &BootstrapReceipt,
+        fresh: SessionBirthEvidence,
+    ) -> Result<SealSuccess, SealFailure> {
+        self.install_closure();
+        let frontier = self.adapter.consumed_frontier();
+        let audit = JournalAuditReceipt::scripted(
+            7,
+            7,
+            None,
+            0,
+            H3DispositionEvidence::scripted_clean(self.adapter.consumed_through_for_test()),
+            self.fixture.attachment().generation(),
+        );
+        let cell = SteadyFaultCell(7);
+        let mut births = ScriptedBirthSource::once(fresh);
+        self.adapter.seal(
+            &mut self.model,
+            &audit,
+            bootstrap,
+            frontier,
+            &mut births,
+            &cell,
+        )
+    }
 }
 
 /// One S1-shaped call: admission facts plus matching journal record
@@ -5256,9 +5289,26 @@ fn key_operation_n1_genuine_birth_bootstrap() {
     scene.ingest(&begin);
     scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
     let birth = BootstrapReceipt::attest(&scene.adapter, &grant).expect("observed grant attests");
+    // Fresh native words at seal: a second publisher run, pulled
+    // through a new reader — never the first run's words (T3's
+    // re-observation at seal, mirrored for the Joint bootstrap).
+    let (fresh_row, fresh_control, _) = publisher.publish_stamped(&["0", "1"], generation);
+    let mut fresh_rows = NativeBirthRows {
+        row: fresh_row,
+        control: fresh_control,
+    };
+    let (_, fresh) = observe_exec_birth(
+        &mut fresh_rows,
+        scene.fixture.binding(),
+        scene.fixture.attachment(),
+        &admitted,
+    )
+    .expect("fresh words re-observe");
     // Settle the sighting pair on its own seal so each Joint
     // quantum below settles exactly its own call.
-    let pre = scene.seal().expect("sighting pair seals");
+    let pre = scene
+        .seal_with_birth(&birth, fresh)
+        .expect("sighting pair seals");
     assert_eq!(pre.prefix.settled().len(), 1, "sighting pair settles alone");
     let mut staging = JointStaging::select_joint(Some(&birth));
     let mut joint = EdgeSemantics::default();

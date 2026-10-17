@@ -763,15 +763,13 @@ impl ObservationPublisher {
 #[cfg(test)]
 pub(crate) mod producer {
     use super::*;
-    use crate::semantics_edge::{KeyReceipt, KeyRole, OperationOutcome};
-    use crate::semantics_key_use::{FeedMode, JointStaging, KeyUseReducer, unbound_reason_for};
+    use crate::semantics_key_use::{FeedMode, JointStaging, KeyUseReducer};
     use crate::semantics_objects::{
-        Attribution, Birth, CreationFamily, FieldState, FieldValue, KeyLabel, Lifetime,
-        MetadataView, ObjectGap, ObjectProjection, ObjectView, QueryStatus, SessionOrigin,
-        SessionState, SessionView, ViewOrigin, field_index,
+        Attribution, Birth, CreationFamily, FieldState, FieldValue, Lifetime, MetadataView,
+        ObjectGap, ObjectProjection, ObjectView, QueryStatus, SessionOrigin, SessionState,
+        SessionView, ViewOrigin, field_index,
     };
     use p11scope_ebpf_common::object_policy::{SafeAttributeKind, SafeCurve};
-    use std::collections::BTreeMap;
 
     /// Commit one immutable revision from the live reducers: the one
     /// typed producer-to-projection mapping. Status derives from the
@@ -815,7 +813,7 @@ pub(crate) mod producer {
             gaps_suppressed: 0,
             budgets: ObsBudgets {
                 key_limit: keyuse.capacity(),
-                key_occupied: keyuse.rows().len().saturating_add(keyuse.open().len()),
+                key_occupied: keyuse.aggregates().len(),
                 key_refused: evidence.rows_refused,
                 object_limit: crate::semantics_objects::ObjectLimits::policy().object_records,
                 object_occupied: model.objects.len(),
@@ -833,149 +831,41 @@ pub(crate) mod producer {
         observations
     }
 
-    /// Aggregate per-operation reducer state into proved-key rows
-    /// (one per association key) and capture-wide unknown summaries.
-    /// Terminals partition once per primary operation role; starts
-    /// are never fabricated into the unknown bucket.
+    /// Render the reducer's retained aggregate buckets and fixed
+    /// unknown summaries into proved-key rows and capture-wide
+    /// unknown rows. The reducer partitions terminals once per
+    /// primary operation role at close time; this mapping only
+    /// renders (sorted, stable) — it never re-partitions.
     fn aggregate_key_use(
         observations: &mut ObjectObservations,
         model: &ObjectProjection,
         keyuse: &KeyUseReducer,
     ) {
+        use crate::semantics_key_use::{UNKNOWN_CATEGORIES, UNKNOWN_REASONS};
         let live: std::collections::BTreeSet<u64> =
             model.objects.iter().map(|view| view.id.as_u64()).collect();
-        let mut proved: BTreeMap<
-            (String, u64, &'static str, &'static str, &'static str),
-            KeyAggRow,
-        > = BTreeMap::new();
-        let mut unknown: BTreeMap<(&'static str, &'static str), UnknownAggRow> = BTreeMap::new();
         let mut dangling = 0u64;
-
-        // Completed rows: starts and terminals per association.
-        for row in keyuse.rows() {
-            let instance = row.instance.label();
-            if row.partial {
-                add_unknown(&mut unknown, row.category, "unbound", row.outcome);
-                continue;
+        let mut key_rows: Vec<KeyAggRow> = Vec::with_capacity(keyuse.aggregates().len());
+        for (bucket, counters) in keyuse.aggregates() {
+            if !live.contains(&bucket.object) {
+                dangling = dangling.saturating_add(counters.started);
             }
-            let primary = primary_receipt(&row.keys);
-            for receipt in &row.keys {
-                if !live.contains(&receipt.key.as_u64()) {
-                    dangling = dangling.saturating_add(1);
-                }
-                match association_bucket(receipt) {
-                    AssociationBucket::Proved { label } => {
-                        let slot = proved
-                            .entry((
-                                instance.clone(),
-                                receipt.key.as_u64(),
-                                row.category,
-                                role_label(receipt.role),
-                                label,
-                            ))
-                            .or_insert_with(|| KeyAggRow {
-                                instance: instance.clone(),
-                                object: receipt.key.as_u64(),
-                                category: row.category,
-                                role: role_label(receipt.role),
-                                metadata_at_use: label,
-                                unit: crate::semantics_key_use::unit_for(row.category),
-                                started: 0,
-                                completed: 0,
-                                failed: 0,
-                                cancelled: 0,
-                                unknown: 0,
-                                active: 0,
-                                key_join_lost: 0,
-                            });
-                        slot.started = slot.started.saturating_add(1);
-                        if receipt.lost {
-                            slot.key_join_lost = slot.key_join_lost.saturating_add(1);
-                        } else {
-                            add_outcome(slot, row.outcome);
-                        }
-                    }
-                    AssociationBucket::Unknown { .. } => {}
-                }
-            }
-            // The terminal partitions once, by the primary role.
-            match primary {
-                Some(receipt) if !receipt.lost && association_bucket(receipt).label().is_some() => {
-                }
-                Some(receipt) if receipt.lost => {
-                    add_unknown(&mut unknown, row.category, "key_join_lost", row.outcome);
-                }
-                Some(receipt) => {
-                    let reason = metadata_reason(receipt);
-                    add_unknown(&mut unknown, row.category, reason, row.outcome);
-                }
-                None => {
-                    let reason = unbound_reason_for(row.category);
-                    add_unknown(&mut unknown, row.category, reason, row.outcome);
-                }
-            }
+            key_rows.push(KeyAggRow {
+                instance: bucket.instance.label(),
+                object: bucket.object,
+                category: bucket.category,
+                role: bucket.role,
+                metadata_at_use: bucket.metadata,
+                unit: crate::semantics_key_use::unit_for(bucket.category),
+                started: counters.started,
+                completed: counters.completed,
+                failed: counters.failed,
+                cancelled: counters.cancelled,
+                unknown: counters.unknown,
+                active: counters.active,
+                key_join_lost: counters.key_join_lost,
+            });
         }
-        // Open associations: started + active; lost joins stay active
-        // until their terminal (counted once, at the end).
-        for open in keyuse.open().values() {
-            let instance = open.instance.label();
-            if open.keys.is_empty() {
-                let reason = unbound_reason_for(open.category);
-                add_unknown_open(&mut unknown, open.category, reason);
-                continue;
-            }
-            for receipt in &open.keys {
-                if !live.contains(&receipt.key.as_u64()) {
-                    dangling = dangling.saturating_add(1);
-                }
-                match association_bucket(receipt) {
-                    AssociationBucket::Proved { label } => {
-                        let slot = proved
-                            .entry((
-                                instance.clone(),
-                                receipt.key.as_u64(),
-                                open.category,
-                                role_label(receipt.role),
-                                label,
-                            ))
-                            .or_insert_with(|| KeyAggRow {
-                                instance: instance.clone(),
-                                object: receipt.key.as_u64(),
-                                category: open.category,
-                                role: role_label(receipt.role),
-                                metadata_at_use: label,
-                                unit: crate::semantics_key_use::unit_for(open.category),
-                                started: 0,
-                                completed: 0,
-                                failed: 0,
-                                cancelled: 0,
-                                unknown: 0,
-                                active: 0,
-                                key_join_lost: 0,
-                            });
-                        slot.started = slot.started.saturating_add(1);
-                        slot.active = slot.active.saturating_add(1);
-                    }
-                    AssociationBucket::Unknown { .. } => {
-                        let reason = if receipt.lost {
-                            "key_join_lost"
-                        } else {
-                            metadata_reason(receipt)
-                        };
-                        add_unknown_open(&mut unknown, open.category, reason);
-                    }
-                }
-            }
-        }
-        // Refused opens are live S1 without associations.
-        for refused in keyuse.refused_opens().values() {
-            add_unknown_open(
-                &mut unknown,
-                refused.category,
-                unbound_reason_for(refused.category),
-            );
-        }
-        let mut key_rows: Vec<KeyAggRow> = proved.into_values().collect();
         key_rows.sort_by(|a, b| {
             (&a.instance, a.object, a.category, a.role, a.metadata_at_use).cmp(&(
                 &b.instance,
@@ -985,7 +875,24 @@ pub(crate) mod producer {
                 b.metadata_at_use,
             ))
         });
-        let mut unknown_rows: Vec<UnknownAggRow> = unknown.into_values().collect();
+        let mut unknown_rows = Vec::new();
+        for (index, counters) in keyuse.unknown_counters().iter().enumerate() {
+            if !counters.is_live() {
+                continue;
+            }
+            let category = UNKNOWN_CATEGORIES[index / UNKNOWN_REASONS.len()];
+            let reason = UNKNOWN_REASONS[index % UNKNOWN_REASONS.len()];
+            unknown_rows.push(UnknownAggRow {
+                category,
+                reason,
+                unit: crate::semantics_key_use::unit_for(category),
+                completed: counters.completed,
+                failed: counters.failed,
+                cancelled: counters.cancelled,
+                unknown: counters.unknown,
+                active: counters.active,
+            });
+        }
         unknown_rows.sort_by(|a, b| (a.category, a.reason).cmp(&(b.category, b.reason)));
         observations.key_operations = key_rows;
         observations.unknown_key_operations = unknown_rows;
@@ -997,137 +904,6 @@ pub(crate) mod producer {
                 repeats: dangling,
             });
         }
-    }
-
-    /// The primary receipt decides the terminal's bucket: the first
-    /// non-secondary receipt (`wrapped_object` is secondary, H9 §82),
-    /// else none. A secondary-only row never promotes its secondary
-    /// to primary: the proved secondary association is retained in
-    /// its own row while the missing primary's terminal partitions
-    /// to the unknown-key summary.
-    fn primary_receipt(keys: &[KeyReceipt]) -> Option<&KeyReceipt> {
-        keys.iter()
-            .find(|receipt| receipt.role != KeyRole::WrappedKey)
-    }
-
-    /// Where one receipt's association counts: a proved row under its
-    /// usable label, or the unknown bucket. Lost joins keep their
-    /// proved row (the association existed) and close it with
-    /// `key_join_lost` at the end.
-    enum AssociationBucket {
-        Proved { label: &'static str },
-        Unknown { _private: () },
-    }
-
-    impl AssociationBucket {
-        fn label(&self) -> Option<&'static str> {
-            match self {
-                Self::Proved { label } => Some(label),
-                Self::Unknown { .. } => None,
-            }
-        }
-    }
-
-    fn association_bucket(receipt: &KeyReceipt) -> AssociationBucket {
-        match usable_label(receipt) {
-            Some(label) => AssociationBucket::Proved { label },
-            None => AssociationBucket::Unknown { _private: () },
-        }
-    }
-
-    /// The usable metadata-at-use label (H9 §72): established-only,
-    /// valid attribution, non-conflicting required fields.
-    fn usable_label(receipt: &KeyReceipt) -> Option<&'static str> {
-        if !receipt.attribution_valid {
-            return None;
-        }
-        let label = receipt.label?;
-        let required = match label {
-            KeyLabel::Aes { .. } => {
-                (1 << field_index(SafeAttributeKind::Class))
-                    | (1 << field_index(SafeAttributeKind::KeyType))
-                    | (1 << field_index(SafeAttributeKind::ValueLen))
-            }
-            KeyLabel::Rsa { .. } => {
-                (1 << field_index(SafeAttributeKind::Class))
-                    | (1 << field_index(SafeAttributeKind::KeyType))
-                    | (1 << field_index(SafeAttributeKind::ModulusBits))
-            }
-            KeyLabel::Ec { .. } => {
-                (1 << field_index(SafeAttributeKind::Class))
-                    | (1 << field_index(SafeAttributeKind::KeyType))
-                    | (1 << field_index(SafeAttributeKind::EcParams))
-            }
-        };
-        if receipt.metadata.conflicted & required != 0 {
-            return None;
-        }
-        Some(metadata_label(label))
-    }
-
-    /// The unknown reason for an unusable label: any conflict at use
-    /// reports conflicting, otherwise unknown.
-    fn metadata_reason(receipt: &KeyReceipt) -> &'static str {
-        if receipt.metadata.conflicted != 0 {
-            "metadata_conflicting"
-        } else {
-            "metadata_unknown"
-        }
-    }
-
-    fn add_outcome(slot: &mut KeyAggRow, outcome: OperationOutcome) {
-        match outcome {
-            OperationOutcome::Completed => slot.completed = slot.completed.saturating_add(1),
-            OperationOutcome::Failed => slot.failed = slot.failed.saturating_add(1),
-            OperationOutcome::Cancelled => slot.cancelled = slot.cancelled.saturating_add(1),
-            OperationOutcome::Unknown => slot.unknown = slot.unknown.saturating_add(1),
-        }
-    }
-
-    fn add_unknown(
-        unknown: &mut BTreeMap<(&'static str, &'static str), UnknownAggRow>,
-        category: &'static str,
-        reason: &'static str,
-        outcome: OperationOutcome,
-    ) {
-        let slot = unknown
-            .entry((category, reason))
-            .or_insert_with(|| UnknownAggRow {
-                category,
-                reason,
-                unit: crate::semantics_key_use::unit_for(category),
-                completed: 0,
-                failed: 0,
-                cancelled: 0,
-                unknown: 0,
-                active: 0,
-            });
-        match outcome {
-            OperationOutcome::Completed => slot.completed = slot.completed.saturating_add(1),
-            OperationOutcome::Failed => slot.failed = slot.failed.saturating_add(1),
-            OperationOutcome::Cancelled => slot.cancelled = slot.cancelled.saturating_add(1),
-            OperationOutcome::Unknown => slot.unknown = slot.unknown.saturating_add(1),
-        }
-    }
-
-    fn add_unknown_open(
-        unknown: &mut BTreeMap<(&'static str, &'static str), UnknownAggRow>,
-        category: &'static str,
-        reason: &'static str,
-    ) {
-        let slot = unknown
-            .entry((category, reason))
-            .or_insert_with(|| UnknownAggRow {
-                category,
-                reason,
-                unit: crate::semantics_key_use::unit_for(category),
-                completed: 0,
-                failed: 0,
-                cancelled: 0,
-                unknown: 0,
-                active: 0,
-            });
-        slot.active = slot.active.saturating_add(1);
     }
 
     /// Model gaps plus key-side scope facts, sorted, bounded (the
@@ -1220,7 +996,7 @@ pub(crate) mod producer {
                 ),
                 ec_params: query_label(view.queries[field_index(SafeAttributeKind::EcParams)]),
             },
-            label: view.label.map(metadata_label),
+            label: view.label.map(crate::semantics_key_use::metadata_label),
             successful_references: view.references,
             successful_key_references: view.key_uses,
             accessing_sessions: view.accessing_sessions as u64,
@@ -1286,40 +1062,6 @@ pub(crate) mod producer {
             QueryStatus::Unsupported => "unsupported",
             QueryStatus::Malformed => "malformed",
             QueryStatus::Excluded => "excluded",
-        }
-    }
-
-    pub(crate) fn role_label(role: KeyRole) -> &'static str {
-        match role {
-            KeyRole::OperationKey => "key",
-            KeyRole::WrappingKey => "wrapping_key",
-            KeyRole::WrappedKey => "wrapped_object",
-            KeyRole::BaseKey => "base_key",
-            KeyRole::UnwrappingKey => "unwrapping_key",
-            KeyRole::Other => "other",
-        }
-    }
-
-    pub(crate) fn metadata_label(label: KeyLabel) -> &'static str {
-        match label {
-            KeyLabel::Rsa { modulus_bits } => match modulus_bits {
-                1024 => "rsa_1024",
-                2048 => "rsa_2048",
-                3072 => "rsa_3072",
-                4096 => "rsa_4096",
-                _ => "rsa_other",
-            },
-            KeyLabel::Aes { value_len } => match value_len {
-                16 => "aes_128",
-                24 => "aes_192",
-                32 => "aes_256",
-                _ => "aes_other",
-            },
-            KeyLabel::Ec { curve } => match curve {
-                SafeCurve::Secp256r1 => "ec_p256",
-                SafeCurve::Secp384r1 => "ec_p384",
-                SafeCurve::Secp521r1 => "ec_p521",
-            },
         }
     }
 

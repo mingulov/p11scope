@@ -539,39 +539,253 @@ pub(crate) fn unit_for(category: &str) -> &'static str {
     }
 }
 
-/// One completed key-operation row: the S1 transition joined to its
-/// positional key receipts. Frozen at completion — later-learned
-/// metadata never rewrites a row. Carries no raw handles (keys are
-/// opaque exact observations) and no metadata values (presence
-/// bitmaps plus established size/curve labels only). Internal
-/// identities ([`OperationId`]) never reach rows: joins happen
-/// inside the reducer; rows carry only their own output-safe
-/// sequence.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct KeyOpRow {
-    pub seq: u64,
+/// The frozen role label for one key role (H9 §82): shared by
+/// aggregate reservation and the projection's rows, so admission
+/// and publication cannot disagree on buckets.
+pub(crate) fn role_label(role: KeyRole) -> &'static str {
+    match role {
+        KeyRole::OperationKey => "key",
+        KeyRole::WrappingKey => "wrapping_key",
+        KeyRole::WrappedKey => "wrapped_object",
+        KeyRole::BaseKey => "base_key",
+        KeyRole::UnwrappingKey => "unwrapping_key",
+        KeyRole::Other => "other",
+    }
+}
+
+/// The frozen metadata-at-use label for one established key label:
+/// shared by aggregate reservation and the projection's rows, so
+/// admission and publication cannot disagree on buckets.
+pub(crate) fn metadata_label(label: crate::semantics_objects::KeyLabel) -> &'static str {
+    use crate::semantics_objects::KeyLabel;
+    use p11scope_ebpf_common::object_policy::SafeCurve;
+    match label {
+        KeyLabel::Rsa { modulus_bits } => match modulus_bits {
+            1024 => "rsa_1024",
+            2048 => "rsa_2048",
+            3072 => "rsa_3072",
+            4096 => "rsa_4096",
+            _ => "rsa_other",
+        },
+        KeyLabel::Aes { value_len } => match value_len {
+            16 => "aes_128",
+            24 => "aes_192",
+            32 => "aes_256",
+            _ => "aes_other",
+        },
+        KeyLabel::Ec { curve } => match curve {
+            SafeCurve::Secp256r1 => "ec_p256",
+            SafeCurve::Secp384r1 => "ec_p384",
+            SafeCurve::Secp521r1 => "ec_p521",
+        },
+    }
+}
+
+/// The usable metadata-at-use label (H9 §72): established-only,
+/// valid attribution, non-conflicting required fields. Decides
+/// admission: usable receipts reserve proved aggregate buckets;
+/// unusable ones count in fixed unknown summaries. Later-learned
+/// metadata never rewrites a bucket's label: receipts carry the
+/// join-time snapshot, and each label is its own bucket.
+fn usable_label(receipt: &KeyReceipt) -> Option<&'static str> {
+    use crate::semantics_objects::KeyLabel;
+    use p11scope_ebpf_common::object_policy::SafeAttributeKind;
+    if !receipt.attribution_valid {
+        return None;
+    }
+    let label = receipt.label?;
+    let required = match label {
+        KeyLabel::Aes { .. } => {
+            (1 << crate::semantics_objects::field_index(SafeAttributeKind::Class))
+                | (1 << crate::semantics_objects::field_index(SafeAttributeKind::KeyType))
+                | (1 << crate::semantics_objects::field_index(SafeAttributeKind::ValueLen))
+        }
+        KeyLabel::Rsa { .. } => {
+            (1 << crate::semantics_objects::field_index(SafeAttributeKind::Class))
+                | (1 << crate::semantics_objects::field_index(SafeAttributeKind::KeyType))
+                | (1 << crate::semantics_objects::field_index(SafeAttributeKind::ModulusBits))
+        }
+        KeyLabel::Ec { .. } => {
+            (1 << crate::semantics_objects::field_index(SafeAttributeKind::Class))
+                | (1 << crate::semantics_objects::field_index(SafeAttributeKind::KeyType))
+                | (1 << crate::semantics_objects::field_index(SafeAttributeKind::EcParams))
+        }
+    };
+    if receipt.metadata.conflicted & required != 0 {
+        return None;
+    }
+    Some(metadata_label(label))
+}
+
+/// The unknown reason for an unusable label: any conflict at use
+/// reports conflicting, otherwise unknown.
+fn metadata_reason(receipt: &KeyReceipt) -> &'static str {
+    if receipt.metadata.conflicted != 0 {
+        "metadata_conflicting"
+    } else {
+        "metadata_unknown"
+    }
+}
+
+/// One retained proved-key aggregate bucket key: (instance, object,
+/// category, role, metadata_at_use) (H9 §81). The 65,536 ceiling
+/// counts these keys: operations sharing one update its counters
+/// without new slots; roles and metadata-at-use labels are separate
+/// buckets. Carries no raw handles (the object is the opaque exact
+/// observation) and no metadata values (frozen labels only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct AggKey {
     pub instance: RegistryInstanceId,
+    pub object: u64,
     pub category: &'static str,
-    pub mechanism: Option<u64>,
-    /// Positional receipts bound at the operation's start (empty =
-    /// unknown-key, with explicit evidence — never loss).
-    pub keys: Vec<KeyReceipt>,
-    pub outcome: OperationOutcome,
-    /// Start timestamp (`None` for partial rows: an end without a
-    /// start, counted — never a fabricated start).
-    pub started_ts_ns: Option<u64>,
-    pub ended_ts_ns: u64,
-    pub partial: bool,
+    pub role: &'static str,
+    pub metadata: &'static str,
+}
+
+/// One retained proved-key aggregate's counters. The row equation
+/// `started = completed + failed + cancelled + unknown + active +
+/// key_join_lost` holds before counter saturation. Buckets are
+/// never evicted: refused associations land in fixed counters, and
+/// terminal increments move within the reserved bucket.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AggCounters {
+    pub started: u64,
+    pub completed: u64,
+    pub failed: u64,
+    pub cancelled: u64,
+    pub unknown: u64,
+    pub active: u64,
+    pub key_join_lost: u64,
+}
+
+impl AggCounters {
+    fn add(&mut self, outcome: OperationOutcome) {
+        match outcome {
+            OperationOutcome::Completed => self.completed = self.completed.saturating_add(1),
+            OperationOutcome::Failed => self.failed = self.failed.saturating_add(1),
+            OperationOutcome::Cancelled => self.cancelled = self.cancelled.saturating_add(1),
+            OperationOutcome::Unknown => self.unknown = self.unknown.saturating_add(1),
+        }
+    }
+}
+
+/// One fixed unknown-key summary's counters (H9 §82): terminal
+/// outcomes partitioned once per primary operation role, plus live
+/// unknown-key activity. Fixed vocabulary — always admitted, never
+/// a positive row, never a capacity refusal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct UnknownCounters {
+    pub completed: u64,
+    pub failed: u64,
+    pub cancelled: u64,
+    pub unknown: u64,
+    pub active: u64,
+}
+
+impl UnknownCounters {
+    fn add(&mut self, outcome: OperationOutcome) {
+        match outcome {
+            OperationOutcome::Completed => self.completed = self.completed.saturating_add(1),
+            OperationOutcome::Failed => self.failed = self.failed.saturating_add(1),
+            OperationOutcome::Cancelled => self.cancelled = self.cancelled.saturating_add(1),
+            OperationOutcome::Unknown => self.unknown = self.unknown.saturating_add(1),
+        }
+    }
+
+    /// Whether any counter is nonzero: only live summaries publish.
+    pub(crate) fn is_live(&self) -> bool {
+        self.completed != 0
+            || self.failed != 0
+            || self.cancelled != 0
+            || self.unknown != 0
+            || self.active != 0
+    }
+}
+
+/// The fixed unknown-summary category vocabulary: every S1 category
+/// the reducer can observe (11 machine + 9 direct + the
+/// `operation` / `direct` / `unknown` fallbacks). Mirrors the frozen
+/// contract table; the schema contract test pins them equal.
+pub(crate) const UNKNOWN_CATEGORIES: [&str; 23] = [
+    "digest",
+    "sign",
+    "verify",
+    "encrypt",
+    "decrypt",
+    "sign_recover",
+    "verify_recover",
+    "message_encrypt",
+    "message_decrypt",
+    "message_sign",
+    "message_verify",
+    "generate_key",
+    "generate_key_pair",
+    "wrap",
+    "unwrap",
+    "derive",
+    "encapsulate",
+    "decapsulate",
+    "wrap_authenticated",
+    "unwrap_authenticated",
+    "operation",
+    "direct",
+    "unknown",
+];
+
+/// The fixed unknown-summary reason vocabulary (H9 §82). Mirrors
+/// the frozen contract table; the schema contract test pins them
+/// equal.
+pub(crate) const UNKNOWN_REASONS: [&str; 6] = [
+    "unbound",
+    "key_join_lost",
+    "metadata_unknown",
+    "metadata_conflicting",
+    "role_unavailable",
+    "not_applicable",
+];
+
+/// Fixed unknown summaries: every category × reason pair exists, so
+/// terminal increments never allocate. Index `category * 6 + reason`
+/// in the tables above.
+pub(crate) const UNKNOWN_BUCKETS: usize = 23 * 6;
+
+/// The fixed-summary index for one (category, reason) pair. Total:
+/// S1 categories and reducer reasons always land in-vocabulary (a
+/// debug assertion guards that), and anything else folds into the
+/// `unknown`/`unbound` summary rather than allocating or refusing.
+fn unknown_index(category: &str, reason: &str) -> usize {
+    let cat = UNKNOWN_CATEGORIES
+        .iter()
+        .position(|known| *known == category)
+        .unwrap_or_else(|| {
+            debug_assert!(false, "S1 categories stay within the frozen 23");
+            UNKNOWN_CATEGORIES
+                .iter()
+                .position(|known| *known == "unknown")
+                .expect("frozen fallback row")
+        });
+    let why = UNKNOWN_REASONS
+        .iter()
+        .position(|known| *known == reason)
+        .unwrap_or_else(|| {
+            debug_assert!(false, "unknown reasons stay within the frozen 6");
+            UNKNOWN_REASONS
+                .iter()
+                .position(|known| *known == "unbound")
+                .expect("frozen fallback reason")
+        });
+    cat * UNKNOWN_REASONS.len() + why
 }
 
 /// Explicit key-use evidence: association outcomes, never silent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct KeyUseEvidence {
-    /// Completed non-partial rows with no bound key (S1Only starts,
+    /// Admitted receipt-less operations at terminal (S1Only starts,
     /// unassociated starts, async starts): definite S1, unknown key.
     pub unknown_key_rows: u64,
     /// Ends observed without their start (stream splice; unreachable
-    /// from one reducer pass): partial rows, no fabricated starts.
+    /// from one reducer pass): fixed-counter outcomes, no fabricated
+    /// starts.
     pub orphan_ends: u64,
     /// Receipts outside the classified role vocabulary.
     pub unclassified_roles: u64,
@@ -579,10 +793,12 @@ pub(crate) struct KeyUseEvidence {
     /// projection's semantic coverage is PARTIAL from then on.
     pub partial: bool,
     /// Associations refused at N+1 (started or direct-completed
-    /// without a reserved slot): S1 preserved, key row omitted.
+    /// without a reserved aggregate slot): S1 preserved, key row
+    /// omitted.
     pub rows_refused: u64,
-    /// Terminals that landed without a reserved row (refused starts
-    /// and refused partials): counted, allocation-free, never rows.
+    /// Terminals that landed without a reserved bucket (refused
+    /// starts and refused directs): counted, allocation-free, never
+    /// rows.
     pub refused_terminals: u64,
     /// Receipts dropped because their category never binds keys
     /// (generation, ordinary digest, reference-only directs, KEM).
@@ -596,17 +812,49 @@ pub(crate) struct KeyUseEvidence {
     pub duplicate_starts: u64,
 }
 
-/// One open (started, unterminated) key association. Open rows are
-/// inherently bounded: one per live machine — every open
-/// corresponds to a reducer machine, and every machine end closes
-/// exactly its row.
+/// One open association's bucket: a reserved proved aggregate key
+/// or a fixed unknown-summary index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssocBucket {
+    Proved(AggKey),
+    Unknown(usize),
+}
+
+/// One open association: the bucket its terminal will close, the
+/// exact key it references (for retirement matching), whether
+/// retirement ended its join early, and whether it carries the
+/// operation's terminal partition (the primary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OpenAssoc {
+    bucket: AssocBucket,
+    key: ObjectId,
+    lost: bool,
+    primary: bool,
+}
+
+/// One receipt resolved to its bucket at admission, before any
+/// reservation: the bucket plus whether this receipt is the
+/// operation's primary (terminal partition carrier).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedAssoc {
+    bucket: AssocBucket,
+    primary: bool,
+}
+
+/// One open (started, unterminated) key association: the buckets its
+/// terminal will close. Opens are inherently bounded: one per live
+/// machine — every open corresponds to a reducer machine, and every
+/// machine end closes exactly its buckets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OpenKeyUse {
     pub instance: RegistryInstanceId,
-    pub keys: Vec<KeyReceipt>,
     pub category: &'static str,
     pub mechanism: Option<u64>,
     pub started_ts_ns: u64,
+    associations: Vec<OpenAssoc>,
+    /// Whether any receipt bound (receipt-less opens close to the
+    /// unknown-key summary with explicit evidence — never loss).
+    bound: bool,
 }
 
 /// One open association refused at full budget: no slot reserved,
@@ -619,11 +867,14 @@ pub(crate) struct RefusedOpen {
 }
 
 /// The key-use reducer (H9): joins the operation-effect stream to
-/// positional receipts into bounded, immutable rows. Row slots are
-/// reserved at start (`rows + open <= capacity` always): terminal
-/// increments move an entry from open to its reserved row and
-/// allocate no new slot. Completed history is immutable and never
-/// evicted; refused associations land in fixed counters.
+/// positional receipts into bounded aggregate buckets. Aggregate
+/// slots are reserved before admission (`aggregates.len() <=
+/// capacity` always): a start or direct needing a new bucket past
+/// the bound refuses atomically, while operations sharing retained
+/// buckets update their counters without new slots. Terminal
+/// increments move within reserved buckets and allocate nothing.
+/// Completed history is immutable and never evicted; refused
+/// associations land in fixed counters.
 ///
 /// Joins namespace the reducer-local [`OperationId`] by exact
 /// instance (H9: the operation identity is the instance/era plus the
@@ -632,9 +883,9 @@ pub(crate) struct RefusedOpen {
 pub(crate) struct KeyUseReducer {
     open: BTreeMap<(RegistryInstanceId, OperationId), OpenKeyUse>,
     refused: BTreeMap<(RegistryInstanceId, OperationId), RefusedOpen>,
-    rows: VecDeque<KeyOpRow>,
+    aggregates: BTreeMap<AggKey, AggCounters>,
+    unknown: [UnknownCounters; UNKNOWN_BUCKETS],
     capacity: usize,
-    next_seq: u64,
     evidence: KeyUseEvidence,
 }
 
@@ -643,7 +894,7 @@ impl std::fmt::Debug for KeyUseReducer {
         f.debug_struct("KeyUseReducer")
             .field("open", &self.open.len())
             .field("refused", &self.refused.len())
-            .field("rows", &self.rows.len())
+            .field("aggregates", &self.aggregates.len())
             .field("evidence", &self.evidence)
             .finish_non_exhaustive()
     }
@@ -654,21 +905,25 @@ impl KeyUseReducer {
         Self::with_capacity(KEY_OP_ROW_CAPACITY)
     }
 
-    /// A reducer with an injected row bound (N/N+1 twins): the
+    /// A reducer with an injected aggregate bound (N/N+1 twins): the
     /// production bound is [`KEY_OP_ROW_CAPACITY`].
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             open: BTreeMap::new(),
             refused: BTreeMap::new(),
-            rows: VecDeque::new(),
+            aggregates: BTreeMap::new(),
+            unknown: [UnknownCounters::default(); UNKNOWN_BUCKETS],
             capacity,
-            next_seq: 0,
             evidence: KeyUseEvidence::default(),
         }
     }
 
-    pub(crate) fn rows(&self) -> &VecDeque<KeyOpRow> {
-        &self.rows
+    pub(crate) fn aggregates(&self) -> &BTreeMap<AggKey, AggCounters> {
+        &self.aggregates
+    }
+
+    pub(crate) fn unknown_counters(&self) -> &[UnknownCounters; UNKNOWN_BUCKETS] {
+        &self.unknown
     }
 
     pub(crate) fn open(&self) -> &BTreeMap<(RegistryInstanceId, OperationId), OpenKeyUse> {
@@ -689,10 +944,11 @@ impl KeyUseReducer {
         self.evidence
     }
 
-    /// Observe one operation effect from one instance: reserve on
-    /// start (refuse at N+1, never evict), close into the reserved
-    /// row on end, complete atomically on direct. Rows freeze at
-    /// completion; terminals allocate no new slot.
+    /// Observe one operation effect from one instance: reserve
+    /// aggregate buckets on start (refuse at N+1, never evict),
+    /// close into the reserved buckets on end, complete atomically
+    /// on direct. Terminals move within reserved buckets and fixed
+    /// summaries and allocate nothing.
     pub(crate) fn observe_effect(
         &mut self,
         instance: RegistryInstanceId,
@@ -715,22 +971,39 @@ impl KeyUseReducer {
                         self.evidence.duplicate_starts.saturating_add(1);
                     return;
                 }
-                if self.rows.len().saturating_add(self.open.len()) >= self.capacity {
+                let receipts =
+                    Self::bound_receipts(category, key_receipt.iter().copied(), &mut self.evidence);
+                let resolved = Self::resolve(instance, category, &receipts);
+                if !self.admits(&resolved) {
                     self.refuse(key, instance, category, origin.ts_ns);
                     return;
+                }
+                self.open_buckets(&resolved);
+                let associations = resolved
+                    .iter()
+                    .zip(receipts.iter())
+                    .map(|(slot, receipt)| OpenAssoc {
+                        bucket: slot.bucket,
+                        key: receipt.key,
+                        lost: false,
+                        primary: slot.primary,
+                    })
+                    .collect();
+                if receipts.is_empty() {
+                    // A receipt-less open is live unknown-key S1:
+                    // active now, outcome at close.
+                    let slot = unknown_index(category, unbound_reason_for(category));
+                    self.unknown[slot].active = self.unknown[slot].active.saturating_add(1);
                 }
                 self.open.insert(
                     key,
                     OpenKeyUse {
                         instance,
-                        keys: Self::bound_receipts(
-                            category,
-                            key_receipt.iter().copied(),
-                            &mut self.evidence,
-                        ),
                         category,
                         mechanism: *mechanism,
                         started_ts_ns: origin.ts_ns,
+                        associations,
+                        bound: !receipts.is_empty(),
                     },
                 );
             }
@@ -738,85 +1011,177 @@ impl KeyUseReducer {
                 id,
                 category: _,
                 outcome,
-                origin,
+                origin: _,
             } => {
                 let key = (instance, *id);
                 if let Some(open) = self.open.remove(&key) {
-                    self.push_row(KeyOpRow {
-                        seq: 0,
-                        instance: open.instance,
-                        category: open.category,
-                        mechanism: open.mechanism,
-                        keys: open.keys,
-                        outcome: *outcome,
-                        started_ts_ns: Some(open.started_ts_ns),
-                        ended_ts_ns: origin.ts_ns,
-                        partial: false,
-                    });
+                    self.close_open(open, *outcome);
                     return;
                 }
-                if self.refused.remove(&key).is_some() {
+                if let Some(refused) = self.refused.remove(&key) {
                     // A refused start's terminal: S1 owns the
                     // outcome; the key side counts it without a row.
+                    let slot =
+                        unknown_index(refused.category, unbound_reason_for(refused.category));
+                    self.unknown[slot].active = self.unknown[slot].active.saturating_sub(1);
                     self.evidence.refused_terminals =
                         self.evidence.refused_terminals.saturating_add(1);
                     return;
                 }
+                // An end without a start: no fabricated start — the
+                // outcome lands in the fixed unknown summary, which
+                // needs no positive row and never refuses.
                 self.evidence.orphan_ends = self.evidence.orphan_ends.saturating_add(1);
-                if self.rows.len().saturating_add(self.open.len()) >= self.capacity {
-                    self.evidence.rows_refused = self.evidence.rows_refused.saturating_add(1);
-                    self.evidence.partial = true;
-                    self.evidence.refused_terminals =
-                        self.evidence.refused_terminals.saturating_add(1);
-                    return;
-                }
-                self.push_row(KeyOpRow {
-                    seq: 0,
-                    instance,
-                    category: "unknown",
-                    mechanism: None,
-                    keys: Vec::new(),
-                    outcome: *outcome,
-                    started_ts_ns: None,
-                    ended_ts_ns: origin.ts_ns,
-                    partial: true,
-                });
+                self.unknown[unknown_index("unknown", "unbound")].add(*outcome);
             }
             OperationEffect::DirectCompleted {
                 category,
-                mechanism,
                 key_receipts,
-                origin,
                 ..
             } => {
-                if self.rows.len().saturating_add(self.open.len()) >= self.capacity {
-                    self.evidence.rows_refused = self.evidence.rows_refused.saturating_add(1);
-                    self.evidence.partial = true;
-                    self.evidence.refused_terminals =
-                        self.evidence.refused_terminals.saturating_add(1);
-                    return;
-                }
-                let keys = Self::bound_receipts(
+                let receipts = Self::bound_receipts(
                     category,
                     key_receipts.iter().copied(),
                     &mut self.evidence,
                 );
-                self.push_row(KeyOpRow {
-                    seq: 0,
-                    instance,
-                    category,
-                    mechanism: *mechanism,
-                    keys,
-                    outcome: OperationOutcome::Completed,
-                    started_ts_ns: Some(origin.ts_ns),
-                    ended_ts_ns: origin.ts_ns,
-                    partial: false,
-                });
+                let resolved = Self::resolve(instance, category, &receipts);
+                if !self.admits(&resolved) {
+                    self.evidence.rows_refused = self.evidence.rows_refused.saturating_add(1);
+                    self.evidence.partial = true;
+                    self.evidence.refused_terminals =
+                        self.evidence.refused_terminals.saturating_add(1);
+                    return;
+                }
+                if receipts.is_empty() {
+                    self.evidence.unknown_key_rows =
+                        self.evidence.unknown_key_rows.saturating_add(1);
+                    let slot = unknown_index(category, unbound_reason_for(category));
+                    self.unknown[slot].add(OperationOutcome::Completed);
+                    return;
+                }
+                let mut saw_primary = false;
+                for slot in &resolved {
+                    saw_primary = saw_primary || slot.primary;
+                    match slot.bucket {
+                        AssocBucket::Proved(bucket) => {
+                            let counters = self.aggregates.entry(bucket).or_default();
+                            counters.started = counters.started.saturating_add(1);
+                            counters.add(OperationOutcome::Completed);
+                        }
+                        AssocBucket::Unknown(index) => {
+                            // The terminal partitions once, by the
+                            // primary role only.
+                            if slot.primary {
+                                self.unknown[index].add(OperationOutcome::Completed);
+                            }
+                        }
+                    }
+                }
+                if !saw_primary {
+                    // Secondary-only direct: the proved secondary
+                    // associations stand above while the missing
+                    // primary's terminal partitions unknown.
+                    let slot = unknown_index(category, unbound_reason_for(category));
+                    self.unknown[slot].add(OperationOutcome::Completed);
+                }
             }
         }
     }
 
-    /// Count one refused start: no slot, S1 untouched, PARTIAL cover.
+    /// Whether every new proved bucket in one resolution fits the
+    /// retained budget. Existing buckets update without new slots;
+    /// unknown summaries are fixed and always admit.
+    fn admits(&self, resolved: &[ResolvedAssoc]) -> bool {
+        let mut fresh = 0usize;
+        for (i, slot) in resolved.iter().enumerate() {
+            let AssocBucket::Proved(bucket) = slot.bucket else {
+                continue;
+            };
+            let seen = resolved[..i]
+                .iter()
+                .any(|earlier| earlier.bucket == AssocBucket::Proved(bucket));
+            if !seen && !self.aggregates.contains_key(&bucket) {
+                fresh = fresh.saturating_add(1);
+            }
+        }
+        self.aggregates.len().saturating_add(fresh) <= self.capacity
+    }
+
+    /// Open one admitted start's buckets: proved buckets start and
+    /// go active; unknown associations go active (their terminal
+    /// partitions once, at close).
+    fn open_buckets(&mut self, resolved: &[ResolvedAssoc]) {
+        for slot in resolved {
+            match slot.bucket {
+                AssocBucket::Proved(bucket) => {
+                    let counters = self.aggregates.entry(bucket).or_default();
+                    counters.started = counters.started.saturating_add(1);
+                    counters.active = counters.active.saturating_add(1);
+                }
+                AssocBucket::Unknown(index) => {
+                    self.unknown[index].active = self.unknown[index].active.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    /// Close one open's buckets at its terminal: live proved buckets
+    /// take the outcome, retired ones close `key_join_lost`, and the
+    /// terminal partitions once to the unknown summary unless a live
+    /// proved primary already counted it. Allocation-free: reserved
+    /// buckets and fixed summaries only.
+    fn close_open(&mut self, open: OpenKeyUse, outcome: OperationOutcome) {
+        if !open.bound {
+            self.evidence.unknown_key_rows = self.evidence.unknown_key_rows.saturating_add(1);
+            let slot = unknown_index(open.category, unbound_reason_for(open.category));
+            self.unknown[slot].active = self.unknown[slot].active.saturating_sub(1);
+            self.unknown[slot].add(outcome);
+            return;
+        }
+        let mut saw_primary = false;
+        for assoc in open.associations {
+            saw_primary = saw_primary || assoc.primary;
+            match assoc.bucket {
+                AssocBucket::Proved(bucket) => {
+                    let counters = self
+                        .aggregates
+                        .get_mut(&bucket)
+                        .expect("admission reserved every proved bucket");
+                    counters.active = counters.active.saturating_sub(1);
+                    if assoc.lost {
+                        counters.key_join_lost = counters.key_join_lost.saturating_add(1);
+                    } else {
+                        counters.add(outcome);
+                    }
+                }
+                AssocBucket::Unknown(index) => {
+                    self.unknown[index].active = self.unknown[index].active.saturating_sub(1);
+                    if assoc.primary && !assoc.lost {
+                        self.unknown[index].add(outcome);
+                    }
+                }
+            }
+            if assoc.primary && assoc.lost {
+                // A retired primary's S1 terminal routes once to the
+                // unknown-key summary; its proved bucket already
+                // closed `key_join_lost` above.
+                self.unknown[unknown_index(open.category, "key_join_lost")].add(outcome);
+            }
+        }
+        if !saw_primary {
+            // A secondary-only operation has no primary: its proved
+            // secondary associations stand above while the missing
+            // primary's terminal partitions unknown (never a
+            // promotion of the secondary).
+            let slot = unknown_index(open.category, unbound_reason_for(open.category));
+            self.unknown[slot].add(outcome);
+        }
+    }
+
+    /// Count one refused start: no bucket, S1 untouched, PARTIAL
+    /// cover. The refused open stays tracked (bounded by live
+    /// machines) so its terminal lands counted; its live S1 shows in
+    /// the fixed unknown summary.
     fn refuse(
         &mut self,
         key: (RegistryInstanceId, OperationId),
@@ -832,6 +1197,8 @@ impl KeyUseReducer {
                 started_ts_ns,
             },
         );
+        let slot = unknown_index(category, unbound_reason_for(category));
+        self.unknown[slot].active = self.unknown[slot].active.saturating_add(1);
         self.evidence.rows_refused = self.evidence.rows_refused.saturating_add(1);
         self.evidence.partial = true;
     }
@@ -856,20 +1223,41 @@ impl KeyUseReducer {
         Vec::new()
     }
 
-    /// Freeze one completed row with the next sequence. The caller
-    /// reserved the slot (start reservation or direct admission):
-    /// history is never evicted for a new row.
-    fn push_row(&mut self, mut row: KeyOpRow) {
-        row.seq = self.next_seq;
-        self.next_seq = self.next_seq.saturating_add(1);
-        if !row.partial && row.keys.is_empty() {
-            self.evidence.unknown_key_rows = self.evidence.unknown_key_rows.saturating_add(1);
-        }
-        debug_assert!(
-            self.rows.len().saturating_add(self.open.len()) < self.capacity,
-            "rows are pushed only into reserved slots"
-        );
-        self.rows.push_back(row);
+    /// Resolve one operation's bound receipts to their buckets:
+    /// usable receipts to proved aggregate keys, unusable ones to
+    /// fixed unknown summaries. The primary (first non-secondary
+    /// receipt — `wrapped_object` is secondary, H9 §82) carries the
+    /// terminal's partition; a secondary-only operation has no
+    /// primary, so its terminal partitions unknown while its proved
+    /// secondary associations stand.
+    fn resolve(
+        instance: RegistryInstanceId,
+        category: &'static str,
+        receipts: &[KeyReceipt],
+    ) -> Vec<ResolvedAssoc> {
+        let primary = receipts
+            .iter()
+            .position(|receipt| receipt.role != KeyRole::WrappedKey);
+        receipts
+            .iter()
+            .enumerate()
+            .map(|(index, receipt)| {
+                let bucket = match usable_label(receipt) {
+                    Some(label) => AssocBucket::Proved(AggKey {
+                        instance,
+                        object: receipt.key.as_u64(),
+                        category,
+                        role: role_label(receipt.role),
+                        metadata: label,
+                    }),
+                    None => AssocBucket::Unknown(unknown_index(category, metadata_reason(receipt))),
+                };
+                ResolvedAssoc {
+                    bucket,
+                    primary: Some(index) == primary,
+                }
+            })
+            .collect()
     }
 
     /// End every active association on one object before its S1
@@ -877,9 +1265,9 @@ impl KeyUseReducer {
     /// still lands later through the ordinary path.
     pub(crate) fn retire_object(&mut self, object: ObjectId) {
         for open in self.open.values_mut() {
-            for receipt in &mut open.keys {
-                if receipt.key == object && !receipt.lost {
-                    receipt.lost = true;
+            for assoc in &mut open.associations {
+                if assoc.key == object && !assoc.lost {
+                    assoc.lost = true;
                     self.evidence.join_lost = self.evidence.join_lost.saturating_add(1);
                 }
             }
@@ -890,15 +1278,15 @@ impl KeyUseReducer {
     /// to one ended session (domain/session loss, H9 §66).
     pub(crate) fn retire_session(&mut self, session: SessionIncarnation, model: &ObjectSemantics) {
         for open in self.open.values_mut() {
-            for receipt in &mut open.keys {
-                if receipt.lost {
+            for assoc in &mut open.associations {
+                if assoc.lost {
                     continue;
                 }
                 let ended = model
-                    .receipt_snapshot(receipt.key)
+                    .receipt_snapshot(assoc.key)
                     .is_some_and(|snapshot| snapshot.session == session);
                 if ended {
-                    receipt.lost = true;
+                    assoc.lost = true;
                     self.evidence.join_lost = self.evidence.join_lost.saturating_add(1);
                 }
             }

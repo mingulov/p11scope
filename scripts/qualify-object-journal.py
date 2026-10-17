@@ -48,6 +48,21 @@ DEADLINE_SECONDS = 90
 READY_SECONDS = 10
 KEY_SENTINEL = "PRIVATE-KEY-MATERIAL"
 PROGRESS_FLOOD_CAP = 65536
+# Tolerance past the declared workload's exact population: a perfect
+# provider streams exactly rate*duration progress lines (one per
+# observation), so anything past the cap is flood or duplication. The
+# slack cannot pass a bad run — the exact population rule still
+# decides — and small workloads keep the fixed floor.
+FLOOD_SLACK = 1024
+
+
+def flood_cap_for(rate, duration):
+    """The workload-specific progress bound: the fixed floor, or the
+    declared workload's exact population plus tolerance, whichever is
+    larger. Every declared profile's population fits under it (N16);
+    anything past it is still a flood, and the owned-child deadline
+    still bounds wall time independently."""
+    return max(PROGRESS_FLOOD_CAP, rate * duration + FLOOD_SLACK)
 
 
 def fail(message):
@@ -283,26 +298,48 @@ def compare(observed, ledger, observed_raw, ledger_raw, run=None):
             f"INVOCATION_COUNT_MISMATCH: observed {len(got_calls)} calls, "
             f"ledger holds {len(want_calls)}"
         )
-    # Duplicate observed identities reject explicitly (equality-based:
-    # unhashable hostile fields still compare, never crash the oracle).
-    seen_seqs = []
+    # Duplicate observed identities reject explicitly. Hashable
+    # identities compare through a set (linear time, so declared
+    # workload populations stay feasible — N16); unhashable hostile
+    # fields still compare exactly through a side list, never crash
+    # the oracle. Verdicts match the old equality scan for every JSON
+    # value (set membership and list membership agree on ==).
+    seen_seqs = set()
+    stray_seqs = []
     for call in got_calls:
         seq = call.get("seq") if isinstance(call, dict) else None
-        if seq in seen_seqs:
-            reasons.append(
-                f"DUPLICATE_INVOCATION: observed invocations repeat seq {seq!r}"
-            )
-            break
-        seen_seqs.append(seq)
-    seen_ordinals = []
+        try:
+            if seq in seen_seqs:
+                reasons.append(
+                    f"DUPLICATE_INVOCATION: observed invocations repeat seq {seq!r}"
+                )
+                break
+            seen_seqs.add(seq)
+        except TypeError:
+            if seq in stray_seqs:
+                reasons.append(
+                    f"DUPLICATE_INVOCATION: observed invocations repeat seq {seq!r}"
+                )
+                break
+            stray_seqs.append(seq)
+    seen_ordinals = set()
+    stray_ordinals = []
     for record in got_records:
         ordinal = record.get("ordinal") if isinstance(record, dict) else None
-        if ordinal in seen_ordinals:
-            reasons.append(
-                f"DUPLICATE_RECORD: observed journal records repeat ordinal {ordinal!r}"
-            )
-            break
-        seen_ordinals.append(ordinal)
+        try:
+            if ordinal in seen_ordinals:
+                reasons.append(
+                    f"DUPLICATE_RECORD: observed journal records repeat ordinal {ordinal!r}"
+                )
+                break
+            seen_ordinals.add(ordinal)
+        except TypeError:
+            if ordinal in stray_ordinals:
+                reasons.append(
+                    f"DUPLICATE_RECORD: observed journal records repeat ordinal {ordinal!r}"
+                )
+                break
+            stray_ordinals.append(ordinal)
     for want, got in zip(want_calls, got_calls):
         if not isinstance(got, dict):
             reasons.append(f"INVOCATION_MISMATCH seq={want.get('seq')}: not an object")
@@ -553,11 +590,12 @@ def run_profile(args):
     os.set_blocking(ack_fd, False)
     go_at = time.monotonic()
     deadline_at = go_at + deadline
+    flood_cap = flood_cap_for(rate, duration)
     arrivals = []
     ack_dead = False
     flooded = False
     while True:
-        if len(arrivals) >= PROGRESS_FLOOD_CAP:
+        if len(arrivals) >= flood_cap:
             flooded = True
             break
         try:
@@ -584,9 +622,7 @@ def run_profile(args):
     if flooded:
         child.kill()
         child.communicate()
-        print(
-            f"harness: progress flood over {PROGRESS_FLOOD_CAP} lines", file=sys.stderr
-        )
+        print(f"harness: progress flood over {flood_cap} lines", file=sys.stderr)
         return 3
     if buf:
         # A dangling fragment without its newline is malformed progress,

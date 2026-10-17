@@ -4350,6 +4350,113 @@ fn key_operation_emitter_tracking_bounded_across_object_churn() {
     assert!(peak <= 2, "tracking never accumulates churn: peak {peak}");
 }
 
+/// N6: key history pins its object records inline. Under a
+/// 1-object cap, retiring the key-used object then admitting a
+/// newcomer must REFUSE the newcomer visibly (ObjectCapacity) while
+/// the proved row still names the original — never prune the
+/// referent and paper over it with a gap entry.
+#[test]
+fn key_operation_pinned_key_object_refuses_newcomer() {
+    use crate::semantics_objects::{ObjectGap, ObjectLimits};
+
+    const OTHER_KEY: u64 = 0xB3B3_B3B3_B3B3_B3B3;
+    let mut scene = JointScene::new();
+    scene.model = ObjectSemantics::with_limits(ObjectLimits {
+        views_per_instance: 1,
+        object_records: 1,
+        ..ObjectLimits::policy()
+    });
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+
+    // Lifetime 1: create, label, key-use (pins the record),
+    // destroy (retires it but the proved row still names it).
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            input0: Some((CREATED_KEY, 1)),
+            getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+            ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+        },
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let id1 = scene.model.project().objects[0].id;
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_DestroyObject", CkRv::OK.0, 0, 0),
+    );
+    // Lifetime 2: the newcomer must refuse, visibly.
+    let mut second = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
+    second.result = Some(OTHER_KEY);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &second,
+    );
+    let projected = scene.model.project();
+    assert!(
+        projected.gap(ObjectGap::ObjectCapacity) >= 1,
+        "the newcomer refuses visibly while the pin holds"
+    );
+    assert!(
+        projected.object(id1).is_some(),
+        "the pinned original stays retained"
+    );
+    assert_eq!(projected.objects.len(), 1);
+    let committed = commit(11, &[&staging], &projected, &keyuse);
+    assert!(
+        committed
+            .key_operations
+            .iter()
+            .any(|row| row.object == id1.as_u64()),
+        "the proved row still names its retained referent"
+    );
+    assert!(
+        !committed
+            .gaps
+            .iter()
+            .any(|gap| gap.reason == "pruned_object_referenced"),
+        "a retained referent never dangles"
+    );
+}
+
 /// H9-§3: the frozen contract. Rendered sections carry exactly the
 /// frozen keys and enums (pinned key-for-key against the schema file
 /// and the golden); row equations, sort orders and the no-started
@@ -4979,8 +5086,12 @@ fn key_operation_schema_contract() {
             .any(|gap| gap.reason == "pruned_object_referenced"),
         "live objects never dangle"
     );
-    // History is immutable: against a model that pruned the object
-    // the proved row stays and the dangle is explicit, never silent.
+    // The pruned-reference tripwire is defensive-only: through the
+    // model a proved bucket's referent is pinned (N6), so a real
+    // commit never dangles — but an inconsistent embedding that
+    // commits proved history against a model missing the referent
+    // still renders the row (history is immutable) and fires the
+    // tripwire loudly, never silently.
     let pruned_model = JointScene::new().model.project();
     assert!(pruned_model.objects.is_empty());
     let pruned_commit = commit(10, &[&tiny_staging], &pruned_model, &shape_keyuse);
@@ -4989,14 +5100,14 @@ fn key_operation_schema_contract() {
         1,
         "the proved row stays"
     );
-    let dangle = pruned_commit
+    let tripwire = pruned_commit
         .gaps
         .iter()
         .find(|gap| gap.reason == "pruned_object_referenced")
-        .expect("the dangle is explicit");
-    assert_eq!(dangle.subject, "key_operation");
+        .expect("the inconsistent embedding trips the wire");
+    assert_eq!(tripwire.subject, "key_operation");
     assert_eq!(
-        dangle.repeats, 1,
+        tripwire.repeats, 1,
         "only proved buckets retain object references; unknown summaries count outcomes"
     );
 

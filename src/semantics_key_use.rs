@@ -841,6 +841,15 @@ struct ResolvedAssoc {
     primary: bool,
 }
 
+impl ResolvedAssoc {
+    /// Padding for the stack resolution batch: never read (the batch
+    /// length guards every access).
+    const NONE: Self = Self {
+        bucket: AssocBucket::Unknown(usize::MAX),
+        primary: false,
+    };
+}
+
 /// One open (started, unterminated) key association: the buckets its
 /// terminal will close. Opens are inherently bounded: one per live
 /// machine — every open corresponds to a reducer machine, and every
@@ -972,13 +981,14 @@ impl KeyUseReducer {
                     return;
                 }
                 let receipts =
-                    Self::bound_receipts(category, key_receipt.iter().copied(), &mut self.evidence);
-                let resolved = Self::resolve(instance, category, &receipts);
-                if !self.admits(&resolved) {
+                    Self::bound_slice(category, key_receipt.as_slice(), &mut self.evidence);
+                let (slots, len) = Self::resolve(instance, category, receipts);
+                let resolved = &slots[..len];
+                if !self.admits(resolved) {
                     self.refuse(key, instance, category, origin.ts_ns);
                     return;
                 }
-                self.open_buckets(&resolved);
+                self.open_buckets(resolved);
                 let associations = resolved
                     .iter()
                     .zip(receipts.iter())
@@ -1041,13 +1051,11 @@ impl KeyUseReducer {
                 key_receipts,
                 ..
             } => {
-                let receipts = Self::bound_receipts(
-                    category,
-                    key_receipts.iter().copied(),
-                    &mut self.evidence,
-                );
-                let resolved = Self::resolve(instance, category, &receipts);
-                if !self.admits(&resolved) {
+                let receipts =
+                    Self::bound_slice(category, key_receipts.as_slice(), &mut self.evidence);
+                let (slots, len) = Self::resolve(instance, category, receipts);
+                let resolved = &slots[..len];
+                if !self.admits(resolved) {
                     // A refused direct's terminal outcome (directs
                     // complete atomically) preserves into the fixed
                     // unknown summary — never a positive row.
@@ -1067,7 +1075,7 @@ impl KeyUseReducer {
                     return;
                 }
                 let mut saw_primary = false;
-                for slot in &resolved {
+                for slot in resolved {
                     saw_primary = saw_primary || slot.primary;
                     match slot.bucket {
                         AssocBucket::Proved(bucket) => {
@@ -1214,20 +1222,29 @@ impl KeyUseReducer {
     /// generation/digest/reference-only/KEM categories drop them
     /// with evidence (their key side is `not_applicable` or
     /// `role_unavailable`, never a fabricated association).
-    fn bound_receipts(
+    /// Borrows the effect's slice (S1 emits at most two receipts per
+    /// effect), so even refused terminals allocate nothing.
+    fn bound_slice<'a>(
         category: &str,
-        receipts: impl Iterator<Item = KeyReceipt>,
+        receipts: &'a [KeyReceipt],
         evidence: &mut KeyUseEvidence,
-    ) -> Vec<KeyReceipt> {
-        if binds_keys(category) {
-            return receipts.collect();
+    ) -> &'a [KeyReceipt] {
+        if !binds_keys(category) {
+            evidence.dropped_receipts = evidence
+                .dropped_receipts
+                .saturating_add(receipts.len() as u64);
+            return &[];
         }
-        let mut dropped = 0u64;
-        for _ in receipts {
-            dropped = dropped.saturating_add(1);
+        if receipts.len() > 2 {
+            // Unreachable: S1 emits at most two receipts per effect
+            // (asserted at emission) — counted loudly if it ever does.
+            debug_assert!(false, "at most two receipts per effect");
+            evidence.dropped_receipts = evidence
+                .dropped_receipts
+                .saturating_add(receipts.len().saturating_sub(2) as u64);
+            return &receipts[..2];
         }
-        evidence.dropped_receipts = evidence.dropped_receipts.saturating_add(dropped);
-        Vec::new()
+        receipts
     }
 
     /// Resolve one operation's bound receipts to their buckets:
@@ -1236,35 +1253,38 @@ impl KeyUseReducer {
     /// receipt — `wrapped_object` is secondary, H9 §82) carries the
     /// terminal's partition; a secondary-only operation has no
     /// primary, so its terminal partitions unknown while its proved
-    /// secondary associations stand.
+    /// secondary associations stand. Stack-held (at most two
+    /// receipts per effect), so even refused terminals allocate
+    /// nothing.
     fn resolve(
         instance: RegistryInstanceId,
         category: &'static str,
         receipts: &[KeyReceipt],
-    ) -> Vec<ResolvedAssoc> {
+    ) -> ([ResolvedAssoc; 2], usize) {
+        debug_assert!(receipts.len() <= 2, "bound_slice truncates first");
         let primary = receipts
             .iter()
             .position(|receipt| receipt.role != KeyRole::WrappedKey);
-        receipts
-            .iter()
-            .enumerate()
-            .map(|(index, receipt)| {
-                let bucket = match usable_label(receipt) {
-                    Some(label) => AssocBucket::Proved(AggKey {
-                        instance,
-                        object: receipt.key.as_u64(),
-                        category,
-                        role: role_label(receipt.role),
-                        metadata: label,
-                    }),
-                    None => AssocBucket::Unknown(unknown_index(category, metadata_reason(receipt))),
-                };
-                ResolvedAssoc {
-                    bucket,
-                    primary: Some(index) == primary,
-                }
-            })
-            .collect()
+        let mut slots = [ResolvedAssoc::NONE; 2];
+        let mut len = 0usize;
+        for (index, receipt) in receipts.iter().enumerate().take(slots.len()) {
+            let bucket = match usable_label(receipt) {
+                Some(label) => AssocBucket::Proved(AggKey {
+                    instance,
+                    object: receipt.key.as_u64(),
+                    category,
+                    role: role_label(receipt.role),
+                    metadata: label,
+                }),
+                None => AssocBucket::Unknown(unknown_index(category, metadata_reason(receipt))),
+            };
+            slots[len] = ResolvedAssoc {
+                bucket,
+                primary: Some(index) == primary,
+            };
+            len += 1;
+        }
+        (slots, len)
     }
 
     /// End every active association on one object before its S1

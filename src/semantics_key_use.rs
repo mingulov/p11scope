@@ -968,7 +968,7 @@ impl KeyUseReducer {
         let name = pkcs11_module::function_name(usize::try_from(function).unwrap_or(usize::MAX));
         let action = p11scope_ebpf_common::object_policy::object_descriptor(function)
             .map(|descriptor| descriptor.action);
-        let role = match (name, action, ordinal) {
+        match (name, action, ordinal) {
             (Some("C_WrapKey"), _, 0) => KeyRole::WrappingKey,
             (Some("C_WrapKey"), _, 1) => KeyRole::WrappedKey,
             (Some("C_DeriveKey"), _, _) => KeyRole::BaseKey,
@@ -981,8 +981,7 @@ impl KeyUseReducer {
                     self.evidence.unclassified_roles.saturating_add(1);
                 KeyRole::Other
             }
-        };
-        role
+        }
     }
 }
 

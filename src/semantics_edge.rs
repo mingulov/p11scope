@@ -1422,6 +1422,7 @@ impl EdgeSemantics {
     /// wrapping or recycling an identity. `key_receipt` fixes the
     /// machine's receipt for its life (`None` for S1Only/unassociated
     /// starts).
+    #[allow(clippy::too_many_arguments)] // Exact machine identity: session/bit/category/mechanism/receipt plus origin/sink.
     fn start_machine<S: OperationSink>(
         &mut self,
         session: u64,
@@ -2098,7 +2099,7 @@ impl EdgeSemantics {
                     *bit,
                     Self::category_name(*bit),
                     EndState::Unknown,
-                    &effect_origin,
+                    effect_origin,
                     sink,
                 );
             }

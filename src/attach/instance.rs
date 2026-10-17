@@ -792,6 +792,12 @@ pub(crate) enum BirthObservationRefusal {
     /// The real router refused the appearance (already observed at
     /// these epochs, stale era, retired): no accepted mapping.
     AppearanceRejected,
+    /// The negative witness is not current and consistent with the
+    /// appearance: its retained publication fence is not the
+    /// router's current fence, or the appearance's fence is not the
+    /// negative's. An absence witness must not bridge a gap that
+    /// invalidated its authority; the positive stays withheld.
+    NegativeFenceMismatch,
 }
 
 /// Shared birth producers: the admitted domain and image, the
@@ -959,6 +965,20 @@ pub(crate) fn observe_absence_birth(
     let after = appearance.epochs();
     if (after.local, after.global) <= (before.local, before.global) {
         return Err(BirthObservationRefusal::AppearanceNotAdvanced);
+    }
+    // N15: the negative's retained publication fence must be CURRENT
+    // (the router's live fence, read here — never a cached value)
+    // and CONSISTENT with the appearance before the positive
+    // publishes. The router validates only the appearance it
+    // receives, so without this an absence witness sealed before a
+    // fault-era gap would bridge the gap beside a fresh appearance.
+    // Outstanding negatives therefore never survive a gap/void
+    // transition: any take after the fence moved refuses here, and
+    // the single-shot take consumes the pair, so no later take can
+    // recover bootstrap through ordinary S1 recovery (H8:117). The
+    // positive stays withheld: this fires before the router join.
+    if absence.fence() != router.fence() || appearance.fence() != absence.fence() {
+        return Err(BirthObservationRefusal::NegativeFenceMismatch);
     }
     // The negative committed: the appearance must join as a
     // genuinely new observation. Anything else refuses.

@@ -272,7 +272,7 @@ pub(crate) struct KeyReceipt {
     pub key: crate::semantics_objects::ObjectId,
     /// Catalog id of the referencing call.
     pub function: u32,
-    /// Input ordinal within the call (model emission order).
+    /// Input ordinal within the call (minted at the qualified join).
     pub input: u8,
     /// The input's role.
     pub role: KeyRole,

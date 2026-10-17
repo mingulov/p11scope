@@ -2183,12 +2183,11 @@ pub(crate) fn finish_output(
     let event_requested = stream.writer.is_some() || stream.first_error().is_some();
     stream.attempt("completion", |writer| {
         // Exact repeat counts, then the final combined sweep of physical
-        // edges plus both instance kinds, then ended: preserve healthy
-        // ordering and the sweep's retention reservation. The instance
-        // rows join before retention settles, so appending semantic rows
-        // can never silently evict a retained physical final row: an
+        // edges plus both instance kinds plus key-operation rows, then
+        // ended: preserve healthy ordering and the sweep's retention
+        // reservation. Every kind joins before retention settles, so an
         // eviction is either repaired by the combined dump or disclosed
-        // in the exact unretained counts.
+        // in the exact unretained counts — never silent for any kind.
         stream_state
             .gaps
             .emit(writer, &presentation.gaps, true, presentation.ended_ns)?;
@@ -2225,8 +2224,14 @@ pub(crate) fn finish_output(
                 .sweep_exact(writer, &published, presentation.ended_ns)?;
         writer.reserve(tail)?;
         let mut estimate = combined_unretained_after(stream_state, writer, presentation, tail);
-        if estimate.0 + estimate.1 + estimate.2 > 0
-            && combined_dump_fits(&stream_state.edges, &stream_state.instances, writer, tail)
+        if estimate.0 + estimate.1 + estimate.2 + estimate.3 > 0
+            && combined_dump_fits(
+                &stream_state.edges,
+                &stream_state.instances,
+                &stream_state.key_operations,
+                writer,
+                tail,
+            )
         {
             stream_state.edges.dump_all(
                 writer,
@@ -2242,6 +2247,9 @@ pub(crate) fn finish_output(
                 presentation.budgets.instances_limit,
                 presentation.ended_ns,
             )?;
+            stream_state
+                .key_operations
+                .dump_all(writer, &published, presentation.ended_ns)?;
             // No second reserve: the fit bound already holds the tail.
             estimate = combined_unretained_after(stream_state, writer, presentation, tail);
         }
@@ -2252,11 +2260,12 @@ pub(crate) fn finish_output(
         let (_, payload) = settle_ended_combined(
             &stream_state.edges,
             &stream_state.instances,
+            &stream_state.key_operations,
             writer,
             presentation,
             estimate,
             presentation.ended_ns,
-            |(edges_unretained, instances_unretained, semantic_unretained)| {
+            |(edges_unretained, instances_unretained, semantic_unretained, key_unretained)| {
                 let mut payload = ended_payload(presentation, presentation.ended_ns, writer);
                 payload["edge_events"] = edge_events.into();
                 payload["edges_unretained"] = edges_unretained.into();
@@ -2265,6 +2274,7 @@ pub(crate) fn finish_output(
                 payload["semantic_edge_events"] = semantic_edge_events.into();
                 payload["semantic_edges_unretained"] = semantic_unretained.into();
                 payload["key_operation_events"] = key_operation_events.into();
+                payload["key_operations_unretained"] = key_unretained.into();
                 payload
             },
         );
@@ -2359,15 +2369,15 @@ fn finish_runtime_output<Source: ProcessSource>(
     outcome
 }
 
-/// All three kinds' rows whose last record will not be retained
+/// All four kinds' rows whose last record will not be retained
 /// once the `tail` bytes still to come are written: `(physical edges,
-/// instances, semantic edges)`.
+/// instances, semantic edges, key-operation rows)`.
 fn combined_unretained_after(
     stream_state: &StreamState,
     writer: &EventWriter,
     presentation: &Presentation,
     tail: u64,
-) -> (usize, usize, usize) {
+) -> (usize, usize, usize, usize) {
     let edges_unretained = stream_state
         .edges
         .unretained_after(writer, &presentation.edges, tail);
@@ -2377,7 +2387,17 @@ fn combined_unretained_after(
         &presentation.semantic_edges,
         tail,
     );
-    (edges_unretained, instances_unretained, semantic_unretained)
+    let key_unretained = stream_state.key_operations.unretained_after(
+        writer,
+        &presentation.object_observations,
+        tail,
+    );
+    (
+        edges_unretained,
+        instances_unretained,
+        semantic_unretained,
+        key_unretained,
+    )
 }
 
 /// Bytes the `ended` line may take: its payload as measured now plus
@@ -2390,6 +2410,8 @@ fn ended_tail(presentation: &Presentation, writer: &EventWriter) -> u64 {
     payload["instances_unretained"] = u64::MAX.into();
     payload["semantic_edge_events"] = u64::MAX.into();
     payload["semantic_edges_unretained"] = u64::MAX.into();
+    payload["key_operation_events"] = u64::MAX.into();
+    payload["key_operations_unretained"] = u64::MAX.into();
     (payload.to_string().len() as u64).saturating_add(crate::inventory_events::ENDED_TAIL_SLACK)
 }
 

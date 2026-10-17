@@ -3210,6 +3210,12 @@ impl CallerRegistry {
                 observer.as_mut().expect("enabled count observer")(count);
             }
         }
+        // Ledger-bearing publishes settle pended staging releases
+        // (C4/C5 loss and ledger-less fallback disposal) before
+        // publication; plain publishes leave them pended.
+        if let Some(ledger) = ledger.as_deref_mut() {
+            self.flush_staging_releases(ledger);
+        }
         self.reconcile_initial_semantic_coverage();
         self.facts_revision = self.facts_revision.saturating_add(1);
         self.published_revision = self.facts_revision;

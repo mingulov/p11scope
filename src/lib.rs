@@ -106,6 +106,8 @@ pub static EBPF_INVENTORY_CALLERS_OBJECT: &[u8] =
 
 pub(crate) mod history;
 #[cfg(test)]
+mod key_operation_tests;
+#[cfg(test)]
 mod s1_tests;
 #[cfg(test)]
 mod s2s3_tests;

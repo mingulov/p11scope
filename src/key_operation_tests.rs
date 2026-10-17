@@ -5840,8 +5840,9 @@ fn run_rsa_ledger() -> Vec<serde_json::Value> {
 
 /// Replay one ledger call through the edge in ledger order:
 /// mechanisms from the fixture's fixed SHA256-RSA header shape,
-/// returns verbatim, the null-output size query without its output
-/// bit (phase-known). Returns the call's fresh S1 effects.
+/// returns verbatim, the null-output size query with OUTPUT_NULL
+/// (phase-known) so it retains its machine. Returns the call's
+/// fresh S1 effects.
 fn replay_ledger_call(
     edge: &mut EdgeSemantics,
     sink: &mut Vec<OperationEffect>,
@@ -5862,11 +5863,43 @@ fn replay_ledger_call(
         facts.rv = rv;
         facts.mechanism = 0;
         if phase == "query" {
-            facts.capture = capture::MECHANISM_NONE;
+            // The null-output size query: OUTPUT_NULL retains the
+            // machine (a bare MECHANISM_NONE clears the output field
+            // and falsely completes on the query).
+            facts.capture = capture::MECHANISM_NONE | capture::OUTPUT_NULL;
         }
         facts
     };
     feed(edge, sink, &facts)
+}
+
+/// N12: the null-output size query retains its machine — no
+/// completion on the query; the later real terminal completes it.
+#[test]
+fn key_operation_size_query_stays_active() {
+    let init_call =
+        serde_json::json!({"fn": "C_SignInit", "rv": 0, "start_ns": 100, "phase": "init"});
+    let query = serde_json::json!({"fn": "C_Sign", "rv": 0, "start_ns": 200, "phase": "query"});
+    let terminal =
+        serde_json::json!({"fn": "C_Sign", "rv": 0, "start_ns": 300, "phase": "terminal"});
+    let mut edge = EdgeSemantics::default();
+    let mut sink = Vec::new();
+    assert_eq!(
+        replay_ledger_call(&mut edge, &mut sink, &init_call).len(),
+        1
+    );
+    assert!(
+        replay_ledger_call(&mut edge, &mut sink, &query).is_empty(),
+        "no completion on the size query"
+    );
+    assert_eq!((edge.started(), edge.completed(), edge.failed()), (1, 0, 0));
+    assert_eq!(
+        replay_ledger_call(&mut edge, &mut sink, &terminal).len(),
+        1,
+        "the one real terminal lands"
+    );
+    assert_eq!((edge.started(), edge.completed(), edge.failed()), (1, 1, 0));
+    assert_eq!(edge.orphans(), 0);
 }
 
 /// H9-§4: the installed RSA ledger is the reference population. The
@@ -5940,8 +5973,8 @@ fn key_operation_rsa_ledger_reference() {
 
     // Every real call replays through S1Only reduction in ledger
     // order: mechanisms from the ledger's fixed SHA256-RSA header
-    // shape, returns verbatim, the null-output size query without
-    // its output bit (phase-known). Non-operation calls must emit
+    // shape, returns verbatim, the null-output size query with
+    // OUTPUT_NULL (phase-known). Non-operation calls must emit
     // nothing: any S1 misclassification fails here, not silently.
     let instance =
         crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(7);
@@ -5954,19 +5987,16 @@ fn key_operation_rsa_ledger_reference() {
         let fresh = replay_ledger_call(&mut edge, &mut sink, call);
         // Exact S1 emission per phase: inits start; the first OK
         // sign/verify/final after its init ends the machine;
-        // continuations emit nothing; the size-query completion
-        // orphans op 1's retry + terminal (counted, never joined).
-        let number = call["operation"].as_u64().unwrap();
+        // queries, retries, updates and too-small replies retain
+        // the machine and emit nothing; every terminal lands once.
         let expected = if name == "C_GenerateKeyPair" {
             1
         } else if !name.starts_with("C_Sign") && !name.starts_with("C_Verify") {
             0
         } else {
             match phase {
-                "init" | "query" => 1,
-                "update" | "too_small" => 0,
-                "terminal" if number == 1 => 0,
-                "terminal" => 1,
+                "init" | "terminal" => 1,
+                "query" | "update" | "too_small" => 0,
                 other => panic!("unknown ledger phase {other}"),
             }
         };
@@ -5981,8 +6011,8 @@ fn key_operation_rsa_ledger_reference() {
     );
     assert_eq!(
         edge.orphans(),
-        2,
-        "query completion orphans the retry + terminal"
+        0,
+        "no false completion strands the retry or the terminal"
     );
 
     let s1only = JointStaging::select_s1_only();

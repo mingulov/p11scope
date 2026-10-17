@@ -8740,6 +8740,18 @@ mod tests {
         ranges: Vec<crate::discovery::instances::MapRange>,
         fence: u64,
     ) -> crate::attach::image_query::ImageScanProof {
+        scan_proof_at_fault(domain, cookie, file_slot, local, ranges, fence, 0)
+    }
+
+    fn scan_proof_at_fault(
+        domain: NativeDomainId,
+        cookie: u64,
+        file_slot: u32,
+        local: u64,
+        ranges: Vec<crate::discovery::instances::MapRange>,
+        fence: u64,
+        fault: u64,
+    ) -> crate::attach::image_query::ImageScanProof {
         crate::attach::image_query::acquire_test_scan(
             domain,
             ImageIdentity {
@@ -8750,7 +8762,7 @@ mod tests {
             crate::attach::image_query::CompleteEpochs {
                 local,
                 global: 0,
-                fault: 0,
+                fault,
                 sticky: 0,
                 record_flags: 0,
             },
@@ -9522,6 +9534,181 @@ mod tests {
             &admitted,
         )
         .expect("the withheld appearance births once the negative commits");
+    }
+
+    #[test]
+    fn object_journal_session_absence_birth_refuses_stale_fence_pair() {
+        // N15: a negative witness sealed under an old publication
+        // fence cannot birth against a router that has advanced past
+        // it, even beside a fresh appearance — the pair must be
+        // current and consistent before the positive publishes, with
+        // zero router joins on refusal. A fresh pair at the new fence
+        // still births (no over-refusal).
+        use crate::attach::{BirthObservationRefusal, observe_absence_birth};
+
+        let publisher = NativePublisher::build();
+        let mut scene = Scene::new(image_default());
+        let admitted = scene.fixture.admit();
+        scene.adapter.attest_key(&admitted).expect("key attests");
+        let (domain, _, _, _) = admitted.journal_binding();
+        let full = scan_ranges_full();
+        let closure = scene.closure_generation();
+        let (row, control, _) = publisher.publish(&["0", "0", "0", "0", "1"]);
+        // The reviewer probe shape: a stale-fence negative (fence 0)
+        // beside a fresh appearance the advanced router would join as
+        // New (fence 1, fault 1). Pre-fix this births; post-fix it
+        // refuses before the positive publishes.
+        let mut router = scan_router(domain);
+        router.audit(1, 0, 0);
+        assert_eq!(router.fence(), 1, "the gap advanced the fence");
+        let mut rows = NativeBirthRows { row, control };
+        assert_eq!(
+            observe_absence_birth(
+                &mut rows,
+                absence_proof(
+                    domain,
+                    COOKIE,
+                    SCAN_FILE,
+                    0,
+                    closure,
+                    absence_entries_free(),
+                    0
+                ),
+                scan_proof_at_fault(domain, COOKIE, SCAN_FILE, 1, full.clone(), 1, 1),
+                &mut router,
+                scene.fixture.binding(),
+                scene.fixture.attachment(),
+                &admitted,
+            ),
+            Err(BirthObservationRefusal::NegativeFenceMismatch)
+        );
+        assert_eq!(
+            router.counters().observations,
+            0,
+            "the refused pair joins nothing"
+        );
+        assert_eq!(router.instances_minted(), 0);
+        // An internally consistent but stale pair (both fences 0)
+        // refuses the same way: the negative is not current.
+        let mut rows = NativeBirthRows { row, control };
+        assert_eq!(
+            observe_absence_birth(
+                &mut rows,
+                absence_proof(
+                    domain,
+                    COOKIE,
+                    SCAN_FILE,
+                    0,
+                    closure,
+                    absence_entries_free(),
+                    0
+                ),
+                scan_proof(domain, COOKIE, SCAN_FILE, 1, full.clone(), 0),
+                &mut router,
+                scene.fixture.binding(),
+                scene.fixture.attachment(),
+                &admitted,
+            ),
+            Err(BirthObservationRefusal::NegativeFenceMismatch)
+        );
+        assert_eq!(
+            router.counters().observations,
+            0,
+            "the refused pair joins nothing"
+        );
+        // Control: a fresh pair at the new fence still births.
+        let mut fresh_router = scan_router(domain);
+        fresh_router.audit(1, 0, 0);
+        let mut rows = NativeBirthRows { row, control };
+        observe_absence_birth(
+            &mut rows,
+            absence_proof(
+                domain,
+                COOKIE,
+                SCAN_FILE,
+                0,
+                closure,
+                absence_entries_free(),
+                1,
+            ),
+            scan_proof_at_fault(domain, COOKIE, SCAN_FILE, 1, full.clone(), 1, 1),
+            &mut fresh_router,
+            scene.fixture.binding(),
+            scene.fixture.attachment(),
+            &admitted,
+        )
+        .expect("a current consistent pair births");
+        assert_eq!(fresh_router.counters().observations, 1);
+    }
+
+    #[test]
+    fn object_journal_session_stale_negative_discards_on_gap_take() {
+        // N15: the production take path discards an outstanding stale
+        // negative on its gap: wiring the sealed pair, then taking
+        // against the advanced router, refuses — and the refusal
+        // consumes the single-shot pair, so no later take can recover
+        // bootstrap through it. A fresh pair takes cleanly.
+        use crate::attach::{AbsenceBirthSource, BirthObservationRefusal};
+        use crate::semantics_objects::journal::BirthEvidenceSource;
+
+        let publisher = NativePublisher::build();
+        let mut scene = Scene::new(image_default());
+        let admitted = scene.fixture.admit();
+        scene.adapter.attest_key(&admitted).expect("key attests");
+        let (domain, _, _, _) = admitted.journal_binding();
+        let full = scan_ranges_full();
+        let closure = scene.closure_generation();
+        let (row, control, _) = publisher.publish(&["0", "0", "0", "0", "1"]);
+        let mut router = scan_router(domain);
+        router.audit(1, 0, 0);
+        let mut source = AbsenceBirthSource::over(
+            NativeBirthRows { row, control },
+            absence_proof(
+                domain,
+                COOKIE,
+                SCAN_FILE,
+                0,
+                closure,
+                absence_entries_free(),
+                0,
+            ),
+            scan_proof_at_fault(domain, COOKIE, SCAN_FILE, 1, full.clone(), 1, 1),
+            &mut router,
+            scene.fixture.binding(),
+            scene.fixture.attachment(),
+            &admitted,
+        );
+        assert_eq!(
+            source.take_birth_evidence(),
+            Err(BirthObservationRefusal::NegativeFenceMismatch)
+        );
+        assert_eq!(
+            source.take_birth_evidence(),
+            Err(BirthObservationRefusal::AppearanceRejected),
+            "the refused take consumed the single-shot pair"
+        );
+        let mut fresh_router = scan_router(domain);
+        fresh_router.audit(1, 0, 0);
+        let mut fresh = AbsenceBirthSource::over(
+            NativeBirthRows { row, control },
+            absence_proof(
+                domain,
+                COOKIE,
+                SCAN_FILE,
+                0,
+                closure,
+                absence_entries_free(),
+                1,
+            ),
+            scan_proof_at_fault(domain, COOKIE, SCAN_FILE, 1, full, 1, 1),
+            &mut fresh_router,
+            scene.fixture.binding(),
+            scene.fixture.attachment(),
+            &admitted,
+        );
+        fresh
+            .take_birth_evidence()
+            .expect("a current consistent pair takes");
     }
 
     #[test]

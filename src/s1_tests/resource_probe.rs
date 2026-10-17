@@ -647,7 +647,11 @@ fn native_semantic_resource_final_types_pinned() {
         size_of::<crate::inventory_present::InstanceSemanticView>(),
         272
     );
-    assert_eq!(size_of::<crate::inventory_present::Presentation>(), 824);
+    // H9 (T4): +224 B for the one immutable operation/key projection
+    // (`object_observations`): revision, status, six row vectors and
+    // budgets. One snapshot per pass; heap rows stay empty while the
+    // publication is unavailable (production today).
+    assert_eq!(size_of::<crate::inventory_present::Presentation>(), 1048);
     // Supporting payload: RoutedCall carries one EventRecord.
     assert_eq!(size_of::<p11scope_ebpf_common::EventRecord>(), 368);
     // Existing bounds the N/N+1 populations use.

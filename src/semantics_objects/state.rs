@@ -3154,6 +3154,7 @@ impl ModelState {
         let view = self.objects.get(&key)?;
         let mut requested = 0u8;
         let mut established = 0u8;
+        let mut conflicted = 0u8;
         for index in 0..super::METADATA_FIELDS {
             let asked = !matches!(view.requested[index], FieldState::Unknown)
                 || !matches!(view.queries[index], QueryStatus::NotQueried);
@@ -3163,16 +3164,36 @@ impl ModelState {
                     | FieldState::Conflict(Some(_))
                     | FieldState::Invalidated(Some(_))
             );
+            let clash = matches!(
+                view.requested[index],
+                FieldState::Conflict(_) | FieldState::Invalidated(_)
+            ) || matches!(
+                view.established[index],
+                FieldState::Conflict(_) | FieldState::Invalidated(_)
+            );
             if asked {
                 requested |= 1 << index;
             }
             if kept {
                 established |= 1 << index;
             }
+            if clash {
+                conflicted |= 1 << index;
+            }
         }
         Some(super::KeyMetadataFlags {
             requested,
             established,
+            conflicted,
+        })
+    }
+
+    pub(super) fn receipt_snapshot(&self, key: ObjectId) -> Option<super::ReceiptSnapshot> {
+        let view = self.objects.get(&key)?;
+        Some(super::ReceiptSnapshot {
+            label: view.label(),
+            attribution_valid: view.attribution == super::Attribution::Valid,
+            session: view.session,
         })
     }
 

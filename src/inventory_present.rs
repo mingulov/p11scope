@@ -528,6 +528,10 @@ pub(crate) struct Presentation {
     /// lane after capture; `disabled` without a lane. The summary
     /// grants no semantic permission.
     pub semantic_capture: crate::inventory_semantics::SemanticCaptureSummary,
+    /// The H9 operation/key projection (additive, versioned): the ONE
+    /// immutable observation JSON, JSONL and the dashboard share.
+    /// Unavailable until Joint evidence exists; S1 never waits for it.
+    pub object_observations: crate::key_operation_projection::ObjectObservations,
 }
 
 /// What an edge's activity label answers (Choice 3).
@@ -792,6 +796,13 @@ impl Presentation {
             gaps,
             gaps_suppressed: registry.gaps_suppressed(),
             semantic_capture: crate::inventory_semantics::SemanticCaptureSummary::default(),
+            // No Joint evidence reaches the live registry today
+            // (live-loop carry): the projection is honestly
+            // unavailable at this pass revision, S1 unaffected.
+            object_observations: crate::key_operation_projection::ObjectObservations::unavailable(
+                passes,
+                "bootstrap_unavailable",
+            ),
             budgets: BudgetView {
                 callers_limit: limits.max_callers,
                 callers_occupied: coordinator.adapter().len(),

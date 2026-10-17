@@ -51,6 +51,7 @@ pub mod inventory_events;
 pub(crate) mod inventory_output;
 pub mod inventory_present;
 pub(crate) mod inventory_semantics;
+pub(crate) mod key_operation_projection;
 pub mod kinds;
 pub mod longrun;
 pub mod manifest_input;
@@ -66,6 +67,12 @@ pub mod scope;
 pub(crate) mod semantic_capture;
 pub mod semantics;
 pub mod semantics_edge;
+// Live-loop carry (T4): the H9 feed driver, key-use reducer and
+// receipt pipeline have no production driver until the Joint
+// live-loop routing lands (the registry reduces S1Only today), so
+// the module is test-reachable only. Ungate with its driver; the
+// frozen output contract and its consumers ship ungated.
+#[cfg(test)]
 pub(crate) mod semantics_key_use;
 pub(crate) mod semantics_objects;
 pub mod shapes;

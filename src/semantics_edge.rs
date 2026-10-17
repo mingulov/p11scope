@@ -240,6 +240,11 @@ impl std::fmt::Debug for EffectOrigin {
 /// (descriptor action, function, input ordinal); anything outside
 /// the classified vocabulary is [`KeyRole::Other`] with explicit
 /// evidence, never a guessed role.
+// Live-loop carry (T4): values are constructed only by the staged
+// receipt pipeline; ungate (drop this allow) with its driver. Kept
+// ungated (not cfg(test)) so the machine layout stays identical in
+// production and test builds.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyRole {
     /// A single-input operation key (`*Init`, `C_DigestKey`).
@@ -275,6 +280,15 @@ pub(crate) struct KeyReceipt {
     pub position: u64,
     /// Metadata presence known by (not after) the transition.
     pub metadata: crate::semantics_objects::KeyMetadataFlags,
+    /// Established-only combined label snapshot (sizes/curve, never
+    /// key material): `None` when unestablished at use.
+    pub label: Option<crate::semantics_objects::KeyLabel>,
+    /// Whether the viewed attribution was valid at use (H9 §72: a
+    /// label needs valid attribution plus non-conflicting fields).
+    pub attribution_valid: bool,
+    /// Set when retirement ends this association before the S1
+    /// terminal (H9 §66 `key_join_lost`); never backfilled.
+    pub lost: bool,
 }
 
 impl From<&SemanticCall> for EffectOrigin {
@@ -887,6 +901,9 @@ impl EdgeSemantics {
     /// positional key receipts (at most two) for the machines and
     /// direct operations it starts. S1Only reduction passes none —
     /// receipts exist only under sealed object proof.
+    // Live-loop carry (T4): called only by the staged feed driver;
+    // ungate with it.
+    #[cfg(test)]
     pub(crate) fn observe_joint<S: OperationSink>(
         &mut self,
         call: &SemanticCall,
@@ -2176,6 +2193,10 @@ impl EdgeSemantics {
     pub(crate) fn unknown(&self) -> u64 {
         self.unknown
     }
+    // Live-loop carry (T4): read only by staged tests until the
+    // projection carries exhaustion as a coverage fact. Kept ungated
+    // (not cfg(test)) so the counter field stays read in all builds.
+    #[allow(dead_code)]
     pub(crate) fn id_exhaustions(&self) -> u64 {
         self.id_exhaustions
     }

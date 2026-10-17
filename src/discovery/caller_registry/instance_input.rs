@@ -992,13 +992,7 @@ impl CallerRegistry {
             },
         );
         if boundary.is_some() {
-            self.invalidate_instance(
-                id,
-                boundary,
-                InstanceReason::SemanticLoss,
-                false,
-                shared.as_deref_mut(),
-            );
+            self.invalidate_instance(id, boundary, InstanceReason::SemanticLoss, false, shared);
         }
         self.inherit_instance_reasons(id, reasons);
     }
@@ -1181,7 +1175,7 @@ impl CallerRegistry {
         let refused = match refused {
             Ok(refused) => refused,
             Err(refusal) => {
-                self.refuse_instance_resource(id, &input, module, refusal, ledger.as_deref_mut());
+                self.refuse_instance_resource(id, &input, module, refusal, ledger);
                 return;
             }
         };
@@ -1588,7 +1582,7 @@ impl CallerRegistry {
     pub(super) fn apply_instance_loss(
         &mut self,
         input: InstanceSemanticLoss,
-        mut shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
         if input
             .position
@@ -1606,12 +1600,12 @@ impl CallerRegistry {
         negative.reasons = input.reason.bit();
         negative.authority_exhausted =
             input.reason == InstanceReason::AuthorityExhausted || input.position.is_none();
-        self.apply_negative(negative, shared.as_deref_mut());
+        self.apply_negative(negative, shared);
     }
     pub(super) fn apply_instance_retirement(
         &mut self,
         input: InstanceRetirement,
-        mut shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
         if input.position.domain != input.scope.domain() {
             self.instance_gap(None, None, InstanceReason::InstanceUnproven, None);
@@ -1631,7 +1625,7 @@ impl CallerRegistry {
         negative.barrier = input.position.ordinal;
         negative.reasons = input.reason.bit();
         negative.retirement = Some(input.reason);
-        self.apply_negative(negative, shared.as_deref_mut());
+        self.apply_negative(negative, shared);
     }
     pub(super) fn invalidate_physical_instances(
         &mut self,

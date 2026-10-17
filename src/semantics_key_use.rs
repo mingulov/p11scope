@@ -568,7 +568,7 @@ impl JointStaging {
                             instance,
                             sink,
                             Some(&mut *ledger),
-                            assoc_fallback.as_deref_mut(),
+                            assoc_fallback,
                         );
                         let disposed = self.drain_staged(Some(ledger));
                         self.mode = FeedMode::S1Only;
@@ -1319,8 +1319,8 @@ impl KeyUseReducer {
                 // fallback; a full census refuses exactly like a
                 // full aggregate table.
                 let ticket_shared = shared.is_some();
-                let mut target = shared.as_deref_mut().or(fallback.as_deref_mut());
-                let Some(ledger) = target.as_deref_mut() else {
+                let target = shared.as_deref_mut().or(fallback.as_deref_mut());
+                let Some(ledger) = target else {
                     debug_assert!(false, "keyassoc mint needs a ledger");
                     self.refuse(key, instance, category, origin.ts_ns);
                     return;
@@ -1378,11 +1378,11 @@ impl KeyUseReducer {
                     // pends for the next one (flushed above), never
                     // leaks.
                     if open.ticket_shared {
-                        match shared.as_deref_mut() {
+                        match shared {
                             Some(ledger) => ledger.release_keyassoc(open.ticket),
                             None => self.pending_shared_releases.push(open.ticket),
                         }
-                    } else if let Some(ledger) = fallback.as_deref_mut() {
+                    } else if let Some(ledger) = fallback {
                         ledger.release_keyassoc(open.ticket);
                     } else {
                         debug_assert!(false, "fallback ticket needs its ledger");

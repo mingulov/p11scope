@@ -4112,7 +4112,8 @@ pub(crate) mod tests {
         session: u64,
         mechanism: u64,
         capture: u32,
-        input0: Option<u64>,
+        input0: Option<(u64, u8)>,
+        input1: Option<(u64, u8)>,
         call_flags: u64,
     ) -> [u8; 224] {
         let mut bytes = begin_bytes_image(thread, sequence, function, flags, image);
@@ -4120,9 +4121,13 @@ pub(crate) mod tests {
         put_u64(&mut bytes, 112, mechanism);
         put_u32(&mut bytes, 120, capture);
         put_u64(&mut bytes, 208, call_flags);
-        if let Some(word) = input0 {
+        if let Some((word, status)) = input0 {
             put_u64(&mut bytes, 88, word);
-            bytes[126] = 1;
+            bytes[126] = status;
+        }
+        if let Some((word, status)) = input1 {
+            put_u64(&mut bytes, 96, word);
+            bytes[127] = status;
         }
         bytes
     }
@@ -4212,6 +4217,46 @@ pub(crate) mod tests {
         tail
     }
 
+    /// END with an explicit CREATE result word (distinct keys for
+    /// multi-key histories). Shared with H9 tests.
+    pub(crate) fn end_bytes_result(
+        begin: &[u8; 224],
+        action: u8,
+        rv: u64,
+        ts_ns: u64,
+        result: u64,
+    ) -> [u8; 632] {
+        let mut end = end_bytes(begin, action, rv, ts_ns);
+        // Tail result word: record[392 + 32 .. 392 + 40].
+        put_u64(&mut end, 424, result);
+        end
+    }
+
+    /// GET END with explicit attribute cells (kind, status, value):
+    /// requested-only (unavailable status) or establishing (status 1
+    /// with a classifying scalar). Shared with H9 tests.
+    pub(crate) fn end_bytes_getattr(
+        begin: &[u8; 224],
+        rv: u64,
+        ts_ns: u64,
+        cells: &[(u8, u8, u16)],
+    ) -> [u8; 632] {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_GET;
+        let mut end = end_bytes(begin, OBJECT_ACTION_GET, rv, ts_ns);
+        // Attribute list: tail[200..236] = record[592..628]; eight
+        // 4-byte cells, inspected count at +32, flags at +33.
+        assert!(cells.len() <= 8, "at most eight attribute cells");
+        for (index, (kind, status, value)) in cells.iter().enumerate() {
+            let base = 592 + index * 4;
+            end[base] = *kind;
+            end[base + 1] = *status;
+            end[base + 2..base + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        end[624] = cells.len() as u8;
+        end[625] = 1;
+        end
+    }
+
     pub(crate) fn end_bytes(begin: &[u8; 224], action: u8, rv: u64, ts_ns: u64) -> [u8; 632] {
         use p11scope_ebpf_common::object_journal::*;
         let thread = u64::from_le_bytes(begin[8..16].try_into().unwrap());
@@ -4295,7 +4340,7 @@ pub(crate) mod tests {
     /// manifest: every modeled function journal tests stage needs an
     /// admittable plan slot, since each staged call converts only
     /// under its own H3 admission claim.
-    const ADMITTABLE_FUNCTIONS: [&str; 15] = [
+    const ADMITTABLE_FUNCTIONS: [&str; 16] = [
         "C_CreateObject",
         "C_GetAttributeValue",
         "C_SignInit",
@@ -4313,6 +4358,8 @@ pub(crate) mod tests {
         "C_SessionCancel",
         "C_MessageSignInit",
         "C_MessageSignFinal",
+        // H9 key-role extension (dual-reference direct call).
+        "C_WrapKey",
     ];
 
     /// v3-only functions, resolved on the 3.0 interface surface

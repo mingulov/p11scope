@@ -183,6 +183,10 @@ struct OpMachine {
     /// exhaustion refuses the new identity (counted in
     /// [`EdgeSemantics::id_exhaustions`]) instead of wrapping.
     generation: u64,
+    /// At most one fixed key receipt for the `Init` that started
+    /// this machine (H9): bound positionally at replay, fixed for
+    /// the machine's life, `None` for S1Only or unassociated starts.
+    key: Option<KeyReceipt>,
 }
 
 /// Reducer-local checked operation identity: the reducer is per exact
@@ -231,6 +235,48 @@ impl std::fmt::Debug for EffectOrigin {
     }
 }
 
+/// The role one positional key receipt plays in its call (H9): the
+/// input's meaning, never an inferred label. Assigned by
+/// (descriptor action, function, input ordinal); anything outside
+/// the classified vocabulary is [`KeyRole::Other`] with explicit
+/// evidence, never a guessed role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyRole {
+    /// A single-input operation key (`*Init`, `C_DigestKey`).
+    OperationKey,
+    /// `C_WrapKey` input 0: the key that wraps.
+    WrappingKey,
+    /// `C_WrapKey` input 1: the key being wrapped.
+    WrappedKey,
+    /// `C_DeriveKey` input 0: the base key.
+    BaseKey,
+    /// `C_UnwrapKey` input 0: the unwrapping key.
+    UnwrappingKey,
+    /// Outside the classified vocabulary: counted, never guessed.
+    Other,
+}
+
+/// One positional key receipt (H9): the model's qualified exact
+/// observation for one call input, bound positionally at replay —
+/// never callback position, never an inferred label. The key is the
+/// opaque exact observation (never a raw handle); metadata is a
+/// presence snapshot (never values).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KeyReceipt {
+    /// The qualified exact key observation.
+    pub key: crate::semantics_objects::ObjectId,
+    /// Catalog id of the referencing call.
+    pub function: u32,
+    /// Input ordinal within the call (model emission order).
+    pub input: u8,
+    /// The input's role.
+    pub role: KeyRole,
+    /// H0 ordinal of the referencing call.
+    pub position: u64,
+    /// Metadata presence known by (not after) the transition.
+    pub metadata: crate::semantics_objects::KeyMetadataFlags,
+}
+
 impl From<&SemanticCall> for EffectOrigin {
     fn from(call: &SemanticCall) -> Self {
         Self {
@@ -262,12 +308,16 @@ impl EffectOrigin {
 /// replacement, retirement, eviction and loss; `DirectCompleted` is
 /// the one atomic effect of a successful direct call (start and
 /// completion together — a failed direct call emits nothing).
+/// `Started` carries the machine's fixed key receipt (`None` for
+/// S1Only or unassociated starts); `DirectCompleted` carries the
+/// call's positional receipts (at most two); `Ended` joins by id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OperationEffect {
     Started {
         id: OperationId,
         category: &'static str,
         mechanism: Option<u64>,
+        key_receipt: Option<KeyReceipt>,
         origin: EffectOrigin,
     },
     Ended {
@@ -280,6 +330,7 @@ pub(crate) enum OperationEffect {
         id: OperationId,
         category: &'static str,
         mechanism: Option<u64>,
+        key_receipts: Vec<KeyReceipt>,
         origin: EffectOrigin,
     },
 }
@@ -829,6 +880,30 @@ impl EdgeSemantics {
         origin: &EffectOrigin,
         sink: &mut S,
     ) -> u64 {
+        self.observe_inner(call, origin, &[], sink)
+    }
+
+    /// Joint replay (H9): the same single pass, plus this call's
+    /// positional key receipts (at most two) for the machines and
+    /// direct operations it starts. S1Only reduction passes none —
+    /// receipts exist only under sealed object proof.
+    pub(crate) fn observe_joint<S: OperationSink>(
+        &mut self,
+        call: &SemanticCall,
+        origin: &EffectOrigin,
+        keys: &[KeyReceipt],
+        sink: &mut S,
+    ) -> u64 {
+        self.observe_inner(call, origin, keys, sink)
+    }
+
+    fn observe_inner<S: OperationSink>(
+        &mut self,
+        call: &SemanticCall,
+        origin: &EffectOrigin,
+        keys: &[KeyReceipt],
+        sink: &mut S,
+    ) -> u64 {
         let dropped_before = self.dropped;
         let Some(descriptor) = self.gate(call) else {
             return 0;
@@ -845,7 +920,7 @@ impl EdgeSemantics {
         } else if call.rv == CkRv::PENDING.0 {
             self.queue_pending(call, sink);
         } else {
-            self.apply_completed(call, &descriptor, origin, sink);
+            self.apply_completed(call, &descriptor, origin, keys, sink);
         }
         self.dropped.saturating_sub(dropped_before)
     }
@@ -907,11 +982,14 @@ impl EdgeSemantics {
     /// completion path — so completions never double-count.)
     /// `origin` is the source-call identity effects from this call
     /// carry (the consumed call, or the original for async replay).
+    /// `keys` are this call's positional key receipts for the
+    /// machines and direct operations it starts (Joint only).
     fn apply_completed<S: OperationSink>(
         &mut self,
         call: &SemanticCall,
         descriptor: &SlotSemantics,
         origin: &EffectOrigin,
+        keys: &[KeyReceipt],
         sink: &mut S,
     ) {
         if descriptor.transition == transition::INITIALIZE || descriptor.direct != direct::NONE {
@@ -922,11 +1000,11 @@ impl EdgeSemantics {
         }
         self.apply_lifecycle(call, descriptor, origin, sink);
         if descriptor.transition == transition::INITIALIZE {
-            self.apply_init(call, descriptor, origin, sink);
+            self.apply_init(call, descriptor, origin, keys, sink);
         } else if descriptor.direct == direct::NONE && descriptor.operations != 0 {
             self.apply_operations(call, descriptor, origin, sink);
         } else if descriptor.direct != direct::NONE {
-            self.apply_direct(call, descriptor, origin, sink);
+            self.apply_direct(call, descriptor, origin, keys, sink);
         }
     }
 
@@ -1276,15 +1354,29 @@ impl EdgeSemantics {
         call: &SemanticCall,
         descriptor: &SlotSemantics,
         origin: &EffectOrigin,
+        keys: &[KeyReceipt],
         sink: &mut S,
     ) {
         if call.rv != CkRv::OK.0 || call.session == SESSION_NONE {
             return;
         }
+        // An Init names at most one key: the first positional receipt
+        // fixes every machine this Init starts. (Descriptors admit a
+        // single key input for `*Init`; anything beyond the first
+        // would be a second input the model never emits for one.)
+        let key = keys.first().copied();
         for (bit, name) in crate::semantics::operation_bits(descriptor.operations) {
             match call.mechanism_capture() {
                 capture::MECHANISM_VALUE => {
-                    self.start_machine(call.session, bit, name, Some(call.mechanism), origin, sink);
+                    self.start_machine(
+                        call.session,
+                        bit,
+                        name,
+                        Some(call.mechanism),
+                        key,
+                        origin,
+                        sink,
+                    );
                 }
                 capture::MECHANISM_NULL
                     if descriptor.semantic_flags & semantic_flags::NULL_MECHANISM_CANCEL != 0 =>
@@ -1294,10 +1386,10 @@ impl EdgeSemantics {
                 capture::MECHANISM_NULL => {
                     self.evidence.semantic_capture_failures =
                         self.evidence.semantic_capture_failures.saturating_add(1);
-                    self.start_machine(call.session, bit, name, None, origin, sink);
+                    self.start_machine(call.session, bit, name, None, key, origin, sink);
                 }
                 _ => {
-                    self.start_machine(call.session, bit, name, None, origin, sink);
+                    self.start_machine(call.session, bit, name, None, key, origin, sink);
                 }
             }
         }
@@ -1310,13 +1402,16 @@ impl EdgeSemantics {
     /// (H9): on exhaustion no machine is retained — the competing
     /// old machine still ends cancelled, the new operation counts
     /// started-then-unknown, and the refusal is counted instead of
-    /// wrapping or recycling an identity.
+    /// wrapping or recycling an identity. `key_receipt` fixes the
+    /// machine's receipt for its life (`None` for S1Only/unassociated
+    /// starts).
     fn start_machine<S: OperationSink>(
         &mut self,
         session: u64,
         bit: u16,
         category: &'static str,
         mechanism: Option<u64>,
+        key_receipt: Option<KeyReceipt>,
         origin: &EffectOrigin,
         sink: &mut S,
     ) {
@@ -1343,6 +1438,7 @@ impl EdgeSemantics {
                 mechanism,
                 state: OpState::Initialized,
                 generation,
+                key: key_receipt,
             },
         );
         if let Some(old) = replaced {
@@ -1361,10 +1457,15 @@ impl EdgeSemantics {
         }
         self.started = self.started.saturating_add(1);
         if S::WANTS_EFFECTS {
+            // The emit reads the stored binding: the machine is the
+            // single source of truth for its fixed receipt.
+            let stored = self.active.get(&key).and_then(|machine| machine.key);
+            debug_assert_eq!(stored, key_receipt);
             sink.emit(OperationEffect::Started {
                 id: OperationId(generation),
                 category,
                 mechanism,
+                key_receipt: stored,
                 origin: origin.clone(),
             });
         }
@@ -1444,6 +1545,7 @@ impl EdgeSemantics {
         call: &SemanticCall,
         descriptor: &SlotSemantics,
         origin: &EffectOrigin,
+        keys: &[KeyReceipt],
         sink: &mut S,
     ) {
         if call.rv != CkRv::OK.0 {
@@ -1456,12 +1558,17 @@ impl EdgeSemantics {
             return;
         };
         if S::WANTS_EFFECTS {
+            debug_assert!(
+                keys.len() <= 2,
+                "descriptors admit at most two key inputs per direct call"
+            );
             let mechanism =
                 (call.mechanism_capture() == capture::MECHANISM_VALUE).then_some(call.mechanism);
             sink.emit(OperationEffect::DirectCompleted {
                 id: OperationId(generation),
                 category: crate::semantics::direct_name(descriptor.direct).unwrap_or("direct"),
                 mechanism,
+                key_receipts: keys.to_vec(),
                 origin: origin.clone(),
             });
         }
@@ -1891,7 +1998,14 @@ impl EdgeSemantics {
             owned = EffectOrigin::placeholder();
             &owned
         };
-        self.apply_completed(&completed, &descriptor, effect_origin, sink);
+        // Async replay carries no receipts: H8's frozen endpoint
+        // table leaves async completions negative-only, so the
+        // original call never completes in the model, its inputs
+        // never join, and no receipt can exist for the machine
+        // starting here. Such rows are unknown-key with explicit
+        // evidence (carry: modeling async completions in H8 is an
+        // owner decision).
+        self.apply_completed(&completed, &descriptor, effect_origin, &[], sink);
     }
 
     /// Oldest-first async eviction past the bound, mirroring

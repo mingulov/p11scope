@@ -5617,6 +5617,206 @@ fn key_operation_g29_concurrent_overlap_matches_s1only_twin() {
 /// (never destroys); definite completed history stands; S1 records
 /// the call without inventing an operation.
 #[test]
+fn key_operation_g29_unknown_scope_widens_without_inventing() {
+    // G29 (N1b): unknown token/scope widening through Joint. H8
+    // emits SlotScope::Unknown for these shapes; the model must
+    // never invent known scope, and an ambiguous cross-session
+    // destroy widens the object lifetime (retired) instead of
+    // destroying it, while the completed sign history stands.
+    use crate::semantics_objects::Lifetime;
+
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let mut destroy = ShapedS1::shaped("C_DestroyObject", CkRv::GENERAL_ERROR.0, 0, 0);
+    destroy.session = Some(8);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &destroy,
+    );
+    let projection = scene.model.project();
+    assert!(!projection.sessions.is_empty(), "sessions observed");
+    assert!(
+        projection.sessions.iter().all(|view| !view.scope_known),
+        "unknown scope is never invented known"
+    );
+    assert!(
+        projection
+            .objects
+            .iter()
+            .any(|view| matches!(view.lifetime, Lifetime::Retired(_))),
+        "ambiguity widens lifetime to retired"
+    );
+    assert!(
+        projection
+            .objects
+            .iter()
+            .all(|view| !matches!(view.lifetime, Lifetime::Destroyed)),
+        "never synthesize destruction from failure"
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("definite history stands");
+    assert_eq!(
+        (row.started, row.completed, row.active, row.key_join_lost),
+        (1, 1, 0, 0),
+        "ambiguity never rewrites a completed use"
+    );
+}
+
+#[test]
+fn key_operation_g29_ambiguous_close_sweeps_retire_without_destroying() {
+    // G29 (N1b): ambiguous creator-close sweeps through Joint. S3
+    // (s2s3_creator_close_scope_failed_and_ambiguous_close) pins:
+    // GENERAL_ERROR/SESSION_CLOSED/DEVICE_REMOVED closes retire
+    // object views and end the session — never destroy. H9 ends the
+    // live binding (key_join_lost) without rewriting S1.
+    use crate::semantics_objects::{Lifetime, SessionState};
+
+    for rv in [
+        CkRv::GENERAL_ERROR.0,
+        CkRv::SESSION_CLOSED.0,
+        CkRv::DEVICE_REMOVED.0,
+    ] {
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let mut joint = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        for session in [7u64, 8u64] {
+            let mut open = ShapedS1::shaped("C_OpenSession", CkRv::OK.0, 0, 0);
+            open.session = Some(session);
+            drive_quantum(
+                &mut scene,
+                &mut staging,
+                &mut joint,
+                &mut keyuse,
+                &mut sink,
+                &open,
+            );
+        }
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+        );
+        let get = ShapedS1 {
+            getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+            ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+        };
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &get,
+        );
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+        );
+        assert!(joint.has_live_operations(), "rv {rv:#x}: live machine");
+        let close = ShapedS1::shaped("C_CloseSession", rv, 0, 0);
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &close,
+        );
+        let projection = scene.model.project();
+        assert!(
+            projection
+                .objects
+                .iter()
+                .any(|view| matches!(view.lifetime, Lifetime::Retired(_))),
+            "rv {rv:#x}: ambiguity widens lifetime to retired"
+        );
+        assert!(
+            projection
+                .objects
+                .iter()
+                .all(|view| !matches!(view.lifetime, Lifetime::Destroyed)),
+            "rv {rv:#x}: never synthesize destruction from failure"
+        );
+        assert!(
+            projection
+                .sessions
+                .iter()
+                .any(|view| matches!(view.state, SessionState::Ended(_))),
+            "rv {rv:#x}: the closed session ends"
+        );
+        let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+        let row = committed
+            .key_operations
+            .iter()
+            .find(|row| row.category == "sign")
+            .expect("rv {rv:#x}: the use row stands");
+        assert_eq!(
+            (row.active, row.key_join_lost),
+            (0, 1),
+            "rv {rv:#x}: the ended session ends its binding"
+        );
+    }
+}
+
+#[test]
 fn key_operation_g29_ambiguous_destroy_widens_without_destroying() {
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();

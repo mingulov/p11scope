@@ -3741,6 +3741,172 @@ fn key_operation_one_projection_three_consumers() {
     assert_reconstructed_eq_json(&reconstruct(&lines), section, false);
 }
 
+/// N9: key-row terminals replace, never silently drop: a refused
+/// active unknown row's terminal re-emits under the same row key
+/// (the digest changes), so JSONL reconstruction matches the JSON
+/// section — no stale active row, no silent vanishing.
+#[test]
+fn key_operation_refused_row_terminal_replaces_in_stream() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut probe = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut probe,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut probe,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut probe,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    let start = sink
+        .iter()
+        .find(|effect| matches!(effect, OperationEffect::Started { .. }))
+        .cloned()
+        .expect("proved start");
+    let mut end_sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut KeyUseReducer::new(),
+        &mut end_sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let end = end_sink
+        .iter()
+        .find(|effect| matches!(effect, OperationEffect::Ended { .. }))
+        .cloned()
+        .expect("sign terminal");
+    // One bucket: instance 0 admits, instance 1 refuses (active).
+    let mut keyuse = KeyUseReducer::with_capacity(1);
+    keyuse.observe_effect(RegistryInstanceId::from_raw(0), &start);
+    keyuse.observe_effect(RegistryInstanceId::from_raw(1), &start);
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+    let mut emitter = KeyOperationEmitter::new();
+    let r1 = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    emitter.emit(&mut writer, &r1, 1_000).unwrap();
+    // The refused terminal lands under the same row key: the
+    // zero-active terminal row replaces the active row.
+    keyuse.observe_effect(RegistryInstanceId::from_raw(1), &end);
+    let r2 = commit(2, &[&staging], &scene.model.project(), &keyuse);
+    emitter.emit(&mut writer, &r2, 2_000).unwrap();
+    drop(writer);
+    let lines = read_stream(dir.path(), "events.jsonl");
+    let rebuilt = reconstruct(&lines);
+    let row = rebuilt
+        .unknown
+        .get("u:sign:unbound")
+        .expect("the refused row reaches the stream");
+    assert_eq!(row.0, 2, "the terminal replacement carries revision 2");
+    assert_eq!(row.1["completed"], 1);
+    assert_eq!(row.1["active"], 0, "never the stale active row");
+    let live = r2
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "unbound")
+        .expect("live section row");
+    assert_eq!(row.1["completed"], live.completed);
+    assert_eq!(row.1["active"], live.active, "JSONL matches JSON");
+}
+
+/// N9: emitter digest tracking is bounded by the current
+/// publication: churning single-object publications (each object
+/// pruned before the next arrives) never accumulates tracking for
+/// absent rows.
+#[test]
+fn key_operation_emitter_tracking_bounded_across_object_churn() {
+    use crate::key_operation_projection::{
+        MetadataBlock, MetadataField, ObjectObservations, ObjectRow, ObsStatus, QueriesBlock,
+    };
+
+    fn churned(revision: u64, object: u64) -> ObjectObservations {
+        let mut observations = ObjectObservations::unavailable(revision, "bootstrap_unavailable");
+        observations.status = ObsStatus::Populated;
+        observations.reason = "none";
+        let blank = MetadataField {
+            status: "absent",
+            scalar: None,
+            curve: None,
+        };
+        let block = MetadataBlock {
+            class: blank,
+            key_type: blank,
+            token: blank,
+            value_len: blank,
+            modulus_bits: blank,
+            ec_params: blank,
+        };
+        observations.objects.push(ObjectRow {
+            object,
+            session: 7,
+            origin: "observed",
+            creation: None,
+            birth: None,
+            lifetime: "destroyed",
+            lifetime_reason: None,
+            attribution: "valid",
+            attribution_reason: None,
+            requested: block,
+            established: block,
+            queries: QueriesBlock {
+                class: "not_queried",
+                key_type: "not_queried",
+                token: "not_queried",
+                value_len: "not_queried",
+                modulus_bits: "not_queried",
+                ec_params: "not_queried",
+            },
+            label: None,
+            successful_references: 1,
+            successful_key_references: 0,
+            accessing_sessions: 1,
+        });
+        observations
+    }
+
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 8 << 20, 5).unwrap();
+    let mut emitter = KeyOperationEmitter::new();
+    let mut peak = 0usize;
+    for id in 1..=2_000u64 {
+        let observations = churned(id, id);
+        emitter
+            .emit(&mut writer, &observations, id * 1_000)
+            .unwrap();
+        peak = peak.max(emitter.tracked());
+    }
+    assert_eq!(emitter.tracked(), 1, "only the current row stays tracked");
+    assert!(peak <= 2, "tracking never accumulates churn: peak {peak}");
+}
+
 /// H9-§3: the frozen contract. Rendered sections carry exactly the
 /// frozen keys and enums (pinned key-for-key against the schema file
 /// and the golden); row equations, sort orders and the no-started

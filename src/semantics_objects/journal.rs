@@ -9464,6 +9464,66 @@ mod tests {
     }
 
     #[test]
+    fn object_journal_session_absence_withholds_positive_until_negative_commits() {
+        // C1b: the positive stays withheld until the negative commits.
+        // A refused negative leaves the router clean — the same
+        // appearance still births once a committed negative precedes
+        // it. (If the refused attempt had joined the appearance, the
+        // retry would see AppearanceRejected instead of birthing.)
+        use crate::attach::{BirthObservationRefusal, observe_absence_birth};
+
+        let publisher = NativePublisher::build();
+        let mut scene = Scene::new(image_default());
+        let admitted = scene.fixture.admit();
+        scene.adapter.attest_key(&admitted).expect("key attests");
+        let (domain, _, _, _) = admitted.journal_binding();
+        let full = scan_ranges_full();
+        let closure = scene.closure_generation();
+        let (row, control, _) = publisher.publish(&["0", "0", "0", "0", "1"]);
+        let mut router = scan_router(domain);
+        let mut rows = NativeBirthRows { row, control };
+        assert_eq!(
+            observe_absence_birth(
+                &mut rows,
+                absence_proof(
+                    domain,
+                    COOKIE,
+                    SCAN_FILE,
+                    0,
+                    closure.wrapping_add(1),
+                    absence_entries_free(),
+                    0
+                ),
+                scan_proof(domain, COOKIE, SCAN_FILE, 1, full.clone(), 0),
+                &mut router,
+                scene.fixture.binding(),
+                scene.fixture.attachment(),
+                &admitted,
+            ),
+            Err(BirthObservationRefusal::GenerationMismatch)
+        );
+        let mut rows = NativeBirthRows { row, control };
+        observe_absence_birth(
+            &mut rows,
+            absence_proof(
+                domain,
+                COOKIE,
+                SCAN_FILE,
+                0,
+                closure,
+                absence_entries_free(),
+                0,
+            ),
+            scan_proof(domain, COOKIE, SCAN_FILE, 1, full.clone(), 0),
+            &mut router,
+            scene.fixture.binding(),
+            scene.fixture.attachment(),
+            &admitted,
+        )
+        .expect("the withheld appearance births once the negative commits");
+    }
+
+    #[test]
     fn object_journal_session_birth_grant_binds_observed_words() {
         // C1: the grant binds the observed evidence, and the seal
         // re-checks fresh words: native truth that moved between

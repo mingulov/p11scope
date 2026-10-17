@@ -216,12 +216,19 @@ pub(crate) enum OperationOutcome {
 /// [`EdgeSemantics::observe_with_effects`]; async completions carry
 /// their ORIGINAL call's identity (never the receiver's). Presence of
 /// an origin is not object authority — only a positional key receipt
-/// can bind a key (H9).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// can bind a key (H9). Redacted `Debug`: raw session handles never
+/// render.
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct EffectOrigin {
     pub function: String,
     pub session: u64,
     pub ts_ns: u64,
+}
+
+impl std::fmt::Debug for EffectOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("EffectOrigin(<private facts>)")
+    }
 }
 
 impl From<&SemanticCall> for EffectOrigin {

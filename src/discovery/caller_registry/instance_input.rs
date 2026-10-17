@@ -177,6 +177,20 @@ impl AdmittedInstanceCall {
         )
     }
 
+    /// H9 joint staging: the S1 payload this admission proved, for
+    /// ordered replay after the seal settles its call. Only the H9
+    /// feed child reads this; the payload is never modified.
+    pub(crate) fn s1_facts(&self) -> &SemanticCall {
+        &self.facts
+    }
+
+    /// H9 joint staging: the H0 ordinal positioning this admission,
+    /// for replay-order and fallback-coverage checks. Only the H9
+    /// feed child reads this.
+    pub(crate) fn h0_ordinal(&self) -> u64 {
+        self.position.ordinal
+    }
+
     /// Journal per-call authority (H8): this admitted call's
     /// attribution shape for staged-BEGIN matching. `None` when the
     /// call cannot name its instance (unattributable) or names no

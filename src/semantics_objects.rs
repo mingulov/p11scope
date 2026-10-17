@@ -196,6 +196,14 @@ impl CallKey {
     pub(in crate::semantics_objects) fn sealed(ticket: journal::JournalTicket) -> Self {
         Self(ticket.key())
     }
+
+    /// The admission ordinal this key binds (C2): sealed keys mint
+    /// from the converted admission's H0 ordinal; reference keys
+    /// carry their scripted ordinal. H9 identity compares this to the
+    /// staged head's H0 position.
+    pub(crate) fn admission(self) -> u64 {
+        self.0
+    }
 }
 
 /// Known slot/token scope evidence, or explicitly unknown. Unknown is

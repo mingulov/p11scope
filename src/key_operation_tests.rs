@@ -4809,6 +4809,142 @@ fn key_operation_n9_lost_unknown_metadata_keeps_zero_replacement() {
     assert_eq!(replaced.1["active"], 0, "never the stale active row");
 }
 
+/// C2 remainder (fix round 2): a seal binds its ACTUAL ADMITTED
+/// INVOCATION (identity), not a value-equal shape. Two same-shaped
+/// Inits stage; delivering the second seal first holds (its key
+/// names the second invocation, not the head) with staging and S1
+/// untouched — then in-order delivery replays each exactly once.
+#[test]
+fn key_operation_c2_reordered_seal_refuses_then_recovers_in_order() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+
+    let instance = RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    // Two same-shaped Inits (same session): only invocation identity
+    // distinguishes them.
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let (_, first_pos) = prepare_call(&mut scene, &mut staging, &init);
+    let first = scene.seal().expect("first quantum seals");
+    assert_eq!(first.prefix.settled().len(), 1);
+    let (_, second_pos) = prepare_call(&mut scene, &mut staging, &init);
+    let second = scene.seal().expect("second quantum seals");
+    assert_eq!(second.prefix.settled().len(), 1);
+    assert!(first_pos < second_pos, "non-vacuous order");
+    assert_eq!(staging.staged_len(), 2);
+
+    // The second seal first: held — its invocation is not the head.
+    let (outcome, _) = staging.apply_seal(
+        &second,
+        &scene.model,
+        &mut scene.ledger,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
+    assert_eq!(
+        outcome,
+        SealApplyOutcome::Held,
+        "a matching shape is not exact call identity"
+    );
+    assert_eq!(staging.staged_len(), 2, "held seals keep staging");
+    assert_eq!(joint.calls(), 0, "held seals reduce nothing");
+    // In-order delivery replays each exactly once.
+    let (outcome, _) = staging.apply_seal(
+        &first,
+        &scene.model,
+        &mut scene.ledger,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
+    assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
+    let (outcome, _) = staging.apply_seal(
+        &second,
+        &scene.model,
+        &mut scene.ledger,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
+    assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
+    assert_eq!(staging.staged_len(), 0);
+    assert_eq!(joint.calls(), 2, "each invocation replays exactly once");
+    assert_eq!(staging.reduced(), 2, "the held quantum never replayed");
+}
+
+/// C2 remainder (fix round 2): consumption is irreversible — no
+/// bounded forget window for live claims. 1,025 same-shaped seals
+/// consume (evicting the first ticket from the 1,024-slot dedup);
+/// reapplying the first seal against a new head still holds: its
+/// invocation lies below the staging frontier and can never match
+/// again.
+#[test]
+fn key_operation_c2_consumption_survives_fifo_eviction() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+
+    let instance = RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let mut first_seal = None;
+    for n in 0..=1024u64 {
+        let (_, position) = prepare_call(&mut scene, &mut staging, &init);
+        let seal = scene.seal().expect("quantum seals");
+        assert_eq!(seal.prefix.settled().len(), 1, "iteration {n}");
+        let (outcome, _) = staging.apply_seal(
+            &seal,
+            &scene.model,
+            &mut scene.ledger,
+            &mut joint,
+            &mut keyuse,
+            instance,
+            &mut sink,
+        );
+        assert_eq!(outcome, SealApplyOutcome::ReplayedOne, "iteration {n}");
+        if n == 0 {
+            assert_eq!(position, first_pos_of(&seal), "seal binds its admission");
+            first_seal = Some(seal);
+        }
+    }
+    assert_eq!(staging.reduced(), 1025);
+    // One new head, then the first seal again: held forever.
+    let (_, _) = prepare_call(&mut scene, &mut staging, &init);
+    let first = first_seal.expect("kept the first seal");
+    let (outcome, _) = staging.apply_seal(
+        &first,
+        &scene.model,
+        &mut scene.ledger,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
+    assert_eq!(
+        outcome,
+        SealApplyOutcome::Held,
+        "bounded dedup eviction cannot re-authorize an old seal"
+    );
+    assert_eq!(staging.reduced(), 1025, "the old seal replays nothing");
+}
+
+/// The admission ordinal one single-call seal binds (C2 test helper):
+/// the settled call's key.
+fn first_pos_of(seal: &SealSuccess) -> u64 {
+    seal.prefix.settled()[0].key.admission()
+}
+
 /// N9: emitter digest tracking is bounded by the current
 /// publication: churning single-object publications (each object
 /// pruned before the next arrives) never accumulates tracking for

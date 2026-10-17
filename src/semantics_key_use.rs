@@ -175,9 +175,13 @@ pub(crate) struct JointStaging {
     frontier: u64,
     /// Redeemed seal claims by model ticket: each seal replays at
     /// most one staged call, and a repeated seal never replays —
-    /// even against a same-shaped head. Bounded FIFO: ancient
-    /// tickets evict (a duplicate that old mismatches the head
-    /// shape and refuses on correlation instead).
+    /// even against a same-shaped head. Bounded FIFO with a proof
+    /// (C2): redeemed tickets bind admissions at or below the
+    /// staging frontier (heads pop in ascending H0 order, and the
+    /// frontier trails the highest consumed position), while
+    /// identity match requires the seal's admission to EQUAL a live
+    /// head's position (strictly above the frontier) — so an evicted
+    /// ticket's seal can never match again, with or without the set.
     consumed: BTreeSet<CallToken>,
     consumed_order: VecDeque<CallToken>,
     reduced: u64,
@@ -427,7 +431,12 @@ impl JointStaging {
         // without consuming: a delayed seal can still redeem against
         // its own head later.
         let exact = crate::kinds::function_id(&head.facts.function).is_some_and(|function| {
-            settled[0].matches_head(function, head.facts.session, head.facts.capture)
+            settled[0].matches_head(
+                function,
+                head.facts.session,
+                head.facts.capture,
+                head.position,
+            )
         });
         if !exact {
             self.correlation_refusals = self.correlation_refusals.saturating_add(1);

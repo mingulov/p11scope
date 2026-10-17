@@ -29,8 +29,10 @@ use crate::semantics_objects::journal::{
     BootstrapReceipt, H3DispositionEvidence, H3EvidenceSource, JournalGap, SealFailure,
     SealSuccess, SealedCall,
 };
-use crate::semantics_objects::{ObjectEffect, ObjectId, ObjectSemantics, SessionIncarnation};
-use std::collections::{BTreeMap, VecDeque};
+use crate::semantics_objects::{
+    CallToken, ObjectEffect, ObjectId, ObjectSemantics, SessionIncarnation,
+};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// At most 1,024 unsettled staged payloads: the H8 pending-call bound
 /// mirrored on the H9 side (one logical ticket; byte-charge
@@ -151,6 +153,13 @@ pub(crate) struct JointStaging {
     /// Highest consumed H0 position (replayed or disposed): staging
     /// at or below it is a forbidden replay.
     frontier: u64,
+    /// Redeemed seal claims by model ticket: each seal replays at
+    /// most one staged call, and a repeated seal never replays —
+    /// even against a same-shaped head. Bounded FIFO: ancient
+    /// tickets evict (a duplicate that old mismatches the head
+    /// shape and refuses on correlation instead).
+    consumed: BTreeSet<CallToken>,
+    consumed_order: VecDeque<CallToken>,
     reduced: u64,
     history_disposed: u64,
     correlation_refusals: u64,
@@ -169,6 +178,7 @@ impl std::fmt::Debug for JointStaging {
         f.debug_struct("JointStaging")
             .field("mode", &self.mode)
             .field("staged", &self.staged.len())
+            .field("consumed", &self.consumed.len())
             .field("reduced", &self.reduced)
             .field("history_disposed", &self.history_disposed)
             .field("correlation_refusals", &self.correlation_refusals)
@@ -186,6 +196,8 @@ impl JointStaging {
             mode: FeedMode::S1Only,
             staged: VecDeque::new(),
             frontier: 0,
+            consumed: BTreeSet::new(),
+            consumed_order: VecDeque::new(),
             reduced: 0,
             history_disposed: 0,
             correlation_refusals: 0,
@@ -222,9 +234,25 @@ impl JointStaging {
     }
 
     /// Seal quanta refused for correlation (multi-call seals H9 does
-    /// not batch, function mismatch, or settled-but-never-staged).
+    /// not batch, exact-match failure, repeated seals, or
+    /// settled-but-never-staged).
     pub(crate) fn correlation_refusals(&self) -> u64 {
         self.correlation_refusals
+    }
+
+    /// Redeem one seal claim: the ticket replays exactly once.
+    /// Bounded FIFO at the staging capacity.
+    fn mark_consumed(&mut self, ticket: CallToken) {
+        if !self.consumed.insert(ticket) {
+            return;
+        }
+        self.consumed_order.push_back(ticket);
+        while self.consumed.len() > JOINT_STAGING_CAPACITY {
+            let Some(oldest) = self.consumed_order.pop_front() else {
+                break;
+            };
+            self.consumed.remove(&oldest);
+        }
     }
 
     /// Currently staged (unsettled) payloads.
@@ -287,9 +315,12 @@ impl JointStaging {
     }
 
     /// Apply one seal: replay the staged head iff the seal settled
-    /// exactly its call — one settled call, function-verified against
-    /// the head, terminally bounded (END cut or abandonment bound).
-    /// Anything else holds staging intact. The replay runs through
+    /// exactly its call — one settled call, exact-matched against
+    /// the head (catalog function, session, mechanism shape),
+    /// terminally bounded (END cut or abandonment bound) — and
+    /// consume that claim once: a repeated seal never replays, even
+    /// against a same-shaped head. Anything else holds staging
+    /// intact. The replay runs through
     /// [`EdgeSemantics::observe_joint`] with this quantum's
     /// positional receipts (assembled from the seal's ticket-
     /// qualified references plus at-transition metadata snapshots);
@@ -319,19 +350,34 @@ impl JointStaging {
             self.correlation_refusals = self.correlation_refusals.saturating_add(1);
             return (SealApplyOutcome::Held, 0);
         }
+        if self.consumed.contains(&settled[0].ticket) {
+            // The claim already redeemed: a repeated seal never
+            // replays, even against a same-shaped staged head.
+            self.correlation_refusals = self.correlation_refusals.saturating_add(1);
+            return (SealApplyOutcome::Held, 0);
+        }
         let Some(head) = self.staged.front() else {
             self.correlation_refusals = self.correlation_refusals.saturating_add(1);
             return (SealApplyOutcome::Held, 0);
         };
-        let function_matches =
-            crate::kinds::function_id(&head.facts.function) == Some(settled[0].function);
-        if !function_matches {
+        // Exact binding: the settled call must BE the staged head
+        // (function, session, mechanism shape) — never merely the
+        // same function. The fingerprint rides the seal itself: the
+        // model already settled (and pruned) this call, so no
+        // model-side lookup can bind it afterwards. Mismatches hold
+        // without consuming: a delayed seal can still redeem against
+        // its own head later.
+        let exact = crate::kinds::function_id(&head.facts.function).is_some_and(|function| {
+            settled[0].matches_head(function, head.facts.session, head.facts.capture)
+        });
+        if !exact {
             self.correlation_refusals = self.correlation_refusals.saturating_add(1);
             return (SealApplyOutcome::Held, 0);
         }
         if settled[0].end_cut.is_none() && !settled[0].abandoned {
             return (SealApplyOutcome::Held, 0);
         }
+        self.mark_consumed(settled[0].ticket);
         let head = self.staged.pop_front().expect("head verified above");
         self.frontier = self.frontier.max(head.position);
         let receipts = keyuse.receipts_for_call(seal, &settled[0], model, head.position);

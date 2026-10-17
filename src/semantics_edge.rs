@@ -925,6 +925,9 @@ impl EdgeSemantics {
     /// receipts exist only under sealed object proof.
     // Guarded (N1): reachable only through Joint seal/failure
     // delivery, which needs installed receipts + an H8 driver.
+    // Production replay reserves first (N14); this stays for
+    // unit-test reducers without a pool.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn observe_joint<S: OperationSink>(
         &mut self,
         call: &SemanticCall,

@@ -6919,6 +6919,17 @@ impl GuardedScene {
             .started()
     }
 
+    fn edge_completed(&self, id: RegistryInstanceId) -> u64 {
+        self.registry
+            .instance_semantic_edges()
+            .find(|record| record.id == id)
+            .expect("edge retained")
+            .semantics
+            .as_ref()
+            .expect("materialized")
+            .completed()
+    }
+
     /// Drive one Joint quantum for `key`/`id`: admit, stage, seal,
     /// deliver. Returns the seal outcome.
     fn drive_joint(
@@ -7020,31 +7031,90 @@ fn key_operation_joint_staging_charges_shared_ledger() {
     assert_eq!(guarded.edge_calls(sibling_id), 1, "S1 preserved direct");
     assert_eq!(guarded.registry.joint_direct_fallback(), 0);
 
-    // No ledger, no staging: the Joint call reduces S1-direct and
-    // the fallback counts it.
+    // No ledger with a queued call: ordered fallback replays the
+    // queued Init first (C4) — the Sign must not overtake it — then
+    // the Sign reduces direct. Releases pend without a ledger.
     let shape = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
     let (facts, position) = guarded.admit_shape(&shape);
     guarded.observe(&joint_key, position, facts);
     guarded.registry.publish();
-    assert_eq!(guarded.scene.ledger.staged(), 1, "nothing new staged");
     assert_eq!(guarded.registry.joint_direct_fallback(), 1);
-    assert_eq!(guarded.edge_calls(joint_id), 1, "S1 preserved direct");
-
-    // A frozen byte pool refuses staging the same way.
-    guarded.scene.ledger.set_byte_limit(0);
-    let shape = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
-    let (facts, position) = guarded.admit_shape(&shape);
-    guarded.observe(&joint_key, position, facts);
-    guarded
-        .registry
-        .publish_with_ledger(&mut guarded.scene.ledger);
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only),
+        "capacity fallback degrades the feed"
+    );
+    assert_eq!(
+        (
+            guarded.edge_calls(joint_id),
+            guarded.edge_started(joint_id),
+            guarded.edge_completed(joint_id)
+        ),
+        (2, 1, 1),
+        "one completed Sign in original order"
+    );
     assert_eq!(
         guarded.scene.ledger.staged(),
         1,
-        "refused staging holds nothing"
+        "ledger-less releases pend, never leak silently"
     );
+    // The next ledger contact flushes the pended release.
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    ingest_call(&mut guarded.scene, &init);
+    let seal = guarded.scene.seal().expect("init quantum seals");
+    assert_eq!(
+        guarded.registry.deliver_joint_seal(
+            joint_id,
+            &seal,
+            &guarded.scene.model,
+            &mut guarded.scene.ledger,
+        ),
+        SealApplyOutcome::Held,
+        "late seals never re-replay a fallback"
+    );
+    assert_eq!(guarded.scene.ledger.staged(), 0, "ledger contact flushes");
+
+    // A frozen byte pool refuses staging the same ordered way, on a
+    // fresh Joint feed (the first already fell back above).
+    let bootstrap = guarded.scene.bootstrap();
+    let full_key = guarded.key(3);
+    guarded
+        .registry
+        .install_joint_receipt(full_key.clone(), bootstrap);
+    let (_, full_id) = guarded.register(3);
+    let (facts, position) = guarded.admit_shape(&init);
+    guarded.observe(&full_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    assert_eq!(guarded.scene.ledger.staged(), 1, "one ticket charged");
+    guarded.scene.ledger.set_byte_limit(0);
+    let shape = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    let (facts, position) = guarded.admit_shape(&shape);
+    guarded.observe(&full_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
     assert_eq!(guarded.registry.joint_direct_fallback(), 2);
-    assert_eq!(guarded.edge_calls(joint_id), 2, "S1 preserved direct");
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(full_id),
+        Some(FeedMode::S1Only),
+        "capacity fallback degrades the feed"
+    );
+    assert_eq!(
+        (
+            guarded.edge_calls(full_id),
+            guarded.edge_started(full_id),
+            guarded.edge_completed(full_id)
+        ),
+        (2, 1, 1),
+        "one completed Sign in original order"
+    );
+    assert_eq!(
+        guarded.scene.ledger.staged(),
+        0,
+        "fallback with a ledger releases tickets"
+    );
     guarded.scene.ledger.set_byte_limit(u64::MAX);
 }
 
@@ -7611,4 +7681,289 @@ fn key_operation_n15_post_loss_s1_still_accounted() {
         .find(|row| row.category == "sign" && row.reason == "unbound")
         .expect("S1 accounting continues after the loss");
     assert_eq!((row.completed, row.active), (1, 0));
+}
+
+/// C4: capacity fallback preserves original order. The staged Init
+/// plus the capacity-refused Sign replay in order (one completed
+/// Sign, nothing live) — never the direct terminal overtaking the
+/// queued Init. The late Init seal then holds: no double-replay.
+/// S1 matches the direct twin exactly.
+#[test]
+fn key_operation_c4_full_fallback_preserves_order() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(joint_key.clone(), bootstrap);
+    let (_, joint_id) = guarded.register(1);
+
+    // Stage the Init, then freeze the pool: the terminal refuses.
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    let (init_facts, init_pos) = guarded.admit_shape(&init);
+    guarded.observe(&joint_key, init_pos, init_facts.clone());
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    assert_eq!(guarded.scene.ledger.staged(), 1);
+    guarded.scene.ledger.set_byte_limit(0);
+    let (sign_facts, sign_pos) = guarded.admit_shape(&sign);
+    guarded.observe(&joint_key, sign_pos, sign_facts.clone());
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    // The late Init seal must not re-replay the fallback.
+    ingest_call(&mut guarded.scene, &init);
+    let seal = guarded.scene.seal().expect("init quantum seals");
+    assert_eq!(
+        guarded.registry.deliver_joint_seal(
+            joint_id,
+            &seal,
+            &guarded.scene.model,
+            &mut guarded.scene.ledger,
+        ),
+        SealApplyOutcome::Held,
+        "the late seal never re-replays"
+    );
+    {
+        let edge = guarded
+            .registry
+            .instance_semantic_edges()
+            .find(|record| record.id == joint_id)
+            .expect("edge retained")
+            .semantics
+            .as_ref()
+            .expect("materialized");
+        assert_eq!(
+            (edge.calls(), edge.started(), edge.completed()),
+            (2, 1, 1),
+            "one completed Sign in original order"
+        );
+        assert!(!edge.has_live_operations(), "nothing left live");
+        let mut twin = EdgeSemantics::default();
+        let mut twin_sink = Vec::new();
+        for facts in [&init_facts, &sign_facts] {
+            let origin = EffectOrigin::from(facts);
+            twin.observe_with_effects(facts, &origin, &mut twin_sink);
+        }
+        assert_s1_equal(edge, &twin);
+    }
+    assert_eq!(
+        guarded.scene.ledger.staged(),
+        0,
+        "fallback releases tickets"
+    );
+}
+
+/// C4: staging N/N+1 falls back in order. 1,024 Creates stage; the
+/// 1,025th refuses Full, replaying all 1,024 in order before its own
+/// direct reduction. S1 matches the direct twin exactly.
+#[test]
+fn key_operation_c4_staging_n_plus_one_falls_back_in_order() {
+    use crate::semantics_key_use::JOINT_STAGING_CAPACITY;
+
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(joint_key.clone(), bootstrap);
+    let (_, joint_id) = guarded.register(1);
+
+    let create = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
+    let mut twin = EdgeSemantics::default();
+    let mut twin_sink = Vec::new();
+    for _ in 0..JOINT_STAGING_CAPACITY {
+        let (facts, position) = guarded.admit_shape(&create);
+        let origin = EffectOrigin::from(&facts);
+        twin.observe_with_effects(&facts, &origin, &mut twin_sink);
+        guarded.observe(&joint_key, position, facts);
+        guarded
+            .registry
+            .publish_with_ledger(&mut guarded.scene.ledger);
+    }
+    assert_eq!(
+        guarded.scene.ledger.staged(),
+        JOINT_STAGING_CAPACITY,
+        "N stage"
+    );
+    // N+1 refuses Full: ordered fallback replays N in order, then N+1
+    // reduces direct.
+    let (facts, position) = guarded.admit_shape(&create);
+    let origin = EffectOrigin::from(&facts);
+    twin.observe_with_effects(&facts, &origin, &mut twin_sink);
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only),
+        "capacity fallback degrades the feed"
+    );
+    assert_eq!(
+        guarded.scene.ledger.staged(),
+        0,
+        "fallback releases tickets"
+    );
+    let edge = guarded
+        .registry
+        .instance_semantic_edges()
+        .find(|record| record.id == joint_id)
+        .expect("edge retained")
+        .semantics
+        .as_ref()
+        .expect("materialized");
+    assert_eq!(
+        edge.calls(),
+        JOINT_STAGING_CAPACITY as u64 + 1,
+        "every call reduced exactly once"
+    );
+    assert_s1_equal(edge, &twin);
+}
+
+/// C4: missing-ledger fallback preserves order with pended releases.
+/// The staged Init plus the ledger-less Sign replay in order (one
+/// completed Sign); the ticket releases pend until the next ledger
+/// contact, when a seal delivery flushes them. S1 matches the twin.
+#[test]
+fn key_operation_c4_missing_ledger_falls_back_in_order() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(joint_key.clone(), bootstrap);
+    let (_, joint_id) = guarded.register(1);
+
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    let (init_facts, init_pos) = guarded.admit_shape(&init);
+    guarded.observe(&joint_key, init_pos, init_facts.clone());
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    assert_eq!(guarded.scene.ledger.staged(), 1);
+    // No ledger: the Sign cannot stage, but must not overtake.
+    let (sign_facts, sign_pos) = guarded.admit_shape(&sign);
+    guarded.observe(&joint_key, sign_pos, sign_facts.clone());
+    guarded.registry.publish();
+    {
+        let edge = guarded
+            .registry
+            .instance_semantic_edges()
+            .find(|record| record.id == joint_id)
+            .expect("edge retained")
+            .semantics
+            .as_ref()
+            .expect("materialized");
+        assert_eq!(
+            (edge.calls(), edge.started(), edge.completed()),
+            (2, 1, 1),
+            "one completed Sign in original order"
+        );
+        let mut twin = EdgeSemantics::default();
+        let mut twin_sink = Vec::new();
+        for facts in [&init_facts, &sign_facts] {
+            let origin = EffectOrigin::from(facts);
+            twin.observe_with_effects(facts, &origin, &mut twin_sink);
+        }
+        assert_s1_equal(edge, &twin);
+    }
+    // The ticket release pended (no ledger supplied); the next ledger
+    // contact — here a late seal delivery — flushes it.
+    assert_eq!(
+        guarded.scene.ledger.staged(),
+        1,
+        "ledger-less releases pend, never leak silently"
+    );
+    ingest_call(&mut guarded.scene, &init);
+    let seal = guarded.scene.seal().expect("init quantum seals");
+    assert_eq!(
+        guarded.registry.deliver_joint_seal(
+            joint_id,
+            &seal,
+            &guarded.scene.model,
+            &mut guarded.scene.ledger,
+        ),
+        SealApplyOutcome::Held
+    );
+    assert_eq!(guarded.scene.ledger.staged(), 0, "ledger contact flushes");
+}
+
+/// C4: an unsealable completion with queued calls falls back in
+/// order first. The staged PENDING Init replays (queuing S1-side)
+/// before the completion reduces direct, so the completion routes to
+/// its original instead of orphaning. S1 matches the direct twin.
+#[test]
+fn key_operation_c4_unsealable_with_queued_calls_falls_back_in_order() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(joint_key.clone(), bootstrap);
+    let (_, joint_id) = guarded.register(1);
+
+    // The PENDING Init stages and stays queued (no seal yet).
+    let pending = ShapedS1::shaped("C_SignInit", CkRv::PENDING.0, RSA_PKCS, init_capture());
+    let (pending_facts, pending_pos) = guarded.admit_shape(&pending);
+    guarded.observe(&joint_key, pending_pos, pending_facts.clone());
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    assert_eq!(guarded.scene.ledger.staged(), 1);
+    // The completion is unsealable (frozen negative-only table) but
+    // must not overtake the queued original. It rides a
+    // fixture-minted H0 ordinal: the async completion is
+    // p11scope-synthesized, not a PKCS#11 table function, so the
+    // fixture cannot admit its shape; the S1 facts mirror the unit
+    // carve-out exactly.
+    let minted = guarded.scene.fixture.admit_function("C_SignInit");
+    let complete_pos = minted.h0_ordinal();
+    let target = crate::kinds::function_id("C_SignInit").unwrap();
+    let complete_facts = SemanticCall {
+        function: "C_AsyncComplete".into(),
+        session: pending_facts.session,
+        target_function: target,
+        capture: op_capture(),
+        ts_ns: pending_facts.ts_ns.saturating_add(100),
+        rv: CkRv::OK.0,
+        authorized: true,
+        unambiguous: true,
+        attributable: true,
+        ..SemanticCall::default()
+    };
+    guarded.observe(&joint_key, complete_pos, complete_facts.clone());
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    {
+        let edge = guarded
+            .registry
+            .instance_semantic_edges()
+            .find(|record| record.id == joint_id)
+            .expect("edge retained")
+            .semantics
+            .as_ref()
+            .expect("materialized");
+        assert_eq!(
+            (edge.calls(), edge.started(), edge.orphans()),
+            (2, 1, 0),
+            "the completion routes to its queued original"
+        );
+        let mut twin = EdgeSemantics::default();
+        let mut twin_sink = Vec::new();
+        for facts in [&pending_facts, &complete_facts] {
+            let origin = EffectOrigin::from(facts);
+            twin.observe_with_effects(facts, &origin, &mut twin_sink);
+        }
+        assert_s1_equal(edge, &twin);
+    }
+    assert_eq!(
+        guarded.scene.ledger.staged(),
+        0,
+        "fallback releases tickets"
+    );
 }

@@ -2279,6 +2279,12 @@ mod tests {
         raced: bool,
         first_was_foreign: bool,
         confirms: usize,
+        /// N17: rendezvous with the racing unhinted allocation. The
+        /// confirm hook waits after the move (competitor allocates and
+        /// writes its sentinel), waits again (sentinel written), then
+        /// replaces the old address and waits a third time (competitor
+        /// reads its byte back). Three waits each side, same order.
+        barrier: std::sync::Arc<std::sync::Barrier>,
     }
     impl ScanSource for LiveConfirmRace {
         fn budget(&self) -> Result<(), ImageQueryRefusal> {
@@ -2337,19 +2343,30 @@ mod tests {
                     )
                 };
                 assert_ne!(target, libc::MAP_FAILED, "reserve the move target");
-                // MREMAP_FIXED over the HELD reservation: no munmap
-                // hole another thread could grab in between.
+                // MREMAP_FIXED over the HELD reservation plus
+                // DONTUNMAP: the old address stays owned by this
+                // fixture until the MAP_FIXED replacement below, so
+                // no racing allocation in this shared test process
+                // can land there in between (N17). The observable
+                // race is unchanged: afterwards the old address
+                // holds the foreign file and the moved address the
+                // watched one.
                 let moved = unsafe {
                     libc::mremap(
                         self.old as *mut libc::c_void,
                         4096,
                         4096,
-                        libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED,
+                        libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED | libc::MREMAP_DONTUNMAP,
                         target,
                     )
                 };
                 assert_ne!(moved, libc::MAP_FAILED, "move the watched mapping");
                 assert_eq!(moved, target, "the move must really relocate");
+                // N17: let a racing unhinted allocation land in the
+                // move/replacement window; it must take another
+                // address and its sentinel must survive below.
+                self.barrier.wait();
+                self.barrier.wait();
                 let replaced = unsafe {
                     libc::mmap(
                         self.old as *mut libc::c_void,
@@ -2364,6 +2381,7 @@ mod tests {
                     replaced, self.old as *mut libc::c_void,
                     "replace the old address"
                 );
+                self.barrier.wait();
                 self.moved = target as u64;
                 self.epoch.global = 1;
                 let target_name =
@@ -2422,6 +2440,38 @@ mod tests {
             })
             .expect("the watched mapping is listed");
         assert_ne!(watched_key.inode, 0, "the watched key must select");
+        // N17 competing-allocation control: a thread racing an
+        // ordinary unhinted mmap plus sentinel byte 165 into the
+        // move/replacement window (the reviewer's probe shape). The
+        // rendezvous is barrier-deterministic, not timing luck.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let competitor_addr = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let competitor_byte = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let competitor = std::thread::spawn({
+            let barrier = std::sync::Arc::clone(&barrier);
+            let competitor_addr = std::sync::Arc::clone(&competitor_addr);
+            let competitor_byte = std::sync::Arc::clone(&competitor_byte);
+            move || {
+                barrier.wait();
+                let raced = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        4096,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                assert_ne!(raced, libc::MAP_FAILED, "competitor maps");
+                competitor_addr.store(raced as u64, std::sync::atomic::Ordering::SeqCst);
+                unsafe { std::ptr::write_bytes(raced, 165, 1) };
+                barrier.wait();
+                barrier.wait();
+                let back = unsafe { std::ptr::read(raced as *const u8) };
+                competitor_byte.store(back, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
         let mut source = LiveConfirmRace {
             image: ImageIdentity {
                 task_cookie: 7,
@@ -2444,6 +2494,7 @@ mod tests {
             raced: false,
             first_was_foreign: false,
             confirms: 0,
+            barrier,
         };
         let result = prove_absence_with(&mut source, domain(), 3, 4);
         // The watched provider never stopped being mapped (the
@@ -2464,7 +2515,23 @@ mod tests {
             libc::close(watched);
             libc::close(replacement);
         }
+        competitor.join().expect("the competitor thread finishes");
+        let landed = competitor_addr.load(std::sync::atomic::Ordering::SeqCst);
+        let survived = competitor_byte.load(std::sync::atomic::Ordering::SeqCst);
+        if landed != 0 && landed != old_addr {
+            unsafe {
+                libc::munmap(landed as *mut libc::c_void, 4096);
+            }
+        }
         assert!(source.raced, "the race hook never fired");
+        assert_ne!(
+            landed, old_addr,
+            "the racing allocation must not take the fixture's address"
+        );
+        assert_eq!(
+            survived, 165,
+            "the racing allocation's sentinel must survive the replacement"
+        );
         assert!(
             source.first_was_foreign,
             "the old candidate must drop as foreign during the race"

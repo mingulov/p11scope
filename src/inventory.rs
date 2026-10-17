@@ -2223,7 +2223,8 @@ pub(crate) fn finish_output(
                 .key_operations
                 .sweep_exact(writer, &published, presentation.ended_ns)?;
         writer.reserve(tail)?;
-        let mut estimate = combined_unretained_after(stream_state, writer, presentation, tail);
+        let mut estimate =
+            combined_unretained_after(stream_state, writer, presentation, &published, tail);
         if estimate.0 + estimate.1 + estimate.2 + estimate.3 > 0
             && combined_dump_fits(
                 &stream_state.edges,
@@ -2251,7 +2252,8 @@ pub(crate) fn finish_output(
                 .key_operations
                 .dump_all(writer, &published, presentation.ended_ns)?;
             // No second reserve: the fit bound already holds the tail.
-            estimate = combined_unretained_after(stream_state, writer, presentation, tail);
+            estimate =
+                combined_unretained_after(stream_state, writer, presentation, &published, tail);
         }
         let edge_events = swept.emitted;
         let instance_events = swept_instances.instance_emitted;
@@ -2263,6 +2265,7 @@ pub(crate) fn finish_output(
             &stream_state.key_operations,
             writer,
             presentation,
+            &published,
             estimate,
             presentation.ended_ns,
             |(edges_unretained, instances_unretained, semantic_unretained, key_unretained)| {
@@ -2376,6 +2379,7 @@ fn combined_unretained_after(
     stream_state: &StreamState,
     writer: &EventWriter,
     presentation: &Presentation,
+    key_observations: &crate::key_operation_projection::ObjectObservations,
     tail: u64,
 ) -> (usize, usize, usize, usize) {
     let edges_unretained = stream_state
@@ -2387,11 +2391,12 @@ fn combined_unretained_after(
         &presentation.semantic_edges,
         tail,
     );
-    let key_unretained = stream_state.key_operations.unretained_after(
-        writer,
-        &presentation.object_observations,
-        tail,
-    );
+    // The key disclosure counts the SELECTED publication (N11) — the
+    // same rows the sweep wrote — never the newer presentation.
+    let key_unretained =
+        stream_state
+            .key_operations
+            .unretained_after(writer, key_observations, tail);
     (
         edges_unretained,
         instances_unretained,
@@ -2488,6 +2493,17 @@ impl StreamState {
             emitted_suppressed: 0,
             emitted_unbound: BTreeMap::new(),
         }
+    }
+
+    /// Install a pre-loaded key publisher (N11 stale-publication
+    /// tests): the finish path publishes the current presentation
+    /// into this publisher, which may retain an older selection.
+    #[cfg(test)]
+    pub(crate) fn reference_key_publisher(
+        &mut self,
+        publisher: crate::key_operation_projection::ObservationPublisher,
+    ) {
+        self.key_publisher = publisher;
     }
 }
 

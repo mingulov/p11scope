@@ -2183,34 +2183,27 @@ pub(crate) fn combined_dump_fits(
 /// `ended` line) the counts can only fall, and longer counts never
 /// shorten the line, so this converges to counts that are exact
 /// for the line actually written.
-#[allow(clippy::too_many_arguments)] // The four converging emitters plus writer, presentation, estimate and payload.
+#[allow(clippy::too_many_arguments)] // The four converging emitters plus writer, presentation, selected key rows, estimate and payload.
 pub(crate) fn settle_ended_combined(
     edges: &EdgeEmitter,
     instances: &InstanceEmitter,
     key_operations: &KeyOperationEmitter,
     writer: &EventWriter,
     presentation: &Presentation,
+    key_observations: &crate::key_operation_projection::ObjectObservations,
     estimate: (usize, usize, usize, usize),
     at_ns: u64,
     ended: impl Fn((usize, usize, usize, usize)) -> serde_json::Value,
 ) -> ((usize, usize, usize, usize), serde_json::Value) {
     let mut counts = estimate;
-    let key_rows = presentation
-        .object_observations
-        .objects
-        .len()
-        .saturating_add(
-            presentation
-                .object_observations
-                .key_operations
-                .len()
-                .saturating_add(
-                    presentation
-                        .object_observations
-                        .unknown_key_operations
-                        .len(),
-                ),
-        );
+    // The convergence bound counts the SELECTED publication's key
+    // rows (N11) — the same rows the sweep settled.
+    let key_rows = key_observations.objects.len().saturating_add(
+        key_observations
+            .key_operations
+            .len()
+            .saturating_add(key_observations.unknown_key_operations.len()),
+    );
     let bound = presentation
         .edges
         .len()
@@ -2239,7 +2232,7 @@ pub(crate) fn settle_ended_combined(
                     incoming,
                 )
                 .1,
-            key_operations.unretained_after(writer, &presentation.object_observations, incoming),
+            key_operations.unretained_after(writer, key_observations, incoming),
         );
         if exact == counts {
             return (counts, payload);

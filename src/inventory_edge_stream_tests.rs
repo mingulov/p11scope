@@ -1430,3 +1430,254 @@ fn key_rows_lost_to_pressure_are_repaired_by_the_dump_when_it_fits() {
         assert_eq!(*count, expected, "retained rows equal the swept state");
     }
 }
+
+/// N11 remainder (fix round 2): the finish path threads the SAME
+/// SELECTED publication through every convergence/count/bound step.
+/// The current presentation names object#2 but the publisher retains
+/// the stale object#1 selection (exact-byte refusal); under
+/// retention pressure the swept object#1 row loses its record and
+/// `ended` must disclose 1 unretained (the selected row) — never 0
+/// (the current row, which was never swept).
+#[test]
+fn finish_counts_the_selected_stale_publication_not_the_current() {
+    use crate::key_operation_projection::{
+        MetadataBlock, MetadataField, ObjectObservations, ObjectRow, ObsBudgets, ObsStatus,
+        ObservationPublisher, QueriesBlock,
+    };
+
+    fn row(object: u64) -> ObjectRow {
+        let blank = MetadataField {
+            status: "absent",
+            scalar: None,
+            curve: None,
+        };
+        let block = MetadataBlock {
+            class: blank,
+            key_type: blank,
+            token: blank,
+            value_len: blank,
+            modulus_bits: blank,
+            ec_params: blank,
+        };
+        ObjectRow {
+            object,
+            session: 7,
+            origin: "observed",
+            creation: None,
+            birth: None,
+            lifetime: "active",
+            lifetime_reason: None,
+            attribution: "valid",
+            attribution_reason: None,
+            requested: block,
+            established: block,
+            queries: QueriesBlock {
+                class: "not_queried",
+                key_type: "not_queried",
+                token: "not_queried",
+                value_len: "not_queried",
+                modulus_bits: "not_queried",
+                ec_params: "not_queried",
+            },
+            label: None,
+            successful_references: 1,
+            successful_key_references: 0,
+            accessing_sessions: 1,
+        }
+    }
+
+    fn observations(revision: u64, object: u64, bytes: usize) -> ObjectObservations {
+        ObjectObservations {
+            revision,
+            status: ObsStatus::Populated,
+            reason: "none",
+            sessions: Vec::new(),
+            objects: vec![row(object)],
+            key_operations: Vec::new(),
+            unknown_key_operations: Vec::new(),
+            gaps: Vec::new(),
+            gaps_suppressed: 0,
+            budgets: ObsBudgets {
+                key_limit: 64,
+                key_occupied: 0,
+                key_refused: 0,
+                object_limit: 65_536,
+                object_occupied: 1,
+                object_refused: 0,
+                unknown_occupied: 0,
+                encoded_bytes: bytes,
+            },
+        }
+    }
+
+    // The retained selection names object#1; the current presentation
+    // names object#2 but refuses the exact-byte bound (stale).
+    let old = observations(1, 1, 1000);
+    let current = observations(u64::MAX, 2, 1001);
+    let mut publisher = ObservationPublisher::with_byte_limit(old.budgets.encoded_bytes);
+    publisher.publish(old);
+    let mut state = StreamState::new();
+    state.reference_key_publisher(publisher);
+    let harness = harness(0, 0);
+    let mut last = presentation(&harness);
+    last.object_observations = current;
+    // Retention too small for the swept row plus the terminal record:
+    // the swept row must lose its record while `ended` survives.
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let writer = EventWriter::create(&path, 512, 2).unwrap();
+    let mut text = Vec::new();
+    let outcome = finish_output(
+        None,
+        &mut EventLogState::new(Some(writer)),
+        &mut state,
+        &last,
+        false,
+        false,
+        &mut crate::inventory_output::WriterStdout(&mut text),
+        None,
+        None,
+    );
+    assert_eq!(outcome.exit_code(), 0);
+    assert_eq!(outcome.event_log_confirmed, Some(true));
+    let mut swept_object = None;
+    let mut ended = None;
+    for line in retained_lines(&path) {
+        if line["kind"] == "object_observed" {
+            swept_object = Some(line["event"]["row"]["object"].as_u64().unwrap());
+        }
+        if line["kind"] == "ended" {
+            ended = Some(line["event"].clone());
+        }
+    }
+    assert_eq!(swept_object, None, "pressure evicted the swept row");
+    let ended = ended.expect("the terminal record is retained");
+    assert_eq!(
+        ended["key_operation_events"], 1,
+        "the sweep wrote the selected row"
+    );
+    assert_eq!(
+        ended["key_operations_unretained"], 1,
+        "the disclosure counts the SELECTED row, not the current one"
+    );
+}
+
+/// N11 remainder (fix round 2, guard): when the stale selection fits
+/// retention, nothing is unretained — threading the selected
+/// publication must not over-count either.
+#[test]
+fn finish_with_fitting_stale_selection_discloses_nothing() {
+    use crate::key_operation_projection::{
+        MetadataBlock, MetadataField, ObjectObservations, ObjectRow, ObsBudgets, ObsStatus,
+        ObservationPublisher, QueriesBlock,
+    };
+
+    fn row(object: u64) -> ObjectRow {
+        let blank = MetadataField {
+            status: "absent",
+            scalar: None,
+            curve: None,
+        };
+        let block = MetadataBlock {
+            class: blank,
+            key_type: blank,
+            token: blank,
+            value_len: blank,
+            modulus_bits: blank,
+            ec_params: blank,
+        };
+        ObjectRow {
+            object,
+            session: 7,
+            origin: "observed",
+            creation: None,
+            birth: None,
+            lifetime: "active",
+            lifetime_reason: None,
+            attribution: "valid",
+            attribution_reason: None,
+            requested: block,
+            established: block,
+            queries: QueriesBlock {
+                class: "not_queried",
+                key_type: "not_queried",
+                token: "not_queried",
+                value_len: "not_queried",
+                modulus_bits: "not_queried",
+                ec_params: "not_queried",
+            },
+            label: None,
+            successful_references: 1,
+            successful_key_references: 0,
+            accessing_sessions: 1,
+        }
+    }
+
+    fn observations(revision: u64, object: u64, bytes: usize) -> ObjectObservations {
+        ObjectObservations {
+            revision,
+            status: ObsStatus::Populated,
+            reason: "none",
+            sessions: Vec::new(),
+            objects: vec![row(object)],
+            key_operations: Vec::new(),
+            unknown_key_operations: Vec::new(),
+            gaps: Vec::new(),
+            gaps_suppressed: 0,
+            budgets: ObsBudgets {
+                key_limit: 64,
+                key_occupied: 0,
+                key_refused: 0,
+                object_limit: 65_536,
+                object_occupied: 1,
+                object_refused: 0,
+                unknown_occupied: 0,
+                encoded_bytes: bytes,
+            },
+        }
+    }
+
+    let old = observations(1, 1, 1000);
+    let current = observations(u64::MAX, 2, 1001);
+    let mut publisher = ObservationPublisher::with_byte_limit(old.budgets.encoded_bytes);
+    publisher.publish(old);
+    let mut state = StreamState::new();
+    state.reference_key_publisher(publisher);
+    let harness = harness(0, 0);
+    let mut last = presentation(&harness);
+    last.object_observations = current;
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+    let mut text = Vec::new();
+    let outcome = finish_output(
+        None,
+        &mut EventLogState::new(Some(writer)),
+        &mut state,
+        &last,
+        false,
+        false,
+        &mut crate::inventory_output::WriterStdout(&mut text),
+        None,
+        None,
+    );
+    assert_eq!(outcome.exit_code(), 0);
+    assert_eq!(outcome.event_log_confirmed, Some(true));
+    let mut swept_object = None;
+    let mut ended = None;
+    for line in retained_lines(&path) {
+        if line["kind"] == "object_observed" {
+            swept_object = Some(line["event"]["row"]["object"].as_u64().unwrap());
+        }
+        if line["kind"] == "ended" {
+            ended = Some(line["event"].clone());
+        }
+    }
+    assert_eq!(swept_object, Some(1), "the SELECTED row is swept");
+    let ended = ended.expect("the terminal record is retained");
+    assert_eq!(ended["key_operation_events"], 1);
+    assert_eq!(
+        ended["key_operations_unretained"], 0,
+        "a fitting selection discloses nothing"
+    );
+}

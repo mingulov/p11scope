@@ -1000,6 +1000,7 @@ fn key_operation_fallback_and_history_loss() {
     let (outcome, refused) = staging.apply_failure(
         &failure,
         &mut pending_source,
+        &scene.model,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1016,6 +1017,7 @@ fn key_operation_fallback_and_history_loss() {
     let (outcome, refused) = staging.apply_failure(
         &failure,
         &mut clean_source,
+        &scene.model,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1088,6 +1090,7 @@ fn key_operation_fallback_and_history_loss() {
     let (outcome, refused) = staging.apply_failure(
         &failure,
         &mut h3,
+        &scene.model,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1320,6 +1323,7 @@ fn key_operation_joint_retry_and_degraded_inert() {
     let (outcome, refused) = staging.apply_failure(
         &failure,
         &mut h3,
+        &scene.model,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1382,6 +1386,7 @@ fn key_operation_joint_retry_and_degraded_inert() {
     let (outcome, refused) = staging.apply_failure(
         &failure,
         &mut loss_source,
+        &scene.model,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1398,6 +1403,7 @@ fn key_operation_joint_retry_and_degraded_inert() {
     let (outcome, refused) = staging.apply_failure(
         &failure,
         &mut loss_source,
+        &scene.model,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1499,6 +1505,261 @@ fn key_operation_abandoned_quantum_replays_s1() {
 
 /// G29/H9-§2: the S1 matrix (failed Init, size query, too-small
 /// retry, multipart, message context, cancellation) holds
+/// N3: proof-only fallback invalidates before it replays: the
+/// seal failure's retirement effects close the open key association
+/// first, so the replayed S1 terminal cannot complete a now-unproved
+/// binding — earlier completed history stands, and the primary S1
+/// outcome routes once to the unknown-key summary.
+#[test]
+fn key_operation_fallback_invalidates_before_replay() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+
+    let instance = RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    // The terminal stages; then proof fails while the model retires
+    // the key (loss): the fallback must invalidate first.
+    let terminal = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    attest_and_stage(&mut scene, &mut staging, &terminal);
+    let effects = scene.model.invalidate(
+        crate::semantics_objects::AffectedScope::Capture,
+        crate::semantics_objects::ObjectGap::Loss,
+    );
+    assert!(
+        effects.effects.iter().any(|effect| matches!(
+            effect,
+            crate::semantics_objects::ObjectEffect::Retired { .. }
+        )),
+        "non-vacuous: invalidation retires the key"
+    );
+    let failure = SealFailure {
+        gap: JournalGap::ClosureStale,
+        effects,
+        h3_voided: None,
+    };
+    let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_failure(
+        &failure,
+        &mut clean,
+        &scene.model,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
+    assert_eq!(outcome, FailureApplyOutcome::FellBack { replayed: 1 });
+    assert_eq!(joint.completed(), 1, "proof-only loss preserves S1");
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert!(
+        committed
+            .key_operations
+            .iter()
+            .all(|row| row.completed == 0),
+        "fallback must not complete a now-unproved key binding: {:?}",
+        committed.key_operations
+    );
+    let lost = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("earlier association history stands");
+    assert_eq!((lost.started, lost.key_join_lost), (1, 1));
+    let terminal = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "key_join_lost")
+        .expect("the primary S1 outcome routes once to unknown-key");
+    assert_eq!(terminal.completed, 1);
+}
+
+/// N3: object retirement closes the live association at invalidation
+/// time: the committed row shows no active association and one lost
+/// join immediately — never a still-active row awaiting its S1
+/// terminal — and the eventual terminal routes once to unknown-key
+/// without double-closing.
+#[test]
+fn key_operation_retirement_closes_association_before_terminal() {
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    let key = sink
+        .iter()
+        .find_map(|effect| match effect {
+            OperationEffect::Started { key_receipt, .. } => *key_receipt,
+            _ => None,
+        })
+        .expect("init start carries its receipt")
+        .key;
+    keyuse.retire_object(key);
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("the live association publishes");
+    assert_eq!(
+        (row.active, row.key_join_lost),
+        (0, 1),
+        "retirement ends key authority immediately"
+    );
+    // The eventual S1 terminal routes once to unknown-key; the
+    // proved bucket never double-closes.
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let committed = commit(2, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("history stands");
+    assert_eq!((row.started, row.completed, row.key_join_lost), (1, 0, 1));
+    let terminal = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "key_join_lost")
+        .expect("the S1 terminal routes once to unknown-key");
+    assert_eq!(terminal.completed, 1);
+}
+
+/// N3: the success path retires before it replays: a session close
+/// whose seal ends the session retires the open key association
+/// first, so the close's own S1 terminal cannot complete a binding
+/// the same seal just unproved.
+#[test]
+fn key_operation_success_path_retires_before_replay() {
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CloseSession", CkRv::OK.0, 0, 0),
+    );
+    assert_eq!(joint.started(), 1);
+    assert_eq!(joint.cancelled(), 1, "the close cancels the live machine");
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("the association publishes");
+    assert_eq!(
+        (row.completed, row.cancelled, row.failed, row.unknown),
+        (0, 0, 0, 0),
+        "no proved outcome past retirement"
+    );
+    assert_eq!(row.key_join_lost, 1);
+    let terminal = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "key_join_lost")
+        .expect("the close terminal routes once to unknown-key");
+    assert_eq!(terminal.cancelled, 1);
+}
+
 /// C2: a seal binds its EXACT staged call and consumes the claim
 /// once. Re-applying the same single-call seal refuses (Held) even
 /// when another same-function call stages; foreign, delayed,
@@ -1830,6 +2091,7 @@ fn key_operation_s1_matrix_through_both_feeds() {
     let (outcome, _) = staging.apply_failure(
         &failure,
         &mut clean,
+        &scene.model,
         &mut joint,
         &mut keyuse,
         instance,
@@ -4769,6 +5031,7 @@ fn key_operation_schema_contract() {
     let (outcome, _) = fall_staging.apply_failure(
         &failure,
         &mut h3,
+        &fall_scene.model,
         &mut fall_edge,
         &mut fall_keyuse,
         instance,
@@ -4815,6 +5078,7 @@ fn key_operation_schema_contract() {
     let (outcome, _) = loss_staging.apply_failure(
         &loss_failure,
         &mut loss_h3,
+        &loss_scene.model,
         &mut loss_edge,
         &mut loss_keyuse,
         instance,

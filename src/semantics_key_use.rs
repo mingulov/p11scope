@@ -1020,10 +1020,12 @@ impl KeyUseReducer {
                 }
                 if let Some(refused) = self.refused.remove(&key) {
                     // A refused start's terminal: S1 owns the
-                    // outcome; the key side counts it without a row.
+                    // outcome; the key side preserves it in the
+                    // fixed unknown summary — never a positive row.
                     let slot =
                         unknown_index(refused.category, unbound_reason_for(refused.category));
                     self.unknown[slot].active = self.unknown[slot].active.saturating_sub(1);
+                    self.unknown[slot].add(*outcome);
                     self.evidence.refused_terminals =
                         self.evidence.refused_terminals.saturating_add(1);
                     return;
@@ -1046,6 +1048,11 @@ impl KeyUseReducer {
                 );
                 let resolved = Self::resolve(instance, category, &receipts);
                 if !self.admits(&resolved) {
+                    // A refused direct's terminal outcome (directs
+                    // complete atomically) preserves into the fixed
+                    // unknown summary — never a positive row.
+                    let slot = unknown_index(category, unbound_reason_for(category));
+                    self.unknown[slot].add(OperationOutcome::Completed);
                     self.evidence.rows_refused = self.evidence.rows_refused.saturating_add(1);
                     self.evidence.partial = true;
                     self.evidence.refused_terminals =

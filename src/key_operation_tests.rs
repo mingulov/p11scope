@@ -5403,110 +5403,15 @@ fn key_operation_rsa_ledger_reference() {
     );
 }
 
-/// H9-§91/§93: retained aggregates never outgrow the bound, so
-/// repeat publication costs identical bytes on every pass. The
-/// receipt-less ledger replay lands in fixed unknown summaries
-/// (never refused, never rowed); a proved-pressure twin sized to
-/// one bucket refuses later instances into scalar counters only,
-/// never into buckets or render buffers. (N7 upgrades this
-/// serialization-request accounting to retained/live/peak memory
-/// measurement.)
+/// N7: every terminal uses pre-reserved storage: closes of
+/// admitted, receipt-less and refused associations, orphan ends and
+/// refused directs allocate nothing (starts reserve; terminals
+/// move within reserved buckets and fixed summaries).
 #[test]
-fn key_operation_allocation_pressure_is_bounded_across_passes() {
-    let missing = ledger_prerequisites();
-    if !missing.is_empty() {
-        eprintln!(
-            "SKIP key_operation_allocation_pressure_is_bounded_across_passes: missing {}",
-            missing.join(", ")
-        );
-        return;
-    }
-    let rows = run_rsa_ledger();
-    let calls: Vec<_> = rows.iter().filter(|row| row["kind"] == "call").collect();
-    assert_eq!(calls.len(), 68, "the fixture's exact API population");
-    let instance =
-        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(7);
-    // Three identical receipt-less ledger passes, each into a
-    // fresh reducer: identical summaries, identical commit+render
-    // cost (zero growth on repeat publication).
-    let mut passes = Vec::new();
-    for revision in 1..=3u64 {
-        let mut edge = EdgeSemantics::default();
-        let mut sink = Vec::new();
-        let mut keyuse = KeyUseReducer::new();
-        for call in &calls {
-            for effect in &replay_ledger_call(&mut edge, &mut sink, call) {
-                keyuse.observe_effect(instance, effect);
-            }
-        }
-        assert!(
-            keyuse.aggregates().is_empty(),
-            "pass {revision}: receipt-less passes row no bucket"
-        );
-        assert_eq!(
-            keyuse.evidence().rows_refused,
-            0,
-            "pass {revision}: fixed summaries never refuse"
-        );
-        let model = JointScene::new().model.project();
-        let s1only = JointStaging::select_s1_only();
-        let ((committed, rendered), blocks, bytes) = crate::test_alloc::count_allocs_during(|| {
-            let committed = commit(revision, &[&s1only], &model, &keyuse);
-            let rendered =
-                serde_json::to_string(&object_observations_json(&committed)).expect("render");
-            (committed, rendered)
-        });
-        assert_eq!(committed.status, ObsStatus::Unavailable);
-        assert_eq!(committed.reason, "bootstrap_unavailable");
-        assert!(
-            blocks > 0 && bytes > 0,
-            "pass {revision}: measured, not empty"
-        );
-        passes.push((committed, rendered, blocks, bytes));
-    }
-    assert_eq!(
-        passes[1].0.unknown_key_operations, passes[0].0.unknown_key_operations,
-        "repeat passes summarize identically"
-    );
-    assert_eq!(
-        passes[2].0.unknown_key_operations, passes[0].0.unknown_key_operations,
-        "repeat passes summarize identically"
-    );
-    assert_eq!(
-        (passes[1].2, passes[1].3),
-        (passes[0].2, passes[0].3),
-        "commit+render allocates identically on repeat passes: zero growth"
-    );
-    // Shared-reducer accumulation: three passes into one reducer
-    // accumulate counters only — no buckets, no refusals.
-    let mut shared = KeyUseReducer::new();
-    for _ in 0..3 {
-        let mut edge = EdgeSemantics::default();
-        let mut sink = Vec::new();
-        for call in &calls {
-            for effect in &replay_ledger_call(&mut edge, &mut sink, call) {
-                shared.observe_effect(instance, effect);
-            }
-        }
-    }
-    assert!(shared.aggregates().is_empty());
-    assert_eq!(shared.evidence().rows_refused, 0);
-    let model = JointScene::new().model.project();
-    let s1only = JointStaging::select_s1_only();
-    let accumulated = commit(4, &[&s1only], &model, &shared);
-    let completed = |rows: &[crate::key_operation_projection::UnknownAggRow]| {
-        rows.iter()
-            .find(|row| row.category == "sign" && row.reason == "unbound")
-            .expect("sign summary")
-            .completed
-    };
-    assert_eq!(
-        completed(&accumulated.unknown_key_operations),
-        3 * completed(&passes[0].0.unknown_key_operations),
-        "shared passes accumulate counters, not buckets"
-    );
-    // Proved-pressure twin: one bucket, two instances — the second
-    // refuses into scalar counters, summaries and render identical.
+fn key_operation_terminals_allocate_nothing() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+    use crate::test_alloc::count_allocs_during;
+
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
@@ -5546,18 +5451,323 @@ fn key_operation_allocation_pressure_is_bounded_across_passes() {
         .find(|effect| matches!(effect, OperationEffect::Started { .. }))
         .cloned()
         .expect("proved start");
-    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
-    let mut pressured = KeyUseReducer::with_capacity(1);
-    pressured.observe_effect(RegistryInstanceId::from_raw(0), &start);
-    let model = scene.model.project();
-    let first = commit(1, &[&staging], &model, &pressured);
-    assert_eq!(first.budgets.key_refused, 0);
-    pressured.observe_effect(RegistryInstanceId::from_raw(1), &start);
-    let second = commit(2, &[&staging], &model, &pressured);
-    assert_eq!(second.budgets.key_refused, 1, "N+1 refuses into scalars");
-    assert_eq!(pressured.aggregates().len(), 1, "no new bucket");
+    let mut end_sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut KeyUseReducer::new(),
+        &mut end_sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let end = end_sink
+        .iter()
+        .find(|effect| matches!(effect, OperationEffect::Ended { .. }))
+        .cloned()
+        .expect("sign terminal");
+
+    // Proved close: reserved bucket, fixed outcome.
+    let mut keyuse = KeyUseReducer::with_capacity(1);
+    keyuse.observe_effect(RegistryInstanceId::from_raw(0), &start);
+    let ((), blocks, bytes) = count_allocs_during(|| {
+        keyuse.observe_effect(RegistryInstanceId::from_raw(0), &end);
+    });
+    assert_eq!((blocks, bytes), (0, 0), "proved close allocates nothing");
+    // Refused close: fixed summary, counted scalar.
+    keyuse.observe_effect(RegistryInstanceId::from_raw(1), &start);
+    let ((), blocks, bytes) = count_allocs_during(|| {
+        keyuse.observe_effect(RegistryInstanceId::from_raw(1), &end);
+    });
+    assert_eq!((blocks, bytes), (0, 0), "refused close allocates nothing");
+    // Receipt-less close: fixed summary, explicit evidence.
+    let mut edge = EdgeSemantics::default();
+    let mut bare = KeyUseReducer::with_capacity(1);
+    let mut bare_sink = Vec::new();
+    let c = init("C_SignInit", 7, RSA_PKCS, 100);
+    feed(&mut edge, &mut bare_sink, &c);
+    for effect in bare_sink.clone() {
+        bare.observe_effect(RegistryInstanceId::from_raw(0), &effect);
+    }
+    let c = op("C_Sign", 7, 200);
+    let terms = feed(&mut edge, &mut bare_sink, &c);
+    let ((), blocks, bytes) = count_allocs_during(|| {
+        bare.observe_effect(RegistryInstanceId::from_raw(0), &terms[0]);
+    });
     assert_eq!(
-        second.key_operations, first.key_operations,
-        "refused input keeps the committed rows"
+        (blocks, bytes),
+        (0, 0),
+        "receipt-less close allocates nothing"
+    );
+    // Orphan end and refused direct: fixed summaries only.
+    let mut orphan = KeyUseReducer::with_capacity(1);
+    let ((), blocks, bytes) = count_allocs_during(|| {
+        orphan.observe_effect(RegistryInstanceId::from_raw(9), &end);
+    });
+    assert_eq!((blocks, bytes), (0, 0), "orphan end allocates nothing");
+    let wrap = ShapedS1 {
+        input0: Some((CREATED_KEY, 1)),
+        input1: Some((CREATED_KEY, 1)),
+        ..ShapedS1::shaped("C_WrapKey", CkRv::OK.0, RSA_PKCS, init_capture())
+    };
+    let mut wrap_sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut KeyUseReducer::new(),
+        &mut wrap_sink,
+        &wrap,
+    );
+    let direct = wrap_sink
+        .iter()
+        .find(|effect| matches!(effect, OperationEffect::DirectCompleted { .. }))
+        .cloned()
+        .expect("wrap direct");
+    let mut full = KeyUseReducer::with_capacity(0);
+    let ((), blocks, bytes) = count_allocs_during(|| {
+        full.observe_effect(RegistryInstanceId::from_raw(0), &direct);
+    });
+    assert_eq!((blocks, bytes), (0, 0), "refused direct allocates nothing");
+    assert_eq!(full.evidence().rows_refused, 1);
+}
+
+/// N7/H9-§91/§93: retained/live/peak memory stays bounded across
+/// useful updates and churn. One pipeline (model, staging, S1 join,
+/// key-use reducer, publisher, emitter) serves an updates phase on a
+/// working key set and a churn phase on fresh keys; per-component
+/// structural occupancy plus allocator live/peak prove the envelope:
+/// fixed structures stay flat, history grows only per retained
+/// bucket, steady-state emission retains nothing.
+#[test]
+fn key_operation_allocation_pressure_is_bounded_across_passes() {
+    use crate::test_alloc::{armed_requested_snapshot, requested_peak_during};
+
+    const WORKING_KEYS: u64 = 4;
+    const UPDATE_USES: u64 = 4;
+    const CHURN_KEYS: u64 = 24;
+
+    fn word_quantum(name: &'static str, word: u64) -> ShapedS1 {
+        let (mechanism, capture) = match name {
+            "C_SignInit" => (RSA_PKCS, init_capture()),
+            "C_Sign" => (0, op_capture()),
+            _ => (0, 0),
+        };
+        let mut shaped = ShapedS1::shaped(name, CkRv::OK.0, mechanism, capture);
+        match name {
+            "C_CreateObject" => shaped.result = Some(word),
+            "C_SignInit" | "C_Sign" | "C_DestroyObject" | "C_GetAttributeValue" => {
+                shaped.input0 = Some((word, 1));
+            }
+            other => panic!("unexpected quantum {other}"),
+        }
+        shaped
+    }
+    fn label_quantum(word: u64) -> ShapedS1 {
+        ShapedS1 {
+            getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+            ..word_quantum("C_GetAttributeValue", word)
+        }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn drive_cycle(
+        scene: &mut JointScene,
+        staging: &mut JointStaging,
+        joint: &mut EdgeSemantics,
+        keyuse: &mut KeyUseReducer,
+        quanta: &[ShapedS1],
+    ) {
+        let mut sink = Vec::new();
+        for quantum in quanta {
+            drive_quantum(scene, staging, joint, keyuse, &mut sink, quantum);
+        }
+    }
+
+    #[derive(Debug)]
+    struct PhaseFootprint {
+        model_objects: usize,
+        model_pending: usize,
+        staged: usize,
+        joint_started: u64,
+        joint_completed: u64,
+        aggregates: usize,
+        open: usize,
+        refused: usize,
+        unknown_live: usize,
+        emitter_tracked: usize,
+        published_rows: usize,
+    }
+    impl PhaseFootprint {
+        #[allow(clippy::too_many_arguments)]
+        fn capture(
+            scene: &JointScene,
+            staging: &JointStaging,
+            joint: &EdgeSemantics,
+            keyuse: &KeyUseReducer,
+            emitter: &KeyOperationEmitter,
+            committed: &crate::key_operation_projection::ObjectObservations,
+        ) -> Self {
+            Self {
+                model_objects: scene.model.project().objects.len(),
+                model_pending: scene.model.project().usage.pending_calls,
+                staged: staging.staged_len(),
+                joint_started: joint.started(),
+                joint_completed: joint.completed(),
+                aggregates: keyuse.aggregates().len(),
+                open: keyuse.open().len(),
+                refused: keyuse.refused_opens().len(),
+                unknown_live: committed.unknown_key_operations.len(),
+                emitter_tracked: emitter.tracked(),
+                published_rows: committed.objects.len()
+                    + committed.key_operations.len()
+                    + committed.unknown_key_operations.len(),
+            }
+        }
+    }
+
+    let dir = private_tempdir();
+    let (pipeline, peak) = requested_peak_during(|| {
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let mut joint = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let path = dir.path().join("events.jsonl");
+        let mut writer = EventWriter::create(&path, 8 << 20, 10).unwrap();
+        let mut emitter = KeyOperationEmitter::new();
+        let mut revision = 0u64;
+        // Phase A: useful updates on a working set — repeated uses
+        // share eight buckets.
+        for key in 0..WORKING_KEYS {
+            let word = 0xB000_0000_0000_0000 + key;
+            drive_cycle(
+                &mut scene,
+                &mut staging,
+                &mut joint,
+                &mut keyuse,
+                &[word_quantum("C_CreateObject", word), label_quantum(word)],
+            );
+        }
+        for use_number in 0..UPDATE_USES {
+            let word = 0xB000_0000_0000_0000 + (use_number % WORKING_KEYS);
+            drive_cycle(
+                &mut scene,
+                &mut staging,
+                &mut joint,
+                &mut keyuse,
+                &[
+                    word_quantum("C_SignInit", word),
+                    word_quantum("C_Sign", word),
+                ],
+            );
+        }
+        revision += 1;
+        let committed = commit(revision, &[&staging], &scene.model.project(), &keyuse);
+        emitter
+            .emit(&mut writer, &committed, revision * 1_000)
+            .unwrap();
+        let phase_a =
+            PhaseFootprint::capture(&scene, &staging, &joint, &keyuse, &emitter, &committed);
+        let live_a = armed_requested_snapshot();
+        drop(committed);
+        // Phase B: churn — every cycle mints, labels, uses and
+        // retires a fresh key.
+        for key in 0..CHURN_KEYS {
+            let word = 0xC000_0000_0000_0000 + key;
+            drive_cycle(
+                &mut scene,
+                &mut staging,
+                &mut joint,
+                &mut keyuse,
+                &[
+                    word_quantum("C_CreateObject", word),
+                    label_quantum(word),
+                    word_quantum("C_SignInit", word),
+                    word_quantum("C_Sign", word),
+                    word_quantum("C_DestroyObject", word),
+                ],
+            );
+        }
+        revision += 1;
+        let committed = commit(revision, &[&staging], &scene.model.project(), &keyuse);
+        emitter
+            .emit(&mut writer, &committed, revision * 1_000)
+            .unwrap();
+        let phase_b =
+            PhaseFootprint::capture(&scene, &staging, &joint, &keyuse, &emitter, &committed);
+        let live_b = armed_requested_snapshot();
+        drop(committed);
+        (
+            (phase_a, live_a, phase_b, live_b),
+            scene,
+            staging,
+            keyuse,
+            emitter,
+            writer,
+        )
+    });
+    let ((phase_a, live_a, phase_b, live_b), scene, staging, keyuse, mut emitter, mut writer) =
+        pipeline;
+    eprintln!("phase A: {phase_a:?} live {live_a:?}");
+    eprintln!("phase B: {phase_b:?} live {live_b:?}");
+    eprintln!("pipeline peak: {peak:?}");
+
+    // The tracker saw everything (no overflow, no failure).
+    assert!(!peak.incomplete, "complete allocation report");
+    assert_eq!(peak.failed_requests, 0);
+    assert!(!live_a.incomplete && !live_b.incomplete);
+
+    // Structural occupancy: exact per-component retention.
+    assert_eq!(phase_a.aggregates, WORKING_KEYS as usize);
+    assert_eq!(phase_a.model_objects, WORKING_KEYS as usize);
+    let buckets = WORKING_KEYS as usize + CHURN_KEYS as usize;
+    assert_eq!(phase_b.aggregates, buckets, "one bucket per churned key");
+    assert_eq!(
+        phase_b.model_objects, buckets,
+        "retired views retained under cap"
+    );
+    assert_eq!(phase_b.staged, 0, "every quantum replayed");
+    assert!(phase_b.model_pending <= 2, "settled calls prune");
+    assert_eq!(phase_b.open, 0);
+    assert_eq!(phase_b.refused, 0);
+    assert_eq!(phase_b.joint_started, UPDATE_USES + CHURN_KEYS);
+    assert_eq!(phase_b.joint_completed, UPDATE_USES + CHURN_KEYS);
+    assert_eq!(
+        phase_b.emitter_tracked, phase_b.published_rows,
+        "tracking bounded by the live publication"
+    );
+    assert!(phase_b.unknown_live <= 138, "fixed summaries stay fixed");
+
+    // Live/peak envelope: churn grows only per retained bucket.
+    assert!(
+        live_b.live_bytes >= live_a.live_bytes,
+        "history accumulates"
+    );
+    let growth = live_b.live_bytes - live_a.live_bytes;
+    assert!(
+        growth <= CHURN_KEYS as usize * 4096,
+        "churn growth {growth} within per-bucket envelope"
+    );
+    assert!(peak.peak_bytes <= 8 << 20, "pipeline peak {:?}", peak);
+
+    // Publisher isolation: one retained commit of churned state.
+    let (committed, published) =
+        requested_peak_during(|| commit(9_999, &[&staging], &scene.model.project(), &keyuse));
+    eprintln!("publisher retained: {published:?}");
+    assert!(!published.incomplete);
+    assert!(
+        published.live_bytes <= 256 << 10,
+        "commit retains {:?}",
+        published
+    );
+    // Emitter isolation: a steady-state pass retains nothing; a
+    // changed row retains only its digest.
+    let steady = requested_peak_during(|| {
+        emitter.emit(&mut writer, &committed, 9_999_000).unwrap();
+    })
+    .1;
+    assert_eq!(
+        (steady.live_blocks, steady.live_bytes),
+        (0, 0),
+        "steady-state emission retains nothing"
     );
 }

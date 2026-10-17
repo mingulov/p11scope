@@ -67,6 +67,7 @@ fn started(effect: &OperationEffect) -> (u64, &'static str, Option<u64>, &Effect
             category,
             mechanism,
             origin,
+            ..
         } => (id.ordinal_for_test(), category, *mechanism, origin),
         other => panic!("expected Started, got {other:?}"),
     }
@@ -91,9 +92,58 @@ fn direct(effect: &OperationEffect) -> (u64, &'static str, Option<u64>, &EffectO
             category,
             mechanism,
             origin,
+            ..
         } => (id.ordinal_for_test(), category, *mechanism, origin),
         other => panic!("expected DirectCompleted, got {other:?}"),
     }
+}
+
+/// Strip positional key receipts for S1-shape comparison: Joint
+/// effects carry sealed receipts the S1Only twin never has; every
+/// other field must match exactly.
+fn strip_receipts(stream: &[OperationEffect]) -> Vec<OperationEffect> {
+    stream
+        .iter()
+        .map(|effect| match effect {
+            OperationEffect::Started {
+                id,
+                category,
+                mechanism,
+                origin,
+                ..
+            } => OperationEffect::Started {
+                id: *id,
+                category,
+                mechanism: *mechanism,
+                key_receipt: None,
+                origin: origin.clone(),
+            },
+            OperationEffect::Ended {
+                id,
+                category,
+                outcome,
+                origin,
+            } => OperationEffect::Ended {
+                id: *id,
+                category,
+                outcome: *outcome,
+                origin: origin.clone(),
+            },
+            OperationEffect::DirectCompleted {
+                id,
+                category,
+                mechanism,
+                origin,
+                ..
+            } => OperationEffect::DirectCompleted {
+                id: *id,
+                category,
+                mechanism: *mechanism,
+                key_receipts: Vec::new(),
+                origin: origin.clone(),
+            },
+        })
+        .collect()
 }
 
 /// G11/H9-§2: started/ended/direct effects exactly match the existing
@@ -426,7 +476,7 @@ use crate::semantics_key_use::{
 use crate::semantics_objects::ObjectSemantics;
 use crate::semantics_objects::journal::tests::{
     AttestationFixture, COOKIE, ENTRY_NS, EXEC, FLAGS, SESSION, abandon_bytes, begin_bytes_shaped,
-    end_bytes, end_bytes_absent, ordinary_for,
+    end_bytes, end_bytes_absent, end_bytes_getattr, end_bytes_result, ordinary_for,
 };
 use crate::semantics_objects::journal::{
     BirthKind, BootstrapReceipt, FaultEpoch, FaultReadError, H3DispositionEvidence, JournalAdapter,
@@ -568,16 +618,36 @@ struct ShapedS1 {
     mechanism: u64,
     capture: u32,
     flags: u64,
+    /// Input words as (word, status): `Some` overrides the
+    /// per-function default (`None` = absent).
+    input0: Option<(u64, u8)>,
+    input1: Option<(u64, u8)>,
+    /// CREATE result word override (`None` = the default key word).
+    result: Option<u64>,
+    /// GET attribute cells as (kind, status, value).
+    getattr_cells: Vec<(u8, u8, u16)>,
 }
 
 impl ShapedS1 {
     fn shaped(name: &'static str, rv: u64, mechanism: u64, capture: u32) -> Self {
+        let input0 = match name {
+            "C_SignInit"
+            | "C_VerifyInit"
+            | "C_MessageSignInit"
+            | "C_DestroyObject"
+            | "C_GetAttributeValue" => Some((CREATED_KEY, 1)),
+            _ => None,
+        };
         Self {
             name,
             rv,
             mechanism,
             capture,
             flags: FLAGS,
+            input0,
+            input1: None,
+            result: None,
+            getattr_cells: Vec::new(),
         }
     }
 }
@@ -595,12 +665,13 @@ fn query_capture() -> u32 {
 }
 
 /// Attest + stage one call (no ingest): for correlation twins that
-/// stage and ingest different calls.
+/// stage and ingest different calls. Returns the payload and its H0
+/// position.
 fn attest_and_stage(
     scene: &mut JointScene,
     staging: &mut JointStaging,
     call: &ShapedS1,
-) -> SemanticCall {
+) -> (SemanticCall, u64) {
     let admitted = scene.fixture.admit_shaped(
         SESSION,
         call.name,
@@ -612,10 +683,11 @@ fn attest_and_stage(
     scene.adapter.attest_key(&admitted).expect("call attests");
     let facts = admitted.s1_facts().clone();
     let origin = EffectOrigin::from(&facts);
+    let position = admitted.h0_ordinal();
     staging
-        .stage(facts.clone(), origin, admitted.h0_ordinal())
+        .stage(facts.clone(), origin, position)
         .expect("call stages");
-    facts
+    (facts, position)
 }
 
 /// Attest (no stage) + ingest one call: the seal settles a call H9
@@ -637,12 +709,6 @@ fn attest_and_ingest(scene: &mut JointScene, call: &ShapedS1) {
 fn ingest_call(scene: &mut JointScene, call: &ShapedS1) {
     scene.sequence += 1;
     let fid = crate::kinds::function_id(call.name).unwrap();
-    let input0 = match call.name {
-        "C_SignInit" | "C_VerifyInit" | "C_MessageSignInit" | "C_DestroyObject" => {
-            Some(CREATED_KEY)
-        }
-        _ => None,
-    };
     let begin = begin_bytes_shaped(
         scene.thread,
         scene.sequence,
@@ -652,7 +718,8 @@ fn ingest_call(scene: &mut JointScene, call: &ShapedS1) {
         SESSION,
         call.mechanism,
         call.capture,
-        input0,
+        call.input0,
+        call.input1,
         call.flags,
     );
     assert_eq!(
@@ -662,11 +729,19 @@ fn ingest_call(scene: &mut JointScene, call: &ShapedS1) {
         call.name
     );
     let end = match call.name {
-        "C_CreateObject" => end_bytes(&begin, OBJECT_ACTION_CREATE, call.rv, ENTRY_NS + 50),
-        "C_SignInit" | "C_VerifyInit" | "C_MessageSignInit" => {
+        "C_CreateObject" => match call.result {
+            Some(result) => {
+                end_bytes_result(&begin, OBJECT_ACTION_CREATE, call.rv, ENTRY_NS + 50, result)
+            }
+            None => end_bytes(&begin, OBJECT_ACTION_CREATE, call.rv, ENTRY_NS + 50),
+        },
+        "C_SignInit" | "C_VerifyInit" | "C_MessageSignInit" | "C_WrapKey" => {
             end_bytes(&begin, OBJECT_ACTION_ACCESS, call.rv, ENTRY_NS + 50)
         }
         "C_DestroyObject" => end_bytes(&begin, OBJECT_ACTION_DESTROY, call.rv, ENTRY_NS + 50),
+        "C_GetAttributeValue" => {
+            end_bytes_getattr(&begin, call.rv, ENTRY_NS + 50, &call.getattr_cells)
+        }
         _ => end_bytes_absent(&begin, call.rv, ENTRY_NS + 50),
     };
     assert_eq!(
@@ -679,15 +754,15 @@ fn ingest_call(scene: &mut JointScene, call: &ShapedS1) {
 
 /// Attest + stage + ingest one call's quantum; seal separately so
 /// tests drive success and failure arms explicitly. Returns the
-/// admitted S1 payload for the direct twin.
+/// admitted S1 payload for the direct twin plus its H0 position.
 fn prepare_call(
     scene: &mut JointScene,
     staging: &mut JointStaging,
     call: &ShapedS1,
-) -> SemanticCall {
-    let facts = attest_and_stage(scene, staging, call);
+) -> (SemanticCall, u64) {
+    let (facts, position) = attest_and_stage(scene, staging, call);
     ingest_call(scene, call);
-    facts
+    (facts, position)
 }
 
 fn sign_flow() -> Vec<ShapedS1> {
@@ -753,14 +828,21 @@ fn key_operation_single_feed_exactly_once() {
     assert_eq!(staging.mode(), FeedMode::Joint);
     let mut joint = EdgeSemantics::default();
     let mut joint_sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
     let mut direct = EdgeSemantics::default();
     let mut direct_sink = Vec::new();
 
     for call in sign_flow() {
-        let facts = prepare_call(&mut scene, &mut staging, &call);
+        let (facts, _) = prepare_call(&mut scene, &mut staging, &call);
         let success = scene.seal().expect("single-call quantum seals");
         assert_eq!(success.prefix.settled().len(), 1);
-        let (outcome, refused) = staging.apply_seal(&success, &mut joint, &mut joint_sink);
+        let (outcome, refused) = staging.apply_seal(
+            &success,
+            &scene.model,
+            &mut joint,
+            &mut keyuse,
+            &mut joint_sink,
+        );
         assert_eq!(
             outcome,
             SealApplyOutcome::ReplayedOne,
@@ -773,7 +855,7 @@ fn key_operation_single_feed_exactly_once() {
         direct.observe_with_effects(&facts, &origin, &mut direct_sink);
         // One visit per accepted completed call on both feeds: equal
         // effects, equal counters, after every call.
-        assert_eq!(joint_sink, direct_sink, "effect streams match");
+        assert_eq!(strip_receipts(&joint_sink), direct_sink, "S1 shapes match");
         assert_s1_equal(&joint, &direct);
     }
     assert_eq!(
@@ -811,13 +893,15 @@ fn key_operation_single_feed_exactly_once() {
     let mut staging2 = JointStaging::select_joint(Some(&bootstrap2));
     let mut edge2 = EdgeSemantics::default();
     let mut sink2 = Vec::new();
-    let facts = prepare_call(
+    let mut keyuse = KeyUseReducer::new();
+    let (facts, _) = prepare_call(
         &mut scene2,
         &mut staging2,
         &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
     );
     let success = scene2.seal().expect("quantum seals");
-    let (outcome, refused) = staging2.apply_seal(&success, &mut edge2, &mut sink2);
+    let (outcome, refused) =
+        staging2.apply_seal(&success, &scene2.model, &mut edge2, &mut keyuse, &mut sink2);
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
     assert_eq!(refused, 0);
     // Restaging the same H0 position after reduction refuses.
@@ -853,11 +937,12 @@ fn key_operation_fallback_and_history_loss() {
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
     let mut joint = EdgeSemantics::default();
     let mut joint_sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
     let mut direct = EdgeSemantics::default();
     let mut direct_sink = Vec::new();
     let mut staged_facts = Vec::new();
     for call in sign_flow().into_iter().take(3) {
-        staged_facts.push(prepare_call(&mut scene, &mut staging, &call));
+        staged_facts.push(prepare_call(&mut scene, &mut staging, &call).0);
     }
     // Seal under the foreign proof: genuine mismatch, no loss fenced.
     scene.install_closure();
@@ -898,8 +983,13 @@ fn key_operation_fallback_and_history_loss() {
         u64::MAX,
         Some(1),
     ));
-    let (outcome, refused) =
-        staging.apply_failure(&failure, &mut pending_source, &mut joint, &mut joint_sink);
+    let (outcome, refused) = staging.apply_failure(
+        &failure,
+        &mut pending_source,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+    );
     assert_eq!(outcome, FailureApplyOutcome::HeldForCompleteness);
     assert_eq!(refused, 0);
     assert_eq!(staging.mode(), FeedMode::Joint);
@@ -908,8 +998,13 @@ fn key_operation_fallback_and_history_loss() {
     // With the explicit complete stream, retained calls replay once
     // in original order through ordinary S1, then S1Only forever.
     let mut clean_source = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
-    let (outcome, refused) =
-        staging.apply_failure(&failure, &mut clean_source, &mut joint, &mut joint_sink);
+    let (outcome, refused) = staging.apply_failure(
+        &failure,
+        &mut clean_source,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+    );
     assert_eq!(outcome, FailureApplyOutcome::FellBack { replayed: 3 });
     assert_eq!(refused, 0);
     assert_eq!(staging.mode(), FeedMode::S1Only);
@@ -917,7 +1012,11 @@ fn key_operation_fallback_and_history_loss() {
         let origin = EffectOrigin::from(facts);
         direct.observe_with_effects(facts, &origin, &mut direct_sink);
     }
-    assert_eq!(joint_sink, direct_sink, "fallback equals direct S1");
+    assert_eq!(
+        strip_receipts(&joint_sink),
+        direct_sink,
+        "fallback equals direct S1"
+    );
     assert_s1_equal(&joint, &direct);
     assert_eq!((joint.started(), joint.completed()), (1, 1));
     // Fresh calls after fallback reduce directly, never stage.
@@ -937,15 +1036,22 @@ fn key_operation_fallback_and_history_loss() {
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
     let mut joint = EdgeSemantics::default();
     let mut joint_sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
     // One live machine before the loss.
-    let live = prepare_call(
+    let (live, _) = prepare_call(
         &mut scene,
         &mut staging,
         &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
     );
     assert!(live.function == "C_SignInit");
     let success = scene.seal().expect("first quantum seals");
-    let (outcome, refused) = staging.apply_seal(&success, &mut joint, &mut joint_sink);
+    let (outcome, refused) = staging.apply_seal(
+        &success,
+        &scene.model,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+    );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
     assert_eq!(refused, 0);
     assert_eq!(joint.started(), 1);
@@ -962,7 +1068,8 @@ fn key_operation_fallback_and_history_loss() {
         .expect_err("moved fault voids the seal");
     assert_eq!(failure.gap, JournalGap::FaultChanged);
     let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
-    let (outcome, refused) = staging.apply_failure(&failure, &mut h3, &mut joint, &mut joint_sink);
+    let (outcome, refused) =
+        staging.apply_failure(&failure, &mut h3, &mut joint, &mut keyuse, &mut joint_sink);
     assert_eq!(outcome, FailureApplyOutcome::Degraded { disposed: 2 });
     assert_eq!(refused, 0);
     // Live authority invalidated first: the machine ends Unknown in
@@ -1028,6 +1135,7 @@ fn key_operation_joint_staging_bounds() {
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
     let mut joint = EdgeSemantics::default();
     let mut sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
     let call = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
     attest_and_stage(&mut scene, &mut staging, &call);
     scene.sequence += 1;
@@ -1042,13 +1150,15 @@ fn key_operation_joint_staging_bounds() {
         call.mechanism,
         call.capture,
         None,
+        None,
         call.flags,
     );
     assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
     let success = scene.seal().expect("begin-only quantum seals");
     assert_eq!(success.prefix.settled().len(), 1);
     assert!(success.prefix.settled()[0].end_cut.is_none());
-    let (outcome, refused) = staging.apply_seal(&success, &mut joint, &mut sink);
+    let (outcome, refused) =
+        staging.apply_seal(&success, &scene.model, &mut joint, &mut keyuse, &mut sink);
     assert_eq!(outcome, SealApplyOutcome::Held);
     assert_eq!(refused, 0);
     assert_eq!(joint.calls(), 0, "open terminal reduces nothing");
@@ -1060,7 +1170,8 @@ fn key_operation_joint_staging_bounds() {
         JournalDisposition::EndStaged
     );
     let success = scene.seal().expect("terminal quantum seals");
-    let (outcome, _) = staging.apply_seal(&success, &mut joint, &mut sink);
+    let (outcome, _) =
+        staging.apply_seal(&success, &scene.model, &mut joint, &mut keyuse, &mut sink);
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
     assert_eq!(joint.calls(), 1);
     assert_eq!(staging.reduced(), 1);
@@ -1071,12 +1182,14 @@ fn key_operation_joint_staging_bounds() {
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
     let mut joint = EdgeSemantics::default();
     let mut sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
     for call in sign_flow().into_iter().take(2) {
         prepare_call(&mut scene, &mut staging, &call);
     }
     let success = scene.seal().expect("two-call quantum seals");
     assert_eq!(success.prefix.settled().len(), 2);
-    let (outcome, refused) = staging.apply_seal(&success, &mut joint, &mut sink);
+    let (outcome, refused) =
+        staging.apply_seal(&success, &scene.model, &mut joint, &mut keyuse, &mut sink);
     assert_eq!(outcome, SealApplyOutcome::Held);
     assert_eq!(refused, 0);
     assert_eq!(staging.correlation_refusals(), 1);
@@ -1089,6 +1202,7 @@ fn key_operation_joint_staging_bounds() {
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
     let mut joint = EdgeSemantics::default();
     let mut sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
     attest_and_stage(
         &mut scene,
         &mut staging,
@@ -1100,7 +1214,8 @@ fn key_operation_joint_staging_bounds() {
     );
     let success = scene.seal().expect("quantum seals");
     assert_eq!(success.prefix.settled().len(), 1);
-    let (outcome, _) = staging.apply_seal(&success, &mut joint, &mut sink);
+    let (outcome, _) =
+        staging.apply_seal(&success, &scene.model, &mut joint, &mut keyuse, &mut sink);
     assert_eq!(outcome, SealApplyOutcome::Held);
     assert_eq!(staging.correlation_refusals(), 1);
     assert_eq!(staging.staged_len(), 1);
@@ -1117,6 +1232,7 @@ fn key_operation_joint_retry_and_degraded_inert() {
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
     let mut joint = EdgeSemantics::default();
     let mut sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
     prepare_call(
         &mut scene,
         &mut staging,
@@ -1150,7 +1266,8 @@ fn key_operation_joint_retry_and_degraded_inert() {
         .expect_err("short H3 coverage pends");
     assert_eq!(failure.gap, JournalGap::H3Pending);
     let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
-    let (outcome, refused) = staging.apply_failure(&failure, &mut h3, &mut joint, &mut sink);
+    let (outcome, refused) =
+        staging.apply_failure(&failure, &mut h3, &mut joint, &mut keyuse, &mut sink);
     assert_eq!(outcome, FailureApplyOutcome::Retried);
     assert_eq!(refused, 0);
     assert_eq!(staging.mode(), FeedMode::Joint);
@@ -1169,6 +1286,7 @@ fn key_operation_joint_retry_and_degraded_inert() {
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
     let mut joint = EdgeSemantics::default();
     let mut sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
     for call in sign_flow().into_iter().take(2) {
         prepare_call(&mut scene, &mut staging, &call);
     }
@@ -1204,8 +1322,13 @@ fn key_operation_joint_retry_and_degraded_inert() {
         .expect_err("foreign proof mismatches");
     assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
     let mut loss_source = ScriptedH3Source::once(H3DispositionEvidence::scripted_loss(5));
-    let (outcome, refused) =
-        staging.apply_failure(&failure, &mut loss_source, &mut joint, &mut sink);
+    let (outcome, refused) = staging.apply_failure(
+        &failure,
+        &mut loss_source,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+    );
     assert_eq!(outcome, FailureApplyOutcome::Degraded { disposed: 2 });
     assert_eq!(refused, 0);
     assert_eq!(staging.history_disposed(), 2);
@@ -1214,8 +1337,13 @@ fn key_operation_joint_retry_and_degraded_inert() {
 
     // --- Post-degradation outcomes are inert, never touching S1Only. ---
     let calls_before = joint.calls();
-    let (outcome, refused) =
-        staging.apply_failure(&failure, &mut loss_source, &mut joint, &mut sink);
+    let (outcome, refused) = staging.apply_failure(
+        &failure,
+        &mut loss_source,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+    );
     assert_eq!(outcome, FailureApplyOutcome::Ignored);
     assert_eq!(refused, 0);
     assert_eq!(joint.calls(), calls_before);
@@ -1230,7 +1358,8 @@ fn key_operation_joint_retry_and_degraded_inert() {
         !stray.prefix.settled().is_empty(),
         "stray seal settles real calls the degraded feed ignores"
     );
-    let (outcome, refused) = staging.apply_seal(&stray, &mut joint, &mut sink);
+    let (outcome, refused) =
+        staging.apply_seal(&stray, &scene.model, &mut joint, &mut keyuse, &mut sink);
     assert_eq!(outcome, SealApplyOutcome::Held);
     assert_eq!(refused, 0);
     assert_eq!(staging.correlation_refusals(), 0);
@@ -1247,10 +1376,11 @@ fn key_operation_abandoned_quantum_replays_s1() {
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
     let mut joint = EdgeSemantics::default();
     let mut joint_sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
     let mut direct = EdgeSemantics::default();
     let mut direct_sink = Vec::new();
     let call = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
-    let facts = attest_and_stage(&mut scene, &mut staging, &call);
+    let (facts, _) = attest_and_stage(&mut scene, &mut staging, &call);
     scene.sequence += 1;
     let fid = crate::kinds::function_id(call.name).unwrap();
     let begin = begin_bytes_shaped(
@@ -1262,6 +1392,7 @@ fn key_operation_abandoned_quantum_replays_s1() {
         SESSION,
         call.mechanism,
         call.capture,
+        None,
         None,
         call.flags,
     );
@@ -1282,12 +1413,18 @@ fn key_operation_abandoned_quantum_replays_s1() {
     let success = scene.seal().expect("bounded-abandon quantum seals");
     assert_eq!(success.prefix.settled().len(), 1);
     assert!(success.prefix.settled()[0].abandoned);
-    let (outcome, refused) = staging.apply_seal(&success, &mut joint, &mut joint_sink);
+    let (outcome, refused) = staging.apply_seal(
+        &success,
+        &scene.model,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+    );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
     assert_eq!(refused, 0);
     let origin = EffectOrigin::from(&facts);
     direct.observe_with_effects(&facts, &origin, &mut direct_sink);
-    assert_eq!(joint_sink, direct_sink);
+    assert_eq!(strip_receipts(&joint_sink), direct_sink);
     assert_s1_equal(&joint, &direct);
     assert_eq!((joint.started(), joint.completed()), (1, 0));
 }
@@ -1335,18 +1472,25 @@ fn key_operation_s1_matrix_through_both_feeds() {
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
     let mut joint = EdgeSemantics::default();
     let mut joint_sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
     let mut direct = EdgeSemantics::default();
     let mut direct_sink = Vec::new();
     for call in &matrix {
-        let facts = prepare_call(&mut scene, &mut staging, call);
+        let (facts, _) = prepare_call(&mut scene, &mut staging, call);
         let success = scene.seal().expect("matrix quantum seals");
         assert_eq!(success.prefix.settled().len(), 1, "{}", call.name);
-        let (outcome, refused) = staging.apply_seal(&success, &mut joint, &mut joint_sink);
+        let (outcome, refused) = staging.apply_seal(
+            &success,
+            &scene.model,
+            &mut joint,
+            &mut keyuse,
+            &mut joint_sink,
+        );
         assert_eq!(outcome, SealApplyOutcome::ReplayedOne, "{}", call.name);
         assert_eq!(refused, 0);
         let origin = EffectOrigin::from(&facts);
         direct.observe_with_effects(&facts, &origin, &mut direct_sink);
-        assert_eq!(joint_sink, direct_sink, "{}", call.name);
+        assert_eq!(strip_receipts(&joint_sink), direct_sink, "{}", call.name);
         assert_s1_equal(&joint, &direct);
     }
     assert_eq!(joint.calls(), 17);
@@ -1379,12 +1523,19 @@ fn key_operation_s1_matrix_through_both_feeds() {
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
     let mut joint = EdgeSemantics::default();
     let mut joint_sink = Vec::new();
+    let mut keyuse = KeyUseReducer::new();
     let mut direct = EdgeSemantics::default();
     let mut direct_sink = Vec::new();
     for call in matrix.iter().take(2) {
-        let facts = prepare_call(&mut scene, &mut staging, call);
+        let (facts, _) = prepare_call(&mut scene, &mut staging, call);
         let success = scene.seal().expect("grounding quantum seals");
-        let (outcome, _) = staging.apply_seal(&success, &mut joint, &mut joint_sink);
+        let (outcome, _) = staging.apply_seal(
+            &success,
+            &scene.model,
+            &mut joint,
+            &mut keyuse,
+            &mut joint_sink,
+        );
         assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
         let origin = EffectOrigin::from(&facts);
         direct.observe_with_effects(&facts, &origin, &mut direct_sink);
@@ -1393,7 +1544,7 @@ fn key_operation_s1_matrix_through_both_feeds() {
     assert_eq!(before.objects.len(), 1, "grounding created the key");
     let mut staged_facts = Vec::new();
     for call in matrix.iter().skip(2).take(3) {
-        staged_facts.push(attest_and_stage(&mut scene, &mut staging, call));
+        staged_facts.push(attest_and_stage(&mut scene, &mut staging, call).0);
     }
     scene.install_closure();
     let foreign_bootstrap = BootstrapReceipt::scripted(
@@ -1426,17 +1577,562 @@ fn key_operation_s1_matrix_through_both_feeds() {
         )
         .expect_err("foreign proof mismatches");
     let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
-    let (outcome, _) = staging.apply_failure(&failure, &mut clean, &mut joint, &mut joint_sink);
+    let (outcome, _) = staging.apply_failure(
+        &failure,
+        &mut clean,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+    );
     assert_eq!(outcome, FailureApplyOutcome::FellBack { replayed: 3 });
     for facts in &staged_facts {
         let origin = EffectOrigin::from(facts);
         direct.observe_with_effects(facts, &origin, &mut direct_sink);
     }
-    assert_eq!(joint_sink, direct_sink);
+    assert_eq!(strip_receipts(&joint_sink), direct_sink);
     assert_s1_equal(&joint, &direct);
     assert_eq!(
         scene.model.project(),
         before,
         "fallback invents no object facts"
     );
+}
+
+// ==================== Checkbox 3: key receipts and rows ====================
+
+use crate::semantics_edge::{KeyReceipt, KeyRole};
+use crate::semantics_key_use::{KeyOpRow, KeyUseReducer};
+use crate::semantics_objects::ObjectId;
+
+/// Drive one Joint quantum to completion: prepare + seal + apply.
+/// Returns the admitted payload, its H0 position and the seal.
+fn drive_quantum(
+    scene: &mut JointScene,
+    staging: &mut JointStaging,
+    reducer: &mut EdgeSemantics,
+    keyuse: &mut KeyUseReducer,
+    sink: &mut Vec<OperationEffect>,
+    call: &ShapedS1,
+) -> (SemanticCall, u64) {
+    let (facts, position) = prepare_call(scene, staging, call);
+    let success = scene.seal().expect("quantum seals");
+    assert_eq!(success.prefix.settled().len(), 1, "{}", call.name);
+    let (outcome, refused) = staging.apply_seal(&success, &scene.model, reducer, keyuse, sink);
+    assert_eq!(outcome, SealApplyOutcome::ReplayedOne, "{}", call.name);
+    assert_eq!(refused, 0);
+    (facts, position)
+}
+
+/// G11/H9-§1: Joint async flows through the carve-out: the PENDING
+/// Init stages and seals (queuing S1-side), while the completion —
+/// H8-negative-only, un-ingestable without tainting the image —
+/// refuses staging and reduces S1Only-direct. Both feeds agree on
+/// S1; the async-started machine rows unknown-key (its inputs never
+/// join in the model), with explicit evidence.
+#[test]
+fn key_operation_joint_async_pending_then_direct_completion() {
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut joint_sink = Vec::new();
+    let mut direct = EdgeSemantics::default();
+    let mut direct_sink = Vec::new();
+
+    // The PENDING Init is modelable: attest, stage, seal, replay,
+    // queue — on both feeds.
+    let pending = ShapedS1::shaped("C_SignInit", CkRv::PENDING.0, RSA_PKCS, init_capture());
+    let (facts, _) = prepare_call(&mut scene, &mut staging, &pending);
+    let success = scene.seal().expect("pending quantum seals");
+    assert_eq!(success.prefix.settled().len(), 1);
+    let (outcome, _) = staging.apply_seal(
+        &success,
+        &scene.model,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+    );
+    assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
+    let origin = EffectOrigin::from(&facts);
+    direct.observe_with_effects(&facts, &origin, &mut direct_sink);
+    assert_eq!(strip_receipts(&joint_sink), direct_sink);
+    assert_s1_equal(&joint, &direct);
+    assert_eq!(
+        (joint.started(), joint.completed()),
+        (0, 0),
+        "queued, not started"
+    );
+
+    // The completion cannot stage (frozen negative-only table), so
+    // the driver reduces it S1Only-direct on both feeds.
+    let target = crate::kinds::function_id("C_SignInit").unwrap();
+    let mut complete = SemanticCall {
+        function: "C_AsyncComplete".into(),
+        session: SESSION,
+        target_function: target,
+        capture: op_capture(),
+        ts_ns: 999,
+        ..SemanticCall::default()
+    };
+    complete.rv = CkRv::OK.0;
+    let origin = EffectOrigin::from(&complete);
+    assert_eq!(
+        staging.stage(complete.clone(), origin.clone(), 999),
+        Err(StagingRefusal::Unsealable)
+    );
+    let effects_before = joint_sink.len();
+    joint.observe_with_effects(&complete, &origin, &mut joint_sink);
+    // The direct carve-out has no tee: the driver feeds the new
+    // effects to the key-use reducer itself.
+    for effect in &joint_sink[effects_before..] {
+        keyuse.observe_effect(effect);
+    }
+    direct.observe_with_effects(&complete, &origin, &mut direct_sink);
+    assert_eq!(strip_receipts(&joint_sink), direct_sink);
+    assert_s1_equal(&joint, &direct);
+    assert_eq!(joint.started(), 1, "the completion starts the machine");
+    let (_, _, _, corigin) = started(joint_sink.last().unwrap());
+    assert_eq!(corigin.function, "C_SignInit", "original call identity");
+
+    // The Sign completes the async-started machine on both feeds;
+    // its row is unknown-key with explicit evidence.
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    let (facts, _) = prepare_call(&mut scene, &mut staging, &sign);
+    let success = scene.seal().expect("terminal quantum seals");
+    let (outcome, _) = staging.apply_seal(
+        &success,
+        &scene.model,
+        &mut joint,
+        &mut keyuse,
+        &mut joint_sink,
+    );
+    assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
+    let origin = EffectOrigin::from(&facts);
+    direct.observe_with_effects(&facts, &origin, &mut direct_sink);
+    assert_eq!(strip_receipts(&joint_sink), direct_sink);
+    assert_eq!((joint.started(), joint.completed()), (1, 1));
+    let rows = keyuse.rows();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].keys.is_empty(), "async start binds no receipt");
+    assert_eq!(rows[0].outcome, OperationOutcome::Completed);
+    assert_eq!(keyuse.evidence().unknown_key_rows, 1);
+}
+
+/// G11/H9-§3: positional key receipts bind operation transitions
+/// from the qualified positional join: colliding lifetimes qualify
+/// distinct keys, and Wrap binds two distinct roles in input order.
+#[test]
+fn key_operation_key_roles_bind_transitions() {
+    use crate::semantics_objects::Lifetime;
+
+    const WRAP_KEY: u64 = 0xA1A1_A1A1_A1A1_A1A1;
+    const DATA_KEY: u64 = 0xA2A2_A2A2_A2A2_A2A2;
+
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+
+    // Lifetime 1: create, use, destroy.
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let (_, pos_init1) = drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_DestroyObject", CkRv::OK.0, 0, 0),
+    );
+    // Lifetime 2: the same handle word, a new qualified key.
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let (_, pos_init2) = drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+
+    assert!(pos_init1 < pos_init2);
+    let rows = keyuse.rows();
+    assert_eq!(rows.len(), 2, "two completed sign operations");
+    assert_eq!(rows[0].keys.len(), 1);
+    assert_eq!(rows[1].keys.len(), 1);
+    let (key1, key2) = (rows[0].keys[0].key, rows[1].keys[0].key);
+    assert_ne!(key1, key2, "colliding lifetimes qualify distinct keys");
+    assert_eq!(rows[0].keys[0].role, KeyRole::OperationKey);
+    assert_eq!(rows[1].keys[0].role, KeyRole::OperationKey);
+    assert_eq!(rows[0].keys[0].position, pos_init1);
+    assert_eq!(rows[1].keys[0].position, pos_init2);
+    assert_eq!(rows[0].keys[0].metadata.requested_count(), 0);
+    assert_eq!(rows[0].outcome, OperationOutcome::Completed);
+    assert_eq!(rows[1].outcome, OperationOutcome::Completed);
+    // Cross-check against the model's own qualified observations.
+    let objects = &scene.model.project().objects;
+    assert_eq!(objects.len(), 2);
+    assert_eq!(objects[0].lifetime, Lifetime::Destroyed);
+    assert_eq!(objects[1].lifetime, Lifetime::Live);
+    assert_eq!((objects[0].id, objects[1].id), (key1, key2));
+    assert_eq!(keyuse.evidence().unknown_key_rows, 0);
+
+    // Wrap dual-reference: two keys, two distinct roles, input order.
+    let create_wrap = ShapedS1 {
+        result: Some(WRAP_KEY),
+        ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &create_wrap,
+    );
+    let create_data = ShapedS1 {
+        result: Some(DATA_KEY),
+        ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &create_data,
+    );
+    let wrap = ShapedS1 {
+        input0: Some((WRAP_KEY, 1)),
+        input1: Some((DATA_KEY, 1)),
+        ..ShapedS1::shaped("C_WrapKey", CkRv::OK.0, RSA_PKCS, init_capture())
+    };
+    let (_, pos_wrap) = drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &wrap,
+    );
+    let rows = keyuse.rows();
+    assert_eq!(rows.len(), 3);
+    let wrap_row = &rows[2];
+    assert_eq!(wrap_row.keys.len(), 2);
+    assert_eq!(wrap_row.keys[0].role, KeyRole::WrappingKey);
+    assert_eq!(wrap_row.keys[1].role, KeyRole::WrappedKey);
+    assert_eq!(wrap_row.keys[0].input, 0);
+    assert_eq!(wrap_row.keys[1].input, 1);
+    assert_ne!(wrap_row.keys[0].key, wrap_row.keys[1].key);
+    assert_eq!(wrap_row.keys[0].position, pos_wrap);
+    assert_eq!(wrap_row.keys[1].position, pos_wrap);
+    assert_eq!(wrap_row.outcome, OperationOutcome::Completed);
+    // The receipts name the two created keys in input order (this
+    // pins the model's index-order reference emission H9 relies on).
+    let objects = &scene.model.project().objects;
+    assert_eq!(objects.len(), 4);
+    assert_eq!(wrap_row.keys[0].key, objects[2].id);
+    assert_eq!(wrap_row.keys[1].key, objects[3].id);
+}
+
+/// G11/H9-§3: association failure on effect-neutral calls records
+/// unknown-key S1 with explicit evidence (never loss), and
+/// requested-only metadata keeps definite operations without values.
+#[test]
+fn key_operation_unknown_key_and_requested_only() {
+    // Unreadable Init input: the model explicitly leaves the join
+    // unresolved, so no reference exists to associate. (Absent
+    // inputs are wire-malformed for ACCESS — present positions
+    // carry non-absent statuses — so unreadable is the only
+    // unassociated shape.)
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let unreadable_init = ShapedS1 {
+        input0: Some((0, 2)),
+        ..ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture())
+    };
+    let (facts, _) = prepare_call(&mut scene, &mut staging, &unreadable_init);
+    assert_eq!(facts.function, "C_SignInit");
+    let success = scene.seal().expect("quantum seals");
+    assert!(
+        success.effects.effects.iter().any(|effect| matches!(
+            effect,
+            crate::semantics_objects::ObjectEffect::Unresolved { .. }
+        )),
+        "the model explicitly leaves the join unresolved"
+    );
+    assert!(
+        success.effects.effects.iter().all(|effect| !matches!(
+            effect,
+            crate::semantics_objects::ObjectEffect::Referenced { .. }
+        )),
+        "no reference to associate"
+    );
+    let (outcome, _) =
+        staging.apply_seal(&success, &scene.model, &mut joint, &mut keyuse, &mut sink);
+    assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    // Definite S1, unknown key, explicit evidence.
+    assert_eq!((joint.started(), joint.completed()), (1, 1));
+    let rows = keyuse.rows();
+    assert_eq!(rows.len(), 1, "the operation still rows");
+    assert!(rows[0].keys.is_empty(), "no key bound");
+    assert_eq!(rows[0].outcome, OperationOutcome::Completed);
+    assert_eq!(keyuse.evidence().unknown_key_rows, 1);
+
+    // S1Only-direct: no object proof, same unknown-key row.
+    let mut direct = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let c = init("C_SignInit", 7, RSA_PKCS, 100);
+    feed(&mut direct, &mut sink, &c);
+    let c = op("C_Sign", 7, 200);
+    feed(&mut direct, &mut sink, &c);
+    for effect in &sink {
+        keyuse.observe_effect(effect);
+    }
+    assert_eq!(keyuse.rows().len(), 1);
+    assert!(keyuse.rows()[0].keys.is_empty());
+    assert_eq!(keyuse.evidence().unknown_key_rows, 1);
+
+    // Requested-only: the GET requests Class without values; the
+    // later sign operation stays definite and its row shows
+    // requested-but-unestablished metadata (presence only).
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 3u8, 0u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    assert_eq!((joint.started(), joint.completed()), (1, 1));
+    let rows = keyuse.rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].keys.len(), 1);
+    let metadata = rows[0].keys[0].metadata;
+    assert_eq!(metadata.requested_count(), 1, "Class was requested");
+    assert!(metadata.is_requested(0), "field 0 is Class");
+    assert_eq!(metadata.established_count(), 0, "no value ever arrived");
+}
+
+/// G11/H9-§3: later-learned key metadata never rewrites S1 rows: the
+/// completed row is byte-identical before and after the GET that
+/// establishes values the row predates.
+#[test]
+fn key_operation_later_metadata_never_rewrites_rows() {
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    assert_eq!(keyuse.rows().len(), 1);
+    let frozen: KeyOpRow = keyuse.rows()[0].clone();
+    assert_eq!(frozen.keys.len(), 1);
+    // The GET establishes Class=3 after the row completed.
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    // The model's view learned the value (non-vacuous: the GET
+    // landed), but the completed row is untouched.
+    let key = frozen.keys[0].key;
+    let flags = scene
+        .model
+        .key_metadata_flags(key)
+        .expect("key view exists");
+    assert_eq!(flags.established_count(), 1, "the GET established Class");
+    assert!(flags.is_established(0), "field 0 is Class");
+    assert_eq!(keyuse.rows().len(), 1, "the GET rows no operation");
+    assert_eq!(keyuse.rows()[0], frozen, "completed rows never rewrite");
+}
+
+/// G11/H9-§3: key-operation rows are bounded (65,536 retained,
+/// oldest-first drops with explicit reason + timestamp), and keys
+/// referenced across the pruned boundary row correctly.
+#[test]
+fn key_operation_row_retention_bounds() {
+    use crate::semantics_key_use::{KEY_OP_ROW_CAPACITY, RetentionDropReason};
+
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    assert_eq!(KEY_OP_ROW_CAPACITY, 65_536);
+    // 65,546 real direct operations through the real reducer: real
+    // identities, real effects, receipt-less rows.
+    for n in 0..65_546u64 {
+        let mut sink = Vec::new();
+        let c = op("C_GenerateKey", 7, 1_000 + n);
+        let origin = EffectOrigin::from(&c);
+        edge.observe_with_effects(&c, &origin, &mut sink);
+        assert_eq!(sink.len(), 1);
+        keyuse.observe_effect(&sink[0]);
+    }
+    assert_eq!(keyuse.rows().len(), KEY_OP_ROW_CAPACITY);
+    assert_eq!(keyuse.drops(), 10);
+    let drop = keyuse.last_drop().expect("drops recorded");
+    assert_eq!(drop.reason, RetentionDropReason::CapacityOverflow);
+    assert_eq!(drop.seq, 9, "the tenth drop evicted row 9");
+    assert_eq!(drop.ended_ts_ns, 1_000 + 9);
+    assert_eq!(keyuse.rows()[0].seq, 10, "oldest-first retention");
+    assert_eq!(keyuse.rows().back().unwrap().seq, 65_545);
+
+    // Across the pruned boundary: new receipt-bearing operations
+    // for colliding keys row with exact receipts and running seqs.
+    // Three competing Inits (two replacements), then one Sign
+    // completing the survivor.
+    let key_a = ObjectId::for_test(0xA11CE);
+    let key_b = ObjectId::for_test(0xB0B);
+    for (n, key) in [key_a, key_b, key_a].into_iter().enumerate() {
+        let receipt = KeyReceipt {
+            key,
+            function: crate::kinds::function_id("C_SignInit").unwrap(),
+            input: 0,
+            role: KeyRole::OperationKey,
+            position: 500 + n as u64,
+            metadata: crate::semantics_objects::KeyMetadataFlags::ZERO,
+        };
+        let mut sink = Vec::new();
+        let c = init("C_SignInit", 7, RSA_PKCS, 200_000 + n as u64);
+        let origin = EffectOrigin::from(&c);
+        edge.observe_joint(&c, &origin, std::slice::from_ref(&receipt), &mut sink);
+        assert_eq!(sink.len(), 1 + n.min(1), "replacement after the first");
+        for effect in &sink {
+            keyuse.observe_effect(effect);
+        }
+    }
+    let mut sink = Vec::new();
+    let c = op("C_Sign", 7, 300_000);
+    let origin = EffectOrigin::from(&c);
+    edge.observe_with_effects(&c, &origin, &mut sink);
+    assert_eq!(sink.len(), 1);
+    for effect in &sink {
+        keyuse.observe_effect(effect);
+    }
+    assert_eq!(keyuse.rows().len(), KEY_OP_ROW_CAPACITY);
+    assert_eq!(keyuse.drops(), 13, "10 + 3 closed rows");
+    let tail: Vec<KeyOpRow> = keyuse.rows().iter().rev().take(3).cloned().collect();
+    assert_eq!(tail[2].keys[0].key, key_a);
+    assert_eq!(tail[1].keys[0].key, key_b);
+    assert_eq!(tail[0].keys[0].key, key_a);
+    assert_eq!(tail[2].outcome, OperationOutcome::Cancelled, "replaced");
+    assert_eq!(tail[1].outcome, OperationOutcome::Cancelled, "replaced");
+    assert_eq!(tail[0].outcome, OperationOutcome::Completed);
 }

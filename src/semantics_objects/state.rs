@@ -3144,6 +3144,38 @@ impl ModelState {
         effects
     }
 
+    /// H9 metadata-at-use snapshot for one qualified key: presence
+    /// bitmaps only, read by reference. Values never cross to H9
+    /// (only discriminants are matched; nothing is copied out).
+    /// `None` when the view is gone (a reference implies a live view
+    /// at settle, so callers treat absence as unavailable metadata,
+    /// never as proof of no metadata).
+    pub(super) fn key_metadata_flags(&self, key: ObjectId) -> Option<super::KeyMetadataFlags> {
+        let view = self.objects.get(&key)?;
+        let mut requested = 0u8;
+        let mut established = 0u8;
+        for index in 0..super::METADATA_FIELDS {
+            let asked = !matches!(view.requested[index], FieldState::Unknown)
+                || !matches!(view.queries[index], QueryStatus::NotQueried);
+            let kept = matches!(
+                view.established[index],
+                FieldState::Value(_)
+                    | FieldState::Conflict(Some(_))
+                    | FieldState::Invalidated(Some(_))
+            );
+            if asked {
+                requested |= 1 << index;
+            }
+            if kept {
+                established |= 1 << index;
+            }
+        }
+        Some(super::KeyMetadataFlags {
+            requested,
+            established,
+        })
+    }
+
     pub(super) fn project(&self) -> ObjectProjection {
         // Access relations are derived from live bindings, not assumed.
         let mut relations: BTreeMap<ObjectId, usize> = BTreeMap::new();

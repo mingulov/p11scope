@@ -1109,15 +1109,23 @@ impl CallerRegistry {
                 .semantics = Some(reducer);
             self.instance_state.occupied += 1;
         }
-        // Guarded H9 arm: while no Joint feed exists anywhere the
-        // reduction below is today's plain S1Only path, untouched.
+        // Guarded H9 arm: while no Joint feed exists anywhere AND
+        // no Joint evidence was retained, the reduction below is
+        // today's plain S1Only path, untouched. Once Joint evidence
+        // exists (the retained H8 projection capture commits from),
+        // every S1 reduction tees effects into the shared key-use
+        // reducer — including after the final feed leaves Joint (N15):
+        // retained opens still need their ordinary S1 terminals, and
+        // recording definite S1 outcomes invents no object authority.
         let joint_path = {
             let state = self
                 .instance_state
                 .semantics
                 .get(&id)
                 .expect("retained edge");
-            state.feed.mode() == FeedMode::Joint || self.joint_feeds > 0
+            state.feed.mode() == FeedMode::Joint
+                || self.joint_feeds > 0
+                || self.key_projection.is_some()
         };
         let refused = if joint_path {
             self.reduce_with_joint_path(id, &input, ledger)

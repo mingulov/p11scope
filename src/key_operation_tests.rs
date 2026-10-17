@@ -6936,6 +6936,14 @@ impl GuardedScene {
         self.registry
             .deliver_joint_seal(id, &seal, &self.scene.model, &mut self.scene.ledger)
     }
+
+    /// Drive one S1Only-direct call for `key`: admit, observe,
+    /// publish (no ledger). Effects tee while Joint evidence exists.
+    fn drive_s1only(&mut self, key: &InstanceKey, shape: &ShapedS1) {
+        let (facts, position) = self.admit_shape(shape);
+        self.observe(key, position, facts);
+        self.registry.publish();
+    }
 }
 
 /// N1: an installed receipt selects Joint exactly once; without one
@@ -7490,4 +7498,117 @@ fn key_operation_n14_fallback_replay_reserves_and_disposes_on_refusal() {
         .find(|row| row.category == "sign" && row.reason == "unbound")
         .expect("the replayed start's terminal routes to unknown-key");
     assert_eq!((row.unknown, row.active), (1, 0));
+}
+
+/// N15: capture-wide effect accounting continues after the final
+/// Joint-feed exit. Fallback replays A's Init (open) while B's S1Only
+/// Init tees alongside; after the transition both terminals plus a
+/// repeated fresh pair still account (completed, none stuck).
+#[test]
+fn key_operation_n15_post_fallback_terminals_still_accounted() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let a_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(a_key.clone(), bootstrap);
+    let (_, a_id) = guarded.register(1);
+    let (b_key, _) = guarded.register(2);
+
+    // B's S1Only Init tees while Joint exists (open).
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    guarded.drive_s1only(&b_key, &init);
+    // A's Init stages, then fallback replays it (open).
+    let (facts, position) = guarded.admit_shape(&init);
+    guarded.observe(&a_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    let failure = SealFailure {
+        gap: JournalGap::ClosureStale,
+        effects: crate::semantics_objects::ObjectEffects::default(),
+        h3_voided: None,
+    };
+    let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    assert_eq!(
+        guarded.registry.deliver_joint_failure(
+            a_id,
+            &failure,
+            &mut clean,
+            &guarded.scene.model,
+            &mut guarded.scene.ledger,
+        ),
+        FailureApplyOutcome::FellBack { replayed: 1 }
+    );
+    assert_eq!(
+        guarded.registry.joint_feeds(),
+        0,
+        "the final feed fell back"
+    );
+
+    // After the transition: both terminals plus a repeated fresh pair.
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    guarded.drive_s1only(&a_key, &sign);
+    guarded.drive_s1only(&b_key, &sign);
+    guarded.drive_s1only(&a_key, &init);
+    guarded.drive_s1only(&a_key, &sign);
+
+    let observations = guarded.registry.joint_observations(11);
+    let row = observations
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "unbound")
+        .expect("S1 accounting continues after the transition");
+    assert_eq!((row.completed, row.active), (3, 0));
+}
+
+/// N15: the same accounting continues after a real-loss transition:
+/// fresh S1Only calls reduce definite outcomes into the retained
+/// capture (no object authority invented).
+#[test]
+fn key_operation_n15_post_loss_s1_still_accounted() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let a_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(a_key.clone(), bootstrap);
+    let (_, a_id) = guarded.register(1);
+
+    // One staged call, then real loss disposes it.
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let (facts, position) = guarded.admit_shape(&init);
+    guarded.observe(&a_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    let failure = SealFailure {
+        gap: JournalGap::FaultChanged,
+        effects: crate::semantics_objects::ObjectEffects::default(),
+        h3_voided: None,
+    };
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    assert_eq!(
+        guarded.registry.deliver_joint_failure(
+            a_id,
+            &failure,
+            &mut h3,
+            &guarded.scene.model,
+            &mut guarded.scene.ledger,
+        ),
+        FailureApplyOutcome::Degraded { disposed: 1 }
+    );
+    assert_eq!(guarded.registry.joint_feeds(), 0, "the final feed degraded");
+
+    // A fresh S1Only pair after the loss still accounts.
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    guarded.drive_s1only(&a_key, &init);
+    guarded.drive_s1only(&a_key, &sign);
+    let observations = guarded.registry.joint_observations(12);
+    let row = observations
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "unbound")
+        .expect("S1 accounting continues after the loss");
+    assert_eq!((row.completed, row.active), (1, 0));
 }

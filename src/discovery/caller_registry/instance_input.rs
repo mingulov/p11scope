@@ -12,7 +12,8 @@ use crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBi
 use crate::discovery::instances::{InstanceId, Route};
 use crate::inventory_semantics::{AttestedSubset, LaneCoverage, LaneNegative};
 use crate::semantic_capture::{Endpoint, InvalidationScope, RoutedCall};
-use crate::semantics_edge::{EdgeSemantics, SemanticCall};
+use crate::semantics_edge::{EdgeSemantics, EffectOrigin, NoSink, SemanticCall};
+use crate::semantics_key_use::{FeedMode, JointStaging, KeyUseTee, StagingRefusal};
 use p11scope_ebpf_common::object_wire::ValidatedObjectCall;
 use p11scope_ebpf_common::{Event, ImageIdentity, SlotSemantics};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -37,6 +38,64 @@ impl Hash for InstanceKey {
         self.image.exec_id.hash(state);
         self.router.hash(state);
         self.module.hash(state);
+    }
+}
+
+#[cfg(test)]
+impl InstanceKey {
+    /// Tests-only reference key (N1): production keys come only
+    /// from admission.
+    pub(crate) fn scripted(
+        domain: NativeDomainId,
+        image: ImageIdentity,
+        router: InstanceId,
+        module: ModuleKey,
+    ) -> Self {
+        Self {
+            domain,
+            image,
+            router,
+            module,
+        }
+    }
+}
+
+#[cfg(test)]
+impl AdmittedInstance {
+    /// Tests-only reference registration (N1): a current,
+    /// boundary-free registration for feed-selection tests.
+    pub(crate) fn scripted(key: InstanceKey, caller: CallerId) -> Self {
+        Self {
+            key,
+            caller,
+            observed_ns: 0,
+            boundary: None,
+        }
+    }
+}
+
+#[cfg(test)]
+impl AdmittedInstanceCall {
+    /// Tests-only reference call (N1): a current-continuity call at
+    /// `ordinal` carrying `facts`, for guarded-path tests.
+    pub(crate) fn scripted(
+        key: InstanceKey,
+        caller: CallerId,
+        ordinal: u64,
+        facts: SemanticCall,
+    ) -> Self {
+        let position = SemanticPosition {
+            domain: key.domain,
+            ordinal,
+        };
+        Self {
+            key,
+            caller,
+            position,
+            facts,
+            permission: ReductionPermission::CurrentContinuity,
+            object: None,
+        }
     }
 }
 
@@ -321,6 +380,10 @@ pub(crate) struct InstanceSemanticRecord {
     pub(crate) lossy: bool,
     pub(crate) semantics: Option<EdgeSemantics>,
     authority_exhausted: bool,
+    /// The instance's H9 feed, selected once at registration from an
+    /// installed Joint receipt (S1Only without one — the production
+    /// default, since no live grants exist).
+    pub(crate) feed: JointStaging,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -553,6 +616,177 @@ impl CallerRegistry {
     pub(crate) fn note_instance(&mut self, input: AdmittedInstance) {
         self.staged.push(Mutation::NoteInstance(input));
     }
+
+    /// Install one instance's Joint feed receipt (guarded H9 path):
+    /// the next registration of `key` selects Joint, consuming the
+    /// receipt. Bounded by the instance limit (excess installs
+    /// refuse). Live-loop carry: only the staged driver and
+    /// tests install (production has no grants until the joint seal
+    /// tick lands).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn install_joint_receipt(
+        &mut self,
+        key: InstanceKey,
+        receipt: crate::semantics_objects::journal::BootstrapReceipt,
+    ) -> bool {
+        if self.joint_grants.len() >= self.instance_state.limit {
+            return false;
+        }
+        self.joint_grants.insert(key, receipt);
+        true
+    }
+
+    /// Joint-mode feeds (the effects-tee guard reads this).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn joint_feeds(&self) -> usize {
+        self.joint_feeds
+    }
+
+    /// Tests-only feed-mode read (N1): the feed an instance's
+    /// registration selected.
+    #[cfg(test)]
+    pub(crate) fn feed_mode_for_test(
+        &self,
+        id: RegistryInstanceId,
+    ) -> Option<crate::semantics_key_use::FeedMode> {
+        self.instance_state
+            .semantics
+            .get(&id)
+            .map(|record| record.feed.mode())
+    }
+
+    /// Joint calls reduced S1Only-direct for lack of H8 staging.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn joint_direct_fallback(&self) -> u64 {
+        self.joint_direct_fallback
+    }
+
+    /// Deliver one H8 seal to an instance's Joint feed (guarded H9
+    /// path): exact-correlated replay through the shared reducer,
+    /// then the H8 projection is retained for capture. Unknown
+    /// instances and missing reducers hold without effect.
+    /// Live-loop carry: only the staged driver and tests deliver
+    /// (production runs no H8 seals until the joint seal tick lands).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn deliver_joint_seal(
+        &mut self,
+        id: RegistryInstanceId,
+        seal: &crate::semantics_objects::journal::SealSuccess,
+        model: &crate::semantics_objects::ObjectSemantics,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+    ) -> crate::semantics_key_use::SealApplyOutcome {
+        use crate::semantics_key_use::SealApplyOutcome;
+        let Some(record) = self.instance_state.semantics.get_mut(&id) else {
+            return SealApplyOutcome::Held;
+        };
+        let was_joint = record.feed.mode() == FeedMode::Joint;
+        let Some(reducer) = record.semantics.as_mut() else {
+            return SealApplyOutcome::Held;
+        };
+        let mut outer = NoSink;
+        let (outcome, refused) = record.feed.apply_seal(
+            seal,
+            model,
+            ledger,
+            reducer,
+            &mut self.joint_keyuse,
+            id,
+            &mut outer,
+        );
+        self.instance_state.semantic_refused =
+            self.instance_state.semantic_refused.saturating_add(refused);
+        self.after_joint_delivery(id, was_joint, model);
+        outcome
+    }
+
+    /// Deliver one H8 seal failure (guarded H9 path): loss disposal
+    /// or proof-only fallback through the shared reducer, then the
+    /// H8 projection is retained for capture. Same holds as seals.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn deliver_joint_failure(
+        &mut self,
+        id: RegistryInstanceId,
+        failure: &crate::semantics_objects::journal::SealFailure,
+        finalizer: &mut impl crate::semantics_objects::journal::H3EvidenceSource,
+        model: &crate::semantics_objects::ObjectSemantics,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+    ) -> crate::semantics_key_use::FailureApplyOutcome {
+        use crate::semantics_key_use::FailureApplyOutcome;
+        let Some(record) = self.instance_state.semantics.get_mut(&id) else {
+            return FailureApplyOutcome::Ignored;
+        };
+        let was_joint = record.feed.mode() == FeedMode::Joint;
+        let Some(reducer) = record.semantics.as_mut() else {
+            return FailureApplyOutcome::Ignored;
+        };
+        let mut outer = NoSink;
+        let (outcome, refused) = record.feed.apply_failure(
+            failure,
+            finalizer,
+            model,
+            ledger,
+            reducer,
+            &mut self.joint_keyuse,
+            id,
+            &mut outer,
+        );
+        self.instance_state.semantic_refused =
+            self.instance_state.semantic_refused.saturating_add(refused);
+        self.after_joint_delivery(id, was_joint, model);
+        outcome
+    }
+
+    /// Post-delivery bookkeeping: feeds leaving Joint release the
+    /// effects-tee guard; evidence that arrived under Joint
+    /// authority refreshes the retained H8 projection for capture.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn after_joint_delivery(
+        &mut self,
+        id: RegistryInstanceId,
+        was_joint: bool,
+        model: &crate::semantics_objects::ObjectSemantics,
+    ) {
+        let now_joint = self
+            .instance_state
+            .semantics
+            .get(&id)
+            .expect("delivered record retained")
+            .feed
+            .mode()
+            == FeedMode::Joint;
+        if was_joint && !now_joint {
+            self.joint_feeds = self.joint_feeds.saturating_sub(1);
+        }
+        if was_joint {
+            self.key_projection = Some(model.project());
+        }
+    }
+
+    /// Capture the guarded H9 section: commit from retained Joint
+    /// evidence, or unavailable exactly as before without it.
+    pub(crate) fn joint_observations(
+        &self,
+        revision: u64,
+    ) -> crate::key_operation_projection::ObjectObservations {
+        let Some(projection) = self.key_projection.as_ref() else {
+            return crate::key_operation_projection::ObjectObservations::unavailable(
+                revision,
+                "bootstrap_unavailable",
+            );
+        };
+        let stagings: Vec<&JointStaging> = self
+            .instance_state
+            .semantics
+            .values()
+            .map(|record| &record.feed)
+            .collect();
+        crate::key_operation_projection::producer::commit(
+            revision,
+            &stagings,
+            projection,
+            &self.joint_keyuse,
+        )
+    }
     pub(crate) fn observe_instance_semantic(&mut self, input: AdmittedInstanceCall) {
         self.staged.push(Mutation::ObserveInstanceSemantic(input));
     }
@@ -700,6 +934,14 @@ impl CallerRegistry {
         let id = RegistryInstanceId(self.instance_state.next_id);
         self.instance_state.next_id = next;
         self.instance_state.by_key.insert(input.key.clone(), id);
+        // Feed selection, once at registration: an installed Joint
+        // receipt selects Joint (consumed — one receipt, one feed);
+        // without one the feed stays S1Only, exactly as before.
+        let installed = self.joint_grants.remove(&input.key);
+        let feed = JointStaging::select_joint(installed.as_ref());
+        if feed.mode() == FeedMode::Joint {
+            self.joint_feeds = self.joint_feeds.saturating_add(1);
+        }
         self.instance_state.records.insert(
             id,
             InstanceRecord {
@@ -728,6 +970,7 @@ impl CallerRegistry {
                 lossy: false,
                 semantics: None,
                 authority_exhausted: false,
+                feed,
             },
         );
         if boundary.is_some() {
@@ -750,7 +993,11 @@ impl CallerRegistry {
         }
     }
 
-    pub(super) fn apply_instance_call(&mut self, input: AdmittedInstanceCall) {
+    pub(super) fn apply_instance_call(
+        &mut self,
+        input: AdmittedInstanceCall,
+        ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) {
         let Some(id) = self.instance_state.by_key.get(&input.key).copied() else {
             self.instance_gap(
                 Some(input.caller),
@@ -862,16 +1109,30 @@ impl CallerRegistry {
                 .semantics = Some(reducer);
             self.instance_state.occupied += 1;
         }
-        let state = self
-            .instance_state
-            .semantics
-            .get_mut(&id)
-            .expect("retained edge");
-        let refused = state
-            .semantics
-            .as_mut()
-            .expect("materialized above")
-            .observe_with_resources(&input.facts);
+        // Guarded H9 arm: while no Joint feed exists anywhere the
+        // reduction below is today's plain S1Only path, untouched.
+        let joint_path = {
+            let state = self
+                .instance_state
+                .semantics
+                .get(&id)
+                .expect("retained edge");
+            state.feed.mode() == FeedMode::Joint || self.joint_feeds > 0
+        };
+        let refused = if joint_path {
+            self.reduce_with_joint_path(id, &input, ledger)
+        } else {
+            let state = self
+                .instance_state
+                .semantics
+                .get_mut(&id)
+                .expect("retained edge");
+            state
+                .semantics
+                .as_mut()
+                .expect("materialized above")
+                .observe_with_resources(&input.facts)
+        };
         let refused = match refused {
             Ok(refused) => refused,
             Err(refusal) => {
@@ -895,6 +1156,73 @@ impl CallerRegistry {
         record.state = InstanceLifecycle::Observed;
         record.reason = None;
         record.last_seen_ns = record.last_seen_ns.max(input.facts.ts_ns);
+    }
+
+    /// Reduce one call on the guarded Joint path (N1): Joint feeds
+    /// stage against the shared H8 ledger for seal replay; S1Only
+    /// siblings (and Joint staging fallbacks) reduce direct, teeing
+    /// effects into the shared key-use reducer. Unreached while no
+    /// Joint feed exists and no ledger is supplied.
+    fn reduce_with_joint_path(
+        &mut self,
+        id: RegistryInstanceId,
+        input: &AdmittedInstanceCall,
+        ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) -> Result<u64, crate::semantics_edge::resources::SemanticResourceRefusal> {
+        let joint = self
+            .instance_state
+            .semantics
+            .get(&id)
+            .expect("retained edge")
+            .feed
+            .mode()
+            == FeedMode::Joint;
+        if joint {
+            if let Some(ledger) = ledger {
+                let origin = EffectOrigin::from(&input.facts);
+                let state = self
+                    .instance_state
+                    .semantics
+                    .get_mut(&id)
+                    .expect("retained edge");
+                match state
+                    .feed
+                    .stage(input.facts.clone(), origin, input.position.ordinal, ledger)
+                {
+                    Ok(()) => return Ok(0),
+                    Err(StagingRefusal::Unsealable) => {} // By-design carve-out: direct below.
+                    Err(StagingRefusal::Full) => {
+                        self.joint_direct_fallback = self.joint_direct_fallback.saturating_add(1);
+                    }
+                    Err(_) => {
+                        // NotJoint contradicts the mode branch;
+                        // ReplayRefused contradicts the
+                        // OutOfOrderReturn guard above (frontier can
+                        // only trail staged ordinals): drop, never
+                        // double-reduce — counted, never silent.
+                        self.joint_direct_fallback = self.joint_direct_fallback.saturating_add(1);
+                        return Ok(0);
+                    }
+                }
+            } else {
+                // No H8 owner, no staging: S1 preserved direct,
+                // Joint evidence absent for this call.
+                self.joint_direct_fallback = self.joint_direct_fallback.saturating_add(1);
+            }
+        }
+        // S1Only-direct reduction with effects into the shared
+        // reducer (no outer consumer: the committed projection
+        // carries S1 facts downstream).
+        let origin = EffectOrigin::from(&input.facts);
+        let state = self
+            .instance_state
+            .semantics
+            .get_mut(&id)
+            .expect("retained edge");
+        let reducer = state.semantics.as_mut().expect("materialized above");
+        let mut outer = NoSink;
+        let mut tee = KeyUseTee::new(&mut outer, &mut self.joint_keyuse, id);
+        reducer.observe_with_resources_and_effects(&input.facts, &origin, &mut tee)
     }
 
     fn refuse_instance_resource(

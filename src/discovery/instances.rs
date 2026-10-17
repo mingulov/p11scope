@@ -173,6 +173,13 @@ impl InstanceId {
     pub(crate) const fn get(self) -> u64 {
         self.0
     }
+
+    /// Tests-only reference id (N1): production ids come only from
+    /// the router.
+    #[cfg(test)]
+    pub(crate) const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
 }
 
 /// One bracketed epoch reading for (process, watched file). Private epoch

@@ -67,12 +67,12 @@ pub mod scope;
 pub(crate) mod semantic_capture;
 pub mod semantics;
 pub mod semantics_edge;
-// Live-loop carry (T4): the H9 feed driver, key-use reducer and
-// receipt pipeline have no production driver until the Joint
-// live-loop routing lands (the registry reduces S1Only today), so
-// the module is test-reachable only. Ungate with its driver; the
-// frozen output contract and its consumers ship ungated.
-#[cfg(test)]
+// Guarded H9 feed (N1): the feed driver, key-use reducer and receipt
+// pipeline ship in production behind the install guard — the
+// registry owns per-instance feeds and a capture-wide reducer, but
+// feeds stay S1Only until a Joint receipt is installed (only the
+// staged driver and tests install today; the live loop will supply
+// H8 grants when the joint seal tick lands).
 pub(crate) mod semantics_key_use;
 pub(crate) mod semantics_objects;
 pub mod shapes;

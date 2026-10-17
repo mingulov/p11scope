@@ -799,10 +799,11 @@ impl Presentation {
             // No Joint evidence reaches the live registry today
             // (live-loop carry): the projection is honestly
             // unavailable at this pass revision, S1 unaffected.
-            object_observations: crate::key_operation_projection::ObjectObservations::unavailable(
-                passes,
-                "bootstrap_unavailable",
-            ),
+            // Guarded H9 section (N1): retained Joint evidence
+            // commits; without it this stays unavailable, exactly as
+            // before (production holds no receipts, seals or
+            // projections).
+            object_observations: coordinator.registry().joint_observations(passes),
             budgets: BudgetView {
                 callers_limit: limits.max_callers,
                 callers_occupied: coordinator.adapter().len(),

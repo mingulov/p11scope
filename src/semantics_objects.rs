@@ -281,12 +281,6 @@ pub(crate) struct KeyMetadataFlags {
 }
 
 impl KeyMetadataFlags {
-    pub(crate) const ZERO: Self = Self {
-        requested: 0,
-        established: 0,
-        conflicted: 0,
-    };
-
     pub(crate) fn requested_count(self) -> u32 {
         self.requested.count_ones()
     }
@@ -781,6 +775,14 @@ pub(crate) enum ObjectEffect {
         /// positional join, never reconstructed from emission order.
         /// `None` for found-handle references, which join no input.
         input: Option<u8>,
+        /// Metadata presence frozen at the join (H9): routing delay
+        /// between the join and receipt assembly cannot backfill an
+        /// earlier use.
+        metadata: KeyMetadataFlags,
+        /// The established-only combined label at the join.
+        label: Option<KeyLabel>,
+        /// Whether attribution was valid at the join.
+        attribution_valid: bool,
     },
     Destroyed {
         call: CallToken,

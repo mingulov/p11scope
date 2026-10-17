@@ -4278,7 +4278,7 @@ pub(crate) mod tests {
         bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     }
 
-    fn function_id(name: &str) -> u32 {
+    pub(crate) fn function_id(name: &str) -> u32 {
         crate::kinds::function_id(name).expect("catalog function")
     }
 
@@ -4990,7 +4990,7 @@ pub(crate) mod tests {
 
         /// The happy-path binding, genuinely bound: read back from the
         /// coordinator's stored proof.
-        fn binding(
+        pub(crate) fn binding(
             &self,
         ) -> &crate::discovery::engine::inventory_coordinator::semantics::SemanticCallerBinding
         {
@@ -8765,13 +8765,16 @@ pub(crate) mod tests {
     /// from the production publication/dirty/admission
     /// implementation. See
     /// `tests/fixtures/object-journal/birth_row_publisher.c`.
-    struct NativePublisher {
+    /// Exposed `pub(crate)` so H9 Joint tests can bootstrap from the
+    /// same genuine-producer chain as T3 founding (see
+    /// `object_journal_session_exec_birth_observes_genuine_producers`).
+    pub(crate) struct NativePublisher {
         _dir: tempfile::TempDir,
         binary: std::path::PathBuf,
     }
 
     impl NativePublisher {
-        fn build() -> Self {
+        pub(crate) fn build() -> Self {
             let dir = tempfile::tempdir().expect("publisher directory");
             let binary = dir.path().join("birth-row-publisher");
             let output = std::process::Command::new("clang-18")
@@ -8801,7 +8804,7 @@ pub(crate) mod tests {
         /// native structs (little-endian u64 cells, matching the C
         /// layouts byte for byte). Returns the row, the control row,
         /// and the native win count.
-        fn publish(
+        pub(crate) fn publish(
             &self,
             args: &[&str],
         ) -> (
@@ -8843,7 +8846,7 @@ pub(crate) mod tests {
         /// the argv-settled exec stamp the generation comparison pins.
         /// Short argv pads with zeros through `nopub` so the stamp
         /// always lands in the sixth slot.
-        fn publish_stamped(
+        pub(crate) fn publish_stamped(
             &self,
             args: &[&str],
             stamp: u64,
@@ -8899,9 +8902,9 @@ pub(crate) mod tests {
 
     /// Birth-row reader over one publisher dump: the rows a real
     /// native publication left behind.
-    struct NativeBirthRows {
-        row: p11scope_ebpf_common::InstanceRecord,
-        control: p11scope_ebpf_common::JournalAdmissionControl,
+    pub(crate) struct NativeBirthRows {
+        pub(crate) row: p11scope_ebpf_common::InstanceRecord,
+        pub(crate) control: p11scope_ebpf_common::JournalAdmissionControl,
     }
 
     impl crate::attach::BirthRowReader for NativeBirthRows {

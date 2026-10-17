@@ -211,6 +211,37 @@ observed.pop("trace", None)
 open(args.out, "w").write(json.dumps(observed, sort_keys=True))
 """
 
+BURST_BIG_CHILD = """#!/usr/bin/env python3
+import argparse, hashlib, json, os, sys
+parser = argparse.ArgumentParser()
+parser.add_argument("--ledger", required=True)
+parser.add_argument("--out", required=True)
+parser.add_argument("--rate", default=None)
+parser.add_argument("--duration", default=None)
+parser.add_argument("--run-token", default=None)
+args = parser.parse_args()
+raw = open(args.ledger, "rb").read()
+ledger = json.loads(raw.decode("utf-8"))
+print(json.dumps({"schema": "p11scope/object-journal-ready/v1",
+                  "provider": "burst-big-child", "pid": os.getpid(),
+                  "abi": ledger["provider"]["abi"],
+                  "ledger_digest": hashlib.sha256(raw).hexdigest()}), flush=True)
+assert sys.stdin.readline().strip() == "GO"
+# N16: 66,000 well-formed progress lines past the old fixed floor,
+# back-to-back with no ACK reads (the N13-tolerated shape). The
+# population verdict — not the flood trip — must judge them.
+for seq in range(1, 33001):
+    print(json.dumps({"progress": "call", "seq": seq}), flush=True)
+for ordinal in range(1, 33001):
+    print(json.dumps({"progress": "record", "ordinal": ordinal}), flush=True)
+observed = json.loads(json.dumps(ledger))
+observed["key_material"] = None
+observed["ledger_digest"] = hashlib.sha256(raw).hexdigest()
+observed["run_token"] = args.run_token
+observed.pop("trace", None)
+open(args.out, "w").write(json.dumps(observed, sort_keys=True))
+"""
+
 PARTIAL_CHILD = """#!/usr/bin/env python3
 import argparse, hashlib, json, os, sys
 parser = argparse.ArgumentParser()
@@ -777,6 +808,46 @@ class PacingTests(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("profile complete", proc.stdout)
+
+    def test_flood_cap_covers_declared_profiles(self):
+        # N16: the progress bound is workload-specific — every
+        # declared profile's exact population fits under it, while
+        # small workloads keep the fixed floor.
+        spec = importlib.util.spec_from_file_location("qualify_object_journal", ORACLE)
+        oracle = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(oracle)
+        for name, rate in sorted(oracle.PROFILES.items()):
+            expected = rate * oracle.PROFILE_SECONDS
+            self.assertGreater(
+                oracle.flood_cap_for(rate, oracle.PROFILE_SECONDS),
+                expected,
+                f"the {name} profile's {expected} deliveries must fit",
+            )
+        self.assertEqual(oracle.flood_cap_for(100, 60), oracle.PROGRESS_FLOOD_CAP)
+
+    def test_workload_cap_accepts_over_floor_stream(self):
+        # N16 wiring: with a declared workload of 66,000 lines the
+        # controller accepts all 66,000 arrivals past the old fixed
+        # floor and judges them by the population verdict (naming the
+        # exact streamed count) instead of tripping the flood.
+        with tempfile.TemporaryDirectory() as temp:
+            child = Path(temp) / "burst-big-child.py"
+            child.write_text(BURST_BIG_CHILD)
+            out = str(Path(temp) / "observed.json")
+            proc, _ = run_profiled(
+                temp,
+                sys.executable,
+                [str(child), "--ledger", str(LEDGER), "--out", out],
+                "--rate",
+                "66000",
+                "--duration",
+                "1",
+                timeout=120,
+            )
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("STREAM_POPULATION_MISMATCH", proc.stdout)
+            self.assertIn("streamed 66000 progress observations", proc.stdout)
+            self.assertNotIn("progress flood", proc.stderr)
 
 
 class EmptyTests(unittest.TestCase):

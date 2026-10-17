@@ -6918,6 +6918,24 @@ impl GuardedScene {
             .expect("materialized")
             .started()
     }
+
+    /// Drive one Joint quantum for `key`/`id`: admit, stage, seal,
+    /// deliver. Returns the seal outcome.
+    fn drive_joint(
+        &mut self,
+        key: &InstanceKey,
+        id: RegistryInstanceId,
+        shape: &ShapedS1,
+    ) -> SealApplyOutcome {
+        let (facts, position) = self.admit_shape(shape);
+        self.observe(key, position, facts);
+        self.registry.publish_with_ledger(&mut self.scene.ledger);
+        ingest_call(&mut self.scene, shape);
+        let seal = self.scene.seal().expect("quantum seals");
+        assert_eq!(seal.prefix.settled().len(), 1, "{}", shape.name);
+        self.registry
+            .deliver_joint_seal(id, &seal, &self.scene.model, &mut self.scene.ledger)
+    }
 }
 
 /// N1: an installed receipt selects Joint exactly once; without one
@@ -7199,4 +7217,277 @@ fn key_operation_s1only_capture_stays_unavailable() {
     assert_eq!(observations.status, ObsStatus::Unavailable);
     assert_eq!(observations.reason, "bootstrap_unavailable");
     assert!(observations.key_operations.is_empty());
+}
+
+/// N14: Joint seal replay reserves H3 resources: the shared charge
+/// grows when the replay adds machine/mechanism/provenance state.
+#[test]
+fn key_operation_n14_joint_replay_reserves_resources() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(joint_key.clone(), bootstrap);
+    let (_, joint_id) = guarded.register(1);
+
+    // Grounding quanta (create + label) first, like every proved flow.
+    let create = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    for shape in [&create, &get] {
+        assert_eq!(
+            guarded.drive_joint(&joint_key, joint_id, shape),
+            SealApplyOutcome::ReplayedOne
+        );
+    }
+    // The Init replay adds a live machine plus mechanism/provenance
+    // rows: the shared H3 charge must grow.
+    let shape = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let (facts, position) = guarded.admit_shape(&shape);
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    ingest_call(&mut guarded.scene, &shape);
+    let seal = guarded.scene.seal().expect("init quantum seals");
+    let before = guarded.registry.semantic_resource_snapshot().charged_bytes;
+    let outcome = guarded.registry.deliver_joint_seal(
+        joint_id,
+        &seal,
+        &guarded.scene.model,
+        &mut guarded.scene.ledger,
+    );
+    let after = guarded.registry.semantic_resource_snapshot().charged_bytes;
+    assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
+    eprintln!("Joint Init replay charge: {before} -> {after}");
+    assert!(
+        after > before,
+        "a new machine/mechanism/provenance must reserve its H3 charge"
+    );
+}
+
+/// N14: small-budget N/N+1 refusal with a useful sibling and eligible
+/// release. A fits; B's identical replay refuses (claim consumed,
+/// head disposed as history, feed stays Joint); A's live machine
+/// stays useful and completes; its release makes room for B's retry.
+#[test]
+fn key_operation_n14_small_budget_refuses_n_plus_one() {
+    use crate::semantics_edge::resources::{REDUCER_BASE_CHARGE, SEMANTIC_TRANSITION_SCRATCH};
+
+    // Self-calibrate: one Init replay's growth on a fresh reducer.
+    let growth = {
+        let mut probe = GuardedScene::new();
+        let bootstrap = probe.scene.bootstrap();
+        let key = probe.key(1);
+        probe.registry.install_joint_receipt(key.clone(), bootstrap);
+        let (_, id) = probe.register(1);
+        let shape = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+        let (facts, position) = probe.admit_shape(&shape);
+        probe.observe(&key, position, facts);
+        probe.registry.publish_with_ledger(&mut probe.scene.ledger);
+        ingest_call(&mut probe.scene, &shape);
+        let seal = probe.scene.seal().expect("probe quantum seals");
+        let before = probe.registry.semantic_resource_snapshot().charged_bytes;
+        assert_eq!(
+            probe.registry.deliver_joint_seal(
+                id,
+                &seal,
+                &probe.scene.model,
+                &mut probe.scene.ledger
+            ),
+            SealApplyOutcome::ReplayedOne
+        );
+        let after = probe.registry.semantic_resource_snapshot().charged_bytes;
+        assert!(after > before, "probe: replay reserves");
+        after - before
+    };
+    eprintln!("calibrated Init growth: {growth}");
+
+    let mut guarded = GuardedScene::new();
+    // Room for both reducers + A's full Init + all but 100 bytes of
+    // B's: B refuses by a hair, and A's eventual net release (the
+    // freed machine minus terminal growth) makes room for B's retry.
+    guarded.registry.reference_semantic_resource_limit(
+        SEMANTIC_TRANSITION_SCRATCH + 2 * REDUCER_BASE_CHARGE + 2 * growth - 100,
+    );
+    let bootstrap = guarded.scene.bootstrap();
+    let a_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(a_key.clone(), bootstrap);
+    let (_, a_id) = guarded.register(1);
+    let bootstrap = guarded.scene.bootstrap();
+    let b_key = guarded.key(2);
+    guarded
+        .registry
+        .install_joint_receipt(b_key.clone(), bootstrap);
+    let (_, b_id) = guarded.register(2);
+
+    // A fits.
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    assert_eq!(
+        guarded.drive_joint(&a_key, a_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    // B's identical replay refuses: same shape, no room.
+    assert_eq!(
+        guarded.drive_joint(&b_key, b_id, &init),
+        SealApplyOutcome::ResourceRefused
+    );
+    assert_eq!(
+        guarded.registry.semantic_resource_snapshot().refused,
+        1,
+        "the pool counts the refusal"
+    );
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(b_id),
+        Some(FeedMode::Joint),
+        "refusal keeps the feed Joint"
+    );
+    assert_eq!(
+        guarded.scene.ledger.staged(),
+        0,
+        "the refused head releases its ticket"
+    );
+    // A's live machine stays useful (refusal is instance-local).
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    assert_eq!(
+        guarded.drive_joint(&a_key, a_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    // Eligible release made room: B's retry fits.
+    assert_eq!(
+        guarded.drive_joint(&b_key, b_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+}
+
+/// N14: fallback replay reserves too, and mid-fallback refusal
+/// preserves invalidation: the first call replays, the second
+/// refuses, live S1 ends Unknown with terminals teed (no leaked
+/// opens), the rest disposes as history.
+#[test]
+fn key_operation_n14_fallback_replay_reserves_and_disposes_on_refusal() {
+    use crate::semantics_edge::resources::{REDUCER_BASE_CHARGE, SEMANTIC_TRANSITION_SCRATCH};
+
+    // --- Default pool: fallback replay reserves. ---
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(joint_key.clone(), bootstrap);
+    let (_, joint_id) = guarded.register(1);
+    let init7 = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let mut init8 = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    init8.session = Some(8);
+    for shape in [&init7, &init8] {
+        let (facts, position) = guarded.admit_shape(shape);
+        guarded.observe(&joint_key, position, facts);
+        guarded
+            .registry
+            .publish_with_ledger(&mut guarded.scene.ledger);
+    }
+    assert_eq!(guarded.scene.ledger.staged(), 2);
+    let failure = SealFailure {
+        gap: JournalGap::ClosureStale,
+        effects: crate::semantics_objects::ObjectEffects::default(),
+        h3_voided: None,
+    };
+    let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let before = guarded.registry.semantic_resource_snapshot().charged_bytes;
+    let outcome = guarded.registry.deliver_joint_failure(
+        joint_id,
+        &failure,
+        &mut clean,
+        &guarded.scene.model,
+        &mut guarded.scene.ledger,
+    );
+    let after = guarded.registry.semantic_resource_snapshot().charged_bytes;
+    assert_eq!(outcome, FailureApplyOutcome::FellBack { replayed: 2 });
+    eprintln!("fallback replay charge: {before} -> {after}");
+    assert!(after > before, "fallback replay must reserve its H3 charge");
+
+    // --- Small budget: the second replay refuses; live S1 ends
+    // Unknown with terminals teed, the rest disposes as history. ---
+    let growth = {
+        let mut probe = GuardedScene::new();
+        let bootstrap = probe.scene.bootstrap();
+        let key = probe.key(1);
+        probe.registry.install_joint_receipt(key.clone(), bootstrap);
+        let (_, id) = probe.register(1);
+        let shape = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+        let (facts, position) = probe.admit_shape(&shape);
+        probe.observe(&key, position, facts);
+        probe.registry.publish_with_ledger(&mut probe.scene.ledger);
+        ingest_call(&mut probe.scene, &shape);
+        let seal = probe.scene.seal().expect("probe quantum seals");
+        let before = probe.registry.semantic_resource_snapshot().charged_bytes;
+        assert_eq!(
+            probe.registry.deliver_joint_seal(
+                id,
+                &seal,
+                &probe.scene.model,
+                &mut probe.scene.ledger
+            ),
+            SealApplyOutcome::ReplayedOne
+        );
+        let after = probe.registry.semantic_resource_snapshot().charged_bytes;
+        assert!(after > before, "probe: replay reserves");
+        after - before
+    };
+    let mut guarded = GuardedScene::new();
+    // Room for one Init plus 512 bytes of the second machine-only
+    // growth (1024): the second replay refuses mid-fallback.
+    guarded.registry.reference_semantic_resource_limit(
+        SEMANTIC_TRANSITION_SCRATCH + REDUCER_BASE_CHARGE + growth + 512,
+    );
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(joint_key.clone(), bootstrap);
+    let (_, joint_id) = guarded.register(1);
+    for shape in [&init7, &init8] {
+        let (facts, position) = guarded.admit_shape(shape);
+        guarded.observe(&joint_key, position, facts);
+        guarded
+            .registry
+            .publish_with_ledger(&mut guarded.scene.ledger);
+    }
+    let failure = SealFailure {
+        gap: JournalGap::ClosureStale,
+        effects: crate::semantics_objects::ObjectEffects::default(),
+        h3_voided: None,
+    };
+    let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let outcome = guarded.registry.deliver_joint_failure(
+        joint_id,
+        &failure,
+        &mut clean,
+        &guarded.scene.model,
+        &mut guarded.scene.ledger,
+    );
+    assert_eq!(outcome, FailureApplyOutcome::FellBack { replayed: 1 });
+    assert_eq!(
+        guarded.scene.ledger.staged(),
+        0,
+        "refusal disposes the rest as history"
+    );
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only),
+        "fallback still degrades the feed"
+    );
+    // Live S1 ended Unknown with terminals teed: no leaked opens.
+    let observations = guarded.registry.joint_observations(9);
+    let row = observations
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "unbound")
+        .expect("the replayed start's terminal routes to unknown-key");
+    assert_eq!((row.unknown, row.active), (1, 0));
 }

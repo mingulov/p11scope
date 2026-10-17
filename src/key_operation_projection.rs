@@ -1001,11 +1001,13 @@ pub(crate) mod producer {
 
     /// The primary receipt decides the terminal's bucket: the first
     /// non-secondary receipt (`wrapped_object` is secondary, H9 §82),
-    /// else the first receipt, else none.
+    /// else none. A secondary-only row never promotes its secondary
+    /// to primary: the proved secondary association is retained in
+    /// its own row while the missing primary's terminal partitions
+    /// to the unknown-key summary.
     fn primary_receipt(keys: &[KeyReceipt]) -> Option<&KeyReceipt> {
         keys.iter()
             .find(|receipt| receipt.role != KeyRole::WrappedKey)
-            .or_else(|| keys.first())
     }
 
     /// Where one receipt's association counts: a proved row under its

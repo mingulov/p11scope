@@ -1951,6 +1951,110 @@ fn key_operation_key_roles_bind_transitions() {
     assert_eq!(wrap_row.keys[1].key, objects[3].id);
 }
 
+/// C3: a proved later Wrap input keeps its true input position and
+/// role when the earlier input is unprovable (positions come from the
+/// qualified model join, never from successful-reference order); the
+/// missing primary yields an unknown-key terminal while the proved
+/// secondary association is retained (never promoted to primary).
+/// Equal-handle inputs keep both positions with distinct roles.
+#[test]
+fn key_operation_partial_wrap_preserves_input_position() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    // Establish an RSA label so the proved secondary is usable.
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(&mut scene, &mut staging, &mut joint, &mut keyuse, &mut sink, &get);
+    // Wrap with input 0 unreadable and input 1 the proved key.
+    let wrap = ShapedS1 {
+        input0: Some((0, 2)),
+        input1: Some((CREATED_KEY, 1)),
+        ..ShapedS1::shaped("C_WrapKey", CkRv::OK.0, RSA_PKCS, init_capture())
+    };
+    let (_, position) = prepare_call(&mut scene, &mut staging, &wrap);
+    let seal = scene.seal().expect("partial wrap quantum seals");
+    assert_eq!(seal.prefix.settled().len(), 1);
+    let receipts =
+        keyuse.receipts_for_call(&seal, &seal.prefix.settled()[0], &scene.model, position);
+    assert_eq!(receipts.len(), 1, "only input 1 proved");
+    assert_eq!(receipts[0].input, 1, "position is the joined input, not reference order");
+    assert_eq!(receipts[0].role, KeyRole::WrappedKey);
+    let (outcome, _) = staging.apply_seal(
+        &seal,
+        &scene.model,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
+    assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let secondary = committed
+        .key_operations
+        .iter()
+        .find(|row| row.role == "wrapped_object")
+        .expect("proved secondary association retained");
+    assert_eq!((secondary.started, secondary.completed), (1, 1));
+    assert!(
+        committed.key_operations.iter().all(|row| row.role != "wrapping_key"),
+        "no invented primary association: {:?}",
+        committed.key_operations
+    );
+    let missing_primary = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "wrap" && row.reason == "unbound")
+        .expect("missing primary yields an unknown-key terminal");
+    assert_eq!(missing_primary.completed, 1);
+
+    // Equal handles: both positions prove with distinct roles.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let wrap = ShapedS1 {
+        input0: Some((CREATED_KEY, 1)),
+        input1: Some((CREATED_KEY, 1)),
+        ..ShapedS1::shaped("C_WrapKey", CkRv::OK.0, RSA_PKCS, init_capture())
+    };
+    let (_, position) = prepare_call(&mut scene, &mut staging, &wrap);
+    let seal = scene.seal().expect("equal-handle wrap quantum seals");
+    let receipts =
+        keyuse.receipts_for_call(&seal, &seal.prefix.settled()[0], &scene.model, position);
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(receipts[0].input, 0);
+    assert_eq!(receipts[0].role, KeyRole::WrappingKey);
+    assert_eq!(receipts[1].input, 1);
+    assert_eq!(receipts[1].role, KeyRole::WrappedKey);
+    assert_eq!(receipts[0].key, receipts[1].key, "same object, both positions");
+}
+
 /// G11/H9-§3: association failure on effect-neutral calls records
 /// unknown-key S1 with explicit evidence (never loss), and
 /// requested-only metadata keeps definite operations without values.

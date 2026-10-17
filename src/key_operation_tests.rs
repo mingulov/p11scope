@@ -1728,7 +1728,7 @@ fn key_operation_fallback_invalidates_before_replay() {
 
 /// N3 remainder (fix round 2): a held multi-call quantum still
 /// applies its qualified invalidations. The two-call seal (terminal
-/// + destroy) holds S1 replay — H9 runs no batching — but the
+/// and destroy) holds S1 replay — H9 runs no batching — but the
 /// destroyed key's open association closes at invalidation time
 /// (active 0, lost 1), never held with the replay. The eventual
 /// fallback terminal then routes once to unknown-key.

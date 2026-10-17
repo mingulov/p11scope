@@ -956,10 +956,7 @@ impl EdgeSemantics {
         if self.resource_owner.is_none() {
             return Ok(self.observe_inner(call, origin, keys, sink));
         }
-        let prepared = match self.prepare_resource_transition(call) {
-            Ok(prepared) => prepared,
-            Err(refusal) => return Err(refusal),
-        };
+        let prepared = self.prepare_resource_transition(call)?;
         assert!(self.resource_transition.is_none());
         self.resource_transition = Some(prepared);
         let refused = self.observe_inner(call, origin, keys, sink);

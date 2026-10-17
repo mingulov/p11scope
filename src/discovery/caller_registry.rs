@@ -3219,7 +3219,7 @@ impl CallerRegistry {
         // Ledger-bearing publishes settle pended staging releases
         // (C4/C5 loss and ledger-less fallback disposal) before
         // publication; plain publishes leave them pended.
-        if let Some(ledger) = ledger.as_deref_mut() {
+        if let Some(ledger) = ledger {
             self.flush_staging_releases(ledger);
         }
         self.reconcile_initial_semantic_coverage();
@@ -4767,7 +4767,7 @@ impl CallerRegistry {
         module: ModuleId,
         complete_scan: bool,
         at_ns: u64,
-        mut shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
         let _ = at_ns;
         {
@@ -4797,12 +4797,7 @@ impl CallerRegistry {
                 state.invalidate();
             }
         }
-        self.invalidate_physical_instances(
-            caller,
-            Some(module),
-            complete_scan,
-            shared.as_deref_mut(),
-        );
+        self.invalidate_physical_instances(caller, Some(module), complete_scan, shared);
         // The module unloaded only when no edge still maps it or could:
         // mapped and uncertain edges both block the verdict (an
         // incomplete scan just marked this edge uncertain, so it

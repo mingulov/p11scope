@@ -1990,6 +1990,15 @@ impl ModelState {
         input: Option<u8>,
         effects: &mut ObjectEffects,
     ) {
+        // The metadata snapshot freezes here, at the qualified join:
+        // whatever the view learns later (even before H9 assembles
+        // the receipt) cannot rewrite this observation.
+        let Some(view) = self.objects.get(&id) else {
+            return;
+        };
+        let metadata = Self::metadata_flags_of(view);
+        let label = view.label();
+        let attribution_valid = view.attribution == super::Attribution::Valid;
         if let Some(view) = self.objects.get_mut(&id) {
             view.references = view.references.saturating_add(1);
             if key_use {
@@ -2000,6 +2009,9 @@ impl ModelState {
                 object: id,
                 key_use,
                 input,
+                metadata,
+                label,
+                attribution_valid,
             });
         }
     }
@@ -3154,7 +3166,13 @@ impl ModelState {
     /// at settle, so callers treat absence as unavailable metadata,
     /// never as proof of no metadata).
     pub(super) fn key_metadata_flags(&self, key: ObjectId) -> Option<super::KeyMetadataFlags> {
-        let view = self.objects.get(&key)?;
+        self.objects.get(&key).map(Self::metadata_flags_of)
+    }
+
+    /// Presence bitmaps for one view: the shared computation behind
+    /// the current-state read above and the join-time snapshot in
+    /// [`Self::reference`].
+    fn metadata_flags_of(view: &ViewRecord) -> super::KeyMetadataFlags {
         let mut requested = 0u8;
         let mut established = 0u8;
         let mut conflicted = 0u8;
@@ -3184,11 +3202,11 @@ impl ModelState {
                 conflicted |= 1 << index;
             }
         }
-        Some(super::KeyMetadataFlags {
+        super::KeyMetadataFlags {
             requested,
             established,
             conflicted,
-        })
+        }
     }
 
     pub(super) fn receipt_snapshot(&self, key: ObjectId) -> Option<super::ReceiptSnapshot> {

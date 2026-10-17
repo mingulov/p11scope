@@ -2189,6 +2189,68 @@ fn key_operation_unknown_key_and_requested_only() {
     assert_eq!(metadata.established_count(), 0, "no value ever arrived");
 }
 
+/// N2: metadata freezes in the positional model receipt at the
+/// join: a receipt assembled after routing delay (the model learned
+/// an RSA label after the Init settled) carries no label — delay
+/// cannot backfill an earlier use. Conflict/attribution state
+/// freezes the same way.
+#[test]
+fn key_operation_delayed_receipt_does_not_backfill_metadata() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    // The Init settles with no metadata established.
+    let (_, pos_init) = prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    let earlier = scene.seal().expect("init quantum seals");
+    assert_eq!(earlier.prefix.settled().len(), 1);
+    let (outcome, _) = staging.apply_seal(
+        &earlier,
+        &scene.model,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
+    assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
+    // Routing delay: the model learns a full RSA label afterwards.
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(&mut scene, &mut staging, &mut joint, &mut keyuse, &mut sink, &get);
+    let objects = &scene.model.project().objects;
+    assert_eq!(objects.len(), 1);
+    assert!(objects[0].label.is_some(), "non-vacuous: the GET landed");
+    // The delayed receipt for the earlier Init carries no label.
+    let receipts = keyuse.receipts_for_call(
+        &earlier,
+        &earlier.prefix.settled()[0],
+        &scene.model,
+        pos_init,
+    );
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].label, None, "delay cannot backfill the earlier use");
+    assert_eq!(receipts[0].metadata.established_count(), 0);
+    assert_eq!(receipts[0].input, 0);
+}
+
 /// G11/H9-§3: later-learned key metadata never rewrites S1 rows: the
 /// completed row is byte-identical before and after the GET that
 /// establishes values the row predates.

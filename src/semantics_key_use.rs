@@ -84,6 +84,12 @@ pub(crate) enum SealApplyOutcome {
     /// terminal is still open, the quantum needs batching H9 does not
     /// run, or the feed already left Joint. Staging is intact.
     Held,
+    /// The seal settled exactly the staged head, but H3's resource
+    /// pool refused the S1 growth (N14): live S1 invalidated with
+    /// terminals teed (opens close as Unknown), the head disposed as
+    /// history, the claim consumed. The feed stays Joint: later seals
+    /// may still replay once budget frees.
+    ResourceRefused,
 }
 
 /// How one seal failure advanced the staging.
@@ -359,7 +365,9 @@ impl JointStaging {
     /// its effects feed both the caller's sink and the key-use
     /// reducer from the same single pass. Returns the outcome plus
     /// this quantum's per-edge bound refusals (the owner folds them
-    /// into `semantic_refused`, like the direct feed).
+    /// into `semantic_refused`, like the direct feed). Resource
+    /// refusal disposes the head as history (see
+    /// [`SealApplyOutcome::ResourceRefused`]).
     #[allow(clippy::too_many_arguments)] // Staging borrows the exact pipeline facts plus the shared ledger.
     pub(crate) fn apply_seal<S: OperationSink>(
         &mut self,
@@ -430,9 +438,23 @@ impl JointStaging {
             keyuse,
             instance,
         };
-        let refused = reducer.observe_joint(&head.facts, &head.origin, &receipts, &mut tee);
-        self.reduced = self.reduced.saturating_add(1);
-        (SealApplyOutcome::ReplayedOne, refused)
+        match reducer.observe_joint_with_resources(&head.facts, &head.origin, &receipts, &mut tee) {
+            Ok(refused) => {
+                self.reduced = self.reduced.saturating_add(1);
+                (SealApplyOutcome::ReplayedOne, refused)
+            }
+            Err(_) => {
+                // H3 resource refusal (N14): the S1 growth doesn't
+                // fit. Invalidate live S1 with terminals teed (opens
+                // close as Unknown, like S1Only exhaustion), dispose
+                // the un-replayable head as history (ticket already
+                // released, claim already consumed above), and keep
+                // the feed Joint for later seals.
+                reducer.invalidate_with_effects(&mut tee);
+                self.history_disposed = self.history_disposed.saturating_add(1);
+                (SealApplyOutcome::ResourceRefused, 0)
+            }
+        }
     }
 
     /// Apply one seal failure: real loss invalidates live operation
@@ -561,9 +583,12 @@ impl JointStaging {
 
     /// Replay every retained payload once in original H3 order
     /// through ordinary S1 (S1Only: no receipts — fallback rows are
-    /// unknown-key, never invented object facts). Effects feed the
-    /// key-use reducer too. Returns the replay count plus per-edge
-    /// bound refusals.
+    /// unknown-key, never invented object facts), reserving H3
+    /// resources per replay (N14). Effects feed the key-use reducer
+    /// too. On mid-fallback resource refusal, live S1 invalidates
+    /// with terminals teed (no leaked opens) and this head plus every
+    /// remaining payload disposes as history. Returns the replay
+    /// count plus per-edge bound refusals.
     fn replay_staged<S: OperationSink>(
         &mut self,
         reducer: &mut EdgeSemantics,
@@ -582,13 +607,19 @@ impl JointStaging {
                 keyuse: &mut *keyuse,
                 instance,
             };
-            refused = refused.saturating_add(reducer.observe_with_effects(
-                &head.facts,
-                &head.origin,
-                &mut tee,
-            ));
-            self.reduced = self.reduced.saturating_add(1);
-            replayed += 1;
+            match reducer.observe_joint_with_resources(&head.facts, &head.origin, &[], &mut tee) {
+                Ok(head_refused) => {
+                    refused = refused.saturating_add(head_refused);
+                    self.reduced = self.reduced.saturating_add(1);
+                    replayed += 1;
+                }
+                Err(_) => {
+                    reducer.invalidate_with_effects(&mut tee);
+                    self.history_disposed = self.history_disposed.saturating_add(1);
+                    self.drain_staged(ledger);
+                    break;
+                }
+            }
         }
         (replayed, refused)
     }

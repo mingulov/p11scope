@@ -1169,8 +1169,11 @@ impl CallerRegistry {
     /// Reduce one call on the guarded Joint path (N1): Joint feeds
     /// stage against the shared H8 ledger for seal replay; S1Only
     /// siblings (and Joint staging fallbacks) reduce direct, teeing
-    /// effects into the shared key-use reducer. Unreached while no
-    /// Joint feed exists and no ledger is supplied.
+    /// effects into the shared key-use reducer. When staging cannot
+    /// hold the order (Full, missing ledger, unsealable with queued
+    /// calls), queued calls fall back in order first (C4) — reducing
+    /// a later fact direct would overtake them. Unreached while no
+    /// Joint feed exists and no Joint evidence was retained.
     fn reduce_with_joint_path(
         &mut self,
         id: RegistryInstanceId,
@@ -1185,37 +1188,85 @@ impl CallerRegistry {
             .feed
             .mode()
             == FeedMode::Joint;
+        let mut fallback_refused = 0u64;
         if joint {
             if let Some(ledger) = ledger {
                 let origin = EffectOrigin::from(&input.facts);
-                let state = self
-                    .instance_state
-                    .semantics
-                    .get_mut(&id)
-                    .expect("retained edge");
-                match state
-                    .feed
-                    .stage(input.facts.clone(), origin, input.position.ordinal, ledger)
-                {
-                    Ok(()) => return Ok(0),
-                    Err(StagingRefusal::Unsealable) => {} // By-design carve-out: direct below.
-                    Err(StagingRefusal::Full) => {
-                        self.joint_direct_fallback = self.joint_direct_fallback.saturating_add(1);
-                    }
-                    Err(_) => {
+                // The stage attempt borrows the feed; the fallback
+                // below reborrows the registry, so decide first.
+                enum StageAction {
+                    Staged,
+                    CarveOut,
+                    FallbackUncounted,
+                    FallbackCounted,
+                    Drop,
+                }
+                let action = {
+                    let state = self
+                        .instance_state
+                        .semantics
+                        .get_mut(&id)
+                        .expect("retained edge");
+                    match state.feed.stage(
+                        input.facts.clone(),
+                        origin,
+                        input.position.ordinal,
+                        &mut *ledger,
+                    ) {
+                        Ok(()) => StageAction::Staged,
+                        // By-design carve-out, but ordered (C4): with
+                        // queued calls the completion must not
+                        // overtake its original — fall back in order
+                        // first, then reduce direct below.
+                        Err(StagingRefusal::Unsealable) => {
+                            if state.feed.staged_len() > 0 {
+                                StageAction::FallbackUncounted
+                            } else {
+                                StageAction::CarveOut
+                            }
+                        }
+                        Err(StagingRefusal::Full) => StageAction::FallbackCounted,
                         // NotJoint contradicts the mode branch;
                         // ReplayRefused contradicts the
                         // OutOfOrderReturn guard above (frontier can
                         // only trail staged ordinals): drop, never
                         // double-reduce — counted, never silent.
+                        // (Dropped, not reduced: no overtake.)
+                        Err(_) => StageAction::Drop,
+                    }
+                };
+                match action {
+                    StageAction::Staged => return Ok(0),
+                    StageAction::CarveOut => {}
+                    StageAction::FallbackUncounted => {
+                        fallback_refused = self.fallback_joint_for_order(id, Some(ledger));
+                    }
+                    StageAction::FallbackCounted => {
+                        self.joint_direct_fallback = self.joint_direct_fallback.saturating_add(1);
+                        fallback_refused = self.fallback_joint_for_order(id, Some(ledger));
+                    }
+                    StageAction::Drop => {
                         self.joint_direct_fallback = self.joint_direct_fallback.saturating_add(1);
                         return Ok(0);
                     }
                 }
             } else {
                 // No H8 owner, no staging: S1 preserved direct,
-                // Joint evidence absent for this call.
+                // Joint evidence absent for this call. With queued
+                // calls, fall back in order first (C4, releases
+                // pend until the next ledger contact).
                 self.joint_direct_fallback = self.joint_direct_fallback.saturating_add(1);
+                let queued = self
+                    .instance_state
+                    .semantics
+                    .get(&id)
+                    .expect("retained edge")
+                    .feed
+                    .staged_len()
+                    > 0;
+                if queued {
+                    fallback_refused = self.fallback_joint_for_order(id, None);
+                }
             }
         }
         // S1Only-direct reduction with effects into the shared
@@ -1230,7 +1281,33 @@ impl CallerRegistry {
         let reducer = state.semantics.as_mut().expect("materialized above");
         let mut outer = NoSink;
         let mut tee = KeyUseTee::new(&mut outer, &mut self.joint_keyuse, id);
-        reducer.observe_with_resources_and_effects(&input.facts, &origin, &mut tee)
+        let refused =
+            reducer.observe_with_resources_and_effects(&input.facts, &origin, &mut tee)?;
+        Ok(fallback_refused.saturating_add(refused))
+    }
+
+    /// Ordered fallback for one Joint feed (C4): replay queued calls
+    /// S1-direct in original order, degrade to S1Only, release the
+    /// Joint-feeds guard. Returns fallback per-edge bound refusals.
+    fn fallback_joint_for_order(
+        &mut self,
+        id: RegistryInstanceId,
+        ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) -> u64 {
+        let mut outer = NoSink;
+        let record = self
+            .instance_state
+            .semantics
+            .get_mut(&id)
+            .expect("retained edge");
+        debug_assert_eq!(record.feed.mode(), FeedMode::Joint);
+        let (feed, reducer_slot) = (&mut record.feed, &mut record.semantics);
+        let reducer = reducer_slot.as_mut().expect("materialized above");
+        let (_, refused) =
+            feed.ordered_fallback(reducer, &mut self.joint_keyuse, id, &mut outer, ledger);
+        debug_assert_eq!(feed.mode(), FeedMode::S1Only);
+        self.joint_feeds = self.joint_feeds.saturating_sub(1);
+        refused
     }
 
     fn refuse_instance_resource(

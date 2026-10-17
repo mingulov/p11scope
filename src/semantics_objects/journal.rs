@@ -731,6 +731,14 @@ impl JournalAdapter {
     /// The current consumption frontier: the highest ordinal consumed, in
     /// any form. The only source of seal frontiers besides older held
     /// values, so a seal can never claim unconsumed history.
+    /// Test-only read of the consumed ordinal: H9 scenes mirror the
+    /// seal's H3 coverage claim against it. Production passes the
+    /// opaque frontier through, never minting from raw cuts.
+    #[cfg(test)]
+    pub(crate) fn consumed_through_for_test(&self) -> u64 {
+        self.consumed_through
+    }
+
     pub(crate) fn consumed_frontier(&self) -> ConsumptionOrdinal {
         ConsumptionOrdinal(self.consumed_through)
     }
@@ -4034,8 +4042,13 @@ where
     }
 }
 
+/// Test-only authority drivers, shared with H9's production-minter
+/// tests (`key_operation_tests`): real admissions, real wire records,
+/// real attest/ingest/seal. Only the marked support items are
+/// reachable; `#[test]` fns stay private. No production impact: the
+/// module vanishes outside `cfg(test)`.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::attach::capture::NativeDomainId;
     use crate::discovery::caller_registry::ModuleKey;
@@ -4055,13 +4068,13 @@ mod tests {
     };
     use p11scope_ebpf_common::{Event, ImageIdentity, InstanceStamp, MAX_DESCRIPTORS};
 
-    const COOKIE: u64 = 71;
-    const EXEC: u64 = 0;
+    pub(crate) const COOKIE: u64 = 71;
+    pub(crate) const EXEC: u64 = 0;
     const PID_TGID: u64 = 0xAAAA_BBBB_CCCC_DDDD;
-    const SESSION: u64 = 0x5050_5050_5050_5050;
-    const SLOT_ID: u64 = 0x6060_6060_6060_6060;
-    const FLAGS: u64 = 0x7070_7070_7070_7070;
-    const ENTRY_NS: u64 = 0x3030_3030_3030_3030;
+    pub(crate) const SESSION: u64 = 0x5050_5050_5050_5050;
+    pub(crate) const SLOT_ID: u64 = 0x6060_6060_6060_6060;
+    pub(crate) const FLAGS: u64 = 0x7070_7070_7070_7070;
+    pub(crate) const ENTRY_NS: u64 = 0x3030_3030_3030_3030;
     const ENTRY_IP: u64 = 0x4040_4040_4040_4040;
 
     fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
@@ -4082,8 +4095,34 @@ mod tests {
 
     /// Minimal valid BEGIN for any catalog function: VALUE session, absent
     /// inputs, valid entry stamp, zero requested lists.
-    fn begin_bytes(thread: u64, sequence: u64, function: u32, flags: u8) -> [u8; 224] {
+    pub(crate) fn begin_bytes(thread: u64, sequence: u64, function: u32, flags: u8) -> [u8; 224] {
         begin_bytes_image(thread, sequence, function, flags, (COOKIE, EXEC))
+    }
+
+    /// Shaped BEGIN: the minimal record with explicit fingerprint
+    /// fields (session word, entry mechanism, capture vocabulary)
+    /// plus an optional input-0 word for key-use calls, for
+    /// admissions whose S1 shape varies. Shared with H9 tests.
+    pub(crate) fn begin_bytes_shaped(
+        thread: u64,
+        sequence: u64,
+        function: u32,
+        flags: u8,
+        image: (u64, u64),
+        session: u64,
+        mechanism: u64,
+        capture: u32,
+        input0: Option<u64>,
+    ) -> [u8; 224] {
+        let mut bytes = begin_bytes_image(thread, sequence, function, flags, image);
+        put_u64(&mut bytes, 80, session);
+        put_u64(&mut bytes, 112, mechanism);
+        put_u32(&mut bytes, 120, capture);
+        if let Some(word) = input0 {
+            put_u64(&mut bytes, 88, word);
+            bytes[126] = 1;
+        }
+        bytes
     }
 
     fn begin_bytes_image(
@@ -4171,7 +4210,7 @@ mod tests {
         tail
     }
 
-    fn end_bytes(begin: &[u8; 224], action: u8, rv: u64, ts_ns: u64) -> [u8; 632] {
+    pub(crate) fn end_bytes(begin: &[u8; 224], action: u8, rv: u64, ts_ns: u64) -> [u8; 632] {
         use p11scope_ebpf_common::object_journal::*;
         let thread = u64::from_le_bytes(begin[8..16].try_into().unwrap());
         let sequence = u64::from_le_bytes(begin[16..24].try_into().unwrap());
@@ -4189,7 +4228,7 @@ mod tests {
 
     /// Minimal valid absent-tail END for a no-row (neutral/lifecycle)
     /// BEGIN: the absent bit set with 240 zero tail bytes.
-    fn end_bytes_absent(begin: &[u8; 224], rv: u64, ts_ns: u64) -> [u8; 632] {
+    pub(crate) fn end_bytes_absent(begin: &[u8; 224], rv: u64, ts_ns: u64) -> [u8; 632] {
         use p11scope_ebpf_common::object_journal::*;
         let mut bytes = end_bytes(begin, OBJECT_ACTION_CREATE, rv, ts_ns);
         bytes[5] = JOURNAL_END_TAIL_ABSENT;
@@ -4197,7 +4236,12 @@ mod tests {
         bytes
     }
 
-    fn abandon_bytes(thread: u64, sequence: u64, reason: u32, image: (u64, u64)) -> [u8; 64] {
+    pub(crate) fn abandon_bytes(
+        thread: u64,
+        sequence: u64,
+        reason: u32,
+        image: (u64, u64),
+    ) -> [u8; 64] {
         use p11scope_ebpf_common::object_journal::*;
         let mut bytes = [0u8; JOURNAL_ABANDON_BYTES];
         put_u16(&mut bytes, 0, JOURNAL_VERSION);
@@ -4216,8 +4260,8 @@ mod tests {
 
     /// One ordinary CALL corroborating `begin`: the same seven-word call
     /// identity read from the BEGIN, returned after entry, completed
-    /// (non-pending) rv.
-    fn ordinary_for(begin: &[u8; 224], rv: u64) -> Event {
+    /// (non-pending) rv. Shared with H9 tests.
+    pub(crate) fn ordinary_for(begin: &[u8; 224], rv: u64) -> Event {
         let entry_ns = u64::from_le_bytes(begin[48..56].try_into().unwrap());
         Event {
             ts_ns: entry_ns + 100,
@@ -4418,7 +4462,7 @@ mod tests {
         caller
     }
 
-    struct AttestationFixture {
+    pub(crate) struct AttestationFixture {
         _dir: tempfile::TempDir,
         subset: Option<AttestedSubset>,
         coordinator: crate::discovery::engine::inventory_coordinator::InventoryCoordinator<
@@ -4446,7 +4490,7 @@ mod tests {
     }
 
     impl AttestationFixture {
-        fn new(image: ImageIdentity) -> Self {
+        pub(crate) fn new(image: ImageIdentity) -> Self {
             use p11scope_manifest::identity::{inspect_file, mapping_file_key, open_object};
             use p11scope_manifest::manifest::*;
             let dir = tempfile::tempdir().unwrap();
@@ -4681,7 +4725,7 @@ mod tests {
 
         /// The fixture's minted native domain: the Session-side
         /// native identity its admissions name.
-        fn domain(&self) -> NativeDomainId {
+        pub(crate) fn domain(&self) -> NativeDomainId {
             self.domain
         }
 
@@ -4787,12 +4831,31 @@ mod tests {
         /// One real admission for a chosen function: routed evidence
         /// against that function's plan slot, through the real
         /// descriptor/binding proofs.
-        fn admit_function(&mut self, name: &str) -> AdmittedInstanceCall {
+        pub(crate) fn admit_function(&mut self, name: &str) -> AdmittedInstanceCall {
             self.admit_session_function(SESSION, name)
         }
 
         /// One real admission for a chosen session word and function.
-        fn admit_session_function(&mut self, session: u64, name: &str) -> AdmittedInstanceCall {
+        pub(crate) fn admit_session_function(
+            &mut self,
+            session: u64,
+            name: &str,
+        ) -> AdmittedInstanceCall {
+            self.admit_shaped(session, name, 0, 0, Event::default().capture)
+        }
+
+        /// One real admission with explicit S1 evidence shape: return
+        /// code, entry mechanism and capture vocabulary ride the routed
+        /// event into the proved facts. Shared with H9 tests, whose
+        /// S1-varied streams need failed/query/Init-shaped admissions.
+        pub(crate) fn admit_shaped(
+            &mut self,
+            session: u64,
+            name: &str,
+            rv: u64,
+            mechanism: u64,
+            capture: u32,
+        ) -> AdmittedInstanceCall {
             let (slot, endpoint) = self.functions[name];
             self.next_token += 1;
             let token = self.next_token;
@@ -4812,7 +4875,9 @@ mod tests {
                             slot_id: SLOT_ID,
                             flags: FLAGS,
                             user_type: 1,
-                            rv: 0,
+                            rv,
+                            mechanism,
+                            capture,
                             ts_ns: 100 + token,
                             image: self.image,
                             ..Default::default()
@@ -4848,7 +4913,7 @@ mod tests {
         /// subset at construction (a working subset was re-attested
         /// for admissions), so admits and sealing share one domain
         /// without ordering constraints.
-        fn attachment(&self) -> &crate::attach::AttachedSemanticSet {
+        pub(crate) fn attachment(&self) -> &crate::attach::AttachedSemanticSet {
             &self.attachment
         }
     }

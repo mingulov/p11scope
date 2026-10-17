@@ -4115,7 +4115,7 @@ fn key_operation_one_projection_three_consumers() {
             "objects/keys rev 1 populated | sess 1 obj 3 krows {} urows {} refused 0+0 | {}",
             r1.key_operations.len(),
             r1.unknown_key_operations.len(),
-            "encapsulate 1/0/0 operations, generate_key 1/0/0 operations, sign 1/0/2 operations, verify 1/1/0 operations, wrap 2/0/0 operations",
+            "encapsulate 1/0/0 operations, generate_key 1/0/0 operations, sign 1/0/2 operations, verify 1/1/0 operations, wrap 1/0/0 operations",
         ),
         "dashboard agrees on revision, status, counts, units and tallies"
     );
@@ -4603,6 +4603,10 @@ fn key_operation_schema_contract() {
     assert_eq!(REDUCER_REASONS.as_slice(), UNKNOWN_REASONS.as_slice());
     assert_eq!(UNKNOWN_BUCKETS, 23 * 6);
     assert_eq!(enums("/$defs/role/enum"), table(&ROLE_LABELS));
+    assert!(
+        ROLE_LABELS.contains(&crate::key_operation_projection::SECONDARY_ROLE),
+        "the secondary tally exclusion stays frozen vocabulary"
+    );
     assert_eq!(enums("/$defs/unit/enum"), table(&UNIT_LABELS));
     assert_eq!(enums("/$defs/metadata_label/enum"), table(&METADATA_LABELS));
     assert_eq!(enums("/$defs/unknown_reason/enum"), table(&UNKNOWN_REASONS));

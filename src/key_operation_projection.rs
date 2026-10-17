@@ -286,19 +286,17 @@ pub(crate) mod contract {
     ];
     pub(crate) const ROW_BUDGET_KEYS: [&str; 3] = ["limit", "occupied", "refused"];
     pub(crate) const UNKNOWN_BUDGET_KEYS: [&str; 1] = ["occupied"];
-
-    /// Gap rows carried per publication before `suppressed` counts.
-    pub(crate) const GAPS_CAPACITY: usize = 256;
 }
+
+/// Gap rows carried per publication before `suppressed` counts.
+pub(crate) const GAPS_CAPACITY: usize = 256;
 
 /// Publication status: object authority, never S1 health.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ObsStatus {
-    // Live-loop carry (T4): constructed only by the staged commit;
-    // ungate (drop these allows) with its driver.
-    #[allow(dead_code)]
+    // Guarded (N1): constructed by the guarded commit once Joint
+    // evidence exists; unreachable while feeds stay S1Only.
     Populated,
-    #[allow(dead_code)]
     Partial,
     Stale,
     Unavailable,
@@ -767,7 +765,8 @@ impl ObservationPublisher {
 /// (live-loop carry); ungate with them. Every vocabulary map is
 /// exhaustive over its source enum, so the compiler pins the frozen
 /// sets; the contract tests pin keys, enums, equations and orders.
-#[cfg(test)]
+/// Guarded (N1): capture commits only from retained Joint evidence;
+/// without it the section stays unavailable, exactly as before.
 pub(crate) mod producer {
     use super::*;
     use crate::semantics_key_use::{FeedMode, JointStaging, KeyUseReducer};
@@ -926,9 +925,9 @@ pub(crate) mod producer {
         observations
             .gaps
             .sort_by(|a, b| (a.subject, a.reason).cmp(&(b.subject, b.reason)));
-        if observations.gaps.len() > super::contract::GAPS_CAPACITY {
-            let suppressed = observations.gaps.len() - super::contract::GAPS_CAPACITY;
-            observations.gaps.truncate(super::contract::GAPS_CAPACITY);
+        if observations.gaps.len() > super::GAPS_CAPACITY {
+            let suppressed = observations.gaps.len() - super::GAPS_CAPACITY;
+            observations.gaps.truncate(super::GAPS_CAPACITY);
             observations.gaps_suppressed = observations
                 .gaps_suppressed
                 .saturating_add(suppressed as u64);

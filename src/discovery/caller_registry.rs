@@ -2306,6 +2306,25 @@ pub(crate) struct CallerRegistry {
     /// Semantic keys refused: materializations past
     /// `max_semantic_states` plus per-edge keys past the S1 bounds.
     semantic_refused: u64,
+    /// Installed Joint feed receipts by instance key (guarded H9
+    /// path): consumed once at registration; empty in production
+    /// (no live grants), so every feed stays S1Only. Bounded by the
+    /// instance limit.
+    joint_grants:
+        HashMap<instance_input::InstanceKey, crate::semantics_objects::journal::BootstrapReceipt>,
+    /// Capture-wide key-use reducer (guarded H9 path): fed only
+    /// while a Joint feed exists; S1Only siblings contribute
+    /// unknown-key facts.
+    joint_keyuse: crate::semantics_key_use::KeyUseReducer,
+    /// Joint-mode feeds: the effects-tee guard (mutation side).
+    joint_feeds: usize,
+    /// Last H8 projection retained at seal/failure delivery: capture
+    /// commits from it; `None` names `bootstrap_unavailable`.
+    key_projection: Option<crate::semantics_objects::ObjectProjection>,
+    /// Joint calls reduced S1Only-direct for lack of H8 staging
+    /// (no ledger supplied, or the shared ledger refused): S1
+    /// preserved, Joint evidence absent for those calls.
+    joint_direct_fallback: u64,
 }
 
 impl CallerRegistry {
@@ -2361,6 +2380,11 @@ impl CallerRegistry {
             endpoints_refused: 0,
             semantic_occupied: 0,
             semantic_refused: 0,
+            joint_grants: HashMap::new(),
+            joint_keyuse: crate::semantics_key_use::KeyUseReducer::new(),
+            joint_feeds: 0,
+            key_projection: None,
+            joint_direct_fallback: 0,
         }
     }
 
@@ -2370,6 +2394,63 @@ impl CallerRegistry {
     #[cfg_attr(not(test), allow(dead_code))] // Task 6 C5 native lane.
     pub(crate) fn set_uncovered_reason(&mut self, reason: UnknownReason) {
         self.uncovered_reason = reason;
+    }
+
+    /// Tests-only reference wiring (N1): bind one module key to one
+    /// caller edge, retained exactly as a mapped admission would
+    /// leave it. Skips admission verdicts: the guarded-path tests
+    /// prove feed selection, not admission.
+    #[cfg(test)]
+    pub(crate) fn scripted_module_edge(&mut self, key: ModuleKey, caller: CallerId) -> ModuleId {
+        let module = self.modules_by_key.get(&key).copied().unwrap_or_else(|| {
+            let id = ModuleId(self.next_module);
+            self.next_module = self.next_module.saturating_add(1);
+            let mut paths = BTreeSet::new();
+            paths.insert("/scripted/driver.so".to_string());
+            self.modules.insert(
+                id,
+                ModuleRecord {
+                    id,
+                    key: key.clone(),
+                    paths,
+                    build_id: None,
+                    identity_source: None,
+                    admission: AdmissionState::Admitted,
+                    admission_class: None,
+                    admission_endpoints: None,
+                    admission_reasons: Vec::new(),
+                    admission_history: Vec::new(),
+                    lifecycle: ModuleLifecycle::Mapped,
+                    unloaded_observed: false,
+                    unbound_use: None,
+                },
+            );
+            self.modules_by_key.insert(key, id);
+            id
+        });
+        self.edges.insert(
+            (caller, module),
+            EdgeRecord {
+                caller,
+                module,
+                mapping: MappingState::Mapped,
+                mapping_reason: None,
+                mapping_evidence: MappingEvidence::DeepScan,
+                mapping_first_seen_ns: 0,
+                mapping_last_seen_ns: 0,
+                mapping_interruptions: 0,
+                entry_count: 0,
+                entry_saturated: false,
+                entry_first_seen_ns: None,
+                entry_last_seen_ns: None,
+                entry_in_flight: false,
+                entry_rose_since_previous_pass: false,
+                semantics: None,
+                double_loaded: false,
+                coverage: EdgeCoverage::default(),
+            },
+        );
+        module
     }
 
     /// Derived summary only: true when at least one edge holds usage
@@ -3065,12 +3146,32 @@ impl CallerRegistry {
     /// Apply every staged mutation in order and publish the snapshot.
     /// Returns the number of applied mutations.
     pub(crate) fn publish(&mut self) -> usize {
-        self.publish_with_count_observer(None)
+        self.publish_inner(None, None)
+    }
+
+    /// Publish with the shared H8 staging ledger (guarded H9 path):
+    /// Joint feeds stage against it; `None` (plain [`publish`]) keeps
+    /// every feed S1Only-direct. Live-loop carry: only the staged
+    /// driver and tests supply a ledger.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn publish_with_ledger(
+        &mut self,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+    ) -> usize {
+        self.publish_inner(None, Some(ledger))
     }
 
     pub(crate) fn publish_with_count_observer(
         &mut self,
+        observer: Option<&mut dyn FnMut(CountPublication)>,
+    ) -> usize {
+        self.publish_inner(observer, None)
+    }
+
+    fn publish_inner(
+        &mut self,
         mut observer: Option<&mut dyn FnMut(CountPublication)>,
+        mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) -> usize {
         let staged = std::mem::take(&mut self.staged);
         let applied = staged.len();
@@ -3100,7 +3201,7 @@ impl CallerRegistry {
             } else {
                 None
             };
-            self.apply(mutation);
+            self.apply(mutation, ledger.as_deref_mut());
             if let Some(mut count) = count {
                 count.edge_total = count
                     .module
@@ -3196,10 +3297,14 @@ impl CallerRegistry {
         self.gap_repeats.push(1);
     }
 
-    fn apply(&mut self, mutation: Mutation) {
+    fn apply(
+        &mut self,
+        mutation: Mutation,
+        ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) {
         match mutation {
             Mutation::NoteInstance(input) => self.apply_instance(input),
-            Mutation::ObserveInstanceSemantic(input) => self.apply_instance_call(input),
+            Mutation::ObserveInstanceSemantic(input) => self.apply_instance_call(input, ledger),
             Mutation::InstanceSemanticLoss(input) => self.apply_instance_loss(input),
             Mutation::RetireInstance(input) => self.apply_instance_retirement(input),
             Mutation::NoteMapping {
@@ -3859,19 +3964,25 @@ impl CallerRegistry {
                 if !admitted {
                     PendingCountOutcome::Unadmitted { module: key }
                 } else {
-                    self.apply(Mutation::NoteCountedUse {
-                        caller,
-                        module: key.clone(),
-                        count,
-                        first_ns,
-                        last_ns,
-                        base,
-                    });
-                    self.apply(Mutation::NoteCoverage {
-                        caller,
-                        module: key.clone(),
-                        note: CoverageNote::Counted { since_ns },
-                    });
+                    self.apply(
+                        Mutation::NoteCountedUse {
+                            caller,
+                            module: key.clone(),
+                            count,
+                            first_ns,
+                            last_ns,
+                            base,
+                        },
+                        None,
+                    );
+                    self.apply(
+                        Mutation::NoteCoverage {
+                            caller,
+                            module: key.clone(),
+                            note: CoverageNote::Counted { since_ns },
+                        },
+                        None,
+                    );
                     PendingCountOutcome::Placed { module: key }
                 }
             }

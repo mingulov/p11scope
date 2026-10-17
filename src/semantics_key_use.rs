@@ -33,12 +33,15 @@ use crate::semantics_objects::{
     CallToken, ObjectEffect, ObjectEffects, ObjectId, ObjectSemantics, SessionIncarnation,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::mem::size_of;
 
-/// At most 1,024 unsettled staged payloads: the H8 pending-call bound
-/// mirrored on the H9 side (one logical ticket; byte-charge
-/// unification with the H8 lease awaits the production lease-staging
-/// design). The N+1 admission backpressures instead of staging.
-pub(crate) const JOINT_STAGING_CAPACITY: usize = 1_024;
+/// At most 1,024 unsettled staged payloads per feed: one bound, two
+/// enforcers — this per-feed ceiling mirrors the shared H8 ticket
+/// space, and every staged byte charges to the shared [`StagingLedger`]
+/// (no unaccounted duplicate pool, H9 §89). The N+1 admission
+/// backpressures instead of staging.
+pub(crate) const JOINT_STAGING_CAPACITY: usize =
+    crate::semantics_objects::journal::MAX_UNSETTLED_STAGED;
 
 /// Permanent per-instance/era feed selection, chosen at registration
 /// before the first semantic mutation (H9).
@@ -144,6 +147,17 @@ struct StagedCall {
     position: u64,
 }
 
+impl StagedCall {
+    /// Duplicate bytes charged to the shared ledger: the entry plus
+    /// both function-name heaps (facts and origin carry separate
+    /// copies). Capacities bound the heaps from above.
+    fn charged_bytes(&self) -> u64 {
+        size_of::<Self>() as u64
+            + self.facts.function.capacity() as u64
+            + self.origin.function.capacity() as u64
+    }
+}
+
 /// The Joint replay adapter (H9): the staging FIFO plus the consumed
 /// frontier. The H8 adapter/model and the reducer stay owner-held;
 /// each quantum borrows them.
@@ -224,11 +238,13 @@ impl JointStaging {
     }
 
     /// Calls replayed through the one reducer (seal or fallback).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn reduced(&self) -> u64 {
         self.reduced
     }
 
     /// Retained payloads disposed once as history-only.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn history_disposed(&self) -> u64 {
         self.history_disposed
     }
@@ -236,6 +252,7 @@ impl JointStaging {
     /// Seal quanta refused for correlation (multi-call seals H9 does
     /// not batch, exact-match failure, repeated seals, or
     /// settled-but-never-staged).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn correlation_refusals(&self) -> u64 {
         self.correlation_refusals
     }
@@ -256,6 +273,7 @@ impl JointStaging {
     }
 
     /// Currently staged (unsettled) payloads.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn staged_len(&self) -> usize {
         self.staged.len()
     }
@@ -277,12 +295,16 @@ impl JointStaging {
     /// calls stage: anything the frozen endpoint table leaves
     /// negative-only or irrelevant (async completions, encapsulate,
     /// info calls) can never settle — ingesting one would taint the
-    /// image — so the driver reduces those S1Only-direct instead.
+    /// image — so the driver reduces those S1Only-direct instead. The
+    /// payload's ticket and duplicate bytes charge to the shared H8
+    /// ledger before the entry lands (refused staging never holds a
+    /// ticket); replay, fallback and loss disposal release.
     pub(crate) fn stage(
         &mut self,
         facts: SemanticCall,
         origin: EffectOrigin,
         position: u64,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
     ) -> Result<(), StagingRefusal> {
         if self.mode != FeedMode::Joint {
             return Err(StagingRefusal::NotJoint);
@@ -306,11 +328,21 @@ impl JointStaging {
         if self.staged.len() >= JOINT_STAGING_CAPACITY {
             return Err(StagingRefusal::Full);
         }
-        self.staged.push_back(StagedCall {
+        let staged = StagedCall {
             facts,
             origin,
             position,
-        });
+        };
+        ledger
+            .charge(position, staged.charged_bytes())
+            .map_err(|refusal| {
+                use crate::semantics_objects::journal::LedgerRefusal::*;
+                match refusal {
+                    Full => StagingRefusal::Full,
+                    ReplayRefused => StagingRefusal::ReplayRefused,
+                }
+            })?;
+        self.staged.push_back(staged);
         Ok(())
     }
 
@@ -328,10 +360,12 @@ impl JointStaging {
     /// reducer from the same single pass. Returns the outcome plus
     /// this quantum's per-edge bound refusals (the owner folds them
     /// into `semantic_refused`, like the direct feed).
+    #[allow(clippy::too_many_arguments)] // Staging borrows the exact pipeline facts plus the shared ledger.
     pub(crate) fn apply_seal<S: OperationSink>(
         &mut self,
         seal: &SealSuccess,
         model: &ObjectSemantics,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
         reducer: &mut EdgeSemantics,
         keyuse: &mut KeyUseReducer,
         instance: RegistryInstanceId,
@@ -379,6 +413,7 @@ impl JointStaging {
         }
         self.mark_consumed(settled[0].ticket);
         let head = self.staged.pop_front().expect("head verified above");
+        ledger.release(head.position, head.charged_bytes());
         self.frontier = self.frontier.max(head.position);
         let receipts = keyuse.receipts_for_call(seal, &settled[0], model, head.position);
         // Retirement in the same seal ends active key associations
@@ -414,6 +449,7 @@ impl JointStaging {
         failure: &SealFailure,
         finalizer: &mut impl H3EvidenceSource,
         model: &ObjectSemantics,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
         reducer: &mut EdgeSemantics,
         keyuse: &mut KeyUseReducer,
         instance: RegistryInstanceId,
@@ -430,7 +466,7 @@ impl JointStaging {
                 // Unknown terminals (H9 §66).
                 keyuse.apply_invalidations(&failure.effects, model);
                 self.dispose_as_loss(reducer, keyuse, instance, sink);
-                let disposed = self.drain_staged();
+                let disposed = self.drain_staged(ledger);
                 self.mode = FeedMode::S1Only;
                 self.degraded_loss = true;
                 (FailureApplyOutcome::Degraded { disposed }, 0)
@@ -447,7 +483,7 @@ impl JointStaging {
                         // terminals cannot complete unproved bindings.
                         keyuse.apply_invalidations(&failure.effects, model);
                         let (replayed, refused) =
-                            self.replay_staged(reducer, keyuse, instance, sink);
+                            self.replay_staged(reducer, keyuse, instance, sink, ledger);
                         self.mode = FeedMode::S1Only;
                         self.fell_back = true;
                         (FailureApplyOutcome::FellBack { replayed }, refused)
@@ -457,7 +493,7 @@ impl JointStaging {
                         // S1 proof with it. Real-loss treatment.
                         keyuse.apply_invalidations(&failure.effects, model);
                         self.dispose_as_loss(reducer, keyuse, instance, sink);
-                        let disposed = self.drain_staged();
+                        let disposed = self.drain_staged(ledger);
                         self.mode = FeedMode::S1Only;
                         self.degraded_loss = true;
                         (FailureApplyOutcome::Degraded { disposed }, 0)
@@ -493,10 +529,15 @@ impl JointStaging {
     }
 
     /// Dispose every retained payload once as history-only: counted,
-    /// frontier-advanced, never reduced, never re-staged.
-    fn drain_staged(&mut self) -> usize {
+    /// frontier-advanced, never reduced, never re-staged. Every
+    /// ticket and byte releases to the shared ledger.
+    fn drain_staged(
+        &mut self,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+    ) -> usize {
         let disposed = self.staged.len();
         for call in self.staged.drain(..) {
+            ledger.release(call.position, call.charged_bytes());
             self.frontier = self.frontier.max(call.position);
             self.history_disposed = self.history_disposed.saturating_add(1);
         }
@@ -514,10 +555,12 @@ impl JointStaging {
         keyuse: &mut KeyUseReducer,
         instance: RegistryInstanceId,
         sink: &mut S,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
     ) -> (usize, u64) {
         let mut replayed = 0;
         let mut refused = 0u64;
         while let Some(head) = self.staged.pop_front() {
+            ledger.release(head.position, head.charged_bytes());
             self.frontier = self.frontier.max(head.position);
             let mut tee = KeyUseTee {
                 outer: &mut *sink,
@@ -979,10 +1022,12 @@ impl KeyUseReducer {
         &self.unknown
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn open(&self) -> &BTreeMap<(RegistryInstanceId, OperationId), OpenKeyUse> {
         &self.open
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn refused_opens(
         &self,
     ) -> &BTreeMap<(RegistryInstanceId, OperationId), RefusedOpen> {
@@ -1498,6 +1543,23 @@ pub(crate) struct KeyUseTee<'a, S: OperationSink> {
     outer: &'a mut S,
     keyuse: &'a mut KeyUseReducer,
     instance: RegistryInstanceId,
+}
+
+impl<'a, S: OperationSink> KeyUseTee<'a, S> {
+    /// Tee one reduction's effects into the shared reducer plus an
+    /// outer sink (the registry's guarded Joint arm uses a
+    /// no-op outer: effects feed only the reducer there).
+    pub(crate) fn new(
+        outer: &'a mut S,
+        keyuse: &'a mut KeyUseReducer,
+        instance: RegistryInstanceId,
+    ) -> Self {
+        Self {
+            outer,
+            keyuse,
+            instance,
+        }
+    }
 }
 
 impl<S: OperationSink> OperationSink for KeyUseTee<'_, S> {

@@ -240,11 +240,9 @@ impl std::fmt::Debug for EffectOrigin {
 /// (descriptor action, function, input ordinal); anything outside
 /// the classified vocabulary is [`KeyRole::Other`] with explicit
 /// evidence, never a guessed role.
-// Live-loop carry (T4): values are constructed only by the staged
-// receipt pipeline; ungate (drop this allow) with its driver. Kept
-// ungated (not cfg(test)) so the machine layout stays identical in
-// production and test builds.
-#[allow(dead_code)]
+// Guarded (N1): values flow through the Joint receipt pipeline once
+// installed receipts + an H8 driver exist; unreachable while feeds
+// stay S1Only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyRole {
     /// A single-input operation key (`*Init`, `C_DigestKey`).
@@ -598,6 +596,30 @@ impl EdgeSemantics {
         Ok(refused)
     }
 
+    /// The same resourced observation, plus typed transition
+    /// notifications into `sink`: the guarded Joint arm's
+    /// S1Only-direct reduction (sibling facts under Joint, or Joint
+    /// staging fallback). Unreached while no Joint feed exists.
+    pub(crate) fn observe_with_resources_and_effects<S: OperationSink>(
+        &mut self,
+        call: &SemanticCall,
+        origin: &EffectOrigin,
+        sink: &mut S,
+    ) -> Result<u64, SemanticResourceRefusal> {
+        let prepared = match self.prepare_resource_transition(call) {
+            Ok(prepared) => prepared,
+            Err(refusal) => {
+                self.invalidate();
+                return Err(refusal);
+            }
+        };
+        assert!(self.resource_transition.is_none());
+        self.resource_transition = Some(prepared);
+        let refused = self.observe_with_effects(call, origin, sink);
+        drop(self.resource_transition.take());
+        Ok(refused)
+    }
+
     fn prepare_resource_transition(
         &self,
         call: &SemanticCall,
@@ -901,9 +923,8 @@ impl EdgeSemantics {
     /// positional key receipts (at most two) for the machines and
     /// direct operations it starts. S1Only reduction passes none —
     /// receipts exist only under sealed object proof.
-    // Live-loop carry (T4): called only by the staged feed driver;
-    // ungate with it.
-    #[cfg(test)]
+    // Guarded (N1): reachable only through Joint seal/failure
+    // delivery, which needs installed receipts + an H8 driver.
     pub(crate) fn observe_joint<S: OperationSink>(
         &mut self,
         call: &SemanticCall,

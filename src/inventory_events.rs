@@ -1814,11 +1814,13 @@ pub(crate) const KEY_OPERATION_EVENTS_PER_PASS: usize = 4096;
 
 /// What the stream last carried for one projection row: a 128-bit
 /// keyed digest of the exact payload plus the generation that
-/// carried it (the rotation backstop, like every other emitter).
+/// carried it (the rotation backstop, like every other emitter)
+/// and that record's line bytes (the combined dump's size bound).
 #[derive(Debug, Clone, Copy)]
 struct KeyOperationDigest {
     exact: (u64, u64),
     generation: u64,
+    bytes: u64,
 }
 
 /// Per-pass key-operation emission accounting.
@@ -1841,16 +1843,16 @@ pub(crate) struct KeyOperationEmitted {
 /// current revision; unchanged rows persist client-side).
 ///
 /// Memory: one digest per carried row key, bounded by the projection
-/// row bounds. Retention-eviction accounting (`ended` unretained
-/// counts, combined dump fit) still covers only physical edges and
-/// instances: extending that convergence to the two new kinds needs
-/// H3 retention-author review (carry — the exact final sweep below
-/// carries every row before `ended` regardless).
+/// row bounds. Retention-eviction accounting covers the new kinds
+/// like the older ones: per-row line bytes bound the combined
+/// dump, and `ended` discloses the exact unretained key rows (N11).
 #[derive(Debug)]
 pub(crate) struct KeyOperationEmitter {
     digests: BTreeMap<String, KeyOperationDigest>,
     per_pass: usize,
     deferred_total: u64,
+    carried_bytes: u64,
+    largest_line: u64,
     keys: (std::hash::RandomState, std::hash::RandomState),
 }
 
@@ -1871,6 +1873,8 @@ impl KeyOperationEmitter {
             digests: BTreeMap::new(),
             per_pass,
             deferred_total: 0,
+            carried_bytes: 0,
+            largest_line: 0,
             keys: (std::hash::RandomState::new(), std::hash::RandomState::new()),
         }
     }
@@ -1878,7 +1882,23 @@ impl KeyOperationEmitter {
     /// Rows holding a digest.
     #[cfg(test)]
     pub(crate) fn tracked(&self) -> usize {
+        self.tracked_len()
+    }
+
+    /// Tracked rows (the combined retention dump's slack bound).
+    pub(crate) fn tracked_len(&self) -> usize {
         self.digests.len()
+    }
+
+    /// One copy of every tracked row's last record, in bytes (the
+    /// combined retention dump's size bound).
+    pub(crate) fn carried_bytes(&self) -> u64 {
+        self.carried_bytes
+    }
+
+    /// The largest key-operation record line written so far.
+    pub(crate) fn largest_line(&self) -> u64 {
+        self.largest_line
     }
 
     /// Rows deferred by the per-pass cap so far.
@@ -1906,6 +1926,32 @@ impl KeyOperationEmitter {
         })
     }
 
+    /// Write one row record and remember it.
+    fn write(
+        &mut self,
+        writer: &mut EventWriter,
+        key: &str,
+        kind: &str,
+        payload: &serde_json::Value,
+        at_ns: u64,
+    ) -> Result<(), String> {
+        let exact = self.digest(payload);
+        let bytes = writer.append_sized(kind, payload.clone(), at_ns)?;
+        self.largest_line = self.largest_line.max(bytes);
+        self.carried_bytes = self.carried_bytes.saturating_add(bytes);
+        if let Some(old) = self.digests.insert(
+            key.to_string(),
+            KeyOperationDigest {
+                exact,
+                generation: writer.generation(),
+                bytes,
+            },
+        ) {
+            self.carried_bytes = self.carried_bytes.saturating_sub(old.bytes);
+        }
+        Ok(())
+    }
+
     /// Emit one pass of projection rows from the published
     /// publication (stale-aware): changed-or-unretained rows up to
     /// the per-pass cap, the rest deferred and counted. Tracking is
@@ -1931,14 +1977,7 @@ impl KeyOperationEmitter {
                 deferred = deferred.saturating_add(1);
                 continue;
             }
-            writer.append(kind, payload.clone(), at_ns)?;
-            self.digests.insert(
-                key.clone(),
-                KeyOperationDigest {
-                    exact,
-                    generation: writer.generation(),
-                },
-            );
+            self.write(writer, key, kind, payload, at_ns)?;
             emitted = emitted.saturating_add(1);
         }
         self.evict_absent(&current);
@@ -1965,18 +2004,47 @@ impl KeyOperationEmitter {
             if self.carried(key, exact, writer) {
                 continue;
             }
-            writer.append(kind, payload.clone(), at_ns)?;
-            self.digests.insert(
-                key.clone(),
-                KeyOperationDigest {
-                    exact,
-                    generation: writer.generation(),
-                },
-            );
+            self.write(writer, key, kind, payload, at_ns)?;
             emitted = emitted.saturating_add(1);
         }
         self.evict_absent(&current);
         Ok(emitted)
+    }
+
+    /// One contiguous copy of every projection row, in publication
+    /// order. The final retention dump's key-operation third; the
+    /// caller already proved it fits.
+    pub(crate) fn dump_all(
+        &mut self,
+        writer: &mut EventWriter,
+        observations: &crate::key_operation_projection::ObjectObservations,
+        at_ns: u64,
+    ) -> Result<usize, String> {
+        let mut emitted = 0;
+        for (key, kind, payload) in &projection_row_events(observations) {
+            self.write(writer, key, kind, payload, at_ns)?;
+            emitted += 1;
+        }
+        Ok(emitted)
+    }
+
+    /// Projection rows whose last record will not be retained once
+    /// one more line of `incoming` bytes is appended.
+    pub(crate) fn unretained_after(
+        &self,
+        writer: &EventWriter,
+        observations: &crate::key_operation_projection::ObjectObservations,
+        incoming: u64,
+    ) -> usize {
+        let oldest = writer.oldest_generation_after(incoming);
+        projection_row_keys(observations)
+            .iter()
+            .filter(|key| {
+                self.digests
+                    .get(*key)
+                    .is_some_and(|digest| digest.generation < oldest)
+            })
+            .count()
     }
 
     /// Evict tracking for rows absent from the current publication,
@@ -1986,8 +2054,53 @@ impl KeyOperationEmitter {
     /// are retained, never dropped), so no evicted digest is ever
     /// needed again.
     fn evict_absent(&mut self, current: &std::collections::BTreeSet<&str>) {
-        self.digests.retain(|key, _| current.contains(key.as_str()));
+        let mut evicted_bytes = 0u64;
+        self.digests.retain(|key, digest| {
+            if current.contains(key.as_str()) {
+                true
+            } else {
+                evicted_bytes = evicted_bytes.saturating_add(digest.bytes);
+                false
+            }
+        });
+        self.carried_bytes = self.carried_bytes.saturating_sub(evicted_bytes);
     }
+}
+
+/// One object row's stream key.
+fn object_event_key(object: u64) -> String {
+    format!("o:{object}")
+}
+
+/// One proved-key row's stream key.
+fn known_event_key(row: &crate::key_operation_projection::KeyAggRow) -> String {
+    format!(
+        "k:{}:{}:{}:{}:{}",
+        row.instance, row.object, row.category, row.role, row.metadata_at_use
+    )
+}
+
+/// One unknown-key summary row's stream key.
+fn unknown_event_key(row: &crate::key_operation_projection::UnknownAggRow) -> String {
+    format!("u:{}:{}", row.category, row.reason)
+}
+
+/// Every projection row's stream key, in publication order. The
+/// retention backstop iterates keys without building payloads.
+fn projection_row_keys(
+    observations: &crate::key_operation_projection::ObjectObservations,
+) -> Vec<String> {
+    let mut keys = Vec::new();
+    for row in &observations.objects {
+        keys.push(object_event_key(row.object));
+    }
+    for row in &observations.key_operations {
+        keys.push(known_event_key(row));
+    }
+    for row in &observations.unknown_key_operations {
+        keys.push(unknown_event_key(row));
+    }
+    keys
 }
 
 /// Every projection row as its stream event: replacement key, kind
@@ -2005,7 +2118,7 @@ fn projection_row_events(
             "revision": observations.revision,
             "row": object_row_json(row),
         });
-        events.push((format!("o:{}", row.object), "object_observed", payload));
+        events.push((object_event_key(row.object), "object_observed", payload));
     }
     for row in &observations.key_operations {
         let payload = serde_json::json!({
@@ -2013,14 +2126,7 @@ fn projection_row_events(
             "bucket": "known",
             "row": key_row_json(row),
         });
-        events.push((
-            format!(
-                "k:{}:{}:{}:{}:{}",
-                row.instance, row.object, row.category, row.role, row.metadata_at_use
-            ),
-            "key_operations_observed",
-            payload,
-        ));
+        events.push((known_event_key(row), "key_operations_observed", payload));
     }
     for row in &observations.unknown_key_operations {
         let payload = serde_json::json!({
@@ -2028,65 +2134,89 @@ fn projection_row_events(
             "bucket": "unknown",
             "row": unknown_row_json(row),
         });
-        events.push((
-            format!("u:{}:{}", row.category, row.reason),
-            "key_operations_observed",
-            payload,
-        ));
+        events.push((unknown_event_key(row), "key_operations_observed", payload));
     }
     events
 }
 
-/// Whether one contiguous copy of every tracked row of all three
-/// kinds, plus a tail of `tail` bytes, is guaranteed to survive
-/// retention: the combined dump's fit bound. Rows past the digest
-/// bound (unreachable while the registry enforces the same limit)
-/// only undercount here; the exact unretained count after the dump is
+/// Whether one contiguous copy of every tracked row of all four
+/// kinds (physical edges, instances, key-operation rows), plus a
+/// tail of `tail` bytes, is guaranteed to survive retention: the
+/// combined dump's fit bound. Rows past the digest bound
+/// (unreachable while the registry enforces the same limit) only
+/// undercount here; the exact unretained count after the dump is
 /// the backstop, so a misjudged dump is disclosed, never silent.
 pub(crate) fn combined_dump_fits(
     edges: &EdgeEmitter,
     instances: &InstanceEmitter,
+    key_operations: &KeyOperationEmitter,
     writer: &EventWriter,
     tail: u64,
 ) -> bool {
-    let slack = DUMP_LINE_SLACK
-        .saturating_mul(edges.tracked_len().saturating_add(instances.tracked_len()) as u64);
+    let slack = DUMP_LINE_SLACK.saturating_mul(
+        edges
+            .tracked_len()
+            .saturating_add(instances.tracked_len())
+            .saturating_add(key_operations.tracked_len()) as u64,
+    );
     let dump = edges
         .carried_bytes()
         .saturating_add(instances.carried_bytes())
+        .saturating_add(key_operations.carried_bytes())
         .saturating_add(slack)
         .saturating_add(tail);
     dump <= writer.contiguous_capacity(
         edges
             .largest_line()
             .max(instances.largest_line())
+            .max(key_operations.largest_line())
             .saturating_add(DUMP_LINE_SLACK),
     )
 }
 
-/// The exact `ended` payload and its three unretained counts: physical
-/// edges, instances and semantic edges settle together. `ended(counts)`
-/// builds the payload carrying `counts`; the counts are recomputed for
-/// that payload's exact line length until stable. Starting from the
-/// sweep's `estimate` (taken for the reserved tail, at least as long as
-/// any real `ended` line) the counts can only fall, and longer counts
-/// never shorten the line, so this converges to counts that are exact
+/// The exact `ended` payload and its four unretained counts:
+/// physical edges, instances, semantic edges and key-operation rows
+/// settle together. `ended(counts)` builds the payload carrying
+/// `counts`; the counts are recomputed for that payload's exact
+/// line length until stable. Starting from the sweep's `estimate`
+/// (taken for the reserved tail, at least as long as any real
+/// `ended` line) the counts can only fall, and longer counts never
+/// shorten the line, so this converges to counts that are exact
 /// for the line actually written.
+#[allow(clippy::too_many_arguments)] // The four converging emitters plus writer, presentation, estimate and payload.
 pub(crate) fn settle_ended_combined(
     edges: &EdgeEmitter,
     instances: &InstanceEmitter,
+    key_operations: &KeyOperationEmitter,
     writer: &EventWriter,
     presentation: &Presentation,
-    estimate: (usize, usize, usize),
+    estimate: (usize, usize, usize, usize),
     at_ns: u64,
-    ended: impl Fn((usize, usize, usize)) -> serde_json::Value,
-) -> ((usize, usize, usize), serde_json::Value) {
+    ended: impl Fn((usize, usize, usize, usize)) -> serde_json::Value,
+) -> ((usize, usize, usize, usize), serde_json::Value) {
     let mut counts = estimate;
+    let key_rows = presentation
+        .object_observations
+        .objects
+        .len()
+        .saturating_add(
+            presentation
+                .object_observations
+                .key_operations
+                .len()
+                .saturating_add(
+                    presentation
+                        .object_observations
+                        .unknown_key_operations
+                        .len(),
+                ),
+        );
     let bound = presentation
         .edges
         .len()
         .saturating_add(presentation.instances.len())
         .saturating_add(presentation.semantic_edges.len())
+        .saturating_add(key_rows)
         .saturating_add(1);
     for _ in 0..=bound {
         let payload = ended(counts);
@@ -2109,6 +2239,7 @@ pub(crate) fn settle_ended_combined(
                     incoming,
                 )
                 .1,
+            key_operations.unretained_after(writer, &presentation.object_observations, incoming),
         );
         if exact == counts {
             return (counts, payload);

@@ -639,8 +639,16 @@ fn object_keys_line(
     };
     // Per-category terminals across proved and unknown buckets; the
     // unit comes from the rows (one unit per category, by contract).
+    // Each operation counts ONCE (H9 §82): the primary association's
+    // row carries the tally while secondary association rows stand
+    // beside it, never double-counted. Unknown summaries already
+    // partition once per primary.
+    let secondary = crate::key_operation_projection::SECONDARY_ROLE;
     let mut categories: BTreeMap<&str, (u64, u64, u64, &str)> = BTreeMap::new();
     for row in &observations.key_operations {
+        if row.role == secondary {
+            continue;
+        }
         let slot = categories
             .entry(row.category)
             .or_insert((0, 0, 0, row.unit));

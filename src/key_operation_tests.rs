@@ -2149,6 +2149,92 @@ fn key_operation_later_metadata_never_rewrites_rows() {
     assert_eq!(keyuse.rows()[0], frozen, "completed rows never rewrite");
 }
 
+/// G11/H9-§3: conflicting key metadata never last-writer-wins:
+/// two GETs establishing different Class values keep the earlier
+/// value as history (established stays) and raise the conflict
+/// bit; untouched fields and out-of-range indexes stay clear.
+#[test]
+fn key_operation_conflicting_metadata_keeps_earlier_value() {
+    use crate::semantics_objects::METADATA_FIELDS;
+
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    assert_eq!(keyuse.rows().len(), 1);
+    let frozen: KeyOpRow = keyuse.rows()[0].clone();
+    assert_eq!(frozen.keys.len(), 1);
+    // Two GETs disagree on Class: 3 first, then 4.
+    for value in [3u16, 4u16] {
+        let get = ShapedS1 {
+            getattr_cells: vec![(1u8, 1u8, value)],
+            ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+        };
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &get,
+        );
+    }
+    let key = frozen.keys[0].key;
+    let flags = scene
+        .model
+        .key_metadata_flags(key)
+        .expect("key view exists");
+    assert!(flags.is_requested(0), "Class was asked");
+    assert!(
+        flags.is_established(0),
+        "the earlier value stays as history"
+    );
+    assert!(
+        flags.is_conflicted(0),
+        "the second value conflicts, never overwrites"
+    );
+    for field in 1..METADATA_FIELDS {
+        assert!(
+            !flags.is_requested(field)
+                && !flags.is_established(field)
+                && !flags.is_conflicted(field),
+            "field {field} untouched"
+        );
+    }
+    assert!(
+        !flags.is_conflicted(METADATA_FIELDS),
+        "out of range stays clear"
+    );
+    assert_eq!(keyuse.rows().len(), 1, "GETs row no operation");
+    assert_eq!(keyuse.rows()[0], frozen, "completed rows never rewrite");
+}
+
 /// G11/H9-§3/§91: key-operation rows are bounded (65,536):
 /// history is never evicted for a new row. At N+1 the new
 /// association is refused — S1 preserved, old rows intact — with
@@ -2909,7 +2995,7 @@ fn key_operation_schema_contract() {
         keys.sort();
         keys
     };
-    let mut table = |keys: &[&str]| -> Vec<String> {
+    let table = |keys: &[&str]| -> Vec<String> {
         let mut owned: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
         owned.sort();
         owned
@@ -2972,18 +3058,20 @@ fn key_operation_schema_contract() {
         serde_json::json!({"const": 65536})
     );
     assert_eq!(
-        defs["session_row"]["properties"]["origin"]["enum"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
+        enums("/$defs/session_row/properties/origin/enum"),
+        table(&SESSION_ORIGINS)
     );
     assert_eq!(
-        defs["object_row"]["properties"]["origin"]["enum"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
+        enums("/$defs/session_row/properties/status/enum"),
+        table(&SESSION_STATUSES)
+    );
+    assert_eq!(
+        enums("/$defs/object_row/properties/origin/enum"),
+        table(&OBJECT_ORIGINS)
+    );
+    assert_eq!(
+        enums("/$defs/object_row/properties/creation/enum"),
+        table(&CREATION_LABELS)
     );
 
     // ---- The golden carries exactly the frozen keys. ----
@@ -3846,7 +3934,7 @@ fn key_operation_pqc_matrix_negative() {
     // frozen endpoint table leaves KEM negative-only (KEM is not
     // even fixture-admittable), and the feed refuses KEM-shaped
     // facts loudly instead of joining thin air.
-    let mut scene = JointScene::new();
+    let scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
     for (n, name) in ["C_EncapsulateKey", "C_DecapsulateKey"]

@@ -374,6 +374,12 @@ impl JointStaging {
         if self.mode != FeedMode::Joint {
             return (SealApplyOutcome::Held, 0);
         }
+        // Qualified invalidations apply even when the quantum cannot
+        // replay (N3): holding S1 replay must never hold
+        // already-applied object invalidations. Runs before every
+        // Held return below (idempotent: re-applied retirements find
+        // their joins already lost and count nothing twice).
+        keyuse.apply_invalidations(&seal.effects, model);
         let settled = seal.prefix.settled();
         if settled.is_empty() {
             return (SealApplyOutcome::Held, 0);
@@ -416,11 +422,9 @@ impl JointStaging {
         ledger.release(head.position, head.charged_bytes());
         self.frontier = self.frontier.max(head.position);
         let receipts = keyuse.receipts_for_call(seal, &settled[0], model, head.position);
-        // Retirement in the same seal ends active key associations
-        // BEFORE the replay (H9 §66): a terminal the replay emits
-        // can never complete a binding this seal just unproved. The
-        // S1 terminal still lands later through the ordinary path.
-        keyuse.apply_invalidations(&seal.effects, model);
+        // The seal's retirements already applied above (H9 §66),
+        // before this replay: a terminal the replay emits can never
+        // complete a binding this seal just unproved.
         let mut tee = KeyUseTee {
             outer: sink,
             keyuse,
@@ -459,7 +463,12 @@ impl JointStaging {
             return (FailureApplyOutcome::Ignored, 0);
         }
         match disposition_of(failure.gap) {
-            SealFailureDisposition::Retry => (FailureApplyOutcome::Retried, 0),
+            SealFailureDisposition::Retry => {
+                // Transient waits keep staging, but never swallow
+                // the refusal's own invalidations (N3).
+                keyuse.apply_invalidations(&failure.effects, model);
+                (FailureApplyOutcome::Retried, 0)
+            }
             SealFailureDisposition::HistoryLoss => {
                 // The failure's own invalidations close affected key
                 // associations BEFORE loss disposal emits their
@@ -498,7 +507,13 @@ impl JointStaging {
                         self.degraded_loss = true;
                         (FailureApplyOutcome::Degraded { disposed }, 0)
                     }
-                    _ => (FailureApplyOutcome::HeldForCompleteness, 0),
+                    _ => {
+                        // Completeness holds keep staging, but never
+                        // swallow the refusal's own invalidations
+                        // (N3).
+                        keyuse.apply_invalidations(&failure.effects, model);
+                        (FailureApplyOutcome::HeldForCompleteness, 0)
+                    }
                 }
             }
         }

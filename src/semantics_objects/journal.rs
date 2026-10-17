@@ -233,6 +233,7 @@ pub(crate) fn abandon_disposition(reason: u32) -> Option<AbandonDisposition> {
 }
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::mem::size_of;
 
 use p11scope_ebpf_common::MAX_DESCRIPTORS;
 use p11scope_ebpf_common::capture;
@@ -387,6 +388,14 @@ impl StagingLedger {
         if let Some(bytes) = self.h8open.remove(&ordinal) {
             self.bytes = self.bytes.saturating_sub(bytes);
         }
+    }
+
+    /// Release every H8 open ticket (void paths clear the table).
+    pub(crate) fn release_all_h8open(&mut self) {
+        for bytes in self.h8open.values() {
+            self.bytes = self.bytes.saturating_sub(*bytes);
+        }
+        self.h8open.clear();
     }
 
     /// Charge one model pending call: its call token plus the
@@ -1111,6 +1120,16 @@ impl JournalAdapter {
         if self.open.len() >= self.limits.open_calls {
             return self.refuse_begin(ordinal, &begin, image);
         }
+        // One shared reservation owner (N1c): the open begin takes
+        // its ticket before it lands. A full shared census refuses
+        // exactly like a full open table.
+        if self
+            .ledger
+            .charge_h8open(ordinal, size_of::<OpenEntry>() as u64)
+            .is_err()
+        {
+            return self.refuse_begin(ordinal, &begin, image);
+        }
         self.open.insert(
             key,
             OpenEntry {
@@ -1327,7 +1346,14 @@ impl JournalAdapter {
         } else {
             self.tainted_images.insert(image);
         }
-        self.open.retain(|_, entry| entry.image != image);
+        let ledger = &mut self.ledger;
+        self.open.retain(|_, entry| {
+            let keep = entry.image != image;
+            if !keep {
+                ledger.release_h8open(entry.begin_ordinal);
+            }
+            keep
+        });
         self.refused.retain(|refused| refused.image != image);
     }
 }
@@ -3599,6 +3625,7 @@ impl JournalAdapter {
     /// explicitly lost, so later proof resumes at or above the fence
     /// instead of silently skipping it.
     fn void_staged(&mut self) {
+        self.ledger.release_all_h8open();
         self.open.clear();
         self.refused.clear();
         self.claims.clear();
@@ -3658,7 +3685,14 @@ impl JournalAdapter {
                 })
                 .map(|(native, _)| *native)
                 .collect();
-            self.open.retain(|native, _| !drop.contains(native));
+            let ledger = &mut self.ledger;
+            self.open.retain(|native, entry| {
+                let keep = !drop.contains(native);
+                if !keep {
+                    ledger.release_h8open(entry.begin_ordinal);
+                }
+                keep
+            });
             let mut kept = Vec::with_capacity(self.refused.len());
             for refused in self.refused.iter() {
                 if !self.refused_converts_here(key, &live, refused) {
@@ -3826,6 +3860,12 @@ impl JournalAdapter {
             let origin = origin_of(domain, entry.begin_ordinal, ticket, &entry.begin);
             let function = entry.function;
             let call_key = CallKey::sealed(ticket);
+            // N1c transfer: the call's ticket migrates from the H8
+            // open population to the model pending population across
+            // this begin. Release-then-charge, so a full census still
+            // converts; a failed begin restores the open ticket below.
+            let begin_ordinal = entry.begin_ordinal;
+            self.ledger.release_h8open(begin_ordinal);
             let (admitted, begin_effects) = model.begin_with_effects(origin);
             effects.effects.extend(begin_effects.effects);
             match admitted {
@@ -3850,6 +3890,14 @@ impl JournalAdapter {
                 }
                 Err(_) => {
                     self.keys.get_mut(&key).expect("sealed key").tainted = true;
+                    // The open entry stays unconverted, so its ticket
+                    // returns. Restoration cannot fail: the census only
+                    // shrank since the release above (a failed begin
+                    // charges nothing).
+                    let restored = self
+                        .ledger
+                        .charge_h8open(begin_ordinal, size_of::<OpenEntry>() as u64);
+                    debug_assert!(restored.is_ok(), "released ticket restores");
                     return Err(SealFailure {
                         gap: JournalGap::ModelRefused,
                         effects,
@@ -4049,22 +4097,22 @@ impl JournalAdapter {
         let Some(watermark) = watermark else {
             return;
         };
+        let ledger = &mut self.ledger;
         self.open.retain(|_, entry| {
             if entry.converted_for != Some(key) {
                 return true;
             }
-            if entry
+            let drop = entry
                 .abandon
                 .is_some_and(|staged| staged.ordinal <= frontier)
-            {
-                return false;
+                || entry.end.is_some_and(|staged| staged.ordinal <= watermark);
+            // Converted entries already migrated their ticket to the
+            // model at conversion; release is idempotent, so unmigrated
+            // drops release here and migrated ones no-op.
+            if drop {
+                ledger.release_h8open(entry.begin_ordinal);
             }
-            if let Some(staged) = entry.end
-                && staged.ordinal <= watermark
-            {
-                return false;
-            }
-            true
+            !drop
         });
     }
 
@@ -4226,6 +4274,7 @@ impl JournalAdapter {
             effects.effects.extend(applied.effects);
             self.keys.get_mut(&key).expect("stopped key").refused = true;
         }
+        self.ledger.release_all_h8open();
         self.open.clear();
         self.refused.clear();
         effects

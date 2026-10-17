@@ -1908,7 +1908,9 @@ impl KeyOperationEmitter {
 
     /// Emit one pass of projection rows from the published
     /// publication (stale-aware): changed-or-unretained rows up to
-    /// the per-pass cap, the rest deferred and counted.
+    /// the per-pass cap, the rest deferred and counted. Tracking is
+    /// bounded by the current publication: digests for absent rows
+    /// evict after every pass.
     pub(crate) fn emit(
         &mut self,
         writer: &mut EventWriter,
@@ -1917,18 +1919,21 @@ impl KeyOperationEmitter {
     ) -> Result<KeyOperationEmitted, String> {
         let mut emitted = 0usize;
         let mut deferred = 0usize;
-        for (key, kind, payload) in projection_row_events(observations) {
-            let exact = self.digest(&payload);
-            if self.carried(&key, exact, writer) {
+        let events = projection_row_events(observations);
+        let current: std::collections::BTreeSet<&str> =
+            events.iter().map(|(key, _, _)| key.as_str()).collect();
+        for (key, kind, payload) in &events {
+            let exact = self.digest(payload);
+            if self.carried(key, exact, writer) {
                 continue;
             }
             if emitted >= self.per_pass {
                 deferred = deferred.saturating_add(1);
                 continue;
             }
-            writer.append(kind, payload, at_ns)?;
+            writer.append(kind, payload.clone(), at_ns)?;
             self.digests.insert(
-                key,
+                key.clone(),
                 KeyOperationDigest {
                     exact,
                     generation: writer.generation(),
@@ -1936,13 +1941,15 @@ impl KeyOperationEmitter {
             );
             emitted = emitted.saturating_add(1);
         }
+        self.evict_absent(&current);
         self.deferred_total = self.deferred_total.saturating_add(deferred as u64);
         Ok(KeyOperationEmitted { emitted, deferred })
     }
 
     /// One exact copy of every uncarried projection row, in
     /// publication order. The final retention sweep's key-operation
-    /// third; the caller owns the retention reservation.
+    /// third; the caller owns the retention reservation. Tracking
+    /// stays bounded by the swept publication, like [`Self::emit`].
     pub(crate) fn sweep_exact(
         &mut self,
         writer: &mut EventWriter,
@@ -1950,14 +1957,17 @@ impl KeyOperationEmitter {
         at_ns: u64,
     ) -> Result<usize, String> {
         let mut emitted = 0usize;
-        for (key, kind, payload) in projection_row_events(observations) {
-            let exact = self.digest(&payload);
-            if self.carried(&key, exact, writer) {
+        let events = projection_row_events(observations);
+        let current: std::collections::BTreeSet<&str> =
+            events.iter().map(|(key, _, _)| key.as_str()).collect();
+        for (key, kind, payload) in &events {
+            let exact = self.digest(payload);
+            if self.carried(key, exact, writer) {
                 continue;
             }
-            writer.append(kind, payload, at_ns)?;
+            writer.append(kind, payload.clone(), at_ns)?;
             self.digests.insert(
-                key,
+                key.clone(),
                 KeyOperationDigest {
                     exact,
                     generation: writer.generation(),
@@ -1965,7 +1975,18 @@ impl KeyOperationEmitter {
             );
             emitted = emitted.saturating_add(1);
         }
+        self.evict_absent(&current);
         Ok(emitted)
+    }
+
+    /// Evict tracking for rows absent from the current publication,
+    /// so digest memory stays bounded by live rows (never by churn
+    /// history). Safe: absent rows never reappear under the same key
+    /// (object ids are never reused; key-operation and unknown rows
+    /// are retained, never dropped), so no evicted digest is ever
+    /// needed again.
+    fn evict_absent(&mut self, current: &std::collections::BTreeSet<&str>) {
+        self.digests.retain(|key, _| current.contains(key.as_str()));
     }
 }
 

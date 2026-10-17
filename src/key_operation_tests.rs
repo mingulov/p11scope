@@ -4706,6 +4706,109 @@ fn key_operation_refused_row_terminal_replaces_in_stream() {
     assert_eq!(row.1["active"], live.active, "JSONL matches JSON");
 }
 
+/// N9 remainder (fix round 2): a lost join before the terminal keeps
+/// the old unknown row's zero-active replacement. The
+/// metadata_unknown summary drains to all zeros (its outcome routes
+/// to key_join_lost) but must still emit — else the cumulative
+/// consumer keeps stale activity the JSON section no longer shows.
+#[test]
+fn key_operation_n9_lost_unknown_metadata_keeps_zero_replacement() {
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    // Known object, unknown metadata (no getattr): the use aggregates
+    // metadata_unknown.
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    let key = sink
+        .iter()
+        .find_map(|effect| match effect {
+            OperationEffect::Started { key_receipt, .. } => *key_receipt,
+            _ => None,
+        })
+        .expect("init start carries its receipt")
+        .key;
+    let before = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let live = before
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "metadata_unknown")
+        .expect("live unknown row");
+    assert_eq!(live.active, 1, "precondition: the use is live");
+    // Lost join before the terminal, then the S1 terminal routes to
+    // key_join_lost while the old summary drains to zeros.
+    keyuse.retire_object(key);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let after = commit(2, &[&staging], &scene.model.project(), &keyuse);
+    let zero = after
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "metadata_unknown")
+        .expect("zero-active replacement");
+    assert_eq!(
+        (
+            zero.active,
+            zero.completed,
+            zero.failed,
+            zero.cancelled,
+            zero.unknown
+        ),
+        (0, 0, 0, 0, 0),
+        "drained but still emitted"
+    );
+    let lost = after
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "key_join_lost")
+        .expect("the routed outcome");
+    assert_eq!(lost.completed, 1);
+    // The stream replaces the stale row: reconstruction matches JSON.
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+    let mut emitter = KeyOperationEmitter::new();
+    emitter.emit(&mut writer, &before, 1_000).unwrap();
+    emitter.emit(&mut writer, &after, 2_000).unwrap();
+    drop(writer);
+    let lines = read_stream(dir.path(), "events.jsonl");
+    let rebuilt = reconstruct(&lines);
+    assert_eq!(
+        rebuilt.unknown.len(),
+        after.unknown_key_operations.len(),
+        "no stale rows, none missing"
+    );
+    let replaced = rebuilt
+        .unknown
+        .get("u:sign:metadata_unknown")
+        .expect("the replacement reaches the stream");
+    assert_eq!(replaced.0, 2, "the terminal replacement carries revision 2");
+    assert_eq!(replaced.1["active"], 0, "never the stale active row");
+}
+
 /// N9: emitter digest tracking is bounded by the current
 /// publication: churning single-object publications (each object
 /// pruned before the next arrives) never accumulates tracking for

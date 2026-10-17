@@ -425,7 +425,7 @@ use crate::semantics_key_use::{
 };
 use crate::semantics_objects::ObjectSemantics;
 use crate::semantics_objects::journal::tests::{
-    AttestationFixture, COOKIE, ENTRY_NS, EXEC, SESSION, abandon_bytes, begin_bytes_shaped,
+    AttestationFixture, COOKIE, ENTRY_NS, EXEC, FLAGS, SESSION, abandon_bytes, begin_bytes_shaped,
     end_bytes, end_bytes_absent, ordinary_for,
 };
 use crate::semantics_objects::journal::{
@@ -438,8 +438,8 @@ use p11scope_ebpf_common::object_journal::{
     JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, decode_journal_record,
 };
 use p11scope_ebpf_common::object_wire::{
-    OBJECT_ACTION_ACCESS, OBJECT_ACTION_CREATE, ObjectDescriptorWire, publish_object_descriptors,
-    verify_object_descriptors,
+    OBJECT_ACTION_ACCESS, OBJECT_ACTION_CREATE, OBJECT_ACTION_DESTROY, ObjectDescriptorWire,
+    publish_object_descriptors, verify_object_descriptors,
 };
 use p11scope_ebpf_common::{Event, ImageIdentity, InstanceStamp, MAX_DESCRIPTORS};
 
@@ -567,6 +567,19 @@ struct ShapedS1 {
     rv: u64,
     mechanism: u64,
     capture: u32,
+    flags: u64,
+}
+
+impl ShapedS1 {
+    fn shaped(name: &'static str, rv: u64, mechanism: u64, capture: u32) -> Self {
+        Self {
+            name,
+            rv,
+            mechanism,
+            capture,
+            flags: FLAGS,
+        }
+    }
 }
 
 fn init_capture() -> u32 {
@@ -577,6 +590,10 @@ fn op_capture() -> u32 {
     capture::MECHANISM_NONE | capture::OUTPUT_NON_NULL
 }
 
+fn query_capture() -> u32 {
+    capture::MECHANISM_NONE | capture::OUTPUT_NULL
+}
+
 /// Attest + stage one call (no ingest): for correlation twins that
 /// stage and ingest different calls.
 fn attest_and_stage(
@@ -584,10 +601,14 @@ fn attest_and_stage(
     staging: &mut JointStaging,
     call: &ShapedS1,
 ) -> SemanticCall {
-    let admitted =
-        scene
-            .fixture
-            .admit_shaped(SESSION, call.name, call.rv, call.mechanism, call.capture);
+    let admitted = scene.fixture.admit_shaped(
+        SESSION,
+        call.name,
+        call.rv,
+        call.mechanism,
+        call.capture,
+        call.flags,
+    );
     scene.adapter.attest_key(&admitted).expect("call attests");
     let facts = admitted.s1_facts().clone();
     let origin = EffectOrigin::from(&facts);
@@ -600,10 +621,14 @@ fn attest_and_stage(
 /// Attest (no stage) + ingest one call: the seal settles a call H9
 /// never staged.
 fn attest_and_ingest(scene: &mut JointScene, call: &ShapedS1) {
-    let admitted =
-        scene
-            .fixture
-            .admit_shaped(SESSION, call.name, call.rv, call.mechanism, call.capture);
+    let admitted = scene.fixture.admit_shaped(
+        SESSION,
+        call.name,
+        call.rv,
+        call.mechanism,
+        call.capture,
+        call.flags,
+    );
     scene.adapter.attest_key(&admitted).expect("call attests");
     ingest_call(scene, call);
 }
@@ -613,7 +638,9 @@ fn ingest_call(scene: &mut JointScene, call: &ShapedS1) {
     scene.sequence += 1;
     let fid = crate::kinds::function_id(call.name).unwrap();
     let input0 = match call.name {
-        "C_SignInit" | "C_VerifyInit" => Some(CREATED_KEY),
+        "C_SignInit" | "C_VerifyInit" | "C_MessageSignInit" | "C_DestroyObject" => {
+            Some(CREATED_KEY)
+        }
         _ => None,
     };
     let begin = begin_bytes_shaped(
@@ -626,6 +653,7 @@ fn ingest_call(scene: &mut JointScene, call: &ShapedS1) {
         call.mechanism,
         call.capture,
         input0,
+        call.flags,
     );
     assert_eq!(
         scene.ingest(&begin),
@@ -635,9 +663,10 @@ fn ingest_call(scene: &mut JointScene, call: &ShapedS1) {
     );
     let end = match call.name {
         "C_CreateObject" => end_bytes(&begin, OBJECT_ACTION_CREATE, call.rv, ENTRY_NS + 50),
-        "C_SignInit" | "C_VerifyInit" => {
+        "C_SignInit" | "C_VerifyInit" | "C_MessageSignInit" => {
             end_bytes(&begin, OBJECT_ACTION_ACCESS, call.rv, ENTRY_NS + 50)
         }
+        "C_DestroyObject" => end_bytes(&begin, OBJECT_ACTION_DESTROY, call.rv, ENTRY_NS + 50),
         _ => end_bytes_absent(&begin, call.rv, ENTRY_NS + 50),
     };
     assert_eq!(
@@ -663,42 +692,12 @@ fn prepare_call(
 
 fn sign_flow() -> Vec<ShapedS1> {
     vec![
-        ShapedS1 {
-            name: "C_CreateObject",
-            rv: CkRv::OK.0,
-            mechanism: 0,
-            capture: 0,
-        },
-        ShapedS1 {
-            name: "C_SignInit",
-            rv: CkRv::OK.0,
-            mechanism: RSA_PKCS,
-            capture: init_capture(),
-        },
-        ShapedS1 {
-            name: "C_Sign",
-            rv: CkRv::OK.0,
-            mechanism: 0,
-            capture: op_capture(),
-        },
-        ShapedS1 {
-            name: "C_VerifyInit",
-            rv: CkRv::OK.0,
-            mechanism: RSA_PKCS,
-            capture: init_capture(),
-        },
-        ShapedS1 {
-            name: "C_Verify",
-            rv: CkRv::SIGNATURE_INVALID.0,
-            mechanism: 0,
-            capture: op_capture(),
-        },
-        ShapedS1 {
-            name: "C_SignMessage",
-            rv: CkRv::OK.0,
-            mechanism: 0,
-            capture: op_capture(),
-        },
+        ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+        ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+        ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+        ShapedS1::shaped("C_VerifyInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+        ShapedS1::shaped("C_Verify", CkRv::SIGNATURE_INVALID.0, 0, op_capture()),
+        ShapedS1::shaped("C_SignMessage", CkRv::OK.0, 0, op_capture()),
     ]
 }
 
@@ -815,12 +814,7 @@ fn key_operation_single_feed_exactly_once() {
     let facts = prepare_call(
         &mut scene2,
         &mut staging2,
-        &ShapedS1 {
-            name: "C_CreateObject",
-            rv: CkRv::OK.0,
-            mechanism: 0,
-            capture: 0,
-        },
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
     );
     let success = scene2.seal().expect("quantum seals");
     let (outcome, refused) = staging2.apply_seal(&success, &mut edge2, &mut sink2);
@@ -947,12 +941,7 @@ fn key_operation_fallback_and_history_loss() {
     let live = prepare_call(
         &mut scene,
         &mut staging,
-        &ShapedS1 {
-            name: "C_SignInit",
-            rv: CkRv::OK.0,
-            mechanism: RSA_PKCS,
-            capture: init_capture(),
-        },
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
     );
     assert!(live.function == "C_SignInit");
     let success = scene.seal().expect("first quantum seals");
@@ -963,18 +952,8 @@ fn key_operation_fallback_and_history_loss() {
     assert!(joint.has_live_operations());
     // Two more staged, then the fault moves under the seal.
     for call in [
-        ShapedS1 {
-            name: "C_Sign",
-            rv: CkRv::OK.0,
-            mechanism: 0,
-            capture: op_capture(),
-        },
-        ShapedS1 {
-            name: "C_VerifyInit",
-            rv: CkRv::OK.0,
-            mechanism: RSA_PKCS,
-            capture: init_capture(),
-        },
+        ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+        ShapedS1::shaped("C_VerifyInit", CkRv::OK.0, RSA_PKCS, init_capture()),
     ] {
         prepare_call(&mut scene, &mut staging, &call);
     }
@@ -1049,12 +1028,7 @@ fn key_operation_joint_staging_bounds() {
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
     let mut joint = EdgeSemantics::default();
     let mut sink = Vec::new();
-    let call = ShapedS1 {
-        name: "C_Sign",
-        rv: CkRv::OK.0,
-        mechanism: 0,
-        capture: op_capture(),
-    };
+    let call = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
     attest_and_stage(&mut scene, &mut staging, &call);
     scene.sequence += 1;
     let fid = crate::kinds::function_id(call.name).unwrap();
@@ -1068,6 +1042,7 @@ fn key_operation_joint_staging_bounds() {
         call.mechanism,
         call.capture,
         None,
+        call.flags,
     );
     assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
     let success = scene.seal().expect("begin-only quantum seals");
@@ -1117,21 +1092,11 @@ fn key_operation_joint_staging_bounds() {
     attest_and_stage(
         &mut scene,
         &mut staging,
-        &ShapedS1 {
-            name: "C_SignInit",
-            rv: CkRv::OK.0,
-            mechanism: RSA_PKCS,
-            capture: init_capture(),
-        },
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
     );
     attest_and_ingest(
         &mut scene,
-        &ShapedS1 {
-            name: "C_VerifyInit",
-            rv: CkRv::OK.0,
-            mechanism: RSA_PKCS,
-            capture: init_capture(),
-        },
+        &ShapedS1::shaped("C_VerifyInit", CkRv::OK.0, RSA_PKCS, init_capture()),
     );
     let success = scene.seal().expect("quantum seals");
     assert_eq!(success.prefix.settled().len(), 1);
@@ -1155,12 +1120,7 @@ fn key_operation_joint_retry_and_degraded_inert() {
     prepare_call(
         &mut scene,
         &mut staging,
-        &ShapedS1 {
-            name: "C_CreateObject",
-            rv: CkRv::OK.0,
-            mechanism: 0,
-            capture: 0,
-        },
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
     );
     scene.install_closure();
     let frontier = scene.adapter.consumed_frontier();
@@ -1263,12 +1223,7 @@ fn key_operation_joint_retry_and_degraded_inert() {
     // guard without counting a correlation refusal.
     attest_and_ingest(
         &mut scene,
-        &ShapedS1 {
-            name: "C_Sign",
-            rv: CkRv::OK.0,
-            mechanism: 0,
-            capture: op_capture(),
-        },
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
     );
     let stray = scene.seal().expect("H8 still seals; H9 no longer consumes");
     assert!(
@@ -1294,12 +1249,7 @@ fn key_operation_abandoned_quantum_replays_s1() {
     let mut joint_sink = Vec::new();
     let mut direct = EdgeSemantics::default();
     let mut direct_sink = Vec::new();
-    let call = ShapedS1 {
-        name: "C_SignInit",
-        rv: CkRv::OK.0,
-        mechanism: RSA_PKCS,
-        capture: init_capture(),
-    };
+    let call = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
     let facts = attest_and_stage(&mut scene, &mut staging, &call);
     scene.sequence += 1;
     let fid = crate::kinds::function_id(call.name).unwrap();
@@ -1313,6 +1263,7 @@ fn key_operation_abandoned_quantum_replays_s1() {
         call.mechanism,
         call.capture,
         None,
+        call.flags,
     );
     assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
     assert_eq!(
@@ -1339,4 +1290,153 @@ fn key_operation_abandoned_quantum_replays_s1() {
     assert_eq!(joint_sink, direct_sink);
     assert_s1_equal(&joint, &direct);
     assert_eq!((joint.started(), joint.completed()), (1, 0));
+}
+
+/// G29/H9-§2: the S1 matrix (failed Init, size query, too-small
+/// retry, multipart, message context, cancellation) holds
+/// identically through S1Only-direct and Joint replay; S2/S3
+/// close/destroy/session scope appears only in Joint; fallback
+/// preserves S1 without inventing object facts.
+#[test]
+fn key_operation_s1_matrix_through_both_feeds() {
+    use crate::semantics_objects::Lifetime;
+
+    const CKF_SIGN: u64 = 0x0000_0800;
+    let matrix = vec![
+        ShapedS1::shaped("C_OpenSession", CkRv::OK.0, 0, 0),
+        ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+        ShapedS1::shaped(
+            "C_SignInit",
+            CkRv::OPERATION_ACTIVE.0,
+            RSA_PKCS,
+            init_capture(),
+        ),
+        ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+        ShapedS1::shaped("C_Sign", CkRv::BUFFER_TOO_SMALL.0, 0, op_capture()),
+        ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, query_capture()),
+        ShapedS1::shaped("C_SignUpdate", CkRv::OK.0, 0, op_capture()),
+        ShapedS1::shaped("C_SignUpdate", CkRv::OK.0, 0, op_capture()),
+        ShapedS1::shaped("C_SignUpdate", CkRv::OK.0, 0, op_capture()),
+        ShapedS1::shaped("C_SignFinal", CkRv::OK.0, 0, op_capture()),
+        ShapedS1::shaped("C_MessageSignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+        ShapedS1::shaped("C_SignMessage", CkRv::OK.0, 0, op_capture()),
+        ShapedS1::shaped("C_MessageSignFinal", CkRv::OK.0, 0, op_capture()),
+        ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+        ShapedS1 {
+            flags: CKF_SIGN,
+            ..ShapedS1::shaped("C_SessionCancel", CkRv::OK.0, 0, 0)
+        },
+        ShapedS1::shaped("C_DestroyObject", CkRv::OK.0, 0, 0),
+        ShapedS1::shaped("C_CloseSession", CkRv::OK.0, 0, 0),
+    ];
+
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut joint_sink = Vec::new();
+    let mut direct = EdgeSemantics::default();
+    let mut direct_sink = Vec::new();
+    for call in &matrix {
+        let facts = prepare_call(&mut scene, &mut staging, call);
+        let success = scene.seal().expect("matrix quantum seals");
+        assert_eq!(success.prefix.settled().len(), 1, "{}", call.name);
+        let (outcome, refused) = staging.apply_seal(&success, &mut joint, &mut joint_sink);
+        assert_eq!(outcome, SealApplyOutcome::ReplayedOne, "{}", call.name);
+        assert_eq!(refused, 0);
+        let origin = EffectOrigin::from(&facts);
+        direct.observe_with_effects(&facts, &origin, &mut direct_sink);
+        assert_eq!(joint_sink, direct_sink, "{}", call.name);
+        assert_s1_equal(&joint, &direct);
+    }
+    assert_eq!(joint.calls(), 17);
+    assert_eq!(
+        (joint.started(), joint.completed(), joint.cancelled()),
+        (3, 2, 1)
+    );
+    assert_eq!(
+        (joint.failed(), joint.unknown(), joint.orphans()),
+        (0, 0, 0)
+    );
+
+    // S2/S3 scope belongs to Joint: the model proves the destroy and
+    // the session; the S1Only twin is a bare reducer (no objects).
+    let projection = scene.model.project();
+    assert_eq!(projection.objects.len(), 1);
+    assert_eq!(projection.objects[0].lifetime, Lifetime::Destroyed);
+    assert!(!projection.sessions.is_empty(), "Joint proves the session");
+
+    // Fallback preserves S1 without inventing object facts: the
+    // model snapshot is identical across the fallback replay.
+    let mut scene = JointScene::new();
+    let mut foreign = JointScene::new();
+    let foreign_admitted = foreign.fixture.admit_function("C_SignInit");
+    let foreign_proof = foreign
+        .adapter
+        .attest_key(&foreign_admitted)
+        .expect("foreign key attests");
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut joint_sink = Vec::new();
+    let mut direct = EdgeSemantics::default();
+    let mut direct_sink = Vec::new();
+    for call in matrix.iter().take(2) {
+        let facts = prepare_call(&mut scene, &mut staging, call);
+        let success = scene.seal().expect("grounding quantum seals");
+        let (outcome, _) = staging.apply_seal(&success, &mut joint, &mut joint_sink);
+        assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
+        let origin = EffectOrigin::from(&facts);
+        direct.observe_with_effects(&facts, &origin, &mut direct_sink);
+    }
+    let before = scene.model.project();
+    assert_eq!(before.objects.len(), 1, "grounding created the key");
+    let mut staged_facts = Vec::new();
+    for call in matrix.iter().skip(2).take(3) {
+        staged_facts.push(attest_and_stage(&mut scene, &mut staging, call));
+    }
+    scene.install_closure();
+    let foreign_bootstrap = BootstrapReceipt::scripted(
+        foreign_proof,
+        BirthKind::ExecMarker,
+        0,
+        scene.fixture.attachment().generation(),
+    );
+    let frontier = scene.adapter.consumed_frontier();
+    let audit = JournalAuditReceipt::scripted(
+        7,
+        7,
+        None,
+        0,
+        H3DispositionEvidence::scripted_clean(scene.adapter.consumed_through_for_test()),
+        scene.fixture.attachment().generation(),
+    );
+    let fresh = SessionBirthEvidence::scripted_for_receipt(&foreign_bootstrap);
+    let cell = SteadyFaultCell(7);
+    let mut births = ScriptedBirthSource::once(fresh);
+    let failure = scene
+        .adapter
+        .seal(
+            &mut scene.model,
+            &audit,
+            &foreign_bootstrap,
+            frontier,
+            &mut births,
+            &cell,
+        )
+        .expect_err("foreign proof mismatches");
+    let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_failure(&failure, &mut clean, &mut joint, &mut joint_sink);
+    assert_eq!(outcome, FailureApplyOutcome::FellBack { replayed: 3 });
+    for facts in &staged_facts {
+        let origin = EffectOrigin::from(facts);
+        direct.observe_with_effects(facts, &origin, &mut direct_sink);
+    }
+    assert_eq!(joint_sink, direct_sink);
+    assert_s1_equal(&joint, &direct);
+    assert_eq!(
+        scene.model.project(),
+        before,
+        "fallback invents no object facts"
+    );
 }

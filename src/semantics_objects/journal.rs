@@ -4113,11 +4113,13 @@ pub(crate) mod tests {
         mechanism: u64,
         capture: u32,
         input0: Option<u64>,
+        call_flags: u64,
     ) -> [u8; 224] {
         let mut bytes = begin_bytes_image(thread, sequence, function, flags, image);
         put_u64(&mut bytes, 80, session);
         put_u64(&mut bytes, 112, mechanism);
         put_u32(&mut bytes, 120, capture);
+        put_u64(&mut bytes, 208, call_flags);
         if let Some(word) = input0 {
             put_u64(&mut bytes, 88, word);
             bytes[126] = 1;
@@ -4293,7 +4295,7 @@ pub(crate) mod tests {
     /// manifest: every modeled function journal tests stage needs an
     /// admittable plan slot, since each staged call converts only
     /// under its own H3 admission claim.
-    const ADMITTABLE_FUNCTIONS: [&str; 8] = [
+    const ADMITTABLE_FUNCTIONS: [&str; 15] = [
         "C_CreateObject",
         "C_GetAttributeValue",
         "C_SignInit",
@@ -4302,6 +4304,25 @@ pub(crate) mod tests {
         "C_Verify",
         "C_SignMessage",
         "C_DestroyObject",
+        // H9 S1-matrix extensions, appended so the T3 indices above
+        // (and their legacy offsets) never shift.
+        "C_SignUpdate",
+        "C_SignFinal",
+        "C_OpenSession",
+        "C_CloseSession",
+        "C_SessionCancel",
+        "C_MessageSignInit",
+        "C_MessageSignFinal",
+    ];
+
+    /// v3-only functions, resolved on the 3.0 interface surface
+    /// (they ride no legacy table) at `start + 64 + stride`, clear of
+    /// the legacy `start + index` band.
+    const V3_ONLY_FUNCTIONS: [&str; 4] = [
+        "C_SignMessage",
+        "C_MessageSignInit",
+        "C_MessageSignFinal",
+        "C_SessionCancel",
     ];
 
     /// Genuine-bind identity answers: the cookie queries the bind
@@ -4502,7 +4523,7 @@ pub(crate) mod tests {
             let start = inspected
                 .executable_ranges
                 .iter()
-                .find(|(a, b)| b - a > ADMITTABLE_FUNCTIONS.len() as u64)
+                .find(|(a, b)| b - a > 64 + ADMITTABLE_FUNCTIONS.len() as u64)
                 .unwrap()
                 .0;
             let functions: Vec<FunctionRecord> =
@@ -4532,9 +4553,10 @@ pub(crate) mod tests {
                         .collect(),
                     _ => panic!("2.40 is a full standard table"),
                 };
-            // The v3 message functions ride no legacy table: resolve
-            // the one the neutral history stages on a v3 interface
-            // surface (canonical V3_0 walk order).
+            // The v3-only functions ride no legacy table: resolve
+            // each on a v3 interface surface (canonical V3_0 walk
+            // order) at `start + 64 + stride`, clear of the legacy
+            // `start + index` band.
             let message_functions: Vec<FunctionRecord> =
                 match pkcs11_module::tables_for(pkcs11_module::Surface::StandardInterface {
                     version: cryptoki_sys::CK_VERSION { major: 3, minor: 0 },
@@ -4543,14 +4565,14 @@ pub(crate) mod tests {
                         .iter()
                         .flat_map(|span| span.fields())
                         .map(|field| {
-                            let resolution = if field.name == "C_SignMessage" {
-                                Resolution::Resolved {
+                            let resolution = V3_ONLY_FUNCTIONS
+                                .iter()
+                                .position(|name| *name == field.name)
+                                .map(|stride| Resolution::Resolved {
                                     object: 0,
-                                    file_offset: start + 8,
-                                }
-                            } else {
-                                Resolution::NullPointer
-                            };
+                                    file_offset: start + 64 + stride as u64,
+                                })
+                                .unwrap_or(Resolution::NullPointer);
                             FunctionRecord {
                                 name: field.name.into(),
                                 resolution,
@@ -4841,13 +4863,14 @@ pub(crate) mod tests {
             session: u64,
             name: &str,
         ) -> AdmittedInstanceCall {
-            self.admit_shaped(session, name, 0, 0, Event::default().capture)
+            self.admit_shaped(session, name, 0, 0, Event::default().capture, FLAGS)
         }
 
         /// One real admission with explicit S1 evidence shape: return
-        /// code, entry mechanism and capture vocabulary ride the routed
-        /// event into the proved facts. Shared with H9 tests, whose
-        /// S1-varied streams need failed/query/Init-shaped admissions.
+        /// code, entry mechanism, capture vocabulary and call flags
+        /// ride the routed event into the proved facts. Shared with H9
+        /// tests, whose S1-varied streams need failed/query/Init-shaped
+        /// admissions.
         pub(crate) fn admit_shaped(
             &mut self,
             session: u64,
@@ -4855,6 +4878,7 @@ pub(crate) mod tests {
             rv: u64,
             mechanism: u64,
             capture: u32,
+            call_flags: u64,
         ) -> AdmittedInstanceCall {
             let (slot, endpoint) = self.functions[name];
             self.next_token += 1;
@@ -4873,7 +4897,7 @@ pub(crate) mod tests {
                             slot,
                             session,
                             slot_id: SLOT_ID,
-                            flags: FLAGS,
+                            flags: call_flags,
                             user_type: 1,
                             rv,
                             mechanism,

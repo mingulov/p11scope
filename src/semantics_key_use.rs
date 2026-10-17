@@ -915,10 +915,13 @@ impl KeyUseReducer {
 
     /// Assemble this quantum's positional receipts: the seal's
     /// references qualified to the settled call's ticket (never
-    /// another call's), in model emission order (input ordinals),
-    /// each snapshotting metadata presence known by — not after —
-    /// this transition. Callers pass the seal's verified single
-    /// settled call (see [`JointStaging::apply_seal`]).
+    /// another call's), each carrying the input ordinal the qualified
+    /// model join minted — never a renumbering of successful
+    /// references (holes stay holes; equal handles keep both
+    /// positions). Found-handle references join no input and yield no
+    /// receipt. Each receipt snapshots metadata presence known by —
+    /// not after — this transition. Callers pass the seal's verified
+    /// single settled call (see [`JointStaging::apply_seal`]).
     pub(crate) fn receipts_for_call(
         &mut self,
         seal: &SealSuccess,
@@ -927,15 +930,20 @@ impl KeyUseReducer {
         position: u64,
     ) -> Vec<KeyReceipt> {
         let mut receipts = Vec::new();
-        let mut ordinal = 0u8;
         for effect in &seal.effects.effects {
-            let ObjectEffect::Referenced { call, object, .. } = effect else {
+            let ObjectEffect::Referenced {
+                call, object, input, ..
+            } = effect
+            else {
                 continue;
             };
             if *call != settled.ticket {
                 continue;
             }
-            let role = self.classify_role(settled.function, ordinal);
+            let Some(input) = input else {
+                continue;
+            };
+            let role = self.classify_role(settled.function, *input);
             let snapshot = model.receipt_snapshot(*object);
             if snapshot.is_none() {
                 self.evidence.metadata_unavailable =
@@ -947,7 +955,7 @@ impl KeyUseReducer {
             receipts.push(KeyReceipt {
                 key: *object,
                 function: settled.function,
-                input: ordinal,
+                input: *input,
                 role,
                 position,
                 metadata,
@@ -955,7 +963,6 @@ impl KeyUseReducer {
                 attribution_valid: snapshot.is_some_and(|seen| seen.attribution_valid),
                 lost: false,
             });
-            ordinal = ordinal.saturating_add(1);
         }
         receipts
     }

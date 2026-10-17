@@ -777,6 +777,10 @@ pub(crate) enum ObjectEffect {
         call: CallToken,
         object: ObjectId,
         key_use: bool,
+        /// The joined call-input ordinal (H9): minted at the qualified
+        /// positional join, never reconstructed from emission order.
+        /// `None` for found-handle references, which join no input.
+        input: Option<u8>,
     },
     Destroyed {
         call: CallToken,

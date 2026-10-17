@@ -30,7 +30,7 @@ use crate::semantics_objects::journal::{
     SealSuccess, SealedCall,
 };
 use crate::semantics_objects::{
-    CallToken, ObjectEffect, ObjectId, ObjectSemantics, SessionIncarnation,
+    CallToken, ObjectEffect, ObjectEffects, ObjectId, ObjectSemantics, SessionIncarnation,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -381,6 +381,11 @@ impl JointStaging {
         let head = self.staged.pop_front().expect("head verified above");
         self.frontier = self.frontier.max(head.position);
         let receipts = keyuse.receipts_for_call(seal, &settled[0], model, head.position);
+        // Retirement in the same seal ends active key associations
+        // BEFORE the replay (H9 §66): a terminal the replay emits
+        // can never complete a binding this seal just unproved. The
+        // S1 terminal still lands later through the ordinary path.
+        keyuse.apply_invalidations(&seal.effects, model);
         let mut tee = KeyUseTee {
             outer: sink,
             keyuse,
@@ -388,25 +393,6 @@ impl JointStaging {
         };
         let refused = reducer.observe_joint(&head.facts, &head.origin, &receipts, &mut tee);
         self.reduced = self.reduced.saturating_add(1);
-        // Retirement in the same seal ends active key associations
-        // before any later terminal (H9 §66); the S1 terminal still
-        // lands later through the ordinary path.
-        for effect in &seal.effects.effects {
-            match effect {
-                ObjectEffect::Destroyed { object, .. }
-                | ObjectEffect::AccessEnded { object, .. }
-                | ObjectEffect::Retired { object, .. }
-                | ObjectEffect::Downgraded { object, .. }
-                | ObjectEffect::MetadataConflict { object, .. }
-                | ObjectEffect::MetadataInvalidated { object, .. } => {
-                    keyuse.retire_object(*object);
-                }
-                ObjectEffect::SessionEnded { session, .. } => {
-                    keyuse.retire_session(*session, model);
-                }
-                _ => {}
-            }
-        }
         (SealApplyOutcome::ReplayedOne, refused)
     }
 
@@ -426,6 +412,7 @@ impl JointStaging {
         &mut self,
         failure: &SealFailure,
         finalizer: &mut impl H3EvidenceSource,
+        model: &ObjectSemantics,
         reducer: &mut EdgeSemantics,
         keyuse: &mut KeyUseReducer,
         instance: RegistryInstanceId,
@@ -437,6 +424,10 @@ impl JointStaging {
         match disposition_of(failure.gap) {
             SealFailureDisposition::Retry => (FailureApplyOutcome::Retried, 0),
             SealFailureDisposition::HistoryLoss => {
+                // The failure's own invalidations close affected key
+                // associations BEFORE loss disposal emits their
+                // Unknown terminals (H9 §66).
+                keyuse.apply_invalidations(&failure.effects, model);
                 self.dispose_as_loss(reducer, keyuse, instance, sink);
                 let disposed = self.drain_staged();
                 self.mode = FeedMode::S1Only;
@@ -449,6 +440,11 @@ impl JointStaging {
                         staged_max,
                         pending_floor: None,
                     } if self.covered_by(staged_max) => {
+                        // Fallback replays staged S1 without object
+                        // proof: the failure's invalidations close
+                        // affected associations FIRST, so replayed
+                        // terminals cannot complete unproved bindings.
+                        keyuse.apply_invalidations(&failure.effects, model);
                         let (replayed, refused) =
                             self.replay_staged(reducer, keyuse, instance, sink);
                         self.mode = FeedMode::S1Only;
@@ -458,6 +454,7 @@ impl JointStaging {
                     H3DispositionEvidence::StagedLoss { .. } | H3DispositionEvidence::Exhausted => {
                         // H3's own stream is lossy: the staged calls'
                         // S1 proof with it. Real-loss treatment.
+                        keyuse.apply_invalidations(&failure.effects, model);
                         self.dispose_as_loss(reducer, keyuse, instance, sink);
                         let disposed = self.drain_staged();
                         self.mode = FeedMode::S1Only;
@@ -1204,14 +1201,16 @@ impl KeyUseReducer {
             saw_primary = saw_primary || assoc.primary;
             match assoc.bucket {
                 AssocBucket::Proved(bucket) => {
-                    let counters = self
-                        .aggregates
-                        .get_mut(&bucket)
-                        .expect("admission reserved every proved bucket");
-                    counters.active = counters.active.saturating_sub(1);
                     if assoc.lost {
-                        counters.key_join_lost = counters.key_join_lost.saturating_add(1);
+                        // Closed at invalidation time (active to
+                        // `key_join_lost`); the terminal only routes
+                        // once below, never double-closes.
                     } else {
+                        let counters = self
+                            .aggregates
+                            .get_mut(&bucket)
+                            .expect("admission reserved every proved bucket");
+                        counters.active = counters.active.saturating_sub(1);
                         counters.add(outcome);
                     }
                 }
@@ -1333,23 +1332,49 @@ impl KeyUseReducer {
         (slots, len)
     }
 
-    /// End every active association on one object before its S1
-    /// terminal (H9 §66): each loses its join once; the terminal
-    /// still lands later through the ordinary path.
-    pub(crate) fn retire_object(&mut self, object: ObjectId) {
-        for open in self.open.values_mut() {
-            for assoc in &mut open.associations {
-                if assoc.key == object && !assoc.lost {
-                    assoc.lost = true;
-                    self.evidence.join_lost = self.evidence.join_lost.saturating_add(1);
-                }
+    /// Apply one seal's (or failure's) retirement effects to the
+    /// open associations (H9 §66): object retirements by exact key,
+    /// session ends by model attribution. Runs BEFORE any replay or
+    /// disposal the same seal/failure triggers, so a terminal can
+    /// never complete a binding its own seal just unproved.
+    pub(crate) fn apply_invalidations(&mut self, effects: &ObjectEffects, model: &ObjectSemantics) {
+        for effect in &effects.effects {
+            match effect {
+                ObjectEffect::Destroyed { object, .. }
+                | ObjectEffect::Retired { object, .. }
+                | ObjectEffect::AccessEnded { object, .. }
+                | ObjectEffect::Downgraded { object, .. }
+                | ObjectEffect::MetadataInvalidated { object, .. }
+                | ObjectEffect::MetadataConflict { object, .. } => self.retire_object(*object),
+                ObjectEffect::SessionEnded { session, .. } => self.retire_session(*session, model),
+                _ => {}
             }
         }
     }
 
+    /// End every active association on one object before its S1
+    /// terminal (H9 §66): each loses its join once, closing active
+    /// to `key_join_lost` immediately; the terminal still lands
+    /// later through the ordinary path (routing once to the
+    /// unknown-key summary, never double-closing).
+    pub(crate) fn retire_object(&mut self, object: ObjectId) {
+        let mut lost = Vec::new();
+        for open in self.open.values_mut() {
+            for assoc in &mut open.associations {
+                if assoc.key == object && !assoc.lost {
+                    assoc.lost = true;
+                    lost.push(assoc.bucket);
+                }
+            }
+        }
+        self.close_lost_buckets(&lost);
+    }
+
     /// End every active association whose key the model attributes
-    /// to one ended session (domain/session loss, H9 §66).
+    /// to one ended session (domain/session loss, H9 §66). Closes
+    /// like [`Self::retire_object`].
     pub(crate) fn retire_session(&mut self, session: SessionIncarnation, model: &ObjectSemantics) {
+        let mut lost = Vec::new();
         for open in self.open.values_mut() {
             for assoc in &mut open.associations {
                 if assoc.lost {
@@ -1360,8 +1385,28 @@ impl KeyUseReducer {
                     .is_some_and(|snapshot| snapshot.session == session);
                 if ended {
                     assoc.lost = true;
-                    self.evidence.join_lost = self.evidence.join_lost.saturating_add(1);
+                    lost.push(assoc.bucket);
                 }
+            }
+        }
+        self.close_lost_buckets(&lost);
+    }
+
+    /// Close newly-lost associations' proved buckets at invalidation
+    /// time: active out, `key_join_lost` in. Unknown-bucket
+    /// associations keep their live S1 active until the terminal
+    /// (which routes the outcome); the evidence counts every join
+    /// lost, proved or not.
+    fn close_lost_buckets(&mut self, lost: &[AssocBucket]) {
+        for bucket in lost {
+            self.evidence.join_lost = self.evidence.join_lost.saturating_add(1);
+            if let AssocBucket::Proved(key) = bucket {
+                let counters = self
+                    .aggregates
+                    .get_mut(key)
+                    .expect("lost joins close reserved buckets");
+                counters.active = counters.active.saturating_sub(1);
+                counters.key_join_lost = counters.key_join_lost.saturating_add(1);
             }
         }
     }

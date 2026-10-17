@@ -29,9 +29,7 @@ use crate::semantics_objects::journal::{
     BootstrapReceipt, H3DispositionEvidence, H3EvidenceSource, JournalGap, SealFailure,
     SealSuccess, SealedCall,
 };
-use crate::semantics_objects::{
-    KeyMetadataFlags, ObjectEffect, ObjectId, ObjectSemantics, SessionIncarnation,
-};
+use crate::semantics_objects::{ObjectEffect, ObjectId, ObjectSemantics, SessionIncarnation};
 use std::collections::{BTreeMap, VecDeque};
 
 /// At most 1,024 unsettled staged payloads: the H8 pending-call bound
@@ -577,10 +575,6 @@ pub(crate) struct KeyUseEvidence {
     pub orphan_ends: u64,
     /// Receipts outside the classified role vocabulary.
     pub unclassified_roles: u64,
-    /// Receipts whose key view was already gone at snapshot time
-    /// (unreachable in-quantum; absence is unavailable metadata,
-    /// never proof of no metadata).
-    pub metadata_unavailable: u64,
     /// True once any association was refused at full budget: the
     /// projection's semantic coverage is PARTIAL from then on.
     pub partial: bool,
@@ -919,20 +913,28 @@ impl KeyUseReducer {
     /// model join minted — never a renumbering of successful
     /// references (holes stay holes; equal handles keep both
     /// positions). Found-handle references join no input and yield no
-    /// receipt. Each receipt snapshots metadata presence known by —
-    /// not after — this transition. Callers pass the seal's verified
-    /// single settled call (see [`JointStaging::apply_seal`]).
+    /// receipt. Metadata (presence, label, attribution) is the
+    /// snapshot the join froze into the effect — never the model's
+    /// current state, so routing delay cannot backfill an earlier
+    /// use. Callers pass the seal's verified single settled call
+    /// (see [`JointStaging::apply_seal`]).
     pub(crate) fn receipts_for_call(
         &mut self,
         seal: &SealSuccess,
         settled: &SealedCall,
-        model: &ObjectSemantics,
+        _model: &ObjectSemantics,
         position: u64,
     ) -> Vec<KeyReceipt> {
         let mut receipts = Vec::new();
         for effect in &seal.effects.effects {
             let ObjectEffect::Referenced {
-                call, object, input, ..
+                call,
+                object,
+                input,
+                metadata,
+                label,
+                attribution_valid,
+                ..
             } = effect
             else {
                 continue;
@@ -944,23 +946,15 @@ impl KeyUseReducer {
                 continue;
             };
             let role = self.classify_role(settled.function, *input);
-            let snapshot = model.receipt_snapshot(*object);
-            if snapshot.is_none() {
-                self.evidence.metadata_unavailable =
-                    self.evidence.metadata_unavailable.saturating_add(1);
-            }
-            let metadata = model
-                .key_metadata_flags(*object)
-                .unwrap_or(KeyMetadataFlags::ZERO);
             receipts.push(KeyReceipt {
                 key: *object,
                 function: settled.function,
                 input: *input,
                 role,
                 position,
-                metadata,
-                label: snapshot.and_then(|seen| seen.label),
-                attribution_valid: snapshot.is_some_and(|seen| seen.attribution_valid),
+                metadata: *metadata,
+                label: *label,
+                attribution_valid: *attribution_valid,
                 lost: false,
             });
         }

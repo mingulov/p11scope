@@ -43,8 +43,9 @@ use crate::inventory_diagnostics::{
 use crate::inventory_diagnostics_output::{DiagnosticsDestination, PrepareError};
 use crate::inventory_event_identity::IdentityIndex;
 use crate::inventory_events::{
-    EdgeEmitter, EventWriter, GapEmitter, InstanceEmitter, caller_event_payload,
-    combined_dump_fits, ended_payload, pass_payload, settle_ended_combined, started_payload,
+    EdgeEmitter, EventWriter, GapEmitter, InstanceEmitter, KeyOperationEmitter,
+    caller_event_payload, combined_dump_fits, ended_payload, pass_payload, settle_ended_combined,
+    started_payload,
 };
 #[cfg(test)]
 use crate::inventory_output::WriterStdout;
@@ -2208,6 +2209,20 @@ pub(crate) fn finish_output(
             presentation.budgets.instances_limit,
             presentation.ended_ns,
         )?;
+        // The H9 third of the exact final sweep: every uncarried
+        // projection row from the gated publication, before `ended`.
+        stream_state
+            .key_publisher
+            .publish(presentation.object_observations.clone());
+        let published = stream_state
+            .key_publisher
+            .publication()
+            .expect("the publisher retains a publication")
+            .clone();
+        let swept_key_operations =
+            stream_state
+                .key_operations
+                .sweep_exact(writer, &published, presentation.ended_ns)?;
         writer.reserve(tail)?;
         let mut estimate = combined_unretained_after(stream_state, writer, presentation, tail);
         if estimate.0 + estimate.1 + estimate.2 > 0
@@ -2233,6 +2248,7 @@ pub(crate) fn finish_output(
         let edge_events = swept.emitted;
         let instance_events = swept_instances.instance_emitted;
         let semantic_edge_events = swept_instances.edge_emitted;
+        let key_operation_events = swept_key_operations;
         let (_, payload) = settle_ended_combined(
             &stream_state.edges,
             &stream_state.instances,
@@ -2248,6 +2264,7 @@ pub(crate) fn finish_output(
                 payload["instances_unretained"] = instances_unretained.into();
                 payload["semantic_edge_events"] = semantic_edge_events.into();
                 payload["semantic_edges_unretained"] = semantic_unretained.into();
+                payload["key_operation_events"] = key_operation_events.into();
                 payload
             },
         );
@@ -2430,6 +2447,8 @@ pub(crate) struct StreamState {
     gaps: GapEmitter,
     edges: EdgeEmitter,
     instances: InstanceEmitter,
+    key_operations: KeyOperationEmitter,
+    key_publisher: crate::key_operation_projection::ObservationPublisher,
     emitted_suppressed: u64,
     /// Unbound witness rows per (module, reason) already counted on a
     /// pass marker.
@@ -2442,6 +2461,8 @@ impl StreamState {
             gaps: GapEmitter::new(),
             edges: EdgeEmitter::new(),
             instances: InstanceEmitter::new(),
+            key_operations: KeyOperationEmitter::new(),
+            key_publisher: crate::key_operation_projection::ObservationPublisher::new(),
             emitted_suppressed: 0,
             emitted_unbound: BTreeMap::new(),
         }
@@ -2556,17 +2577,31 @@ fn emit_commit(
         presentation.budgets.instances_limit,
         now_ns,
     )?;
+    // H9 rows ride from the gated publication (stale-aware), never
+    // straight from the fresh presentation: the stream must freeze
+    // with a retained publication, not skip ahead of it.
+    state
+        .key_publisher
+        .publish(presentation.object_observations.clone());
+    let published = state
+        .key_publisher
+        .publication()
+        .expect("the publisher retains a publication")
+        .clone();
+    let key_operations = state.key_operations.emit(writer, &published, now_ns)?;
     let suppressed_delta = presentation
         .gaps_suppressed
         .saturating_sub(state.emitted_suppressed);
     state.emitted_suppressed = presentation.gaps_suppressed;
-    let mut payload = pass_payload(report, presentation, fresh, suppressed_delta);
+    let mut payload = pass_payload(report, presentation, &published, fresh, suppressed_delta);
     payload["edge_events"] = edges.emitted.into();
     payload["edge_events_deferred"] = edges.deferred.into();
     payload["instance_events"] = instances.instance_emitted.into();
     payload["instance_events_deferred"] = instances.instance_deferred.into();
     payload["semantic_edge_events"] = instances.edge_emitted.into();
     payload["semantic_edge_events_deferred"] = instances.edge_deferred.into();
+    payload["key_operation_events"] = key_operations.emitted.into();
+    payload["key_operation_events_deferred"] = key_operations.deferred.into();
     add_unbound_rows(&mut payload, state, presentation);
     if stop {
         payload["final"] = serde_json::Value::Bool(true);
@@ -3502,6 +3537,7 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
         "edges": presentation.edges.iter().map(edge_json).collect::<Vec<_>>(),
         "instances": presentation.instances.iter().map(instance_json).collect::<Vec<_>>(),
         "semantic_edges": presentation.semantic_edges.iter().map(instance_semantic_json).collect::<Vec<_>>(),
+        "object_observations": crate::key_operation_projection::object_observations_json(&presentation.object_observations),
         "gaps": gaps,
         "gaps_suppressed": presentation.gaps_suppressed,
         // Additive (v1, DR-K8S-2): caller PIDs are this observer's /proc

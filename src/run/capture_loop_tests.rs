@@ -2537,6 +2537,10 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
         instances: Vec::new(),
         semantic_edges: Vec::new(),
         gaps_suppressed: 0,
+        object_observations: crate::key_operation_projection::ObjectObservations::unavailable(
+            1,
+            "bootstrap_unavailable",
+        ),
         budgets: BudgetView {
             callers_limit: 8,
             callers_occupied: 1,

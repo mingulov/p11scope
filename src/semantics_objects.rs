@@ -256,11 +256,11 @@ impl fmt::Debug for CallToken {
 pub(crate) struct ObjectId(u64);
 
 impl ObjectId {
-    /// H9 volume-test key identity only (retention bounds): never
-    /// authority, never a seal input, never a join key.
+    /// The capture-local public id for output rows. Read-only: H9
+    /// never mints ids from integers (staged with the producer).
     #[cfg(test)]
-    pub(crate) fn for_test(id: u64) -> Self {
-        Self(id)
+    pub(crate) const fn as_u64(self) -> u64 {
+        self.0
     }
 }
 
@@ -275,12 +275,16 @@ pub(crate) struct KeyMetadataFlags {
     /// A retained value exists (current, conflict or invalidation
     /// history — never the value itself).
     pub established: u8,
+    /// Two claims disagreed on this field (requested or
+    /// established side): labels needing it are unusable.
+    pub conflicted: u8,
 }
 
 impl KeyMetadataFlags {
     pub(crate) const ZERO: Self = Self {
         requested: 0,
         established: 0,
+        conflicted: 0,
     };
 
     pub(crate) fn requested_count(self) -> u32 {
@@ -298,6 +302,20 @@ impl KeyMetadataFlags {
     pub(crate) fn is_established(self, field: usize) -> bool {
         field < METADATA_FIELDS && self.established & (1 << field) != 0
     }
+
+    pub(crate) fn is_conflicted(self, field: usize) -> bool {
+        field < METADATA_FIELDS && self.conflicted & (1 << field) != 0
+    }
+}
+
+/// H9 receipt snapshot: established-only label (sizes/curve, never
+/// key material), attribution validity, and the one proven
+/// accessing session — everything a positional receipt may carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReceiptSnapshot {
+    pub label: Option<KeyLabel>,
+    pub attribution_valid: bool,
+    pub session: SessionIncarnation,
 }
 
 impl fmt::Debug for ObjectId {
@@ -309,6 +327,15 @@ impl fmt::Debug for ObjectId {
 /// A capture-local session incarnation (`sess#N`).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct SessionIncarnation(u64);
+
+impl SessionIncarnation {
+    /// The capture-local public id for output rows. Read-only: H9
+    /// never mints ids from integers (staged with the producer).
+    #[cfg(test)]
+    pub(crate) const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
 
 impl fmt::Debug for SessionIncarnation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -875,7 +902,7 @@ impl MetadataView {
     }
 }
 
-fn field_index(kind: SafeAttributeKind) -> usize {
+pub(crate) fn field_index(kind: SafeAttributeKind) -> usize {
     match kind {
         SafeAttributeKind::Class => 0,
         SafeAttributeKind::KeyType => 1,
@@ -1132,6 +1159,14 @@ impl ObjectSemantics {
     /// never cross to H9 (only discriminants are matched).
     pub(crate) fn key_metadata_flags(&self, key: ObjectId) -> Option<KeyMetadataFlags> {
         self.state.key_metadata_flags(key)
+    }
+
+    /// H9 receipt snapshot: the established-only label, attribution
+    /// validity and accessing session for one object. No access
+    /// counts (those need the relations scan; receipts never carry
+    /// them).
+    pub(crate) fn receipt_snapshot(&self, key: ObjectId) -> Option<ReceiptSnapshot> {
+        self.state.receipt_snapshot(key)
     }
 
     pub(crate) fn state_estimate(&self) -> StateEstimate {

@@ -2398,7 +2398,7 @@ fn read_stream(dir: &std::path::Path, live: &str) -> Vec<serde_json::Value> {
         let suffix = name.strip_prefix(&format!("{live}.")).unwrap_or("");
         (false, suffix.parse().unwrap_or(u64::MAX))
     };
-    files.sort_by(|a, b| sequence(a).cmp(&sequence(b)));
+    files.sort_by_key(sequence);
     let mut lines = Vec::new();
     for name in files {
         let body = std::fs::read_to_string(dir.join(&name)).unwrap();

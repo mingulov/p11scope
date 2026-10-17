@@ -4103,6 +4103,7 @@ pub(crate) mod tests {
     /// fields (session word, entry mechanism, capture vocabulary)
     /// plus an optional input-0 word for key-use calls, for
     /// admissions whose S1 shape varies. Shared with H9 tests.
+    #[allow(clippy::too_many_arguments)] // Fixture shaper: every record word explicit, no hidden defaults.
     pub(crate) fn begin_bytes_shaped(
         thread: u64,
         sequence: u64,

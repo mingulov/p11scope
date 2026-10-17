@@ -725,17 +725,16 @@ impl ObservationPublisher {
             self.last = Some(candidate);
             return self.last.as_ref().expect("just published");
         }
-        if self.last.is_some() {
-            let retained = self.last.as_mut().expect("checked above");
+        if self.last.is_none() {
+            self.last = Some(ObjectObservations::unavailable(
+                candidate.revision,
+                "publication_budget_exhausted",
+            ));
+        } else if let Some(retained) = self.last.as_mut() {
             retained.status = ObsStatus::Stale;
             retained.reason = "publication_budget_exhausted";
-            return self.last.as_ref().expect("checked above");
         }
-        self.last = Some(ObjectObservations::unavailable(
-            candidate.revision,
-            "publication_budget_exhausted",
-        ));
-        self.last.as_ref().expect("just published the negative")
+        self.last.as_ref().expect("retained or just published")
     }
 
     /// Record a sink failure after a populated revision: the retained

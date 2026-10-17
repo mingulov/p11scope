@@ -232,7 +232,7 @@ pub(crate) fn abandon_disposition(reason: u32) -> Option<AbandonDisposition> {
     }
 }
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use p11scope_ebpf_common::MAX_DESCRIPTORS;
 use p11scope_ebpf_common::capture;
@@ -741,7 +741,6 @@ impl std::fmt::Debug for JournalIngestItem {
 pub(crate) struct JournalAdapter {
     limits: JournalLimits,
     consumed_through: u64,
-    mint: u64,
     open: BTreeMap<JournalNativeKey, OpenEntry>,
     floors: BTreeMap<u64, u64>,
     refused: Vec<RefusedBegin>,
@@ -755,10 +754,15 @@ pub(crate) struct JournalAdapter {
     taint_overflow: bool,
     sightings: BTreeMap<(u64, u64), ImageSighting>,
     /// Per-call admission authority: each admitted modeled call's
-    /// fingerprint, claimed by its key with a multiset count. Conversion
-    /// consumes one count per staged call; total counts stay within the
-    /// staged-call bound (a void clears the store with the staging).
-    claims: BTreeMap<CallFingerprint, BTreeMap<JournalDomainKey, u64>>,
+    /// fingerprint, claimed by its key with a FIFO of H0 admission
+    /// ordinals (C2 identity: attested in H0 order, converted in
+    /// journal order — per fingerprint these coincide, so each
+    /// conversion pops its own admission). Conversion consumes one
+    /// ordinal per staged call and mints the call's ticket FROM it, so
+    /// the sealed key binds the actual admitted invocation; total
+    /// counts stay within the staged-call bound (a void clears the
+    /// store with the staging).
+    claims: BTreeMap<CallFingerprint, BTreeMap<JournalDomainKey, VecDeque<u64>>>,
     claim_counts: usize,
     last_audit_failure: Option<u64>,
     /// H0 positions below this watermark were voided by an H3-loss
@@ -790,7 +794,6 @@ impl JournalAdapter {
         Self {
             limits,
             consumed_through: 0,
-            mint: 0,
             open: BTreeMap::new(),
             floors: BTreeMap::new(),
             refused: Vec::new(),
@@ -1211,13 +1214,6 @@ impl JournalAdapter {
         }
         self.open.retain(|_, entry| entry.image != image);
         self.refused.retain(|refused| refused.image != image);
-    }
-
-    /// Mint one checked nonrecycled ticket, failing closed on exhaustion.
-    fn mint_ticket(&mut self) -> Option<JournalTicket> {
-        let next = self.mint.checked_add(1)?;
-        self.mint = next;
-        Some(JournalTicket(next))
     }
 }
 
@@ -2463,12 +2459,25 @@ pub(crate) struct SealedCall {
 
 impl SealedCall {
     /// Whether this sealed call IS the staged head's call (H9 exact
-    /// correlation): the same catalog function, the same session,
-    /// and the same mechanism capture shape. Value words are never
-    /// compared (only the finite class crosses); an unreadable
-    /// sealed session never matches; a session-less staged head
-    /// matches only a session-less sealed call.
-    pub(crate) fn matches_head(&self, function: u32, session: u64, mechanism_capture: u32) -> bool {
+    /// correlation): FIRST the same admitted invocation — the sealed
+    /// key's admission ordinal IS the head's H0 position (C2
+    /// identity: conversion mints tickets from queued admissions, so
+    /// value-equal shapes from different invocations never match) —
+    /// then the same catalog function, the same session, and the same
+    /// mechanism capture shape. Value words are never compared (only
+    /// the finite class crosses); an unreadable sealed session never
+    /// matches; a session-less staged head matches only a
+    /// session-less sealed call.
+    pub(crate) fn matches_head(
+        &self,
+        function: u32,
+        session: u64,
+        mechanism_capture: u32,
+        head_position: u64,
+    ) -> bool {
+        if self.key.admission() != head_position {
+            return false;
+        }
         if self.function != function {
             return false;
         }
@@ -2746,7 +2755,7 @@ impl JournalAdapter {
         if let Some(fingerprint) = admitted.journal_call_fingerprint()
             && endpoint_class(fingerprint.function) == Some(EndpointClass::ModeledAffecting)
         {
-            self.claim_fingerprint(fingerprint, key)?;
+            self.claim_fingerprint(fingerprint, key, admitted.h0_ordinal())?;
         }
         let era = self.keys[&key].era;
         Ok(JournalDomainProof { key, era })
@@ -2806,13 +2815,15 @@ impl JournalAdapter {
             .collect()
     }
 
-    /// Claim one admitted fingerprint for its key. Counts stay within
-    /// the staged-call bound; a full store first drops dead keys'
+    /// Claim one admitted fingerprint for its key, queueing its H0
+    /// admission ordinal (C2 identity). Counts stay within the
+    /// staged-call bound; a full store first drops dead keys'
     /// claims, then refuses the attestation.
     fn claim_fingerprint(
         &mut self,
         fingerprint: CallFingerprint,
         key: JournalDomainKey,
+        admission: u64,
     ) -> Result<(), AttestationRefusal> {
         if self.claim_counts >= self.limits.open_calls + self.limits.refused_begins {
             self.prune_dead_claims();
@@ -2820,12 +2831,12 @@ impl JournalAdapter {
                 return Err(AttestationRefusal::ClaimsExhausted);
             }
         }
-        *self
-            .claims
+        self.claims
             .entry(fingerprint)
             .or_default()
             .entry(key)
-            .or_default() += 1;
+            .or_default()
+            .push_back(admission);
         self.claim_counts += 1;
         Ok(())
     }
@@ -2847,22 +2858,40 @@ impl JournalAdapter {
         self.claim_counts = self
             .claims
             .values()
-            .map(|m| m.values().sum::<u64>())
-            .sum::<u64>() as usize;
+            .map(|m| m.values().map(VecDeque::len).sum::<usize>())
+            .sum::<usize>();
     }
 
-    /// Consume one claim count for a converted call. Every conversion
-    /// holds a claim (attribution requires it, and coverage is checked
-    /// before conversion), so the store always has the count.
-    fn consume_claim(&mut self, fingerprint: &CallFingerprint, key: JournalDomainKey) {
+    /// Peek the oldest queued admission ordinal for one claimed call
+    /// (C2 identity): the conversion mints its ticket FROM this, then
+    /// [`Self::consume_claim`] pops it on success.
+    fn peek_claim(&self, fingerprint: &CallFingerprint, key: JournalDomainKey) -> Option<u64> {
+        self.claims
+            .get(fingerprint)
+            .and_then(|claimants| claimants.get(&key))
+            .and_then(|ordinals| ordinals.front().copied())
+    }
+
+    /// Consume one queued admission for a converted (or refused)
+    /// call, returning its H0 ordinal. Every conversion holds a claim
+    /// (attribution requires it, and coverage is checked before
+    /// conversion), so the store always has the ordinal; refused
+    /// burns discard it. Returns `None` only on invariant break
+    /// (callers refuse loudly, never minting from thin air).
+    fn consume_claim(
+        &mut self,
+        fingerprint: &CallFingerprint,
+        key: JournalDomainKey,
+    ) -> Option<u64> {
         let mut vacated = false;
+        let mut popped = None;
         if let Some(claimants) = self.claims.get_mut(fingerprint) {
-            if let Some(count) = claimants.get_mut(&key)
-                && *count > 0
-            {
-                *count -= 1;
-                self.claim_counts -= 1;
-                if *count == 0 {
+            if let Some(ordinals) = claimants.get_mut(&key) {
+                popped = ordinals.pop_front();
+                if popped.is_some() {
+                    self.claim_counts -= 1;
+                }
+                if ordinals.is_empty() {
                     claimants.remove(&key);
                 }
             }
@@ -2871,6 +2900,7 @@ impl JournalAdapter {
         if vacated {
             self.claims.remove(fingerprint);
         }
+        popped
     }
 
     /// Attribute one staged fingerprint under a sealing key. Every
@@ -2889,8 +2919,8 @@ impl JournalAdapter {
         let mut sibling = false;
         let mut dead = false;
         if let Some(claimants) = self.claims.get(fingerprint) {
-            for (claimant, count) in claimants {
-                if *count == 0 {
+            for (claimant, ordinals) in claimants {
+                if ordinals.is_empty() {
                     continue;
                 }
                 if *claimant == key {
@@ -3231,7 +3261,9 @@ impl JournalAdapter {
                         .get(&fingerprint)
                         .map(|m| {
                             m.iter()
-                                .filter(|(key, count)| **count > 0 && live.contains(key))
+                                .filter(|(key, ordinals)| {
+                                    !ordinals.is_empty() && live.contains(key)
+                                })
                                 .map(|(key, _)| *key)
                                 .collect()
                         })
@@ -3353,7 +3385,7 @@ impl JournalAdapter {
             self.claims
                 .get(&fingerprint)
                 .and_then(|claimants| claimants.get(&key))
-                .copied()
+                .map(|ordinals| ordinals.len() as u64)
                 .unwrap_or(0)
                 >= need
         })
@@ -3659,7 +3691,15 @@ impl JournalAdapter {
         begins.sort_by_key(|(_, ordinal)| *ordinal);
         let mut settled = Vec::new();
         for (native, _) in begins {
-            let Some(ticket) = self.mint_ticket() else {
+            let entry = *self.open.get(&native).expect("staged begin");
+            // C2 identity: the conversion mints its ticket FROM the
+            // oldest queued admission ordinal for this call (peeked;
+            // popped below on success), so the sealed key binds the
+            // actual admitted invocation. Missing ordinal
+            // (unreachable: coverage checked) refuses like ticket
+            // exhaustion did before.
+            let fingerprint = fingerprint_of_begin(&entry.begin);
+            let Some(admission) = self.peek_claim(&fingerprint, key) else {
                 self.keys.get_mut(&key).expect("sealed key").tainted = true;
                 return Err(SealFailure {
                     gap: JournalGap::ModelRefused,
@@ -3667,7 +3707,7 @@ impl JournalAdapter {
                     h3_voided: None,
                 });
             };
-            let entry = *self.open.get(&native).expect("staged begin");
+            let ticket = JournalTicket(admission);
             let origin = origin_of(domain, entry.begin_ordinal, ticket, &entry.begin);
             let function = entry.function;
             let call_key = CallKey::sealed(ticket);
@@ -3675,7 +3715,8 @@ impl JournalAdapter {
             effects.effects.extend(begin_effects.effects);
             match admitted {
                 Ok(token) => {
-                    let fingerprint = fingerprint_of_begin(&entry.begin);
+                    let popped = self.consume_claim(&fingerprint, key);
+                    debug_assert_eq!(popped, Some(admission));
                     let (session, mechanism) = sealed_fingerprint(&entry.begin);
                     let entry = self.open.get_mut(&native).expect("staged begin");
                     entry.converted_ticket = Some(token);
@@ -3691,7 +3732,6 @@ impl JournalAdapter {
                         session,
                         mechanism,
                     });
-                    self.consume_claim(&fingerprint, key);
                 }
                 Err(_) => {
                     self.keys.get_mut(&key).expect("sealed key").tainted = true;

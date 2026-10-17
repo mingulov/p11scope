@@ -1213,3 +1213,220 @@ fn class_emissions_reset_the_count_cadence_and_buckets_stay_immediate() {
         .collect();
     assert_eq!(counts, [4, 5, 6, 8]);
 }
+
+/// N11: a populated key section with retention too small for the
+/// final sweep + terminal record (30 rows ≈ 15 KiB against 4 KiB x
+/// 2 files) discloses exactly which key rows lost their last
+/// record — `ended` carries the exact unretained count, never
+/// silent loss.
+#[test]
+fn final_sweep_under_tiny_retention_discloses_unretained_key_rows() {
+    use crate::key_operation_projection::{KeyAggRow, ObjectObservations, ObsBudgets, ObsStatus};
+
+    const ROWS: u64 = 30;
+    let rows: Vec<KeyAggRow> = (0..ROWS)
+        .map(|n| KeyAggRow {
+            instance: "i3".to_string(),
+            object: 1000 + n,
+            category: "sign",
+            role: "key",
+            metadata_at_use: "rsa_2048",
+            unit: "operations",
+            started: 1,
+            completed: 1,
+            failed: 0,
+            cancelled: 0,
+            unknown: 0,
+            active: 0,
+            key_join_lost: 0,
+        })
+        .collect();
+    let observations = ObjectObservations {
+        revision: 1,
+        status: ObsStatus::Populated,
+        reason: "none",
+        sessions: Vec::new(),
+        objects: Vec::new(),
+        key_operations: rows,
+        unknown_key_operations: Vec::new(),
+        gaps: Vec::new(),
+        gaps_suppressed: 0,
+        budgets: ObsBudgets {
+            key_limit: 64,
+            key_occupied: ROWS as usize,
+            key_refused: 0,
+            object_limit: 65_536,
+            object_occupied: 0,
+            object_refused: 0,
+            unknown_occupied: 0,
+            encoded_bytes: 0,
+        },
+    };
+    let harness = harness(0, 0);
+    let mut last = presentation(&harness);
+    last.object_observations = observations;
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let writer = EventWriter::create(&path, 4096, 2).unwrap();
+    let mut state = StreamState::new();
+    let mut text = Vec::new();
+    let outcome = finish_output(
+        None,
+        &mut EventLogState::new(Some(writer)),
+        &mut state,
+        &last,
+        false,
+        false,
+        &mut crate::inventory_output::WriterStdout(&mut text),
+        None,
+        None,
+    );
+    assert_eq!(outcome.exit_code(), 0);
+    assert_eq!(outcome.event_log_confirmed, Some(true));
+    let mut retained = std::collections::BTreeSet::new();
+    let mut ended = None;
+    for line in retained_lines(&path) {
+        if line["kind"] == "key_operations_observed" {
+            let row = &line["event"]["row"];
+            retained.insert((
+                row["instance"].as_str().unwrap().to_string(),
+                row["object"].as_u64().unwrap(),
+            ));
+        }
+        if line["kind"] == "ended" {
+            ended = Some(line["event"].clone());
+        }
+    }
+    let ended = ended.expect("the terminal record is retained");
+    assert_eq!(
+        ended["key_operation_events"], ROWS,
+        "every row written by the sweep"
+    );
+    let unretained = ended["key_operations_unretained"]
+        .as_u64()
+        .expect("the exact key disclosure");
+    assert!(unretained > 0, "tiny retention cannot keep the sweep");
+    assert_eq!(
+        unretained as usize,
+        ROWS as usize - retained.len(),
+        "the disclosure is exact"
+    );
+}
+
+/// N11 (repair): under retention pressure some swept key rows lose
+/// their last record and the counter names them exactly; when one
+/// contiguous copy fits, the repair dump rewrites every row and
+/// nothing stays unretained.
+#[test]
+fn key_rows_lost_to_pressure_are_repaired_by_the_dump_when_it_fits() {
+    use crate::inventory_events::KeyOperationEmitter;
+    use crate::key_operation_projection::{KeyAggRow, ObjectObservations, ObsBudgets, ObsStatus};
+
+    fn observations(bump_through: u64) -> ObjectObservations {
+        ObjectObservations {
+            revision: 1,
+            status: ObsStatus::Populated,
+            reason: "none",
+            sessions: Vec::new(),
+            objects: Vec::new(),
+            key_operations: (0..20u64)
+                .map(|n| KeyAggRow {
+                    instance: "i3".to_string(),
+                    object: 1000 + n,
+                    category: "sign",
+                    role: "key",
+                    metadata_at_use: "rsa_2048",
+                    unit: "operations",
+                    started: 1,
+                    completed: if n < bump_through { 2 } else { 1 },
+                    failed: 0,
+                    cancelled: 0,
+                    unknown: 0,
+                    active: 0,
+                    key_join_lost: 0,
+                })
+                .collect(),
+            unknown_key_operations: Vec::new(),
+            gaps: Vec::new(),
+            gaps_suppressed: 0,
+            budgets: ObsBudgets {
+                key_limit: 64,
+                key_occupied: 20,
+                key_refused: 0,
+                object_limit: 65_536,
+                object_occupied: 0,
+                object_refused: 0,
+                unknown_occupied: 0,
+                encoded_bytes: 0,
+            },
+        }
+    }
+
+    fn retained_completed(path: &std::path::Path) -> std::collections::BTreeMap<u64, u64> {
+        let mut completed = std::collections::BTreeMap::new();
+        for line in retained_lines(path) {
+            if line["kind"] == "key_operations_observed" {
+                let row = &line["event"]["row"];
+                completed.insert(
+                    row["object"].as_u64().unwrap(),
+                    row["completed"].as_u64().unwrap(),
+                );
+            }
+        }
+        completed
+    }
+
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 8 * 1024, 4).unwrap();
+    let mut emitter = KeyOperationEmitter::new();
+    emitter.emit(&mut writer, &observations(0), 1).unwrap();
+    assert_eq!(emitter.tracked(), 20);
+    // Most rows change; the sweep rewrites them while the rest keep
+    // their older records.
+    let swept_state = observations(16);
+    let swept = emitter.sweep_exact(&mut writer, &swept_state, 2).unwrap();
+    assert_eq!(swept, 16, "only changed rows rewritten");
+    // Pressure until rows actually lose their last record (measured,
+    // not sized by arithmetic).
+    let pad = serde_json::json!({"pad": "x".repeat(64)});
+    for _ in 0..10_000 {
+        if emitter.unretained_after(&writer, &swept_state, 0) > 0 {
+            break;
+        }
+        writer.append("probe", pad.clone(), 2).unwrap();
+    }
+    let missing = 20 - retained_completed(&path).len();
+    assert!(missing > 0, "pressure evicted rows before the assertion");
+    assert_eq!(
+        emitter.unretained_after(&writer, &swept_state, 0),
+        missing,
+        "the counter names exactly the rows without a record"
+    );
+    let tail = 512u64;
+    writer.reserve(tail).unwrap();
+    assert!(
+        crate::inventory_events::combined_dump_fits(
+            &crate::inventory_events::EdgeEmitter::new(),
+            &crate::inventory_events::InstanceEmitter::new(),
+            &emitter,
+            &writer,
+            tail,
+        ),
+        "one contiguous copy fits"
+    );
+    let dumped = emitter.dump_all(&mut writer, &swept_state, 2).unwrap();
+    assert_eq!(dumped, 20);
+    assert_eq!(
+        emitter.unretained_after(&writer, &swept_state, tail),
+        0,
+        "the repair keeps every row past the tail"
+    );
+    drop(writer);
+    let completed = retained_completed(&path);
+    assert_eq!(completed.len(), 20);
+    for (object, count) in &completed {
+        let expected = if object - 1000 < 16 { 2 } else { 1 };
+        assert_eq!(*count, expected, "retained rows equal the swept state");
+    }
+}

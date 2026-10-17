@@ -590,6 +590,10 @@ pub(crate) struct KeyUseEvidence {
     /// Active associations ended by retirement before their S1
     /// terminal (`key_join_lost` applications).
     pub join_lost: u64,
+    /// Exact duplicate starts refused without touching the retained
+    /// custody (same instance and operation identity delivered
+    /// twice): counted, never an overwrite.
+    pub duplicate_starts: u64,
 }
 
 /// One open (started, unterminated) key association. Open rows are
@@ -620,9 +624,14 @@ pub(crate) struct RefusedOpen {
 /// increments move an entry from open to its reserved row and
 /// allocate no new slot. Completed history is immutable and never
 /// evicted; refused associations land in fixed counters.
+///
+/// Joins namespace the reducer-local [`OperationId`] by exact
+/// instance (H9: the operation identity is the instance/era plus the
+/// local ordinal): equal ordinals on sibling instances are disjoint
+/// custody, never one entry.
 pub(crate) struct KeyUseReducer {
-    open: BTreeMap<OperationId, OpenKeyUse>,
-    refused: BTreeMap<OperationId, RefusedOpen>,
+    open: BTreeMap<(RegistryInstanceId, OperationId), OpenKeyUse>,
+    refused: BTreeMap<(RegistryInstanceId, OperationId), RefusedOpen>,
     rows: VecDeque<KeyOpRow>,
     capacity: usize,
     next_seq: u64,
@@ -662,11 +671,13 @@ impl KeyUseReducer {
         &self.rows
     }
 
-    pub(crate) fn open(&self) -> &BTreeMap<OperationId, OpenKeyUse> {
+    pub(crate) fn open(&self) -> &BTreeMap<(RegistryInstanceId, OperationId), OpenKeyUse> {
         &self.open
     }
 
-    pub(crate) fn refused_opens(&self) -> &BTreeMap<OperationId, RefusedOpen> {
+    pub(crate) fn refused_opens(
+        &self,
+    ) -> &BTreeMap<(RegistryInstanceId, OperationId), RefusedOpen> {
         &self.refused
     }
 
@@ -695,35 +706,21 @@ impl KeyUseReducer {
                 key_receipt,
                 origin,
             } => {
-                if self.open.contains_key(id) {
-                    // Same-id restarts overwrite the open entry (no
-                    // new slot); same-id refused stays refused (the
-                    // totals never shrink, so no slot freed).
-                    self.open.insert(
-                        *id,
-                        OpenKeyUse {
-                            instance,
-                            keys: Self::bound_receipts(
-                                category,
-                                key_receipt.iter().copied(),
-                                &mut self.evidence,
-                            ),
-                            category,
-                            mechanism: *mechanism,
-                            started_ts_ns: origin.ts_ns,
-                        },
-                    );
-                    return;
-                }
-                if self.refused.contains_key(id) {
+                let key = (instance, *id);
+                if self.open.contains_key(&key) || self.refused.contains_key(&key) {
+                    // Exact duplicate delivery: the retained custody
+                    // stands untouched — a duplicate never overwrites,
+                    // and totals never shrink, so no slot is freed.
+                    self.evidence.duplicate_starts =
+                        self.evidence.duplicate_starts.saturating_add(1);
                     return;
                 }
                 if self.rows.len().saturating_add(self.open.len()) >= self.capacity {
-                    self.refuse(*id, instance, category, origin.ts_ns);
+                    self.refuse(key, instance, category, origin.ts_ns);
                     return;
                 }
                 self.open.insert(
-                    *id,
+                    key,
                     OpenKeyUse {
                         instance,
                         keys: Self::bound_receipts(
@@ -743,7 +740,8 @@ impl KeyUseReducer {
                 outcome,
                 origin,
             } => {
-                if let Some(open) = self.open.remove(id) {
+                let key = (instance, *id);
+                if let Some(open) = self.open.remove(&key) {
                     self.push_row(KeyOpRow {
                         seq: 0,
                         instance: open.instance,
@@ -757,7 +755,7 @@ impl KeyUseReducer {
                     });
                     return;
                 }
-                if self.refused.remove(id).is_some() {
+                if self.refused.remove(&key).is_some() {
                     // A refused start's terminal: S1 owns the
                     // outcome; the key side counts it without a row.
                     self.evidence.refused_terminals =
@@ -821,13 +819,13 @@ impl KeyUseReducer {
     /// Count one refused start: no slot, S1 untouched, PARTIAL cover.
     fn refuse(
         &mut self,
-        id: OperationId,
+        key: (RegistryInstanceId, OperationId),
         instance: RegistryInstanceId,
         category: &'static str,
         started_ts_ns: u64,
     ) {
         self.refused.insert(
-            id,
+            key,
             RefusedOpen {
                 instance,
                 category,

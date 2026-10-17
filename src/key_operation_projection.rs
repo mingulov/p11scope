@@ -380,6 +380,13 @@ pub(crate) struct ObjectRow {
     pub accessing_sessions: u64,
 }
 
+/// The one secondary association role (H9 §82): [`KeyAggRow`]s
+/// carrying it stand beside the primary's row, never
+/// double-counted in operation tallies. Must stay an element of
+/// the frozen role vocabulary (asserted against `contract` in
+/// tests).
+pub(crate) const SECONDARY_ROLE: &str = "wrapped_object";
+
 /// One proved-key aggregate row: associations for one
 /// (instance, object, category, role, metadata_at_use) key. Role
 /// rows count associations; the equation

@@ -255,6 +255,51 @@ impl fmt::Debug for CallToken {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ObjectId(u64);
 
+impl ObjectId {
+    /// H9 volume-test key identity only (retention bounds): never
+    /// authority, never a seal input, never a join key.
+    #[cfg(test)]
+    pub(crate) fn for_test(id: u64) -> Self {
+        Self(id)
+    }
+}
+
+/// H9 metadata-at-use: per-field presence bitmaps, structurally
+/// value-free. Bit `i` is field `i` in [`SafeAttributeKind`] order;
+/// only discriminants are ever read — values never cross to H9.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct KeyMetadataFlags {
+    /// Requested via template or query (whether or not a value
+    /// arrived).
+    pub requested: u8,
+    /// A retained value exists (current, conflict or invalidation
+    /// history — never the value itself).
+    pub established: u8,
+}
+
+impl KeyMetadataFlags {
+    pub(crate) const ZERO: Self = Self {
+        requested: 0,
+        established: 0,
+    };
+
+    pub(crate) fn requested_count(self) -> u32 {
+        self.requested.count_ones()
+    }
+
+    pub(crate) fn established_count(self) -> u32 {
+        self.established.count_ones()
+    }
+
+    pub(crate) fn is_requested(self, field: usize) -> bool {
+        field < METADATA_FIELDS && self.requested & (1 << field) != 0
+    }
+
+    pub(crate) fn is_established(self, field: usize) -> bool {
+        field < METADATA_FIELDS && self.established & (1 << field) != 0
+    }
+}
+
 impl fmt::Debug for ObjectId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "object#{}", self.0)
@@ -1081,6 +1126,12 @@ impl ObjectSemantics {
 
     pub(crate) fn project(&self) -> ObjectProjection {
         self.state.project()
+    }
+
+    /// H9 metadata-at-use snapshot: presence bitmaps only. Values
+    /// never cross to H9 (only discriminants are matched).
+    pub(crate) fn key_metadata_flags(&self, key: ObjectId) -> Option<KeyMetadataFlags> {
+        self.state.key_metadata_flags(key)
     }
 
     pub(crate) fn state_estimate(&self) -> StateEstimate {

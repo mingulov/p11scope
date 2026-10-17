@@ -44,7 +44,10 @@ const _: () = {
     assert!(std::mem::align_of::<super::PendingCall>() == 8);
     assert!(std::mem::align_of::<super::AsyncId>() == 8);
     assert!(std::mem::size_of::<super::SemanticCall>() == 96);
-    assert!(std::mem::size_of::<super::OpMachine>() == 32);
+    // H9 stores the machine's fixed key receipt (56 = 32 + 24 for
+    // niche-filled `Option<KeyReceipt>`); the machine charge below
+    // still dominates the node plus entry.
+    assert!(std::mem::size_of::<super::OpMachine>() == 56);
     assert!(std::mem::size_of::<super::EdgeMechStat>() == 104);
     // Final lease-bearing layouts, rather than the earlier probe types.
     assert!(std::mem::size_of::<super::PendingCall>() == 144);

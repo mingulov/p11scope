@@ -258,7 +258,6 @@ pub(crate) struct ObjectId(u64);
 impl ObjectId {
     /// The capture-local public id for output rows. Read-only: H9
     /// never mints ids from integers (staged with the producer).
-    #[cfg(test)]
     pub(crate) const fn as_u64(self) -> u64 {
         self.0
     }
@@ -325,7 +324,6 @@ pub(crate) struct SessionIncarnation(u64);
 impl SessionIncarnation {
     /// The capture-local public id for output rows. Read-only: H9
     /// never mints ids from integers (staged with the producer).
-    #[cfg(test)]
     pub(crate) const fn as_u64(self) -> u64 {
         self.0
     }

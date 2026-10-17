@@ -528,7 +528,7 @@ use crate::semantics_objects::journal::{
     BirthKind, BootstrapReceipt, FaultEpoch, FaultReadError, H3DispositionEvidence, JournalAdapter,
     JournalAuditReceipt, JournalDisposition, JournalDomainProof, JournalGap, JournalIngestItem,
     JournalLimits, ScriptedBirthSource, ScriptedH3Source, SealFailure, SealSuccess,
-    SessionBirthEvidence, SessionClosureGrant,
+    SessionBirthEvidence, SessionClosureGrant, StagingLedger,
 };
 use p11scope_ebpf_common::object_journal::{
     JOURNAL_REASON_SYNC_RETURN_RESULT_LOST, decode_journal_record,
@@ -552,10 +552,13 @@ impl FaultEpoch for SteadyFaultCell {
 }
 
 /// One Joint scene: real H3 admissions, real H8 attest/ingest/seal,
-/// H9 staging plus the one reducer, and an S1Only direct twin.
+/// H9 staging plus the one reducer, and an S1Only direct twin. The
+/// shared staging ledger sits H8-side (next to the adapter/model),
+/// borrowed by every staging call.
 struct JointScene {
     adapter: JournalAdapter,
     model: ObjectSemantics,
+    ledger: StagingLedger,
     descriptors: [ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
     fixture: AttestationFixture,
     proof: JournalDomainProof,
@@ -579,6 +582,7 @@ impl JointScene {
         Self {
             adapter,
             model: ObjectSemantics::new(),
+            ledger: StagingLedger::new(),
             descriptors,
             fixture,
             proof,
@@ -734,7 +738,7 @@ fn attest_and_stage(
     let origin = EffectOrigin::from(&facts);
     let position = admitted.h0_ordinal();
     staging
-        .stage(facts.clone(), origin, position)
+        .stage(facts.clone(), origin, position, &mut scene.ledger)
         .expect("call stages");
     (facts, position)
 }
@@ -890,6 +894,7 @@ fn key_operation_single_feed_exactly_once() {
         let (outcome, refused) = staging.apply_seal(
             &success,
             &scene.model,
+            &mut scene.ledger,
             &mut joint,
             &mut keyuse,
             instance,
@@ -927,7 +932,7 @@ fn key_operation_single_feed_exactly_once() {
     };
     let origin = EffectOrigin::from(&facts);
     assert_eq!(
-        s1only.stage(facts.clone(), origin.clone(), 1),
+        s1only.stage(facts.clone(), origin.clone(), 1, &mut scene.ledger),
         Err(StagingRefusal::NotJoint)
     );
     // A receipt arriving after S1Only selection changes nothing: no
@@ -935,7 +940,7 @@ fn key_operation_single_feed_exactly_once() {
     let _late_receipt = scene.bootstrap();
     assert_eq!(s1only.mode(), FeedMode::S1Only);
     assert_eq!(
-        s1only.stage(facts, origin, 2),
+        s1only.stage(facts, origin, 2, &mut scene.ledger),
         Err(StagingRefusal::NotJoint)
     );
 
@@ -955,6 +960,7 @@ fn key_operation_single_feed_exactly_once() {
     let (outcome, refused) = staging2.apply_seal(
         &success,
         &scene2.model,
+        &mut scene2.ledger,
         &mut edge2,
         &mut keyuse,
         instance,
@@ -965,7 +971,7 @@ fn key_operation_single_feed_exactly_once() {
     // Restaging the same H0 position after reduction refuses.
     let origin = EffectOrigin::from(&facts);
     assert_eq!(
-        staging2.stage(facts.clone(), origin.clone(), 1),
+        staging2.stage(facts.clone(), origin.clone(), 1, &mut scene.ledger),
         Err(StagingRefusal::ReplayRefused)
     );
     // Staging at or below the consumed frontier refuses even with
@@ -973,7 +979,7 @@ fn key_operation_single_feed_exactly_once() {
     let mut older = facts.clone();
     older.ts_ns += 1;
     assert_eq!(
-        staging2.stage(older, origin, 1),
+        staging2.stage(older, origin, 1, &mut scene.ledger),
         Err(StagingRefusal::ReplayRefused)
     );
 }
@@ -1047,6 +1053,7 @@ fn key_operation_fallback_and_history_loss() {
         &failure,
         &mut pending_source,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1064,6 +1071,7 @@ fn key_operation_fallback_and_history_loss() {
         &failure,
         &mut clean_source,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1090,7 +1098,7 @@ fn key_operation_fallback_and_history_loss() {
     };
     let origin = EffectOrigin::from(&fresh);
     assert_eq!(
-        staging.stage(fresh, origin, 99),
+        staging.stage(fresh, origin, 99, &mut scene.ledger),
         Err(StagingRefusal::NotJoint)
     );
 
@@ -1112,6 +1120,7 @@ fn key_operation_fallback_and_history_loss() {
     let (outcome, refused) = staging.apply_seal(
         &success,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1137,6 +1146,7 @@ fn key_operation_fallback_and_history_loss() {
         &failure,
         &mut h3,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1178,7 +1188,7 @@ fn key_operation_joint_staging_bounds() {
     use crate::semantics_key_use::JOINT_STAGING_CAPACITY;
 
     // --- N/N+1: 1,024 stage, the 1,025th backpressures. ---
-    let scene = JointScene::new();
+    let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
     for position in 1..=JOINT_STAGING_CAPACITY as u64 {
@@ -1188,7 +1198,9 @@ fn key_operation_joint_staging_bounds() {
             ..SemanticCall::default()
         };
         let origin = EffectOrigin::from(&facts);
-        staging.stage(facts, origin, position).expect("N stages");
+        staging
+            .stage(facts, origin, position, &mut scene.ledger)
+            .expect("N stages");
     }
     assert_eq!(staging.staged_len(), JOINT_STAGING_CAPACITY);
     let facts = SemanticCall {
@@ -1197,7 +1209,12 @@ fn key_operation_joint_staging_bounds() {
     };
     let origin = EffectOrigin::from(&facts);
     assert_eq!(
-        staging.stage(facts, origin, JOINT_STAGING_CAPACITY as u64 + 1),
+        staging.stage(
+            facts,
+            origin,
+            JOINT_STAGING_CAPACITY as u64 + 1,
+            &mut scene.ledger
+        ),
         Err(StagingRefusal::Full)
     );
     assert_eq!(staging.staged_len(), JOINT_STAGING_CAPACITY);
@@ -1234,6 +1251,7 @@ fn key_operation_joint_staging_bounds() {
     let (outcome, refused) = staging.apply_seal(
         &success,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1253,6 +1271,7 @@ fn key_operation_joint_staging_bounds() {
     let (outcome, _) = staging.apply_seal(
         &success,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1277,6 +1296,7 @@ fn key_operation_joint_staging_bounds() {
     let (outcome, refused) = staging.apply_seal(
         &success,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1309,6 +1329,7 @@ fn key_operation_joint_staging_bounds() {
     let (outcome, _) = staging.apply_seal(
         &success,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1370,6 +1391,7 @@ fn key_operation_joint_retry_and_degraded_inert() {
         &failure,
         &mut h3,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1433,6 +1455,7 @@ fn key_operation_joint_retry_and_degraded_inert() {
         &failure,
         &mut loss_source,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1450,6 +1473,7 @@ fn key_operation_joint_retry_and_degraded_inert() {
         &failure,
         &mut loss_source,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1472,6 +1496,7 @@ fn key_operation_joint_retry_and_degraded_inert() {
     let (outcome, refused) = staging.apply_seal(
         &stray,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1535,6 +1560,7 @@ fn key_operation_abandoned_quantum_replays_s1() {
     let (outcome, refused) = staging.apply_seal(
         &success,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1620,6 +1646,7 @@ fn key_operation_fallback_invalidates_before_replay() {
         &failure,
         &mut clean,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1838,6 +1865,7 @@ fn key_operation_seal_binds_exact_call_once() {
     let (outcome, _) = staging.apply_seal(
         &seal,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1849,6 +1877,7 @@ fn key_operation_seal_binds_exact_call_once() {
     let (outcome, _) = staging.apply_seal(
         &seal,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1892,6 +1921,7 @@ fn key_operation_seal_binds_exact_call_once() {
     let (outcome, _) = staging.apply_seal(
         &seal,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1932,6 +1962,7 @@ fn key_operation_seal_binds_exact_call_once() {
     let (outcome, _) = staging.apply_seal(
         &seal,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -1975,6 +2006,7 @@ fn key_operation_seal_binds_exact_call_once() {
     let (outcome, _) = staging.apply_seal(
         &seal,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -2037,6 +2069,7 @@ fn key_operation_s1_matrix_through_both_feeds() {
         let (outcome, refused) = staging.apply_seal(
             &success,
             &scene.model,
+            &mut scene.ledger,
             &mut joint,
             &mut keyuse,
             instance,
@@ -2088,6 +2121,7 @@ fn key_operation_s1_matrix_through_both_feeds() {
         let (outcome, _) = staging.apply_seal(
             &success,
             &scene.model,
+            &mut scene.ledger,
             &mut joint,
             &mut keyuse,
             instance,
@@ -2138,6 +2172,7 @@ fn key_operation_s1_matrix_through_both_feeds() {
         &failure,
         &mut clean,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -2177,8 +2212,15 @@ fn drive_quantum(
     let (facts, position) = prepare_call(scene, staging, call);
     let success = scene.seal().expect("quantum seals");
     assert_eq!(success.prefix.settled().len(), 1, "{}", call.name);
-    let (outcome, refused) =
-        staging.apply_seal(&success, &scene.model, reducer, keyuse, instance, sink);
+    let (outcome, refused) = staging.apply_seal(
+        &success,
+        &scene.model,
+        &mut scene.ledger,
+        reducer,
+        keyuse,
+        instance,
+        sink,
+    );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne, "{}", call.name);
     assert_eq!(refused, 0);
     (facts, position)
@@ -2212,6 +2254,7 @@ fn key_operation_joint_async_pending_then_direct_completion() {
     let (outcome, _) = staging.apply_seal(
         &success,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -2242,7 +2285,7 @@ fn key_operation_joint_async_pending_then_direct_completion() {
     complete.rv = CkRv::OK.0;
     let origin = EffectOrigin::from(&complete);
     assert_eq!(
-        staging.stage(complete.clone(), origin.clone(), 999),
+        staging.stage(complete.clone(), origin.clone(), 999, &mut scene.ledger),
         Err(StagingRefusal::Unsealable)
     );
     let effects_before = joint_sink.len();
@@ -2267,6 +2310,7 @@ fn key_operation_joint_async_pending_then_direct_completion() {
     let (outcome, _) = staging.apply_seal(
         &success,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -2583,6 +2627,7 @@ fn key_operation_partial_wrap_preserves_input_position() {
     let (outcome, _) = staging.apply_seal(
         &seal,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -2688,6 +2733,7 @@ fn key_operation_unknown_key_and_requested_only() {
     let (outcome, _) = staging.apply_seal(
         &success,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -2837,6 +2883,7 @@ fn key_operation_delayed_receipt_does_not_backfill_metadata() {
     let (outcome, _) = staging.apply_seal(
         &earlier,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -3078,6 +3125,7 @@ fn key_operation_wrap_reserves_two_aggregate_rows() {
     let (outcome, _) = staging.apply_seal(
         &seal,
         &scene.model,
+        &mut scene.ledger,
         &mut joint,
         &mut keyuse,
         instance,
@@ -5193,6 +5241,7 @@ fn key_operation_schema_contract() {
         &failure,
         &mut h3,
         &fall_scene.model,
+        &mut fall_scene.ledger,
         &mut fall_edge,
         &mut fall_keyuse,
         instance,
@@ -5240,6 +5289,7 @@ fn key_operation_schema_contract() {
         &loss_failure,
         &mut loss_h3,
         &loss_scene.model,
+        &mut loss_scene.ledger,
         &mut loss_edge,
         &mut loss_keyuse,
         instance,
@@ -5553,7 +5603,7 @@ fn key_operation_pqc_matrix_negative() {
     // frozen endpoint table leaves KEM negative-only (KEM is not
     // even fixture-admittable), and the feed refuses KEM-shaped
     // facts loudly instead of joining thin air.
-    let scene = JointScene::new();
+    let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
     for (n, name) in ["C_EncapsulateKey", "C_DecapsulateKey"]
@@ -5569,7 +5619,7 @@ fn key_operation_pqc_matrix_negative() {
         let facts = op(name, 9, 700_000 + n as u64);
         let origin = EffectOrigin::from(&facts);
         assert_eq!(
-            staging.stage(facts, origin, 100 + n as u64),
+            staging.stage(facts, origin, 100 + n as u64, &mut scene.ledger),
             Err(StagingRefusal::Unsealable),
             "{name} is explicitly unstageable"
         );
@@ -6406,4 +6456,414 @@ fn key_operation_allocation_pressure_is_bounded_across_passes() {
         (0, 0),
         "steady-state emission retains nothing"
     );
+}
+
+// ==================== N1: guarded Joint delivery ====================
+
+use crate::attach::capture::NativeDomainId;
+use crate::discovery::caller_registry::instance_input::{
+    AdmittedInstance, AdmittedInstanceCall, InstanceKey, RegistryInstanceId,
+};
+use crate::discovery::caller_registry::{CallerId, CallerRegistry, ModuleKey};
+use crate::discovery::instances::InstanceId;
+
+/// One guarded-path scene: a real H8 joint scene plus a standalone
+/// registry with one scripted module edge. Registrations take ids
+/// 0, 1, ... in order.
+struct GuardedScene {
+    scene: JointScene,
+    registry: CallerRegistry,
+    domain: NativeDomainId,
+    caller: CallerId,
+    module: ModuleKey,
+    next_id: u32,
+}
+
+impl GuardedScene {
+    fn new() -> Self {
+        let scene = JointScene::new();
+        let mut registry =
+            CallerRegistry::new(RegistryLimits::new(8, 8, 8, 8, 8, 8).expect("generous limits"));
+        let domain = NativeDomainId::try_mint().expect("fresh domain");
+        let caller = CallerId(7);
+        let module = ModuleKey::Physical {
+            dev_major: 1,
+            dev_minor: 2,
+            ino: 3,
+            sha256: None,
+        };
+        registry.scripted_module_edge(module.clone(), caller);
+        Self {
+            scene,
+            registry,
+            domain,
+            caller,
+            module,
+            next_id: 0,
+        }
+    }
+
+    fn key(&self, router: u64) -> InstanceKey {
+        InstanceKey::scripted(
+            self.domain,
+            ImageIdentity {
+                task_cookie: 100 + router,
+                exec_id: 1,
+            },
+            InstanceId::from_raw(router),
+            self.module.clone(),
+        )
+    }
+
+    fn register(&mut self, router: u64) -> (InstanceKey, RegistryInstanceId) {
+        let key = self.key(router);
+        let id = RegistryInstanceId::from_raw(self.next_id);
+        self.next_id += 1;
+        self.registry
+            .note_instance(AdmittedInstance::scripted(key.clone(), self.caller));
+        self.registry.publish();
+        assert!(
+            self.registry.feed_mode_for_test(id).is_some(),
+            "registration retains the instance"
+        );
+        (key, id)
+    }
+
+    fn observe(&mut self, key: &InstanceKey, ordinal: u64, facts: SemanticCall) {
+        self.registry
+            .observe_instance_semantic(AdmittedInstanceCall::scripted(
+                key.clone(),
+                self.caller,
+                ordinal,
+                facts,
+            ));
+    }
+
+    /// Attest one shaped call and return registry-ready facts
+    /// (admission flags set — they never participate in the C2
+    /// fingerprint) and its H0 position.
+    fn admit_shape(&mut self, call: &ShapedS1) -> (SemanticCall, u64) {
+        let admitted = self.scene.fixture.admit_shaped(
+            call.session.unwrap_or(SESSION),
+            call.name,
+            call.rv,
+            call.mechanism,
+            call.capture,
+            call.flags,
+        );
+        self.scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("call attests");
+        let mut facts = admitted.s1_facts().clone();
+        facts.authorized = true;
+        facts.unambiguous = true;
+        facts.attributable = true;
+        facts.count_only = false;
+        let position = admitted.h0_ordinal();
+        (facts, position)
+    }
+
+    fn edge_calls(&self, id: RegistryInstanceId) -> u64 {
+        self.registry
+            .instance_semantic_edges()
+            .find(|record| record.id == id)
+            .expect("edge retained")
+            .semantics
+            .as_ref()
+            .expect("materialized")
+            .calls()
+    }
+
+    fn edge_started(&self, id: RegistryInstanceId) -> u64 {
+        self.registry
+            .instance_semantic_edges()
+            .find(|record| record.id == id)
+            .expect("edge retained")
+            .semantics
+            .as_ref()
+            .expect("materialized")
+            .started()
+    }
+}
+
+/// N1: an installed receipt selects Joint exactly once; without one
+/// the feed stays S1Only (the production default).
+#[test]
+fn key_operation_joint_install_selects_joint_default_s1only() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap),
+        "install fits the instance bound"
+    );
+    let (_, joint_id) = guarded.register(1);
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::Joint),
+        "the installed receipt selects Joint"
+    );
+    assert_eq!(guarded.registry.joint_feeds(), 1);
+    let (_, s1_id) = guarded.register(2);
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(s1_id),
+        Some(FeedMode::S1Only),
+        "no receipt, no Joint: the default stays S1Only"
+    );
+    assert_eq!(guarded.registry.joint_feeds(), 1);
+}
+
+/// N1: Joint staging charges the shared H8 ledger (tickets and
+/// bytes); S1Only siblings never stage; Joint calls without a
+/// ledger (or past a frozen byte pool) reduce S1-direct and count
+/// the fallback — S1 is always preserved.
+#[test]
+fn key_operation_joint_staging_charges_shared_ledger() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(joint_key.clone(), bootstrap);
+    let (_, joint_id) = guarded.register(1);
+
+    let shape = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let (facts, position) = guarded.admit_shape(&shape);
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    assert_eq!(guarded.scene.ledger.staged(), 1, "one ticket charged");
+    assert!(
+        guarded.scene.ledger.charged_bytes() > 0,
+        "duplicate bytes charged"
+    );
+    assert_eq!(guarded.registry.joint_direct_fallback(), 0);
+    assert_eq!(
+        guarded.edge_calls(joint_id),
+        0,
+        "staged calls reduce only at the seal"
+    );
+
+    // An S1Only sibling reduces direct through the shared pass and
+    // never touches the ledger.
+    let (sibling_key, sibling_id) = guarded.register(2);
+    let shape = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let (facts, position) = guarded.admit_shape(&shape);
+    guarded.observe(&sibling_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    assert_eq!(guarded.scene.ledger.staged(), 1, "siblings never stage");
+    assert_eq!(guarded.edge_calls(sibling_id), 1, "S1 preserved direct");
+    assert_eq!(guarded.registry.joint_direct_fallback(), 0);
+
+    // No ledger, no staging: the Joint call reduces S1-direct and
+    // the fallback counts it.
+    let shape = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    let (facts, position) = guarded.admit_shape(&shape);
+    guarded.observe(&joint_key, position, facts);
+    guarded.registry.publish();
+    assert_eq!(guarded.scene.ledger.staged(), 1, "nothing new staged");
+    assert_eq!(guarded.registry.joint_direct_fallback(), 1);
+    assert_eq!(guarded.edge_calls(joint_id), 1, "S1 preserved direct");
+
+    // A frozen byte pool refuses staging the same way.
+    guarded.scene.ledger.set_byte_limit(0);
+    let shape = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    let (facts, position) = guarded.admit_shape(&shape);
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    assert_eq!(
+        guarded.scene.ledger.staged(),
+        1,
+        "refused staging holds nothing"
+    );
+    assert_eq!(guarded.registry.joint_direct_fallback(), 2);
+    assert_eq!(guarded.edge_calls(joint_id), 2, "S1 preserved direct");
+    guarded.scene.ledger.set_byte_limit(u64::MAX);
+}
+
+/// N1: seal delivery replays the staged head through the shared
+/// reducer, releases the ledger, and capture commits Populated from
+/// the retained projection.
+#[test]
+fn key_operation_joint_seal_delivery_replays_and_populates_capture() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(joint_key.clone(), bootstrap);
+    let (_, joint_id) = guarded.register(1);
+
+    // The create grounds the key and the getattr establishes its
+    // label (as every proved-key flow does); the sign then
+    // aggregates against it.
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    let flow = [
+        ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+        get,
+        ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+        ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    ];
+    let mut last_seal = None;
+    for shape in &flow {
+        let (facts, position) = guarded.admit_shape(shape);
+        guarded.observe(&joint_key, position, facts);
+        guarded
+            .registry
+            .publish_with_ledger(&mut guarded.scene.ledger);
+        ingest_call(&mut guarded.scene, shape);
+        let seal = guarded.scene.seal().expect("single-call quantum seals");
+        let outcome = guarded.registry.deliver_joint_seal(
+            joint_id,
+            &seal,
+            &guarded.scene.model,
+            &mut guarded.scene.ledger,
+        );
+        assert_eq!(
+            outcome,
+            SealApplyOutcome::ReplayedOne,
+            "{} replays once",
+            shape.name
+        );
+        last_seal = Some(seal);
+    }
+    assert_eq!(guarded.scene.ledger.staged(), 0, "replay releases tickets");
+    assert_eq!(guarded.registry.joint_direct_fallback(), 0);
+    assert_eq!(
+        guarded.edge_calls(joint_id),
+        4,
+        "each quantum reduced exactly once"
+    );
+    assert_eq!(guarded.edge_started(joint_id), 1);
+
+    let observations = guarded.registry.joint_observations(41);
+    assert_eq!(observations.revision, 41);
+    assert_eq!(observations.status, ObsStatus::Populated);
+    assert_eq!(observations.reason, "none");
+    assert_eq!(observations.key_operations.len(), 1);
+    let row = &observations.key_operations[0];
+    assert_eq!(
+        (row.category, row.role, row.metadata_at_use),
+        ("sign", "key", "rsa_2048"),
+        "the proved key joins its label"
+    );
+    assert_eq!(
+        (row.started, row.completed),
+        (1, 1),
+        "the sign operation aggregates once"
+    );
+
+    // Unknown instances hold without effect.
+    let last_seal = last_seal.expect("four quanta sealed");
+    assert_eq!(
+        guarded.registry.deliver_joint_seal(
+            RegistryInstanceId::from_raw(99),
+            &last_seal,
+            &guarded.scene.model,
+            &mut guarded.scene.ledger,
+        ),
+        SealApplyOutcome::Held,
+    );
+}
+
+/// N1: failure delivery disposes retained staging, degrades the feed
+/// to S1Only, releases the guard — and still retains the H8
+/// projection for capture.
+#[test]
+fn key_operation_joint_failure_delivery_retains_projection() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(joint_key.clone(), bootstrap);
+    let (_, joint_id) = guarded.register(1);
+
+    let shape = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let (facts, position) = guarded.admit_shape(&shape);
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(&mut guarded.scene.ledger);
+    ingest_call(&mut guarded.scene, &shape);
+    let failure = guarded
+        .scene
+        .seal_with_fault(7, 8)
+        .expect_err("moved fault voids the seal");
+    assert_eq!(failure.gap, JournalGap::FaultChanged);
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let outcome = guarded.registry.deliver_joint_failure(
+        joint_id,
+        &failure,
+        &mut h3,
+        &guarded.scene.model,
+        &mut guarded.scene.ledger,
+    );
+    assert_eq!(outcome, FailureApplyOutcome::Degraded { disposed: 1 });
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only),
+        "loss degrades the feed"
+    );
+    assert_eq!(guarded.registry.joint_feeds(), 0, "the guard releases");
+    assert_eq!(
+        guarded.scene.ledger.staged(),
+        0,
+        "disposal releases tickets"
+    );
+
+    // Capture still commits from the retained projection: the
+    // section names the loss, never bootstrap silence.
+    let observations = guarded.registry.joint_observations(42);
+    assert_eq!(observations.revision, 42);
+    assert_eq!(observations.status, ObsStatus::Unavailable);
+    assert_eq!(observations.reason, "authority_lost");
+
+    // Unknown instances ignore without effect.
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    assert_eq!(
+        guarded.registry.deliver_joint_failure(
+            RegistryInstanceId::from_raw(99),
+            &failure,
+            &mut h3,
+            &guarded.scene.model,
+            &mut guarded.scene.ledger,
+        ),
+        FailureApplyOutcome::Ignored,
+    );
+}
+
+/// N1 guard: with no install anywhere the registry reduces S1Only
+/// and capture stays unavailable exactly as before — the N1 path
+/// cuts no production scope.
+#[test]
+fn key_operation_s1only_capture_stays_unavailable() {
+    let mut guarded = GuardedScene::new();
+    let (key, id) = guarded.register(1);
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(id),
+        Some(FeedMode::S1Only)
+    );
+    let shape = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let (facts, position) = guarded.admit_shape(&shape);
+    guarded.observe(&key, position, facts);
+    guarded.registry.publish();
+    assert_eq!(guarded.edge_calls(id), 1, "plain S1Only reduction");
+    assert_eq!(guarded.registry.joint_feeds(), 0);
+    let observations = guarded.registry.joint_observations(7);
+    assert_eq!(observations.revision, 7);
+    assert_eq!(observations.status, ObsStatus::Unavailable);
+    assert_eq!(observations.reason, "bootstrap_unavailable");
+    assert!(observations.key_operations.is_empty());
 }

@@ -280,6 +280,89 @@ impl JournalLimits {
     }
 }
 
+/// Unsettled payloads across the whole capture (H9 §89): at most
+/// 1,024 open H8 calls, staged H9 payloads and prospective key
+/// associations share one logical ticket space. The H9 staging
+/// bound mirrors this ceiling; the [`StagingLedger`] enforces it
+/// across all feeds.
+pub(crate) const MAX_UNSETTLED_STAGED: usize = 1_024;
+
+/// The shared H8 ticket/charge owner for staged H9 payloads (N1):
+/// one logical ticket per unsettled H0 ordinal, with every physical
+/// duplicate byte charged. Owned H8-side (next to the adapter and
+/// model); each staging call borrows it. The byte limit stays
+/// `None` (admit all) until a reviewed pool freezes one.
+#[derive(Debug, Default)]
+pub(crate) struct StagingLedger {
+    tickets: std::collections::BTreeSet<u64>,
+    bytes: u64,
+    byte_limit: Option<u64>,
+}
+
+/// Why the shared ledger refused a charge: staging maps these to
+/// its own refusals (H8 never names H9 types).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LedgerRefusal {
+    /// Shared unsettled ceiling or byte pool exhausted.
+    Full,
+    /// Ticket already charged (forbidden replay).
+    ReplayRefused,
+}
+
+impl StagingLedger {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Charge one staged payload: its H0 ticket plus `bytes`
+    /// duplicate bytes. Refuses when the shared unsettled ceiling
+    /// is reached, the ticket is already charged, or the byte limit
+    /// (once reviewed) would break.
+    pub(crate) fn charge(&mut self, ticket: u64, bytes: u64) -> Result<(), LedgerRefusal> {
+        if self.tickets.len() >= MAX_UNSETTLED_STAGED {
+            return Err(LedgerRefusal::Full);
+        }
+        if !self.tickets.insert(ticket) {
+            return Err(LedgerRefusal::ReplayRefused);
+        }
+        if self
+            .byte_limit
+            .is_some_and(|limit| self.bytes.saturating_add(bytes) > limit)
+        {
+            self.tickets.remove(&ticket);
+            return Err(LedgerRefusal::Full);
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        Ok(())
+    }
+
+    /// Release one staged payload's ticket and bytes.
+    pub(crate) fn release(&mut self, ticket: u64, bytes: u64) {
+        if self.tickets.remove(&ticket) {
+            self.bytes = self.bytes.saturating_sub(bytes);
+        }
+    }
+
+    /// Staged payload count (the shared unsettled census).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn staged(&self) -> usize {
+        self.tickets.len()
+    }
+
+    /// Charged duplicate bytes.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn charged_bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Freeze the byte pool (only a reviewed limit; tests use it for
+    /// refusal twins).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn set_byte_limit(&mut self, limit: u64) {
+        self.byte_limit = Some(limit);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sealed primitives: only the adapter mints these
 // ---------------------------------------------------------------------------

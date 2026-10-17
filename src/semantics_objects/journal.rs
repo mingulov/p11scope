@@ -287,14 +287,23 @@ impl JournalLimits {
 /// across all feeds.
 pub(crate) const MAX_UNSETTLED_STAGED: usize = 1_024;
 
-/// The shared H8 ticket/charge owner for staged H9 payloads (N1):
-/// one logical ticket per unsettled H0 ordinal, with every physical
-/// duplicate byte charged. Owned H8-side (next to the adapter and
-/// model); each staging call borrows it. The byte limit stays
-/// `None` (admit all) until a reviewed pool freezes one.
+/// The shared reservation owner for unsettled calls (N1c): H8 open
+/// begins, model pending calls, staged H9 payloads and prospective
+/// key associations take tickets from this ONE ledger, with every
+/// physical duplicate byte charged. At most
+/// [`MAX_UNSETTLED_STAGED`] live tickets across ALL populations —
+/// one call holds one ticket in whichever population currently
+/// represents it, migrating (release-then-charge) at conversion and
+/// replay. Owned H8-side, inside the adapter; H9 staging and the
+/// key-use reducer borrow it per call. The byte limit stays `None`
+/// (admit all) until a reviewed pool freezes one.
 #[derive(Debug, Default)]
 pub(crate) struct StagingLedger {
     tickets: std::collections::BTreeSet<u64>,
+    h8open: std::collections::BTreeMap<u64, u64>,
+    model: std::collections::BTreeMap<u64, u64>,
+    keyassoc: std::collections::BTreeMap<u64, u64>,
+    next_keyassoc: u64,
     bytes: u64,
     byte_limit: Option<u64>,
 }
@@ -314,21 +323,34 @@ impl StagingLedger {
         Self::default()
     }
 
+    /// Live tickets across every population: the one shared
+    /// unsettled census H9 §89 caps.
+    pub(crate) fn census(&self) -> usize {
+        self.tickets
+            .len()
+            .saturating_add(self.h8open.len())
+            .saturating_add(self.model.len())
+            .saturating_add(self.keyassoc.len())
+    }
+
+    fn fits_bytes(&self, bytes: u64) -> bool {
+        !self
+            .byte_limit
+            .is_some_and(|limit| self.bytes.saturating_add(bytes) > limit)
+    }
+
     /// Charge one staged payload: its H0 ticket plus `bytes`
     /// duplicate bytes. Refuses when the shared unsettled ceiling
     /// is reached, the ticket is already charged, or the byte limit
     /// (once reviewed) would break.
     pub(crate) fn charge(&mut self, ticket: u64, bytes: u64) -> Result<(), LedgerRefusal> {
-        if self.tickets.len() >= MAX_UNSETTLED_STAGED {
+        if self.census() >= MAX_UNSETTLED_STAGED {
             return Err(LedgerRefusal::Full);
         }
         if !self.tickets.insert(ticket) {
             return Err(LedgerRefusal::ReplayRefused);
         }
-        if self
-            .byte_limit
-            .is_some_and(|limit| self.bytes.saturating_add(bytes) > limit)
-        {
+        if !self.fits_bytes(bytes) {
             self.tickets.remove(&ticket);
             return Err(LedgerRefusal::Full);
         }
@@ -343,7 +365,83 @@ impl StagingLedger {
         }
     }
 
-    /// Staged payload count (the shared unsettled census).
+    /// Charge one H8 open begin: its consumption ordinal plus the
+    /// entry's structural bytes. Same shared ceiling as [`charge`].
+    pub(crate) fn charge_h8open(&mut self, ordinal: u64, bytes: u64) -> Result<(), LedgerRefusal> {
+        if self.census() >= MAX_UNSETTLED_STAGED {
+            return Err(LedgerRefusal::Full);
+        }
+        if self.h8open.contains_key(&ordinal) {
+            return Err(LedgerRefusal::ReplayRefused);
+        }
+        if !self.fits_bytes(bytes) {
+            return Err(LedgerRefusal::Full);
+        }
+        self.h8open.insert(ordinal, bytes);
+        self.bytes = self.bytes.saturating_add(bytes);
+        Ok(())
+    }
+
+    /// Release one H8 open begin's ticket and bytes.
+    pub(crate) fn release_h8open(&mut self, ordinal: u64) {
+        if let Some(bytes) = self.h8open.remove(&ordinal) {
+            self.bytes = self.bytes.saturating_sub(bytes);
+        }
+    }
+
+    /// Charge one model pending call: its call token plus the
+    /// pending record's structural bytes. Same shared ceiling.
+    pub(crate) fn charge_model(&mut self, token: u64, bytes: u64) -> Result<(), LedgerRefusal> {
+        if self.census() >= MAX_UNSETTLED_STAGED {
+            return Err(LedgerRefusal::Full);
+        }
+        if self.model.contains_key(&token) {
+            return Err(LedgerRefusal::ReplayRefused);
+        }
+        if !self.fits_bytes(bytes) {
+            return Err(LedgerRefusal::Full);
+        }
+        self.model.insert(token, bytes);
+        self.bytes = self.bytes.saturating_add(bytes);
+        Ok(())
+    }
+
+    /// Release one model pending call's ticket and bytes.
+    pub(crate) fn release_model(&mut self, token: u64) {
+        if let Some(bytes) = self.model.remove(&token) {
+            self.bytes = self.bytes.saturating_sub(bytes);
+        }
+    }
+
+    /// Mint one prospective-association ticket: the key-use
+    /// reducer's opens are keyed H9-side, so the ledger mints their
+    /// tickets itself (monotone, never recycled within the ledger's
+    /// life). Same shared ceiling.
+    pub(crate) fn mint_keyassoc(&mut self, bytes: u64) -> Result<u64, LedgerRefusal> {
+        if self.census() >= MAX_UNSETTLED_STAGED {
+            return Err(LedgerRefusal::Full);
+        }
+        let Some(ticket) = self.next_keyassoc.checked_add(1) else {
+            return Err(LedgerRefusal::Full);
+        };
+        if !self.fits_bytes(bytes) {
+            return Err(LedgerRefusal::Full);
+        }
+        self.next_keyassoc = ticket;
+        self.keyassoc.insert(ticket, bytes);
+        self.bytes = self.bytes.saturating_add(bytes);
+        Ok(ticket)
+    }
+
+    /// Release one prospective-association ticket and bytes.
+    pub(crate) fn release_keyassoc(&mut self, ticket: u64) {
+        if let Some(bytes) = self.keyassoc.remove(&ticket) {
+            self.bytes = self.bytes.saturating_sub(bytes);
+        }
+    }
+
+    /// Staged H9 payload count. The binding ceiling is the shared
+    /// [`census`](Self::census), not this per-population count.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn staged(&self) -> usize {
         self.tickets.len()
@@ -787,6 +885,11 @@ pub(crate) struct JournalAdapter {
     invalidated: bool,
     stopped: bool,
     closure_generation: u64,
+    /// The one shared reservation owner (N1c): H8 open begins,
+    /// model pending calls, staged H9 payloads and prospective key
+    /// associations all take tickets from this ledger. H9 borrows
+    /// it per call through [`ledger`](Self::ledger_mut).
+    ledger: StagingLedger,
 }
 
 impl JournalAdapter {
@@ -811,7 +914,19 @@ impl JournalAdapter {
             invalidated: false,
             stopped: false,
             closure_generation: 0,
+            ledger: StagingLedger::new(),
         }
+    }
+
+    /// The shared reservation ledger (read side).
+    pub(crate) fn ledger(&self) -> &StagingLedger {
+        &self.ledger
+    }
+
+    /// The shared reservation ledger (charge side): H9 staging and
+    /// the key-use reducer borrow it per call.
+    pub(crate) fn ledger_mut(&mut self) -> &mut StagingLedger {
+        &mut self.ledger
     }
 
     /// The current consumption frontier: the highest ordinal consumed, in

@@ -1051,6 +1051,29 @@ fn prove_absence_with(
         if !confirmed.is_empty() {
             return Err(ImageQueryRefusal::Present);
         }
+        // N14: confirmation performed I/O after the maps snapshot —
+        // a mapping can move while its old address is replaced by a
+        // foreign file between the enumeration and its stat, which
+        // drops the old candidate as foreign and manufactures a
+        // provider-free interval from stale brackets. Close the
+        // brackets AGAIN after every identity confirmation: the
+        // sealed epochs/image must still be current and the audits,
+        // budget and fence must still hold. Anything that moved
+        // retries with a fresh enumeration; exhaustion refuses with
+        // Unstable, never a stale seal. (A closure that advanced
+        // during confirmation needs no re-read here: the sealed
+        // attach cell then mismatches the live closure and the birth
+        // refuses on generation.)
+        let verify_epochs = source.epochs()?;
+        let verify_image = source.query()?;
+        source.audit()?;
+        source.budget()?;
+        if !source.fence(fence) {
+            return Err(ImageQueryRefusal::Fence);
+        }
+        if image != verify_image || epochs != verify_epochs {
+            continue;
+        }
         return Ok(ImageAbsenceProof {
             domain,
             image,
@@ -1459,10 +1482,17 @@ mod tests {
     }
     fn script(exec_after: u64) -> Script {
         Script {
+            // A third closing read: the positive seal consumes two
+            // image reads per attempt; the absence seal consumes one
+            // more after its identity confirmation (N14).
             images: VecDeque::from([
                 ImageIdentity {
                     task_cookie: 7,
                     exec_id: 0,
+                },
+                ImageIdentity {
+                    task_cookie: 7,
+                    exec_id: exec_after,
                 },
                 ImageIdentity {
                     task_cookie: 7,
@@ -1990,7 +2020,9 @@ mod tests {
         assert_eq!(proof.total_entries(), 3);
         assert_eq!(proof.fence(), 4);
         assert_eq!(source.confirms, 0, "no candidate consulted");
-        assert_eq!(source.script.audits, 2);
+        // Three audits per sealed attempt: opening, closing, and the
+        // post-confirmation bracket (N14).
+        assert_eq!(source.script.audits, 3);
     }
 
     #[test]
@@ -2061,5 +2093,389 @@ mod tests {
             prove_absence_with(&mut sticky, domain(), 3, 4),
             Err(ImageQueryRefusal::Coverage)
         ));
+    }
+
+    /// N14: the move-and-replace race DURING confirmation. The first
+    /// `confirm` advances the epoch cell (the watched mapping moved
+    /// and its old address now maps a foreign file) and reports the
+    /// old candidate as foreign; enumerations offered on later
+    /// attempts carry the moved watched mapping at its new address.
+    /// A seal that closes its brackets before confirmation seals the
+    /// stale epoch; the fixed seal re-checks after every identity
+    /// confirmation and refuses.
+    struct ConfirmRace {
+        image: ImageIdentity,
+        epoch: CompleteEpochs,
+        before: Vec<p11scope_manifest::maps::MapEntry>,
+        after: Vec<p11scope_manifest::maps::MapEntry>,
+        attach: u64,
+        keys: Vec<p11scope_manifest::maps::ObjectKey>,
+        identity: crate::discovery::instances::MappedFileIdentity,
+        foreign: crate::discovery::instances::MappedFileIdentity,
+        advance_epoch: bool,
+        flip_fence: bool,
+        fence_cell: u64,
+        raced: bool,
+        confirms: usize,
+    }
+    impl ScanSource for ConfirmRace {
+        fn budget(&self) -> Result<(), ImageQueryRefusal> {
+            Ok(())
+        }
+        fn audit(&mut self) -> Result<(), ImageQueryRefusal> {
+            Ok(())
+        }
+        fn query(&mut self) -> Result<ImageIdentity, ImageQueryRefusal> {
+            Ok(self.image)
+        }
+        fn epochs(&mut self) -> Result<CompleteEpochs, ImageQueryRefusal> {
+            Ok(self.epoch)
+        }
+        fn ranges(&mut self) -> Result<Vec<MapRange>, ImageQueryRefusal> {
+            Ok(Vec::new())
+        }
+        fn fence(&self, original: u64) -> bool {
+            original == self.fence_cell
+        }
+    }
+    impl AbsenceScanSource for ConfirmRace {
+        fn watched_keys(&self) -> &[p11scope_manifest::maps::ObjectKey] {
+            &self.keys
+        }
+        fn watched_identity(&self) -> crate::discovery::instances::MappedFileIdentity {
+            self.identity
+        }
+        fn entries(&mut self) -> Result<Vec<p11scope_manifest::maps::MapEntry>, ImageQueryRefusal> {
+            Ok(if self.raced {
+                self.after.clone()
+            } else {
+                self.before.clone()
+            })
+        }
+        fn attach_generation(&mut self) -> Result<u64, ImageQueryRefusal> {
+            Ok(self.attach)
+        }
+        fn confirm(
+            &mut self,
+            _start: u64,
+            _end: u64,
+        ) -> Result<crate::discovery::instances::MappedFileIdentity, ImageQueryRefusal> {
+            self.confirms += 1;
+            if !self.raced {
+                self.raced = true;
+                if self.advance_epoch {
+                    self.epoch.global = 1;
+                }
+                if self.flip_fence {
+                    self.fence_cell = 9;
+                }
+                return Ok(self.foreign);
+            }
+            Ok(self.identity)
+        }
+    }
+    fn confirm_race(advance_epoch: bool, flip_fence: bool) -> ConfirmRace {
+        let mut before = absence_free_entries();
+        before.push(absence_entry(0x7000_0000, 0x7000_1000, 8, 1, 999));
+        let mut after = absence_free_entries();
+        after.push(absence_entry(0x9000_0000, 0x9000_1000, 8, 1, 999));
+        ConfirmRace {
+            image: ImageIdentity {
+                task_cookie: 7,
+                exec_id: 0,
+            },
+            epoch: CompleteEpochs {
+                local: 0,
+                global: 0,
+                fault: 0,
+                sticky: 0,
+                record_flags: 0,
+            },
+            before,
+            after,
+            attach: 7,
+            keys: vec![watched_key()],
+            identity: watched_identity(),
+            foreign: crate::discovery::instances::MappedFileIdentity {
+                dev: 0x802,
+                ino: 1001,
+            },
+            advance_epoch,
+            flip_fence,
+            fence_cell: 4,
+            raced: false,
+            confirms: 0,
+        }
+    }
+
+    #[test]
+    fn absence_seal_refuses_move_and_replace_during_confirmation() {
+        // N14: the old candidate drops as foreign DURING confirmation
+        // while the epoch advances (the watched mapping moved and its
+        // old address was replaced). The first attempt's brackets are
+        // stale; the retry re-enumerates, confirms the moved mapping
+        // by identity, and refuses Present. Sealing the stale epoch
+        // here is the defect.
+        let mut source = confirm_race(true, false);
+        let result = prove_absence_with(&mut source, domain(), 3, 4);
+        assert!(
+            matches!(result, Err(ImageQueryRefusal::Present)),
+            "move-and-replace during confirmation sealed: {:?}",
+            result
+                .as_ref()
+                .map(|proof| (proof.epochs().global, proof.total_entries()))
+        );
+        assert!(source.raced, "the race hook never fired");
+        assert_eq!(source.confirms, 2, "old candidate plus moved mapping");
+    }
+
+    #[test]
+    fn absence_seal_checks_fence_after_confirmation() {
+        // N14: the fence half of the post-confirmation bracket — a
+        // fence that moves during confirmation refuses the whole seal
+        // even though the dropped candidate looks foreign.
+        let mut source = confirm_race(false, true);
+        assert!(matches!(
+            prove_absence_with(&mut source, domain(), 3, 4),
+            Err(ImageQueryRefusal::Fence)
+        ));
+        assert!(source.raced, "the race hook never fired");
+        assert_eq!(source.confirms, 1, "fence refuses before any retry");
+    }
+
+    fn live_race_identity(fd: i32) -> crate::discovery::instances::MappedFileIdentity {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+        crate::discovery::instances::MappedFileIdentity {
+            dev: stat.st_dev as u64,
+            ino: stat.st_ino as u64,
+        }
+    }
+
+    fn live_race_maps() -> Vec<p11scope_manifest::maps::MapEntry> {
+        let bytes = std::fs::read("/proc/self/maps").expect("read own maps");
+        p11scope_manifest::maps::parse_maps(&bytes).expect("parse own maps")
+    }
+
+    /// N14 with real mappings: the reviewer's probe shape — a watched
+    /// memfd mapped in this process, a complete LIVE /proc/self/maps
+    /// listing on every enumeration read, and a REAL mremap plus a
+    /// foreign replacement mapping performed DURING the first
+    /// confirmation. Identity comes from each VMA's own file
+    /// (resolved through its map_files link, fstat'd by fd because
+    /// Yama denies stat on the link itself). Only the
+    /// epoch/audit/image source is injected: stable except for the
+    /// raced advance; the fence never moves.
+    struct LiveConfirmRace {
+        image: ImageIdentity,
+        epoch: CompleteEpochs,
+        attach: u64,
+        keys: Vec<p11scope_manifest::maps::ObjectKey>,
+        identity: crate::discovery::instances::MappedFileIdentity,
+        watched_fd: i32,
+        replacement_fd: i32,
+        old: u64,
+        moved: u64,
+        raced: bool,
+        first_was_foreign: bool,
+        confirms: usize,
+    }
+    impl ScanSource for LiveConfirmRace {
+        fn budget(&self) -> Result<(), ImageQueryRefusal> {
+            Ok(())
+        }
+        fn audit(&mut self) -> Result<(), ImageQueryRefusal> {
+            Ok(())
+        }
+        fn query(&mut self) -> Result<ImageIdentity, ImageQueryRefusal> {
+            Ok(self.image)
+        }
+        fn epochs(&mut self) -> Result<CompleteEpochs, ImageQueryRefusal> {
+            Ok(self.epoch)
+        }
+        fn ranges(&mut self) -> Result<Vec<MapRange>, ImageQueryRefusal> {
+            Ok(Vec::new())
+        }
+        fn fence(&self, original: u64) -> bool {
+            original == 4
+        }
+    }
+    impl AbsenceScanSource for LiveConfirmRace {
+        fn watched_keys(&self) -> &[p11scope_manifest::maps::ObjectKey] {
+            &self.keys
+        }
+        fn watched_identity(&self) -> crate::discovery::instances::MappedFileIdentity {
+            self.identity
+        }
+        fn entries(&mut self) -> Result<Vec<p11scope_manifest::maps::MapEntry>, ImageQueryRefusal> {
+            Ok(live_race_maps())
+        }
+        fn attach_generation(&mut self) -> Result<u64, ImageQueryRefusal> {
+            Ok(self.attach)
+        }
+        fn confirm(
+            &mut self,
+            start: u64,
+            end: u64,
+        ) -> Result<crate::discovery::instances::MappedFileIdentity, ImageQueryRefusal> {
+            self.confirms += 1;
+            // The VMA's own file, resolved through its map_files link.
+            let link = format!("/proc/self/map_files/{start:x}-{end:x}");
+            if !self.raced {
+                self.raced = true;
+                // Move the watched mapping elsewhere, replace its old
+                // address with the foreign file, and advance the epoch
+                // — all between the enumeration and its stat.
+                let target = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        4096,
+                        libc::PROT_NONE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                assert_ne!(target, libc::MAP_FAILED, "reserve the move target");
+                assert_eq!(unsafe { libc::munmap(target, 4096) }, 0);
+                let moved = unsafe {
+                    libc::mremap(
+                        self.old as *mut libc::c_void,
+                        4096,
+                        4096,
+                        libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED,
+                        target,
+                    )
+                };
+                assert_ne!(moved, libc::MAP_FAILED, "move the watched mapping");
+                assert_eq!(moved, target, "the move must really relocate");
+                let replaced = unsafe {
+                    libc::mmap(
+                        self.old as *mut libc::c_void,
+                        4096,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_SHARED | libc::MAP_FIXED,
+                        self.replacement_fd,
+                        0,
+                    )
+                };
+                assert_eq!(
+                    replaced, self.old as *mut libc::c_void,
+                    "replace the old address"
+                );
+                self.moved = target as u64;
+                self.epoch.global = 1;
+                let target_name =
+                    std::fs::read_link(&link).expect("the replaced VMA keeps a map_files link");
+                assert!(
+                    target_name.to_string_lossy().contains("n14-repl"),
+                    "the kernel must agree the old address is replaced: {target_name:?}"
+                );
+                let identity = live_race_identity(self.replacement_fd);
+                self.first_was_foreign = identity != self.identity;
+                return Ok(identity);
+            }
+            let target_name = std::fs::read_link(&link).map_err(|_| ImageQueryRefusal::Custody)?;
+            if target_name.to_string_lossy().contains("n14-watched") {
+                Ok(live_race_identity(self.watched_fd))
+            } else if target_name.to_string_lossy().contains("n14-repl") {
+                Ok(live_race_identity(self.replacement_fd))
+            } else {
+                Err(ImageQueryRefusal::Custody)
+            }
+        }
+    }
+
+    #[test]
+    fn absence_seal_refuses_move_and_replace_during_confirmation_live_maps() {
+        // N14, reviewer probe shape with real mappings (see above).
+        // Pre-fix this seals the stale epoch while the watched
+        // provider stays mapped; post-fix the retry confirms the
+        // moved mapping by identity and refuses Present.
+        fn memfd(name: &std::ffi::CStr) -> i32 {
+            let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+            assert_ne!(fd, -1, "create {name:?}");
+            assert_eq!(unsafe { libc::ftruncate(fd, 4096) }, 0);
+            fd
+        }
+        let watched = memfd(c"n14-watched");
+        let replacement = memfd(c"n14-repl");
+        let old = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                watched,
+                0,
+            )
+        };
+        assert_ne!(old, libc::MAP_FAILED, "map the watched file");
+        let old_addr = old as u64;
+        let watched_key = live_race_maps()
+            .into_iter()
+            .find(|entry| entry.start <= old_addr && old_addr < entry.end)
+            .map(|entry| p11scope_manifest::maps::ObjectKey {
+                device: entry.device,
+                inode: entry.inode,
+            })
+            .expect("the watched mapping is listed");
+        assert_ne!(watched_key.inode, 0, "the watched key must select");
+        let mut source = LiveConfirmRace {
+            image: ImageIdentity {
+                task_cookie: 7,
+                exec_id: 0,
+            },
+            epoch: CompleteEpochs {
+                local: 0,
+                global: 0,
+                fault: 0,
+                sticky: 0,
+                record_flags: 0,
+            },
+            attach: 7,
+            keys: vec![watched_key],
+            identity: live_race_identity(watched),
+            watched_fd: watched,
+            replacement_fd: replacement,
+            old: old_addr,
+            moved: 0,
+            raced: false,
+            first_was_foreign: false,
+            confirms: 0,
+        };
+        let result = prove_absence_with(&mut source, domain(), 3, 4);
+        // The watched provider never stopped being mapped (the
+        // reviewer's `watched_still_mapped` control), checked before
+        // teardown unmaps anything.
+        let still_mapped = source.moved != 0
+            && std::fs::read_link(format!(
+                "/proc/self/map_files/{:x}-{:x}",
+                source.moved,
+                source.moved + 4096
+            ))
+            .is_ok_and(|target| target.to_string_lossy().contains("n14-watched"));
+        unsafe {
+            if source.moved != 0 {
+                libc::munmap(source.moved as *mut libc::c_void, 4096);
+            }
+            libc::munmap(old, 4096);
+            libc::close(watched);
+            libc::close(replacement);
+        }
+        assert!(source.raced, "the race hook never fired");
+        assert!(
+            source.first_was_foreign,
+            "the old candidate must drop as foreign during the race"
+        );
+        assert!(still_mapped, "the watched provider must stay mapped");
+        assert!(
+            matches!(result, Err(ImageQueryRefusal::Present)),
+            "move-and-replace during confirmation sealed: {:?}",
+            result
+                .as_ref()
+                .map(|proof| (proof.epochs().global, proof.total_entries()))
+        );
+        assert_eq!(source.confirms, 2, "old candidate plus moved mapping");
     }
 }

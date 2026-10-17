@@ -3828,3 +3828,585 @@ fn key_operation_schema_contract() {
         true,
     );
 }
+
+// ==================== Checkbox 5: ledger, PQC, measurement ====================
+
+/// H9-§4: executed KEM operations stay `role_unavailable` with S1
+/// mechanism activity qualified separately: KEM endpoints are
+/// negative-only (staging refuses them explicitly — no KEM object
+/// read exists to join), while S1Only-direct execution with real PQC
+/// mechanism ids advances S1 mechanism counters and outcomes
+/// unchanged, and the projection carries no proved rows and no
+/// invented object facts.
+#[test]
+fn key_operation_pqc_matrix_negative() {
+    use crate::semantics_key_use::StagingRefusal;
+
+    // KEM never stages: no KEM object descriptor exists, so the
+    // frozen endpoint table leaves KEM negative-only (KEM is not
+    // even fixture-admittable), and the feed refuses KEM-shaped
+    // facts loudly instead of joining thin air.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    for (n, name) in ["C_EncapsulateKey", "C_DecapsulateKey"]
+        .into_iter()
+        .enumerate()
+    {
+        let fid = crate::kinds::function_id(name).unwrap();
+        assert_eq!(
+            crate::semantics_objects::journal::endpoint_class(fid),
+            Some(crate::semantics_objects::journal::EndpointClass::NegativeOnlyAffecting),
+            "{name} withholds proof: absent prerequisite, explicit"
+        );
+        let facts = op(name, 9, 700_000 + n as u64);
+        let origin = EffectOrigin::from(&facts);
+        assert_eq!(
+            staging.stage(facts, origin, 100 + n as u64),
+            Err(StagingRefusal::Unsealable),
+            "{name} is explicitly unstageable"
+        );
+    }
+
+    // S1Only-direct execution with real PQC mechanism ids: S1
+    // mechanism activity advances; the key side reports role
+    // unavailable (KEM) and not-applicable (PQC key generation).
+    const CKM_ML_KEM: u64 = 0x17;
+    const CKM_ML_KEM_KEY_PAIR_GEN: u64 = 0x0F;
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(4);
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    for (name, mechanism, ts) in [
+        ("C_EncapsulateKey", CKM_ML_KEM, 700_000u64),
+        ("C_DecapsulateKey", CKM_ML_KEM, 700_001),
+        ("C_GenerateKeyPair", CKM_ML_KEM_KEY_PAIR_GEN, 700_002),
+    ] {
+        let mut call = op(name, 9, ts);
+        call.mechanism = mechanism;
+        call.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
+        for effect in feed(&mut edge, &mut sink, &call) {
+            keyuse.observe_effect(instance, &effect);
+        }
+    }
+    assert_eq!(
+        (edge.started(), edge.completed()),
+        (3, 3),
+        "S1 outcomes unchanged"
+    );
+    assert_eq!(edge.failed(), 0);
+    // S1 mechanism activity is qualified separately at the effect
+    // level (direct calls attribute no machine-bound mechanism row):
+    // the PQC ids flow through S1 effects into key-use rows, while
+    // the projection contract stays mechanism-free.
+    let mut direct_mechs: Vec<_> = sink
+        .iter()
+        .filter_map(|effect| match effect {
+            OperationEffect::DirectCompleted { mechanism, .. } => Some(*mechanism),
+            _ => None,
+        })
+        .collect();
+    direct_mechs.sort();
+    assert_eq!(
+        direct_mechs,
+        vec![
+            Some(CKM_ML_KEM_KEY_PAIR_GEN),
+            Some(CKM_ML_KEM),
+            Some(CKM_ML_KEM)
+        ]
+    );
+    let mut row_mechs: Vec<_> = keyuse.rows().iter().map(|row| row.mechanism).collect();
+    row_mechs.sort();
+    assert_eq!(
+        row_mechs,
+        vec![
+            Some(CKM_ML_KEM_KEY_PAIR_GEN),
+            Some(CKM_ML_KEM),
+            Some(CKM_ML_KEM)
+        ]
+    );
+    let s1only = JointStaging::select_s1_only();
+    let committed = commit(1, &[&s1only], &scene.model.project(), &keyuse);
+    assert_eq!(committed.status, ObsStatus::Unavailable);
+    assert_eq!(committed.reason, "bootstrap_unavailable");
+    assert!(committed.key_operations.is_empty(), "no KEM proved rows");
+    assert!(committed.objects.is_empty(), "no KEM object read invented");
+    let mut reasons: Vec<_> = committed
+        .unknown_key_operations
+        .iter()
+        .map(|row| (row.category, row.reason, row.completed))
+        .collect();
+    reasons.sort();
+    assert_eq!(
+        reasons,
+        vec![
+            ("decapsulate", "role_unavailable", 1),
+            ("encapsulate", "role_unavailable", 1),
+            ("generate_key_pair", "not_applicable", 1),
+        ]
+    );
+}
+
+/// Unique scratch roots for fixture processes (parallel-safe).
+static SCRATCH_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Probe the RSA ledger prerequisites: gcc, SoftHSM tool + module,
+/// and a real `pkcs11.h` (system/`PKCS11_HEADER_DIR`/cryptoki-sys
+/// vendor). Returns the missing pieces (empty = runnable).
+fn ledger_prerequisites() -> Vec<String> {
+    let mut missing = Vec::new();
+    for tool in ["gcc", "softhsm2-util"] {
+        let found = std::env::var_os("PATH")
+            .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(tool).is_file()));
+        if !found {
+            missing.push(tool.to_string());
+        }
+    }
+    let module = [
+        "/usr/lib/softhsm/libsofthsm2.so",
+        "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
+    ]
+    .into_iter()
+    .find(|path| std::path::Path::new(path).is_file());
+    if module.is_none() {
+        missing.push("libsofthsm2.so".to_string());
+    }
+    if pkcs11_header_dir().is_none() {
+        missing.push("pkcs11.h".to_string());
+    }
+    missing
+}
+
+/// The directory containing a real `pkcs11.h`, mirroring the Python
+/// driver's discovery (explicit env wins, cryptoki-sys vendor
+/// header is the sanctioned fallback).
+fn pkcs11_header_dir() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("PKCS11_HEADER_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        if dir.join("pkcs11.h").is_file() {
+            return Some(dir);
+        }
+    }
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+    let registry = home.join(".cargo/registry/src");
+    let mut vendors: Vec<_> = std::fs::read_dir(&registry)
+        .ok()?
+        .flatten()
+        .flat_map(|index| {
+            std::fs::read_dir(index.path())
+                .into_iter()
+                .flatten()
+                .flatten()
+        })
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("cryptoki-sys-") {
+                return None;
+            }
+            let dir = entry.path().join("vendor");
+            dir.join("pkcs11.h").is_file().then_some(dir)
+        })
+        .collect();
+    vendors.sort();
+    vendors.into_iter().next()
+}
+
+/// Build, run (disposable token) and oracle-attest the current RSA
+/// ledger fixture from build/runtime truth: the C source and oracle
+/// are read from the tree, binaries/tokens/ledgers live in a private
+/// scratch dir and are deleted afterwards. Returns the parsed ledger
+/// rows. A missing prerequisite is the caller's skip decision (see
+/// [`ledger_prerequisites`]); anything failing afterwards fails the
+/// lane — a real boot/loader/run failure is never a skip.
+fn run_rsa_ledger() -> Vec<serde_json::Value> {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let header = pkcs11_header_dir().expect("pkcs11.h probed present");
+    let module = [
+        "/usr/lib/softhsm/libsofthsm2.so",
+        "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
+    ]
+    .into_iter()
+    .find(|path| std::path::Path::new(path).is_file())
+    .expect("SoftHSM module probed present");
+    let scratch = std::env::temp_dir().join(format!(
+        "p11scope-rsa-ledger-{}-{}",
+        std::process::id(),
+        SCRATCH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(scratch.join("tokens")).expect("scratch tokens dir");
+    std::fs::set_permissions(
+        &scratch,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("scratch 0700");
+    let keep_on_failure = |scratch: &std::path::Path, what: &str| -> ! {
+        eprintln!("RSA ledger {what}; scratch kept at {}", scratch.display());
+        panic!("RSA ledger {what}");
+    };
+    let conf = format!(
+        "directories.tokendir = {}\nobjectstore.backend = file\nlog.level = ERROR\n",
+        scratch.join("tokens").display()
+    );
+    std::fs::write(scratch.join("softhsm2.conf"), conf).expect("softhsm conf");
+    std::fs::set_permissions(
+        scratch.join("softhsm2.conf"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o600),
+    )
+    .expect("conf 0600");
+    let init = std::process::Command::new("softhsm2-util")
+        .args([
+            "--init-token",
+            "--free",
+            "--label",
+            "key-ledger",
+            "--so-pin",
+            "5678",
+            "--pin",
+            "1234",
+        ])
+        .env("SOFTHSM2_CONF", scratch.join("softhsm2.conf"))
+        .output()
+        .expect("spawn softhsm2-util");
+    if !init.status.success() {
+        keep_on_failure(&scratch, "token init failed");
+    }
+    let binary = scratch.join("rsa-ledger");
+    let build = std::process::Command::new("gcc")
+        .args([
+            "-std=c11",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-I",
+            header.to_str().unwrap(),
+        ])
+        .arg(root.join("tests/fixtures/key-operations/rsa-ledger.c"))
+        .arg("-ldl")
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .expect("spawn gcc");
+    if !build.status.success() {
+        eprintln!("gcc stderr: {}", String::from_utf8_lossy(&build.stderr));
+        keep_on_failure(&scratch, "fixture build failed");
+    }
+    // The fixture's absolute deadline bounds the run; the controller
+    // owns/reaps the child and requires successful exit.
+    let mut child = std::process::Command::new(&binary)
+        .arg(module)
+        .env("SOFTHSM2_CONF", scratch.join("softhsm2.conf"))
+        .env("P11SCOPE_KEY_FIXTURE_PIN", "1234")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rsa-ledger");
+    use std::io::Write as _;
+    child
+        .stdin
+        .as_mut()
+        .expect("fixture stdin")
+        .write_all(b"GF")
+        .expect("control barriers");
+    let run = child.wait_with_output().expect("reap rsa-ledger");
+    if !run.status.success() {
+        eprintln!("fixture stderr: {}", String::from_utf8_lossy(&run.stderr));
+        keep_on_failure(&scratch, "fixture run failed");
+    }
+    let ledger_path = scratch.join("application.jsonl");
+    std::fs::write(&ledger_path, &run.stdout).expect("write ledger");
+    let oracle = std::process::Command::new("python3")
+        .arg(root.join("scripts/key-operation-ledger.py"))
+        .arg(&ledger_path)
+        .output()
+        .expect("spawn ledger oracle");
+    if !oracle.status.success() {
+        eprintln!("oracle stderr: {}", String::from_utf8_lossy(&oracle.stderr));
+        keep_on_failure(&scratch, "oracle refused the ledger");
+    }
+    let mut rows = Vec::new();
+    for line in String::from_utf8(run.stdout)
+        .expect("ledger is UTF-8")
+        .lines()
+    {
+        rows.push(serde_json::from_str(line).expect("ledger line parses"));
+    }
+    std::fs::remove_dir_all(&scratch).ok();
+    rows
+}
+
+/// Replay one ledger call through the edge in ledger order:
+/// mechanisms from the fixture's fixed SHA256-RSA header shape,
+/// returns verbatim, the null-output size query without its output
+/// bit (phase-known). Returns the call's fresh S1 effects.
+fn replay_ledger_call(
+    edge: &mut EdgeSemantics,
+    sink: &mut Vec<OperationEffect>,
+    call: &serde_json::Value,
+) -> Vec<OperationEffect> {
+    const CKM_SHA256_RSA_PKCS: u64 = 0x40;
+    let name = call["fn"].as_str().unwrap();
+    let rv = call["rv"].as_u64().unwrap();
+    let ts = call["start_ns"].as_u64().unwrap();
+    let phase = call["phase"].as_str().unwrap();
+    let facts = if name.ends_with("Init") {
+        assert_eq!(rv, 0, "{name} inits return OK");
+        let mut facts = init(name, 7, CKM_SHA256_RSA_PKCS, ts);
+        facts.rv = rv;
+        facts
+    } else {
+        let mut facts = op(name, 7, ts);
+        facts.rv = rv;
+        facts.mechanism = 0;
+        if phase == "query" {
+            facts.capture = capture::MECHANISM_NONE;
+        }
+        facts
+    };
+    feed(edge, sink, &facts)
+}
+
+/// H9-§4: the installed RSA ledger is the reference population. The
+/// current fixture builds, runs against a disposable SoftHSM token
+/// and attests clean; its 68 API calls partition 31 sign / 24 verify
+/// / 13 other with 10 sign complete, 10 verify complete and 2 verify
+/// failed. Replaying every real call through S1Only reduction
+/// preserves those outcomes exactly into unknown-key summaries (no
+/// Joint evidence exists here, so no object facts are invented).
+/// Absent build/run prerequisites skip explicitly; anything failing
+/// afterwards fails the lane.
+#[test]
+fn key_operation_rsa_ledger_reference() {
+    let missing = ledger_prerequisites();
+    if !missing.is_empty() {
+        eprintln!(
+            "SKIP key_operation_rsa_ledger_reference: missing {}",
+            missing.join(", ")
+        );
+        return;
+    }
+    let rows = run_rsa_ledger();
+    let calls: Vec<_> = rows.iter().filter(|row| row["kind"] == "call").collect();
+    assert_eq!(calls.len(), 68, "the fixture's exact API population");
+    let mut sign = 0usize;
+    let mut verify = 0usize;
+    let mut other = 0usize;
+    for call in &calls {
+        let name = call["fn"].as_str().unwrap();
+        if name.starts_with("C_Sign") {
+            sign += 1;
+        } else if name.starts_with("C_Verify") {
+            verify += 1;
+        } else {
+            other += 1;
+        }
+    }
+    assert_eq!((sign, verify, other), (31, 24, 13), "API family partition");
+    let mut categories: std::collections::BTreeMap<u64, &str> = std::collections::BTreeMap::new();
+    for row in rows
+        .iter()
+        .filter(|row| row["kind"] == "operation" && row["event"] == "begin")
+    {
+        categories.insert(
+            row["operation"].as_u64().unwrap(),
+            row["category"].as_str().unwrap(),
+        );
+    }
+    let mut outcomes: std::collections::BTreeMap<(&str, &str), u64> =
+        std::collections::BTreeMap::new();
+    for row in rows
+        .iter()
+        .filter(|row| row["kind"] == "operation" && row["event"] == "end")
+    {
+        let number = row["operation"].as_u64().unwrap();
+        let key = (categories[&number], row["outcome"].as_str().unwrap());
+        *outcomes.entry(key).or_default() += 1;
+    }
+    assert_eq!(outcomes.get(&("sign", "completed")), Some(&10));
+    assert_eq!(outcomes.get(&("verify", "completed")), Some(&10));
+    assert_eq!(outcomes.get(&("verify", "failed")), Some(&2));
+    assert_eq!(outcomes.len(), 3, "no other operation outcomes exist");
+    let done = rows
+        .iter()
+        .find(|row| row["kind"] == "done")
+        .expect("done row");
+    assert_eq!(done["api_calls"], 68);
+    assert_eq!(done["operations"]["sign"]["completed"], 10);
+    assert_eq!(done["operations"]["verify"]["completed"], 10);
+    assert_eq!(done["operations"]["verify"]["failed"], 2);
+
+    // Every real call replays through S1Only reduction in ledger
+    // order: mechanisms from the ledger's fixed SHA256-RSA header
+    // shape, returns verbatim, the null-output size query without
+    // its output bit (phase-known). Non-operation calls must emit
+    // nothing: any S1 misclassification fails here, not silently.
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(7);
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    for call in &calls {
+        let name = call["fn"].as_str().unwrap();
+        let phase = call["phase"].as_str().unwrap();
+        let fresh = replay_ledger_call(&mut edge, &mut sink, call);
+        // Exact S1 emission per phase: inits start; the first OK
+        // sign/verify/final after its init ends the machine;
+        // continuations emit nothing; the size-query completion
+        // orphans op 1's retry + terminal (counted, never joined).
+        let number = call["operation"].as_u64().unwrap();
+        let expected = if name == "C_GenerateKeyPair" {
+            1
+        } else if !name.starts_with("C_Sign") && !name.starts_with("C_Verify") {
+            0
+        } else {
+            match phase {
+                "init" | "query" => 1,
+                "update" | "too_small" => 0,
+                "terminal" if number == 1 => 0,
+                "terminal" => 1,
+                other => panic!("unknown ledger phase {other}"),
+            }
+        };
+        assert_eq!(fresh.len(), expected, "{name} ({phase}) S1 emission");
+        for effect in &fresh {
+            keyuse.observe_effect(instance, effect);
+        }
+    }
+    assert_eq!(
+        (edge.started(), edge.completed(), edge.failed()),
+        (23, 21, 2)
+    );
+    assert_eq!(
+        edge.orphans(),
+        2,
+        "query completion orphans the retry + terminal"
+    );
+
+    let s1only = JointStaging::select_s1_only();
+    let model = JointScene::new().model.project();
+    let committed = commit(1, &[&s1only], &model, &keyuse);
+    assert_eq!(committed.status, ObsStatus::Unavailable);
+    assert_eq!(committed.reason, "bootstrap_unavailable");
+    assert!(committed.key_operations.is_empty(), "S1Only proves no rows");
+    assert!(committed.objects.is_empty() && committed.sessions.is_empty());
+    let mut summaries: Vec<_> = committed
+        .unknown_key_operations
+        .iter()
+        .map(|row| (row.category, row.reason, row.completed, row.failed))
+        .collect();
+    summaries.sort();
+    assert_eq!(
+        summaries,
+        vec![
+            ("generate_key_pair", "not_applicable", 1, 0),
+            ("sign", "unbound", 10, 0),
+            ("verify", "unbound", 10, 2),
+        ],
+        "the fixture's exact outcomes survive S1Only reduction"
+    );
+}
+
+/// H9-§91/§93: retained rows never outgrow the bound, so repeat
+/// publication costs identical bytes on every pass: refused input
+/// accumulates in scalar counters only, never in rows or render
+/// buffers. Three ledger passes share one reducer sized to the
+/// first pass (a probe pass learns the exact retained
+/// population): later passes refuse everything, the committed
+/// summaries stay put, and commit+render allocates exactly the
+/// same blocks and bytes on the two refused passes (same status,
+/// same digit widths, zero growth).
+#[test]
+fn key_operation_allocation_pressure_is_bounded_across_passes() {
+    let missing = ledger_prerequisites();
+    if !missing.is_empty() {
+        eprintln!(
+            "SKIP key_operation_allocation_pressure_is_bounded_across_passes: missing {}",
+            missing.join(", ")
+        );
+        return;
+    }
+    let rows = run_rsa_ledger();
+    let calls: Vec<_> = rows.iter().filter(|row| row["kind"] == "call").collect();
+    assert_eq!(calls.len(), 68, "the fixture's exact API population");
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(7);
+    let mut probe_edge = EdgeSemantics::default();
+    let mut probe_sink = Vec::new();
+    let mut probe = KeyUseReducer::new();
+    for call in &calls {
+        for effect in &replay_ledger_call(&mut probe_edge, &mut probe_sink, call) {
+            probe.observe_effect(instance, effect);
+        }
+    }
+    let retained = probe.rows().len();
+    assert!(retained > 0, "the ledger retains rows to bound");
+    assert_eq!(
+        probe.evidence().rows_refused,
+        0,
+        "the default bound fits one ledger"
+    );
+
+    let mut keyuse = KeyUseReducer::with_capacity(retained);
+    let mut passes = Vec::new();
+    for revision in 1..=3u64 {
+        let mut edge = EdgeSemantics::default();
+        let mut sink = Vec::new();
+        for call in &calls {
+            for effect in &replay_ledger_call(&mut edge, &mut sink, call) {
+                keyuse.observe_effect(instance, effect);
+            }
+        }
+        assert_eq!(
+            keyuse.rows().len(),
+            retained,
+            "pass {revision}: rows never grow past the bound"
+        );
+        let model = JointScene::new().model.project();
+        let s1only = JointStaging::select_s1_only();
+        let ((committed, rendered), blocks, bytes) = crate::test_alloc::count_allocs_during(|| {
+            let committed = commit(revision, &[&s1only], &model, &keyuse);
+            let rendered =
+                serde_json::to_string(&object_observations_json(&committed)).expect("render");
+            (committed, rendered)
+        });
+        assert_eq!(committed.status, ObsStatus::Unavailable);
+        assert_eq!(committed.reason, "bootstrap_unavailable");
+        assert!(
+            blocks > 0 && bytes > 0,
+            "pass {revision}: measured, not empty"
+        );
+        passes.push((committed, rendered, blocks, bytes));
+    }
+    assert_eq!(
+        passes[0].0.budgets.key_refused, 0,
+        "the sized bound fits pass one"
+    );
+    assert!(
+        passes[1].0.budgets.key_refused > 0,
+        "pass two refuses into scalar counters"
+    );
+    assert!(
+        passes[2].0.budgets.key_refused > passes[1].0.budgets.key_refused,
+        "pass three refuses more, still scalar"
+    );
+    assert_eq!(
+        passes[1].0.unknown_key_operations, passes[0].0.unknown_key_operations,
+        "refused passes keep the committed summaries"
+    );
+    assert_eq!(
+        passes[2].0.unknown_key_operations, passes[1].0.unknown_key_operations,
+        "refused passes keep the committed summaries"
+    );
+    assert_eq!(
+        passes[2].1.len(),
+        passes[1].1.len(),
+        "refused passes render the same bytes wide"
+    );
+    assert_eq!(
+        (passes[2].2, passes[2].3),
+        (passes[1].2, passes[1].3),
+        "commit+render allocates identically on refused passes: zero growth"
+    );
+}

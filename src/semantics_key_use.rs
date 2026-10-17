@@ -191,6 +191,11 @@ pub(crate) struct JointStaging {
     /// ordinary S1 and degraded to S1Only: the projection reports
     /// `proof_refused_fallback`.
     fell_back: bool,
+    /// Ledger releases pended by a ledger-less ordered fallback
+    /// (C4): flushed on the next ledger contact. At most one
+    /// fallback per feed (feeds never re-enter Joint), so bounded by
+    /// [`JOINT_STAGING_CAPACITY`].
+    pending_releases: Vec<(u64, u64)>,
 }
 
 impl std::fmt::Debug for JointStaging {
@@ -204,6 +209,7 @@ impl std::fmt::Debug for JointStaging {
             .field("correlation_refusals", &self.correlation_refusals)
             .field("degraded_loss", &self.degraded_loss)
             .field("fell_back", &self.fell_back)
+            .field("pending_releases", &self.pending_releases.len())
             .finish_non_exhaustive()
     }
 }
@@ -223,6 +229,7 @@ impl JointStaging {
             correlation_refusals: 0,
             degraded_loss: false,
             fell_back: false,
+            pending_releases: Vec::new(),
         }
     }
 
@@ -312,6 +319,8 @@ impl JointStaging {
         position: u64,
         ledger: &mut crate::semantics_objects::journal::StagingLedger,
     ) -> Result<(), StagingRefusal> {
+        // Ledger contact flushes pended releases first (C4).
+        self.flush_pending_releases(ledger);
         if self.mode != FeedMode::Joint {
             return Err(StagingRefusal::NotJoint);
         }
@@ -379,6 +388,8 @@ impl JointStaging {
         instance: RegistryInstanceId,
         sink: &mut S,
     ) -> (SealApplyOutcome, u64) {
+        // Ledger contact flushes pended releases first (C4).
+        self.flush_pending_releases(ledger);
         if self.mode != FeedMode::Joint {
             return (SealApplyOutcome::Held, 0);
         }
@@ -481,6 +492,8 @@ impl JointStaging {
         instance: RegistryInstanceId,
         sink: &mut S,
     ) -> (FailureApplyOutcome, u64) {
+        // Ledger contact flushes pended releases first (C4).
+        self.flush_pending_releases(ledger);
         if self.mode != FeedMode::Joint {
             return (FailureApplyOutcome::Ignored, 0);
         }
@@ -497,7 +510,7 @@ impl JointStaging {
                 // Unknown terminals (H9 §66).
                 keyuse.apply_invalidations(&failure.effects, model);
                 self.dispose_as_loss(reducer, keyuse, instance, sink);
-                let disposed = self.drain_staged(ledger);
+                let disposed = self.drain_staged(Some(ledger));
                 self.mode = FeedMode::S1Only;
                 self.degraded_loss = true;
                 (FailureApplyOutcome::Degraded { disposed }, 0)
@@ -514,7 +527,7 @@ impl JointStaging {
                         // terminals cannot complete unproved bindings.
                         keyuse.apply_invalidations(&failure.effects, model);
                         let (replayed, refused) =
-                            self.replay_staged(reducer, keyuse, instance, sink, ledger);
+                            self.replay_staged(reducer, keyuse, instance, sink, Some(ledger));
                         self.mode = FeedMode::S1Only;
                         self.fell_back = true;
                         (FailureApplyOutcome::FellBack { replayed }, refused)
@@ -524,7 +537,7 @@ impl JointStaging {
                         // S1 proof with it. Real-loss treatment.
                         keyuse.apply_invalidations(&failure.effects, model);
                         self.dispose_as_loss(reducer, keyuse, instance, sink);
-                        let disposed = self.drain_staged(ledger);
+                        let disposed = self.drain_staged(Some(ledger));
                         self.mode = FeedMode::S1Only;
                         self.degraded_loss = true;
                         (FailureApplyOutcome::Degraded { disposed }, 0)
@@ -547,6 +560,57 @@ impl JointStaging {
         self.staged.iter().all(|call| call.position <= staged_max)
     }
 
+    /// Flush ledger-less fallback releases on ledger contact (C4).
+    fn flush_pending_releases(
+        &mut self,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+    ) {
+        for (ticket, bytes) in self.pending_releases.drain(..) {
+            ledger.release(ticket, bytes);
+        }
+    }
+
+    /// Release one popped head's ticket and bytes to the ledger when
+    /// present, else pend it for the next ledger contact (C4).
+    fn release_or_pend(
+        &mut self,
+        ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        position: u64,
+        bytes: u64,
+    ) {
+        match ledger {
+            Some(ledger) => ledger.release(position, bytes),
+            None => self.pending_releases.push((position, bytes)),
+        }
+    }
+
+    /// Ordered capacity fallback (C4): replay every retained payload
+    /// once in original H3 order through ordinary S1 (no receipts —
+    /// fallback rows are unknown-key, never invented object facts),
+    /// then continue S1Only. The driver calls this when staging
+    /// cannot hold the order (Full, missing ledger, unsealable with
+    /// queued calls): reducing a later fact direct would overtake
+    /// queued calls. Releases to the ledger when present, else pends
+    /// them for the next ledger contact. Sets `fell_back` (S1
+    /// preserved without object proof, like proof-only fallback).
+    /// Returns the replay count plus per-edge bound refusals.
+    pub(crate) fn ordered_fallback<S: OperationSink>(
+        &mut self,
+        reducer: &mut EdgeSemantics,
+        keyuse: &mut KeyUseReducer,
+        instance: RegistryInstanceId,
+        sink: &mut S,
+        ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) -> (usize, u64) {
+        // Staging order is arrival order (positions strictly ascend),
+        // so replaying it is complete by construction — no H3 receipt
+        // needed, unlike proof-only fallback across a seal gap.
+        let (replayed, refused) = self.replay_staged(reducer, keyuse, instance, sink, ledger);
+        self.mode = FeedMode::S1Only;
+        self.fell_back = true;
+        (replayed, refused)
+    }
+
     /// Invalidate live operation authority (terminals first), before
     /// any disposal accounting. Terminals feed the key-use reducer
     /// too, so open rows close as Unknown instead of leaking.
@@ -567,16 +631,22 @@ impl JointStaging {
 
     /// Dispose every retained payload once as history-only: counted,
     /// frontier-advanced, never reduced, never re-staged. Every
-    /// ticket and byte releases to the shared ledger.
+    /// ticket and byte releases to the shared ledger when present,
+    /// else pends for the next ledger contact (C4).
     fn drain_staged(
         &mut self,
-        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+        mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) -> usize {
-        let disposed = self.staged.len();
-        for call in self.staged.drain(..) {
-            ledger.release(call.position, call.charged_bytes());
-            self.frontier = self.frontier.max(call.position);
+        // `release_or_pend` borrows `self`, so pop heads one at a
+        // time instead of draining under the ledger borrow.
+        let mut disposed = 0;
+        while let Some(call) = self.staged.pop_front() {
+            let bytes = call.charged_bytes();
+            let position = call.position;
+            self.release_or_pend(ledger.as_deref_mut(), position, bytes);
+            self.frontier = self.frontier.max(position);
             self.history_disposed = self.history_disposed.saturating_add(1);
+            disposed += 1;
         }
         disposed
     }
@@ -585,23 +655,26 @@ impl JointStaging {
     /// through ordinary S1 (S1Only: no receipts — fallback rows are
     /// unknown-key, never invented object facts), reserving H3
     /// resources per replay (N14). Effects feed the key-use reducer
-    /// too. On mid-fallback resource refusal, live S1 invalidates
-    /// with terminals teed (no leaked opens) and this head plus every
-    /// remaining payload disposes as history. Returns the replay
-    /// count plus per-edge bound refusals.
+    /// too. Releases to the ledger when present, else pends for the
+    /// next ledger contact (C4). On mid-fallback resource refusal,
+    /// live S1 invalidates with terminals teed (no leaked opens) and
+    /// this head plus every remaining payload disposes as history.
+    /// Returns the replay count plus per-edge bound refusals.
     fn replay_staged<S: OperationSink>(
         &mut self,
         reducer: &mut EdgeSemantics,
         keyuse: &mut KeyUseReducer,
         instance: RegistryInstanceId,
         sink: &mut S,
-        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+        mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) -> (usize, u64) {
         let mut replayed = 0;
         let mut refused = 0u64;
         while let Some(head) = self.staged.pop_front() {
-            ledger.release(head.position, head.charged_bytes());
-            self.frontier = self.frontier.max(head.position);
+            let bytes = head.charged_bytes();
+            let position = head.position;
+            self.release_or_pend(ledger.as_deref_mut(), position, bytes);
+            self.frontier = self.frontier.max(position);
             let mut tee = KeyUseTee {
                 outer: &mut *sink,
                 keyuse: &mut *keyuse,

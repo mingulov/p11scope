@@ -50,6 +50,11 @@ impl fmt::Debug for InstanceKey {
 pub(crate) struct RegistryInstanceId(u32);
 
 impl RegistryInstanceId {
+    /// The raw registry instance number (H9 key-row attribution).
+    pub(crate) const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
     pub(crate) fn label(self) -> String {
         format!("i{}", self.0)
     }

@@ -47,7 +47,7 @@ const _: () = {
     // H9 stores the machine's fixed key receipt (56 = 32 + 24 for
     // niche-filled `Option<KeyReceipt>`); the machine charge below
     // still dominates the node plus entry.
-    assert!(std::mem::size_of::<super::OpMachine>() == 56);
+    assert!(std::mem::size_of::<super::OpMachine>() == 64);
     assert!(std::mem::size_of::<super::EdgeMechStat>() == 104);
     // Final lease-bearing layouts, rather than the earlier probe types.
     assert!(std::mem::size_of::<super::PendingCall>() == 144);

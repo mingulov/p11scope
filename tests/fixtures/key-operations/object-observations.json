@@ -1,0 +1,119 @@
+{
+  "version": 1,
+  "revision": 7,
+  "status": "populated",
+  "reason": "none",
+  "sessions": [
+    {"session": 1, "origin": "opened", "status": "live"},
+    {"session": 2, "origin": "first_observed", "status": "closed"}
+  ],
+  "objects": [
+    {
+      "object": 11,
+      "session": 1,
+      "origin": "created",
+      "creation": "generate_pair",
+      "birth": {"start_ns": 1000, "end_ns": 2000},
+      "lifetime": "live",
+      "lifetime_reason": null,
+      "attribution": "valid",
+      "attribution_reason": null,
+      "requested": {
+        "class": {"status": "value", "value": 3},
+        "key_type": {"status": "value", "value": 0},
+        "token": {"status": "value", "value": 0},
+        "value_len": {"status": "unknown", "value": null},
+        "modulus_bits": {"status": "value", "value": 2048},
+        "ec_params": {"status": "unknown", "value": null}
+      },
+      "established": {
+        "class": {"status": "value", "value": 3},
+        "key_type": {"status": "value", "value": 0},
+        "token": {"status": "value", "value": 0},
+        "value_len": {"status": "unknown", "value": null},
+        "modulus_bits": {"status": "value", "value": 2048},
+        "ec_params": {"status": "unknown", "value": null}
+      },
+      "queries": {
+        "class": "established",
+        "key_type": "established",
+        "token": "established",
+        "value_len": "not_queried",
+        "modulus_bits": "established",
+        "ec_params": "not_queried"
+      },
+      "label": "rsa_2048",
+      "successful_references": 31,
+      "successful_key_references": 10,
+      "accessing_sessions": 1
+    },
+    {
+      "object": 12,
+      "session": 2,
+      "origin": "first_observed",
+      "creation": null,
+      "birth": null,
+      "lifetime": "retired",
+      "lifetime_reason": "session_closed",
+      "attribution": "downgraded",
+      "attribution_reason": "session_closed",
+      "requested": {
+        "class": {"status": "unknown", "value": null},
+        "key_type": {"status": "unknown", "value": null},
+        "token": {"status": "unknown", "value": null},
+        "value_len": {"status": "unknown", "value": null},
+        "modulus_bits": {"status": "unknown", "value": null},
+        "ec_params": {"status": "unknown", "value": null}
+      },
+      "established": {
+        "class": {"status": "unknown", "value": null},
+        "key_type": {"status": "unknown", "value": null},
+        "token": {"status": "unknown", "value": null},
+        "value_len": {"status": "unknown", "value": null},
+        "modulus_bits": {"status": "unknown", "value": null},
+        "ec_params": {"status": "unknown", "value": null}
+      },
+      "queries": {
+        "class": "not_queried",
+        "key_type": "not_queried",
+        "token": "not_queried",
+        "value_len": "not_queried",
+        "modulus_bits": "unavailable",
+        "ec_params": "not_queried"
+      },
+      "label": null,
+      "successful_references": 2,
+      "successful_key_references": 1,
+      "accessing_sessions": 0
+    }
+  ],
+  "key_operations": [
+    {"instance": "i3", "object": 11, "category": "sign", "role": "key", "metadata_at_use": "rsa_2048", "unit": "operations", "started": 10, "completed": 9, "failed": 0, "cancelled": 0, "unknown": 0, "active": 1, "key_join_lost": 0},
+    {"instance": "i3", "object": 11, "category": "verify", "role": "key", "metadata_at_use": "rsa_2048", "unit": "operations", "started": 12, "completed": 10, "failed": 2, "cancelled": 0, "unknown": 0, "active": 0, "key_join_lost": 0},
+    {"instance": "i3", "object": 11, "category": "wrap", "role": "wrapping_key", "metadata_at_use": "rsa_2048", "unit": "operations", "started": 1, "completed": 1, "failed": 0, "cancelled": 0, "unknown": 0, "active": 0, "key_join_lost": 0},
+    {"instance": "i3", "object": 12, "category": "wrap", "role": "wrapped_object", "metadata_at_use": "rsa_2048", "unit": "operations", "started": 1, "completed": 0, "failed": 0, "cancelled": 0, "unknown": 0, "active": 0, "key_join_lost": 1},
+    {"instance": "i4", "object": 11, "category": "message_sign", "role": "key", "metadata_at_use": "rsa_2048", "unit": "message_contexts", "started": 2, "completed": 2, "failed": 0, "cancelled": 0, "unknown": 0, "active": 0, "key_join_lost": 0}
+  ],
+  "unknown_key_operations": [
+    {"category": "encapsulate", "reason": "role_unavailable", "unit": "operations", "completed": 3, "failed": 0, "cancelled": 0, "unknown": 0, "active": 0},
+    {"category": "generate_key", "reason": "not_applicable", "unit": "operations", "completed": 1, "failed": 0, "cancelled": 0, "unknown": 0, "active": 0},
+    {"category": "sign", "reason": "metadata_unknown", "unit": "operations", "completed": 2, "failed": 0, "cancelled": 0, "unknown": 0, "active": 0},
+    {"category": "sign", "reason": "unbound", "unit": "operations", "completed": 1, "failed": 0, "cancelled": 0, "unknown": 0, "active": 1},
+    {"category": "verify", "reason": "key_join_lost", "unit": "operations", "completed": 1, "failed": 0, "cancelled": 0, "unknown": 0, "active": 0}
+  ],
+  "gaps": {
+    "rows": [
+      {"subject": "model", "reason": "session_closed", "repeats": 4},
+      {"subject": "key_operation", "reason": "pruned_object_referenced", "repeats": 1}
+    ],
+    "suppressed": 0
+  },
+  "budgets": {
+    "key_rows": {"limit": 65536, "occupied": 5, "refused": 0},
+    "object_rows": {"limit": 65536, "occupied": 2, "refused": 0},
+    "unknown_rows": {"occupied": 5},
+    "encoded_bytes": 4123,
+    "allocation_refused": false,
+    "refusal_reason": "none"
+  }
+}

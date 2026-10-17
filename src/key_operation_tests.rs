@@ -822,6 +822,8 @@ fn assert_s1_equal(joint: &EdgeSemantics, direct: &EdgeSemantics) {
 /// identical to direct reduction; model facts appear only in Joint.
 #[test]
 fn key_operation_single_feed_exactly_once() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
@@ -841,6 +843,7 @@ fn key_operation_single_feed_exactly_once() {
             &scene.model,
             &mut joint,
             &mut keyuse,
+            instance,
             &mut joint_sink,
         );
         assert_eq!(
@@ -900,8 +903,14 @@ fn key_operation_single_feed_exactly_once() {
         &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
     );
     let success = scene2.seal().expect("quantum seals");
-    let (outcome, refused) =
-        staging2.apply_seal(&success, &scene2.model, &mut edge2, &mut keyuse, &mut sink2);
+    let (outcome, refused) = staging2.apply_seal(
+        &success,
+        &scene2.model,
+        &mut edge2,
+        &mut keyuse,
+        instance,
+        &mut sink2,
+    );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
     assert_eq!(refused, 0);
     // Restaging the same H0 position after reduction refuses.
@@ -925,6 +934,8 @@ fn key_operation_single_feed_exactly_once() {
 /// history-only disposal and starts no old machine.
 #[test]
 fn key_operation_fallback_and_history_loss() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
     // --- Proof-only refusal: a foreign proof mismatches, H3 is clean. ---
     let mut scene = JointScene::new();
     let mut foreign = JointScene::new();
@@ -988,6 +999,7 @@ fn key_operation_fallback_and_history_loss() {
         &mut pending_source,
         &mut joint,
         &mut keyuse,
+        instance,
         &mut joint_sink,
     );
     assert_eq!(outcome, FailureApplyOutcome::HeldForCompleteness);
@@ -1003,6 +1015,7 @@ fn key_operation_fallback_and_history_loss() {
         &mut clean_source,
         &mut joint,
         &mut keyuse,
+        instance,
         &mut joint_sink,
     );
     assert_eq!(outcome, FailureApplyOutcome::FellBack { replayed: 3 });
@@ -1050,6 +1063,7 @@ fn key_operation_fallback_and_history_loss() {
         &scene.model,
         &mut joint,
         &mut keyuse,
+        instance,
         &mut joint_sink,
     );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
@@ -1068,8 +1082,14 @@ fn key_operation_fallback_and_history_loss() {
         .expect_err("moved fault voids the seal");
     assert_eq!(failure.gap, JournalGap::FaultChanged);
     let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
-    let (outcome, refused) =
-        staging.apply_failure(&failure, &mut h3, &mut joint, &mut keyuse, &mut joint_sink);
+    let (outcome, refused) = staging.apply_failure(
+        &failure,
+        &mut h3,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut joint_sink,
+    );
     assert_eq!(outcome, FailureApplyOutcome::Degraded { disposed: 2 });
     assert_eq!(refused, 0);
     // Live authority invalidated first: the machine ends Unknown in
@@ -1101,6 +1121,8 @@ fn key_operation_fallback_and_history_loss() {
 /// loudly with staging intact.
 #[test]
 fn key_operation_joint_staging_bounds() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
     use crate::semantics_key_use::JOINT_STAGING_CAPACITY;
 
     // --- N/N+1: 1,024 stage, the 1,025th backpressures. ---
@@ -1157,8 +1179,14 @@ fn key_operation_joint_staging_bounds() {
     let success = scene.seal().expect("begin-only quantum seals");
     assert_eq!(success.prefix.settled().len(), 1);
     assert!(success.prefix.settled()[0].end_cut.is_none());
-    let (outcome, refused) =
-        staging.apply_seal(&success, &scene.model, &mut joint, &mut keyuse, &mut sink);
+    let (outcome, refused) = staging.apply_seal(
+        &success,
+        &scene.model,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
     assert_eq!(outcome, SealApplyOutcome::Held);
     assert_eq!(refused, 0);
     assert_eq!(joint.calls(), 0, "open terminal reduces nothing");
@@ -1170,8 +1198,14 @@ fn key_operation_joint_staging_bounds() {
         JournalDisposition::EndStaged
     );
     let success = scene.seal().expect("terminal quantum seals");
-    let (outcome, _) =
-        staging.apply_seal(&success, &scene.model, &mut joint, &mut keyuse, &mut sink);
+    let (outcome, _) = staging.apply_seal(
+        &success,
+        &scene.model,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
     assert_eq!(joint.calls(), 1);
     assert_eq!(staging.reduced(), 1);
@@ -1188,8 +1222,14 @@ fn key_operation_joint_staging_bounds() {
     }
     let success = scene.seal().expect("two-call quantum seals");
     assert_eq!(success.prefix.settled().len(), 2);
-    let (outcome, refused) =
-        staging.apply_seal(&success, &scene.model, &mut joint, &mut keyuse, &mut sink);
+    let (outcome, refused) = staging.apply_seal(
+        &success,
+        &scene.model,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
     assert_eq!(outcome, SealApplyOutcome::Held);
     assert_eq!(refused, 0);
     assert_eq!(staging.correlation_refusals(), 1);
@@ -1214,8 +1254,14 @@ fn key_operation_joint_staging_bounds() {
     );
     let success = scene.seal().expect("quantum seals");
     assert_eq!(success.prefix.settled().len(), 1);
-    let (outcome, _) =
-        staging.apply_seal(&success, &scene.model, &mut joint, &mut keyuse, &mut sink);
+    let (outcome, _) = staging.apply_seal(
+        &success,
+        &scene.model,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
     assert_eq!(outcome, SealApplyOutcome::Held);
     assert_eq!(staging.correlation_refusals(), 1);
     assert_eq!(staging.staged_len(), 1);
@@ -1226,6 +1272,8 @@ fn key_operation_joint_staging_bounds() {
 /// degrades, and post-degradation seal outcomes are inert.
 #[test]
 fn key_operation_joint_retry_and_degraded_inert() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
     // --- H3Pending retries: staging and reducer untouched. ---
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
@@ -1266,8 +1314,14 @@ fn key_operation_joint_retry_and_degraded_inert() {
         .expect_err("short H3 coverage pends");
     assert_eq!(failure.gap, JournalGap::H3Pending);
     let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
-    let (outcome, refused) =
-        staging.apply_failure(&failure, &mut h3, &mut joint, &mut keyuse, &mut sink);
+    let (outcome, refused) = staging.apply_failure(
+        &failure,
+        &mut h3,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
     assert_eq!(outcome, FailureApplyOutcome::Retried);
     assert_eq!(refused, 0);
     assert_eq!(staging.mode(), FeedMode::Joint);
@@ -1327,6 +1381,7 @@ fn key_operation_joint_retry_and_degraded_inert() {
         &mut loss_source,
         &mut joint,
         &mut keyuse,
+        instance,
         &mut sink,
     );
     assert_eq!(outcome, FailureApplyOutcome::Degraded { disposed: 2 });
@@ -1342,6 +1397,7 @@ fn key_operation_joint_retry_and_degraded_inert() {
         &mut loss_source,
         &mut joint,
         &mut keyuse,
+        instance,
         &mut sink,
     );
     assert_eq!(outcome, FailureApplyOutcome::Ignored);
@@ -1358,8 +1414,14 @@ fn key_operation_joint_retry_and_degraded_inert() {
         !stray.prefix.settled().is_empty(),
         "stray seal settles real calls the degraded feed ignores"
     );
-    let (outcome, refused) =
-        staging.apply_seal(&stray, &scene.model, &mut joint, &mut keyuse, &mut sink);
+    let (outcome, refused) = staging.apply_seal(
+        &stray,
+        &scene.model,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
     assert_eq!(outcome, SealApplyOutcome::Held);
     assert_eq!(refused, 0);
     assert_eq!(staging.correlation_refusals(), 0);
@@ -1371,6 +1433,8 @@ fn key_operation_joint_retry_and_degraded_inert() {
 /// the completed H3 observation).
 #[test]
 fn key_operation_abandoned_quantum_replays_s1() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
@@ -1418,6 +1482,7 @@ fn key_operation_abandoned_quantum_replays_s1() {
         &scene.model,
         &mut joint,
         &mut keyuse,
+        instance,
         &mut joint_sink,
     );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
@@ -1436,6 +1501,8 @@ fn key_operation_abandoned_quantum_replays_s1() {
 /// preserves S1 without inventing object facts.
 #[test]
 fn key_operation_s1_matrix_through_both_feeds() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
     use crate::semantics_objects::Lifetime;
 
     const CKF_SIGN: u64 = 0x0000_0800;
@@ -1484,6 +1551,7 @@ fn key_operation_s1_matrix_through_both_feeds() {
             &scene.model,
             &mut joint,
             &mut keyuse,
+            instance,
             &mut joint_sink,
         );
         assert_eq!(outcome, SealApplyOutcome::ReplayedOne, "{}", call.name);
@@ -1534,6 +1602,7 @@ fn key_operation_s1_matrix_through_both_feeds() {
             &scene.model,
             &mut joint,
             &mut keyuse,
+            instance,
             &mut joint_sink,
         );
         assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
@@ -1582,6 +1651,7 @@ fn key_operation_s1_matrix_through_both_feeds() {
         &mut clean,
         &mut joint,
         &mut keyuse,
+        instance,
         &mut joint_sink,
     );
     assert_eq!(outcome, FailureApplyOutcome::FellBack { replayed: 3 });
@@ -1600,9 +1670,8 @@ fn key_operation_s1_matrix_through_both_feeds() {
 
 // ==================== Checkbox 3: key receipts and rows ====================
 
-use crate::semantics_edge::{KeyReceipt, KeyRole};
+use crate::semantics_edge::KeyRole;
 use crate::semantics_key_use::{KeyOpRow, KeyUseReducer};
-use crate::semantics_objects::ObjectId;
 
 /// Drive one Joint quantum to completion: prepare + seal + apply.
 /// Returns the admitted payload, its H0 position and the seal.
@@ -1614,10 +1683,13 @@ fn drive_quantum(
     sink: &mut Vec<OperationEffect>,
     call: &ShapedS1,
 ) -> (SemanticCall, u64) {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
     let (facts, position) = prepare_call(scene, staging, call);
     let success = scene.seal().expect("quantum seals");
     assert_eq!(success.prefix.settled().len(), 1, "{}", call.name);
-    let (outcome, refused) = staging.apply_seal(&success, &scene.model, reducer, keyuse, sink);
+    let (outcome, refused) =
+        staging.apply_seal(&success, &scene.model, reducer, keyuse, instance, sink);
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne, "{}", call.name);
     assert_eq!(refused, 0);
     (facts, position)
@@ -1631,6 +1703,8 @@ fn drive_quantum(
 /// join in the model), with explicit evidence.
 #[test]
 fn key_operation_joint_async_pending_then_direct_completion() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
     let mut scene = JointScene::new();
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
@@ -1651,6 +1725,7 @@ fn key_operation_joint_async_pending_then_direct_completion() {
         &scene.model,
         &mut joint,
         &mut keyuse,
+        instance,
         &mut joint_sink,
     );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
@@ -1686,7 +1761,7 @@ fn key_operation_joint_async_pending_then_direct_completion() {
     // The direct carve-out has no tee: the driver feeds the new
     // effects to the key-use reducer itself.
     for effect in &joint_sink[effects_before..] {
-        keyuse.observe_effect(effect);
+        keyuse.observe_effect(instance, effect);
     }
     direct.observe_with_effects(&complete, &origin, &mut direct_sink);
     assert_eq!(strip_receipts(&joint_sink), direct_sink);
@@ -1705,6 +1780,7 @@ fn key_operation_joint_async_pending_then_direct_completion() {
         &scene.model,
         &mut joint,
         &mut keyuse,
+        instance,
         &mut joint_sink,
     );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
@@ -1880,6 +1956,8 @@ fn key_operation_key_roles_bind_transitions() {
 /// requested-only metadata keeps definite operations without values.
 #[test]
 fn key_operation_unknown_key_and_requested_only() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
     // Unreadable Init input: the model explicitly leaves the join
     // unresolved, so no reference exists to associate. (Absent
     // inputs are wire-malformed for ACCESS — present positions
@@ -1912,8 +1990,14 @@ fn key_operation_unknown_key_and_requested_only() {
         )),
         "no reference to associate"
     );
-    let (outcome, _) =
-        staging.apply_seal(&success, &scene.model, &mut joint, &mut keyuse, &mut sink);
+    let (outcome, _) = staging.apply_seal(
+        &success,
+        &scene.model,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
     drive_quantum(
         &mut scene,
@@ -1940,7 +2024,7 @@ fn key_operation_unknown_key_and_requested_only() {
     let c = op("C_Sign", 7, 200);
     feed(&mut direct, &mut sink, &c);
     for effect in &sink {
-        keyuse.observe_effect(effect);
+        keyuse.observe_effect(instance, effect);
     }
     assert_eq!(keyuse.rows().len(), 1);
     assert!(keyuse.rows()[0].keys.is_empty());
@@ -2065,74 +2149,1682 @@ fn key_operation_later_metadata_never_rewrites_rows() {
     assert_eq!(keyuse.rows()[0], frozen, "completed rows never rewrite");
 }
 
-/// G11/H9-§3: key-operation rows are bounded (65,536 retained,
-/// oldest-first drops with explicit reason + timestamp), and keys
-/// referenced across the pruned boundary row correctly.
+/// G11/H9-§3/§91: key-operation rows are bounded (65,536):
+/// history is never evicted for a new row. At N+1 the new
+/// association is refused — S1 preserved, old rows intact — with
+/// explicit PARTIAL evidence, and terminals of refused
+/// associations land in fixed counters without allocating rows.
 #[test]
 fn key_operation_row_retention_bounds() {
-    use crate::semantics_key_use::{KEY_OP_ROW_CAPACITY, RetentionDropReason};
+    use crate::key_operation_projection::KEY_OP_ROW_CAPACITY;
 
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
     let mut edge = EdgeSemantics::default();
     let mut keyuse = KeyUseReducer::new();
     assert_eq!(KEY_OP_ROW_CAPACITY, 65_536);
-    // 65,546 real direct operations through the real reducer: real
+    // Fill exactly to capacity with real direct operations: real
     // identities, real effects, receipt-less rows.
-    for n in 0..65_546u64 {
+    for n in 0..65_536u64 {
         let mut sink = Vec::new();
         let c = op("C_GenerateKey", 7, 1_000 + n);
         let origin = EffectOrigin::from(&c);
         edge.observe_with_effects(&c, &origin, &mut sink);
         assert_eq!(sink.len(), 1);
-        keyuse.observe_effect(&sink[0]);
+        keyuse.observe_effect(instance, &sink[0]);
     }
     assert_eq!(keyuse.rows().len(), KEY_OP_ROW_CAPACITY);
-    assert_eq!(keyuse.drops(), 10);
-    let drop = keyuse.last_drop().expect("drops recorded");
-    assert_eq!(drop.reason, RetentionDropReason::CapacityOverflow);
-    assert_eq!(drop.seq, 9, "the tenth drop evicted row 9");
-    assert_eq!(drop.ended_ts_ns, 1_000 + 9);
-    assert_eq!(keyuse.rows()[0].seq, 10, "oldest-first retention");
-    assert_eq!(keyuse.rows().back().unwrap().seq, 65_545);
-
-    // Across the pruned boundary: new receipt-bearing operations
-    // for colliding keys row with exact receipts and running seqs.
-    // Three competing Inits (two replacements), then one Sign
-    // completing the survivor.
-    let key_a = ObjectId::for_test(0xA11CE);
-    let key_b = ObjectId::for_test(0xB0B);
-    for (n, key) in [key_a, key_b, key_a].into_iter().enumerate() {
-        let receipt = KeyReceipt {
-            key,
-            function: crate::kinds::function_id("C_SignInit").unwrap(),
-            input: 0,
-            role: KeyRole::OperationKey,
-            position: 500 + n as u64,
-            metadata: crate::semantics_objects::KeyMetadataFlags::ZERO,
-        };
+    assert!(!keyuse.evidence().partial, "exact fit is not partial");
+    // N+1 refuses: S1 still completes, old rows intact, PARTIAL.
+    let completed_before = edge.completed();
+    for n in 0..10u64 {
         let mut sink = Vec::new();
-        let c = init("C_SignInit", 7, RSA_PKCS, 200_000 + n as u64);
+        let c = op("C_GenerateKey", 7, 200_000 + n);
         let origin = EffectOrigin::from(&c);
-        edge.observe_joint(&c, &origin, std::slice::from_ref(&receipt), &mut sink);
-        assert_eq!(sink.len(), 1 + n.min(1), "replacement after the first");
-        for effect in &sink {
-            keyuse.observe_effect(effect);
-        }
+        edge.observe_with_effects(&c, &origin, &mut sink);
+        assert_eq!(sink.len(), 1);
+        keyuse.observe_effect(instance, &sink[0]);
+    }
+    assert_eq!(edge.completed(), completed_before + 10, "S1 preserved");
+    assert_eq!(keyuse.rows().len(), KEY_OP_ROW_CAPACITY);
+    assert_eq!(keyuse.rows()[0].seq, 0, "history never evicted");
+    assert_eq!(keyuse.rows().back().unwrap().seq, 65_535);
+    let evidence = keyuse.evidence();
+    assert!(evidence.partial, "refusal makes coverage PARTIAL");
+    assert_eq!(evidence.rows_refused, 10);
+    assert_eq!(
+        evidence.refused_terminals, 10,
+        "refused directs land counted, never rowed"
+    );
+
+    // Small-N twin: reservation at start, reserved closes reuse
+    // their slot allocation-free, N+1 refuses starts and directs.
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::with_capacity(4);
+    assert_eq!(keyuse.capacity(), 4, "injected bound");
+    for n in 0..3u64 {
+        let mut sink = Vec::new();
+        let c = op("C_GenerateKey", 7, 300_000 + n);
+        let origin = EffectOrigin::from(&c);
+        edge.observe_with_effects(&c, &origin, &mut sink);
+        keyuse.observe_effect(instance, &sink[0]);
     }
     let mut sink = Vec::new();
-    let c = op("C_Sign", 7, 300_000);
+    let c = init("C_SignInit", 7, RSA_PKCS, 400_000);
+    let origin = EffectOrigin::from(&c);
+    edge.observe_joint(&c, &origin, &[], &mut sink);
+    for effect in &sink {
+        keyuse.observe_effect(instance, effect);
+    }
+    assert_eq!(keyuse.open().len(), 1, "the start reserved its slot");
+    assert!(!keyuse.evidence().partial);
+    let mut sink = Vec::new();
+    let c = op("C_Sign", 7, 400_001);
     let origin = EffectOrigin::from(&c);
     edge.observe_with_effects(&c, &origin, &mut sink);
-    assert_eq!(sink.len(), 1);
     for effect in &sink {
-        keyuse.observe_effect(effect);
+        keyuse.observe_effect(instance, effect);
     }
-    assert_eq!(keyuse.rows().len(), KEY_OP_ROW_CAPACITY);
-    assert_eq!(keyuse.drops(), 13, "10 + 3 closed rows");
-    let tail: Vec<KeyOpRow> = keyuse.rows().iter().rev().take(3).cloned().collect();
-    assert_eq!(tail[2].keys[0].key, key_a);
-    assert_eq!(tail[1].keys[0].key, key_b);
-    assert_eq!(tail[0].keys[0].key, key_a);
-    assert_eq!(tail[2].outcome, OperationOutcome::Cancelled, "replaced");
-    assert_eq!(tail[1].outcome, OperationOutcome::Cancelled, "replaced");
-    assert_eq!(tail[0].outcome, OperationOutcome::Completed);
+    assert_eq!(keyuse.rows().len(), 4, "the end reused its slot");
+    assert!(keyuse.open().is_empty());
+    assert!(!keyuse.evidence().partial, "reserved closes never refuse");
+    assert_eq!(keyuse.rows()[3].category, "sign");
+    assert_eq!(keyuse.rows()[3].outcome, OperationOutcome::Completed);
+    // N+1 from here on: a direct refuses atomically, a refused
+    // start's terminal lands counted without a row.
+    let mut sink = Vec::new();
+    let c = op("C_GenerateKey", 7, 500_000);
+    let origin = EffectOrigin::from(&c);
+    edge.observe_with_effects(&c, &origin, &mut sink);
+    keyuse.observe_effect(instance, &sink[0]);
+    assert_eq!(keyuse.evidence().rows_refused, 1);
+    assert!(keyuse.evidence().partial);
+    let started_before = edge.started();
+    let mut sink = Vec::new();
+    let c = init("C_SignInit", 7, RSA_PKCS, 500_001);
+    let origin = EffectOrigin::from(&c);
+    edge.observe_joint(&c, &origin, &[], &mut sink);
+    for effect in &sink {
+        keyuse.observe_effect(instance, effect);
+    }
+    assert_eq!(keyuse.evidence().rows_refused, 2);
+    assert_eq!(keyuse.refused_opens().len(), 1);
+    assert_eq!(
+        edge.started(),
+        started_before + 1,
+        "refused S1 machines still run"
+    );
+    let completed_before = edge.completed();
+    let mut sink = Vec::new();
+    let c = op("C_Sign", 7, 500_002);
+    let origin = EffectOrigin::from(&c);
+    edge.observe_with_effects(&c, &origin, &mut sink);
+    for effect in &sink {
+        keyuse.observe_effect(instance, effect);
+    }
+    assert_eq!(keyuse.rows().len(), 4, "refused terminals row nothing");
+    assert_eq!(keyuse.evidence().refused_terminals, 2);
+    assert!(keyuse.refused_opens().is_empty());
+    assert_eq!(
+        edge.completed(),
+        completed_before + 1,
+        "S1 outcomes preserved"
+    );
+}
+
+// ==================== Checkbox 4: one projection, three consumers ====================
+
+use crate::discovery::caller_registry::RegistryLimits;
+use crate::discovery::inventory_workload::{Harness, ScaleSpec};
+use crate::inventory::render_json_from_presentation;
+use crate::inventory_dashboard::{DashboardState, DisplayFrame, LogTail, Viewport, render_frame};
+use crate::inventory_events::{EventWriter, KeyOperationEmitter};
+use crate::inventory_present::Presentation;
+use crate::key_operation_projection::{
+    ObjectObservations, ObsStatus, ObservationPublisher, object_observations_json, producer::commit,
+};
+use std::collections::BTreeMap;
+
+/// A private scratch dir for stream files (0700, TMPDIR-backed).
+fn private_tempdir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        dir.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    dir
+}
+
+/// Read every stream file (rotations oldest-first, live last) into
+/// parsed lines.
+fn read_stream(dir: &std::path::Path, live: &str) -> Vec<serde_json::Value> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name == live || name.starts_with(&format!("{live}.")))
+        .collect();
+    let sequence = |name: &String| -> (bool, u64) {
+        if name == live {
+            return (true, u64::MAX);
+        }
+        let suffix = name.strip_prefix(&format!("{live}.")).unwrap_or("");
+        (false, suffix.parse().unwrap_or(u64::MAX))
+    };
+    files.sort_by(|a, b| sequence(a).cmp(&sequence(b)));
+    let mut lines = Vec::new();
+    for name in files {
+        let body = std::fs::read_to_string(dir.join(&name)).unwrap();
+        for line in body.lines() {
+            lines.push(
+                serde_json::from_str(line)
+                    .unwrap_or_else(|_| panic!("{name}: unparsable line: {line:?}")),
+            );
+        }
+    }
+    lines
+}
+
+/// The test consumer: replays `object_observed` /
+/// `key_operations_observed` lines into row maps by (bucket, row
+/// key), replacing by revision. Same-revision repeats must be
+/// identical (rotation re-emission); older revisions never replace.
+fn reconstruct(lines: &[serde_json::Value]) -> Reconstructed {
+    let mut objects = BTreeMap::new();
+    let mut known = BTreeMap::new();
+    let mut unknown = BTreeMap::new();
+    for line in lines {
+        let kind = line["kind"].as_str().unwrap_or("");
+        let event = &line["event"];
+        let revision = event["revision"].as_u64().unwrap_or(u64::MAX);
+        let (map, key) = match kind {
+            "object_observed" => (&mut objects, format!("o:{}", event["row"]["object"])),
+            "key_operations_observed" if event["bucket"] == "known" => {
+                let row = &event["row"];
+                (
+                    &mut known,
+                    format!(
+                        "k:{}:{}:{}:{}:{}",
+                        row["instance"].as_str().unwrap_or("?"),
+                        row["object"],
+                        row["category"].as_str().unwrap_or("?"),
+                        row["role"].as_str().unwrap_or("?"),
+                        row["metadata_at_use"].as_str().unwrap_or("?"),
+                    ),
+                )
+            }
+            "key_operations_observed" => {
+                let row = &event["row"];
+                (
+                    &mut unknown,
+                    format!(
+                        "u:{}:{}",
+                        row["category"].as_str().unwrap_or("?"),
+                        row["reason"].as_str().unwrap_or("?"),
+                    ),
+                )
+            }
+            _ => continue,
+        };
+        match map.get(&key) {
+            Some((stored_revision, stored_row)) => {
+                assert!(
+                    revision >= *stored_revision,
+                    "revisions never move backwards for {key}"
+                );
+                if revision == *stored_revision {
+                    assert_eq!(
+                        &event["row"], stored_row,
+                        "same-revision repeats are identical for {key}"
+                    );
+                } else {
+                    map.insert(key, (revision, event["row"].clone()));
+                }
+            }
+            None => {
+                map.insert(key, (revision, event["row"].clone()));
+            }
+        }
+    }
+    Reconstructed {
+        objects,
+        known,
+        unknown,
+    }
+}
+
+#[derive(Debug, Default)]
+struct Reconstructed {
+    objects: BTreeMap<String, (u64, serde_json::Value)>,
+    known: BTreeMap<String, (u64, serde_json::Value)>,
+    unknown: BTreeMap<String, (u64, serde_json::Value)>,
+}
+
+/// The same rows keyed the same way, from the JSON section.
+fn section_rows(section: &serde_json::Value) -> Reconstructed {
+    let revision = section["revision"].as_u64().unwrap();
+    let mut out = Reconstructed::default();
+    for row in section["objects"].as_array().unwrap() {
+        out.objects
+            .insert(format!("o:{}", row["object"]), (revision, row.clone()));
+    }
+    for row in section["key_operations"].as_array().unwrap() {
+        out.known.insert(
+            format!(
+                "k:{}:{}:{}:{}:{}",
+                row["instance"].as_str().unwrap(),
+                row["object"],
+                row["category"].as_str().unwrap(),
+                row["role"].as_str().unwrap(),
+                row["metadata_at_use"].as_str().unwrap(),
+            ),
+            (revision, row.clone()),
+        );
+    }
+    for row in section["unknown_key_operations"].as_array().unwrap() {
+        out.unknown.insert(
+            format!(
+                "u:{}:{}",
+                row["category"].as_str().unwrap(),
+                row["reason"].as_str().unwrap(),
+            ),
+            (revision, row.clone()),
+        );
+    }
+    out
+}
+
+/// Rows agree exactly; revisions agree exactly on fresh emission,
+/// or persist below the section revision after delta emission (a
+/// row event's revision is its last change).
+fn assert_reconstructed_eq_json(
+    reconstructed: &Reconstructed,
+    section: &serde_json::Value,
+    exact_revision: bool,
+) {
+    let expected = section_rows(section);
+    let section_revision = section["revision"].as_u64().unwrap();
+    for (name, got, want) in [
+        ("object", &reconstructed.objects, &expected.objects),
+        ("key", &reconstructed.known, &expected.known),
+        ("unknown", &reconstructed.unknown, &expected.unknown),
+    ] {
+        assert_eq!(got.len(), want.len(), "{name} row count agrees");
+        for (key, (want_revision, want_row)) in want {
+            let (got_revision, got_row) = got
+                .get(key)
+                .unwrap_or_else(|| panic!("{name} row {key} reconstructed"));
+            assert_eq!(got_row, want_row, "{name} row {key} agrees");
+            if exact_revision {
+                assert_eq!(
+                    got_revision, want_revision,
+                    "{name} row {key} revision agrees"
+                );
+            } else {
+                assert!(
+                    *got_revision <= section_revision,
+                    "{name} row {key} persists below the section revision"
+                );
+            }
+        }
+    }
+}
+
+/// A captured harness presentation to embed committed projections
+/// into (the future live loop publishes atomically; tests embed the
+/// committed revision the same way).
+fn harness_presentation() -> Presentation {
+    let mut harness = Harness::new(RegistryLimits::default_limits()).unwrap();
+    harness.stage_scale(&ScaleSpec {
+        name: "projection-consumers",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 4,
+        first_pid: 91_000,
+    });
+    harness.commit();
+    Presentation::capture(harness.coordinator(), "workload", 1, 2, 1)
+}
+
+fn dashboard_text(presentation: &Presentation, width: usize, height: usize) -> Vec<String> {
+    let mut tail = LogTail::bounded();
+    tail.push("p11scope: pass 1: projection consumers");
+    let frame = DisplayFrame {
+        presentation: std::sync::Arc::new(presentation.clone()),
+        log: tail.snapshot(),
+    };
+    let bytes = render_frame(&frame, Viewport { width, height }, &DashboardState::new());
+    let text = String::from_utf8(bytes).expect("frames are valid UTF-8");
+    assert!(text.starts_with("\x1b[H"), "frames home first");
+    text.replace("\x1b[H", "")
+        .replace("\x1b[K", "")
+        .split('\n')
+        .map(str::to_string)
+        .collect()
+}
+
+/// H9-§3: one immutable projection, three consumers. A populated
+/// Joint scene (RSA-2048 label established before use, sign, verify,
+/// failed verify, two-role wrap, an open proved association and an
+/// open unbound S1Only association, KEM and generation activity)
+/// commits revision 1; JSON, JSONL reconstruction and the dashboard
+/// agree on revision, status, IDs, units and counters. Revision 2
+/// retires the key (destroy before the open sign's terminal):
+/// changed rows re-emit, unchanged rows persist client-side, and
+/// reconstruction still equals JSON with no double counting.
+/// Rotation preserves the same final facts across files.
+#[test]
+fn key_operation_one_projection_three_consumers() {
+    const WRAP_KEY: u64 = 0xA1A1_A1A1_A1A1_A1A1;
+    const DATA_KEY: u64 = 0xA2A2_A2A2_A2A2_A2A2;
+    let s1_instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(4);
+
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let s1_marker = JointStaging::select_s1_only();
+    let mut joint = EdgeSemantics::default();
+    let mut s1_edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+
+    // The sign key exists, then its RSA-2048 label is established
+    // before use.
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    // Sign, verify, one failed verify.
+    for call in [
+        ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+        ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+        ShapedS1::shaped("C_VerifyInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+        ShapedS1::shaped("C_Verify", CkRv::OK.0, 0, op_capture()),
+        ShapedS1::shaped("C_VerifyInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+        ShapedS1::shaped("C_Verify", CkRv::SIGNATURE_INVALID.0, 0, op_capture()),
+    ] {
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &call,
+        );
+    }
+    // Two-role wrap over two created keys, both RSA-labeled like
+    // the sign key (the GET queries its input0 override).
+    for result in [WRAP_KEY, DATA_KEY] {
+        let create = ShapedS1 {
+            result: Some(result),
+            ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
+        };
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &create,
+        );
+        let label = ShapedS1 {
+            input0: Some((result, 1)),
+            getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+            ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+        };
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &label,
+        );
+    }
+    let wrap = ShapedS1 {
+        input0: Some((WRAP_KEY, 1)),
+        input1: Some((DATA_KEY, 1)),
+        ..ShapedS1::shaped("C_WrapKey", CkRv::OK.0, RSA_PKCS, init_capture())
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &wrap,
+    );
+    // One proved association stays open at revision 1.
+    let open_sign = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &open_sign,
+    );
+    assert_eq!(keyuse.open().len(), 1);
+
+    // The S1Only sibling instance (separate reducer, shared
+    // capture-wide key-use): KEM + generation activity plus one open
+    // unbound association. No staging: S1Only reduces directly.
+    for (name, ts) in [("C_EncapsulateKey", 900_000u64), ("C_GenerateKey", 900_001)] {
+        let mut direct_sink = Vec::new();
+        let c = op(name, 9, ts);
+        let origin = EffectOrigin::from(&c);
+        s1_edge.observe_with_effects(&c, &origin, &mut direct_sink);
+        assert!(!direct_sink.is_empty(), "{name} emits its S1 effect");
+        for effect in &direct_sink {
+            keyuse.observe_effect(s1_instance, effect);
+        }
+    }
+    let mut direct_sink = Vec::new();
+    let c = init("C_SignInit", 9, RSA_PKCS, 900_002);
+    let origin = EffectOrigin::from(&c);
+    s1_edge.observe_with_effects(&c, &origin, &mut direct_sink);
+    assert!(!direct_sink.is_empty(), "the unbound start emits");
+    for effect in &direct_sink {
+        keyuse.observe_effect(s1_instance, effect);
+    }
+    assert_eq!(keyuse.open().len(), 2);
+
+    // Revision 1 commits populated: the Joint feed carries object
+    // authority; the S1Only sibling contributes unknown-key S1 facts.
+    let r1 = commit(1, &[&staging, &s1_marker], &scene.model.project(), &keyuse);
+    assert_eq!(r1.status, ObsStatus::Populated);
+    assert_eq!(r1.reason, "none");
+    assert_eq!(r1.sessions.len(), 1);
+    assert_eq!(r1.objects.len(), 3, "sign key + wrap key + data key");
+    assert!(
+        r1.key_operations
+            .iter()
+            .all(|row| row.metadata_at_use == "rsa_2048"),
+        "established labels bind at use"
+    );
+    assert!(
+        r1.key_operations.iter().all(|row| row.instance == "i3"),
+        "proved rows carry the Joint instance; the S1Only sibling stays unknown-key"
+    );
+    let sign_rows: Vec<_> = r1
+        .key_operations
+        .iter()
+        .filter(|row| row.category == "sign")
+        .collect();
+    assert_eq!(sign_rows.len(), 1);
+    assert_eq!((sign_rows[0].completed, sign_rows[0].active), (1, 1));
+    let verify_row = r1
+        .key_operations
+        .iter()
+        .find(|row| row.category == "verify")
+        .expect("proved verify row");
+    assert_eq!((verify_row.completed, verify_row.failed), (1, 1));
+    let mut wrap_roles: Vec<_> = r1
+        .key_operations
+        .iter()
+        .filter(|row| row.category == "wrap")
+        .map(|row| row.role)
+        .collect();
+    wrap_roles.sort_unstable();
+    assert_eq!(
+        wrap_roles,
+        vec!["wrapped_object", "wrapping_key"],
+        "both wrap roles"
+    );
+    let wrap_keys: Vec<_> = r1
+        .key_operations
+        .iter()
+        .filter(|row| row.category == "wrap")
+        .map(|row| (row.instance.clone(), row.object, row.role))
+        .collect();
+    assert_eq!(wrap_keys.len(), 2);
+    assert!(wrap_keys[0] < wrap_keys[1], "rows sort by full key tuple");
+    let unknown_sign = r1
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "unbound")
+        .expect("open unbound sign");
+    assert_eq!(unknown_sign.active, 1);
+    assert!(
+        r1.unknown_key_operations
+            .iter()
+            .any(|row| row.category == "encapsulate" && row.reason == "role_unavailable"),
+        "KEM reports role unavailable, S1 intact"
+    );
+    assert!(
+        r1.unknown_key_operations
+            .iter()
+            .any(|row| row.category == "generate_key" && row.reason == "not_applicable"),
+        "generation stays not-applicable"
+    );
+    assert_eq!(s1_edge.completed(), 2, "KEM + generation S1 totals");
+
+    // Consumer 1 (JSON) and consumer 3 (dashboard) read the shared
+    // presentation; consumer 2 (JSONL) reconstructs from the stream.
+    let mut presentation = harness_presentation();
+    presentation.object_observations = r1.clone();
+    let document = render_json_from_presentation(&presentation);
+    let section = &document["object_observations"];
+    assert_eq!(section["version"], 1);
+    assert_eq!(section["revision"], 1);
+    assert_eq!(section["status"], "populated");
+
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+    let mut emitter = KeyOperationEmitter::new();
+    let first = emitter.emit(&mut writer, &r1, 1_000).unwrap();
+    assert_eq!(first.deferred, 0);
+    assert_eq!(
+        first.emitted,
+        r1.objects.len() + r1.key_operations.len() + r1.unknown_key_operations.len(),
+        "first emission carries every row"
+    );
+    drop(writer);
+    let lines = read_stream(dir.path(), "events.jsonl");
+    assert_reconstructed_eq_json(&reconstruct(&lines), section, true);
+
+    let wide = dashboard_text(&presentation, 300, 24);
+    assert_eq!(wide.len(), 24, "frames fill the viewport");
+    let line = wide
+        .iter()
+        .find(|line| line.starts_with("objects/keys"))
+        .expect("projection line");
+    assert_eq!(
+        line,
+        &format!(
+            "objects/keys rev 1 populated | sess 1 obj 3 krows {} urows {} refused 0+0 | {}",
+            r1.key_operations.len(),
+            r1.unknown_key_operations.len(),
+            "encapsulate 1/0/0 operations, generate_key 1/0/0 operations, sign 1/0/2 operations, verify 1/1/0 operations, wrap 2/0/0 operations",
+        ),
+        "dashboard agrees on revision, status, counts, units and tallies"
+    );
+    assert!(
+        wide.last().unwrap().contains("scroll 0/"),
+        "footer pinned: {}",
+        wide.last().unwrap()
+    );
+    let narrow = dashboard_text(&presentation, 80, 24);
+    let short = narrow
+        .iter()
+        .find(|line| line.starts_with("objects/keys"))
+        .expect("narrow line");
+    assert!(
+        short.starts_with("objects/keys rev 1 populated | sess 1 obj 3 krows "),
+        "{short}"
+    );
+
+    // Revision 2: destroy retires the open sign association before
+    // its terminal; the terminal closes key_join_lost and lands
+    // unknown-key, with no second start anywhere.
+    let destroy = ShapedS1::shaped("C_DestroyObject", CkRv::OK.0, 0, 0);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &destroy,
+    );
+    assert_eq!(
+        keyuse.evidence().join_lost,
+        1,
+        "the open sign lost its join"
+    );
+    let close = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &close,
+    );
+    let r2 = commit(2, &[&staging, &s1_marker], &scene.model.project(), &keyuse);
+    assert_eq!(r2.status, ObsStatus::Populated);
+    let sign_row = r2
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("proved sign row");
+    assert_eq!(
+        (
+            sign_row.started,
+            sign_row.completed,
+            sign_row.active,
+            sign_row.key_join_lost
+        ),
+        (2, 1, 0, 1),
+        "started = completed + key_join_lost across the retirement"
+    );
+    let lost_terminal = r2
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "key_join_lost")
+        .expect("retired terminal lands unknown-key");
+    assert_eq!(lost_terminal.completed, 1);
+    assert!(
+        !r2.unknown_key_operations
+            .iter()
+            .any(|row| row.category == "sign" && row.reason == "key_join_lost" && row.active > 0),
+        "no fabricated unknown starts"
+    );
+    presentation.object_observations = r2.clone();
+    let document = render_json_from_presentation(&presentation);
+    let section = &document["object_observations"];
+
+    // Changed rows re-emit; unchanged rows persist client-side.
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+    let mut emitter = KeyOperationEmitter::new();
+    emitter.emit(&mut writer, &r1, 1_000).unwrap();
+    let before = emitter.tracked();
+    let delta = emitter.emit(&mut writer, &r2, 2_000).unwrap();
+    assert_eq!(delta.deferred, 0);
+    assert_eq!(
+        delta.emitted, 3,
+        "only the sign row, the new lost summary and the destroyed object row re-emit"
+    );
+    assert_eq!(
+        emitter.tracked(),
+        before + 1,
+        "one row is new, two changed in place"
+    );
+    drop(writer);
+    let lines = read_stream(dir.path(), "events.jsonl");
+    assert_reconstructed_eq_json(&reconstruct(&lines), section, false);
+
+    // Rotation preserves the same final facts across files.
+    let spin = dir.path().join("spin.jsonl");
+    let mut writer = EventWriter::create(&spin, 1024, 16).unwrap();
+    let mut emitter = KeyOperationEmitter::new();
+    emitter.emit(&mut writer, &r1, 1_000).unwrap();
+    emitter.emit(&mut writer, &r2, 2_000).unwrap();
+    assert!(writer.rotations() > 0, "rotation exercised");
+    drop(writer);
+    let lines = read_stream(dir.path(), "spin.jsonl");
+    assert!(
+        lines.iter().any(|line| line["kind"] == "rotated"),
+        "rotation marker present"
+    );
+    assert_reconstructed_eq_json(&reconstruct(&lines), section, false);
+}
+
+/// H9-§3: the frozen contract. Rendered sections carry exactly the
+/// frozen keys and enums (pinned key-for-key against the schema file
+/// and the golden); row equations, sort orders and the no-started
+/// unknown rule hold; every vocabulary map is exhaustive; the
+/// status matrix, stale publication, sink failure, full-budget
+/// terminals and deferred delivery behave exactly.
+#[test]
+fn key_operation_schema_contract() {
+    use crate::key_operation_projection::contract::*;
+    use crate::key_operation_projection::producer::{
+        gap_label, metadata_field, metadata_label, query_label, role_label,
+    };
+    use crate::semantics_edge::KeyRole;
+    use crate::semantics_key_use::{binds_keys, unbound_reason_for, unit_for};
+    use crate::semantics_objects::{FieldState, FieldValue, KeyLabel, QueryStatus};
+
+    // ---- Frozen tables mirror the schema file key-for-key. ----
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let defs = &schema["$defs"];
+    let required = |pointer: &str| -> Vec<String> {
+        let mut keys: Vec<String> = schema
+            .pointer(pointer)
+            .unwrap_or(&serde_json::Value::Null)
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|key| key.as_str().unwrap().to_string())
+            .collect();
+        keys.sort();
+        keys
+    };
+    let mut table = |keys: &[&str]| -> Vec<String> {
+        let mut owned: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+        owned.sort();
+        owned
+    };
+    assert_eq!(required("/required"), table(&SECTION_KEYS), "section keys");
+    assert_eq!(
+        required("/$defs/session_row/required"),
+        table(&SESSION_ROW_KEYS)
+    );
+    assert_eq!(
+        required("/$defs/object_row/required"),
+        table(&OBJECT_ROW_KEYS)
+    );
+    assert_eq!(required("/$defs/key_row/required"), table(&KEY_ROW_KEYS));
+    assert_eq!(
+        required("/$defs/unknown_row/required"),
+        table(&UNKNOWN_ROW_KEYS)
+    );
+    assert_eq!(required("/$defs/gap_row/required"), table(&GAP_ROW_KEYS));
+    assert_eq!(
+        required("/properties/budgets/required"),
+        table(&BUDGET_KEYS)
+    );
+    assert_eq!(required("/properties/gaps/required"), table(&GAP_KEYS));
+    assert_eq!(
+        required("/$defs/row_budget/required"),
+        table(&ROW_BUDGET_KEYS)
+    );
+    assert_eq!(
+        required("/$defs/metadata_block/required"),
+        table(&METADATA_KEYS)
+    );
+    let enums = |pointer: &str| -> Vec<String> {
+        let mut values: Vec<String> = schema
+            .pointer(pointer)
+            .unwrap_or(&serde_json::Value::Null)
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect();
+        values.sort();
+        values
+    };
+    assert_eq!(enums("/properties/status/enum"), table(&STATUS_LABELS));
+    assert_eq!(
+        enums("/properties/reason/enum"),
+        table(&crate::key_operation_projection::REASON_LABELS)
+    );
+    assert_eq!(enums("/$defs/category/enum"), table(&CATEGORY_LABELS));
+    assert_eq!(enums("/$defs/role/enum"), table(&ROLE_LABELS));
+    assert_eq!(enums("/$defs/unit/enum"), table(&UNIT_LABELS));
+    assert_eq!(enums("/$defs/metadata_label/enum"), table(&METADATA_LABELS));
+    assert_eq!(enums("/$defs/unknown_reason/enum"), table(&UNKNOWN_REASONS));
+    assert_eq!(enums("/$defs/gap_reason/enum"), table(&GAP_REASONS));
+    assert_eq!(enums("/$defs/query_status/enum"), table(&QUERY_STATUSES));
+    assert_eq!(
+        defs["row_budget"]["properties"]["limit"],
+        serde_json::json!({"const": 65536})
+    );
+    assert_eq!(
+        defs["session_row"]["properties"]["origin"]["enum"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        defs["object_row"]["properties"]["origin"]["enum"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // ---- The golden carries exactly the frozen keys. ----
+    let golden: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("tests/fixtures/key-operations/object-observations.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let keys_of = |value: &serde_json::Value| -> Vec<String> {
+        let mut keys: Vec<String> = value.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    assert_eq!(
+        keys_of(&golden),
+        table(&SECTION_KEYS),
+        "golden section keys"
+    );
+    for row in golden["sessions"].as_array().unwrap() {
+        assert_eq!(keys_of(row), table(&SESSION_ROW_KEYS));
+    }
+    for row in golden["objects"].as_array().unwrap() {
+        assert_eq!(keys_of(row), table(&OBJECT_ROW_KEYS));
+        assert_eq!(keys_of(&row["requested"]), table(&METADATA_KEYS));
+        assert_eq!(keys_of(&row["established"]), table(&METADATA_KEYS));
+        for field in [
+            "class",
+            "key_type",
+            "token",
+            "value_len",
+            "modulus_bits",
+            "ec_params",
+        ] {
+            assert_eq!(keys_of(&row["requested"][field]), table(&FIELD_KEYS));
+            assert_eq!(keys_of(&row["established"][field]), table(&FIELD_KEYS));
+        }
+        assert_eq!(keys_of(&row["queries"]), table(&METADATA_KEYS));
+        if !row["birth"].is_null() {
+            assert_eq!(keys_of(&row["birth"]), table(&BIRTH_KEYS));
+        }
+    }
+    for row in golden["key_operations"].as_array().unwrap() {
+        assert_eq!(keys_of(row), table(&KEY_ROW_KEYS));
+    }
+    for row in golden["unknown_key_operations"].as_array().unwrap() {
+        assert_eq!(keys_of(row), table(&UNKNOWN_ROW_KEYS));
+    }
+    assert_eq!(keys_of(&golden["gaps"]), table(&GAP_KEYS));
+    for row in golden["gaps"]["rows"].as_array().unwrap() {
+        assert_eq!(keys_of(row), table(&GAP_ROW_KEYS));
+    }
+    assert_eq!(keys_of(&golden["budgets"]), table(&BUDGET_KEYS));
+    assert_eq!(
+        keys_of(&golden["budgets"]["key_rows"]),
+        table(&ROW_BUDGET_KEYS)
+    );
+    assert_eq!(
+        keys_of(&golden["budgets"]["object_rows"]),
+        table(&ROW_BUDGET_KEYS)
+    );
+    assert_eq!(
+        keys_of(&golden["budgets"]["unknown_rows"]),
+        table(&UNKNOWN_BUDGET_KEYS)
+    );
+
+    // ---- Every vocabulary map is exhaustive over its source. ----
+    let gaps = [
+        crate::semantics_objects::ObjectGap::BootstrapUnproven,
+        crate::semantics_objects::ObjectGap::BootstrapRefused,
+        crate::semantics_objects::ObjectGap::PrefixContradiction,
+        crate::semantics_objects::ObjectGap::StalePrefix,
+        crate::semantics_objects::ObjectGap::ClosedFrontier,
+        crate::semantics_objects::ObjectGap::DuplicateCall,
+        crate::semantics_objects::ObjectGap::DuplicateCompletion,
+        crate::semantics_objects::ObjectGap::StaleToken,
+        crate::semantics_objects::ObjectGap::FencedCompletion,
+        crate::semantics_objects::ObjectGap::MalformedFact,
+        crate::semantics_objects::ObjectGap::UnsupportedFunction,
+        crate::semantics_objects::ObjectGap::DomainEnded,
+        crate::semantics_objects::ObjectGap::ResultProtocolUnavailable,
+        crate::semantics_objects::ObjectGap::PendingResultUnavailable,
+        crate::semantics_objects::ObjectGap::OutputUnreadable,
+        crate::semantics_objects::ObjectGap::PairDuplicate,
+        crate::semantics_objects::ObjectGap::NullMechanismCancel,
+        crate::semantics_objects::ObjectGap::SameSessionOverlap,
+        crate::semantics_objects::ObjectGap::OverlapUncertain,
+        crate::semantics_objects::ObjectGap::OutputCollision,
+        crate::semantics_objects::ObjectGap::StaleOrigin,
+        crate::semantics_objects::ObjectGap::DependencyBroken,
+        crate::semantics_objects::ObjectGap::UnprovenInput,
+        crate::semantics_objects::ObjectGap::UnprovenSession,
+        crate::semantics_objects::ObjectGap::MetadataUncertain,
+        crate::semantics_objects::ObjectGap::DestroyAlias,
+        crate::semantics_objects::ObjectGap::CloseUncertain,
+        crate::semantics_objects::ObjectGap::CloseAllUncertain,
+        crate::semantics_objects::ObjectGap::LogoutUncertain,
+        crate::semantics_objects::ObjectGap::SessionClosed,
+        crate::semantics_objects::ObjectGap::InvalidHandle,
+        crate::semantics_objects::ObjectGap::AmbiguousOutcome,
+        crate::semantics_objects::ObjectGap::SessionContradiction,
+        crate::semantics_objects::ObjectGap::HandleReuse,
+        crate::semantics_objects::ObjectGap::Finalize,
+        crate::semantics_objects::ObjectGap::TokenReset,
+        crate::semantics_objects::ObjectGap::Exec,
+        crate::semantics_objects::ObjectGap::Fork,
+        crate::semantics_objects::ObjectGap::Unload,
+        crate::semantics_objects::ObjectGap::Loss,
+        crate::semantics_objects::ObjectGap::PendingCapacity,
+        crate::semantics_objects::ObjectGap::SessionCapacity,
+        crate::semantics_objects::ObjectGap::ObjectCapacity,
+        crate::semantics_objects::ObjectGap::InstanceCapacity,
+        crate::semantics_objects::ObjectGap::IdExhausted,
+        crate::semantics_objects::ObjectGap::DeviceLoss,
+        crate::semantics_objects::ObjectGap::UnseenFinalize,
+        crate::semantics_objects::ObjectGap::InconsistentMechanism,
+        crate::semantics_objects::ObjectGap::OutcomeLost,
+        crate::semantics_objects::ObjectGap::UnknownDomain,
+        crate::semantics_objects::ObjectGap::DomainPruned,
+    ];
+    assert_eq!(gaps.len(), 51, "every model gap enumerated");
+    let mut mapped: Vec<&str> = gaps.iter().map(|gap| gap_label(*gap)).collect();
+    mapped.sort_unstable();
+    mapped.dedup();
+    assert_eq!(mapped.len(), 51, "gap labels are distinct");
+    assert!(mapped.iter().all(|label| GAP_REASONS.contains(label)));
+    assert!(GAP_REASONS.contains(&"pruned_object_referenced"));
+    assert_eq!(GAP_REASONS.len(), 52);
+
+    let roles = [
+        (KeyRole::OperationKey, "key"),
+        (KeyRole::WrappingKey, "wrapping_key"),
+        (KeyRole::WrappedKey, "wrapped_object"),
+        (KeyRole::BaseKey, "base_key"),
+        (KeyRole::UnwrappingKey, "unwrapping_key"),
+        (KeyRole::Other, "other"),
+    ];
+    for (role, expected) in roles {
+        assert_eq!(role_label(role), expected);
+        assert!(ROLE_LABELS.contains(&expected));
+    }
+    let labels = [
+        (KeyLabel::Rsa { modulus_bits: 1024 }, "rsa_1024"),
+        (KeyLabel::Rsa { modulus_bits: 2048 }, "rsa_2048"),
+        (KeyLabel::Rsa { modulus_bits: 3072 }, "rsa_3072"),
+        (KeyLabel::Rsa { modulus_bits: 4096 }, "rsa_4096"),
+        (KeyLabel::Rsa { modulus_bits: 512 }, "rsa_other"),
+        (KeyLabel::Aes { value_len: 16 }, "aes_128"),
+        (KeyLabel::Aes { value_len: 24 }, "aes_192"),
+        (KeyLabel::Aes { value_len: 32 }, "aes_256"),
+        (KeyLabel::Aes { value_len: 8 }, "aes_other"),
+        (
+            KeyLabel::Ec {
+                curve: p11scope_ebpf_common::object_policy::SafeCurve::Secp256r1,
+            },
+            "ec_p256",
+        ),
+        (
+            KeyLabel::Ec {
+                curve: p11scope_ebpf_common::object_policy::SafeCurve::Secp384r1,
+            },
+            "ec_p384",
+        ),
+        (
+            KeyLabel::Ec {
+                curve: p11scope_ebpf_common::object_policy::SafeCurve::Secp521r1,
+            },
+            "ec_p521",
+        ),
+    ];
+    for (label, expected) in labels {
+        assert_eq!(metadata_label(label), expected);
+        assert!(METADATA_LABELS.contains(&expected));
+    }
+    for category in CATEGORY_LABELS {
+        assert!(UNIT_LABELS.contains(&unit_for(category)), "{category}");
+        assert!(
+            UNKNOWN_REASONS.contains(&unbound_reason_for(category)),
+            "{category}"
+        );
+        let applicable = ![
+            "generate_key",
+            "generate_key_pair",
+            "digest",
+            "direct",
+            "encapsulate",
+            "decapsulate",
+        ]
+        .contains(&category);
+        assert_eq!(binds_keys(category), applicable, "{category}");
+        let message = matches!(
+            category,
+            "message_encrypt" | "message_decrypt" | "message_sign" | "message_verify"
+        );
+        assert_eq!(
+            unit_for(category),
+            if message {
+                "message_contexts"
+            } else {
+                "operations"
+            }
+        );
+    }
+    let queries = [
+        (QueryStatus::NotQueried, "not_queried"),
+        (QueryStatus::Established, "established"),
+        (QueryStatus::Unavailable, "unavailable"),
+        (QueryStatus::SizeOnly, "size_only"),
+        (QueryStatus::Unsupported, "unsupported"),
+        (QueryStatus::Malformed, "malformed"),
+        (QueryStatus::Excluded, "excluded"),
+    ];
+    for (status, expected) in queries {
+        assert_eq!(query_label(status), expected);
+        assert!(QUERY_STATUSES.contains(&expected));
+    }
+    let curve = p11scope_ebpf_common::object_policy::SafeCurve::Secp384r1;
+    let fields = [
+        (FieldState::Unknown, "unknown", None, None),
+        (
+            FieldState::Value(FieldValue::Scalar(2048)),
+            "value",
+            Some(2048u16),
+            None,
+        ),
+        (
+            FieldState::Value(FieldValue::Curve(curve)),
+            "value",
+            None,
+            Some("secp384r1"),
+        ),
+        (
+            FieldState::Conflict(Some(FieldValue::Scalar(7))),
+            "conflict",
+            Some(7),
+            None,
+        ),
+        (FieldState::Conflict(None), "conflict", None, None),
+        (
+            FieldState::Invalidated(Some(FieldValue::Scalar(9))),
+            "invalidated",
+            Some(9),
+            None,
+        ),
+        (FieldState::Invalidated(None), "invalidated", None, None),
+    ];
+    for (state, status, scalar, curve_name) in fields {
+        let field = metadata_field(state);
+        assert_eq!(field.status, status);
+        assert!(FIELD_STATUSES.contains(&status));
+        assert_eq!(field.scalar, scalar);
+        assert_eq!(field.curve, curve_name);
+        if let Some(name) = curve_name {
+            assert!(CURVE_LABELS.contains(&name));
+        }
+    }
+
+    // ---- Rendered output carries exactly the frozen keys/enums. ----
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    for call in [
+        ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+        ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+        ShapedS1::shaped("C_VerifyInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+        ShapedS1::shaped("C_Verify", CkRv::SIGNATURE_INVALID.0, 0, op_capture()),
+        ShapedS1::shaped("C_DestroyObject", CkRv::OK.0, 0, 0),
+    ] {
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &call,
+        );
+    }
+    let r1 = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(r1.status, ObsStatus::Populated);
+    let section = object_observations_json(&r1);
+    assert_eq!(
+        keys_of(&section),
+        table(&SECTION_KEYS),
+        "rendered section keys"
+    );
+    assert_eq!(section["version"], 1);
+    assert_eq!(section["revision"], 1);
+    assert!(STATUS_LABELS.contains(&section["status"].as_str().unwrap()));
+    assert_eq!(section["reason"], "none");
+    for row in section["sessions"].as_array().unwrap() {
+        assert_eq!(keys_of(row), table(&SESSION_ROW_KEYS));
+        assert!(row["session"].as_u64().is_some());
+    }
+    assert!(!section["sessions"].as_array().unwrap().is_empty());
+    for row in section["objects"].as_array().unwrap() {
+        assert_eq!(keys_of(row), table(&OBJECT_ROW_KEYS));
+        assert_eq!(keys_of(&row["requested"]), table(&METADATA_KEYS));
+        assert_eq!(keys_of(&row["established"]), table(&METADATA_KEYS));
+        for field in [
+            "class",
+            "key_type",
+            "token",
+            "value_len",
+            "modulus_bits",
+            "ec_params",
+        ] {
+            assert_eq!(keys_of(&row["requested"][field]), table(&FIELD_KEYS));
+            assert_eq!(keys_of(&row["established"][field]), table(&FIELD_KEYS));
+            assert!(
+                FIELD_STATUSES.contains(&row["established"][field]["status"].as_str().unwrap())
+            );
+            assert!(QUERY_STATUSES.contains(&row["queries"][field].as_str().unwrap()));
+        }
+        assert_eq!(keys_of(&row["queries"]), table(&METADATA_KEYS));
+        if !row["birth"].is_null() {
+            assert_eq!(keys_of(&row["birth"]), table(&BIRTH_KEYS));
+        }
+        if let Some(label) = row["label"].as_str() {
+            assert!(METADATA_LABELS.contains(&label));
+        }
+        assert!(LIFETIME_LABELS.contains(&row["lifetime"].as_str().unwrap()));
+        assert!(ATTRIBUTION_LABELS.contains(&row["attribution"].as_str().unwrap()));
+    }
+    assert_eq!(section["objects"][0]["lifetime"], "destroyed");
+    assert_eq!(section["objects"][0]["label"], "rsa_2048");
+    for row in section["key_operations"].as_array().unwrap() {
+        assert_eq!(keys_of(row), table(&KEY_ROW_KEYS));
+        assert!(CATEGORY_LABELS.contains(&row["category"].as_str().unwrap()));
+        assert!(ROLE_LABELS.contains(&row["role"].as_str().unwrap()));
+        assert!(METADATA_LABELS.contains(&row["metadata_at_use"].as_str().unwrap()));
+        assert!(UNIT_LABELS.contains(&row["unit"].as_str().unwrap()));
+        let total = row["completed"].as_u64().unwrap()
+            + row["failed"].as_u64().unwrap()
+            + row["cancelled"].as_u64().unwrap()
+            + row["unknown"].as_u64().unwrap()
+            + row["active"].as_u64().unwrap()
+            + row["key_join_lost"].as_u64().unwrap();
+        assert_eq!(row["started"], total, "row equation holds for {row}");
+        assert!(row["instance"].as_str().unwrap().starts_with('i'));
+    }
+    for row in section["unknown_key_operations"].as_array().unwrap() {
+        assert_eq!(keys_of(row), table(&UNKNOWN_ROW_KEYS));
+        assert!(
+            row.get("started").is_none(),
+            "unknown rows never carry started"
+        );
+    }
+    assert_eq!(keys_of(&section["gaps"]), table(&GAP_KEYS));
+    for row in section["gaps"]["rows"].as_array().unwrap() {
+        assert_eq!(keys_of(row), table(&GAP_ROW_KEYS));
+        assert!(GAP_SUBJECTS.contains(&row["subject"].as_str().unwrap()));
+        assert!(GAP_REASONS.contains(&row["reason"].as_str().unwrap()));
+    }
+    assert_eq!(keys_of(&section["budgets"]), table(&BUDGET_KEYS));
+    assert_eq!(section["budgets"]["key_rows"]["limit"], 65536);
+    assert_eq!(section["budgets"]["object_rows"]["limit"], 65536);
+    assert_eq!(section["budgets"]["allocation_refused"], false);
+    assert_eq!(section["budgets"]["refusal_reason"], "none");
+    let measured = serde_json::to_vec(&section).unwrap().len();
+    assert_eq!(
+        section["budgets"]["encoded_bytes"], measured,
+        "bytes measured, not estimated"
+    );
+    let order: Vec<_> = section["key_operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["instance"].as_str().unwrap().to_string(),
+                row["object"].as_u64().unwrap(),
+                row["category"].as_str().unwrap().to_string(),
+                row["role"].as_str().unwrap().to_string(),
+                row["metadata_at_use"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let mut sorted = order.clone();
+    sorted.sort();
+    assert_eq!(order, sorted, "key rows sort by full key tuple");
+
+    // ---- Receipt metadata shapes aggregate exactly. ----
+    // Hand-built receipts over a REAL object id through the real
+    // edge reducer: usable labels prove rows; conflicting, unknown
+    // and requested-only metadata partition unknown with exact
+    // reasons (requested-only RSA2048 stays untyped).
+    let mut tiny = JointScene::new();
+    let tiny_bootstrap = tiny.bootstrap();
+    let mut tiny_staging = JointStaging::select_joint(Some(&tiny_bootstrap));
+    let mut tiny_edge = EdgeSemantics::default();
+    let mut tiny_keyuse = KeyUseReducer::new();
+    let mut tiny_sink = Vec::new();
+    drive_quantum(
+        &mut tiny,
+        &mut tiny_staging,
+        &mut tiny_edge,
+        &mut tiny_keyuse,
+        &mut tiny_sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let real_id = tiny.model.project().objects[0].id;
+    let sign_fn = crate::kinds::function_id("C_SignInit").unwrap();
+    let rsa = KeyLabel::Rsa { modulus_bits: 2048 };
+    // (label, attribution_valid, requested, established, conflicted)
+    let shapes = [
+        (Some(rsa), true, 0x1Fu8, 0x1Fu8, 0u8),
+        (Some(rsa), true, 0x1F, 0x1F, 1u8 << 4),
+        (None, true, 0u8, 0u8, 0u8),
+        (None, true, 0x13u8, 0u8, 0u8),
+    ];
+    let mut shape_edge = EdgeSemantics::default();
+    let mut shape_keyuse = KeyUseReducer::new();
+    for (n, (label, attribution_valid, requested, established, conflicted)) in
+        shapes.into_iter().enumerate()
+    {
+        let receipt = crate::semantics_edge::KeyReceipt {
+            key: real_id,
+            function: sign_fn,
+            input: 0,
+            role: KeyRole::OperationKey,
+            position: 700 + n as u64,
+            metadata: crate::semantics_objects::KeyMetadataFlags {
+                requested,
+                established,
+                conflicted,
+            },
+            label,
+            attribution_valid,
+            lost: false,
+        };
+        let mut start_sink = Vec::new();
+        let c = init("C_SignInit", 7, RSA_PKCS, 800_000 + n as u64 * 10);
+        let origin = EffectOrigin::from(&c);
+        shape_edge.observe_joint(&c, &origin, std::slice::from_ref(&receipt), &mut start_sink);
+        assert_eq!(start_sink.len(), 1);
+        for effect in &start_sink {
+            shape_keyuse.observe_effect(instance, effect);
+        }
+        let mut end_sink = Vec::new();
+        let c = op("C_Sign", 7, 800_005 + n as u64 * 10);
+        let origin = EffectOrigin::from(&c);
+        shape_edge.observe_with_effects(&c, &origin, &mut end_sink);
+        assert_eq!(end_sink.len(), 1);
+        for effect in &end_sink {
+            shape_keyuse.observe_effect(instance, effect);
+        }
+    }
+    let shaped_commit = commit(9, &[&tiny_staging], &tiny.model.project(), &shape_keyuse);
+    assert_eq!(shaped_commit.status, ObsStatus::Populated);
+    let proved = shaped_commit
+        .key_operations
+        .iter()
+        .find(|row| row.metadata_at_use == "rsa_2048")
+        .expect("the usable label proves its row");
+    assert_eq!((proved.started, proved.completed), (1, 1));
+    assert_eq!(
+        shaped_commit.key_operations.len(),
+        1,
+        "only the usable label proves"
+    );
+    let conflicting = shaped_commit
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.reason == "metadata_conflicting")
+        .expect("required-field conflict partitions unknown");
+    assert_eq!(conflicting.completed, 1);
+    let unknown = shaped_commit
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.reason == "metadata_unknown")
+        .expect("unknown and requested-only partition unknown");
+    assert_eq!(unknown.completed, 2, "requested-only RSA2048 stays untyped");
+    assert!(
+        !shaped_commit
+            .gaps
+            .iter()
+            .any(|gap| gap.reason == "pruned_object_referenced"),
+        "live objects never dangle"
+    );
+    // History is immutable: against a model that pruned the object
+    // the proved row stays and the dangle is explicit, never silent.
+    let pruned_model = JointScene::new().model.project();
+    assert!(pruned_model.objects.is_empty());
+    let pruned_commit = commit(10, &[&tiny_staging], &pruned_model, &shape_keyuse);
+    assert_eq!(
+        pruned_commit.key_operations.len(),
+        1,
+        "the proved row stays"
+    );
+    let dangle = pruned_commit
+        .gaps
+        .iter()
+        .find(|gap| gap.reason == "pruned_object_referenced")
+        .expect("the dangle is explicit");
+    assert_eq!(dangle.subject, "key_operation");
+    assert_eq!(dangle.repeats, 4);
+
+    // ---- The status matrix: every feed census maps exactly. ----
+    let fresh = JointStaging::select_s1_only();
+    let empty_model = JointScene::new().model.project();
+    let empty_keyuse = KeyUseReducer::new();
+    let never_joint = commit(1, &[&fresh], &empty_model, &empty_keyuse);
+    assert_eq!(never_joint.status, ObsStatus::Unavailable);
+    assert_eq!(never_joint.reason, "bootstrap_unavailable");
+    assert!(never_joint.key_operations.is_empty());
+    assert!(never_joint.unknown_key_operations.is_empty());
+
+    // Proof-only refusal: the replayed S1 is preserved (unknown-key
+    // rows exist) while no object facts are invented.
+    let mut fall_scene = JointScene::new();
+    let fall_bootstrap = fall_scene.bootstrap();
+    let mut fall_staging = JointStaging::select_joint(Some(&fall_bootstrap));
+    let mut fall_edge = EdgeSemantics::default();
+    let mut fall_keyuse = KeyUseReducer::new();
+    let mut fall_sink = Vec::new();
+    for call in sign_flow()[0..3].iter() {
+        prepare_call(&mut fall_scene, &mut fall_staging, call);
+    }
+    let failure = SealFailure {
+        gap: JournalGap::BootstrapMismatch,
+        effects: crate::semantics_objects::ObjectEffects::default(),
+        h3_voided: None,
+    };
+    let clean = H3DispositionEvidence::scripted_clean(u64::MAX);
+    let mut h3 = ScriptedH3Source::once(clean);
+    let (outcome, _) = fall_staging.apply_failure(
+        &failure,
+        &mut h3,
+        &mut fall_edge,
+        &mut fall_keyuse,
+        instance,
+        &mut fall_sink,
+    );
+    assert!(matches!(
+        outcome,
+        crate::semantics_key_use::FailureApplyOutcome::FellBack { replayed: 3 }
+    ));
+    assert!(fall_staging.fell_back());
+    let fell = commit(
+        2,
+        &[&fall_staging],
+        &fall_scene.model.project(),
+        &fall_keyuse,
+    );
+    assert_eq!(fell.status, ObsStatus::Unavailable);
+    assert_eq!(fell.reason, "proof_refused_fallback");
+    assert!(fell.objects.is_empty(), "fallback invents no object facts");
+    assert!(
+        !fell.unknown_key_operations.is_empty(),
+        "fallback preserves replayed S1"
+    );
+
+    // Real loss degrades louder than proof-only refusal.
+    let mut loss_scene = JointScene::new();
+    let loss_bootstrap = loss_scene.bootstrap();
+    let mut loss_staging = JointStaging::select_joint(Some(&loss_bootstrap));
+    let mut loss_edge = EdgeSemantics::default();
+    let mut loss_keyuse = KeyUseReducer::new();
+    let mut loss_sink = Vec::new();
+    prepare_call(
+        &mut loss_scene,
+        &mut loss_staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let loss_failure = SealFailure {
+        gap: JournalGap::H3Loss,
+        effects: crate::semantics_objects::ObjectEffects::default(),
+        h3_voided: None,
+    };
+    // HistoryLoss never consults the finalizer: any scripted source will do.
+    let mut loss_h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = loss_staging.apply_failure(
+        &loss_failure,
+        &mut loss_h3,
+        &mut loss_edge,
+        &mut loss_keyuse,
+        instance,
+        &mut loss_sink,
+    );
+    assert!(matches!(
+        outcome,
+        crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+    ));
+    assert!(loss_staging.degraded_loss());
+    let lost = commit(
+        3,
+        &[&loss_staging],
+        &loss_scene.model.project(),
+        &loss_keyuse,
+    );
+    assert_eq!(lost.status, ObsStatus::Unavailable);
+    assert_eq!(lost.reason, "authority_lost");
+
+    // Full budget: the commit surface reports PARTIAL with exact
+    // budgets; refused terminals land counted without rows.
+    let mut full_edge = EdgeSemantics::default();
+    let mut full_keyuse = KeyUseReducer::with_capacity(2);
+    for n in 0..2u64 {
+        let mut direct_sink = Vec::new();
+        let c = op("C_GenerateKey", 7, 600_000 + n);
+        let origin = EffectOrigin::from(&c);
+        full_edge.observe_with_effects(&c, &origin, &mut direct_sink);
+        full_keyuse.observe_effect(instance, &direct_sink[0]);
+    }
+    let mut direct_sink = Vec::new();
+    let c = op("C_GenerateKey", 7, 600_002);
+    let origin = EffectOrigin::from(&c);
+    full_edge.observe_with_effects(&c, &origin, &mut direct_sink);
+    full_keyuse.observe_effect(instance, &direct_sink[0]);
+    assert!(full_keyuse.evidence().partial);
+    let partial = commit(4, &[&staging], &scene.model.project(), &full_keyuse);
+    assert_eq!(partial.status, ObsStatus::Partial);
+    assert_eq!(partial.reason, "row_budget_exhausted");
+    assert_eq!(partial.budgets.key_occupied, 2);
+    assert_eq!(partial.budgets.key_refused, 1);
+    assert_eq!(full_keyuse.evidence().refused_terminals, 1);
+
+    // The producer emits only feed/budget reasons: publisher reasons
+    // (publication/sink/serialization) never come from a commit.
+    for reason in [
+        r1.reason,
+        never_joint.reason,
+        fell.reason,
+        lost.reason,
+        partial.reason,
+    ] {
+        assert!(
+            [
+                "none",
+                "bootstrap_unavailable",
+                "proof_refused_fallback",
+                "authority_lost",
+                "row_budget_exhausted"
+            ]
+            .contains(&reason),
+            "producer-only reason: {reason}"
+        );
+    }
+
+    // ---- Stale publication: the last complete revision survives with
+    // its rows and budgets intact, relabeled in place. ----
+    let mut small_scene = JointScene::new();
+    let small_bootstrap = small_scene.bootstrap();
+    let mut small_staging = JointStaging::select_joint(Some(&small_bootstrap));
+    let mut small_edge = EdgeSemantics::default();
+    let mut small_keyuse = KeyUseReducer::new();
+    let mut small_sink = Vec::new();
+    for call in [
+        ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+        ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+        ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    ] {
+        drive_quantum(
+            &mut small_scene,
+            &mut small_staging,
+            &mut small_edge,
+            &mut small_keyuse,
+            &mut small_sink,
+            &call,
+        );
+    }
+    let small_r1 = commit(
+        1,
+        &[&small_staging],
+        &small_scene.model.project(),
+        &small_keyuse,
+    );
+    for call in [
+        ShapedS1::shaped("C_VerifyInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+        ShapedS1::shaped("C_Verify", CkRv::OK.0, 0, op_capture()),
+    ] {
+        drive_quantum(
+            &mut small_scene,
+            &mut small_staging,
+            &mut small_edge,
+            &mut small_keyuse,
+            &mut small_sink,
+            &call,
+        );
+    }
+    let small_r2 = commit(
+        2,
+        &[&small_staging],
+        &small_scene.model.project(),
+        &small_keyuse,
+    );
+    assert!(
+        small_r2.budgets.encoded_bytes > small_r1.budgets.encoded_bytes,
+        "the second revision is genuinely bigger"
+    );
+    let mut publisher = ObservationPublisher::new();
+    assert_eq!(publisher.publish(small_r1.clone()).revision, 1);
+    assert_eq!(
+        publisher.publication().unwrap().status,
+        ObsStatus::Populated
+    );
+    let mut limited = ObservationPublisher::with_byte_limit(small_r1.budgets.encoded_bytes);
+    assert_eq!(limited.publish(small_r1.clone()).revision, 1);
+    let stale = limited.publish(small_r2.clone());
+    assert_eq!(stale.status, ObsStatus::Stale);
+    assert_eq!(stale.reason, "publication_budget_exhausted");
+    assert_eq!(
+        stale.revision, 1,
+        "the retained revision, not the refused one"
+    );
+    assert_eq!(
+        stale.key_operations, small_r1.key_operations,
+        "rows survive intact"
+    );
+    assert_eq!(stale.objects, small_r1.objects);
+    assert_eq!(
+        stale.budgets, small_r1.budgets,
+        "budgets keep content state"
+    );
+    // An over-budget first publication yields the pre-reserved
+    // negative: unavailable + cause, no rows, no big allocation.
+    let mut starved = ObservationPublisher::with_byte_limit(10);
+    let negative = starved.publish(small_r1.clone());
+    assert_eq!(negative.status, ObsStatus::Unavailable);
+    assert_eq!(negative.reason, "publication_budget_exhausted");
+    assert_eq!(negative.revision, 1);
+    assert!(negative.key_operations.is_empty() && negative.objects.is_empty());
+    assert!(negative.budgets.encoded_bytes < small_r1.budgets.encoded_bytes);
+
+    // ---- Failed sinks stale the retained publication without a new
+    // snapshot; unavailable publications have nothing to stale. ----
+    let attempts = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let fault = crate::inventory_events::EventFault {
+        kind: "key_operations_observed",
+        final_pass_only: false,
+        after_ended: false,
+        attempts: attempts.clone(),
+    };
+    let anon = tempfile::tempfile().unwrap();
+    let mut failing = EventWriter::anonymous_test_sink(anon);
+    failing.fault = Some(fault);
+    let mut failing_emitter = KeyOperationEmitter::new();
+    let error = failing_emitter
+        .emit(&mut failing, &small_r1, 1_000)
+        .unwrap_err();
+    assert!(error.contains("key_operations_observed"), "{error}");
+    let tried: Vec<String> = attempts.borrow().clone();
+    assert!(
+        tried.contains(&"object_observed".to_string()),
+        "objects went first: {tried:?}"
+    );
+    assert!(tried.contains(&"key_operations_observed".to_string()));
+    let before_rows = publisher.publication().unwrap().key_operations.clone();
+    publisher.note_sink_failed();
+    let staled = publisher.publication().unwrap();
+    assert_eq!(staled.status, ObsStatus::Stale);
+    assert_eq!(staled.reason, "sink_failed");
+    assert_eq!(staled.revision, 1, "same revision, no new snapshot");
+    assert_eq!(
+        staled.key_operations, before_rows,
+        "history, not fresh authority"
+    );
+    let mut no_rows = ObservationPublisher::new();
+    no_rows.publish(ObjectObservations::unavailable(5, "bootstrap_unavailable"));
+    no_rows.note_sink_failed();
+    assert_eq!(
+        no_rows.publication().unwrap().status,
+        ObsStatus::Unavailable
+    );
+    assert_eq!(
+        no_rows.publication().unwrap().reason,
+        "bootstrap_unavailable"
+    );
+
+    // ---- Deferred delivery: the per-pass cap spreads rows across
+    // passes without loss; the full stream reconstructs exactly. ----
+    let dir = private_tempdir();
+    let path = dir.path().join("slow.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+    let mut slow = KeyOperationEmitter::with_cap(2);
+    let total_rows = small_r2.objects.len()
+        + small_r2.key_operations.len()
+        + small_r2.unknown_key_operations.len();
+    assert!(total_rows > 2, "the cap binds");
+    let mut delivered = 0usize;
+    for _ in 0..total_rows + 1 {
+        let out = slow.emit(&mut writer, &small_r2, 1_000).unwrap();
+        delivered += out.emitted;
+        if out.emitted == 0 {
+            break;
+        }
+    }
+    assert_eq!(delivered, total_rows, "every row eventually delivers");
+    assert_eq!(slow.tracked(), total_rows);
+    assert!(slow.deferred_total() > 0, "deferrals counted, not silent");
+    drop(writer);
+    let lines = read_stream(dir.path(), "slow.jsonl");
+    let mut presentation = harness_presentation();
+    presentation.object_observations = small_r2.clone();
+    let document = render_json_from_presentation(&presentation);
+    assert_reconstructed_eq_json(&reconstruct(&lines), &document["object_observations"], true);
+
+    // ---- The snapshot path carries the same section and rows. ----
+    let snap_path = dir.path().join("snap.jsonl");
+    let mut snap_writer = EventWriter::create(&snap_path, 1 << 20, 5).unwrap();
+    crate::inventory_events::emit_snapshot_as_events(&mut snap_writer, &presentation, 3_000)
+        .unwrap();
+    drop(snap_writer);
+    let snap_lines = read_stream(dir.path(), "snap.jsonl");
+    let snapshot = snap_lines
+        .iter()
+        .find(|line| line["kind"] == "snapshot")
+        .expect("snapshot marker present");
+    assert_eq!(
+        snapshot["event"]["object_observations"],
+        document["object_observations"]
+    );
+    assert_reconstructed_eq_json(
+        &reconstruct(&snap_lines),
+        &document["object_observations"],
+        true,
+    );
 }

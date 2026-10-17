@@ -618,6 +618,64 @@ fn render_compact_edge_window(
     (lines, shown)
 }
 
+/// The H9 projection summary line, or `None` while no publication
+/// exists. Reads only the shared projection: revision, status (plus
+/// reason unless `none`), row counts, refusals, and per-category
+/// completed/failed/active totals with their units. Important fields
+/// come first: narrow terminals truncate the category tail, never
+/// the revision or status.
+fn object_keys_line(
+    observations: &crate::key_operation_projection::ObjectObservations,
+) -> Option<String> {
+    use crate::key_operation_projection::ObsStatus;
+    use std::collections::BTreeMap;
+    if observations.status == ObsStatus::Unavailable {
+        return None;
+    }
+    let status = if observations.reason == "none" {
+        observations.status.label().to_string()
+    } else {
+        format!("{} ({})", observations.status.label(), observations.reason)
+    };
+    // Per-category terminals across proved and unknown buckets; the
+    // unit comes from the rows (one unit per category, by contract).
+    let mut categories: BTreeMap<&str, (u64, u64, u64, &str)> = BTreeMap::new();
+    for row in &observations.key_operations {
+        let slot = categories
+            .entry(row.category)
+            .or_insert((0, 0, 0, row.unit));
+        slot.0 = slot.0.saturating_add(row.completed);
+        slot.1 = slot.1.saturating_add(row.failed);
+        slot.2 = slot.2.saturating_add(row.active);
+    }
+    for row in &observations.unknown_key_operations {
+        let slot = categories
+            .entry(row.category)
+            .or_insert((0, 0, 0, row.unit));
+        slot.0 = slot.0.saturating_add(row.completed);
+        slot.1 = slot.1.saturating_add(row.failed);
+        slot.2 = slot.2.saturating_add(row.active);
+    }
+    let tallies: Vec<String> = categories
+        .into_iter()
+        .map(|(category, (completed, failed, active, unit))| {
+            format!("{category} {completed}/{failed}/{active} {unit}")
+        })
+        .collect();
+    Some(format!(
+        "objects/keys rev {} {} | sess {} obj {} krows {} urows {} refused {}+{} | {}",
+        observations.revision,
+        status,
+        observations.sessions.len(),
+        observations.objects.len(),
+        observations.key_operations.len(),
+        observations.unknown_key_operations.len(),
+        observations.budgets.key_refused,
+        observations.budgets.object_refused,
+        tallies.join(", "),
+    ))
+}
+
 fn render_full(
     frame: &DisplayFrame,
     width: usize,
@@ -628,6 +686,13 @@ fn render_full(
     let budgets = &presentation.budgets;
     let total = state.items_total(presentation);
     let scroll = state.scroll.min(total.saturating_sub(1));
+    // The H9 projection line shows only while a publication exists
+    // (absent = unavailable, exactly like today); when shown it
+    // takes its row from the edge window so headers, log and footer
+    // stay pinned.
+    let object_line =
+        object_keys_line(&presentation.object_observations).map(|line| truncate_cell(&line, width));
+    let extra = usize::from(object_line.is_some());
     let mut lines = vec![
         truncate_cell(
             &format!(
@@ -681,7 +746,10 @@ fn render_full(
             width,
         ),
     ];
-    let edge_room = detail_room(height);
+    if let Some(line) = object_line {
+        lines.push(line);
+    }
+    let edge_room = detail_room(height).saturating_sub(extra);
     let log_rows = detail_log_rows(height);
     let kind = match state.detail {
         DetailPage::Gaps => "gaps",
@@ -701,8 +769,9 @@ fn render_full(
     ));
     lines.append(&mut edge_lines);
     // Pad a short window so the log tail + footer stay pinned to the
-    // bottom rows regardless of content.
-    while lines.len() < 3 + 1 + edge_room {
+    // bottom rows regardless of content. The target counts the
+    // projection line when shown, against the shrunken window.
+    while lines.len() < 3 + extra + 1 + edge_room {
         lines.push(String::new());
     }
     let log_header = if frame.log.dropped_lines > 0 || frame.log.dropped_bytes > 0 {

@@ -26,7 +26,7 @@ use crate::inventory_present::GapView;
 use crate::inventory_present::{
     Activity, Capture, EdgeView, InstanceSemanticView, InstanceView, Presence, Presentation,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::hash::BuildHasher as _;
 use std::io::Write as _;
@@ -816,6 +816,12 @@ pub(crate) fn emit_snapshot_as_events(
             at_ns,
         )?;
     }
+    // H9 snapshot equivalence: every projection row as its cumulative
+    // event, straight from the shared presentation (no digest state —
+    // whole-snapshot replay is exact by construction).
+    for (_, kind, payload) in projection_row_events(&presentation.object_observations) {
+        writer.append(kind, payload, at_ns)?;
+    }
     EdgeEmitter::new().sweep(
         writer,
         &presentation.edges,
@@ -832,6 +838,7 @@ pub(crate) fn emit_snapshot_as_events(
             "passes": presentation.passes,
             "budgets": document["budgets"].clone(),
             "gaps_suppressed": presentation.gaps_suppressed,
+            "object_observations": document["object_observations"].clone(),
         }),
         at_ns,
     )
@@ -1801,6 +1808,214 @@ impl InstanceEmitter {
     }
 }
 
+/// The most key-operation records one pass writes; the rest wait,
+/// counted in `key_operation_events_deferred`.
+pub(crate) const KEY_OPERATION_EVENTS_PER_PASS: usize = 4096;
+
+/// What the stream last carried for one projection row: a 128-bit
+/// keyed digest of the exact payload plus the generation that
+/// carried it (the rotation backstop, like every other emitter).
+#[derive(Debug, Clone, Copy)]
+struct KeyOperationDigest {
+    exact: (u64, u64),
+    generation: u64,
+}
+
+/// Per-pass key-operation emission accounting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct KeyOperationEmitted {
+    pub emitted: usize,
+    pub deferred: usize,
+}
+
+/// Bounded changed-row delivery for the H9 projection: `object_observed`
+/// and `key_operations_observed` row events, each a cumulative row
+/// snapshot at its publication revision. A row emits when its ROW
+/// digest changed since the stream last carried it (the revision
+/// rides in the event for ordering but never dirties the digest: a
+/// revision bump alone re-emits nothing), or when its last record
+/// aged out of retention (rotation backstop). Consumers key rows by
+/// (bucket, row key) and replace by revision; rows never delete,
+/// snapshots are never summed as deltas, and a row's event revision
+/// is its last change (the pass marker's `object_revision` names the
+/// current revision; unchanged rows persist client-side).
+///
+/// Memory: one digest per carried row key, bounded by the projection
+/// row bounds. Retention-eviction accounting (`ended` unretained
+/// counts, combined dump fit) still covers only physical edges and
+/// instances: extending that convergence to the two new kinds needs
+/// H3 retention-author review (carry — the exact final sweep below
+/// carries every row before `ended` regardless).
+#[derive(Debug)]
+pub(crate) struct KeyOperationEmitter {
+    digests: BTreeMap<String, KeyOperationDigest>,
+    per_pass: usize,
+    deferred_total: u64,
+    keys: (std::hash::RandomState, std::hash::RandomState),
+}
+
+impl Default for KeyOperationEmitter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KeyOperationEmitter {
+    pub(crate) fn new() -> Self {
+        Self::with_cap(KEY_OPERATION_EVENTS_PER_PASS)
+    }
+
+    /// An emitter with its own shared per-pass record cap (tests).
+    pub(crate) fn with_cap(per_pass: usize) -> Self {
+        Self {
+            digests: BTreeMap::new(),
+            per_pass,
+            deferred_total: 0,
+            keys: (std::hash::RandomState::new(), std::hash::RandomState::new()),
+        }
+    }
+
+    /// Rows holding a digest.
+    #[cfg(test)]
+    pub(crate) fn tracked(&self) -> usize {
+        self.digests.len()
+    }
+
+    /// Rows deferred by the per-pass cap so far.
+    #[cfg(test)]
+    pub(crate) fn deferred_total(&self) -> u64 {
+        self.deferred_total
+    }
+
+    /// The row digest: hashes the row only, never the revision or
+    /// bucket (both are implied by the tracking key and travel in
+    /// the event for ordering).
+    fn digest(&self, payload: &serde_json::Value) -> (u64, u64) {
+        let bytes = payload["row"].to_string();
+        (
+            self.keys.0.hash_one(bytes.as_bytes()),
+            self.keys.1.hash_one(bytes.as_bytes()),
+        )
+    }
+
+    /// Whether the stream still carries this exact payload: same
+    /// digest, and its generation retained on disk.
+    fn carried(&self, key: &str, exact: (u64, u64), writer: &EventWriter) -> bool {
+        self.digests.get(key).is_some_and(|carried| {
+            carried.exact == exact && carried.generation >= writer.oldest_generation()
+        })
+    }
+
+    /// Emit one pass of projection rows from the published
+    /// publication (stale-aware): changed-or-unretained rows up to
+    /// the per-pass cap, the rest deferred and counted.
+    pub(crate) fn emit(
+        &mut self,
+        writer: &mut EventWriter,
+        observations: &crate::key_operation_projection::ObjectObservations,
+        at_ns: u64,
+    ) -> Result<KeyOperationEmitted, String> {
+        let mut emitted = 0usize;
+        let mut deferred = 0usize;
+        for (key, kind, payload) in projection_row_events(observations) {
+            let exact = self.digest(&payload);
+            if self.carried(&key, exact, writer) {
+                continue;
+            }
+            if emitted >= self.per_pass {
+                deferred = deferred.saturating_add(1);
+                continue;
+            }
+            writer.append(kind, payload, at_ns)?;
+            self.digests.insert(
+                key,
+                KeyOperationDigest {
+                    exact,
+                    generation: writer.generation(),
+                },
+            );
+            emitted = emitted.saturating_add(1);
+        }
+        self.deferred_total = self.deferred_total.saturating_add(deferred as u64);
+        Ok(KeyOperationEmitted { emitted, deferred })
+    }
+
+    /// One exact copy of every uncarried projection row, in
+    /// publication order. The final retention sweep's key-operation
+    /// third; the caller owns the retention reservation.
+    pub(crate) fn sweep_exact(
+        &mut self,
+        writer: &mut EventWriter,
+        observations: &crate::key_operation_projection::ObjectObservations,
+        at_ns: u64,
+    ) -> Result<usize, String> {
+        let mut emitted = 0usize;
+        for (key, kind, payload) in projection_row_events(observations) {
+            let exact = self.digest(&payload);
+            if self.carried(&key, exact, writer) {
+                continue;
+            }
+            writer.append(kind, payload, at_ns)?;
+            self.digests.insert(
+                key,
+                KeyOperationDigest {
+                    exact,
+                    generation: writer.generation(),
+                },
+            );
+            emitted = emitted.saturating_add(1);
+        }
+        Ok(emitted)
+    }
+}
+
+/// Every projection row as its stream event: replacement key, kind
+/// and cumulative payload. Rows render through the single section
+/// renderer, so JSON and JSONL agree by construction. Sessions ride
+/// no stream kind (snapshot-only); session lifecycle reaches the
+/// stream through `object_observed` rows' session attribution.
+fn projection_row_events(
+    observations: &crate::key_operation_projection::ObjectObservations,
+) -> Vec<(String, &'static str, serde_json::Value)> {
+    use crate::key_operation_projection::{key_row_json, object_row_json, unknown_row_json};
+    let mut events = Vec::new();
+    for row in &observations.objects {
+        let payload = serde_json::json!({
+            "revision": observations.revision,
+            "row": object_row_json(row),
+        });
+        events.push((format!("o:{}", row.object), "object_observed", payload));
+    }
+    for row in &observations.key_operations {
+        let payload = serde_json::json!({
+            "revision": observations.revision,
+            "bucket": "known",
+            "row": key_row_json(row),
+        });
+        events.push((
+            format!(
+                "k:{}:{}:{}:{}:{}",
+                row.instance, row.object, row.category, row.role, row.metadata_at_use
+            ),
+            "key_operations_observed",
+            payload,
+        ));
+    }
+    for row in &observations.unknown_key_operations {
+        let payload = serde_json::json!({
+            "revision": observations.revision,
+            "bucket": "unknown",
+            "row": unknown_row_json(row),
+        });
+        events.push((
+            format!("u:{}:{}", row.category, row.reason),
+            "key_operations_observed",
+            payload,
+        ));
+    }
+    events
+}
+
 /// Whether one contiguous copy of every tracked row of all three
 /// kinds, plus a tail of `tail` bytes, is guaranteed to survive
 /// retention: the combined dump's fit bound. Rows past the digest
@@ -1972,6 +2187,7 @@ impl GapEmitter {
 pub(crate) fn pass_payload(
     report: &PassReport,
     presentation: &Presentation,
+    published: &crate::key_operation_projection::ObjectObservations,
     new_gaps: usize,
     suppressed_delta: u64,
 ) -> serde_json::Value {
@@ -1989,6 +2205,8 @@ pub(crate) fn pass_payload(
         "new_gaps": new_gaps,
         "suppressed_delta": suppressed_delta,
         "gaps_suppressed": presentation.gaps_suppressed,
+        "object_revision": published.revision,
+        "object_status": published.status.label(),
     })
 }
 

@@ -1977,16 +1977,18 @@ impl EdgeSemantics {
         })
     }
 
-    /// Apply a completion to the record it named: the pending call's
-    /// facts with the completion's return, session, and time — but
+    /// Apply a completion to the record it named: the execution
+    /// replays the pending call's facts with the completion's return,
+    /// session, and time (receiver custody + terminal time) — but
     /// ONLY when the completing session still holds the originating
-    /// operation lifetime on every affected bit (F2). A stale
-    /// completion (replaced, ended, or never-related machine — notably
-    /// a joined completion landing on the receiver's own operation)
-    /// orphans per affected bit instead of joining, like any other
-    /// unattributable evidence. This deliberately differs from the
-    /// capture-wide `complete_pending`, which replays against current
-    /// bindings.
+    /// operation lifetime on every affected bit (F2). The replayed
+    /// effects keep the ORIGINAL consumed call's identity, separate
+    /// from that custody. A stale completion (replaced, ended, or
+    /// never-related machine — notably a joined completion landing
+    /// on the receiver's own operation) orphans per affected bit
+    /// instead of joining, like any other unattributable evidence.
+    /// This deliberately differs from the capture-wide
+    /// `complete_pending`, which replays against current bindings.
     fn complete_pending<S: OperationSink>(
         &mut self,
         completion: &SemanticCall,
@@ -1999,23 +2001,25 @@ impl EdgeSemantics {
             self.orphans = self.orphans.saturating_add(unattributed);
             return;
         }
+        // The replayed effects carry the ORIGINAL call's identity —
+        // never the completion's, never a receiver's later key (H9).
+        // Built only when consumed: plain observation stays free.
+        // The execution facts below still take the completion's
+        // return, session and time.
+        let owned;
+        let effect_origin: &EffectOrigin = if S::WANTS_EFFECTS {
+            owned = EffectOrigin::from(&pending);
+            &owned
+        } else {
+            owned = EffectOrigin::placeholder();
+            &owned
+        };
         let mut completed = pending;
         completed.rv = completion.rv;
         completed.session = completion.session;
         completed.ts_ns = completion.ts_ns;
         let descriptor =
             crate::kinds::descriptor(&completed.function).unwrap_or(SlotSemantics::COUNT_ONLY);
-        // The replayed effects carry the ORIGINAL call's identity —
-        // never the completion's, never a receiver's later key (H9).
-        // Built only when consumed: plain observation stays free.
-        let owned;
-        let effect_origin: &EffectOrigin = if S::WANTS_EFFECTS {
-            owned = EffectOrigin::from(&completed);
-            &owned
-        } else {
-            owned = EffectOrigin::placeholder();
-            &owned
-        };
         // Async replay carries no receipts: H8's frozen endpoint
         // table leaves async completions negative-only, so the
         // original call never completes in the model, its inputs

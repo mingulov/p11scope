@@ -391,6 +391,7 @@ impl JointStaging {
         keyuse: &mut KeyUseReducer,
         instance: RegistryInstanceId,
         sink: &mut S,
+        assoc_fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) -> (SealApplyOutcome, u64) {
         // Ledger contact flushes pended releases first (C4).
         self.flush_pending_releases(ledger);
@@ -457,6 +458,8 @@ impl JointStaging {
             outer: sink,
             keyuse,
             instance,
+            shared: Some(&mut *ledger),
+            fallback: assoc_fallback,
         };
         match reducer.observe_joint_with_resources(&head.facts, &head.origin, &receipts, &mut tee) {
             Ok(refused) => {
@@ -500,6 +503,7 @@ impl JointStaging {
         keyuse: &mut KeyUseReducer,
         instance: RegistryInstanceId,
         sink: &mut S,
+        mut assoc_fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) -> (FailureApplyOutcome, u64) {
         // Ledger contact flushes pended releases first (C4).
         self.flush_pending_releases(ledger);
@@ -518,7 +522,14 @@ impl JointStaging {
                 // associations BEFORE loss disposal emits their
                 // Unknown terminals (H9 §66).
                 keyuse.apply_invalidations(&failure.effects, model);
-                self.dispose_as_loss(reducer, keyuse, instance, sink);
+                self.dispose_as_loss(
+                    reducer,
+                    keyuse,
+                    instance,
+                    sink,
+                    Some(&mut *ledger),
+                    assoc_fallback.as_deref_mut(),
+                );
                 let disposed = self.drain_staged(Some(ledger));
                 self.mode = FeedMode::S1Only;
                 self.degraded_loss = true;
@@ -535,8 +546,14 @@ impl JointStaging {
                         // affected associations FIRST, so replayed
                         // terminals cannot complete unproved bindings.
                         keyuse.apply_invalidations(&failure.effects, model);
-                        let (replayed, refused) =
-                            self.replay_staged(reducer, keyuse, instance, sink, Some(ledger));
+                        let (replayed, refused) = self.replay_staged(
+                            reducer,
+                            keyuse,
+                            instance,
+                            sink,
+                            Some(&mut *ledger),
+                            assoc_fallback.as_deref_mut(),
+                        );
                         self.mode = FeedMode::S1Only;
                         self.fell_back = true;
                         (FailureApplyOutcome::FellBack { replayed }, refused)
@@ -545,7 +562,14 @@ impl JointStaging {
                         // H3's own stream is lossy: the staged calls'
                         // S1 proof with it. Real-loss treatment.
                         keyuse.apply_invalidations(&failure.effects, model);
-                        self.dispose_as_loss(reducer, keyuse, instance, sink);
+                        self.dispose_as_loss(
+                            reducer,
+                            keyuse,
+                            instance,
+                            sink,
+                            Some(&mut *ledger),
+                            assoc_fallback.as_deref_mut(),
+                        );
                         let disposed = self.drain_staged(Some(ledger));
                         self.mode = FeedMode::S1Only;
                         self.degraded_loss = true;
@@ -637,11 +661,13 @@ impl JointStaging {
         instance: RegistryInstanceId,
         sink: &mut S,
         ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        assoc_fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) -> (usize, u64) {
         // Staging order is arrival order (positions strictly ascend),
         // so replaying it is complete by construction — no H3 receipt
         // needed, unlike proof-only fallback across a seal gap.
-        let (replayed, refused) = self.replay_staged(reducer, keyuse, instance, sink, ledger);
+        let (replayed, refused) =
+            self.replay_staged(reducer, keyuse, instance, sink, ledger, assoc_fallback);
         self.mode = FeedMode::S1Only;
         self.fell_back = true;
         (replayed, refused)
@@ -656,11 +682,15 @@ impl JointStaging {
         keyuse: &mut KeyUseReducer,
         instance: RegistryInstanceId,
         sink: &mut S,
+        shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
         let mut tee = KeyUseTee {
             outer: sink,
             keyuse,
             instance,
+            shared,
+            fallback,
         };
         reducer.invalidate_with_effects(&mut tee);
     }
@@ -703,6 +733,7 @@ impl JointStaging {
         instance: RegistryInstanceId,
         sink: &mut S,
         mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        mut assoc_fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) -> (usize, u64) {
         let mut replayed = 0;
         let mut refused = 0u64;
@@ -715,6 +746,8 @@ impl JointStaging {
                 outer: &mut *sink,
                 keyuse: &mut *keyuse,
                 instance,
+                shared: ledger.as_deref_mut(),
+                fallback: assoc_fallback.as_deref_mut(),
             };
             match reducer.observe_joint_with_resources(&head.facts, &head.origin, &[], &mut tee) {
                 Ok(head_refused) => {
@@ -1106,6 +1139,11 @@ pub(crate) struct OpenKeyUse {
     /// Whether any receipt bound (receipt-less opens close to the
     /// unknown-key summary with explicit evidence — never loss).
     bound: bool,
+    /// The open's prospective-association ticket plus which ledger
+    /// minted it (N1c): ends release to the minting ledger, or pend
+    /// a shared release when the shared ledger is absent (C4-style).
+    ticket: u64,
+    ticket_shared: bool,
 }
 
 /// One open association refused at full budget: no slot reserved,
@@ -1143,6 +1181,10 @@ pub(crate) struct KeyUseReducer {
     unknown_ever_live: [bool; UNKNOWN_BUCKETS],
     capacity: usize,
     evidence: KeyUseEvidence,
+    /// Shared tickets closed while the shared ledger was absent
+    /// (N1c): flushed at the next shared contact, C4-style. Bounded
+    /// by the shared census — each pend holds a live shared ticket.
+    pending_shared_releases: Vec<u64>,
 }
 
 impl std::fmt::Debug for KeyUseReducer {
@@ -1172,6 +1214,7 @@ impl KeyUseReducer {
             unknown_ever_live: [false; UNKNOWN_BUCKETS],
             capacity,
             evidence: KeyUseEvidence::default(),
+            pending_shared_releases: Vec::new(),
         }
     }
 
@@ -1233,7 +1276,17 @@ impl KeyUseReducer {
         &mut self,
         instance: RegistryInstanceId,
         effect: &OperationEffect,
+        mut shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        mut fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
+        // Ledger contact flushes pended shared releases first (N1c,
+        // C4-style): tickets closed while the shared ledger was
+        // absent return now instead of leaking.
+        if let Some(ledger) = shared.as_deref_mut() {
+            for ticket in self.pending_shared_releases.drain(..) {
+                ledger.release_keyassoc(ticket);
+            }
+        }
         match effect {
             OperationEffect::Started {
                 id,
@@ -1259,6 +1312,28 @@ impl KeyUseReducer {
                     self.refuse(key, instance, category, origin.ts_ns);
                     return;
                 }
+                // One shared reservation owner (N1c): the prospective
+                // association mints its ticket before its buckets
+                // land, so a refusal reserves nothing. The shared
+                // ledger mints when present, else the scene's
+                // fallback; a full census refuses exactly like a
+                // full aggregate table.
+                let ticket_shared = shared.is_some();
+                let mut target = shared.as_deref_mut().or(fallback.as_deref_mut());
+                let Some(ledger) = target.as_deref_mut() else {
+                    debug_assert!(false, "keyassoc mint needs a ledger");
+                    self.refuse(key, instance, category, origin.ts_ns);
+                    return;
+                };
+                let assoc_bytes = size_of::<OpenKeyUse>() as u64
+                    + (resolved.len() * size_of::<OpenAssoc>()) as u64;
+                let ticket = match ledger.mint_keyassoc(assoc_bytes) {
+                    Ok(ticket) => ticket,
+                    Err(_) => {
+                        self.refuse(key, instance, category, origin.ts_ns);
+                        return;
+                    }
+                };
                 self.open_buckets(resolved);
                 let associations = resolved
                     .iter()
@@ -1285,6 +1360,8 @@ impl KeyUseReducer {
                         started_ts_ns: origin.ts_ns,
                         associations,
                         bound: !receipts.is_empty(),
+                        ticket,
+                        ticket_shared,
                     },
                 );
             }
@@ -1296,6 +1373,20 @@ impl KeyUseReducer {
             } => {
                 let key = (instance, *id);
                 if let Some(open) = self.open.remove(&key) {
+                    // The ticket returns to its minting ledger; a
+                    // shared ticket closed without shared contact
+                    // pends for the next one (flushed above), never
+                    // leaks.
+                    if open.ticket_shared {
+                        match shared.as_deref_mut() {
+                            Some(ledger) => ledger.release_keyassoc(open.ticket),
+                            None => self.pending_shared_releases.push(open.ticket),
+                        }
+                    } else if let Some(ledger) = fallback.as_deref_mut() {
+                        ledger.release_keyassoc(open.ticket);
+                    } else {
+                        debug_assert!(false, "fallback ticket needs its ledger");
+                    }
                     self.close_open(open, *outcome);
                     return;
                 }
@@ -1725,6 +1816,10 @@ pub(crate) struct KeyUseTee<'a, S: OperationSink> {
     outer: &'a mut S,
     keyuse: &'a mut KeyUseReducer,
     instance: RegistryInstanceId,
+    /// Prospective-association ledgers (N1c): the shared owner when
+    /// present, else the scene fallback; ends release to the minter.
+    shared: Option<&'a mut crate::semantics_objects::journal::StagingLedger>,
+    fallback: Option<&'a mut crate::semantics_objects::journal::StagingLedger>,
 }
 
 impl<'a, S: OperationSink> KeyUseTee<'a, S> {
@@ -1735,11 +1830,15 @@ impl<'a, S: OperationSink> KeyUseTee<'a, S> {
         outer: &'a mut S,
         keyuse: &'a mut KeyUseReducer,
         instance: RegistryInstanceId,
+        shared: Option<&'a mut crate::semantics_objects::journal::StagingLedger>,
+        fallback: Option<&'a mut crate::semantics_objects::journal::StagingLedger>,
     ) -> Self {
         Self {
             outer,
             keyuse,
             instance,
+            shared,
+            fallback,
         }
     }
 }
@@ -1748,7 +1847,12 @@ impl<S: OperationSink> OperationSink for KeyUseTee<'_, S> {
     const WANTS_EFFECTS: bool = true;
 
     fn emit(&mut self, effect: OperationEffect) {
-        self.keyuse.observe_effect(self.instance, &effect);
+        self.keyuse.observe_effect(
+            self.instance,
+            &effect,
+            self.shared.as_deref_mut(),
+            self.fallback.as_deref_mut(),
+        );
         self.outer.emit(effect);
     }
 }

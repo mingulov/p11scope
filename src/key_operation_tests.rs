@@ -1671,7 +1671,7 @@ fn key_operation_s1_matrix_through_both_feeds() {
 // ==================== Checkbox 3: key receipts and rows ====================
 
 use crate::semantics_edge::KeyRole;
-use crate::semantics_key_use::{KeyOpRow, KeyUseReducer};
+use crate::semantics_key_use::KeyUseReducer;
 
 /// Drive one Joint quantum to completion: prepare + seal + apply.
 /// Returns the admitted payload, its H0 position and the seal.
@@ -1788,11 +1788,18 @@ fn key_operation_joint_async_pending_then_direct_completion() {
     direct.observe_with_effects(&facts, &origin, &mut direct_sink);
     assert_eq!(strip_receipts(&joint_sink), direct_sink);
     assert_eq!((joint.started(), joint.completed()), (1, 1));
-    let rows = keyuse.rows();
-    assert_eq!(rows.len(), 1);
-    assert!(rows[0].keys.is_empty(), "async start binds no receipt");
-    assert_eq!(rows[0].outcome, OperationOutcome::Completed);
+    assert!(
+        keyuse.aggregates().is_empty(),
+        "async start binds no receipt"
+    );
     assert_eq!(keyuse.evidence().unknown_key_rows, 1);
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "unbound")
+        .expect("async completion rows unknown-key");
+    assert_eq!((row.completed, row.active), (1, 0));
 }
 
 /// G11/H9-§3: positional key receipts bind operation transitions
@@ -1811,8 +1818,23 @@ fn key_operation_key_roles_bind_transitions() {
     let mut joint = EdgeSemantics::default();
     let mut keyuse = KeyUseReducer::new();
     let mut sink = Vec::new();
+    // Receipt detail rides the typed effects; aggregate buckets
+    // retain the proved associations.
+    fn start_receipts(sink: &[OperationEffect]) -> Vec<crate::semantics_edge::KeyReceipt> {
+        sink.iter()
+            .filter_map(|effect| match effect {
+                OperationEffect::Started { key_receipt, .. } => *key_receipt,
+                _ => None,
+            })
+            .collect()
+    }
+    let rsa_get = |word: u64| ShapedS1 {
+        input0: Some((word, 1)),
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
 
-    // Lifetime 1: create, use, destroy.
+    // Lifetime 1: create, label, use, destroy.
     drive_quantum(
         &mut scene,
         &mut staging,
@@ -1820,6 +1842,14 @@ fn key_operation_key_roles_bind_transitions() {
         &mut keyuse,
         &mut sink,
         &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &rsa_get(CREATED_KEY),
     );
     let (_, pos_init1) = drive_quantum(
         &mut scene,
@@ -1854,6 +1884,14 @@ fn key_operation_key_roles_bind_transitions() {
         &mut sink,
         &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
     );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &rsa_get(CREATED_KEY),
+    );
     let (_, pos_init2) = drive_quantum(
         &mut scene,
         &mut staging,
@@ -1872,25 +1910,39 @@ fn key_operation_key_roles_bind_transitions() {
     );
 
     assert!(pos_init1 < pos_init2);
-    let rows = keyuse.rows();
-    assert_eq!(rows.len(), 2, "two completed sign operations");
-    assert_eq!(rows[0].keys.len(), 1);
-    assert_eq!(rows[1].keys.len(), 1);
-    let (key1, key2) = (rows[0].keys[0].key, rows[1].keys[0].key);
-    assert_ne!(key1, key2, "colliding lifetimes qualify distinct keys");
-    assert_eq!(rows[0].keys[0].role, KeyRole::OperationKey);
-    assert_eq!(rows[1].keys[0].role, KeyRole::OperationKey);
-    assert_eq!(rows[0].keys[0].position, pos_init1);
-    assert_eq!(rows[1].keys[0].position, pos_init2);
-    assert_eq!(rows[0].keys[0].metadata.requested_count(), 0);
-    assert_eq!(rows[0].outcome, OperationOutcome::Completed);
-    assert_eq!(rows[1].outcome, OperationOutcome::Completed);
+    // The Started effects carry the bound receipts: distinct keys,
+    // roles and H0 positions per lifetime.
+    let starts = start_receipts(&sink);
+    assert_eq!(starts.len(), 2, "two completed sign operations");
+    assert_ne!(
+        starts[0].key, starts[1].key,
+        "colliding lifetimes qualify distinct keys"
+    );
+    assert_eq!(starts[0].role, KeyRole::OperationKey);
+    assert_eq!(starts[1].role, KeyRole::OperationKey);
+    assert_eq!(starts[0].position, pos_init1);
+    assert_eq!(starts[1].position, pos_init2);
+    // The proved associations aggregate per lifetime key.
+    let buckets: Vec<_> = keyuse.aggregates().iter().collect();
+    assert_eq!(buckets.len(), 2);
+    assert_ne!(buckets[0].0.object, buckets[1].0.object);
+    for (bucket, counters) in &buckets {
+        assert_eq!(
+            (bucket.category, bucket.role, bucket.metadata),
+            ("sign", "key", "rsa_2048")
+        );
+        assert_eq!(
+            (counters.started, counters.completed, counters.active),
+            (1, 1, 0)
+        );
+    }
     // Cross-check against the model's own qualified observations.
     let objects = &scene.model.project().objects;
     assert_eq!(objects.len(), 2);
     assert_eq!(objects[0].lifetime, Lifetime::Destroyed);
     assert_eq!(objects[1].lifetime, Lifetime::Live);
-    assert_eq!((objects[0].id, objects[1].id), (key1, key2));
+    assert_eq!(objects[0].id.as_u64(), buckets[0].0.object);
+    assert_eq!(objects[1].id.as_u64(), buckets[1].0.object);
     assert_eq!(keyuse.evidence().unknown_key_rows, 0);
 
     // Wrap dual-reference: two keys, two distinct roles, input order.
@@ -1906,6 +1958,14 @@ fn key_operation_key_roles_bind_transitions() {
         &mut sink,
         &create_wrap,
     );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &rsa_get(WRAP_KEY),
+    );
     let create_data = ShapedS1 {
         result: Some(DATA_KEY),
         ..ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0)
@@ -1917,6 +1977,14 @@ fn key_operation_key_roles_bind_transitions() {
         &mut keyuse,
         &mut sink,
         &create_data,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &rsa_get(DATA_KEY),
     );
     let wrap = ShapedS1 {
         input0: Some((WRAP_KEY, 1)),
@@ -1931,24 +1999,42 @@ fn key_operation_key_roles_bind_transitions() {
         &mut sink,
         &wrap,
     );
-    let rows = keyuse.rows();
-    assert_eq!(rows.len(), 3);
-    let wrap_row = &rows[2];
-    assert_eq!(wrap_row.keys.len(), 2);
-    assert_eq!(wrap_row.keys[0].role, KeyRole::WrappingKey);
-    assert_eq!(wrap_row.keys[1].role, KeyRole::WrappedKey);
-    assert_eq!(wrap_row.keys[0].input, 0);
-    assert_eq!(wrap_row.keys[1].input, 1);
-    assert_ne!(wrap_row.keys[0].key, wrap_row.keys[1].key);
-    assert_eq!(wrap_row.keys[0].position, pos_wrap);
-    assert_eq!(wrap_row.keys[1].position, pos_wrap);
-    assert_eq!(wrap_row.outcome, OperationOutcome::Completed);
-    // The receipts name the two created keys in input order (this
-    // pins the model's index-order reference emission H9 relies on).
+    let direct = sink
+        .iter()
+        .filter_map(|effect| match effect {
+            OperationEffect::DirectCompleted { key_receipts, .. } => Some(key_receipts.clone()),
+            _ => None,
+        })
+        .find(|receipts| receipts.len() == 2)
+        .expect("wrap direct effect");
+    assert_eq!(direct.len(), 2);
+    assert_eq!(direct[0].role, KeyRole::WrappingKey);
+    assert_eq!(direct[1].role, KeyRole::WrappedKey);
+    assert_eq!(direct[0].input, 0);
+    assert_eq!(direct[1].input, 1);
+    assert_ne!(direct[0].key, direct[1].key);
+    assert_eq!(direct[0].position, pos_wrap);
+    assert_eq!(direct[1].position, pos_wrap);
+    // The receipts name the two created keys in input order: the
+    // join minted both positions, and each role aggregates.
     let objects = &scene.model.project().objects;
     assert_eq!(objects.len(), 4);
-    assert_eq!(wrap_row.keys[0].key, objects[2].id);
-    assert_eq!(wrap_row.keys[1].key, objects[3].id);
+    assert_eq!(direct[0].key, objects[2].id);
+    assert_eq!(direct[1].key, objects[3].id);
+    let buckets: Vec<_> = keyuse.aggregates().iter().collect();
+    assert_eq!(buckets.len(), 4, "two signs plus two wrap roles");
+    let wrapping = buckets
+        .iter()
+        .find(|(bucket, _)| bucket.role == "wrapping_key")
+        .expect("wrapping role bucket");
+    let wrapped = buckets
+        .iter()
+        .find(|(bucket, _)| bucket.role == "wrapped_object")
+        .expect("wrapped role bucket");
+    assert_eq!(wrapping.0.object, objects[2].id.as_u64());
+    assert_eq!(wrapped.0.object, objects[3].id.as_u64());
+    assert_eq!((wrapping.1.started, wrapping.1.completed), (1, 1));
+    assert_eq!((wrapped.1.started, wrapped.1.completed), (1, 1));
 }
 
 /// C3: a proved later Wrap input keeps its true input position and
@@ -1980,7 +2066,14 @@ fn key_operation_partial_wrap_preserves_input_position() {
         getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
         ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
     };
-    drive_quantum(&mut scene, &mut staging, &mut joint, &mut keyuse, &mut sink, &get);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
     // Wrap with input 0 unreadable and input 1 the proved key.
     let wrap = ShapedS1 {
         input0: Some((0, 2)),
@@ -1993,7 +2086,10 @@ fn key_operation_partial_wrap_preserves_input_position() {
     let receipts =
         keyuse.receipts_for_call(&seal, &seal.prefix.settled()[0], &scene.model, position);
     assert_eq!(receipts.len(), 1, "only input 1 proved");
-    assert_eq!(receipts[0].input, 1, "position is the joined input, not reference order");
+    assert_eq!(
+        receipts[0].input, 1,
+        "position is the joined input, not reference order"
+    );
     assert_eq!(receipts[0].role, KeyRole::WrappedKey);
     let (outcome, _) = staging.apply_seal(
         &seal,
@@ -2012,7 +2108,10 @@ fn key_operation_partial_wrap_preserves_input_position() {
         .expect("proved secondary association retained");
     assert_eq!((secondary.started, secondary.completed), (1, 1));
     assert!(
-        committed.key_operations.iter().all(|row| row.role != "wrapping_key"),
+        committed
+            .key_operations
+            .iter()
+            .all(|row| row.role != "wrapping_key"),
         "no invented primary association: {:?}",
         committed.key_operations
     );
@@ -2052,7 +2151,10 @@ fn key_operation_partial_wrap_preserves_input_position() {
     assert_eq!(receipts[0].role, KeyRole::WrappingKey);
     assert_eq!(receipts[1].input, 1);
     assert_eq!(receipts[1].role, KeyRole::WrappedKey);
-    assert_eq!(receipts[0].key, receipts[1].key, "same object, both positions");
+    assert_eq!(
+        receipts[0].key, receipts[1].key,
+        "same object, both positions"
+    );
 }
 
 /// G11/H9-§3: association failure on effect-neutral calls records
@@ -2113,11 +2215,15 @@ fn key_operation_unknown_key_and_requested_only() {
     );
     // Definite S1, unknown key, explicit evidence.
     assert_eq!((joint.started(), joint.completed()), (1, 1));
-    let rows = keyuse.rows();
-    assert_eq!(rows.len(), 1, "the operation still rows");
-    assert!(rows[0].keys.is_empty(), "no key bound");
-    assert_eq!(rows[0].outcome, OperationOutcome::Completed);
+    assert!(keyuse.aggregates().is_empty(), "no key bound");
     assert_eq!(keyuse.evidence().unknown_key_rows, 1);
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "unbound")
+        .expect("the operation still rows unknown-key");
+    assert_eq!((row.completed, row.active), (1, 0));
 
     // S1Only-direct: no object proof, same unknown-key row.
     let mut direct = EdgeSemantics::default();
@@ -2130,8 +2236,7 @@ fn key_operation_unknown_key_and_requested_only() {
     for effect in &sink {
         keyuse.observe_effect(instance, effect);
     }
-    assert_eq!(keyuse.rows().len(), 1);
-    assert!(keyuse.rows()[0].keys.is_empty());
+    assert!(keyuse.aggregates().is_empty());
     assert_eq!(keyuse.evidence().unknown_key_rows, 1);
 
     // Requested-only: the GET requests Class without values; the
@@ -2180,13 +2285,33 @@ fn key_operation_unknown_key_and_requested_only() {
         &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
     );
     assert_eq!((joint.started(), joint.completed()), (1, 1));
-    let rows = keyuse.rows();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].keys.len(), 1);
-    let metadata = rows[0].keys[0].metadata;
-    assert_eq!(metadata.requested_count(), 1, "Class was requested");
-    assert!(metadata.is_requested(0), "field 0 is Class");
-    assert_eq!(metadata.established_count(), 0, "no value ever arrived");
+    // The Started effect carries the requested-only receipt (presence
+    // only); the unusable association counts unknown-key.
+    let receipt = sink
+        .iter()
+        .find_map(|effect| match effect {
+            OperationEffect::Started { key_receipt, .. } => *key_receipt,
+            _ => None,
+        })
+        .expect("init start carries its receipt");
+    assert_eq!(receipt.metadata.requested_count(), 1, "Class was requested");
+    assert!(receipt.metadata.is_requested(0), "field 0 is Class");
+    assert_eq!(
+        receipt.metadata.established_count(),
+        0,
+        "no value ever arrived"
+    );
+    assert!(
+        keyuse.aggregates().is_empty(),
+        "requested-only proves no bucket"
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "metadata_unknown")
+        .expect("requested-only rows metadata-unknown");
+    assert_eq!((row.completed, row.active), (1, 0));
 }
 
 /// N2: metadata freezes in the positional model receipt at the
@@ -2234,7 +2359,14 @@ fn key_operation_delayed_receipt_does_not_backfill_metadata() {
         getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
         ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
     };
-    drive_quantum(&mut scene, &mut staging, &mut joint, &mut keyuse, &mut sink, &get);
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
     let objects = &scene.model.project().objects;
     assert_eq!(objects.len(), 1);
     assert!(objects[0].label.is_some(), "non-vacuous: the GET landed");
@@ -2246,7 +2378,10 @@ fn key_operation_delayed_receipt_does_not_backfill_metadata() {
         pos_init,
     );
     assert_eq!(receipts.len(), 1);
-    assert_eq!(receipts[0].label, None, "delay cannot backfill the earlier use");
+    assert_eq!(
+        receipts[0].label, None,
+        "delay cannot backfill the earlier use"
+    );
     assert_eq!(receipts[0].metadata.established_count(), 0);
     assert_eq!(receipts[0].input, 0);
 }
@@ -2286,10 +2421,9 @@ fn key_operation_later_metadata_never_rewrites_rows() {
         &mut sink,
         &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
     );
-    assert_eq!(keyuse.rows().len(), 1);
-    let frozen: KeyOpRow = keyuse.rows()[0].clone();
-    assert_eq!(frozen.keys.len(), 1);
-    // The GET establishes Class=3 after the row completed.
+    let before = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(before.unknown_key_operations.len(), 1);
+    // The GET establishes Class=3 after the operation completed.
     let get = ShapedS1 {
         getattr_cells: vec![(1u8, 1u8, 3u16)],
         ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
@@ -2303,16 +2437,20 @@ fn key_operation_later_metadata_never_rewrites_rows() {
         &get,
     );
     // The model's view learned the value (non-vacuous: the GET
-    // landed), but the completed row is untouched.
-    let key = frozen.keys[0].key;
+    // landed), but completed history is untouched.
+    let key = scene.model.project().objects[0].id;
     let flags = scene
         .model
         .key_metadata_flags(key)
         .expect("key view exists");
     assert_eq!(flags.established_count(), 1, "the GET established Class");
     assert!(flags.is_established(0), "field 0 is Class");
-    assert_eq!(keyuse.rows().len(), 1, "the GET rows no operation");
-    assert_eq!(keyuse.rows()[0], frozen, "completed rows never rewrite");
+    let after = commit(2, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(after.key_operations, before.key_operations);
+    assert_eq!(
+        after.unknown_key_operations, before.unknown_key_operations,
+        "completed history never rewrites"
+    );
 }
 
 /// G11/H9-§3: conflicting key metadata never last-writer-wins:
@@ -2353,9 +2491,8 @@ fn key_operation_conflicting_metadata_keeps_earlier_value() {
         &mut sink,
         &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
     );
-    assert_eq!(keyuse.rows().len(), 1);
-    let frozen: KeyOpRow = keyuse.rows()[0].clone();
-    assert_eq!(frozen.keys.len(), 1);
+    let before = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(before.unknown_key_operations.len(), 1);
     // Two GETs disagree on Class: 3 first, then 4.
     for value in [3u16, 4u16] {
         let get = ShapedS1 {
@@ -2371,7 +2508,7 @@ fn key_operation_conflicting_metadata_keeps_earlier_value() {
             &get,
         );
     }
-    let key = frozen.keys[0].key;
+    let key = scene.model.project().objects[0].id;
     let flags = scene
         .model
         .key_metadata_flags(key)
@@ -2397,8 +2534,142 @@ fn key_operation_conflicting_metadata_keeps_earlier_value() {
         !flags.is_conflicted(METADATA_FIELDS),
         "out of range stays clear"
     );
-    assert_eq!(keyuse.rows().len(), 1, "GETs row no operation");
-    assert_eq!(keyuse.rows()[0], frozen, "completed rows never rewrite");
+    let after = commit(2, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(after.key_operations, before.key_operations);
+    assert_eq!(
+        after.unknown_key_operations, before.unknown_key_operations,
+        "completed history never rewrites"
+    );
+}
+
+/// N4: the retained-row budget counts aggregate keys, not
+/// operations: one two-role Wrap reserves two aggregate slots, so a
+/// one-slot budget refuses it atomically (S1 preserved, PARTIAL).
+#[test]
+fn key_operation_wrap_reserves_two_aggregate_rows() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::with_capacity(1);
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    // Equal-handle Wrap: two usable roles, two aggregate slots.
+    let wrap = ShapedS1 {
+        input0: Some((CREATED_KEY, 1)),
+        input1: Some((CREATED_KEY, 1)),
+        ..ShapedS1::shaped("C_WrapKey", CkRv::OK.0, RSA_PKCS, init_capture())
+    };
+    let (_, position) = prepare_call(&mut scene, &mut staging, &wrap);
+    let seal = scene.seal().expect("wrap quantum seals");
+    let receipts =
+        keyuse.receipts_for_call(&seal, &seal.prefix.settled()[0], &scene.model, position);
+    assert_eq!(receipts.len(), 2, "both roles prove");
+    let (outcome, _) = staging.apply_seal(
+        &seal,
+        &scene.model,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
+    assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
+    assert_eq!((joint.started(), joint.completed()), (1, 1), "S1 preserved");
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert!(
+        committed.key_operations.len() <= keyuse.capacity(),
+        "a two-role Wrap consumes two aggregate slots: {:?}",
+        committed.key_operations
+    );
+    assert!(
+        committed.key_operations.is_empty(),
+        "atomic refusal rows nothing"
+    );
+    assert_eq!(committed.budgets.key_refused, 1);
+    assert!(keyuse.evidence().partial, "refusal makes coverage PARTIAL");
+}
+
+/// N4: repeated uses of one aggregate update its counters without
+/// consuming new slots: two identical proved Signs share one bucket.
+#[test]
+fn key_operation_repeated_use_updates_one_aggregate() {
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::with_capacity(1);
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    for _ in 0..2 {
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+        );
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+        );
+    }
+    assert_eq!((joint.started(), joint.completed()), (2, 2));
+    assert!(!keyuse.evidence().partial, "one bucket suffices");
+    assert_eq!(keyuse.evidence().rows_refused, 0);
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(committed.key_operations.len(), 1);
+    let row = &committed.key_operations[0];
+    assert_eq!(
+        (row.category, row.role, row.metadata_at_use),
+        ("sign", "key", "rsa_2048")
+    );
+    assert_eq!((row.started, row.completed), (2, 2));
+    assert_eq!(committed.budgets.key_occupied, 1);
 }
 
 /// G11/H9-§3/§91: key-operation rows are bounded (65,536):
@@ -2410,14 +2681,15 @@ fn key_operation_conflicting_metadata_keeps_earlier_value() {
 fn key_operation_row_retention_bounds() {
     use crate::key_operation_projection::KEY_OP_ROW_CAPACITY;
 
-    let instance =
-        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+
+    let instance = RegistryInstanceId::from_raw(3);
     let mut edge = EdgeSemantics::default();
     let mut keyuse = KeyUseReducer::new();
     assert_eq!(KEY_OP_ROW_CAPACITY, 65_536);
-    // Fill exactly to capacity with real direct operations: real
-    // identities, real effects, receipt-less rows.
-    for n in 0..65_536u64 {
+    // Receipt-less operations never consume aggregate slots: they
+    // count in fixed unknown summaries, however many arrive.
+    for n in 0..65_546u64 {
         let mut sink = Vec::new();
         let c = op("C_GenerateKey", 7, 1_000 + n);
         let origin = EffectOrigin::from(&c);
@@ -2425,103 +2697,140 @@ fn key_operation_row_retention_bounds() {
         assert_eq!(sink.len(), 1);
         keyuse.observe_effect(instance, &sink[0]);
     }
-    assert_eq!(keyuse.rows().len(), KEY_OP_ROW_CAPACITY);
-    assert!(!keyuse.evidence().partial, "exact fit is not partial");
-    // N+1 refuses: S1 still completes, old rows intact, PARTIAL.
-    let completed_before = edge.completed();
-    for n in 0..10u64 {
-        let mut sink = Vec::new();
-        let c = op("C_GenerateKey", 7, 200_000 + n);
-        let origin = EffectOrigin::from(&c);
-        edge.observe_with_effects(&c, &origin, &mut sink);
-        assert_eq!(sink.len(), 1);
-        keyuse.observe_effect(instance, &sink[0]);
+    assert!(keyuse.aggregates().is_empty(), "no bucket without a key");
+    assert!(!keyuse.evidence().partial, "fixed summaries never refuse");
+    assert_eq!(keyuse.evidence().rows_refused, 0);
+    let marker = JointStaging::select_s1_only();
+    let model = ObjectSemantics::new().project();
+    let committed = commit(1, &[&marker], &model, &keyuse);
+    let row = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "generate_key" && row.reason == "not_applicable")
+        .expect("receipt-less directs summarize");
+    assert_eq!(row.completed, 65_546);
+
+    // One real proved start, fanned out over distinct instances:
+    // each instance is its own aggregate bucket.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    let start = sink
+        .iter()
+        .find(|effect| matches!(effect, OperationEffect::Started { .. }))
+        .cloned()
+        .expect("proved start");
+    // Fill exactly to capacity across instances.
+    let mut keyuse = KeyUseReducer::new();
+    for n in 0..65_536u32 {
+        keyuse.observe_effect(RegistryInstanceId::from_raw(n), &start);
     }
-    assert_eq!(edge.completed(), completed_before + 10, "S1 preserved");
-    assert_eq!(keyuse.rows().len(), KEY_OP_ROW_CAPACITY);
-    assert_eq!(keyuse.rows()[0].seq, 0, "history never evicted");
-    assert_eq!(keyuse.rows().back().unwrap().seq, 65_535);
+    assert_eq!(keyuse.aggregates().len(), KEY_OP_ROW_CAPACITY);
+    assert_eq!(keyuse.open().len(), KEY_OP_ROW_CAPACITY);
+    assert!(!keyuse.evidence().partial, "exact fit is not partial");
+    // N+1 refuses: S1 still completes, old buckets intact, PARTIAL.
+    keyuse.observe_effect(RegistryInstanceId::from_raw(65_536), &start);
+    assert_eq!(keyuse.aggregates().len(), KEY_OP_ROW_CAPACITY);
     let evidence = keyuse.evidence();
     assert!(evidence.partial, "refusal makes coverage PARTIAL");
-    assert_eq!(evidence.rows_refused, 10);
-    assert_eq!(
-        evidence.refused_terminals, 10,
-        "refused directs land counted, never rowed"
+    assert_eq!(evidence.rows_refused, 1);
+    assert_eq!(keyuse.refused_opens().len(), 1);
+    let first = keyuse
+        .aggregates()
+        .values()
+        .next()
+        .expect("history never evicted");
+    assert_eq!((first.started, first.active), (1, 1));
+    // The refused start's terminal lands counted without a bucket.
+    let mut end_sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut KeyUseReducer::new(),
+        &mut end_sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
     );
+    let end = end_sink
+        .iter()
+        .rev()
+        .find(|effect| matches!(effect, OperationEffect::Ended { .. }))
+        .cloned()
+        .expect("sign terminal");
+    keyuse.observe_effect(RegistryInstanceId::from_raw(0), &end);
+    keyuse.observe_effect(RegistryInstanceId::from_raw(65_536), &end);
+    assert_eq!(keyuse.aggregates().len(), KEY_OP_ROW_CAPACITY);
+    assert_eq!(keyuse.evidence().refused_terminals, 1);
+    assert!(keyuse.refused_opens().is_empty());
+    let closed = keyuse.aggregates().values().next().expect("first bucket");
+    assert_eq!((closed.completed, closed.active), (1, 0));
 
     // Small-N twin: reservation at start, reserved closes reuse
-    // their slot allocation-free, N+1 refuses starts and directs.
-    let mut edge = EdgeSemantics::default();
-    let mut keyuse = KeyUseReducer::with_capacity(4);
-    assert_eq!(keyuse.capacity(), 4, "injected bound");
-    for n in 0..3u64 {
-        let mut sink = Vec::new();
-        let c = op("C_GenerateKey", 7, 300_000 + n);
-        let origin = EffectOrigin::from(&c);
-        edge.observe_with_effects(&c, &origin, &mut sink);
-        keyuse.observe_effect(instance, &sink[0]);
-    }
-    let mut sink = Vec::new();
-    let c = init("C_SignInit", 7, RSA_PKCS, 400_000);
-    let origin = EffectOrigin::from(&c);
-    edge.observe_joint(&c, &origin, &[], &mut sink);
-    for effect in &sink {
-        keyuse.observe_effect(instance, effect);
-    }
-    assert_eq!(keyuse.open().len(), 1, "the start reserved its slot");
+    // their bucket allocation-free, N+1 refuses starts and directs.
+    let mut keyuse = KeyUseReducer::with_capacity(2);
+    assert_eq!(keyuse.capacity(), 2, "injected bound");
+    keyuse.observe_effect(RegistryInstanceId::from_raw(0), &start);
+    keyuse.observe_effect(RegistryInstanceId::from_raw(1), &start);
+    assert_eq!(keyuse.open().len(), 2, "both starts reserved");
     assert!(!keyuse.evidence().partial);
-    let mut sink = Vec::new();
-    let c = op("C_Sign", 7, 400_001);
-    let origin = EffectOrigin::from(&c);
-    edge.observe_with_effects(&c, &origin, &mut sink);
-    for effect in &sink {
-        keyuse.observe_effect(instance, effect);
-    }
-    assert_eq!(keyuse.rows().len(), 4, "the end reused its slot");
-    assert!(keyuse.open().is_empty());
+    keyuse.observe_effect(RegistryInstanceId::from_raw(0), &end);
+    assert_eq!(keyuse.aggregates().len(), 2, "the end reused its bucket");
     assert!(!keyuse.evidence().partial, "reserved closes never refuse");
-    assert_eq!(keyuse.rows()[3].category, "sign");
-    assert_eq!(keyuse.rows()[3].outcome, OperationOutcome::Completed);
-    // N+1 from here on: a direct refuses atomically, a refused
-    // start's terminal lands counted without a row.
+    // N+1: a proved start refuses, while receipt-less operations
+    // still count in fixed summaries at full budget.
+    keyuse.observe_effect(RegistryInstanceId::from_raw(2), &start);
+    assert_eq!(keyuse.evidence().rows_refused, 1);
+    assert!(keyuse.evidence().partial);
+    assert_eq!(keyuse.refused_opens().len(), 1);
     let mut sink = Vec::new();
     let c = op("C_GenerateKey", 7, 500_000);
     let origin = EffectOrigin::from(&c);
     edge.observe_with_effects(&c, &origin, &mut sink);
     keyuse.observe_effect(instance, &sink[0]);
-    assert_eq!(keyuse.evidence().rows_refused, 1);
-    assert!(keyuse.evidence().partial);
-    let started_before = edge.started();
-    let mut sink = Vec::new();
-    let c = init("C_SignInit", 7, RSA_PKCS, 500_001);
-    let origin = EffectOrigin::from(&c);
-    edge.observe_joint(&c, &origin, &[], &mut sink);
-    for effect in &sink {
-        keyuse.observe_effect(instance, effect);
-    }
-    assert_eq!(keyuse.evidence().rows_refused, 2);
-    assert_eq!(keyuse.refused_opens().len(), 1);
     assert_eq!(
-        edge.started(),
-        started_before + 1,
-        "refused S1 machines still run"
+        keyuse.evidence().rows_refused,
+        1,
+        "fixed summaries never refuse"
     );
-    let completed_before = edge.completed();
-    let mut sink = Vec::new();
-    let c = op("C_Sign", 7, 500_002);
-    let origin = EffectOrigin::from(&c);
-    edge.observe_with_effects(&c, &origin, &mut sink);
-    for effect in &sink {
-        keyuse.observe_effect(instance, effect);
-    }
-    assert_eq!(keyuse.rows().len(), 4, "refused terminals row nothing");
-    assert_eq!(keyuse.evidence().refused_terminals, 2);
+    keyuse.observe_effect(RegistryInstanceId::from_raw(2), &end);
+    assert_eq!(
+        keyuse.aggregates().len(),
+        2,
+        "refused terminals row nothing"
+    );
+    assert_eq!(keyuse.evidence().refused_terminals, 1);
     assert!(keyuse.refused_opens().is_empty());
-    assert_eq!(
-        edge.completed(),
-        completed_before + 1,
-        "S1 outcomes preserved"
-    );
 }
 
 /// C1: the key-use join namespaces reducer-local operation IDs by
@@ -2548,7 +2857,11 @@ fn key_operation_cross_instance_operation_identity() {
     let origin = EffectOrigin::from(&c);
     eb.observe_joint(&c, &origin, &[], &mut sink);
     let start_b = sink.last().cloned().unwrap();
-    assert_eq!(started(&start_a).0, started(&start_b).0, "equal ordinals collide");
+    assert_eq!(
+        started(&start_a).0,
+        started(&start_b).0,
+        "equal ordinals collide"
+    );
     keyuse.observe_effect(a, &start_a);
     keyuse.observe_effect(b, &start_b);
     assert_eq!((ea.started(), eb.started()), (1, 1));
@@ -2563,39 +2876,100 @@ fn key_operation_cross_instance_operation_identity() {
     ea.observe_with_effects(&c, &origin, &mut sink);
     keyuse.observe_effect(a, sink.last().unwrap());
     assert!(keyuse.open().is_empty());
-    let rows = keyuse.rows();
-    assert_eq!(rows.len(), 2);
-    assert_eq!((rows[0].instance, rows[0].category), (b, "verify"));
-    assert_eq!((rows[1].instance, rows[1].category), (a, "sign"));
+    // Each terminal closed its own custody: both categories counted,
+    // nothing orphaned (a cross-close would orphan one terminal).
+    assert_eq!(keyuse.evidence().orphan_ends, 0);
+    let marker = JointStaging::select_s1_only();
+    let model = ObjectSemantics::new().project();
+    let committed = commit(1, &[&marker], &model, &keyuse);
+    for category in ["sign", "verify"] {
+        let row = committed
+            .unknown_key_operations
+            .iter()
+            .find(|row| row.category == category && row.reason == "unbound")
+            .expect("terminal counted");
+        assert_eq!((row.completed, row.active), (1, 0));
+    }
+    assert!(
+        committed
+            .unknown_key_operations
+            .iter()
+            .all(|row| row.category != "unknown"),
+        "no orphaned terminal"
+    );
 
-    // Refused starts are namespaced: i11's N+1 start cannot evict
-    // i10's open, and i10's terminal closes i10's custody.
-    let mut ea = EdgeSemantics::default();
-    let mut eb = EdgeSemantics::default();
-    let mut keyuse = KeyUseReducer::with_capacity(1);
+    // Refused starts are namespaced: with one proved bucket, i10's
+    // start admits, i11's equal-ordinal start refuses without
+    // touching i10's open, and each terminal lands in its place.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut probe = KeyUseReducer::new();
     let mut sink = Vec::new();
-    let c = init("C_SignInit", 7, RSA_PKCS, 100);
-    let origin = EffectOrigin::from(&c);
-    ea.observe_joint(&c, &origin, &[], &mut sink);
-    keyuse.observe_effect(a, sink.last().unwrap());
-    let c = init("C_VerifyInit", 7, AES_GCM, 100);
-    let origin = EffectOrigin::from(&c);
-    eb.observe_joint(&c, &origin, &[], &mut sink);
-    keyuse.observe_effect(b, sink.last().unwrap());
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut probe,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut probe,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut probe,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    let start = sink
+        .iter()
+        .find(|effect| matches!(effect, OperationEffect::Started { .. }))
+        .cloned()
+        .expect("proved start");
+    let mut terminator = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut KeyUseReducer::new(),
+        &mut terminator,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let end = terminator
+        .iter()
+        .find(|effect| matches!(effect, OperationEffect::Ended { .. }))
+        .cloned()
+        .expect("sign terminal");
+    let mut keyuse = KeyUseReducer::with_capacity(1);
+    keyuse.observe_effect(a, &start);
+    keyuse.observe_effect(b, &start);
     assert_eq!(keyuse.open().len(), 1);
     assert_eq!(keyuse.refused_opens().len(), 1);
-    let c = op("C_Sign", 7, 200);
-    let origin = EffectOrigin::from(&c);
-    ea.observe_with_effects(&c, &origin, &mut sink);
-    keyuse.observe_effect(a, sink.last().unwrap());
-    let rows = keyuse.rows();
-    assert_eq!(rows.len(), 1);
-    assert_eq!((rows[0].instance, rows[0].category), (a, "sign"));
-    let c = op("C_Verify", 7, 300);
-    let origin = EffectOrigin::from(&c);
-    eb.observe_with_effects(&c, &origin, &mut sink);
-    keyuse.observe_effect(b, sink.last().unwrap());
-    assert_eq!(keyuse.rows().len(), 1, "refused terminals row nothing");
+    keyuse.observe_effect(a, &end);
+    let buckets: Vec<_> = keyuse.aggregates().iter().collect();
+    assert_eq!(buckets.len(), 1);
+    assert_eq!((buckets[0].0.instance, buckets[0].0.category), (a, "sign"));
+    assert_eq!((buckets[0].1.started, buckets[0].1.completed), (1, 1));
+    keyuse.observe_effect(b, &end);
+    assert_eq!(
+        keyuse.aggregates().len(),
+        1,
+        "refused terminals row nothing"
+    );
     assert_eq!(keyuse.evidence().refused_terminals, 1);
 
     // An exact duplicate start refuses loudly; the original custody
@@ -2611,7 +2985,7 @@ fn key_operation_cross_instance_operation_identity() {
     keyuse.observe_effect(a, &start);
     assert_eq!(keyuse.open().len(), 1);
     assert_eq!(keyuse.evidence().duplicate_starts, 1);
-    assert_eq!(keyuse.rows().len(), 0);
+    assert!(keyuse.aggregates().is_empty());
 }
 
 // ==================== Checkbox 4: one projection, three consumers ====================
@@ -3221,10 +3595,12 @@ fn key_operation_one_projection_three_consumers() {
 #[test]
 fn key_operation_schema_contract() {
     use crate::key_operation_projection::contract::*;
-    use crate::key_operation_projection::producer::{
-        gap_label, metadata_field, metadata_label, query_label, role_label,
-    };
+    use crate::key_operation_projection::producer::{gap_label, metadata_field, query_label};
     use crate::semantics_edge::KeyRole;
+    use crate::semantics_key_use::{
+        UNKNOWN_BUCKETS, UNKNOWN_CATEGORIES, UNKNOWN_REASONS as REDUCER_REASONS, metadata_label,
+        role_label,
+    };
     use crate::semantics_key_use::{binds_keys, unbound_reason_for, unit_for};
     use crate::semantics_objects::{FieldState, FieldValue, KeyLabel, QueryStatus};
 
@@ -3303,6 +3679,12 @@ fn key_operation_schema_contract() {
         table(&crate::key_operation_projection::REASON_LABELS)
     );
     assert_eq!(enums("/$defs/category/enum"), table(&CATEGORY_LABELS));
+    // The reducer's fixed-summary vocabulary mirrors the frozen
+    // contract tables exactly (same sets, same order): admission
+    // and publication index the same buckets.
+    assert_eq!(UNKNOWN_CATEGORIES.as_slice(), CATEGORY_LABELS.as_slice());
+    assert_eq!(REDUCER_REASONS.as_slice(), UNKNOWN_REASONS.as_slice());
+    assert_eq!(UNKNOWN_BUCKETS, 23 * 6);
     assert_eq!(enums("/$defs/role/enum"), table(&ROLE_LABELS));
     assert_eq!(enums("/$defs/unit/enum"), table(&UNIT_LABELS));
     assert_eq!(enums("/$defs/metadata_label/enum"), table(&METADATA_LABELS));
@@ -3849,7 +4231,10 @@ fn key_operation_schema_contract() {
         .find(|gap| gap.reason == "pruned_object_referenced")
         .expect("the dangle is explicit");
     assert_eq!(dangle.subject, "key_operation");
-    assert_eq!(dangle.repeats, 4);
+    assert_eq!(
+        dangle.repeats, 1,
+        "only proved buckets retain object references; unknown summaries count outcomes"
+    );
 
     // ---- The status matrix: every feed census maps exactly. ----
     let fresh = JointStaging::select_s1_only();
@@ -3948,27 +4333,78 @@ fn key_operation_schema_contract() {
     assert_eq!(lost.reason, "authority_lost");
 
     // Full budget: the commit surface reports PARTIAL with exact
-    // budgets; refused terminals land counted without rows.
+    // budgets; refused terminals land counted without buckets.
+    let mut full_scene = JointScene::new();
+    let full_bootstrap = full_scene.bootstrap();
+    let mut full_staging = JointStaging::select_joint(Some(&full_bootstrap));
     let mut full_edge = EdgeSemantics::default();
+    let mut full_probe = KeyUseReducer::new();
+    let mut full_sink = Vec::new();
+    drive_quantum(
+        &mut full_scene,
+        &mut full_staging,
+        &mut full_edge,
+        &mut full_probe,
+        &mut full_sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let full_get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut full_scene,
+        &mut full_staging,
+        &mut full_edge,
+        &mut full_probe,
+        &mut full_sink,
+        &full_get,
+    );
+    drive_quantum(
+        &mut full_scene,
+        &mut full_staging,
+        &mut full_edge,
+        &mut full_probe,
+        &mut full_sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    let full_start = full_sink
+        .iter()
+        .find(|effect| matches!(effect, OperationEffect::Started { .. }))
+        .cloned()
+        .expect("proved start");
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
     let mut full_keyuse = KeyUseReducer::with_capacity(2);
-    for n in 0..2u64 {
-        let mut direct_sink = Vec::new();
-        let c = op("C_GenerateKey", 7, 600_000 + n);
-        let origin = EffectOrigin::from(&c);
-        full_edge.observe_with_effects(&c, &origin, &mut direct_sink);
-        full_keyuse.observe_effect(instance, &direct_sink[0]);
-    }
-    let mut direct_sink = Vec::new();
-    let c = op("C_GenerateKey", 7, 600_002);
-    let origin = EffectOrigin::from(&c);
-    full_edge.observe_with_effects(&c, &origin, &mut direct_sink);
-    full_keyuse.observe_effect(instance, &direct_sink[0]);
+    full_keyuse.observe_effect(RegistryInstanceId::from_raw(0), &full_start);
+    full_keyuse.observe_effect(RegistryInstanceId::from_raw(1), &full_start);
+    full_keyuse.observe_effect(RegistryInstanceId::from_raw(2), &full_start);
     assert!(full_keyuse.evidence().partial);
-    let partial = commit(4, &[&staging], &scene.model.project(), &full_keyuse);
+    let partial = commit(
+        4,
+        &[&full_staging],
+        &full_scene.model.project(),
+        &full_keyuse,
+    );
     assert_eq!(partial.status, ObsStatus::Partial);
     assert_eq!(partial.reason, "row_budget_exhausted");
     assert_eq!(partial.budgets.key_occupied, 2);
     assert_eq!(partial.budgets.key_refused, 1);
+    // The refused start's terminal lands counted without a bucket.
+    let mut full_end_sink = Vec::new();
+    drive_quantum(
+        &mut full_scene,
+        &mut full_staging,
+        &mut full_edge,
+        &mut KeyUseReducer::new(),
+        &mut full_end_sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let full_end = full_end_sink
+        .iter()
+        .find(|effect| matches!(effect, OperationEffect::Ended { .. }))
+        .cloned()
+        .expect("sign terminal");
+    full_keyuse.observe_effect(RegistryInstanceId::from_raw(2), &full_end);
     assert_eq!(full_keyuse.evidence().refused_terminals, 1);
 
     // The producer emits only feed/budget reasons: publisher reasons
@@ -4260,16 +4696,10 @@ fn key_operation_pqc_matrix_negative() {
             Some(CKM_ML_KEM)
         ]
     );
-    let mut row_mechs: Vec<_> = keyuse.rows().iter().map(|row| row.mechanism).collect();
-    row_mechs.sort();
-    assert_eq!(
-        row_mechs,
-        vec![
-            Some(CKM_ML_KEM_KEY_PAIR_GEN),
-            Some(CKM_ML_KEM),
-            Some(CKM_ML_KEM)
-        ]
-    );
+    // Aggregates carry no mechanism dimension (H9 §81: mechanism
+    // stays S1 provenance): KEM activity rows unknown-key with the
+    // role-unavailable reason, generation without a key role.
+    assert!(keyuse.aggregates().is_empty(), "no KEM proved bucket");
     let s1only = JointStaging::select_s1_only();
     let committed = commit(1, &[&s1only], &scene.model.project(), &keyuse);
     assert_eq!(committed.status, ObsStatus::Unavailable);
@@ -4652,15 +5082,14 @@ fn key_operation_rsa_ledger_reference() {
     );
 }
 
-/// H9-§91/§93: retained rows never outgrow the bound, so repeat
-/// publication costs identical bytes on every pass: refused input
-/// accumulates in scalar counters only, never in rows or render
-/// buffers. Three ledger passes share one reducer sized to the
-/// first pass (a probe pass learns the exact retained
-/// population): later passes refuse everything, the committed
-/// summaries stay put, and commit+render allocates exactly the
-/// same blocks and bytes on the two refused passes (same status,
-/// same digit widths, zero growth).
+/// H9-§91/§93: retained aggregates never outgrow the bound, so
+/// repeat publication costs identical bytes on every pass. The
+/// receipt-less ledger replay lands in fixed unknown summaries
+/// (never refused, never rowed); a proved-pressure twin sized to
+/// one bucket refuses later instances into scalar counters only,
+/// never into buckets or render buffers. (N7 upgrades this
+/// serialization-request accounting to retained/live/peak memory
+/// measurement.)
 #[test]
 fn key_operation_allocation_pressure_is_bounded_across_passes() {
     let missing = ledger_prerequisites();
@@ -4676,36 +5105,27 @@ fn key_operation_allocation_pressure_is_bounded_across_passes() {
     assert_eq!(calls.len(), 68, "the fixture's exact API population");
     let instance =
         crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(7);
-    let mut probe_edge = EdgeSemantics::default();
-    let mut probe_sink = Vec::new();
-    let mut probe = KeyUseReducer::new();
-    for call in &calls {
-        for effect in &replay_ledger_call(&mut probe_edge, &mut probe_sink, call) {
-            probe.observe_effect(instance, effect);
-        }
-    }
-    let retained = probe.rows().len();
-    assert!(retained > 0, "the ledger retains rows to bound");
-    assert_eq!(
-        probe.evidence().rows_refused,
-        0,
-        "the default bound fits one ledger"
-    );
-
-    let mut keyuse = KeyUseReducer::with_capacity(retained);
+    // Three identical receipt-less ledger passes, each into a
+    // fresh reducer: identical summaries, identical commit+render
+    // cost (zero growth on repeat publication).
     let mut passes = Vec::new();
     for revision in 1..=3u64 {
         let mut edge = EdgeSemantics::default();
         let mut sink = Vec::new();
+        let mut keyuse = KeyUseReducer::new();
         for call in &calls {
             for effect in &replay_ledger_call(&mut edge, &mut sink, call) {
                 keyuse.observe_effect(instance, effect);
             }
         }
+        assert!(
+            keyuse.aggregates().is_empty(),
+            "pass {revision}: receipt-less passes row no bucket"
+        );
         assert_eq!(
-            keyuse.rows().len(),
-            retained,
-            "pass {revision}: rows never grow past the bound"
+            keyuse.evidence().rows_refused,
+            0,
+            "pass {revision}: fixed summaries never refuse"
         );
         let model = JointScene::new().model.project();
         let s1only = JointStaging::select_s1_only();
@@ -4724,33 +5144,99 @@ fn key_operation_allocation_pressure_is_bounded_across_passes() {
         passes.push((committed, rendered, blocks, bytes));
     }
     assert_eq!(
-        passes[0].0.budgets.key_refused, 0,
-        "the sized bound fits pass one"
-    );
-    assert!(
-        passes[1].0.budgets.key_refused > 0,
-        "pass two refuses into scalar counters"
-    );
-    assert!(
-        passes[2].0.budgets.key_refused > passes[1].0.budgets.key_refused,
-        "pass three refuses more, still scalar"
-    );
-    assert_eq!(
         passes[1].0.unknown_key_operations, passes[0].0.unknown_key_operations,
-        "refused passes keep the committed summaries"
+        "repeat passes summarize identically"
     );
     assert_eq!(
-        passes[2].0.unknown_key_operations, passes[1].0.unknown_key_operations,
-        "refused passes keep the committed summaries"
+        passes[2].0.unknown_key_operations, passes[0].0.unknown_key_operations,
+        "repeat passes summarize identically"
     );
     assert_eq!(
-        passes[2].1.len(),
-        passes[1].1.len(),
-        "refused passes render the same bytes wide"
-    );
-    assert_eq!(
-        (passes[2].2, passes[2].3),
         (passes[1].2, passes[1].3),
-        "commit+render allocates identically on refused passes: zero growth"
+        (passes[0].2, passes[0].3),
+        "commit+render allocates identically on repeat passes: zero growth"
+    );
+    // Shared-reducer accumulation: three passes into one reducer
+    // accumulate counters only — no buckets, no refusals.
+    let mut shared = KeyUseReducer::new();
+    for _ in 0..3 {
+        let mut edge = EdgeSemantics::default();
+        let mut sink = Vec::new();
+        for call in &calls {
+            for effect in &replay_ledger_call(&mut edge, &mut sink, call) {
+                shared.observe_effect(instance, effect);
+            }
+        }
+    }
+    assert!(shared.aggregates().is_empty());
+    assert_eq!(shared.evidence().rows_refused, 0);
+    let model = JointScene::new().model.project();
+    let s1only = JointStaging::select_s1_only();
+    let accumulated = commit(4, &[&s1only], &model, &shared);
+    let completed = |rows: &[crate::key_operation_projection::UnknownAggRow]| {
+        rows.iter()
+            .find(|row| row.category == "sign" && row.reason == "unbound")
+            .expect("sign summary")
+            .completed
+    };
+    assert_eq!(
+        completed(&accumulated.unknown_key_operations),
+        3 * completed(&passes[0].0.unknown_key_operations),
+        "shared passes accumulate counters, not buckets"
+    );
+    // Proved-pressure twin: one bucket, two instances — the second
+    // refuses into scalar counters, summaries and render identical.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut probe = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut probe,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut probe,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut probe,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    let start = sink
+        .iter()
+        .find(|effect| matches!(effect, OperationEffect::Started { .. }))
+        .cloned()
+        .expect("proved start");
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+    let mut pressured = KeyUseReducer::with_capacity(1);
+    pressured.observe_effect(RegistryInstanceId::from_raw(0), &start);
+    let model = scene.model.project();
+    let first = commit(1, &[&staging], &model, &pressured);
+    assert_eq!(first.budgets.key_refused, 0);
+    pressured.observe_effect(RegistryInstanceId::from_raw(1), &start);
+    let second = commit(2, &[&staging], &model, &pressured);
+    assert_eq!(second.budgets.key_refused, 1, "N+1 refuses into scalars");
+    assert_eq!(pressured.aggregates().len(), 1, "no new bucket");
+    assert_eq!(
+        second.key_operations, first.key_operations,
+        "refused input keeps the committed rows"
     );
 }

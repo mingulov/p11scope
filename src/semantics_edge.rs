@@ -935,6 +935,35 @@ impl EdgeSemantics {
         self.observe_inner(call, origin, keys, sink)
     }
 
+    /// Joint replay with H3 resource reservation (N14): prepares the
+    /// growth reservation BEFORE the single replay pass (fallback
+    /// passes no receipts). On refusal returns Err WITHOUT
+    /// invalidating, so the caller can invalidate with effects teed
+    /// (open key rows close as Unknown) and dispose the
+    /// un-replayable payload as history. Reducers without a pool
+    /// (unit-test defaults; production registry reducers always
+    /// carry one) replay unresourced.
+    pub(crate) fn observe_joint_with_resources<S: OperationSink>(
+        &mut self,
+        call: &SemanticCall,
+        origin: &EffectOrigin,
+        keys: &[KeyReceipt],
+        sink: &mut S,
+    ) -> Result<u64, SemanticResourceRefusal> {
+        if self.resource_owner.is_none() {
+            return Ok(self.observe_inner(call, origin, keys, sink));
+        }
+        let prepared = match self.prepare_resource_transition(call) {
+            Ok(prepared) => prepared,
+            Err(refusal) => return Err(refusal),
+        };
+        assert!(self.resource_transition.is_none());
+        self.resource_transition = Some(prepared);
+        let refused = self.observe_inner(call, origin, keys, sink);
+        drop(self.resource_transition.take());
+        Ok(refused)
+    }
+
     fn observe_inner<S: OperationSink>(
         &mut self,
         call: &SemanticCall,

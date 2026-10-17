@@ -1987,6 +1987,7 @@ impl ModelState {
         token: CallToken,
         id: ObjectId,
         key_use: bool,
+        input: Option<u8>,
         effects: &mut ObjectEffects,
     ) {
         if let Some(view) = self.objects.get_mut(&id) {
@@ -1998,6 +1999,7 @@ impl ModelState {
                 call: token,
                 object: id,
                 key_use,
+                input,
             });
         }
     }
@@ -2092,7 +2094,7 @@ impl ModelState {
         if call.inputs[0] != HandleInput::Absent {
             let key_use = matches!(family, CreationFamily::Derive | CreationFamily::Unwrap);
             match self.join_input(call, token, 0, session, effects) {
-                Ok(Some(id)) => self.reference(token, id, key_use, effects),
+                Ok(Some(id)) => self.reference(token, id, key_use, Some(0), effects),
                 Ok(None) => {}
                 Err(reason) => self.unresolved(effects, token, reason),
             }
@@ -2381,7 +2383,8 @@ impl ModelState {
         for index in 0..call.inputs.len() {
             match self.join_input(call, token, index, session, effects) {
                 Ok(Some(id)) => {
-                    self.reference(token, id, key_use, effects);
+                    let input = u8::try_from(index).ok();
+                    self.reference(token, id, key_use, input, effects);
                     if let Some(metadata_uncertain) = metadata_interference {
                         if metadata_uncertain {
                             self.unresolved(effects, token, ObjectGap::MetadataUncertain);
@@ -2524,7 +2527,7 @@ impl ModelState {
         }
         if outcome == Outcome::Ok && interference.is_none() {
             if let Ok(Some(id)) = self.join_input(call, token, 0, session, effects) {
-                self.reference(token, id, false, effects);
+                self.reference(token, id, false, Some(0), effects);
             }
         } else if let Some(reason) = interference {
             self.unresolved(effects, token, reason);
@@ -2570,7 +2573,7 @@ impl ModelState {
                 .get(&(session, handle))
                 .copied()
             {
-                Some(Binding::View(id)) => self.reference(token, id, false, effects),
+                Some(Binding::View(id)) => self.reference(token, id, false, None, effects),
                 Some(Binding::Tombstone) => {
                     self.unresolved(effects, token, ObjectGap::DependencyBroken)
                 }
@@ -2589,7 +2592,7 @@ impl ModelState {
                             object: id,
                             session,
                         });
-                        self.reference(token, id, false, effects);
+                        self.reference(token, id, false, None, effects);
                     }
                     Err(reason) => self.unresolved(effects, token, reason),
                 },

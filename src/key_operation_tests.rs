@@ -2672,6 +2672,161 @@ fn key_operation_repeated_use_updates_one_aggregate() {
     assert_eq!(committed.budgets.key_occupied, 1);
 }
 
+/// N5: refused associations preserve their terminal outcomes in
+/// fixed unknown summaries (Completed/Failed/Cancelled/Unknown per
+/// category/reason) without allocating a positive row: one proved
+/// bucket, one admitted and four refused instances, one terminal
+/// per outcome.
+#[test]
+fn key_operation_refused_terminals_preserve_outcomes() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+    use crate::semantics_edge::OperationOutcome;
+
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut probe = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut probe,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut probe,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut probe,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    let start = sink
+        .iter()
+        .find(|effect| matches!(effect, OperationEffect::Started { .. }))
+        .cloned()
+        .expect("proved start");
+    let mut end_sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut KeyUseReducer::new(),
+        &mut end_sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let completed = end_sink
+        .iter()
+        .find(|effect| matches!(effect, OperationEffect::Ended { .. }))
+        .cloned()
+        .expect("completed terminal");
+    // One bucket: instance 0 admits, instances 1..=4 refuse.
+    let mut keyuse = KeyUseReducer::with_capacity(1);
+    for n in 0..=4u32 {
+        keyuse.observe_effect(RegistryInstanceId::from_raw(n), &start);
+    }
+    assert_eq!(keyuse.aggregates().len(), 1);
+    assert_eq!(keyuse.refused_opens().len(), 4);
+    // The admitted terminal closes its bucket; each refused
+    // terminal preserves its outcome in the fixed summary.
+    keyuse.observe_effect(RegistryInstanceId::from_raw(0), &completed);
+    keyuse.observe_effect(RegistryInstanceId::from_raw(1), &completed);
+    // Failed: a bad-rv terminal on the same ordinal.
+    let mut edge = EdgeSemantics::default();
+    let mut failed_sink = Vec::new();
+    let c = init("C_SignInit", 7, RSA_PKCS, 100);
+    feed(&mut edge, &mut failed_sink, &c);
+    let c = call("C_Sign", 7, 0x30, 200);
+    let failed = feed(&mut edge, &mut failed_sink, &c);
+    assert!(matches!(
+        failed[0],
+        OperationEffect::Ended {
+            outcome: OperationOutcome::Failed,
+            ..
+        }
+    ));
+    keyuse.observe_effect(RegistryInstanceId::from_raw(2), &failed[0]);
+    // Cancelled: a competing Init ends the old machine.
+    let mut edge = EdgeSemantics::default();
+    let mut cancelled_sink = Vec::new();
+    let c = init("C_SignInit", 7, RSA_PKCS, 100);
+    feed(&mut edge, &mut cancelled_sink, &c);
+    let c = init("C_SignInit", 7, RSA_PKCS, 200);
+    let cancelled = feed(&mut edge, &mut cancelled_sink, &c);
+    let cancelled_end = cancelled
+        .iter()
+        .find(|effect| matches!(effect, OperationEffect::Ended { .. }))
+        .expect("replacement terminal");
+    assert!(matches!(
+        cancelled_end,
+        OperationEffect::Ended {
+            outcome: OperationOutcome::Cancelled,
+            ..
+        }
+    ));
+    keyuse.observe_effect(RegistryInstanceId::from_raw(3), cancelled_end);
+    // Unknown: loss disposal ends the live machine.
+    let mut edge = EdgeSemantics::default();
+    let mut unknown_sink = Vec::new();
+    let c = init("C_SignInit", 7, RSA_PKCS, 100);
+    feed(&mut edge, &mut unknown_sink, &c);
+    let mut lost_sink = Vec::new();
+    edge.invalidate_with_effects(&mut lost_sink);
+    let unknown = lost_sink
+        .iter()
+        .find(|effect| matches!(effect, OperationEffect::Ended { .. }))
+        .expect("loss terminal");
+    assert!(matches!(
+        unknown,
+        OperationEffect::Ended {
+            outcome: OperationOutcome::Unknown,
+            ..
+        }
+    ));
+    keyuse.observe_effect(RegistryInstanceId::from_raw(4), unknown);
+
+    assert!(keyuse.refused_opens().is_empty());
+    assert_eq!(keyuse.aggregates().len(), 1, "no positive row for refusals");
+    assert_eq!(keyuse.evidence().refused_terminals, 4);
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let summary = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "unbound")
+        .expect("refused terminals summarize per outcome");
+    assert_eq!(
+        (
+            summary.completed,
+            summary.failed,
+            summary.cancelled,
+            summary.unknown
+        ),
+        (1, 1, 1, 1)
+    );
+    assert_eq!(summary.active, 0);
+    let admitted = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("admitted bucket stands");
+    assert_eq!((admitted.started, admitted.completed), (1, 1));
+}
+
 /// G11/H9-§3/§91: key-operation rows are bounded (65,536):
 /// history is never evicted for a new row. At N+1 the new
 /// association is refused — S1 preserved, old rows intact — with

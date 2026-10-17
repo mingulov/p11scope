@@ -9,6 +9,7 @@
 //! helpers and never hands the model an oracle identity/sharing fact.
 
 use crate::semantics_edge::{EdgeSemantics, SemanticCall};
+use crate::semantics_objects::journal::StagingLedger;
 use crate::semantics_objects::{
     AffectedScope, AttrObservation, AttributeList, Attribution, Birth, CallKey, CallToken,
     CompleteInputPrefix, CompletedFact, CreationFamily, FieldState, FieldValue, FindResult,
@@ -236,6 +237,10 @@ struct Book {
 /// A reference history driving one shared model across explicit domains.
 struct Hist {
     model: ObjectSemantics,
+    /// The history's reservation ledger (N1c): reference-model tests
+    /// own a private ledger, so the shared census never binds here —
+    /// it binds in adapter-integrated scenes.
+    ledger: StagingLedger,
     domains: Vec<(ObjectDomain, Book)>,
 }
 
@@ -248,6 +253,7 @@ impl Hist {
     fn with_limits(limits: ObjectLimits) -> Self {
         let mut hist = Self {
             model: ObjectSemantics::with_limits(limits),
+            ledger: StagingLedger::new(),
             domains: Vec::new(),
         };
         hist.add_domain(base_domain(), true);
@@ -257,6 +263,7 @@ impl Hist {
     fn unqualified() -> Self {
         let mut hist = Self {
             model: ObjectSemantics::new(),
+            ledger: StagingLedger::new(),
             domains: Vec::new(),
         };
         hist.add_domain(base_domain(), false);
@@ -292,7 +299,7 @@ impl Hist {
 
     fn try_begin_in(&mut self, dom: usize, cut: u64, call: Call) -> Result<CallToken, ObjectGap> {
         let origin = self.origin(dom, cut, &call);
-        let token = self.model.begin(origin)?;
+        let token = self.model.begin(origin, &mut self.ledger)?;
         self.domains[dom].1.calls.insert(cut, (token, None));
         Ok(token)
     }
@@ -324,7 +331,7 @@ impl Hist {
             found: done.found,
             attributes: done.attributes,
         };
-        self.model.complete(token, fact)
+        self.model.complete(token, fact, &mut self.ledger)
     }
 
     fn done(&mut self, token: CallToken, cut: u64, done: Done) -> ObjectEffects {
@@ -364,7 +371,7 @@ impl Hist {
 
     fn settle_in(&mut self, dom: usize, frontier: u64) -> ObjectEffects {
         let prefix = self.prefix(dom, frontier);
-        let effects = self.model.settle(prefix);
+        let effects = self.model.settle(prefix, &mut self.ledger);
         // A bootstrap is a one-time reference statement.
         self.domains[dom].1.bootstrap = None;
         effects
@@ -1201,6 +1208,7 @@ fn s2s3_stale_origin_and_dependency_fences_predecessor_loss() {
     let lost = h.model.invalidate(
         AffectedScope::Session(base_domain(), sess(SA)),
         ObjectGap::Loss,
+        &mut h.ledger,
     );
     assert!(!has_created(&lost));
     let settled = h.settle(6);
@@ -1353,6 +1361,7 @@ fn s2s3_stale_origin_and_dependency_fences_timeout_mints_no_proof() {
     h.model.invalidate(
         AffectedScope::Session(base_domain(), sess(SA)),
         ObjectGap::Loss,
+        &mut h.ledger,
     );
     let after = h.settle(8);
     assert!(!has_created(&after), "timeout/loss mints no proof");
@@ -2125,7 +2134,7 @@ fn s2s3_lifecycle_loss_and_prefix_contradiction_reference_boundaries() {
         let effects = h.settle(4);
         let id = created(&effects, x, 0).unwrap();
         h.model
-            .invalidate(AffectedScope::Domain(base_domain()), reason);
+            .invalidate(AffectedScope::Domain(base_domain()), reason, &mut h.ledger);
         let p = h.project();
         assert_eq!(view(&p, id).lifetime, Lifetime::Retired(reason));
         assert_eq!(
@@ -2156,8 +2165,11 @@ fn s2s3_lifecycle_loss_and_prefix_contradiction_ended_domain_releases_tickets() 
     h.settle(2);
     let in_flight = h.begin(3, create(SA));
     assert_eq!(h.project().usage.pending_calls, 1);
-    h.model
-        .invalidate(AffectedScope::Domain(base_domain()), ObjectGap::Unload);
+    h.model.invalidate(
+        AffectedScope::Domain(base_domain()),
+        ObjectGap::Unload,
+        &mut h.ledger,
+    );
     assert_eq!(
         h.project().usage.pending_calls,
         0,
@@ -2188,6 +2200,7 @@ fn s2s3_lifecycle_loss_and_prefix_contradiction_token_reset_and_local_loss() {
     h.model.invalidate(
         AffectedScope::Session(base_domain(), sess(SC)),
         ObjectGap::Loss,
+        &mut h.ledger,
     );
     let p = h.project();
     assert_eq!(view(&p, ic).lifetime, Lifetime::Retired(ObjectGap::Loss));
@@ -2206,6 +2219,7 @@ fn s2s3_lifecycle_loss_and_prefix_contradiction_token_reset_and_local_loss() {
     h.model.invalidate(
         AffectedScope::Slot(base_domain(), slot(SLOT1)),
         ObjectGap::TokenReset,
+        &mut h.ledger,
     );
     let p = h.project();
     assert_eq!(
@@ -2213,7 +2227,8 @@ fn s2s3_lifecycle_loss_and_prefix_contradiction_token_reset_and_local_loss() {
         Lifetime::Retired(ObjectGap::TokenReset)
     );
     assert_eq!(view(&p, ib).lifetime, Lifetime::Live, "other slot survives");
-    h.model.invalidate(AffectedScope::Capture, ObjectGap::Loss);
+    h.model
+        .invalidate(AffectedScope::Capture, ObjectGap::Loss, &mut h.ledger);
     let p = h.project();
     assert_eq!(view(&p, ib).lifetime, Lifetime::Retired(ObjectGap::Loss));
     // Global loss voids bootstrap: later success publishes nothing.
@@ -2302,7 +2317,7 @@ fn s2s3_lifecycle_loss_and_prefix_contradiction_open_set_mismatch() {
     let _open = h.begin(5, sign_init(SA, H1));
     // A prefix through 6 that omits the registered open call.
     let bad = CompleteInputPrefix::reference(base_domain(), RefCut::reference(6), &[], None);
-    h.model.settle(bad);
+    h.model.settle(bad, &mut h.ledger);
     assert_eq!(
         view(&h.project(), id).attribution,
         Attribution::Downgraded(ObjectGap::PrefixContradiction)
@@ -2318,7 +2333,7 @@ fn s2s3_lifecycle_loss_and_prefix_contradiction_open_set_mismatch() {
         &[CallKey::reference(5)],
         None,
     );
-    h.model.settle(phantom);
+    h.model.settle(phantom, &mut h.ledger);
     assert_eq!(
         view(&h.project(), id).attribution,
         Attribution::Downgraded(ObjectGap::PrefixContradiction)
@@ -2866,7 +2881,7 @@ fn s2s3_bounded_state_and_redaction_cut_exhaustion() {
         &[],
         Some(RefCut::reference(0)),
     );
-    let effects = h.model.settle(top);
+    let effects = h.model.settle(top, &mut h.ledger);
     let id = created(&effects, x, 0).expect("published before exhaustion");
     assert_eq!(
         h.try_begin_in(0, u64::MAX, get_size(SA, H1)),
@@ -2931,6 +2946,7 @@ fn s2s3_bounded_state_and_redaction_policy_scale_n_and_n_plus_one() {
     // reach the capture-wide 65,536 object records; then N+1 per instance,
     // capture-wide and for the 1,024-call pending budget.
     let mut model = ObjectSemantics::new();
+    let mut ledger = StagingLedger::new();
     let rss_before = crate::discovery::inventory_workload::rss_bytes();
     let mut created_total = 0usize;
     let mut last_cut = BTreeMap::new();
@@ -2945,16 +2961,13 @@ fn s2s3_bounded_state_and_redaction_policy_scale_n_and_n_plus_one() {
                 raw += 1;
                 cut += 1;
                 let token = model
-                    .begin(scale_origin(
-                        domain,
-                        cut,
-                        "C_CreateObject",
-                        0x6600 + session,
-                        None,
-                    ))
+                    .begin(
+                        scale_origin(domain, cut, "C_CreateObject", 0x6600 + session, None),
+                        &mut ledger,
+                    )
                     .expect("within pending budget");
                 cut += 1;
-                model.complete(token, scale_created(cut, 0x9000_0000 + raw));
+                model.complete(token, scale_created(cut, 0x9000_0000 + raw), &mut ledger);
                 if raw.is_multiple_of(64) {
                     let prefix = CompleteInputPrefix::reference(
                         domain,
@@ -2962,7 +2975,7 @@ fn s2s3_bounded_state_and_redaction_policy_scale_n_and_n_plus_one() {
                         &[],
                         bootstrap.take(),
                     );
-                    created_total += count_created(&model.settle(prefix));
+                    created_total += count_created(&model.settle(prefix, &mut ledger));
                 }
             }
         }
@@ -2981,36 +2994,37 @@ fn s2s3_bounded_state_and_redaction_policy_scale_n_and_n_plus_one() {
     let domain = ObjectDomain::reference(1, 1, 1, 100, 1);
     let cut = last_cut[&0];
     let token = model
-        .begin(scale_origin(
-            domain,
-            cut + 1,
-            "C_CreateObject",
-            0x6600,
-            None,
-        ))
+        .begin(
+            scale_origin(domain, cut + 1, "C_CreateObject", 0x6600, None),
+            &mut ledger,
+        )
         .unwrap();
-    model.complete(token, scale_created(cut + 2, 0x9100_0001));
-    let effects = model.settle(CompleteInputPrefix::reference(
-        domain,
-        RefCut::reference(cut + 2),
-        &[],
-        None,
-    ));
+    model.complete(token, scale_created(cut + 2, 0x9100_0001), &mut ledger);
+    let effects = model.settle(
+        CompleteInputPrefix::reference(domain, RefCut::reference(cut + 2), &[], None),
+        &mut ledger,
+    );
     assert_eq!(count_created(&effects), 0, "per-instance N+1 refused");
 
     // Capture-wide N+1 in a fresh instance.
     let domain = ObjectDomain::reference(1, 1, 1, 999, 1);
     model.register_domain(domain).unwrap();
     let token = model
-        .begin(scale_origin(domain, 1, "C_CreateObject", 0x6600, None))
+        .begin(
+            scale_origin(domain, 1, "C_CreateObject", 0x6600, None),
+            &mut ledger,
+        )
         .unwrap();
-    model.complete(token, scale_created(2, 0x9999_0001));
-    let effects = model.settle(CompleteInputPrefix::reference(
-        domain,
-        RefCut::reference(2),
-        &[],
-        Some(RefCut::reference(0)),
-    ));
+    model.complete(token, scale_created(2, 0x9999_0001), &mut ledger);
+    let effects = model.settle(
+        CompleteInputPrefix::reference(
+            domain,
+            RefCut::reference(2),
+            &[],
+            Some(RefCut::reference(0)),
+        ),
+        &mut ledger,
+    );
     assert_eq!(count_created(&effects), 0, "capture-wide N+1 refused");
     assert_eq!(model.project().usage.object_records, 65_536);
     assert!(model.project().gap(ObjectGap::ObjectCapacity) >= 2);
@@ -3020,24 +3034,18 @@ fn s2s3_bounded_state_and_redaction_policy_scale_n_and_n_plus_one() {
     model.register_domain(domain).unwrap();
     for cut in 1..=1_024u64 {
         model
-            .begin(scale_origin(
-                domain,
-                cut,
-                "C_GetObjectSize",
-                0x6600,
-                Some(0x9000_0001),
-            ))
+            .begin(
+                scale_origin(domain, cut, "C_GetObjectSize", 0x6600, Some(0x9000_0001)),
+                &mut ledger,
+            )
             .expect("N pending");
     }
     assert_eq!(model.project().usage.pending_calls, 1_024);
     assert_eq!(
-        model.begin(scale_origin(
-            domain,
-            1_025,
-            "C_GetObjectSize",
-            0x6600,
-            Some(0x9000_0001)
-        )),
+        model.begin(
+            scale_origin(domain, 1_025, "C_GetObjectSize", 0x6600, Some(0x9000_0001)),
+            &mut ledger
+        ),
         Err(ObjectGap::PendingCapacity)
     );
     let rss_after = crate::discovery::inventory_workload::rss_bytes();
@@ -3129,9 +3137,11 @@ fn s2s3_bounded_state_and_redaction_sentinel_canaries() {
     let mut text = String::new();
     text.push_str(&format!("{dup:?}"));
     let effects = h.settle_in(dom, 10);
-    let invalidated = h
-        .model
-        .invalidate(AffectedScope::Session(domain, sess(SA)), ObjectGap::Loss);
+    let invalidated = h.model.invalidate(
+        AffectedScope::Session(domain, sess(SA)),
+        ObjectGap::Loss,
+        &mut h.ledger,
+    );
     let projection = h.project();
     let origin = h.origin(dom, 11, &get_size(SA, H1).input(1, H2));
     let fact = CompletedFact {
@@ -3191,6 +3201,7 @@ fn s2s3_lifecycle_loss_and_prefix_contradiction_void_rejects_applied_snapshots()
     h.model.invalidate(
         AffectedScope::Session(base_domain(), sess(SA)),
         ObjectGap::Loss,
+        &mut h.ledger,
     );
     h.run(6, close(SB), 7, ok());
     h.done(c0, 8, ok().result(0, H2));
@@ -3353,7 +3364,10 @@ fn s2s3_stale_origin_and_dependency_fences_unrepresentable_begin_voids_proof() {
     );
     let mut colliding = h.origin(0, 5, &get_size(SA, H1));
     colliding.key = CallKey::reference(99);
-    assert_eq!(h.model.begin(colliding), Err(ObjectGap::MalformedFact));
+    assert_eq!(
+        h.model.begin(colliding, &mut h.ledger),
+        Err(ObjectGap::MalformedFact)
+    );
     assert_eq!(
         view(&h.project(), id).attribution,
         Attribution::Downgraded(ObjectGap::MalformedFact)
@@ -3365,7 +3379,10 @@ fn s2s3_stale_origin_and_dependency_fences_unrepresentable_begin_voids_proof() {
     let id = created(&h.settle(4), x, 0).unwrap();
     let mut late = h.origin(0, 2, &get_size(SA, H1));
     late.key = CallKey::reference(77);
-    assert_eq!(h.model.begin(late), Err(ObjectGap::ClosedFrontier));
+    assert_eq!(
+        h.model.begin(late, &mut h.ledger),
+        Err(ObjectGap::ClosedFrontier)
+    );
     let p = h.project();
     assert_eq!(
         view(&p, id).attribution,
@@ -3538,8 +3555,10 @@ fn s2s3_stale_origin_and_dependency_fences_refused_begin_blocks_bootstrap() {
         None,
         "the refused call may still be running"
     );
-    h.model
-        .outcome_lost(LostOutcome::Refused(base_domain(), RefCut::reference(9)));
+    h.model.outcome_lost(
+        LostOutcome::Refused(base_domain(), RefCut::reference(9)),
+        &mut h.ledger,
+    );
     h.rebootstrap(0, 10);
     h.settle(10);
     let later = h.run(11, create(SA), 12, ok().result(0, H3));
@@ -3553,7 +3572,10 @@ fn s2s3_stale_origin_and_dependency_fences_refused_begin_blocks_bootstrap() {
     // be running: ClosedFrontier (a new key at or below the frontier).
     let mut late = h.origin(0, 3, &get_size(SA, H9));
     late.key = CallKey::reference(1_003);
-    assert_eq!(h.model.begin(late), Err(ObjectGap::ClosedFrontier));
+    assert_eq!(
+        h.model.begin(late, &mut h.ledger),
+        Err(ObjectGap::ClosedFrontier)
+    );
     h.rebootstrap(0, 13);
     h.settle(13);
     let blocked = h.run(14, create(SA), 15, ok().result(0, H4));
@@ -3563,8 +3585,10 @@ fn s2s3_stale_origin_and_dependency_fences_refused_begin_blocks_bootstrap() {
         None,
         "a ClosedFrontier begin may still be running"
     );
-    h.model
-        .outcome_lost(LostOutcome::Refused(base_domain(), RefCut::reference(16)));
+    h.model.outcome_lost(
+        LostOutcome::Refused(base_domain(), RefCut::reference(16)),
+        &mut h.ledger,
+    );
     h.rebootstrap(0, 17);
     h.settle(17);
     let resumed = h.run(18, create(SA), 19, ok().result(0, H5));
@@ -3575,7 +3599,10 @@ fn s2s3_stale_origin_and_dependency_fences_refused_begin_blocks_bootstrap() {
     let occupant = h.begin(20, get_size(SA, H9));
     let mut clash = h.origin(0, 20, &get_size(SA, H9));
     clash.key = CallKey::reference(1_020);
-    assert_eq!(h.model.begin(clash), Err(ObjectGap::MalformedFact));
+    assert_eq!(
+        h.model.begin(clash, &mut h.ledger),
+        Err(ObjectGap::MalformedFact)
+    );
     h.done(occupant, 21, ok());
     h.rebootstrap(0, 22);
     h.settle(22);
@@ -3586,8 +3613,10 @@ fn s2s3_stale_origin_and_dependency_fences_refused_begin_blocks_bootstrap() {
         None,
         "a colliding begin may still be running"
     );
-    h.model
-        .outcome_lost(LostOutcome::Refused(base_domain(), RefCut::reference(25)));
+    h.model.outcome_lost(
+        LostOutcome::Refused(base_domain(), RefCut::reference(25)),
+        &mut h.ledger,
+    );
     h.rebootstrap(0, 26);
     h.settle(26);
     let resumed = h.run(27, create(SA), 28, ok().result(0, H7));
@@ -3603,14 +3632,17 @@ fn s2s3_stale_origin_and_dependency_fences_lost_outcome_releases_ticket() {
     h.model.invalidate(
         AffectedScope::Session(base_domain(), sess(SA)),
         ObjectGap::Loss,
+        &mut h.ledger,
     );
     h.rebootstrap(0, 4);
     let refused = h.settle(4);
     assert!(refused.effects.contains(&ObjectEffect::Gap {
         reason: ObjectGap::BootstrapRefused
     }));
-    h.model
-        .outcome_lost(LostOutcome::Ticket(stuck, RefCut::reference(5)));
+    h.model.outcome_lost(
+        LostOutcome::Ticket(stuck, RefCut::reference(5)),
+        &mut h.ledger,
+    );
     for (_, completion) in h.domains[0].1.calls.values_mut() {
         if completion.is_none() {
             *completion = Some(5);
@@ -3639,8 +3671,11 @@ fn s2s3_bounded_state_and_redaction_proof_generation_never_wraps() {
     h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
     h.settle(2);
     h.model.exhaust_generation(base_domain());
-    h.model
-        .invalidate(AffectedScope::Domain(base_domain()), ObjectGap::Loss);
+    h.model.invalidate(
+        AffectedScope::Domain(base_domain()),
+        ObjectGap::Loss,
+        &mut h.ledger,
+    );
     assert_eq!(
         h.try_begin_in(0, 3, create(SA)),
         Err(ObjectGap::DomainEnded),
@@ -3661,21 +3696,24 @@ fn s2s3_stale_origin_and_dependency_fences_lost_outcome_bound_is_validated() {
     h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
     let open = h.begin(5, create(SA));
     let before = h.project().usage.pending_calls;
-    let e = h
-        .model
-        .outcome_lost(LostOutcome::Ticket(open, RefCut::reference(4)));
+    let e = h.model.outcome_lost(
+        LostOutcome::Ticket(open, RefCut::reference(4)),
+        &mut h.ledger,
+    );
     assert!(malformed(&e), "a bound below the begin is rejected");
     assert_eq!(h.project().usage.pending_calls, before, "ticket kept");
     let done = h.begin(7, create(SA));
     h.done(done, 9, ok().result(0, H2));
-    let e = h
-        .model
-        .outcome_lost(LostOutcome::Ticket(done, RefCut::reference(8)));
+    let e = h.model.outcome_lost(
+        LostOutcome::Ticket(done, RefCut::reference(8)),
+        &mut h.ledger,
+    );
     assert!(malformed(&e), "a bound below the completion is rejected");
     assert_eq!(h.project().usage.pending_calls, before + 1, "ticket kept");
-    let e = h
-        .model
-        .outcome_lost(LostOutcome::Ticket(open, RefCut::reference(10)));
+    let e = h.model.outcome_lost(
+        LostOutcome::Ticket(open, RefCut::reference(10)),
+        &mut h.ledger,
+    );
     assert!(!malformed(&e));
     assert_eq!(h.project().usage.pending_calls, before, "released");
 }
@@ -3760,49 +3798,61 @@ fn churn(limits: ObjectLimits, cycles: u64) -> (ObjectSemantics, Vec<ObjectId>, 
     };
     let sa = HandleInput::Value(sess(SA));
     let mut model = ObjectSemantics::with_limits(limits);
+    let mut ledger = StagingLedger::new();
     model.register_domain(domain).unwrap();
     let open = model
-        .begin(origin(
-            1,
-            "C_OpenSession",
-            HandleInput::Absent,
-            HandleInput::Absent,
-            slot(SLOT1),
-        ))
+        .begin(
+            origin(
+                1,
+                "C_OpenSession",
+                HandleInput::Absent,
+                HandleInput::Absent,
+                slot(SLOT1),
+            ),
+            &mut ledger,
+        )
         .unwrap();
-    model.complete(open, completed(2, ResultSlot::NotCaptured, sa));
-    model.settle(prefix(2, Some(0)));
+    model.complete(open, completed(2, ResultSlot::NotCaptured, sa), &mut ledger);
+    model.settle(prefix(2, Some(0)), &mut ledger);
     let mut ids = Vec::new();
     let mut peak = 0;
     for i in 0..cycles {
         let b = 3 + 4 * i;
         let c = model
-            .begin(origin(
-                b,
-                "C_CreateObject",
-                sa,
-                HandleInput::Absent,
-                SlotScope::Unknown,
-            ))
+            .begin(
+                origin(
+                    b,
+                    "C_CreateObject",
+                    sa,
+                    HandleInput::Absent,
+                    SlotScope::Unknown,
+                ),
+                &mut ledger,
+            )
             .unwrap();
         model.complete(
             c,
             completed(b + 1, ResultSlot::Handle(obj(H1)), HandleInput::Absent),
+            &mut ledger,
         );
         let d = model
-            .begin(origin(
-                b + 2,
-                "C_DestroyObject",
-                sa,
-                HandleInput::Value(obj(H1)),
-                SlotScope::Unknown,
-            ))
+            .begin(
+                origin(
+                    b + 2,
+                    "C_DestroyObject",
+                    sa,
+                    HandleInput::Value(obj(H1)),
+                    SlotScope::Unknown,
+                ),
+                &mut ledger,
+            )
             .unwrap();
         model.complete(
             d,
             completed(b + 3, ResultSlot::NotCaptured, HandleInput::Absent),
+            &mut ledger,
         );
-        let e = model.settle(prefix(b + 3, None));
+        let e = model.settle(prefix(b + 3, None), &mut ledger);
         ids.push(created(&e, c, 0).expect("churn keeps publishing new IDs"));
         if i % 64 == 0 || i + 1 == cycles {
             let usage = model.project().usage;
@@ -3923,7 +3973,11 @@ fn churn_domain(n: u64) -> ObjectDomain {
 
 /// One short-lived process: open, create, settle, then an exec boundary
 /// ends the domain. Returns the created view.
-fn short_lived(model: &mut ObjectSemantics, domain: ObjectDomain) -> Option<ObjectId> {
+fn short_lived(
+    model: &mut ObjectSemantics,
+    domain: ObjectDomain,
+    ledger: &mut StagingLedger,
+) -> Option<ObjectId> {
     let origin =
         |cut: u64, function: &str, session: HandleInput<SessionHandle>, scope| OriginFact {
             domain,
@@ -3949,35 +4003,50 @@ fn short_lived(model: &mut ObjectSemantics, domain: ObjectDomain) -> Option<Obje
     };
     let sa = HandleInput::Value(sess(SA));
     let open = model
-        .begin(origin(1, "C_OpenSession", HandleInput::Absent, slot(SLOT1)))
+        .begin(
+            origin(1, "C_OpenSession", HandleInput::Absent, slot(SLOT1)),
+            &mut *ledger,
+        )
         .ok()?;
-    model.complete(open, completed(2, ResultSlot::NotCaptured, sa));
+    model.complete(
+        open,
+        completed(2, ResultSlot::NotCaptured, sa),
+        &mut *ledger,
+    );
     let create = model
-        .begin(origin(3, "C_CreateObject", sa, SlotScope::Unknown))
+        .begin(
+            origin(3, "C_CreateObject", sa, SlotScope::Unknown),
+            &mut *ledger,
+        )
         .ok()?;
     model.complete(
         create,
         completed(4, ResultSlot::Handle(obj(H1)), HandleInput::Absent),
+        &mut *ledger,
     );
-    let effects = model.settle(CompleteInputPrefix::reference(
-        domain,
-        RefCut::reference(4),
-        &[],
-        Some(RefCut::reference(0)),
-    ));
-    model.invalidate(AffectedScope::Domain(domain), ObjectGap::Exec);
+    let effects = model.settle(
+        CompleteInputPrefix::reference(
+            domain,
+            RefCut::reference(4),
+            &[],
+            Some(RefCut::reference(0)),
+        ),
+        &mut *ledger,
+    );
+    model.invalidate(AffectedScope::Domain(domain), ObjectGap::Exec, &mut *ledger);
     created(&effects, create, 0)
 }
 
 fn domain_churn(limits: ObjectLimits, domains: u64) -> (ObjectSemantics, Vec<ObjectId>) {
     let mut model = ObjectSemantics::with_limits(limits);
+    let mut ledger = StagingLedger::new();
     let mut ids = Vec::new();
     for n in 0..domains {
         let domain = churn_domain(n);
         model
             .register_domain(domain)
             .expect("ended domains are reclaimed under the cap");
-        ids.push(short_lived(&mut model, domain).expect("new domains keep working"));
+        ids.push(short_lived(&mut model, domain, &mut ledger).expect("new domains keep working"));
         if n % 256 == 0 || n + 1 == domains {
             assert!(model.project().usage.domains <= limits.instances);
         }
@@ -4015,32 +4084,40 @@ fn s2s3_bounded_state_and_redaction_unknown_and_pruned_domains_fail_closed() {
         ..ObjectLimits::policy()
     };
     let mut model = ObjectSemantics::with_limits(limits);
-    let refused_begin = |model: &mut ObjectSemantics, domain: ObjectDomain| {
-        model.begin(OriginFact {
-            domain,
-            cut: RefCut::reference(50),
-            key: CallKey::reference(50),
-            entry_ns: 50,
-            function: fid("C_GetObjectSize"),
-            session: HandleInput::Value(sess(SA)),
-            inputs: [HandleInput::Value(obj(H1)), HandleInput::Absent],
-            requested: [None, None],
-            entry_mechanism: MechanismEvidence::NotCaptured,
-            scope: SlotScope::Unknown,
-        })
-    };
+    let mut ledger = StagingLedger::new();
+    let refused_begin =
+        |model: &mut ObjectSemantics, domain: ObjectDomain, ledger: &mut StagingLedger| {
+            model.begin(
+                OriginFact {
+                    domain,
+                    cut: RefCut::reference(50),
+                    key: CallKey::reference(50),
+                    entry_ns: 50,
+                    function: fid("C_GetObjectSize"),
+                    session: HandleInput::Value(sess(SA)),
+                    inputs: [HandleInput::Value(obj(H1)), HandleInput::Absent],
+                    requested: [None, None],
+                    entry_mechanism: MechanismEvidence::NotCaptured,
+                    scope: SlotScope::Unknown,
+                },
+                &mut *ledger,
+            )
+        };
     // A never-registered domain is never created implicitly.
     let stranger = churn_domain(77);
     assert_eq!(
-        refused_begin(&mut model, stranger),
+        refused_begin(&mut model, stranger, &mut ledger),
         Err(ObjectGap::UnknownDomain)
     );
-    let e = model.settle(CompleteInputPrefix::reference(
-        stranger,
-        RefCut::reference(60),
-        &[],
-        Some(RefCut::reference(0)),
-    ));
+    let e = model.settle(
+        CompleteInputPrefix::reference(
+            stranger,
+            RefCut::reference(60),
+            &[],
+            Some(RefCut::reference(0)),
+        ),
+        &mut ledger,
+    );
     assert!(e.effects.contains(&ObjectEffect::Gap {
         reason: ObjectGap::UnknownDomain
     }));
@@ -4050,22 +4127,23 @@ fn s2s3_bounded_state_and_redaction_unknown_and_pruned_domains_fail_closed() {
     let (a, b, c) = (churn_domain(1), churn_domain(2), churn_domain(3));
     for d in [a, b] {
         model.register_domain(d).unwrap();
-        short_lived(&mut model, d).unwrap();
+        short_lived(&mut model, d, &mut ledger).unwrap();
     }
     model.register_domain(c).unwrap();
-    let live = short_lived(&mut model, c);
+    let live = short_lived(&mut model, c, &mut ledger);
     assert!(live.is_some());
     let before = model.project();
     assert_eq!(before.usage.pruned_domains, 2);
 
     // Late facts for a pruned domain: refused, counted, no state, no join.
-    assert_eq!(refused_begin(&mut model, a), Err(ObjectGap::DomainPruned));
-    let e = model.settle(CompleteInputPrefix::reference(
-        a,
-        RefCut::reference(60),
-        &[],
-        Some(RefCut::reference(55)),
-    ));
+    assert_eq!(
+        refused_begin(&mut model, a, &mut ledger),
+        Err(ObjectGap::DomainPruned)
+    );
+    let e = model.settle(
+        CompleteInputPrefix::reference(a, RefCut::reference(60), &[], Some(RefCut::reference(55))),
+        &mut ledger,
+    );
     assert!(e.effects.contains(&ObjectEffect::Gap {
         reason: ObjectGap::DomainPruned
     }));
@@ -4073,9 +4151,13 @@ fn s2s3_bounded_state_and_redaction_unknown_and_pruned_domains_fail_closed() {
         x,
         ObjectEffect::Created { .. } | ObjectEffect::FirstObserved { .. }
     )));
-    model.invalidate(AffectedScope::Domain(a), ObjectGap::Loss);
-    model.invalidate(AffectedScope::Session(a, sess(SA)), ObjectGap::Loss);
-    let e = model.outcome_lost(LostOutcome::Refused(a, RefCut::reference(70)));
+    model.invalidate(AffectedScope::Domain(a), ObjectGap::Loss, &mut ledger);
+    model.invalidate(
+        AffectedScope::Session(a, sess(SA)),
+        ObjectGap::Loss,
+        &mut ledger,
+    );
+    let e = model.outcome_lost(LostOutcome::Refused(a, RefCut::reference(70)), &mut ledger);
     assert!(e.effects.contains(&ObjectEffect::Gap {
         reason: ObjectGap::DomainPruned
     }));
@@ -4099,7 +4181,7 @@ fn s2s3_bounded_state_and_redaction_domain_with_pending_ticket_is_kept() {
     // An ended domain is reclaimed; the held domain with a ticket is not.
     let ended = churn_domain(1);
     h.model.register_domain(ended).unwrap();
-    short_lived(&mut h.model, ended).unwrap();
+    short_lived(&mut h.model, ended, &mut h.ledger).unwrap();
     let next = churn_domain(2);
     assert_eq!(h.model.register_domain(next), Ok(()));
     assert_eq!(

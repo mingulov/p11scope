@@ -3431,7 +3431,7 @@ impl JournalAdapter {
                 .expect("doomed key");
             if registered {
                 let domain = ObjectDomain::sealed(&JournalDomainProof { key, era });
-                let refused = model.abandon_domain(domain);
+                let refused = model.abandon_domain(domain, &mut self.ledger);
                 effects.effects.extend(refused.effects);
             }
             self.keys.get_mut(&key).expect("doomed key").refused = true;
@@ -3458,10 +3458,10 @@ impl JournalAdapter {
                 continue;
             }
             let domain = ObjectDomain::sealed(&JournalDomainProof { key, era });
-            let lost = model.outcome_lost(super::LostOutcome::Voided(
-                domain,
-                RefCut::sealed(ConsumptionOrdinal(upper)),
-            ));
+            let lost = model.outcome_lost(
+                super::LostOutcome::Voided(domain, RefCut::sealed(ConsumptionOrdinal(upper))),
+                &mut self.ledger,
+            );
             effects.effects.extend(lost.effects);
         }
         effects
@@ -3673,7 +3673,7 @@ impl JournalAdapter {
         });
         if unbounded {
             let domain = ObjectDomain::sealed(&bootstrap.proof());
-            let effects = model.abandon_domain(domain);
+            let effects = model.abandon_domain(domain, &mut self.ledger);
             self.keys.get_mut(&key).expect("sealed key").refused = true;
             let drop: BTreeSet<JournalNativeKey> = self
                 .open
@@ -3777,8 +3777,11 @@ impl JournalAdapter {
             .collect();
         refused_cuts.sort_unstable();
         for cut in &refused_cuts {
-            let refused_effects =
-                model.note_refused_begin(domain, RefCut::sealed(ConsumptionOrdinal(*cut)));
+            let refused_effects = model.note_refused_begin(
+                domain,
+                RefCut::sealed(ConsumptionOrdinal(*cut)),
+                &mut self.ledger,
+            );
             effects.effects.extend(refused_effects.effects);
         }
         if !refused_cuts.is_empty() {
@@ -3792,10 +3795,13 @@ impl JournalAdapter {
                 .max();
             match upper {
                 Some(upper) => {
-                    let lost = model.outcome_lost(super::LostOutcome::Refused(
-                        domain,
-                        RefCut::sealed(ConsumptionOrdinal(upper)),
-                    ));
+                    let lost = model.outcome_lost(
+                        super::LostOutcome::Refused(
+                            domain,
+                            RefCut::sealed(ConsumptionOrdinal(upper)),
+                        ),
+                        &mut self.ledger,
+                    );
                     effects.effects.extend(lost.effects);
                     // The model fences this upper too; the adapter keeps
                     // the running maximum so the bootstrap rule stays
@@ -3866,7 +3872,7 @@ impl JournalAdapter {
             // converts; a failed begin restores the open ticket below.
             let begin_ordinal = entry.begin_ordinal;
             self.ledger.release_h8open(begin_ordinal);
-            let (admitted, begin_effects) = model.begin_with_effects(origin);
+            let (admitted, begin_effects) = model.begin_with_effects(origin, &mut self.ledger);
             effects.effects.extend(begin_effects.effects);
             match admitted {
                 Ok(token) => {
@@ -3934,7 +3940,7 @@ impl JournalAdapter {
                 && !entry.end_converted
             {
                 let completed = completed_of(staged.ordinal, entry.function, &staged.end);
-                let applied = model.complete(token, completed);
+                let applied = model.complete(token, completed, &mut self.ledger);
                 effects.effects.extend(applied.effects);
                 self.open
                     .get_mut(&native)
@@ -3970,10 +3976,10 @@ impl JournalAdapter {
                         h3_voided: None,
                     });
                 };
-                let lost = model.outcome_lost(super::LostOutcome::Ticket(
-                    token,
-                    RefCut::sealed(ConsumptionOrdinal(at)),
-                ));
+                let lost = model.outcome_lost(
+                    super::LostOutcome::Ticket(token, RefCut::sealed(ConsumptionOrdinal(at))),
+                    &mut self.ledger,
+                );
                 effects.effects.extend(lost.effects);
                 let retained = self.keys.get_mut(&key).expect("sealed key");
                 retained.bounded_upper =
@@ -4024,7 +4030,7 @@ impl JournalAdapter {
             settled: settled.clone(),
             open,
         };
-        let applied = model.settle(CompleteInputPrefix::sealed(&prefix));
+        let applied = model.settle(CompleteInputPrefix::sealed(&prefix), &mut self.ledger);
         let ended = applied.effects.iter().any(|effect| {
             matches!(
                 effect,
@@ -4270,7 +4276,7 @@ impl JournalAdapter {
             }
             let era = self.keys[&key].era;
             let domain = ObjectDomain::sealed(&JournalDomainProof { key, era });
-            let applied = model.abandon_domain(domain);
+            let applied = model.abandon_domain(domain, &mut self.ledger);
             effects.effects.extend(applied.effects);
             self.keys.get_mut(&key).expect("stopped key").refused = true;
         }
@@ -8559,9 +8565,11 @@ pub(crate) mod tests {
         // A model-side refusal the adapter mirror never drove: an
         // unbound refused begin fences the model's authority.
         let domain = super::ObjectDomain::sealed(&proof);
-        let _ = scene
-            .model
-            .note_refused_begin(domain, super::RefCut::reference(99));
+        let _ = scene.model.note_refused_begin(
+            domain,
+            super::RefCut::reference(99),
+            scene.adapter.ledger_mut(),
+        );
         let next = begin_bytes(1, 2, create, 0);
         scene.ingest(&next);
         scene.ingest(&end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
@@ -8592,12 +8600,10 @@ pub(crate) mod tests {
         let ticket = held.prefix.settled()[0].ticket;
         // The model's custody diverges behind the adapter's back: the
         // ticket the adapter still lists as open is gone.
-        let _ = scene
-            .model
-            .outcome_lost(crate::semantics_objects::LostOutcome::Ticket(
-                ticket,
-                super::RefCut::reference(999),
-            ));
+        let _ = scene.model.outcome_lost(
+            crate::semantics_objects::LostOutcome::Ticket(ticket, super::RefCut::reference(999)),
+            scene.adapter.ledger_mut(),
+        );
         scene.ingest(&begin_bytes(1, 2, sign, 0));
         let failure = scene
             .seal(&bootstrap)

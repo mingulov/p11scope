@@ -1088,8 +1088,12 @@ impl ObjectSemantics {
 
     /// Reference fact: a call's terminal outcome was lost; the cut is an
     /// upper bound on where it could have taken effect.
-    pub(crate) fn outcome_lost(&mut self, lost: LostOutcome) -> ObjectEffects {
-        self.state.outcome_lost(lost)
+    pub(crate) fn outcome_lost(
+        &mut self,
+        lost: LostOutcome,
+        ledger: &mut journal::StagingLedger,
+    ) -> ObjectEffects {
+        self.state.outcome_lost(lost, ledger)
     }
 
     /// Sealed production input: the journal adapter consumed a begin it
@@ -1103,8 +1107,9 @@ impl ObjectSemantics {
         &mut self,
         domain: ObjectDomain,
         cut: RefCut,
+        ledger: &mut journal::StagingLedger,
     ) -> ObjectEffects {
-        self.state.note_refused(domain, cut.0)
+        self.state.note_refused(domain, cut.0, ledger)
     }
 
     /// Register a domain identity before any fact names it. Idempotent
@@ -1124,8 +1129,12 @@ impl ObjectSemantics {
     /// (`DuplicateCall`); a new key at or below the covered frontier
     /// (`ClosedFrontier`) or at an occupied cut (`MalformedFact`) is
     /// unrepresentable history and contradicts the domain's proof.
-    pub(crate) fn begin(&mut self, origin: OriginFact) -> Result<CallToken, ObjectGap> {
-        self.state.begin(origin)
+    pub(crate) fn begin(
+        &mut self,
+        origin: OriginFact,
+        ledger: &mut journal::StagingLedger,
+    ) -> Result<CallToken, ObjectGap> {
+        self.state.begin(origin, ledger)
     }
 
     /// Sealed production input: admission with its refusal effects. The
@@ -1135,23 +1144,38 @@ impl ObjectSemantics {
     pub(crate) fn begin_with_effects(
         &mut self,
         origin: OriginFact,
+        ledger: &mut journal::StagingLedger,
     ) -> (Result<CallToken, ObjectGap>, ObjectEffects) {
-        self.state.begin_with_effects(origin)
+        self.state.begin_with_effects(origin, ledger)
     }
 
     /// Stage one matched completion privately; publishes no object claim.
-    pub(crate) fn complete(&mut self, token: CallToken, result: CompletedFact) -> ObjectEffects {
-        self.state.complete(token, result)
+    pub(crate) fn complete(
+        &mut self,
+        token: CallToken,
+        result: CompletedFact,
+        ledger: &mut journal::StagingLedger,
+    ) -> ObjectEffects {
+        self.state.complete(token, result, ledger)
     }
 
     /// Apply the history covered by a complete reference prefix.
-    pub(crate) fn settle(&mut self, prefix: CompleteInputPrefix) -> ObjectEffects {
-        self.state.settle(prefix)
+    pub(crate) fn settle(
+        &mut self,
+        prefix: CompleteInputPrefix,
+        ledger: &mut journal::StagingLedger,
+    ) -> ObjectEffects {
+        self.state.settle(prefix, ledger)
     }
 
     /// Apply an explicit reference boundary to the affected scope.
-    pub(crate) fn invalidate(&mut self, scope: AffectedScope, reason: ObjectGap) -> ObjectEffects {
-        self.state.invalidate(scope, reason)
+    pub(crate) fn invalidate(
+        &mut self,
+        scope: AffectedScope,
+        reason: ObjectGap,
+        ledger: &mut journal::StagingLedger,
+    ) -> ObjectEffects {
+        self.state.invalidate(scope, reason, ledger)
     }
 
     /// Sealed production input: unbounded abandonment disposes one
@@ -1159,8 +1183,12 @@ impl ObjectSemantics {
     /// abandoned incarnation's call storage is released with its
     /// custody; the incarnation stays refused. Only the journal's
     /// permanent-refusal paths call this, with a sealed domain.
-    pub(crate) fn abandon_domain(&mut self, domain: ObjectDomain) -> ObjectEffects {
-        self.state.abandon_domain(domain)
+    pub(crate) fn abandon_domain(
+        &mut self,
+        domain: ObjectDomain,
+        ledger: &mut journal::StagingLedger,
+    ) -> ObjectEffects {
+        self.state.abandon_domain(domain, ledger)
     }
 
     pub(crate) fn project(&self) -> ObjectProjection {

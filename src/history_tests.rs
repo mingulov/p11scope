@@ -55,6 +55,8 @@ fn plan() -> crate::plan::AttachPlan {
             "C_GetInfo",
             "C_CloseSession",
             "C_CloseAllSessions",
+            // H9 E20: appended, so slots 0-9 never shift.
+            "C_Initialize",
         ]
         .into_iter()
         .enumerate()
@@ -1611,4 +1613,202 @@ fn e20_fu2_history_close_on_live_tombstone_preserves_refusal() {
     feed(&mut s, &mut t, [join]);
     assert_eq!(s.semantic_evidence().async_orphans, 1);
     assert!(s.mechanisms().is_empty());
+}
+
+/// E20/H9-§2, exec reuse through the actual capture-wide
+/// profile/trace reducer: an exec retires the old generation, so a
+/// post-exec completion cannot adopt the pre-exec async record; a
+/// post-exec re-issue of the same id value starts clean (no
+/// tombstone from the dead record).
+#[test]
+fn e20_exec_reuse_cannot_adopt_pre_exec_async() {
+    let target = crate::kinds::function_id("C_SignInit").unwrap();
+    let (mut s, mut t, _) = setup(16);
+    let old = key(90, 0);
+    feed(&mut s, &mut t, [ev(100, 90, 0, 0)]);
+    let mut init = ev(100, 90, 0, 1);
+    init.rv = pkcs11_types::CkRv::PENDING.0;
+    init.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
+    init.mechanism = 0x101;
+    feed(&mut s, &mut t, [init]);
+    let mut get = ev(100, 90, 0, 4);
+    get.target_function = target;
+    get.async_value = 42;
+    feed(&mut s, &mut t, [get]);
+    assert_eq!(s.pending_at_end(), 1);
+    assert!(s.has_process_state(old));
+
+    // Same cookie, new exec: the tracker retires the old generation
+    // (its open session closes with it).
+    let mut complete = ev(100, 90, 1, 6);
+    complete.target_function = target;
+    complete.async_value = pkcs11_types::CkRv::OK.0;
+    feed(&mut s, &mut t, [complete]);
+    assert_eq!(
+        s.semantic_evidence().async_orphans,
+        1,
+        "post-exec completion cannot adopt the retired record"
+    );
+    assert_eq!(s.pending_at_end(), 0);
+    assert!(!s.has_process_state(old), "exec retired the old key");
+    assert_eq!(s.sessions().closed, 1, "the old open retired with it");
+    assert!(s.mechanisms().is_empty(), "nothing published");
+
+    // Re-issue under the new generation: the same id value starts a
+    // clean record (the dead one left no tombstone).
+    let new = semantics::ProcessKey::history(1, 90, 1, 100);
+    feed(&mut s, &mut t, [ev(100, 90, 1, 0)]);
+    let mut init = ev(100, 90, 1, 1);
+    init.rv = pkcs11_types::CkRv::PENDING.0;
+    init.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
+    init.mechanism = 0x101;
+    feed(&mut s, &mut t, [init]);
+    let mut get = ev(100, 90, 1, 4);
+    get.target_function = target;
+    get.async_value = 42;
+    feed(&mut s, &mut t, [get]);
+    assert_eq!(s.pending_at_end(), 1);
+    assert_eq!(s.semantic_evidence().async_duplicates, 0);
+    let mut join = ev(100, 90, 1, 5);
+    join.target_function = target;
+    join.async_value = 42;
+    feed(&mut s, &mut t, [join]);
+    let mut complete = ev(100, 90, 1, 6);
+    complete.target_function = target;
+    complete.async_value = pkcs11_types::CkRv::OK.0;
+    feed(&mut s, &mut t, [complete]);
+    assert_eq!(s.pending_at_end(), 0);
+    assert_eq!(
+        s.semantic_evidence().async_orphans,
+        1,
+        "only the pre-exec completion orphaned"
+    );
+    assert!(s.has_process_state(new));
+}
+
+/// E20/H9-§2, persisted async through the actual capture-wide
+/// reducer: GetID → Finalize → Initialize → Join → Complete. The
+/// process's own finalize kills its detached ids; Initialize
+/// resurrects nothing, so joining the old value orphans without
+/// adopting a dead operation — while re-issuing the same value
+/// fresh works cleanly.
+#[test]
+fn e20_persisted_async_value_reuse_after_finalize() {
+    let target = crate::kinds::function_id("C_SignInit").unwrap();
+    let (mut s, mut t, _) = setup(16);
+    let a = key(90, 0);
+    feed(&mut s, &mut t, [ev(100, 90, 0, 0)]);
+    let mut init = ev(100, 90, 0, 1);
+    init.rv = pkcs11_types::CkRv::PENDING.0;
+    init.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
+    init.mechanism = 0x101;
+    feed(&mut s, &mut t, [init]);
+    let mut get = ev(100, 90, 0, 4);
+    get.target_function = target;
+    get.async_value = 42;
+    feed(&mut s, &mut t, [get]);
+    assert_eq!(s.pending_at_end(), 1);
+
+    // The process's own finalize kills its detached ids.
+    let mut finalize = ev(100, 90, 0, 3);
+    finalize.session = p11scope_ebpf_common::SESSION_NONE;
+    feed(&mut s, &mut t, [finalize]);
+    assert_eq!(s.pending_at_end(), 0);
+    assert!(!s.has_process_state(a));
+
+    // Re-initialize: rouses nothing.
+    let initialize = ev(100, 90, 0, 10);
+    feed(&mut s, &mut t, [initialize]);
+    assert_eq!(s.pending_at_end(), 0);
+    assert_eq!(
+        s.cgroups()[&0].calls,
+        5,
+        "Initialize routed and counted, not dropped"
+    );
+
+    // Joining the old value orphans: no adoption of a dead operation.
+    let mut open = ev(100, 90, 0, 0);
+    open.session = 9;
+    feed(&mut s, &mut t, [open]);
+    let mut join = ev(100, 90, 0, 5);
+    join.session = 9;
+    join.target_function = target;
+    join.async_value = 42;
+    feed(&mut s, &mut t, [join]);
+    assert_eq!(s.semantic_evidence().async_orphans, 1);
+    let mut complete = ev(100, 90, 0, 6);
+    complete.session = 9;
+    complete.target_function = target;
+    feed(&mut s, &mut t, [complete]);
+    assert_eq!(s.semantic_evidence().async_orphans, 2);
+    assert!(s.mechanisms().is_empty(), "the dead id published nothing");
+
+    // Re-issuing the same value fresh works cleanly.
+    let mut init = ev(100, 90, 0, 1);
+    init.session = 9;
+    init.rv = pkcs11_types::CkRv::PENDING.0;
+    init.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
+    init.mechanism = 0x101;
+    feed(&mut s, &mut t, [init]);
+    let mut get = ev(100, 90, 0, 4);
+    get.session = 9;
+    get.target_function = target;
+    get.async_value = 42;
+    feed(&mut s, &mut t, [get]);
+    assert_eq!(s.semantic_evidence().async_duplicates, 0);
+    let mut join = ev(100, 90, 0, 5);
+    join.session = 9;
+    join.target_function = target;
+    join.async_value = 42;
+    feed(&mut s, &mut t, [join]);
+    let mut complete = ev(100, 90, 0, 6);
+    complete.session = 9;
+    complete.target_function = target;
+    complete.async_value = pkcs11_types::CkRv::OK.0;
+    feed(&mut s, &mut t, [complete]);
+    assert_eq!(s.pending_at_end(), 0);
+    assert_eq!(
+        s.semantic_evidence().async_orphans,
+        2,
+        "only the dead-id join and completion orphaned"
+    );
+}
+
+/// E20/H9-§2, the independently proven legitimate transfer: a join
+/// from a process with no open session refuses (target failure, not
+/// adoption), which is what makes the receiver's own open the
+/// transfer's legitimacy proof.
+#[test]
+fn e20_transfer_without_receiver_open_refuses_without_adoption() {
+    let target = crate::kinds::function_id("C_SignInit").unwrap();
+    let (mut s, mut t, _) = setup(16);
+    let a = key(90, 0);
+    feed(&mut s, &mut t, [ev(100, 90, 0, 0), ev(200, 20, 0, 0)]);
+    let mut init = ev(100, 90, 0, 1);
+    init.rv = pkcs11_types::CkRv::PENDING.0;
+    init.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
+    init.mechanism = 0x101;
+    feed(&mut s, &mut t, [init]);
+    let mut get = ev(100, 90, 0, 4);
+    get.target_function = target;
+    get.async_value = 42;
+    feed(&mut s, &mut t, [get]);
+    // B closes its only session: the join below arrives with no
+    // open session to prove the receiver.
+    feed(&mut s, &mut t, [ev(200, 20, 0, 8)]);
+    let mut join = ev(200, 20, 0, 5);
+    join.target_function = target;
+    join.async_value = 42;
+    feed(&mut s, &mut t, [join]);
+    assert_eq!(s.semantic_evidence().async_target_failures, 1);
+    assert_eq!(s.semantic_evidence().async_orphans, 0);
+    assert_eq!(s.pending_at_end(), 1, "custody never moved");
+    assert!(s.has_process_state(a));
+    // The owner still completes its own operation cleanly.
+    let mut complete = ev(100, 90, 0, 6);
+    complete.target_function = target;
+    complete.async_value = pkcs11_types::CkRv::OK.0;
+    feed(&mut s, &mut t, [complete]);
+    assert_eq!(s.pending_at_end(), 0);
+    assert_eq!(s.semantic_evidence().async_orphans, 0);
 }

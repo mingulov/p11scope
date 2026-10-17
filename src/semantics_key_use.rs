@@ -408,6 +408,7 @@ impl JointStaging {
     /// object facts are never invented in fallback). Returns the
     /// outcome plus fallback per-edge bound refusals for
     /// `semantic_refused`.
+    #[allow(clippy::too_many_arguments)] // Staging borrows the exact pipeline facts plus the model for retirement.
     pub(crate) fn apply_failure<S: OperationSink>(
         &mut self,
         failure: &SealFailure,

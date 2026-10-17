@@ -900,6 +900,7 @@ fn key_operation_single_feed_exactly_once() {
             &mut keyuse,
             instance,
             &mut joint_sink,
+            None,
         );
         assert_eq!(
             outcome,
@@ -966,6 +967,7 @@ fn key_operation_single_feed_exactly_once() {
         &mut keyuse,
         instance,
         &mut sink2,
+        None,
     );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
     assert_eq!(refused, 0);
@@ -1059,6 +1061,7 @@ fn key_operation_fallback_and_history_loss() {
         &mut keyuse,
         instance,
         &mut joint_sink,
+        None,
     );
     assert_eq!(outcome, FailureApplyOutcome::HeldForCompleteness);
     assert_eq!(refused, 0);
@@ -1077,6 +1080,7 @@ fn key_operation_fallback_and_history_loss() {
         &mut keyuse,
         instance,
         &mut joint_sink,
+        None,
     );
     assert_eq!(outcome, FailureApplyOutcome::FellBack { replayed: 3 });
     assert_eq!(refused, 0);
@@ -1126,6 +1130,7 @@ fn key_operation_fallback_and_history_loss() {
         &mut keyuse,
         instance,
         &mut joint_sink,
+        None,
     );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
     assert_eq!(refused, 0);
@@ -1152,6 +1157,7 @@ fn key_operation_fallback_and_history_loss() {
         &mut keyuse,
         instance,
         &mut joint_sink,
+        None,
     );
     assert_eq!(outcome, FailureApplyOutcome::Degraded { disposed: 2 });
     assert_eq!(refused, 0);
@@ -1257,6 +1263,7 @@ fn key_operation_joint_staging_bounds() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, SealApplyOutcome::Held);
     assert_eq!(refused, 0);
@@ -1277,6 +1284,7 @@ fn key_operation_joint_staging_bounds() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
     assert_eq!(joint.calls(), 1);
@@ -1302,6 +1310,7 @@ fn key_operation_joint_staging_bounds() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, SealApplyOutcome::Held);
     assert_eq!(refused, 0);
@@ -1335,6 +1344,7 @@ fn key_operation_joint_staging_bounds() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, SealApplyOutcome::Held);
     assert_eq!(staging.correlation_refusals(), 1);
@@ -1397,6 +1407,7 @@ fn key_operation_joint_retry_and_degraded_inert() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, FailureApplyOutcome::Retried);
     assert_eq!(refused, 0);
@@ -1461,6 +1472,7 @@ fn key_operation_joint_retry_and_degraded_inert() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, FailureApplyOutcome::Degraded { disposed: 2 });
     assert_eq!(refused, 0);
@@ -1479,6 +1491,7 @@ fn key_operation_joint_retry_and_degraded_inert() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, FailureApplyOutcome::Ignored);
     assert_eq!(refused, 0);
@@ -1502,6 +1515,7 @@ fn key_operation_joint_retry_and_degraded_inert() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, SealApplyOutcome::Held);
     assert_eq!(refused, 0);
@@ -1566,6 +1580,7 @@ fn key_operation_abandoned_quantum_replays_s1() {
         &mut keyuse,
         instance,
         &mut joint_sink,
+        None,
     );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
     assert_eq!(refused, 0);
@@ -1653,6 +1668,7 @@ fn key_operation_fallback_invalidates_before_replay() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, FailureApplyOutcome::FellBack { replayed: 1 });
     assert_eq!(joint.completed(), 1, "proof-only loss preserves S1");
@@ -1760,6 +1776,7 @@ fn key_operation_n3_held_multicall_applies_invalidations() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, SealApplyOutcome::Held);
     assert_eq!(refused, 0);
@@ -1797,6 +1814,7 @@ fn key_operation_n3_held_multicall_applies_invalidations() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, FailureApplyOutcome::FellBack { replayed: 2 });
     let committed = commit(3, &[&staging], &scene.model.project(), &keyuse);
@@ -1891,6 +1909,7 @@ fn key_operation_n3_held_failure_paths_apply_invalidations() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, FailureApplyOutcome::HeldForCompleteness);
     assert_eq!(refused, 0);
@@ -1927,6 +1946,7 @@ fn key_operation_n3_held_failure_paths_apply_invalidations() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, FailureApplyOutcome::FellBack { replayed: 1 });
     let committed = commit(2, &[&staging], &scene.model.project(), &keyuse);
@@ -1996,6 +2016,7 @@ fn key_operation_n3_held_failure_paths_apply_invalidations() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, FailureApplyOutcome::Retried);
     assert_eq!(refused, 0);
@@ -2207,6 +2228,7 @@ fn key_operation_seal_binds_exact_call_once() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
     let staged_before = joint.started();
@@ -2219,6 +2241,7 @@ fn key_operation_seal_binds_exact_call_once() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(
         outcome,
@@ -2263,6 +2286,7 @@ fn key_operation_seal_binds_exact_call_once() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(
         outcome,
@@ -2304,6 +2328,7 @@ fn key_operation_seal_binds_exact_call_once() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(
         outcome,
@@ -2348,6 +2373,7 @@ fn key_operation_seal_binds_exact_call_once() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, SealApplyOutcome::Held, "seals never skip the head");
     assert_eq!(staging.staged_len(), 2);
@@ -2411,6 +2437,7 @@ fn key_operation_s1_matrix_through_both_feeds() {
             &mut keyuse,
             instance,
             &mut joint_sink,
+            None,
         );
         assert_eq!(outcome, SealApplyOutcome::ReplayedOne, "{}", call.name);
         assert_eq!(refused, 0);
@@ -2463,6 +2490,7 @@ fn key_operation_s1_matrix_through_both_feeds() {
             &mut keyuse,
             instance,
             &mut joint_sink,
+            None,
         );
         assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
         let origin = EffectOrigin::from(&facts);
@@ -2514,6 +2542,7 @@ fn key_operation_s1_matrix_through_both_feeds() {
         &mut keyuse,
         instance,
         &mut joint_sink,
+        None,
     );
     assert_eq!(outcome, FailureApplyOutcome::FellBack { replayed: 3 });
     for facts in &staged_facts {
@@ -2557,6 +2586,7 @@ fn drive_quantum(
         keyuse,
         instance,
         sink,
+        None,
     );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne, "{}", call.name);
     assert_eq!(refused, 0);
@@ -2571,6 +2601,7 @@ fn drive_quantum(
 /// join in the model), with explicit evidence.
 #[test]
 fn key_operation_joint_async_pending_then_direct_completion() {
+    let mut assoc_ledger = StagingLedger::new();
     let instance =
         crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
     let mut scene = JointScene::new();
@@ -2596,6 +2627,7 @@ fn key_operation_joint_async_pending_then_direct_completion() {
         &mut keyuse,
         instance,
         &mut joint_sink,
+        None,
     );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
     let origin = EffectOrigin::from(&facts);
@@ -2630,7 +2662,7 @@ fn key_operation_joint_async_pending_then_direct_completion() {
     // The direct carve-out has no tee: the driver feeds the new
     // effects to the key-use reducer itself.
     for effect in &joint_sink[effects_before..] {
-        keyuse.observe_effect(instance, effect);
+        keyuse.observe_effect(instance, effect, Some(&mut assoc_ledger), None);
     }
     direct.observe_with_effects(&complete, &origin, &mut direct_sink);
     assert_eq!(strip_receipts(&joint_sink), direct_sink);
@@ -2652,6 +2684,7 @@ fn key_operation_joint_async_pending_then_direct_completion() {
         &mut keyuse,
         instance,
         &mut joint_sink,
+        None,
     );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
     let origin = EffectOrigin::from(&facts);
@@ -2969,6 +3002,7 @@ fn key_operation_partial_wrap_preserves_input_position() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
@@ -3033,6 +3067,7 @@ fn key_operation_partial_wrap_preserves_input_position() {
 /// requested-only metadata keeps definite operations without values.
 #[test]
 fn key_operation_unknown_key_and_requested_only() {
+    let mut assoc_ledger = StagingLedger::new();
     let instance =
         crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
     // Unreadable Init input: the model explicitly leaves the join
@@ -3075,6 +3110,7 @@ fn key_operation_unknown_key_and_requested_only() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
     drive_quantum(
@@ -3106,7 +3142,7 @@ fn key_operation_unknown_key_and_requested_only() {
     let c = op("C_Sign", 7, 200);
     feed(&mut direct, &mut sink, &c);
     for effect in &sink {
-        keyuse.observe_effect(instance, effect);
+        keyuse.observe_effect(instance, effect, Some(&mut assoc_ledger), None);
     }
     assert!(keyuse.aggregates().is_empty());
     assert_eq!(keyuse.evidence().unknown_key_rows, 1);
@@ -3225,6 +3261,7 @@ fn key_operation_delayed_receipt_does_not_backfill_metadata() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
     // Routing delay: the model learns a full RSA label afterwards.
@@ -3467,6 +3504,7 @@ fn key_operation_wrap_reserves_two_aggregate_rows() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
     assert_eq!((joint.started(), joint.completed()), (1, 1), "S1 preserved");
@@ -3553,6 +3591,7 @@ fn key_operation_repeated_use_updates_one_aggregate() {
 /// per outcome.
 #[test]
 fn key_operation_refused_terminals_preserve_outcomes() {
+    let mut assoc_ledger = StagingLedger::new();
     use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
     use crate::semantics_edge::OperationOutcome;
 
@@ -3612,14 +3651,29 @@ fn key_operation_refused_terminals_preserve_outcomes() {
     // One bucket: instance 0 admits, instances 1..=4 refuse.
     let mut keyuse = KeyUseReducer::with_capacity(1);
     for n in 0..=4u32 {
-        keyuse.observe_effect(RegistryInstanceId::from_raw(n), &start);
+        keyuse.observe_effect(
+            RegistryInstanceId::from_raw(n),
+            &start,
+            Some(&mut assoc_ledger),
+            None,
+        );
     }
     assert_eq!(keyuse.aggregates().len(), 1);
     assert_eq!(keyuse.refused_opens().len(), 4);
     // The admitted terminal closes its bucket; each refused
     // terminal preserves its outcome in the fixed summary.
-    keyuse.observe_effect(RegistryInstanceId::from_raw(0), &completed);
-    keyuse.observe_effect(RegistryInstanceId::from_raw(1), &completed);
+    keyuse.observe_effect(
+        RegistryInstanceId::from_raw(0),
+        &completed,
+        Some(&mut assoc_ledger),
+        None,
+    );
+    keyuse.observe_effect(
+        RegistryInstanceId::from_raw(1),
+        &completed,
+        Some(&mut assoc_ledger),
+        None,
+    );
     // Failed: a bad-rv terminal on the same ordinal.
     let mut edge = EdgeSemantics::default();
     let mut failed_sink = Vec::new();
@@ -3634,7 +3688,12 @@ fn key_operation_refused_terminals_preserve_outcomes() {
             ..
         }
     ));
-    keyuse.observe_effect(RegistryInstanceId::from_raw(2), &failed[0]);
+    keyuse.observe_effect(
+        RegistryInstanceId::from_raw(2),
+        &failed[0],
+        Some(&mut assoc_ledger),
+        None,
+    );
     // Cancelled: a competing Init ends the old machine.
     let mut edge = EdgeSemantics::default();
     let mut cancelled_sink = Vec::new();
@@ -3653,7 +3712,12 @@ fn key_operation_refused_terminals_preserve_outcomes() {
             ..
         }
     ));
-    keyuse.observe_effect(RegistryInstanceId::from_raw(3), cancelled_end);
+    keyuse.observe_effect(
+        RegistryInstanceId::from_raw(3),
+        cancelled_end,
+        Some(&mut assoc_ledger),
+        None,
+    );
     // Unknown: loss disposal ends the live machine.
     let mut edge = EdgeSemantics::default();
     let mut unknown_sink = Vec::new();
@@ -3672,7 +3736,12 @@ fn key_operation_refused_terminals_preserve_outcomes() {
             ..
         }
     ));
-    keyuse.observe_effect(RegistryInstanceId::from_raw(4), unknown);
+    keyuse.observe_effect(
+        RegistryInstanceId::from_raw(4),
+        unknown,
+        Some(&mut assoc_ledger),
+        None,
+    );
 
     assert!(keyuse.refused_opens().is_empty());
     assert_eq!(keyuse.aggregates().len(), 1, "no positive row for refusals");
@@ -3708,6 +3777,7 @@ fn key_operation_refused_terminals_preserve_outcomes() {
 /// associations land in fixed counters without allocating rows.
 #[test]
 fn key_operation_row_retention_bounds() {
+    let mut assoc_ledger = StagingLedger::new();
     use crate::key_operation_projection::KEY_OP_ROW_CAPACITY;
 
     use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
@@ -3724,7 +3794,7 @@ fn key_operation_row_retention_bounds() {
         let origin = EffectOrigin::from(&c);
         edge.observe_with_effects(&c, &origin, &mut sink);
         assert_eq!(sink.len(), 1);
-        keyuse.observe_effect(instance, &sink[0]);
+        keyuse.observe_effect(instance, &sink[0], Some(&mut assoc_ledger), None);
     }
     assert!(keyuse.aggregates().is_empty(), "no bucket without a key");
     assert!(!keyuse.evidence().partial, "fixed summaries never refuse");
@@ -3780,28 +3850,7 @@ fn key_operation_row_retention_bounds() {
         .find(|effect| matches!(effect, OperationEffect::Started { .. }))
         .cloned()
         .expect("proved start");
-    // Fill exactly to capacity across instances.
-    let mut keyuse = KeyUseReducer::new();
-    for n in 0..65_536u32 {
-        keyuse.observe_effect(RegistryInstanceId::from_raw(n), &start);
-    }
-    assert_eq!(keyuse.aggregates().len(), KEY_OP_ROW_CAPACITY);
-    assert_eq!(keyuse.open().len(), KEY_OP_ROW_CAPACITY);
-    assert!(!keyuse.evidence().partial, "exact fit is not partial");
-    // N+1 refuses: S1 still completes, old buckets intact, PARTIAL.
-    keyuse.observe_effect(RegistryInstanceId::from_raw(65_536), &start);
-    assert_eq!(keyuse.aggregates().len(), KEY_OP_ROW_CAPACITY);
-    let evidence = keyuse.evidence();
-    assert!(evidence.partial, "refusal makes coverage PARTIAL");
-    assert_eq!(evidence.rows_refused, 1);
-    assert_eq!(keyuse.refused_opens().len(), 1);
-    let first = keyuse
-        .aggregates()
-        .values()
-        .next()
-        .expect("history never evicted");
-    assert_eq!((first.started, first.active), (1, 1));
-    // The refused start's terminal lands counted without a bucket.
+    // The sign terminal, fanned out with the start below.
     let mut end_sink = Vec::new();
     drive_quantum(
         &mut scene,
@@ -3817,8 +3866,48 @@ fn key_operation_row_retention_bounds() {
         .find(|effect| matches!(effect, OperationEffect::Ended { .. }))
         .cloned()
         .expect("sign terminal");
-    keyuse.observe_effect(RegistryInstanceId::from_raw(0), &end);
-    keyuse.observe_effect(RegistryInstanceId::from_raw(65_536), &end);
+    // Fill exactly to capacity across instances, in waves of 1,024
+    // live opens (N1c): the unified census caps simultaneous opens
+    // while the 65,536 aggregate buckets retain closed history.
+    let mut keyuse = KeyUseReducer::new();
+    for wave in 0..64u32 {
+        for n in 0..1_024u32 {
+            let instance = RegistryInstanceId::from_raw(wave * 1_024 + n);
+            keyuse.observe_effect(instance, &start, Some(&mut assoc_ledger), None);
+        }
+        for n in 0..1_024u32 {
+            let instance = RegistryInstanceId::from_raw(wave * 1_024 + n);
+            keyuse.observe_effect(instance, &end, Some(&mut assoc_ledger), None);
+        }
+    }
+    assert_eq!(keyuse.aggregates().len(), KEY_OP_ROW_CAPACITY);
+    assert!(keyuse.open().is_empty(), "waves close their opens");
+    assert!(!keyuse.evidence().partial, "exact fit is not partial");
+    // N+1 refuses: S1 still completes, old buckets intact, PARTIAL.
+    keyuse.observe_effect(
+        RegistryInstanceId::from_raw(65_536),
+        &start,
+        Some(&mut assoc_ledger),
+        None,
+    );
+    assert_eq!(keyuse.aggregates().len(), KEY_OP_ROW_CAPACITY);
+    let evidence = keyuse.evidence();
+    assert!(evidence.partial, "refusal makes coverage PARTIAL");
+    assert_eq!(evidence.rows_refused, 1);
+    assert_eq!(keyuse.refused_opens().len(), 1);
+    let first = keyuse
+        .aggregates()
+        .values()
+        .next()
+        .expect("history never evicted");
+    assert_eq!((first.started, first.active), (1, 0));
+    // The refused start's terminal lands counted without a bucket.
+    keyuse.observe_effect(
+        RegistryInstanceId::from_raw(65_536),
+        &end,
+        Some(&mut assoc_ledger),
+        None,
+    );
     assert_eq!(keyuse.aggregates().len(), KEY_OP_ROW_CAPACITY);
     assert_eq!(keyuse.evidence().refused_terminals, 1);
     assert!(keyuse.refused_opens().is_empty());
@@ -3829,16 +3918,36 @@ fn key_operation_row_retention_bounds() {
     // their bucket allocation-free, N+1 refuses starts and directs.
     let mut keyuse = KeyUseReducer::with_capacity(2);
     assert_eq!(keyuse.capacity(), 2, "injected bound");
-    keyuse.observe_effect(RegistryInstanceId::from_raw(0), &start);
-    keyuse.observe_effect(RegistryInstanceId::from_raw(1), &start);
+    keyuse.observe_effect(
+        RegistryInstanceId::from_raw(0),
+        &start,
+        Some(&mut assoc_ledger),
+        None,
+    );
+    keyuse.observe_effect(
+        RegistryInstanceId::from_raw(1),
+        &start,
+        Some(&mut assoc_ledger),
+        None,
+    );
     assert_eq!(keyuse.open().len(), 2, "both starts reserved");
     assert!(!keyuse.evidence().partial);
-    keyuse.observe_effect(RegistryInstanceId::from_raw(0), &end);
+    keyuse.observe_effect(
+        RegistryInstanceId::from_raw(0),
+        &end,
+        Some(&mut assoc_ledger),
+        None,
+    );
     assert_eq!(keyuse.aggregates().len(), 2, "the end reused its bucket");
     assert!(!keyuse.evidence().partial, "reserved closes never refuse");
     // N+1: a proved start refuses, while receipt-less operations
     // still count in fixed summaries at full budget.
-    keyuse.observe_effect(RegistryInstanceId::from_raw(2), &start);
+    keyuse.observe_effect(
+        RegistryInstanceId::from_raw(2),
+        &start,
+        Some(&mut assoc_ledger),
+        None,
+    );
     assert_eq!(keyuse.evidence().rows_refused, 1);
     assert!(keyuse.evidence().partial);
     assert_eq!(keyuse.refused_opens().len(), 1);
@@ -3846,13 +3955,18 @@ fn key_operation_row_retention_bounds() {
     let c = op("C_GenerateKey", 7, 500_000);
     let origin = EffectOrigin::from(&c);
     edge.observe_with_effects(&c, &origin, &mut sink);
-    keyuse.observe_effect(instance, &sink[0]);
+    keyuse.observe_effect(instance, &sink[0], Some(&mut assoc_ledger), None);
     assert_eq!(
         keyuse.evidence().rows_refused,
         1,
         "fixed summaries never refuse"
     );
-    keyuse.observe_effect(RegistryInstanceId::from_raw(2), &end);
+    keyuse.observe_effect(
+        RegistryInstanceId::from_raw(2),
+        &end,
+        Some(&mut assoc_ledger),
+        None,
+    );
     assert_eq!(
         keyuse.aggregates().len(),
         2,
@@ -3870,6 +3984,7 @@ fn key_operation_row_retention_bounds() {
 /// unrelated custody.
 #[test]
 fn key_operation_cross_instance_operation_identity() {
+    let mut assoc_ledger = StagingLedger::new();
     use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
     let a = RegistryInstanceId::from_raw(10);
     let b = RegistryInstanceId::from_raw(11);
@@ -3891,19 +4006,19 @@ fn key_operation_cross_instance_operation_identity() {
         started(&start_b).0,
         "equal ordinals collide"
     );
-    keyuse.observe_effect(a, &start_a);
-    keyuse.observe_effect(b, &start_b);
+    keyuse.observe_effect(a, &start_a, Some(&mut assoc_ledger), None);
+    keyuse.observe_effect(b, &start_b, Some(&mut assoc_ledger), None);
     assert_eq!((ea.started(), eb.started()), (1, 1));
     assert_eq!(keyuse.open().len(), 2, "both custodies retained");
     // Reversed terminals: i11's Verify first, then i10's Sign.
     let c = op("C_Verify", 7, 200);
     let origin = EffectOrigin::from(&c);
     eb.observe_with_effects(&c, &origin, &mut sink);
-    keyuse.observe_effect(b, sink.last().unwrap());
+    keyuse.observe_effect(b, sink.last().unwrap(), Some(&mut assoc_ledger), None);
     let c = op("C_Sign", 7, 300);
     let origin = EffectOrigin::from(&c);
     ea.observe_with_effects(&c, &origin, &mut sink);
-    keyuse.observe_effect(a, sink.last().unwrap());
+    keyuse.observe_effect(a, sink.last().unwrap(), Some(&mut assoc_ledger), None);
     assert!(keyuse.open().is_empty());
     // Each terminal closed its own custody: both categories counted,
     // nothing orphaned (a cross-close would orphan one terminal).
@@ -3984,16 +4099,16 @@ fn key_operation_cross_instance_operation_identity() {
         .cloned()
         .expect("sign terminal");
     let mut keyuse = KeyUseReducer::with_capacity(1);
-    keyuse.observe_effect(a, &start);
-    keyuse.observe_effect(b, &start);
+    keyuse.observe_effect(a, &start, Some(&mut assoc_ledger), None);
+    keyuse.observe_effect(b, &start, Some(&mut assoc_ledger), None);
     assert_eq!(keyuse.open().len(), 1);
     assert_eq!(keyuse.refused_opens().len(), 1);
-    keyuse.observe_effect(a, &end);
+    keyuse.observe_effect(a, &end, Some(&mut assoc_ledger), None);
     let buckets: Vec<_> = keyuse.aggregates().iter().collect();
     assert_eq!(buckets.len(), 1);
     assert_eq!((buckets[0].0.instance, buckets[0].0.category), (a, "sign"));
     assert_eq!((buckets[0].1.started, buckets[0].1.completed), (1, 1));
-    keyuse.observe_effect(b, &end);
+    keyuse.observe_effect(b, &end, Some(&mut assoc_ledger), None);
     assert_eq!(
         keyuse.aggregates().len(),
         1,
@@ -4010,8 +4125,8 @@ fn key_operation_cross_instance_operation_identity() {
     let origin = EffectOrigin::from(&c);
     edge.observe_joint(&c, &origin, &[], &mut sink);
     let start = sink.last().cloned().unwrap();
-    keyuse.observe_effect(a, &start);
-    keyuse.observe_effect(a, &start);
+    keyuse.observe_effect(a, &start, Some(&mut assoc_ledger), None);
+    keyuse.observe_effect(a, &start, Some(&mut assoc_ledger), None);
     assert_eq!(keyuse.open().len(), 1);
     assert_eq!(keyuse.evidence().duplicate_starts, 1);
     assert!(keyuse.aggregates().is_empty());
@@ -4262,6 +4377,7 @@ fn dashboard_text(presentation: &Presentation, width: usize, height: usize) -> V
 /// Rotation preserves the same final facts across files.
 #[test]
 fn key_operation_one_projection_three_consumers() {
+    let mut assoc_ledger = StagingLedger::new();
     const WRAP_KEY: u64 = 0xA1A1_A1A1_A1A1_A1A1;
     const DATA_KEY: u64 = 0xA2A2_A2A2_A2A2_A2A2;
     let s1_instance =
@@ -4380,7 +4496,7 @@ fn key_operation_one_projection_three_consumers() {
         s1_edge.observe_with_effects(&c, &origin, &mut direct_sink);
         assert!(!direct_sink.is_empty(), "{name} emits its S1 effect");
         for effect in &direct_sink {
-            keyuse.observe_effect(s1_instance, effect);
+            keyuse.observe_effect(s1_instance, effect, Some(&mut assoc_ledger), None);
         }
     }
     let mut direct_sink = Vec::new();
@@ -4389,7 +4505,7 @@ fn key_operation_one_projection_three_consumers() {
     s1_edge.observe_with_effects(&c, &origin, &mut direct_sink);
     assert!(!direct_sink.is_empty(), "the unbound start emits");
     for effect in &direct_sink {
-        keyuse.observe_effect(s1_instance, effect);
+        keyuse.observe_effect(s1_instance, effect, Some(&mut assoc_ledger), None);
     }
     assert_eq!(keyuse.open().len(), 2);
 
@@ -4621,6 +4737,7 @@ fn key_operation_one_projection_three_consumers() {
 /// section — no stale active row, no silent vanishing.
 #[test]
 fn key_operation_refused_row_terminal_replaces_in_stream() {
+    let mut assoc_ledger = StagingLedger::new();
     use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
 
     let mut scene = JointScene::new();
@@ -4678,8 +4795,18 @@ fn key_operation_refused_row_terminal_replaces_in_stream() {
         .expect("sign terminal");
     // One bucket: instance 0 admits, instance 1 refuses (active).
     let mut keyuse = KeyUseReducer::with_capacity(1);
-    keyuse.observe_effect(RegistryInstanceId::from_raw(0), &start);
-    keyuse.observe_effect(RegistryInstanceId::from_raw(1), &start);
+    keyuse.observe_effect(
+        RegistryInstanceId::from_raw(0),
+        &start,
+        Some(&mut assoc_ledger),
+        None,
+    );
+    keyuse.observe_effect(
+        RegistryInstanceId::from_raw(1),
+        &start,
+        Some(&mut assoc_ledger),
+        None,
+    );
     let dir = private_tempdir();
     let path = dir.path().join("events.jsonl");
     let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
@@ -4688,7 +4815,12 @@ fn key_operation_refused_row_terminal_replaces_in_stream() {
     emitter.emit(&mut writer, &r1, 1_000).unwrap();
     // The refused terminal lands under the same row key: the
     // zero-active terminal row replaces the active row.
-    keyuse.observe_effect(RegistryInstanceId::from_raw(1), &end);
+    keyuse.observe_effect(
+        RegistryInstanceId::from_raw(1),
+        &end,
+        Some(&mut assoc_ledger),
+        None,
+    );
     let r2 = commit(2, &[&staging], &scene.model.project(), &keyuse);
     emitter.emit(&mut writer, &r2, 2_000).unwrap();
     drop(writer);
@@ -4850,6 +4982,7 @@ fn key_operation_c2_reordered_seal_refuses_then_recovers_in_order() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(
         outcome,
@@ -4867,6 +5000,7 @@ fn key_operation_c2_reordered_seal_refuses_then_recovers_in_order() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
     let (outcome, _) = staging.apply_seal(
@@ -4877,6 +5011,7 @@ fn key_operation_c2_reordered_seal_refuses_then_recovers_in_order() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
     assert_eq!(staging.staged_len(), 0);
@@ -4915,6 +5050,7 @@ fn key_operation_c2_consumption_survives_fifo_eviction() {
             &mut keyuse,
             instance,
             &mut sink,
+            None,
         );
         assert_eq!(outcome, SealApplyOutcome::ReplayedOne, "iteration {n}");
         if n == 0 {
@@ -4934,6 +5070,7 @@ fn key_operation_c2_consumption_survives_fifo_eviction() {
         &mut keyuse,
         instance,
         &mut sink,
+        None,
     );
     assert_eq!(
         outcome,
@@ -4956,17 +5093,18 @@ fn first_pos_of(seal: &SealSuccess) -> u64 {
 /// without inventing an operation.
 #[test]
 fn key_operation_n1c_shared_owner_unsettled_census() {
-    // N1(c): H8 open begins and staged H9 payloads share ONE
-    // reservation owner: 1,023 open begins + 1 staged payload fill
-    // the 1,024 census, and the next begin refuses even though the
-    // per-population open cap (1,024) is not reached.
+    // N1(c): H8 open begins, staged H9 payloads, model pending calls
+    // and prospective key associations share ONE reservation owner:
+    // 1,020 opens + 1 staged + 3 assocs fill the 1,024 census, and
+    // the next charge in ANY population refuses even though no
+    // per-population cap is reached.
     let mut scene = JointScene::new();
     let create = function_id("C_CreateObject");
-    for sequence in 1..=1_023u64 {
+    for sequence in 1..=1_020u64 {
         let begin = begin_bytes(1, sequence, create, 0);
         assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
     }
-    assert_eq!(scene.adapter.ledger().census(), 1_023);
+    assert_eq!(scene.adapter.ledger().census(), 1_020);
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
     let call = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
@@ -4981,18 +5119,92 @@ fn key_operation_n1c_shared_owner_unsettled_census() {
     scene.adapter.attest_key(&admitted).expect("call attests");
     let facts = admitted.s1_facts().clone();
     let origin = EffectOrigin::from(&facts);
+    let position = admitted.h0_ordinal();
     staging
-        .stage(
-            facts,
-            origin,
-            admitted.h0_ordinal(),
-            scene.adapter.ledger_mut(),
-        )
-        .expect("stages at census 1,023");
+        .stage(facts, origin, position, scene.adapter.ledger_mut())
+        .expect("stages at census 1,020");
+    assert_eq!(scene.adapter.ledger().census(), 1_021);
+    // Three prospective associations against the same owner: one
+    // S1Only-direct start fanned over distinct instances.
+    let mut edge = EdgeSemantics::default();
+    let mut start_sink = Vec::new();
+    let c = init("C_SignInit", 7, RSA_PKCS, 100);
+    let start_origin = EffectOrigin::from(&c);
+    edge.observe_with_effects(&c, &start_origin, &mut start_sink);
+    let start = start_sink
+        .iter()
+        .find(|effect| matches!(effect, OperationEffect::Started { .. }))
+        .cloned()
+        .expect("proved start");
+    let mut keyuse = KeyUseReducer::new();
+    for n in 0..3u32 {
+        keyuse.observe_effect(
+            RegistryInstanceId::from_raw(n),
+            &start,
+            Some(scene.adapter.ledger_mut()),
+            None,
+        );
+    }
+    assert_eq!(keyuse.open().len(), 3);
     assert_eq!(scene.adapter.ledger().census(), 1_024);
+    // The next charge in every population refuses: the shared
+    // ceiling binds, not the per-population caps.
     assert_eq!(
-        scene.ingest(&begin_bytes(1, 1_024, create, 0)),
+        scene.ingest(&begin_bytes(1, 1_021, create, 0)),
         JournalDisposition::BeginRefusedCapacity
+    );
+    let call2 = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    let admitted2 = scene.fixture.admit_shaped(
+        call2.session.unwrap_or(SESSION),
+        call2.name,
+        call2.rv,
+        call2.mechanism,
+        call2.capture,
+        call2.flags,
+    );
+    scene.adapter.attest_key(&admitted2).expect("call attests");
+    let facts2 = admitted2.s1_facts().clone();
+    let origin2 = EffectOrigin::from(&facts2);
+    assert_eq!(
+        staging.stage(
+            facts2,
+            origin2,
+            admitted2.h0_ordinal(),
+            scene.adapter.ledger_mut()
+        ),
+        Err(StagingRefusal::Full)
+    );
+    keyuse.observe_effect(
+        RegistryInstanceId::from_raw(3),
+        &start,
+        Some(scene.adapter.ledger_mut()),
+        None,
+    );
+    assert_eq!(keyuse.open().len(), 3, "fourth assoc refuses");
+    assert_eq!(keyuse.refused_opens().len(), 1);
+    let domain = crate::semantics_objects::ObjectDomain::reference(9, 9, 9, 9, 1);
+    scene
+        .model
+        .register_domain(domain)
+        .expect("reference domain registers");
+    let model_origin = crate::semantics_objects::OriginFact {
+        domain,
+        cut: crate::semantics_objects::RefCut::reference(1),
+        key: crate::semantics_objects::CallKey::reference(1),
+        entry_ns: 100,
+        function: crate::kinds::function_id("C_CreateObject").expect("known function"),
+        session: crate::semantics_objects::HandleInput::Absent,
+        inputs: [
+            crate::semantics_objects::HandleInput::Absent,
+            crate::semantics_objects::HandleInput::Absent,
+        ],
+        requested: [None, None],
+        entry_mechanism: crate::semantics_objects::MechanismEvidence::NotCaptured,
+        scope: crate::semantics_objects::SlotScope::Unknown,
+    };
+    assert_eq!(
+        scene.model.begin(model_origin, scene.adapter.ledger_mut()),
+        Err(crate::semantics_objects::ObjectGap::PendingCapacity)
     );
 }
 
@@ -5389,6 +5601,7 @@ fn key_operation_g29_concurrent_overlap_matches_s1only_twin() {
             &mut keyuse,
             RegistryInstanceId::from_raw(3),
             &mut sink,
+            None,
         );
         assert_eq!(outcome, SealApplyOutcome::ReplayedOne);
     }
@@ -5916,6 +6129,7 @@ fn key_operation_pinned_key_object_refuses_newcomer() {
 /// terminals and deferred delivery behave exactly.
 #[test]
 fn key_operation_schema_contract() {
+    let mut assoc_ledger = StagingLedger::new();
     use crate::key_operation_projection::contract::*;
     use crate::key_operation_projection::producer::{gap_label, metadata_field, query_label};
     use crate::semantics_edge::KeyRole;
@@ -6498,7 +6712,7 @@ fn key_operation_schema_contract() {
         shape_edge.observe_joint(&c, &origin, std::slice::from_ref(&receipt), &mut start_sink);
         assert_eq!(start_sink.len(), 1);
         for effect in &start_sink {
-            shape_keyuse.observe_effect(instance, effect);
+            shape_keyuse.observe_effect(instance, effect, Some(&mut assoc_ledger), None);
         }
         let mut end_sink = Vec::new();
         let c = op("C_Sign", 7, 800_005 + n as u64 * 10);
@@ -6506,7 +6720,7 @@ fn key_operation_schema_contract() {
         shape_edge.observe_with_effects(&c, &origin, &mut end_sink);
         assert_eq!(end_sink.len(), 1);
         for effect in &end_sink {
-            shape_keyuse.observe_effect(instance, effect);
+            shape_keyuse.observe_effect(instance, effect, Some(&mut assoc_ledger), None);
         }
     }
     let shaped_commit = commit(9, &[&tiny_staging], &tiny.model.project(), &shape_keyuse);
@@ -6603,6 +6817,7 @@ fn key_operation_schema_contract() {
         &mut fall_keyuse,
         instance,
         &mut fall_sink,
+        None,
     );
     assert!(matches!(
         outcome,
@@ -6651,6 +6866,7 @@ fn key_operation_schema_contract() {
         &mut loss_keyuse,
         instance,
         &mut loss_sink,
+        None,
     );
     assert!(matches!(
         outcome,
@@ -6709,9 +6925,24 @@ fn key_operation_schema_contract() {
         .expect("proved start");
     use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
     let mut full_keyuse = KeyUseReducer::with_capacity(2);
-    full_keyuse.observe_effect(RegistryInstanceId::from_raw(0), &full_start);
-    full_keyuse.observe_effect(RegistryInstanceId::from_raw(1), &full_start);
-    full_keyuse.observe_effect(RegistryInstanceId::from_raw(2), &full_start);
+    full_keyuse.observe_effect(
+        RegistryInstanceId::from_raw(0),
+        &full_start,
+        Some(&mut assoc_ledger),
+        None,
+    );
+    full_keyuse.observe_effect(
+        RegistryInstanceId::from_raw(1),
+        &full_start,
+        Some(&mut assoc_ledger),
+        None,
+    );
+    full_keyuse.observe_effect(
+        RegistryInstanceId::from_raw(2),
+        &full_start,
+        Some(&mut assoc_ledger),
+        None,
+    );
     assert!(full_keyuse.evidence().partial);
     let partial = commit(
         4,
@@ -6738,7 +6969,12 @@ fn key_operation_schema_contract() {
         .find(|effect| matches!(effect, OperationEffect::Ended { .. }))
         .cloned()
         .expect("sign terminal");
-    full_keyuse.observe_effect(RegistryInstanceId::from_raw(2), &full_end);
+    full_keyuse.observe_effect(
+        RegistryInstanceId::from_raw(2),
+        &full_end,
+        Some(&mut assoc_ledger),
+        None,
+    );
     assert_eq!(full_keyuse.evidence().refused_terminals, 1);
 
     // The producer emits only feed/budget reasons: publisher reasons
@@ -6954,6 +7190,7 @@ fn key_operation_schema_contract() {
 /// invented object facts.
 #[test]
 fn key_operation_pqc_matrix_negative() {
+    let mut assoc_ledger = StagingLedger::new();
     use crate::semantics_key_use::StagingRefusal;
 
     // KEM never stages: no KEM object descriptor exists, so the
@@ -7001,7 +7238,7 @@ fn key_operation_pqc_matrix_negative() {
         call.mechanism = mechanism;
         call.capture = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
         for effect in feed(&mut edge, &mut sink, &call) {
-            keyuse.observe_effect(instance, &effect);
+            keyuse.observe_effect(instance, &effect, Some(&mut assoc_ledger), None);
         }
     }
     assert_eq!(
@@ -7320,6 +7557,7 @@ fn key_operation_size_query_stays_active() {
 /// afterwards fails the lane.
 #[test]
 fn key_operation_rsa_ledger_reference() {
+    let mut assoc_ledger = StagingLedger::new();
     let missing = ledger_prerequisites();
     if !missing.is_empty() {
         eprintln!(
@@ -7409,7 +7647,7 @@ fn key_operation_rsa_ledger_reference() {
         };
         assert_eq!(fresh.len(), expected, "{name} ({phase}) S1 emission");
         for effect in &fresh {
-            keyuse.observe_effect(instance, effect);
+            keyuse.observe_effect(instance, effect, Some(&mut assoc_ledger), None);
         }
     }
     assert_eq!(
@@ -7452,6 +7690,7 @@ fn key_operation_rsa_ledger_reference() {
 /// move within reserved buckets and fixed summaries).
 #[test]
 fn key_operation_terminals_allocate_nothing() {
+    let mut assoc_ledger = StagingLedger::new();
     use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
     use crate::test_alloc::count_allocs_during;
 
@@ -7511,15 +7750,35 @@ fn key_operation_terminals_allocate_nothing() {
 
     // Proved close: reserved bucket, fixed outcome.
     let mut keyuse = KeyUseReducer::with_capacity(1);
-    keyuse.observe_effect(RegistryInstanceId::from_raw(0), &start);
+    keyuse.observe_effect(
+        RegistryInstanceId::from_raw(0),
+        &start,
+        Some(&mut assoc_ledger),
+        None,
+    );
     let ((), blocks, bytes) = count_allocs_during(|| {
-        keyuse.observe_effect(RegistryInstanceId::from_raw(0), &end);
+        keyuse.observe_effect(
+            RegistryInstanceId::from_raw(0),
+            &end,
+            Some(&mut assoc_ledger),
+            None,
+        );
     });
     assert_eq!((blocks, bytes), (0, 0), "proved close allocates nothing");
     // Refused close: fixed summary, counted scalar.
-    keyuse.observe_effect(RegistryInstanceId::from_raw(1), &start);
+    keyuse.observe_effect(
+        RegistryInstanceId::from_raw(1),
+        &start,
+        Some(&mut assoc_ledger),
+        None,
+    );
     let ((), blocks, bytes) = count_allocs_during(|| {
-        keyuse.observe_effect(RegistryInstanceId::from_raw(1), &end);
+        keyuse.observe_effect(
+            RegistryInstanceId::from_raw(1),
+            &end,
+            Some(&mut assoc_ledger),
+            None,
+        );
     });
     assert_eq!((blocks, bytes), (0, 0), "refused close allocates nothing");
     // Receipt-less close: fixed summary, explicit evidence.
@@ -7529,12 +7788,22 @@ fn key_operation_terminals_allocate_nothing() {
     let c = init("C_SignInit", 7, RSA_PKCS, 100);
     feed(&mut edge, &mut bare_sink, &c);
     for effect in bare_sink.clone() {
-        bare.observe_effect(RegistryInstanceId::from_raw(0), &effect);
+        bare.observe_effect(
+            RegistryInstanceId::from_raw(0),
+            &effect,
+            Some(&mut assoc_ledger),
+            None,
+        );
     }
     let c = op("C_Sign", 7, 200);
     let terms = feed(&mut edge, &mut bare_sink, &c);
     let ((), blocks, bytes) = count_allocs_during(|| {
-        bare.observe_effect(RegistryInstanceId::from_raw(0), &terms[0]);
+        bare.observe_effect(
+            RegistryInstanceId::from_raw(0),
+            &terms[0],
+            Some(&mut assoc_ledger),
+            None,
+        );
     });
     assert_eq!(
         (blocks, bytes),
@@ -7544,7 +7813,12 @@ fn key_operation_terminals_allocate_nothing() {
     // Orphan end and refused direct: fixed summaries only.
     let mut orphan = KeyUseReducer::with_capacity(1);
     let ((), blocks, bytes) = count_allocs_during(|| {
-        orphan.observe_effect(RegistryInstanceId::from_raw(9), &end);
+        orphan.observe_effect(
+            RegistryInstanceId::from_raw(9),
+            &end,
+            Some(&mut assoc_ledger),
+            None,
+        );
     });
     assert_eq!((blocks, bytes), (0, 0), "orphan end allocates nothing");
     let wrap = ShapedS1 {
@@ -7568,7 +7842,12 @@ fn key_operation_terminals_allocate_nothing() {
         .expect("wrap direct");
     let mut full = KeyUseReducer::with_capacity(0);
     let ((), blocks, bytes) = count_allocs_during(|| {
-        full.observe_effect(RegistryInstanceId::from_raw(0), &direct);
+        full.observe_effect(
+            RegistryInstanceId::from_raw(0),
+            &direct,
+            Some(&mut assoc_ledger),
+            None,
+        );
     });
     assert_eq!((blocks, bytes), (0, 0), "refused direct allocates nothing");
     assert_eq!(full.evidence().rows_refused, 1);

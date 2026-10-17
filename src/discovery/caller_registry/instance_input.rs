@@ -692,6 +692,7 @@ impl CallerRegistry {
             &mut self.joint_keyuse,
             id,
             &mut outer,
+            Some(&mut self.assoc_fallback),
         );
         self.instance_state.semantic_refused =
             self.instance_state.semantic_refused.saturating_add(refused);
@@ -729,6 +730,7 @@ impl CallerRegistry {
             &mut self.joint_keyuse,
             id,
             &mut outer,
+            Some(&mut self.assoc_fallback),
         );
         self.instance_state.semantic_refused =
             self.instance_state.semantic_refused.saturating_add(refused);
@@ -814,7 +816,11 @@ impl CallerRegistry {
         });
     }
 
-    pub(super) fn apply_instance(&mut self, input: AdmittedInstance) {
+    pub(super) fn apply_instance(
+        &mut self,
+        input: AdmittedInstance,
+        mut shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) {
         let module = self.modules_by_key.get(&input.key.module).copied();
         let refuse = if matches!(input.key.module, ModuleKey::Unidentified { .. })
             || input.key.image.task_cookie == 0
@@ -893,7 +899,13 @@ impl CallerRegistry {
                     .boundary
                     .is_none_or(|old| b > old)
             }) {
-                self.invalidate_instance(id, boundary, InstanceReason::SemanticLoss, false);
+                self.invalidate_instance(
+                    id,
+                    boundary,
+                    InstanceReason::SemanticLoss,
+                    false,
+                    shared.as_deref_mut(),
+                );
             }
             self.inherit_instance_reasons(id, reasons);
             return;
@@ -916,7 +928,13 @@ impl CallerRegistry {
             self.instance_state.identity_exhausted = true;
             let ids: Vec<_> = self.instance_state.records.keys().copied().collect();
             for id in ids {
-                self.invalidate_instance(id, None, InstanceReason::AuthorityExhausted, false);
+                self.invalidate_instance(
+                    id,
+                    None,
+                    InstanceReason::AuthorityExhausted,
+                    false,
+                    shared.as_deref_mut(),
+                );
                 self.instance_state
                     .semantics
                     .get_mut(&id)
@@ -974,7 +992,13 @@ impl CallerRegistry {
             },
         );
         if boundary.is_some() {
-            self.invalidate_instance(id, boundary, InstanceReason::SemanticLoss, false);
+            self.invalidate_instance(
+                id,
+                boundary,
+                InstanceReason::SemanticLoss,
+                false,
+                shared.as_deref_mut(),
+            );
         }
         self.inherit_instance_reasons(id, reasons);
     }
@@ -996,7 +1020,7 @@ impl CallerRegistry {
     pub(super) fn apply_instance_call(
         &mut self,
         input: AdmittedInstanceCall,
-        ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
         let Some(id) = self.instance_state.by_key.get(&input.key).copied() else {
             self.instance_gap(
@@ -1066,7 +1090,13 @@ impl CallerRegistry {
             None
         };
         if let Some(reason) = downgrade {
-            self.invalidate_instance(id, Some(input.position.ordinal), reason, false);
+            self.invalidate_instance(
+                id,
+                Some(input.position.ordinal),
+                reason,
+                false,
+                ledger.as_deref_mut(),
+            );
             return;
         }
         let materialize = state.semantics.is_none();
@@ -1081,6 +1111,7 @@ impl CallerRegistry {
                 Some(input.position.ordinal),
                 InstanceReason::SemanticStateCapacity,
                 false,
+                ledger.as_deref_mut(),
             );
             self.instance_gap(
                 Some(input.caller),
@@ -1098,7 +1129,13 @@ impl CallerRegistry {
             let reducer = match EdgeSemantics::with_resources(&self.semantic_resources) {
                 Ok(reducer) => reducer,
                 Err(refusal) => {
-                    self.refuse_instance_resource(id, &input, module, refusal);
+                    self.refuse_instance_resource(
+                        id,
+                        &input,
+                        module,
+                        refusal,
+                        ledger.as_deref_mut(),
+                    );
                     return;
                 }
             };
@@ -1128,7 +1165,7 @@ impl CallerRegistry {
                 || self.key_projection.is_some()
         };
         let refused = if joint_path {
-            self.reduce_with_joint_path(id, &input, ledger)
+            self.reduce_with_joint_path(id, &input, ledger.as_deref_mut())
         } else {
             let state = self
                 .instance_state
@@ -1144,7 +1181,7 @@ impl CallerRegistry {
         let refused = match refused {
             Ok(refused) => refused,
             Err(refusal) => {
-                self.refuse_instance_resource(id, &input, module, refusal);
+                self.refuse_instance_resource(id, &input, module, refusal, ledger.as_deref_mut());
                 return;
             }
         };
@@ -1178,7 +1215,7 @@ impl CallerRegistry {
         &mut self,
         id: RegistryInstanceId,
         input: &AdmittedInstanceCall,
-        ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) -> Result<u64, crate::semantics_edge::resources::SemanticResourceRefusal> {
         let joint = self
             .instance_state
@@ -1190,7 +1227,7 @@ impl CallerRegistry {
             == FeedMode::Joint;
         let mut fallback_refused = 0u64;
         if joint {
-            if let Some(ledger) = ledger {
+            if let Some(ledger) = ledger.as_deref_mut() {
                 let origin = EffectOrigin::from(&input.facts);
                 // The stage attempt borrows the feed; the fallback
                 // below reborrows the registry, so decide first.
@@ -1280,7 +1317,13 @@ impl CallerRegistry {
             .expect("retained edge");
         let reducer = state.semantics.as_mut().expect("materialized above");
         let mut outer = NoSink;
-        let mut tee = KeyUseTee::new(&mut outer, &mut self.joint_keyuse, id);
+        let mut tee = KeyUseTee::new(
+            &mut outer,
+            &mut self.joint_keyuse,
+            id,
+            ledger,
+            Some(&mut self.assoc_fallback),
+        );
         let refused =
             reducer.observe_with_resources_and_effects(&input.facts, &origin, &mut tee)?;
         Ok(fallback_refused.saturating_add(refused))
@@ -1303,8 +1346,14 @@ impl CallerRegistry {
         debug_assert_eq!(record.feed.mode(), FeedMode::Joint);
         let (feed, reducer_slot) = (&mut record.feed, &mut record.semantics);
         let reducer = reducer_slot.as_mut().expect("materialized above");
-        let (_, refused) =
-            feed.ordered_fallback(reducer, &mut self.joint_keyuse, id, &mut outer, ledger);
+        let (_, refused) = feed.ordered_fallback(
+            reducer,
+            &mut self.joint_keyuse,
+            id,
+            &mut outer,
+            ledger,
+            Some(&mut self.assoc_fallback),
+        );
         debug_assert_eq!(feed.mode(), FeedMode::S1Only);
         self.joint_feeds = self.joint_feeds.saturating_sub(1);
         refused
@@ -1316,6 +1365,7 @@ impl CallerRegistry {
         input: &AdmittedInstanceCall,
         module: ModuleId,
         refusal: crate::semantics_edge::resources::SemanticResourceRefusal,
+        mut shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
         self.instance_state.semantic_refused =
             self.instance_state.semantic_refused.saturating_add(1);
@@ -1324,6 +1374,7 @@ impl CallerRegistry {
             Some(input.position.ordinal),
             InstanceReason::SemanticResourceCapacity,
             false,
+            shared,
         );
         self.instance_gap(
             Some(input.caller),
@@ -1343,6 +1394,7 @@ impl CallerRegistry {
         boundary: Option<u64>,
         reason: InstanceReason,
         retire: bool,
+        mut shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
         // Joint accounting is active for this feed's S1 (same latch
         // as the reduce path): its starts teed, so its loss
@@ -1379,7 +1431,13 @@ impl CallerRegistry {
         if let Some(reducer) = reducer_slot.as_mut() {
             if joint_accounting {
                 let mut outer = NoSink;
-                let mut tee = KeyUseTee::new(&mut outer, &mut self.joint_keyuse, id);
+                let mut tee = KeyUseTee::new(
+                    &mut outer,
+                    &mut self.joint_keyuse,
+                    id,
+                    shared,
+                    Some(&mut self.assoc_fallback),
+                );
                 reducer.invalidate_with_effects(&mut tee);
             } else {
                 reducer.invalidate();
@@ -1429,7 +1487,11 @@ impl CallerRegistry {
         record
     }
 
-    fn retain_negative(&mut self, input: NegativeRecord) -> Option<NegativeRecord> {
+    fn retain_negative(
+        &mut self,
+        input: NegativeRecord,
+        mut shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) -> Option<NegativeRecord> {
         if let Some(old) = self
             .instance_state
             .negatives
@@ -1454,7 +1516,13 @@ impl CallerRegistry {
             self.instance_state.negative_exhausted = true;
             let ids: Vec<_> = self.instance_state.records.keys().copied().collect();
             for id in ids {
-                self.invalidate_instance(id, None, InstanceReason::NegativeStateCapacity, false);
+                self.invalidate_instance(
+                    id,
+                    None,
+                    InstanceReason::NegativeStateCapacity,
+                    false,
+                    shared.as_deref_mut(),
+                );
             }
         }
         self.instance_gap(
@@ -1470,8 +1538,12 @@ impl CallerRegistry {
         None
     }
 
-    fn apply_negative(&mut self, negative: NegativeRecord) {
-        let Some(negative) = self.retain_negative(negative) else {
+    fn apply_negative(
+        &mut self,
+        negative: NegativeRecord,
+        mut shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) {
+        let Some(negative) = self.retain_negative(negative, shared.as_deref_mut()) else {
             return;
         };
         let ids: Vec<_> = self
@@ -1501,6 +1573,7 @@ impl CallerRegistry {
                     (negative.barrier != 0).then_some(negative.barrier),
                     reason,
                     negative.retirement.is_some(),
+                    shared.as_deref_mut(),
                 );
             }
             self.inherit_instance_reasons(id, negative.reasons);
@@ -1512,7 +1585,11 @@ impl CallerRegistry {
         }
     }
 
-    pub(super) fn apply_instance_loss(&mut self, input: InstanceSemanticLoss) {
+    pub(super) fn apply_instance_loss(
+        &mut self,
+        input: InstanceSemanticLoss,
+        mut shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) {
         if input
             .position
             .is_some_and(|p| p.domain != input.scope.domain())
@@ -1529,9 +1606,13 @@ impl CallerRegistry {
         negative.reasons = input.reason.bit();
         negative.authority_exhausted =
             input.reason == InstanceReason::AuthorityExhausted || input.position.is_none();
-        self.apply_negative(negative);
+        self.apply_negative(negative, shared.as_deref_mut());
     }
-    pub(super) fn apply_instance_retirement(&mut self, input: InstanceRetirement) {
+    pub(super) fn apply_instance_retirement(
+        &mut self,
+        input: InstanceRetirement,
+        mut shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) {
         if input.position.domain != input.scope.domain() {
             self.instance_gap(None, None, InstanceReason::InstanceUnproven, None);
             return;
@@ -1550,13 +1631,14 @@ impl CallerRegistry {
         negative.barrier = input.position.ordinal;
         negative.reasons = input.reason.bit();
         negative.retirement = Some(input.reason);
-        self.apply_negative(negative);
+        self.apply_negative(negative, shared.as_deref_mut());
     }
     pub(super) fn invalidate_physical_instances(
         &mut self,
         caller: CallerId,
         module: Option<ModuleId>,
         retire: bool,
+        mut shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
         let ids: Vec<_> = self
             .instance_state
@@ -1575,6 +1657,7 @@ impl CallerRegistry {
                     InstanceReason::SemanticLoss
                 },
                 retire,
+                shared.as_deref_mut(),
             );
         }
     }

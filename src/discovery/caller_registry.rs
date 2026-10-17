@@ -2316,6 +2316,11 @@ pub(crate) struct CallerRegistry {
     /// while a Joint feed exists; S1Only siblings contribute
     /// unknown-key facts.
     joint_keyuse: crate::semantics_key_use::KeyUseReducer,
+    /// Prospective-association fallback ledger (N1c): mints the
+    /// key-use opens of ledger-less publishes (S1Only unit scenes),
+    /// so every open holds a ticket somewhere. Shared scenes pass
+    /// the shared owner and never touch this.
+    assoc_fallback: crate::semantics_objects::journal::StagingLedger,
     /// Joint-mode feeds: the effects-tee guard (mutation side).
     joint_feeds: usize,
     /// Last H8 projection retained at seal/failure delivery: capture
@@ -2382,6 +2387,7 @@ impl CallerRegistry {
             semantic_refused: 0,
             joint_grants: HashMap::new(),
             joint_keyuse: crate::semantics_key_use::KeyUseReducer::new(),
+            assoc_fallback: crate::semantics_objects::journal::StagingLedger::new(),
             joint_feeds: 0,
             key_projection: None,
             joint_direct_fallback: 0,
@@ -3306,13 +3312,19 @@ impl CallerRegistry {
     fn apply(
         &mut self,
         mutation: Mutation,
-        ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
         match mutation {
-            Mutation::NoteInstance(input) => self.apply_instance(input),
-            Mutation::ObserveInstanceSemantic(input) => self.apply_instance_call(input, ledger),
-            Mutation::InstanceSemanticLoss(input) => self.apply_instance_loss(input),
-            Mutation::RetireInstance(input) => self.apply_instance_retirement(input),
+            Mutation::NoteInstance(input) => self.apply_instance(input, ledger.as_deref_mut()),
+            Mutation::ObserveInstanceSemantic(input) => {
+                self.apply_instance_call(input, ledger.as_deref_mut())
+            }
+            Mutation::InstanceSemanticLoss(input) => {
+                self.apply_instance_loss(input, ledger.as_deref_mut())
+            }
+            Mutation::RetireInstance(input) => {
+                self.apply_instance_retirement(input, ledger.as_deref_mut())
+            }
             Mutation::NoteMapping {
                 caller,
                 pid,
@@ -3561,13 +3573,13 @@ impl CallerRegistry {
                 caller,
                 reason,
                 at_ns,
-            } => self.apply_retire(caller, reason, at_ns),
+            } => self.apply_retire(caller, reason, at_ns, ledger.as_deref_mut()),
             Mutation::NoteModuleAbsent {
                 caller,
                 module,
                 complete_scan,
                 at_ns,
-            } => self.apply_absent(caller, module, complete_scan, at_ns),
+            } => self.apply_absent(caller, module, complete_scan, at_ns, ledger.as_deref_mut()),
             Mutation::NoteMemberUnscanned { caller } => {
                 let mut modules = BTreeSet::new();
                 for edge in self
@@ -3590,7 +3602,12 @@ impl CallerRegistry {
                     modules.insert(edge.module);
                 }
                 for module in modules {
-                    self.invalidate_physical_instances(caller, Some(module), false);
+                    self.invalidate_physical_instances(
+                        caller,
+                        Some(module),
+                        false,
+                        ledger.as_deref_mut(),
+                    );
                     self.recompute_module(module);
                 }
             }
@@ -4685,10 +4702,16 @@ impl CallerRegistry {
         });
     }
 
-    fn apply_retire(&mut self, caller: CallerId, reason: String, at_ns: u64) {
+    fn apply_retire(
+        &mut self,
+        caller: CallerId,
+        reason: String,
+        at_ns: u64,
+        shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) {
         let _ = at_ns;
         self.retired.insert(caller, reason.clone());
-        self.invalidate_physical_instances(caller, None, true);
+        self.invalidate_physical_instances(caller, None, true, shared);
         let mut modules = BTreeSet::new();
         for edge in self
             .edges
@@ -4744,6 +4767,7 @@ impl CallerRegistry {
         module: ModuleId,
         complete_scan: bool,
         at_ns: u64,
+        mut shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
         let _ = at_ns;
         {
@@ -4773,7 +4797,12 @@ impl CallerRegistry {
                 state.invalidate();
             }
         }
-        self.invalidate_physical_instances(caller, Some(module), complete_scan);
+        self.invalidate_physical_instances(
+            caller,
+            Some(module),
+            complete_scan,
+            shared.as_deref_mut(),
+        );
         // The module unloaded only when no edge still maps it or could:
         // mapped and uncertain edges both block the verdict (an
         // incomplete scan just marked this edge uncertain, so it

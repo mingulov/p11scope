@@ -3953,6 +3953,7 @@ where
     /// drain, frozen descriptors, fault cell, H3 finalizer, sealed
     /// attachment (the closure generation's observed source) and
     /// retained drain producers (the grant's observed source).
+    #[allow(clippy::too_many_arguments)] // Every quantum producer is injected, none supplied.
     pub(crate) fn wire(
         adapter: &'a mut JournalAdapter,
         model: &'a mut ObjectSemantics,
@@ -8644,7 +8645,7 @@ mod tests {
             start,
             end,
             file_offset: 0,
-            permissions: [b'r', b'-', b'x', b'p'],
+            permissions: *b"r-xp",
             device: p11scope_manifest::maps::Device { major, minor },
             inode,
             raw_path: None,

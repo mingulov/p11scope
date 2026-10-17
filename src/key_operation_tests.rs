@@ -1677,6 +1677,339 @@ fn key_operation_fallback_invalidates_before_replay() {
     assert_eq!(terminal.completed, 1);
 }
 
+/// N3 remainder (fix round 2): a held multi-call quantum still
+/// applies its qualified invalidations. The two-call seal (terminal
+/// + destroy) holds S1 replay — H9 runs no batching — but the
+/// destroyed key's open association closes at invalidation time
+/// (active 0, lost 1), never held with the replay. The eventual
+/// fallback terminal then routes once to unknown-key.
+#[test]
+fn key_operation_n3_held_multicall_applies_invalidations() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+
+    let instance = RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    // Ground the key with its label, then open one proved use.
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    let calls_before = joint.calls();
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("one open proved use");
+    assert_eq!(
+        (row.active, row.key_join_lost),
+        (1, 0),
+        "precondition: the Init association is live"
+    );
+
+    // The terminal plus the destroy settle in one quantum: replay
+    // holds, the invalidation must not.
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_DestroyObject", CkRv::OK.0, 0, 0),
+    );
+    let success = scene.seal().expect("two-call quantum seals");
+    assert_eq!(success.prefix.settled().len(), 2);
+    let (outcome, refused) = staging.apply_seal(
+        &success,
+        &scene.model,
+        &mut scene.ledger,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
+    assert_eq!(outcome, SealApplyOutcome::Held);
+    assert_eq!(refused, 0);
+    assert_eq!(staging.staged_len(), 2, "the held quantum keeps staging");
+    assert_eq!(
+        joint.calls(),
+        calls_before,
+        "the held quantum replays nothing"
+    );
+    let committed = commit(2, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("earlier association history stands");
+    assert_eq!(
+        (row.active, row.key_join_lost),
+        (0, 1),
+        "invalidation closes authority when it occurs"
+    );
+
+    // The eventual primary outcome still routes once (fallback).
+    let failure = SealFailure {
+        gap: JournalGap::ClosureStale,
+        effects: crate::semantics_objects::ObjectEffects::default(),
+        h3_voided: None,
+    };
+    let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_failure(
+        &failure,
+        &mut clean,
+        &scene.model,
+        &mut scene.ledger,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
+    assert_eq!(outcome, FailureApplyOutcome::FellBack { replayed: 2 });
+    let committed = commit(3, &[&staging], &scene.model.project(), &keyuse);
+    let proved = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("earlier association history stands");
+    assert_eq!((proved.completed, proved.key_join_lost), (0, 1));
+    let terminal = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "key_join_lost")
+        .expect("the eventual primary outcome routes once to unknown-key");
+    assert_eq!(terminal.completed, 1);
+}
+
+/// N3 remainder (fix round 2): failure-completeness holds still
+/// apply their qualified invalidations. HeldForCompleteness and
+/// Retried keep staging and S1 intact while the retired association
+/// closes immediately; the later fallback still routes once.
+#[test]
+fn key_operation_n3_held_failure_paths_apply_invalidations() {
+    use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
+
+    let instance = RegistryInstanceId::from_raw(3);
+    // --- HeldForCompleteness: proof-only gap, incomplete H3. ---
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    let terminal = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    attest_and_stage(&mut scene, &mut staging, &terminal);
+    let calls_before = joint.calls();
+    let effects = scene.model.invalidate(
+        crate::semantics_objects::AffectedScope::Capture,
+        crate::semantics_objects::ObjectGap::Loss,
+    );
+    assert!(
+        effects.effects.iter().any(|effect| matches!(
+            effect,
+            crate::semantics_objects::ObjectEffect::Retired { .. }
+        )),
+        "non-vacuous: invalidation retires the key"
+    );
+    let failure = SealFailure {
+        gap: JournalGap::ClosureStale,
+        effects,
+        h3_voided: None,
+    };
+    let mut pending = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean_pending(
+        u64::MAX,
+        Some(1),
+    ));
+    let (outcome, refused) = staging.apply_failure(
+        &failure,
+        &mut pending,
+        &scene.model,
+        &mut scene.ledger,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
+    assert_eq!(outcome, FailureApplyOutcome::HeldForCompleteness);
+    assert_eq!(refused, 0);
+    assert_eq!(staging.staged_len(), 1, "completeness holds keep staging");
+    assert_eq!(
+        joint.calls(),
+        calls_before,
+        "completeness holds reduce nothing"
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("earlier association history stands");
+    assert_eq!(
+        (row.active, row.key_join_lost),
+        (0, 1),
+        "invalidation closes authority when it occurs"
+    );
+    // The later fallback still routes the primary outcome once.
+    let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let failure = SealFailure {
+        gap: JournalGap::ClosureStale,
+        effects: crate::semantics_objects::ObjectEffects::default(),
+        h3_voided: None,
+    };
+    let (outcome, _) = staging.apply_failure(
+        &failure,
+        &mut clean,
+        &scene.model,
+        &mut scene.ledger,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
+    assert_eq!(outcome, FailureApplyOutcome::FellBack { replayed: 1 });
+    let committed = commit(2, &[&staging], &scene.model.project(), &keyuse);
+    let terminal = committed
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "key_join_lost")
+        .expect("the eventual primary outcome routes once to unknown-key");
+    assert_eq!(terminal.completed, 1);
+
+    // --- Retried: transient gaps wait, but never swallow the
+    // refusal's own invalidations. ---
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    let terminal = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    attest_and_stage(&mut scene, &mut staging, &terminal);
+    let calls_before = joint.calls();
+    let effects = scene.model.invalidate(
+        crate::semantics_objects::AffectedScope::Capture,
+        crate::semantics_objects::ObjectGap::Loss,
+    );
+    let failure = SealFailure {
+        gap: JournalGap::H3Pending,
+        effects,
+        h3_voided: None,
+    };
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, refused) = staging.apply_failure(
+        &failure,
+        &mut h3,
+        &scene.model,
+        &mut scene.ledger,
+        &mut joint,
+        &mut keyuse,
+        instance,
+        &mut sink,
+    );
+    assert_eq!(outcome, FailureApplyOutcome::Retried);
+    assert_eq!(refused, 0);
+    assert_eq!(staging.staged_len(), 1, "retries keep staging");
+    assert_eq!(joint.calls(), calls_before, "retries reduce nothing");
+    let committed = commit(3, &[&staging], &scene.model.project(), &keyuse);
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign")
+        .expect("earlier association history stands");
+    assert_eq!(
+        (row.active, row.key_join_lost),
+        (0, 1),
+        "retries never swallow invalidations"
+    );
+}
+
 /// N3: object retirement closes the live association at invalidation
 /// time: the committed row shows no active association and one lost
 /// join immediately — never a still-active row awaiting its S1

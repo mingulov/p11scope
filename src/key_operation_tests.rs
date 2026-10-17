@@ -4953,6 +4953,48 @@ fn first_pos_of(seal: &SealSuccess) -> u64 {
 /// without inventing an operation.
 #[test]
 #[test]
+fn key_operation_n1c_shared_owner_unsettled_census() {
+    // N1(c): H8 open begins and staged H9 payloads share ONE
+    // reservation owner: 1,023 open begins + 1 staged payload fill
+    // the 1,024 census, and the next begin refuses even though the
+    // per-population open cap (1,024) is not reached.
+    let mut scene = JointScene::new();
+    let create = function_id("C_CreateObject");
+    for sequence in 1..=1_023u64 {
+        let begin = begin_bytes(1, sequence, create, 0);
+        assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+    }
+    assert_eq!(scene.adapter.ledger().census(), 1_023);
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let call = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let admitted = scene.fixture.admit_shaped(
+        call.session.unwrap_or(SESSION),
+        call.name,
+        call.rv,
+        call.mechanism,
+        call.capture,
+        call.flags,
+    );
+    scene.adapter.attest_key(&admitted).expect("call attests");
+    let facts = admitted.s1_facts().clone();
+    let origin = EffectOrigin::from(&facts);
+    staging
+        .stage(
+            facts,
+            origin,
+            admitted.h0_ordinal(),
+            scene.adapter.ledger_mut(),
+        )
+        .expect("stages at census 1,023");
+    assert_eq!(scene.adapter.ledger().census(), 1_024);
+    assert_eq!(
+        scene.ingest(&begin_bytes(1, 1_024, create, 0)),
+        JournalDisposition::BeginRefusedCapacity
+    );
+}
+
+#[test]
 fn key_operation_n1_genuine_birth_bootstrap() {
     // N1(a): H9 Joint bootstrap needs no scripted birth receipt. The
     // same genuine-producer chain T3 pins (a natively published READY

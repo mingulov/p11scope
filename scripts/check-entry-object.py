@@ -945,6 +945,191 @@ def scalar_body_contract(internal_blocks, internal_calls, variant):
             consumer.facts(initial, proof)
 
 
+
+class _SeedCaller(Consumer):
+    """Caller-only summaries for the reviewed native APIs, never a native model.
+
+    Identity writes its two-word output; a separate CFG check requires success
+    and nonzero cookie before construction. Memset's exact emitted byte loop is
+    checked below. Shadow marker facts join only proven zero/current-cookie
+    values, so initialization cannot be inferred from an unknown merged word.
+    This subclass leaves the historical checker and stop-gate Consumer unchanged.
+    """
+    def transfer(self, pc, incoming):
+        state = super().transfer(pc, incoming)
+        text, target = self.text[pc], self.calls.get(pc, "")
+        identity = (self.section, self.name)
+        if match := STORE.fullmatch(text):
+            width, base, sign, offset, source = match.groups()
+            pointer = address(incoming, base, sign, offset)
+            if pointer and pointer[0] == "stack":
+                size = int(width) // 8
+                for key in list(state):
+                    if isinstance(key, tuple) and key[0] == "seed_marker" and key[1] < pointer[1]+size and pointer[1] < key[1]+8:
+                        del state[key]
+                fact = value(incoming, source)
+                if width == "64" and fact in (("constant", 0), ("entry_marker", identity)):
+                    state[("seed_marker", pointer[1])] = True
+            elif pointer is None and incoming.get("r"+base, (None,))[0] != "result":
+                for key in list(state):
+                    if isinstance(key, tuple) and key[0] == "seed_marker":
+                        del state[key]
+        if "atomic" in text or "xchg" in text or text.startswith("lock "):
+            match = ATOMIC_POINTER.search(text) or EXCHANGE_POINTER.search(text)
+            pointer = address(incoming, *match.groups()[1:]) if match else None
+            disjoint = match and incoming.get("r"+match[2], (None,))[0] == "result"
+            for key in list(state):
+                if isinstance(key, tuple) and key[0] == "seed_marker" and not disjoint:
+                    if pointer is None or pointer[0] != "stack" or (key[1] < pointer[1]+int(match[1])//8 and pointer[1] < key[1]+8):
+                        del state[key]
+        if target in ("memset", "p11_link_current_identity") or target.endswith("scope_auth"):
+            pointer = incoming.get("r1")
+            size = incoming.get("r3") if target == "memset" else ("constant", 16)
+            width = size[1] if size and size[0] == "constant" else 512
+            for key in list(state):
+                if isinstance(key, tuple) and key[0] == "seed_marker":
+                    if not pointer or pointer[0] != "stack" or (key[1] < pointer[1]+width and pointer[1] < key[1]+8):
+                        del state[key]
+        if target == "memset":
+            pointer, byte, size = (incoming.get(reg) for reg in ("r1", "r2", "r3"))
+            if pointer and pointer[0] == "stack" and byte == ("constant", 0) and size and size[0] == "constant" and 0 < size[1] <= 32 and size[1] % 8 == 0:
+                for offset in range(0, size[1], 8):
+                    state[("stack", pointer[1]+offset, 8)] = ("constant", 0)
+                    state[("seed_marker", pointer[1]+offset)] = True
+        elif target == "p11_link_current_identity":
+            pointer = incoming.get("r1")
+            if pointer and pointer[0] == "stack":
+                state[("stack", pointer[1], 8)] = ("image_cookie", identity, pc)
+                state[("stack", pointer[1]+8, 8)] = ("image_exec", identity, pc)
+                state["r0"] = ("identity_result", pc)
+        elif target.endswith("object_marker_for"):
+            if incoming.get("r1") == ("cookie", identity):
+                state["r0"] = ("entry_marker", identity)
+        elif target == "p11_owner_start_begin":
+            state["r0"] = ("owned", pc, 0)
+        if match := re.fullmatch(r"([rw]\d+) (=|<<=|>>=) ([rw]\d+|-?0x[0-9a-f]+)(?: ll)?", text):
+            dst, op, src = match.groups()
+            fact = value(incoming, src) if op == "=" else incoming.get(reg(dst))
+            if fact and fact[0] == "identity_result" and (op == "=" or src == "0x20"):
+                state[reg(dst)] = fact
+        return state
+
+
+def seeded_start_contract(disassembly):
+    """Actual ordinary-entry key/immutable-seed wiring, independent of old pins.
+
+    The native transaction is exercised by the real C fixture and ELF/frame
+    contracts, not summarized as a second owner algorithm here. This proves
+    caller provenance and refusal edges; it is not kernel verifier acceptance.
+    """
+    split = sections(disassembly)
+    require(".text" in split and "uprobe" in split, "seeded START missing sections")
+    blocks = D.function_blocks(split[".text"])
+    require("memset" in blocks, "seeded START missing memset")
+    memset = D.instructions(blocks["memset"])
+    patterns = (r"if r3 == 0x0 goto .*", r"r4 = 0x0", r"r5 = r1", r"r5 \+= r4",
+                r"\*\(u8 \*\)\(r5 \+ 0x0\) = w2", r"r4 \+= 0x1", r"if r3 > r4 goto .*", r"exit")
+    require(len(memset) == len(patterns) and all(re.fullmatch(pattern, instruction) for (_, instruction), pattern in zip(memset, patterns)),
+            "seeded START memset byte-loop summary changed")
+    _, graph = D.instruction_graph(blocks["memset"])
+    require(D.relative_target(memset[0][0], memset[0][1]) == memset[-1][0]
+            and D.relative_target(memset[-2][0], memset[-2][1]) == memset[2][0],
+            "seeded START memset loop edges changed")
+    calls = D.internal_call_targets(split["uprobe"] + "\n" + split[".text"])
+    report = {}
+    for name, lines in D.function_blocks(split["uprobe"]).items():
+        if not name.startswith("p11_entry") or name == "p11_entry_template_second":
+            continue
+        consumer = _SeedCaller("uprobe", name, lines, {pc: target for caller, _, pc, target in calls if caller == name})
+        begins = [pc for pc, target in consumer.calls.items() if target == "p11_owner_start_begin"]
+        require(len(begins) == 1, name + ": seeded START constructor inventory")
+        begin = begins[0]
+        facts = consumer.facts()
+        state = facts.get(begin, {})
+        identity = (consumer.section, name)
+        key, seed = state.get("r1"), state.get("r2")
+        require(key and seed and key[0] == seed[0] == "stack" and key != seed,
+                name + ": seeded START key/seed addresses")
+        require(stack_read(state, key, 8) == ("pid_tgid", identity)
+                and stack_read(state, key, 4, 8) == ("low", identity)
+                and stack_read(state, key, 4, 12) == ("constant", 0), name + ": seeded START full owner key/padding")
+        require(stack_read(state, seed, 8) == ("ktime_ns", identity), name + ": seeded START original timestamp")
+        cookie, image = stack_read(state, seed, 8, 8), stack_read(state, seed, 8, 16)
+        require(cookie and cookie[:2] == ("image_cookie", identity) and image == ("image_exec", identity, cookie[2]),
+                name + ": seeded START current image words")
+        require(sum(target == "p11_link_current_identity" for target in consumer.calls.values()) == 1,
+                name + ": seeded START current identity inventory")
+        require(state.get(("seed_marker", seed[1]+24)) is True, name + ": seeded START marker uninitialized/nonzero/unproven")
+        entry = consumer.insns[0][0]
+        before = D.reachable(consumer.graph, [entry], blocked={begin})
+        can_reach_begin = {pc for pc in before if begin in D.reachable(consumer.graph, [pc])}
+        require(sum(pc in can_reach_begin and pc in consumer.helper and text == "call 0x5" for pc, text in consumer.insns) == 1,
+                name + ": seeded START must use one original timestamp")
+        def guarded(expected, constant, success_taken):
+            matches = []
+            for pc, text in consumer.insns:
+                branch = BRANCH.fullmatch(text)
+                if branch and value(facts.get(pc, {}), branch[1]) == expected and value(facts.get(pc, {}), branch[3]) == ("constant", constant) and branch[2] in ("==", "!="):
+                    taken = D.relative_target(pc, text)
+                    success = taken if (branch[2] == "==") == success_taken else next(edge for edge in consumer.graph[pc] if edge != taken)
+                    failure = next(edge for edge in consumer.graph[pc] if edge != success)
+                    if begin in D.reachable(consumer.graph, [success]) and begin not in D.reachable(consumer.graph, [failure]) and begin not in D.reachable(consumer.graph, [entry], blocked={pc}):
+                        matches.append(pc)
+            require(len(matches) == 1, name + ": seeded START identity success/nonzero guard")
+            return matches[0]
+        identity_guard = guarded(("identity_result", cookie[2]), 1, True)
+        cookie_guard = guarded(cookie, 0, False)
+        witnesses = [pc for pc, target in consumer.calls.items() if target == "p11_instance_entry"]
+        require(len(witnesses) == 1, name + ": seeded START witness inventory")
+        witness = witnesses[0]
+        witness_state = facts.get(witness, {})
+        require(witness_state.get("r1") == key and witness_state.get("r3") == cookie and witness_state.get("r4") == image
+                and begin not in D.reachable(consumer.graph, [entry], blocked={witness}),
+                name + ": seeded START witness key/image provenance")
+        for pc in can_reach_begin:
+            target = consumer.calls.get(pc, "")
+            require(not target or target in ("memset", "p11_link_current_identity", "p11_instance_entry")
+                    or target.endswith(("scope_auth", "object_marker_for")),
+                    name + ": seeded START unknown pre-construction callee effects")
+            require(pc not in consumer.helper or consumer.text[pc] in
+                    ("call 0x1", "call 0x5", "call 0xc", "call 0xe", "call 0xae"),
+                    name + ": seeded START private read before construction/unknown helper")
+            require(not (pc in consumer.helper and consumer.text[pc] in ("call 0x70", "call 0x72"))
+                    and not any(target.endswith(suffix) for suffix in ("capture_scalar", "capture_async_target", "object_fill_entry", "object_entry_attributes")),
+                    name + ": seeded START private read before construction")
+        captures = {pc for pc, text in consumer.insns
+                    if (pc in consumer.helper and text in ("call 0x70", "call 0x72"))
+                    or any(consumer.calls.get(pc, "").endswith(suffix) for suffix in
+                           ("capture_scalar", "capture_async_target", "object_fill_entry", "object_entry_attributes", "p11_decode_params", "p11_walk_template", "p11_walk_template_types"))}
+        require(captures, name + ": seeded START no capture boundary witness")
+        null_guards = []
+        for pc, text in consumer.insns:
+            branch = BRANCH.fullmatch(text)
+            if not branch or branch[2] not in ("==", "!=") or value(facts.get(pc, {}), branch[1]) != ("owned", begin, 0) or value(facts.get(pc, {}), branch[3]) != ("constant", 0):
+                continue
+            taken = D.relative_target(pc, text)
+            failure = taken if branch[2] == "==" else next(edge for edge in consumer.graph[pc] if edge != taken)
+            if not captures & D.reachable(consumer.graph, [failure]) and not captures & D.reachable(consumer.graph, [entry], blocked={pc}):
+                null_guards.append(pc)
+        require(len(null_guards) == 1, name + ": seeded START null refusal before private reads")
+        aggregate_calls = [pc for pc, target in consumer.calls.items() if target == "p11_owner_start_aggregate"]
+        require(len(aggregate_calls) == 1, name + ": aggregate START constructor inventory")
+        aggregate = aggregate_calls[0]
+        aggregate_state = facts.get(aggregate, {})
+        require(aggregate_state.get("r1") == key
+                and stack_read(aggregate_state, key, 8) == ("pid_tgid", identity)
+                and stack_read(aggregate_state, key, 4, 8) == ("low", identity)
+                and stack_read(aggregate_state, key, 4, 12) == ("constant", 0),
+                name + ": aggregate START full owner key/padding")
+        require(aggregate_state.get("r2") == ("ktime_ns", identity),
+                name + ": aggregate START original scalar timestamp")
+        report[name] = {"constructor": begin, "key": key[1], "seed": seed[1],
+                        "identity_guard": identity_guard, "cookie_guard": cookie_guard, "witness": witness,
+                        "null_guard": null_guards[0], "aggregate": aggregate}
+    require("p11_entry" in report, "seeded START missing ordinary entry")
+    return report
+
+
 def final_sink_contract(consumer, variant, selectors, internal_blocks, internal_calls):
     name = consumer.name
     key = "default" if variant == "default" else name

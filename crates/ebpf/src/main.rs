@@ -45,7 +45,7 @@ use p11scope_ebpf_common::object_wire::{
 };
 #[cfg_attr(feature = "inventory-only", allow(unused_imports))]
 use p11scope_ebpf_common::{
-    ARG_NONE, CFG_FLAGS, COALESCED_NO_HELPER_RC, CallStart, DISCOVERY_BYTES,
+    ARG_NONE, CFG_FLAGS, COALESCED_NO_HELPER_RC, CallStart, CallStartSeed, DISCOVERY_BYTES,
     DISCOVERY_COUNTER_CELLS, DISCOVERY_COUNTER_EXPORT_BOUNDED_READ_FAILURES,
     DISCOVERY_COUNTER_EXPORT_STATE_FAILURES, DISCOVERY_COUNTER_LOADER_HITS,
     DISCOVERY_COUNTER_LOADER_STATE_READ_FAILURES, DISCOVERY_COUNTER_RING_LOSS,
@@ -404,53 +404,6 @@ fn read_word_pair(address: u64, layout: LinuxLayout) -> Result<[u64; 2], ()> {
 
 const _: [(); 288] = [(); core::mem::size_of::<CallStart>()];
 
-#[cfg(not(feature = "inventory-only"))]
-#[inline(always)]
-fn zero_call_start(start: &mut MaybeUninit<CallStart>) {
-    let words = start.as_mut_ptr().cast::<u64>();
-    // Keep this straight-line, as with DiscoveryRecord: LLVM otherwise lowers
-    // the full initialization to verifier-hostile memset/memcpy backtracking.
-    unsafe {
-        // CALL_START_INITIALIZER_BEGIN
-        core::ptr::write_volatile(words.add(0), 0u64);
-        core::ptr::write_volatile(words.add(1), 0u64);
-        core::ptr::write_volatile(words.add(2), 0u64);
-        core::ptr::write_volatile(words.add(3), 0u64);
-        core::ptr::write_volatile(words.add(4), 0u64);
-        core::ptr::write_volatile(words.add(5), 0u64);
-        core::ptr::write_volatile(words.add(6), 0u64);
-        core::ptr::write_volatile(words.add(7), 0u64);
-        core::ptr::write_volatile(words.add(8), 0u64);
-        core::ptr::write_volatile(words.add(9), 0u64);
-        core::ptr::write_volatile(words.add(10), 0u64);
-        core::ptr::write_volatile(words.add(11), 0u64);
-        core::ptr::write_volatile(words.add(12), 0u64);
-        core::ptr::write_volatile(words.add(13), 0u64);
-        core::ptr::write_volatile(words.add(14), 0u64);
-        core::ptr::write_volatile(words.add(15), 0u64);
-        core::ptr::write_volatile(words.add(16), 0u64);
-        core::ptr::write_volatile(words.add(17), 0u64);
-        core::ptr::write_volatile(words.add(18), 0u64);
-        core::ptr::write_volatile(words.add(19), 0u64);
-        core::ptr::write_volatile(words.add(20), 0u64);
-        core::ptr::write_volatile(words.add(21), 0u64);
-        core::ptr::write_volatile(words.add(22), 0u64);
-        core::ptr::write_volatile(words.add(23), 0u64);
-        core::ptr::write_volatile(words.add(24), 0u64);
-        core::ptr::write_volatile(words.add(25), 0u64);
-        core::ptr::write_volatile(words.add(26), 0u64);
-        core::ptr::write_volatile(words.add(27), 0u64);
-        core::ptr::write_volatile(words.add(28), 0u64);
-        core::ptr::write_volatile(words.add(29), 0u64);
-        core::ptr::write_volatile(words.add(30), 0u64);
-        core::ptr::write_volatile(words.add(31), 0u64);
-        core::ptr::write_volatile(words.add(32), 0u64);
-        core::ptr::write_volatile(words.add(33), 0u64);
-        core::ptr::write_volatile(words.add(34), 0u64);
-        core::ptr::write_volatile(words.add(35), 0u64);
-        // CALL_START_INITIALIZER_END
-    }
-}
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -2648,7 +2601,9 @@ unsafe extern "C" {
     #[cfg(not(feature = "inventory-only"))]
     fn p11_owner_start_get(key: *const StartKey, required: u32) -> *mut CallStart;
     #[cfg(not(feature = "inventory-only"))]
-    fn p11_owner_start_insert(key: *const StartKey, value: *const CallStart) -> i64;
+    fn p11_owner_start_aggregate(key: *const StartKey, timestamp: u64) -> u32;
+    #[cfg(not(feature = "inventory-only"))]
+    fn p11_owner_start_begin(key: *const StartKey, seed: *const CallStartSeed) -> *mut CallStart;
     #[cfg(not(feature = "inventory-only"))]
     fn p11_owner_start_remove(key: *const StartKey, required: u32) -> i64;
     fn p11_owner_discovery_get(key: *const StateKey, required: u32) -> *mut StartState;
@@ -3127,25 +3082,12 @@ fn owned_discovery_remove(key: &StateKey, required: bool) -> Result<(), ()> {
 
 #[cfg(not(feature = "inventory-only"))]
 #[inline(always)]
-fn store_start(key: &StartKey, start: &CallStart) -> bool {
-    if unsafe { p11_owner_start_insert(key, start) } == 0 {
-        return true;
-    }
-    // Native NOEXIST handling invalidates the ambiguous invocation and settles
-    // its count/index before reporting failure. Never delete by numeric key here.
-    bump_evidence(EVIDENCE_START_INSERT_FAILURES);
-    false
-}
-
-#[cfg(not(feature = "inventory-only"))]
-#[inline(always)]
 fn record_aggregate_start(key: &StartKey) {
-    let mut storage = MaybeUninit::<CallStart>::uninit();
-    zero_call_start(&mut storage);
-    // SAFETY: zero_call_start initialized every byte, including padding.
-    let start = unsafe { storage.assume_init_mut() };
-    start.ts_ns = unsafe { helpers::bpf_ktime_get_ns() };
-    let _ = store_start(key, start);
+    // No image mint, side row or 288-byte scratch: native construction copies
+    // the verified zero prefix and writes only this original entry timestamp.
+    if unsafe { p11_owner_start_aggregate(key, helpers::bpf_ktime_get_ns()) } != 1 {
+        bump_evidence(EVIDENCE_START_INSERT_FAILURES);
+    }
 }
 
 /// The probed runtime address: the uprobe `pt_regs` IP is `bp_vaddr`
@@ -3203,14 +3145,14 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         record_aggregate_start(&key);
         return 0;
     }
-    let mut storage = MaybeUninit::<CallStart>::uninit();
-    zero_call_start(&mut storage);
-    // SAFETY: zero_call_start initialized every byte, including padding.
-    let start = unsafe { storage.assume_init_mut() };
-    start.ts_ns = unsafe { helpers::bpf_ktime_get_ns() };
-    // Write into caller-owned initialized storage: a second live identity
-    // temporary would increase diagnostic entry call-chain stack usage.
-    if unsafe { p11_link_current_identity(&mut start.image) } != 1 || start.image.task_cookie == 0 {
+    // One original entry timestamp: the native constructor binds this same
+    // value to START and its side row, and S1 return duration uses it unchanged.
+    let mut seed = CallStartSeed {
+        ts_ns: unsafe { helpers::bpf_ktime_get_ns() },
+        image: ImageIdentity::default(),
+        object_required: 0,
+    };
+    if unsafe { p11_link_current_identity(&mut seed.image) } != 1 || seed.image.task_cookie == 0 {
         let _ = owned_start_remove(&key, false);
         bump_evidence(EVIDENCE_SEMANTIC_CAPTURE_FAILURES);
         return 0;
@@ -3224,26 +3166,29 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         p11_instance_entry(
             &key,
             entry_ip(&ctx, layout),
-            start.image.task_cookie,
-            start.image.exec_id,
+            seed.image.task_cookie,
+            seed.image.exec_id,
         )
     };
+    if flags & FLAG_POLICY_ALLOWLISTED != 0 {
+        seed.object_required = object_marker_for(cookie_of(&ctx));
+    }
+    // The final immutable seed is bound before native side allocation. No
+    // pointer escapes a failed transaction; its native cleanup owns rollback.
+    let start_pointer = unsafe { p11_owner_start_begin(&key, &seed) };
+    if start_pointer.is_null() {
+        bump_evidence(EVIDENCE_START_INSERT_FAILURES);
+        return 0;
+    }
+    // SAFETY: this task owns the new map row. This projection ends before
+    // native custody queries/removal can read the same row through an alias.
+    let start = unsafe { &mut *start_pointer };
     start.session = SESSION_NONE;
     start.mechanism = MECH_NONE;
     start.user_type = USER_TYPE_NONE;
     start.shape = shape::NONE;
     start.capture = capture::MECHANISM_NONE | capture::OUTPUT_NONE;
     start.target_function = FUNCTION_NONE;
-
-    // H7 slice B custody: bind the required-object marker after
-    // descriptor/attachment admission, before native NOEXIST insertion. The
-    // native transaction establishes the subordinate row and its immutable
-    // binding; a zero marker keeps the ordinary path. Placed before the
-    // capture sequences on purpose: entry has no frame to spare, and the
-    // marker computation is independent of every captured field.
-    if flags & FLAG_POLICY_ALLOWLISTED != 0 {
-        start.object_required = object_marker_for(cookie_of(&ctx));
-    }
 
     // Materialized late on purpose: its fields stay out of entry's live set
     // across the marker call above. The descriptor table is frozen, so this
@@ -3388,18 +3333,18 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
         }
     }
 
-    if !store_start(&key, start) {
-        return 0;
-    }
-    if start.object_required != 0 {
+    let object_required = start.object_required;
+    let entry_capture = start.capture;
+    // No mutable START projection remains live beyond this point. Native
+    // queries below re-read the same immutable binding, then may remove it.
+    if object_required != 0 {
         // Record the entry ABI on the subordinate row through the query
         // row: return requires it unset or equal to the return layout. The
         // marker is descriptor-plus-one by construction, so the query
         // descriptor derives from it without another cookie read. A
         // missing row here contradicts the just-committed transaction, so
         // abandon the invocation loudly instead of running half-bound.
-        let recorded =
-            object_record_entry_abi(&key, (start.object_required - 1) as u32, layout);
+        let recorded = object_record_entry_abi(&key, (object_required - 1) as u32, layout);
         if !recorded {
             let _ = owned_start_remove(&key, true);
             unsafe { p11_object_fault() };
@@ -3407,12 +3352,11 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
             return 0;
         }
         // H7 adapters tail: entry-fill after the ABI record.
-        let null_cancel = semantics_of(&ctx).semantic_flags
-            & semantic_flags::NULL_MECHANISM_CANCEL
+        let null_cancel = semantics_of(&ctx).semantic_flags & semantic_flags::NULL_MECHANISM_CANCEL
             != 0
-            && start.capture & capture::MECHANISM_MASK == capture::MECHANISM_NULL;
+            && entry_capture & capture::MECHANISM_MASK == capture::MECHANISM_NULL;
         let fill_side =
-            unsafe { p11_object_side_get(&key, (start.object_required - 1) as u32, 0).as_mut() };
+            unsafe { p11_object_side_get(&key, (object_required - 1) as u32, 0).as_mut() };
         if !object_fill_entry(&ctx, fill_side, layout, null_cancel) {
             let _ = owned_start_remove(&key, true);
             unsafe { p11_object_fault() };
@@ -3420,7 +3364,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
             return 0;
         }
         let derive_side =
-            unsafe { p11_object_side_get(&key, (start.object_required - 1) as u32, 0).as_mut() };
+            unsafe { p11_object_side_get(&key, (object_required - 1) as u32, 0).as_mut() };
         if !object_entry_derive(&ctx, derive_side, layout) {
             let _ = owned_start_remove(&key, true);
             unsafe { p11_object_fault() };
@@ -3428,7 +3372,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
             return 0;
         }
         let results_side =
-            unsafe { p11_object_side_get(&key, (start.object_required - 1) as u32, 0).as_mut() };
+            unsafe { p11_object_side_get(&key, (object_required - 1) as u32, 0).as_mut() };
         if !object_entry_results(&ctx, results_side, layout) {
             let _ = owned_start_remove(&key, true);
             unsafe { p11_object_fault() };
@@ -3436,7 +3380,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
             return 0;
         }
         let find_side =
-            unsafe { p11_object_side_get(&key, (start.object_required - 1) as u32, 0).as_mut() };
+            unsafe { p11_object_side_get(&key, (object_required - 1) as u32, 0).as_mut() };
         if !object_entry_find(&ctx, find_side, layout) {
             let _ = owned_start_remove(&key, true);
             unsafe { p11_object_fault() };
@@ -3444,7 +3388,7 @@ fn p11_entry_impl<const TEMPLATE_MODE: u8, const ENTRY_ABI: u8>(ctx: ProbeContex
             return 0;
         }
         let attributes_side =
-            unsafe { p11_object_side_get(&key, (start.object_required - 1) as u32, 0).as_mut() };
+            unsafe { p11_object_side_get(&key, (object_required - 1) as u32, 0).as_mut() };
         if !object_entry_attributes(&ctx, attributes_side, layout) {
             let _ = owned_start_remove(&key, true);
             unsafe { p11_object_fault() };

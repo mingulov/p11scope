@@ -124,6 +124,20 @@ _Static_assert(__builtin_offsetof(struct owner_discovery_key, domain) == 16, "di
 #define OBJECT_CALL_START_TS_OFF 0U
 #define OBJECT_CALL_START_MARKER_OFF 264U
 #define OBJECT_CALL_START_IMAGE_OFF 272U
+/* The one original timestamp is also S1's duration origin and the future
+ * native BEGIN.entry_ns. Construction must not acquire a replacement clock. */
+struct call_start_seed {
+    u64 ts_ns;
+    u64 task_cookie;
+    u64 exec_id;
+    u64 object_required;
+};
+_Static_assert(sizeof(struct call_start_seed) == 32, "START seed ABI");
+_Static_assert(_Alignof(struct call_start_seed) == 8, "START seed alignment");
+_Static_assert(__builtin_offsetof(struct call_start_seed, ts_ns) == 0, "seed timestamp");
+_Static_assert(__builtin_offsetof(struct call_start_seed, task_cookie) == 8, "seed image");
+_Static_assert(__builtin_offsetof(struct call_start_seed, exec_id) == 16, "seed exec");
+_Static_assert(__builtin_offsetof(struct call_start_seed, object_required) == 24, "seed marker");
 struct object_descriptor_row {
     u32 function;
     unsigned char input_args[2];

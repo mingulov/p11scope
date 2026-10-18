@@ -2,6 +2,12 @@
  * Only kernel helper operations and atomic interference are injected; there is
  * no second owner-accounting algorithm. */
 #include "task_owner.h"
+#ifndef P11SCOPE_INVENTORY_ONLY
+/* Host-only weak declaration makes a missing constructor fail at runtime. */
+extern void *p11_owner_start_begin(const struct owner_start_key *,
+                                   const struct call_start_seed *) __attribute__((weak));
+extern u32 p11_owner_start_aggregate(const struct owner_start_key *, u64) __attribute__((weak));
+#endif
 _Static_assert(OWNER_TRANSIENT_CLAIMS == (1ULL << 22),
                "transient admission excess is bounded by PID_MAX_LIMIT");
 _Static_assert(OWNER_CONTROL_BOUND == OWNER_LIMIT + OWNER_TRANSIENT_CLAIMS,
@@ -49,10 +55,13 @@ static int gets, creates, deletes;
 static u64 expected_delete_debt;
 static unsigned char value[288] __attribute__((aligned(8)));
 struct row { int used; void *map; unsigned char key[24]; unsigned char value[432] __attribute__((aligned(8))); };
-static struct row rows[1024];
+/* START capacity plus subordinate rows and frozen descriptor/zero cells. */
+#define FIXTURE_ROW_BOUND (2U * P11SCOPE_OWNER_SLOT_BOUND + 128U)
+static struct row rows[FIXTURE_ROW_BOUND];
 #ifndef P11SCOPE_INVENTORY_ONLY
 static int fail_object_side_update, fail_object_side_delete, drop_zero_row, poison_zero_row;
 static int fail_object_side_lookup_once, hide_side_slot, zero_outstanding_on_delete;
+static int fail_start_readback_once;
 /* Pre-delete snapshot of the last removed subordinate value: every terminal
  * path must scrub before deleting. */
 static unsigned char deleted_side[432];
@@ -98,7 +107,7 @@ static size_t key_size(void *map) {
 }
 static struct row *row(void *map, const void *key)
 {
-    for (unsigned i = 0; i < 1024; i++)
+    for (unsigned i = 0; i < FIXTURE_ROW_BOUND; i++)
         if (rows[i].used && rows[i].map == map && !memcmp(rows[i].key, key, key_size(map)))
             return &rows[i];
     return NULL;
@@ -108,6 +117,10 @@ static void *lookup(void *map, const void *key)
     if (map == &OWNER_CTL) return &ctl;
 #ifndef P11SCOPE_INVENTORY_ONLY
     if (map == &OBJECT_ZERO && drop_zero_row) return NULL;
+    if (map == &START && fail_start_readback_once && row(map, key)) {
+        fail_start_readback_once = 0;
+        return NULL;
+    }
     if (map == &OBJECT_START && fail_object_side_lookup_once) {
         fail_object_side_lookup_once = 0;
         return NULL;
@@ -130,7 +143,7 @@ static long update(void *map, const void *key, const void *data, u64 flags)
     if (r && flags == 1) return -17;
     if (!r && flags == 2) return -2;
     if (!r) {
-        for (unsigned i = 0; i < 1024; i++)
+        for (unsigned i = 0; i < FIXTURE_ROW_BOUND; i++)
             if (!rows[i].used) { r = &rows[i]; break; }
     }
     if (!r) return -12;
@@ -261,6 +274,7 @@ static void reset(void)
 #ifndef P11SCOPE_INVENTORY_ONLY
     fail_object_side_update = fail_object_side_delete = drop_zero_row = poison_zero_row = 0;
     fail_object_side_lookup_once = 0; hide_side_slot = -1; zero_outstanding_on_delete = 0;
+    fail_start_readback_once = 0;
     deleted_side_seen = 0;
     memset(instance_gen, 0, sizeof(instance_gen));
     memset(&instance_counters_live, 0, sizeof(instance_counters_live));
@@ -722,14 +736,14 @@ static void discovery_foreign_owner(void)
 static void capacity_collision(void)
 {
     reset();
-    for (unsigned i = 0; i < 512; i++) {
+    for (unsigned i = 0; i < P11SCOPE_OWNER_SLOT_BOUND; i++) {
         struct owner_start_key key = start_key(i);
         assert(!p11_owner_start_insert(&key, value));
     }
-    struct owner_start_key nested = start_key(511);
+    struct owner_start_key nested = start_key(P11SCOPE_OWNER_SLOT_BOUND - 1);
     assert(p11_owner_start_insert(&nested, value));
-    assert(!row(&START, &nested) && owners[0].start_count == 511);
-    p11_owner_cleanup(); assert(ctl.abandoned_start == 511 && !ctl.outstanding);
+    assert(!row(&START, &nested) && owners[0].start_count == P11SCOPE_OWNER_SLOT_BOUND - 1);
+    p11_owner_cleanup(); assert(ctl.abandoned_start == P11SCOPE_OWNER_SLOT_BOUND - 1 && !ctl.outstanding);
 }
 static void ordinary_absence(void)
 {
@@ -836,6 +850,209 @@ static struct object_start object_side_copy(const struct owner_start_key *key)
     memcpy(&out, found->value, 432);
     return out;
 }
+static void object_aggregate_start_construction(void)
+{
+    assert(&p11_owner_start_aggregate && "production aggregate START constructor is missing");
+    struct owner_start_key key = { .slot = 7 };
+    for (unsigned clock = 0; clock < 2; clock++) {
+        reset(); object_setup(); key.pid_tgid = pid_tgid();
+        const u64 timestamp = clock ? 0x13579bdf02468aceULL : 0;
+        assert(p11_owner_start_aggregate(&key, timestamp) == 1);
+        unsigned char expected[288] = {0};
+        memcpy(expected, &timestamp, 8);
+        assert(row(&START, &key) && !memcmp(row(&START, &key)->value, expected, 288));
+        assert(!row(&OBJECT_START, &key));
+        assert(owners[0].start_count == 1 && ctl.outstanding == 1 && !ctl.poison);
+        assert(!p11_owner_start_remove(&key, 1));
+        assert(!row(&START, &key) && !ctl.outstanding && idle(0) && !ctl.poison);
+    }
+    for (unsigned fault = 0; fault < 6; fault++) {
+        reset();
+        if (fault == 1) poison_zero_row = 1;
+        object_setup(); key.pid_tgid = pid_tgid();
+        if (fault == 0) drop_zero_row = 1;
+        if (fault == 2) fail_start_readback_once = 1;
+        if (fault == 3) update_error = -12;
+        if (fault == 4) key.pid_tgid++;
+        if (fault == 5) key.pad = 1;
+        assert(!p11_owner_start_aggregate(&key, 17));
+        assert(!row(&START, &key) && !row(&OBJECT_START, &key));
+        assert(!ctl.outstanding && !owners[0].start_count);
+    }
+    key.pad = 0;
+    /* Readback rollback failure retains an allzero owned row for retry. */
+    reset(); object_setup(); key.pid_tgid = pid_tgid();
+    fail_start_readback_once = 1; fail_start_delete = -12;
+    assert(!p11_owner_start_aggregate(&key, 17));
+    assert(row(&START, &key) && !row(&OBJECT_START, &key));
+    assert(!memcmp(row(&START, &key)->value, (unsigned char[288]){0}, 288));
+    assert(owners[0].start_count == 1 && ctl.outstanding == 1);
+    fail_start_delete = 0;
+    assert(p11_owner_cleanup() == 1 && !row(&START, &key) && !ctl.outstanding);
+    reset(); object_setup(); key.pid_tgid = pid_tgid();
+    assert(p11_owner_start_aggregate(&key, 17));
+    assert(!p11_owner_start_aggregate(&key, 18));
+    assert(!row(&START, &key) && !row(&OBJECT_START, &key) && !ctl.outstanding);
+    /* A nested aggregate still retires its ambiguous older object invocation. */
+    reset(); object_setup(); key.pid_tgid = pid_tgid();
+    struct call_start_seed original = {
+        .ts_ns = 17, .task_cookie = 19, .exec_id = 3, .object_required = 22,
+    };
+    assert(p11_owner_start_begin(&key, &original));
+    deleted_side_seen = 0;
+    assert(!p11_owner_start_aggregate(&key, 18));
+    assert(!row(&START, &key) && !row(&OBJECT_START, &key) && !ctl.outstanding);
+    assert(deleted_side_seen && !memcmp(deleted_side, (unsigned char[432]){0}, 432));
+    assert(!ctl.poison);
+    puts("aggregate START construction passed");
+}
+static void object_seeded_start_construction(void)
+{
+    assert(&p11_owner_start_begin && "production seeded START constructor is missing");
+    struct owner_start_key key = { .slot = 7 };
+    struct call_start_seed seed = {
+        .ts_ns = 0, /* Zero is a real timestamp, never an unavailable sentinel. */
+        .task_cookie = 0x123456789abcdef0ULL,
+        .exec_id = 0,
+        .object_required = 0,
+    };
+    for (unsigned variant = 0; variant < 4; variant++) {
+        reset(); object_setup(); key.pid_tgid = pid_tgid();
+        const unsigned required = variant & 1;
+        seed.ts_ns = variant < 2 ? 0 : 0x13579bdf02468aceULL;
+        seed.exec_id = variant < 2 ? 0 : 0x2468ace013579bdfULL;
+        seed.object_required = required ? 22 : 0;
+        unsigned char *start = p11_owner_start_begin(&key, &seed);
+        assert(start && start == row(&START, &key)->value);
+        assert(owners[0].start_count == 1 && ctl.outstanding == 1 && !ctl.poison);
+        unsigned char expected[288] = {0};
+        memcpy(expected, &seed.ts_ns, 8);
+        memcpy(expected + 264, &seed.object_required, 8);
+        memcpy(expected + 272, &seed.task_cookie, 8);
+        memcpy(expected + 280, &seed.exec_id, 8);
+        assert(!memcmp(start, expected, sizeof(expected)));
+        if (required) {
+            struct object_start *side = p11_object_side_get(&key, 21, 0);
+            assert(side && side->phase == OBJECT_PHASE_ENTRY);
+            assert(side->entry_ns == seed.ts_ns && side->task_cookie == seed.task_cookie);
+            assert(side->exec_id == seed.exec_id && side->descriptor_index == 21);
+            assert(!p11_object_side_get(&key, 21, 1));
+            u64 session = 0x9988776655443322ULL;
+            memcpy(start + 8, &session, 8);
+            assert(p11_object_side_get(&key, 21, 0) == side);
+            assert(side->entry_ns == seed.ts_ns && side->task_cookie == seed.task_cookie);
+        } else {
+            assert(!row(&OBJECT_START, &key));
+        }
+        assert(!p11_owner_start_remove(&key, 1));
+        assert(!row(&START, &key) && !row(&OBJECT_START, &key));
+        assert(!ctl.outstanding && idle(0) && !ctl.poison);
+    }
+    /* Changed immutable identity is refused, never rebound. */
+    reset(); object_setup(); key.pid_tgid = pid_tgid(); seed.object_required = 22;
+    unsigned char *start = p11_owner_start_begin(&key, &seed);
+    assert(start);
+    u64 changed = seed.ts_ns + 1;
+    memcpy(start, &changed, 8);
+    assert(!p11_object_side_get(&key, 21, 0));
+    assert(p11_owner_start_remove(&key, 1));
+    assert(!row(&START, &key) && !row(&OBJECT_START, &key));
+    assert(!ctl.outstanding && (ctl.poison & OWNER_OBJECT_MISMATCH));
+    puts("seeded START construction passed");
+}
+
+static void object_seeded_start_failures(void)
+{
+    assert(&p11_owner_start_begin && "production seeded START constructor is missing");
+    struct owner_start_key key = { .slot = 7 };
+    const struct call_start_seed seed = {
+        .ts_ns = 0x13579bdfULL, .task_cookie = 0x2468ace0ULL,
+        .exec_id = 3, .object_required = 22,
+    };
+    for (unsigned fault = 0; fault < 7; fault++) {
+        reset();
+        if (fault == 1) poison_zero_row = 1;
+        object_setup(); key.pid_tgid = pid_tgid();
+        if (fault == 0) drop_zero_row = 1;
+        if (fault == 2) fail_start_readback_once = 1;
+        if (fault == 3) fail_object_side_update = -12;
+        if (fault == 4) fail_object_side_lookup_once = 1;
+        if (fault == 5) key.pid_tgid++;
+        if (fault == 6) update_error = -12;
+        assert(!p11_owner_start_begin(&key, &seed));
+        assert(!row(&START, &key) && !row(&OBJECT_START, &key));
+        assert(!ctl.outstanding && !owners[0].start_count);
+    }
+    /* Missing identity and an invalid descriptor marker never publish a row. */
+    for (unsigned fault = 0; fault < 5; fault++) {
+        reset(); object_setup(); key.pid_tgid = pid_tgid();
+        struct call_start_seed rejected = seed;
+        if (fault == 0) rejected.task_cookie = 0;
+        if (fault == 1) rejected.object_required = 1;
+        if (fault == 2) rejected.object_required = OBJECT_DESCRIPTORS_COUNT + 1;
+        if (fault == 4) key.pad = 1;
+        assert(!p11_owner_start_begin(&key, fault == 3 ? NULL : &rejected));
+        assert(!row(&START, &key) && !row(&OBJECT_START, &key));
+        assert(!ctl.outstanding && !owners[0].start_count);
+    }
+    key.pad = 0;
+    /* At the real slot bound, nested ambiguity still retires only its own
+     * invocation and subordinate row; siblings retain their shared lease. */
+    reset(); object_setup(); key.pid_tgid = pid_tgid();
+    for (unsigned slot = 0; slot < P11SCOPE_OWNER_SLOT_BOUND; slot++) {
+        struct owner_start_key fill = { .pid_tgid = pid_tgid(), .slot = slot };
+        struct call_start_seed bounded = seed;
+        if (slot != key.slot) bounded.object_required = 0;
+        assert(p11_owner_start_begin(&fill, &bounded));
+    }
+    assert(owners[0].start_count == P11SCOPE_OWNER_SLOT_BOUND && ctl.outstanding == 1);
+    deleted_side_seen = 0;
+    assert(!p11_owner_start_begin(&key, &seed));
+    assert(!row(&START, &key) && !row(&OBJECT_START, &key));
+    assert(deleted_side_seen && !memcmp(deleted_side, (unsigned char[432]){0}, 432));
+    assert(owners[0].start_count == P11SCOPE_OWNER_SLOT_BOUND - 1 && ctl.outstanding == 1);
+    assert(!ctl.poison && !p11_owner_cleanup());
+    assert(!ctl.outstanding && ctl.abandoned_start == P11SCOPE_OWNER_SLOT_BOUND - 1);
+    /* Failed START rollback retains its count, lease and teardown route. */
+    reset(); object_setup(); key.pid_tgid = pid_tgid();
+    fail_start_readback_once = 1; fail_start_delete = -12;
+    assert(!p11_owner_start_begin(&key, &seed));
+    assert(row(&START, &key) && !row(&OBJECT_START, &key));
+    assert(!memcmp(row(&START, &key)->value, (unsigned char[288]){0}, 288));
+    assert(ctl.outstanding == 1 && owners[0].start_count == 1);
+    assert(ctl.poison & OWNER_STATE_DELETE_FAILED);
+    fail_start_delete = 0;
+    assert(p11_owner_cleanup() == 1); /* Sticky poison remains visible. */
+    assert(!row(&START, &key) && !ctl.outstanding);
+    /* The subordinate orphan-delete retry contract remains intact. */
+    reset(); object_setup(); key.pid_tgid = pid_tgid();
+    fail_object_side_lookup_once = 1; fail_object_side_delete = -12;
+    assert(!p11_owner_start_begin(&key, &seed));
+    assert(row(&START, &key) && row(&OBJECT_START, &key));
+    assert(ctl.outstanding == 1 && owners[0].start_count == 1);
+    assert(!memcmp(row(&OBJECT_START, &key)->value, (unsigned char[432]){0}, 432));
+    fail_object_side_delete = 0;
+    assert(p11_owner_cleanup() == 1); /* Cleanup settles debt, not poison. */
+    assert(!row(&START, &key) && !row(&OBJECT_START, &key) && !ctl.outstanding);
+    /* Same-key NOEXIST ambiguity retires the original invocation. */
+    reset(); object_setup(); key.pid_tgid = pid_tgid();
+    assert(p11_owner_start_begin(&key, &seed));
+    assert(!p11_owner_start_begin(&key, &seed));
+    assert(!row(&START, &key) && !row(&OBJECT_START, &key));
+    assert(!ctl.outstanding && !owners[0].start_count && ctl.admission_failures);
+    /* A foreign task's live key never supplies cleanup authority. */
+    reset(); object_setup(); current_index = 1; key.pid_tgid = pid_tgid();
+    assert(p11_owner_start_begin(&key, &seed));
+    current_index = 0;
+    assert(!p11_owner_start_begin(&key, &seed));
+    assert(row(&START, &key) && row(&OBJECT_START, &key));
+    assert(owners[1].start_count == 1 && ctl.outstanding == 1 && idle(0));
+    assert(!ctl.poison);
+    current_index = 1;
+    assert(!p11_owner_start_remove(&key, 1) && !ctl.outstanding);
+    puts("seeded START failure controls passed");
+}
+
 static int object_bytes_zeroed(const unsigned char *bytes)
 {
     for (unsigned i = 0; i < 432; i++)
@@ -1003,7 +1220,7 @@ static void object_producer_owner_terminal_matrix(void)
     assert(deleted_side_seen && object_bytes_zeroed(deleted_side));
     /* Capacity-bound invalidation retires the nested subordinate row. */
     reset(); object_setup();
-    for (unsigned slot = 0; slot < 512; slot++) {
+    for (unsigned slot = 0; slot < P11SCOPE_OWNER_SLOT_BOUND; slot++) {
         struct owner_start_key fill = { .pid_tgid = pid_tgid(), .slot = slot };
         if (slot == 7)
             continue;
@@ -1013,14 +1230,14 @@ static void object_producer_owner_terminal_matrix(void)
     key.pid_tgid = pid_tgid();
     memset(value, 0, sizeof(value)); object_write_start(value, 24);
     assert(!p11_owner_start_insert(&key, value));
-    assert(owners[0].start_count == 512 && ctl.outstanding == 1);
+    assert(owners[0].start_count == P11SCOPE_OWNER_SLOT_BOUND && ctl.outstanding == 1);
     memset(value, 0, sizeof(value)); object_write_start(value, 22);
     deleted_side_seen = 0;
     assert(p11_owner_start_insert(&key, value) == -1);
     assert(!row(&OBJECT_START, &key) && !row(&START, &key));
-    assert(owners[0].start_count == 511);
+    assert(owners[0].start_count == P11SCOPE_OWNER_SLOT_BOUND - 1);
     assert(deleted_side_seen && object_bytes_zeroed(deleted_side));
-    assert(!p11_owner_cleanup() && ctl.abandoned_start == 511);
+    assert(!p11_owner_cleanup() && ctl.abandoned_start == P11SCOPE_OWNER_SLOT_BOUND - 1);
     assert(!ctl.outstanding && !ctl.poison);
     /* Missing side row: invocation retired, refunded, poisoned. */
     reset(); object_setup();
@@ -1980,6 +2197,9 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[1], "object_producer_orphan_delete_failure_keeps_cleanup_authority")) object_producer_orphan_delete_failure_keeps_cleanup_authority();
         else if (!strcmp(argv[1], "object_producer_empty_lease_refund_failure_remains_visible")) object_producer_empty_lease_refund_failure_remains_visible();
         else if (!strcmp(argv[1], "object_owner_sweep_adjacent_lookup_preserves_custody")) object_owner_sweep_adjacent_lookup_preserves_custody();
+        else if (!strcmp(argv[1], "object_seeded_start_construction")) object_seeded_start_construction();
+        else if (!strcmp(argv[1], "object_aggregate_start_construction")) object_aggregate_start_construction();
+        else if (!strcmp(argv[1], "object_seeded_start_failures")) object_seeded_start_failures();
         else assert(0);
     } else {
         cas_boundaries(); accounting_contention(); threaded_contention(); idle_owner_retention();
@@ -1989,6 +2209,7 @@ int main(int argc, char **argv)
         object_producer_return_refusals_retire_owned_state(); object_producer_alloc_readback_failure_preserves_cleanup_authority();
         object_producer_orphan_delete_failure_keeps_cleanup_authority();
         object_producer_empty_lease_refund_failure_remains_visible(); object_owner_sweep_adjacent_lookup_preserves_custody();
+        object_seeded_start_construction(); object_seeded_start_failures(); object_aggregate_start_construction();
     }
     puts("task-owner: actual helper classifier, transactions, directory and lifecycle controls passed");
 }

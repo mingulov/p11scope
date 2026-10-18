@@ -235,10 +235,16 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Every H0-position-bearing finalizer field belongs to one Session.
     /// A different live lane cannot consume, overwrite or acknowledge it.
     semantic_finalizer: Option<semantics::SessionFinalizerState>,
-    /// The capture's joint owner: the one object model (with its retained
-    /// history) plus the SAME move-only reservation ledger every
-    /// publication below borrows. Parked/active transfer moves the whole
-    /// owner; no second model or ledger exists for one capture.
+    /// The capture's joint owner: the one journal adapter (with its
+    /// move-only reservation ledger) plus the one object model (with its
+    /// retained history). Every ledger-bearing publication below borrows
+    /// the adapter's ledger. Parked/active transfer moves the whole
+    /// owner by value.
+    /// Deviation record (F3): the progress note says "Session-owned
+    /// adapter", but the owner lives here because commit_batch_inner
+    /// has no Session handle (precedents: CallerAdapter, the binder,
+    /// the semantic finalizer). The parked/active transfer design must
+    /// define owner replace/reset semantics; no transfer runs here.
     joint_capture: crate::semantics_objects::journal::joint_driver::JointCaptureOwner,
     /// Optional hints retain only their own identity-qualified source state.
     /// They do not supply Inventory, H0 or Detailed admission authority.
@@ -407,6 +413,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     ) -> Result<Self> {
         let registry = CallerRegistry::new(registry_limits);
         let joint_capture = crate::semantics_objects::journal::joint_driver::JointCaptureOwner::new(
+            crate::semantics_objects::journal::JournalLimits::policy(),
             registry.semantic_storage_reserver(),
         );
         let mut adapter = CallerAdapter::new(source, registry.semantic_storage_reserver());

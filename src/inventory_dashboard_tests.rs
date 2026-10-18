@@ -3275,6 +3275,12 @@ impl PromoPty {
         self.display.tick();
     }
 
+    /// Exercise a scheduled repaint without depending on elapsed wall time.
+    fn repaint_now(&mut self) {
+        self.display.next_redraw = std::time::Instant::now();
+        self.display.tick();
+    }
+
     /// Wait for a screen needle, draining the terminal.
     fn shown(&mut self, needle: &[u8]) {
         self.pty.read_until(needle, Duration::from_secs(5));
@@ -3629,7 +3635,7 @@ fn pty_promotion_shed_frame_refuses_until_full_repaint() {
     // The repaint reaches the terminal whole and commits the viewed
     // triple; the retained cursor (never cleared by the shed) requests.
     drain(&mut terminal.pty, Duration::from_millis(100));
-    terminal.display.tick();
+    terminal.repaint_now();
     terminal.shown(b"promotion: idle; selected");
     assert!(terminal.display.viewed_presentation.is_some());
     assert_eq!(terminal.display.viewed_revision.get(), 1);
@@ -3660,7 +3666,7 @@ fn pty_promotion_shed_new_frame_never_binds_candidate() {
     assert_eq!(terminal.display.viewed_revision.get(), 1);
     fill(&terminal.pty);
     terminal.display.offer(varied_presentation());
-    terminal.display.tick();
+    terminal.repaint_now();
     assert!(
         terminal.display.viewed_presentation.is_none(),
         "shed B clears viewed authority"
@@ -3669,7 +3675,7 @@ fn pty_promotion_shed_new_frame_never_binds_candidate() {
     assert!(terminal.display.take_promotion_request().is_none());
     assert_eq!(terminal.display.promotion_state(), PromotionState::Idle);
     drain(&mut terminal.pty, Duration::from_millis(100));
-    terminal.display.tick();
+    terminal.repaint_now();
     terminal.shown(b"promotion: idle; selected");
     assert_eq!(terminal.display.viewed_revision.get(), 2);
     terminal.key(b"d");
@@ -3698,15 +3704,20 @@ fn pty_promotion_cut_frame_clears_until_repair() {
     // lands partially (cut), not whole and not fully shed.
     let mut freed = 0;
     let mut chunk = [0u8; 512];
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while freed < 1024 {
         use std::io::Read as _;
+        assert!(std::time::Instant::now() < deadline, "pty drain stalled");
         match terminal.pty.master.read(&mut chunk) {
-            Ok(n) => freed += n,
+            Ok(n) => {
+                assert_ne!(n, 0, "pty closed before the partial-frame control");
+                freed += n;
+            }
             Err(_) => std::thread::sleep(Duration::from_millis(5)),
         }
     }
     terminal.display.offer(varied_presentation());
-    terminal.display.tick();
+    terminal.repaint_now();
     let account = terminal.display.account().terminal;
     assert_eq!(account.frames_cut, 1, "{account:?}");
     assert!(!terminal.display.writer.last_frame_written());
@@ -3716,7 +3727,7 @@ fn pty_promotion_cut_frame_clears_until_repair() {
     assert_eq!(terminal.display.promotion_state(), PromotionState::Idle);
     // The repair (CAN prefix) plus full repaint recommits.
     drain(&mut terminal.pty, Duration::from_millis(100));
-    terminal.display.tick();
+    terminal.repaint_now();
     terminal.shown(b"promotion: idle; selected");
     assert!(terminal.display.viewed_presentation.is_some());
     terminal.key(b"d");
@@ -3738,7 +3749,7 @@ fn pty_promotion_view_exhaustion_refuses_honestly() {
     assert_eq!(terminal.display.viewed_revision.get(), 1);
     terminal.display.next_view_revision = ViewRevision::EXHAUSTED;
     terminal.display.offer(varied_presentation());
-    terminal.display.tick();
+    terminal.repaint_now();
     assert!(terminal.display.view_exhausted);
     assert!(terminal.display.viewed_presentation.is_none());
     terminal.key(b"d");

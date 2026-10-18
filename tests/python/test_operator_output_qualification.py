@@ -993,6 +993,14 @@ class CancellationMarkerTests(unittest.TestCase):
                     HARNESS['cancellation_marker'](line, 15)
                 with self.assertRaises(ValueError):
                     HARNESS['cancellation_marker'](line + line, 2)
+        for phase, template in (
+                ('capture', b'p11scope: cancel: loop exited on signal 2 after %d ticks\n'),
+                ('finalization', b'p11scope: cancel: signal 2 observed during finalization after %d ticks\n')):
+            with self.subTest(phase=phase, boundary='u64-ticks'):
+                ceiling = template % (2**64 - 1)
+                self.assertEqual(HARNESS['cancellation_marker'](ceiling, 2)['ticks'], 2**64 - 1)
+                with self.assertRaises(ValueError):
+                    HARNESS['cancellation_marker'](template % 2**64, 2)
         for data in (b'', b'noise p11scope: cancel: loop exited on signal 2 after 7 ticks\n',
                      b'p11scope: cancel: loop exited on signal 2 after -1 ticks\n',
                      b'p11scope: cancel: signal 2 observed in worker after 7 ticks\n'):

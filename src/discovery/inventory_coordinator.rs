@@ -5664,7 +5664,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 scan_callers: scoped_scan_callers,
             });
         }
-        self.synchronize_caller_metadata(now_ns());
+        self.synchronize_caller_metadata(crate::discovery::caller_registry::now_ns());
         Ok(BatchReceipt {
             engine_facts: self.engine.facts_revision,
             engine_published: self.engine.published_facts_revision,

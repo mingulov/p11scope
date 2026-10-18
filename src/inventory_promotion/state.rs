@@ -15,7 +15,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct CaptureId(u64);
 
-#[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): runtime enables the per-run capture identity.
+#[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): constructed by the runtime owner per run; compared here today.
 impl CaptureId {
     pub(crate) fn new(raw: u64) -> Self {
         Self(raw)
@@ -33,6 +33,10 @@ impl CaptureId {
 pub(crate) struct ViewRevision(u64);
 
 impl ViewRevision {
+    /// Reserved marker: the view counter reached it, so no further
+    /// frame can take a serial. Compared, never issued.
+    pub(crate) const EXHAUSTED: u64 = u64::MAX;
+
     pub(crate) fn new(raw: u64) -> Self {
         Self(raw)
     }
@@ -53,7 +57,7 @@ impl RequestId {
     /// can take a serial. Compared, never issued.
     pub(crate) const EXHAUSTED: u64 = u64::MAX;
 
-    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): runtime constructs status request IDs.
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): tests mint serials directly; the runtime reads them from taken requests.
     pub(crate) fn new(raw: u64) -> Self {
         Self(raw)
     }
@@ -230,20 +234,28 @@ pub(crate) enum PromotionOutcome {
     },
 }
 
-/// One runtime status update: the outcome plus the request serial it
-/// answers. A serial that is not the outstanding one is stale/foreign
-/// and ignored.
+/// One runtime status update: the capture it answers, the request
+/// serial and the outcome. The runtime builds it from the exact held
+/// request (see `PromotionRequest::status_update`), never from a
+/// global last request. A capture that is not the bound one, or a
+/// serial that is not the outstanding one, is stale/foreign and
+/// ignored before any mailbox/state/note change.
 #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): constructed by the runtime owner; consumed by set_status today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PromotionStatusUpdate {
+    pub(crate) capture: CaptureId,
     pub(crate) request: RequestId,
     pub(crate) outcome: PromotionOutcome,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): runtime reports preparation and activation results.
+#[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): constructed by the runtime owner from its held request; consumed by set_status today.
 impl PromotionStatusUpdate {
-    pub(crate) fn new(request: RequestId, outcome: PromotionOutcome) -> Self {
-        Self { request, outcome }
+    pub(crate) fn new(capture: CaptureId, request: RequestId, outcome: PromotionOutcome) -> Self {
+        Self {
+            capture,
+            request,
+            outcome,
+        }
     }
 }
 
@@ -533,13 +545,17 @@ impl PromotionControl {
         }
     }
 
-    /// Apply a runtime outcome. Accepted only for the outstanding
-    /// serial in a non-terminal state, along legal transitions: no
-    /// activation (or further preparation) once stopping was
-    /// requested, no refusal after activation, and an activation pair
-    /// must match the requested pair. Returns the new state, or `None`
-    /// for a stale/foreign/illegal update (state unchanged).
+    /// Apply a runtime outcome. Accepted only for the bound capture
+    /// and the outstanding serial in a non-terminal state, along legal
+    /// transitions: no activation (or further preparation) once
+    /// stopping was requested, no refusal after activation, and an
+    /// activation pair must match the requested pair. A foreign capture
+    /// rejects before any mailbox/state/note change. Returns the new
+    /// state, or `None` for a stale/foreign/illegal update (unchanged).
     pub(crate) fn set_status(&mut self, update: PromotionStatusUpdate) -> Option<PromotionState> {
+        if Some(update.capture) != self.capture {
+            return None;
+        }
         let outstanding = self.outstanding?;
         if outstanding.id != update.request {
             return None;
@@ -694,7 +710,11 @@ mod tests {
             .expect("first request queues");
         control.take_ticket().expect("runtime takes it");
         assert_eq!(
-            control.set_status(PromotionStatusUpdate::new(id, PromotionOutcome::Preparing)),
+            control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
+                id,
+                PromotionOutcome::Preparing
+            )),
             Some(PromotionState::Preparing)
         );
         assert_eq!(
@@ -712,6 +732,7 @@ mod tests {
         control.take_ticket().expect("runtime takes it");
         assert_eq!(
             control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
                 id,
                 PromotionOutcome::Active { pair: pair(1, 2) }
             )),
@@ -763,7 +784,11 @@ mod tests {
         // The runtime evidently holds the request, so a later take
         // must not duplicate custody.
         assert_eq!(
-            control.set_status(PromotionStatusUpdate::new(id, PromotionOutcome::Preparing)),
+            control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
+                id,
+                PromotionOutcome::Preparing
+            )),
             Some(PromotionState::Preparing)
         );
         assert_eq!(control.take_ticket(), None);
@@ -776,6 +801,7 @@ mod tests {
             .request(ViewRevision::new(1), pair(1, 2))
             .expect("request queues");
         let stale = PromotionStatusUpdate::new(
+            CaptureId::new(7),
             RequestId::new(id.get() + 1),
             PromotionOutcome::Active { pair: pair(1, 2) },
         );
@@ -788,7 +814,11 @@ mod tests {
     #[test]
     fn status_without_request_is_rejected() {
         let mut control = enabled_control();
-        let update = PromotionStatusUpdate::new(RequestId::new(1), PromotionOutcome::Preparing);
+        let update = PromotionStatusUpdate::new(
+            CaptureId::new(7),
+            RequestId::new(1),
+            PromotionOutcome::Preparing,
+        );
         assert_eq!(control.set_status(update), None);
         assert_eq!(control.state(), PromotionState::Idle);
     }
@@ -801,6 +831,7 @@ mod tests {
             .expect("request queues");
         assert_eq!(
             control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
                 id,
                 PromotionOutcome::Refused {
                     reason: PromotionRefusal::CallerRetired
@@ -811,6 +842,7 @@ mod tests {
         // A late activation for the refused request is not recorded.
         assert_eq!(
             control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
                 id,
                 PromotionOutcome::Active { pair: pair(1, 2) }
             )),
@@ -833,18 +865,24 @@ mod tests {
         // No activation after cancellation was requested.
         assert_eq!(
             control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
                 id,
                 PromotionOutcome::Active { pair: pair(1, 2) }
             )),
             None
         );
         assert_eq!(
-            control.set_status(PromotionStatusUpdate::new(id, PromotionOutcome::Preparing)),
+            control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
+                id,
+                PromotionOutcome::Preparing
+            )),
             None
         );
         assert_eq!(control.state(), PromotionState::Stopping);
         assert_eq!(
             control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
                 id,
                 PromotionOutcome::Ended {
                     reason: PromotionEnd::Cancelled
@@ -863,6 +901,7 @@ mod tests {
         control.take_ticket().expect("runtime takes it");
         assert_eq!(
             control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
                 id,
                 PromotionOutcome::Active { pair: pair(1, 2) }
             )),
@@ -871,6 +910,7 @@ mod tests {
         // Refusal after activation is incoherent: the runtime ends.
         assert_eq!(
             control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
                 id,
                 PromotionOutcome::Refused {
                     reason: PromotionRefusal::ScopeEnded
@@ -881,6 +921,7 @@ mod tests {
         assert_eq!(control.state(), PromotionState::Active);
         assert_eq!(
             control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
                 id,
                 PromotionOutcome::Ended {
                     reason: PromotionEnd::LaneClosed
@@ -899,6 +940,7 @@ mod tests {
         control.take_ticket().expect("runtime takes it");
         assert_eq!(
             control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
                 id,
                 PromotionOutcome::Active { pair: pair(9, 9) }
             )),
@@ -914,25 +956,42 @@ mod tests {
             .request(ViewRevision::new(3), pair(4, 6))
             .expect("request queues");
         assert_eq!(
-            control.set_status(PromotionStatusUpdate::new(id, PromotionOutcome::Preparing)),
+            control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
+                id,
+                PromotionOutcome::Preparing
+            )),
             Some(PromotionState::Preparing)
         );
         // An idempotent re-report is accepted without regressing.
         assert_eq!(
-            control.set_status(PromotionStatusUpdate::new(id, PromotionOutcome::Preparing)),
+            control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
+                id,
+                PromotionOutcome::Preparing
+            )),
             Some(PromotionState::Preparing)
         );
         assert_eq!(
-            control.set_status(PromotionStatusUpdate::new(id, PromotionOutcome::Validating)),
+            control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
+                id,
+                PromotionOutcome::Validating
+            )),
             Some(PromotionState::Validating)
         );
         // No backward step once validating.
         assert_eq!(
-            control.set_status(PromotionStatusUpdate::new(id, PromotionOutcome::Preparing)),
+            control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
+                id,
+                PromotionOutcome::Preparing
+            )),
             None
         );
         assert_eq!(
             control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
                 id,
                 PromotionOutcome::Active { pair: pair(4, 6) }
             )),
@@ -941,6 +1000,7 @@ mod tests {
         // The control never self-activates: only the runtime update did.
         assert_eq!(
             control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
                 id,
                 PromotionOutcome::Ended {
                     reason: PromotionEnd::RunStopped
@@ -991,6 +1051,7 @@ mod tests {
         control.take_ticket().expect("runtime takes it");
         assert_eq!(
             control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
                 id,
                 PromotionOutcome::Active { pair: pair(1, 2) }
             )),
@@ -1103,6 +1164,7 @@ mod tests {
             .expect("request queues");
         assert_eq!(
             control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
                 id,
                 PromotionOutcome::Refused {
                     reason: PromotionRefusal::ProviderUnloaded
@@ -1131,13 +1193,21 @@ mod tests {
         control.set_note(Some(PromotionNote::Duplicate));
         // An accepted status update clears it too.
         assert_eq!(
-            control.set_status(PromotionStatusUpdate::new(id, PromotionOutcome::Preparing)),
+            control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
+                id,
+                PromotionOutcome::Preparing
+            )),
             Some(PromotionState::Preparing)
         );
         assert_eq!(control.note(), None);
         // A rejected update leaves a standing note alone.
         control.set_note(Some(PromotionNote::Busy));
-        let stale = PromotionStatusUpdate::new(RequestId::new(999), PromotionOutcome::Validating);
+        let stale = PromotionStatusUpdate::new(
+            CaptureId::new(7),
+            RequestId::new(999),
+            PromotionOutcome::Validating,
+        );
         assert_eq!(control.set_status(stale), None);
         assert_eq!(control.note(), Some(PromotionNote::Busy));
     }
@@ -1236,10 +1306,15 @@ mod tests {
         assert_eq!(RequestId::new(1).get(), 1);
         assert_eq!(pair(1, 2).caller(), 1);
         assert_eq!(pair(1, 2).provider(), 2);
-        assert_eq!(
-            PromotionStatusUpdate::new(RequestId::new(1), PromotionOutcome::Preparing).request,
-            RequestId::new(1)
+        let update = PromotionStatusUpdate::new(
+            CaptureId::new(7),
+            RequestId::new(1),
+            PromotionOutcome::Preparing,
         );
+        assert_eq!(update.capture, CaptureId::new(7));
+        assert_eq!(update.request, RequestId::new(1));
+        assert_eq!(ViewRevision::EXHAUSTED, u64::MAX);
+        assert_eq!(RequestId::EXHAUSTED, u64::MAX);
     }
 
     #[test]
@@ -1269,7 +1344,11 @@ mod tests {
             .expect("request queues");
         control.take_ticket().expect("runtime takes it");
         assert_eq!(
-            control.set_status(PromotionStatusUpdate::new(id, PromotionOutcome::Preparing)),
+            control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
+                id,
+                PromotionOutcome::Preparing
+            )),
             Some(PromotionState::Preparing)
         );
         assert!(control.note_run_stopped());
@@ -1288,6 +1367,7 @@ mod tests {
         control.take_ticket().expect("runtime takes it");
         assert_eq!(
             control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
                 id,
                 PromotionOutcome::Active { pair: pair(1, 2) }
             )),
@@ -1308,6 +1388,7 @@ mod tests {
         assert!(control.note_run_stopped());
         assert_eq!(
             control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
                 id,
                 PromotionOutcome::Active { pair: pair(1, 2) }
             )),
@@ -1326,6 +1407,7 @@ mod tests {
         assert!(control.note_run_stopped());
         assert_eq!(
             control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
                 id,
                 PromotionOutcome::Ended {
                     reason: PromotionEnd::Cancelled
@@ -1336,6 +1418,7 @@ mod tests {
         // Exactly once: a repeated end is not re-recorded.
         assert_eq!(
             control.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(7),
                 id,
                 PromotionOutcome::Ended {
                     reason: PromotionEnd::Cancelled
@@ -1364,5 +1447,137 @@ mod tests {
         assert!(!control.enable(CaptureId::new(9)));
         assert_eq!(control.capture(), Some(CaptureId::new(7)));
         assert_eq!(control.take_ticket(), None);
+    }
+
+    fn captured_control(capture: u64) -> PromotionControl {
+        let mut control = PromotionControl::new();
+        assert!(control.enable(CaptureId::new(capture)));
+        control
+    }
+
+    #[test]
+    fn foreign_capture_preparing_leaves_state_mailbox_and_note_unchanged() {
+        let mut ours = captured_control(2);
+        let id = ours
+            .request(ViewRevision::new(1), pair(1, 2))
+            .expect("request 1 queues");
+        assert_eq!(id.get(), 1);
+        ours.set_note(Some(PromotionNote::Busy));
+        // Capture 1's request 1 for the same raw pair: numerically
+        // identical, but foreign.
+        let foreign = PromotionStatusUpdate::new(
+            CaptureId::new(1),
+            RequestId::new(1),
+            PromotionOutcome::Preparing,
+        );
+        assert_eq!(ours.set_status(foreign), None);
+        assert_eq!(ours.state(), PromotionState::Queued);
+        assert_eq!(ours.note(), Some(PromotionNote::Busy));
+        assert_eq!(ours.take_ticket().map(|ticket| ticket.id), Some(id));
+        // Our own update still works.
+        assert_eq!(
+            ours.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(2),
+                id,
+                PromotionOutcome::Preparing
+            )),
+            Some(PromotionState::Preparing)
+        );
+    }
+
+    #[test]
+    fn foreign_capture_active_refused_ended_all_reject() {
+        let mut ours = captured_control(2);
+        let id = ours
+            .request(ViewRevision::new(1), pair(1, 2))
+            .expect("request 1 queues");
+        ours.take_ticket().expect("runtime takes it");
+        for outcome in [
+            PromotionOutcome::Active { pair: pair(1, 2) },
+            PromotionOutcome::Refused {
+                reason: PromotionRefusal::CallerRetired,
+            },
+            PromotionOutcome::Ended {
+                reason: PromotionEnd::LaneClosed,
+            },
+        ] {
+            let foreign = PromotionStatusUpdate::new(CaptureId::new(1), id, outcome);
+            assert_eq!(ours.set_status(foreign), None, "{outcome:?}");
+            assert_eq!(ours.state(), PromotionState::Queued);
+        }
+        // Our own activation for the same pair still lands.
+        assert_eq!(
+            ours.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(2),
+                id,
+                PromotionOutcome::Active { pair: pair(1, 2) }
+            )),
+            Some(PromotionState::Active)
+        );
+    }
+
+    #[test]
+    fn foreign_ended_after_cancel_cannot_release_or_replace() {
+        let mut ours = captured_control(2);
+        let id = ours
+            .request(ViewRevision::new(1), pair(1, 2))
+            .expect("request 1 queues");
+        ours.take_ticket().expect("runtime takes it");
+        assert_eq!(ours.cancel(), PromotionCancel::Stopping);
+        // Foreign end for the same numeric serial: ignored, still busy.
+        assert_eq!(
+            ours.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(1),
+                id,
+                PromotionOutcome::Ended {
+                    reason: PromotionEnd::LaneClosed
+                }
+            )),
+            None
+        );
+        assert_eq!(ours.state(), PromotionState::Stopping);
+        assert_eq!(
+            ours.request(ViewRevision::new(2), pair(3, 4)),
+            Err(PromotionRefusal::Busy)
+        );
+        // Genuine cancellation end still lands exactly once.
+        assert_eq!(
+            ours.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(2),
+                id,
+                PromotionOutcome::Ended {
+                    reason: PromotionEnd::Cancelled
+                }
+            )),
+            Some(PromotionState::Ended(PromotionEnd::Cancelled))
+        );
+    }
+
+    #[test]
+    fn same_capture_stale_serial_and_wrong_pair_still_refuse() {
+        let mut ours = captured_control(2);
+        let id = ours
+            .request(ViewRevision::new(1), pair(1, 2))
+            .expect("request 1 queues");
+        ours.take_ticket().expect("runtime takes it");
+        // Same capture, wrong serial.
+        assert_eq!(
+            ours.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(2),
+                RequestId::new(999),
+                PromotionOutcome::Preparing
+            )),
+            None
+        );
+        // Same capture and serial, wrong active pair.
+        assert_eq!(
+            ours.set_status(PromotionStatusUpdate::new(
+                CaptureId::new(2),
+                id,
+                PromotionOutcome::Active { pair: pair(9, 9) }
+            )),
+            None
+        );
+        assert_eq!(ours.state(), PromotionState::Queued);
     }
 }

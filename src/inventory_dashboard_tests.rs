@@ -2985,7 +2985,11 @@ fn promoter_reports_active_only_from_runtime_and_holds_busy_after() {
         .expect("exact pair queues");
     promoter.take_request().expect("runtime takes it");
     assert_eq!(
-        promoter.set_status(PromotionStatusUpdate::new(id, PromotionOutcome::Preparing)),
+        promoter.set_status(PromotionStatusUpdate::new(
+            CaptureId::new(11),
+            id,
+            PromotionOutcome::Preparing
+        )),
         Some(PromotionState::Preparing)
     );
     // A repeat of the in-flight pair is a duplicate, not a new request.
@@ -2995,6 +2999,7 @@ fn promoter_reports_active_only_from_runtime_and_holds_busy_after() {
     );
     assert_eq!(
         promoter.set_status(PromotionStatusUpdate::new(
+            CaptureId::new(11),
             id,
             PromotionOutcome::Active {
                 pair: PromotionPair::new(edge.caller.0, edge.module.0)
@@ -3017,6 +3022,7 @@ fn promoter_reports_active_only_from_runtime_and_holds_busy_after() {
     assert_eq!(promoter.cancel(), PromotionCancel::Stopping);
     assert_eq!(
         promoter.set_status(PromotionStatusUpdate::new(
+            CaptureId::new(11),
             id,
             PromotionOutcome::Active {
                 pair: PromotionPair::new(edge.caller.0, edge.module.0)
@@ -3026,6 +3032,7 @@ fn promoter_reports_active_only_from_runtime_and_holds_busy_after() {
     );
     assert_eq!(
         promoter.set_status(PromotionStatusUpdate::new(
+            CaptureId::new(11),
             id,
             PromotionOutcome::Ended {
                 reason: PromotionEnd::Cancelled

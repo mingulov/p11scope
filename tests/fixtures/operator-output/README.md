@@ -372,3 +372,8 @@ its no-signal oracle; actual helper/PMU observations still need execution. The
 adapter does not activate the blocked-stderr E17 cell. Main blocked after actual
 handler delivery, wrong actual worker thread and full blocked-stderr
 pressure/content/cleanup oracles remain explicit acceptance dependencies.
+
+Observer stderr is finished through the existing bounded Reader contract while
+the original child remains unreaped, before any no-signal absence or final probe
+verdict. An actual exited-child/gated-reader control proves that delayed queued
+stderr cannot be accepted as empty merely because the process has exited.

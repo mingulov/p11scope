@@ -6,6 +6,7 @@ import os
 import subprocess
 import struct
 import tempfile
+import threading
 import sys
 import time
 from pathlib import Path
@@ -619,6 +620,51 @@ class InventorySavedCaptureTests(unittest.TestCase):
 
 
 class ReporterControlAdapterTests(unittest.TestCase):
+    def test_no_signal_absence_waits_for_actual_delayed_reader_after_child_exit(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/qualify_reporter_probe.py'))
+        gate, finish_started = threading.Event(), threading.Event()
+        result = []
+        class GatedStream:
+            def __iter__(self):
+                if not gate.wait(2):
+                    raise OSError('test reader gate never opened')
+                yield from child.stdout
+        class ObservedReader(HARNESS['NATIVE'].Reader):
+            def finish(self):
+                finish_started.set()
+                return super().finish()
+        with tempfile.TemporaryDirectory() as temporary:
+            child = subprocess.Popen([sys.executable, '-I', '-c',
+                'import os; os.write(1,b"p11scope: cancel: loop exited on signal 2 after 3 ticks\\n")'],
+                stdout=subprocess.PIPE, text=True)
+            reader = ObservedReader(GatedStream(), Path(temporary) / 'delayed-stderr')
+            collector = None
+            try:
+                self.assertEqual(child.wait(timeout=3), 0)
+                self.assertEqual(reader.lines, [], 'owned reader must still hold the late bytes')
+                def collect():
+                    try:
+                        module['observer_diagnostics'](reader, no_signal=True)
+                    except BaseException as error:
+                        result.append(error)
+                collector = threading.Thread(target=collect)
+                collector.start()
+                self.assertTrue(finish_started.wait(1), 'absence check must finish the actual reader first')
+                self.assertTrue(collector.is_alive())
+                gate.set()
+                collector.join(timeout=3)
+                self.assertFalse(collector.is_alive())
+                self.assertEqual(len(result), 1)
+                self.assertIsInstance(result[0], ValueError)
+                self.assertIn('no-signal', str(result[0]))
+                self.assertIn('p11scope: cancel:', ''.join(reader.lines))
+            finally:
+                gate.set()
+                if collector:
+                    collector.join(timeout=3)
+                reader.thread.join(timeout=3)
+                child.stdout.close()
+
     def test_no_signal_control_cannot_accept_sample_fixture_loss_or_foreign_ready(self):
         module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/qualify_reporter_probe.py'))
         expected = dict(pid=123, tid=123, start_time=9, dev=2, ino=3, file_offset=80)

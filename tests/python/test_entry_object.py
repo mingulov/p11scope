@@ -110,7 +110,7 @@ class EntryObjectTests(unittest.TestCase):
                     tag_pc, tag_text = next((pc, text) for pc, text in scalar_insns
                         if text == "r1 = *(u64 *)(r10 - 0x20)")
                     guard_pc, guard_text = next((pc, text) for pc, text in scalar_insns
-                        if re.fullmatch(r"if r1 (==|!=) 0x0 goto .*", text))
+                        if re.fullmatch(r"if r1 (==|!=) 0x[01] goto .*", text))
                     zero_pc, zero_text = next((pc, text) for pc, text in scalar_insns if text == "r0 = 0x0")
                     for pc, replacement in [(scalar_insns[0][0], "r1 = r2"),
                             (scalar_insns[2][0], "call 0x70"),

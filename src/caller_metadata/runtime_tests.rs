@@ -261,3 +261,145 @@ fn off_frame_has_no_metadata_or_storage_and_epoch_zero_never_starts() {
     invalid.synchronize([caller(0)], 0);
     assert!(invalid.next(0).is_none());
 }
+
+#[test]
+fn immutable_frame_projection_agrees_across_json_identity_text_and_stream() {
+    use crate::discovery::caller_registry::RegistryLimits;
+    use crate::discovery::inventory_workload::{Harness, ScaleSpec};
+    use crate::inventory_event_identity::IdentityIndex;
+    use crate::inventory_events::EventWriter;
+    use crate::inventory_present::Presentation;
+    use std::io::{Read as _, Seek as _};
+
+    let mut harness = Harness::new(RegistryLimits::default_limits()).unwrap();
+    harness.stage_scale(&ScaleSpec {
+        name: "metadata-consumers",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 4,
+        first_pid: 91_000,
+    });
+    harness.commit();
+    let mut view = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    let before = crate::inventory::render_json_from_presentation(&view);
+    assert!(before["callers"][0].get("metadata").is_none());
+    assert_eq!(before["caller_metadata"]["mode"], "none");
+
+    let mut runtime = MetadataRuntime::new(7);
+    let mut observed = caller(view.callers[0].id.0);
+    observed.incarnation = view.callers[0].incarnation;
+    runtime.synchronize([observed], 0);
+    let ticket = runtime.next(0).unwrap();
+    assert!(runtime.finish(ticket, observed, Ok(sample()), 20));
+    view.caller_metadata = runtime.frame();
+    let json = crate::inventory::render_json_from_presentation(&view);
+    let context = IdentityIndex::new(&view).caller_context(observed.id);
+    assert_eq!(json["callers"][0]["metadata"], context["metadata"]);
+    assert_eq!(
+        json["callers"][0]["metadata"]["container"]["id"],
+        "a".repeat(64)
+    );
+    assert_eq!(
+        json["budgets"], before["budgets"],
+        "display context cannot change accounting"
+    );
+    assert_eq!(
+        json["edges"], before["edges"],
+        "display context cannot grant admission or counts"
+    );
+    let detail = crate::caller_metadata::consumer::detail(
+        view.caller_metadata.metadata(observed.id).unwrap(),
+        view.ended_ns,
+    );
+    assert!(crate::inventory_present::render_snapshot(&view).contains(&detail));
+
+    let file = tempfile::tempfile().unwrap();
+    let mut reader = file.try_clone().unwrap();
+    let mut writer = EventWriter::anonymous_test_sink(file);
+    let mut emitter = crate::caller_metadata::consumer::MetadataEmitter::default();
+    assert_eq!(emitter.emit(&mut writer, &view, 20, false).unwrap(), 1);
+    assert_eq!(emitter.emit(&mut writer, &view, 30, false).unwrap(), 0);
+    runtime.synchronize([observed], REFRESH_NS);
+    let ticket = runtime.next(REFRESH_NS).unwrap();
+    runtime.finish(ticket, observed, Ok(sample()), REFRESH_NS + 20);
+    view.caller_metadata = runtime.frame();
+    assert_eq!(
+        emitter
+            .emit(&mut writer, &view, REFRESH_NS + 20, false)
+            .unwrap(),
+        0,
+        "unchanged refresh not an event"
+    );
+    runtime.synchronize([observed], REFRESH_NS * 2);
+    let ticket = runtime.next(REFRESH_NS * 2).unwrap();
+    runtime.refuse(ticket, MetadataReason::ReadFailed);
+    view.caller_metadata = runtime.frame();
+    assert_eq!(
+        emitter
+            .emit(&mut writer, &view, REFRESH_NS * 2, false)
+            .unwrap(),
+        1
+    );
+    let failure =
+        crate::inventory::render_json_from_presentation(&view)["callers"][0]["metadata"].clone();
+    observed.retired = true;
+    runtime.synchronize([observed], REFRESH_NS * 3);
+    view.caller_metadata = runtime.frame();
+    assert_eq!(
+        emitter
+            .emit(&mut writer, &view, REFRESH_NS * 3, false)
+            .unwrap(),
+        1
+    );
+    reader.rewind().unwrap();
+    let mut bytes = String::new();
+    reader.read_to_string(&mut bytes).unwrap();
+    let records: Vec<serde_json::Value> = bytes
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 3);
+    assert!(
+        records
+            .iter()
+            .all(|record| record["kind"] == "caller_metadata_changed")
+    );
+    assert_eq!(
+        records[0]["event"]["metadata"],
+        json["callers"][0]["metadata"]
+    );
+    assert_eq!(records[1]["event"]["metadata"], failure);
+    assert_eq!(records[2]["event"]["metadata"]["status"], "historical");
+    assert_eq!(records[2]["event"]["metadata"]["reason"], "read_failed");
+}
+
+#[test]
+fn final_frame_ages_sample_without_mutating_table_or_unknown_causes() {
+    let mut runtime = MetadataRuntime::new(7);
+    runtime.synchronize([caller(0), caller(1)], 0);
+    let healthy = runtime.next(0).unwrap();
+    runtime.finish(healthy, caller(0), Ok(sample()), 10);
+    let failed = runtime.next(0).unwrap();
+    runtime.refuse(failed, MetadataReason::ProcessExited);
+    let fresh = runtime.frame();
+    let final_frame = runtime.frame_at(STALE_NS + 11);
+    assert_eq!(
+        final_frame.metadata(CallerId(0)).unwrap().status,
+        MetadataStatus::Stale
+    );
+    assert_eq!(final_frame.summary.stale, 1);
+    assert_eq!(final_frame.summary.sampled, 0);
+    assert_eq!(
+        final_frame.metadata(CallerId(1)).unwrap().reason,
+        Some(MetadataReason::ProcessExited)
+    );
+    assert_eq!(
+        fresh.metadata(CallerId(0)).unwrap().status,
+        MetadataStatus::Sampled
+    );
+    assert_eq!(
+        runtime.frame().metadata(CallerId(0)).unwrap().status,
+        MetadataStatus::Sampled
+    );
+}

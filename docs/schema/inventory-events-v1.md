@@ -349,6 +349,25 @@ Inline placement and bounded rotation lifetime are authorized by the
 It adds no reads or capture and publishes no command line, environment, `comm`,
 raw native tgid, task cookie or exec ID in these compact contexts.
 
+## Caller metadata (additive within v1; proposed)
+
+**Status: PROPOSED; implementation, publication and installed acceptance
+pending.** No producer emits these payloads until the DR04 owner wires
+the opt-in, the coordinator and the shared `Presentation` revision.
+Existing kinds, budgets, rotation and loss accounting are unchanged.
+
+The proposed contract carries the same immutable frame metadata in
+snapshots, dashboards and the stream: JSON, snapshots and dashboard
+consume exactly one `Presentation` revision. The bounded
+`caller_metadata_changed` event is keyed by CallerId plus metadata
+`revision` and fires on semantic payload changes from that same frame;
+unchanged refreshes may update sample time in normal snapshots without
+one event per refresh, and baseline events contain current state.
+Migration, stale and historical transitions must reach all consumers;
+diff may display metadata changes separately but never uses metadata
+as a cross-capture caller/provider identity join or revises counters
+from it.
+
 ## Example (abridged)
 
 ```json

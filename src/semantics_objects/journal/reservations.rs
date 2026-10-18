@@ -95,6 +95,28 @@ impl<C> ReservationTable<C> {
         self.populations[role.index()]
     }
 
+    pub(super) fn reservation(&self, role: Role, key: RoleKey) -> Option<ReservationId> {
+        let at = self.key_slot(role, key)?;
+        self.slots[at].as_ref()?.aliases[0]
+    }
+
+    pub(super) fn release_role(&mut self, role: Role) {
+        for slot in &mut self.slots {
+            let Some(operation) = slot.as_mut() else {
+                continue;
+            };
+            if let Some(member) = operation.roles[role.index()].take() {
+                self.populations[role.index()] -= 1;
+                self.bytes -= member.bytes;
+                drop(member);
+            }
+            if operation.roles.iter().all(Option::is_none) {
+                *slot = None;
+                self.live -= 1;
+            }
+        }
+    }
+
     fn key_slot(&self, role: Role, key: RoleKey) -> Option<usize> {
         self.slots.iter().position(|slot| {
             slot.as_ref().is_some_and(|operation| {

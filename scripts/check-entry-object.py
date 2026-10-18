@@ -1018,7 +1018,7 @@ class _SeedCaller(Consumer):
 def scalar_scope_flags_contract(disassembly):
     """Summarize only the actual scalar wrapper's own-stack/full-word effects.
 
-    The real authority body remains scope_auth. This eight-instruction
+    The real authority body remains scope_auth. This finite branch-first
     wrapper supplies its own 32-byte output, returns flags64 on Some and zero
     on None, and cannot write a caller's seed or perform a target read.
     """
@@ -1030,13 +1030,10 @@ def scalar_scope_flags_contract(disassembly):
         return None  # Earlier objects call the already-modeled authority directly.
     name = names[0]
     insns = D.instructions(blocks[name])
-    patterns = (r"r1 = r10", r"r1 \+= -0x20", r"call -?0x[0-9a-f]+",
-                r"r0 = \*\(u64 \*\)\(r10 - 0x18\)",
-                r"r1 = \*\(u64 \*\)\(r10 - 0x20\)",
-                r"if r1 != 0x0 goto .*", r"r0 = 0x0", r"exit")
-    require(len(insns) == len(patterns)
-            and all(re.fullmatch(pattern, text) for (_, text), pattern in zip(insns, patterns)),
-            "scalar scope flags own-stack/full64/discriminant effects")
+    require(8 <= len(insns) <= 9 and insns[0][1] == "r1 = r10"
+            and insns[1][1] == "r1 += -0x20"
+            and re.fullmatch(r"call -?0x[0-9a-f]+", insns[2][1]),
+            "scalar scope flags own-stack/call effects")
     authority = [candidate for candidate in blocks
                  if re.fullmatch(r"_RNv[0-9A-Za-z]+_13p11scope_ebpf10scope_auth", candidate)]
     calls = [(pc, target) for caller, _, pc, target in D.internal_call_targets(split[".text"])
@@ -1044,8 +1041,39 @@ def scalar_scope_flags_contract(disassembly):
     require(len(authority) == 1 and len(calls) == 1 and calls[0][0] == insns[2][0]
             and calls[0][1] == authority[0],
             "scalar scope flags one actual scope_auth callee")
-    require(D.relative_target(insns[5][0], insns[5][1]) == insns[7][0],
-            "scalar scope flags zero-refusal branch")
+    roles = {"tag": [], "flags": [], "zero": [], "guard": [], "exit": [], "jump": []}
+    for pc, text in insns[3:]:
+        if text == "r1 = *(u64 *)(r10 - 0x20)": role = "tag"
+        elif text == "r0 = *(u64 *)(r10 - 0x18)": role = "flags"
+        elif text == "r0 = 0x0": role = "zero"
+        elif re.fullmatch(r"if r1 (==|!=) 0x0 goto .*", text): role = "guard"
+        elif text == "exit": role = "exit"
+        elif re.fullmatch(r"goto .*", text): role = "jump"
+        else: raise RuntimeError("scalar scope flags unknown/full64/discriminant effect")
+        roles[role].append(pc)
+    require(all(len(roles[role]) == 1 for role in ("tag", "flags", "zero", "guard", "exit"))
+            and len(roles["jump"]) <= 1, "scalar scope flags finite effect inventory")
+    texts = dict(insns)
+    _, graph = D.instruction_graph(blocks[name])
+    entry, tag, flags, zero, guard, end = (insns[0][0], roles["tag"][0], roles["flags"][0],
+                                        roles["zero"][0], roles["guard"][0], roles["exit"][0])
+    for pc in roles["guard"] + roles["jump"]:
+        target = D.relative_target(pc, texts[pc])
+        require(target in texts and target > pc, "scalar scope flags finite forward branch")
+    require(guard not in D.reachable(graph, [entry], blocked={tag}),
+            "scalar scope flags initialized discriminant")
+    target = D.relative_target(guard, texts[guard])
+    other = next(edge for edge in graph[guard] if edge != target)
+    some, absent = (target, other) if " != " in texts[guard] else (other, target)
+    require(flags in D.reachable(graph, [some]) and end in D.reachable(graph, [absent])
+            and flags not in D.reachable(graph, [entry], blocked={guard})
+            and flags not in D.reachable(graph, [absent])
+            and end not in D.reachable(graph, [some], blocked={flags}),
+            "scalar scope flags payload load before discriminant/refusal")
+    require(end not in D.reachable(graph, [absent], blocked={zero})
+            and zero not in D.reachable(graph, [flags])
+            and end in D.reachable(graph, [flags]),
+            "scalar scope flags zero-refusal/fullword return")
     return name
 
 

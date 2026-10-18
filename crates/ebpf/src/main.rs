@@ -484,7 +484,13 @@ fn scope_auth() -> Option<ScopeAuth> {
 #[cfg(not(feature = "inventory-only"))]
 #[inline(never)]
 fn scope_flags_word() -> u64 {
-    scope_auth().map_or(0, |scope| scope.flags)
+    let receipt = scope_auth();
+    match receipt.as_ref() {
+        // Volatile access must remain inside Some: LLVM may otherwise
+        // speculate a load of the uninitialized None payload on BPF.
+        Some(scope) => unsafe { core::ptr::addr_of!(scope.flags).read_volatile() },
+        None => 0,
+    }
 }
 
 #[cfg(not(feature = "inventory-only"))]

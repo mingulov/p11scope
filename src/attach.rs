@@ -49,6 +49,7 @@ pub(crate) mod detailed_identity;
 mod ended_pid_retirement;
 mod global_retirement;
 mod native_retirement;
+mod object_stop;
 #[cfg(test)]
 pub(crate) use native_retirement::fixture::RetirementFixture;
 pub(crate) use native_retirement::{RetirementPoll, RetirementTicket};
@@ -6450,7 +6451,7 @@ impl Session {
             .discovery_consumer
             .as_mut()
             .context("retained DISCOVERY consumer vanished after creation")?;
-        Ok(crate::run::quiesce_with(
+        let state = crate::run::quiesce_with(
             gate,
             budget,
             || {
@@ -6464,7 +6465,12 @@ impl Session {
                 service_discovery(&mut *discovery);
             },
             now,
-        ))
+        );
+        if matches!(state, crate::run::StopState::Quiesced { .. }) {
+            object_stop::scrub_after_quiescence(&mut self.ebpf, gate)
+                .context("scrubbing object START after terminal quiescence")?;
+        }
+        Ok(state)
     }
 
     /// The EVENTS ring's current positions, for reading the Q stop

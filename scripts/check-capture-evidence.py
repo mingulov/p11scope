@@ -2714,10 +2714,15 @@ def validate_canary(lane, document, target_bits=64):
         "owned-default-metrics": ("aggregate", "metrics", "scanned"),
         "owned-feature-metrics": ("aggregate", "metrics", "scanned"),
         "freeze-unsafe-profile": ("unsafe", "profile", "manifest-only"),
+        "object-lp64": ("object", "profile", "scanned"),
+        "object-ia32": ("object", "profile", "scanned"),
     }
     require(lane in lanes, f"unknown canary lane: {lane}")
     require(target_bits in (32, 64), f"invalid canary target width: {target_bits!r}")
     policy, kind, discovery = lanes[lane]
+    if policy == "object":
+        require(lane == ("object-ia32" if target_bits == 32 else "object-lp64"),
+                "object lane contradicts the selected target ABI")
     owned_metrics = lane in {"owned-default-metrics", "owned-feature-metrics"}
     trace = kind == "trace"
     evidence = document if trace else document["evidence"]
@@ -2751,7 +2756,8 @@ def validate_canary(lane, document, target_bits=64):
         run=owned_metrics,
     )
     allowances = dict(
-        SAFE_ALLOWANCES if policy == "safe" else UNSAFE_ALLOWANCES if policy == "unsafe" else {}
+        SAFE_ALLOWANCES if policy == "safe" else UNSAFE_ALLOWANCES if policy == "unsafe" else
+        {"orphan_ops": 1, "operation_state_imports": 1} if policy == "object" else {}
     )
     if scanned and target_bits == 64:
         allowances["discovery_conflicts"] = 1
@@ -2777,6 +2783,7 @@ def validate_canary(lane, document, target_bits=64):
         "safe": "allowlisted",
         "unsafe": "unsafe-unvalidated-metadata",
         "aggregate": "aggregate-only",
+        "object": "allowlisted",
     }[policy]
     if trace:
         require(evidence["privacy_mode"] == privacy, evidence["privacy_mode"])
@@ -2820,6 +2827,66 @@ def validate_canary(lane, document, target_bits=64):
                 == ("none", 0, 0, 0),
                 "owned metrics requires exact never-pause evidence",
             )
+    elif policy == "object":
+        validate_object_canary_functions(document)
+
+
+OBJECT_CANARY_ORDINALS = {
+    "C_CreateObject": 20, "C_CopyObject": 21, "C_DestroyObject": 22,
+    "C_GetObjectSize": 23, "C_GetAttributeValue": 24, "C_SetAttributeValue": 25,
+    "C_FindObjects": 27, "C_EncryptInit": 29, "C_DecryptInit": 33,
+    "C_DigestKey": 40, "C_SignInit": 42, "C_SignRecoverInit": 46,
+    "C_VerifyInit": 48, "C_VerifyRecoverInit": 52, "C_GenerateKey": 58,
+    "C_GenerateKeyPair": 59, "C_WrapKey": 60, "C_UnwrapKey": 61,
+    "C_DeriveKey": 62, "C_SetOperationState": 17, "C_MessageEncryptInit": 72,
+    "C_MessageDecryptInit": 77, "C_MessageSignInit": 82, "C_MessageVerifyInit": 87,
+    "C_VerifySignatureInit": 94,
+}
+
+
+def validate_object_canary_functions(document):
+    """Exact independent aggregate ledger beside the retained raw-map oracle."""
+    rows = document["functions"]
+    require(isinstance(rows, list) and len(rows) == 104, "object canary requires all 104 fixture rows")
+    wanted = {name: 6 if name == "C_GetAttributeValue" else 1 for name in OBJECT_CANARY_ORDINALS}
+    seen_names, seen_targets, actual = set(), set(), {}
+    for row in rows:
+        exact_keys(row, {"names", "aliased", "target", "ordinals", "module", "module_ambiguous",
+                         "module_unresolved", "calls", "errors", "pending_returns", "in_flight",
+                         "latency_ns", "rv_counts"}, "object function")
+        names = row["names"]
+        require(isinstance(names, list) and len(names) == 1 and isinstance(names[0], str),
+                "object function requires one unaliased name")
+        name = names[0]
+        require(name not in seen_names and row["aliased"] is False, "duplicate/aliased object function")
+        seen_names.add(name)
+        target = json.dumps(row["target"], sort_keys=True, separators=(",", ":"))
+        require(target not in seen_targets, "duplicate object function target")
+        seen_targets.add(target)
+        calls = row["calls"]
+        require(u64(calls), "object function call count is not u64")
+        require(calls == wanted.get(name, 0), "object function call count differs from workload ledger")
+        if calls:
+            actual[name] = calls
+            require(row["ordinals"] and {entry["ordinal"] for entry in row["ordinals"]}
+                    == {OBJECT_CANARY_ORDINALS[name]}, "object function ordinal differs from named call")
+        errors = 5 if name == "C_GetAttributeValue" else 0
+        require(u64(row["errors"]) and row["errors"] == errors, "object function error count differs")
+        for field in ("pending_returns", "in_flight"):
+            require(u64(row[field]) and row[field] == 0, f"object function {field} must be zero")
+        expected_rvs = ({f"0x{rv:016x}": 1 for rv in (0, 17, 18, 336, 5, 1)}
+                        if name == "C_GetAttributeValue" else {"0x0000000000000000": 1} if calls else {})
+        rvs = row["rv_counts"]
+        require(isinstance(rvs, dict) and all(u64(count, positive=True) for count in rvs.values())
+                and rvs == expected_rvs, "object function full-width RV counts differ from actual ledger")
+        latency = row["latency_ns"]
+        exact_keys(latency, {"approximate", "p50", "p95", "p99", "total", "max"}, "object function latency")
+        require(latency["approximate"] is True and u64(latency["total"]) and u64(latency["max"])
+                and latency["max"] <= latency["total"], "invalid object function latency")
+        for field in ("p50", "p95", "p99"):
+            require(u64(latency[field]) if calls else latency[field] is None,
+                    "object function latency lacks its exact call population")
+    require(actual == wanted and sum(actual.values()) == 30, "object canary lacks the complete 30-call ledger")
 
 
 # Every induced-gap lane holds its workload behind a go-file, so nothing has
@@ -4131,6 +4198,67 @@ def self_test():
     validate_canary("default-safe-profile", safe32, 32)
     rejected(lambda: validate_canary("default-safe-profile", safe32, 64))
     rejected(lambda: validate_canary("default-safe-profile", safe, 32))
+    # Independently literal H7 ledger expectations. These constructed documents
+    # test the validator; they do not stand in for installed canary captures.
+    object_ordinals = {
+        "C_CreateObject": 20, "C_CopyObject": 21, "C_DestroyObject": 22,
+        "C_GetObjectSize": 23, "C_GetAttributeValue": 24, "C_SetAttributeValue": 25,
+        "C_FindObjects": 27, "C_EncryptInit": 29, "C_DecryptInit": 33,
+        "C_DigestKey": 40, "C_SignInit": 42, "C_SignRecoverInit": 46,
+        "C_VerifyInit": 48, "C_VerifyRecoverInit": 52, "C_GenerateKey": 58,
+        "C_GenerateKeyPair": 59, "C_WrapKey": 60, "C_UnwrapKey": 61,
+        "C_DeriveKey": 62, "C_SetOperationState": 17, "C_MessageEncryptInit": 72,
+        "C_MessageDecryptInit": 77, "C_MessageSignInit": 82, "C_MessageVerifyInit": 87,
+        "C_VerifySignatureInit": 94,
+    }
+    for bits, prior in ((64, safe), (32, safe32)):
+        objects = copy.deepcopy(prior)
+        objects["evidence"].update({name: 0 for name in COUNTERS})
+        objects["evidence"].update(orphan_ops=1, operation_state_imports=1,
+                                   discovery_conflicts=int(bits == 64))
+        pairs = [([name], 6 if name == "C_GetAttributeValue" else 1)
+                 for name in object_ordinals]
+        pairs += [([f"C_Uncalled_{index}"], 0) for index in range(79)]
+        objects["functions"] = function_items(pairs)
+        for row in objects["functions"]:
+            get = row["names"] == ["C_GetAttributeValue"]
+            row.update(errors=5 if get else 0, pending_returns=0, in_flight=0,
+                       latency_ns={"approximate": True, "p50": 1 if row["calls"] else None,
+                                   "p95": 1 if row["calls"] else None,
+                                   "p99": 1 if row["calls"] else None,
+                                   "total": row["calls"], "max": int(row["calls"] > 0)},
+                       rv_counts=({f"0x{rv:016x}": 1 for rv in (0, 17, 18, 336, 5, 1)} if get
+                                  else {"0x0000000000000000": 1} if row["calls"] else {}))
+            if row["names"][0] in object_ordinals:
+                row["ordinals"] = [{"table_file_offset": None,
+                                     "ordinal": object_ordinals[row["names"][0]]}]
+        settle_fixture_verdict(objects)
+        lane = "object-ia32" if bits == 32 else "object-lp64"
+        validate_canary(lane, objects, bits)
+        rejected(lambda: validate_canary(lane, prior, bits))
+        rejected(lambda: validate_canary(lane, objects, 96 - bits))
+        rejected(lambda: validate_canary("object-synthetic", objects, bits))
+        for mutate in (
+            lambda d: d["functions"].pop(),
+            lambda d: d["functions"].clear(),
+            lambda d: d["functions"][0].update(calls=0, rv_counts={}),
+            lambda d: d["functions"][0].update(names=["C_Initialize"]),
+            lambda d: d["functions"][0].update(calls=True),
+            lambda d: d["functions"][0].update(pointer=0x1234),
+            lambda d: d["functions"][0]["ordinals"][0].update(ordinal=21),
+            lambda d: d["functions"][1]["target"].update(file_offset=0x1000),
+            lambda d: d["functions"][4]["rv_counts"].pop("0x0000000000000011"),
+            lambda d: d["functions"][4].update(errors=4),
+            lambda d: d["functions"][4].update(pending_returns=1),
+            lambda d: d["functions"][4]["rv_counts"].update({"0x11": 1}),
+            lambda d: d["evidence"].update(event_loss=1),
+            lambda d: d["evidence"].pop("interface_selection"),
+        ):
+            bad = copy.deepcopy(objects)
+            mutate(bad)
+            settle_fixture_verdict(bad)
+            rejected(lambda bad=bad: validate_canary(lane, bad, bits))
+    print("object canary requires exact 30-call function/RV ledger and target ABI: OK")
     for label, mutate in (
         ("missing ia32 scan table", lambda d: d["evidence"]["discovery"][0]["tables"].pop()),
         (

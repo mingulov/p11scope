@@ -19,8 +19,8 @@
 //! initialized only in observer preparation.
 //!
 //! Hermeticity: no test substitutes host BTF (aya hardcodes the sysfs
-//! path), so the cache cannot shadow a fixture. Cache tests drive local
-//! cells with injected loaders and never touch the production cell.
+//! path), so the cache cannot shadow a fixture. The tests below drive
+//! local cells with injected loaders and never touch the production cell.
 
 use std::sync::OnceLock;
 
@@ -104,4 +104,156 @@ fn cached(
 /// result: no per-query clone of the parse and no repeated name lookup.
 pub(crate) fn shared() -> Result<&'static HostBtf, CachedError> {
     cached(&HOST_BTF, aya::Btf::from_sys_fs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Minimal byte-built BTF blob: INT id 1 plus, when asked, the FUNC id 2
+    /// the selector probe looks for. Pure synthetic bytes; no sysfs read.
+    fn fixture_blob(with_selector: bool) -> Vec<u8> {
+        fn intern(strings: &mut Vec<u8>, text: &str) -> u32 {
+            let offset = strings.len() as u32;
+            strings.extend_from_slice(text.as_bytes());
+            strings.push(0);
+            offset
+        }
+        fn header(types: &mut Vec<u8>, name_off: u32, kind: u32, vlen: u32, size_or_type: u32) {
+            types.extend_from_slice(&name_off.to_le_bytes());
+            types.extend_from_slice(&((kind << 24) | vlen).to_le_bytes());
+            types.extend_from_slice(&size_or_type.to_le_bytes());
+        }
+        let mut types = Vec::new();
+        let mut strings = vec![0u8];
+        header(&mut types, intern(&mut strings, "unsigned int"), 1, 0, 4);
+        types.extend_from_slice(&0x0100_0020u32.to_le_bytes());
+        if with_selector {
+            header(
+                &mut types,
+                intern(&mut strings, PIDFD_SELECTOR_TYPE),
+                12,
+                0,
+                1,
+            );
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&0xE_B9Fu16.to_le_bytes());
+        out.extend_from_slice(&[0x01, 0x00]);
+        out.extend_from_slice(&24u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(types.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(types.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+        out.extend_from_slice(&types);
+        out.extend_from_slice(&strings);
+        out
+    }
+
+    fn parse_fixture(with_selector: bool) -> Result<aya::Btf, aya::BtfError> {
+        aya::Btf::parse(&fixture_blob(with_selector), aya::Endianness::default())
+    }
+
+    #[test]
+    fn local_cell_parses_success_once_and_shares_one_allocation() {
+        let cell = OnceLock::new();
+        let calls = AtomicUsize::new(0);
+        let loader = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            parse_fixture(true)
+        };
+        let first = cached(&cell, loader).expect("byte fixture parses");
+        assert!(first.supports_pidfd_iter_selector());
+        assert!(
+            first
+                .btf()
+                .id_by_type_name_kind(PIDFD_SELECTOR_TYPE, aya_obj::btf::BtfKind::Func)
+                .is_ok()
+        );
+        let loader = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            parse_fixture(true)
+        };
+        let second = cached(&cell, loader).expect("cached facts repeat");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one parse per cell");
+        assert!(std::ptr::eq(first, second), "one shared allocation");
+    }
+
+    #[test]
+    fn local_cell_reports_absent_selector_without_failing() {
+        let fresh = parse_fixture(false).expect("byte fixture parses");
+        assert!(
+            fresh
+                .id_by_type_name_kind(PIDFD_SELECTOR_TYPE, aya_obj::btf::BtfKind::Func)
+                .is_err()
+        );
+        let cell = OnceLock::new();
+        let host = cached(&cell, || parse_fixture(false)).expect("parse succeeds");
+        assert!(!host.supports_pidfd_iter_selector());
+    }
+
+    #[test]
+    fn local_cell_caches_absence_and_never_reloads() {
+        fn missing() -> Result<aya::Btf, aya::BtfError> {
+            aya::Btf::parse_file("/nonexistent-p11scope-host-btf", aya::Endianness::default())
+        }
+        missing().expect_err("the absence loader must fail");
+        let cell = OnceLock::new();
+        let calls = AtomicUsize::new(0);
+        let loader = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            missing()
+        };
+        let first = match cached(&cell, loader) {
+            Err(error) => error,
+            Ok(_) => panic!("absence must fail closed"),
+        };
+        let loader = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            missing()
+        };
+        let second = match cached(&cell, loader) {
+            Err(error) => error,
+            Ok(_) => panic!("absence must fail closed"),
+        };
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one load per cell");
+        assert_eq!(first.to_string(), second.to_string());
+        assert_eq!(format!("{first:?}"), format!("{second:?}"));
+        let raw = missing().expect_err("the absence loader must fail");
+        assert_eq!(first.to_string(), raw.to_string());
+        assert_eq!(format!("{first:?}"), format!("{raw:?}"));
+    }
+
+    #[test]
+    fn local_cell_caches_malformed_and_never_reloads() {
+        fn malformed() -> Result<aya::Btf, aya::BtfError> {
+            aya::Btf::parse(&[0x7Fu8; 64], aya::Endianness::default())
+        }
+        malformed().expect_err("the malformed loader must fail");
+        let cell = OnceLock::new();
+        let calls = AtomicUsize::new(0);
+        let loader = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            malformed()
+        };
+        let first = match cached(&cell, loader) {
+            Err(error) => error,
+            Ok(_) => panic!("malformed input must fail closed"),
+        };
+        let loader = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            malformed()
+        };
+        let second = match cached(&cell, loader) {
+            Err(error) => error,
+            Ok(_) => panic!("malformed input must fail closed"),
+        };
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one load per cell");
+        assert_eq!(first.to_string(), second.to_string());
+        assert_eq!(format!("{first:?}"), format!("{second:?}"));
+        let raw = malformed().expect_err("the malformed loader must fail");
+        assert_eq!(first.to_string(), raw.to_string());
+        assert_eq!(format!("{first:?}"), format!("{raw:?}"));
+    }
 }

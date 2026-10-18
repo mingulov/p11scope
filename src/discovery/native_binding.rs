@@ -70,6 +70,9 @@ use crate::process::PidPin;
 use p11scope_ebpf_common::{DISCOVERY_KIND_EXEC, ImageIdentity};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
+mod metadata;
+pub(crate) use metadata::{BinderMetadataImage, BinderMetadataKey};
+
 /// Where native identity comes from: the owner lane's exact image (the
 /// `ImageGuard` contract; `None` everywhere in production) and the cookie
 /// queries the binder makes through a caller's retained pin.
@@ -411,6 +414,9 @@ struct DomainState {
     lifecycle_ns: Option<u64>,
     /// Start of the latest readable health read.
     health_ns: Option<u64>,
+    /// Latest ordered health qualification for display-only image bindings.
+    metadata_health_ns: Option<u64>,
+    metadata_health_proven: bool,
     /// Where exec coverage began (`None`: not reported, nothing predating
     /// a revalidation is eligible).
     coverage_ns: Option<u64>,
@@ -446,6 +452,8 @@ impl DomainState {
             finished: false,
             lifecycle_ns: None,
             health_ns: None,
+            metadata_health_ns: None,
+            metadata_health_proven: false,
             coverage_ns: None,
             revalidated: None,
             ring_loss: 0,
@@ -498,6 +506,8 @@ pub(crate) struct NativeBinder {
     decided: Vec<Decision>,
     transitions: Vec<ExecTransition>,
     census: BindingCensus,
+    /// Qualified only on the explicit metadata opt-in, never an image grant.
+    metadata_clock_qualified: bool,
     #[cfg(test)]
     current_binding_clock: Option<fn() -> Option<u64>>,
 }
@@ -511,6 +521,7 @@ impl NativeBinder {
             decided: Vec::new(),
             transitions: Vec::new(),
             census: BindingCensus::default(),
+            metadata_clock_qualified: false,
             #[cfg(test)]
             current_binding_clock: None,
         }
@@ -662,6 +673,27 @@ impl NativeBinder {
         let index = self.domain_index(batch.domain);
         let limits = self.limits;
         let state = &mut self.domains[index];
+        let metadata_health = batch.phase == crate::attach::capture::CapturePhase::Active
+            && batch.health.failures.is_empty()
+            && batch.health.discovery_counters.is_some()
+            && batch.health_unproven.is_none()
+            && batch.health_regression.is_none()
+            && !batch.unsettled;
+        match stamp(batch.health_read_ns) {
+            Some(read)
+                if state
+                    .metadata_health_ns
+                    .is_none_or(|previous| read > previous) =>
+            {
+                state.metadata_health_ns = Some(read);
+                state.metadata_health_proven = metadata_health;
+            }
+            Some(read) if state.metadata_health_ns == Some(read) && !metadata_health => {
+                state.metadata_health_proven = false;
+            }
+            None => state.metadata_health_proven = false,
+            _ => {}
+        }
         if let Some(counters) = batch.health.discovery_counters {
             if crate::attach::capture::ring_loss_rose(state.ring_loss, Some(counters)).is_some()
                 || batch.health.malformed_discovery > state.malformed

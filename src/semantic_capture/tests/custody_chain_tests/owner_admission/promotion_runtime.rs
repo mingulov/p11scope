@@ -28,9 +28,9 @@ fn promotion_runtime_scoped_preparation_reuses_original_inventory_pin() {
         .prepare_scoped_caller(&preparation)
         .map_err(|failure| failure.reason)
         .unwrap();
-    let candidate = scene
+    let (candidate, _reservation) = scene
         .coordinator
-        .prepare_scoped_semantic_candidate(&prepared, scene.lane.as_ref().unwrap().domain())
+        .prepare_scoped_promotion_candidate(&prepared, scene.lane.as_ref().unwrap().domain())
         .unwrap();
     assert!(std::ptr::eq(
         candidate.pin().as_ref(),

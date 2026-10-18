@@ -16875,6 +16875,7 @@ impl Engine {
             .any(|view| !self.original_exited(*view))
     }
 
+    #[track_caller]
     fn queue_stale_views(
         &mut self,
         stale: &BTreeSet<ProcessViewId>,
@@ -16917,6 +16918,7 @@ impl Engine {
     /// short-lived target loses that race almost every time. Loss stays loss
     /// whenever exit cannot be proven, and an already-recorded loss stays
     /// sticky: only the incoming cause is reclassified.
+    #[track_caller]
     fn queue_retirement(
         &mut self,
         view: ProcessViewId,
@@ -16929,6 +16931,7 @@ impl Engine {
         {
             self.owned_initial_exec = None;
         }
+        let incoming = cause;
         let previous = self.retirement_intents.get(&view).copied();
         let cause = if cause == RetirementCause::GenerationLost && self.original_exited(view) {
             RetirementCause::ExpectedRemoval
@@ -16988,10 +16991,34 @@ impl Engine {
         if cause == RetirementCause::GenerationLost
             && previous != Some(RetirementCause::GenerationLost)
         {
-            self.mark_live_loss(
-                "live discovery generation",
-                "a retained process generation changed and was scheduled for conservative cleanup",
-            );
+            let reason =
+                "a retained process generation changed and was scheduled for conservative cleanup";
+            if matches!(self.scope, Scope::Pid(_)) {
+                // The first named-generation loss terminates this capture:
+                // one bounded witness, without per-record/per-PID history in
+                // multi-process captures. This is a later observation, not a
+                // replacement for the check that originally refused authority.
+                let retained = self.views.iter().find(|candidate| candidate.id() == view);
+                let pid = retained.map_or(0, ProcessView::pid);
+                let original = match retained.map(ProcessView::original_generation_state) {
+                    Some(Ok(OriginalGenerationState::Current)) => "Current",
+                    Some(Ok(OriginalGenerationState::Exited)) => "Exited",
+                    Some(Ok(OriginalGenerationState::Reused)) => "Reused",
+                    Some(Err(_)) => "Unproven",
+                    None => "Missing",
+                };
+                self.mark_live_loss(
+                    "live discovery generation",
+                    &format!(
+                        "{reason}; view={} pid={pid} enqueue_line={} incoming={incoming:?} previous={previous:?} original={original} cancel_at_enqueue={}",
+                        view.0,
+                        std::panic::Location::caller().line(),
+                        self.cancellation_requested(),
+                    ),
+                );
+            } else {
+                self.mark_live_loss("live discovery generation", reason);
+            }
         }
     }
 
@@ -17018,6 +17045,7 @@ impl Engine {
             .is_some_and(|retained| retained.original_exited() == Ok(true))
     }
 
+    #[track_caller]
     fn queue_apply_outcome(
         &mut self,
         outcome: &ApplyOutcome,
@@ -18553,7 +18581,20 @@ impl Engine {
         self.reject_terminal_selection_handoffs(refused_handoffs, closure);
         self.finalize_expected_target_exit();
         if named_generation_lost {
-            bail!("the named process generation changed during live discovery");
+            let witness = self
+                .counters
+                .object_skips
+                .iter()
+                .find(|skip| {
+                    skip.subject == "live discovery generation"
+                        && skip.reason.starts_with("a retained process generation changed and was scheduled for conservative cleanup;")
+                })
+                .map_or("enqueue witness unavailable", |skip| skip.reason.as_str());
+            bail!(
+                "the named process generation changed during live discovery; {witness}; cancel_now={} mutation_stopped={}",
+                self.cancellation_requested(),
+                session.mutation_stopped(),
+            );
         }
         Ok(changed)
     }

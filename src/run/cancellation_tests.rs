@@ -9,7 +9,22 @@ const CHILD_MODE: &str = "P11SCOPE_CANCEL_MARKER_CHILD";
 
 fn marker_child() -> Option<std::ffi::OsString> {
     let mode = std::env::var_os(CHILD_MODE)?;
-    report_capture_cancel(Some(libc::SIGINT), 42);
+    if mode == "late" {
+        let signals = install_stop_flag().unwrap();
+        let cancellation = CaptureCancellation::default();
+        observe_capture_cancel(&signals, &cancellation, 42, CancellationPhase::Finalization);
+        // Real installed handler delivery; setting handler state alone must
+        // not emit a marker. The capture's later poll reports the first
+        // identity exactly once, without claiming a Signal loop ending.
+        // SAFETY: this subprocess installed the real stop handler above.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+        observe_capture_cancel(&signals, &cancellation, 43, CancellationPhase::Finalization);
+        // SAFETY: the SIGINT handler is installed in the same fresh child.
+        assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
+        observe_capture_cancel(&signals, &cancellation, 44, CancellationPhase::Finalization);
+        std::process::exit(0);
+    }
+    report_capture_cancel(libc::SIGINT, 42, CancellationPhase::Capture);
     // Avoid libtest's own terminal writes: only the production emitter is
     // under test, and a blocked diagnostic must not prevent this exit.
     std::process::exit(if mode == "healthy" || mode == "blocked" {
@@ -17,6 +32,22 @@ fn marker_child() -> Option<std::ffi::OsString> {
     } else {
         2
     });
+}
+
+#[test]
+fn late_finalization_poll_reports_once_after_real_handler_delivery() {
+    let _ = marker_child();
+    let output = child_command(
+        "run::cancellation_tests::late_finalization_poll_reports_once_after_real_handler_delivery",
+        "late",
+    )
+    .output()
+    .unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        output.stderr,
+        b"p11scope: cancel: signal 15 observed during finalization after 43 ticks\n"
+    );
 }
 
 fn child_command(test: &str, mode: &str) -> Command {

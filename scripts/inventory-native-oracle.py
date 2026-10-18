@@ -2310,6 +2310,12 @@ def oracle(rundir, ledgers_only=False):
         view = RunView(manifest, run, rundir)
         for error in view.errors:
             res.add(view.name, "*", "DOC-READ", "fail", error)
+        if isinstance(view.doc, dict):
+            gaps = view.doc.get("gaps", [])
+            if not isinstance(gaps, list) or any(not isinstance(gap, dict) for gap in gaps):
+                res.add(view.name, "*", "DOC-INPUT", "fail",
+                        "gaps must be an array of objects when present")
+                continue
         if run.get("stop"):
             check_stop(view, images_by_cell, res)
             if not isinstance(view.doc, dict):
@@ -4449,7 +4455,12 @@ def self_test():
         counter = [0]
 
         def run_case(name, root, want):
-            res = oracle(root)
+            try:
+                res = oracle(root)
+            except Exception as error:
+                print(f"self-test FAIL {name}: raw {type(error).__name__}: {error}")
+                failures.append(name)
+                return None
             failed = {r["check"] for r in res.failed()}
             if want is None:
                 ok = not failed and res.summary().get("pass", 0) > 0
@@ -4475,6 +4486,30 @@ def self_test():
         def cid(s, cell, gen=0, idx=0):
             keys = sorted(k for k in s.ids if k[0] == cell and k[2] == gen)
             return s.ids[keys[idx]]
+
+        # Malformed gaps must produce a named oracle input failure instead of
+        # escaping from one of the many consumers as a Python exception.
+        for name, malformed in (("null", None), ("scalar", "not-a-list"),
+                                ("scalar-element", ["not-an-object"])):
+            case("gaps-input-" + name, "DOC-INPUT",
+                 lambda s, d, dash, malformed=malformed: (
+                     d.update(gaps=malformed), {"events": s.events(s.doc)})[1])
+        from types import SimpleNamespace
+        empty_view = SimpleNamespace(doc={"gaps": []})
+        missing_view = SimpleNamespace(doc={})
+        healthy_view = SimpleNamespace(doc={"gaps": [
+            {"subject": "endpoint attach failed", "module": "m", "caller": "c"},
+            {"subject": "demoted count placed", "module": "m", "caller": "c"}]})
+        edge = {"module": "m", "caller": "c"}
+        controls_ok = (not has_partial_attach(empty_view, edge)
+                       and not has_demoted_edge(empty_view, edge)
+                       and not has_partial_attach(missing_view, edge)
+                       and not has_demoted_edge(missing_view, edge)
+                       and has_partial_attach(healthy_view, edge)
+                       and has_demoted_edge(healthy_view, edge))
+        print(f"self-test {'ok  ' if controls_ok else 'FAIL'} gaps-input-healthy-controls")
+        if not controls_ok:
+            failures.append("gaps-input-healthy-controls")
 
         # --- passing runs -------------------------------------------------------
         res = case("native-pass", None)

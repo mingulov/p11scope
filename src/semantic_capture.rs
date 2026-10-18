@@ -1490,17 +1490,14 @@ impl SemanticCapture {
         );
         anyhow::ensure!(!self.stopped, "semantic capture stopped");
         let (records, failed) = quantum
-            .take_h0_input(self.router.domain(), self.limits.records)
+            .h0_input(self.router.domain(), self.limits.records)
             .map_err(|reason| anyhow::anyhow!("retained semantic collection: {reason:?}"))?;
-        let collection = Collection {
-            records,
-            status: if failed {
-                CollectionStatus::ReadError
-            } else {
-                CollectionStatus::Complete
-            },
+        let status = if failed {
+            CollectionStatus::ReadError
+        } else {
+            CollectionStatus::Complete
         };
-        let mut report = self.tick_with_inner(io, Some(collection))?;
+        let mut report = self.tick_with_inner(io, Some((records, status)))?;
         self.stamp_disposition(&mut report);
         quantum.note_h0_report(&report);
         Ok(report)
@@ -1509,7 +1506,7 @@ impl SemanticCapture {
     fn tick_with_inner(
         &mut self,
         io: &mut impl CaptureIo,
-        collected: Option<Collection>,
+        collected: Option<(&[DecodedEventRecord], CollectionStatus)>,
     ) -> anyhow::Result<TickReport> {
         anyhow::ensure!(
             io.domain() == Some(self.router.domain()),
@@ -1517,15 +1514,22 @@ impl SemanticCapture {
         );
         anyhow::ensure!(!self.stopped, "semantic capture stopped");
         let mut report = TickReport::default();
-        let mut collected = collected.unwrap_or_else(|| io.collect(self.limits.records));
-        let collection_failed = collected.status != CollectionStatus::Complete
-            || collected.records.len() > self.limits.records;
-        collected.records.truncate(self.limits.records);
+        let owned;
+        let (records, status) = match collected {
+            Some(input) => input,
+            None => {
+                owned = io.collect(self.limits.records);
+                (owned.records.as_slice(), owned.status)
+            }
+        };
+        let collection_failed =
+            status != CollectionStatus::Complete || records.len() > self.limits.records;
         // Positions belong to first collection, including noncalls. Pending
         // resolutions retain them; delivery order is deliberately not FIFO.
-        let batch: Vec<_> = collected
-            .records
-            .into_iter()
+        let batch: Vec<_> = records
+            .iter()
+            .take(self.limits.records)
+            .copied()
             .map(|record| {
                 let position = self.allocate_position();
                 if position.is_none() {
@@ -3491,6 +3495,93 @@ mod tests {
         )
         .unwrap_or_else(|reason| panic!("actual retained ordinary collection: {reason:?}"));
         (quantum, drain, pool)
+    }
+
+    #[test]
+    fn joint_collected_leaf_lifecycle_preserves_capacity_then_routes_later_call_once() {
+        use crate::events::{EventDrain, EventsDomain, RecordSource, record_bytes};
+        use crate::semantics_edge::resources::SemanticResourcePool;
+        use crate::semantics_objects::journal::joint_driver::{RawJointQuantum, RawQuantumRefusal};
+        struct Arriving(std::rc::Rc<std::cell::RefCell<VecDeque<Vec<u8>>>>);
+        impl RecordSource for Arriving {
+            fn next_record(&mut self) -> Option<impl std::ops::Deref<Target = [u8]> + '_> {
+                self.0.borrow_mut().pop_front()
+            }
+        }
+        struct Fault;
+        impl crate::semantics_objects::journal::FaultEpoch for Fault {
+            fn fault_epoch(
+                &self,
+            ) -> Result<u64, crate::semantics_objects::journal::FaultReadError> {
+                Ok(0)
+            }
+        }
+        let mut io = ScriptIo::small(NativeDomainId::mint());
+        let mut capture = capture(&io);
+        io.semantic_call("C_Sign", 0, 0);
+        let call = io.records.pop_front().unwrap();
+        let mut lifecycle = call.base;
+        lifecycle.event.event_type = event_type::FORK;
+        let queue = std::rc::Rc::new(std::cell::RefCell::new(VecDeque::from([record_bytes(
+            &lifecycle,
+        )])));
+        let events = EventsDomain::test_standin(47);
+        let producers = crate::attach::SessionDrainProducers::test_pair(io.domain, events.clone());
+        let mut drain = EventDrain::over_domain(Arriving(queue.clone()), events);
+        let pool = SemanticResourcePool::default();
+        let rows = p11scope_ebpf_common::object_wire::publish_object_descriptors();
+        let mut quantum =
+            RawJointQuantum::collect(&mut drain, &rows, 4_096, &Fault, &producers, |bytes| {
+                pool.reserve(bytes)
+            })
+            .unwrap();
+        let capacities = quantum.retained_capacities();
+        let charged = pool.snapshot().charged_bytes;
+        let first = capture.tick_collected_with(&mut io, &mut quantum).unwrap();
+        assert_eq!(first.collected_calls, 0);
+        assert!(first.outcomes().iter().any(
+            |outcome| matches!(outcome, TickOutcome::Other(other) if other.position == Some(1))
+        ));
+        assert_eq!(quantum.pending_h0_records(), 0);
+        assert_eq!(quantum.retained_capacities(), capacities);
+        // Wait longer than the later H0 pending policy: no provider deadline
+        // is created by a lifecycle-only input or empty raw continuation.
+        io.now += Duration::from_secs(3);
+        assert_eq!(
+            quantum
+                .continue_collect(&mut drain, &rows, 1_024, &Fault, &producers)
+                .unwrap()
+                .attempted,
+            0
+        );
+        queue
+            .borrow_mut()
+            .extend([record_bytes(&call.base), record_bytes(&call.base)]);
+        assert_eq!(
+            quantum
+                .continue_collect(&mut drain, &rows, 1, &Fault, &producers)
+                .unwrap()
+                .attempted,
+            1
+        );
+        let returned = capture.tick_collected_with(&mut io, &mut quantum).unwrap();
+        assert_eq!(returned.collected_calls, 1);
+        let routed = returned.calls().next().unwrap();
+        assert_eq!(routed.position(), Some(2));
+        assert!(matches!(routed.route(), Route::Joined(_)));
+        assert_eq!(quantum.retained_capacities(), capacities);
+        assert_eq!(pool.snapshot().charged_bytes, charged);
+        assert_eq!(
+            quantum.continue_collect(&mut drain, &rows, 1, &Fault, &producers),
+            Err(RawQuantumRefusal::H0Active)
+        );
+        assert_eq!(queue.borrow().len(), 1);
+        let empty = capture.tick_collected_with(&mut io, &mut quantum).unwrap();
+        assert_eq!(empty.collected_calls, 0);
+        assert!(empty.calls().next().is_none());
+        assert_eq!(queue.borrow().len(), 1);
+        assert_eq!(quantum.retained_capacities(), capacities);
+        assert_eq!(pool.snapshot().charged_bytes, charged);
     }
 
     #[test]

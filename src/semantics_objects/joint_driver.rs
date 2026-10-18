@@ -23,6 +23,11 @@ pub(crate) struct RawJointQuantum {
     ordinary: Vec<DecodedEventRecord>,
     audit: JournalCollection,
     native: NativeDomainId,
+    descriptors: [ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+    capacity: usize,
+    attempted: usize,
+    malformed_seen: u64,
+    discarded_seen: u64,
     h0_origins: Vec<usize>,
     h0_delivered: usize,
     completed_delivered: bool,
@@ -32,10 +37,9 @@ pub(crate) struct RawJointQuantum {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RawQuantumRefusal {
-    #[cfg(test)]
-    Unavailable,
-    #[cfg(test)]
     Capacity,
+    H0Active,
+    ForeignDescriptors,
     ForeignDrain,
     ForeignCapture,
     InvalidLimit,
@@ -46,8 +50,8 @@ pub(crate) enum RawQuantumRefusal {
 
 impl RawJointQuantum {
     fn storage_bytes(limit: usize) -> usize {
-        // Both arrays coexist. reserve_exact requests these capacities once;
-        // callbacks never grow either array. Include each allocation's padding.
+        // All three arrays coexist. reserve_exact requests capacity once;
+        // callbacks never grow them. Include each allocation's padding.
         limit
             * (size_of::<JournalIngestItem>()
                 + size_of::<DecodedEventRecord>()
@@ -64,50 +68,207 @@ impl RawJointQuantum {
         self.ordinary.len()
     }
 
-    /// Move each original ordinary/END payload to H0 once. Repeated empty
-    /// takes service pending scans; they neither poll nor replay old inputs.
-    pub(crate) fn take_h0_input(
-        &mut self,
+    #[cfg(test)]
+    pub(crate) fn retained_capacities(&self) -> (usize, usize, usize) {
+        (
+            self.ordered.capacity(),
+            self.ordinary.capacity(),
+            self.h0_origins.capacity(),
+        )
+    }
+
+    fn collection_failed(&self) -> bool {
+        self.audit.malformed_delta != 0
+            || self.audit.discarded_delta != 0
+            || self.audit.counter_error
+            || self.audit.fault_error.is_some()
+            || self.audit.fault_before != self.audit.fault_after
+    }
+
+    /// Borrow the retained H0 inputs. The collected leaf consumes copies into
+    /// its existing router, then acknowledges them with its actual report.
+    /// Keeping this Vec in place preserves the original preallocation even
+    /// when a lifecycle-only slice precedes the eventual completed call.
+    pub(crate) fn h0_input(
+        &self,
         native: NativeDomainId,
         limit: usize,
-    ) -> Result<(Vec<DecodedEventRecord>, bool), RawQuantumRefusal> {
+    ) -> Result<(&[DecodedEventRecord], bool), RawQuantumRefusal> {
         if native != self.native {
             return Err(RawQuantumRefusal::ForeignCapture);
         }
         if self.ordinary.len() > limit {
             return Err(RawQuantumRefusal::InvalidLimit);
         }
-        let records = std::mem::take(&mut self.ordinary);
-        self.h0_delivered += records.len();
-        self.completed_delivered |= records
-            .iter()
-            .any(|record| record.base.event.event_type == p11scope_ebpf_common::event_type::CALL);
-        let failed = self.audit.malformed_delta != 0
-            || self.audit.discarded_delta != 0
-            || self.audit.fault_error.is_some()
-            || self.audit.fault_before != self.audit.fault_after;
-        Ok((records, failed))
+        Ok((&self.ordinary, self.collection_failed()))
     }
 
-    /// Only the actual collected-leaf capture stamps this opaque report. The
-    /// original poll's fault/counter observations remain unchanged.
+    #[cfg(test)]
+    pub(crate) fn take_h0_input(
+        &mut self,
+        native: NativeDomainId,
+        limit: usize,
+    ) -> Result<(Vec<DecodedEventRecord>, bool), RawQuantumRefusal> {
+        let (_, failed) = self.h0_input(native, limit)?;
+        Ok((std::mem::take(&mut self.ordinary), failed))
+    }
+
+    /// Only the actual collected-leaf capture stamps this opaque report. It
+    /// has processed the borrowed inputs, so retain their wire mapping while
+    /// clearing their delivery buffer without releasing its capacity.
     pub(crate) fn note_h0_report(&mut self, report: &crate::semantic_capture::TickReport) {
+        self.h0_delivered += self.ordinary.len();
+        self.completed_delivered |= self
+            .ordinary
+            .iter()
+            .any(|record| record.base.event.event_type == p11scope_ebpf_common::event_type::CALL);
+        self.ordinary.clear();
         self.audit.h0_allocated_below = report.allocated_below();
         self.h0_pending = report.awaiting_floor().is_some();
     }
 
-    // RED scaffold for native-first continuation. It remains test-only until
-    // the real BEGIN-only/capacity/audit regressions execute in the batch.
-    #[cfg(test)]
-    fn continue_collect<S: RecordSource>(
+    fn observe_fault(
         &mut self,
-        _drain: &mut EventDrain<S>,
-        _descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
-        _work: usize,
-        _fault: &impl FaultEpoch,
-        _producers: &SessionDrainProducers,
+        reading: Result<u64, FaultReadError>,
+    ) -> Result<(), FaultReadError> {
+        let reading = reading.and_then(|epoch| {
+            if epoch > u64::from(u32::MAX) {
+                Err(FaultReadError::Saturated)
+            } else {
+                Ok(epoch)
+            }
+        });
+        match reading {
+            Ok(epoch) => {
+                // Retain the first observed change even if a later read
+                // returns to the original value. Never heal a broken chain.
+                if self.audit.fault_after == self.audit.fault_before {
+                    self.audit.fault_after = epoch;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if self.audit.fault_error.is_none() || error == FaultReadError::Saturated {
+                    self.audit.fault_error = Some(error);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn observe_counters(&mut self, malformed: u64, discarded: u64) {
+        fn advance(previous: &mut u64, total: &mut u64, current: u64) -> bool {
+            let delta = current.checked_sub(*previous);
+            let accumulated = delta.and_then(|delta| total.checked_add(delta));
+            let failed = *previous == u64::MAX || current == u64::MAX || accumulated.is_none();
+            if let Some(accumulated) = accumulated {
+                *total = accumulated;
+            }
+            *previous = current;
+            failed
+        }
+        self.audit.counter_error |= advance(
+            &mut self.malformed_seen,
+            &mut self.audit.malformed_delta,
+            malformed,
+        );
+        self.audit.counter_error |= advance(
+            &mut self.discarded_seen,
+            &mut self.audit.discarded_delta,
+            discarded,
+        );
+    }
+
+    /// Continue the SAME allocation before completed-call H0 delivery. Work
+    /// is bounded independently from total custody, including failed decode
+    /// attempts. A full quantum refuses without asking the cursor for N+1.
+    pub(crate) fn continue_collect<S: RecordSource>(
+        &mut self,
+        drain: &mut EventDrain<S>,
+        descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+        work: usize,
+        fault: &impl FaultEpoch,
+        producers: &SessionDrainProducers,
     ) -> Result<crate::events::DispatchPoll, RawQuantumRefusal> {
-        Err(RawQuantumRefusal::Unavailable)
+        if !self.matches_producers(producers) {
+            return Err(RawQuantumRefusal::ForeignCapture);
+        }
+        if drain.domain_id() != self.audit.drain_domain {
+            return Err(RawQuantumRefusal::ForeignDrain);
+        }
+        if descriptors != &self.descriptors {
+            return Err(RawQuantumRefusal::ForeignDescriptors);
+        }
+        if !(1..=1_024).contains(&work) {
+            return Err(RawQuantumRefusal::InvalidLimit);
+        }
+        if self.h0_pending || self.completed_delivered {
+            return Err(RawQuantumRefusal::H0Active);
+        }
+        if self.attempted == self.capacity {
+            return Err(RawQuantumRefusal::Capacity);
+        }
+        self.observe_counters(drain.malformed(), drain.discarded());
+        self.observe_fault(fault.fault_epoch())
+            .map_err(RawQuantumRefusal::Fault)?;
+        Ok(self.poll_slice(
+            drain,
+            descriptors,
+            work.min(self.capacity - self.attempted),
+            fault,
+        ))
+    }
+
+    fn poll_slice<S: RecordSource>(
+        &mut self,
+        drain: &mut EventDrain<S>,
+        descriptors: &[ObjectDescriptorWire; MAX_DESCRIPTORS as usize],
+        work: usize,
+        fault: &impl FaultEpoch,
+    ) -> crate::events::DispatchPoll {
+        let ordered = RefCell::new(&mut self.ordered);
+        let ordinary = RefCell::new(&mut self.ordinary);
+        let h0_origins = RefCell::new(&mut self.h0_origins);
+        let journal_count = Cell::new(0u64);
+        let ordinary_wire_count = Cell::new(0u64);
+        let poll = drain.poll_dispatched_quantum(
+            Some(work),
+            descriptors,
+            |record| {
+                let index = ordered.borrow().len();
+                h0_origins.borrow_mut().push(index);
+                ordinary.borrow_mut().push(record);
+                ordered
+                    .borrow_mut()
+                    .push(JournalIngestItem::Ordinary(record));
+                ordinary_wire_count.set(ordinary_wire_count.get() + 1);
+                ControlFlow::Continue(())
+            },
+            |record| {
+                let index = ordered.borrow().len();
+                if let p11scope_ebpf_common::object_journal::JournalRecord::End(end) = &record {
+                    // Dispatch already validated and observed this completed
+                    // payload. Its H0 copy is not a second wire item or tap.
+                    if let Some(completed) =
+                        crate::events::project_journal_end_payload(end, descriptors)
+                    {
+                        h0_origins.borrow_mut().push(index);
+                        ordinary.borrow_mut().push(completed);
+                    }
+                }
+                ordered
+                    .borrow_mut()
+                    .push(JournalIngestItem::Journal(record));
+                journal_count.set(journal_count.get() + 1);
+                ControlFlow::Continue(())
+            },
+        );
+        self.attempted += poll.attempted;
+        self.audit.ingested += journal_count.get();
+        self.audit.ordinary += ordinary_wire_count.get();
+        self.observe_counters(drain.malformed(), drain.discarded());
+        let _ = self.observe_fault(fault.fault_epoch());
+        poll
     }
 
     /// Collect validated original records through the actual retained cursor.
@@ -142,78 +303,50 @@ impl RawJointQuantum {
         h0_origins
             .try_reserve_exact(limit)
             .map_err(|_| RawQuantumRefusal::Allocation)?;
+        // Capacity is the requested allocation, not an advisory callback
+        // limit. Refuse an allocator over-reservation before touching EVENTS.
+        if ordered.capacity() != limit
+            || ordinary.capacity() != limit
+            || h0_origins.capacity() != limit
+        {
+            return Err(RawQuantumRefusal::Allocation);
+        }
         let fault_before = fault.fault_epoch().map_err(RawQuantumRefusal::Fault)?;
-        let malformed_before = drain.malformed();
-        let discarded_before = drain.discarded();
-        let ordered = RefCell::new(ordered);
-        let ordinary = RefCell::new(ordinary);
-        let h0_origins = RefCell::new(h0_origins);
-        let journal_count = Cell::new(0u64);
-        let ordinary_wire_count = Cell::new(0u64);
-        drain.poll_dispatched_quantum(
-            Some(limit.min(1_024)),
-            descriptors,
-            |record| {
-                let index = ordered.borrow().len();
-                h0_origins.borrow_mut().push(index);
-                ordinary.borrow_mut().push(record);
-                ordered
-                    .borrow_mut()
-                    .push(JournalIngestItem::Ordinary(record));
-                ordinary_wire_count.set(ordinary_wire_count.get() + 1);
-                ControlFlow::Continue(())
-            },
-            |record| {
-                let index = ordered.borrow().len();
-                if let p11scope_ebpf_common::object_journal::JournalRecord::End(end) = &record {
-                    // Dispatch already validated and observed this completed
-                    // payload. Copy it for H0; never fabricate an extra wire
-                    // item, ordinal or trace observation.
-                    if let Some(completed) =
-                        crate::events::project_journal_end_payload(end, descriptors)
-                    {
-                        h0_origins.borrow_mut().push(index);
-                        ordinary.borrow_mut().push(completed);
-                    }
-                }
-                ordered
-                    .borrow_mut()
-                    .push(JournalIngestItem::Journal(record));
-                journal_count.set(journal_count.get() + 1);
-                ControlFlow::Continue(())
-            },
-        );
-        let ordered = ordered.into_inner();
-        let ordinary = ordinary.into_inner();
-        let h0_origins = h0_origins.into_inner();
-        let (fault_after, fault_error) = match fault.fault_epoch() {
-            Ok(epoch) => (epoch, None),
-            Err(error) => (fault_before, Some(error)),
-        };
+        if fault_before > u64::from(u32::MAX) {
+            return Err(RawQuantumRefusal::Fault(FaultReadError::Saturated));
+        }
+        let malformed_seen = drain.malformed();
+        let discarded_seen = drain.discarded();
         let audit = JournalCollection {
-            ingested: journal_count.get(),
-            ordinary: ordinary_wire_count.get(),
-            malformed_delta: drain.malformed().saturating_sub(malformed_before),
-            discarded_delta: drain.discarded().saturating_sub(discarded_before),
+            ingested: 0,
+            ordinary: 0,
+            malformed_delta: 0,
+            discarded_delta: 0,
+            counter_error: malformed_seen == u64::MAX || discarded_seen == u64::MAX,
             fault_before,
-            fault_after,
-            fault_error,
+            fault_after: fault_before,
+            fault_error: None,
             drain_domain: drain.domain_id(),
-            // No H0 allocation happened during raw collection. Only the actual
-            // collected-leaf tick may attach its post-routing watermark.
             h0_allocated_below: 0,
         };
-        Ok(Self {
+        let mut retained = Self {
             ordered,
             ordinary,
             audit,
             native: producers.native_domain(),
+            descriptors: *descriptors,
+            capacity: limit,
+            attempted: 0,
+            malformed_seen,
+            discarded_seen,
             h0_origins,
             h0_delivered: 0,
             completed_delivered: false,
             h0_pending: false,
             _charge: charge,
-        })
+        };
+        retained.poll_slice(drain, descriptors, limit.min(1_024), fault);
+        Ok(retained)
     }
 }
 
@@ -422,6 +555,179 @@ mod tests {
             "lost interpolation evidence stays failed after later healthy reads"
         );
         assert_eq!(pool.snapshot().charged_bytes, charged);
+    }
+
+    #[test]
+    fn joint_native_first_foreign_continuation_is_nonconsuming() {
+        use crate::semantics_objects::journal::tests::{begin_bytes, function_id};
+        let rows = publish_object_descriptors();
+        let begin = begin_bytes(1, 1, function_id("C_Sign"), 0);
+        let events = EventsDomain::test_standin(42);
+        let retained = producers(&events);
+        let queue = std::rc::Rc::new(RefCell::new(std::collections::VecDeque::new()));
+        let mut drain = EventDrain::over_domain(ArrivingRecords(queue.clone()), events.clone());
+        let fault = SteadyFault(Cell::new(None));
+        let pool = SemanticResourcePool::default();
+        let mut quantum =
+            RawJointQuantum::collect(&mut drain, &rows, 4, &fault, &retained, |bytes| {
+                pool.reserve(bytes)
+            })
+            .unwrap();
+        queue.borrow_mut().push_back(begin.to_vec());
+        let stranger = producers(&events);
+        assert_eq!(
+            quantum.continue_collect(&mut drain, &rows, 1, &fault, &stranger),
+            Err(RawQuantumRefusal::ForeignCapture)
+        );
+        let mut changed_rows = rows;
+        changed_rows[0].guard ^= 1;
+        assert_eq!(
+            quantum.continue_collect(&mut drain, &changed_rows, 1, &fault, &retained),
+            Err(RawQuantumRefusal::ForeignDescriptors)
+        );
+        let foreign_events = EventsDomain::test_standin(43);
+        let mut foreign_drain =
+            EventDrain::over_domain(ArrivingRecords(queue.clone()), foreign_events);
+        assert_eq!(
+            quantum.continue_collect(&mut foreign_drain, &rows, 1, &fault, &retained),
+            Err(RawQuantumRefusal::ForeignDrain)
+        );
+        for work in [0, 1_025] {
+            assert_eq!(
+                quantum.continue_collect(&mut drain, &rows, work, &fault, &retained),
+                Err(RawQuantumRefusal::InvalidLimit)
+            );
+        }
+        assert_eq!(queue.borrow().len(), 1);
+        assert_eq!(quantum.attempted, 0);
+        assert_eq!(
+            quantum
+                .continue_collect(&mut drain, &rows, 1, &fault, &retained)
+                .unwrap()
+                .attempted,
+            1
+        );
+        assert_eq!(quantum.ordered.len(), 1);
+        assert!(queue.borrow().is_empty());
+    }
+
+    #[test]
+    fn joint_native_first_changed_and_saturated_faults_stay_failed() {
+        struct MutableFault(Cell<u64>);
+        impl FaultEpoch for MutableFault {
+            fn fault_epoch(&self) -> Result<u64, FaultReadError> {
+                Ok(self.0.get())
+            }
+        }
+        for saturated in [false, true] {
+            let rows = publish_object_descriptors();
+            let events = EventsDomain::test_standin(44);
+            let retained = producers(&events);
+            let mut drain = EventDrain::over_domain(ScriptedRecords::records([], 0), events);
+            let fault = MutableFault(Cell::new(7));
+            let pool = SemanticResourcePool::default();
+            let mut quantum =
+                RawJointQuantum::collect(&mut drain, &rows, 4, &fault, &retained, |bytes| {
+                    pool.reserve(bytes)
+                })
+                .unwrap();
+            fault.0.set(if saturated { u64::MAX } else { 8 });
+            let changed = quantum.continue_collect(&mut drain, &rows, 1, &fault, &retained);
+            if saturated {
+                assert_eq!(
+                    changed,
+                    Err(RawQuantumRefusal::Fault(FaultReadError::Saturated))
+                );
+            } else {
+                assert_eq!(changed.unwrap().attempted, 0);
+                assert_eq!(quantum.audit.fault_after, 8);
+            }
+            fault.0.set(7);
+            assert_eq!(
+                quantum
+                    .continue_collect(&mut drain, &rows, 1, &fault, &retained)
+                    .unwrap()
+                    .attempted,
+                0
+            );
+            assert!(quantum.collection_failed());
+            assert_eq!(quantum.audit.fault_before, 7);
+            if saturated {
+                assert_eq!(quantum.audit.fault_error, Some(FaultReadError::Saturated));
+            }
+        }
+    }
+
+    #[test]
+    fn joint_native_first_counter_regression_saturation_and_discard_only_are_explicit() {
+        struct CounterSource(std::rc::Rc<Cell<u64>>);
+        impl RecordSource for CounterSource {
+            fn next_record(&mut self) -> Option<impl std::ops::Deref<Target = [u8]> + '_> {
+                None::<Vec<u8>>
+            }
+            fn discarded(&self) -> u64 {
+                self.0.get()
+            }
+        }
+        for (initial, later, expected_error, delta) in [
+            (2, 2, false, 0),
+            (2, 3, false, 1),
+            (2, 1, true, 0),
+            (u64::MAX, u64::MAX, true, 0),
+            (0, u64::MAX, true, u64::MAX),
+        ] {
+            let rows = publish_object_descriptors();
+            let events = EventsDomain::test_standin(45);
+            let retained = producers(&events);
+            let counter = std::rc::Rc::new(Cell::new(initial));
+            let mut drain = EventDrain::over_domain(CounterSource(counter.clone()), events);
+            let fault = SteadyFault(Cell::new(None));
+            let pool = SemanticResourcePool::default();
+            let mut quantum =
+                RawJointQuantum::collect(&mut drain, &rows, 4, &fault, &retained, |bytes| {
+                    pool.reserve(bytes)
+                })
+                .unwrap();
+            counter.set(later);
+            assert_eq!(
+                quantum
+                    .continue_collect(&mut drain, &rows, 1, &fault, &retained)
+                    .unwrap()
+                    .attempted,
+                0
+            );
+            assert_eq!(
+                quantum.audit.malformed_delta, 0,
+                "an unprovable counter is not an invented malformed record"
+            );
+            assert_eq!(quantum.audit.discarded_delta, delta);
+            assert_eq!(quantum.audit.counter_error, expected_error);
+            let mut finalizer = crate::semantics_objects::journal::ScriptedH3Source::once(
+                crate::semantics_objects::journal::H3DispositionEvidence::scripted_clean(1),
+            );
+            let receipt = crate::semantics_objects::journal::JournalAuditReceipt::collect(
+                &quantum.audit,
+                &mut finalizer,
+                1,
+            );
+            let checked = receipt.check(None, 0, 1, &Ok(7));
+            assert_eq!(
+                checked,
+                if expected_error {
+                    Err(crate::semantics_objects::journal::JournalGap::CounterUnprovable)
+                } else if delta != 0 {
+                    Err(crate::semantics_objects::journal::JournalGap::Discarded)
+                } else {
+                    Ok(())
+                }
+            );
+            counter.set(2);
+            quantum
+                .continue_collect(&mut drain, &rows, 1, &fault, &retained)
+                .unwrap();
+            assert_eq!(quantum.audit.counter_error, expected_error || later > 2);
+            assert_eq!(quantum.audit.malformed_delta, 0);
+        }
     }
 
     #[test]

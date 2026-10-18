@@ -137,8 +137,8 @@ pub(crate) fn disposition_of(gap: JournalGap) -> SealFailureDisposition {
     use JournalGap::*;
     use SealFailureDisposition::*;
     match gap {
-        FaultChanged | FaultUnreadable | FaultSaturated | Malformed | H3Loss | H3Exhausted
-        | Discarded => HistoryLoss,
+        FaultChanged | FaultUnreadable | FaultSaturated | Malformed | CounterUnprovable
+        | H3Loss | H3Exhausted | Discarded => HistoryLoss,
         H3Pending | BoundNotReady | FrontierRegression => Retry,
         ModelRefused | BootstrapMismatch | ClosureStale | DomainTainted | ImageTainted
         | DomainEnded | AdapterInvalidated | Stopped | DrainMismatch | CutExhausted => Fallback,

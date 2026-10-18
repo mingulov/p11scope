@@ -476,7 +476,12 @@ fn object_producer_compiled_frames_are_bounded() {
     let object = embedded_object(directory.path());
     // Printed, not just carried in the assert message: with --nocapture this
     // is the map-allocation and frame/instruction measurement record.
-    let report = run_object_checker(&object, "frames");
+    let mode = if cfg!(feature = "unsafe-unvalidated-metadata") {
+        "frames-diagnostic"
+    } else {
+        "frames"
+    };
+    let report = run_object_checker(&object, mode);
     println!("{report}");
 }
 
@@ -649,8 +654,13 @@ def longest_chain(raws, bodies, relocations, offsets, root):
     return visit(root, ())
 
 
-def check_maps(report):
-    maps, _, _ = checker.inspect(sys.argv[1])
+def check_maps(report, diagnostic=False):
+    allowed = checker.DIAGNOSTIC_GLOBAL_HELPERS if diagnostic else frozenset()
+    maps, programs, symbols = checker.inspect(sys.argv[1], allowed)
+    if diagnostic:
+        # Explicit feature mode: allow only its exact decoder helpers, then
+        # require the entire frozen diagnostic map/program/symbol inventory.
+        checker.validate_inventory('diagnostic', maps, programs, symbols)
     for name in ('OBJECT_START', 'OBJECT_DESCRIPTORS', 'OBJECT_ZERO'):
         assert name in maps, f'missing owned map {name}'
     start = maps['OBJECT_START']
@@ -794,8 +804,8 @@ def fault_calls_to(data, root_name):
     return calls
 
 
-def check_frames(data, report):
-    check_maps(report)
+def check_frames(data, report, diagnostic=False):
+    check_maps(report, diagnostic)
     leaves = check_leaves(data, report)
     check_roots(data, report)
 
@@ -878,8 +888,8 @@ def main():
     data = Path(sys.argv[1]).read_bytes()
     mode = sys.argv[2]
     report = []
-    if mode == 'frames':
-        check_frames(data, report)
+    if mode in ('frames', 'frames-diagnostic'):
+        check_frames(data, report, diagnostic=mode == 'frames-diagnostic')
     elif mode == 'function-abis':
         check_function_abis(data, report)
     elif mode == 'return-fault':

@@ -2440,6 +2440,7 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
         ModuleView, Presence, Presentation,
     };
     Presentation {
+        caller_metadata: crate::caller_metadata::runtime::MetadataFrame::default(),
         scope_label: "pid 4242".into(),
         started_ns: 1_000,
         ended_ns: 2_000,

@@ -2274,6 +2274,10 @@ pub(crate) fn finish_output(
         stream_state
             .gaps
             .emit(writer, &presentation.gaps, true, presentation.ended_ns)?;
+        let metadata_events =
+            stream_state
+                .metadata
+                .emit(writer, presentation, presentation.ended_ns, true)?;
         let tail = ended_tail(presentation, writer);
         let identities = IdentityIndex::new(presentation);
         let swept = stream_state.edges.sweep(
@@ -2353,6 +2357,7 @@ pub(crate) fn finish_output(
             presentation.ended_ns,
             |(edges_unretained, instances_unretained, semantic_unretained, key_unretained)| {
                 let mut payload = ended_payload(presentation, presentation.ended_ns, writer);
+                payload["caller_metadata_events"] = metadata_events.into();
                 payload["edge_events"] = edge_events.into();
                 payload["edges_unretained"] = edges_unretained.into();
                 payload["instance_events"] = instance_events.into();
@@ -2555,6 +2560,7 @@ fn apply_one_pass(
 /// kinds under one shared per-pass quota.
 pub(crate) struct StreamState {
     gaps: GapEmitter,
+    metadata: crate::caller_metadata::consumer::MetadataEmitter,
     edges: EdgeEmitter,
     instances: InstanceEmitter,
     key_operations: KeyOperationEmitter,
@@ -2569,6 +2575,7 @@ impl StreamState {
     pub(crate) fn new() -> Self {
         Self {
             gaps: GapEmitter::new(),
+            metadata: crate::caller_metadata::consumer::MetadataEmitter::default(),
             edges: EdgeEmitter::new(),
             instances: InstanceEmitter::new(),
             key_operations: KeyOperationEmitter::new(),
@@ -2683,6 +2690,7 @@ fn emit_commit(
             now_ns,
         )?;
     }
+    let metadata_events = state.metadata.emit(writer, presentation, now_ns, false)?;
     let fresh = state.gaps.emit(writer, &presentation.gaps, false, now_ns)?;
     let edges = state.edges.emit(
         writer,
@@ -2715,6 +2723,8 @@ fn emit_commit(
         .saturating_sub(state.emitted_suppressed);
     state.emitted_suppressed = presentation.gaps_suppressed;
     let mut payload = pass_payload(report, presentation, &published, fresh, suppressed_delta);
+    payload["caller_metadata_events"] = metadata_events.into();
+    payload["caller_metadata"] = presentation.caller_metadata.summary.json();
     payload["edge_events"] = edges.emitted.into();
     payload["edge_events_deferred"] = edges.deferred.into();
     payload["instance_events"] = instances.instance_emitted.into();
@@ -3326,7 +3336,10 @@ fn progress_lines<Source: ProcessSource>(
     lines
 }
 
-fn caller_json(caller: &crate::inventory_present::CallerView) -> serde_json::Value {
+fn caller_json(
+    caller: &crate::inventory_present::CallerView,
+    metadata: &crate::caller_metadata::runtime::MetadataFrame,
+) -> serde_json::Value {
     let record = caller;
     let (task_cookie, exec_id) = match record.authority {
         ImageAuthority::NativeExact {
@@ -3347,7 +3360,7 @@ fn caller_json(caller: &crate::inventory_present::CallerView) -> serde_json::Val
             "path": exe.path,
         })
     });
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "id": record.id.label(),
         "pid": record.pid,
         "start_time": record.start_time,
@@ -3365,7 +3378,11 @@ fn caller_json(caller: &crate::inventory_present::CallerView) -> serde_json::Val
         "first_seen_ns": record.first_seen_ns,
         "last_seen_ns": record.last_seen_ns,
         "retired": record.retired,
-    })
+    });
+    if let Some(metadata) = metadata.metadata(record.id) {
+        value["metadata"] = serde_json::to_value(metadata).expect("finite metadata");
+    }
+    value
 }
 
 fn module_json(module: &crate::inventory_present::ModuleView) -> serde_json::Value {
@@ -3636,6 +3653,7 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
         .collect();
     serde_json::json!({
         "schema": DOC_ID,
+        "caller_metadata": presentation.caller_metadata.summary.json(),
         "scope": presentation.scope_label,
         "clock": {
             "basis": crate::discovery::caller_registry::CLOCK_BASIS,
@@ -3653,7 +3671,7 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
             "semantic_capture": presentation.semantic_capture.json(),
         },
         "budgets": budgets_json(&presentation.budgets),
-        "callers": presentation.callers.iter().map(caller_json).collect::<Vec<_>>(),
+        "callers": presentation.callers.iter().map(|caller| caller_json(caller, &presentation.caller_metadata)).collect::<Vec<_>>(),
         "modules": presentation.modules.iter().map(module_json).collect::<Vec<_>>(),
         "edges": presentation.edges.iter().map(edge_json).collect::<Vec<_>>(),
         "instances": presentation.instances.iter().map(instance_json).collect::<Vec<_>>(),

@@ -5,6 +5,7 @@
 //! of parsing and is never copied into the returned value.
 
 pub(crate) mod acquisition;
+pub(crate) mod consumer;
 pub(crate) mod presentation;
 pub(crate) mod runtime;
 

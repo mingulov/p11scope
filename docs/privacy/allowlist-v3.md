@@ -19,6 +19,7 @@ which describes its reviewed development implementation with installed gates
 still open,
 and [inventory diagnostics](#inventory-diagnostics-v04), which defines the
 optional userspace decision export without additional target reads,
+and [DR04 caller metadata](#dr04-caller-metadata-2026-10-18), whose opt-in source contract is described below and whose installed qualification remains open,
 and [object producer activation](#object-producer-activation-h7-slice-d-2026-10-14),
 which implements the reviewed finite producer below with no public
 object projection.**
@@ -826,16 +827,16 @@ ring/map pressure and stop cleanup, through the `object-lp64` /
 `object-ia32` canary cells. Any new read site, broader set, longer
 retention or public projection needs a new explicit review.
 
-## DR04 caller metadata (proposed, 2026-10-18)
+## DR04 caller metadata (2026-10-18)
 
-**Status: PROPOSED; implementation, publication and installed acceptance
-pending.** This subsection adds no capture until its owner wires the
-opt-in, qualifies the reads and activates the fields. Every other
-section keeps its own status; v1/v2 bytes and exclusions are unchanged,
-and there is no global v3 activation.
+**Status: opt-in implementation contract; installed qualification remains
+open.** This subsection permits only the finite Inventory context below.
+Every other section keeps its own status; v1/v2 bytes and exclusions are
+unchanged, and there is no global v3 activation. Required real two-container,
+two-pod, unavailable and migration acceptance is tracked separately.
 
-When the operator explicitly opts in (proposed
-`inventory --caller-metadata=cgroup`, default `none`), the allowlisted
+When the operator explicitly opts in
+(`inventory --caller-metadata=cgroup`, default `none`), the allowlisted
 display context from retained `/proc`/cgroup filesystem observations is
 exactly: finite cgroup2 directory inode plus capture-local
 mount-context identifier, canonical 64-hex container ID, canonical
@@ -857,3 +858,15 @@ callers across captures. Numeric provenance stays withheld as
 cgroup2 root and namespace-coordinate agreement. Missing, refused or
 stale observations remain explicitly unknown/stale/historical, never
 silent.
+
+The full64 native task/image checks bracket the two retained-original proc
+reads. They reuse the Inventory identity-only query and add no application
+argument/pointer reads. A scan-only image cannot be upgraded by a later
+metadata query. Equal membership endpoints remain `endpoint_sample_only`;
+A-to-B-to-A excursions are not excluded. Raw membership is temporary private
+scratch, zeroed/discarded on job completion. One cancellable worker,4096 retained
+caller slots,64 starts/100ms,25ms cooperative job budget,1s target refresh and
+10s staleness bound apply. The independent8MiB allocation ceiling includes
+actual old/new immutable frame overlap and retained job/completion ownership.
+Cancellation cannot preempt a blocked kernel operation; its owned job retains
+original custody and reservations until it actually returns and joins.

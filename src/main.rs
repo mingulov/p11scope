@@ -108,6 +108,7 @@ fn run() -> Result<i32> {
                 a.diagnostics_pid,
                 a.identity_backend,
                 a.identity_backend_explicit,
+                a.caller_metadata,
             )
             .map_err(|error| {
                 if error.is::<pidns::NumberingMismatch>() {

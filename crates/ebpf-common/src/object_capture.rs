@@ -1987,7 +1987,13 @@ pub fn capture_get_entry_into(
                         continue;
                     }
                 };
-                let slot = &mut side.slots[verdict.slot_count as usize];
+                // The retained count never exceeds the inspected8 slots, but
+                // LLVM does not prove that coupled loop invariant on BPF.
+                // Keep failure finite instead of emitting a panic subprogram.
+                let Some(slot) = side.slots.get_mut(usize::from(verdict.slot_count)) else {
+                    verdict.entry_flags |= attr_list_flag::HEADER_READ_FAILURE;
+                    break;
+                };
                 slot.value_ptr = ptr;
                 slot.entry_capacity = len;
                 slot.kind = safe_kind_code(kind);
@@ -2046,7 +2052,12 @@ pub fn capture_get_return_into(
             k += 1;
             continue;
         }
-        let cell = &mut out.cells[i as usize];
+        // Use a finite checked projection as well as i<n: the BPF backend
+        // may lose the range fact through min8 and retained map metadata.
+        let Some(cell) = out.cells.get_mut(i as usize) else {
+            k += 1;
+            continue;
+        };
         // Preserve the reference protocol's first retained slot per index.
         if cell.kind != 0 {
             k += 1;

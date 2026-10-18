@@ -101,6 +101,12 @@ boundaries and whitespace; do not claim runtime qualification from those checks.
   verify its SHA, configuration and required jobs/shards instead of duplicating
   it locally. Installed/kernel-specific acceptance remains separate. Later
   changes invalidate affected checks, not every unrelated historical result.
+- The ordinary CI matrix covers default unignored tests. Track required
+  ignored/excluded/feature/live cells separately and run exact selectors;
+  membership counts alone do not prove a positive executed. Register new or
+  renamed Python suites in the same patch and run
+  `python3 -I scripts/run-python-suites.py --check` before remote pushes.
+  Use that runner with filenames to execute affected standalone suites.
 - Preserve warm build caches and keep one Cargo-heavy lane per shared build
   host unless resource isolation is established. Compiler job limits do not
   limit test threads/subprocesses. Bound fixture concurrency and diagnose
@@ -108,6 +114,9 @@ boundaries and whitespace; do not claim runtime qualification from those checks.
   failed full gate or prove a flake. Do not remove genuine concurrency controls.
 - Parallel source workers use disjoint file ownership and isolated worktrees;
   one integrator serializes shared interfaces and schedules expensive checks.
+  Dispatch exact owned paths, base SHA and consumed interfaces. Before applying
+  commits, check intervening interface changes even if Git applies cleanly;
+  review conflict edits and run affected checks on the integrated SHA.
   Keep briefs/results concise with links to prior context, rather than repeated
   full reports or permanent logs. Commit verified increments with their scope.
 
@@ -133,6 +142,13 @@ runner. Batch authorized temporary-branch pushes at integration checkpoints;
 each push already triggers CI. Avoid duplicate dispatches and keep a candidate
 ref stable while its run is needed. Check actual runner capacity before queuing
 self-hosted jobs. Testing authorization does not imply deployment/publication.
+
+Manual release-preview currently reruns the ordinary CI matrix as well as
+packaging, bypassing same-SHA deduplication; budget it once packaging is ready.
+The separately instrumented coverage matrix remains intentional. Inspect
+runner build steps before using a prebuilt-only host. Follow each script's lock
+interface: internally locking runners must not be wrapped in the same lock;
+quiet measurements also require excluding unrelated heavy builds.
 
 Privileged, container and VM experiments need the host owner's authorization.
 Honor authorization already given for the task, check ownership of resources,

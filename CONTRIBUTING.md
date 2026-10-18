@@ -89,6 +89,18 @@ Verify the tested SHA, flags and every required job/shard. A prior successful
 run does not qualify changed behavior; rerun affected checks. Privileged/live
 acceptance has its own environment and authorization requirements.
 
+After integrating worker commits, check intervening changes to shared interfaces
+and run the appropriate affected checks on the combined revision. Clean textual
+application and separate worker passes do not establish combined correctness.
+Ordinary CI covers default unignored tests; record required ignored, excluded,
+feature and live cells separately with actual selectors and results. Do not use
+membership counts or a blanket `--ignored` as evidence of positive coverage.
+
+Register new or renamed Python suites in `scripts/run-python-suites.py` in the
+same patch. Run `python3 -I scripts/run-python-suites.py --check` before a remote
+push, and use that runner with affected standalone suite filenames to check
+their execution. This catches missing registrations before expensive CI builds.
+
 Run Rust checks through the repository wrapper so pinned dependency sources
 are prepared consistently. For test temporary files, choose a private
 writable directory on a disk filesystem with enough free space; a small

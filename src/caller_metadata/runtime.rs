@@ -10,6 +10,12 @@ use super::presentation::{
     MetadataStatus,
 };
 use crate::discovery::caller_registry::CallerId;
+#[path = "runtime/job.rs"]
+pub(crate) mod job;
+
+#[path = "runtime/work_lane.rs"]
+pub(crate) mod work_lane;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -120,6 +126,14 @@ pub(crate) struct MetadataFrame {
     pub(crate) summary: MetadataSummary,
 }
 impl MetadataFrame {
+    pub(crate) fn contains(&self, caller: CallerId) -> bool {
+        self.rows.as_ref().is_some_and(|rows| {
+            rows.rows
+                .binary_search_by_key(&caller, |row| row.caller)
+                .is_ok()
+        })
+    }
+
     /// Off has no table, allocations, reads, or caller metadata field.
     pub(crate) fn metadata(&self, caller: CallerId) -> Option<CallerMetadata> {
         if !self.summary.enabled {
@@ -365,6 +379,21 @@ impl MetadataRuntime {
         self.finish(ticket, ticket.caller, Err(reason), ticket.started_ns);
     }
 
+    fn ticket_current(&self, ticket: JobTicket, current: MetadataCaller) -> bool {
+        self.running == Some(ticket)
+            && !self.stopped
+            && ticket.epoch == self.epoch
+            && ticket.fence == self.fence
+            && ticket.fence != u64::MAX
+            && current == ticket.caller
+            && !current.retired
+            && self
+                .slots
+                .get(ticket.caller.id.0 as usize)
+                .and_then(Option::as_ref)
+                .is_some_and(|slot| slot.caller == current && slot.sequence == ticket.sequence)
+    }
+
     // Only the worker qualification child can publish a real sample. A raw
     // UncommittedSample is not accepted by the coordinator/public API.
     fn finish(
@@ -372,6 +401,17 @@ impl MetadataRuntime {
         ticket: JobTicket,
         current: MetadataCaller,
         result: Result<UncommittedSample, MetadataReason>,
+        ended_ns: u64,
+    ) -> bool {
+        self.finish_with_times(ticket, current, result, ticket.started_ns, ended_ns)
+    }
+
+    fn finish_with_times(
+        &mut self,
+        ticket: JobTicket,
+        current: MetadataCaller,
+        result: Result<UncommittedSample, MetadataReason>,
+        started_ns: u64,
         ended_ns: u64,
     ) -> bool {
         let owned = self.running == Some(ticket);
@@ -399,7 +439,7 @@ impl MetadataRuntime {
         let slot = slot.expect("validated slot");
         let revision = slot.metadata.revision.saturating_add(1);
         slot.metadata = match result {
-            Ok(sample) => CallerMetadata::sampled(revision, ticket.started_ns, ended_ns, &sample),
+            Ok(sample) => CallerMetadata::sampled(revision, started_ns, ended_ns, &sample),
             Err(reason) => {
                 self.summary.refresh_failures = self.summary.refresh_failures.saturating_add(1);
                 CallerMetadata::unknown(reason, revision)
@@ -418,8 +458,17 @@ impl MetadataRuntime {
     }
 
     pub(crate) fn frame(&self) -> MetadataFrame {
+        self.snapshot(None)
+    }
+    pub(crate) fn frame_at(&self, now_ns: u64) -> MetadataFrame {
+        self.snapshot(Some(now_ns))
+    }
+    fn snapshot(&self, now_ns: Option<u64>) -> MetadataFrame {
         let count = self.slots.iter().flatten().count();
-        let bytes = count * size_of::<FrameRow>() + ALLOCATION_PADDING + arc_bytes::<FrameRows>();
+        let bytes = count * size_of::<FrameRow>()
+            + ALLOCATION_PADDING
+            + arc_bytes::<FrameRows>()
+            + size_of::<MetadataFrame>();
         let Some(storage) = MemoryCharge::reserve(&self.budget, bytes) else {
             let mut summary = self.census();
             summary.pending = 0;
@@ -436,17 +485,40 @@ impl MetadataRuntime {
         let mut rows = Vec::with_capacity(count);
         rows.extend(self.slots.iter().flatten().map(|slot| FrameRow {
             caller: slot.caller.id,
-            metadata: slot.metadata,
+            metadata: if now_ns.is_some_and(|now| {
+                slot.metadata
+                    .sample_ended_ns
+                    .is_some_and(|ended| now.saturating_sub(ended) > STALE_NS)
+            }) {
+                slot.metadata.to_stale()
+            } else {
+                slot.metadata
+            },
         }));
         assert_eq!(rows.capacity(), count);
         let rows = Arc::new(FrameRows {
             rows: rows.into_boxed_slice(),
             _storage: storage,
         });
+        let mut summary = self.census();
+        summary.pending = 0;
+        summary.sampled = 0;
+        summary.unknown = 0;
+        summary.stale = 0;
+        summary.historical = 0;
+        for row in rows.rows.iter() {
+            match row.metadata.status {
+                MetadataStatus::Pending => summary.pending += 1,
+                MetadataStatus::Sampled => summary.sampled += 1,
+                MetadataStatus::Unknown => summary.unknown += 1,
+                MetadataStatus::Stale => summary.stale += 1,
+                MetadataStatus::Historical => summary.historical += 1,
+            }
+        }
         MetadataFrame {
             rows: Some(rows),
             refused_revision: None,
-            summary: self.census(),
+            summary,
         }
     }
 

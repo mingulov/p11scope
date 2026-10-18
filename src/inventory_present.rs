@@ -515,6 +515,8 @@ pub(crate) struct Presentation {
     /// Where the decided witness rows went (edge, module-level, ambiguous
     /// shared endpoint, unresolved); sums to `bound + unbound`.
     pub witness_placement: crate::discovery::caller_registry::WitnessPlacement,
+    /// Display-only opt-in metadata shared by every consumer of this frame.
+    pub caller_metadata: crate::caller_metadata::runtime::MetadataFrame,
     pub callers: Vec<CallerView>,
     pub modules: Vec<ModuleView>,
     pub edges: Vec<EdgeView>,
@@ -788,6 +790,7 @@ impl Presentation {
             usage_feed: registry.usage_feed(),
             native_witnesses: registry.witness_census().clone(),
             witness_placement: registry.witness_placement(),
+            caller_metadata: coordinator.metadata_frame(),
             callers,
             modules,
             edges,
@@ -1282,6 +1285,14 @@ pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
         budgets.inventory_modules_refused,
         semantic_resource_line(&budgets.instance_semantic_resources),
     );
+    if presentation.caller_metadata.summary.enabled {
+        let summary = presentation.caller_metadata.summary;
+        let _ = writeln!(
+            out,
+            "caller context: {} sampled / {} pending / {} unknown / {} stale / {} historical",
+            summary.sampled, summary.pending, summary.unknown, summary.stale, summary.historical
+        );
+    }
     for caller in &presentation.callers {
         let exe = caller
             .exe
@@ -1297,6 +1308,13 @@ pub(crate) fn render_snapshot(presentation: &Presentation) -> String {
             caller.lifecycle.label(),
             escape_controls(exe)
         );
+        if let Some(metadata) = presentation.caller_metadata.metadata(caller.id) {
+            let _ = writeln!(
+                out,
+                "  {}",
+                crate::caller_metadata::consumer::detail(metadata, presentation.ended_ns)
+            );
+        }
     }
     for module in &presentation.modules {
         let path = module.paths.first().map(String::as_str).unwrap_or("?");

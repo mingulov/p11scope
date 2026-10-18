@@ -826,6 +826,22 @@ Limits that matter in pods:
   Entry columns read unknown
   unless a usage feed observed them, mappings are never reported as
   observed calls, and every coverage loss is an explicit gap.
+  `--caller-metadata=cgroup` opts in to finite sampled caller context from
+  the original retained process's cgroup membership. The default `none` opens
+  no metadata files. PID, system and cgroup Inventory scopes all accept it;
+  `--cgroup` still selects scope independently. Recognized Docker/containerd/
+  CRI-O and Kubernetes cgroup patterns can yield canonical container IDs and
+  pod UIDs, labeled as lexical hints. They do not prove orchestrator ownership.
+  No runtime/Kubernetes API, network, credentials, environment or command line
+  is queried; complete paths and arbitrary names are never published.
+  Native full-image proof is required; scan-only identity reports unknown.
+  Numeric cgroup directory identity remains unavailable without proved mount
+  coordinates. Sampling targets1s within fixed budgets; a sample older than10s
+  becomes stale, and failures clear current hints. Text/dashboard detail shows
+  sampled-at/age and endpoint-only validity; equal endpoints do not exclude an
+  intervening migration. Required installed multi-container/pod qualification
+  remains open.
+
   `--capture auto|scan|native` selects the usage lane. `scan` reads
   `/proc` only (no BPF): every edge's usage coverage
   (`entries.coverage`) reads `unknown` with the reason `scan_only` (or

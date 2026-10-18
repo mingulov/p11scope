@@ -27,6 +27,8 @@ use instance_input::{
 use crate::discovery::native_binding::{BindingCensus, UnboundReason};
 use crate::process::CustodyCharge;
 use crate::process::{PidPin, generation_gone, process_is_zombie, process_start_time};
+pub(crate) mod metadata;
+
 use crate::semantics_edge::resources::{SemanticResourceRefusal, SemanticResourceReserver};
 use crate::semantics_edge::{EdgeSemantics, SemanticCall};
 use anyhow::{Result, anyhow, bail};

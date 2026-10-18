@@ -13,6 +13,7 @@ pub(crate) const MAX_IDENTITY_CONTEXT_BYTES: usize = 65536;
 pub(crate) struct IdentityIndex<'a> {
     callers: HashMap<CallerId, &'a CallerView>,
     modules: HashMap<ModuleId, ModuleIdentity<'a>>,
+    metadata: &'a crate::caller_metadata::runtime::MetadataFrame,
 }
 
 struct ModuleIdentity<'a> {
@@ -23,6 +24,7 @@ struct ModuleIdentity<'a> {
 impl<'a> IdentityIndex<'a> {
     pub(crate) fn new(presentation: &'a Presentation) -> Self {
         Self {
+            metadata: &presentation.caller_metadata,
             callers: presentation
                 .callers
                 .iter()
@@ -79,7 +81,7 @@ impl<'a> IdentityIndex<'a> {
             }
             None => (Value::Null, IdentityStatus::Unavailable),
         };
-        json!({
+        let mut context = json!({
             "id": id.label(),
             "pid": caller.pid,
             "incarnation": caller.incarnation,
@@ -88,7 +90,11 @@ impl<'a> IdentityIndex<'a> {
             "lifecycle": caller.lifecycle.label(),
             "executable": executable,
             "status": status.label(),
-        })
+        });
+        if let Some(metadata) = self.metadata.metadata(id) {
+            context["metadata"] = serde_json::to_value(metadata).expect("finite metadata");
+        }
+        context
     }
 
     fn module_context(&self, id: ModuleId) -> Value {

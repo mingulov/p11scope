@@ -777,14 +777,13 @@ physical edge or a newer ordinal alone does not prove semantic recovery.
 Empty arrays in current production captures do not prove absence of instances
 or complete semantic coverage. No object authority is added.
 
-## Caller metadata (additive within v1; proposed)
+## Caller metadata (additive within v1)
 
-**Status: PROPOSED; implementation, publication and installed acceptance
-pending.** No producer writes these keys until the DR04 owner wires the
-opt-in, the coordinator and the `Presentation` projection. Existing
-callers, providers, scope coverage, counts and gaps are unchanged.
+The opt-in source contract uses the one immutable `Presentation`.
+Installed two-container/two-pod and migration acceptance remains open.
+Metadata contributes no admission, scope, provider identity or counter authority.
 
-The proposed top-level option declaration is
+The top-level option declaration is
 `caller_metadata.mode`: `"none"` (default, explicit off) or `"cgroup"`.
 Off omits `callers[].metadata` entirely; omission in an older document
 means not recorded. On carries one optional object per caller even
@@ -907,3 +906,16 @@ label plus the mechanism rows and operation aggregates:
   }
 }
 ```
+
+`caller_metadata` also carries its separate `pending`, `sampled`, `unknown`,
+`stale`, `historical` census and exact decimal strings `started`, `discarded`,
+`refresh_failures`, `budget_refusals`, `retained_bytes`, `peak_retained_bytes`.
+These describe enrichment, not native capture loss or a lossless guarantee.
+Off allocates no metadata table and opens no metadata files. On with scan-only
+identity yields `identity_unavailable`; native image observation is required
+before a sample may be committed. Numeric directory identity is currently
+withheld as `namespace_unresolved`; lexical hints can still be sampled.
+A stale row keeps its sampled components and times, while a failed refresh
+clears current claims. Retired rows freeze historical evidence. Samples target
+1s refresh within the finite scheduling budget;4096 callers are not promised
+one refresh each second. A sample older than10s is stale at frame time.

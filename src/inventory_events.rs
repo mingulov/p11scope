@@ -682,6 +682,7 @@ pub(crate) fn started_payload(
             "unit": crate::discovery::caller_registry::CLOCK_UNIT,
         },
         "started_ns": started_ns,
+        "caller_metadata": presentation.caller_metadata.summary.json(),
         "limits": {
             "callers": presentation.budgets.callers_limit,
             "modules": presentation.budgets.modules_limit,
@@ -2367,6 +2368,7 @@ pub(crate) fn ended_payload(
         "passes": presentation.passes,
         "budgets": document["budgets"].clone(),
         "gaps_suppressed": presentation.gaps_suppressed,
+        "caller_metadata": presentation.caller_metadata.summary.json(),
         "stream": {
             "rotations": writer.rotations(),
             "evicted_events": writer.evicted_events(),

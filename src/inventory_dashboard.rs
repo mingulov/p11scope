@@ -1393,6 +1393,12 @@ fn secondary_identity_items(
     if let Some(lifecycle) = crate::inventory_present::caller_lifecycle_label(caller) {
         items.push(lifecycle.into());
     }
+    if let Some(metadata) = presentation.caller_metadata.metadata(caller.id) {
+        items.push(crate::caller_metadata::consumer::detail(
+            metadata,
+            presentation.ended_ns,
+        ));
+    }
     items
 }
 

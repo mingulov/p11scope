@@ -1,6 +1,8 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Private authority carried from retained Inventory inputs to a Detailed lane.
 
+pub(crate) mod selected;
+
 use crate::attach::capture::NativeDomainId;
 use crate::attach::{AttachedSemanticSet, BackendSelection, Scope, Session};
 use crate::discovery::caller_registry::ModuleKey;
@@ -752,14 +754,30 @@ impl AttestedSemanticLane {
         }
         let (session, attached) = Session::start_attested(attach_subset, scope, backend)
             .map_err(|_| SemanticRefusal::Attachment)?;
-        session
-            .validate_semantic_set(&attached)
-            .map_err(|_| SemanticRefusal::Attachment)?;
-        let domain = session
-            .native_domain()
-            .ok_or(SemanticRefusal::Unavailable)?;
-        let capture = SemanticCapture::new(&session, TickLimits::default())
-            .map_err(|_| SemanticRefusal::Unavailable)?;
+        Self::from_live_owner(session, attached, convert_subset).map_err(|(_, reason)| reason)
+    }
+
+    /// Share the real H0 construction with selected startup. A rejected owner
+    /// returns its Session so selected preparation can retain and join cleanup.
+    /// This private helper cannot extract a usable provisional lane for callers.
+    fn from_live_owner(
+        session: Session,
+        attached: AttachedSemanticSet,
+        convert_subset: AttestedSubset,
+    ) -> Result<Self, (Session, SemanticRefusal)> {
+        if convert_subset.plan().slots.is_empty() {
+            return Err((session, SemanticRefusal::Unattested));
+        }
+        if session.validate_semantic_set(&attached).is_err() {
+            return Err((session, SemanticRefusal::Attachment));
+        }
+        let Some(domain) = session.native_domain() else {
+            return Err((session, SemanticRefusal::Unavailable));
+        };
+        let capture = match SemanticCapture::new(&session, TickLimits::default()) {
+            Ok(capture) => capture,
+            Err(_) => return Err((session, SemanticRefusal::Unavailable)),
+        };
         Ok(Self {
             subset: convert_subset,
             domain,

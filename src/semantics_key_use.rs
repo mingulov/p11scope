@@ -1267,6 +1267,17 @@ impl KeyUseReducer {
         self.evidence
     }
 
+    /// Return ended associations' shared charges at ledger contact,
+    /// including publications which emit no operation effects.
+    pub(crate) fn flush_pending_shared_releases(
+        &mut self,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
+    ) {
+        for ticket in self.pending_shared_releases.drain(..) {
+            ledger.release_keyassoc(ticket);
+        }
+    }
+
     /// Observe one operation effect from one instance: reserve
     /// aggregate buckets on start (refuse at N+1, never evict),
     /// close into the reserved buckets on end, complete atomically
@@ -1283,9 +1294,7 @@ impl KeyUseReducer {
         // C4-style): tickets closed while the shared ledger was
         // absent return now instead of leaking.
         if let Some(ledger) = shared.as_deref_mut() {
-            for ticket in self.pending_shared_releases.drain(..) {
-                ledger.release_keyassoc(ticket);
-            }
+            self.flush_pending_shared_releases(ledger);
         }
         match effect {
             OperationEffect::Started {

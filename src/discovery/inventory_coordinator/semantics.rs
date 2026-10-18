@@ -2874,4 +2874,131 @@ mod finalizer_history_tests {
             "acknowledged loss releases into Clean: {released:?}"
         );
     }
+
+    // Namespace controls over the existing H3 algorithm fixture. The lane's
+    // native I/O is substituted: these are not installed Session qualification.
+    fn namespace_report(domain: NativeDomainId, position: u64) -> TickReport {
+        TickReport::scripted_with_disposition(
+            vec![TickOutcome::Invalidation(
+                crate::semantic_capture::Invalidation::scripted(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    Some(position),
+                ),
+            )],
+            Vec::new(),
+            None,
+            None,
+            false,
+        )
+    }
+
+    fn namespace_commit(
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        lane: &mut AttestedSemanticLane,
+        position: u64,
+    ) -> crate::semantics_objects::journal::H3DispositionEvidence {
+        let batch = SemanticBatch::from_tick_report(
+            lane.domain(),
+            namespace_report(lane.domain(), position),
+            Vec::new(),
+            130,
+        )
+        .unwrap();
+        coordinator.stage_semantic_batch(batch);
+        coordinator
+            .commit_batch_with_semantics(false, Some(lane))
+            .unwrap();
+        coordinator.take_h3_disposition()
+    }
+
+    #[test]
+    fn h3_session_namespace_refuses_new_lane_before_old_completion() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        let pid = std::process::id();
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::Pid(pid),
+            HookRegistry::builtin(),
+            Vec::new(),
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let fixture = HistoryFixture::new();
+        let mut a =
+            AttestedSemanticLane::start(fixture.subset(), &Scope::Pid(pid), BackendSelection::Auto)
+                .unwrap();
+        let mut b =
+            AttestedSemanticLane::start(fixture.subset(), &Scope::Pid(pid), BackendSelection::Auto)
+                .unwrap();
+        assert_ne!(a.domain(), b.domain());
+        assert!(matches!(
+            namespace_commit(&mut coordinator, &mut a, 9),
+            H3DispositionEvidence::Clean {
+                staged_max: 9,
+                pending_floor: None
+            }
+        ));
+        let foreign = namespace_commit(&mut coordinator, &mut b, 1);
+        assert!(
+            matches!(
+                foreign,
+                H3DispositionEvidence::Clean {
+                    staged_max: 0,
+                    pending_floor: None
+                }
+            ),
+            "without complete-A proof B must not mint using A's numeric finalizer namespace: {foreign:?}"
+        );
+    }
+
+    #[test]
+    fn h3_session_namespace_foreign_drop_cannot_poison_active_lane() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        let pid = std::process::id();
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::Pid(pid),
+            HookRegistry::builtin(),
+            Vec::new(),
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let fixture = HistoryFixture::new();
+        let mut a =
+            AttestedSemanticLane::start(fixture.subset(), &Scope::Pid(pid), BackendSelection::Auto)
+                .unwrap();
+        let b =
+            AttestedSemanticLane::start(fixture.subset(), &Scope::Pid(pid), BackendSelection::Auto)
+                .unwrap();
+        assert!(matches!(
+            namespace_commit(&mut coordinator, &mut a, 3),
+            H3DispositionEvidence::Clean {
+                staged_max: 3,
+                pending_floor: None
+            }
+        ));
+        let batch = SemanticBatch::from_tick_report(
+            b.domain(),
+            namespace_report(b.domain(), 99),
+            Vec::new(),
+            130,
+        )
+        .unwrap();
+        coordinator.stage_semantic_batch(batch);
+        coordinator
+            .commit_batch_with_semantics(false, Some(&mut a))
+            .unwrap();
+        let fresh = namespace_commit(&mut coordinator, &mut a, 4);
+        assert!(
+            matches!(
+                fresh,
+                H3DispositionEvidence::Clean {
+                    staged_max: 4,
+                    pending_floor: None
+                }
+            ),
+            "foreign dropped work must not insert numeric loss into A's finalizer namespace: {fresh:?}"
+        );
+    }
 }

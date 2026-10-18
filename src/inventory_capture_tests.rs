@@ -519,6 +519,8 @@ struct Scene {
     log: Log,
     /// The loop's per-tick hook notes `display` (C5.3: the dashboard).
     display_ticks: bool,
+    /// Exercise the serialized optional-job hook without native proof.
+    native_service_ticks: bool,
     /// A second caller (pid, start) that maps the provider from this scan
     /// (1-based) on.
     joiner: Option<(u32, u64, usize)>,
@@ -554,6 +556,7 @@ impl Scene {
             coordinator,
             log: Rc::clone(log),
             display_ticks: false,
+            native_service_ticks: false,
             joiner: None,
             scans: 0,
             collect_gate: None,
@@ -818,6 +821,16 @@ impl PassDriver<Pin> for Scene {
     fn on_tick(&mut self) {
         if self.display_ticks {
             self.note("display");
+        }
+    }
+
+    fn on_native_service(&mut self, capture: Option<&mut dyn CaptureLane<Pin>>) {
+        if self.native_service_ticks {
+            self.note(if capture.is_some() {
+                "native-service"
+            } else {
+                "native-unavailable"
+            });
         }
     }
 }
@@ -2624,6 +2637,78 @@ fn the_ring_is_serviced_before_the_display_while_a_pass_collects() {
     for tick in during.chunks(2) {
         assert_eq!(tick, ["service", "display"], "{log:?}");
     }
+}
+
+#[test]
+fn native_jobs_share_the_retained_owner_between_ring_and_display() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    scene.display_ticks = true;
+    scene.native_service_ticks = true;
+    let mut lane = ScriptedLane::new(&log);
+    let (serviced, gate) = mpsc::channel();
+    lane.serviced = Some(serviced);
+    scene.collect_gate = Some((gate, 3));
+    run_ticking(&mut scene, lane, 1, Duration::from_millis(1));
+    let log = entries(&log);
+    let collect = log.iter().position(|entry| entry == "collect").unwrap();
+    let scan = log.iter().position(|entry| entry == "scan").unwrap();
+    let during = &log[collect + 1..scan];
+    assert!(
+        during.len() >= 9,
+        "the gated real collection must service three times: {log:?}"
+    );
+    for tick in during.chunks(3) {
+        assert_eq!(tick, ["service", "native-service", "display"], "{log:?}");
+    }
+    let retiring = log
+        .iter()
+        .position(|entry| entry.starts_with("publish:retiring"))
+        .unwrap();
+    assert!(
+        !log[retiring..]
+            .iter()
+            .any(|entry| entry == "native-service")
+    );
+}
+
+#[test]
+fn native_jobs_receive_explicit_unavailability_in_scan_ticks() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    scene.display_ticks = true;
+    scene.native_service_ticks = true;
+    let scans = {
+        let log = Rc::clone(&log);
+        move || log.borrow().iter().filter(|entry| *entry == "scan").count()
+    };
+    let stop = move || scans() >= 2;
+    let clock = LoopClock {
+        deadline: Some(Instant::now() + Duration::from_secs(600)),
+        stop: &stop,
+        interval: Duration::from_millis(30),
+        tick: Duration::from_millis(5),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    let none: Option<NativeLane<ScriptedLane>> = None;
+    run_classic(&mut scene, none, &clock, &mut |scene: &mut Scene, _| {
+        scene.note("publish");
+        Ok(())
+    })
+    .unwrap();
+    let log = entries(&log);
+    let first = log.iter().position(|entry| entry == "publish").unwrap();
+    let second = log.iter().rposition(|entry| entry == "scan").unwrap();
+    let between: Vec<&str> = log[first + 1..second]
+        .iter()
+        .map(String::as_str)
+        .filter(|entry| *entry != "collect")
+        .collect();
+    assert!(between.len() >= 4, "{log:?}");
+    for tick in between.chunks(2) {
+        assert_eq!(tick, ["native-unavailable", "display"], "{log:?}");
+    }
+    assert!(!log.iter().any(|entry| entry == "native-service"));
 }
 
 /// C5.3: the tick schedule is fixed-rate: a tick's own work (the draw after

@@ -75,6 +75,8 @@ use count_eligibility::{
     ReceiptView, ReceiptWork, RecoveryWorkBudget,
 };
 
+#[path = "inventory_coordinator/metadata.rs"]
+mod metadata;
 #[path = "inventory_coordinator/semantics.rs"]
 pub(crate) mod semantics;
 
@@ -233,6 +235,9 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Every H0-position-bearing finalizer field belongs to one Session.
     /// A different live lane cannot consume, overwrite or acknowledge it.
     semantic_finalizer: Option<semantics::SessionFinalizerState>,
+    /// Optional hints retain only their own identity-qualified source state.
+    /// They do not supply Inventory, H0 or Detailed admission authority.
+    caller_metadata: Option<crate::caller_metadata::runtime::job::MetadataLane>,
     /// Detailed domains whose semantic authority ended permanently
     /// (cut/writeback/counter failure): new batches refuse, broad
     /// Inventory continues.
@@ -411,6 +416,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             binder: NativeBinder::new(BinderLimits::default()),
             semantic_bindings: semantics::SemanticBindingSet::new(),
             semantic_finalizer: None,
+            caller_metadata: None,
             refused_semantic_domains: HashSet::new(),
             pending_adjudication: BTreeMap::new(),
             tail_uncertain: BTreeSet::new(),

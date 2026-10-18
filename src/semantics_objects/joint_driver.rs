@@ -763,7 +763,7 @@ mod tests {
 
     fn resource_adapter(pool: &SemanticResourcePool) -> JournalAdapter {
         JournalAdapter::with_ledger(
-            crate::semantics_objects::journal::JournalLimits::default(),
+            crate::semantics_objects::journal::JournalLimits::policy(),
             StagingLedger::with_resources(pool.reserver()),
         )
     }

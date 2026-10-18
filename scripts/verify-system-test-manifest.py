@@ -46,6 +46,7 @@ T7_SELECTORS = {
     "T7.default.inventory_n1024_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_inventory_n1024_lp64"],
     "T7.default.inventory_n4097_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_inventory_n4097_lp64"],
     "T7.default.inventory_n6530_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6530_lp64"],
+    "T7.default.inventory_n6531_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6531_lp64"],
     "T7.default.inventory_n8192_boundary_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_inventory_n8192_boundary_lp64"],
     "T7.default.detailed_hot_slot_third_rv_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_detailed_hot_slot_third_rv_lp64"],
     "T7.wide.detailed_hot_slot_third_rv_lp64": ["attach::inventory::activation::privileged_tests::privileged_t7_detailed_hot_slot_third_rv_lp64"],
@@ -111,7 +112,7 @@ def catalog():
             "kernel_profile": "final-supported-matrix", "required_for_claims": ["system-product"],
             "expected_behavior": "public-contract",
             "limitation": "Requires public command and independent oracle; concrete tests remain to be registered."}
-    for profile, slug in [("default", f"inventory_n{n}_lp64") for n in [576, 1024, 4097, 6530]] + [
+    for profile, slug in [("default", f"inventory_n{n}_lp64") for n in [576, 1024, 4097, 6530, 6531]] + [
             ("default", "inventory_n8192_boundary_lp64"), ("default", "detailed_hot_slot_third_rv_lp64"),
             ("wide", "detailed_hot_slot_third_rv_lp64")]:
         policies[f"T7.{profile}.{slug}"] = {

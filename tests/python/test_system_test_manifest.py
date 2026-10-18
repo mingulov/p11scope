@@ -21,6 +21,7 @@ EXPECTED_BOUNDED_IN = frozenset({
     "T7.default.inventory_n4097_lp64",
     "T7.default.inventory_n576_lp64",
     "T7.default.inventory_n6530_lp64",
+    "T7.default.inventory_n6531_lp64",
     "T7.default.inventory_n8192_boundary_lp64",
     "T7.wide.detailed_hot_slot_third_rv_lp64",
     "finding:A-F8",
@@ -264,7 +265,7 @@ class ManifestTests(unittest.TestCase):
         self.row["receipt_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
 
     def test_complete_selected_claim_passes_and_other_claim_stays_open(self):
-        self.assertEqual(self.verify()["passed"], 7)
+        self.assertEqual(self.verify()["passed"], 8)
         with self.assertRaisesRegex(ValueError, "required cell"):
             VERIFY["verify_manifest"](self.manifest, self.root, claim="system-product")
 
@@ -401,7 +402,7 @@ class ManifestTests(unittest.TestCase):
         # Independently pinned population: production membership must
         # equal the literal lists, never a metadata derivation. Nothing
         # here reads kernel_profile or any other production metadata.
-        self.assertEqual(len(EXPECTED_BOUNDED_IN), 80)
+        self.assertEqual(len(EXPECTED_BOUNDED_IN), 81)
         self.assertEqual(len(EXPECTED_BOUNDED_OUT), 122)
         self.assertEqual(bounded, EXPECTED_BOUNDED_IN)
         self.assertEqual(system - bounded, EXPECTED_BOUNDED_OUT)
@@ -432,7 +433,7 @@ class ManifestTests(unittest.TestCase):
         self.assertTrue(any(identifier.startswith("T7.") for identifier in bounded))
         static = {identifier for identifier, policy in policies.items()
                   if "t7-static" in policy["required_for_claims"]}
-        self.assertEqual(len(static), 7)
+        self.assertEqual(len(static), 8)
 
     def test_placeholder_flip_cannot_change_bounded_membership(self):
         # Bounded membership comes only from the checked-in scope catalog:
@@ -560,6 +561,7 @@ class ManifestTests(unittest.TestCase):
             "T7.default.inventory_n1024_lp64": "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n1024_lp64",
             "T7.default.inventory_n4097_lp64": "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n4097_lp64",
             "T7.default.inventory_n6530_lp64": "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6530_lp64",
+            "T7.default.inventory_n6531_lp64": "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6531_lp64",
             "T7.default.inventory_n8192_boundary_lp64": "attach::inventory::activation::privileged_tests::privileged_t7_inventory_n8192_boundary_lp64",
             "T7.default.detailed_hot_slot_third_rv_lp64": "attach::inventory::activation::privileged_tests::privileged_t7_detailed_hot_slot_third_rv_lp64",
             "T7.wide.detailed_hot_slot_third_rv_lp64": "attach::inventory::activation::privileged_tests::privileged_t7_detailed_hot_slot_third_rv_lp64",

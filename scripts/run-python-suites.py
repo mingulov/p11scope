@@ -63,6 +63,7 @@ RUN = [
     ("test_ia32_automatic_exec.py", []),
     ("test_inventory_capacity_oracle.py", []),
     ("test_inventory_count_only_hooks.py", []),
+    ("test_inventory_output_readiness.py", []),
     ("test_inventory_provider_identity.py", []),
     ("test_inventory_readiness_cadence.py", []),
     ("test_inventory_system_recovery_disclosures.py", []),

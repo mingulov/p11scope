@@ -1425,9 +1425,12 @@ fn privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64() -> Re
     let facts = check_startup_probe_records(&records, public, pid, module, &intervals)?;
     ensure!((facts["path"] == "startup_fence") == fenced.get());
     eprintln!(
-        "G21_STARTUP_PROBE elapsed_ms={} first_public_mapping_last_seen_ns={} facts={facts}",
+        "G21_STARTUP_PROBE cadence_ms={} elapsed_ms={} passes={} first_public_mapping_last_seen_ns={} actual_kind_totals={} facts={facts}",
+        inventory_test_poll_interval().as_millis(),
         started.elapsed().as_millis(),
-        first_mapping.get()
+        observation["passes"],
+        first_mapping.get(),
+        records.last().context("actual probe footer")?["kinds"],
     );
     Ok(())
 }
@@ -1525,4 +1528,16 @@ fn operator_diagnostics_three_round_probe_checks_fence_and_physical_pair() -> Re
         );
     }
     Ok(())
+}
+
+/// Actual engine/BPF at a declared test-local cadence, not default CLI cost.
+/// The pilot's real wall time and exported per-kind production are the input to
+/// any later long schedule; no synthetic clock or record multiplier is used.
+#[test]
+#[ignore = "root-owned BPF lane; real3-round accelerated10ms cadence pilot, bounded90s"]
+fn privileged_native_lane_pid_diagnostics_three_round_accelerated_pilot_lp64() -> Result<()> {
+    with_inventory_test_poll_interval(
+        Duration::from_millis(10),
+        privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64,
+    )
 }

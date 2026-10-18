@@ -911,9 +911,11 @@ label plus the mechanism rows and operation aggregates:
 `stale`, `historical` census and exact decimal strings `started`, `discarded`,
 `refresh_failures`, `budget_refusals`, `retained_bytes`, `peak_retained_bytes`.
 These describe enrichment, not native capture loss or a lossless guarantee.
-Off allocates no metadata table and opens no metadata files. On with scan-only
-identity yields `identity_unavailable`; native image observation is required
-before a sample may be committed. Numeric directory identity is currently
+Off allocates no metadata table and opens no metadata files. Without a genuine native caller-use image binding after coverage starts,
+metadata yields `identity_unavailable` (including scan-only captures). The
+selected original and full64 image must match the binding and both native
+observations before a sample may be committed. This display proof never
+upgrades the CallerRecord's admission or image-authority field. Numeric directory identity is currently
 withheld as `namespace_unresolved`; lexical hints can still be sampled.
 A stale row keeps its sampled components and times, while a failed refresh
 clears current claims. Retired rows freeze historical evidence. Samples target

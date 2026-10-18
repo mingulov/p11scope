@@ -834,7 +834,9 @@ Limits that matter in pods:
   pod UIDs, labeled as lexical hints. They do not prove orchestrator ownership.
   No runtime/Kubernetes API, network, credentials, environment or command line
   is queried; complete paths and arbitrary names are never published.
-  Native full-image proof is required; scan-only identity reports unknown.
+  A genuine native caller-use binding after coverage starts and full-image
+  proof are required; scan-only captures and unbound callers report unknown.
+  The display proof never upgrades caller admission authority.
   Numeric cgroup directory identity remains unavailable without proved mount
   coordinates. Sampling targets1s within fixed budgets; a sample older than10s
   becomes stale, and failures clear current hints. Text/dashboard detail shows

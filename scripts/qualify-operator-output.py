@@ -115,6 +115,32 @@ def bounded_read(path, limit=LIMIT):
     return data
 
 
+def manifest_arguments(manifests, provider):
+    """Forward explicit operator attestation only for the pinned provider.
+
+    The runtime validates the full manifest contract and entry offsets. This
+    gate binds the separately generated helper output to this workload input;
+    it neither invents authority nor claims scan-only discovery succeeded.
+    """
+    provider.verify()
+    arguments = []
+    for pin in manifests:
+        pin.verify()
+        current = pin.path.stat()
+        if (current.st_dev, current.st_ino) != (pin.initial.st_dev, pin.initial.st_ino):
+            raise ValueError('manifest pathname no longer names the held input')
+        document = json.loads(bounded_read(pin.path))
+        objects = [row for row in document.get('objects', [])
+                   if row.get('path') == str(provider.path)]
+        if (document.get('schema') != 'p11scope-manifest/5'
+                or document.get('module_path') != str(provider.path)
+                or len(objects) != 1
+                or objects[0].get('identity', {}).get('sha256') != provider.digest):
+            raise ValueError('manifest does not bind exactly the held provider content')
+        arguments.extend(('--manifest', str(pin.path)))
+    return arguments
+
+
 def file_limit():
     # Only this direct exec child; regular-file output failure is a negative
     # control, never evidence of interruptibility of kernel-blocked file I/O.
@@ -126,7 +152,7 @@ def save(path, value):
     path.write_text(json.dumps(value, indent=2) + '\n')
 
 
-def cell(args, label, directory, env, binary, provider, caller_pin):
+def cell(args, label, directory, env, binary, provider, caller_pin, manifests=()):
     ring, sink, cancel = label.split('-')
     owners, readers, pipes = [], [], []
     receipt = dict(cell=label, source_revision=args.source_revision, sink=sink, cancel=cancel,
@@ -142,6 +168,9 @@ def cell(args, label, directory, env, binary, provider, caller_pin):
     start = time.monotonic()
     try:
         receipt['provider_before'] = PIN_PROVIDER(provider.fd)
+        manifest_argv = manifest_arguments(manifests, provider)
+        receipt['discovery_mode'] = 'explicit-manifest' if manifests else 'scan-only'
+        receipt['manifests'] = [pin.metadata() for pin in manifests]
         caller = NATIVE.spawn_owned(owners,
             [str(caller_pin.path), str(provider.path), '0', 'selected'], args.uid,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -166,7 +195,7 @@ def cell(args, label, directory, env, binary, provider, caller_pin):
         pipes.append(stderr_pipe)
         argv = [str(binary.path), 'trace', '--pid', str(caller.pid),
                 '--module', str(provider.path), '--ring-bytes', ring,
-                '--duration', '6s', '-o', str(trace_path)]
+                '--duration', '6s', '-o', str(trace_path), *manifest_argv]
         observer = NATIVE.spawn_owned(owners, argv, 0, stdin=subprocess.DEVNULL,
             stdout=stdout_fd, stderr=stderr_pipe.write_fd, env=env,
             start_new_session=True,
@@ -298,6 +327,7 @@ def cell(args, label, directory, env, binary, provider, caller_pin):
             result['regular_file_limit_observed'] = receipt['observer_rc'] != 0
         for pin in (binary, provider, caller_pin):
             pin.verify()
+        manifest_arguments(manifests, provider)
         save(directory / 'receipt.json', receipt)
         save(directory / 'result.json', result)
         return result
@@ -328,6 +358,8 @@ def main():
     for name in ('binary', 'provider', 'caller', 'out'):
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--source-revision', required=True)
+    parser.add_argument('--manifest', type=Path, action='append', default=[],
+                        help='explicit trusted-helper attestation for this exact provider; repeatable')
     parser.add_argument('--uid', type=int, required=True)
     parser.add_argument('--gid', type=int, required=True)
     parser.add_argument('--cells', default=','.join(CELLS))
@@ -340,7 +372,8 @@ def main():
             or not re.fullmatch('[0-9a-f]{40}', args.source_revision)
             or not 1 <= args.calls <= 10000 or not names or len(set(names)) != len(names)
             or any(name not in CELLS for name in names)
-            or any(not getattr(args, name).is_absolute() for name in ('binary', 'provider', 'caller', 'out'))):
+            or any(not getattr(args, name).is_absolute() for name in ('binary', 'provider', 'caller', 'out'))
+            or any(not path.is_absolute() for path in args.manifest)):
         parser.error('requires root, ordinary workload uid/gid, exact source commit, bounded unique cells and absolute paths')
     if args.control == 'child-held-stdout' and any('-slowpipe-' not in name for name in names):
         parser.error('child-held-stdout requires only slowpipe cells')
@@ -350,27 +383,31 @@ def main():
     args.out.mkdir(mode=0o755)  # new-only; never overwrite a previous run
     work = args.out / 'workload'
     work.mkdir(mode=0o755)
-    pins, results = [], []
+    pins, manifests, results = [], [], []
     try:
         env = NATIVE.initialize_tokens(work, args.uid, args.gid)
         for path in (args.binary, args.provider, args.caller):
             pins.append(NATIVE.FilePin(path))
+        for path in args.manifest:
+            manifests.append(NATIVE.FilePin(path))
+        manifest_arguments(manifests, pins[1])
         for name in names:
             directory = args.out / name
             directory.mkdir(mode=0o755)
             try:
-                result = cell(args, name, directory, env, *pins)
+                result = cell(args, name, directory, env, *pins, manifests)
             except (OSError, ValueError, TimeoutError, subprocess.SubprocessError) as error:
                 result = {'pass': False, 'status': 'FAIL', 'errors': [str(error)]}
             results.append(dict(cell=name, **result))
             print(json.dumps(results[-1]), flush=True)
         save(args.out / 'summary.json', dict(source_revision=args.source_revision,
             kernel=os.uname().release, control=args.control,
-            inputs=[pin.metadata() for pin in pins], cells=results,
+            inputs=[pin.metadata() for pin in pins], manifests=[pin.metadata() for pin in manifests],
+            discovery_mode='explicit-manifest' if manifests else 'scan-only', cells=results,
             unexecuted=[name for name in CELLS if name not in names]))
         return 0 if all(result['pass'] for result in results) else 1
     finally:
-        for pin in pins:
+        for pin in (*pins, *manifests):
             pin.close()
 
 

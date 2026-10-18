@@ -4,6 +4,9 @@
 
 use super::*;
 
+#[path = "promotion_runtime/staging.rs"]
+mod staging;
+
 #[test]
 fn promotion_runtime_scoped_preparation_reuses_original_inventory_pin() {
     let mut scene = AdmissionScene::new(Selection::Cgroup);

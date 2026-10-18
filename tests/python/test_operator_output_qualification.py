@@ -472,6 +472,8 @@ class ReporterProbeTests(unittest.TestCase):
                 ('duplicate', sample * 2, None),
                 ('foreign-tid', struct.pack('<IHHQIIQ', 9, 0, 32, 0x1234, 123, 124, 700), None),
                 ('foreign-pid', struct.pack('<IHHQIIQ', 9, 0, 32, 0x1234, 124, 123, 700), None),
+                ('zero-ip', struct.pack('<IHHQIIQ', 9, 0, 32, 0, 123, 123, 700), None),
+                ('zero-time', struct.pack('<IHHQIIQ', 9, 0, 32, 0x1234, 123, 123, 0), None),
                 ('lost', struct.pack('<IHHQQ', 2, 0, 24, 1, 1), None),
                 ('lost-samples', struct.pack('<IHHQ', 13, 0, 16, 1), None),
                 ('short', sample[:-1], None),
@@ -786,6 +788,16 @@ class InventorySavedCaptureTests(unittest.TestCase):
 
 
 class ReporterControlAdapterTests(unittest.TestCase):
+    def test_gate_pipe_acquisition_leaves_no_owned_fds_on_first_pipe_failure(self):
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'))
+        descriptors = []
+        def fail_first(flags):
+            raise OSError('owned first-pipe failure')
+        with mock.patch.object(negative['gate_pipes'].__globals__['os'], 'pipe2', fail_first):
+            with self.assertRaisesRegex(OSError, 'first-pipe'):
+                negative['gate_pipes'](descriptors)
+        self.assertEqual(descriptors, [])
+
     def test_partial_gate_pipe_acquisition_remains_owned_on_second_pipe_failure(self):
         negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'))
         pipe2, descriptors = os.pipe2, []

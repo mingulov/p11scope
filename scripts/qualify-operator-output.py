@@ -87,6 +87,12 @@ def events_ring_capacity(pid):
             info = path.read_text()
         except FileNotFoundError:
             continue
+        # BPF_MAP_TYPE_RINGBUF=27 in Linux UAPI. Avoid spawning one bpftool
+        # process per unrelated map while a bounded capture is already live.
+        # fdinfo is from this held observer; bpftool still proves the name,
+        # type and configured capacity of each candidate ring.
+        if not re.search(r'^map_type:\s*27$', info, re.MULTILINE):
+            continue
         match = re.search(r'^map_id:\s*([0-9]+)$', info, re.MULTILINE)
         if not match:
             continue

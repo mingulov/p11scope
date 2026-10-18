@@ -3043,6 +3043,89 @@ fn promoter_reports_active_only_from_runtime_and_holds_busy_after() {
 }
 
 #[test]
+fn promoter_rejects_foreign_capture_status_before_any_change() {
+    // Two separately enabled captures issue the same numeric request
+    // 1 for the same raw pair; only the bound capture's updates land.
+    let presentation = varied_presentation();
+    let edge = presentation.edges[0].clone();
+    let raw = PromotionPair::new(edge.caller.0, edge.module.0);
+    let mut ours = Promoter::new();
+    assert!(ours.enable(CaptureId::new(2)));
+    let view = Arc::new(PromotionView::new(
+        CaptureId::new(2),
+        ViewRevision::new(1),
+        Arc::new(presentation),
+    ));
+    let id = ours
+        .request(Arc::clone(&view), edge.caller, edge.module)
+        .expect("request 1 queues");
+    assert_eq!(id.get(), 1);
+    let held = ours.take_request().expect("runtime takes it");
+    // The held request builds correctly qualified updates.
+    let own = held.status_update(PromotionOutcome::Preparing);
+    assert_eq!(own.capture, CaptureId::new(2));
+    assert_eq!(own.request, id);
+    ours.set_note(Some(PromotionNote::Busy));
+    for outcome in [
+        PromotionOutcome::Preparing,
+        PromotionOutcome::Active { pair: raw },
+        PromotionOutcome::Refused {
+            reason: PromotionRefusal::CallerRetired,
+        },
+        PromotionOutcome::Ended {
+            reason: PromotionEnd::LaneClosed,
+        },
+    ] {
+        let foreign = PromotionStatusUpdate::new(CaptureId::new(1), id, outcome);
+        assert_eq!(ours.set_status(foreign), None, "{outcome:?}");
+        assert_eq!(ours.state(), PromotionState::Queued);
+        assert!(ours.take_request().is_none(), "mailbox stays consumed");
+    }
+    // The standing note survives foreign updates.
+    assert_eq!(ours.snapshot(None).note, Some(PromotionNote::Busy));
+    // Our own update (from the held request) still works.
+    assert_eq!(
+        ours.set_status(held.status_update(PromotionOutcome::Preparing)),
+        Some(PromotionState::Preparing)
+    );
+}
+
+#[test]
+fn promoter_foreign_ended_after_cancel_neither_releases_nor_replaces() {
+    let presentation = varied_presentation();
+    let edge = presentation.edges[0].clone();
+    let mut ours = Promoter::new();
+    assert!(ours.enable(CaptureId::new(2)));
+    let view = Arc::new(PromotionView::new(
+        CaptureId::new(2),
+        ViewRevision::new(1),
+        Arc::new(presentation),
+    ));
+    let id = ours
+        .request(Arc::clone(&view), edge.caller, edge.module)
+        .expect("request 1 queues");
+    let held = ours.take_request().expect("runtime takes it");
+    assert_eq!(ours.cancel(), PromotionCancel::Stopping);
+    assert_eq!(
+        ours.set_status(PromotionStatusUpdate::new(
+            CaptureId::new(1),
+            id,
+            PromotionOutcome::Ended {
+                reason: PromotionEnd::LaneClosed
+            }
+        )),
+        None
+    );
+    assert_eq!(ours.state(), PromotionState::Stopping);
+    assert_eq!(
+        ours.set_status(held.status_update(PromotionOutcome::Ended {
+            reason: PromotionEnd::Cancelled
+        })),
+        Some(PromotionState::Ended(PromotionEnd::Cancelled))
+    );
+}
+
+#[test]
 fn promotion_status_lines_are_plain_and_exact() {
     let mut ui = PromotionUi::disabled();
     assert_eq!(ui.status_line(), None);
@@ -3394,7 +3477,7 @@ fn pty_promotion_status_and_request_survive_frame_coalescing() {
 }
 
 #[test]
-fn pty_promotion_run_stop_ends_outstanding_work() {
+fn pty_promotion_restore_untaken_ends_synchronously() {
     let mut terminal = PromoPty::open();
     assert!(terminal.display.promotion_enable(CaptureId::new(5)));
     terminal.display.offer(varied_presentation());
@@ -3402,16 +3485,282 @@ fn pty_promotion_run_stop_ends_outstanding_work() {
     terminal.shown(b"promotion: idle; selected");
     terminal.key(b"d");
     terminal.shown(b"promotion: request 1 queued");
-    terminal
-        .display
-        .take_promotion_request()
-        .expect("runtime takes it");
+    // Untaken work ends with the run and never reaches the runtime.
     terminal.display.restore();
     assert_eq!(
         terminal.display.promotion_state(),
         PromotionState::Ended(PromotionEnd::RunStopped)
     );
     assert!(terminal.display.take_promotion_request().is_none());
+    // The shutdown latch is irreversible.
+    assert!(!terminal.display.promotion_enable(CaptureId::new(5)));
+    assert!(!terminal.display.promotion_enable(CaptureId::new(6)));
+}
+
+#[test]
+fn pty_promotion_restore_requests_stop_then_genuine_end() {
+    // Driver-order contract: the real Inventory driver calls
+    // `display.restore()` from its `Publish::Retiring` callback
+    // (`src/inventory.rs:2930`) BEFORE the native lane stops
+    // (`src/inventory_capture.rs:1714`). Restore therefore requests
+    // stop and latches shutdown; only the lane's own disposal ends
+    // transferred work. A core-only test that blesses restore as
+    // completion would certify the wrong hook.
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    terminal.key(b"d");
+    terminal.shown(b"promotion: request 1 queued");
+    let held = terminal
+        .display
+        .take_promotion_request()
+        .expect("runtime takes it");
+    // Retiring callback: terminal restore precedes native stop.
+    terminal.display.restore();
+    assert_eq!(
+        terminal.display.promotion_state(),
+        PromotionState::Stopping,
+        "transferred work awaits its own disposal"
+    );
+    assert!(terminal.display.take_promotion_request().is_none());
+    // Late Active cannot revive the stopped run.
+    assert_eq!(
+        terminal
+            .display
+            .set_promotion_status(held.status_update(PromotionOutcome::Active {
+                pair: PromotionPair::new(held.caller().0, held.provider().0)
+            })),
+        None
+    );
+    assert_eq!(terminal.display.promotion_state(), PromotionState::Stopping);
+    // Genuine matching disposal (the native stop) ends exactly once.
+    assert_eq!(
+        terminal
+            .display
+            .set_promotion_status(held.status_update(PromotionOutcome::Ended {
+                reason: PromotionEnd::Cancelled
+            })),
+        Some(PromotionState::Ended(PromotionEnd::Cancelled))
+    );
+    assert_eq!(
+        terminal
+            .display
+            .set_promotion_status(held.status_update(PromotionOutcome::Ended {
+                reason: PromotionEnd::Cancelled
+            })),
+        None
+    );
+    // Future admission stays closed.
+    assert!(!terminal.display.promotion_enable(CaptureId::new(5)));
+    assert!(!terminal.display.promotion_enable(CaptureId::new(6)));
+}
+
+#[test]
+fn pty_promotion_shed_frame_refuses_until_full_repaint() {
+    // P2 twin: an initial wholly shed frame (real TerminalWriter
+    // outcome on a stalled pty) never becomes the viewed frame, so `d`
+    // refuses; the full repaint afterwards commits and requests.
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    fill(&terminal.pty);
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    let account = terminal.display.account().terminal;
+    assert!(account.frames_shed >= 1, "{account:?}");
+    assert_eq!(account.frames_written, 0, "{account:?}");
+    assert!(
+        terminal.display.viewed_presentation.is_none(),
+        "shed candidate is not viewed"
+    );
+    terminal.key(b"d");
+    assert!(terminal.display.take_promotion_request().is_none());
+    assert_eq!(terminal.display.promotion_state(), PromotionState::Idle);
+    // The repaint reaches the terminal whole and commits the viewed
+    // triple; the retained cursor (never cleared by the shed) requests.
+    drain(&mut terminal.pty, Duration::from_millis(100));
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    assert!(terminal.display.viewed_presentation.is_some());
+    assert_eq!(terminal.display.viewed_revision.get(), 1);
+    terminal.key(b"d");
+    terminal.shown(b"promotion: request 1 queued");
+    let request = terminal
+        .display
+        .take_promotion_request()
+        .expect("repaint commits the viewed frame");
+    assert_eq!(request.viewed().revision().get(), 1);
+    assert!(Arc::ptr_eq(
+        request.viewed().presentation(),
+        terminal.display.viewed_presentation.as_ref().unwrap()
+    ));
+    terminal.display.restore();
+}
+
+#[test]
+fn pty_promotion_shed_new_frame_never_binds_candidate() {
+    // P2 twin: full A, then fully shed B. B never binds (conservative
+    // no-view refusal); the full repaint of B binds B's exact Arc and
+    // revision, never A.
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    assert_eq!(terminal.display.viewed_revision.get(), 1);
+    fill(&terminal.pty);
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    assert!(
+        terminal.display.viewed_presentation.is_none(),
+        "shed B clears viewed authority"
+    );
+    terminal.key(b"d");
+    assert!(terminal.display.take_promotion_request().is_none());
+    assert_eq!(terminal.display.promotion_state(), PromotionState::Idle);
+    drain(&mut terminal.pty, Duration::from_millis(100));
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    assert_eq!(terminal.display.viewed_revision.get(), 2);
+    terminal.key(b"d");
+    terminal.shown(b"promotion: request 1 queued");
+    let request = terminal
+        .display
+        .take_promotion_request()
+        .expect("repaint binds the repainted frame");
+    assert_eq!(request.viewed().revision().get(), 2);
+    terminal.display.restore();
+}
+
+#[test]
+fn pty_promotion_cut_frame_clears_until_repair() {
+    // P2 twin: a frame the terminal took only in part (cut, torn)
+    // clears viewed authority; no promotion until the repaired full
+    // repaint. Real writer accounting proves the cut happened.
+    let mut terminal = PromoPty::open();
+    terminal.pty.set_winsize(200, 60);
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    fill(&terminal.pty);
+    // Free a little room, less than the large frame: the next write
+    // lands partially (cut), not whole and not fully shed.
+    let mut freed = 0;
+    let mut chunk = [0u8; 512];
+    while freed < 1024 {
+        use std::io::Read as _;
+        match terminal.pty.master.read(&mut chunk) {
+            Ok(n) => freed += n,
+            Err(_) => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    let account = terminal.display.account().terminal;
+    assert_eq!(account.frames_cut, 1, "{account:?}");
+    assert!(!terminal.display.writer.last_frame_written());
+    assert!(terminal.display.viewed_presentation.is_none());
+    terminal.key(b"d");
+    assert!(terminal.display.take_promotion_request().is_none());
+    assert_eq!(terminal.display.promotion_state(), PromotionState::Idle);
+    // The repair (CAN prefix) plus full repaint recommits.
+    drain(&mut terminal.pty, Duration::from_millis(100));
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    assert!(terminal.display.viewed_presentation.is_some());
+    terminal.key(b"d");
+    terminal.shown(b"promotion: request 1 queued");
+    assert!(terminal.display.take_promotion_request().is_some());
+    terminal.display.restore();
+}
+
+#[test]
+fn pty_promotion_view_exhaustion_refuses_honestly() {
+    // P2 twin: checked view serials never reuse a revision. Once the
+    // counter reaches EXHAUSTED, installs close authority and `d`
+    // refuses with Exhausted instead of minting a duplicate.
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    assert_eq!(terminal.display.viewed_revision.get(), 1);
+    terminal.display.next_view_revision = ViewRevision::EXHAUSTED;
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    assert!(terminal.display.view_exhausted);
+    assert!(terminal.display.viewed_presentation.is_none());
+    terminal.key(b"d");
+    assert!(terminal.display.take_promotion_request().is_none());
+    assert_eq!(terminal.display.promotion_state(), PromotionState::Idle);
+    assert_eq!(
+        terminal.display.state.promotion.note,
+        Some(PromotionNote::Exhausted)
+    );
+    terminal.display.restore();
+}
+
+#[test]
+fn pty_promotion_foreign_capture_status_rejected() {
+    // P3 twin through the staged driver surface: capture 6's updates
+    // for the same numeric request 1 leave capture 5 unchanged across
+    // Preparing/Active/Refused/Ended; capture 5's own held-request
+    // updates work.
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    terminal.key(b"d");
+    terminal.shown(b"promotion: request 1 queued");
+    let held = terminal
+        .display
+        .take_promotion_request()
+        .expect("runtime takes it");
+    let raw = PromotionPair::new(held.caller().0, held.provider().0);
+    for outcome in [
+        PromotionOutcome::Preparing,
+        PromotionOutcome::Active { pair: raw },
+        PromotionOutcome::Refused {
+            reason: PromotionRefusal::CallerRetired,
+        },
+        PromotionOutcome::Ended {
+            reason: PromotionEnd::LaneClosed,
+        },
+    ] {
+        assert_eq!(
+            terminal
+                .display
+                .set_promotion_status(PromotionStatusUpdate::new(
+                    CaptureId::new(6),
+                    held.id(),
+                    outcome
+                )),
+            None,
+            "{outcome:?}"
+        );
+        assert_eq!(terminal.display.promotion_state(), PromotionState::Queued);
+    }
+    assert_eq!(
+        terminal
+            .display
+            .set_promotion_status(held.status_update(PromotionOutcome::Preparing)),
+        Some(PromotionState::Preparing)
+    );
+    terminal.display.restore();
+    // Restore requested stop for the transferred preparation; the
+    // genuine end still lands exactly once.
+    assert_eq!(terminal.display.promotion_state(), PromotionState::Stopping);
+    assert_eq!(
+        terminal
+            .display
+            .set_promotion_status(held.status_update(PromotionOutcome::Ended {
+                reason: PromotionEnd::Cancelled
+            })),
+        Some(PromotionState::Ended(PromotionEnd::Cancelled))
+    );
 }
 
 #[test]

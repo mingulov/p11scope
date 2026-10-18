@@ -31,6 +31,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    pub(super) fn synchronize_caller_metadata(&mut self, now_ns: u64) {
+        if let Some(metadata) = self.caller_metadata.as_mut() {
+            // Publication can precede the first service tick. Account every
+            // current/retired row without starting native or proc I/O here.
+            metadata.synchronize(&self.adapter, now_ns);
+        }
+    }
+
     pub(crate) fn metadata_frame(&self) -> MetadataFrame {
         self.caller_metadata
             .as_ref()

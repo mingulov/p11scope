@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Oracle mutations and genuine fd controls, never installed acceptance."""
 import copy
+import io
 import json
 import os
 import subprocess
@@ -542,7 +543,7 @@ class ReporterProbeTests(unittest.TestCase):
 
     def test_wire_witness_requires_actual_mode_identity_and_loss_free_causal_once(self):
         module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/reporter_probe.py'))
-        expected = dict(pid=123, tid=123, start_time=9, dev=2, ino=3, file_offset=80, ip=0x1234)
+        expected = dict(role='reporter', pid=123, tid=123, start_time=9, dev=2, ino=3, file_offset=80, ip=0x1234)
         ready = dict(kind='ready', mode='perf_uprobe', clock='CLOCK_MONOTONIC', t_ns=400,
                      **{key: value for key, value in expected.items() if key != 'ip'})
         event = dict(kind='reporter', mode='perf_uprobe', pid=123, tid=123, ip=0x1234, t_ns=700)
@@ -574,6 +575,33 @@ class ReporterProbeTests(unittest.TestCase):
                 module['validate_witness'](changed, expected, signals)
         with self.assertRaises(ValueError):
             module['validate_witness'](records, expected, [])
+
+    def test_prompt_callback_delivery_is_never_reporter_acknowledgement(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/reporter_probe.py'))
+        expected = dict(role='callback', pid=123, tid=123, start_time=9, dev=2,
+                        ino=3, file_offset=80, ip=0x1234)
+        rows = [dict(kind='ready', mode='perf_uprobe', clock='CLOCK_MONOTONIC', t_ns=400,
+                     **{key: value for key, value in expected.items() if key != 'ip'}),
+                dict(kind='callback', mode='perf_uprobe', pid=123, tid=123, ip=0x1234, t_ns=700),
+                dict(kind='final', mode='perf_uprobe', samples=1, lost=0, kernel_count=1,
+                     time_enabled=500, time_running=500)]
+        module['validate_callback_binding'](rows, expected)
+        for mutation in ('unchanged', 'reporter-kind', 'foreign-ip', 'foreign-role'):
+            changed = copy.deepcopy(rows)
+            if mutation == 'reporter-kind': changed[1]['kind'] = 'reporter'
+            elif mutation == 'foreign-ip': changed[1]['ip'] += 1
+            elif mutation == 'foreign-role': changed[0]['role'] = 'reporter'
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                module['validate_witness'](changed, expected, [dict(signal='SIGINT', t_ns=600)])
+            if mutation in ('foreign-ip', 'foreign-role'):
+                with self.assertRaises(ValueError):
+                    module['validate_callback_binding'](changed, expected)
+        with self.assertRaises(ValueError):
+            module['read_reporter_symbols'](io.BytesIO(b'p11scope::run::install_stop_flag::{closure#1} t 12 10\n'), 'callback')
+        self.assertEqual(module['read_reporter_symbols'](
+            io.BytesIO(b'p11scope::run::install_stop_flag::{closure#0} t 12 10\n'), 'callback'), [0x12])
+        with self.assertRaises(ValueError):
+            module['read_reporter_symbols'](io.BytesIO(b'arbitrary_symbol t 12 10\n'), 'arbitrary')
 
     def test_live_mode_refuses_a_foreign_executable_before_attaching(self):
         fd = os.open(self.probe, os.O_RDONLY)
@@ -667,17 +695,18 @@ class ReporterControlAdapterTests(unittest.TestCase):
 
     def test_no_signal_control_cannot_accept_sample_fixture_loss_or_foreign_ready(self):
         module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/qualify_reporter_probe.py'))
-        expected = dict(pid=123, tid=123, start_time=9, dev=2, ino=3, file_offset=80)
+        expected = dict(role='reporter', pid=123, tid=123, start_time=9, dev=2, ino=3, file_offset=80)
         rows = [dict(kind='ready', mode='perf_uprobe', clock='CLOCK_MONOTONIC', **expected),
                 dict(kind='final', mode='perf_uprobe', samples=0, kernel_count=0, lost=0,
                      time_enabled=100, time_running=100)]
         self.assertEqual(module['check_zero'](rows, expected)['no_signal_samples'], 0)
-        for mutation in ('sample', 'fixture', 'loss', 'foreign', 'multiplex'):
+        for mutation in ('sample', 'fixture', 'loss', 'foreign', 'multiplex', 'callback-role'):
             changed = copy.deepcopy(rows)
             if mutation == 'sample': changed[1]['samples'] = 1
             elif mutation == 'fixture': changed[0]['mode'] = 'decode_fixture'
             elif mutation == 'loss': changed[1]['lost'] = 1
             elif mutation == 'foreign': changed[0]['ino'] += 1
+            elif mutation == 'callback-role': changed[0]['role'] = 'callback'
             else: changed[1]['time_running'] = 99
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
                 module['check_zero'](changed, expected)

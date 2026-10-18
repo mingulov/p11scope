@@ -42,6 +42,7 @@ def check_zero(records, expected):
         raise ValueError('no-signal control lacks actual ready/final with zero samples')
     ready, final = records
     if (ready.get('clock') != 'CLOCK_MONOTONIC'
+            or ready.get('role') != 'reporter' or expected.get('role') != 'reporter'
             or any(ready.get(key) != expected[key] for key in ('pid', 'tid', 'start_time', 'dev', 'ino', 'file_offset'))
             or any(type(final.get(key)) is not int or final[key] != 0 for key in ('samples', 'kernel_count', 'lost'))
             or type(final.get('time_enabled')) is not int or final['time_enabled'] <= 0
@@ -104,6 +105,7 @@ def cell(args, name, directory, env, binary, provider, caller_pin, helper, manif
                 ready = facts.wait(lambda reader: next((row for row in json_rows(reader)
                     if row.get('kind') == 'ready'), None), seconds=5)
                 if (ready.get('mode') != 'perf_uprobe' or ready.get('clock') != 'CLOCK_MONOTONIC'
+                        or ready.get('role') != 'reporter'
                         or any(ready.get(key) != expected[key] for key in ('pid', 'tid', 'start_time', 'dev', 'ino', 'file_offset'))):
                     raise ValueError('probe readiness does not bind the actual original observer')
                 for key in ('pid_namespace', 'time_namespace'):

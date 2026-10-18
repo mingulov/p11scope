@@ -21,6 +21,7 @@ struct decoder {
     uint32_t pid;
     unsigned samples;
     const char *mode;
+    const char *role;
 };
 
 static int refuse(const char *message) {
@@ -64,9 +65,9 @@ static int consume(struct decoder *decoder, const unsigned char *data, uint64_t 
             return refuse("reporter sample is not the bound observer main TID");
         if (!timestamp || !ip || ++decoder->samples != 1)
             return refuse("zero/duplicate reporter observation");
-        printf("{\"kind\":\"reporter\",\"mode\":\"%s\",\"ip\":%" PRIu64
+        printf("{\"kind\":\"%s\",\"mode\":\"%s\",\"ip\":%" PRIu64
                ",\"pid\":%u,\"tid\":%u,\"t_ns\":%" PRIu64 "}\n",
-               decoder->mode, ip, ids[0], ids[1], timestamp);
+               decoder->role, decoder->mode, ip, ids[0], ids[1], timestamp);
         fflush(stdout);
         *tail += header.size;
     }
@@ -86,7 +87,7 @@ static int decode_fixture(int argc, char **argv) {
     if (bad || length > sizeof(data) || head < tail || head - tail != length)
         return refuse("invalid fixture extent");
     for (size_t i = 0; i < length; ++i) data[(tail + i) % sizeof(data)] = payload[i];
-    struct decoder decoder = {(uint32_t)pid, 0, "decode_fixture"};
+    struct decoder decoder = {(uint32_t)pid, 0, "decode_fixture", "reporter"};
     if (consume(&decoder, data, sizeof(data), head, &tail)) return -1;
     printf("{\"kind\":\"final\",\"mode\":\"decode_fixture\",\"samples\":%u,\"lost\":0}\n", decoder.samples);
     return 0;
@@ -133,6 +134,7 @@ static uint64_t monotonic_ns(void) {
 }
 
 static int probe(int argc, char **argv) {
+    const char *role = !strcmp(argv[1], "--probe-callback") ? "callback" : "reporter";
     uint64_t exe_fd, pid, birth, offset, duration;
     struct stat held, after;
     if (argc != 7 || number(argv[2], &exe_fd) || exe_fd > INT32_MAX ||
@@ -181,12 +183,12 @@ static int probe(int argc, char **argv) {
     }
     uint64_t start = monotonic_ns(), tail = 0;
     if (!start) { refuse("monotonic clock unavailable"); goto disable; }
-    printf("{\"kind\":\"ready\",\"mode\":\"perf_uprobe\",\"pid\":%" PRIu64
+    printf("{\"kind\":\"ready\",\"mode\":\"perf_uprobe\",\"role\":\"%s\",\"pid\":%" PRIu64
            ",\"tid\":%" PRIu64 ",\"start_time\":%" PRIu64 ",\"dev\":%ju,\"ino\":%ju,"
            "\"file_offset\":%" PRIu64 ",\"clock\":\"CLOCK_MONOTONIC\",\"t_ns\":%" PRIu64 "}\n",
-           pid, pid, birth, (uintmax_t)held.st_dev, (uintmax_t)held.st_ino, offset, start);
+           role, pid, pid, birth, (uintmax_t)held.st_dev, (uintmax_t)held.st_ino, offset, start);
     fflush(stdout);
-    struct decoder decoder = {(uint32_t)pid, 0, "perf_uprobe"};
+    struct decoder decoder = {(uint32_t)pid, 0, "perf_uprobe", role};
     int event_hup = 0;
     for (;;) {
         struct pollfd polling[] = {{event_hup ? -1 : event, POLLIN, 0}, {STDIN_FILENO, POLLIN, 0}};
@@ -244,6 +246,7 @@ close_event:
 
 int main(int argc, char **argv) {
     if (argc > 1 && !strcmp(argv[1], "--decode-fixture")) return decode_fixture(argc, argv) ? 2 : 0;
-    if (argc > 1 && !strcmp(argv[1], "--probe")) return probe(argc, argv) ? 2 : 0;
-    return refuse("use --probe EXE_FD PID BIRTH FILE_OFFSET LIMIT_MS or --decode-fixture") ? 2 : 0;
+    if (argc > 1 && (!strcmp(argv[1], "--probe") || !strcmp(argv[1], "--probe-callback")))
+        return probe(argc, argv) ? 2 : 0;
+    return refuse("use --probe/--probe-callback EXE_FD PID BIRTH FILE_OFFSET LIMIT_MS or --decode-fixture") ? 2 : 0;
 }

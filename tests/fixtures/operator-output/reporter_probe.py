@@ -16,6 +16,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[3]
 MAPPING_FROM_FD = runpy.run_path(str(ROOT / 'scripts/mapped-provider-pin.py'))['mapping_from_fd']
 SYMBOL = 'p11scope::run::report_capture_cancel'
+ROLE_SYMBOLS = {'reporter': SYMBOL, 'callback': 'p11scope::run::install_stop_flag::{closure#0}'}
 
 
 def symbol_file_offset(fd, address):
@@ -52,13 +53,15 @@ def verify_path(pin):
         raise ValueError('actual candidate pathname differs from held executable')
 
 
-def read_reporter_symbols(output):
+def read_reporter_symbols(output, role='reporter'):
+    if role not in ROLE_SYMBOLS:
+        raise ValueError('unsupported finite probe role')
     output.seek(0, os.SEEK_END)
     if output.tell() > 64 * 1024 * 1024:
         raise ValueError('actual candidate symbol table exceeds bounded disk extent')
     output.seek(0)
     matches = []
-    pattern = re.compile(r'^' + re.escape(SYMBOL) + r'(?:::h[0-9a-f]{16})? [tT] ([0-9a-fA-F]+)(?: [0-9a-fA-F]+)?$')
+    pattern = re.compile(r'^' + re.escape(ROLE_SYMBOLS[role]) + r'(?:::h[0-9a-f]{16})? [tT] ([0-9a-fA-F]+)(?: [0-9a-fA-F]+)?$')
     while line := output.readline(65537):
         if len(line) > 65536:
             raise ValueError('actual candidate symbol line exceeds bounded input')
@@ -71,7 +74,7 @@ def read_reporter_symbols(output):
     return matches
 
 
-def resolve_reporter(pin):
+def resolve_role(pin, role):
     verify_path(pin)
     # Disk-backed nm output, bounded before reading into memory. Symbol names
     # come from the actual held candidate, never a source-name/offset guess.
@@ -81,11 +84,15 @@ def resolve_reporter(pin):
                                 stdout=output, stderr=errors, timeout=10)
         if result.returncode:
             raise ValueError('actual candidate symbol table is unavailable')
-        matches = read_reporter_symbols(output)
+        matches = read_reporter_symbols(output, role)
     offset = symbol_file_offset(pin.fd, matches[0])
     verify_path(pin)
-    return dict(symbol=SYMBOL, virtual_address=matches[0], file_offset=offset,
+    return dict(role=role, symbol=ROLE_SYMBOLS[role], virtual_address=matches[0], file_offset=offset,
                 candidate=pin.metadata())
+
+
+def resolve_reporter(pin):
+    return resolve_role(pin, 'reporter')
 
 
 def expected_witness(pin, owner, resolved):
@@ -97,6 +104,9 @@ def expected_witness(pin, owner, resolved):
         raise ValueError('actual observer image differs from held reporter candidate')
     if resolved.get('candidate') != pin.metadata():
         raise ValueError('resolved reporter belongs to another held candidate')
+    role = resolved.get('role')
+    if role not in ROLE_SYMBOLS or resolved.get('symbol') != ROLE_SYMBOLS[role]:
+        raise ValueError('resolved symbol does not bind a finite probe role')
     with open(f'/proc/{owner.pid}/maps', 'rb') as source:
         payload = source.read(4 * 1024 * 1024 + 1)
     if len(payload) > 4 * 1024 * 1024:
@@ -122,21 +132,22 @@ def expected_witness(pin, owner, resolved):
         raise ValueError('actual reporter executable mapping is absent or ambiguous')
     owner.verify()
     verify_path(pin)
-    return dict(pid=owner.pid, tid=owner.pid, start_time=owner.identity['start_time'],
+    return dict(role=role, pid=owner.pid, tid=owner.pid, start_time=owner.identity['start_time'],
                 dev=pin.initial.st_dev, ino=pin.initial.st_ino,
                 file_offset=resolved['file_offset'], ip=addresses[0], mapped_identity=anchor)
 
 
-def validate_binding(records, expected):
+def _validate_binding(records, expected, role):
     """Actual identity/clock/zero-loss envelope, independent of latency policy."""
     if (not isinstance(records, (list, tuple)) or len(records) != 3
             or any(not isinstance(row, dict) for row in records)
-            or [row.get('kind') for row in records] != ['ready', 'reporter', 'final']):
+            or expected.get('role') != role
+            or [row.get('kind') for row in records] != ['ready', role, 'final']):
         raise ValueError('need exactly one actual ready/sample/final reporter witness')
     ready, event, final = records
     if any(row.get('mode') != 'perf_uprobe' for row in records):
         raise ValueError('fixture evidence cannot qualify live acknowledgement')
-    if ready.get('clock') != 'CLOCK_MONOTONIC':
+    if ready.get('clock') != 'CLOCK_MONOTONIC' or ready.get('role') != role:
         raise ValueError('probe timestamp clock is not the signal-send clock')
     for key in ('pid', 'tid', 'start_time', 'dev', 'ino', 'file_offset'):
         if type(ready.get(key)) is not int or ready[key] < 0 or ready[key] != expected[key]:
@@ -151,6 +162,15 @@ def validate_binding(records, expected):
             or final['time_enabled'] <= 0
             or final['time_enabled'] != final.get('time_running')):
         raise ValueError('lost/multiplexed/unreconciled kernel reporter evidence')
+
+
+def validate_binding(records, expected):
+    return _validate_binding(records, expected, 'reporter')
+
+
+def validate_callback_binding(records, expected):
+    """Delivery evidence only: this finite role can never qualify an ACK."""
+    return _validate_binding(records, expected, 'callback')
 
 
 def validate_witness(records, expected, signals):

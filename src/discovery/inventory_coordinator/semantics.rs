@@ -3,6 +3,8 @@
 
 use super::*;
 
+#[path = "semantics/finalizer.rs"]
+mod finalizer;
 #[path = "semantics/promotion.rs"]
 mod promotion;
 #[cfg(test)]
@@ -21,6 +23,8 @@ use crate::semantic_capture::{
     CurrentReceiptRefusal, Endpoint, InvalidationScope, PhysicalSemanticGap, TickOutcome,
 };
 use crate::semantics_edge::resources::{OWNED_ALLOCATION_PADDING, ResourceLease};
+pub(super) use finalizer::SessionFinalizerState;
+pub(crate) use finalizer::SessionH3Finalizer;
 use p11scope_ebpf_common::ImageIdentity;
 pub(crate) use promotion::{
     PromotionAdmissionReservation, PromotionInstallCapacity, StagedPromotionAdmission,
@@ -1565,7 +1569,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             self.record_semantic_drop(&batch);
             return;
         }
-        if self.pending_semantic.is_some() {
+        let state = self
+            .semantic_finalizer
+            .get_or_insert_with(|| SessionFinalizerState::new(batch.domain()));
+        if state.domain != batch.domain() {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "semantic batch refused for another Session".into(),
+                reason: "the retained Session has not completed; another domain cannot stage or change its finalizer namespace".into(),
+                budget: None,
+            });
+            return;
+        }
+        if state.pending_semantic.is_some() {
             self.registry.record_gap(RegistryGap {
                 caller: None,
                 module: None,
@@ -1579,7 +1597,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             self.record_semantic_drop(&batch);
             return;
         }
-        self.pending_semantic = Some(batch);
+        self.semantic_finalizer
+            .as_mut()
+            .expect("the matching Session state is retained")
+            .pending_semantic = Some(batch);
     }
 
     /// Take the latest H3 disposition evidence for one seal audit
@@ -1590,12 +1611,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// `acknowledge_h3_void`). The seal audit constructor calls this
     /// through [`H3EvidenceSource`](crate::semantics_objects::journal::H3EvidenceSource),
     /// so the seal never audits caller-supplied H3 evidence.
+    #[cfg(test)]
     pub(crate) fn take_h3_disposition(
         &mut self,
     ) -> crate::semantics_objects::journal::H3DispositionEvidence {
         use crate::semantics_objects::journal::H3DispositionEvidence;
-        self.h3_pending
-            .take()
+        self.semantic_finalizer
+            .as_mut()
+            .map(SessionFinalizerState::take_disposition)
             .unwrap_or_else(H3DispositionEvidence::genesis)
     }
 
@@ -1604,8 +1627,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// corresponding loss evidence, so barriers there release the next
     /// mint into Clean. Monotone; the joint seal tick forwards the
     /// seal failure's void report here.
+    #[cfg(test)]
     pub(crate) fn acknowledge_h3_void(&mut self, voided_below: u64) {
-        self.h3_acked_below = self.h3_acked_below.max(voided_below);
+        if let Some(state) = &mut self.semantic_finalizer {
+            state.h3_acked_below = state.h3_acked_below.max(voided_below);
+        }
     }
 
     /// Record one dropped semantic batch's disposition shadow: its
@@ -1614,10 +1640,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// accounting. Later drops overwrite earlier ones: H0 positions
     /// ascend, so the latest drop covers all previous ones.
     fn record_semantic_drop(&mut self, batch: &crate::inventory_semantics::SemanticBatch) {
+        let Some(state) = self
+            .semantic_finalizer
+            .as_mut()
+            .filter(|state| state.domain == batch.domain())
+        else {
+            // Foreign positions belong to a different H0 allocator. The gap
+            // remains visible, but it must not become loss in this Session.
+            return;
+        };
         let floor = batch.min_outcome_position();
         let exhausted = batch.exhausted();
         if floor.is_some() || exhausted {
-            self.pending_drop = Some((floor.unwrap_or(0), exhausted));
+            state.pending_drop = Some((floor.unwrap_or(0), exhausted));
         }
     }
 
@@ -1635,7 +1670,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // Tail bits drain uncut: the cut joins its own publication
                 // or not at all, never a later one.
                 std::mem::take(&mut self.tail_uncertain);
-                if let Some(dropped) = self.pending_semantic.take() {
+                if let Some(dropped) = self
+                    .semantic_finalizer
+                    .as_mut()
+                    .and_then(|state| state.pending_semantic.take())
+                {
                     self.registry.record_gap(RegistryGap {
                         caller: None,
                         module: None,
@@ -1781,6 +1820,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     fn finalize_with_lane(&mut self, lane: &mut crate::inventory_semantics::AttestedSemanticLane) {
+        let state = self
+            .semantic_finalizer
+            .get_or_insert_with(|| SessionFinalizerState::new(lane.domain()));
+        if state.domain != lane.domain() {
+            self.registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: "semantic finalizer refused another Session".into(),
+                reason: "the retained Session must complete before a fresh H0 namespace can be installed".into(),
+                budget: None,
+            });
+            return;
+        }
         // The tail cut joins this publication directly, ahead of the
         // pending ordinary quantum: its barrier fences every unpublished
         // positive below, including just-resolved and queued inputs.
@@ -1833,7 +1886,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             floor = cut.cut_barrier();
             self.finalize_batch(lane, cut, None);
         }
-        if let Some(pending) = self.pending_semantic.take() {
+        if let Some(pending) = self
+            .semantic_finalizer
+            .as_mut()
+            .and_then(|state| state.pending_semantic.take())
+        {
             self.finalize_batch(lane, pending, floor);
         }
     }
@@ -2144,11 +2201,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // pending floor joins the batch's route-waiting floor with
         // unpublished and lane-stashed history; shed minima (batch,
         // finalizer, dropped) barrier as loss.
-        if let Some((floor, exhausted)) = self.pending_drop.take() {
+        let state = self
+            .semantic_finalizer
+            .as_mut()
+            .expect("finalization retains the matching Session namespace");
+        debug_assert_eq!(state.domain, lane.domain());
+        if let Some((floor, exhausted)) = state.pending_drop.take() {
             shed_min = Some(shed_min.map_or(floor, |at| at.min(floor)));
             unpositioned = unpositioned || exhausted;
         }
-        let unpublished = self
+        let unpublished = state
             .pending_semantic
             .as_ref()
             .and_then(|batch| batch.min_outcome_position())
@@ -2164,11 +2226,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 shed_floor,
                 unpublished,
                 batch_exhausted || unpositioned,
-                &self.h3_last,
-                self.h3_acked_below,
+                &state.h3_last,
+                state.h3_acked_below,
             );
-        self.h3_last = evidence.clone();
-        self.h3_pending = Some(evidence);
+        state.h3_last = evidence.clone();
+        state.h3_pending = Some(evidence);
     }
 
     /// Finite conversion refusal through the audited path.
@@ -2184,6 +2246,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 }
 
+#[cfg(test)]
 impl crate::semantics_objects::journal::H3EvidenceSource
     for InventoryCoordinator<crate::discovery::caller_registry::OsProcessSource>
 {
@@ -2192,11 +2255,21 @@ impl crate::semantics_objects::journal::H3EvidenceSource
     }
 }
 
+#[cfg(test)]
 impl crate::semantics_objects::journal::H3FinalizerPort
     for InventoryCoordinator<crate::discovery::caller_registry::OsProcessSource>
 {
-    fn acknowledge_h3_void(&mut self, voided_below: u64) {
-        InventoryCoordinator::acknowledge_h3_void(self, voided_below)
+    fn acknowledge_h3_void(
+        &mut self,
+        acknowledgement: crate::semantics_objects::journal::H3VoidAcknowledgement,
+    ) {
+        // Legacy algorithm fixtures have independently constructed shell
+        // lanes and adapter scenes. They do not claim Session qualification;
+        // production has only the exact-pair borrowed port above.
+        if let Some(state) = self.semantic_finalizer.as_mut() {
+            let voided_below = acknowledgement.for_legacy_test();
+            state.h3_acked_below = state.h3_acked_below.max(voided_below);
+        }
     }
 }
 

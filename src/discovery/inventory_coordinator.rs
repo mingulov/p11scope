@@ -230,27 +230,9 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Accepted semantic caller bindings (H3 Task 3): one stable custody
     /// Arc per accepted caller, owned by the coordinator semantic child.
     semantic_bindings: semantics::SemanticBindingSet,
-    /// At most one ordinary semantic collection quantum, finalized after
-    /// the commit tail and before registry publication.
-    pending_semantic: Option<SemanticBatch>,
-    /// Last H3 disposition minted by the actual finalizer (H8):
-    /// previous-evidence chaining for monotone staged maxima.
-    h3_last: crate::semantics_objects::journal::H3DispositionEvidence,
-    /// Latest minted H3 disposition not yet consumed by a seal audit.
-    /// Each mint replaces the slot but ack-gating preserves an
-    /// unconsumed loss barrier, so the seal observes every staged
-    /// loss. Taken (consumed) by the seal audit constructor.
-    h3_pending: Option<crate::semantics_objects::journal::H3DispositionEvidence>,
-    /// The seal's H3-loss acknowledgement: H0 positions below this
-    /// watermark were voided by a seal that consumed the corresponding
-    /// loss evidence. Only acknowledged barriers release a later mint
-    /// into Clean. Monotone; forwarded from the seal's void report.
-    h3_acked_below: u64,
-    /// Minimum position (plus exhaustion) of the latest dropped
-    /// semantic batch: refused/foreign batches never stage, so the next
-    /// derivation reports them as shed. Taken on use; each drop reports
-    /// exactly once.
-    pending_drop: Option<(u64, bool)>,
+    /// Every H0-position-bearing finalizer field belongs to one Session.
+    /// A different live lane cannot consume, overwrite or acknowledge it.
+    semantic_finalizer: Option<semantics::SessionFinalizerState>,
     /// Detailed domains whose semantic authority ended permanently
     /// (cut/writeback/counter failure): new batches refuse, broad
     /// Inventory continues.
@@ -428,11 +410,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             capture: None,
             binder: NativeBinder::new(BinderLimits::default()),
             semantic_bindings: semantics::SemanticBindingSet::new(),
-            pending_semantic: None,
-            h3_last: crate::semantics_objects::journal::H3DispositionEvidence::genesis(),
-            h3_pending: None,
-            h3_acked_below: 0,
-            pending_drop: None,
+            semantic_finalizer: None,
             refused_semantic_domains: HashSet::new(),
             pending_adjudication: BTreeMap::new(),
             tail_uncertain: BTreeSet::new(),

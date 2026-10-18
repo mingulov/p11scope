@@ -6,11 +6,16 @@
 
 use super::*;
 use crate::discovery::caller_registry::{
-    AdmissionState, BudgetRefusal, CallerId, CoverageNote, ImageAuthority, ModuleInfo, ModuleKey,
-    RegistryGap, RegistryLimits,
+    AdmissionState, BudgetRefusal, CallerId, CoverageNote, ImageAuthority, ModuleId, ModuleInfo,
+    ModuleKey, RegistryGap, RegistryLimits,
 };
 use crate::discovery::inventory_workload::{ChurnSpec, Harness, ScaleSpec};
 use crate::inventory_present::Presentation;
+use crate::inventory_promotion::{
+    CaptureId, Promoter, PromotionCancel, PromotionEnd, PromotionNote, PromotionOutcome,
+    PromotionPair, PromotionRefusal, PromotionRequestError, PromotionState, PromotionStatusUpdate,
+    PromotionUi, PromotionView, RequestId, ViewRevision,
+};
 use crate::semantics_edge::SemanticCall;
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -575,7 +580,7 @@ fn truncate_cell_never_splits_chars() {
 }
 
 #[test]
-fn key_parsing_maps_arrows_quit_and_nothing_else() {
+fn key_parsing_maps_navigation_promotion_quit_and_nothing_else() {
     fn scripted(bytes: &[u8]) -> Option<Key> {
         let mut remaining = bytes.to_vec();
         poll_key_from(&mut |into: &mut [u8]| {
@@ -604,7 +609,11 @@ fn key_parsing_maps_arrows_quit_and_nothing_else() {
     assert_eq!(scripted(b"\x1b[A"), Some(Key::Up));
     assert_eq!(scripted(b"\x1b[B"), Some(Key::Down));
     assert_eq!(scripted(b""), None);
-    assert_eq!(scripted(b"x"), None);
+    assert_eq!(scripted(b"d"), Some(Key::Promote));
+    assert_eq!(scripted(b"D"), Some(Key::Promote));
+    assert_eq!(scripted(b"x"), Some(Key::CancelPromotion));
+    assert_eq!(scripted(b"X"), Some(Key::CancelPromotion));
+    assert_eq!(scripted(b"z"), None);
     assert_eq!(scripted(b"\x1b[C"), None);
     assert_eq!(scripted(b"\t"), Some(Key::Detail));
 }
@@ -1589,7 +1598,7 @@ fn starved_windows_stay_honest_about_showing_nothing() {
     // edge the frame does not show).
     let presentation = varied_presentation();
     assert!(!presentation.edges.is_empty());
-    let (lines, shown) = render_edge_window(&presentation, 80, 2, 0, false);
+    let (lines, shown) = render_edge_window(&presentation, 80, 2, 0, false, None);
     assert_eq!(shown, 0);
     assert_eq!(
         lines,
@@ -1600,7 +1609,7 @@ fn starved_windows_stay_honest_about_showing_nothing() {
     // The normal path is unchanged: counts, not scroll arithmetic.
     assert_eq!(visible_item_range(2, 13, 1), (2, 3));
     // Sanity: the same fixture shows edges once the room suffices.
-    let (_, shown) = render_edge_window(&presentation, 80, 7, 0, false);
+    let (_, shown) = render_edge_window(&presentation, 80, 7, 0, false, None);
     assert!(shown > 0);
 }
 
@@ -2540,7 +2549,7 @@ fn app_first_dashboard_reserves_both_identity_labels() {
     let mut long = presentation.clone();
     long.callers[0].exe.as_mut().unwrap().path = Some(format!("/{}", "日本語ＷＩＤＥ".repeat(40)));
     long.modules[0].paths = vec![format!("/{}", "ＷＩＤＥ日本語".repeat(40))];
-    let line = edge_identity_line(&long, edge, 40);
+    let line = edge_identity_line(&long, edge, 40, false);
     assert!(
         line.contains(&format!("[{}]", edge.caller.label())),
         "{line}"
@@ -2831,5 +2840,602 @@ fn assert_compact_log_drop_accounting_with_large_counters(width: usize) {
     assert!(
         loss_row.contains(&format!("{} dropped bytes", u64::MAX)),
         "{loss_row}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// DR37 promotion UI/request/state: exact-pair selection, one pending
+// mailbox, bounded status and the staged driver surface.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn promotion_pair_helpers_resolve_by_identity() {
+    let presentation = varied_presentation();
+    assert!(presentation.edges.len() >= 3, "varied workload has edges");
+    let edge = &presentation.edges[1];
+    let pair = pair_at_scroll(&presentation, 1).expect("pair at row 1");
+    assert_eq!(pair.caller(), edge.caller.0);
+    assert_eq!(pair.provider(), edge.module.0);
+    assert_eq!(index_of_pair(&presentation, pair), Some(1));
+    assert_eq!(pair_at_scroll(&presentation, 10_000), None);
+    assert_eq!(
+        index_of_pair(&presentation, PromotionPair::new(999_999, 888_888)),
+        None
+    );
+}
+
+#[test]
+fn promotion_pair_index_follows_reorder_not_row() {
+    let presentation = varied_presentation();
+    assert!(presentation.edges.len() > 3, "varied workload has edges");
+    let pair = pair_at_scroll(&presentation, 1).expect("pair at row 1");
+    let mut reordered = presentation.clone();
+    reordered.edges.reverse();
+    let moved = reordered.edges.len() - 2;
+    assert_eq!(index_of_pair(&reordered, pair), Some(moved));
+    assert_ne!(pair_at_scroll(&reordered, 1), Some(pair));
+    let mut removed = presentation.clone();
+    removed.edges.remove(1);
+    assert_eq!(index_of_pair(&removed, pair), None);
+}
+
+fn enabled_promoter() -> Promoter {
+    let mut promoter = Promoter::new();
+    assert!(promoter.enable(CaptureId::new(11)));
+    promoter
+}
+
+#[test]
+fn promoter_verifies_exact_pair_in_immutable_view() {
+    let presentation = varied_presentation();
+    let edge = presentation.edges[0].clone();
+    let mut promoter = enabled_promoter();
+    let view = Arc::new(PromotionView::new(
+        CaptureId::new(11),
+        ViewRevision::new(3),
+        Arc::new(presentation),
+    ));
+    let id = promoter
+        .request(Arc::clone(&view), edge.caller, edge.module)
+        .expect("exact pair queues");
+    assert_eq!(id.get(), 1);
+    // A module that never co-occurs with the caller is not in the view —
+    // and the check runs before the busy gate, so the refused probe
+    // leaves the queued request alone.
+    assert_eq!(
+        promoter.request(Arc::clone(&view), edge.caller, ModuleId(909_090)),
+        Err(PromotionRequestError::PairNotInView)
+    );
+    let taken = promoter.take_request().expect("mailbox holds the first");
+    assert_eq!(taken.id(), id);
+    assert_eq!(taken.caller(), edge.caller);
+    assert_eq!(taken.provider(), edge.module);
+}
+
+#[test]
+fn promoter_rejects_foreign_capture_view() {
+    let presentation = varied_presentation();
+    let edge = presentation.edges[0].clone();
+    let mut promoter = enabled_promoter();
+    let foreign = Arc::new(PromotionView::new(
+        CaptureId::new(12),
+        ViewRevision::new(1),
+        Arc::new(presentation),
+    ));
+    assert_eq!(
+        promoter.request(foreign, edge.caller, edge.module),
+        Err(PromotionRequestError::ForeignCapture)
+    );
+    assert!(promoter.take_request().is_none());
+}
+
+#[test]
+fn promoter_mailbox_takes_once_and_second_request_is_busy() {
+    let presentation = varied_presentation();
+    let first = presentation.edges[0].clone();
+    let second = presentation.edges[1].clone();
+    let mut promoter = enabled_promoter();
+    let view = Arc::new(PromotionView::new(
+        CaptureId::new(11),
+        ViewRevision::new(1),
+        Arc::new(presentation),
+    ));
+    promoter
+        .request(Arc::clone(&view), first.caller, first.module)
+        .expect("first queues");
+    assert_eq!(
+        promoter.request(Arc::clone(&view), second.caller, second.module),
+        Err(PromotionRequestError::Refused(PromotionRefusal::Busy))
+    );
+    promoter.take_request().expect("one take yields");
+    assert!(promoter.take_request().is_none());
+}
+
+#[test]
+fn promoter_retains_the_viewed_arc_without_cloning() {
+    let presentation = varied_presentation();
+    let edge = presentation.edges[0].clone();
+    let mut promoter = enabled_promoter();
+    let presented = Arc::new(presentation);
+    let view = Arc::new(PromotionView::new(
+        CaptureId::new(11),
+        ViewRevision::new(1),
+        Arc::clone(&presented),
+    ));
+    promoter
+        .request(view, edge.caller, edge.module)
+        .expect("exact pair queues");
+    let taken = promoter.take_request().expect("mailbox holds it");
+    assert!(Arc::ptr_eq(taken.viewed().presentation(), &presented));
+}
+
+#[test]
+fn promoter_reports_active_only_from_runtime_and_holds_busy_after() {
+    let presentation = varied_presentation();
+    let edge = presentation.edges[0].clone();
+    let other = presentation.edges[1].clone();
+    let mut promoter = enabled_promoter();
+    let view = Arc::new(PromotionView::new(
+        CaptureId::new(11),
+        ViewRevision::new(1),
+        Arc::new(presentation),
+    ));
+    let id = promoter
+        .request(Arc::clone(&view), edge.caller, edge.module)
+        .expect("exact pair queues");
+    promoter.take_request().expect("runtime takes it");
+    assert_eq!(
+        promoter.set_status(PromotionStatusUpdate::new(id, PromotionOutcome::Preparing)),
+        Some(PromotionState::Preparing)
+    );
+    // A repeat of the in-flight pair is a duplicate, not a new request.
+    assert_eq!(
+        promoter.request(Arc::clone(&view), edge.caller, edge.module),
+        Err(PromotionRequestError::Refused(PromotionRefusal::Duplicate))
+    );
+    assert_eq!(
+        promoter.set_status(PromotionStatusUpdate::new(
+            id,
+            PromotionOutcome::Active {
+                pair: PromotionPair::new(edge.caller.0, edge.module.0)
+            }
+        )),
+        Some(PromotionState::Active)
+    );
+    assert_eq!(
+        promoter.request(Arc::clone(&view), edge.caller, edge.module),
+        Err(PromotionRequestError::Refused(
+            PromotionRefusal::AlreadyDetailed
+        ))
+    );
+    assert_eq!(
+        promoter.request(Arc::clone(&view), other.caller, other.module),
+        Err(PromotionRequestError::Refused(PromotionRefusal::Busy))
+    );
+    // Cancellation of an active lane asks the runtime to stop; a racing
+    // activation then refuses and only the end lands.
+    assert_eq!(promoter.cancel(), PromotionCancel::Stopping);
+    assert_eq!(
+        promoter.set_status(PromotionStatusUpdate::new(
+            id,
+            PromotionOutcome::Active {
+                pair: PromotionPair::new(edge.caller.0, edge.module.0)
+            }
+        )),
+        None
+    );
+    assert_eq!(
+        promoter.set_status(PromotionStatusUpdate::new(
+            id,
+            PromotionOutcome::Ended {
+                reason: PromotionEnd::Cancelled
+            }
+        )),
+        Some(PromotionState::Ended(PromotionEnd::Cancelled))
+    );
+}
+
+#[test]
+fn promotion_status_lines_are_plain_and_exact() {
+    let mut ui = PromotionUi::disabled();
+    assert_eq!(ui.status_line(), None);
+    ui.enabled = true;
+    assert_eq!(
+        ui.status_line().as_deref(),
+        Some("promotion: idle; no pair selected")
+    );
+    ui.selected = Some(PromotionPair::new(3, 7));
+    assert_eq!(
+        ui.status_line().as_deref(),
+        Some("promotion: idle; selected c3/m7")
+    );
+    ui.state = PromotionState::Queued;
+    ui.request = Some(RequestId::new(4));
+    ui.pair = Some(PromotionPair::new(3, 7));
+    ui.view = Some(ViewRevision::new(12));
+    assert_eq!(
+        ui.status_line().as_deref(),
+        Some("promotion: request 4 queued for c3/m7 (view 12)")
+    );
+    ui.state = PromotionState::Refused(PromotionRefusal::CallerRetired);
+    ui.note = Some(PromotionNote::Busy);
+    let refused = ui.status_line().expect("refused line shows");
+    assert_eq!(
+        refused,
+        "promotion: request 4 refused for c3/m7: caller retired; last key: busy"
+    );
+    ui.state = PromotionState::Active;
+    ui.note = None;
+    assert_eq!(
+        ui.status_line().as_deref(),
+        Some("promotion: request 4 active: detailed capture on c3/m7")
+    );
+    ui.state = PromotionState::Ended(PromotionEnd::RunStopped);
+    assert_eq!(
+        ui.status_line().as_deref(),
+        Some("promotion: request 4 ended for c3/m7: run stopped")
+    );
+    // Every rendered line is plain ASCII with no escape byte.
+    for state in [
+        PromotionState::Idle,
+        PromotionState::Queued,
+        PromotionState::Preparing,
+        PromotionState::Validating,
+        PromotionState::Active,
+        PromotionState::Refused(PromotionRefusal::EndpointDependency),
+        PromotionState::Stopping,
+        PromotionState::Ended(PromotionEnd::LaneClosed),
+    ] {
+        ui.state = state;
+        let line = ui.status_line().expect("enabled states render");
+        assert!(!line.bytes().any(|byte| byte == 0x1b), "{line:?}");
+        assert!(line.is_ascii(), "{line:?}");
+    }
+}
+
+#[test]
+fn enabled_selection_marks_exactly_the_selected_edge_row() {
+    let presentation = varied_presentation();
+    let frame = frame_for(&presentation);
+    let edge = &presentation.edges[0];
+    let viewport = Viewport {
+        width: 100,
+        height: 30,
+    };
+    let mut state = DashboardState::new();
+    state.promotion.enabled = true;
+    state.promotion.selected = Some(PromotionPair::new(edge.caller.0, edge.module.0));
+    let bytes = render_frame(&frame, viewport, &state);
+    assert_own_escapes_only(&bytes);
+    let text = frame_text(&bytes);
+    let marked: Vec<&str> = text.lines().filter(|line| line.starts_with("> ")).collect();
+    assert_eq!(marked.len(), 1, "one cursor mark: {text}");
+    assert!(
+        marked[0].contains(&format!("[{}]", edge.caller.label()))
+            && marked[0].contains(&format!("[{}]", edge.module.label())),
+        "mark sits on the selected pair: {}",
+        marked[0]
+    );
+    assert!(
+        text.contains("promotion: idle; selected"),
+        "status names the cursor: {text}"
+    );
+}
+
+#[test]
+fn disabled_dashboard_renders_default_bytes_despite_stale_cursor() {
+    let presentation = varied_presentation();
+    let frame = frame_for(&presentation);
+    let viewport = Viewport {
+        width: 100,
+        height: 30,
+    };
+    let mut state = DashboardState::new();
+    // A stale cursor with a disabled control must not leak into the
+    // render: byte-identical to the pristine default state.
+    state.promotion.selected = Some(PromotionPair::new(
+        presentation.edges[0].caller.0,
+        presentation.edges[0].module.0,
+    ));
+    let bytes = render_frame(&frame, viewport, &state);
+    assert_eq!(
+        bytes,
+        render_frame(&frame, viewport, &DashboardState::new())
+    );
+    let text = frame_text(&bytes);
+    // (Identity lines carry " -> ", so only a line-initial mark counts.)
+    assert!(text.lines().all(|line| !line.starts_with("> ")));
+    assert!(!text.contains("promotion:"));
+    assert!(!text.contains("d promote"));
+}
+
+/// A live (drained) terminal plus an opened display for promotion tests.
+struct PromoPty {
+    display: Display,
+    pty: Pty,
+    _input: File,
+}
+
+impl PromoPty {
+    fn open() -> Self {
+        let pty = Pty::open();
+        pty.set_winsize(100, 30);
+        let output = pty.slave.as_raw_fd();
+        let input = pty.slave.try_clone().unwrap();
+        let input_fd = input.as_raw_fd();
+        let io = DashboardIo {
+            output,
+            input: Some(input_fd),
+            account: None,
+            stderr_fd: 2,
+            stderr: StderrRoute::Leave,
+        };
+        let display = Display::open(&io, "pid:1").unwrap();
+        Self {
+            display,
+            pty,
+            _input: input,
+        }
+    }
+
+    /// Deliver key bytes, then run one service tick (keys redraw at once).
+    fn key(&mut self, bytes: &[u8]) {
+        use std::io::Write as _;
+        self.pty.master.write_all(bytes).unwrap();
+        self.display.tick();
+    }
+
+    /// Wait for a screen needle, draining the terminal.
+    fn shown(&mut self, needle: &[u8]) {
+        self.pty.read_until(needle, Duration::from_secs(5));
+    }
+}
+
+#[test]
+fn pty_promotion_d_requests_the_selected_displayed_pair() {
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    let presentation = varied_presentation();
+    let edge = presentation.edges[0].clone();
+    terminal.display.offer(presentation);
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    assert_eq!(
+        terminal.display.state.promotion.selected,
+        Some(PromotionPair::new(edge.caller.0, edge.module.0))
+    );
+    terminal.key(b"d");
+    terminal.shown(b"promotion: request 1 queued");
+    let request = terminal
+        .display
+        .take_promotion_request()
+        .expect("d queues one request");
+    assert_eq!(request.caller(), edge.caller);
+    assert_eq!(request.provider(), edge.module);
+    assert_eq!(request.viewed().capture(), CaptureId::new(5));
+    assert_eq!(request.viewed().revision().get(), 1);
+    assert!(terminal.display.take_promotion_request().is_none());
+    // Another pair while the first is outstanding reports busy and leaves
+    // the accepted work alone.
+    terminal.key(b"j");
+    terminal.key(b"d");
+    terminal.shown(b"last key: busy");
+    assert!(terminal.display.take_promotion_request().is_none());
+    terminal.display.restore();
+}
+
+#[test]
+fn pty_promotion_gaps_page_never_requests() {
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    terminal.key(b"\t\t");
+    assert_eq!(terminal.display.state.detail, DetailPage::Gaps);
+    terminal.key(b"d");
+    assert!(terminal.display.take_promotion_request().is_none());
+    assert_eq!(terminal.display.promotion_state(), PromotionState::Idle);
+    terminal.key(b"x");
+    assert!(terminal.display.take_promotion_request().is_none());
+    assert_eq!(terminal.display.promotion_state(), PromotionState::Idle);
+    // The gaps excursion leaves the stored cursor alone for the return.
+    assert!(terminal.display.state.promotion.selected.is_some());
+    terminal.display.restore();
+}
+
+#[test]
+fn pty_promotion_disabled_display_ignores_promotion_keys() {
+    let mut terminal = PromoPty::open();
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    terminal.shown(b"q quit");
+    terminal.key(b"d");
+    assert!(terminal.display.take_promotion_request().is_none());
+    assert_eq!(terminal.display.promotion_state(), PromotionState::Idle);
+    assert_eq!(terminal.display.state.promotion.selected, None);
+    terminal.key(b"x");
+    assert!(terminal.display.take_promotion_request().is_none());
+    terminal.display.restore();
+}
+
+#[test]
+fn pty_promotion_cancel_reports_honest_outcomes() {
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    terminal.key(b"x");
+    terminal.shown(b"last key: nothing to cancel");
+    terminal.key(b"d");
+    terminal.shown(b"promotion: request 1 queued");
+    // Untaken work cancels synchronously: nothing reaches the runtime.
+    terminal.key(b"x");
+    terminal.shown(b"cancelled by operator");
+    assert!(terminal.display.take_promotion_request().is_none());
+    assert_eq!(
+        terminal.display.promotion_state(),
+        PromotionState::Ended(PromotionEnd::Cancelled)
+    );
+    terminal.display.restore();
+}
+
+#[test]
+fn pty_promotion_selection_follows_identity_across_reorder() {
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    let first = varied_presentation();
+    assert!(first.edges.len() >= 3, "varied workload has edges");
+    let held = first.edges[1].clone();
+    let held_pair = PromotionPair::new(held.caller.0, held.module.0);
+    terminal.display.offer(first.clone());
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    terminal.key(b"j");
+    assert_eq!(terminal.display.state.promotion.selected, Some(held_pair));
+    assert_eq!(terminal.display.state.scroll, 1);
+    // Rotate the same ledger: the held pair moves from row 1 to row 0.
+    let mut second = first;
+    second.edges.rotate_left(1);
+    terminal.display.offer(second);
+    terminal.display.tick();
+    terminal.shown(b"q quit");
+    assert_eq!(
+        terminal.display.state.promotion.selected,
+        Some(held_pair),
+        "cursor follows the pair by identity"
+    );
+    assert_eq!(terminal.display.state.scroll, 0, "view follows the pair");
+    // The request names the held pair, not the row now at index 1.
+    terminal.key(b"d");
+    terminal.shown(b"promotion: request 1 queued");
+    let request = terminal
+        .display
+        .take_promotion_request()
+        .expect("d queues the held pair");
+    assert_eq!(request.caller(), held.caller);
+    assert_eq!(request.provider(), held.module);
+    terminal.display.restore();
+}
+
+#[test]
+fn pty_promotion_missing_pair_clears_without_replacement() {
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    let first = varied_presentation();
+    terminal.display.offer(first.clone());
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    assert!(terminal.display.state.promotion.selected.is_some());
+    // Drop the selected row from the same ledger: the cursor clears
+    // instead of landing on whatever row now sits at the old index.
+    let mut second = first;
+    second.edges.remove(0);
+    terminal.display.offer(second);
+    terminal.display.tick();
+    terminal.shown(b"q quit");
+    assert_eq!(terminal.display.state.promotion.selected, None);
+    terminal.key(b"d");
+    terminal.shown(b"last key: no pair selected");
+    assert!(terminal.display.take_promotion_request().is_none());
+    assert_eq!(terminal.display.promotion_state(), PromotionState::Idle);
+    // Navigation reselects from the new ledger.
+    terminal.key(b"j");
+    let reselected = terminal.display.state.promotion.selected;
+    assert_eq!(
+        reselected,
+        pair_at_scroll(
+            &terminal
+                .display
+                .last_frame
+                .as_ref()
+                .expect("frame shown")
+                .presentation,
+            terminal.display.state.scroll
+        )
+    );
+    assert!(reselected.is_some());
+    terminal.display.restore();
+}
+
+#[test]
+fn pty_promotion_status_and_request_survive_frame_coalescing() {
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    let first = varied_presentation();
+    let edge = first.edges[0].clone();
+    terminal.display.offer(first);
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    terminal.key(b"d");
+    terminal.shown(b"promotion: request 1 queued");
+    // Two offers without a tick: the handoff sheds the older frame, but
+    // display-side status and the retained viewed Arc survive.
+    terminal.display.offer(varied_presentation());
+    terminal.display.offer(varied_presentation());
+    terminal.key(b"j");
+    terminal.shown(b"promotion: request 1 queued");
+    let request = terminal
+        .display
+        .take_promotion_request()
+        .expect("request survives coalescing");
+    assert_eq!(request.caller(), edge.caller);
+    assert_eq!(request.provider(), edge.module);
+    assert_eq!(request.viewed().revision().get(), 1);
+    terminal.display.restore();
+}
+
+#[test]
+fn pty_promotion_run_stop_ends_outstanding_work() {
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    terminal.key(b"d");
+    terminal.shown(b"promotion: request 1 queued");
+    terminal
+        .display
+        .take_promotion_request()
+        .expect("runtime takes it");
+    terminal.display.restore();
+    assert_eq!(
+        terminal.display.promotion_state(),
+        PromotionState::Ended(PromotionEnd::RunStopped)
+    );
+    assert!(terminal.display.take_promotion_request().is_none());
+}
+
+#[test]
+fn enabled_footer_names_promotion_keys_on_edge_pages_only() {
+    let presentation = varied_presentation();
+    let frame = frame_for(&presentation);
+    let viewport = Viewport {
+        width: 100,
+        height: 30,
+    };
+    for detail in [DetailPage::Summary, DetailPage::Evidence] {
+        let mut state = DashboardState::new();
+        state.detail = detail;
+        state.promotion.enabled = true;
+        let text = frame_text(&render_frame(&frame, viewport, &state));
+        assert!(
+            text.contains("d promote, x cancel"),
+            "edge page names promotion keys: {text}"
+        );
+        assert!(text.contains("promotion: idle"), "{text}");
+    }
+    let mut state = DashboardState::new();
+    state.detail = DetailPage::Gaps;
+    state.promotion.enabled = true;
+    let text = frame_text(&render_frame(&frame, viewport, &state));
+    assert!(
+        !text.contains("d promote"),
+        "gaps page names no promotion key: {text}"
+    );
+    assert!(
+        text.contains("promotion: idle"),
+        "status stays visible on gaps: {text}"
     );
 }

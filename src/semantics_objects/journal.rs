@@ -525,20 +525,29 @@ pub(crate) struct JournalDomainProof {
 
 /// One admitted call's journal-attribution shape: the exact overlap
 /// between H3's admitted facts and a staged BEGIN's wire scalars (plus
-/// the image both sides bind). Return-time facts (rv, timestamps) are
-/// excluded: a BEGIN is entry truth. Two same-image instances whose
-/// calls share a fingerprint are indistinguishable on the wire, so a
-/// fingerprint claimed by two live keys attributes to neither.
+/// the image both sides bind). Original Event duration reconstructs
+/// the exact retained START timestamp; physical thread and attested slot
+/// distinguish same-shaped invocations. Return time stays claim-side
+/// until checked against an END and advanced into its physical fence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct CallFingerprint {
     pub(crate) image: (u64, u64),
     pub(crate) function: u32,
+    pub(crate) pid_tgid: u64,
+    pub(crate) entry_ns: u64,
+    pub(crate) slot: u32,
     pub(crate) session: u64,
     pub(crate) mechanism: u64,
     pub(crate) capture: u32,
     pub(crate) slot_id: u64,
     pub(crate) flags: u64,
     pub(crate) user_type: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AdmittedJournalClaim {
+    admission: u64,
+    return_ns: u64,
 }
 
 /// One staged entry's attribution under a sealing key.
@@ -850,6 +859,16 @@ pub(crate) struct JournalAdapter {
     consumed_through: u64,
     open: BTreeMap<JournalNativeKey, OpenEntry>,
     floors: BTreeMap<u64, u64>,
+    /// One ordered Session EVENTS/boot-clock namespace. Non-evicted
+    /// physical-thread return fences complement native sequence floors:
+    /// newly arriving STARTs must follow a proved physical API return.
+    /// Existing retained overlapping STARTs are not compared to this.
+    /// Both maps survive void, exec, era and native-thread-ticket changes.
+    /// The pinned Rust B-tree requested-allocation estimate is 320 bytes
+    /// per retained u64 pair plus 224 root/2560 split scratch: at the
+    /// policy bound, 5,266,144 bytes. Count enforcement is active; full
+    /// H9 shared-byte enforcement remains an explicit separate carry.
+    physical_return_floors: BTreeMap<u64, u64>,
     refused: Vec<RefusedBegin>,
     keys: BTreeMap<JournalDomainKey, JournalDomainState>,
     image_keys: BTreeMap<(u64, u64), Vec<JournalDomainKey>>,
@@ -860,16 +879,11 @@ pub(crate) struct JournalAdapter {
     tainted_images: BTreeSet<(u64, u64)>,
     taint_overflow: bool,
     sightings: BTreeMap<(u64, u64), ImageSighting>,
-    /// Per-call admission authority: each admitted modeled call's
-    /// fingerprint, claimed by its key with a FIFO of H0 admission
-    /// ordinals (C2 identity: attested in H0 order, converted in
-    /// journal order — per fingerprint these coincide, so each
-    /// conversion pops its own admission). Conversion consumes one
-    /// ordinal per staged call and mints the call's ticket FROM it, so
-    /// the sealed key binds the actual admitted invocation; total
-    /// counts stay within the staged-call bound (a void clears the
-    /// store with the staging).
-    claims: BTreeMap<CallFingerprint, BTreeMap<JournalDomainKey, VecDeque<u64>>>,
+    /// Exact physical invocation claims, qualified by native domain,
+    /// image, caller/router and era authority. A deque represents
+    /// duplicate/colliding inputs only; conversion never selects a
+    /// winner by FIFO rank. Counts remain bounded by unsettled work.
+    claims: BTreeMap<CallFingerprint, BTreeMap<JournalDomainKey, VecDeque<AdmittedJournalClaim>>>,
     claim_counts: usize,
     last_audit_failure: Option<u64>,
     /// H0 positions below this watermark were voided by an H3-loss
@@ -908,6 +922,7 @@ impl JournalAdapter {
             consumed_through: 0,
             open: BTreeMap::new(),
             floors: BTreeMap::new(),
+            physical_return_floors: BTreeMap::new(),
             refused: Vec::new(),
             keys: BTreeMap::new(),
             image_keys: BTreeMap::new(),
@@ -1115,6 +1130,21 @@ impl JournalAdapter {
         {
             self.taint_image(image);
             return JournalDisposition::Contradiction(JournalContradiction::FloorExhausted);
+        }
+        if !self.physical_return_floors.contains_key(&begin.pid_tgid())
+            && self.physical_return_floors.len() >= self.limits.thread_floors
+        {
+            self.taint_image(image);
+            return JournalDisposition::Contradiction(JournalContradiction::FloorExhausted);
+        }
+        let floor = self
+            .physical_return_floors
+            .entry(begin.pid_tgid())
+            .or_default();
+        if begin.pid_tgid() as u32 == 0 || begin.pid_tgid() >> 32 == 0 || begin.entry_ns() < *floor
+        {
+            self.taint_image(image);
+            return JournalDisposition::Contradiction(JournalContradiction::SequenceRegression);
         }
         self.floors.insert(begin.thread(), begin.sequence());
         if self.open.len() >= self.limits.open_calls {
@@ -1371,6 +1401,9 @@ fn fingerprint_of_begin(begin: &ValidatedJournalBegin) -> CallFingerprint {
     CallFingerprint {
         image: (begin.image_cookie(), begin.image_exec()),
         function: begin.descriptor() - 1,
+        pid_tgid: begin.pid_tgid(),
+        entry_ns: begin.entry_ns(),
+        slot: begin.slot(),
         session: begin.session_word(),
         mechanism: begin.entry_mechanism(),
         capture: begin.capture(),
@@ -1385,6 +1418,9 @@ fn fingerprint_of_refused(refused: &RefusedBegin) -> CallFingerprint {
     CallFingerprint {
         image: refused.image,
         function: refused.function,
+        pid_tgid: refused.pid_tgid,
+        entry_ns: refused.entry_ns,
+        slot: refused.slot,
         session: refused.session,
         mechanism: refused.mechanism,
         capture: refused.capture,
@@ -2555,6 +2591,11 @@ impl BootstrapReceipt {
         self.grant.proof
     }
 
+    /// The immutable qualified incarnation already proven by this receipt.
+    pub(crate) fn domain(&self) -> ObjectDomain {
+        self.grant.proof.domain()
+    }
+
     pub(crate) fn birth(&self) -> BirthKind {
         self.grant.birth
     }
@@ -2719,6 +2760,7 @@ pub(crate) struct SealSuccess {
 /// applied (abandonment invalidations are reported, never swallowed).
 #[derive(Debug)]
 pub(crate) struct SealFailure {
+    scope: SealFailureScope,
     pub(crate) gap: JournalGap,
     pub(crate) effects: ObjectEffects,
     /// H3-loss acknowledgement: H0 positions below this watermark were
@@ -2728,9 +2770,31 @@ pub(crate) struct SealFailure {
     pub(crate) h3_voided: Option<u64>,
 }
 
+/// Identity of an existing adapter refusal, never positive authority.
+/// Rare global losses retain at most JournalLimits::domain_keys domains.
+#[derive(Debug)]
+enum SealFailureScope {
+    Unqualified,
+    Domain(ObjectDomain),
+    AffectedDomains(Vec<ObjectDomain>),
+}
+
+impl SealFailure {
+    pub(crate) fn affects_domain(&self, domain: ObjectDomain) -> bool {
+        match &self.scope {
+            SealFailureScope::Unqualified => false,
+            SealFailureScope::Domain(owned) => *owned == domain,
+            SealFailureScope::AffectedDomains(owned) => owned.contains(&domain),
+        }
+    }
+}
+
 /// Finite attestation refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AttestationRefusal {
+    /// Original physical invocation is already below its irreversible
+    /// return fence and no unique unconsumed retained START owns it.
+    InvocationStale,
     ImageTainted,
     KeysExhausted,
     Stopped,
@@ -2896,7 +2960,16 @@ impl JournalAdapter {
         if let Some(fingerprint) = admitted.journal_call_fingerprint()
             && endpoint_class(fingerprint.function) == Some(EndpointClass::ModeledAffecting)
         {
-            self.claim_fingerprint(fingerprint, key, admitted.h0_ordinal())?;
+            self.claim_fingerprint(
+                fingerprint,
+                key,
+                AdmittedJournalClaim {
+                    admission: admitted.h0_ordinal(),
+                    return_ns: admitted
+                        .journal_return_ns()
+                        .expect("fingerprint retained its return"),
+                },
+            )?;
         }
         let era = self.keys[&key].era;
         Ok(JournalDomainProof { key, era })
@@ -2924,6 +2997,15 @@ impl JournalAdapter {
             .any(|key| key.domain_tag == grant.domain_tag)
         {
             return Err(DrainBindRefusal::DomainUnattested);
+        }
+        // A single adapter has one ordered EVENTS/clock namespace;
+        // native domains may share that drain, never independent drains.
+        if self
+            .drain_pins
+            .values()
+            .any(|pinned| *pinned != grant.events_id)
+        {
+            return Err(DrainBindRefusal::DrainConflict);
         }
         match self.drain_pins.get(&grant.domain_tag) {
             Some(pinned) if *pinned == grant.events_id => Ok(()),
@@ -2964,8 +3046,39 @@ impl JournalAdapter {
         &mut self,
         fingerprint: CallFingerprint,
         key: JournalDomainKey,
-        admission: u64,
+        claim: AdmittedJournalClaim,
     ) -> Result<(), AttestationRefusal> {
+        let retained = self
+            .open
+            .values()
+            .filter(|entry| {
+                entry.converted_ticket.is_none()
+                    && fingerprint_of_begin(&entry.begin) == fingerprint
+            })
+            .count()
+            + self
+                .refused
+                .iter()
+                .filter(|entry| fingerprint_of_refused(entry) == fingerprint)
+                .count();
+        if self
+            .physical_return_floors
+            .get(&fingerprint.pid_tgid)
+            .is_some_and(|floor| fingerprint.entry_ns < *floor)
+            && retained != 1
+        {
+            return Err(AttestationRefusal::InvocationStale);
+        }
+        if !self
+            .physical_return_floors
+            .contains_key(&fingerprint.pid_tgid)
+            && self.physical_return_floors.len() >= self.limits.thread_floors
+        {
+            return Err(AttestationRefusal::ClaimsExhausted);
+        }
+        self.physical_return_floors
+            .entry(fingerprint.pid_tgid)
+            .or_default();
         if self.claim_counts >= self.limits.open_calls + self.limits.refused_begins {
             self.prune_dead_claims();
             if self.claim_counts >= self.limits.open_calls + self.limits.refused_begins {
@@ -2977,8 +3090,19 @@ impl JournalAdapter {
             .or_default()
             .entry(key)
             .or_default()
-            .push_back(admission);
+            .push_back(claim);
         self.claim_counts += 1;
+        if self.claims[&fingerprint]
+            .values()
+            .map(VecDeque::len)
+            .sum::<usize>()
+            > 1
+        {
+            // No ordering can select between identical physical inputs.
+            // Preserve claims unconsumed and make the ambiguity sticky,
+            // including across later pruning and staging voids.
+            self.taint_image(fingerprint.image);
+        }
         Ok(())
     }
 
@@ -3003,10 +3127,13 @@ impl JournalAdapter {
             .sum::<usize>();
     }
 
-    /// Peek the oldest queued admission ordinal for one claimed call
-    /// (C2 identity): the conversion mints its ticket FROM this, then
-    /// [`Self::consume_claim`] pops it on success.
-    fn peek_claim(&self, fingerprint: &CallFingerprint, key: JournalDomainKey) -> Option<u64> {
+    /// Peek the exact invocation claim after whole-quantum uniqueness
+    /// validation. Conversion mints its ticket from that H0 identity.
+    fn peek_claim(
+        &self,
+        fingerprint: &CallFingerprint,
+        key: JournalDomainKey,
+    ) -> Option<AdmittedJournalClaim> {
         self.claims
             .get(fingerprint)
             .and_then(|claimants| claimants.get(&key))
@@ -3023,14 +3150,19 @@ impl JournalAdapter {
         &mut self,
         fingerprint: &CallFingerprint,
         key: JournalDomainKey,
-    ) -> Option<u64> {
+    ) -> Option<AdmittedJournalClaim> {
         let mut vacated = false;
         let mut popped = None;
         if let Some(claimants) = self.claims.get_mut(fingerprint) {
             if let Some(ordinals) = claimants.get_mut(&key) {
                 popped = ordinals.pop_front();
-                if popped.is_some() {
+                if let Some(claim) = popped {
                     self.claim_counts -= 1;
+                    let floor = self
+                        .physical_return_floors
+                        .get_mut(&fingerprint.pid_tgid)
+                        .expect("physical namespace reserved before claim consumption");
+                    *floor = (*floor).max(claim.return_ns);
                 }
                 if ordinals.is_empty() {
                     claimants.remove(&key);
@@ -3097,12 +3229,44 @@ impl JournalAdapter {
         births: &mut impl BirthEvidenceSource,
         fault: &impl FaultEpoch,
     ) -> Result<SealSuccess, SealFailure> {
+        let requested = self.retained_failure_domain(bootstrap);
+        self.seal_inner(model, audit, bootstrap, frontier, births, fault)
+            .map_err(|mut failure| {
+                if matches!(failure.scope, SealFailureScope::Unqualified)
+                    && failure.gap != JournalGap::DrainMismatch
+                    && let Some(domain) = requested
+                {
+                    failure.scope = SealFailureScope::Domain(domain);
+                }
+                failure
+            })
+    }
+
+    fn seal_inner(
+        &mut self,
+        model: &mut ObjectSemantics,
+        audit: &JournalAuditReceipt,
+        bootstrap: &BootstrapReceipt,
+        frontier: ConsumptionOrdinal,
+        births: &mut impl BirthEvidenceSource,
+        fault: &impl FaultEpoch,
+    ) -> Result<SealSuccess, SealFailure> {
+        // A foreign/unbound EVENTS stream proves no loss of this adapter.
+        // Check before global audit mutation, independently of the requested
+        // bootstrap; an actual owned audit can still void owned domains when
+        // that requested bootstrap is missing or otherwise invalid.
+        if audit
+            .drain_domain
+            .is_some_and(|drained| !self.drain_pins.values().any(|pinned| *pinned == drained))
+        {
+            return Err(self.failure(JournalGap::DrainMismatch));
+        }
         let frontier = frontier.0;
         if self.stopped {
-            return Err(self.failure(JournalGap::Stopped));
+            return Err(self.global_failure(JournalGap::Stopped));
         }
         if self.invalidated {
-            return Err(self.failure(JournalGap::AdapterInvalidated));
+            return Err(self.global_failure(JournalGap::AdapterInvalidated));
         }
         if frontier > self.consumed_through {
             return Err(self.failure(JournalGap::FrontierRegression));
@@ -3120,6 +3284,10 @@ impl JournalAdapter {
             // truth, so later proof resumes above a fenced interval
             // instead of silently skipping it; the fencing effects are
             // reported with the refusal.
+            let scope = match gap {
+                JournalGap::H3Pending | JournalGap::ClosureStale => SealFailureScope::Unqualified,
+                _ => self.affected_failure_scope(),
+            };
             self.last_audit_failure = Some(self.consumed_through);
             let mut effects = ObjectEffects::default();
             let mut h3_voided = None;
@@ -3173,6 +3341,7 @@ impl JournalAdapter {
                 gap,
                 effects,
                 h3_voided,
+                scope,
             });
         }
         // The audit passed: pin the cumulative baseline. Past the first
@@ -3363,7 +3532,7 @@ impl JournalAdapter {
             Some(pinned) if pinned < floors => None,
             _ => Some(floors),
         };
-        self.seal_validated(model, key, bootstrap, frontier, fence)
+        self.seal_validated(model, key, bootstrap, frontier, fence, audit)
     }
 
     /// Preserve staged unbounded abandonments across a void: each
@@ -3635,11 +3804,65 @@ impl JournalAdapter {
         }
     }
 
+    fn retained_failure_domain(&self, bootstrap: &BootstrapReceipt) -> Option<ObjectDomain> {
+        let proof = bootstrap.proof();
+        self.keys
+            .get(&proof.key)
+            .filter(|state| state.era == proof.era)
+            .map(|state| {
+                JournalDomainProof {
+                    key: proof.key,
+                    era: state.era,
+                }
+                .domain()
+            })
+    }
+
+    fn affected_failure_scope(&self) -> SealFailureScope {
+        // Count bounded by the existing domain-key policy (4096). The
+        // requested allocation is capacity * size_of::<ObjectDomain>();
+        // the failure releases it on drop. H9's byte envelope remains a
+        // separate enforcement carry; a None byte limit is not enforcement.
+        let mut domains = Vec::with_capacity(self.keys.len());
+        domains.extend(self.keys.iter().map(|(key, state)| {
+            JournalDomainProof {
+                key: *key,
+                era: state.era,
+            }
+            .domain()
+        }));
+        SealFailureScope::AffectedDomains(domains)
+    }
+
+    fn global_failure(&self, gap: JournalGap) -> SealFailure {
+        SealFailure {
+            scope: self.affected_failure_scope(),
+            ..self.failure(gap)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scripted_failure(
+        &self,
+        gap: JournalGap,
+        bootstrap: &BootstrapReceipt,
+        effects: ObjectEffects,
+    ) -> SealFailure {
+        SealFailure {
+            scope: self
+                .retained_failure_domain(bootstrap)
+                .map_or(SealFailureScope::Unqualified, SealFailureScope::Domain),
+            effects,
+            ..self.failure(gap)
+        }
+    }
+
     fn failure(&self, gap: JournalGap) -> SealFailure {
         SealFailure {
             gap,
             effects: ObjectEffects::default(),
             h3_voided: None,
+            scope: SealFailureScope::Unqualified,
         }
     }
 
@@ -3652,6 +3875,7 @@ impl JournalAdapter {
         bootstrap: &BootstrapReceipt,
         frontier: u64,
         model_fence: Option<u64>,
+        audit: &JournalAuditReceipt,
     ) -> Result<SealSuccess, SealFailure> {
         let image = (key.cookie, key.exec);
         let live = self.live_keys_for_image(image);
@@ -3704,6 +3928,7 @@ impl JournalAdapter {
                 gap: JournalGap::DomainTainted,
                 effects,
                 h3_voided: None,
+                scope: SealFailureScope::Unqualified,
             });
         }
         // This key's bounded abandonments need their corroborating
@@ -3732,7 +3957,86 @@ impl JournalAdapter {
         if refused_unready {
             return Err(self.failure(JournalGap::BoundNotReady));
         }
+        self.validate_invocation_claims(key, &live, frontier, audit)?;
         self.convert_and_settle(model, key, bootstrap, frontier, model_fence)
+    }
+
+    fn validate_invocation_claims(
+        &mut self,
+        key: JournalDomainKey,
+        live: &[JournalDomainKey],
+        frontier: u64,
+        audit: &JournalAuditReceipt,
+    ) -> Result<(), SealFailure> {
+        let mut candidates: BTreeMap<
+            CallFingerprint,
+            (usize, Option<p11scope_ebpf_common::Event>),
+        > = BTreeMap::new();
+        for entry in self.open.values() {
+            if entry.begin_ordinal <= frontier && self.converts_here(key, live, entry) {
+                let value = candidates
+                    .entry(fingerprint_of_begin(&entry.begin))
+                    .or_default();
+                value.0 += 1;
+                value.1 = entry
+                    .end
+                    .filter(|end| end.ordinal <= frontier)
+                    .map(|end| end.end.payload_base().event);
+            }
+        }
+        for entry in &self.refused {
+            if entry.cut <= frontier && self.refused_converts_here(key, live, entry) {
+                candidates
+                    .entry(fingerprint_of_refused(entry))
+                    .or_default()
+                    .0 += 1;
+            }
+        }
+        for (fingerprint, (_, end)) in candidates {
+            let count = self
+                .open
+                .values()
+                .filter(|entry| fingerprint_of_begin(&entry.begin) == fingerprint)
+                .count()
+                + self
+                    .refused
+                    .iter()
+                    .filter(|entry| fingerprint_of_refused(entry) == fingerprint)
+                    .count();
+            let claims = &self.claims[&fingerprint][&key];
+            if count != 1 || claims.len() != 1 {
+                // Do not let pruning/void turn this ambiguity into a later
+                // singleton winner. Taint preserves every claim unconsumed.
+                self.taint_image(fingerprint.image);
+                return Err(self.failure(JournalGap::ImageTainted));
+            }
+            let claim = claims.front().expect("one exact claim");
+            // Only the loss-audited ordered prefix may make this
+            // physical return irreversible. Zero H0 watermarks exist
+            // solely in the explicitly scripted algorithm audit factory.
+            let covered = match audit.h3 {
+                H3DispositionEvidence::Clean {
+                    staged_max,
+                    pending_floor,
+                } => {
+                    staged_max >= claim.admission
+                        && pending_floor.is_none_or(|floor| floor > claim.admission)
+                        && (audit.h0_below == 0 || claim.admission < audit.h0_below)
+                }
+                _ => false,
+            };
+            if !covered {
+                return Err(self.failure(JournalGap::H3Pending));
+            }
+            if let Some(end) = end
+                && (end.duration_ns == 0
+                    || end.ts_ns.checked_sub(end.duration_ns) != Some(fingerprint.entry_ns)
+                    || end.ts_ns != claim.return_ns)
+            {
+                return Err(self.failure(JournalGap::H3Pending));
+            }
+        }
+        Ok(())
     }
 
     /// Register, convert (refused, begins, terminals, abandonments),
@@ -3756,6 +4060,7 @@ impl JournalAdapter {
                 gap: JournalGap::ModelRefused,
                 effects,
                 h3_voided: None,
+                scope: SealFailureScope::Unqualified,
             });
         }
         self.keys
@@ -3816,6 +4121,7 @@ impl JournalAdapter {
                         gap: JournalGap::ModelRefused,
                         effects,
                         h3_voided: None,
+                        scope: SealFailureScope::Unqualified,
                     });
                 }
             }
@@ -3847,22 +4153,22 @@ impl JournalAdapter {
         let mut settled = Vec::new();
         for (native, _) in begins {
             let entry = *self.open.get(&native).expect("staged begin");
-            // C2 identity: the conversion mints its ticket FROM the
-            // oldest queued admission ordinal for this call (peeked;
-            // popped below on success), so the sealed key binds the
-            // actual admitted invocation. Missing ordinal
-            // (unreachable: coverage checked) refuses like ticket
-            // exhaustion did before.
+            // The exact physical invocation has one qualified H0
+            // claim. Whole-quantum validation preceded any refusal
+            // burn/model mutation; no FIFO/rank inference assigns it.
+            // A missing claim is an invariant refusal, never a ticket
+            // minted from another invocation.
             let fingerprint = fingerprint_of_begin(&entry.begin);
-            let Some(admission) = self.peek_claim(&fingerprint, key) else {
+            let Some(claim) = self.peek_claim(&fingerprint, key) else {
                 self.keys.get_mut(&key).expect("sealed key").tainted = true;
                 return Err(SealFailure {
                     gap: JournalGap::ModelRefused,
                     effects,
                     h3_voided: None,
+                    scope: SealFailureScope::Unqualified,
                 });
             };
-            let ticket = JournalTicket(admission);
+            let ticket = JournalTicket(claim.admission);
             let origin = origin_of(domain, entry.begin_ordinal, ticket, &entry.begin);
             let function = entry.function;
             let call_key = CallKey::sealed(ticket);
@@ -3877,7 +4183,7 @@ impl JournalAdapter {
             match admitted {
                 Ok(token) => {
                     let popped = self.consume_claim(&fingerprint, key);
-                    debug_assert_eq!(popped, Some(admission));
+                    debug_assert_eq!(popped, Some(claim));
                     let (session, mechanism) = sealed_fingerprint(&entry.begin);
                     let entry = self.open.get_mut(&native).expect("staged begin");
                     entry.converted_ticket = Some(token);
@@ -3908,6 +4214,7 @@ impl JournalAdapter {
                         gap: JournalGap::ModelRefused,
                         effects,
                         h3_voided: None,
+                        scope: SealFailureScope::Unqualified,
                     });
                 }
             }
@@ -3974,6 +4281,7 @@ impl JournalAdapter {
                         gap: JournalGap::ModelRefused,
                         effects,
                         h3_voided: None,
+                        scope: SealFailureScope::Unqualified,
                     });
                 };
                 let lost = model.outcome_lost(
@@ -4059,6 +4367,7 @@ impl JournalAdapter {
                 gap: JournalGap::DomainEnded,
                 effects,
                 h3_voided: None,
+                scope: SealFailureScope::Unqualified,
             });
         }
         if rejected {
@@ -4066,6 +4375,7 @@ impl JournalAdapter {
                 gap: JournalGap::ModelRefused,
                 effects,
                 h3_voided: None,
+                scope: SealFailureScope::Unqualified,
             });
         }
         self.keys.get_mut(&key).expect("sealed key").sealed_through = frontier;
@@ -4421,6 +4731,7 @@ pub(crate) mod tests {
     use crate::inventory_semantics::AttestedSubset;
     use crate::semantic_capture::{Endpoint, RoutedCall};
     use p11scope_ebpf_common::instance::STAMP_VALID;
+    use p11scope_ebpf_common::object_journal::decode_journal_record;
     use p11scope_ebpf_common::object_wire::{
         OBJECT_ACTION_CREATE, OBJECT_LAYOUT_LP64, publish_object_descriptors,
         verify_object_descriptors,
@@ -4507,10 +4818,10 @@ pub(crate) mod tests {
         bytes[5] = flags;
         put_u64(&mut bytes, 8, thread);
         put_u64(&mut bytes, 16, sequence);
-        put_u64(&mut bytes, 24, PID_TGID);
+        put_u64(&mut bytes, 24, invocation_pid(thread));
         put_u64(&mut bytes, 32, image.0);
         put_u64(&mut bytes, 40, image.1);
-        put_u64(&mut bytes, 48, ENTRY_NS);
+        put_u64(&mut bytes, 48, invocation_entry_ns(thread, sequence));
         put_u64(&mut bytes, 56, ENTRY_IP);
         put_u32(&mut bytes, 64, 7);
         put_u32(&mut bytes, 68, 8);
@@ -4518,7 +4829,7 @@ pub(crate) mod tests {
         put_u16(&mut bytes, 76, 3);
         put_u16(&mut bytes, 78, STAMP_VALID);
         put_u64(&mut bytes, 80, SESSION);
-        put_u32(&mut bytes, 104, 11);
+        put_u32(&mut bytes, 104, fixture_slot(function).unwrap_or(11));
         put_u32(&mut bytes, 108, function + 1);
         bytes[124] = OBJECT_LAYOUT_LP64;
         bytes[125] = 1;
@@ -4528,14 +4839,62 @@ pub(crate) mod tests {
         bytes
     }
 
+    fn invocation_pid(thread: u64) -> u64 {
+        PID_TGID + thread
+    }
+
+    fn invocation_entry_ns(thread: u64, sequence: u64) -> u64 {
+        ENTRY_NS + thread * 1_000_000 + sequence * 1_000
+    }
+
+    fn fixture_slot(function: u32) -> Option<u32> {
+        // Plan slots follow the original table traversal, not file-offset
+        // order. Reconstruct the fixture's input recipe before admission;
+        // admit_original_event independently checks the actual attested slot.
+        let surfaces = [
+            pkcs11_module::Surface::LegacyFunctionList {
+                version: cryptoki_sys::CK_VERSION {
+                    major: 2,
+                    minor: 40,
+                },
+            },
+            pkcs11_module::Surface::StandardInterface {
+                version: cryptoki_sys::CK_VERSION { major: 3, minor: 0 },
+            },
+        ];
+        let mut functions = Vec::new();
+        for surface in surfaces {
+            if let pkcs11_module::TableSet::Walk(spans) = pkcs11_module::tables_for(surface) {
+                for name in spans
+                    .iter()
+                    .flat_map(|span| span.fields())
+                    .map(|field| field.name)
+                {
+                    if ADMITTABLE_FUNCTIONS.contains(&name) && !functions.contains(&name) {
+                        functions.push(name);
+                    }
+                }
+            }
+        }
+        functions
+            .iter()
+            .position(|name| function_id(name) == function)
+            .map(|slot| slot as u32)
+    }
+
     /// Minimal valid 608-byte completed payload matching `begin`: same
     /// image, session, slot, mechanism, capture, slot identity, flags,
     /// user type, entry address/stamp and requested lists.
     fn payload_for(begin: &[u8; 224], rv: u64, ts_ns: u64) -> [u8; 608] {
         use p11scope_ebpf_common::event_type;
         let mut payload = [0u8; 608];
-        put_u64(&mut payload, 0, ts_ns);
-        put_u64(&mut payload, 8, ts_ns.saturating_sub(ENTRY_NS));
+        // Existing algorithm cases specify the return offset relative
+        // to ENTRY_NS; the paired wire input retains this BEGIN's own
+        // START time, so the original Event reconstructs it exactly.
+        let entry_ns = u64::from_le_bytes(begin[48..56].try_into().unwrap());
+        let duration = ts_ns.checked_sub(ENTRY_NS).expect("fixture return offset");
+        put_u64(&mut payload, 0, entry_ns + duration);
+        put_u64(&mut payload, 8, duration);
         payload[16..24].copy_from_slice(&begin[24..32]);
         put_u64(&mut payload, 24, 0x3333_3333_3333_3333);
         payload[32..40].copy_from_slice(&begin[80..88]);
@@ -4656,12 +5015,12 @@ pub(crate) mod tests {
         bytes[4] = JOURNAL_KIND_ABANDON;
         put_u64(&mut bytes, 8, thread);
         put_u64(&mut bytes, 16, sequence);
-        put_u64(&mut bytes, 24, PID_TGID);
+        put_u64(&mut bytes, 24, invocation_pid(thread));
         put_u64(&mut bytes, 32, image.0);
         put_u64(&mut bytes, 40, image.1);
         put_u32(&mut bytes, 48, 11);
         put_u32(&mut bytes, 52, reason);
-        put_u64(&mut bytes, 56, ENTRY_NS);
+        put_u64(&mut bytes, 56, invocation_entry_ns(thread, sequence));
         bytes
     }
 
@@ -4673,7 +5032,7 @@ pub(crate) mod tests {
         Event {
             ts_ns: entry_ns + 100,
             duration_ns: 100,
-            pid_tgid: PID_TGID,
+            pid_tgid: u64::from_le_bytes(begin[24..32].try_into().unwrap()),
             session: u64::from_le_bytes(begin[80..88].try_into().unwrap()),
             slot_id: u64::from_le_bytes(begin[200..208].try_into().unwrap()),
             mechanism: u64::from_le_bytes(begin[112..120].try_into().unwrap()),
@@ -5287,7 +5646,41 @@ pub(crate) mod tests {
             capture: u32,
             call_flags: u64,
         ) -> AdmittedInstanceCall {
+            let slot = self.functions[name].0;
+            self.admit_original_event(
+                name,
+                Event {
+                    slot,
+                    session,
+                    slot_id: SLOT_ID,
+                    flags: call_flags,
+                    user_type: 1,
+                    rv,
+                    mechanism,
+                    capture,
+                    ts_ns: 100 + self.next_token + 1,
+                    image: self.image,
+                    ..Default::default()
+                },
+            )
+        }
+
+        /// The original Event is complete before routed admission. No
+        /// admitted authority or private identity is rewritten afterward.
+        pub(crate) fn admit_original_event(
+            &mut self,
+            name: &str,
+            event: Event,
+        ) -> AdmittedInstanceCall {
             let (slot, endpoint) = self.functions[name];
+            assert_eq!(
+                event.slot, slot,
+                "native slot belongs to the attested function"
+            );
+            assert!(
+                event.image == self.image,
+                "original Event belongs to this image"
+            );
             self.next_token += 1;
             let token = self.next_token;
             let stamp = InstanceStamp {
@@ -5299,23 +5692,7 @@ pub(crate) mod tests {
             let routed = RoutedCall::scripted(
                 self.domain,
                 crate::events::DecodedEventRecord {
-                    base: crate::semantic_capture::event_record_with_routing(
-                        Event {
-                            slot,
-                            session,
-                            slot_id: SLOT_ID,
-                            flags: call_flags,
-                            user_type: 1,
-                            rv,
-                            mechanism,
-                            capture,
-                            ts_ns: 100 + token,
-                            image: self.image,
-                            ..Default::default()
-                        },
-                        stamp,
-                        0x2200,
-                    ),
+                    base: crate::semantic_capture::event_record_with_routing(event, stamp, 0x2200),
                     object: None,
                 },
                 Route::Joined(self.router),
@@ -5334,6 +5711,10 @@ pub(crate) mod tests {
             .expect("scripted evidence admits")
         }
 
+        pub(crate) fn h0_allocated_below(&self) -> u64 {
+            self.next_token + 1
+        }
+
         /// Move the attested subset out (for a semantic lane): the
         /// fixture keeps its binding/router for further admissions.
         fn take_subset(&mut self) -> AttestedSubset {
@@ -5349,6 +5730,26 @@ pub(crate) mod tests {
         }
     }
 
+    fn original_for_validated_begin(begin: &ValidatedJournalBegin) -> Event {
+        Event {
+            ts_ns: begin.entry_ns() + 100,
+            duration_ns: 100,
+            pid_tgid: begin.pid_tgid(),
+            session: begin.session_word(),
+            slot_id: begin.slot_id(),
+            mechanism: begin.entry_mechanism(),
+            flags: begin.call_flags(),
+            slot: begin.slot(),
+            user_type: begin.user_type(),
+            capture: begin.capture(),
+            image: ImageIdentity {
+                task_cookie: begin.image_cookie(),
+                exec_id: begin.image_exec(),
+            },
+            ..Event::default()
+        }
+    }
+
     /// One full journal scene: adapter, model, frozen table and H3
     /// attestation for one image.
     struct Scene {
@@ -5361,6 +5762,8 @@ pub(crate) mod tests {
         /// production): the drain-side producer behind every drain
         /// grant this scene mints. One Session retains one domain.
         retained_events: crate::events::EventsDomain,
+        pending_claims: VecDeque<(String, u64)>,
+        paired_admissions: BTreeMap<u64, u64>,
     }
 
     impl Scene {
@@ -5377,6 +5780,8 @@ pub(crate) mod tests {
                 descriptors,
                 fixture: AttestationFixture::new(image),
                 retained_events: crate::events::EventsDomain::test_standin(7),
+                pending_claims: VecDeque::new(),
+                paired_admissions: BTreeMap::new(),
             };
             // The Session sealed before journal work: the adapter
             // starts under the observed closure.
@@ -5385,8 +5790,7 @@ pub(crate) mod tests {
         }
 
         fn attest(&mut self) -> JournalDomainProof {
-            let admitted = self.fixture.admit();
-            self.adapter.attest_key(&admitted).expect("key attests")
+            self.attest_session_function(SESSION, "C_CreateObject")
         }
 
         /// This scene's sealed attachment: the closure generation's
@@ -5424,8 +5828,7 @@ pub(crate) mod tests {
         /// Attest one admission for a chosen function: the staged
         /// call's H3-routed return for that function's fingerprint.
         fn attest_function(&mut self, name: &str) -> JournalDomainProof {
-            let admitted = self.fixture.admit_function(name);
-            self.adapter.attest_key(&admitted).expect("key attests")
+            self.attest_session_function(SESSION, name)
         }
 
         /// Attest `n` admissions for a chosen function.
@@ -5440,8 +5843,148 @@ pub(crate) mod tests {
 
         /// Attest one admission for a chosen session word and function.
         fn attest_session_function(&mut self, session: u64, name: &str) -> JournalDomainProof {
+            // Bind the key separately from the paired physical invocation.
+            // Zero-duration binding grants no journal call claim.
             let admitted = self.fixture.admit_session_function(session, name);
-            self.adapter.attest_key(&admitted).expect("key attests")
+            let proof = self.adapter.attest_key(&admitted).expect("key attests");
+            self.pending_claims.push_back((name.into(), session));
+            proof
+        }
+
+        /// Build paired original inputs before normal routed admission.
+        /// H8 algorithm fixtures deliberately substitute the I/O here;
+        /// this is not the N1a production-ingress acceptance driver.
+        fn prepare_claims(&mut self) {
+            let image = (self.fixture.image.task_cookie, self.fixture.image.exec_id);
+            if self.adapter.is_tainted(image) {
+                return;
+            }
+            let mut inputs: Vec<(u64, u32, Event)> = self
+                .adapter
+                .open
+                .values()
+                .filter(|entry| entry.image == image && entry.converted_ticket.is_none())
+                .map(|entry| {
+                    let event = entry
+                        .end
+                        .map(|end| end.end.payload_base().event)
+                        .unwrap_or_else(|| original_for_validated_begin(&entry.begin));
+                    (entry.begin_ordinal, entry.function, event)
+                })
+                .collect();
+            inputs.extend(
+                self.adapter
+                    .refused
+                    .iter()
+                    .filter(|entry| entry.image == image)
+                    .map(|entry| {
+                        (
+                            entry.cut,
+                            entry.function,
+                            Event {
+                                ts_ns: entry.entry_ns + 100,
+                                duration_ns: 100,
+                                pid_tgid: entry.pid_tgid,
+                                session: entry.session,
+                                slot_id: entry.slot_id,
+                                mechanism: entry.mechanism,
+                                flags: entry.flags,
+                                slot: entry.slot,
+                                user_type: entry.user_type,
+                                capture: entry.capture,
+                                image: ImageIdentity {
+                                    task_cookie: image.0,
+                                    exec_id: image.1,
+                                },
+                                ..Event::default()
+                            },
+                        )
+                    }),
+            );
+            self.admit_paired_inputs(inputs);
+        }
+
+        fn admit_paired_inputs(&mut self, mut inputs: Vec<(u64, u32, Event)>) {
+            inputs.sort_by_key(|input| input.0);
+            for (cut, function, event) in inputs {
+                if self.paired_admissions.contains_key(&cut) {
+                    continue;
+                }
+                let Some(index) = self.pending_claims.iter().position(|(name, session)| {
+                    function_id(name) == function && *session == event.session
+                }) else {
+                    continue;
+                };
+                let (name, _) = self
+                    .pending_claims
+                    .remove(index)
+                    .expect("selected fixture input");
+                let admitted = self.fixture.admit_original_event(&name, event);
+                self.adapter
+                    .attest_key(&admitted)
+                    .expect("paired input admits");
+                self.paired_admissions.insert(cut, admitted.h0_ordinal());
+            }
+        }
+
+        /// Explicit scripted wire inputs are paired before routed H0
+        /// admission and collection. This is an algorithm/drain fixture,
+        /// not the outstanding N1a production single-cursor driver.
+        fn prepare_record_claims(&mut self, records: &[Vec<u8>]) {
+            let decoded: Vec<_> = records
+                .iter()
+                .enumerate()
+                .filter_map(|(index, bytes)| {
+                    decode_journal_record(bytes, &self.descriptors)
+                        .map(|record| (self.adapter.consumed_through + index as u64 + 1, record))
+                })
+                .collect();
+            let inputs = decoded
+                .iter()
+                .filter_map(|(cut, record)| {
+                    let JournalRecord::Begin(begin) = record else {
+                        return None;
+                    };
+                    if (begin.image_cookie(), begin.image_exec())
+                        != (self.fixture.image.task_cookie, self.fixture.image.exec_id)
+                    {
+                        return None;
+                    }
+                    let event = decoded
+                        .iter()
+                        .find_map(|(_, record)| {
+                            let JournalRecord::End(end) = record else {
+                                return None;
+                            };
+                            (end.thread() == begin.thread() && end.sequence() == begin.sequence())
+                                .then(|| end.payload_base().event)
+                        })
+                        .unwrap_or_else(|| original_for_validated_begin(begin));
+                    Some((*cut, begin.descriptor() - 1, event))
+                })
+                .collect();
+            self.admit_paired_inputs(inputs);
+        }
+
+        fn admit_other_end(
+            &mut self,
+            other: &mut AttestationFixture,
+            name: &str,
+            end: &[u8],
+        ) -> JournalDomainProof {
+            let JournalRecord::End(end) = decode_journal_record(end, &self.descriptors).unwrap()
+            else {
+                panic!("paired END")
+            };
+            // These algorithm fixtures model one H0 allocator across
+            // two admitted callers. Advance the input allocator before
+            // normal admission; no admitted identity is rewritten.
+            other.next_token = other.next_token.max(self.fixture.next_token);
+            let admitted = other.admit_original_event(name, end.payload_base().event);
+            self.fixture.next_token = other.next_token;
+            self.adapter
+                .attest_key(&admitted)
+                .expect("paired sibling return attests")
         }
 
         /// This scene's retained drain producers: its fixture's
@@ -5492,13 +6035,14 @@ pub(crate) mod tests {
                 .ingest_any(JournalIngestItem::Ordinary(decoded))
         }
 
-        fn audit(&self) -> JournalAuditReceipt {
+        fn audit(&mut self) -> JournalAuditReceipt {
+            self.prepare_claims();
             JournalAuditReceipt::scripted(
                 7,
                 7,
                 None,
                 0,
-                H3DispositionEvidence::scripted_clean(self.adapter.consumed_through),
+                H3DispositionEvidence::scripted_clean(self.fixture.next_token),
                 self.closure_generation(),
             )
         }
@@ -5520,13 +6064,14 @@ pub(crate) mod tests {
             epoch: u64,
         ) -> Result<SealSuccess, SealFailure> {
             self.install_observed_closure();
+            self.prepare_claims();
             let frontier = self.adapter.consumed_frontier();
             let audit = JournalAuditReceipt::scripted(
                 epoch,
                 epoch,
                 None,
                 0,
-                H3DispositionEvidence::scripted_clean(self.adapter.consumed_through),
+                H3DispositionEvidence::scripted_clean(self.fixture.next_token),
                 self.closure_generation(),
             );
             let fresh = SessionBirthEvidence::scripted_for_receipt(bootstrap);
@@ -5545,6 +6090,7 @@ pub(crate) mod tests {
             fresh: SessionBirthEvidence,
         ) -> Result<SealSuccess, SealFailure> {
             self.install_observed_closure();
+            self.prepare_claims();
             let cell = ScriptedFaultCell::steady(audit.fault_after);
             let mut births = ScriptedBirthSource::once(fresh);
             self.adapter.seal(
@@ -5576,14 +6122,20 @@ pub(crate) mod tests {
             records: Vec<Vec<u8>>,
             fault: &impl FaultEpoch,
         ) -> JournalCollection {
+            self.bind_session_drain();
+            self.prepare_record_claims(&records);
             let bound = records.len();
             let mut drain = crate::events::EventDrain::over_test_domain(
                 crate::events::ScriptedRecords::records(records, bound),
                 self.retained_events.id(),
             );
-            self.bind_session_drain();
-            self.adapter
-                .collect_from_drain(&mut drain, &self.descriptors, Some(bound), fault, 0)
+            self.adapter.collect_from_drain(
+                &mut drain,
+                &self.descriptors,
+                Some(bound),
+                fault,
+                self.fixture.h0_allocated_below(),
+            )
         }
 
         /// One seal from a real collection: H3 disposition covers the
@@ -5593,7 +6145,7 @@ pub(crate) mod tests {
             bootstrap: &BootstrapReceipt,
             collection: &JournalCollection,
         ) -> Result<SealSuccess, SealFailure> {
-            let h3 = H3DispositionEvidence::scripted_clean(self.adapter.consumed_through);
+            let h3 = H3DispositionEvidence::scripted_clean(self.fixture.next_token);
             let mut source = ScriptedH3Source::once(h3);
             let audit =
                 JournalAuditReceipt::collect(collection, &mut source, self.closure_generation());
@@ -6239,6 +6791,11 @@ pub(crate) mod tests {
             JournalGap::DomainTainted
         );
         let healthy = begin_bytes_image(2, 1, create, 0, (COOKIE + 1, EXEC));
+        scene.admit_other_end(
+            &mut other,
+            "C_CreateObject",
+            &end_bytes(&healthy, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50),
+        );
         assert_eq!(scene.ingest(&healthy), JournalDisposition::BeginAdmitted);
         scene.ingest(&end_bytes(&healthy, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
         let bootstrap_b = scene.bootstrap(proof_b, 1);
@@ -6295,6 +6852,11 @@ pub(crate) mod tests {
         // New history above the fence seals under the fresh birth.
         let create = function_id("C_CreateObject");
         let healthy = begin_bytes_image(3, 1, create, 0, (COOKIE + 1, EXEC));
+        scene.admit_other_end(
+            &mut other,
+            "C_CreateObject",
+            &end_bytes(&healthy, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70),
+        );
         scene.ingest(&healthy);
         scene.ingest(&end_bytes(&healthy, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 70));
         let rebootstrap = BootstrapReceipt::scripted(
@@ -6555,14 +7117,18 @@ pub(crate) mod tests {
         let create = function_id("C_CreateObject");
         let begin = begin_bytes(1, 1, create, 0);
         let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        scene.prepare_record_claims(&[begin.to_vec(), end.to_vec()]);
         let mut script = BusyScript::new(vec![begin.to_vec(), end.to_vec()]);
         script.busy_after = Some(1);
         let mut drain = crate::events::EventDrain::over_test_domain(script, 7);
         let fault = ScriptedFaultCell::steady(7);
-        let first =
-            scene
-                .adapter
-                .collect_from_drain(&mut drain, &scene.descriptors, None, &fault, 0);
+        let first = scene.adapter.collect_from_drain(
+            &mut drain,
+            &scene.descriptors,
+            None,
+            &fault,
+            scene.fixture.h0_allocated_below(),
+        );
         assert_eq!((first.ingested, first.ordinary), (1, 0));
         assert_eq!(scene.adapter.consumed_through, 1);
         let bootstrap = scene.bootstrap(proof, 0);
@@ -6570,10 +7136,13 @@ pub(crate) mod tests {
             .seal_collected(&bootstrap, &first)
             .expect("prefix frontier seals");
         assert_eq!(held.prefix.open_keys().len(), 1);
-        let second =
-            scene
-                .adapter
-                .collect_from_drain(&mut drain, &scene.descriptors, None, &fault, 0);
+        let second = scene.adapter.collect_from_drain(
+            &mut drain,
+            &scene.descriptors,
+            None,
+            &fault,
+            scene.fixture.h0_allocated_below(),
+        );
         assert_eq!((second.ingested, second.ordinary), (1, 0));
         let bootstrap = scene.bootstrap(proof, 0);
         let success = scene
@@ -6932,8 +7501,7 @@ pub(crate) mod tests {
             let begin = begin_bytes(1, sequence, create, 0);
             assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
         }
-        let mut refused = begin_bytes(1, 1_025, create, 0);
-        put_u32(&mut refused, 104, 77);
+        let refused = begin_bytes(1, 1_025, create, 0);
         assert_eq!(
             scene.ingest(&refused),
             JournalDisposition::BeginRefusedCapacity
@@ -7751,6 +8319,7 @@ pub(crate) mod tests {
                 .birth_covers_staged(proof.key, &live, image, 0)
         );
         scene.ingest(&begin_bytes(1, 1, create, 0));
+        scene.prepare_claims();
         assert!(
             scene
                 .adapter
@@ -9310,7 +9879,16 @@ pub(crate) mod tests {
 
         let publisher = NativePublisher::build();
         let mut scene = Scene::new(image_default());
-        let admitted = scene.fixture.admit();
+        let paired_begin = begin_bytes(1, 1, function_id("C_CreateObject"), 0);
+        let paired_end = end_bytes(&paired_begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        let JournalRecord::End(paired_end) =
+            decode_journal_record(&paired_end, &scene.descriptors).unwrap()
+        else {
+            panic!("paired END")
+        };
+        let admitted = scene
+            .fixture
+            .admit_original_event("C_CreateObject", paired_end.payload_base().event);
         let proof = scene.adapter.attest_key(&admitted).expect("key attests");
         let (row, control, wins) =
             publisher.publish_stamped(&["0", "1"], scene.closure_generation());
@@ -9636,7 +10214,16 @@ pub(crate) mod tests {
 
         let publisher = NativePublisher::build();
         let mut scene = Scene::new(image_default());
-        let admitted = scene.fixture.admit();
+        let paired_begin = begin_bytes(1, 1, function_id("C_CreateObject"), 0);
+        let paired_end = end_bytes(&paired_begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+        let JournalRecord::End(paired_end) =
+            decode_journal_record(&paired_end, &scene.descriptors).unwrap()
+        else {
+            panic!("paired END")
+        };
+        let admitted = scene
+            .fixture
+            .admit_original_event("C_CreateObject", paired_end.payload_base().event);
         let proof = scene.adapter.attest_key(&admitted).expect("key attests");
         let (domain, _, _, _) = admitted.journal_binding();
         let full = scan_ranges_full();
@@ -10652,6 +11239,632 @@ pub(crate) mod tests {
         assert_eq!(bound.prefix.settled().len(), 1);
     }
 
+    /// A refused invocation burns only its own exact admission. Keep
+    /// the retained call open so its H8 receipt names that admission
+    /// even when the refused call's bound moves the bootstrap floor.
+    fn retained_and_refused_claim_identity(refused_first: bool) {
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_calls(2);
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        let mut second = begin_bytes(2, 1, create, 0);
+        put_u64(&mut second, 48, ENTRY_NS + 1_000);
+        scene.adapter.limits.open_calls = usize::from(!refused_first);
+        scene.ingest(&first);
+        scene.adapter.limits.open_calls = usize::from(refused_first);
+        scene.ingest(&second);
+        let refused = if refused_first { &first } else { &second };
+        assert_eq!(
+            scene.ingest_ordinary(ordinary_for(refused, 0)),
+            JournalDisposition::ReturnObserved
+        );
+        let mut pad = ordinary_for(refused, 0);
+        pad.slot = 99;
+        scene.ingest_ordinary(pad);
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.prepare_claims();
+        let expected = scene.paired_admissions[&if refused_first { 2 } else { 1 }];
+        let seal = scene
+            .seal(&bootstrap)
+            .expect("bounded refusal with one retained open seals");
+        assert_eq!(seal.prefix.settled().len(), 1);
+        assert_eq!(
+            seal.prefix.settled()[0].key.admission(),
+            expected,
+            "the refused call cannot burn the retained invocation's H0 admission"
+        );
+        assert_eq!(seal.prefix.open_keys().len(), 1);
+    }
+
+    #[test]
+    fn object_journal_c2_retained_then_refused_claim_identity() {
+        retained_and_refused_claim_identity(false);
+    }
+
+    #[test]
+    fn object_journal_c2_refused_then_retained_claim_identity() {
+        retained_and_refused_claim_identity(true);
+    }
+
+    #[test]
+    fn object_journal_c2_ambiguous_overlap_reversed_returns_keeps_claims() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_calls(2);
+        let create = function_id("C_CreateObject");
+        let first = begin_bytes(1, 1, create, 0);
+        let mut second = begin_bytes(2, 1, create, 0);
+        second[24..32].copy_from_slice(&first[24..32]);
+        second[48..56].copy_from_slice(&first[48..56]);
+        scene.ingest(&first);
+        scene.ingest(&second);
+        scene.ingest(&end_bytes(&second, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
+        scene.prepare_claims();
+        let claims = scene.adapter.claims.clone();
+        let count = scene.adapter.claim_counts;
+        let bootstrap = scene.bootstrap(proof, 0);
+        let outcome = scene.seal(&bootstrap);
+        assert_eq!(
+            scene.adapter.claims, claims,
+            "ambiguous conversion must consume no invocation's claim"
+        );
+        assert_eq!(scene.adapter.claim_counts, count);
+        assert_eq!(
+            outcome
+                .expect_err("identical physical tuple needs explicit correlation refusal")
+                .gap,
+            JournalGap::ImageTainted
+        );
+        assert!(scene.model.project().objects.is_empty());
+        let retry = scene
+            .seal(&bootstrap)
+            .expect_err("ambiguity remains unresolved");
+        assert_eq!(retry.gap, JournalGap::ImageTainted);
+        assert_eq!(scene.adapter.claims, claims);
+    }
+
+    #[test]
+    fn object_journal_c2_consumed_identity_stays_stale_after_1025_calls() {
+        let mut scene = Scene::new(image_default());
+        let function = function_id("C_SignUpdate");
+        let begin = begin_bytes(1, 1, function, 0);
+        let end = end_bytes_absent(&begin, 0, ENTRY_NS + 50);
+        let JournalRecord::End(native) = decode_journal_record(&end, &scene.descriptors).unwrap()
+        else {
+            panic!("END")
+        };
+        let first = scene
+            .fixture
+            .admit_original_event("C_SignUpdate", native.payload_base().event);
+        let proof = scene.adapter.attest_key(&first).unwrap();
+        scene.ingest(&begin);
+        scene.ingest(&end);
+        let bootstrap = scene.bootstrap(proof, 0);
+        let delayed = scene.seal(&bootstrap).unwrap();
+        assert_eq!(
+            delayed.prefix.settled()[0].key.admission(),
+            first.h0_ordinal()
+        );
+        assert_eq!(
+            scene.adapter.attest_key(&first),
+            Err(AttestationRefusal::InvocationStale)
+        );
+        for sequence in 2..=1_026 {
+            scene.attest_function("C_SignUpdate");
+            let begin = begin_bytes(1, sequence, function, 0);
+            scene.ingest(&begin);
+            scene.ingest(&end_bytes_absent(&begin, 0, ENTRY_NS + 50));
+            scene.seal(&bootstrap).unwrap();
+        }
+        assert_eq!(
+            scene.adapter.attest_key(&first),
+            Err(AttestationRefusal::InvocationStale)
+        );
+        assert_eq!(scene.adapter.claim_counts, 0);
+        assert_eq!(scene.adapter.physical_return_floors.len(), 1);
+        assert_eq!(
+            delayed.prefix.settled()[0].key.admission(),
+            first.h0_ordinal(),
+            "late seal retains its actual original H0 identity"
+        );
+    }
+
+    #[test]
+    fn object_journal_c2_new_native_ticket_cannot_recycle_old_physical_entry() {
+        for new_ticket in [false, true] {
+            let mut scene = Scene::new(image_default());
+            let proof = scene.attest_function("C_SignUpdate");
+            let function = function_id("C_SignUpdate");
+            let first = begin_bytes(1, 1, function, 0);
+            scene.ingest(&first);
+            scene.ingest(&end_bytes_absent(&first, 0, ENTRY_NS + 50));
+            scene.seal(&scene.bootstrap(proof, 0)).unwrap();
+            let floor = scene.adapter.physical_return_floors[&invocation_pid(1)];
+            scene.adapter.void_staged(); // Bounded direct-guard reset test.
+            let mut replay = begin_bytes_image(
+                if new_ticket { 2 } else { 1 },
+                if new_ticket { 1 } else { 2 },
+                function,
+                0,
+                (COOKIE, EXEC + 1),
+            );
+            replay[24..32].copy_from_slice(&first[24..32]);
+            replay[48..56].copy_from_slice(&first[48..56]);
+            assert_eq!(
+                scene.ingest(&replay),
+                JournalDisposition::Contradiction(JournalContradiction::SequenceRegression)
+            );
+            assert_eq!(
+                scene.adapter.physical_return_floors[&invocation_pid(1)],
+                floor,
+                "void/exec/native ticket never reset the physical fence"
+            );
+            assert_eq!(scene.adapter.claim_counts, 0);
+        }
+    }
+
+    #[test]
+    fn object_journal_c2_namespace_capacity_spares_tracked_namespace() {
+        let mut scene = Scene::new_with_limits(
+            image_default(),
+            JournalLimits {
+                thread_floors: 1,
+                ..JournalLimits::policy()
+            },
+        );
+        let proof = scene.attest_function("C_SignUpdate");
+        let function = function_id("C_SignUpdate");
+        let first = begin_bytes(1, 1, function, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes_absent(&first, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).unwrap();
+        let mut refused = begin_bytes_image(1, 2, function, 0, (COOKIE + 1, EXEC));
+        put_u64(&mut refused, 24, invocation_pid(2));
+        assert_eq!(
+            scene.ingest(&refused),
+            JournalDisposition::Contradiction(JournalContradiction::FloorExhausted)
+        );
+        assert_eq!(
+            scene.adapter.claim_counts, 0,
+            "capacity burns no unrelated claim"
+        );
+        scene.attest_function("C_SignUpdate");
+        let healthy = begin_bytes(1, 2, function, 0);
+        scene.ingest(&healthy);
+        scene.ingest(&end_bytes_absent(&healthy, 0, ENTRY_NS + 50));
+        assert_eq!(scene.seal(&bootstrap).unwrap().prefix.settled().len(), 1);
+        assert_eq!(scene.adapter.physical_return_floors.len(), 1);
+    }
+
+    #[test]
+    fn object_journal_c2_unique_unconsumed_start_exception_is_bounded_guard_only() {
+        let mut scene = Scene::new(image_default());
+        let begin = begin_bytes(1, 1, function_id("C_SignUpdate"), 0);
+        let JournalRecord::Begin(native) =
+            decode_journal_record(&begin, &scene.descriptors).unwrap()
+        else {
+            panic!("BEGIN")
+        };
+        scene.ingest(&begin);
+        // Deliberately inject only the later fence for this guard-unit
+        // test: normal full-image attribution currently holds unclaimed
+        // outer STARTs, so this is not end-to-end ingress evidence.
+        scene
+            .adapter
+            .physical_return_floors
+            .insert(native.pid_tgid(), native.entry_ns() + 10_000);
+        let event = original_for_validated_begin(&native);
+        let admitted = scene.fixture.admit_original_event("C_SignUpdate", event);
+        scene
+            .adapter
+            .attest_key(&admitted)
+            .expect("unique retained unconsumed START owns its delayed original return");
+        let mut foreign = event;
+        foreign.ts_ns -= 1;
+        let wrong = scene.fixture.admit_original_event("C_SignUpdate", foreign);
+        assert_eq!(
+            scene.adapter.attest_key(&wrong),
+            Err(AttestationRefusal::InvocationStale)
+        );
+        assert_eq!(scene.adapter.claim_counts, 1);
+    }
+
+    #[test]
+    fn object_journal_c2_equal_next_entry_and_previous_return_is_healthy() {
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_function("C_SignUpdate");
+        let function = function_id("C_SignUpdate");
+        let first = begin_bytes(1, 1, function, 0);
+        scene.ingest(&first);
+        scene.ingest(&end_bytes_absent(&first, 0, ENTRY_NS + 50));
+        let bootstrap = scene.bootstrap(proof, 0);
+        scene.seal(&bootstrap).unwrap();
+        let previous_return = scene.adapter.physical_return_floors[&invocation_pid(1)];
+        scene.attest_function("C_SignUpdate");
+        let mut next = begin_bytes(1, 2, function, 0);
+        put_u64(&mut next, 48, previous_return);
+        assert_eq!(scene.ingest(&next), JournalDisposition::BeginAdmitted);
+        scene.ingest(&end_bytes_absent(&next, 0, ENTRY_NS + 50));
+        assert_eq!(scene.seal(&bootstrap).unwrap().prefix.settled().len(), 1);
+        assert_eq!(
+            scene.adapter.physical_return_floors[&invocation_pid(1)],
+            previous_return + 50
+        );
+    }
+
+    #[test]
+    fn object_journal_c2_foreign_begin_identity_never_burns_original_claim() {
+        for changed in 0..4 {
+            let mut scene = Scene::new(image_default());
+            let function = function_id("C_SignUpdate");
+            let begin = begin_bytes(1, 1, function, 0);
+            let end = end_bytes_absent(&begin, 0, ENTRY_NS + 50);
+            let JournalRecord::End(native) =
+                decode_journal_record(&end, &scene.descriptors).unwrap()
+            else {
+                panic!("END")
+            };
+            let admitted = scene
+                .fixture
+                .admit_original_event("C_SignUpdate", native.payload_base().event);
+            let proof = scene.adapter.attest_key(&admitted).unwrap();
+            let mut foreign = begin;
+            match changed {
+                0 => put_u64(&mut foreign, 24, invocation_pid(2)),
+                1 => put_u64(&mut foreign, 48, invocation_entry_ns(1, 1) + 1),
+                2 => put_u32(&mut foreign, 104, fixture_slot(function).unwrap() + 1),
+                _ => put_u64(&mut foreign, 32, COOKIE + 1),
+            }
+            scene.ingest(&foreign);
+            scene.ingest(&end_bytes_absent(&foreign, 0, ENTRY_NS + 50));
+            let claims = scene.adapter.claims.clone();
+            scene
+                .seal(&scene.bootstrap(proof, 0))
+                .expect_err("different physical identity is not the admitted original");
+            assert_eq!(scene.adapter.claims, claims);
+            assert_eq!(scene.adapter.claim_counts, 1);
+        }
+    }
+
+    #[test]
+    fn object_journal_c2_adapter_refuses_independent_drain_namespace() {
+        let mut scene = Scene::new(image_default());
+        let admitted = scene.fixture.admit();
+        scene.adapter.attest_key(&admitted).unwrap();
+        let grant = SessionDrainGrant::observe(&scene.producers(), &admitted).unwrap();
+        scene.adapter.bind_session_drain(&grant).unwrap();
+        let mut other = Scene::new(image_default());
+        other.retained_events = crate::events::EventsDomain::test_standin(8);
+        let foreign = other.fixture.admit();
+        scene.adapter.attest_key(&foreign).unwrap();
+        let grant = SessionDrainGrant::observe(&other.producers(), &foreign).unwrap();
+        assert_eq!(
+            scene.adapter.bind_session_drain(&grant),
+            Err(DrainBindRefusal::DrainConflict)
+        );
+        let same_cursor = crate::attach::SessionDrainProducers::test_pair(
+            other.fixture.domain(),
+            scene.retained_events.clone(),
+        );
+        let grant = SessionDrainGrant::observe(&same_cursor, &foreign).unwrap();
+        scene
+            .adapter
+            .bind_session_drain(&grant)
+            .expect("native domains can share the same retained Session cursor");
+    }
+
+    /// Direct era/request guard: production currently has no era-revival
+    /// path, so this deliberately scripts the mismatched request only.
+    #[test]
+    fn object_journal_c2_failure_scope_preserves_full_era() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let begin = begin_bytes(1, 1, function_id("C_CreateObject"), 0);
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let receipt = scene.bootstrap(proof, 0);
+        let next_era = BootstrapReceipt::scripted(
+            JournalDomainProof {
+                era: proof.era + 1,
+                ..proof
+            },
+            BirthKind::ExecMarker,
+            0,
+            scene.closure_generation(),
+        );
+        let old_failure = scene.adapter.scripted_failure(
+            JournalGap::ClosureStale,
+            &receipt,
+            ObjectEffects::default(),
+        );
+        assert!(old_failure.affects_domain(receipt.domain()));
+        assert!(!old_failure.affects_domain(next_era.domain()));
+        let audit = scene.audit();
+        let frontier = scene.adapter.consumed_frontier();
+        let failure = scene
+            .seal_explicit(
+                &audit,
+                &next_era,
+                frontier,
+                SessionBirthEvidence::scripted_for_receipt(&next_era),
+            )
+            .expect_err("unknown requested era is inert");
+        assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
+        assert!(!failure.affects_domain(receipt.domain()));
+        assert!(!failure.affects_domain(next_era.domain()));
+        assert!(
+            old_failure.affects_domain(receipt.domain()),
+            "scope is an immutable snapshot"
+        );
+        scene
+            .seal(&receipt)
+            .expect("the actual current era remains healthy");
+        let global = scene.adapter.global_failure(JournalGap::Stopped);
+        let SealFailureScope::AffectedDomains(domains) = global.scope else {
+            panic!("global snapshot")
+        };
+        assert_eq!(domains.len(), 1);
+        assert_eq!(std::mem::size_of::<ObjectDomain>(), 40);
+        assert!(domains.capacity() <= scene.adapter.limits.domain_keys);
+        eprintln!(
+            "C2 scoped-loss storage: {} domains, {} requested bytes; maximum {} bytes",
+            domains.len(),
+            domains.capacity() * std::mem::size_of::<ObjectDomain>(),
+            JournalLimits::policy().domain_keys * std::mem::size_of::<ObjectDomain>()
+        );
+    }
+
+    #[test]
+    fn object_journal_c2_same_shape_reversed_returns_keep_actual_h0_identity() {
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_ACCESS;
+        let mut scene = Scene::new(image_default());
+        let function = function_id("C_SignInit");
+        let capture = capture::MECHANISM_VALUE | capture::OUTPUT_NON_NULL;
+        let first = begin_bytes_shaped(
+            1,
+            1,
+            function,
+            0,
+            (COOKIE, EXEC),
+            SESSION,
+            1,
+            capture,
+            Some((7, 1)),
+            None,
+            FLAGS,
+        );
+        let mut second = begin_bytes_shaped(
+            2,
+            1,
+            function,
+            0,
+            (COOKIE, EXEC),
+            SESSION,
+            1,
+            capture,
+            Some((7, 1)),
+            None,
+            FLAGS,
+        );
+        put_u64(&mut second, 48, invocation_entry_ns(1, 1) + 10);
+        let first_end = end_bytes(&first, OBJECT_ACTION_ACCESS, 0, ENTRY_NS + 60);
+        let second_end = end_bytes(&second, OBJECT_ACTION_ACCESS, 0, ENTRY_NS + 20);
+        // H0 admits in physical return order, opposite native BEGIN order.
+        let JournalRecord::End(second_return) =
+            decode_journal_record(&second_end, &scene.descriptors).unwrap()
+        else {
+            panic!("END")
+        };
+        let admitted_second = scene
+            .fixture
+            .admit_original_event("C_SignInit", second_return.payload_base().event);
+        let proof = scene.adapter.attest_key(&admitted_second).unwrap();
+        let JournalRecord::End(first_return) =
+            decode_journal_record(&first_end, &scene.descriptors).unwrap()
+        else {
+            panic!("END")
+        };
+        let admitted_first = scene
+            .fixture
+            .admit_original_event("C_SignInit", first_return.payload_base().event);
+        scene.adapter.attest_key(&admitted_first).unwrap();
+        scene.ingest(&first);
+        scene.ingest(&second);
+        scene.ingest(&second_end);
+        scene.ingest(&first_end);
+        let seal = scene
+            .seal(&scene.bootstrap(proof, 0))
+            .expect("distinct physical identities need no rank inference");
+        assert_eq!(seal.prefix.settled().len(), 2);
+        assert_eq!(
+            seal.prefix.settled()[0].key.admission(),
+            admitted_first.h0_ordinal()
+        );
+        assert_eq!(
+            seal.prefix.settled()[1].key.admission(),
+            admitted_second.h0_ordinal()
+        );
+        let mut s1 = crate::semantics_edge::EdgeSemantics::default();
+        s1.observe(admitted_second.s1_facts());
+        s1.observe(admitted_first.s1_facts());
+        assert_eq!(
+            (s1.calls(), s1.started(), s1.cancelled(), s1.unknown()),
+            (2, 2, 1, 0)
+        );
+        assert_eq!(
+            s1.completed(),
+            0,
+            "identity binding invents no S1 completion"
+        );
+    }
+
+    #[test]
+    fn object_journal_c2_original_interval_refusals_preserve_s1() {
+        use crate::semantics_edge::EdgeSemantics;
+        let mut scene = Scene::new(image_default());
+        let function = function_id("C_SignUpdate");
+        let begin = begin_bytes(1, 1, function, 0);
+        let JournalRecord::Begin(native) =
+            decode_journal_record(&begin, &scene.descriptors).unwrap()
+        else {
+            panic!("BEGIN")
+        };
+        let valid = original_for_validated_begin(&native);
+        for invalid in 0..4 {
+            let mut event = valid;
+            match invalid {
+                0 => event.duration_ns = 0,
+                1 => {
+                    event.ts_ns = 10;
+                    event.duration_ns = 11;
+                }
+                2 => event.pid_tgid &= 0xffff_ffff_0000_0000,
+                _ => event.pid_tgid &= 0xffff_ffff,
+            }
+            let admitted = scene.fixture.admit_original_event("C_SignUpdate", event);
+            assert!(admitted.journal_call_fingerprint().is_none());
+            scene.adapter.attest_key(&admitted).unwrap();
+            assert_eq!(scene.adapter.claim_counts, 0);
+            let mut edge = EdgeSemantics::default();
+            edge.observe(admitted.s1_facts());
+            assert_eq!(
+                edge.calls(),
+                1,
+                "refusing Joint identity preserves definite S1 input"
+            );
+        }
+    }
+
+    #[test]
+    fn object_journal_c2_native_end_interval_mismatch_keeps_claim() {
+        let mut scene = Scene::new(image_default());
+        let begin = begin_bytes(1, 1, function_id("C_SignUpdate"), 0);
+        let end = end_bytes_absent(&begin, 0, ENTRY_NS + 50);
+        let JournalRecord::End(native) = decode_journal_record(&end, &scene.descriptors).unwrap()
+        else {
+            panic!("END")
+        };
+        let admitted = scene
+            .fixture
+            .admit_original_event("C_SignUpdate", native.payload_base().event);
+        let proof = scene.adapter.attest_key(&admitted).unwrap();
+        scene.ingest(&begin);
+        scene.ingest(&end_bytes_absent(&begin, 0, ENTRY_NS + 60));
+        let claims = scene.adapter.claims.clone();
+        let failure = scene
+            .seal(&scene.bootstrap(proof, 0))
+            .expect_err("a different original END interval is not this admission");
+        assert_eq!(failure.gap, JournalGap::H3Pending);
+        assert_eq!(scene.adapter.claims, claims);
+    }
+
+    #[test]
+    fn object_journal_c2_missing_end_pending_physical_return_is_not_completion() {
+        let mut scene = Scene::new(image_default());
+        let begin = begin_bytes(1, 1, function_id("C_SignInit"), 0);
+        let JournalRecord::Begin(native) =
+            decode_journal_record(&begin, &scene.descriptors).unwrap()
+        else {
+            panic!("BEGIN")
+        };
+        let mut event = original_for_validated_begin(&native);
+        event.rv = pkcs11_types::CkRv::PENDING.0;
+        let admitted = scene.fixture.admit_original_event("C_SignInit", event);
+        let proof = scene.adapter.attest_key(&admitted).unwrap();
+        scene.ingest(&begin);
+        let seal = scene
+            .seal(&scene.bootstrap(proof, 0))
+            .expect("original physical return identifies this open native invocation");
+        assert_eq!(seal.prefix.settled().len(), 1);
+        assert_eq!(
+            seal.prefix.settled()[0].key.admission(),
+            admitted.h0_ordinal()
+        );
+        assert!(seal.prefix.settled()[0].end_cut.is_none());
+        assert_eq!(
+            scene.adapter.physical_return_floors[&native.pid_tgid()],
+            event.ts_ns
+        );
+        let mut edge = crate::semantics_edge::EdgeSemantics::default();
+        edge.observe(admitted.s1_facts());
+        assert_eq!(
+            edge.completed(),
+            0,
+            "physical return is never semantic completion"
+        );
+    }
+
+    #[test]
+    fn object_journal_c2_guard_stays_bounded_through_100k_calls() {
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_function("C_SignUpdate");
+        let bootstrap = scene.bootstrap(proof, 0);
+        let function = function_id("C_SignUpdate");
+        for sequence in 1..=100_000 {
+            if sequence != 1 {
+                scene.attest_function("C_SignUpdate");
+            }
+            let begin = begin_bytes(1, sequence, function, 0);
+            let cut = scene.adapter.consumed_through + 1;
+            assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
+            scene.ingest(&end_bytes_absent(&begin, 0, ENTRY_NS + 50));
+            let seal = scene
+                .seal(&bootstrap)
+                .expect("healthy namespace never hits a lifetime call cap");
+            assert_eq!(seal.prefix.settled().len(), 1);
+            assert_eq!(
+                seal.prefix.settled()[0].key.admission(),
+                scene.paired_admissions[&cut]
+            );
+            assert_eq!(scene.adapter.floors.len(), 1);
+            assert_eq!(scene.adapter.physical_return_floors.len(), 1);
+            assert_eq!(scene.adapter.claim_counts, 0);
+            assert!(scene.adapter.open.is_empty());
+            assert!(scene.adapter.refused.is_empty());
+        }
+    }
+
+    #[test]
+    fn object_journal_c2_retained_outer_survives_inner_return_fence() {
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest_function("C_SignUpdate");
+        let bootstrap = scene.bootstrap(proof, 0);
+        let function = function_id("C_SignUpdate");
+        let outer = begin_bytes(1, 1, function, 0);
+        scene.ingest(&outer);
+        // Original physical API return is admitted even though the
+        // native END is delayed. This is algorithm-level late delivery.
+        scene
+            .seal(&bootstrap)
+            .expect("outer START converts from its original return");
+        for sequence in 2..=100 {
+            scene.attest_function("C_SignUpdate");
+            let begin = begin_bytes(1, sequence, function, 0);
+            scene.ingest(&begin);
+            scene.ingest(&end_bytes_absent(&begin, 0, ENTRY_NS + 50));
+            scene
+                .seal(&bootstrap)
+                .expect("bounded inner wave advances the physical floor");
+        }
+        let floor = scene.adapter.physical_return_floors[&invocation_pid(1)];
+        assert!(floor > invocation_entry_ns(1, 1) + 100);
+        // END retains the exact original physical interval, rather than
+        // replacing it with delivery time after the inner calls.
+        scene.ingest(&end_bytes_absent(&outer, 0, ENTRY_NS + 100));
+        scene
+            .seal(&bootstrap)
+            .expect("retained outer completes below the advanced floor");
+        assert!(scene.adapter.open.is_empty());
+        assert_eq!(
+            scene.adapter.physical_return_floors[&invocation_pid(1)],
+            floor
+        );
+        assert_eq!(scene.adapter.physical_return_floors.len(), 1);
+    }
+
     #[test]
     fn object_journal_conversion_attributes_per_call_authority() {
         // C4: two provider instances share one image. Each key converts
@@ -10674,6 +11887,11 @@ pub(crate) mod tests {
         scene.ingest(&first);
         let mut second = begin_bytes(2, 1, create, 0);
         put_u64(&mut second, 80, OTHER_SESSION);
+        scene.admit_other_end(
+            &mut other,
+            "C_CreateObject",
+            &end_bytes(&second, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60),
+        );
         scene.ingest(&second);
         scene.ingest(&end_bytes(&first, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
         scene.ingest(&end_bytes(&second, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60));
@@ -10858,6 +12076,10 @@ pub(crate) mod tests {
             .seal_explicit(&audit, &bootstrap, frontier, fresh)
             .expect_err("first-presented foreign drain refuses");
         assert_eq!(failure.gap, JournalGap::DrainMismatch);
+        assert!(
+            !failure.affects_domain(bootstrap.domain()),
+            "foreign drain refusal has no loss authority"
+        );
         // Session authority mints the association from its retained
         // EVENTS domain (7) plus the admission: the grant carries the
         // producers' identities, and binding it is idempotent.
@@ -11267,7 +12489,19 @@ pub(crate) mod tests {
         // claims: re-attest for the new history. No manual
         // acknowledgement anywhere: the tick forwarded quantum 1's
         // report through production code.
-        scene.attest();
+        let paired_end = end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60);
+        let JournalRecord::End(paired_end) =
+            decode_journal_record(&paired_end, &scene.descriptors).unwrap()
+        else {
+            panic!("paired END")
+        };
+        let admitted_return = scene
+            .fixture
+            .admit_original_event("C_CreateObject", paired_end.payload_base().event);
+        scene
+            .adapter
+            .attest_key(&admitted_return)
+            .expect("new exact return attests after void");
         commit(
             &mut coordinator,
             &mut lane,
@@ -11408,7 +12642,19 @@ pub(crate) mod tests {
             next: H3DispositionEvidence::scripted_clean(fence + 2),
             acked: Vec::new(),
         };
-        scene.attest();
+        let paired_end = end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60);
+        let JournalRecord::End(paired_end) =
+            decode_journal_record(&paired_end, &scene.descriptors).unwrap()
+        else {
+            panic!("paired END")
+        };
+        let admitted_return = scene
+            .fixture
+            .admit_original_event("C_CreateObject", paired_end.payload_base().event);
+        scene
+            .adapter
+            .attest_key(&admitted_return)
+            .expect("new physical return attests");
         let grant = SessionBirthGrant::scripted(
             proof,
             BirthKind::AbsenceAppearance,
@@ -11775,12 +13021,16 @@ pub(crate) mod tests {
         scene.attest();
         let next = begin_bytes(1, 2, create, 0);
         let next_end = end_bytes(&next, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 60);
+        scene.prepare_record_claims(&[next.to_vec(), next_end.to_vec()]);
         let script = BusyScript::new(vec![next.to_vec(), next_end.to_vec()]);
         let mut drain = crate::events::EventDrain::over_test_domain(script, 7);
-        let collection =
-            scene
-                .adapter
-                .collect_from_drain(&mut drain, &scene.descriptors, None, &fault, 0);
+        let collection = scene.adapter.collect_from_drain(
+            &mut drain,
+            &scene.descriptors,
+            None,
+            &fault,
+            scene.fixture.h0_allocated_below(),
+        );
         assert_eq!(collection.discarded_delta, 0);
         let grant = SessionBirthGrant::scripted(
             proof,

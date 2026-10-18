@@ -30,7 +30,8 @@ use crate::semantics_objects::journal::{
     SealSuccess, SealedCall,
 };
 use crate::semantics_objects::{
-    CallToken, ObjectEffect, ObjectEffects, ObjectId, ObjectSemantics, SessionIncarnation,
+    CallToken, ObjectDomain, ObjectEffect, ObjectEffects, ObjectId, ObjectSemantics,
+    SessionIncarnation,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::mem::size_of;
@@ -169,6 +170,8 @@ impl StagedCall {
 /// each quantum borrows them.
 pub(crate) struct JointStaging {
     mode: FeedMode,
+    /// Immutable selection for this per-era feed; delivery never rebinds it.
+    selected_domain: Option<ObjectDomain>,
     staged: VecDeque<StagedCall>,
     /// Highest consumed H0 position (replayed or disposed): staging
     /// at or below it is a forbidden replay.
@@ -224,6 +227,7 @@ impl JointStaging {
     pub(crate) fn select_s1_only() -> Self {
         Self {
             mode: FeedMode::S1Only,
+            selected_domain: None,
             staged: VecDeque::new(),
             frontier: 0,
             consumed: BTreeSet::new(),
@@ -244,10 +248,22 @@ impl JointStaging {
     /// still verifies birth independently.
     pub(crate) fn select_joint(receipt: Option<&BootstrapReceipt>) -> Self {
         let mut staging = Self::select_s1_only();
-        if receipt.is_some() {
+        if let Some(receipt) = receipt {
             staging.mode = FeedMode::Joint;
+            staging.selected_domain = Some(receipt.domain());
         }
         staging
+    }
+
+    pub(crate) fn accepts_seal(&self, seal: &SealSuccess) -> bool {
+        self.mode == FeedMode::Joint && self.selected_domain == Some(seal.prefix.domain())
+    }
+
+    pub(crate) fn accepts_failure(&self, failure: &SealFailure) -> bool {
+        self.mode == FeedMode::Joint
+            && self
+                .selected_domain
+                .is_some_and(|domain| failure.affects_domain(domain))
     }
 
     pub(crate) fn mode(&self) -> FeedMode {
@@ -393,11 +409,12 @@ impl JointStaging {
         sink: &mut S,
         assoc_fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) -> (SealApplyOutcome, u64) {
-        // Ledger contact flushes pended releases first (C4).
-        self.flush_pending_releases(ledger);
-        if self.mode != FeedMode::Joint {
+        // A foreign receipt has no authority even over pending releases.
+        if !self.accepts_seal(seal) {
             return (SealApplyOutcome::Held, 0);
         }
+        // Ledger contact flushes pended releases first (C4).
+        self.flush_pending_releases(ledger);
         // Qualified invalidations apply even when the quantum cannot
         // replay (N3): holding S1 replay must never hold
         // already-applied object invalidations. Runs before every
@@ -505,11 +522,12 @@ impl JointStaging {
         sink: &mut S,
         mut assoc_fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) -> (FailureApplyOutcome, u64) {
-        // Ledger contact flushes pended releases first (C4).
-        self.flush_pending_releases(ledger);
-        if self.mode != FeedMode::Joint {
+        // A foreign receipt has no authority even over pending releases.
+        if !self.accepts_failure(failure) {
             return (FailureApplyOutcome::Ignored, 0);
         }
+        // Ledger contact flushes pended releases first (C4).
+        self.flush_pending_releases(ledger);
         match disposition_of(failure.gap) {
             SealFailureDisposition::Retry => {
                 // Transient waits keep staging, but never swallow

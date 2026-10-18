@@ -94,6 +94,7 @@ impl AdmittedInstanceCall {
             position,
             facts,
             permission: ReductionPermission::CurrentContinuity,
+            journal_invocation: None,
             object: None,
         }
     }
@@ -194,12 +195,39 @@ enum ReductionPermission {
     HistoricalOnly(InstanceReason),
 }
 
+/// Original physical API invocation, retained privately before S1 drops
+/// the raw thread and duration. It carries no continuity authority.
+#[derive(Clone, Copy)]
+struct JournalInvocationIdentity {
+    pid_tgid: u64,
+    entry_ns: u64,
+    return_ns: u64,
+    slot: u32,
+}
+
+impl JournalInvocationIdentity {
+    fn from_event(event: &p11scope_ebpf_common::Event) -> Option<Self> {
+        // The producer saturates its duration subtraction. Zero duration
+        // cannot distinguish an actual zero interval from saturation.
+        if event.duration_ns == 0 || event.pid_tgid as u32 == 0 || event.pid_tgid >> 32 == 0 {
+            return None;
+        }
+        Some(Self {
+            pid_tgid: event.pid_tgid,
+            entry_ns: event.ts_ns.checked_sub(event.duration_ns)?,
+            return_ns: event.ts_ns,
+            slot: event.slot,
+        })
+    }
+}
+
 pub(crate) struct AdmittedInstanceCall {
     key: InstanceKey,
     caller: CallerId,
     position: SemanticPosition,
     facts: SemanticCall,
     permission: ReductionPermission,
+    journal_invocation: Option<JournalInvocationIdentity>,
     /// Slice D: the private validated object tail, bound to the attested
     /// slot descriptor at admission and dropped on mismatch. H9 consumes
     /// it; no public object projection exists here.
@@ -268,9 +296,13 @@ impl AdmittedInstanceCall {
             return None;
         }
         let function = crate::kinds::function_id(&self.facts.function)?;
+        let invocation = self.journal_invocation?;
         Some(CallFingerprint {
             image: (self.key.image.task_cookie, self.key.image.exec_id),
             function,
+            pid_tgid: invocation.pid_tgid,
+            entry_ns: invocation.entry_ns,
+            slot: invocation.slot,
             session: self.facts.session,
             mechanism: self.facts.mechanism,
             capture: self.facts.capture,
@@ -278,6 +310,10 @@ impl AdmittedInstanceCall {
             flags: self.facts.flags,
             user_type: self.facts.user_type,
         })
+    }
+    pub(crate) fn journal_return_ns(&self) -> Option<u64> {
+        self.journal_invocation
+            .map(|invocation| invocation.return_ns)
     }
 }
 
@@ -685,6 +721,9 @@ impl CallerRegistry {
         let Some(record) = self.instance_state.semantics.get_mut(&id) else {
             return SealApplyOutcome::Held;
         };
+        if !record.feed.accepts_seal(seal) {
+            return SealApplyOutcome::Held;
+        }
         let was_joint = record.feed.mode() == FeedMode::Joint;
         let Some(reducer) = record.semantics.as_mut() else {
             return SealApplyOutcome::Held;
@@ -722,6 +761,9 @@ impl CallerRegistry {
         let Some(record) = self.instance_state.semantics.get_mut(&id) else {
             return FailureApplyOutcome::Ignored;
         };
+        if !record.feed.accepts_failure(failure) {
+            return FailureApplyOutcome::Ignored;
+        }
         let was_joint = record.feed.mode() == FeedMode::Joint;
         let Some(reducer) = record.semantics.as_mut() else {
             return FailureApplyOutcome::Ignored;
@@ -1933,6 +1975,7 @@ pub(crate) fn admit_call_from_evidence(
             ts_ns: evidence.event.ts_ns,
         },
         permission,
+        journal_invocation: JournalInvocationIdentity::from_event(&evidence.event),
         object,
     })
 }
@@ -2208,6 +2251,7 @@ mod reference {
                 ReductionPermission::CurrentContinuity,
                 ReductionPermission::HistoricalOnly,
             ),
+            journal_invocation: None,
             object: None,
         }
     }

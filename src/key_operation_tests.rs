@@ -10921,3 +10921,109 @@ fn key_operation_c5_above_barrier_survives_and_retirement_disposes() {
         "retirement ends live S1 with terminals teed"
     );
 }
+
+/// The capture owner holds ONE ledger: a staged H9 charge plus its
+/// association mint account together in one census/total, so either
+/// release frees allowance for the other role. Scalar-role charges
+/// stay distinct operations; only the same-wire bridge joins roles.
+#[test]
+fn joint_capture_owner_single_ledger_accounts_staged_and_assoc() {
+    use crate::semantics_edge::resources::SemanticResourcePool;
+    use crate::semantics_objects::journal::joint_driver::JointCaptureOwner;
+
+    let pool = SemanticResourcePool::default();
+    let mut owner = JointCaptureOwner::new(pool.reserver());
+    assert_eq!(owner.ledger().census(), 0);
+    assert_eq!(owner.ledger().charged_bytes(), 0);
+    owner.ledger_mut().charge(7, 40).expect("staged charges");
+    assert_eq!(owner.ledger().staged(), 1);
+    assert_eq!(owner.ledger().charged_bytes(), 40);
+    let ticket = owner.ledger_mut().mint_keyassoc(24).expect("assoc mints");
+    assert_eq!(owner.ledger().census(), 2);
+    assert_eq!(owner.ledger().charged_bytes(), 64);
+    owner.ledger_mut().release_keyassoc(ticket);
+    assert_eq!(owner.ledger().charged_bytes(), 40);
+    owner.ledger_mut().release(7, 40);
+    assert_eq!(owner.ledger().staged(), 0);
+    assert_eq!(owner.ledger().charged_bytes(), 0);
+    assert_eq!(owner.ledger().census(), 0);
+}
+
+/// A coordinator commit borrows the capture owner's ledger: a Joint
+/// call observed then committed stages its H9 charge into the owner's
+/// ledger through the real commit path, not the fallback.
+#[test]
+fn joint_capture_owner_commit_batch_stages_into_owned_ledger() {
+    use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
+
+    let mut coordinator = InventoryCoordinator::new(
+        crate::attach::Scope::Pid(std::process::id()),
+        crate::discovery::hooks::HookRegistry::builtin(),
+        Vec::new(),
+        crate::discovery::caller_registry::OsProcessSource,
+        RegistryLimits::new(8, 8, 8, 8, 8, 8).expect("generous limits"),
+    )
+    .expect("coordinator builds");
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let module = ModuleKey::Physical {
+        dev_major: 1,
+        dev_minor: 2,
+        ino: 3,
+        sha256: None,
+    };
+    let caller = CallerId(7);
+    let domain = NativeDomainId::try_mint().expect("fresh domain");
+    let key = InstanceKey::scripted(
+        domain,
+        ImageIdentity {
+            task_cookie: 101,
+            exec_id: 1,
+        },
+        InstanceId::from_raw(1),
+        module.clone(),
+    );
+    {
+        let registry = coordinator.registry_mut();
+        registry.scripted_module_edge(module, caller);
+        assert!(
+            registry.install_joint_receipt(key.clone(), bootstrap),
+            "the receipt install fits the instance bound"
+        );
+        registry.note_instance(AdmittedInstance::scripted(key.clone(), caller));
+    }
+    coordinator
+        .commit_batch(false)
+        .expect("registration commits");
+    let id = RegistryInstanceId::from_raw(0);
+    assert_eq!(
+        coordinator.registry().feed_mode_for_test(id),
+        Some(FeedMode::Joint),
+        "the installed receipt selects Joint through the commit"
+    );
+    assert_eq!(coordinator.joint_capture().ledger().staged(), 0);
+    let shape = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let admitted = admit_call_input(&mut scene, &shape);
+    scene.adapter.attest_key(&admitted).expect("call attests");
+    let (facts, position) = (admitted.s1_facts().clone(), admitted.h0_ordinal());
+    coordinator
+        .registry_mut()
+        .observe_instance_semantic(AdmittedInstanceCall::scripted(
+            key.clone(),
+            caller,
+            position,
+            facts,
+        ));
+    coordinator
+        .commit_batch(false)
+        .expect("observation commits");
+    assert_eq!(
+        coordinator.joint_capture().ledger().staged(),
+        1,
+        "the commit stages the Joint call into the owner's ledger"
+    );
+    assert!(
+        coordinator.joint_capture().ledger().charged_bytes() > 0,
+        "the staged call charges the owner's bytes"
+    );
+}

@@ -3248,16 +3248,19 @@ impl CallerRegistry {
     }
 
     /// Apply every staged mutation in order and publish the snapshot.
-    /// Returns the number of applied mutations.
+    /// Returns the number of applied mutations. Ledger-less: Joint
+    /// feeds reduce S1Only-direct and key-use opens charge the
+    /// fallback; tests use this for the no-ledger twin. Production
+    /// commits borrow the capture owner's ledger instead.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn publish(&mut self) -> usize {
         self.publish_inner(None, None)
     }
 
     /// Publish with the shared H8 staging ledger (guarded H9 path):
     /// Joint feeds stage against it; `None` (plain [`publish`]) keeps
-    /// every feed S1Only-direct. Live-loop carry: only the staged
-    /// driver and tests supply a ledger.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// every feed S1Only-direct. Production commits borrow the
+    /// capture owner's ledger here.
     pub(crate) fn publish_with_ledger(
         &mut self,
         ledger: &mut crate::semantics_objects::journal::StagingLedger,
@@ -3265,11 +3268,15 @@ impl CallerRegistry {
         self.publish_inner(None, Some(ledger))
     }
 
+    /// Publish with a count observer plus the capture owner's ledger:
+    /// the diagnostics commit path. Joint feeds stage against the
+    /// owner's ledger exactly like [`publish_with_ledger`].
     pub(crate) fn publish_with_count_observer(
         &mut self,
         observer: Option<&mut dyn FnMut(CountPublication)>,
+        ledger: &mut crate::semantics_objects::journal::StagingLedger,
     ) -> usize {
-        self.publish_inner(observer, None)
+        self.publish_inner(observer, Some(ledger))
     }
 
     fn publish_inner(

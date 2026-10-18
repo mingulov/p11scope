@@ -3331,13 +3331,11 @@ fn publish_descriptors<S>(
 type ObjectRows = [ObjectDescriptorWire; MAX_DESCRIPTORS as usize];
 type ObjectResult<T> = std::result::Result<T, crate::inventory_semantics::SemanticRefusal>;
 
-/// H7 slice D: object descriptor rows frozen for the attested decode
-/// lane. The live-map readback matched the canonical table exactly at
-/// `Session::start_attested`, so these rows are the receipt-bound table
-/// `decode_object_record` validates tails against. No other lane holds
-/// one: non-attested sessions stay 368-byte-only.
+/// Verified frozen object descriptor rows. Ordinary consumers may validate the
+/// producer's full record before discarding its tail; only start_attested places
+/// a table in Session::object_decode for the semantic admission lane.
 pub(crate) struct ObjectDecodeTable {
-    rows: ObjectRows,
+    rows: Arc<ObjectRows>,
 }
 
 impl ObjectDecodeTable {
@@ -3346,10 +3344,28 @@ impl ObjectDecodeTable {
     }
 }
 
-/// Freeze the attested decode lane: read back every live
+/// Select wire decoding independently of attested semantic eligibility. A
+/// producer-enabled ordinary session requires its own verified map readback;
+/// an attested session can share its already verified immutable rows.
+pub(crate) fn object_transport_rows_with(
+    policy: CapturePolicy,
+    attested: Option<&Arc<ObjectRows>>,
+    readback: impl FnOnce() -> Result<Arc<ObjectRows>>,
+) -> Result<Option<Arc<ObjectRows>>> {
+    match policy {
+        CapturePolicy::Allowlisted => match attested {
+            Some(rows) => Ok(Some(Arc::clone(rows))),
+            None => readback().map(Some),
+        },
+        CapturePolicy::AggregateOnly | CapturePolicy::UnsafeUnvalidatedMetadata => Ok(None),
+    }
+}
+
+/// Verify the frozen transport rows: read back every live
 /// OBJECT_DESCRIPTORS row and require the exact canonical table the
 /// loader published and froze. Any absence or disagreement refuses the
-/// attested session rather than decoding tails against wrong rows.
+/// session rather than decoding tails against wrong rows. This verification
+/// does not itself attest an attachment or authorize semantic admission.
 fn freeze_object_decode_table(ebpf: &Ebpf) -> Result<ObjectDecodeTable> {
     use p11scope_ebpf_common::object_wire::publish_object_descriptors;
     let expected = publish_object_descriptors();
@@ -3362,10 +3378,12 @@ fn freeze_object_decode_table(ebpf: &Ebpf) -> Result<ObjectDecodeTable> {
             .get(&(index as u32), 0)
             .with_context(|| format!("reading OBJECT_DESCRIPTORS row {index}"))?;
         if actual != object_descriptor_row_bytes(row) {
-            bail!("OBJECT_DESCRIPTORS attested readback differs at row {index}");
+            bail!("OBJECT_DESCRIPTORS transport readback differs at row {index}");
         }
     }
-    Ok(ObjectDecodeTable { rows: expected })
+    Ok(ObjectDecodeTable {
+        rows: Arc::new(expected),
+    })
 }
 
 /// Exact inputs for one attested-receipt validation, bundled so the object
@@ -6098,17 +6116,13 @@ impl Session {
     /// The session's single retained EVENTS consumer plus, on the
     /// attested allowlisted lane with verified object rows, the frozen
     /// receipt-bound decode table. One call hands out both disjoint
-    /// borrows, so collection decodes 608-byte records on exactly that
-    /// lane and stays 368-byte-only everywhere else.
+    /// borrows, so semantic collection retains object facts on exactly that
+    /// lane. Ordinary drains validate their producer's full transport form and
+    /// receive its base without semantic object authority.
     pub(crate) fn event_drain_with_object_table(
         &mut self,
     ) -> Result<(&mut events::OwnedDrain, Option<&ObjectRows>)> {
-        if self.events_consumer.is_none() {
-            let consumer = events::OwnedDrain::for_session(&self.ebpf, &self.events_domain)?;
-            self.events_consumer = Some(consumer);
-            self.wire_trace_consumers()
-                .map_err(|reason| anyhow!("private trace proof: {reason:?}"))?;
-        }
+        self.ensure_events_consumer()?;
         let consumer = self
             .events_consumer
             .as_mut()
@@ -6188,7 +6202,16 @@ impl Session {
 
     fn ensure_events_consumer(&mut self) -> Result<()> {
         if self.events_consumer.is_none() {
-            let consumer = events::OwnedDrain::for_session(&self.ebpf, &self.events_domain)?;
+            let transport = object_transport_rows_with(
+                self.policy,
+                self.object_decode.as_ref().map(|table| &table.rows),
+                || freeze_object_decode_table(&self.ebpf).map(|table| table.rows),
+            )?;
+            let consumer = events::OwnedDrain::for_session_with_transport(
+                &self.ebpf,
+                &self.events_domain,
+                transport,
+            )?;
             self.events_consumer = Some(consumer);
             self.wire_trace_consumers()
                 .map_err(|reason| anyhow!("private trace proof: {reason:?}"))?;
@@ -6833,6 +6856,59 @@ mod tests {
         publish_object_descriptors,
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn object_transport_ordinary_policy_requires_verified_rows() {
+        use super::{CapturePolicy, object_transport_rows_with};
+        use std::sync::Arc;
+
+        for command in ["profile", "trace"] {
+            let policy = CapturePolicy::from_cli(command, false, false).unwrap();
+            let rows = Arc::new(publish_object_descriptors());
+            let mut reads = 0;
+            let selected = object_transport_rows_with(policy, None, || {
+                reads += 1;
+                Ok(Arc::clone(&rows))
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!(reads, 1);
+            assert!(Arc::ptr_eq(&selected, &rows));
+            let refused = object_transport_rows_with(policy, None, || {
+                anyhow::bail!("injected frozen-map readback failure")
+            });
+            assert!(
+                refused.is_err(),
+                "{command} must not silently fall back to 368-byte records"
+            );
+        }
+    }
+
+    #[test]
+    fn object_transport_attested_rows_are_shared_without_new_authority() {
+        use super::{CapturePolicy, object_transport_rows_with};
+        use std::sync::Arc;
+
+        let rows = Arc::new(publish_object_descriptors());
+        let selected = object_transport_rows_with(CapturePolicy::Allowlisted, Some(&rows), || {
+            panic!("attested transport reuses its verified rows")
+        })
+        .unwrap()
+        .unwrap();
+        assert!(Arc::ptr_eq(&selected, &rows));
+        for policy in [
+            CapturePolicy::AggregateOnly,
+            CapturePolicy::UnsafeUnvalidatedMetadata,
+        ] {
+            assert!(
+                object_transport_rows_with(policy, Some(&rows), || {
+                    panic!("non-object policy must not acquire transport rows")
+                })
+                .unwrap()
+                .is_none()
+            );
+        }
+    }
 
     struct FakeObjectMap {
         rows: BTreeMap<u32, ObjectDescriptorWire>,

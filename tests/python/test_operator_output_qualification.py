@@ -78,6 +78,7 @@ class OracleTests(unittest.TestCase):
 
     def test_exact_stdout_shed_includes_terminal_record_bytes(self):
         self.receipt.update(sink='slowpipe', stdout_stalled=True)
+        self.evidence['scheduling']['sink_timeouts'] = 1
         self.evidence['scheduling']['sink_dropped_bytes'] = 17
         trace = render(self.counts, self.evidence)
         self.assertTrue(self.check(stdout=trace[17:])['pass'])
@@ -94,6 +95,8 @@ class OracleTests(unittest.TestCase):
     def test_nonstalled_pipe_cannot_claim_stall_acceptance(self):
         self.receipt['sink'] = 'slowpipe'
         self.assertFalse(self.check()['pass'])
+        self.receipt['stdout_stalled'] = True
+        self.assertFalse(self.check()['pass'], 'kernel pressure alone needs actual sink timeout evidence')
 
     def test_zero_or_unacknowledged_or_failed_provider_calls_are_rejected(self):
         for change in ('zero', 'issued', 'failed', 'prefix', 'wrongpid', 'function'):
@@ -155,6 +158,7 @@ class OracleTests(unittest.TestCase):
 
     def test_lossy_same_size_corruption_and_reordering_are_rejected(self):
         self.receipt.update(sink='slowpipe', stdout_stalled=True)
+        self.evidence['scheduling']['sink_timeouts'] = 1
         self.evidence['scheduling']['sink_dropped_bytes'] = 17
         trace = render(self.counts, self.evidence)
         for damaged in (b'X' * (len(trace) - 17), trace[:-17][::-1]):
@@ -162,6 +166,7 @@ class OracleTests(unittest.TestCase):
 
     def test_lossy_stdout_terminal_may_have_only_prior_sink_totals(self):
         self.receipt.update(sink='slowpipe', stdout_stalled=True)
+        self.evidence['scheduling']['sink_timeouts'] = 1
         stdout_ev = copy.deepcopy(self.evidence)
         stdout_ev['scheduling']['sink_dropped_bytes'] = 0
         stdout = render(self.counts, stdout_ev)[20:]
@@ -393,6 +398,31 @@ class ManifestControls(unittest.TestCase):
 
 
 class FdControls(unittest.TestCase):
+    def test_atomic_writer_stalls_before_pipe_byte_capacity_is_full(self):
+        pipe = HARNESS['OutputPipe']()
+        child = None
+        try:
+            os.write(pipe.write_fd, b'H' * 169)
+            child = subprocess.Popen([sys.executable, '-I', '-c',
+                'import os; os.write(1, b"X" * 4096)'], stdout=pipe.write_fd)
+            time.sleep(0.05)
+            self.assertIsNone(child.poll(), 'atomic writer must actually remain blocked')
+            self.assertFalse(pipe.full(), 'this regression requires occupancy below4096')
+            self.assertTrue(pipe.stalled(), 'owned kernel write readiness must show pressure')
+            deadline = time.monotonic() + 3
+            while child.poll() is None:
+                pipe.drain_available()
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.001)
+            child.wait(timeout=1)
+            self.assertEqual(pipe.drain_available(), b'H' * 169 + b'X' * 4096)
+            self.assertFalse(pipe.stalled(), 'empty pipe cannot qualify pressure')
+        finally:
+            if child and child.poll() is None:
+                child.kill()
+                child.wait(timeout=1)
+            pipe.close()
+
     def test_real_writer_stalls_and_drain_counts_exact_bytes(self):
         pipe = HARNESS['OutputPipe']()
         child = None

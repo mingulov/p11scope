@@ -198,6 +198,94 @@ impl ProviderScene {
         result
     }
 
+    /// The original producer receipt is validated before the same owned
+    /// receipt reaches its normal finalizer; no receipt is constructed here.
+    fn refresh_coverage(&mut self, file: u32) -> crate::inventory_semantics::LaneCoverage {
+        let caller = self.scene.caller();
+        let lane = self.scene.lane.as_mut().unwrap();
+        let candidate = self
+            .scene
+            .coordinator
+            .prepare_legacy_semantic_candidate(caller, lane.domain())
+            .unwrap();
+        let slot = self.scene.h0.0.borrow().io.held.slot(file, "C_SignInit");
+        let prepared = lane
+            .prepare_caller_admission(
+                candidate.pin(),
+                slot,
+                &self.modules[file as usize],
+                |bytes| {
+                    self.scene
+                        .coordinator
+                        .registry()
+                        .reserve_semantic_storage(bytes)
+                },
+            )
+            .unwrap();
+        let (receipt, result) = self
+            .scene
+            .coordinator
+            .consume_semantic_admission(candidate, prepared, None);
+        result.unwrap();
+        let mut report = TickReport::default();
+        let coverage = lane
+            .validate_current(&receipt, &mut report)
+            .expect("the original fresh H0 receipt validates");
+        assert!(
+            report.into_parts().0.is_empty(),
+            "healthy validation produces no refusal"
+        );
+        lane.deliver_admission_receipt(receipt);
+        coverage
+    }
+
+    fn record_for(
+        &self,
+        file: u32,
+    ) -> (
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId,
+        crate::discovery::caller_registry::instance_input::InstanceLifecycle,
+    ) {
+        let registry = self.scene.coordinator.registry();
+        let module = registry
+            .module_id_for(&self.modules[file as usize])
+            .unwrap();
+        let records: Vec<_> = registry
+            .instances()
+            .filter(|record| record.module == module)
+            .collect();
+        assert_eq!(records.len(), 1);
+        (records[0].id, records[0].state)
+    }
+
+    fn apply_invalidations(
+        &mut self,
+        scope: InvalidationScope,
+        fresh: &[crate::inventory_semantics::LaneCoverage],
+    ) -> (usize, usize) {
+        use crate::discovery::caller_registry::instance_input::finalize_invalidation;
+        let caller = self.scene.caller();
+        let domain = self.scene.lane.as_ref().unwrap().domain();
+        let (losses, retirements) = finalize_invalidation(
+            &scope,
+            Some(1000),
+            domain,
+            self.scene.coordinator.semantic_bindings().get(caller),
+            fresh,
+        )
+        .unwrap();
+        let counts = (losses.len(), retirements.len());
+        let registry = self.scene.coordinator.registry_mut();
+        for loss in losses {
+            registry.note_instance_semantic_loss(loss);
+        }
+        for retirement in retirements {
+            registry.retire_instance(retirement);
+        }
+        registry.publish();
+        counts
+    }
+
     fn pin(&self) -> Arc<PidPin> {
         self.scene
             .coordinator
@@ -701,4 +789,161 @@ fn prepared_b_cannot_promote_or_erase_a_historical_returns() {
     assert_eq!(second, Ok(()));
     fixture.publish();
     assert_eq!(historical(&fixture), (Some(2), 2, 0));
+}
+
+#[test]
+fn prepared_provider_b_file_loss_preserves_a_and_unknown_file_widens() {
+    use crate::discovery::caller_registry::instance_input::InstanceLifecycle;
+    for unknown in [false, true] {
+        for reverse in [false, true] {
+            let mut fixture = ProviderScene::new(reverse);
+            let a = fixture.physical_a_file;
+            let b = 1 - a;
+            fixture.admit(a).unwrap();
+            fixture.admit(b).unwrap();
+            fixture.publish();
+            for file in [a, b] {
+                fixture.enqueue(file, "C_SignInit", 0x0001, 0);
+            }
+            fixture.publish();
+            let image = fixture
+                .scene
+                .coordinator
+                .semantic_bindings()
+                .get(fixture.scene.caller())
+                .unwrap()
+                .image();
+            assert_eq!(
+                fixture.apply_invalidations(
+                    InvalidationScope::File {
+                        image,
+                        file_slot: if unknown { 99 } else { b },
+                    },
+                    &[]
+                ),
+                (1, 0)
+            );
+            assert_eq!(fixture.record_for(b).1, InstanceLifecycle::Uncertain);
+            assert_eq!(
+                fixture.record_for(a).1,
+                if unknown {
+                    InstanceLifecycle::Uncertain
+                } else {
+                    InstanceLifecycle::Observed
+                }
+            );
+            fixture.enqueue(a, "C_Sign", 0, 0);
+            fixture.publish();
+            assert_eq!(
+                fixture.summary(a as usize).2,
+                u64::from(!unknown),
+                "B-local loss keeps A's operation; unknown file ownership conservatively fences both"
+            );
+        }
+    }
+}
+
+#[test]
+fn prepared_provider_b_retirement_uses_its_genuine_fresh_partition() {
+    use crate::discovery::caller_registry::instance_input::InstanceLifecycle;
+    for reverse in [false, true] {
+        let mut fixture = ProviderScene::new(reverse);
+        let a = fixture.physical_a_file;
+        let b = 1 - a;
+        fixture.admit(a).unwrap();
+        let old = fixture.refresh_coverage(b);
+        fixture.publish();
+        let old_id = fixture.record_for(b).0;
+        for file in [a, b] {
+            fixture.enqueue(file, "C_SignInit", 0x0001, 0);
+        }
+        fixture.publish();
+        {
+            let mut h0 = fixture.scene.h0.0.borrow_mut();
+            let (base, local) = h0.io.held.scan_input(b);
+            h0.io
+                .held
+                .scan_inputs
+                .insert(b, (base + 0x4000_0000, local + 1));
+        }
+        let fresh = fixture.refresh_coverage(b);
+        assert!(!fresh.instances().is_empty());
+        assert!(
+            fresh
+                .instances()
+                .iter()
+                .all(|id| !old.instances().contains(id)),
+            "the actual H0 scan must mint a genuinely disjoint B partition"
+        );
+        assert_eq!(
+            fixture.apply_invalidations(
+                InvalidationScope::InstancesRetired {
+                    image: old.image(),
+                    file_slot: b,
+                    ids: old.instances().to_vec(),
+                },
+                std::slice::from_ref(&fresh)
+            ),
+            (0, old.instances().len())
+        );
+        let registry = fixture.scene.coordinator.registry();
+        assert_eq!(
+            registry
+                .instances()
+                .find(|record| record.id == old_id)
+                .unwrap()
+                .state,
+            InstanceLifecycle::Retired
+        );
+        assert_eq!(fixture.record_for(a).1, InstanceLifecycle::Observed);
+        fixture.enqueue(a, "C_Sign", 0, 0);
+        fixture.publish();
+        assert_eq!(fixture.summary(a as usize), (2, 1, 1, 0));
+        let registry = fixture.scene.coordinator.registry();
+        let old = registry
+            .instance_semantic_edges()
+            .find(|record| record.id == old_id)
+            .unwrap();
+        let semantics = old.semantics.as_ref().unwrap();
+        assert_eq!(
+            (
+                semantics.started(),
+                semantics.completed(),
+                semantics.unknown()
+            ),
+            (1, 0, 1),
+            "retirement keeps B's original operation history"
+        );
+    }
+}
+
+#[test]
+fn prepared_provider_b_retirement_refuses_other_provider_fresh_coverage() {
+    use crate::discovery::caller_registry::instance_input::InstanceLifecycle;
+    let mut fixture = ProviderScene::new(false);
+    let a = fixture.physical_a_file;
+    let b = 1 - a;
+    let other = fixture.refresh_coverage(a);
+    let old = fixture.refresh_coverage(b);
+    fixture.publish();
+    for file in [a, b] {
+        fixture.enqueue(file, "C_SignInit", 0x0001, 0);
+    }
+    fixture.publish();
+    assert_eq!(
+        fixture.apply_invalidations(
+            InvalidationScope::InstancesRetired {
+                image: old.image(),
+                file_slot: b,
+                ids: old.instances().to_vec(),
+            },
+            std::slice::from_ref(&other)
+        ),
+        (old.instances().len(), 0)
+    );
+    assert_eq!(fixture.record_for(b).1, InstanceLifecycle::Uncertain);
+    assert_eq!(fixture.record_for(a).1, InstanceLifecycle::Observed);
+    fixture.enqueue(a, "C_Sign", 0, 0);
+    fixture.publish();
+    assert_eq!(fixture.summary(a as usize), (2, 1, 1, 0));
 }

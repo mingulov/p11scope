@@ -5558,7 +5558,7 @@ pub(crate) mod tests {
                     )),
                     ..crate::attach::capture::ExtendReceipt::default()
                 });
-            let module = self.binding().module().clone();
+            let module = self.binding().reference_single_provider_module().clone();
             genuine_bind(
                 &mut self.coordinator,
                 &mut self.identity,

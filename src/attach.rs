@@ -1500,6 +1500,21 @@ pub(crate) fn attachment_admission(
     Ok(())
 }
 
+/// Refuse fresh attachment once the Session is stopping or detached: a
+/// post-terminal link would silently extend capture past the joined
+/// detach a saved completion attests. Refusal (never silent invalidation)
+/// is the codebase semantic — static attach inlines the same check, the
+/// group rebuild re-checks it after its baseline read, and a new Session
+/// is the recovery. Every path that adds a link past static attach
+/// funnels through here before touching BPF; idempotent no-ops
+/// (already-attached dedup) still succeed.
+fn stopped_attachment_admission(mutation_stopped: bool, path: &str) -> Result<()> {
+    if mutation_stopped {
+        bail!("{path} attachment refused while Session is stopping or detached");
+    }
+    Ok(())
+}
+
 fn static_attachment_baseline_with<S>(
     state: &mut S,
     acquire: impl FnOnce(&mut S) -> Option<pid_continuity::AttachBaseline>,
@@ -2128,6 +2143,18 @@ impl SessionDrainProducers {
 /// (tests adjudicate explicit evidence through `from_joined_evidence`);
 /// there is no other constructor, so joint lanes consume but never
 /// manufacture it.
+///
+/// Single-session consumption contract: the completion binds the
+/// minting Session's retained EVENTS identity (`events_id`), not just
+/// counts, so a well-formed completion from another session is
+/// recognizable as foreign. The DR37 1C/1F joint promotion wiring must,
+/// at consumption: (1) consume each completion at most once for its
+/// minting Session; (2) refuse when
+/// `!completion.binds_events(&session.events_domain())` — a foreign
+/// session's completion never promotes here; (3) never persist or replay
+/// a completion past its Session's lifetime — the retained FD pins the
+/// kernel map ID against reuse only while that history survives, and
+/// only within that lifetime is the binding meaningful.
 #[allow(dead_code)] // No joint consumer until the promotion lane wires DR37 1C/1F.
 #[derive(Debug)]
 pub(crate) struct SessionNativeCompletion {
@@ -2136,16 +2163,34 @@ pub(crate) struct SessionNativeCompletion {
     scrubbed_objects: usize,
     detach_wall_ms: u64,
     selected_terminal: bool,
+    events_id: u64,
 }
 
 #[allow(dead_code)] // No joint consumer until the promotion lane wires DR37 1C/1F.
 impl SessionNativeCompletion {
+    /// The join gates both ends of the mint enforce: the fail-fast at the
+    /// top of [`Session::mint_native_completion`] (before the terminal
+    /// poll, so a refused mint consumes nothing and no retry can mint
+    /// over a split backlog) and the end adjudication here (defense in
+    /// depth with the post-poll Q re-check). One shared check, so the two
+    /// can never drift.
+    fn join_gates(detach_complete: bool, quiescent: bool) -> Result<()> {
+        anyhow::ensure!(
+            detach_complete,
+            "native completion requires joined producer detach"
+        );
+        anyhow::ensure!(quiescent, "native completion requires proven quiescence");
+        Ok(())
+    }
+
     /// Adjudicate observed native evidence into a completion. Every gate
     /// must hold: joined detach, proven quiescence, no terminal-drain
-    /// backlog. Counts ride along untouched; an empty scrub (nothing
-    /// retained) or an ordinary session (no selection) still mints, since
-    /// the completed scrub and the joined detach are the proof, not the
-    /// counts.
+    /// backlog, no reserved-but-uncommitted EVENTS head. Counts ride along
+    /// untouched; an empty scrub (nothing retained) or an ordinary session
+    /// (no selection) still mints, since the completed scrub and the
+    /// joined detach are the proof, not the counts. `events_id` is the
+    /// minting Session's retained EVENTS identity the joint promotion
+    /// lane re-checks at consumption (see the struct contract).
     /// (Too many arguments is the honest shape: every gate is injected,
     /// none supplied.)
     #[allow(clippy::too_many_arguments)]
@@ -2153,20 +2198,22 @@ impl SessionNativeCompletion {
         detach_complete: bool,
         quiescent: bool,
         backlog: bool,
+        head_pending: bool,
         terminal_events: u64,
         terminal_malformed: u64,
         scrubbed_objects: usize,
         detach_wall_ms: u64,
         selected_terminal: bool,
+        events_id: u64,
     ) -> Result<Self> {
-        anyhow::ensure!(
-            detach_complete,
-            "native completion requires joined producer detach"
-        );
-        anyhow::ensure!(quiescent, "native completion requires proven quiescence");
+        Self::join_gates(detach_complete, quiescent)?;
         anyhow::ensure!(
             !backlog,
             "native completion refused: terminal drain left backlog past its bound"
+        );
+        anyhow::ensure!(
+            !head_pending,
+            "native completion refused: EVENTS head reserved but uncommitted"
         );
         Ok(Self {
             terminal_events,
@@ -2174,6 +2221,7 @@ impl SessionNativeCompletion {
             scrubbed_objects,
             detach_wall_ms,
             selected_terminal,
+            events_id,
         })
     }
 
@@ -2203,6 +2251,54 @@ impl SessionNativeCompletion {
     /// at mint. Ordinary sessions mint with false.
     pub(crate) fn selected_terminal(&self) -> bool {
         self.selected_terminal
+    }
+
+    /// The minting Session's retained EVENTS identity.
+    pub(crate) fn events_id(&self) -> u64 {
+        self.events_id
+    }
+
+    /// True only for the retained EVENTS domain this completion was minted
+    /// from. The joint promotion lane checks this at consumption: a
+    /// completion never promotes a foreign session (see the struct
+    /// contract).
+    pub(crate) fn binds_events(&self, domain: &events::EventsDomain) -> bool {
+        self.events_id == domain.id()
+    }
+}
+
+/// The completion mint's bounded terminal EVENTS poll over the retained
+/// consumer: counts consumed records and the malformed delta, and reports
+/// `backlog` when the poll stopped with records queued, plus a separate
+/// `head_pending` when positions still show unread bytes after an empty
+/// read (the head is reserved but uncommitted — the unbounded `poll` maps
+/// that Pending head to `None`, so positions are the verdict, per
+/// `events_head_pending`). Generic over the source so tests pin the exact
+/// verdict the mint consumes.
+#[allow(dead_code)] // No joint consumer until the promotion lane wires DR37 1C/1F.
+struct TerminalPollVerdict {
+    backlog: bool,
+    head_pending: bool,
+    terminal_events: u64,
+    terminal_malformed: u64,
+}
+
+#[allow(dead_code)] // No joint consumer until the promotion lane wires DR37 1C/1F.
+fn terminal_poll_verdict<S>(drain: &mut events::EventDrain<S>) -> TerminalPollVerdict
+where
+    S: events::RecordSource + events::BoundedRecordSource,
+{
+    let malformed_before = drain.malformed();
+    let mut terminal_events = 0u64;
+    let backlog = drain.poll(Some(events::TERMINAL_DRAIN_BOUND), |_| {
+        terminal_events = terminal_events.saturating_add(1);
+        std::ops::ControlFlow::Continue(())
+    });
+    TerminalPollVerdict {
+        backlog,
+        head_pending: events::events_head_pending(drain),
+        terminal_events,
+        terminal_malformed: drain.malformed().saturating_sub(malformed_before),
     }
 }
 
@@ -5195,6 +5291,8 @@ impl Session {
         if self.has_dynamic_link(context, "dl_debug_state", object, file_offset, cookie) {
             return Ok(false);
         }
+        stopped_attachment_admission(self.mutation_stopped(), "dynamic")
+            .map_err(DynamicLoaderAttachFailure::Registry)?;
         attachment_admission(&self.detach_failures, true)
             .map_err(DynamicLoaderAttachFailure::Registry)?;
         let path = objects
@@ -5259,6 +5357,7 @@ impl Session {
         if self.has_dynamic_link(context, return_program, object, file_offset, cookie) {
             return Ok((false, None));
         }
+        stopped_attachment_admission(self.mutation_stopped(), "dynamic")?;
         attachment_admission(&self.detach_failures, true)?;
         let path = objects
             .attach_path_for(object)
@@ -6170,15 +6269,23 @@ impl Session {
 
     /// Mint the native-owned terminal completion after the terminal
     /// sequence. Gates, in order: the producer detach worker joined
-    /// (Complete, never an observed empty link set), the stop gate still
-    /// proves Q, the selected gate (when present) reads back TERMINAL,
-    /// one explicitly bounded terminal EVENTS poll leaves no backlog,
-    /// and the OBJECT_START scrub completes. Any failure refuses: no
-    /// partial completion exists.
+    /// (Complete, never an observed empty link set) and the stop gate
+    /// still proves Q — both enforced fail-fast before the terminal poll,
+    /// so a refused mint consumes nothing — then the selected gate (when
+    /// present) reads back TERMINAL, one explicitly bounded terminal
+    /// EVENTS poll leaves no backlog and no reserved-but-uncommitted
+    /// head, and the OBJECT_START scrub completes. The end adjudication
+    /// re-checks the join gates with the post-poll Q read as defense in
+    /// depth. Any failure refuses: no partial completion exists.
     #[allow(dead_code)] // No joint consumer until the promotion lane wires DR37 1C/1F.
     pub(crate) fn mint_native_completion(&mut self) -> Result<SessionNativeCompletion> {
         let detach_complete = matches!(self.producer_detach, OwnedProducerDetach::Complete);
         let quiescent = self.stop_gate.quiescent();
+        // Fail fast before the terminal poll consumes anything: a refused
+        // mint must leave the backlog whole, or a retry could mint over
+        // the split the refusal ate. (The selected gate below already
+        // refuses fail-fast the same way.)
+        SessionNativeCompletion::join_gates(detach_complete, quiescent)?;
         let selected_terminal = match &self.native_selection {
             Some(selected) => {
                 selected.require_terminal()?;
@@ -6187,34 +6294,26 @@ impl Session {
             None => false,
         };
         self.ensure_events_consumer()?;
-        let (backlog, terminal_events, terminal_malformed) = {
+        let verdict = {
             let consumer = self
                 .events_consumer
                 .as_mut()
                 .context("retained EVENTS consumer vanished after creation")?;
-            let malformed_before = consumer.malformed();
-            let mut terminal_events = 0u64;
-            let backlog = consumer.poll(Some(events::TERMINAL_DRAIN_BOUND), |_| {
-                terminal_events = terminal_events.saturating_add(1);
-                std::ops::ControlFlow::Continue(())
-            });
-            (
-                backlog,
-                terminal_events,
-                consumer.malformed().saturating_sub(malformed_before),
-            )
+            terminal_poll_verdict(consumer)
         };
         let scrubbed_objects = object_stop::scrub_after_quiescence(&mut self.ebpf, &self.stop_gate)
             .context("scrubbing object START for native completion")?;
         SessionNativeCompletion::from_joined_evidence(
             detach_complete,
             quiescent && self.stop_gate.quiescent(),
-            backlog,
-            terminal_events,
-            terminal_malformed,
+            verdict.backlog,
+            verdict.head_pending,
+            verdict.terminal_events,
+            verdict.terminal_malformed,
             scrubbed_objects,
             self.detach_wall_ms,
             selected_terminal,
+            self.events_domain.id(),
         )
     }
 
@@ -6381,6 +6480,7 @@ impl Session {
     }
 
     pub(crate) fn attach_diagnostic_probe(&mut self, path: &Path, offset: u64) -> Result<()> {
+        stopped_attachment_admission(self.mutation_stopped(), "diagnostic")?;
         attachment_admission(&self.detach_failures, true)?;
         let probe: &mut UProbe = self
             .ebpf

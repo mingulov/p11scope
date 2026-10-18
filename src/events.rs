@@ -947,6 +947,19 @@ pub(crate) fn event_drain_positions<S: BoundedRecordSource>(
     drain.source.positions()
 }
 
+/// The EVENTS ring still holds unconsumed bytes. Read after an unbounded
+/// poll came back empty, it means the head is reserved but not committed,
+/// and records committed behind it stay invisible: that empty read did
+/// not drain the ring. Only the drain advances `consumer` and `producer`
+/// only grows, so `consumer == producer` proves the ring was empty at the
+/// read. (The completion mint's backlog verdict; DISCOVERY's counterpart
+/// is `discovery_head_pending`.)
+#[allow(dead_code)] // Only the unwired completion mint consumes it so far.
+pub(crate) fn events_head_pending<S: BoundedRecordSource>(drain: &EventDrain<S>) -> bool {
+    let positions = drain.source.positions();
+    positions.producer != positions.consumer
+}
+
 /// Drains one bounded EVENTS quantum up to the producer `stop` position
 /// read at Q, never consuming past it. Returns `(post_q_record, backlog)`:
 /// `post_q_record` when the producer has moved past `stop` — under a
@@ -1370,6 +1383,47 @@ impl BoundedRecordSource for ScriptedRecords {
             }
             None => Ok(BoundedRecord::Pending),
         }
+    }
+}
+
+/// A ring whose head is reserved but uncommitted: the unbounded read sees
+/// nothing (Aya maps a Pending head to `None`), while positions still
+/// show unread bytes. Pins the false-empty the terminal mint must refuse
+/// via positions, and the `UngatedWriterBeforeQ` the bounded drain
+/// reports for the same head below its stop.
+#[cfg(test)]
+pub(crate) struct PendingHeadRecords {
+    pub(crate) consumer: usize,
+    pub(crate) producer: usize,
+}
+
+#[cfg(test)]
+impl RecordSource for PendingHeadRecords {
+    fn next_record(&mut self) -> Option<impl Deref<Target = [u8]> + '_> {
+        None::<Vec<u8>>
+    }
+}
+
+#[cfg(test)]
+impl BoundedRecordSource for PendingHeadRecords {
+    fn positions(&self) -> aya::maps::ring_buf::RingBufPositions {
+        aya::maps::ring_buf::RingBufPositions {
+            consumer: self.consumer,
+            producer: self.producer,
+            capacity: 4096,
+        }
+    }
+    fn consumer(&self) -> usize {
+        self.consumer
+    }
+    fn bounded_record(
+        &mut self,
+        stop: usize,
+    ) -> Result<BoundedRecord<impl Deref<Target = [u8]> + '_>> {
+        if self.consumer == stop {
+            return Ok(BoundedRecord::<Vec<u8>>::Reached);
+        }
+        Ok(BoundedRecord::<Vec<u8>>::Pending)
     }
 }
 

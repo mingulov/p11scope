@@ -6,6 +6,10 @@
 mod native_tests;
 
 pub(crate) mod baseline;
+mod failure;
+mod lifecycle;
+pub(super) mod multi;
+pub(crate) use failure::{SelectedCleanupStatus, SelectedPreparationFailure};
 mod wire;
 use wire::{BootstrapControl, SelectedTarget};
 
@@ -99,6 +103,10 @@ impl StateControl {
 pub(super) struct NativeSelection {
     state: StateControl,
     target: SelectedTarget,
+    // These same original owners survive preparation refusal through joined
+    // cleanup, including before the construction permit exists.
+    original: Option<std::sync::Arc<crate::process::PidPin>>,
+    parent: Option<super::Scope>,
 }
 impl NativeSelection {
     pub(super) fn publish(
@@ -173,7 +181,12 @@ impl NativeSelection {
             .with_cell(|cell| cell.compare_exchange(0, CLOSED, Ordering::SeqCst, Ordering::SeqCst))?
             .map_err(|_| anyhow::anyhow!("selected state changed before links"))?;
         state.closed()?;
-        Ok(Some(Self { state, target }))
+        Ok(Some(Self {
+            state,
+            target,
+            original: None,
+            parent: None,
+        }))
     }
     pub(super) fn require_closed(&self) -> Result<()> {
         self.state.closed()
@@ -327,4 +340,388 @@ fn bootstrap(
         task_cookie: image.cookie,
         exec_id: image.exec_id,
     })
+}
+
+/// Exact retained Session owner identity. This wraps the existing EVENTS
+/// owner's Arc allocation; cloning it allocates no new Arc or descriptor.
+#[derive(Clone)]
+pub(crate) struct SelectedSessionIdentity(crate::events::EventsDomain);
+impl SelectedSessionIdentity {
+    pub(crate) fn same_owner(&self, other: &Self) -> bool {
+        self.0.same_allocation(&other.0)
+    }
+}
+impl std::fmt::Debug for SelectedSessionIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SelectedSessionIdentity(<retained>)")
+    }
+}
+
+/// Only actual closed preparation constructs this move-only factory permit.
+/// It grants construction of the sealed provisional capsule, never activation.
+pub(crate) struct SelectedConstructionPermit {
+    owner: SelectedSessionIdentity,
+    original: std::sync::Arc<crate::process::PidPin>,
+    parent: super::Scope,
+    domain: super::capture::NativeDomainId,
+    image: ImageIdentity,
+    generation: u64,
+    baseline: baseline::PromotionImageBaseline,
+}
+impl SelectedConstructionPermit {
+    pub(crate) fn identity(&self) -> &SelectedSessionIdentity {
+        &self.owner
+    }
+    pub(crate) fn original(&self) -> &std::sync::Arc<crate::process::PidPin> {
+        &self.original
+    }
+    pub(crate) fn parent(&self) -> &super::Scope {
+        &self.parent
+    }
+    pub(crate) fn domain(&self) -> super::capture::NativeDomainId {
+        self.domain
+    }
+    pub(crate) fn image(&self) -> ImageIdentity {
+        self.image
+    }
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub(crate) fn baseline(&self) -> &baseline::PromotionImageBaseline {
+        &self.baseline
+    }
+    pub(crate) fn validate(
+        &self,
+        session: &super::Session,
+        attached: &super::AttachedSemanticSet,
+    ) -> Result<()> {
+        ensure!(
+            self.owner.0.same_allocation(&session.events_domain),
+            "selected factory received a different native owner"
+        );
+        ensure!(
+            session.native_domain() == Some(self.domain)
+                && attached.domain() == self.domain
+                && attached.generation() == self.generation,
+            "selected factory received a different attachment seal"
+        );
+        let native = session
+            .native_selection
+            .as_ref()
+            .context("selected native control missing")?;
+        native.require_closed()?;
+        ensure!(
+            native
+                .original
+                .as_ref()
+                .is_some_and(|held| std::sync::Arc::ptr_eq(held, &self.original)),
+            "selected factory original custody differs from native owner"
+        );
+        ensure!(
+            !session.stop_gate.stop_requested(),
+            "selected native owner is stopping"
+        );
+        ensure!(
+            self.baseline
+                .matches_original_and_exec(&self.original, self.image.exec_id),
+            "selected view baseline no longer matches original image"
+        );
+        self.original.open_proc_dir().map_err(anyhow::Error::msg)?;
+        ensure!(
+            !self
+                .original
+                .original_exited()
+                .map_err(anyhow::Error::msg)?,
+            "selected original process exited"
+        );
+        ensure!(
+            session.instance_maps().cookie(self.original.pidfd()?)? == Some(self.image.task_cookie),
+            "selected original pidfd image cookie differs"
+        );
+        let map: Array<_, SelectedTarget> = Array::try_from(
+            session
+                .ebpf
+                .map("SELECTED_DETAILED")
+                .context("selected target map")?,
+        )?;
+        ensure!(
+            map.get(&0, 0)? == native.target
+                && native.target.mode == 1
+                && native.target.tgid == self.original.pid()
+                && native.target.cookie == self.image.task_cookie
+                && native.target.exec_id == self.image.exec_id,
+            "selected frozen image differs from factory permit"
+        );
+        match &self.parent {
+            super::Scope::Pid(pid) => ensure!(
+                *pid == self.original.pid() && native.target.parent_kind == 1,
+                "selected PID parent differs"
+            ),
+            super::Scope::System => ensure!(
+                native.target.parent_kind == 3,
+                "selected system parent differs"
+            ),
+            super::Scope::Cgroup { .. } => {
+                bail!("selected cgroup negative migration coverage is not qualified")
+            }
+        }
+        session.validate_semantic_set(attached)?;
+        session
+            .audit_image_continuity()
+            .map_err(|error| anyhow::anyhow!("selected factory image coverage: {error:?}"))?;
+        native.require_closed()
+    }
+}
+impl std::fmt::Debug for SelectedConstructionPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SelectedConstructionPermit(<retained>)")
+    }
+}
+
+/// The sole native preparation owner; fields never escape as generic raw parts.
+pub(crate) struct PreparedSelectedSession {
+    session: super::Session,
+    attached: super::AttachedSemanticSet,
+    permit: SelectedConstructionPermit,
+}
+impl PreparedSelectedSession {
+    /// Caller must supply the pre-view receipt from the actual Inventory
+    /// acquisition/binder. A later image query cannot construct that receipt.
+    pub(crate) fn prepare(
+        subset: crate::inventory_semantics::AttestedSubset,
+        baseline: baseline::PromotionImageBaseline,
+        original: std::sync::Arc<crate::process::PidPin>,
+        parent: super::Scope,
+        backend: super::BackendSelection,
+        window: super::capture::ReadWindow,
+    ) -> std::result::Result<Self, SelectedPreparationFailure> {
+        let mut session = start_selected(
+            subset.plan(),
+            subset.pins(),
+            &parent,
+            &original,
+            backend,
+            window,
+        )?;
+        let prepared = (|| -> Result<_> {
+            let image = bootstrap(&mut session, &original, window)?;
+            ensure!(
+                baseline.matches_original_and_exec(&original, image.exec_id),
+                "selected image differs from displayed original image baseline"
+            );
+            session
+                .native_selection
+                .as_mut()
+                .context("selected native control missing")?
+                .complete_identity(&mut session.ebpf, image)?;
+            // The normal same-domain query, not a bootstrap approximation, checks
+            // READY continuity under the real installed image-hook audit.
+            let current = session
+                .query_images(&[&original], window)
+                .map_err(|error| anyhow::anyhow!("selected final image query: {error:?}"))?;
+            let domain = session
+                .native_domain()
+                .context("selected native image domain unavailable")?;
+            ensure!(
+                current.domain() == domain && current.image(image.task_cookie) == Some(image),
+                "selected full image changed during preparation"
+            );
+            session.object_decode = Some(super::freeze_object_decode_table(&session.ebpf)?);
+            let attached = super::seal_attached_subset_native(
+                &session.ebpf,
+                subset,
+                domain,
+                session.policy,
+                session.semantic_descriptors(),
+                &session.retained_static,
+                &session.current_static_sides(),
+                |object| {
+                    session
+                        .instance
+                        .watched(object)
+                        .map(|watched| watched.retained_target())
+                },
+            )
+            .map_err(|reason| anyhow::anyhow!("selected semantic attachment refused: {reason}"))?;
+            let permit = SelectedConstructionPermit {
+                owner: SelectedSessionIdentity(session.events_domain()),
+                original,
+                parent,
+                domain,
+                image,
+                generation: attached.generation(),
+                baseline,
+            };
+            permit.validate(&session, &attached)?;
+            Ok((attached, permit))
+        })();
+        match prepared {
+            Ok((attached, permit)) => Ok(Self {
+                session,
+                attached,
+                permit,
+            }),
+            Err(error) => Err(SelectedPreparationFailure::retaining(session, error)),
+        }
+    }
+    pub(crate) fn identity(&self) -> &SelectedSessionIdentity {
+        self.permit.identity()
+    }
+
+    /// Concrete one-way handoff. This is deliberately not into_parts or a
+    /// generic callback that could export a usable provisional Session/H0.
+    pub(crate) fn into_provisional_lane(
+        self,
+        convert_subset: crate::inventory_semantics::AttestedSubset,
+    ) -> std::result::Result<
+        crate::inventory_semantics::selected::ProvisionalSelectedLane,
+        SelectedPreparationFailure,
+    > {
+        crate::inventory_semantics::selected::ProvisionalSelectedLane::from_closed_native(
+            self.session,
+            self.attached,
+            self.permit,
+            convert_subset,
+        )
+    }
+}
+
+/// Runs on the preparation worker. Auto can retry only after the failed Multi
+/// attempt's original worker has joined successfully. A deadline or uncertain
+/// close returns the same retained failure owner instead of starting Singles.
+fn start_selected(
+    plan: &super::AttachPlan,
+    objects: &crate::discovery::identity::PinnedObjects,
+    parent: &super::Scope,
+    original: &std::sync::Arc<crate::process::PidPin>,
+    selection: super::BackendSelection,
+    window: super::capture::ReadWindow,
+) -> std::result::Result<super::Session, SelectedPreparationFailure> {
+    let preliminary = (|| -> Result<_> {
+        original
+            .pidfd()
+            .context("selected preparation requires original pidfd")?;
+        original.open_proc_dir().map_err(anyhow::Error::msg)?;
+        ensure!(
+            !original.original_exited().map_err(anyhow::Error::msg)?,
+            "selected original exited"
+        );
+        let _ = crate::process::raise_nofile();
+        super::select_session_backend(
+            selection,
+            true,
+            super::multi_functional_probe,
+            super::kernel_multi_pid_filter,
+        )
+    })()
+    .map_err(SelectedPreparationFailure::before_links)?;
+    let super::SessionBackend { backend, fallback } = preliminary;
+    let mut session = match start_selected_attempt(plan, objects, parent, original, backend) {
+        Ok(session) => session,
+        Err(mut failure)
+            if selection == super::BackendSelection::Auto
+                && backend == super::AttachBackend::Multi
+                && failure.requires_backend_fallback() =>
+        {
+            let mut quiet = std::io::sink();
+            loop {
+                match failure.poll_cleanup(&mut quiet) {
+                    SelectedCleanupStatus::Settled => break,
+                    SelectedCleanupStatus::Unproved => return Err(failure),
+                    SelectedCleanupStatus::Pending => {
+                        if std::time::Instant::now() >= window.deadline() {
+                            return Err(failure);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+            }
+            let mut session = start_selected_attempt(
+                plan,
+                objects,
+                parent,
+                original,
+                super::AttachBackend::Singles,
+            )?;
+            session.backend_fallback = Some(
+                "the uprobe-multi attach failed; its original cleanup settled before Singles"
+                    .into(),
+            );
+            session
+        }
+        Err(failure) => return Err(failure),
+    };
+    session.selection = selection;
+    if session.backend_fallback.is_none() {
+        session.backend_fallback = fallback;
+    }
+    Ok(session)
+}
+
+fn start_selected_attempt(
+    plan: &super::AttachPlan,
+    objects: &crate::discovery::identity::PinnedObjects,
+    parent: &super::Scope,
+    original: &std::sync::Arc<crate::process::PidPin>,
+    backend: super::AttachBackend,
+) -> std::result::Result<super::Session, SelectedPreparationFailure> {
+    let (mut session, prepared_instance) = (|| -> Result<_> {
+        ensure!(
+            objects.check_unchanged().map_err(anyhow::Error::msg)?,
+            "selected pinned provider changed before attach"
+        );
+        super::Session::prepare_inner_unlinked(
+            parent,
+            super::CapturePolicy::Allowlisted,
+            None,
+            None,
+            None,
+            backend,
+            Some(original),
+        )
+    })()
+    .map_err(SelectedPreparationFailure::before_links)?;
+    let native = session
+        .native_selection
+        .as_mut()
+        .expect("selected preparation published native owner");
+    native.original = Some(std::sync::Arc::clone(original));
+    native.parent = Some(parent.clone());
+    let attached = (|| -> Result<()> {
+        session
+            .cleanup_worker
+            .as_ref()
+            .context("selected cleanup worker absent")?
+            .live_admission()
+            .map_err(anyhow::Error::msg)?;
+        lifecycle::attach_retained_with(&mut session.links, |program| {
+            super::Session::attach_lifecycle_program(&mut session.ebpf, program)
+                .with_context(|| format!("attaching required selected {program}"))
+        })?;
+        session.trace_coverage = super::detailed_identity::TraceCoverage::after_activation(
+            parent,
+            super::monotonic_ns(),
+        );
+        session.instance = super::InstanceTracking::start_selected(
+            &mut session.ebpf,
+            &session.image_coverage,
+            prepared_instance,
+        );
+        session
+            .audit_image_continuity()
+            .map_err(|error| anyhow::anyhow!("selected image hooks: {error:?}"))?;
+        session
+            .attach_plan(plan, objects)
+            .map_err(super::unsupported_environment_context)?;
+        session.stage_discovery(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM, 0)?;
+        ensure!(
+            objects.check_unchanged().map_err(anyhow::Error::msg)?,
+            "selected pinned provider changed while attaching"
+        );
+        Ok(())
+    })();
+    match attached {
+        Ok(()) => Ok(session),
+        Err(error) => Err(SelectedPreparationFailure::retaining(session, error)),
+    }
 }

@@ -1362,6 +1362,23 @@ impl OwnedProducerDetach {
         !matches!(self, Self::NotStarted)
     }
 
+    /// Snapshot-only readiness for selected preparation cleanup. Attempted is
+    /// not settled: only returned closes count, and this never moves a worker.
+    fn ready_to_finish(&self) -> bool {
+        match self {
+            Self::Pending { worker, .. } => {
+                let progress = worker.progress();
+                !worker.running()
+                    || progress
+                        .released
+                        .checked_add(progress.uncertain)
+                        .is_some_and(|settled| settled >= progress.total)
+            }
+            Self::Complete => true,
+            Self::NotStarted | Self::Unproved => false,
+        }
+    }
+
     fn drive(
         &mut self,
         failures: &mut Vec<String>,
@@ -4333,6 +4350,65 @@ impl Session {
         backend: AttachBackend,
         selected: Option<&crate::process::PidPin>,
     ) -> Result<Self> {
+        let (mut session, prepared_instance) = Self::prepare_inner_unlinked(
+            scope,
+            policy,
+            pause_key,
+            ring_bytes,
+            owned_child,
+            backend,
+            selected,
+        )?;
+        session.links = activate_after_preparation_with(Ok(()), || {
+            attach_lifecycle_with(
+                &mut session.ebpf,
+                |ebpf, program| Self::attach_lifecycle_program(ebpf, program),
+                |ebpf, _, link| detach_registered_link(ebpf, link),
+            )
+        })?;
+        // Preserve ordinary activation order: mandatory lifecycle first,
+        // then image continuity, and endpoint attachment only afterwards.
+        session.trace_coverage =
+            detailed_identity::TraceCoverage::after_activation(scope, monotonic_ns());
+        session.instance = InstanceTracking::start(
+            &mut session.ebpf,
+            &session.image_coverage,
+            prepared_instance,
+        );
+        Ok(session)
+    }
+
+    fn attach_lifecycle_program(ebpf: &mut Ebpf, program: &'static str) -> Result<RegisteredLink> {
+        if program == "task_newtask" {
+            let hook: &mut BtfTracePoint = ebpf
+                .program_mut(program)
+                .context("required task_newtask program")?
+                .try_into()?;
+            Ok(RegisteredLink::BtfTracePoint {
+                program,
+                id: hook.attach()?,
+            })
+        } else {
+            let hook: &mut RawTracePoint = ebpf
+                .program_mut(program)
+                .with_context(|| format!("required raw {program} program"))?
+                .try_into()?;
+            Ok(RegisteredLink::RawTracePoint {
+                program,
+                id: hook.attach(program)?,
+            })
+        }
+    }
+
+    fn prepare_inner_unlinked(
+        scope: &Scope,
+        policy: CapturePolicy,
+        pause_key: Option<PauseKey>,
+        ring_bytes: Option<u32>,
+        owned_child: Option<&OwnedChild>,
+        backend: AttachBackend,
+        selected: Option<&crate::process::PidPin>,
+    ) -> Result<(Self, instance::PreparedInstanceTracking)> {
         if policy.uses_unsafe_decoders() && !cfg!(feature = "unsafe-unvalidated-metadata") {
             bail!("unsafe-unvalidated-metadata policy is absent from this eBPF object");
         }
@@ -4532,51 +4608,13 @@ impl Session {
             }
             Ok(())
         });
-        let (events_domain, discovery_domain, links) =
-            activate_after_preparation_with(preparation, || {
-                let events_domain =
-                    prepared_domain.expect("preparation established the events domain");
-                let discovery_domain = prepared_discovery_domain
-                    .expect("preparation established the discovery domain");
-                let links = attach_lifecycle_with(
-                    &mut ebpf,
-                    |ebpf, program| {
-                        if program == "task_newtask" {
-                            let hook: &mut BtfTracePoint = ebpf
-                                .program_mut(program)
-                                .context("required task_newtask program")?
-                                .try_into()?;
-                            Ok(RegisteredLink::BtfTracePoint {
-                                program,
-                                id: hook.attach()?,
-                            })
-                        } else {
-                            let hook: &mut RawTracePoint = ebpf
-                                .program_mut(program)
-                                .with_context(|| format!("required raw {program} program"))?
-                                .try_into()?;
-                            Ok(RegisteredLink::RawTracePoint {
-                                program,
-                                id: hook.attach(program)?,
-                            })
-                        }
-                    },
-                    |ebpf, _, link| detach_registered_link(ebpf, link),
-                )?;
-                Ok((events_domain, discovery_domain, links))
-            })?;
-        // After the mandatory lifecycle links and before any endpoint link
-        // (ordering I1). A failure refuses instance routing, not capture.
-        // Metrics sessions skip the hooks (Task 1d overhead gate): they
-        // never join per-call records, so their slots stay unmapped.
-        let trace_coverage =
-            detailed_identity::TraceCoverage::after_activation(scope, monotonic_ns());
+        // No producer has been attached yet. A selected attempt takes custody
+        // of this complete owner before attaching its first lifecycle link.
+        preparation?;
+        let events_domain = prepared_domain.expect("preparation established the events domain");
+        let discovery_domain =
+            prepared_discovery_domain.expect("preparation established the discovery domain");
         let image_coverage = image_query::CoverageControl::new(&ebpf)?;
-        let instance = InstanceTracking::start(
-            &mut ebpf,
-            &image_coverage,
-            prepared_instance.expect("preparation established image program load result"),
-        );
 
         let pid_lifecycle = match uprobe_scope {
             UProbeScope::OneProcess(pid) => {
@@ -4585,51 +4623,54 @@ impl Session {
             UProbeScope::AllProcesses | UProbeScope::CallingProcess => None,
         };
 
-        Ok(Self {
-            stop_gate: stop_gate.expect("preparation established the stop gate"),
-            native_selection,
-            image_coverage,
-            image_query,
-            ebpf,
-            events_domain,
-            events_consumer: None,
-            discovery_domain,
-            trace_coverage,
-            trace_proof: None,
-            discovery_consumer: None,
-            discovery_staged: DiscoveryStage::default(),
-            root_seed,
-            attach_failures: vec![],
-            detach_failures: vec![],
-            producers_detached: false,
-            detach_wall_ms: 0,
-            attach_mono_ns: None,
-            successful_static: BTreeSet::new(),
-            dynamic_attach_evidence: DynamicAttachEvidence::default(),
-            policy,
-            backend,
-            selection: BackendSelection::Auto,
-            backend_fallback: None,
-            uprobe_scope,
-            pause_key,
-            lifecycle_tracking_unavailable: None,
-            process_creation_tracking_unavailable: None,
-            retained_static: BTreeMap::new(),
-            pid_pairs: pid_continuity::PairBook::default(),
-            global_retirements: global_retirement::Retirements::default(),
-            native_retirement: native_retirement::NativeRetirement::default(),
-            pid_health: pid_continuity::OwnerHealth::default(),
-            prepared_owner_limit: prepared_owner_limit
-                .expect("identity preparation retained exact owner limit"),
-            pid_lifecycle,
-            links,
-            instance,
-            cleanup_worker: Some(CleanupWorker::pre_start()),
-            producer_detach: OwnedProducerDetach::NotStarted,
-            object_decode: None,
-            #[cfg(feature = "h6-reexec-diagnostic")]
-            reexec_diagnostic: None,
-        })
+        Ok((
+            Self {
+                stop_gate: stop_gate.expect("preparation established the stop gate"),
+                native_selection,
+                image_coverage,
+                image_query,
+                ebpf,
+                events_domain,
+                events_consumer: None,
+                discovery_domain,
+                trace_coverage: None,
+                trace_proof: None,
+                discovery_consumer: None,
+                discovery_staged: DiscoveryStage::default(),
+                root_seed,
+                attach_failures: vec![],
+                detach_failures: vec![],
+                producers_detached: false,
+                detach_wall_ms: 0,
+                attach_mono_ns: None,
+                successful_static: BTreeSet::new(),
+                dynamic_attach_evidence: DynamicAttachEvidence::default(),
+                policy,
+                backend,
+                selection: BackendSelection::Auto,
+                backend_fallback: None,
+                uprobe_scope,
+                pause_key,
+                lifecycle_tracking_unavailable: None,
+                process_creation_tracking_unavailable: None,
+                retained_static: BTreeMap::new(),
+                pid_pairs: pid_continuity::PairBook::default(),
+                global_retirements: global_retirement::Retirements::default(),
+                native_retirement: native_retirement::NativeRetirement::default(),
+                pid_health: pid_continuity::OwnerHealth::default(),
+                prepared_owner_limit: prepared_owner_limit
+                    .expect("identity preparation retained exact owner limit"),
+                pid_lifecycle,
+                links: Vec::new(),
+                instance: InstanceTracking::default(),
+                cleanup_worker: Some(CleanupWorker::pre_start()),
+                producer_detach: OwnedProducerDetach::NotStarted,
+                object_decode: None,
+                #[cfg(feature = "h6-reexec-diagnostic")]
+                reexec_diagnostic: None,
+            },
+            prepared_instance.expect("preparation established image program load result"),
+        ))
     }
 
     pub(crate) fn counter_snapshot(&self) -> Result<CounterSnapshot> {
@@ -5345,6 +5386,19 @@ impl Session {
                 }
             })
             .collect();
+        if self.native_selection.is_some() {
+            // Selected failure cleanup must retain the actual provider closure
+            // even if the first endpoint side or a later multi leaf fails.
+            for target in &prepared_targets {
+                if target.held.is_none() {
+                    bail!("selected provider target custody unavailable before attachment");
+                }
+            }
+            for target in &prepared_targets {
+                self.retained_static
+                    .insert(target.slot.index, target.clone());
+            }
+        }
         let continuity_baseline = static_attachment_baseline_with(
             self,
             Session::pid_attach_baseline,
@@ -5531,6 +5585,48 @@ impl Session {
             prog_fds.insert(program, multi_prog_fd(&mut self.ebpf, program)?);
         }
         let pid = multi_link_pid(self.uprobe_scope);
+        if self.native_selection.is_some() {
+            let slots_by_cookie: BTreeMap<_, _> = groups
+                .iter()
+                .flat_map(|group| &group.members)
+                .map(|member| (member.cookie, member.slot.index))
+                .collect();
+            let links = &mut self.links;
+            let pairs = &mut self.pid_pairs;
+            let (_resource_free_bundles, outcome) = attach_target_groups_observed_with(
+                &groups,
+                |_| monotonic_ns(),
+                |program, path, slice, is_return| {
+                    let prog_fd = prog_fds
+                        .get(program)
+                        .copied()
+                        .expect("every selected group side pre-resolved its program fd");
+                    let (offsets, cookies): (Vec<u64>, Vec<u64>) = slice.iter().copied().unzip();
+                    let attempt = pid_continuity::NativeAttempt::run(
+                        pid_continuity::comparable_monotonic_ns,
+                        || attach_group(prog_fd, pid, path, &offsets, &cookies, is_return),
+                    );
+                    let result = selected_detailed::multi::retain_success(attempt.result, |fd| {
+                        links.push(RegisteredLink::MultiUProbe {
+                            program,
+                            slots: slice
+                                .iter()
+                                .map(|(_, cookie)| slots_by_cookie[cookie])
+                                .collect(),
+                            fds: vec![fd],
+                            registration: pairs.register(),
+                        });
+                    });
+                    pid_continuity::NativeAttempt {
+                        started_ns: attempt.started_ns,
+                        result,
+                    }
+                },
+            )?;
+            // Every actual fd is already in Session. Unit bundles can be
+            // dropped on any later Unsupported without losing native custody.
+            return Ok(outcome);
+        }
         let (bundles, outcome) = attach_target_groups_observed_with(
             &groups,
             |_| monotonic_ns(),
@@ -5893,7 +5989,11 @@ impl Session {
         if let Some(selected) = &self.native_selection {
             self.stop_gate.request_stop();
             self.image_coverage.fail();
-            selected.close()?;
+            if let Err(error) = selected.close() {
+                // Terminal failure cannot skip transfer of already owned links.
+                self.detach_failures
+                    .push(format!("closing selected native admission: {error:#}"));
+            }
         }
         invalidate_pid_session(&mut self.pid_pairs, self.pid_lifecycle.as_ref());
         // No owner proof may survive retirement of the continuity hooks.
@@ -8257,6 +8357,69 @@ mod tests {
     }
 
     #[test]
+    fn selected_cleanup_poll_keeps_blocked_original_worker_until_joined_receipt() {
+        let (release, released) = std::sync::mpsc::channel();
+        let released = std::sync::Mutex::new(released);
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let worker = CleanupWorker::pre_start_with(
+            Box::new(move |payload, _| {
+                entered.send(()).unwrap();
+                released
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+                drop(payload.take());
+                Ok(())
+            }),
+            Arc::new(|| std::time::Duration::ZERO),
+        );
+        worker.submit(
+            vec![(
+                OwnedLink::Multi(Vec::new()),
+                ProducerProgram::UProbe("p11_entry"),
+            )],
+            Arc::default(),
+            DetachOrder,
+        );
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let mut job = OwnedProducerDetach::Pending {
+            worker,
+            started: std::time::Instant::now(),
+            had_work: true,
+        };
+        for _ in 0..4 {
+            assert!(
+                !job.ready_to_finish(),
+                "started close cannot grant settlement"
+            );
+            assert!(matches!(job, OwnedProducerDetach::Pending { .. }));
+        }
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !job.ready_to_finish() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(
+            matches!(job, OwnedProducerDetach::Pending { .. }),
+            "readiness must not consume job"
+        );
+        let mut detached = false;
+        job.drive(
+            &mut Vec::new(),
+            &mut detached,
+            &mut 0,
+            || false,
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        assert!(detached && matches!(job, OwnedProducerDetach::Complete));
+    }
+
+    #[test]
     fn owner_terminal_interrupted_job_cannot_turn_empty_into_success() {
         let (release, released) = std::sync::mpsc::channel();
         let released = std::sync::Mutex::new(released);
@@ -8329,6 +8492,10 @@ mod tests {
             .is_err()
         );
         assert!(!detached);
+        assert!(
+            !job.ready_to_finish(),
+            "abandoned cleanup cannot become retry permission"
+        );
     }
 
     #[test]
@@ -9583,6 +9750,45 @@ mod tests {
                     bundle.slots
                 );
             }
+        }
+    }
+
+    #[test]
+    fn selected_multi_late_unsupported_keeps_every_acquired_group_fd() {
+        for fail_second_group in [false, true] {
+            let (slots, targets) = two_groups();
+            let groups = group_static_slots(&slots, CapturePolicy::Allowlisted, false, &targets);
+            let mut retained: Vec<OwnedFd> = Vec::new();
+            let result = attach_target_groups_with(
+                &groups,
+                |_| Some(7),
+                |_, path, _, is_return| {
+                    let refuse = if fail_second_group {
+                        path == Path::new("/b.so") && is_return
+                    } else {
+                        !is_return
+                    };
+                    let acquired = if refuse {
+                        Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+                    } else {
+                        Ok(tempfile::tempfile().unwrap().into())
+                    };
+                    selected_detailed::multi::retain_success(acquired, |fd| retained.push(fd))
+                },
+            );
+            assert!(
+                result.is_err(),
+                "real group orchestration must return fallback sentinel"
+            );
+            assert_eq!(retained.len(), if fail_second_group { 2 } else { 1 });
+            assert!(
+                retained
+                    .iter()
+                    .all(|fd| unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } >= 0),
+                "later group failure must leave acquired native fds with their original owner"
+            );
+            // The preparation failure transfers this same retained Session to
+            // actual terminal cleanup; this test grants no joined receipt.
         }
     }
 

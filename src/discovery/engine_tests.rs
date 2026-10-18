@@ -9,6 +9,8 @@ use crate::discovery::test_subject::{OwnedMapper, poll_fd as system_scope_poll_f
 mod inventory_claims;
 #[path = "tabled_readiness_tests.rs"]
 mod tabled_readiness;
+#[path = "engine_cancellation_tests.rs"]
+mod cancellation;
 use crate::discovery::identity::test_fixture::{
     SHA as OVERLAY_SHA, backing_file as overlay_backing_file, module as overlay_module,
     overlay as overlay_key, pins as overlay_pins, reback as overlay_reback,

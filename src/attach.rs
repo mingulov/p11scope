@@ -1263,6 +1263,7 @@ pub struct Session {
     /// Mmap of the STOP_GATE cell. Declared first so the mapping unmaps
     /// before the map FDs owned by `ebpf` close.
     stop_gate: StopGate,
+    native_selection: Option<selected_detailed::NativeSelection>,
     image_coverage: image_query::CoverageControl,
     image_query: Option<image_query::ImageQueryOwner>,
     pub(crate) ebpf: Ebpf,
@@ -3818,6 +3819,7 @@ fn validate_program_inventory(ebpf: &Ebpf, unsafe_enabled: bool) -> Result<()> {
     // before deferred freezes, optionally (`InstanceTracking::prepare`).
     expected.extend(INSTANCE_PROGRAMS.iter().map(|(program, _)| *program));
     expected.insert("p11_image_query");
+    expected.extend(selected_detailed::PROGRAMS);
     let actual: BTreeSet<_> = ebpf.programs().map(|(name, _)| name).collect();
     if actual != expected {
         bail!("eBPF program inventory {actual:?} differs from {expected:?}");
@@ -4081,6 +4083,31 @@ impl Session {
         owned_child: Option<&OwnedChild>,
         selection: BackendSelection,
     ) -> Result<Self> {
+        Self::start_with_selected(
+            plan,
+            scope,
+            objects,
+            policy,
+            pause_generation,
+            ring_bytes,
+            owned_child,
+            selection,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_with_selected(
+        plan: &AttachPlan,
+        scope: &Scope,
+        objects: &PinnedObjects,
+        policy: CapturePolicy,
+        pause_generation: Option<OwnedPauseGeneration>,
+        ring_bytes: Option<u32>,
+        owned_child: Option<&OwnedChild>,
+        selection: BackendSelection,
+        selected: Option<&crate::process::PidPin>,
+    ) -> Result<Self> {
         // Raise before the first link: every return/entry pair burns fds
         // against RLIMIT_NOFILE, and no tracker (the previous raise site)
         // exists yet at attach time. A 1024 soft limit dies near slot 256.
@@ -4088,7 +4115,7 @@ impl Session {
         let pause_key = pause_key_for(scope, pause_generation.as_ref())?;
         let SessionBackend { backend, fallback } = select_session_backend(
             selection,
-            matches!(scope, Scope::Pid(_)),
+            matches!(scope, Scope::Pid(_)) || selected.is_some(),
             multi_functional_probe,
             kernel_multi_pid_filter,
         )?;
@@ -4101,6 +4128,7 @@ impl Session {
             ring_bytes,
             owned_child,
             backend,
+            selected,
         ) {
             Ok(session) => Ok((session, fallback)),
             Err(error)
@@ -4128,6 +4156,7 @@ impl Session {
                     ring_bytes,
                     owned_child,
                     AttachBackend::Singles,
+                    selected,
                 )
                 .map(|session| (session, Some(reason)))
             }
@@ -4232,15 +4261,23 @@ impl Session {
         ring_bytes: Option<u32>,
         owned_child: Option<&OwnedChild>,
         backend: AttachBackend,
+        selected: Option<&crate::process::PidPin>,
     ) -> Result<Self> {
         if !objects.check_unchanged().map_err(anyhow::Error::msg)? {
             bail!(
                 "a pinned provider object changed before attach; refusing to observe changed bytes"
             );
         }
-        let mut session =
-            Self::start_inner(scope, policy, pause_key, ring_bytes, owned_child, backend)
-                .map_err(unsupported_environment_context)?;
+        let mut session = Self::start_inner(
+            scope,
+            policy,
+            pause_key,
+            ring_bytes,
+            owned_child,
+            backend,
+            selected,
+        )
+        .map_err(unsupported_environment_context)?;
         #[cfg(test)]
         crate::first_use_probe::discovery_loss(
             crate::first_use_probe::DiscoveryStage::LifecycleActive,
@@ -4279,6 +4316,7 @@ impl Session {
             None,
             None,
             AttachBackend::Singles,
+            None,
         )?;
         Ok(AttachPreflight {
             lifecycle: session.lifecycle_tracking_unavailable.is_none(),
@@ -4293,6 +4331,7 @@ impl Session {
         ring_bytes: Option<u32>,
         owned_child: Option<&OwnedChild>,
         backend: AttachBackend,
+        selected: Option<&crate::process::PidPin>,
     ) -> Result<Self> {
         if policy.uses_unsafe_decoders() && !cfg!(feature = "unsafe-unvalidated-metadata") {
             bail!("unsafe-unvalidated-metadata policy is absent from this eBPF object");
@@ -4314,6 +4353,8 @@ impl Session {
             policy.wants_instance_hooks(),
         )
         .context("loading BPF object with required task storage")?;
+        let native_selection =
+            selected_detailed::NativeSelection::publish(&mut ebpf, scope, selected)?;
         let object_has_unsafe = cfg!(feature = "unsafe-unvalidated-metadata");
         let unsafe_enabled = object_has_unsafe && policy.uses_unsafe_decoders();
         let generation_token = pause_key.map(|key| key.generation_token);
@@ -4335,6 +4376,7 @@ impl Session {
                     validate_runtime_maps(&ebpf, discovery_ring_bytes(scope))
                         .context("validating live-discovery runtime maps")?;
                     image_query::prepare_maps(&ebpf, policy.wants_instance_hooks())?;
+                    selected_detailed::validate_maps(&ebpf)?;
                 }
                 SessionPreparation::ValidateStopGate => {
                     validate_stop_gate(&ebpf).context("stop gate unavailable")?;
@@ -4402,13 +4444,19 @@ impl Session {
                     freeze_published_maps(&ebpf).context("freezing published policy maps")?;
                 }
                 SessionPreparation::SelectScope => {
-                    uprobe_scope = match scope {
-                        Scope::Pid(pid) => UProbeScope::OneProcess(
-                            std::num::NonZeroU32::new(*pid).context("pid must be non-zero")?,
-                        ),
-                        // Cgroup and system scoping are enforced in BPF, so the
-                        // probe itself is process-wide and the CONFIG bit decides.
-                        Scope::Cgroup { .. } | Scope::System => UProbeScope::AllProcesses,
+                    uprobe_scope = if let Some(pin) = selected {
+                        UProbeScope::OneProcess(
+                            NonZeroU32::new(pin.pid()).context("selected pid must be nonzero")?,
+                        )
+                    } else {
+                        match scope {
+                            Scope::Pid(pid) => UProbeScope::OneProcess(
+                                std::num::NonZeroU32::new(*pid).context("pid must be non-zero")?,
+                            ),
+                            // Cgroup and system scoping are enforced in BPF, so the
+                            // probe itself is process-wide and the CONFIG bit decides.
+                            Scope::Cgroup { .. } | Scope::System => UProbeScope::AllProcesses,
+                        }
                     };
                 }
                 SessionPreparation::LoadProgram(prog_name) => {
@@ -4441,6 +4489,9 @@ impl Session {
                     }
                 }
                 SessionPreparation::LoadImagePrograms => {
+                    if selected.is_some() {
+                        selected_detailed::load_bootstrap(&mut ebpf, &btf)?;
+                    }
                     let query_refusal = match domain {
                         Some(domain) => {
                             match image_query::ImageQueryOwner::load(&mut ebpf, &btf, domain) {
@@ -4536,6 +4587,7 @@ impl Session {
 
         Ok(Self {
             stop_gate: stop_gate.expect("preparation established the stop gate"),
+            native_selection,
             image_coverage,
             image_query,
             ebpf,
@@ -5838,6 +5890,11 @@ impl Session {
         // Mark terminal before any fallible transfer, so missing/partial
         // ownership never reopens attachment or mints an empty success later.
         self.producer_detach = OwnedProducerDetach::Unproved;
+        if let Some(selected) = &self.native_selection {
+            self.stop_gate.request_stop();
+            self.image_coverage.fail();
+            selected.close()?;
+        }
         invalidate_pid_session(&mut self.pid_pairs, self.pid_lifecycle.as_ref());
         // No owner proof may survive retirement of the continuity hooks.
         self.image_coverage.fail();
@@ -6072,6 +6129,7 @@ impl Session {
             None,
             None,
             AttachBackend::Singles,
+            None,
         )
     }
 
@@ -6738,6 +6796,10 @@ fn finish_producer_detach(
 
 impl Drop for Session {
     fn drop(&mut self) {
+        if let Some(selected) = &self.native_selection {
+            self.stop_gate.request_stop();
+            let _ = selected.close();
+        }
         invalidate_pid_session(&mut self.pid_pairs, self.pid_lifecycle.as_ref());
         // Refuse continuity before closing any owned producer/hook link.
         self.image_coverage.fail();

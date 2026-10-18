@@ -92,6 +92,8 @@ fn main() {
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity_fork.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity_query.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity_query.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/selected_detailed.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/selected_detailed.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/stop_gate.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.h");
@@ -213,6 +215,7 @@ fn build_variant(
             "image_identity",
             "image_identity_fork",
             "image_identity_query",
+            "selected_detailed",
             "task_owner",
             "root_affiliation",
             "instance_epoch",
@@ -376,6 +379,12 @@ fn build_variant(
             "link-arg=--export=p11_image_exec_release",
             "-C",
             "link-arg=--export=p11_image_query",
+            "-C",
+            "link-arg=--export=p11_selected_bootstrap",
+            "-C",
+            "link-arg=--export=p11_selected_cgroup_migrate",
+            "-C",
+            "link-arg=--export=p11_selected_current_allowed",
             "-C",
             "link-arg=--export=p11_instance_entry",
             "-C",

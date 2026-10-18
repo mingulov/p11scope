@@ -913,6 +913,7 @@ struct DemotionWorkload {
 }
 
 #[cfg(test)]
+#[path = "inventory_privileged_tests/operator_diagnostics_wrap.rs"]
 mod operator_diagnostics_wrap;
 
 const DEMOTION_PREBUILT_FILES: [&str; 4] = [

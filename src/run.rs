@@ -14085,13 +14085,20 @@ mod tests {
     #[test]
     fn terminal_trace_evidence_accounts_every_terminal_drop_byte_exact() {
         let (reader, writer) = pipe_pair();
+        // Make every phase encounter real backpressure, independently of
+        // the host's default pipe capacity. A 64 KiB pipe can now accept
+        // the bounded sink's first exact 64 KiB batch without any drop.
+        assert_eq!(
+            unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) },
+            4096
+        );
         let mut sink =
             crate::sink::SinkWriter::new(crate::sink::StdoutInner::File(writer)).unwrap();
         let mut stdout_open = true;
         let mut file = Some(Vec::new());
         let mut scheduling = SchedulingAccumulator::default();
         sink.begin_tick(crate::sink::SINK_TICK_BUDGET);
-        // 100KB past a 64KB pipe with no reader yet: the mid-write
+        // 100KB past a 4KB pipe with no reader yet: the mid-write
         // auto-flush delivers a pipeful and drops the rest.
         emit_pre_terminal_lines(&mut sink, &mut stdout_open, &mut file, 100, 1000);
         let parked = Arc::new(AtomicBool::new(false));

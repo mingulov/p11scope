@@ -317,7 +317,9 @@ const IDENTITY_MAPS: [(&str, ExactMapMetadata); 6] = [
     ),
     (
         "THREAD_OWNER",
-        map_metadata(MapType::TaskStorage, 4, 544, 0, 1),
+        // Detailed includes H8's two retained journal words. Inventory's
+        // separate objects intentionally keep the 544-byte base owner.
+        map_metadata(MapType::TaskStorage, 4, 560, 0, 1),
     ),
     (
         "ROOT_AFFILIATION",
@@ -7412,6 +7414,39 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn identity_metadata_matches_embedded_native_objects() {
+        let detailed = aya_obj::Object::parse(crate::EBPF_OBJECT).unwrap();
+        for (name, expected) in IDENTITY_MAPS {
+            let actual = detailed.maps.get(name).unwrap();
+            assert_eq!(actual.map_type(), expected.map_type as u32, "{name} type");
+            assert_eq!(actual.key_size(), expected.key_size, "{name} key");
+            assert_eq!(actual.value_size(), expected.value_size, "{name} value");
+            assert_eq!(actual.max_entries(), expected.max_entries, "{name} entries");
+            assert_eq!(actual.map_flags(), expected.flags, "{name} flags");
+        }
+        let (_, detailed_owner) = IDENTITY_MAPS
+            .iter()
+            .find(|(name, _)| *name == "THREAD_OWNER")
+            .unwrap();
+        for bytes in [
+            crate::EBPF_INVENTORY_OBJECT,
+            crate::EBPF_INVENTORY_CALLERS_OBJECT,
+        ] {
+            let inventory = aya_obj::Object::parse(bytes).unwrap();
+            let owner = inventory.maps.get("THREAD_OWNER").unwrap();
+            assert_eq!(owner.value_size(), 544);
+            let actual = map_metadata(
+                MapType::TaskStorage,
+                owner.key_size(),
+                owner.value_size(),
+                owner.max_entries(),
+                owner.map_flags(),
+            );
+            assert!(compare_map_metadata("THREAD_OWNER", actual, *detailed_owner).is_err());
+        }
+    }
+
     #[test]
     fn identity_metadata_checks_every_tuple_field() {
         for (name, expected) in IDENTITY_MAPS {

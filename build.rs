@@ -94,6 +94,8 @@ fn main() {
     println!("cargo:rerun-if-changed=crates/ebpf/native/image_identity_query.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/selected_detailed.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/selected_detailed.h");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/selected_detailed_baseline.c");
+    println!("cargo:rerun-if-changed=crates/ebpf/native/selected_detailed_baseline.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/stop_gate.h");
     println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.c");
     println!("cargo:rerun-if-changed=crates/ebpf/native/task_owner.h");
@@ -210,7 +212,12 @@ fn build_variant(
     // flavor has a fork wrapper, root affiliation, or START dependency.
     let native_units: &[&str] = match flavor {
         BpfFlavor::InventoryGlobal => &["task_owner", "exec_task"],
-        BpfFlavor::InventoryCallers => &["image_identity", "task_owner", "exec_task"],
+        BpfFlavor::InventoryCallers => &[
+            "image_identity",
+            "selected_detailed_baseline",
+            "task_owner",
+            "exec_task",
+        ],
         BpfFlavor::Detailed => &[
             "image_identity",
             "image_identity_fork",
@@ -357,6 +364,10 @@ fn build_variant(
     if !matches!(flavor, BpfFlavor::InventoryGlobal) {
         append_flag("-C");
         append_flag("link-arg=--export=p11_link_current_identity");
+    }
+    if matches!(flavor, BpfFlavor::InventoryCallers) {
+        append_flag("-C");
+        append_flag("link-arg=--export=p11_inventory_image_baseline");
     }
     append_flag("-C");
     append_flag("link-arg=--export=p11_exec_dumpability");

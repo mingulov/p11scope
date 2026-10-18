@@ -44,6 +44,14 @@ pub(super) fn validate_caller_maps(
     let mut expected = inventory_maps(n);
     expected.extend([
         (
+            "INV_BASELINE_REQUESTS",
+            (K::Hash, map_metadata(MapType::Hash, 4, 16, 1024, 129)),
+        ),
+        (
+            "INV_BASELINE_CTL",
+            (K::Array, map_metadata(MapType::Array, 4, 56, 1, 0)),
+        ),
+        (
             "ENDPOINT_OBJECT",
             (
                 K::Array,
@@ -78,7 +86,7 @@ pub(super) fn validate_caller_maps(
         .map(String::as_str)
         .eq(expected.keys().copied())
     {
-        bail!("caller Inventory map names differ from exact 18-map manifest");
+        bail!("caller Inventory map names differ from exact 21-map manifest");
     }
     for (name, (kind, metadata)) in expected {
         let (actual_kind, actual_metadata) = actual[name];

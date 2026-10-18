@@ -413,3 +413,15 @@ wrong-thread refusals. They check unchanged bytes, original errno/mask and
 continued gating after actual handler delivery. These fixtures do not substitute
 for the source-matched product callback/perf/marker negative or its150ms absence
 interval. No product preload control is activated by this preparation alone.
+
+The control adapter's `validate_handler_blocked` oracle reconciles both real
+probe envelopes, exact entered/interrupted/released gate facts, same candidate
+and main thread, one SIGINT, ready-before-send ordering, at least150ms before
+parent release, and reporter entry at/after actual gate release consumption. A
+complete matching readable marker remains required. The normal ACK validator
+must refuse the late reporter. `validate_worker_negative` requires a ready
+distinct worker in the same candidate process, zero worker events/loss and an
+actual prompt main reporter plus matching marker; the normal main validator
+must reject the worker identity. Their healthy/mutation documents are validator
+controls, not installed negatives. Actual adapters and source-reviewed execution
+remain required before dependent blocked-stderr acceptance.

@@ -1574,6 +1574,22 @@ unsafe impl aya::Pod for InstanceCounters {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for JournalAdmissionControl {}
 
+/// Immutable seed for native construction of one owned START row. The original
+/// timestamp remains S1's duration origin and the future native BEGIN time.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CallStartSeed {
+    pub ts_ns: u64,
+    pub image: ImageIdentity,
+    pub object_required: u64,
+}
+
+const _: [(); 32] = [(); core::mem::size_of::<CallStartSeed>()];
+const _: () = assert!(core::mem::align_of::<CallStartSeed>() == 8);
+const _: () = assert!(core::mem::offset_of!(CallStartSeed, ts_ns) == 0);
+const _: () = assert!(core::mem::offset_of!(CallStartSeed, image) == 8);
+const _: () = assert!(core::mem::offset_of!(CallStartSeed, object_required) == 24);
+
 /// What the entry probe stashes until the matching return. Replaces the
 /// bare timestamp Phase 1b stored.
 #[repr(C)]
@@ -2024,6 +2040,11 @@ mod tests {
         use core::mem::{offset_of, size_of};
         assert_eq!(size_of::<ImageIdentity>(), 16);
         assert_eq!(offset_of!(ImageIdentity, exec_id), 8);
+        assert_eq!(size_of::<CallStartSeed>(), 32);
+        assert_eq!(core::mem::align_of::<CallStartSeed>(), 8);
+        assert_eq!(offset_of!(CallStartSeed, ts_ns), 0);
+        assert_eq!(offset_of!(CallStartSeed, image), 8);
+        assert_eq!(offset_of!(CallStartSeed, object_required), 24);
         assert_eq!(size_of::<ImageIdentityControl>(), 40);
         assert_eq!(offset_of!(ImageIdentityControl, limit), 0);
         assert_eq!(offset_of!(ImageIdentityControl, next_ticket), 8);

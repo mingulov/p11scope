@@ -394,7 +394,7 @@ REQUIRED_GLOBAL_SCALAR_HELPERS = frozenset({"p11_read_ia32_arg"})
 REQUIRED_GLOBAL_EXEC_HELPERS = frozenset({"p11_exec_dumpability"})
 REQUIRED_LOCAL_OWNER_HELPERS = frozenset({
     "p11_owner_cleanup", "p11_owner_start_get",
-    "p11_owner_start_insert", "p11_owner_start_remove", "p11_owner_discovery_get",
+    "p11_owner_start_aggregate", "p11_owner_start_begin", "p11_owner_start_remove", "p11_owner_discovery_get",
     "p11_owner_discovery_insert", "p11_owner_discovery_remove",
 })
 REQUIRED_LOCAL_ROOT_HELPERS = frozenset({
@@ -610,7 +610,7 @@ def validate_owner_helpers(elf, inventory=False):
     exported = (REQUIRED_GLOBAL_OWNER_HELPERS
                 if any(symbol[0] == "OWNER_CTL" for symbol in elf.symbols)
                 else frozenset())
-    required = (REQUIRED_LOCAL_OWNER_HELPERS - {"p11_owner_start_get", "p11_owner_start_insert", "p11_owner_start_remove"}
+    required = (REQUIRED_LOCAL_OWNER_HELPERS - {"p11_owner_start_get", "p11_owner_start_aggregate", "p11_owner_start_begin", "p11_owner_start_remove"}
                 if inventory else REQUIRED_LOCAL_OWNER_HELPERS)
     validate_private_helpers(elf, "p11_owner_", required,
                              OPTIONAL_LOCAL_OWNER_HELPERS, "owner", exported, "OWNER_CTL", inventory=inventory)

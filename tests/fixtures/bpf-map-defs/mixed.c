@@ -34,7 +34,8 @@ __attribute__((noinline, used)) unsigned p11_exec_dumpability(void) {
     int name(volatile int *ctx) { return ctx[index]; }
 OWNER(p11_owner_cleanup, 0)
 OWNER(p11_owner_start_get, 1)
-OWNER(p11_owner_start_insert, 2)
+OWNER(p11_owner_start_aggregate, 2)
+OWNER(p11_owner_start_begin, 11)
 OWNER(p11_owner_start_remove, 3)
 OWNER(p11_owner_discovery_get, 4)
 OWNER(p11_owner_discovery_insert, 5)
@@ -48,9 +49,10 @@ ROOT_HELPER(p11_root_propagate_thread, 8)
 ROOT_HELPER(p11_root_current_tag, 9)
 ROOT_HELPER(p11_root_current_exit, 10)
 SEC("tp_btf/task_newtask") int task_newtask(void *ctx) {
-    int result = p11_owner_start_get(ctx) + p11_owner_start_insert(ctx)
+    int result = p11_owner_start_get(ctx) + p11_owner_start_aggregate(ctx)
         + p11_owner_start_remove(ctx) + p11_owner_discovery_get(ctx)
-        + p11_owner_discovery_insert(ctx) + p11_owner_discovery_remove(ctx);
+        + p11_owner_discovery_insert(ctx) + p11_owner_discovery_remove(ctx)
+        + p11_owner_start_begin(ctx);
     result += p11_root_propagate_thread(ctx) + p11_root_current_tag(ctx);
 #ifdef OWNER_HEALTHY
     result += p11_owner_healthy(ctx);

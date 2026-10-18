@@ -56,6 +56,46 @@ fn object_producer_owner_terminal_matrix() {
 }
 
 #[test]
+fn object_seeded_start_construction_preserves_immutable_binding() {
+    owner_fixture::run_object_subcommand(
+        "object_seeded_start_construction",
+        "seeded START construction passed",
+    );
+}
+
+#[test]
+fn object_aggregate_start_preserves_zero_image_marker_and_padding() {
+    owner_fixture::run_object_subcommand(
+        "object_aggregate_start_construction",
+        "aggregate START construction passed",
+    );
+}
+
+#[test]
+fn object_seeded_start_failures_preserve_cleanup_authority() {
+    owner_fixture::run_object_subcommand(
+        "object_seeded_start_failures",
+        "seeded START failure controls passed",
+    );
+}
+
+#[test]
+fn object_seeded_start_emitted_caller_and_causal_mutations() {
+    let directory = tempfile::tempdir().expect("seeded START emitted caller");
+    let object = embedded_object(directory.path());
+    let output = Command::new("python3")
+        .args(["-I", "tests/python/test_entry_object.py", "--seeded-object"])
+        .arg(object)
+        .arg("EntryObjectTests.test_seeded_start_caller_contract")
+        .output()
+        .expect("run actual seeded START caller and mutations");
+    let result = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "seeded START caller: {result}");
+    assert!(result.contains("Ran 1 test"), "zero selection: {result}");
+    assert!(!result.contains("skipped"), "skipped proof: {result}");
+}
+
+#[test]
 fn object_producer_side_state_n_and_n_plus_one() {
     owner_fixture::run_object_subcommand(
         "object_producer_side_state_n_and_n_plus_one",
@@ -440,18 +480,58 @@ def check_leaves(data, report):
         matches = [key for key, symbol in bodies.items() if symbol[0] == missing]
         assert not matches, f'{missing} must stay out of the BPF object'
         report.append(f'absent {missing}: query-plus-retire drain pinned')
-    # The query row and the fault leaf are true producer leaves: bounded
-    # frames, no nesting.
-    for name in ('p11_object_side_get', 'p11_object_fault'):
+    # The constructor keeps the existing scalar lease/refund boundaries for
+    # admission complexity. Query and fault remain true leaves. All own frames
+    # stay bounded, and complete constructor paths count in the root budget.
+    for name in ('p11_owner_start_begin', 'p11_owner_start_aggregate', 'p11_object_side_get', 'p11_object_fault'):
         key = only(bodies, name)
         symbol = bodies[key]
         assert symbol[3] == text and symbol[5], f'{name} must be a defined .text function'
         depth, deepest, _ = frame_of(body_of(raws, bodies, key))
         assert depth <= LEAF_FRAME_BOUND, f'{name} frame {depth} exceeds {LEAF_FRAME_BOUND}'
         leaves[name] = (key, depth, deepest)
-        report.append(f'leaf {name}: frame={depth}')
+        report.append(f'helper {name}: frame={depth}')
         nested = pseudo_calls(raws, offsets, bodies, relocations, key)
-        assert not nested, f'{name} must make no nested BPF call'
+        if name in ('p11_owner_start_begin', 'p11_owner_start_aggregate'):
+            children = {bodies[target][0] for _, target, _ in nested}
+            assert children == {'p11_owner_lease', 'p11_owner_refund'}, \
+                f'{name} must retain only scalar lease/refund children: {children}'
+            if name == 'p11_owner_start_aggregate':
+                # Aggregate creates no identity/side custody. Ambiguous old
+                # invocations may still require checked side retirement.
+                maps_section = elf.indices['.maps']
+                map_names = {symbol[4]: symbol[0] for symbol in elf.symbols
+                             if symbol[3] == maps_section and symbol[1] & 15 == 1}
+                referenced = set()
+                map_loads = {}
+                for (section, address), (kind, target) in relocations.items():
+                    if section != key[0] or not key[1] <= address < key[1]+symbol[5] or kind != 1:
+                        continue
+                    immediate = struct.unpack_from('<i', raws[section], address+4)[0]
+                    mapped = (map_names.get(target[4]+immediate)
+                              if target[1] & 15 == 3 and target[3] == maps_section else target[0])
+                    referenced.add(mapped)
+                    map_loads[address] = mapped
+                assert {'START', 'OBJECT_ZERO'} <= referenced, f'aggregate zero-prefix maps: {referenced}'
+                assert 'TASK_COOKIE' not in referenced, f'aggregate identity mint: {referenced}'
+                _, _, instructions = frame_of(body_of(raws, bodies, key))
+                updates = [index for index, (op, reg, _, immediate) in enumerate(instructions)
+                           if op == 0x85 and reg >> 4 == 0 and immediate == 2]
+                assert len(updates) == 1, f'aggregate must have only its START insert: {updates}'
+                for update in updates:
+                    destination = None
+                    for index in range(update-1, -1, -1):
+                        op, reg, _, _ = instructions[index]
+                        if op == 0x85:
+                            break
+                        if reg & 15 == 1 and (op == 0x18 or op & 7 in (1, 4, 7)):
+                            destination = map_loads.get(key[1]+index*8) if op == 0x18 else None
+                            break
+                    assert destination == 'START', f'aggregate side/unproven insertion: {destination}'
+                assert not any(op == 0x85 and reg >> 4 == 0 and immediate in (4, 112, 114)
+                               for op, reg, _, immediate in instructions), 'aggregate target read'
+        else:
+            assert not nested, f'{name} must make no nested BPF call'
     return leaves
 
 
@@ -499,13 +579,14 @@ def check_frames(data, report):
         _, _, offsets, _, _ = bodies_and_relocations(raw)
         return offsets
 
-    bad = mutate_frame('p11_object_fault', LEAF_FRAME_BOUND + 1)
-    try:
-        check_leaves(bytes(bad), [])
-    except AssertionError:
-        pass
-    else:
-        raise AssertionError('over-budget fault frame accepted')
+    for named in ('p11_owner_start_begin', 'p11_owner_start_aggregate', 'p11_object_fault'):
+        bad = mutate_frame(named, LEAF_FRAME_BOUND + 1)
+        try:
+            check_leaves(bytes(bad), [])
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError(f'over-budget {named} frame accepted')
     elf, raws, offsets, bodies, _ = bodies_and_relocations(data)
     fault = only(bodies, 'p11_object_fault')
     body = body_of(raws, bodies, fault)

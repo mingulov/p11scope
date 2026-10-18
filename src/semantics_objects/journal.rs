@@ -1986,10 +1986,41 @@ pub(crate) trait H3EvidenceSource {
 /// The joint tick's H3 finalizer: the actual finalizer takes (consumes)
 /// dispositions and accepts the seal's void acknowledgements through
 /// one port, so the acknowledgement flows to the finalizer through
-/// production code. Production wires the live coordinator; tests wire
-/// the real coordinator over a scripted lane.
+/// production code. Production wires a borrow of the retained Session's
+/// finalizer state and producer pair.
 pub(crate) trait H3FinalizerPort: H3EvidenceSource {
-    fn acknowledge_h3_void(&mut self, voided_below: u64);
+    fn acknowledge_h3_void(&mut self, acknowledgement: H3VoidAcknowledgement);
+}
+
+/// One actual joint seal's void acknowledgement. Its private constructor is
+/// used only by JointSealTick after a seal reports a void. The retained native
+/// and EVENTS identity must match before its numeric H0 watermark is read.
+/// Move-only: it cannot be cloned or synthesized from a supplied scalar.
+pub(crate) struct H3VoidAcknowledgement {
+    producers: crate::attach::SessionDrainProducers,
+    voided_below: u64,
+}
+
+impl H3VoidAcknowledgement {
+    pub(crate) fn for_producers(
+        &self,
+        producers: &crate::attach::SessionDrainProducers,
+    ) -> Option<u64> {
+        (self.producers.native_domain() == producers.native_domain()
+            && self.producers.events_id() == producers.events_id())
+        .then_some(self.voided_below)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_legacy_test(&self) -> u64 {
+        self.voided_below
+    }
+}
+
+impl std::fmt::Debug for H3VoidAcknowledgement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("H3VoidAcknowledgement(<retained>)")
+    }
 }
 
 /// Production birth-evidence source: the seal pulls one fresh
@@ -4722,7 +4753,10 @@ where
         if let Err(failure) = &outcome
             && let Some(voided) = failure.h3_voided
         {
-            self.finalizer.acknowledge_h3_void(voided);
+            self.finalizer.acknowledge_h3_void(H3VoidAcknowledgement {
+                producers: self.producers.clone(),
+                voided_below: voided,
+            });
         }
         outcome
     }
@@ -12580,6 +12614,86 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn object_journal_h3_acknowledgement_checks_retained_session() {
+        use crate::discovery::caller_registry::{OsProcessSource, RegistryLimits};
+        use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
+
+        struct HeldAcknowledgement(Option<H3VoidAcknowledgement>);
+        impl H3EvidenceSource for HeldAcknowledgement {
+            fn take_h3_disposition(&mut self) -> H3DispositionEvidence {
+                H3DispositionEvidence::scripted_loss(1)
+            }
+        }
+        impl H3FinalizerPort for HeldAcknowledgement {
+            fn acknowledge_h3_void(&mut self, acknowledgement: H3VoidAcknowledgement) {
+                assert!(self.0.replace(acknowledgement).is_none());
+            }
+        }
+
+        for mismatch in 0..3 {
+            // Native I/O is substituted by the existing algorithm scene. The
+            // actual JointSealTick alone mints each move-only acknowledgement.
+            let mut scene = Scene::new(image_default());
+            let proof = scene.attest();
+            let producers = scene.producers();
+            let begin = begin_bytes(1, 1, function_id("C_CreateObject"), 0);
+            let end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+            let mut drain = crate::events::EventDrain::over_test_domain(
+                crate::events::ScriptedRecords::records([begin.to_vec(), end.to_vec()], 2),
+                7,
+            );
+            let fault = ScriptedFaultCell::steady(7);
+            let bootstrap = scene.bootstrap(proof, 0);
+            let mut births =
+                ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(&bootstrap));
+            let admitted = scene.fixture.admit();
+            let mut held = HeldAcknowledgement(None);
+            let failure = JointSealTick::wire(
+                &mut scene.adapter,
+                &mut scene.model,
+                &mut drain,
+                &scene.descriptors,
+                &fault,
+                &mut held,
+                scene.fixture.attachment(),
+                &producers,
+            )
+            .tick(Some(2), 0, &bootstrap, &admitted, &mut births)
+            .expect_err("real seal loss mints a void acknowledgement");
+            assert_eq!(failure.gap, JournalGap::H3Loss);
+            let voided = failure.h3_voided.unwrap();
+            let target = match mismatch {
+                0 => producers.clone(),
+                1 => crate::attach::SessionDrainProducers::test_pair(
+                    NativeDomainId::mint(),
+                    scene.retained_events.clone(),
+                ),
+                _ => crate::attach::SessionDrainProducers::test_pair(
+                    producers.native_domain(),
+                    crate::events::EventsDomain::test_standin(8),
+                ),
+            };
+            let mut coordinator = InventoryCoordinator::new(
+                crate::attach::Scope::Pid(std::process::id()),
+                crate::discovery::hooks::HookRegistry::builtin(),
+                Vec::new(),
+                OsProcessSource,
+                RegistryLimits::default_limits(),
+            )
+            .unwrap();
+            coordinator
+                .session_h3_finalizer(&target)
+                .unwrap()
+                .acknowledge_h3_void(held.0.take().unwrap());
+            assert_eq!(
+                coordinator.reference_h3_acknowledged_below(),
+                if mismatch == 0 { voided } else { 0 },
+                "only the exact retained native/EVENTS pair may mutate its H0 namespace"
+            );
+        }
+    }
+
+    #[test]
     fn object_journal_joint_tick_forwards_void_report() {
         // C3: the production tick forwards the seal's void report to
         // the finalizer exactly once, and only on a voiding seal. A
@@ -12589,7 +12703,7 @@ pub(crate) mod tests {
 
         struct RecordingFinalizer {
             next: H3DispositionEvidence,
-            acked: Vec<u64>,
+            acked: Vec<H3VoidAcknowledgement>,
         }
 
         impl H3EvidenceSource for RecordingFinalizer {
@@ -12599,8 +12713,8 @@ pub(crate) mod tests {
         }
 
         impl H3FinalizerPort for RecordingFinalizer {
-            fn acknowledge_h3_void(&mut self, voided_below: u64) {
-                self.acked.push(voided_below);
+            fn acknowledge_h3_void(&mut self, acknowledgement: H3VoidAcknowledgement) {
+                self.acked.push(acknowledgement);
             }
         }
 
@@ -12648,10 +12762,10 @@ pub(crate) mod tests {
                 .expect_err("taken loss voids")
         };
         assert_eq!(failure.gap, JournalGap::H3Loss);
-        assert_eq!(
-            finalizer.acked,
-            vec![failure.h3_voided.expect("void report")]
-        );
+        assert_eq!(finalizer.acked.len(), 1);
+        let acknowledgement = finalizer.acked.pop().unwrap();
+        let voided = failure.h3_voided.expect("void report");
+        assert_eq!(acknowledgement.for_producers(&producers), Some(voided));
         // A clean seal acknowledges nothing. The clean evidence covers
         // the post-quantum watermark (fence + 2 records).
         let fence = scene.adapter.consumed_through;
@@ -12735,7 +12849,7 @@ pub(crate) mod tests {
             }
         }
         impl H3FinalizerPort for RefusingFinalizer {
-            fn acknowledge_h3_void(&mut self, _voided_below: u64) {
+            fn acknowledge_h3_void(&mut self, _acknowledgement: H3VoidAcknowledgement) {
                 unreachable!("the foreign quantum refuses before any void report");
             }
         }

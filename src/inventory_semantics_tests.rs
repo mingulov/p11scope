@@ -5748,6 +5748,187 @@ fn dual_provider_subset() -> (ProviderFixture, ProviderFixture, AttestedSubset) 
     (first, second, subset)
 }
 
+/// Preparation at the existing coordinator binding-proof seam. These tests use
+/// held physical providers and the real mapping/sight/re-sight decisions, but
+/// do not qualify prepared H0 owner receipts, native attachment or cgroup scope.
+struct SameCallerProviders {
+    _files: (ProviderFixture, ProviderFixture),
+    scene: BindingScene,
+    lane: AttestedSemanticLane,
+    caller: CallerId,
+    image: ImageIdentity,
+    image_published: bool,
+    providers: Vec<(String, ModuleKey)>,
+}
+
+impl SameCallerProviders {
+    fn new() -> Self {
+        set_sight(1_005);
+        let (first, second, subset) = dual_provider_subset();
+        let mut scene = BindingScene::new();
+        let pid = std::process::id();
+        let lane = AttestedSemanticLane::start(subset, &Scope::Pid(pid), BackendSelection::Auto)
+            .expect("two physically held providers form a shell lane");
+        let domain = lane.domain();
+        scene.coordinator.note_extend_receipt(&ExtendReceipt {
+            activated_roots: true,
+            exec_coverage: Some(ExecCoverage::scripted(domain, 0)),
+            ..ExtendReceipt::default()
+        });
+        let providers: Vec<_> = lane
+            .subset()
+            .required()
+            .keys()
+            .map(|object| {
+                let pin = lane
+                    .subset()
+                    .pins()
+                    .pinned()
+                    .find(|pin| pin.id == *object)
+                    .expect("each provider has an original held target");
+                (
+                    pin.path.to_owned(),
+                    ModuleKey::physical(
+                        pin.key.device.major,
+                        pin.key.device.minor,
+                        pin.key.inode,
+                        Some(pin.sha256.to_owned()),
+                        pin.path,
+                    ),
+                )
+            })
+            .collect();
+        assert_eq!(providers.len(), 2);
+        assert_ne!(
+            providers[0].1, providers[1].1,
+            "separately held physical files cannot share provider authority"
+        );
+        let caller = scene.admit(pid, 7_000);
+        scene.answer(pid, domain, 100);
+        set_sight(7_100);
+        Self {
+            _files: (first, second),
+            scene,
+            lane,
+            caller,
+            image: ImageIdentity {
+                task_cookie: 100,
+                exec_id: 1,
+            },
+            image_published: false,
+            providers,
+        }
+    }
+
+    fn map(&mut self, provider: usize) {
+        let (path, module) = &self.providers[provider];
+        self.scene.map_module(
+            self.caller,
+            std::process::id(),
+            module,
+            path,
+            7_100 + provider as u64,
+        );
+    }
+
+    fn bind(&mut self, provider: usize) -> Result<(), SemanticBindingRefusal> {
+        if !self.image_published {
+            self.scene.bind_image(
+                self.lane.domain(),
+                vec![(100, 1, std::process::id(), 7_200)],
+                7_300,
+            );
+            self.image_published = true;
+        }
+        self.scene.bind(
+            self.caller,
+            &self.providers[provider].1,
+            self.lane.domain(),
+            self.image,
+        )
+    }
+
+    fn original_pin(&self) -> Arc<PidPin> {
+        self.scene
+            .coordinator
+            .semantic_bindings()
+            .get(self.caller)
+            .expect("accepted caller retains custody")
+            .pin()
+    }
+}
+
+#[test]
+fn native_semantic_same_caller_two_providers_reuse_one_process_custody() {
+    for first in [0, 1] {
+        let second = 1 - first;
+        let mut fixture = SameCallerProviders::new();
+        fixture.map(first);
+        fixture.map(second);
+        assert_eq!(fixture.bind(first), Ok(()));
+        let original = fixture.original_pin();
+        let second_result = fixture.bind(second);
+        assert!(Arc::ptr_eq(&original, &fixture.original_pin()));
+        let targets = fixture
+            .scene
+            .coordinator
+            .semantic_bindings_mut()
+            .bindings_for_tick();
+        assert_eq!(targets.len(), 1, "providers must not duplicate H0 targets");
+        assert!(Arc::ptr_eq(&original, &targets[0].pin()));
+        assert_eq!(
+            second_result,
+            Ok(()),
+            "a mapped second physical provider must join the original caller binding"
+        );
+        assert_eq!(fixture.bind(first), Ok(()));
+        assert_eq!(fixture.bind(second), Ok(()));
+        assert!(Arc::ptr_eq(&original, &fixture.original_pin()));
+    }
+}
+
+#[test]
+fn native_semantic_same_caller_late_provider_retries_after_unmapped_refusal() {
+    let mut fixture = SameCallerProviders::new();
+    fixture.map(0);
+    assert_eq!(fixture.bind(0), Ok(()));
+    let original = fixture.original_pin();
+    assert!(fixture.bind(1).is_err(), "unmapped B cannot gain authority");
+    assert_eq!(fixture.bind(0), Ok(()), "refusing B must preserve A");
+    assert!(Arc::ptr_eq(&original, &fixture.original_pin()));
+    fixture.map(1);
+    assert_eq!(
+        fixture.bind(1),
+        Ok(()),
+        "a real later mapping of B must permit retry on the same custody"
+    );
+    assert_eq!(fixture.bind(0), Ok(()));
+    assert!(Arc::ptr_eq(&original, &fixture.original_pin()));
+}
+
+#[test]
+fn native_semantic_same_caller_bound_a_keeps_b_refresh_eligible() {
+    let mut fixture = SameCallerProviders::new();
+    fixture.map(0);
+    fixture.map(1);
+    assert_eq!(fixture.bind(0), Ok(()));
+    let original = fixture.original_pin();
+    let attempts = fixture
+        .scene
+        .coordinator
+        .semantic_refresh_attempts(&fixture.lane, None, |_| true);
+    assert_eq!(attempts.len(), 1, "only the missing provider needs refresh");
+    assert_eq!(attempts[0].caller, fixture.caller);
+    assert_eq!(attempts[0].module.as_ref(), Some(&fixture.providers[1].1));
+    let targets = fixture
+        .scene
+        .coordinator
+        .semantic_bindings_mut()
+        .bindings_for_tick();
+    assert_eq!(targets.len(), 1);
+    assert!(Arc::ptr_eq(&original, &targets[0].pin()));
+}
+
 #[test]
 fn native_semantic_multiprovider_candidates_bind_per_provider() {
     set_sight(1_005);

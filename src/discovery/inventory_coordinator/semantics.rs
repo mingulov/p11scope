@@ -3,6 +3,7 @@
 
 use super::*;
 
+#[path = "semantics/promotion.rs"]
 mod promotion;
 #[cfg(test)]
 use crate::discovery::caller_registry::OsProcessSource;

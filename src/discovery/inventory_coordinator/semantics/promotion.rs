@@ -4,6 +4,7 @@
 use super::*;
 use crate::discovery::caller_registry::CallerAdapter;
 
+#[path = "promotion/capacity.rs"]
 mod capacity;
 
 /// This is only the storage used by the existing consume algorithm. Neither

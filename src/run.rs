@@ -4225,6 +4225,10 @@ fn cancel_marker(signal: Option<libc::c_int>, ticks: u64) -> String {
     )
 }
 
+fn report_capture_cancel(signal: Option<libc::c_int>, ticks: u64) {
+    eprintln!("{}", cancel_marker(signal, ticks));
+}
+
 /// The loop-end marker for a target that exited mid-capture: the
 /// measurement harness timestamps this stderr line as the actual
 /// early-exit boundary (F-74), instead of assuming the full window.
@@ -4945,7 +4949,7 @@ fn capture_profile(
     // the acknowledgement, adjacent to the request.
     session.stop_gate().request_stop();
     if matches!(loop_result, Ok(CaptureEnd::Signal)) {
-        eprintln!("{}", cancel_marker(interrupted.first_signal(), ticks));
+        report_capture_cancel(interrupted.first_signal(), ticks);
     }
     if matches!(loop_result, Ok(CaptureEnd::TargetExit)) {
         eprintln!("{}", target_exit_marker(ticks));
@@ -5772,7 +5776,7 @@ fn capture_trace(
         STOP_QUIESCE_BUDGET.saturating_sub(stop_started.elapsed()),
     );
     if matches!(loop_result, Ok(CaptureEnd::Signal)) {
-        eprintln!("{}", cancel_marker(interrupted.first_signal(), ticks));
+        report_capture_cancel(interrupted.first_signal(), ticks);
     }
     if matches!(loop_result, Ok(CaptureEnd::TargetExit)) {
         eprintln!("{}", target_exit_marker(ticks));
@@ -7836,6 +7840,10 @@ fn fmt_rfc3339(t: SystemTime) -> String {
 #[cfg(test)]
 #[path = "run/capture_loop_tests.rs"]
 mod capture_loop_tests;
+
+#[cfg(test)]
+#[path = "run/cancellation_tests.rs"]
+mod cancellation_tests;
 
 #[cfg(test)]
 mod tests {

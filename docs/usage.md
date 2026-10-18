@@ -832,6 +832,8 @@ Limits that matter in pods:
   `--cgroup` still selects scope independently. Recognized Docker/containerd/
   CRI-O and Kubernetes cgroup patterns can yield canonical container IDs and
   pod UIDs, labeled as lexical hints. They do not prove orchestrator ownership.
+  Kubernetes systemd patterns include the exact `kubepods.slice` and
+  `kubelet.slice/kubelet-kubepods.slice` stems, with matching QoS/pod units.
   No runtime/Kubernetes API, network, credentials, environment or command line
   is queried; complete paths and arbitrary names are never published.
   A genuine native caller-use binding after coverage starts and full-image

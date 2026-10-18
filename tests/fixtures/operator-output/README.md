@@ -116,12 +116,13 @@ shared body and actual A-unmapped/B-retained topology. Temporary FIFO/ledger
 controls are removed; the four needed prebuilt inputs remain. Neither these
 native acknowledgements nor that ledger claim observer admission/coverage.
 
-The current Rust test always compiles these artifacts at runtime. The proposed
-small test-only interface is `P11SCOPE_DEMOTION_PREBUILT_DIR=/absolute/directory`:
+The test-only explicit prebuilt interface is `P11SCOPE_DEMOTION_PREBUILT_DIR=/absolute/directory`:
 copy those four regular files into the test's existing private directory, then
-reuse unchanged FIFO, mapping, callback and ledger assertions. That interface
-is **not implemented** by this helper. The Rust owner must authorize and add it
-before the existing test is usable on prebuilt-only Fedora. No SoftHSM path
+reuse unchanged FIFO, mapping, callback and ledger assertions. The interface is implemented in
+`DemotionWorkload::spawn`; it refuses relative, missing, symlink, nonregular or
+nonexecutable workload inputs, with no fallback to compilation on bad opt-in.
+Its Rust compilation and focused regression execution remain queued; this
+helper native check alone does not qualify the Rust consumer or Fedora cell. No SoftHSM path
 change is needed for this owned demotion fixture.
 
 The current fixture permits one ten-call transition and caps64calls/256rows/

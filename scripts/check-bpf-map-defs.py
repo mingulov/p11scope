@@ -410,7 +410,12 @@ EXACT_PROGRAM_SECTIONS = {
     "p11_inst_vma_copy": "fexit/copy_vma",
     "p11_image_exec_release": "fentry/exec_mm_release",
     "p11_image_query": "iter/task",
+    "p11_selected_bootstrap": "iter/task",
+    "p11_selected_cgroup_migrate": "fentry/cgroup_migrate",
 }
+
+SELECTED_GLOBAL_HELPERS = frozenset({"p11_selected_current_allowed"})
+CALLER_PROGRAM_SECTIONS = {"p11_inventory_image_baseline": "iter/task"}
 
 DIAGNOSTIC_GLOBAL_HELPERS = frozenset({
     "p11_decode_params",
@@ -454,7 +459,8 @@ def validate_private_helpers(elf, prefix, required, optional, label,
     for name, location in EXACT_PROGRAM_SECTIONS.items():
         if inventory and name in ("task_newtask", "p11_inst_vma_map",
                                   "p11_inst_vma_unmap", "p11_inst_vma_copy",
-                                  "p11_image_exec_release", "p11_image_query"):
+                                  "p11_image_exec_release", "p11_image_query",
+                                  "p11_selected_bootstrap", "p11_selected_cgroup_migrate"):
             continue
         matches = [s for s in elf.symbols if s[0] == name]
         if (len(matches) != 1 or matches[0][1] != 0x12 or matches[0][2] != 0
@@ -1410,7 +1416,71 @@ def validate_inventory_caller_entry_reachability(elf):
             raise RuntimeError(f"caller inventory missing real scope/use/identity/pair dependencies: {name}")
         reports[name] = {"functions": len(seen), "maps": sorted(maps),
                          "helpers": sorted(helpers), "compare_exchanges": atomic}
+    roots = [s for s in elf.symbols if s[0] == "p11_inventory_image_baseline"]
+    if (len(roots) != 1 or roots[0][1:3] != (0x12, 0)
+            or roots[0][3] != elf.indices.get("iter/task")):
+        raise RuntimeError("caller inventory requires exact GLOBAL DEFAULT baseline iterator")
+    seen, maps, helpers, _ = walk(roots[0][3:5],
+        {"INV_BASELINE_REQUESTS", "INV_BASELINE_CTL", "TASK_COOKIE", "COOKIE_CTL"},
+        {1, 5, 127, 156})
+    if (maps != {"INV_BASELINE_REQUESTS", "INV_BASELINE_CTL", "TASK_COOKIE", "COOKIE_CTL"}
+            or helpers != {1, 5, 127, 156}):
+        raise RuntimeError("caller baseline iterator requires exact identity-only dependency footprint")
+    reports["p11_inventory_image_baseline"] = {
+        "functions": len(seen), "maps": sorted(maps), "helpers": sorted(helpers)}
     return reports
+
+
+def validate_selected_leaf(elf):
+    """Check the actual hot native gate's bounded, lookup-only call boundary.
+
+    This is own-frame/footprint evidence, not a kernel verifier or proof that
+    every parent-scope branch calls it. Root reachability is checked separately.
+    """
+    names = [symbol for symbol in elf.symbols if symbol[0] == "p11_selected_current_allowed"]
+    if len(names) != 1:
+        raise RuntimeError("selected gate requires one actual native helper")
+    symbol = names[0]
+    if symbol[1:3] != (0x12, 0) or symbol[3] != elf.indices.get(".text") or not symbol[5] or symbol[5] % 8:
+        raise RuntimeError("selected gate must be GLOBAL DEFAULT bounded .text function")
+    section = elf.sections[".text"][1]
+    body = checked_slice(section, symbol[4], symbol[5], "selected native gate")
+    relocations = {}
+    for row, raw in elf.sections.values():
+        if row[1] == 9 and row[7] == symbol[3]:
+            for at in range(0, len(raw), 16):
+                address, info = struct.unpack_from("<QQ", raw, at)
+                relocations[address] = (info & 0xffffffff, elf.symbols[info >> 32])
+    maps, helpers, frame = set(), set(), 0
+    allowed_maps = {"SELECTED_DETAILED", "SELECTED_DETAILED_STATE", "INSTANCE_GEN", "TASK_COOKIE"}
+    for at in range(0, len(body), 8):
+        op, registers, offset, immediate = struct.unpack_from("<BBhi", body, at)
+        if op & 7 in (1, 2, 3) and offset < 0:
+            stack_register = registers >> 4 if op & 7 == 1 else registers & 15
+            if stack_register == 10:
+                frame = max(frame, -offset)
+        if op == 0x85:
+            if registers != 0:
+                raise RuntimeError("selected hot gate cannot nest BPF calls")
+            if immediate not in {1, 156, 158}:
+                raise RuntimeError(f"selected hot gate reaches forbidden helper {immediate}")
+            helpers.add(immediate)
+        relocation = relocations.get(symbol[4] + at)
+        if op == 0x18 and relocation:
+            kind, target = relocation
+            map_name = target[0]
+            if target[1] & 15 == 3:
+                high = struct.unpack_from("<I", body, at + 12)[0]
+                address = target[4] + (immediate & 0xffffffff) + (high << 32)
+                matches = [candidate[0] for candidate in elf.symbols
+                           if candidate[1] & 15 == 1 and candidate[3] == target[3] and candidate[4] == address]
+                map_name = matches[0] if len(matches) == 1 else ""
+            if kind != 1 or map_name not in allowed_maps:
+                raise RuntimeError(f"selected hot gate reaches forbidden map/global {map_name!r}")
+            maps.add(map_name)
+    if not frame or frame > 32 or maps != allowed_maps or helpers != {1, 156, 158}:
+        raise RuntimeError(f"selected gate frame/actual dependency footprint differs: frame={frame} maps={sorted(maps)} helpers={sorted(helpers)}")
+    return {"frame": frame, "rounded_frame": (frame + 31) // 32 * 32, "maps": sorted(maps), "helpers": sorted(helpers)}
 
 
 def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
@@ -1448,6 +1518,7 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
     validate_owner_helpers(elf, inventory)
     validate_exec_helpers(elf, inventory)
     if not inventory:
+        validate_selected_leaf(elf)
         validate_root_helpers(elf)
         validate_diagnostic_helper_linkage(elf)
     elif callers:
@@ -1462,7 +1533,7 @@ def inspect(path, allowed_text_globals=frozenset(), *, variant="default"):
     if global_data:
         raise RuntimeError(f"object carries global-data sections {global_data}")
     image_helpers = (frozenset({"p11_link_current_identity"}) if callers else
-                     frozenset() if inventory else REQUIRED_GLOBAL_HELPERS)
+                     frozenset() if inventory else REQUIRED_GLOBAL_HELPERS | SELECTED_GLOBAL_HELPERS)
     return maps, classify(records, sections, allowed_text_globals | image_helpers
                           | REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS
                           | REQUIRED_GLOBAL_EXEC_HELPERS,
@@ -1501,11 +1572,13 @@ def classify(records, sections, allowed_text_globals=frozenset(), *, inventory=F
                 and name in {"memcpy", "memset", "memmove", "memcmp", "bcmp"}):
             continue
         exact = EXACT_PROGRAM_SECTIONS.get(name)
+        if inventory:
+            exact = CALLER_PROGRAM_SECTIONS.get(name, exact)
         if bind != "GLOBAL" or visibility != "DEFAULT":
             raise RuntimeError(f"unclassified global function {name} in {location}")
         if name in (REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_OWNER_HELPERS
                     | REQUIRED_GLOBAL_SCALAR_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS
-                    | DIAGNOSTIC_GLOBAL_HELPERS):
+                    | DIAGNOSTIC_GLOBAL_HELPERS | SELECTED_GLOBAL_HELPERS):
             if name in allowed_text_globals and location == ".text":
                 helpers.add(name)
                 continue
@@ -1520,7 +1593,7 @@ def classify(records, sections, allowed_text_globals=frozenset(), *, inventory=F
     # Generic fixtures need no production helpers. A production hook or helper
     # selects the complete exact export contract, independent of program counts.
     if not inventory and (programs & EXACT_PROGRAM_SECTIONS.keys() or helpers & REQUIRED_GLOBAL_HELPERS):
-        missing = REQUIRED_GLOBAL_HELPERS - helpers
+        missing = (REQUIRED_GLOBAL_HELPERS | SELECTED_GLOBAL_HELPERS) - helpers
         if missing:
             raise RuntimeError(f"missing required .text helpers: {sorted(missing)}")
     return programs
@@ -1581,6 +1654,9 @@ SAFE_MAPS = {
         "IMAGE_TGID_INDEX": (1, 8, 8, 16_384, 17),
         "IMAGE_QUERY_REQUESTS": (1, 8, 24, 1_024, 129),
         "IMAGE_QUERY_CTL": (2, 4, 56, 1),
+        "SELECTED_DETAILED": (2, 4, 32, 1, 128),
+        "SELECTED_DETAILED_STATE": (2, 4, 8, 1, 1024),
+        "SELECTED_BOOTSTRAP_CTL": (2, 4, 48, 1),
         "INSTANCE_CALIB": (2, 4, 40, 1),
         "INSTANCE_COUNT": (2, 4, 80, 1),
         "INSTANCE_START": (9, 16, 24, 16_384),
@@ -1618,6 +1694,8 @@ SAFE_PROGRAMS = {
     "p11_inst_vma_copy",
     "p11_image_exec_release",
     "p11_image_query",
+    "p11_selected_bootstrap",
+    "p11_selected_cgroup_migrate",
 }
 INSTANCE_PROGRAMS = {"p11_inst_vma_map", "p11_inst_vma_unmap", "p11_inst_vma_copy",
                      "p11_image_exec_release", "p11_image_query"}
@@ -1641,8 +1719,9 @@ INVENTORY_MAPS = {name: SAFE_MAPS[name] for name in (
     "USAGE_CONFIG": map_def(2, 4, 8, 1, 128),
     "USAGE_EVIDENCE": map_def(6, 4, 8, 3),
 }
+SELECTED_PROGRAMS = {"p11_selected_bootstrap", "p11_selected_cgroup_migrate"}
 INVENTORY_PROGRAMS = (SAFE_PROGRAMS - {"p11_entry", "p11_return", "task_newtask"}
-                      - INSTANCE_PROGRAMS) | {
+                      - INSTANCE_PROGRAMS - SELECTED_PROGRAMS) | {
     "p11_usage_entry_lp64", "p11_usage_entry_ia32",
 }
 INVENTORY_FORBIDDEN_MAPS = {
@@ -1652,6 +1731,8 @@ INVENTORY_FORBIDDEN_MAPS = {
     "INSTANCE_GEN", "INSTANCE_CALIB", "INSTANCE_COUNT", "INSTANCE_START",
     "IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS", "IMAGE_QUERY_CTL",
     "OBJECT_START", "OBJECT_DESCRIPTORS", "OBJECT_ZERO",
+    "SELECTED_DETAILED", "SELECTED_DETAILED_STATE", "SELECTED_BOOTSTRAP_CTL",
+    "INV_BASELINE_REQUESTS", "INV_BASELINE_CTL",
 }
 INVENTORY_CALLER_MAPS = INVENTORY_MAPS | {
     "ENDPOINT_OBJECT": map_def(2, 4, 8, 1, 128),
@@ -1659,13 +1740,16 @@ INVENTORY_CALLER_MAPS = INVENTORY_MAPS | {
     "CALLER_EVIDENCE": map_def(6, 4, 8, 4),
     "TASK_COOKIE": SAFE_MAPS["TASK_COOKIE"],
     "COOKIE_CTL": SAFE_MAPS["COOKIE_CTL"],
+    "INV_BASELINE_REQUESTS": map_def(1, 4, 16, 1024, 129),
+    "INV_BASELINE_CTL": map_def(2, 4, 56, 1),
 }
+INVENTORY_CALLER_PROGRAMS = INVENTORY_PROGRAMS | {"p11_inventory_image_baseline"}
 
 FROZEN_INVENTORY = {
     "inventory": (INVENTORY_MAPS, INVENTORY_PROGRAMS),
     "inventory-small-discovery": (INVENTORY_MAPS | {"DISCOVERY": map_def(27, 0, 0, 4096)}, INVENTORY_PROGRAMS),
-    "inventory-callers": (INVENTORY_CALLER_MAPS, INVENTORY_PROGRAMS),
-    "inventory-callers-small-discovery": (INVENTORY_CALLER_MAPS | {"DISCOVERY": map_def(27, 0, 0, 4096)}, INVENTORY_PROGRAMS),
+    "inventory-callers": (INVENTORY_CALLER_MAPS, INVENTORY_CALLER_PROGRAMS),
+    "inventory-callers-small-discovery": (INVENTORY_CALLER_MAPS | {"DISCOVERY": map_def(27, 0, 0, 4096)}, INVENTORY_CALLER_PROGRAMS),
     "default": (SAFE_MAPS, SAFE_PROGRAMS),
     "diagnostic": (UNSAFE_MAPS, UNSAFE_PROGRAMS),
     "wide-default": (WIDE_MAPS, SAFE_PROGRAMS),
@@ -1717,15 +1801,17 @@ def validate_inventory(variant, maps, programs, symbols):
     inventory = variant.startswith("inventory")
     callers = variant.startswith("inventory-callers")
     if inventory:
-        allowed = {"TASK_COOKIE", "COOKIE_CTL", "p11_link_current_identity"} if callers else set()
+        allowed = {"TASK_COOKIE", "COOKIE_CTL", "p11_link_current_identity",
+                   "INV_BASELINE_REQUESTS", "INV_BASELINE_CTL",
+                   "p11_inventory_image_baseline"} if callers else set()
         forbidden = {name for name in symbols if name not in allowed and
                      (name in INVENTORY_FORBIDDEN_MAPS
                       or name.startswith(("p11_owner_start_", "p11_link_", "p11_root_",
-                                          "p11_inst", "p11_image_", "p11_object")))}
+                                          "p11_inst", "p11_image_", "p11_object", "p11_selected_")))}
         if forbidden:
             raise RuntimeError(f"inventory contains forbidden detailed symbols: {sorted(forbidden)}")
     required_helpers = (REQUIRED_GLOBAL_OWNER_HELPERS | REQUIRED_GLOBAL_SCALAR_HELPERS
-                        if inventory else REQUIRED_GLOBAL_HELPERS)
+                        if inventory else REQUIRED_GLOBAL_HELPERS | SELECTED_GLOBAL_HELPERS)
     required_helpers |= REQUIRED_GLOBAL_EXEC_HELPERS
     if callers:
         required_helpers |= {"p11_link_current_identity"}
@@ -1775,15 +1861,15 @@ def self_test():
     assert WIDE_UNSAFE_MAPS["PAIR_CALLS"] == UNSAFE_MAPS["PAIR_CALLS"]
     assert "PAIR_CALLS" not in SAFE_MAPS
     assert "PAIR_CALLS" not in INVENTORY_MAPS
-    assert len(SAFE_MAPS) == 39
-    assert len(UNSAFE_MAPS) == 41
-    assert len(WIDE_MAPS) == 39
-    assert len(WIDE_UNSAFE_MAPS) == 41
-    assert len(SAFE_PROGRAMS) == 18
-    assert len(UNSAFE_PROGRAMS) == 23
+    assert len(SAFE_MAPS) == 42
+    assert len(UNSAFE_MAPS) == 44
+    assert len(WIDE_MAPS) == 42
+    assert len(WIDE_UNSAFE_MAPS) == 44
+    assert len(SAFE_PROGRAMS) == 20
+    assert len(UNSAFE_PROGRAMS) == 25
     assert not INSTANCE_PROGRAMS & INVENTORY_PROGRAMS
     good = (SAFE_MAPS, SAFE_PROGRAMS,
-            {"p11_entry"} | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS)
+            {"p11_entry"} | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS)
     diagnostic = (
         UNSAFE_MAPS,
         UNSAFE_PROGRAMS,
@@ -1797,7 +1883,7 @@ def self_test():
             "walk_template_impl-1",
             "walk_template_types-0",
             "walk_template_types-1",
-        } | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS,
+        } | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS,
     )
     validate_policy_inventory(good, diagnostic)
     validate_inventory("wide-default", WIDE_MAPS, SAFE_PROGRAMS, good[2])
@@ -1806,7 +1892,7 @@ def self_test():
     def rejected(check, *arguments):
         if check is validate_inventory:
             *prefix, symbols = arguments
-            arguments = (*prefix, symbols | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS)
+            arguments = (*prefix, symbols | REQUIRED_GLOBAL_HELPERS | REQUIRED_GLOBAL_EXEC_HELPERS | SELECTED_GLOBAL_HELPERS)
         errors = io.StringIO()
         try:
             with contextlib.redirect_stderr(errors):
@@ -1900,6 +1986,33 @@ def self_test():
                 pass
             else:
                 raise AssertionError(f"non-diagnostic or inexact global helper {name} accepted")
+    assert classify([func(1, "p11_selected_current_allowed")], sections,
+                    SELECTED_GLOBAL_HELPERS) == set()
+    for name, location, allowed in [
+        ("p11_selected_current_allowed", 1, frozenset()),
+        ("p11_selected_current_allowed_extra", 1, SELECTED_GLOBAL_HELPERS),
+        ("p11_selected_current_allowed", 3, SELECTED_GLOBAL_HELPERS),
+    ]:
+        try:
+            classify([func(location, name)], sections, allowed)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("inexact selected helper admitted")
+    iterator_sections = sections | {"iter/task": 4}
+    assert classify([func(4, "p11_inventory_image_baseline")], iterator_sections,
+                    inventory=True) == {"p11_inventory_image_baseline"}
+    for name, location, inventory in [
+        ("p11_inventory_image_baseline", 4, False),
+        ("p11_inventory_image_baseline_extra", 4, True),
+        ("p11_inventory_image_baseline", 1, True),
+    ]:
+        try:
+            classify([func(location, name)], iterator_sections, inventory=inventory)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("inexact caller baseline root admitted")
     # mem* helpers are GLOBAL HIDDEN, so the visibility filter already excludes
     # them; the name carries no exemption of its own.
     assert classify([(0, 0, "FUNC", "GLOBAL", "HIDDEN", "1", "memcpy")], sections) == set()

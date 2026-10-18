@@ -145,8 +145,20 @@ impl StagingLedger {
         existing: Option<ReservationId>,
         bytes: u64,
     ) -> Result<ReservationId, LedgerRefusal> {
+        self.charge_role_with_credit(role, key, existing, bytes, 0)
+    }
+
+    fn charge_role_with_credit(
+        &mut self,
+        role: Role,
+        key: RoleKey,
+        existing: Option<ReservationId>,
+        bytes: u64,
+        credit: u64,
+    ) -> Result<ReservationId, LedgerRefusal> {
         let total = self
             .charged_bytes()
+            .saturating_sub(credit)
             .checked_add(bytes)
             .ok_or(LedgerRefusal::Full)?;
         if total > self.byte_limit {
@@ -346,7 +358,7 @@ impl StagingLedger {
         bytes: u64,
         source: Option<&StagedResourceOrigin>,
     ) -> Result<u64, LedgerRefusal> {
-        let existing = match source {
+        let (existing, credit) = match source {
             Some(source) => {
                 if self.generation != Some(source.generation)
                     || self
@@ -357,15 +369,32 @@ impl StagingLedger {
                 {
                     return Err(LedgerRefusal::ReplayRefused);
                 }
-                Some(source.id)
+                // The replayed association consumes the staged
+                // custody it joins: credit the staged bytes the
+                // replay releases right after this mint, so
+                // at-capacity fallback replay accounts (N15). This
+                // matches release-then-mint ordering exactly while
+                // the staged reservation stays live for custody.
+                let credit = self
+                    .table
+                    .as_ref()
+                    .and_then(|table| table.member_bytes(Role::H9Staged, source.key))
+                    .unwrap_or(0) as u64;
+                (Some(source.id), credit)
             }
-            None => None,
+            None => (None, 0),
         };
         let ticket = self
             .next_keyassoc
             .checked_add(1)
             .ok_or(LedgerRefusal::Full)?;
-        self.charge_role(Role::Association, Self::key(ticket), existing, bytes)?;
+        self.charge_role_with_credit(
+            Role::Association,
+            Self::key(ticket),
+            existing,
+            bytes,
+            credit,
+        )?;
         self.next_keyassoc = ticket;
         Ok(ticket)
     }

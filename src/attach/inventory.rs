@@ -2,7 +2,8 @@
 //! Preparation-only capability for the dedicated compact Inventory object.
 use super::{
     AttachBackend, BPF_F_RDONLY_PROG, ExactMapMetadata, Scope, compare_map_metadata, freeze_map,
-    map_metadata, publish_and_freeze_tail_calls, read_map_metadata, require_empty_stack_guard,
+    freeze_map_data, map_metadata, publish_and_freeze_tail_calls, read_map_metadata,
+    require_empty_stack_guard,
 };
 use crate::capacity::{CallerBudget, InventoryBudget};
 use crate::events::DiscoveryDomain;
@@ -277,7 +278,7 @@ impl PreparedInventory {
                     if name == "STACK_GUARD" {
                         require_empty_stack_guard(map)?;
                     }
-                    freeze_map(name, map)?;
+                    freeze_inventory_map(name, map)?;
                 }
                 InventoryPreparation::LoadProgram(name, mode) => {
                     let program = state
@@ -541,6 +542,22 @@ fn validate_inventory_maps(
         compare_map_metadata(name, actual_metadata, metadata)?;
     }
     Ok(())
+}
+
+fn freeze_inventory_map(name: &str, map: &Map) -> Result<()> {
+    if name != "THREAD_OWNER" {
+        return freeze_map(name, map);
+    }
+    let Map::Unsupported(data) = map else {
+        bail!("Inventory refuses unexpected THREAD_OWNER map variant");
+    };
+    validate_inventory_owner_freeze_metadata(read_map_metadata(name, data)?)?;
+    freeze_map_data(name, data)
+}
+
+fn validate_inventory_owner_freeze_metadata(actual: ExactMapMetadata) -> Result<()> {
+    let (_, expected) = inventory_maps(NonZeroU32::MIN)["THREAD_OWNER"];
+    compare_map_metadata("THREAD_OWNER", actual, expected)
 }
 
 fn inventory_map_data<'a>(name: &str, map: &'a Map) -> Result<(InventoryMapKind, &'a MapData)> {

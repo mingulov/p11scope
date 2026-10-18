@@ -650,6 +650,12 @@ fn freeze_map(name: &str, map: &Map) -> Result<()> {
         policy_map_data(name, map)
     }
     .with_context(|| format!("refusing to freeze unexpected {name} map variant"))?;
+    freeze_map_data(name, data)
+}
+
+/// Issue the freeze only after the owning object's exact map contract was
+/// checked. Inventory and Detailed have distinct THREAD_OWNER value layouts.
+fn freeze_map_data(name: &str, data: &aya::maps::MapData) -> Result<()> {
     let attr = BpfMapFreezeAttr {
         map_fd: data.fd().as_fd().as_raw_fd() as u32,
     };

@@ -46,6 +46,42 @@ impl AttestedSubset {
         &self.required
     }
 
+    /// Two mints must retain the same authorized closure and original opened
+    /// files. Equal paths, object IDs or digests cannot replace that custody.
+    pub(crate) fn same_retained_envelope(&self, other: &Self) -> bool {
+        if self.plan != other.plan
+            || self.required != other.required
+            || self.required.is_empty()
+            || self.plan.slots.is_empty()
+            || self.pins.check_unchanged() != Ok(true)
+            || other.pins.check_unchanged() != Ok(true)
+        {
+            return false;
+        }
+        self.plan.slots.iter().all(|slot| {
+            let Some((ours, theirs)) = self
+                .pins
+                .file_for(slot.object)
+                .zip(other.pins.file_for(slot.object))
+            else {
+                return false;
+            };
+            if !std::ptr::eq(ours, theirs) {
+                return false;
+            }
+            self.pins
+                .pinned()
+                .find(|pin| pin.id == slot.object)
+                .zip(other.pins.pinned().find(|pin| pin.id == slot.object))
+                .is_some_and(|(ours, theirs)| {
+                    !ours.sha256.is_empty()
+                        && ours.key == theirs.key
+                        && ours.sha256 == theirs.sha256
+                        && ours.build_id == theirs.build_id
+                })
+        })
+    }
+
     /// The watched endpoint must be this attested provider's physical
     /// file, with its retained whole-file digest. Paths and matching
     /// content in another inode cannot supply this association.
@@ -2452,6 +2488,43 @@ mod finalizer_history_tests {
             assert_eq!(subset.plan().slots.len(), 2);
             subset
         }
+    }
+
+    #[test]
+    fn selected_conversion_envelope_keeps_original_files_and_exact_closure() {
+        let fixture = HistoryFixture::new();
+        let attached = fixture.subset();
+        let mut converted = fixture.subset();
+        assert!(
+            attached.same_retained_envelope(&converted),
+            "fresh actual mints share the original retained files"
+        );
+        converted.plan.slots[0].file_offset += 1;
+        assert!(
+            !attached.same_retained_envelope(&converted),
+            "a changed endpoint closure is refused"
+        );
+        let mut converted = fixture.subset();
+        converted.required.values_mut().next().unwrap().clear();
+        assert!(
+            !attached.same_retained_envelope(&converted),
+            "missing authorized slots are refused"
+        );
+
+        let path = fixture.dir.path().join("operator-input.json");
+        let independent =
+            crate::discovery::identity::pin_manifest_objects_deferred(&fixture.manifest).unwrap();
+        let engine = engine_for_test(Vec::new(), Vec::new(), independent.pins);
+        let independent = prepare_attested_subset(&engine, &[path]).subset.unwrap();
+        assert_eq!(
+            attached.plan, independent.plan,
+            "same physical file and exact plan are insufficient alone"
+        );
+        assert_eq!(attached.required, independent.required);
+        assert!(
+            !attached.same_retained_envelope(&independent),
+            "independent opening cannot substitute for original file Arc custody"
+        );
     }
 
     fn router_ids(domain: NativeDomainId, count: usize) -> Vec<InstanceId> {

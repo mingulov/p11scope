@@ -315,8 +315,16 @@ pub struct GetEntryVerdict {
 }
 
 /// Checked `count * 3W` table bytes for `count` `CK_ATTRIBUTE` slots.
+#[inline(always)]
 pub fn attribute_table_span(count: u64, layout: LinuxLayout) -> Option<u64> {
-    count.checked_mul(3 * layout.word_bytes() as u64)
+    // Checked generic multiplication lowers to a wide-overflow intrinsic
+    // (__multi3) unsupported by the BPF backend. Keep the full claimed count:
+    // prove the exact constant-stride bound, then form 3W using shifts/add.
+    match layout {
+        LinuxLayout::Lp64 if count <= u64::MAX / 24 => Some((count << 4) + (count << 3)),
+        LinuxLayout::Ilp32 if count <= u64::MAX / 12 => Some((count << 3) + (count << 2)),
+        _ => None,
+    }
 }
 
 /// Validate the complete `[base, base+len)` target span, inclusive last byte.
@@ -365,7 +373,7 @@ pub fn attribute_header_addresses(
     layout: LinuxLayout,
 ) -> Option<(u64, u64, u64)> {
     let w = layout.word_bytes() as u64;
-    let slot = base.checked_add(index.checked_mul(3)?.checked_mul(w)?)?;
+    let slot = base.checked_add(attribute_table_span(index, layout)?)?;
     validate_target_span(slot, 3 * w, layout)?;
     let ptr_addr = slot.checked_add(w)?;
     let len_addr = slot.checked_add(2 * w)?;

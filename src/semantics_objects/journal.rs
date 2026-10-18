@@ -22,6 +22,7 @@
 
 #[path = "joint_driver.rs"]
 pub(crate) mod joint_driver;
+mod reservations;
 
 // ---------------------------------------------------------------------------
 // Frozen effect-neutral S1 vocabulary

@@ -102,6 +102,12 @@ instead, which carries the complete Cargo dependency payload; see
 
 ## Canonical Rust gates
 
+Use the [verification tiers](../CONTRIBUTING.md#verification) while developing:
+focused tests for each subtask, affected checks for an integration batch, then
+these complete gates on the assembled candidate. A complete equivalent CI run
+at that revision can supply the host gate; do not automatically repeat it
+locally. BPF/live/package acceptance still needs its own applicable checks.
+
 Run repository commands through `scripts/cargo.sh`; invoking Cargo directly
 bypasses generated dependency preparation. Keep the existing toolchain
 selectors and gate flags. Set a private disk-backed `TMPDIR` as described

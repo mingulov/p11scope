@@ -970,6 +970,23 @@ impl InventoryState {
 /// Read-side accessors the capture facade uses. None of them hands out
 /// links, programs, or a mutable object.
 impl InventoryState {
+    /// Concrete identity-only endpoint operation; no mutable object escapes.
+    pub(super) fn observe_caller_image(
+        &mut self,
+        domain: crate::attach::capture::NativeDomainId,
+        generation: u64,
+        original: &std::sync::Arc<PidPin>,
+        window: crate::attach::capture::ReadWindow,
+    ) -> Result<crate::attach::capture::CallerImageObservation> {
+        crate::attach::selected_detailed::baseline::observe_caller_image(
+            &mut self.prepared.ebpf,
+            domain,
+            generation,
+            original,
+            window,
+        )
+    }
+
     /// Concrete pre-view identity operation; no mutable object escapes.
     pub(super) fn query_promotion_baselines(
         &mut self,

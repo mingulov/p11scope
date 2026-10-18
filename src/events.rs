@@ -1704,7 +1704,11 @@ mod tests {
             ScriptedRecords::records([good, malformed_tail, ordinary], 3),
             domain.clone(),
         );
-        let command = if route % 2 == 0 { "profile" } else { "trace" };
+        let command = if route.is_multiple_of(2) {
+            "profile"
+        } else {
+            "trace"
+        };
         let policy = crate::attach::CapturePolicy::from_cli(command, false, false).unwrap();
         drain.object_transport = crate::attach::object_transport_rows_with(policy, None, || {
             Ok(Arc::new(

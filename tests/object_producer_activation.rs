@@ -656,9 +656,9 @@ fn pin_continuity_gate_precedes_fills() {
     // Delegation: the BPF wrappers bind BPF-local state and call the
     // shared adapters the harness executes — no second inline copy.
     for (wrapper, shared) in [
-        ("fn object_fill_return(", "adapter_fill_return("),
+        ("fn object_fill_return(", "adapter_fill_return_control("),
         ("fn object_tail_fill(", "adapter_tail_fill("),
-        ("fn object_emit_find(", "adapter_emit_find("),
+        ("fn object_emit_find(", "adapter_emit_find_control("),
     ] {
         let body = source_between(&source, wrapper, "\n}\n");
         assert_eq!(
@@ -1404,7 +1404,7 @@ fn pin_attribute_wrappers_delegate_to_shared_adapters() {
         ),
         (
             "fn object_emit_get_attributes(",
-            "adapter_emit_get_attributes(",
+            "adapter_emit_get_control(",
             "fn owned_start_discard(",
         ),
     ] {

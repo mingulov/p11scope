@@ -61,6 +61,9 @@ pub const OBJECT_FLAGS_MASK: u32 = 0xFF;
 /// cross the public object tail and do not change any layout or wire code.
 pub const GET_ENTRY_FLAGS_SHIFT: u32 = 8;
 pub const GET_ENTRY_FLAGS_MASK: u16 = 0x0F << GET_ENTRY_FLAGS_SHIFT;
+/// Get entry never stores PRESENT (return derives it from inspected). Its
+/// private bit instead marks failed argument acquisition as UNINSPECTED.
+pub const GET_ENTRY_UNINSPECTED: u16 = 1 << GET_ENTRY_FLAGS_SHIFT;
 pub const OBJECT_FIND_FLAGS_MASK: u8 = 0x3F;
 /// Attribute-list flags bit 4: the list's inspection never ran, so its
 /// all-zero cells are uninspected, never inspected-empty. Slice-D

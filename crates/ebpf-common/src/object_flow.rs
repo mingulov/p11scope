@@ -33,6 +33,109 @@ use crate::object_wire::{
 };
 use crate::{target_word_end, InstanceContinuity, LinuxLayout, ARG_NONE};
 
+/// Finite metadata for outlined return wrappers. The layout uses bits0–1
+/// (1 LP64, 2 ia32), bit2 is the actual root continuity verdict. Full-width
+/// RV, mechanism status and mechanism remain separate scalar arguments.
+pub const RETURN_GATE_LAYOUT_MASK: u32 = 3;
+pub const RETURN_GATE_JOINED: u32 = 4;
+pub const RETURN_GATE_MASK: u32 = RETURN_GATE_LAYOUT_MASK | RETURN_GATE_JOINED;
+
+#[inline(always)]
+pub fn encode_return_gate(layout: LinuxLayout, joined: bool) -> u32 {
+    let layout = match layout {
+        LinuxLayout::Lp64 => 1,
+        LinuxLayout::Ilp32 => 2,
+    };
+    layout | if joined { RETURN_GATE_JOINED } else { 0 }
+}
+
+#[inline(always)]
+pub fn decode_return_gate(gate: u32) -> Option<(LinuxLayout, bool)> {
+    if gate & !RETURN_GATE_MASK != 0 {
+        return None;
+    }
+    let layout = match gate & RETURN_GATE_LAYOUT_MASK {
+        1 => LinuxLayout::Lp64,
+        2 => LinuxLayout::Ilp32,
+        _ => return None,
+    };
+    Some((layout, gate & RETURN_GATE_JOINED != 0))
+}
+
+/// Actual controlled fill body, shared with host read spies. Invalid
+/// metadata refuses before reaching the existing custody/continuity gates.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn adapter_fill_return_control(
+    side: Option<&mut ObjectStart>,
+    descriptor: u32,
+    row: Option<&ObjectDescriptorWire>,
+    rv: u64,
+    mech_status: u32,
+    mech: u64,
+    gate: u32,
+    read_word: impl FnMut(u64) -> Result<u64, ()>,
+) -> bool {
+    let Some((layout, joined)) = decode_return_gate(gate) else {
+        return false;
+    };
+    adapter_fill_return(
+        side,
+        descriptor,
+        row,
+        rv,
+        layout,
+        mech_status,
+        mech,
+        joined,
+        read_word,
+    )
+}
+
+/// Actual controlled Find body.
+/// # Safety
+/// `tail` must satisfy the exclusive writable tail contract of `adapter_emit_find`.
+#[inline(always)]
+pub unsafe fn adapter_emit_find_control(
+    tail: *mut ObjectCallWire,
+    side: Option<&ObjectStart>,
+    descriptor: u32,
+    row: Option<&ObjectDescriptorWire>,
+    rv: u64,
+    gate: u32,
+    read_word: impl FnMut(u64) -> Result<u64, ()>,
+) -> bool {
+    let Some((layout, joined)) = decode_return_gate(gate) else {
+        return false;
+    };
+    unsafe { adapter_emit_find(tail, side, descriptor, row, layout, rv, joined, read_word) }
+}
+
+/// Actual controlled Get body.
+/// # Safety
+/// `tail` must satisfy the exclusive writable tail contract of `adapter_emit_get_attributes`.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn adapter_emit_get_control(
+    tail: *mut ObjectCallWire,
+    side: Option<&ObjectStart>,
+    descriptor: u32,
+    row: Option<&ObjectDescriptorWire>,
+    rv: u64,
+    gate: u32,
+    read_word: impl FnMut(u64) -> Result<u64, ()>,
+    read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
+) -> bool {
+    let Some((layout, joined)) = decode_return_gate(gate) else {
+        return false;
+    };
+    unsafe {
+        adapter_emit_get_attributes(
+            tail, side, descriptor, row, layout, rv, joined, read_word, read_bytes,
+        )
+    }
+}
+
 /// Production return-arm continuity gate: the reserved record's entry and
 /// return stamps join. The BPF return root and host tests execute this same
 /// field selection plus predicate; substituting one stamp for the other
@@ -165,12 +268,7 @@ pub fn adapter_attributes_entry(
         return true;
     }
     if row.action == OBJECT_ACTION_GET {
-        let (ptr_arg, count_arg) = (row.template_args[0], row.template_args[1]);
-        if ptr_arg != ARG_NONE && count_arg != ARG_NONE {
-            let template_ptr = fetch_arg(ptr_arg).unwrap_or(0);
-            let count = fetch_arg(count_arg).unwrap_or(0);
-            let _ = production_capture_get_entry(template_ptr, count, layout, side, &mut read_word);
-        }
+        capture_get_template(side, row, layout, fetch_arg, &mut read_word);
         return true;
     }
     capture_request_pairs(
@@ -182,6 +280,34 @@ pub fn adapter_attributes_entry(
         &mut read_bytes,
     );
     true
+}
+
+#[inline(always)]
+pub(crate) fn capture_get_template(
+    side: &mut ObjectStart,
+    row: &ObjectDescriptorWire,
+    layout: LinuxLayout,
+    fetch_arg: &mut impl FnMut(u8) -> Option<u64>,
+    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+) {
+    let (ptr_arg, count_arg) = (row.template_args[0], row.template_args[1]);
+    if ptr_arg == ARG_NONE || count_arg == ARG_NONE {
+        return;
+    }
+    let ptr = fetch_arg(ptr_arg);
+    let count = fetch_arg(count_arg);
+    match (ptr, count) {
+        (Some(ptr), Some(count)) => {
+            let _ = production_capture_get_entry(ptr, count, layout, side, &mut read_word);
+        }
+        _ => {
+            // Clear every retained field/slot before marking acquisition
+            // unavailable, including host reuse or a future retry path.
+            let _ = production_capture_get_entry(0, 0, layout, side, &mut read_word);
+            side.flags |=
+                object_flag::ARG_READ_FAILURE as u16 | crate::object_wire::GET_ENTRY_UNINSPECTED;
+        }
+    }
 }
 
 // The actual scalar request-pair body is separate from the shipping gate so
@@ -312,9 +438,8 @@ fn slot_word(
 /// alias/duplicate/partial rules below recompute both slots from the
 /// retained pointers; emission never trusts slot-0 as final.
 #[inline(always)]
-// Nine scalar parameters map 1:1 to the BPF wrapper's register-passed
-// arguments; bundling them into a struct would risk wrapper stack the
-// 512-byte return chain does not have.
+// This semantic body stays inlined into the checked five-register wrapper;
+// no local context aggregate crosses the tightly bounded return chain.
 #[allow(clippy::too_many_arguments)]
 pub fn adapter_fill_return(
     side: Option<&mut ObjectStart>,

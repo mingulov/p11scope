@@ -158,8 +158,9 @@ def evaluate(trace, stdout, ledger, receipt):
                 errors.append('stdout shed bytes do not equal the complete saved-trace byte difference')
             if stdout is not None and shed > 0 and not delivered_content(stdout, trace, ev):
                 unavailable.append('lossy delivered content cannot be proved in order against saved output/terminal')
-            if receipt['sink'] == 'slowpipe' and not receipt['stdout_stalled']:
-                errors.append('slow pipe never established a genuinely full owned output')
+            if receipt['sink'] == 'slowpipe' and (not receipt['stdout_stalled']
+                    or ev['scheduling']['sink_timeouts'] <= 0):
+                errors.append('slow pipe needs observed kernel pressure and actual sink timeouts')
             result.update(api_calls=expected, events_lost=lost, stdout_shed_bytes=shed)
         if receipt['trace_file_error'] or receipt['observer_rc'] != 0 or receipt['watchdog']:
             errors.append('failed observer, saved trace or watchdog cannot supply authoritative totals')

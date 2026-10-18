@@ -70,6 +70,7 @@ RUN = [
     ("test_inventory_system_sibling.py", []),
     ("test_key_operation_ledger.py", []),
     ("test_loader.py", []),
+    ("test_loader_lifetimes.py", []),
     ("test_measure_e03.py", []),
     ("test_merge_checksum_ledgers.py", []),
     ("test_object_journal_qualification.py", []),

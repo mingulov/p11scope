@@ -15,6 +15,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct CaptureId(u64);
 
+#[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): runtime enables the per-run capture identity.
 impl CaptureId {
     pub(crate) fn new(raw: u64) -> Self {
         Self(raw)
@@ -52,6 +53,7 @@ impl RequestId {
     /// can take a serial. Compared, never issued.
     pub(crate) const EXHAUSTED: u64 = u64::MAX;
 
+    #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): runtime constructs status request IDs.
     pub(crate) fn new(raw: u64) -> Self {
         Self(raw)
     }
@@ -238,6 +240,7 @@ pub(crate) struct PromotionStatusUpdate {
     pub(crate) outcome: PromotionOutcome,
 }
 
+#[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): runtime reports preparation and activation results.
 impl PromotionStatusUpdate {
     pub(crate) fn new(request: RequestId, outcome: PromotionOutcome) -> Self {
         Self { request, outcome }

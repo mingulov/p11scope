@@ -36,20 +36,86 @@ def observer_diagnostics(reader, *, no_signal=False):
     return payload
 
 
-def check_zero(records, expected):
-    if ([row.get('kind') for row in records] != ['ready', 'final']
+def _check_zero(records, expected, *, main_thread):
+    if (not isinstance(records, (list, tuple)) or len(records) != 2
+            or any(not isinstance(row, dict) for row in records)
+            or [row.get('kind') for row in records] != ['ready', 'final']
             or any(row.get('mode') != 'perf_uprobe' for row in records)):
         raise ValueError('no-signal control lacks actual ready/final with zero samples')
     ready, final = records
     if (ready.get('clock') != 'CLOCK_MONOTONIC'
             or ready.get('role') != 'reporter' or expected.get('role') != 'reporter'
-            or expected.get('pid') != expected.get('tid')
-            or any(ready.get(key) != expected[key] for key in ('pid', 'tid', 'start_time', 'dev', 'ino', 'file_offset'))
+            or (expected.get('pid') == expected.get('tid')) != main_thread
+            or any(type(ready.get(key)) is not int or ready[key] < 0 or ready[key] != expected[key]
+                   for key in ('pid', 'tid', 'start_time', 'dev', 'ino', 'file_offset'))
             or any(type(final.get(key)) is not int or final[key] != 0 for key in ('samples', 'kernel_count', 'lost'))
             or type(final.get('time_enabled')) is not int or final['time_enabled'] <= 0
             or final['time_enabled'] != final.get('time_running')):
         raise ValueError('no-signal control has foreign identity, samples, loss or multiplexing')
     return dict(no_signal_samples=0, kernel_count=0, lost=0)
+
+
+def check_zero(records, expected):
+    return _check_zero(records, expected, main_thread=True)
+
+
+def validate_worker_negative(worker, worker_expected, reporter, expected, signals, diagnostics):
+    """A live same-process worker attachment must miss genuine main progress."""
+    facts = _check_zero(worker, worker_expected, main_thread=False)
+    if (any(worker_expected.get(key) != expected.get(key)
+            for key in ('pid', 'dev', 'ino', 'file_offset', 'ip'))
+            or worker_expected['tid'] == expected['pid']):
+        raise ValueError('worker probe does not belong to the same candidate process/reporter')
+    PROBE['validate_witness'](reporter, expected, signals)
+    if (type(worker[0].get('t_ns')) is not int or not 0 < worker[0]['t_ns'] <= signals[0]['t_ns']
+            or HARNESS['cancellation_marker'](diagnostics, int(signal.Signals[signals[0]['signal']])) is None):
+        raise ValueError('worker negative lacks pre-signal readiness and genuine main readable progress')
+    try:
+        check_zero(worker, worker_expected)
+    except ValueError:
+        pass
+    else:
+        raise ValueError('ordinary main validator accepted worker identity')
+    return dict(worker_samples=facts['no_signal_samples'], worker_kernel_count=0,
+                genuine_main_observation_ns=reporter[1]['t_ns'])
+
+
+def validate_handler_blocked(reporter, expected, callback, callback_expected, gates,
+                             signals, release_ns, diagnostics):
+    """Reconcile a negative interval; callback/gate timestamps never select ACK."""
+    PROBE['validate_binding'](reporter, expected)
+    PROBE['validate_callback_binding'](callback, callback_expected)
+    if (len(signals) != 1 or signals[0].get('signal') != 'SIGINT'
+            or any(expected.get(key) != callback_expected.get(key)
+                   for key in ('pid', 'tid', 'start_time', 'dev', 'ino'))
+            or expected['file_offset'] == callback_expected['file_offset']
+            or expected['ip'] == callback_expected['ip']):
+        raise ValueError('negative needs one actual main SIGINT and distinct same-candidate probe roles')
+    if (not isinstance(gates, (list, tuple)) or len(gates) != 3
+            or any(not isinstance(row, dict) for row in gates)
+            or [row.get('kind') for row in gates] != ['entered', 'interrupted', 'released']
+            or any(row.get('pid') != expected['pid'] or row.get('tid') != expected['tid']
+                   or row.get('clock') != 'CLOCK_MONOTONIC' for row in gates)):
+        raise ValueError('missing or foreign actual main gate/EINTR/release facts')
+    entered, interrupted, consumed = [row.get('t_ns') for row in gates]
+    sent, delivered, observed = signals[0].get('t_ns'), callback[1].get('t_ns'), reporter[1].get('t_ns')
+    ready = [reporter[0].get('t_ns'), callback[0].get('t_ns')]
+    if (any(type(stamp) is not int or not 0 < stamp < 2**64
+            for stamp in [entered, interrupted, consumed, sent, delivered, observed, release_ns, *ready])
+            or not max(ready) <= sent <= delivered <= interrupted < release_ns <= consumed <= observed
+            or not entered <= sent or release_ns - sent < 150_000_000):
+        raise ValueError('delivery/EINTR/continued gate/release/main observation interval is unproved')
+    if HARNESS['cancellation_marker'](diagnostics, 2) is None:
+        raise ValueError('late real main observation lacks complete matching readable marker')
+    try:
+        PROBE['validate_witness'](reporter, expected, signals)
+    except ValueError as error:
+        if 'missed<100ms' not in str(error):
+            raise
+    else:
+        raise ValueError('handler-only interval was accepted as prompt main acknowledgement')
+    return dict(late_reporter_rejected=True, handler_delivery_ns=delivered,
+                gate_release_consumed_ns=consumed, late_main_observation_ns=observed)
 
 
 def cell(args, name, directory, env, binary, provider, caller_pin, helper, manifest, resolved):

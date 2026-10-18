@@ -14,7 +14,6 @@ import time
 from pathlib import Path
 import runpy
 import select
-import signal
 import unittest
 from unittest import mock
 
@@ -666,6 +665,7 @@ class ReporterProbeTests(unittest.TestCase):
 class ReadinessGateTests(unittest.TestCase):
     def test_actual_preload_gates_only_complete_forwarded_main_stderr_and_restores_errno_mask(self):
         line = b'p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C\n'
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'))
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             preload, fixture = root / 'gate.so', root / 'fixture'
@@ -687,6 +687,7 @@ class ReadinessGateTests(unittest.TestCase):
                         P11SCOPE_TEST_GATE_CONTROL_FD=str(control), P11SCOPE_TEST_GATE_FACT_FD=str(notify))
                     child = subprocess.Popen([str(fixture), mode], env=env, pass_fds=(control, notify),
                         stdout=subprocess.PIPE, stderr=stderr_write)
+                    owner = None
                     for fd in (control, notify, stderr_write):
                         os.close(fd)
                     stderr = bytearray()
@@ -708,8 +709,10 @@ class ReadinessGateTests(unittest.TestCase):
                         if gated:
                             entered = fact()
                             self.assertEqual(entered['kind'], 'entered')
-                            sent = time.monotonic_ns()
-                            os.kill(child.pid, signal.SIGINT)
+                            owner = HARNESS['NATIVE'].OwnedProcess(child.pid, os.getpid(), os.getuid(), child)
+                            delivery = negative['send_main_sigint'](owner)
+                            sent = delivery['t_ns']
+                            self.assertEqual(delivery['delivery'], 'tgkill_original_main')
                             interrupted = fact()
                             self.assertEqual(interrupted['kind'], 'interrupted')
                             self.assertLessEqual(entered['t_ns'], sent)
@@ -743,6 +746,8 @@ class ReadinessGateTests(unittest.TestCase):
                             child.terminate()
                             child.wait(timeout=3)
                         reader.join(timeout=3)
+                        if owner:
+                            owner.close()
                         child.stdout.close()
                         for fd in (release, facts, stderr_read):
                             os.close(fd)
@@ -781,6 +786,18 @@ class InventorySavedCaptureTests(unittest.TestCase):
 
 
 class ReporterControlAdapterTests(unittest.TestCase):
+    def test_negative_adapter_shares_original_entrypoint_signal_custody(self):
+        base = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/qualify_reporter_probe.py'))
+        negative = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/negative_reporter_controls.py'),
+                                 init_globals={'BASE': base})
+        self.assertIs(negative['BASE'], base)
+        self.assertIs(negative['NATIVE'], base['NATIVE'])
+        self.assertIs(negative['PROBE'], base['PROBE'])
+        with base['NATIVE'].signal_cleanup():
+            self.assertIsNotNone(negative['NATIVE'].cleanup_section())
+            self.assertIs(negative['NATIVE'].spawn_owned.__globals__['_active_signals'],
+                          base['NATIVE'].spawn_owned.__globals__['_active_signals'])
+
     def test_worker_negative_requires_genuine_main_progress_same_process_and_zero_events(self):
         module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/qualify_reporter_probe.py'))
         expected = dict(role='reporter', pid=123, tid=123, start_time=9, dev=2,

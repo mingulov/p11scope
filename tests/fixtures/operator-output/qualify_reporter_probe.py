@@ -20,6 +20,7 @@ HARNESS = runpy.run_path(str(ROOT / 'scripts/qualify-operator-output.py'))
 NATIVE = HARNESS['NATIVE']
 PROBE = runpy.run_path(str(Path(__file__).with_name('reporter_probe.py')))
 CELLS = ('none', 'readable', 'repeated', 'delayed', 'wrongexe', 'wrongprocess')
+NEGATIVE_CELLS = ('handlerblocked', 'wrongworker')
 
 
 def json_rows(reader):
@@ -303,13 +304,20 @@ def main():
     parser.add_argument('--gid', type=int, required=True)
     parser.add_argument('--source-revision', required=True)
     parser.add_argument('--cells', default=','.join(CELLS))
+    parser.add_argument('--readiness-gate', type=Path,
+                        help='explicit verified prebuilt negative-only preload; needed by handlerblocked')
     args = parser.parse_args()
     names = args.cells.split(',')
     if (os.geteuid() != 0 or args.uid <= 0 or args.gid <= 0
             or not re.fullmatch('[0-9a-f]{40}', args.source_revision)
-            or any(name not in CELLS for name in names) or len(set(names)) != len(names)
+            or any(name not in CELLS + NEGATIVE_CELLS for name in names) or len(set(names)) != len(names)
             or any(not getattr(args, name).is_absolute() for name in ('binary', 'provider', 'caller', 'reporter_probe', 'manifest', 'out'))):
         parser.error('requires root, ordinary caller uid/gid, exact source, bounded unique cells and absolute paths')
+    if (('handlerblocked' in names) != (args.readiness_gate is not None)
+            or args.readiness_gate is not None and not args.readiness_gate.is_absolute()
+            or os.environ.get('LD_PRELOAD')
+            or any(key.startswith('P11SCOPE_TEST_GATE_') for key in os.environ)):
+        parser.error('select handlerblocked exactly when supplying an absolute gate; baseline environment must contain no preload/gate')
     os.umask(0o022)
     args.out.mkdir(mode=0o755)
     work = args.out / 'workload'
@@ -319,16 +327,27 @@ def main():
         env = NATIVE.initialize_tokens(work, args.uid, args.gid)
         for name in ('binary', 'provider', 'caller', 'reporter_probe', 'manifest'):
             pins.append(NATIVE.FilePin(getattr(args, name)))
+        gate_pin = NATIVE.FilePin(args.readiness_gate) if args.readiness_gate is not None else None
+        if gate_pin:
+            pins.append(gate_pin)
         resolved = PROBE['resolve_reporter'](pins[0])
+        negative = (runpy.run_path(str(Path(__file__).with_name('negative_reporter_controls.py')),
+                                  init_globals={'BASE': globals()})
+                    if any(name in NEGATIVE_CELLS for name in names) else None)
         for name in names:
             try:
-                result = cell(args, name, args.out / name, env, *pins, resolved)
+                if name in NEGATIVE_CELLS:
+                    result = negative['cell'](args, name, args.out / name, env, *pins[:5], resolved, gate_pin)
+                else:
+                    result = cell(args, name, args.out / name, env, *pins[:5], resolved)
             except (OSError, ValueError, TimeoutError, subprocess.SubprocessError) as error:
                 result = dict(cell=name, control_pass=False, error=str(error))
             results.append(result)
             print(json.dumps(result), flush=True)
+        passed = {row['cell'] for row in results if row['control_pass']}
         summary = dict(source_revision=args.source_revision, controls=results,
-            remaining=['main-blocked after handler delivery', 'wrong actual worker thread', 'complete blocked-stderr E17 oracles'],
+            remaining=[name for name in CELLS + NEGATIVE_CELLS if name not in passed]
+                + ['complete blocked-stderr E17 pressure/content/cleanup oracles'],
             qualification='owned reporter controls only; no blocked-stderr or full E17 acceptance')
         (args.out / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
         return 0 if all(row['control_pass'] for row in results) else 1

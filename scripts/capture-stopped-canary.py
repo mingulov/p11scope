@@ -10,6 +10,7 @@ No Python result alone qualifies a live kernel, BPF build or target ABI.
 """
 import argparse
 import ctypes
+import errno
 import hashlib
 import json
 import math
@@ -361,6 +362,37 @@ def start_bindings(entries, tasks, config, *, complete):
     return bindings, starts
 
 
+def assert_blocked_semantics(config, ordinary, starts, workload_text):
+    """Dispatch the real stopped-map semantic oracle after ownership joins."""
+    if config.workload_mode == 'blocked':
+        lines = [line.removeprefix('P11SCOPE_POINTERS ') for line in workload_text().splitlines()
+                 if line.startswith('P11SCOPE_POINTERS ')]
+        require(len(lines) == 1, 'missing exact hostile pointer record')
+        evidence.assert_hostile_records(starts, json.loads(lines[0], object_pairs_hook=unique_object))
+    elif config.workload_mode == 'object-blocked':
+        lines = [line.removeprefix('P11SCOPE_OBJECT_POINTERS ') for line in workload_text().splitlines()
+                 if line.startswith('P11SCOPE_OBJECT_POINTERS ')]
+        require(len(lines) == 1, 'missing exact object pointer record')
+        start_keys, starts_by_tid = set(), {}
+        for cell in ordinary['START']:
+            key = evidence.bpftool_bytes(cell['key'], 16)
+            tid = evidence.u64(key, 0) & 0xffffffff
+            require(key not in start_keys and tid not in starts_by_tid, 'duplicate object START identity')
+            start_keys.add(key)
+            starts_by_tid[tid] = evidence.decode_start(evidence.bpftool_bytes(cell['value'], evidence.CALL_START_SIZE))
+        rows = [(evidence.bpftool_bytes(cell['key'], 16),
+                 evidence.decode_object_start(evidence.bpftool_bytes(cell['value'], 432)))
+                for cell in ordinary['OBJECT_START']]
+        require(len(rows) == len(start_keys) and {key for key, _ in rows} == start_keys,
+                'object side keys differ from exact START ownership')
+        evidence.assert_object_side_rows(rows, starts_by_tid,
+            json.loads(lines[0], object_pairs_hook=unique_object), config.target_bits)
+    else:
+        cells = [cell for cell in ordinary['EVIDENCE'] if evidence.u32(evidence.bpftool_bytes(cell['key'], 4), 0) == 5]
+        require(len(cells) == 1, 'missing fault evidence cell')
+        evidence.assert_fault_records(starts, evidence.value_total(cells[0].get('values', [])))
+
+
 class LiveMaps:
     """Only live BPF acquisition boundaries; process lifetime belongs to Custody."""
     def __init__(self, config):
@@ -443,6 +475,36 @@ class LiveMaps:
 
     def ring_records(self, positions):
         return {name: reader.read_records(positions[name]) for name, reader in self.rings.items()}
+
+    def verify_object_scrub(self, maps, deadline):
+        """Read the original retained FDs after the observer's normal exit.
+
+        Require actual native Q before asking whether the hash is empty; a
+        stopped process or a closed observer FD is not a quiescence proof.
+        This performs no writes, opens no replacement map and builds nothing.
+        """
+        by_name = {item['name']: item for item in maps}
+        stop_fd = self.fd_by_id[by_name['STOP_GATE']['id']]
+        object_fd = self.fd_by_id[by_name['OBJECT_START']['id']]
+        libc = ctypes.CDLL(None, use_errno=True)
+        key, value = ctypes.create_string_buffer(4), ctypes.create_string_buffer(8)
+        attr = ctypes.create_string_buffer(dumper.BPF_ATTR_MAP_ELEM.pack(
+            stop_fd, 0, ctypes.addressof(key), ctypes.addressof(value), 0), dumper.BPF_ATTR_MAP_ELEM.size)
+        remaining(deadline)
+        require(libc.syscall(dumper.BPF_SYSCALL, 1, ctypes.byref(attr), ctypes.sizeof(attr)) == 0,
+                'retained STOP_GATE lookup failed')
+        remaining(deadline)
+        require(struct.unpack('<Q', value.raw)[0] == 1 << 63,
+                'retained object scrub lacks native quiescence')
+        next_key = ctypes.create_string_buffer(16)
+        attr = ctypes.create_string_buffer(dumper.BPF_ATTR_MAP_ELEM.pack(
+            object_fd, 0, 0, ctypes.addressof(next_key), 0), dumper.BPF_ATTR_MAP_ELEM.size)
+        ctypes.set_errno(0)
+        result = libc.syscall(dumper.BPF_SYSCALL, 4, ctypes.byref(attr), ctypes.sizeof(attr))
+        error = ctypes.get_errno()
+        remaining(deadline)
+        require(result < 0 and error == errno.ENOENT,
+                'retained OBJECT_START was not completely scrubbed and removed')
 
     def close(self):
         issues = []
@@ -836,16 +898,8 @@ class Coordinator:
             require(all(evidence.u32(record['value'], 536) == 1 for record in records
                         if record['map_id'] == owner_id and any(record['value'])),
                     'THREAD_OWNER start_count contradicts START worker keys')
-            if cfg.workload_mode == 'blocked':
-                lines = [line.removeprefix('P11SCOPE_POINTERS ') for line in
-                         read_bytes(cfg.workload_log, MAX_LOG_BYTES, deadline).decode().splitlines()
-                         if line.startswith('P11SCOPE_POINTERS ')]
-                require(len(lines) == 1, 'missing exact hostile pointer record')
-                evidence.assert_hostile_records(starts, json.loads(lines[0], object_pairs_hook=unique_object))
-            else:
-                cells = [cell for cell in ordinary['EVIDENCE'] if evidence.u32(evidence.bpftool_bytes(cell['key'], 4), 0) == 5]
-                require(len(cells) == 1, 'missing fault evidence cell')
-                evidence.assert_fault_records(starts, evidence.value_total(cells[0].get('values', [])))
+            assert_blocked_semantics(cfg, ordinary, starts, lambda:
+                read_bytes(cfg.workload_log, MAX_LOG_BYTES, deadline).decode())
         evidence.assert_retained_ring_records(rings, cfg.lane, cfg.workload_pid, positions)
         acquisition = uuid.uuid4().hex
         receipt = {'contract': dumper.STOPPED_SNAPSHOT_CONTRACT, 'acquisition_id': acquisition,
@@ -953,7 +1007,9 @@ class Coordinator:
                         group.resume(resume_deadline, allow_successful_exit=allow_exit)
                     except BaseException as error:
                         issues.extend(sanitized(f'resume-{group.role}', error))
-            if self.source is not None:
+            hold_object_maps = (getattr(self.config, 'workload_mode', None) == 'object-blocked'
+                                and not issues)
+            if self.source is not None and not hold_object_maps:
                 try:
                     self.source.close()
                 except BaseException as error:
@@ -988,6 +1044,22 @@ class Coordinator:
                     require(self.final_privacy_present(privacy_deadline), 'observer privacy marker missing')
                 except BaseException as error:
                     issues.extend(sanitized('observer-privacy', error))
+            if self.source is not None and hold_object_maps:
+                try:
+                    if not issues:
+                        deadline = time.monotonic() + PUBLICATION_SECONDS
+                        self.check('post-stop-object-scrub', deadline)
+                        workload.snapshot(deadline,
+                            expected={row['tid']: row['generation'] for row in tasks})
+                        self.source.verify_object_scrub(self.maps, deadline)
+                        self.check('post-stop-object-scrub-complete', deadline)
+                except BaseException as error:
+                    issues.extend(sanitized('post-stop-object-scrub', error))
+                finally:
+                    try:
+                        self.source.close()
+                    except BaseException as error:
+                        issues.extend(sanitized('acquisition-resources', error))
             if log is not None:
                 try:
                     log.close()

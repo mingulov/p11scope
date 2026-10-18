@@ -26,6 +26,13 @@ def base_record(pid, session, event_type=0):
     return bytes(raw)
 
 
+def six_fields(values=(4, 16, 1, 32, 2048, 1)):
+    # Literal wire values, independently derived from the frozen v3 policy.
+    cells = b"".join(struct.pack("<BBH", kind, 1, value)
+                     for kind, value in enumerate(values, 1))
+    return cells + bytes(8) + bytes([8, 1, 0, 0])
+
+
 def valid_tail(index=21, action=1, layout=1, result=((1, 0xA11CE), (0, 0)),
                inputs=((0, 0), (0, 0)), requested0=None):
     tail = bytearray(240)
@@ -74,6 +81,11 @@ def ledger_text():
         lines.append("P11SCOPE_OBJECT " + json.dumps({
             "index": index, "name": name, "session": 0x601 + position,
             "rv": 0, "ready": 1,
+        }))
+    for session, rv in ((0x701, 17), (0x702, 18), (0x703, 336), (0x704, 5), (0x705, 1)):
+        lines.append("P11SCOPE_OBJECT " + json.dumps({
+            "index": 24, "name": "C_GetAttributeValue", "session": session,
+            "rv": rv, "ready": 1,
         }))
     return "\n".join(lines) + "\n"
 
@@ -235,7 +247,7 @@ class ObjectLedgerTests(unittest.TestCase):
             log = Path(root) / "workload.log"
             log.write_text(ledger_text())
             entries = evidence["object_ledger_entries"](str(log))
-        self.assertEqual(len(entries), 25)
+        self.assertEqual(len(entries), 30)
 
     def test_short_ledger_refuses(self):
         with tempfile.TemporaryDirectory() as root:
@@ -264,17 +276,23 @@ class ObjectRecordsTests(unittest.TestCase):
                33: 9, 42: 9, 46: 9, 48: 9, 52: 9, 72: 9, 77: 9,
                82: 9, 87: 9, 94: 9, 17: 9}
 
-    def completion_records(self):
+    def completion_records(self, target_bits=64):
         records = []
         for position, (ordinal, _name) in enumerate(evidence["OBJECT_LEDGER"]):
             marked = ordinal + 1 in evidence["OBJECT_TEMPLATE_INDICES"]
             tail = bytearray(valid_tail(
                 index=ordinal + 1, action=self.ACTIONS[ordinal],
+                layout=1 if target_bits == 64 else 2,
                 result=((0, 0), (0, 0)),
                 requested0=(bytes(32) + bytes([0, 0x10, 0, 0])
                             if marked else bytes(36))))
             if ordinal == 24:
-                tail[200 + 33] = 0x10
+                tail[128:164] = bytes(36)
+                tail[200:236] = six_fields()
+            elif ordinal + 1 in {21, 22, 59, 60, 62, 63}:
+                tail[128:164] = six_fields()
+            if ordinal == 59:
+                tail[164:200] = six_fields((2, 3, 0, 24, 4096, 2))
             if ordinal in evidence["OBJECT_RESULT_PRESETS"]:
                 presets = evidence["OBJECT_RESULT_PRESETS"][ordinal]
                 for slot, preset in enumerate(presets):
@@ -294,11 +312,52 @@ class ObjectRecordsTests(unittest.TestCase):
                 tail[112 + slot] = 1
             records.append(base_record(self.COMPLETED_PID, 0x601 + position)
                            + bytes(tail))
+        for session, rv, curve in ((0x701, 17, 2), (0x702, 18, 3), (0x703, 336, 1),
+                                   (0x704, 5, None), (0x705, 1, None)):
+            base = bytearray(base_record(self.COMPLETED_PID, session))
+            struct.pack_into("<Q", base, 64, rv)
+            tail = bytearray(valid_tail(index=25, action=11, result=((0, 0), (0, 0)),
+                                        layout=1 if target_bits == 64 else 2,
+                                        inputs=((1, 0x224), (0, 0)), requested0=bytes(36)))
+            tail[200:236] = (six_fields((4, 16, 1, 32, 2048, curve)) if curve else
+                             bytes(32) + bytes([0, 16, 0, 0]))
+            records.append(bytes(base) + bytes(tail))
         return records
 
     def test_completion_replay_matches_ledger(self):
         evidence["assert_object_completion_records"](
             self.completion_records(), "object-lp64", self.COMPLETED_PID)
+
+    def test_completion_replay_keeps_the_selected_target_width(self):
+        good = self.completion_records(32)
+        evidence["assert_object_completion_records"](good, "object-ia32", self.COMPLETED_PID)
+        bad = [bytearray(row) for row in good]
+        bad[0][368 + 12] = 1
+        with self.assertRaises(AssertionError):
+            evidence["assert_object_completion_records"](
+                [bytes(row) for row in bad], "object-ia32", self.COMPLETED_PID)
+
+    def test_canary_rejects_missing_six_field_capture_and_pair_mixup(self):
+        good = self.completion_records()
+        # Each mutant remains a structurally valid finite wire record.
+        cases = []
+        for field in range(6):
+            bad = [bytearray(row) for row in good]
+            bad[0][368 + 128 + 4 * field:368 + 132 + 4 * field] = bytes(4)
+            cases.append((f"missing field {field}", bad))
+        bad = [bytearray(row) for row in good]
+        bad[0][368 + 128:368 + 164] = bytes(32) + bytes([0, 16, 0, 0])
+        cases.append(("UNINSPECTED instead of capture", bad))
+        bad = [bytearray(row) for row in good]
+        bad[15][368 + 164:368 + 200] = six_fields()
+        cases.append(("pair copied public template", bad))
+        bad = [bytearray(row) for row in good]
+        bad[4][368 + 200:368 + 236] = bytes(36)
+        cases.append(("Get lost results", bad))
+        for name, records in cases:
+            with self.subTest(name=name), self.assertRaises(AssertionError):
+                evidence["assert_object_completion_records"](
+                    [bytes(row) for row in records], "object-lp64", self.COMPLETED_PID)
 
     def test_completion_mutations_refuse(self):
         records = self.completion_records()
@@ -319,19 +378,40 @@ class ObjectRecordsTests(unittest.TestCase):
                 [bytes(row) for row in wrong_tail], "object-lp64",
                 self.COMPLETED_PID)
 
+    def test_partial_results_and_error_cancel_remain_separate(self):
+        good = self.completion_records()
+        evidence["assert_object_completion_records"](good, "object-lp64", self.COMPLETED_PID)
+        for position, change in ((25, "lost_partial"), (26, "wrong_curve"),
+                                 (27, "wrong_rv"), (28, "error_values"),
+                                 (29, "cancel_values")):
+            bad = [bytearray(row) for row in good]
+            if change == "lost_partial":
+                bad[position][368 + 200:368 + 236] = bytes(32) + bytes([0, 16, 0, 0])
+            elif change == "wrong_curve":
+                bad[position][368 + 222:368 + 224] = b"\x01\x00"
+            elif change == "wrong_rv":
+                struct.pack_into("<Q", bad[position], 64, 0)
+            else:
+                bad[position][368 + 200:368 + 236] = six_fields()
+            with self.subTest(change=change), self.assertRaises(AssertionError):
+                evidence["assert_object_completion_records"](
+                    [bytes(row) for row in bad], "object-lp64", self.COMPLETED_PID)
+
 
 class ObjectSideRowTests(unittest.TestCase):
     BLOCKED_PID = 4242
-    POINTERS = {"template": 0x7001, "out_create": 0x7002, "out_pub": 0x7003,
-                "out_priv": 0x7004, "found": 0x7005, "found_count": 0x7006}
+    POINTERS = {"template": 0x7000, "peer_template": 0x8000,
+                "out_create": 0x9000, "out_pub": 0x9008, "out_priv": 0x9010,
+                "found": 0x9020, "found_count": 0x9060,
+                "get_values": [0xA000 + 16 * i for i in range(6)]}
 
-    def blocked_fixture(self):
+    def blocked_fixture(self, target_bits=64):
         starts, rows = {}, []
         specs = (
-            (1001, 0x501, 21, 1, dict(result_ptrs=(0x7002, 0))),
-            (1002, 0x502, 60, 4, dict(result_ptrs=(0x7003, 0x7004))),
-            (1003, 0x503, 28, 10, dict(result_ptrs=(0x7005, 0),
-                                       find_capacity=8, find_count_ptr=0x7006)),
+            (1001, 0x501, 21, 1, dict(result_ptrs=(0x9000, 0))),
+            (1002, 0x502, 60, 4, dict(result_ptrs=(0x9008, 0x9010))),
+            (1003, 0x503, 28, 10, dict(result_ptrs=(0x9020, 0),
+                                       find_capacity=8, find_count_ptr=0x9060)),
             (1004, 0x504, 25, 11, dict(inputs=(0x224, 0),
                                        input_statuses=(1, 0))),
         )
@@ -340,13 +420,28 @@ class ObjectSideRowTests(unittest.TestCase):
             starts[tid] = evidence["decode_start"](
                 start_row(session, markers[session]))
             key = struct.pack("<QII", (self.BLOCKED_PID << 32) | tid, 3, 0)
-            rows.append((key, evidence["decode_object_start"](
-                side_row(descriptor_index=index, action=action, **fields))))
+            raw = bytearray(side_row(descriptor_index=index, action=action,
+                                    layout=1 if target_bits == 64 else 2, **fields))
+            if session in (0x501, 0x502):
+                raw[352:388] = six_fields()
+                if session == 0x502:
+                    raw[388:424] = six_fields((2, 3, 0, 24, 4096, 2))
+            if session == 0x504:
+                width = target_bits // 8
+                struct.pack_into("<QQ", raw, 64, 0x7000, 0x7000 + 24 * width)
+                raw[430] = 8
+                for slot, (pointer, capacity) in enumerate(zip(
+                        self.POINTERS["get_values"], (width, width, 1, width, width, 10))):
+                    struct.pack_into("<QQQBBB5x", raw, 96 + slot * 32,
+                                     pointer, capacity, 0, slot + 1, slot, 0)
+            rows.append((key, evidence["decode_object_start"](bytes(raw))))
         return starts, rows
 
     def test_blocked_offsets_match(self):
-        starts, rows = self.blocked_fixture()
-        evidence["assert_object_side_rows"](rows, starts, self.POINTERS, 64)
+        for width in (32, 64):
+            with self.subTest(width=width):
+                starts, rows = self.blocked_fixture(width)
+                evidence["assert_object_side_rows"](rows, starts, self.POINTERS, width)
 
     def test_neighbor_mutations_refuse(self):
         starts, rows = self.blocked_fixture()
@@ -363,7 +458,7 @@ class ObjectSideRowTests(unittest.TestCase):
             ("create result1 ptr", 0, 56, 8, 0x7002),
             ("create result status", 0, 426, 1, 1),
             ("create find capacity", 0, 80, 8, 8),
-            ("create requested", 0, 352, 1, 1),
+            ("create requested", 0, 352, 1, 2),
             ("create slot", 0, 96, 1, 1),
             ("pair input0", 1, 32, 8, 0x221),
             ("find input0", 2, 32, 8, 0x227),

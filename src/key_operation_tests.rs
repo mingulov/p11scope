@@ -5495,10 +5495,11 @@ fn key_operation_c2_reordered_seal_refuses_then_recovers_in_order() {
 
 /// C2 remainder (fix round 2): consumption is irreversible — no
 /// bounded forget window for live claims. 1,025 same-shaped seals
-/// consume (evicting the first ticket from the 1,024-slot dedup);
+/// consume (historically evicting the first ticket from the 1,024-slot dedup);
 /// reapplying the first seal against a new head still holds: its
 /// invocation lies below the staging frontier and can never match
-/// again.
+/// again. The selector retains its historical name; frontier now enforces
+/// the same permanent refusal without allocating the redundant dedup storage.
 #[test]
 fn key_operation_c2_consumption_survives_fifo_eviction() {
     use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
@@ -5552,6 +5553,213 @@ fn key_operation_c2_consumption_survives_fifo_eviction() {
         "bounded dedup eviction cannot re-authorize an old seal"
     );
     assert_eq!(staging.reduced(), 1025, "the old seal replays nothing");
+}
+
+#[test]
+fn key_operation_c2_frontier_disposed_and_resource_refused_heads_never_replay() {
+    use crate::semantics_edge::resources::{SEMANTIC_RESOURCE_LIMIT, SemanticResourcePool};
+    for resource_refusal in [false, true] {
+        let mut scene = JointScene::new();
+        let receipt = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&receipt));
+        let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+        let (_, first_position) = prepare_call(&mut scene, &mut staging, &init);
+        let first = scene.seal().expect("actual own call seals");
+        let pool = SemanticResourcePool::default();
+        let mut reducer = EdgeSemantics::with_resources(&pool).unwrap();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        if resource_refusal {
+            pool.reference_set_limit(pool.snapshot().charged_bytes);
+            assert_eq!(
+                staging
+                    .apply_seal(
+                        &first,
+                        &scene.model,
+                        scene.adapter.ledger_mut(),
+                        &mut reducer,
+                        &mut keyuse,
+                        RegistryInstanceId::from_raw(3),
+                        &mut sink,
+                        None,
+                    )
+                    .0,
+                SealApplyOutcome::ResourceRefused
+            );
+            pool.reference_set_limit(SEMANTIC_RESOURCE_LIMIT);
+        } else {
+            // The H9 loss/timeout disposal entry point consumes a head as
+            // history. No successful semantic replay or H0 report is scripted.
+            assert_eq!(
+                staging
+                    .dispose_below_barrier(Some(first_position), Some(scene.adapter.ledger_mut())),
+                1
+            );
+        }
+        assert_eq!(staging.staged_len(), 0);
+        assert_eq!(staging.history_disposed(), 1);
+        let (_, next_position) = prepare_call(&mut scene, &mut staging, &init);
+        assert!(next_position > first_position);
+        let before = reducer.calls();
+        assert_eq!(
+            staging
+                .apply_seal(
+                    &first,
+                    &scene.model,
+                    scene.adapter.ledger_mut(),
+                    &mut reducer,
+                    &mut keyuse,
+                    RegistryInstanceId::from_raw(3),
+                    &mut sink,
+                    None,
+                )
+                .0,
+            SealApplyOutcome::Held
+        );
+        assert_eq!(staging.staged_len(), 1);
+        assert_eq!(reducer.calls(), before);
+        let next = scene.seal().expect("new own invocation seals");
+        assert_eq!(
+            staging
+                .apply_seal(
+                    &next,
+                    &scene.model,
+                    scene.adapter.ledger_mut(),
+                    &mut reducer,
+                    &mut keyuse,
+                    RegistryInstanceId::from_raw(3),
+                    &mut sink,
+                    None,
+                )
+                .0,
+            SealApplyOutcome::ReplayedOne
+        );
+    }
+}
+
+#[test]
+fn key_operation_c2_frontier_new_session_reuses_positions_with_foreign_seals_inert() {
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let mut old = JointScene::new();
+    let receipt = old.bootstrap();
+    let mut old_staging = JointStaging::select_joint(Some(&receipt));
+    let (_, old_position) = prepare_call(&mut old, &mut old_staging, &init);
+    let old_seal = old.seal().expect("old namespace seals its own input");
+    let mut old_reducer = EdgeSemantics::default();
+    let mut old_keyuse = KeyUseReducer::new();
+    let mut old_sink = Vec::new();
+    assert_eq!(
+        old_staging
+            .apply_seal(
+                &old_seal,
+                &old.model,
+                old.adapter.ledger_mut(),
+                &mut old_reducer,
+                &mut old_keyuse,
+                RegistryInstanceId::from_raw(3),
+                &mut old_sink,
+                None,
+            )
+            .0,
+        SealApplyOutcome::ReplayedOne
+    );
+
+    let mut new = JointScene::new();
+    let receipt = new.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&receipt));
+    let (_, position) = prepare_call(&mut new, &mut staging, &init);
+    assert_eq!(old_position, position);
+    let own = new.seal().expect("new namespace seals its own input");
+    let mut reducer = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    assert_eq!(
+        staging
+            .apply_seal(
+                &old_seal,
+                &old.model,
+                new.adapter.ledger_mut(),
+                &mut reducer,
+                &mut keyuse,
+                RegistryInstanceId::from_raw(3),
+                &mut sink,
+                None,
+            )
+            .0,
+        SealApplyOutcome::Held
+    );
+    assert_eq!(staging.staged_len(), 1);
+    assert_eq!(reducer.calls(), 0);
+    assert_eq!(
+        staging
+            .apply_seal(
+                &own,
+                &new.model,
+                new.adapter.ledger_mut(),
+                &mut reducer,
+                &mut keyuse,
+                RegistryInstanceId::from_raw(3),
+                &mut sink,
+                None,
+            )
+            .0,
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        staging
+            .apply_seal(
+                &old_seal,
+                &old.model,
+                new.adapter.ledger_mut(),
+                &mut reducer,
+                &mut keyuse,
+                RegistryInstanceId::from_raw(3),
+                &mut sink,
+                None,
+            )
+            .0,
+        SealApplyOutcome::Held
+    );
+    assert_eq!(staging.reduced(), 1);
+    // This uses the established H8/H9 algorithm scenes. It does not claim
+    // actual native cleanup or capture-owned A→B Session transfer acceptance.
+}
+
+#[test]
+fn key_operation_c2_frontier_max_disposal_cannot_wrap_or_reset() {
+    let mut scene = JointScene::new();
+    let receipt = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&receipt));
+    let facts = SemanticCall {
+        function: "C_Sign".into(),
+        ..SemanticCall::default()
+    };
+    staging
+        .stage(
+            facts.clone(),
+            EffectOrigin::from(&facts),
+            u64::MAX,
+            scene.adapter.ledger_mut(),
+        )
+        .unwrap();
+    assert_eq!(
+        staging.dispose_below_barrier(None, Some(scene.adapter.ledger_mut())),
+        1
+    );
+    for position in [0, 1, u64::MAX - 1, u64::MAX] {
+        assert_eq!(
+            staging.stage(
+                facts.clone(),
+                EffectOrigin::from(&facts),
+                position,
+                scene.adapter.ledger_mut()
+            ),
+            Err(StagingRefusal::ReplayRefused)
+        );
+    }
+    assert_eq!(staging.history_disposed(), 1);
+    assert_eq!(staging.reduced(), 0);
+    assert_eq!(staging.staged_len(), 0);
 }
 
 /// The admission ordinal one single-call seal binds (C2 test helper):

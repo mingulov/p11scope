@@ -30,8 +30,7 @@ use crate::semantics_objects::journal::{
     SealSuccess, SealedCall,
 };
 use crate::semantics_objects::{
-    CallToken, ObjectDomain, ObjectEffect, ObjectEffects, ObjectId, ObjectSemantics,
-    SessionIncarnation,
+    ObjectDomain, ObjectEffect, ObjectEffects, ObjectId, ObjectSemantics, SessionIncarnation,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::mem::size_of;
@@ -188,17 +187,12 @@ pub(crate) struct JointStaging {
     /// Highest consumed H0 position (replayed or disposed): staging
     /// at or below it is a forbidden replay.
     frontier: u64,
-    /// Redeemed seal claims by model ticket: each seal replays at
-    /// most one staged call, and a repeated seal never replays —
-    /// even against a same-shaped head. Bounded FIFO with a proof
-    /// (C2): redeemed tickets bind admissions at or below the
-    /// staging frontier (heads pop in ascending H0 order, and the
-    /// frontier trails the highest consumed position), while
-    /// identity match requires the seal's admission to EQUAL a live
-    /// head's position (strictly above the frontier) — so an evicted
-    /// ticket's seal can never match again, with or without the set.
-    consumed: BTreeSet<CallToken>,
-    consumed_order: VecDeque<CallToken>,
+    /// Observability only. C2 consumes admission identity through frontier,
+    /// so replay needs no retained ticket set or FIFO allocation. Each real
+    /// seal names its exact admitted invocation, every live head is strictly
+    /// above frontier, and a redeemed/disposed admission stays at or below
+    /// frontier. Namespace selection is checked before this comparison.
+    redeemed: u64,
     reduced: u64,
     history_disposed: u64,
     correlation_refusals: u64,
@@ -222,7 +216,7 @@ impl std::fmt::Debug for JointStaging {
         f.debug_struct("JointStaging")
             .field("mode", &self.mode)
             .field("staged", &self.staged.len())
-            .field("consumed", &self.consumed.len())
+            .field("redeemed", &self.redeemed)
             .field("reduced", &self.reduced)
             .field("history_disposed", &self.history_disposed)
             .field("correlation_refusals", &self.correlation_refusals)
@@ -242,8 +236,7 @@ impl JointStaging {
             selected_domain: None,
             staged: VecDeque::new(),
             frontier: 0,
-            consumed: BTreeSet::new(),
-            consumed_order: VecDeque::new(),
+            redeemed: 0,
             reduced: 0,
             history_disposed: 0,
             correlation_refusals: 0,
@@ -298,21 +291,6 @@ impl JointStaging {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn correlation_refusals(&self) -> u64 {
         self.correlation_refusals
-    }
-
-    /// Redeem one seal claim: the ticket replays exactly once.
-    /// Bounded FIFO at the staging capacity.
-    fn mark_consumed(&mut self, ticket: CallToken) {
-        if !self.consumed.insert(ticket) {
-            return;
-        }
-        self.consumed_order.push_back(ticket);
-        while self.consumed.len() > JOINT_STAGING_CAPACITY {
-            let Some(oldest) = self.consumed_order.pop_front() else {
-                break;
-            };
-            self.consumed.remove(&oldest);
-        }
     }
 
     /// Currently staged (unsettled) payloads.
@@ -480,9 +458,12 @@ impl JointStaging {
             self.correlation_refusals = self.correlation_refusals.saturating_add(1);
             return (SealApplyOutcome::Held, 0);
         }
-        if self.consumed.contains(&settled[0].ticket) {
-            // The claim already redeemed: a repeated seal never
-            // replays, even against a same-shaped staged head.
+        if settled[0].key.admission() <= self.frontier {
+            // Spent and disposed admissions can never match a live head:
+            // stage() requires position > frontier and exact correlation
+            // below requires seal admission == head position. Partial seals
+            // do not advance frontier, so their eventual terminal can retry.
+            // At MAX, no successor can stage; there is no wrap/reset path.
             self.correlation_refusals = self.correlation_refusals.saturating_add(1);
             return (SealApplyOutcome::Held, 0);
         }
@@ -512,7 +493,7 @@ impl JointStaging {
         if settled[0].end_cut.is_none() && !settled[0].abandoned {
             return (SealApplyOutcome::Held, 0);
         }
-        self.mark_consumed(settled[0].ticket);
+        self.redeemed = self.redeemed.saturating_add(1);
         let head = self.staged.pop_front().expect("head verified above");
         self.frontier = self.frontier.max(head.position);
         let receipts = keyuse.receipts_for_call(seal, &settled[0], model, head.position);

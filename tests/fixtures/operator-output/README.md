@@ -377,3 +377,21 @@ Observer stderr is finished through the existing bounded Reader contract while
 the original child remains unreaped, before any no-signal absence or final probe
 verdict. An actual exited-child/gated-reader control proves that delayed queued
 stderr cannot be accepted as empty merely because the process has exited.
+
+The negative-control helper also supports the finite `callback` role through
+`--probe-callback` with the same main-thread arguments. Python resolves only
+`p11scope::run::install_stop_flag::{closure#0}` for this role. Its readiness
+declares `role=callback` and samples have `kind=callback`; even a prompt,
+otherwise valid callback envelope is rejected by the ordinary ACK validator.
+Callback entry is delivery evidence only and precedes completed handler work.
+
+`--probe-task EXE_FD TGID TID BIRTH FILE_OFFSET LIMIT_MS reporter|callback`
+supports the proposed actual-worker negative. It holds the original
+`/proc/TGID/task/TID` directory, checks its identity, actual status TGID/TID,
+birth and candidate before enable, and rechecks a worker at final reconciliation.
+Exited/replaced workers cannot qualify. The main path still uses TGID=TID and
+retains original unreaped-child/pidfd custody through its final counters; an
+unreaped main zombie no longer exposes `/proc/PID/exe`. Local controls use a real
+live worker plus wrong TGID/TID/birth/directory and exited-worker twins, without
+attaching perf. This API is preparation only: no worker or handler-blocked
+acceptance cell is activated by these source changes.

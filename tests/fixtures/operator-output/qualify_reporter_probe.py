@@ -43,6 +43,7 @@ def check_zero(records, expected):
     ready, final = records
     if (ready.get('clock') != 'CLOCK_MONOTONIC'
             or ready.get('role') != 'reporter' or expected.get('role') != 'reporter'
+            or expected.get('pid') != expected.get('tid')
             or any(ready.get(key) != expected[key] for key in ('pid', 'tid', 'start_time', 'dev', 'ino', 'file_offset'))
             or any(type(final.get(key)) is not int or final[key] != 0 for key in ('samples', 'kernel_count', 'lost'))
             or type(final.get('time_enabled')) is not int or final['time_enabled'] <= 0

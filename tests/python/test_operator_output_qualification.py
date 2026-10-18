@@ -614,6 +614,51 @@ class ReporterProbeTests(unittest.TestCase):
         finally:
             os.close(fd)
 
+    def test_actual_task_identity_binds_distinct_tgid_tid_birth_and_held_directory(self):
+        source = self.root / 'task-identity-fixture.c'
+        target = self.root / 'task-identity-fixture'
+        included = str(ROOT / 'tests/fixtures/operator-output/reporter-probe.c')
+        source.write_text('#define main original_probe_main\n#include "' + included + '"\n#undef main\n'
+            'int main(int argc, char **argv) { struct stat held; uint64_t fd,pid,tid,birth,task;\n'
+            'if(argc!=6 || number(argv[1],&fd) || number(argv[2],&pid) || number(argv[3],&tid) || '
+            'number(argv[4],&birth) || number(argv[5],&task)) return 3;\n'
+            'return observer_identity(fd,pid,tid,birth,task,&held) ? 2 : 0; }\n')
+        built = subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+            str(source), '-o', str(target)], capture_output=True, text=True, timeout=20)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        gate = threading.Event()
+        worker = threading.Thread(target=gate.wait)
+        worker.start()
+        exe = os.open('/proc/self/exe', os.O_RDONLY | os.O_CLOEXEC)
+        task = main_task = None
+        try:
+            tid = worker.native_id
+            birth = HARNESS['NATIVE'].process_identity(tid)['start_time']
+            task = os.open(f'/proc/{os.getpid()}/task/{tid}', os.O_PATH | os.O_DIRECTORY)
+            main_task = os.open(f'/proc/{os.getpid()}/task/{os.getpid()}', os.O_PATH | os.O_DIRECTORY)
+            for mutation in ('healthy', 'wrong-tgid', 'wrong-tid', 'wrong-birth', 'wrong-directory'):
+                pid_arg, tid_arg, birth_arg, task_arg = os.getpid(), tid, birth, task
+                if mutation == 'wrong-tgid': pid_arg += 1
+                elif mutation == 'wrong-tid': tid_arg = os.getpid()
+                elif mutation == 'wrong-birth': birth_arg += 1
+                elif mutation == 'wrong-directory': task_arg = main_task
+                result = subprocess.run([str(target), str(exe), str(pid_arg), str(tid_arg),
+                    str(birth_arg), str(task_arg)], pass_fds=(exe, task_arg),
+                    capture_output=True, text=True, timeout=3)
+                with self.subTest(mutation=mutation):
+                    self.assertEqual(result.returncode == 0, mutation == 'healthy', result.stderr)
+            gate.set()
+            worker.join(timeout=3)
+            stale = subprocess.run([str(target), str(exe), str(os.getpid()), str(tid),
+                str(birth), str(task)], pass_fds=(exe, task), capture_output=True, text=True, timeout=3)
+            self.assertNotEqual(stale.returncode, 0, 'exited worker must not retain live-task authority')
+        finally:
+            gate.set()
+            worker.join(timeout=3)
+            for fd in (exe, task, main_task):
+                if fd is not None:
+                    os.close(fd)
+
 
 class InventorySavedCaptureTests(unittest.TestCase):
     def test_only_committed_owned_positive_milestones_release_calls(self):
@@ -700,6 +745,11 @@ class ReporterControlAdapterTests(unittest.TestCase):
                 dict(kind='final', mode='perf_uprobe', samples=0, kernel_count=0, lost=0,
                      time_enabled=100, time_running=100)]
         self.assertEqual(module['check_zero'](rows, expected)['no_signal_samples'], 0)
+        worker_expected = dict(expected, tid=124)
+        worker_rows = copy.deepcopy(rows)
+        worker_rows[0]['tid'] = 124
+        with self.assertRaises(ValueError):
+            module['check_zero'](worker_rows, worker_expected)
         for mutation in ('sample', 'fixture', 'loss', 'foreign', 'multiplex', 'callback-role'):
             changed = copy.deepcopy(rows)
             if mutation == 'sample': changed[1]['samples'] = 1

@@ -497,14 +497,16 @@ impl JointStaging {
         let head = self.staged.pop_front().expect("head verified above");
         self.frontier = self.frontier.max(head.position);
         let receipts = keyuse.receipts_for_call(seal, &settled[0], model, head.position);
-        // Legacy heads carry no resource custody: release the staged
-        // charge before replay so the replayed open can mint its
-        // association at a byte limit (same N15 capacity order as
-        // fallback replay). Collected heads hold custody through
-        // replay: the assoc mint joins the live staged
-        // reservation.
+        // Legacy heads on a reserver-less ledger carry no resource
+        // custody: release the staged charge before replay so the
+        // replayed open can mint its association at a byte limit
+        // (same N15 capacity order as fallback replay). Collected
+        // heads — and legacy heads on a resource-backed ledger, whose
+        // staged charge holds a real lease — hold custody through
+        // replay: the assoc mint joins the live staged reservation.
         let legacy = head.resource_origin.is_none();
-        if legacy {
+        let early_release = legacy && !ledger.has_reserver();
+        if early_release {
             ledger.release(head.position, head.charged_bytes());
         }
         // The seal's retirements already applied above (H9 §66),
@@ -542,7 +544,7 @@ impl JointStaging {
                 }
             }
         };
-        if legacy {
+        if early_release {
             drop(head);
         } else {
             head.release(ledger);
@@ -830,13 +832,18 @@ impl JointStaging {
             let position = head.position;
             let native = head.resource_native;
             self.frontier = self.frontier.max(position);
-            // Legacy heads carry no resource custody: release the
-            // staged charge before replay so the replayed open can
-            // mint its association at a byte limit (N15 capacity
-            // fallback). Collected heads hold custody through replay:
-            // the assoc mint joins the live staged reservation.
+            // Legacy heads on a reserver-less ledger carry no
+            // resource custody: release the staged charge before
+            // replay so the replayed open can mint its association
+            // at a byte limit (N15 capacity fallback). Collected
+            // heads — and legacy heads on a resource-backed ledger,
+            // whose staged charge holds a real lease — hold custody
+            // through replay: the assoc mint joins the live staged
+            // reservation. A ledger-less fallback still releases
+            // legacy heads early (nothing live to hold).
             let legacy = head.resource_origin.is_none();
-            if legacy {
+            let early_release = legacy && !ledger.as_ref().is_some_and(|held| held.has_reserver());
+            if early_release {
                 self.release_or_pend(ledger.as_deref_mut(), position, bytes, native);
             }
             let failed = {
@@ -864,7 +871,7 @@ impl JointStaging {
                 }
             };
             drop(head);
-            if !legacy {
+            if !early_release {
                 self.release_or_pend(ledger.as_deref_mut(), position, bytes, native);
             }
             if failed {

@@ -1744,26 +1744,32 @@ fn stable_attribute_cell(
         out.status = attr_status::INVALID_SPAN;
         return 0;
     };
-    match (
-        read_word(sel_addr),
-        read_word(ptr_addr),
-        read_word(len_addr),
-    ) {
-        (Ok(sel), Ok(ptr2), Ok(len2))
-            if safe_attribute_kind(sel) == Some(kind) && ptr2 == ptr && len2 == len =>
-        {
-            out.status = if classified.is_ok() {
-                attr_status::VALUE
-            } else {
-                attr_status::UNSUPPORTED
-            };
-            out.value = value;
-        }
-        (Ok(_), Ok(_), Ok(_)) => {
-            out.status = attr_status::CHANGED;
-            return object_flag::CHANGED_METADATA;
-        }
-        _ => out.status = attr_status::UNREADABLE,
+    // Read every recheck word in the same order, but retain only finite
+    // comparison facts instead of three full Result<u64> payloads at once.
+    let (selector_read, selector_same) = match read_word(sel_addr) {
+        Ok(sel) => (true, safe_attribute_kind(sel) == Some(kind)),
+        Err(()) => (false, false),
+    };
+    let (pointer_read, pointer_same) = match read_word(ptr_addr) {
+        Ok(ptr2) => (true, ptr2 == ptr),
+        Err(()) => (false, false),
+    };
+    let (length_read, length_same) = match read_word(len_addr) {
+        Ok(len2) => (true, len2 == len),
+        Err(()) => (false, false),
+    };
+    if !selector_read || !pointer_read || !length_read {
+        out.status = attr_status::UNREADABLE;
+    } else if !selector_same || !pointer_same || !length_same {
+        out.status = attr_status::CHANGED;
+        return object_flag::CHANGED_METADATA;
+    } else {
+        out.status = if classified.is_ok() {
+            attr_status::VALUE
+        } else {
+            attr_status::UNSUPPORTED
+        };
+        out.value = value;
     }
     0
 }

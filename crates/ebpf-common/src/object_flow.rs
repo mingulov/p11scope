@@ -18,6 +18,7 @@
 //! as data (`joined`, side rows, RV); span arithmetic is checked before any
 //! access. `core`-only: this module compiles for BPF and host alike.
 
+use crate::event_type;
 use crate::instance;
 use crate::object_capture::{
     authorize_derive_return, classify_derive_mechanism, find_flag, handle_status, object_flag,
@@ -31,7 +32,112 @@ use crate::object_wire::{
     OBJECT_ACTION_NONE, OBJECT_ATTR_LIST_UNINSPECTED, OBJECT_DERIVE_UNAVAILABLE, OBJECT_FLAGS_MASK,
     OBJECT_GUARD_NONE, OBJECT_GUARD_SCALAR_DERIVE,
 };
-use crate::{target_word_end, InstanceContinuity, LinuxLayout, ARG_NONE};
+use crate::{
+    target_word_end, CallStart, Event, ImageIdentity, InstanceContinuity, LinuxLayout, ARG_NONE,
+};
+
+/// Already captured scalar return facts for the in-place Event writer.
+/// This pure constructor grants no read or semantic authority.
+pub struct ReturnEventFacts {
+    pub ts_ns: u64,
+    pub duration_ns: u64,
+    pub rv: u64,
+    pub mechanism: u64,
+    pub session: u64,
+    pub async_value: u64,
+    pub capture_flags: u32,
+    pub pid_tgid: u64,
+    pub cgroup_id: u64,
+    pub root_affiliation: u64,
+}
+
+/// Initialize every Event byte from retained entry facts and captured scalars.
+/// # Safety
+/// `out` must point to an exclusively writable, aligned Event reservation;
+/// it must not alias `start` or `facts`. The caller retains START ownership
+/// through this call and ends its borrow before any mutation or retirement.
+#[inline(always)]
+pub unsafe fn fill_call_event(
+    out: *mut Event,
+    start: &CallStart,
+    slot: u32,
+    facts: &ReturnEventFacts,
+) {
+    // Every Event field is initialized directly in the exclusive reservation.
+    // No Event aggregate is materialized on the BPF stack.
+    unsafe {
+        core::ptr::write(core::ptr::addr_of_mut!((*out).ts_ns), facts.ts_ns);
+        core::ptr::write(
+            core::ptr::addr_of_mut!((*out).duration_ns),
+            facts.duration_ns,
+        );
+        core::ptr::write(core::ptr::addr_of_mut!((*out).pid_tgid), facts.pid_tgid);
+        core::ptr::write(core::ptr::addr_of_mut!((*out).cgroup_id), facts.cgroup_id);
+        core::ptr::write(core::ptr::addr_of_mut!((*out).session), facts.session);
+        core::ptr::write(core::ptr::addr_of_mut!((*out).slot_id), start.slot_id);
+        core::ptr::write(core::ptr::addr_of_mut!((*out).mechanism), facts.mechanism);
+        core::ptr::write(core::ptr::addr_of_mut!((*out).flags), start.flags);
+        core::ptr::write(core::ptr::addr_of_mut!((*out).rv), facts.rv);
+        core::ptr::write(core::ptr::addr_of_mut!((*out).p0), start.p0);
+        core::ptr::write(core::ptr::addr_of_mut!((*out).p1), start.p1);
+        core::ptr::write(core::ptr::addr_of_mut!((*out).p2), start.p2);
+        core::ptr::write(
+            core::ptr::addr_of_mut!((*out).async_value),
+            facts.async_value,
+        );
+        core::ptr::write(core::ptr::addr_of_mut!((*out).slot), slot);
+        core::ptr::write(
+            core::ptr::addr_of_mut!((*out).target_function),
+            start.target_function,
+        );
+        core::ptr::write(core::ptr::addr_of_mut!((*out).user_type), start.user_type);
+        core::ptr::write(core::ptr::addr_of_mut!((*out).shape), start.shape);
+        core::ptr::copy_nonoverlapping(
+            core::ptr::addr_of!(start.attr_types),
+            core::ptr::addr_of_mut!((*out).attr_types),
+            1,
+        );
+        core::ptr::write(core::ptr::addr_of_mut!((*out).attr_count), start.attr_count);
+        core::ptr::write(core::ptr::addr_of_mut!((*out).attr_total), start.attr_total);
+        core::ptr::write(core::ptr::addr_of_mut!((*out).attr_bools), start.attr_bools);
+        core::ptr::write(
+            core::ptr::addr_of_mut!((*out).attr_bools_seen),
+            start.attr_bools_seen,
+        );
+        core::ptr::copy_nonoverlapping(
+            core::ptr::addr_of!(start.attr_types1),
+            core::ptr::addr_of_mut!((*out).attr_types1),
+            1,
+        );
+        core::ptr::write(
+            core::ptr::addr_of_mut!((*out).attr_count1),
+            start.attr_count1,
+        );
+        core::ptr::write(
+            core::ptr::addr_of_mut!((*out).attr_total1),
+            start.attr_total1,
+        );
+        core::ptr::write(
+            core::ptr::addr_of_mut!((*out).attr_bools1),
+            start.attr_bools1,
+        );
+        core::ptr::write(
+            core::ptr::addr_of_mut!((*out).attr_bools_seen1),
+            start.attr_bools_seen1,
+        );
+        core::ptr::write(core::ptr::addr_of_mut!((*out).capture), facts.capture_flags);
+        core::ptr::write(core::ptr::addr_of_mut!((*out).event_type), event_type::CALL);
+        core::ptr::write(core::ptr::addr_of_mut!((*out).image), start.image);
+        core::ptr::write(
+            core::ptr::addr_of_mut!((*out).child_image),
+            ImageIdentity::default(),
+        );
+        core::ptr::write(
+            core::ptr::addr_of_mut!((*out).root_affiliation),
+            facts.root_affiliation,
+        );
+    }
+}
 
 /// Finite metadata for outlined return wrappers. The layout uses bits0–1
 /// (1 LP64, 2 ia32), bit2 is the actual root continuity verdict. Full-width

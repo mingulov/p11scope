@@ -180,6 +180,80 @@ fn object_producer_missing_side_state_faults_before_return() {
 }
 
 #[test]
+fn object_producer_return_branches_preserve_owned_lifetimes() {
+    let source = std::fs::read_to_string("crates/ebpf/src/main.rs").expect("BPF return source");
+    let dispatch = source_between(
+        &source,
+        "fn p11_return_impl(ctx: RetProbeContext) -> u32 {",
+        "struct ReturnAccounting",
+    );
+    assert!(
+        dispatch
+            .contains("if unsafe { (*start).object_required } == 0 {\n        ordinary_return(")
+    );
+    assert!(dispatch.contains("} else {\n        object_return("));
+    for forbidden in [
+        "EVENTS.reserve",
+        "account_return(",
+        "capture_return_facts(",
+        "let Some(&start)",
+    ] {
+        assert!(
+            !dispatch.contains(forbidden),
+            "dispatcher must not {forbidden}"
+        );
+    }
+    let ordinary = source_between(&source, "fn ordinary_return(", "fn object_return(");
+    let snapshot = ordinary
+        .find("let start = unsafe { *start };")
+        .expect("ordinary snapshot");
+    let retire = ordinary
+        .find("owned_start_remove(&key, true)")
+        .expect("ordinary retirement");
+    let account = ordinary
+        .find("account_return(")
+        .expect("ordinary accounting");
+    let reads = ordinary
+        .find("capture_return_facts(")
+        .expect("ordinary private reads");
+    assert!(snapshot < retire && retire < account && account < reads);
+    let object = source_between(
+        &source,
+        "fn object_return(",
+        "pub extern \"C\" fn p11_link_fork_allowed",
+    );
+    assert!(
+        !object.contains("let start = unsafe { *start }"),
+        "object must retain only live raw START"
+    );
+    assert!(
+        !object.contains("let ev = Event"),
+        "object fills the reservation directly"
+    );
+    let fill = object
+        .find("fill_call_event(")
+        .expect("in-place initialization");
+    let retire = object
+        .find("emission_finalize(")
+        .expect("checked terminal retirement");
+    let submit = object
+        .find("entry.submit(0)")
+        .expect("submit only after retirement");
+    assert!(fill < retire && retire < submit);
+    for forbidden in [
+        "(*start)",
+        "&*start",
+        "p11_object_side_get",
+        "fill_call_event(",
+    ] {
+        assert!(
+            !object[retire..].contains(forbidden),
+            "no {forbidden} after terminal retirement"
+        );
+    }
+}
+
+#[test]
 fn object_producer_cleanup_result_reaches_exec_exit_fault() {
     owner_fixture::run_object_subcommand(
         "object_producer_cleanup_result_reaches_exec_exit_fault",
@@ -584,8 +658,22 @@ def fault_calls_to(data, root_name):
     elf, raws, offsets, bodies, relocations = bodies_and_relocations(data)
     fault = only(bodies, 'p11_object_fault')
     root = only(bodies, root_name)
-    return [call for call in pseudo_calls(raws, offsets, bodies, relocations, root)
-            if call[1] == fault]
+    # Outlined return branches remain part of the root's fault obligation.
+    # Walk the actual reachable graph; never substitute a symbol-presence check.
+    pending = [root]
+    visited = set()
+    calls = []
+    while pending:
+        caller = pending.pop()
+        if caller in visited:
+            continue
+        visited.add(caller)
+        for call in pseudo_calls(raws, offsets, bodies, relocations, caller):
+            if call[1] == fault:
+                calls.append(call)
+            else:
+                pending.append(call[1])
+    return calls
 
 
 def check_frames(data, report):
@@ -648,7 +736,14 @@ def check_frames(data, report):
 def check_return_fault(data, report):
     calls = fault_calls_to(data, 'p11_return')
     assert calls, 'p11_return must call the fault leaf on terminal-drain failure'
-    report.append(f'root p11_return: {len(calls)} sequential fault call site(s)')
+    report.append(f'root p11_return: {len(calls)} reachable fault call site(s)')
+    _, _, _, bodies, _ = bodies_and_relocations(data)
+    for suffix in ('ordinary_return', 'object_return'):
+        names = [symbol[0] for symbol in bodies.values() if suffix in symbol[0]]
+        assert len(names) == 1, f'expected exactly one outlined {suffix}: {names}'
+        branch_calls = fault_calls_to(data, names[0])
+        assert branch_calls, f'{suffix} must propagate its checked-retire failure to fault'
+        report.append(f'branch {suffix}: {len(branch_calls)} reachable fault call site(s)')
 
 
 def check_exec_exit_fault(data, report):

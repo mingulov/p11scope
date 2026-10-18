@@ -970,6 +970,23 @@ impl InventoryState {
 /// Read-side accessors the capture facade uses. None of them hands out
 /// links, programs, or a mutable object.
 impl InventoryState {
+    /// Concrete pre-view identity operation; no mutable object escapes.
+    pub(super) fn query_promotion_baselines(
+        &mut self,
+        domain: crate::attach::capture::NativeDomainId,
+        generation: u64,
+        pins: &[std::sync::Arc<PidPin>],
+        window: crate::attach::capture::ReadWindow,
+    ) -> Result<crate::attach::selected_detailed::baseline::KernelBaselineBatch> {
+        crate::attach::selected_detailed::baseline::query(
+            &mut self.prepared.ebpf,
+            domain,
+            generation,
+            pins,
+            window,
+        )
+    }
+
     pub(super) fn ebpf(&self) -> &Ebpf {
         &self.prepared.ebpf
     }

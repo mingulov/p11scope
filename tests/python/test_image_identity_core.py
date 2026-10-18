@@ -113,7 +113,7 @@ class IdentityCoreTests(unittest.TestCase):
         # still owns its no-fork/no-START object boundary.
         self.assertEqual(' '.join(units.split()),
                          'BpfFlavor::InventoryGlobal => &["task_owner", "exec_task"], '
-                         'BpfFlavor::InventoryCallers => &["image_identity", "task_owner", "exec_task"], '
+                         'BpfFlavor::InventoryCallers => &[ "image_identity", "selected_detailed_baseline", "task_owner", "exec_task", ], '
                          'BpfFlavor::Detailed => &[ "image_identity", "image_identity_fork", '
                          '"image_identity_query", "selected_detailed", '
                          '"task_owner", "root_affiliation", "instance_epoch", "exec_task", ],')

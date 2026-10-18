@@ -131,7 +131,7 @@ fn fd_count() -> usize {
 
 fn inspect_prepared(prepared: &PreparedInventory) -> Result<OwnedIds> {
     validate_runtime_inventory_maps(&prepared.ebpf, prepared.capacity)?;
-    validate_runtime_inventory_programs(&prepared.ebpf)?;
+    validate_runtime_inventory_programs(&prepared.ebpf, false)?;
     anyhow::ensure!(
         prepared.endpoint_capacity().get() as u64 == prepared.budget().endpoint_limit()
     );
@@ -414,10 +414,10 @@ fn privileged_inventory_caller_preparation_freezes_native_maps_and_publishes_bin
         AttachBackend::Singles,
     )?;
     callers::validate_runtime_caller_maps(&prepared.ebpf, caller)?;
-    validate_runtime_inventory_programs(&prepared.ebpf)?;
+    validate_runtime_inventory_programs(&prepared.ebpf, true)?;
     let mut ids = OwnedIds::default();
     ids.observe(&prepared.ebpf)?;
-    anyhow::ensure!(ids.maps.len() == 19 && ids.programs.len() == 12);
+    anyhow::ensure!(ids.maps.len() == 21 && ids.programs.len() == 12);
     let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) };
     anyhow::ensure!(
         pidfd >= 0,
@@ -522,7 +522,7 @@ fn privileged_inventory_caller_preparation_faults_release_exact_resources() -> R
             |state, step| {
                 ids.observe(state.ebpf()?)?;
                 if step == failed {
-                    anyhow::ensure!(ids.maps.len() == 19 && ids.programs.is_empty());
+                    anyhow::ensure!(ids.maps.len() == 21 && ids.programs.is_empty());
                     ids.assert_no_links()?;
                     eprintln!(
                         "I2C_CALLER_PREP_IDS phase=held step={failed:?} ids={ids:?} links={{}}"

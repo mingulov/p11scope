@@ -2920,9 +2920,9 @@ fn object_entry_find(
 // retention: each entry adapter re-queries its side row so the helpers
 // stay leaf-flat. Sequencing lives in the shared
 // `adapter_attributes_entry`, executed by host tests with injected
-// readers; this wrapper only binds BPF-local readers. While E4 is
-// unwired the seams retain nothing and the side keeps its allocated-zero
-// attribute state.
+// readers; this wrapper only binds BPF-local readers. The shipping gate
+// stays closed until the actual scalar decoder passes qualification; the
+// side then keeps its allocated-zero attribute state.
 #[cfg(not(feature = "inventory-only"))]
 #[inline(never)]
 fn object_entry_attributes(
@@ -3019,8 +3019,8 @@ fn object_emit_find(
 // emission: each emission level re-queries its side row so the helpers
 // stay leaf-flat. Sequencing lives in the shared
 // `adapter_emit_get_attributes`, executed by host tests with injected
-// readers; this wrapper only binds BPF-local state. While E4 is unwired
-// the seam marks the list UNINSPECTED and reads nothing.
+// readers; this wrapper only binds BPF-local state. Until qualification,
+// the shared adapter marks the list UNINSPECTED and reads nothing.
 #[cfg(not(feature = "inventory-only"))]
 #[inline(never)]
 fn object_emit_get_attributes(

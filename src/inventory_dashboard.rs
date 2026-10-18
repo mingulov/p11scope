@@ -8,8 +8,12 @@
 //! acceptable, losing capture facts is not. Narrowing the VIEW
 //! (scroll position) never narrows the totals shown.
 //!
-//! Read-only: scrolling and detail paging only — no
-//! filtering/selection (U2), no capture control. ANSI stays on the
+//! Read-only by default: scrolling and detail paging only — no
+//! filtering (U2), no capture control. When the runtime explicitly
+//! enables the DR37 promotion control, `d` requests Detailed capture
+//! for the selected caller/provider pair and `x` cancels; both keys
+//! are ignored while disabled, and the gaps page never requests.
+//! ANSI stays on the
 //! terminal stream; JSON paths
 //! never see an escape byte. The log tail holds SANITIZED observer
 //! diagnostics with explicit truncation accounting (bytes/lines
@@ -21,7 +25,13 @@
 //! Hand-rolled ANSI handles scrolling and resize; unicode-width measures
 //! display cells without adding a terminal widget framework.
 
+use crate::discovery::caller_registry::{CallerId, ModuleId};
 use crate::inventory_present::Presentation;
+use crate::inventory_promotion::{
+    CaptureId, Promoter, PromotionCancel, PromotionNote, PromotionPair, PromotionRequest,
+    PromotionRequestError, PromotionState, PromotionStatusUpdate, PromotionUi, PromotionView,
+    ViewRevision,
+};
 use crate::render::escape_controls;
 use std::collections::VecDeque;
 use std::fs::File;
@@ -302,8 +312,10 @@ impl DetailPage {
     }
 }
 
-/// Read-only view state: the scroll position and the detail page.
-/// There is no filtering/selection (U2) and no capture control.
+/// Read-only view state: the scroll position, the detail page and
+/// the promotion cursor snapshot. There is no filtering (U2) and no
+/// capture control; the promotion cursor is an identity-held row, not
+/// a filter, and stays disabled until the runtime enables it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DashboardState {
     /// Index of the first visible item (edge or gap, per page).
@@ -315,6 +327,10 @@ pub(crate) struct DashboardState {
     /// body line per Down key, before scrolling advances to the
     /// next record. Meaningless (always zero) off the gaps page.
     pub gap_line: usize,
+    /// Promotion cursor snapshot: the selected pair held by identity
+    /// plus the control state the last draw synced. Disabled renders
+    /// and tracks nothing.
+    pub promotion: PromotionUi,
 }
 
 impl DashboardState {
@@ -323,6 +339,7 @@ impl DashboardState {
             scroll: 0,
             detail: DetailPage::Summary,
             gap_line: 0,
+            promotion: PromotionUi::disabled(),
         }
     }
 
@@ -418,6 +435,26 @@ impl Default for DashboardState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The exact caller/provider pair at a scroll index in this
+/// presentation, if any.
+pub(crate) fn pair_at_scroll(presentation: &Presentation, scroll: usize) -> Option<PromotionPair> {
+    presentation
+        .edges
+        .get(scroll)
+        .map(|edge| PromotionPair::new(edge.caller.0, edge.module.0))
+}
+
+/// Where the exact pair sits in this presentation, if at all.
+/// Identity comparison, never row-index equality: reorder-safe by
+/// construction, and a missing pair reports `None` instead of whatever
+/// row now sits at the old index.
+pub(crate) fn index_of_pair(presentation: &Presentation, pair: PromotionPair) -> Option<usize> {
+    presentation
+        .edges
+        .iter()
+        .position(|edge| edge.caller.0 == pair.caller() && edge.module.0 == pair.provider())
 }
 
 /// Render one full dashboard frame as ANSI bytes: cursor-home plus
@@ -518,15 +555,36 @@ fn render_minimal(
     if width >= 30 && height >= 8 {
         let total = state.items_total(presentation);
         let scroll = state.scroll.min(total.saturating_sub(1));
-        let room = height.saturating_sub(4);
+        // The promotion status line (present only while enabled) takes
+        // its row from the association window, like the projection line
+        // does in the full layout.
+        let promo_line = state
+            .promotion
+            .status_line()
+            .map(|line| truncate_cell(&line, width));
+        let promo_room = usize::from(promo_line.is_some());
+        let room = height.saturating_sub(4).saturating_sub(promo_room);
+        // Disabled never marks: only an enabled control holds a cursor.
+        let selected = state
+            .promotion
+            .enabled
+            .then_some(state.promotion.selected)
+            .flatten();
         let (mut window, shown) = match state.detail {
-            DetailPage::Summary => render_compact_edge_window(presentation, width, room, scroll),
-            DetailPage::Evidence => render_edge_window(presentation, width, room, scroll, true),
+            DetailPage::Summary => {
+                render_compact_edge_window(presentation, width, room, scroll, selected)
+            }
+            DetailPage::Evidence => {
+                render_edge_window(presentation, width, room, scroll, true, selected)
+            }
             DetailPage::Gaps => {
                 render_gap_window(presentation, width, room, scroll, state.gap_line)
             }
         };
         let (first, last) = visible_item_range(shown, total, scroll);
+        if let Some(line) = promo_line {
+            lines.push(line);
+        }
         lines.append(&mut window);
         while lines.len() < height - 1 {
             lines.push(String::new());
@@ -543,9 +601,14 @@ fn render_minimal(
         } else {
             String::new()
         };
+        let keys = if state.promotion.enabled && state.detail != DetailPage::Gaps {
+            "j/k tab d x q quit"
+        } else {
+            "j/k tab q quit"
+        };
         lines.push(truncate_cell(
             &format!(
-                "{} {first}-{last}/{total}{continuation} | j/k tab q quit",
+                "{} {first}-{last}/{total}{continuation} | {keys}",
                 state.detail.label()
             ),
             width,
@@ -567,6 +630,7 @@ fn render_compact_edge_window(
     width: usize,
     room: usize,
     scroll: usize,
+    selected: Option<PromotionPair>,
 ) -> (Vec<String>, usize) {
     let total = presentation.edges.len();
     if total == 0 {
@@ -584,12 +648,22 @@ fn render_compact_edge_window(
         if room.saturating_sub(lines.len()) < 3 {
             break;
         }
-        lines.push(identity_cell(
+        // The promotion cursor marks the application line with `> `,
+        // budgeted from the same width; unmarked lines keep their bytes.
+        let marked =
+            selected.is_some_and(|pair| pair == PromotionPair::new(edge.caller.0, edge.module.0));
+        let head_width = if marked {
+            width.saturating_sub(2)
+        } else {
+            width
+        };
+        let head = identity_cell(
             "application ",
             &crate::inventory_present::application_label(presentation, edge.caller),
             &edge.caller.label(),
-            width,
-        ));
+            head_width,
+        );
+        lines.push(if marked { format!("> {head}") } else { head });
         lines.push(identity_cell(
             "module ",
             &crate::inventory_present::module_label(presentation, edge.module),
@@ -701,6 +775,14 @@ fn render_full(
     let object_line =
         object_keys_line(&presentation.object_observations).map(|line| truncate_cell(&line, width));
     let extra = usize::from(object_line.is_some());
+    // The promotion status line shows only while the control is enabled
+    // (absent = read-only, exactly like today); when shown it takes its
+    // row from the edge window so headers, log and footer stay pinned.
+    let promo_line = state
+        .promotion
+        .status_line()
+        .map(|line| truncate_cell(&line, width));
+    let extra_promo = usize::from(promo_line.is_some());
     let mut lines = vec![
         truncate_cell(
             &format!(
@@ -757,15 +839,30 @@ fn render_full(
     if let Some(line) = object_line {
         lines.push(line);
     }
-    let edge_room = detail_room(height).saturating_sub(extra);
+    if let Some(line) = promo_line {
+        lines.push(line);
+    }
+    let edge_room = detail_room(height)
+        .saturating_sub(extra)
+        .saturating_sub(extra_promo);
     let log_rows = detail_log_rows(height);
     let kind = match state.detail {
         DetailPage::Gaps => "gaps",
         DetailPage::Summary | DetailPage::Evidence => "edges",
     };
+    // Disabled never marks: only an enabled control holds a cursor.
+    let selected = state
+        .promotion
+        .enabled
+        .then_some(state.promotion.selected)
+        .flatten();
     let (mut edge_lines, shown) = match state.detail {
-        DetailPage::Summary => render_edge_window(presentation, width, edge_room, scroll, false),
-        DetailPage::Evidence => render_edge_window(presentation, width, edge_room, scroll, true),
+        DetailPage::Summary => {
+            render_edge_window(presentation, width, edge_room, scroll, false, selected)
+        }
+        DetailPage::Evidence => {
+            render_edge_window(presentation, width, edge_room, scroll, true, selected)
+        }
         DetailPage::Gaps => {
             render_gap_window(presentation, width, edge_room, scroll, state.gap_line)
         }
@@ -778,8 +875,9 @@ fn render_full(
     lines.append(&mut edge_lines);
     // Pad a short window so the log tail + footer stay pinned to the
     // bottom rows regardless of content. The target counts the
-    // projection line when shown, against the shrunken window.
-    while lines.len() < 3 + extra + 1 + edge_room {
+    // projection and promotion lines when shown, against the shrunken
+    // window.
+    while lines.len() < 3 + extra + extra_promo + 1 + edge_room {
         lines.push(String::new());
     }
     let log_header = if frame.log.dropped_lines > 0 || frame.log.dropped_bytes > 0 {
@@ -832,8 +930,13 @@ fn render_full(
     } else {
         format!("scroll {scroll}/{max_scroll}")
     };
+    let keys = if state.promotion.enabled && state.detail != DetailPage::Gaps {
+        "j/k scroll, tab details, d promote, x cancel, q quit"
+    } else {
+        "j/k scroll, tab details, q quit"
+    };
     lines.push(truncate_cell(
-        &format!("{position} | showing {kind} {first}-{last} of {total} | j/k scroll, tab details, q quit"),
+        &format!("{position} | showing {kind} {first}-{last} of {total} | {keys}"),
         width,
     ));
     lines.truncate(height);
@@ -907,6 +1010,7 @@ fn render_edge_window(
     room: usize,
     scroll: usize,
     evidence: bool,
+    selected: Option<PromotionPair>,
 ) -> (Vec<String>, usize) {
     let total = presentation.edges.len();
     let mut lines = Vec::new();
@@ -925,10 +1029,12 @@ fn render_edge_window(
         // remain after this block.
         let reserve = usize::from(remaining_after > 0);
         let budget = room.saturating_sub(lines.len() + reserve);
+        let marked =
+            selected.is_some_and(|pair| pair == PromotionPair::new(edge.caller.0, edge.module.0));
         let block = if evidence {
-            fit_evidence_block(presentation, edge, width, budget)
+            fit_evidence_block(presentation, edge, width, budget, marked)
         } else {
-            fit_edge_block(presentation, edge, width, budget)
+            fit_edge_block(presentation, edge, width, budget, marked)
         };
         let Some(block) = block else {
             break;
@@ -1058,6 +1164,7 @@ fn fit_edge_block(
     edge: &crate::inventory_present::EdgeView,
     width: usize,
     budget: usize,
+    selected: bool,
 ) -> Option<Vec<String>> {
     let full = BlockBudget {
         instance_rows: DASHBOARD_MAX_INSTANCES,
@@ -1066,7 +1173,7 @@ fn fit_edge_block(
         show_gaps: true,
         show_identity: true,
     };
-    let block = render_edge_block(presentation, edge, width, full);
+    let block = render_edge_block(presentation, edge, width, full, selected);
     if block.len() <= budget {
         return Some(block);
     }
@@ -1078,7 +1185,7 @@ fn fit_edge_block(
             show_gaps: true,
             show_identity: true,
         };
-        let block = render_edge_block(presentation, edge, width, stage);
+        let block = render_edge_block(presentation, edge, width, stage, selected);
         if block.len() <= budget {
             return Some(block);
         }
@@ -1091,7 +1198,7 @@ fn fit_edge_block(
             show_gaps,
             show_identity: true,
         };
-        let block = render_edge_block(presentation, edge, width, stage);
+        let block = render_edge_block(presentation, edge, width, stage, selected);
         if block.len() <= budget {
             return Some(block);
         }
@@ -1106,7 +1213,7 @@ fn fit_edge_block(
             show_gaps: false,
             show_identity: false,
         };
-        let block = render_edge_block(presentation, edge, width, compact);
+        let block = render_edge_block(presentation, edge, width, compact, selected);
         if block.len() <= budget {
             return Some(block);
         }
@@ -1236,13 +1343,20 @@ fn identity_cell(prefix: &str, label: &str, id: &str, width: usize) -> String {
 }
 
 /// Independently budget the application and module around the arrow.
+/// A selected edge (the promotion cursor) takes a `> ` marker, budgeted
+/// from the same width so marked and unmarked lines share the layout.
+/// Unselected lines render exactly as before.
 fn edge_identity_line(
     presentation: &Presentation,
     edge: &crate::inventory_present::EdgeView,
     width: usize,
+    selected: bool,
 ) -> String {
+    let marker = if selected { "> " } else { "" };
     let separator = " -> ";
-    let available = width.saturating_sub(separator.width());
+    let available = width
+        .saturating_sub(separator.width())
+        .saturating_sub(marker.width());
     let app_width = available / 2;
     let module_width = available - app_width;
     let app = identity_cell(
@@ -1257,7 +1371,7 @@ fn edge_identity_line(
         &edge.module.label(),
         module_width,
     );
-    truncate_cell(&format!("{app}{separator}{module}"), width)
+    truncate_cell(&format!("{marker}{app}{separator}{module}"), width)
 }
 
 /// Retained identity details only; a dangling ID never borrows a current PID.
@@ -1324,8 +1438,9 @@ fn render_edge_block(
     edge: &crate::inventory_present::EdgeView,
     width: usize,
     budget: BlockBudget,
+    selected: bool,
 ) -> Vec<String> {
-    let mut lines = vec![edge_identity_line(presentation, edge, width)];
+    let mut lines = vec![edge_identity_line(presentation, edge, width, selected)];
     let mut items = vec![
         format!("mapping {}", edge.mapping.label()),
         format!("presence {}", edge.presence.label()),
@@ -1477,8 +1592,9 @@ fn render_evidence_block(
     presentation: &Presentation,
     edge: &crate::inventory_present::EdgeView,
     width: usize,
+    selected: bool,
 ) -> Vec<String> {
-    let mut lines = vec![edge_identity_line(presentation, edge, width)];
+    let mut lines = vec![edge_identity_line(presentation, edge, width, selected)];
     let mut items = vec![coverage_item(edge)];
     match edge.semantics.operations.as_ref() {
         Some(operations) => items.extend(evidence_items(operations)),
@@ -1506,8 +1622,9 @@ fn fit_evidence_block(
     edge: &crate::inventory_present::EdgeView,
     width: usize,
     budget: usize,
+    selected: bool,
 ) -> Option<Vec<String>> {
-    let block = render_evidence_block(presentation, edge, width);
+    let block = render_evidence_block(presentation, edge, width, selected);
     (block.len() <= budget).then_some(block)
 }
 
@@ -1948,13 +2065,20 @@ impl Drop for RawModeGuard {
     }
 }
 
-/// Dashboard keys: scrolling, detail paging, plus quit.
+/// Dashboard keys: scrolling, detail paging, promotion request and
+/// cancel (both inert until the runtime enables the DR37 control, and
+/// never requesting from the gaps page), plus quit.
 /// Everything else is ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Key {
     Up,
     Down,
     Detail,
+    /// `d`: request Detailed capture for the selected displayed pair
+    /// (edge pages only).
+    Promote,
+    /// `x`: cancel outstanding promotion work (edge pages only).
+    CancelPromotion,
     Quit,
 }
 
@@ -1966,7 +2090,8 @@ const ESCAPE_CONTINUATION_WAIT: Duration = Duration::from_millis(30);
 /// (C5.3: it runs inside a service tick). Arrow escape sequences parse
 /// as scrolling (their continuation waits at most
 /// [`ESCAPE_CONTINUATION_WAIT`]); Tab pages the detail views;
-/// `q`/`Q`/Ctrl-C/ESC quit.
+/// `d` requests promotion and `x` cancels (both inert until the
+/// runtime enables the control); `q`/`Q`/Ctrl-C/ESC quit.
 pub(crate) fn poll_key_fd(fd: std::os::fd::RawFd) -> Option<Key> {
     let mut first = true;
     poll_key_from(&mut |into: &mut [u8]| {
@@ -1991,6 +2116,8 @@ fn poll_key_from(read: &mut dyn FnMut(&mut [u8]) -> bool) -> Option<Key> {
         b'k' => Some(Key::Up),
         b'j' => Some(Key::Down),
         b'\t' => Some(Key::Detail),
+        b'd' | b'D' => Some(Key::Promote),
+        b'x' | b'X' => Some(Key::CancelPromotion),
         0x1b => {
             // Arrow keys arrive as ESC [ A/B; a lone ESC quits.
             let mut rest = [0u8; 2];
@@ -2457,6 +2584,14 @@ pub(crate) struct Display {
     handoff: DisplayHandoff,
     tail: LogTail,
     state: DashboardState,
+    /// DR37 promotion control: disabled until the runtime enables it
+    /// per run; while disabled it tracks nothing and renders nothing.
+    promoter: Promoter,
+    /// Next view revision to assign at frame install (serials from 1,
+    /// saturating rather than wrapping past the maximum).
+    next_view_revision: u64,
+    /// Revision assigned to `last_frame` (0 while no frame was shown).
+    last_view_revision: ViewRevision,
     last_frame: Option<DisplayFrame>,
     last_viewport: Viewport,
     next_redraw: std::time::Instant,
@@ -2515,6 +2650,9 @@ impl Display {
             handoff: DisplayHandoff::new(),
             tail,
             state: DashboardState::new(),
+            promoter: Promoter::new(),
+            next_view_revision: 1,
+            last_view_revision: ViewRevision::new(0),
             last_frame: None,
             last_viewport: Viewport {
                 width: 80,
@@ -2642,6 +2780,7 @@ impl Display {
                         } else {
                             self.state.scroll_up();
                         }
+                        self.select_from_scroll();
                     }
                     Key::Down => {
                         if let Some(frame) = self.last_frame.as_ref() {
@@ -2660,11 +2799,25 @@ impl Display {
                         } else if self.state.detail != DetailPage::Gaps {
                             self.state.scroll_down(0);
                         }
+                        self.select_from_scroll();
                     }
                     Key::Detail => {
                         self.state.next_detail();
                         if let Some(frame) = self.last_frame.as_ref() {
                             self.state.clamp_to_presentation(&frame.presentation);
+                        }
+                        self.reselect_on_edge_entry();
+                    }
+                    Key::Promote => {
+                        // Edge pages only: the gaps page never requests,
+                        // and the control stays inert until enabled.
+                        if self.promoter.enabled() && self.state.detail != DetailPage::Gaps {
+                            self.promotion_request_key();
+                        }
+                    }
+                    Key::CancelPromotion => {
+                        if self.promoter.enabled() && self.state.detail != DetailPage::Gaps {
+                            self.promotion_cancel_key();
                         }
                     }
                 }
@@ -2678,8 +2831,18 @@ impl Display {
 
     fn draw(&mut self) {
         if let Some(frame) = self.handoff.take() {
+            let first = self.last_frame.is_none();
             self.last_frame = Some(frame);
+            self.install_view_revision();
+            self.reanchor_selection(first);
         }
+        if self.last_frame.is_none() {
+            return;
+        }
+        // Control status is display-side: sync it on every draw so it
+        // survives latest-frame coalescing (frames may shed; this never
+        // does).
+        self.sync_promotion_snapshot();
         let Some(frame) = self.last_frame.as_ref() else {
             return;
         };
@@ -2708,6 +2871,142 @@ impl Display {
         }
     }
 
+    /// Derive the promotion cursor from the scroll position on an
+    /// edge page. No-ops on the gaps page, while disabled and before
+    /// the first frame, so default behavior is untouched.
+    fn select_from_scroll(&mut self) {
+        if self.state.detail == DetailPage::Gaps || !self.promoter.enabled() {
+            return;
+        }
+        let Some(frame) = self.last_frame.as_ref() else {
+            return;
+        };
+        let scroll = self
+            .state
+            .scroll
+            .min(frame.presentation.edges.len().saturating_sub(1));
+        self.state.promotion.selected = pair_at_scroll(&frame.presentation, scroll);
+    }
+
+    /// Entering an edge page: keep the cursor on its pair by identity
+    /// when the pair is still displayed (the view follows it), else
+    /// derive the cursor from the clamped scroll when there is none. A
+    /// cursor pair that left the view clears — the row now sitting at
+    /// the scroll index is never selected as a replacement.
+    fn reselect_on_edge_entry(&mut self) {
+        if self.state.detail == DetailPage::Gaps || !self.promoter.enabled() {
+            return;
+        }
+        let selected = self.state.promotion.selected;
+        let anchored = self
+            .last_frame
+            .as_ref()
+            .and_then(|frame| selected.and_then(|pair| index_of_pair(&frame.presentation, pair)));
+        if let Some(index) = anchored {
+            self.state.scroll = index;
+        } else if selected.is_none() {
+            self.select_from_scroll();
+        } else {
+            self.state.promotion.selected = None;
+        }
+    }
+
+    /// Assign the next view revision to the just-installed frame.
+    /// Serials start at 1 (0 means no frame shown) and saturate rather
+    /// than wrap.
+    fn install_view_revision(&mut self) {
+        self.last_view_revision = ViewRevision::new(self.next_view_revision);
+        self.next_view_revision = self.next_view_revision.saturating_add(1);
+    }
+
+    /// Keep the promotion cursor on its pair by identity across a new
+    /// frame: the scrolled view follows the pair to its new index. A
+    /// pair that left the view clears the cursor — the row now sitting
+    /// at the scroll index is never selected as a replacement. Only the
+    /// first frame derives the cursor from the scroll position; later
+    /// frames never auto-select. No-ops on the gaps page and while
+    /// disabled.
+    fn reanchor_selection(&mut self, first_frame: bool) {
+        if self.state.detail == DetailPage::Gaps || !self.promoter.enabled() {
+            return;
+        }
+        let selected = self.state.promotion.selected;
+        let anchored = self
+            .last_frame
+            .as_ref()
+            .and_then(|frame| selected.and_then(|pair| index_of_pair(&frame.presentation, pair)));
+        if let Some(index) = anchored {
+            self.state.scroll = index;
+        } else if selected.is_none() && first_frame {
+            self.select_from_scroll();
+        } else if selected.is_some() {
+            self.state.promotion.selected = None;
+        }
+    }
+
+    /// Refresh the rendered promotion snapshot from the control, keeping
+    /// the cursor selection. Runs on every draw: control status is
+    /// display-side and survives latest-frame coalescing.
+    fn sync_promotion_snapshot(&mut self) {
+        let selected = self.state.promotion.selected;
+        self.state.promotion = self.promoter.snapshot(selected);
+    }
+
+    /// `d` on an edge page: request Detailed capture for the selected
+    /// displayed pair. No frame or no selection means no request (an
+    /// honest sticky note, never a guessed pair); a selection that
+    /// raced a redraw clears instead of promoting another row. The
+    /// request retains the actual displayed frame `Arc` plus the
+    /// capture/view serials — expected identities for the runtime,
+    /// never authority.
+    fn promotion_request_key(&mut self) {
+        let selected = self.state.promotion.selected;
+        let capture = self.promoter.capture();
+        let displayed = self
+            .last_frame
+            .as_ref()
+            .map(|frame| Arc::clone(&frame.presentation));
+        let (Some(selected), Some(capture), Some(presentation)) = (selected, capture, displayed)
+        else {
+            if self.last_frame.is_some() && selected.is_none() && self.promoter.enabled() {
+                self.promoter.set_note(Some(PromotionNote::NoSelection));
+                self.sync_promotion_snapshot();
+            }
+            return;
+        };
+        let view = Arc::new(PromotionView::new(
+            capture,
+            self.last_view_revision,
+            presentation,
+        ));
+        let caller = CallerId(selected.caller());
+        let provider = ModuleId(selected.provider());
+        match self.promoter.request(view, caller, provider) {
+            Ok(_) => self.sync_promotion_snapshot(),
+            Err(PromotionRequestError::Refused(refusal)) => {
+                if let Some(note) = PromotionNote::for_refusal(refusal) {
+                    self.promoter.set_note(Some(note));
+                }
+                self.sync_promotion_snapshot();
+            }
+            Err(PromotionRequestError::PairNotInView | PromotionRequestError::ForeignCapture) => {
+                self.state.promotion.selected = None;
+                self.promoter.set_note(Some(PromotionNote::StaleSelection));
+                self.sync_promotion_snapshot();
+            }
+        }
+    }
+
+    /// `x` on an edge page: cancel outstanding promotion work. Honest
+    /// about all three outcomes: nothing to cancel, synchronously
+    /// cancelled, or stopping to await the runtime.
+    fn promotion_cancel_key(&mut self) {
+        if self.promoter.cancel() == PromotionCancel::NothingToCancel {
+            self.promoter.set_note(Some(PromotionNote::NothingToCancel));
+        }
+        self.sync_promotion_snapshot();
+    }
+
     fn note_gap(&mut self, now: std::time::Instant) {
         if let Some(last) = self.last_tick.replace(now) {
             let gap = now.saturating_duration_since(last);
@@ -2729,6 +3028,9 @@ impl Display {
         if std::mem::replace(&mut self.restored, true) {
             return;
         }
+        // Outstanding promotion work ends honestly with the run: the
+        // runtime is gone, so nothing waits for its confirmation.
+        self.promoter.note_run_stopped();
         self.note_gap(std::time::Instant::now());
         self.last_tick = None;
         drop(self.keys.take());
@@ -2809,6 +3111,57 @@ impl Display {
             },
             notices_shed: self.notices.shed(),
         }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): the runtime owner drives enable/take/set_status/state; the UI key paths run today.
+impl Display {
+    /// Enable the DR37 promotion control for one capture run, bound to
+    /// the run's capture identity. Default dashboard behavior
+    /// (read-only keys, no cursor, no status line) remains until the
+    /// runtime/CLI calls this; repeating with the same capture is a
+    /// no-op, and a different capture never silently rebinds. Returns
+    /// whether the control is bound to `capture` afterwards.
+    pub(crate) fn promotion_enable(&mut self, capture: CaptureId) -> bool {
+        let bound = self.promoter.enable(capture);
+        if bound && self.state.promotion.selected.is_none() {
+            // Late enable with frames already flowing: derive the
+            // cursor from the scroll position like the first frame does.
+            self.select_from_scroll();
+            self.sync_promotion_snapshot();
+        }
+        bound
+    }
+
+    /// Yield the pending promotion request at most once. A second poll
+    /// (or a poll after the runtime already reported on the request)
+    /// yields nothing; accepted work is never overwritten by a later
+    /// keypress (that keypress reports busy instead).
+    pub(crate) fn take_promotion_request(&mut self) -> Option<PromotionRequest> {
+        self.promoter.take_request()
+    }
+
+    /// Apply a runtime outcome for the outstanding request. Returns the
+    /// new state, or `None` for a stale/foreign/illegal update (state
+    /// unchanged). In particular `Active` is recorded only from a
+    /// genuine runtime activation result, never from UI state. The
+    /// driver must record each terminal transition it observes in the
+    /// normal bounded event/report path; the screen status alone is not
+    /// that record.
+    pub(crate) fn set_promotion_status(
+        &mut self,
+        update: PromotionStatusUpdate,
+    ) -> Option<PromotionState> {
+        let applied = self.promoter.set_status(update);
+        self.sync_promotion_snapshot();
+        applied
+    }
+
+    /// Poll the visible promotion state — notably UI-requested
+    /// `Stopping` and run-stopped ends the driver did not initiate, so
+    /// the driver can wind down work it already took.
+    pub(crate) fn promotion_state(&self) -> PromotionState {
+        self.promoter.state()
     }
 }
 

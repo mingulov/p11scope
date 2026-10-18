@@ -781,6 +781,77 @@ class InventorySavedCaptureTests(unittest.TestCase):
 
 
 class ReporterControlAdapterTests(unittest.TestCase):
+    def test_worker_negative_requires_genuine_main_progress_same_process_and_zero_events(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/qualify_reporter_probe.py'))
+        expected = dict(role='reporter', pid=123, tid=123, start_time=9, dev=2,
+                        ino=3, file_offset=80, ip=0x1234)
+        worker_expected = dict(expected, tid=124, start_time=10)
+        def ready(binding):
+            return dict(kind='ready', mode='perf_uprobe', clock='CLOCK_MONOTONIC', t_ns=400,
+                **{key: value for key, value in binding.items() if key != 'ip'})
+        final = dict(kind='final', mode='perf_uprobe', samples=1, lost=0, kernel_count=1,
+                     time_enabled=500, time_running=500)
+        reporter = [ready(expected), dict(kind='reporter', mode='perf_uprobe',
+            pid=123, tid=123, ip=0x1234, t_ns=700), final]
+        worker = [ready(worker_expected), dict(final, samples=0, kernel_count=0)]
+        signals, diagnostics = [dict(signal='SIGINT', t_ns=600)], b'p11scope: cancel: loop exited on signal 2 after 2 ticks\n'
+        call = module['validate_worker_negative']
+        self.assertEqual(call(worker, worker_expected, reporter, expected, signals, diagnostics)['worker_samples'], 0)
+        for mutation in ('main-target', 'foreign-process', 'foreign-candidate', 'late-ready',
+                         'worker-event', 'loss', 'no-main', 'missing-marker', 'bool-counter'):
+            w, r, e, marker = copy.deepcopy(worker), copy.deepcopy(reporter), dict(worker_expected), diagnostics
+            if mutation == 'main-target': e['tid'] = w[0]['tid'] = 123
+            elif mutation == 'foreign-process': e['pid'] = w[0]['pid'] = 456
+            elif mutation == 'foreign-candidate': e['ino'] = w[0]['ino'] = 999
+            elif mutation == 'late-ready': w[0]['t_ns'] = 601
+            elif mutation == 'worker-event': w[1].update(samples=1, kernel_count=1)
+            elif mutation == 'loss': w[1]['lost'] = 1
+            elif mutation == 'no-main': r.pop(1)
+            elif mutation == 'missing-marker': marker = b''
+            else: w[1]['kernel_count'] = False
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                call(w, e, r, expected, signals, marker)
+
+    def test_handler_blocked_oracle_requires_actual_delivery_gate_and_late_reporter(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/qualify_reporter_probe.py'))
+        expected = dict(role='reporter', pid=123, tid=123, start_time=9, dev=2,
+                        ino=3, file_offset=80, ip=0x1234)
+        callback_expected = dict(expected, role='callback', file_offset=100, ip=0x1250)
+        def rows(binding, stamp):
+            return [dict(kind='ready', mode='perf_uprobe', clock='CLOCK_MONOTONIC', t_ns=100,
+                         **{key: value for key, value in binding.items() if key != 'ip'}),
+                    dict(kind=binding['role'], mode='perf_uprobe', pid=123, tid=123,
+                         ip=binding['ip'], t_ns=stamp),
+                    dict(kind='final', mode='perf_uprobe', samples=1, lost=0, kernel_count=1,
+                         time_enabled=200000000, time_running=200000000)]
+        reporter, callback = rows(expected, 160000800), rows(callback_expected, 700)
+        gates = [dict(kind=kind, pid=123, tid=123, clock='CLOCK_MONOTONIC', t_ns=stamp)
+                 for kind, stamp in [('entered', 200), ('interrupted', 800), ('released', 160000700)]]
+        signals = [dict(signal='SIGINT', t_ns=600)]
+        diagnostics = b'p11scope: cancel: loop exited on signal 2 after 2 ticks\n'
+        call = module['validate_handler_blocked']
+        self.assertTrue(call(reporter, expected, callback, callback_expected, gates,
+                             signals, 160000600, diagnostics)['late_reporter_rejected'])
+        for mutation in ('missing-callback', 'missing-eintr', 'foreign-gate', 'gate-clock',
+                         'before-delivery', 'early-release', 'reporter-before-consumption',
+                         'lost-callback', 'multiplex-reporter', 'callback-as-ack', 'bool-time'):
+            r, c, g, release = copy.deepcopy(reporter), copy.deepcopy(callback), copy.deepcopy(gates), 160000600
+            if mutation == 'missing-callback': c.pop(1)
+            elif mutation == 'missing-eintr': g.pop(1)
+            elif mutation == 'foreign-gate': g[1]['tid'] += 1
+            elif mutation == 'gate-clock': g[1]['clock'] = 'CLOCK_REALTIME'
+            elif mutation == 'before-delivery': g[1]['t_ns'] = 699
+            elif mutation == 'early-release': release = 149000600
+            elif mutation == 'reporter-before-consumption': r[1]['t_ns'] = 160000699
+            elif mutation == 'lost-callback': c[2]['lost'] = 1
+            elif mutation == 'multiplex-reporter': r[2]['time_running'] -= 1
+            elif mutation == 'callback-as-ack': r = copy.deepcopy(c)
+            else: g[1]['t_ns'] = True
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                call(r, expected, c, callback_expected, g, signals, release, diagnostics)
+        with self.assertRaises(ValueError):
+            call(reporter, expected, callback, callback_expected, gates, signals, 160000600, diagnostics[:-1])
+
     def test_no_signal_absence_waits_for_actual_delayed_reader_after_child_exit(self):
         module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/qualify_reporter_probe.py'))
         gate, finish_started = threading.Event(), threading.Event()

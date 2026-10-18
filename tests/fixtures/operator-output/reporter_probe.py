@@ -127,13 +127,8 @@ def expected_witness(pin, owner, resolved):
                 file_offset=resolved['file_offset'], ip=addresses[0], mapped_identity=anchor)
 
 
-def validate_witness(records, expected, signals):
-    """Validate retained actual perf facts; caller also owns pressure/custody.
-
-    No Rust argument-register ABI is assumed. The reviewed actual reporter is
-    reachable only after the main thread wins the first-signal observation.
-    Source/candidate binding and readable-marker controls remain prerequisites.
-    """
+def validate_binding(records, expected):
+    """Actual identity/clock/zero-loss envelope, independent of latency policy."""
     if (not isinstance(records, (list, tuple)) or len(records) != 3
             or any(not isinstance(row, dict) for row in records)
             or [row.get('kind') for row in records] != ['ready', 'reporter', 'final']):
@@ -156,6 +151,17 @@ def validate_witness(records, expected, signals):
             or final['time_enabled'] <= 0
             or final['time_enabled'] != final.get('time_running')):
         raise ValueError('lost/multiplexed/unreconciled kernel reporter evidence')
+
+
+def validate_witness(records, expected, signals):
+    """Validate retained actual perf facts; caller also owns pressure/custody.
+
+    No Rust argument-register ABI is assumed. The reviewed actual reporter is
+    reachable only after the main thread wins the first-signal observation.
+    Source/candidate binding and readable-marker controls remain prerequisites.
+    """
+    validate_binding(records, expected)
+    ready, event, _ = records
     if (not isinstance(signals, (list, tuple)) or not signals or not isinstance(signals[0], dict)
             or signals[0].get('signal') not in ('SIGINT', 'SIGTERM')
             or int(signal.Signals[signals[0]['signal']]) not in (2, 15)):

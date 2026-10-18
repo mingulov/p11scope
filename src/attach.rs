@@ -74,7 +74,7 @@ pub(crate) use inventory::EXPECTED_INVENTORY_DISCOVERY_BYTES;
 #[allow(unused_imports)]
 pub(crate) use inventory::PreparedInventory;
 pub(crate) use inventory::capture;
-#[allow(dead_code)] // Closed preparation; activation waits for the reviewed runtime proof.
+#[allow(dead_code)] // Closed preparation; activation CAS is native, its promotion proof is joint.
 pub(crate) mod selected_detailed;
 mod stop_gate;
 pub(crate) use stop_gate::{StopGate, stop_gate_map_data, validate_stop_gate};
@@ -119,6 +119,8 @@ mod instance_tests;
 mod continuation_guard_tests;
 #[cfg(test)]
 mod lifecycle_tests;
+#[cfg(test)]
+mod native_completion_tests;
 
 const BPF_F_RDONLY_PROG: u32 = 1 << 7;
 const BPF_F_MMAPABLE: u32 = 1024;
@@ -2116,6 +2118,91 @@ impl SessionDrainProducers {
         events: events::EventsDomain,
     ) -> Self {
         Self { native, events }
+    }
+}
+
+/// Native-owned terminal completion: the joined proof that a Session's
+/// terminal sequence actually ran — joined producer detach, proven Q, a
+/// backlog-free bounded terminal EVENTS drain and a completed
+/// OBJECT_START scrub. Only [`Session::mint_native_completion`] mints one
+/// (tests adjudicate explicit evidence through `from_joined_evidence`);
+/// there is no other constructor, so joint lanes consume but never
+/// manufacture it.
+#[allow(dead_code)] // No joint consumer until the promotion lane wires DR37 1C/1F.
+#[derive(Debug)]
+pub(crate) struct SessionNativeCompletion {
+    terminal_events: u64,
+    terminal_malformed: u64,
+    scrubbed_objects: usize,
+    detach_wall_ms: u64,
+    selected_terminal: bool,
+}
+
+#[allow(dead_code)] // No joint consumer until the promotion lane wires DR37 1C/1F.
+impl SessionNativeCompletion {
+    /// Adjudicate observed native evidence into a completion. Every gate
+    /// must hold: joined detach, proven quiescence, no terminal-drain
+    /// backlog. Counts ride along untouched; an empty scrub (nothing
+    /// retained) or an ordinary session (no selection) still mints, since
+    /// the completed scrub and the joined detach are the proof, not the
+    /// counts.
+    /// (Too many arguments is the honest shape: every gate is injected,
+    /// none supplied.)
+    #[allow(clippy::too_many_arguments)]
+    fn from_joined_evidence(
+        detach_complete: bool,
+        quiescent: bool,
+        backlog: bool,
+        terminal_events: u64,
+        terminal_malformed: u64,
+        scrubbed_objects: usize,
+        detach_wall_ms: u64,
+        selected_terminal: bool,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            detach_complete,
+            "native completion requires joined producer detach"
+        );
+        anyhow::ensure!(quiescent, "native completion requires proven quiescence");
+        anyhow::ensure!(
+            !backlog,
+            "native completion refused: terminal drain left backlog past its bound"
+        );
+        Ok(Self {
+            terminal_events,
+            terminal_malformed,
+            scrubbed_objects,
+            detach_wall_ms,
+            selected_terminal,
+        })
+    }
+
+    /// EVENTS records the mint's own bounded terminal poll consumed:
+    /// post-semantic-drain leftovers and post-Q arrivals, never the
+    /// semantic lane's routed batches.
+    pub(crate) fn terminal_events(&self) -> u64 {
+        self.terminal_events
+    }
+
+    /// Malformed records met by the mint's own terminal poll.
+    pub(crate) fn terminal_malformed(&self) -> u64 {
+        self.terminal_malformed
+    }
+
+    /// OBJECT_START rows the mint's scrub zeroed and removed.
+    pub(crate) fn scrubbed_objects(&self) -> usize {
+        self.scrubbed_objects
+    }
+
+    /// Wall time the joined producer detach took, in whole milliseconds.
+    pub(crate) fn detach_wall_ms(&self) -> u64 {
+        self.detach_wall_ms
+    }
+
+    /// True only when a native selection existed and read back TERMINAL
+    /// at mint. Ordinary sessions mint with false.
+    pub(crate) fn selected_terminal(&self) -> bool {
+        self.selected_terminal
     }
 }
 
@@ -6079,6 +6166,56 @@ impl Session {
     ) -> Result<()> {
         self.begin_owned_producer_detach()?;
         self.finish_owned_producer_detach_driven(second_signal, out)
+    }
+
+    /// Mint the native-owned terminal completion after the terminal
+    /// sequence. Gates, in order: the producer detach worker joined
+    /// (Complete, never an observed empty link set), the stop gate still
+    /// proves Q, the selected gate (when present) reads back TERMINAL,
+    /// one explicitly bounded terminal EVENTS poll leaves no backlog,
+    /// and the OBJECT_START scrub completes. Any failure refuses: no
+    /// partial completion exists.
+    #[allow(dead_code)] // No joint consumer until the promotion lane wires DR37 1C/1F.
+    pub(crate) fn mint_native_completion(&mut self) -> Result<SessionNativeCompletion> {
+        let detach_complete = matches!(self.producer_detach, OwnedProducerDetach::Complete);
+        let quiescent = self.stop_gate.quiescent();
+        let selected_terminal = match &self.native_selection {
+            Some(selected) => {
+                selected.require_terminal()?;
+                true
+            }
+            None => false,
+        };
+        self.ensure_events_consumer()?;
+        let (backlog, terminal_events, terminal_malformed) = {
+            let consumer = self
+                .events_consumer
+                .as_mut()
+                .context("retained EVENTS consumer vanished after creation")?;
+            let malformed_before = consumer.malformed();
+            let mut terminal_events = 0u64;
+            let backlog = consumer.poll(Some(events::TERMINAL_DRAIN_BOUND), |_| {
+                terminal_events = terminal_events.saturating_add(1);
+                std::ops::ControlFlow::Continue(())
+            });
+            (
+                backlog,
+                terminal_events,
+                consumer.malformed().saturating_sub(malformed_before),
+            )
+        };
+        let scrubbed_objects = object_stop::scrub_after_quiescence(&mut self.ebpf, &self.stop_gate)
+            .context("scrubbing object START for native completion")?;
+        SessionNativeCompletion::from_joined_evidence(
+            detach_complete,
+            quiescent && self.stop_gate.quiescent(),
+            backlog,
+            terminal_events,
+            terminal_malformed,
+            scrubbed_objects,
+            self.detach_wall_ms,
+            selected_terminal,
+        )
     }
 
     fn take_cleanup_worker(&mut self) -> Result<CleanupWorker> {

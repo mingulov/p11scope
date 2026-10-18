@@ -828,7 +828,9 @@ static void object_setup(void)
     unsigned char zero[432];
     unsigned char desc[16];
     u32 key;
-    memset(zero, poison_zero_row ? 0xA5 : 0, sizeof(zero));
+    memset(zero, poison_zero_row == 1 ? 0xA5 : 0, sizeof(zero));
+    if (poison_zero_row == 2)
+        zero[424] = 1; /* START's first 288 bytes remain clean. */
     key = 0;
     assert(!update(&OBJECT_ZERO, &key, zero, 0));
     for (key = 0; key < 105; key++) {
@@ -866,10 +868,11 @@ static void object_aggregate_start_construction(void)
         assert(!p11_owner_start_remove(&key, 1));
         assert(!row(&START, &key) && !ctl.outstanding && idle(0) && !ctl.poison);
     }
-    for (unsigned fault = 0; fault < 6; fault++) {
+    for (unsigned fault = 0; fault < 7; fault++) {
         reset();
         if (fault == 1) poison_zero_row = 1;
-        object_setup(); key.pid_tgid = pid_tgid();
+        if (fault == 6) poison_zero_row = 2;
+        object_setup(); key.pid_tgid = pid_tgid(); key.pad = 0;
         if (fault == 0) drop_zero_row = 1;
         if (fault == 2) fail_start_readback_once = 1;
         if (fault == 3) update_error = -12;
@@ -877,7 +880,7 @@ static void object_aggregate_start_construction(void)
         if (fault == 5) key.pad = 1;
         assert(!p11_owner_start_aggregate(&key, 17));
         assert(!row(&START, &key) && !row(&OBJECT_START, &key));
-        assert(!ctl.outstanding && !owners[0].start_count);
+        assert(!ctl.outstanding && !owners[0].start_count && idle(0));
     }
     key.pad = 0;
     /* Readback rollback failure retains an allzero owned row for retry. */
@@ -969,9 +972,10 @@ static void object_seeded_start_failures(void)
         .ts_ns = 0x13579bdfULL, .task_cookie = 0x2468ace0ULL,
         .exec_id = 3, .object_required = 22,
     };
-    for (unsigned fault = 0; fault < 7; fault++) {
+    for (unsigned fault = 0; fault < 8; fault++) {
         reset();
         if (fault == 1) poison_zero_row = 1;
+        if (fault == 7) poison_zero_row = 2;
         object_setup(); key.pid_tgid = pid_tgid();
         if (fault == 0) drop_zero_row = 1;
         if (fault == 2) fail_start_readback_once = 1;
@@ -979,9 +983,13 @@ static void object_seeded_start_failures(void)
         if (fault == 4) fail_object_side_lookup_once = 1;
         if (fault == 5) key.pid_tgid++;
         if (fault == 6) update_error = -12;
-        assert(!p11_owner_start_begin(&key, &seed));
+        struct call_start_seed checked = seed;
+        /* Ordinary marker avoids the later side-allocation zero check:
+         * byte424 must be rejected by START construction itself. */
+        if (fault == 7) checked.object_required = 0;
+        assert(!p11_owner_start_begin(&key, &checked));
         assert(!row(&START, &key) && !row(&OBJECT_START, &key));
-        assert(!ctl.outstanding && !owners[0].start_count);
+        assert(!ctl.outstanding && !owners[0].start_count && idle(0));
     }
     /* Missing identity and an invalid descriptor marker never publish a row. */
     for (unsigned fault = 0; fault < 5; fault++) {

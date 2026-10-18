@@ -20,6 +20,12 @@ impl ProvisionalSelectedLane {
         permit: SelectedConstructionPermit,
         convert_subset: AttestedSubset,
     ) -> Result<Self, SelectedPreparationFailure> {
+        if convert_subset.required().len() != 1 {
+            return Err(SelectedPreparationFailure::from_factory_rejection(
+                session,
+                SemanticRefusal::IncompleteProvider,
+            ));
+        }
         if permit
             .validate_conversion(&session, &attached, &convert_subset)
             .is_err()

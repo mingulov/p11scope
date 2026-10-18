@@ -227,7 +227,7 @@ fn actual_table_worker_and_live_snapshot_overlap_stays_below_8mib() {
     let mut held = vec![first];
     loop {
         let frame = runtime.frame();
-        if frame.refused_revision.is_some() {
+        if frame.refusal.is_some() {
             assert_eq!(frame.summary.unknown, 4096);
             assert_eq!(
                 frame.metadata(CallerId(4095)).unwrap().reason,
@@ -443,5 +443,46 @@ fn first_binding_availability_is_not_reported_as_an_observed_exec() {
             .container
             .id
             .is_none()
+    );
+}
+
+#[test]
+fn stop_keeps_last_sample_when_native_binding_is_retired_and_rejects_late_work() {
+    let mut runtime = MetadataRuntime::new(7);
+    runtime.synchronize([caller(0)], 0);
+    let first = runtime.next(0).unwrap();
+    runtime.finish(first, caller(0), Ok(sample()), 20);
+    let late = runtime.next(REFRESH_NS).unwrap();
+    runtime.stop();
+    let unbound = MetadataCaller {
+        image: None,
+        ..caller(0)
+    };
+    runtime.synchronize([unbound], REFRESH_NS + 1);
+    assert_eq!(
+        runtime.frame().metadata(CallerId(0)).unwrap().status,
+        MetadataStatus::Sampled,
+        "normal native retirement after stop cannot erase the last sample"
+    );
+    assert!(!runtime.finish(late, caller(0), Ok(sample()), REFRESH_NS + 2));
+    assert!(runtime.next(REFRESH_NS * 2).is_none());
+    assert_eq!(
+        runtime
+            .frame_at(STALE_NS + 21)
+            .metadata(CallerId(0))
+            .unwrap()
+            .status,
+        MetadataStatus::Stale
+    );
+    runtime.synchronize(
+        [MetadataCaller {
+            retired: true,
+            ..unbound
+        }],
+        STALE_NS + 22,
+    );
+    assert_eq!(
+        runtime.frame().metadata(CallerId(0)).unwrap().status,
+        MetadataStatus::Historical
     );
 }

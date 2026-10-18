@@ -79,8 +79,14 @@ impl std::fmt::Debug for JointResourceOrigin {
 /// publications borrow the ledger. Gating transfer on genuine stopped-A
 /// completion is a separate carry; no transfer runs here.
 pub(crate) struct JointCaptureOwner {
-    adapter: JournalAdapter,
+    // Field order is load-bearing: Rust drops fields in declaration
+    // order, so the model (with its retained history) drops before
+    // the adapter's ledger refunds its charges. Live model bytes stay
+    // accounted until the storage itself is gone; declaring the
+    // adapter first would refund the ledger while model storage is
+    // still alive (transient underaccounting at teardown).
     model: ObjectSemantics,
+    adapter: JournalAdapter,
 }
 
 impl JointCaptureOwner {
@@ -91,9 +97,19 @@ impl JointCaptureOwner {
     /// construction itself never refuses.
     pub(crate) fn new(limits: JournalLimits, reserver: SemanticResourceReserver) -> Self {
         Self {
-            adapter: JournalAdapter::with_ledger(limits, StagingLedger::with_resources(reserver)),
             model: ObjectSemantics::new(),
+            adapter: JournalAdapter::with_ledger(limits, StagingLedger::with_resources(reserver)),
         }
+    }
+
+    /// Disjoint mutable access to the capture's adapter and model: the
+    /// staged seal tick wires both at once, and H9 delivery runs model
+    /// calls against the adapter's mutable ledger. Splitting through
+    /// the owner keeps the one-ledger/one-model identity that separate
+    /// whole-owner borrows cannot lend simultaneously.
+    #[cfg_attr(not(test), allow(dead_code))] // Seal-tick/H9 wiring borrows the owner once those lanes land.
+    pub(crate) fn parts(&mut self) -> (&mut JournalAdapter, &mut ObjectSemantics) {
+        (&mut self.adapter, &mut self.model)
     }
 
     /// The capture's one journal adapter (read side): raw collection
@@ -1674,5 +1690,121 @@ mod tests {
         );
         assert_eq!(drain.source().remaining(), 0);
         assert_eq!(drain.malformed(), 1);
+    }
+
+    /// The owner's disjoint split lends the adapter and the model at
+    /// once: the H9 delivery shape (a model call against the adapter's
+    /// mutable ledger) compiles and accounts through the one ledger.
+    /// Separate whole-owner borrows cannot express this pair.
+    #[test]
+    fn joint_capture_owner_parts_lends_disjoint_adapter_and_model() {
+        use crate::kinds::function_id;
+        use crate::semantics_objects::{
+            CallKey, HandleInput, LostOutcome, MechanismEvidence, ObjectDomain, OriginFact, RefCut,
+            SlotScope,
+        };
+
+        let pool = SemanticResourcePool::default();
+        let mut owner = JointCaptureOwner::new(
+            crate::semantics_objects::journal::JournalLimits::policy(),
+            pool.reserver(),
+        );
+        let (adapter, model) = owner.parts();
+        let domain = ObjectDomain::reference(11, 12, 13, 14, 1);
+        model
+            .register_domain(domain)
+            .expect("reference domain registers");
+        let origin = OriginFact {
+            domain,
+            cut: RefCut::reference(1),
+            key: CallKey::reference(1),
+            entry_ns: 100,
+            function: function_id("C_CreateObject").expect("known function"),
+            session: HandleInput::Absent,
+            inputs: [HandleInput::Absent, HandleInput::Absent],
+            requested: [None, None],
+            entry_mechanism: MechanismEvidence::NotCaptured,
+            scope: SlotScope::Unknown,
+        };
+        let token = model
+            .begin(origin, adapter.ledger_mut())
+            .expect("begin admits against the owner's ledger");
+        assert_eq!(
+            adapter.ledger().census(),
+            1,
+            "the model charge lands in the owner's ledger"
+        );
+        assert!(
+            adapter.ledger().charged_bytes() > 0,
+            "admitted model storage is accounted"
+        );
+        // The lost-outcome bound releases the same pending call through
+        // the same split borrow; the model and ledger stay consistent.
+        let _ = model.outcome_lost(
+            LostOutcome::Ticket(token, RefCut::reference(2)),
+            adapter.ledger_mut(),
+        );
+        assert_eq!(adapter.ledger().census(), 0);
+        assert_eq!(adapter.ledger().charged_bytes(), 0);
+    }
+
+    /// A populated owner's teardown keeps storage accounted until the
+    /// storage itself is released, then refunds the pool exactly once.
+    /// Field order (model before adapter) keeps the ledger alive across
+    /// model teardown; the drop below pins the full refund.
+    #[test]
+    fn joint_capture_owner_populated_drop_refunds_pool_exactly_once() {
+        use crate::kinds::function_id;
+        use crate::semantics_objects::{
+            CallKey, HandleInput, MechanismEvidence, ObjectDomain, OriginFact, RefCut, SlotScope,
+        };
+
+        let pool = SemanticResourcePool::default();
+        let baseline = pool.snapshot().charged_bytes;
+        let mut owner = JointCaptureOwner::new(
+            crate::semantics_objects::journal::JournalLimits::policy(),
+            pool.reserver(),
+        );
+        {
+            let (adapter, model) = owner.parts();
+            let domain = ObjectDomain::reference(21, 22, 23, 24, 1);
+            model
+                .register_domain(domain)
+                .expect("reference domain registers");
+            let origin = OriginFact {
+                domain,
+                cut: RefCut::reference(1),
+                key: CallKey::reference(1),
+                entry_ns: 100,
+                function: function_id("C_CreateObject").expect("known function"),
+                session: HandleInput::Absent,
+                inputs: [HandleInput::Absent, HandleInput::Absent],
+                requested: [None, None],
+                entry_mechanism: MechanismEvidence::NotCaptured,
+                scope: SlotScope::Unknown,
+            };
+            model
+                .begin(origin, adapter.ledger_mut())
+                .expect("begin admits against the owner's ledger");
+        }
+        assert_eq!(
+            owner.ledger().census(),
+            1,
+            "live model storage stays accounted before teardown"
+        );
+        assert!(
+            owner.ledger().charged_bytes() > 0,
+            "live model bytes stay charged before teardown"
+        );
+        assert!(
+            pool.snapshot().charged_bytes > baseline,
+            "the pool holds the owner's charges while it lives"
+        );
+        drop(owner);
+        assert_eq!(
+            pool.snapshot().charged_bytes,
+            baseline,
+            "teardown refunds every owner charge exactly once"
+        );
     }
 }

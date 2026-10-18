@@ -11032,8 +11032,10 @@ fn joint_capture_owner_commit_batch_stages_into_owned_ledger() {
 /// minted by raw collection through the owner's adapter survives the
 /// bridge into a publication-side charge, and the adapter observes the
 /// publication's census. The failure twin charges the same genuine
-/// origin against a second owner's ledger and must refuse, proving
-/// the generation check is real and the pass is not vacuous.
+/// origin against a second owner's ledger — seeded with a live
+/// same-ID reservation so only the generation check can refuse — and
+/// must refuse, proving the generation check is real and the pass is
+/// not vacuous.
 #[test]
 fn joint_capture_owner_adapter_origins_survive_the_owner_bridge() {
     use crate::attach::SessionDrainProducers;
@@ -11088,10 +11090,25 @@ fn joint_capture_owner_adapter_origins_survive_the_owner_bridge() {
     );
     assert_eq!(
         owner.ledger().census(),
+        1,
+        "one census across the bridge: the staged payload joins the raw operation"
+    );
+    assert_eq!(
         owner.adapter().ledger().census(),
-        "one census across the bridge"
+        1,
+        "the adapter observes the same absolute census"
     );
     let mut foreign = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
+    // Seed the foreign ledger with a live first reservation: both tables
+    // mint sequentially from one, so the foreign operation carries the
+    // same numeric reservation ID as the local raw operation, under a
+    // different role (H8Open leaves the H9Staged role free and its key
+    // unused). Without generation validation the bridged charge would
+    // join that operation; only the generation check refuses it.
+    foreign
+        .ledger_mut()
+        .charge_h8open(9, 10)
+        .expect("the foreign ledger holds a live reservation");
     assert!(
         matches!(
             foreign
@@ -11100,5 +11117,20 @@ fn joint_capture_owner_adapter_origins_survive_the_owner_bridge() {
             Err(LedgerRefusal::ReplayRefused)
         ),
         "a foreign ledger still refuses the genuine origin"
+    );
+    assert_eq!(
+        foreign.ledger().census(),
+        1,
+        "the refused charge leaves the foreign census unchanged"
+    );
+    assert_eq!(
+        foreign.ledger().staged(),
+        0,
+        "the refused charge stages nothing foreign"
+    );
+    assert_eq!(
+        foreign.ledger().charged_bytes(),
+        10,
+        "the refused charge adds no foreign bytes"
     );
 }

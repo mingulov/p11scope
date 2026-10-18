@@ -413,14 +413,20 @@ fn prepared_provider_actual_layout_keeps_4096_ordinary_associations_representabl
 fn prepared_provider_copy_reserves_shared_pool_before_retention_and_retries() {
     use crate::discovery::engine::inventory_coordinator::semantics::SemanticBindingRefusal;
     use crate::inventory_semantics::SemanticRefusal;
-    use crate::semantics_edge::resources::{SEMANTIC_RESOURCE_LIMIT, SEMANTIC_TRANSITION_SCRATCH};
+    use crate::semantics_edge::resources::SEMANTIC_RESOURCE_LIMIT;
 
     let mut fixture = ProviderScene::new(false);
+    let baseline = fixture
+        .scene
+        .coordinator
+        .registry()
+        .semantic_resource_snapshot()
+        .charged_bytes;
     fixture
         .scene
         .coordinator
         .registry_mut()
-        .reference_semantic_resource_limit(SEMANTIC_TRANSITION_SCRATCH);
+        .reference_semantic_resource_limit(baseline);
     let before = fixture
         .scene
         .coordinator

@@ -2443,8 +2443,12 @@ impl CallerRegistry {
     }
 
     pub(crate) fn new(limits: RegistryLimits) -> Self {
+        let semantic_resources = crate::semantics_edge::resources::SemanticResourcePool::default();
+        let assoc_fallback = crate::semantics_objects::journal::StagingLedger::with_resources(
+            semantic_resources.reserver(),
+        );
         Self {
-            semantic_resources: crate::semantics_edge::resources::SemanticResourcePool::default(),
+            semantic_resources,
             instance_state: instance_input::InstanceState::default(),
             limits,
             next_module: 0,
@@ -2480,7 +2484,7 @@ impl CallerRegistry {
             semantic_refused: 0,
             joint_grants: HashMap::new(),
             joint_keyuse: crate::semantics_key_use::KeyUseReducer::new(),
-            assoc_fallback: crate::semantics_objects::journal::StagingLedger::new(),
+            assoc_fallback,
             joint_feeds: 0,
             joint_accounting: false,
             key_projection: None,

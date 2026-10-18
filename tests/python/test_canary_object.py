@@ -5,7 +5,6 @@ ledger replay and live-surface honesty, all hermetic."""
 import json
 import runpy
 import struct
-import sys
 import tempfile
 import unittest
 from pathlib import Path

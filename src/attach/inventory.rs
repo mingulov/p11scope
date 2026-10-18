@@ -194,7 +194,10 @@ impl PreparedInventory {
                     }
                 },
                 InventoryPreparation::ValidatePrograms => {
-                    validate_runtime_inventory_programs(state.ebpf()?)?;
+                    validate_runtime_inventory_programs(
+                        state.ebpf()?,
+                        matches!(flavor, InventoryFlavor::Callers(_)),
+                    )?;
                 }
                 InventoryPreparation::PublishScope => {
                     crate::scope::publish_inventory(state.ebpf_mut()?, &scope)?;
@@ -616,9 +619,22 @@ fn validate_inventory_programs(actual: &BTreeMap<String, InventoryProgramKind>) 
     Ok(())
 }
 
-fn validate_runtime_inventory_programs(ebpf: &Ebpf) -> Result<()> {
+fn validate_runtime_inventory_programs(ebpf: &Ebpf, callers: bool) -> Result<()> {
+    const BASELINE: &str = "p11_inventory_image_baseline";
+    if callers {
+        ensure!(
+            matches!(ebpf.program(BASELINE), Some(Program::Iter(_))),
+            "caller Inventory requires its identity-only iterator"
+        );
+    } else {
+        ensure!(
+            ebpf.program(BASELINE).is_none(),
+            "global Inventory must not contain caller identity iterator"
+        );
+    }
     let actual = ebpf
         .programs()
+        .filter(|(name, _)| *name != BASELINE)
         .map(|(name, program)| {
             let kind = match program {
                 Program::UProbe(probe) => match probe.kind() {

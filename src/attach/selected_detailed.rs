@@ -5,6 +5,7 @@
 #[cfg(test)]
 mod native_tests;
 
+pub(crate) mod baseline;
 mod wire;
 use wire::{BootstrapControl, SelectedTarget};
 

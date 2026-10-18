@@ -89,7 +89,7 @@ use crate::discovery::inventory_attach_set::{
     AttachEndpoint, AttachObjectId, EndpointId, InventoryAttachSet, TargetDelta,
 };
 use crate::process::PidPin;
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use aya::Ebpf;
 use aya::maps::Map;
 use p11scope_ebpf_common::inventory_callers::{CallerObjectKey, CallerObjectUse};
@@ -99,6 +99,7 @@ use p11scope_ebpf_common::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::os::fd::AsFd as _;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -1082,6 +1083,7 @@ pub(crate) struct CleanupSummary {
 
 /// Facade bookkeeping that travels through every state.
 struct CaptureBook {
+    promotion_baseline_generation: u64,
     domain: NativeDomainId,
     budget: InventoryBudget,
     /// The backend this capture attaches entries with (fixed at prepare).
@@ -1217,6 +1219,7 @@ impl CaptureBook {
         now_ns: u64,
     ) -> Self {
         Self {
+            promotion_baseline_generation: 0,
             domain,
             budget,
             backend: AttachBackend::Singles,
@@ -2301,6 +2304,40 @@ impl InventoryCapture {
             CaptureState::Failed { retiring, .. } => (CapturePhase::Retiring, retiring.state_mut()),
         };
         read_witnesses_from(state, &mut self.book, phase, window)
+    }
+
+    /// Explicit pre-view identity acquisition; one exclusive native query can
+    /// run at a time. Render/key callbacks never acquire these kernel facts.
+    pub(crate) fn query_promotion_baselines(
+        &mut self,
+        pins: &[Arc<PidPin>],
+        window: ReadWindow,
+    ) -> Result<crate::attach::selected_detailed::baseline::KernelBaselineBatch> {
+        ensure!(!self.book.stopping, "Inventory is stopping");
+        self.book.promotion_baseline_generation = self
+            .book
+            .promotion_baseline_generation
+            .checked_add(1)
+            .context("Inventory baseline query generation exhausted")?;
+        let generation = self.book.promotion_baseline_generation;
+        match &mut self.state {
+            CaptureState::Prepared(prepared) => crate::attach::selected_detailed::baseline::query(
+                &mut prepared.ebpf,
+                self.book.domain,
+                generation,
+                pins,
+                window,
+            ),
+            CaptureState::Active(active) => active.state_mut().query_promotion_baselines(
+                self.book.domain,
+                generation,
+                pins,
+                window,
+            ),
+            CaptureState::Failed { .. } | CaptureState::Moving => {
+                bail!("Inventory native owner is unavailable for a baseline")
+            }
+        }
     }
 
     /// The pidfd-keyed TASK_COOKIE answer for `pin` in this domain.

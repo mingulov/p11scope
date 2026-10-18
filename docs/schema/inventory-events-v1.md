@@ -349,14 +349,13 @@ Inline placement and bounded rotation lifetime are authorized by the
 It adds no reads or capture and publishes no command line, environment, `comm`,
 raw native tgid, task cookie or exec ID in these compact contexts.
 
-## Caller metadata (additive within v1; proposed)
+## Caller metadata (additive within v1)
 
-**Status: PROPOSED; implementation, publication and installed acceptance
-pending.** No producer emits these payloads until the DR04 owner wires
-the opt-in, the coordinator and the shared `Presentation` revision.
-Existing kinds, budgets, rotation and loss accounting are unchanged.
+The opt-in source contract projects the shared `Presentation` revision.
+Installed qualification remains open. Existing rotation and write-failure
+accounting also applies to metadata events; there is no lossless metadata claim.
 
-The proposed contract carries the same immutable frame metadata in
+The contract carries the same immutable frame metadata in
 snapshots, dashboards and the stream: JSON, snapshots and dashboard
 consume exactly one `Presentation` revision. The bounded
 `caller_metadata_changed` event is keyed by CallerId plus metadata
@@ -384,3 +383,14 @@ from it.
            "totals": {"callers": 1, "modules": 1, "edges": 1}, "new_gaps": 1,
            "suppressed_delta": 0, "gaps_suppressed": 0}}
 ```
+
+`caller_metadata_changed.event` has `caller` (capture-local CallerId),
+`revision` (exact decimal string), and `metadata` (the snapshot object verbatim).
+A pass emits at most4096 metadata records. Equal semantic components/status
+with only changed time/revision need no changed event. Migration, stale,
+historical and failed refresh changes do emit. A final bounded baseline emits
+all current caller metadata before the existing final sweep and `ended`.
+Metadata records can rotate out under ordinary stream retention; the existing
+rotation/eviction counters remain authoritative. `started`, `pass_committed`
+and `ended` carry the current `caller_metadata` option/census; pass and ended
+markers include `caller_metadata_events` for records emitted there.

@@ -177,6 +177,8 @@ pub struct InventoryArgs {
     pub diagnostics_pid: Option<u32>,
     /// `--capture`: which usage lane runs; `auto` by default.
     pub capture: CaptureMode,
+    /// Opt-in finite display hints; never changes capture or scope.
+    pub caller_metadata: CallerMetadataMode,
     /// `--attach-backend`: how the native lane attaches its usage entries
     /// (C5.11); `auto` by default. The scan lane attaches nothing.
     pub attach_backend: BackendSelection,
@@ -187,6 +189,31 @@ pub struct InventoryArgs {
     /// selection outside `--system` is a usage error; the implicit
     /// default under `--pid`/`--cgroup` loads nothing and emits no field.
     pub identity_backend_explicit: bool,
+}
+
+/// `inventory --caller-metadata`: local finite display hints only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CallerMetadataMode {
+    #[default]
+    None,
+    Cgroup,
+}
+impl CallerMetadataMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Cgroup => "cgroup",
+        }
+    }
+    fn from_cli(value: &str) -> Result<Self, CliError> {
+        match value {
+            "none" => Ok(Self::None),
+            "cgroup" => Ok(Self::Cgroup),
+            _ => Err(usage_err(format!(
+                "--caller-metadata: invalid value {value:?}: expected none or cgroup"
+            ))),
+        }
+    }
 }
 
 /// `inventory --capture`: the usage lane (Task 6 C5.1, plan §10 ruling D1).
@@ -362,9 +389,9 @@ usage:
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] -- CMD [ARGS...]
   p11scope inspect --pid <n> [--module <provider.so>]... [--hook-symbol <…>]... [--json]
   p11scope inspect --system [--module <provider.so>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
-  p11scope inventory --pid <n> [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --cgroup <path> [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --cgroup <path> [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
   p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
@@ -494,9 +521,9 @@ Without --pid or --cgroup, target readiness is unassessed.
 
 /// `p11scope inventory --help`: scoped syntax, examples and evidence limits.
 const INVENTORY_HELP: &str = "usage:
-  p11scope inventory --pid <n> [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --cgroup <path> [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --pid <n> [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --cgroup <path> [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope inventory --system [--module <provider.so>]... [--manifest <m.json>]... [--hook-symbol <…>]... [--duration <…>] [--json] [-o <out.json>] [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup] [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard] [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]] [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
 
 example (4242 is an example PID, not a detected target):
@@ -995,11 +1022,27 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     let mut diagnostics: Option<PathBuf> = None;
     let mut diagnostics_pid: Option<u32> = None;
     let mut capture: Option<CaptureMode> = None;
+    let mut caller_metadata: Option<CallerMetadataMode> = None;
     let mut attach_backend: Option<BackendSelection> = None;
     let mut identity_backend: Option<IdentityBackendSelection> = None;
     while let Some(a) = args.next() {
         match word(&a).as_ref() {
             "--help" | "-h" => return Err(CliError::Help(HelpTopic::Inventory)),
+            "--caller-metadata" => {
+                if caller_metadata.is_some() {
+                    return Err(usage_err("--caller-metadata given twice"));
+                }
+                let value = require_value(&mut args, "--caller-metadata")?;
+                caller_metadata = Some(CallerMetadataMode::from_cli(&value)?);
+            }
+            value if value.starts_with("--caller-metadata=") => {
+                if caller_metadata.is_some() {
+                    return Err(usage_err("--caller-metadata given twice"));
+                }
+                caller_metadata = Some(CallerMetadataMode::from_cli(
+                    &value["--caller-metadata=".len()..],
+                )?);
+            }
             "--capture" => {
                 if capture.is_some() {
                     return Err(usage_err("--capture given twice"));
@@ -1238,6 +1281,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
         diagnostics,
         diagnostics_pid,
         capture: capture.unwrap_or(CaptureMode::Auto),
+        caller_metadata: caller_metadata.unwrap_or_default(),
         attach_backend: attach_backend.unwrap_or_default(),
         identity_backend_explicit: identity_backend.is_some(),
         identity_backend: identity_backend.unwrap_or_default(),
@@ -2171,6 +2215,48 @@ mod tests {
         };
         assert!(topic.text().contains("inventory diff BEFORE"));
         assert!(!topic.text().contains("--pid"));
+    }
+
+    #[test]
+    fn dr04_caller_metadata_is_opt_in_and_accepts_split_and_equals_forms() {
+        let default = parse(args(&["inventory", "--pid", "7"])).unwrap();
+        assert!(format!("{default:?}").contains("caller_metadata: None"));
+        for scope in [
+            vec!["--pid", "7"],
+            vec!["--system"],
+            vec!["--cgroup", "/owned"],
+        ] {
+            for option in [
+                vec!["--caller-metadata", "cgroup"],
+                vec!["--caller-metadata=cgroup"],
+            ] {
+                let mut words = vec!["inventory"];
+                words.extend_from_slice(&scope);
+                words.extend_from_slice(&option);
+                let parsed = parse(args(&words)).expect("explicit metadata option");
+                assert!(format!("{parsed:?}").contains("caller_metadata: Cgroup"));
+            }
+        }
+        assert!(
+            parse(args(&[
+                "inventory",
+                "--system",
+                "--caller-metadata",
+                "runtime"
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse(args(&[
+                "inventory",
+                "--system",
+                "--caller-metadata",
+                "cgroup",
+                "--caller-metadata=none"
+            ]))
+            .is_err()
+        );
+        assert!(parse(args(&["trace", "--pid", "7", "--caller-metadata=cgroup"])).is_err());
     }
 
     /// D3d RED: `inventory --identity-backend` selects the system sweep

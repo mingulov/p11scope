@@ -780,6 +780,32 @@ class FixtureWorkloadTests(unittest.TestCase):
         ORACLE.validate_ledger(rows, "g16", 1)
         self.assertEqual(rows[1]["provider_ino"], provider.stat().st_ino)
 
+    def test_same_inode_content_restore_is_refused(self):
+        # Same bytes at the end do not erase an in-place change while the
+        # driver was loading the provider. Its mtime remains a refusal witness.
+        work = self.directory / "mutate-restore"
+        work.mkdir(exist_ok=True)
+        provider = work / "provider.so"
+        shutil.copy2(self.provider, provider)
+        before = provider.stat()
+        original = provider.read_bytes()
+        wrapper = work / "restore.sh"
+        wrapper.write_text(
+            f'#!/bin/sh\nprintf "\\0" >> "$1"\n'
+            f'truncate -s {before.st_size} "$1"\n'
+            f'exec "{self.driver}" "$@"\n',
+            encoding="utf-8")
+        wrapper.chmod(0o755)
+        output = work / "ledger.jsonl"
+        with self.assertRaisesRegex(ORACLE.LedgerError, "provider changed"):
+            ORACLE.run_lifetimes(
+                cell="g16", lifetimes=1, provider=str(provider),
+                driver=str(wrapper), output=str(output))
+        self.assertEqual(provider.read_bytes(), original)
+        self.assertEqual(provider.stat().st_ino, before.st_ino)
+        self.assertNotEqual(provider.stat().st_mtime_ns, before.st_mtime_ns)
+        self.assertFalse(output.exists())
+
     def test_path_replacement_retains_fd_authority(self):
         # Coverage: the wrapper replaces the provider pathname (different
         # inode, invalid bytes) before exec. FD-backed exec must still run

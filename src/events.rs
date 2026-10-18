@@ -2761,7 +2761,7 @@ mod tests {
     }
     #[test]
     fn cgroup_trace_bracket_all_actual_event_routes_preserve_delivery() {
-        for route in 0..4 {
+        for route in 0..6 {
             let (proof, view, pending) = cgroup_proof_cursor_fixture();
             let source = CursorScript::scripted([event_bytes(&proof_call(view.pid(), 101, 11, 0))]);
             let cursor = source.cursor.clone();
@@ -2798,7 +2798,7 @@ mod tests {
                     })
                     .unwrap();
                 }
-                _ => {
+                3 => {
                     let mut tail = OwnedRootTail::new(
                         crate::run::OriginalRootExit::test_reaped(proof.test_events_domain()),
                         Instant::now() + Duration::from_secs(1),
@@ -2810,6 +2810,25 @@ mod tests {
                             Ok(())
                         })
                         .unwrap();
+                }
+                4 => {
+                    let descriptors = [ObjectDescriptorWire::default(); MAX_DESCRIPTORS as usize];
+                    drain.poll_object_records(Some(2), &descriptors, |_| {
+                        callback();
+                        ControlFlow::Continue(())
+                    });
+                }
+                _ => {
+                    let descriptors = [ObjectDescriptorWire::default(); MAX_DESCRIPTORS as usize];
+                    drain.poll_dispatched_records(
+                        Some(2),
+                        &descriptors,
+                        |_| {
+                            callback();
+                            ControlFlow::Continue(())
+                        },
+                        |_| panic!("ordinary input must not reach the journal callback"),
+                    );
                 }
             }
             assert_eq!(seen, 1);

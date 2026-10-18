@@ -1468,7 +1468,38 @@ fn privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64() -> Re
     }
     ensure!(observation["native_witnesses"]["integrity"] == 0);
     let edges = doc_edges(&document, pid);
-    ensure!(edges.len() == 1 && edges[0]["presence"] == "mapped");
+    if edges.len() != 1 || edges[0]["presence"] != "mapped" {
+        // The private fixture directory is removed on return. Keep bounded
+        // actual output in the failing test log before rejecting its shape;
+        // these diagnostics never replace the acceptance predicate below.
+        let mut diagnostic_bytes = Vec::new();
+        std::fs::File::open(&diagnostics)?
+            .take(128 * 1024 + 1)
+            .read_to_end(&mut diagnostic_bytes)?;
+        eprintln!(
+            "G21_STARTUP_PROBE_REJECTED cadence_ms={} elapsed_ms={} phase={} fenced={} first_public_mapping_last_seen_ns={} intervals={intervals:?} document_bytes={} diagnostics_bytes={}",
+            inventory_test_poll_interval().as_millis(),
+            started.elapsed().as_millis(),
+            state.get(),
+            fenced.get(),
+            first_mapping.get(),
+            stdout.len(),
+            diagnostic_bytes.len(),
+        );
+        if stdout.len() <= 128 * 1024 {
+            eprintln!("G21_STARTUP_PROBE_ACTUAL_DOCUMENT={document}");
+        }
+        if diagnostic_bytes.len() <= 128 * 1024 {
+            eprintln!(
+                "G21_STARTUP_PROBE_ACTUAL_DIAGNOSTICS={}",
+                std::str::from_utf8(&diagnostic_bytes)?
+            );
+        }
+    }
+    ensure!(
+        edges.len() == 1 && edges[0]["presence"] == "mapped",
+        "actual final caller edge shape differs from the probe's one mapped provider"
+    );
     let module = &edges[0]["module"];
     let public = edges[0]["entries"]["count"]
         .as_u64()

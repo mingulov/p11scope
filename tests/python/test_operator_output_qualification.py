@@ -295,6 +295,35 @@ class PrebuiltDemotionControls(unittest.TestCase):
 
 
 class NativeWrapControls(unittest.TestCase):
+    def test_three_round_probe_has_one_physical_pair_and_exact96_call_oracle(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            directory = Path(scratch) / 'payload'
+            WRAP['build'](directory)
+            observed = WRAP['execute_fixture'](directory, counted=3, shared=1, probe=True)
+            def validate(value):
+                return WRAP['check_ledger'](**value, directory=directory,
+                                            counted=3, shared=1, probe=True)
+            facts = validate(observed)
+            self.assertEqual(facts['calls'], 96)
+            self.assertEqual(facts['physical_pairs'], 1)
+            self.assertEqual(facts['phase_calls'], {'a': 96})
+            self.assertEqual([r['round'] for r in observed['acks'] if r['event'] == 'a-done'], [1, 2, 3])
+            for mutation in ('missing_third_call', 'foreign_pair', 'shared_call', 'unacked_round'):
+                with self.subTest(mutation=mutation):
+                    changed = copy.deepcopy(observed)
+                    calls = [r for r in changed['rows'] if r['kind'] == 'call']
+                    if mutation == 'missing_third_call':
+                        changed['rows'].remove(calls[-1])
+                    elif mutation == 'foreign_pair':
+                        next(r for r in changed['rows'] if r['kind'] == 'target')['ino'] += 1
+                    elif mutation == 'shared_call':
+                        calls[-1]['phase'] = 'shared'
+                    else:
+                        changed['acks'] = [r for r in changed['acks']
+                                           if not (r['event'] == 'a-done' and r['round'] == 3)]
+                    with self.assertRaises(ValueError):
+                        validate(changed)
+
     def test_actual32_body_topology_and_independent_schedule_mutations(self):
         with tempfile.TemporaryDirectory() as scratch:
             directory = Path(scratch) / 'payload'

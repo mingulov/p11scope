@@ -26,7 +26,7 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def check_ledger(rows, acks, nonce, pid, directory, counted, shared):
+def check_ledger(rows, acks, nonce, pid, directory, counted, shared, probe=False):
     identity = rows[0]
     if (identity.get('kind') != 'identity' or identity['nonce'] != nonce
             or identity['pid'] != pid or identity['exe_sha256'] != digest(directory / 'workload')
@@ -45,8 +45,11 @@ def check_ledger(rows, acks, nonce, pid, directory, counted, shared):
                    for row in targets)):
         raise ValueError('native fixture lacks32 distinct physically bound shared entry bodies')
     calls = [row for row in rows if row.get('kind') == 'call']
-    schedule = [('a', index) for index in range(1, counted + 1)] + [
-        ('shared', index) for index in range(1, shared + 1)] + [('fence', 1), ('proof', 1)]
+    if probe and (counted != 3 or shared != 1):
+        raise ValueError('startup probe requires exactly three A rounds')
+    schedule = [('a', index) for index in range(1, counted + 1)]
+    if not probe:
+        schedule += [('shared', index) for index in range(1, shared + 1)] + [('fence', 1), ('proof', 1)]
     expected = [(phase, index, slot) for phase, index in schedule for slot in range(4, 36)]
     if [(row['phase'], row['round'], row['slot']) for row in calls] != expected:
         raise ValueError('actual per-slot call ledger differs from independently issued schedule')
@@ -65,11 +68,12 @@ def check_ledger(rows, acks, nonce, pid, directory, counted, shared):
         if (len(matches) != 1 or matches[0]['calls'] != ordinal * 32
                 or calls[ordinal * 32 - 1]['after_return_ns'] > matches[0]['t']):
             raise ValueError('native phase ACK differs from its actual complete32slot round')
-    return dict(calls=len(expected), targets=32, counted_rounds=counted, shared_rounds=shared,
+    return dict(calls=len(expected), targets=32, physical_pairs=1, counted_rounds=counted,
+                shared_rounds=0 if probe else shared,
                 phase_calls=dict(Counter(row['phase'] for row in calls)))
 
 
-def execute_fixture(directory, counted=2, shared=2):
+def execute_fixture(directory, counted=2, shared=2, probe=False):
     with tempfile.TemporaryDirectory(prefix='.native-', dir=directory) as scratch:
         root = Path(scratch)
         fifo, ledger = root / 'control', root / 'calls.jsonl'
@@ -78,7 +82,7 @@ def execute_fixture(directory, counted=2, shared=2):
         child = subprocess.Popen([str(directory / 'workload'),
             str(directory / 'provider-A.so'), str(directory / 'provider-B.so'),
             str(directory / 'libdemotion-common.so'), str(fifo), str(ledger), nonce,
-            '10000', str(counted), str(shared)], stdin=subprocess.DEVNULL,
+            '10000', str(counted), str(shared), *(['probe'] if probe else [])], stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
         updates, acks = queue.Queue(), []
         def read():
@@ -101,11 +105,13 @@ def execute_fixture(directory, counted=2, shared=2):
             wait('prepared')
             control = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK | os.O_CLOEXEC)
             commands = [('ready', 'ready', 0)] + [
-                ('count', 'a-done', index) for index in range(1, counted + 1)] + [
-                ('load-b', 'b-ready', 0)] + [
-                ('shared', 'shared-done', index) for index in range(1, shared + 1)] + [
-                ('unload-a', 'a-unmapped', 0), ('fence', 'fence-done', 1),
-                ('proof', 'final-calls', 1), ('stop', 'done', 0)]
+                ('count', 'a-done', index) for index in range(1, counted + 1)]
+            if not probe:
+                commands += [('load-b', 'b-ready', 0)] + [
+                    ('shared', 'shared-done', index) for index in range(1, shared + 1)] + [
+                    ('unload-a', 'a-unmapped', 0), ('fence', 'fence-done', 1),
+                    ('proof', 'final-calls', 1)]
+            commands.append(('stop', 'done', 0))
             for command, event, index in commands:
                 os.write(control, (command + '\n').encode())
                 wait(event, index)
@@ -128,9 +134,9 @@ def execute_fixture(directory, counted=2, shared=2):
             child.stderr.close()
 
 
-def check_fixture(directory, counted=2, shared=2):
-    observed = execute_fixture(directory, counted, shared)
-    return check_ledger(**observed, directory=directory, counted=counted, shared=shared)
+def check_fixture(directory, counted=2, shared=2, probe=False):
+    observed = execute_fixture(directory, counted, shared, probe)
+    return check_ledger(**observed, directory=directory, counted=counted, shared=shared, probe=probe)
 
 
 def build(directory, cc='cc'):

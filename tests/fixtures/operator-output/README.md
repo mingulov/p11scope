@@ -352,3 +352,23 @@ failure cleanup. Invoke with absolute `--binary`, `--prebuilt`, `--out` and exac
 The five-entry ledger control is physical-entry evidence; this path claims
 neither semantic API counting nor continuity across these independent windows.
 Source controls pass; the new capture adapter needs its actual installed run.
+
+`qualify_reporter_probe.py` is a separate owned-control adapter for the actual
+matching reporter, ordinary SoftHSM GenerateRandom caller and prebuilt helper.
+It pins the actual candidate/helper/provider/manifest, resolves the actual
+executable offset, verifies actual main-thread mapping/clock namespaces and
+requires probe readiness before the signal. The observer remains unreaped with
+its pidfd until final kernel counters reconcile. Readable and repeated controls
+require a real matching marker and exactly one timely reporter sample; no-signal
+requires actual zero samples/kernel events. Wrong executable/process controls
+must refuse before readiness. `delayed` queues SIGINT while the owned process is
+stopped, resumes after150ms and rejects its actual late reporter observation;
+it explicitly does not claim handler delivery during that stop. Decoder/wire
+loss controls remain separate from actual zero-loss kernel reconciliation.
+
+Invoke only with the authorized lane and explicit absolute inputs, ordinary
+`--uid/--gid`, exact `--source-revision` and a new `--out`. Source controls cover
+its no-signal oracle; actual helper/PMU observations still need execution. The
+adapter does not activate the blocked-stderr E17 cell. Main blocked after actual
+handler delivery, wrong actual worker thread and full blocked-stderr
+pressure/content/cleanup oracles remain explicit acceptance dependencies.

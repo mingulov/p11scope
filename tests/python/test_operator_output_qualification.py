@@ -618,6 +618,25 @@ class InventorySavedCaptureTests(unittest.TestCase):
                 module['check_snapshot'](changed)
 
 
+class ReporterControlAdapterTests(unittest.TestCase):
+    def test_no_signal_control_cannot_accept_sample_fixture_loss_or_foreign_ready(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/qualify_reporter_probe.py'))
+        expected = dict(pid=123, tid=123, start_time=9, dev=2, ino=3, file_offset=80)
+        rows = [dict(kind='ready', mode='perf_uprobe', clock='CLOCK_MONOTONIC', **expected),
+                dict(kind='final', mode='perf_uprobe', samples=0, kernel_count=0, lost=0,
+                     time_enabled=100, time_running=100)]
+        self.assertEqual(module['check_zero'](rows, expected)['no_signal_samples'], 0)
+        for mutation in ('sample', 'fixture', 'loss', 'foreign', 'multiplex'):
+            changed = copy.deepcopy(rows)
+            if mutation == 'sample': changed[1]['samples'] = 1
+            elif mutation == 'fixture': changed[0]['mode'] = 'decode_fixture'
+            elif mutation == 'loss': changed[1]['lost'] = 1
+            elif mutation == 'foreign': changed[0]['ino'] += 1
+            else: changed[1]['time_running'] = 99
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                module['check_zero'](changed, expected)
+
+
 class CancellationMarkerTests(unittest.TestCase):
     def test_only_sent_first_signal_gets_one_conservative_arrival_timestamp(self):
         receipt = dict(signals=[], cancellation_ack_ns=None)

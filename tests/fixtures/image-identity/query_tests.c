@@ -18,6 +18,10 @@ static void index_cas_result(unsigned long long prior, unsigned long long expect
 #define IMG_AFTER_INDEX_CAS(prior, expected) index_cas_result(prior, expected)
 #define P11SCOPE_IMAGE_QUERY_HOST_TEST 1
 #include "image_identity_query.c"
+/* This fixture is deliberately an ordinary/unselected native object.
+ * The selected fixture links the real selector and exec/allocator paths. */
+u32 p11_selected_bootstrap_allowed(u32 tgid) { (void)tgid; return 0; }
+u32 p11_selected_invalidate_tgid(u32 tgid) { (void)tgid; return 0; }
 unsigned char TASK_COOKIE, INSTANCE_GEN, CONFIG;
 static u64 coverage, flags, index_cookie, record_key, indexed_tgid, cookie, now;
 static int index_present, record_present, index_fail, record_fail, storage_busy;

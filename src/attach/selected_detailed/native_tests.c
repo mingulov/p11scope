@@ -10,8 +10,8 @@ static struct selected_target target;
 static u64 state;
 static u64 task_cookie;
 static u64 coverage = 1;
-unsigned char TASK_COOKIE;
 unsigned char INSTANCE_GEN;
+unsigned char CONFIG;
 static struct task_struct task;
 static int missing_target, missing_state, missing_cookie;
 static int terminal_during_cookie;
@@ -84,5 +84,6 @@ int main(void)
     reset(); target.parent_kind = 2; struct task_struct thread = task;
     thread.group_leader = &task; ctx[0] = (u64)&thread;
     assert(p11_selected_cgroup_migrate(ctx) == 0 && state == 3);
-    puts("selected native gate/state: 28 controls passed");
+    reset(); coverage = 2; assert(!p11_selected_current_allowed(1, 400) && state == 3);
+    puts("selected native gate/state: 29 controls passed");
 }

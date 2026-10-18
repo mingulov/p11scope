@@ -219,6 +219,20 @@ pub(crate) fn decode_object_record(
     })
 }
 
+type ObjectTransportRows = Arc<[ObjectDescriptorWire; MAX_DESCRIPTORS as usize]>;
+
+/// Ordinary consumers receive the base only after the entire producer record
+/// validates. Transport rows authorize its wire form, never semantic admission.
+fn decode_transport_record(
+    bytes: &[u8],
+    descriptors: Option<&[ObjectDescriptorWire; MAX_DESCRIPTORS as usize]>,
+) -> Option<EventRecord> {
+    match descriptors {
+        Some(rows) => decode_object_record(bytes, rows).map(|record| record.base),
+        None => decode_record(bytes),
+    }
+}
+
 #[derive(Clone, Copy)]
 #[allow(clippy::large_enum_variant)] // The fixed 920-byte ring ABI stays allocation-free per dequeue.
 pub(crate) enum DiscoveryItem {
@@ -461,7 +475,9 @@ impl<S: RecordSource> EventDrain<S> {
             for _ in 0..quantum {
                 let progress = match self.source.bounded_record(p.producer)? {
                     BoundedRecord::Item(item) => {
-                        match decode(&item) {
+                        match decode_transport_record(&item, self.object_transport.as_deref())
+                            .map(|record| record.event)
+                        {
                             Some(event) => {
                                 if let Some(tap) = &self.trace_tap {
                                     tap.observe_call(&event);
@@ -525,6 +541,7 @@ pub struct EventDrain<S> {
     malformed_reported: u64,
     domain: Option<EventsDomain>,
     trace_tap: Option<crate::attach::detailed_identity::ProofTap>,
+    object_transport: Option<ObjectTransportRows>,
 }
 
 impl OwnedDrain {
@@ -559,7 +576,20 @@ impl OwnedDrain {
             malformed_reported: 0,
             domain: Some(domain.clone()),
             trace_tap: None,
+            object_transport: None,
         })
+    }
+
+    /// The same retained cursor with the producer's verified transport rows.
+    /// This does not expose object facts or enable attested semantic admission.
+    pub(crate) fn for_session_with_transport(
+        ebpf: &Ebpf,
+        domain: &EventsDomain,
+        descriptors: Option<ObjectTransportRows>,
+    ) -> Result<Self> {
+        let mut drain = Self::for_session(ebpf, domain)?;
+        drain.object_transport = descriptors;
+        Ok(drain)
     }
 }
 
@@ -586,6 +616,7 @@ impl<S: RecordSource> EventDrain<S> {
             malformed_reported: 0,
             domain: None,
             trace_tap: None,
+            object_transport: None,
         }
     }
 
@@ -602,6 +633,7 @@ impl<S: RecordSource> EventDrain<S> {
             malformed_reported: 0,
             domain: Some(domain),
             trace_tap: None,
+            object_transport: None,
         }
     }
     #[cfg(test)]
@@ -638,7 +670,9 @@ impl<S: RecordSource> EventDrain<S> {
             if let Some(left) = left.as_mut() {
                 *left -= 1;
             }
-            match decode(&item) {
+            match decode_transport_record(&item, self.object_transport.as_deref())
+                .map(|record| record.event)
+            {
                 Some(event) => {
                     if let Some(tap) = &self.trace_tap {
                         tap.observe_call(&event);
@@ -677,7 +711,7 @@ impl<S: RecordSource> EventDrain<S> {
             if let Some(left) = left.as_mut() {
                 *left -= 1;
             }
-            match decode_record(&item) {
+            match decode_transport_record(&item, self.object_transport.as_deref()) {
                 Some(record) => {
                     if let Some(tap) = &self.trace_tap {
                         tap.observe_call(&record.event);
@@ -863,7 +897,10 @@ pub(crate) fn poll_events_to_position<S: BoundedRecordSource>(
         // blocking the post-Reached positions read below.
         let record: BoundedRecord<Option<Event>> = match drain.source.bounded_record(stop) {
             Ok(bounded) => match bounded {
-                BoundedRecord::Item(item) => BoundedRecord::Item(decode(&item)),
+                BoundedRecord::Item(item) => BoundedRecord::Item(
+                    decode_transport_record(&item, drain.object_transport.as_deref())
+                        .map(|record| record.event),
+                ),
                 BoundedRecord::Reached => BoundedRecord::Reached,
                 BoundedRecord::Pending => BoundedRecord::Pending,
             },
@@ -940,7 +977,10 @@ pub(crate) fn poll_records_to_position<S: BoundedRecordSource>(
         // blocking the post-Reached positions read below.
         let record: BoundedRecord<Option<EventRecord>> = match drain.source.bounded_record(stop) {
             Ok(bounded) => match bounded {
-                BoundedRecord::Item(item) => BoundedRecord::Item(decode_record(&item)),
+                BoundedRecord::Item(item) => BoundedRecord::Item(decode_transport_record(
+                    &item,
+                    drain.object_transport.as_deref(),
+                )),
                 BoundedRecord::Reached => BoundedRecord::Reached,
                 BoundedRecord::Pending => BoundedRecord::Pending,
             },
@@ -1624,6 +1664,137 @@ mod tests {
         // Production decoding stays 368-only until the transport handoff.
         assert!(decode_record(&extended).is_none());
         assert!(decode(&extended).is_none());
+    }
+
+    fn ordinary_object_transport_record(slot: u32) -> Vec<u8> {
+        let mut bytes = event_bytes(&Event {
+            event_type: event_type::CALL,
+            slot,
+            rv: 7,
+            duration_ns: 91,
+            ..Default::default()
+        });
+        let mut tail = [0u8; 240];
+        tail[..2].copy_from_slice(&1u16.to_le_bytes());
+        tail[2..4].copy_from_slice(&240u16.to_le_bytes());
+        tail[4..8].copy_from_slice(&21u32.to_le_bytes());
+        tail[12] = 1; // LP64
+        tail[13] = 1; // C_CreateObject
+        tail[32..40].copy_from_slice(&0x1234u64.to_le_bytes());
+        tail[114] = 1; // result handle VALUE
+        bytes.extend_from_slice(&tail);
+        bytes
+    }
+
+    // A drift back to the strict 368-byte decoder loses the first call;
+    // accepting only a valid prefix of the 608-byte envelope admits slot 99.
+    fn check_ordinary_object_transport_route(route: u8) {
+        let good = ordinary_object_transport_record(12);
+        let mut malformed_tail = ordinary_object_transport_record(99);
+        malformed_tail[368] = 2; // unsupported tail version
+        let ordinary = event_bytes(&Event {
+            event_type: event_type::CALL,
+            slot: 13,
+            rv: 7,
+            duration_ns: 91,
+            ..Default::default()
+        });
+        let domain = EventsDomain::test_standin(811);
+        let mut drain = EventDrain::over_domain(
+            ScriptedRecords::records([good, malformed_tail, ordinary], 3),
+            domain.clone(),
+        );
+        let command = if route % 2 == 0 { "profile" } else { "trace" };
+        let policy = crate::attach::CapturePolicy::from_cli(command, false, false).unwrap();
+        drain.object_transport = crate::attach::object_transport_rows_with(policy, None, || {
+            Ok(Arc::new(
+                p11scope_ebpf_common::object_wire::publish_object_descriptors(),
+            ))
+        })
+        .unwrap();
+        let mut seen = Vec::new();
+        let mut observe = |event: Event| {
+            seen.push((event.slot, event.rv, event.duration_ns));
+            ControlFlow::Continue(())
+        };
+        match route {
+            0 => assert!(!drain.poll(Some(4), &mut observe)),
+            1 => assert!(!drain.poll_records(Some(4), |record| observe(record.event))),
+            2 => assert_eq!(
+                poll_events_to_position(&mut drain, 24, Some(4), &mut observe).unwrap(),
+                (false, false)
+            ),
+            3 => assert_eq!(
+                poll_records_to_position(&mut drain, 24, Some(4), |record| observe(record.event))
+                    .unwrap(),
+                (false, false)
+            ),
+            4 => {
+                let mut tail = OwnedRootTail::new(
+                    crate::run::OriginalRootExit::test_reaped(domain),
+                    Instant::now() + Duration::from_secs(1),
+                );
+                drain.begin_root_tail(&mut tail).unwrap();
+                assert_eq!(
+                    drain
+                        .poll_root_tail(&mut tail, 4, |event| {
+                            let _ = observe(event);
+                            Ok(())
+                        })
+                        .unwrap(),
+                    RootTailProgress::Reached
+                );
+                tail.complete().unwrap();
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(seen, [(12, 7, 91), (13, 7, 91)], "route {route}");
+        assert_eq!(drain.malformed(), 1, "route {route}");
+        assert_eq!(drain.take_malformed_delta(), 1);
+        assert_eq!(drain.take_malformed_delta(), 0);
+        assert_eq!(drain.source.consumer(), 24);
+    }
+
+    #[test]
+    fn ordinary_object_transport_live_poll_preserves_call() {
+        check_ordinary_object_transport_route(0);
+    }
+
+    #[test]
+    fn ordinary_object_transport_record_poll_preserves_call() {
+        check_ordinary_object_transport_route(1);
+    }
+
+    #[test]
+    fn ordinary_object_transport_terminal_poll_preserves_call() {
+        check_ordinary_object_transport_route(2);
+    }
+
+    #[test]
+    fn ordinary_object_transport_terminal_record_poll_preserves_call() {
+        check_ordinary_object_transport_route(3);
+    }
+
+    #[test]
+    fn ordinary_object_transport_root_tail_preserves_call() {
+        check_ordinary_object_transport_route(4);
+    }
+
+    #[test]
+    fn ordinary_object_transport_without_capability_stays_strict() {
+        let extended = ordinary_object_transport_record(12);
+        let ordinary = event_bytes(&Event {
+            slot: 13,
+            ..Default::default()
+        });
+        let mut drain = EventDrain::over(ScriptedRecords::records([extended, ordinary], 2));
+        let mut slots = Vec::new();
+        assert!(!drain.poll(Some(3), |event| {
+            slots.push(event.slot);
+            ControlFlow::Continue(())
+        }));
+        assert_eq!(slots, [13]);
+        assert_eq!(drain.malformed(), 1);
     }
 
     #[test]

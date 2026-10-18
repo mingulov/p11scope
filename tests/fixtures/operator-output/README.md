@@ -203,6 +203,19 @@ one common ELF do not establish32diagnostic pairs. The schedule and pair/wrap
 predicates below describe the intended cell and need revision before another
 long run. The original ten-call installed control is independent.
 
+A separately selected short pilot,
+`privileged_native_lane_pid_diagnostics_three_round_accelerated_pilot_lp64`,
+uses a scoped thread-local10ms scan cadence through the same actual
+`run_classic_finalizing`/NativeLane/coordinator path and unchanged default
+recorder. Production builds and all unselected tests retain the1s cadence.
+The pilot prints declared cadence, real elapsed wall time, actual pass count,
+raw read PRE/POST values and actual per-kind footer totals. Its evidence applies
+to the declared accelerated engine cadence; it does not establish default CLI
+cadence or disabled/enabled cost. The scoped override restores on normal return,
+nested calls and panic and cannot alter another thread's test. Run this short
+pilot before choosing any longer one-pair schedule; no guessed per-call record
+multiplier or arbitrary900s expectation is an acceptance fact.
+
 The new `diagnostics-wrap-ledger.c` physical entry-count fixture uses one PID,
 two2.40 tables and one common ELF with32 distinct real entry bodies at slots4–35.
 Those bodies have the exact fixture type `CK_RV(void)` and return0. This tests

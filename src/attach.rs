@@ -4575,8 +4575,12 @@ impl Session {
                     }
                     let query_refusal = match domain {
                         Some(domain) => {
-                            match image_query::ImageQueryOwner::load(&mut ebpf, host.btf(), domain)
-                            {
+                            match image_query::ImageQueryOwner::load(
+                                &mut ebpf,
+                                host.btf(),
+                                domain,
+                                host.supports_pidfd_iter_selector(),
+                            ) {
                                 Ok(owner) => {
                                     image_query = Some(owner);
                                     None

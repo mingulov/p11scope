@@ -45,6 +45,7 @@ impl ImageQueryOwner {
         ebpf: &mut aya::Ebpf,
         btf: &aya::Btf,
         domain: NativeDomainId,
+        pidfd_selector: bool,
     ) -> anyhow::Result<Self> {
         use anyhow::Context as _;
         let program: &mut aya::programs::Iter = ebpf
@@ -54,9 +55,6 @@ impl ImageQueryOwner {
         program
             .load("task", btf)
             .context("load same-object p11_image_query task iterator")?;
-        let pidfd_selector = btf
-            .id_by_type_name_kind("bpf_iter_attach_task", aya_obj::btf::BtfKind::Func)
-            .is_ok();
         Ok(Self {
             domain,
             generation: 0,

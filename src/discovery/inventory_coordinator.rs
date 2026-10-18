@@ -5435,7 +5435,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         self.semantic_admission_refused(attempt.caller, "caller_custody_unproven");
                         continue;
                     };
-                    match lane.prepare_caller_admission(candidate.pin(), attempt.slot, &module) {
+                    match lane.prepare_caller_admission(
+                        candidate.pin(),
+                        attempt.slot,
+                        &module,
+                        |bytes| self.registry.reserve_semantic_storage(bytes),
+                    ) {
                         Ok(owner) => semantic_prepared.push((candidate, owner)),
                         Err(reason) => {
                             self.semantic_admission_refused(attempt.caller, &reason.to_string())

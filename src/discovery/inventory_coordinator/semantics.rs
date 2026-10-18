@@ -15,8 +15,9 @@ use crate::inventory_semantics::{LaneNegative, SemanticRefusal};
 use crate::inventory_semantics::{PreparedSemanticAdmission, SemanticProviderTarget};
 use crate::process::PidPin;
 use crate::semantic_capture::{
-    CurrentReceiptRefusal, InvalidationScope, PhysicalSemanticGap, TickOutcome,
+    CurrentReceiptRefusal, Endpoint, InvalidationScope, PhysicalSemanticGap, TickOutcome,
 };
+use crate::semantics_edge::resources::{OWNED_ALLOCATION_PADDING, ResourceLease};
 use p11scope_ebpf_common::ImageIdentity;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -320,7 +321,7 @@ fn prepare_retained_subset(engine: &Engine, inputs: &RetainedInputs) -> SubsetPr
     SubsetPreparation { subset, refusals }
 }
 
-/// One accepted semantic caller: a CallerId and physical ModuleKey bound to
+/// One accepted semantic caller: its physical provider associations bound to
 /// the original retained caller custody (one stable duplicated pidfd Arc)
 /// and this Detailed domain's fresh full image. Move-only coordinator
 /// proof: private fields, redacted Debug, no Clone/Default/from_parts.
@@ -328,13 +329,94 @@ fn prepare_retained_subset(engine: &Engine, inputs: &RetainedInputs) -> SubsetPr
 /// every ticket comparison carries its domain.
 pub(crate) struct SemanticCallerBinding {
     caller: CallerId,
-    module: ModuleKey,
     domain: NativeDomainId,
     image: ImageIdentity,
     pin: Arc<PidPin>,
     scope_current: bool,
     suspension_cut: bool,
-    provider: Option<SemanticProviderTarget>,
+    providers: SemanticProviderAssociations,
+    #[cfg(test)]
+    reference_module: Option<ModuleKey>,
+}
+
+/// Exact requested slot allocation: reserve the full replacement while the
+/// old box and its lease remain live. Geometric growth bounds retained spare
+/// slots; each allocation's actual slice length is the charged capacity.
+struct SemanticProviderAssociations {
+    slots: Box<[Option<SemanticProviderTarget>]>,
+    len: usize,
+    capacity_lease: Option<ResourceLease>,
+}
+
+impl SemanticProviderAssociations {
+    fn new() -> Self {
+        Self {
+            slots: Box::default(),
+            len: 0,
+            capacity_lease: None,
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &SemanticProviderTarget> {
+        self.slots[..self.len].iter().map(|slot| {
+            slot.as_ref()
+                .expect("accepted provider slots are contiguous")
+        })
+    }
+
+    fn capacity_charge(capacity: usize) -> Option<usize> {
+        capacity
+            .checked_mul(std::mem::size_of::<Option<SemanticProviderTarget>>())?
+            .checked_add(OWNED_ALLOCATION_PADDING)
+    }
+
+    /// The caller checks the capture-wide association limit before growth.
+    /// Exact reproof needs no additional slot and retains old proof until now.
+    fn insert(
+        &mut self,
+        provider: SemanticProviderTarget,
+        registry: &CallerRegistry,
+    ) -> Result<(), SemanticBindingRefusal> {
+        let existing = self.iter().position(|old| old.same_association(&provider));
+        if let Some(at) = existing {
+            self.slots[at] = Some(provider);
+            return Ok(());
+        }
+        if self.iter().any(|old| old.conflicts_with(&provider)) {
+            return Err(SemanticBindingRefusal::ModuleConflict);
+        }
+        if self.len >= MAX_INSTANCES {
+            return Err(SemanticBindingRefusal::Capacity);
+        }
+        if self.len == self.slots.len() {
+            let capacity = self
+                .slots
+                .len()
+                .max(1)
+                .checked_mul(if self.slots.is_empty() { 1 } else { 2 })
+                .filter(|capacity| *capacity <= MAX_INSTANCES)
+                .ok_or(SemanticBindingRefusal::Capacity)?;
+            let charge = Self::capacity_charge(capacity).ok_or(SemanticBindingRefusal::Capacity)?;
+            let lease = registry
+                .reserve_semantic_storage(charge)
+                .map_err(|_| SemanticBindingRefusal::Capacity)?;
+            let mut allocation =
+                Box::<[Option<SemanticProviderTarget>]>::new_uninit_slice(capacity);
+            for slot in allocation.iter_mut() {
+                slot.write(None);
+            }
+            // SAFETY: every element above is initialized to a valid None.
+            let mut slots = unsafe { allocation.assume_init() };
+            for (old, new) in self.slots.iter_mut().zip(slots.iter_mut()) {
+                *new = old.take();
+            }
+            self.slots = slots; // free the old allocation before its charge
+            self.capacity_lease = Some(lease);
+        }
+        self.slots[self.len] = Some(provider);
+        self.len += 1;
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for SemanticCallerBinding {
@@ -347,8 +429,48 @@ impl SemanticCallerBinding {
     pub(crate) fn caller(&self) -> CallerId {
         self.caller
     }
-    pub(crate) fn module(&self) -> &ModuleKey {
-        &self.module
+    pub(crate) fn provider_for_endpoint(
+        &self,
+        endpoint: Endpoint,
+    ) -> Option<&SemanticProviderTarget> {
+        self.providers
+            .iter()
+            .find(|provider| provider.matches(endpoint))
+    }
+    pub(crate) fn provider_for_file(&self, file_slot: u32) -> Option<&SemanticProviderTarget> {
+        let mut providers = self
+            .providers
+            .iter()
+            .filter(|provider| provider.has_file_slot(file_slot));
+        let provider = providers.next()?;
+        providers.next().is_none().then_some(provider)
+    }
+
+    /// Old algorithm fixtures have exactly one reference module, never
+    /// production authority. Ambiguous real bindings cannot select a first.
+    #[cfg(test)]
+    pub(crate) fn reference_single_provider_module(&self) -> &ModuleKey {
+        assert!(
+            self.providers.len <= 1,
+            "multiple providers require exact endpoint selection"
+        );
+        self.providers
+            .iter()
+            .next()
+            .map(SemanticProviderTarget::module)
+            .or(self.reference_module.as_ref())
+            .expect("single-provider reference fixture")
+    }
+
+    /// Existing scripted reducer fixtures carry only this reference module.
+    /// An actual owner binding can never fall back here on a bad endpoint.
+    #[cfg(test)]
+    pub(crate) fn reference_fixture_module(&self) -> Option<&ModuleKey> {
+        if self.providers.len != 0 {
+            assert!(self.reference_module.is_none());
+            return None;
+        }
+        self.reference_module.as_ref()
     }
     pub(crate) fn domain(&self) -> NativeDomainId {
         self.domain
@@ -364,11 +486,6 @@ impl SemanticCallerBinding {
     pub(crate) fn scope_current(&self) -> bool {
         self.scope_current
     }
-    pub(crate) fn proves_endpoint(&self, endpoint: crate::semantic_capture::Endpoint) -> bool {
-        self.provider
-            .as_ref()
-            .is_none_or(|provider| provider.matches(endpoint))
-    }
 
     /// Tests-only binding: conversion tests script modules (including
     /// unidentified ones production proof refuses) that binding proof
@@ -383,13 +500,13 @@ impl SemanticCallerBinding {
     ) -> Self {
         Self {
             caller,
-            module,
             domain,
             image,
             pin,
             scope_current: true,
             suspension_cut: false,
-            provider: None,
+            providers: SemanticProviderAssociations::new(),
+            reference_module: Some(module),
         }
     }
 }
@@ -430,6 +547,7 @@ pub(crate) struct SemanticBindingSet {
     index: HashMap<CallerId, usize>,
     cursor: usize,
     limit: usize,
+    provider_limit: usize,
     refresh_cursor: Option<(CallerId, PinnedObjectId)>,
     /// Refusal-only history across accepted owner scan / failed scope commit.
     /// A later Detailed exec cannot silently reuse the chosen scan-pinned
@@ -500,6 +618,7 @@ impl SemanticBindingSet {
             index: HashMap::new(),
             cursor: 0,
             limit: MAX_INSTANCES,
+            provider_limit: MAX_INSTANCES,
             refresh_cursor: None,
             admission_images: HashMap::new(),
             successors: HashMap::new(),
@@ -539,6 +658,18 @@ impl SemanticBindingSet {
     #[cfg(test)]
     pub(crate) fn reference_limit(&mut self, limit: usize) {
         self.limit = limit.min(MAX_INSTANCES);
+    }
+
+    fn provider_count(&self) -> usize {
+        self.bindings
+            .iter()
+            .map(|binding| binding.providers.len)
+            .sum()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reference_provider_limit(&mut self, limit: usize) {
+        self.provider_limit = limit.min(MAX_INSTANCES);
     }
 
     fn insert(&mut self, binding: SemanticCallerBinding) -> Result<(), SemanticBindingRefusal> {
@@ -871,15 +1002,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     if module.is_none() {
                         continue;
                     }
-                    if self
-                        .semantic_bindings
-                        .get(record.id)
-                        .is_some_and(|binding| {
-                            binding.scope_current && module.as_ref() == Some(binding.module())
-                        })
-                    {
-                        continue;
-                    }
+                    // This catalog selector has no current Session file-slot
+                    // proof. Refresh the chosen pair instead of treating an
+                    // equal module (or any other bound provider) as that proof.
+                    // The persistent pair cursor keeps already-bound A from
+                    // starving B, including when a refresh refuses.
                     let item = (
                         key,
                         SemanticRefreshAttempt {
@@ -1026,6 +1153,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     ) {
         let (receipt, provider) = prepared.into_parts();
         let caller = candidate.caller;
+        let requested_file = receipt.endpoint().file_slot;
+        let provider_module = provider
+            .as_ref()
+            .ok()
+            .and_then(|provider| self.registry.module_id_for(provider.module()));
         // The accepted H0 scan consumes the published handoff even when the
         // provider or final scope proof refuses positive admission below.
         let bridge = self.semantic_bindings.successors.remove(&caller);
@@ -1164,25 +1296,39 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .initial_scope_cut = false;
             }
             let provider = provider.map_err(Refusal::OwnerRefused)?;
+            let exact_reproof = existing_at.is_some_and(|at| {
+                self.semantic_bindings.bindings[at]
+                    .providers
+                    .iter()
+                    .any(|old| old.same_association(&provider))
+            });
+            if !exact_reproof
+                && self.semantic_bindings.provider_count() >= self.semantic_bindings.provider_limit
+            {
+                return Err(Refusal::Capacity);
+            }
             if let Some(at) = existing_at {
                 let existing = &mut self.semantic_bindings.bindings[at];
-                if existing.module != *provider.module() {
-                    return Err(Refusal::ModuleConflict);
-                }
+                existing.providers.insert(provider, &self.registry)?;
                 existing.scope_current = true;
                 existing.suspension_cut = false;
-                existing.provider = Some(provider);
                 return Ok(());
             }
+            if self.semantic_bindings.bindings.len() >= self.semantic_bindings.limit {
+                return Err(Refusal::Capacity);
+            }
+            let mut providers = SemanticProviderAssociations::new();
+            providers.insert(provider, &self.registry)?;
             self.semantic_bindings.insert(SemanticCallerBinding {
                 caller,
-                module: provider.module().clone(),
                 domain: receipt.domain(),
                 image: receipt.image(),
                 pin: receipt.original_pin().clone(),
                 scope_current: true,
                 suspension_cut: false,
-                provider: Some(provider),
+                providers,
+                #[cfg(test)]
+                reference_module: None,
             })
         })();
         if let Err(reason) = result {
@@ -1200,6 +1346,24 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .insert(caller, bridge);
             }
             self.semantic_admission_refused(caller, reason.code());
+            if matches!(
+                reason,
+                SemanticBindingRefusal::Capacity
+                    | SemanticBindingRefusal::OwnerRefused(SemanticRefusal::ProviderStorage)
+            ) {
+                // Keep the existing finite refusal diagnostic and add the
+                // particular requested provider for resource/count refusal.
+                // A refused copy owns no ModuleKey, so its sealed file slot
+                // supplies bounded context without allocating identity first.
+                self.registry.record_gap(RegistryGap {
+                    caller: Some(caller),
+                    module: provider_module,
+                    pid: None,
+                    subject: format!("semantic provider file {requested_file} admission refused"),
+                    reason: reason.code().into(),
+                    budget: None,
+                });
+            }
         }
         (receipt, result)
     }
@@ -1272,13 +1436,13 @@ impl InventoryCoordinator<OsProcessSource> {
             .ok_or(Refusal::ImageUnproven(UnboundReason::CallerExited))?;
         self.semantic_bindings.insert(SemanticCallerBinding {
             caller,
-            module,
             domain,
             image,
             pin,
             scope_current: true,
             suspension_cut: false,
-            provider: None,
+            providers: SemanticProviderAssociations::new(),
+            reference_module: Some(module),
         })
     }
 
@@ -1300,13 +1464,13 @@ impl InventoryCoordinator<OsProcessSource> {
             None => Ok(()),
             Some(_) => self.semantic_bindings.insert(SemanticCallerBinding {
                 caller,
-                module,
                 domain,
                 image,
                 pin,
                 scope_current: true,
                 suspension_cut: false,
-                provider: None,
+                providers: SemanticProviderAssociations::new(),
+                reference_module: Some(module),
             }),
         }
     }
@@ -1348,7 +1512,7 @@ impl InventoryCoordinator<OsProcessSource> {
             if existing.image() != image {
                 return Err(Refusal::ImageUnproven(UnboundReason::ExecAmbiguous));
             }
-            if existing.module() != module {
+            if existing.reference_single_provider_module() != module {
                 return Err(Refusal::ModuleConflict);
             }
             self.prove_binding(caller, pid, module, domain, image, identity)?;

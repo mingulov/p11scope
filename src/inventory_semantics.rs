@@ -14,6 +14,9 @@ use crate::semantic_capture::{
     CurrentPartitionReceipt, CurrentReceiptRefusal, Endpoint, InvalidationScope,
     PhysicalSemanticGap, SemanticCapture, TickLimits, TickOutcome, TickReport,
 };
+use crate::semantics_edge::resources::{
+    OWNED_ALLOCATION_PADDING, ResourceLease, SemanticResourceRefusal,
+};
 use p11scope_ebpf_common::ImageIdentity;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,6 +30,7 @@ pub(crate) enum SemanticRefusal {
     Attachment,
     Descriptor,
     ProviderInstanceUnproven,
+    ProviderStorage,
     /// The lane cannot serve this operation yet: Task 5 owns Session
     /// startup and H0 driving; the Task 3 shell refuses honestly.
     Unavailable,
@@ -47,6 +51,7 @@ impl SemanticRefusal {
             Self::Attachment => "semantic_attachment_refused",
             Self::Descriptor => "semantic_descriptor_refused",
             Self::ProviderInstanceUnproven => "provider_instance_unproven",
+            Self::ProviderStorage => "provider_storage_refused",
             Self::Unavailable => "semantic_unavailable",
         }
     }
@@ -60,6 +65,7 @@ pub(crate) struct SemanticProviderTarget {
     module: ModuleKey,
     endpoint: Endpoint,
     _retained: RetainedInventoryTarget,
+    _storage: ResourceLease,
 }
 
 impl SemanticProviderTarget {
@@ -68,6 +74,37 @@ impl SemanticProviderTarget {
     }
     pub(crate) fn matches(&self, endpoint: Endpoint) -> bool {
         self.endpoint.object == endpoint.object && self.endpoint.file_slot == endpoint.file_slot
+    }
+
+    pub(crate) fn has_file_slot(&self, file_slot: u32) -> bool {
+        self.endpoint.file_slot == file_slot
+    }
+
+    pub(crate) fn same_association(&self, other: &Self) -> bool {
+        self.module == other.module && self.matches(other.endpoint)
+    }
+
+    pub(crate) fn conflicts_with(&self, other: &Self) -> bool {
+        self.endpoint.object == other.endpoint.object
+            || self.endpoint.file_slot == other.endpoint.file_slot
+    }
+
+    /// Requested copies plus the final real inline type. The latter also
+    /// conservatively covers the move-only prepared target before insertion;
+    /// retained container capacity is reserved independently.
+    fn copy_charge(module: &ModuleKey, watched: &RetainedInventoryTarget) -> Option<usize> {
+        let text = match module {
+            ModuleKey::Physical { sha256, .. } => sha256.as_ref(),
+            ModuleKey::Unidentified { path } => Some(path),
+        };
+        let module_bytes = match text.filter(|text| text.capacity() != 0) {
+            Some(text) => text.capacity().checked_add(OWNED_ALLOCATION_PADDING)?,
+            None => 0,
+        };
+        std::mem::size_of::<Self>()
+            .checked_add(std::mem::size_of::<SemanticCallerBinding>())?
+            .checked_add(watched.retained_copy_allocation_charge()?)?
+            .checked_add(module_bytes)
     }
 }
 
@@ -999,6 +1036,7 @@ impl AttestedSemanticLane {
         pin: Arc<PidPin>,
         slot: u32,
         module: &ModuleKey,
+        reserve: impl FnOnce(usize) -> Result<ResourceLease, SemanticResourceRefusal>,
     ) -> Result<PreparedSemanticAdmission, SemanticRefusal> {
         let (_, effective) = self.refresh_candidate_with_custody(pin, slot)?;
         #[cfg(test)]
@@ -1057,10 +1095,14 @@ impl AttestedSemanticLane {
             }
             self.validate_current(&receipt, &mut validation)
                 .map_err(|_| SemanticRefusal::ProviderInstanceUnproven)?;
+            let bytes = SemanticProviderTarget::copy_charge(module, receipt.watched())
+                .ok_or(SemanticRefusal::ProviderStorage)?;
+            let storage = reserve(bytes).map_err(|_| SemanticRefusal::ProviderStorage)?;
             Ok(SemanticProviderTarget {
                 module: module.clone(),
                 endpoint,
                 _retained: receipt.watched().share(),
+                _storage: storage,
             })
         })();
         // Validation may consume invalidations even on refusal. Keep them

@@ -1761,7 +1761,7 @@ fn native_semantic_domain_binding_uses_retained_custody() {
         .get(caller)
         .expect("accepted binding is retained");
     assert_eq!(bound.caller(), caller);
-    assert_eq!(bound.module(), &module);
+    assert_eq!(bound.reference_single_provider_module(), &module);
     assert_eq!(bound.domain(), detailed);
     assert_eq!(bound.image(), image);
 
@@ -5859,16 +5859,24 @@ impl SameCallerProviders {
 }
 
 #[test]
-fn native_semantic_same_caller_two_providers_reuse_one_process_custody() {
+fn native_semantic_same_caller_two_provider_refreshes_reuse_one_process_custody() {
     for first in [0, 1] {
-        let second = 1 - first;
         let mut fixture = SameCallerProviders::new();
         fixture.map(first);
-        fixture.map(second);
+        fixture.map(1 - first);
         assert_eq!(fixture.bind(first), Ok(()));
         let original = fixture.original_pin();
-        let second_result = fixture.bind(second);
-        assert!(Arc::ptr_eq(&original, &fixture.original_pin()));
+        let attempts =
+            fixture
+                .scene
+                .coordinator
+                .semantic_refresh_attempts(&fixture.lane, None, |_| true);
+        assert_eq!(attempts.len(), 2);
+        for (_, provider) in &fixture.providers {
+            assert!(attempts.iter().any(|attempt| {
+                attempt.caller == fixture.caller && attempt.module.as_ref() == Some(provider)
+            }));
+        }
         let targets = fixture
             .scene
             .coordinator
@@ -5876,31 +5884,37 @@ fn native_semantic_same_caller_two_providers_reuse_one_process_custody() {
             .bindings_for_tick();
         assert_eq!(targets.len(), 1, "providers must not duplicate H0 targets");
         assert!(Arc::ptr_eq(&original, &targets[0].pin()));
+        // The legacy reference fixture deliberately remains single-provider;
+        // only the genuine prepared-owner child qualifies B's admission.
         assert_eq!(
-            second_result,
-            Ok(()),
-            "a mapped second physical provider must join the original caller binding"
+            fixture.bind(1 - first),
+            Err(SemanticBindingRefusal::ModuleConflict)
         );
-        assert_eq!(fixture.bind(first), Ok(()));
-        assert_eq!(fixture.bind(second), Ok(()));
-        assert!(Arc::ptr_eq(&original, &fixture.original_pin()));
     }
 }
 
 #[test]
-fn native_semantic_same_caller_late_provider_retries_after_unmapped_refusal() {
+fn native_semantic_same_caller_late_provider_refresh_follows_mapping() {
     let mut fixture = SameCallerProviders::new();
     fixture.map(0);
     assert_eq!(fixture.bind(0), Ok(()));
     let original = fixture.original_pin();
-    assert!(fixture.bind(1).is_err(), "unmapped B cannot gain authority");
-    assert_eq!(fixture.bind(0), Ok(()), "refusing B must preserve A");
-    assert!(Arc::ptr_eq(&original, &fixture.original_pin()));
+    let attempts = fixture
+        .scene
+        .coordinator
+        .semantic_refresh_attempts(&fixture.lane, None, |_| true);
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].module.as_ref(), Some(&fixture.providers[0].1));
     fixture.map(1);
-    assert_eq!(
-        fixture.bind(1),
-        Ok(()),
-        "a real later mapping of B must permit retry on the same custody"
+    let attempts = fixture
+        .scene
+        .coordinator
+        .semantic_refresh_attempts(&fixture.lane, None, |_| true);
+    assert_eq!(attempts.len(), 2);
+    assert!(
+        attempts
+            .iter()
+            .any(|attempt| attempt.module.as_ref() == Some(&fixture.providers[1].1))
     );
     assert_eq!(fixture.bind(0), Ok(()));
     assert!(Arc::ptr_eq(&original, &fixture.original_pin()));
@@ -5917,9 +5931,21 @@ fn native_semantic_same_caller_bound_a_keeps_b_refresh_eligible() {
         .scene
         .coordinator
         .semantic_refresh_attempts(&fixture.lane, None, |_| true);
-    assert_eq!(attempts.len(), 1, "only the missing provider needs refresh");
-    assert_eq!(attempts[0].caller, fixture.caller);
-    assert_eq!(attempts[0].module.as_ref(), Some(&fixture.providers[1].1));
+    assert_eq!(
+        attempts.len(),
+        2,
+        "the selector cannot invent current file-slot proof"
+    );
+    assert!(
+        attempts
+            .iter()
+            .all(|attempt| attempt.caller == fixture.caller)
+    );
+    assert!(
+        attempts
+            .iter()
+            .any(|attempt| attempt.module.as_ref() == Some(&fixture.providers[1].1))
+    );
     let targets = fixture
         .scene
         .coordinator
@@ -6048,7 +6074,7 @@ fn native_semantic_multiprovider_candidates_bind_per_provider() {
             .semantic_bindings()
             .get(caller_a)
             .unwrap()
-            .module(),
+            .reference_single_provider_module(),
         &module_a
     );
     assert_eq!(
@@ -6057,7 +6083,7 @@ fn native_semantic_multiprovider_candidates_bind_per_provider() {
             .semantic_bindings()
             .get(caller_b)
             .unwrap()
-            .module(),
+            .reference_single_provider_module(),
         &module_b
     );
     assert!(
@@ -6186,8 +6212,10 @@ fn native_semantic_failed_refresh_attempts_remain_bounded_and_fair() {
             .try_clone()
             .unwrap();
         assert!(
-            lane.prepare_caller_admission(Arc::new(pin), attempt.slot, &module)
-                .is_err(),
+            lane.prepare_caller_admission(Arc::new(pin), attempt.slot, &module, |bytes| {
+                scene.coordinator.registry().reserve_semantic_storage(bytes)
+            })
+            .is_err(),
             "a shell lane without H0 I/O cannot mint current owner proof"
         );
     }

@@ -2337,6 +2337,18 @@ pub(crate) struct CallerRegistry {
 }
 
 impl CallerRegistry {
+    /// Provider copies and their retained containers share the reducers' one
+    /// capture-wide pool. The move-only lease follows the actual allocation.
+    pub(crate) fn reserve_semantic_storage(
+        &self,
+        bytes: usize,
+    ) -> Result<
+        crate::semantics_edge::resources::ResourceLease,
+        crate::semantics_edge::resources::SemanticResourceRefusal,
+    > {
+        self.semantic_resources.reserve(bytes)
+    }
+
     pub(crate) fn semantic_resource_snapshot(
         &self,
     ) -> crate::semantics_edge::resources::SemanticResourceSnapshot {

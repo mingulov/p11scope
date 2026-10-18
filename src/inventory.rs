@@ -1651,7 +1651,9 @@ fn bind_semantic_callers(
             coordinator.semantic_admission_refused(attempt.caller, "caller_custody_unproven");
             continue;
         };
-        match lane.prepare_caller_admission(candidate.pin(), attempt.slot, &module) {
+        match lane.prepare_caller_admission(candidate.pin(), attempt.slot, &module, |bytes| {
+            coordinator.registry().reserve_semantic_storage(bytes)
+        }) {
             Ok(prepared) => {
                 let (receipt, _) =
                     coordinator.consume_semantic_admission(candidate, prepared, None);

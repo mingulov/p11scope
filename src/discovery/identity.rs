@@ -207,6 +207,30 @@ impl RetainedMappedIdentities {
 }
 
 impl RetainedInventoryTarget {
+    /// Extra owned allocations made by `share`, without performing the copy
+    /// or exposing identity words. Entry's raw path and display path are two
+    /// independently cloned strings. File/export Arc clones share their
+    /// existing backing; their inline holders are charged by the caller.
+    pub(crate) fn retained_copy_allocation_charge(&self) -> Option<usize> {
+        let mut bytes = 0usize;
+        for text in [
+            Some(&self.entry.raw.path),
+            Some(&self.entry.path),
+            Some(&self.entry.sha256),
+            self.entry.build_id.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if text.capacity() != 0 {
+                bytes = bytes
+                    .checked_add(text.capacity())?
+                    .checked_add(crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING)?;
+            }
+        }
+        Some(bytes)
+    }
+
     /// A second owner of this retained object: the same opened file (one
     /// shared `Arc`, no reopen, no new descriptor), the same canonical
     /// identity, and the sticky changed evidence observed so far. The
@@ -3242,6 +3266,73 @@ mod tests {
         Version, WalkOutcome,
     };
     use std::cell::RefCell;
+
+    #[test]
+    fn retained_provider_copy_charge_covers_each_actual_cloned_allocation() {
+        let pins = test_fixture::real_scan_pin(
+            Path::new("/usr/bin/true"),
+            None,
+            1,
+            "provider-copy-charge",
+        );
+        let id = pins.pinned().next().unwrap().id;
+        let mut target = pins.retain_inventory_target(id).unwrap();
+        target.entry.raw.path.reserve(129);
+        target.entry.path.reserve(257);
+        target.entry.sha256.reserve(513);
+        let mut build_id = String::with_capacity(128);
+        build_id.push_str("a-real-owned-build-id");
+        target.entry.build_id = Some(build_id);
+        for with_build_id in [true, false] {
+            if !with_build_id {
+                target.entry.build_id = None;
+            }
+            let charge = target.retained_copy_allocation_charge().unwrap();
+            let copy = target.share();
+            let sources = [
+                Some(&target.entry.raw.path),
+                Some(&target.entry.path),
+                Some(&target.entry.sha256),
+                target.entry.build_id.as_ref(),
+            ];
+            let copies = [
+                Some(&copy.entry.raw.path),
+                Some(&copy.entry.path),
+                Some(&copy.entry.sha256),
+                copy.entry.build_id.as_ref(),
+            ];
+            let mut actual = 0;
+            let mut expected = 0;
+            for (source, copy) in sources.into_iter().zip(copies) {
+                assert_eq!(source.is_some(), copy.is_some());
+                if let (Some(source), Some(copy)) = (source, copy) {
+                    assert_eq!(source, copy);
+                    assert!(
+                        copy.capacity() <= source.capacity(),
+                        "pinned fresh String clone bound"
+                    );
+                    if !source.is_empty() {
+                        assert_ne!(source.as_ptr(), copy.as_ptr());
+                    }
+                    if source.capacity() != 0 {
+                        expected += source.capacity()
+                            + crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING;
+                    }
+                    if copy.capacity() != 0 {
+                        actual += copy.capacity()
+                            + crate::semantics_edge::resources::OWNED_ALLOCATION_PADDING;
+                    }
+                }
+            }
+            assert_eq!(
+                charge, expected,
+                "both independently cloned path fields are included"
+            );
+            assert!(charge >= actual);
+            assert!(Arc::ptr_eq(&target.entry.file, &copy.entry.file));
+            assert!(Arc::ptr_eq(&target.entry.exports, &copy.entry.exports));
+        }
+    }
 
     thread_local! {
         static BEFORE_HASH_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);

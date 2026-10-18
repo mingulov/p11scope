@@ -777,6 +777,41 @@ physical edge or a newer ordinal alone does not prove semantic recovery.
 Empty arrays in current production captures do not prove absence of instances
 or complete semantic coverage. No object authority is added.
 
+## Caller metadata (additive within v1; proposed)
+
+**Status: PROPOSED; implementation, publication and installed acceptance
+pending.** No producer writes these keys until the DR04 owner wires the
+opt-in, the coordinator and the `Presentation` projection. Existing
+callers, providers, scope coverage, counts and gaps are unchanged.
+
+The proposed top-level option declaration is
+`caller_metadata.mode`: `"none"` (default, explicit off) or `"cgroup"`.
+Off omits `callers[].metadata` entirely; omission in an older document
+means not recorded. On carries one optional object per caller even
+while pending/unknown, with exactly the keys `status`, `reason`,
+`revision`, `sample_started_ns`, `sample_ended_ns`, `validity`,
+`cgroup`, `container`, `pod`. Top `status` is `pending`, `sampled`,
+`unknown`, `stale` or `historical`; `validity` is `endpoint_sample_only`
+when a stable endpoint sample backs the row, else null. `revision`,
+`sample_started_ns`, `sample_ended_ns` and `cgroup.directory_inode` are
+exact decimal strings (values above 2^53 round-trip); unknown values
+are null.
+
+`cgroup` carries `status` (`sampled`/`unknown`), `source`
+(`retained_proc_cgroup2_directory`), `directory_inode`, `mount_context`
+(capture-local `cg<N>`, not portable identity) and finite `reason`.
+`container` carries `status` (`hint`/`unknown`), `source`
+(`cgroup_path_pattern`), `runtime` (`unknown`/`docker`/`containerd`/
+`cri_o`), canonical 64-hex `id` and finite `reason`. `pod` carries
+`status`, `source`, canonical 36-character `uid` and finite `reason`.
+Finite reasons are `permission_denied`, `identity_unavailable`,
+`generation_changed`, `process_exited`, `read_failed`, `malformed`,
+`byte_limit`, `row_limit`, `lookup_limit`, `deadline`,
+`changed_during_sample`, `hierarchy_unsupported`,
+`membership_ambiguous`, `namespace_unresolved`, `unrecognized`,
+`ambiguous_pattern`, `refresh_overdue` and `stopped`. Hints are display
+context only and never join callers across captures or revise counters.
+
 ## Example (abridged)
 
 ```json

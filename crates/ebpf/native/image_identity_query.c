@@ -195,12 +195,11 @@ static IMG_INLINE int image_write(struct image_continuity *record, u64 exec_id,
         image_fail();
     return 0;
 }
-__attribute__((always_inline)) u32 p11_image_entry(u64 tgid, u64 cookie, u64 exec_id)
+static IMG_INLINE u32 image_seed(u64 tgid, u64 cookie, u64 exec_id)
 {
     if (!image_allowed())
         return 0;
-    if (!tgid || tgid > 0xffffffffULL || !image_cookie_valid(cookie) ||
-        tgid != (image_pid_tgid() >> 32)) {
+    if (!tgid || tgid > 0xffffffffULL || !image_cookie_valid(cookie)) {
         image_fail();
         return 0;
     }
@@ -230,10 +229,33 @@ __attribute__((always_inline)) u32 p11_image_entry(u64 tgid, u64 cookie, u64 exe
     }
     return image_allowed();
 }
+/* Ordinary call entry retains its original same-current-task provenance. */
+__attribute__((always_inline)) u32 p11_image_entry(u64 tgid, u64 cookie, u64 exec_id)
+{
+    if (tgid != (image_pid_tgid() >> 32)) {
+        if (image_allowed())
+            image_fail();
+        return 0;
+    }
+    return image_seed(tgid, cookie, exec_id);
+}
+/* Only a closed selected Session may use the remote iterator transaction.
+ * Its earlier exec invalidator makes late READY permanently nonauthoritative. */
+extern u32 p11_selected_bootstrap_allowed(u32 tgid);
+extern u32 p11_selected_invalidate_tgid(u32 tgid);
+__attribute__((always_inline)) u32 p11_image_selected_seed(u64 tgid, u64 cookie, u64 exec_id)
+{
+    if (!tgid || tgid > 0xffffffffULL || !p11_selected_bootstrap_allowed((u32)tgid))
+        return 0;
+    return image_seed(tgid, cookie, exec_id) &&
+        p11_selected_bootstrap_allowed((u32)tgid);
+}
 IMG_SEC("fentry/exec_mm_release")
 int p11_image_exec_release(u64 *ctx)
 {
     (void)ctx; /* Never read either pointer argument or task storage. */
+    /* Mandatory negative action even before a bootstrap locator exists. */
+    (void)p11_selected_invalidate_tgid((u32)(image_pid_tgid() >> 32));
     if (!image_allowed())
         return 0;
     u64 tgid = image_pid_tgid() >> 32;

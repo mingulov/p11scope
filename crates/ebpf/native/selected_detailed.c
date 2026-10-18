@@ -61,6 +61,12 @@ __attribute__((noinline)) u32 p11_selected_current_allowed(u32 parent_allowed, u
     u64 *state = selected_lookup(&SELECTED_DETAILED_STATE, &key);
     if (!state || selected_state(state) != SELECTED_ACTIVE || tgid != target->tgid)
         return 0;
+    key = IMG_GEN_COVERAGE;
+    u64 *coverage = selected_lookup(&INSTANCE_GEN, &key);
+    if (!coverage || *(volatile u64 *)coverage != IMG_ENABLED) {
+        selected_close(state);
+        return 0;
+    }
     struct task_struct *task = selected_current_task();
     struct task_struct *leader = task ? task->group_leader : (void *)0;
     u64 *cookie = leader ? selected_storage_get(&TASK_COOKIE, leader, (void *)0, 0) : (void *)0;
@@ -99,5 +105,71 @@ int p11_selected_cgroup_migrate(u64 *ctx)
     struct task_struct *subject = (void *)ctx[0];
     if (subject && subject->tgid > 0)
         (void)p11_selected_invalidate_tgid((u32)subject->tgid);
+    return 0;
+}
+
+struct selected_iter_meta { void *seq; u64 session_id; u64 seq_num; };
+struct selected_iter_task { struct selected_iter_meta *meta; struct task_struct *task; };
+__attribute__((noinline)) u32 p11_selected_bootstrap_allowed(u32 tgid)
+{
+    u32 zero = 0;
+    const struct selected_target *target = selected_lookup(&SELECTED_DETAILED, &zero);
+    u64 *state = selected_lookup(&SELECTED_DETAILED_STATE, &zero);
+    u32 coverage_key = IMG_GEN_COVERAGE;
+    u64 *coverage = selected_lookup(&INSTANCE_GEN, &coverage_key);
+    return target && target->mode == SELECTED_MODE && target->tgid == tgid &&
+        tgid && state && selected_state(state) == SELECTED_CLOSED &&
+        coverage && *(volatile u64 *)coverage == IMG_ENABLED;
+}
+SEC("iter/task")
+int p11_selected_bootstrap(struct selected_iter_task *ctx)
+{
+    u32 zero = 0;
+    const struct selected_target *target = selected_lookup(&SELECTED_DETAILED, &zero);
+    struct selected_bootstrap_control *ctl = selected_lookup(&SELECTED_BOOTSTRAP_CTL, &zero);
+    if (!ctl || !ctx || !ctx->meta || !ctx->meta->seq)
+        return 1;
+    if (!target || !p11_selected_bootstrap_allowed(target->tgid) ||
+        !ctl->generation || !ctl->visit_limit || ctl->visit_limit > SELECTED_VISIT_LIMIT ||
+        ctl->failed || ctl->visits >= ctl->visit_limit || selected_ktime() >= ctl->deadline_ns) {
+        ctl->failed = 1;
+        return 1;
+    }
+    ctl->visits++;
+    struct selected_bootstrap_row row = { .generation = ctl->generation,
+        .cookie = 0, .exec_id = 0, .visits = ctl->visits, .tgid = target->tgid, .status = 2 };
+    struct task_struct *task = ctx->task;
+    if (!task) {
+        if (ctl->emitted != 1 || !p11_selected_bootstrap_allowed(target->tgid)) {
+            ctl->failed = 1;
+            return 1;
+        }
+        if (selected_seq_write(ctx->meta->seq, &row, sizeof(row)))
+            ctl->failed = 1;
+        return 0;
+    }
+    if (task->tgid != (int)target->tgid || task->group_leader != task)
+        return 0;
+    if (ctl->emitted) {
+        ctl->failed = 1;
+        return 1;
+    }
+    struct image_identity image;
+    if (p11_link_task_identity(task, &image) != COOKIE_STATUS_OK ||
+        !p11_image_selected_seed(target->tgid, image.task_cookie, image.exec_id) ||
+        task->group_leader != task || task->tgid != (int)target->tgid ||
+        *(volatile u64 *)&task->self_exec_id != image.exec_id ||
+        !p11_selected_bootstrap_allowed(target->tgid)) {
+        ctl->failed = 1;
+        return 1;
+    }
+    row.cookie = image.task_cookie;
+    row.exec_id = image.exec_id;
+    row.status = 1;
+    if (selected_seq_write(ctx->meta->seq, &row, sizeof(row))) {
+        ctl->failed = 1;
+        return 1;
+    }
+    ctl->emitted = 1;
     return 0;
 }

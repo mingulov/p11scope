@@ -21,7 +21,10 @@ fn actual_selected_native_gate_and_irreversible_state() {
             "-Werror",
             "-Wno-unknown-attributes",
         ])
-        .arg(root.join("src/attach/selected_detailed/native_tests.c"))
+        .args(
+            ["native_tests.c", "identity_fixture.c", "query_fixture.c"]
+                .map(|name| root.join("src/attach/selected_detailed").join(name)),
+        )
         .arg("-o")
         .arg(&binary)
         .output()
@@ -38,5 +41,44 @@ fn actual_selected_native_gate_and_irreversible_state() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("28 controls passed"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("29 controls passed"));
+}
+
+#[test]
+fn actual_selected_bootstrap_uses_real_allocator_and_continuity() {
+    let root = PathBuf::from(option_env!("CARGO_MANIFEST_DIR").unwrap_or(env!("PWD")));
+    let binary = std::env::temp_dir().join(format!(
+        "p11scope-selected-bootstrap-{}",
+        std::process::id()
+    ));
+    let output = Command::new("clang-18")
+        .args([
+            "-std=gnu11",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-Wno-unknown-attributes",
+        ])
+        .args(
+            ["bootstrap_tests.c", "identity_fixture.c", "query_fixture.c"]
+                .map(|name| root.join("src/attach/selected_detailed").join(name)),
+        )
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new(&binary).output().unwrap();
+    let _ = std::fs::remove_file(binary);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("9 controls passed"));
 }

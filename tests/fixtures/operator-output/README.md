@@ -268,3 +268,15 @@ coverage/loss and settlement facts after normalizing run-local IDs/timestamps.
 Each run has an explicit900s bound; the pair is approximately22minutes at the
 current one-second pass cadence. Report actual runtime/output bytes. Controlled
 RSS/CPU/performance cost is a separate T10 gate.
+
+Readable stderr accepts either complete once-only main-control-thread marker:
+`p11scope: cancel: loop exited on signal N after T ticks` or the truthful late
+`p11scope: cancel: signal N observed during finalization after T ticks`. The
+parser requires a complete newline, the independently sent first signal and a
+finite unsigned tick count; duplicates and a foreign signal fail. The receipt
+records phase and channel. Arrival is a conservative upper bound on main-thread
+observation, distinct from handler delivery and cleanup completion. The late
+marker does not change the recorded capture-loop end reason. These parser
+controls do not qualify any new installed candidate or repair the remaining
+partial stdout terminal-content cells. Blocked stderr still needs the separately
+reviewed, candidate-bound external reporter witness and remains unqualified.

@@ -353,15 +353,16 @@ jobs:
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc libseccomp-dev llvm python3
       - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
-      # Reviewed exec task candidacy and dumpability checks change all three
-      # default objects. Use the latest intended BPF-source revision as baseline.
+      # Reviewed H7 object transport and H8 journal plumbing intentionally
+      # changed the default objects. Pin the accepted T3 source checkpoint;
+      # object parity here does not establish installed/live acceptance.
       # The checker reconstructs and explicitly fetches each immutable snapshot,
       # then builds it offline (including nested nightly Cargo). No target cache.
       - name: Compare complete default objects
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=e2961e08d6760bf617259e3461dc64c37ed4fa24
+          BASELINE=0c761a6408892d864983a52295562e91c6de2900
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

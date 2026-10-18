@@ -87,6 +87,23 @@ sudo -n python3 -I scripts/qualify-operator-output.py \
   --out /home/user/p11scope-operator-ID/NEW_RUN
 ```
 
+Some provider builds construct their tables in `.bss` or on the heap, outside
+file-backed scan discovery. For that case, explicitly choose `--manifest
+/absolute/helper-output.json` (repeatable) after running the trusted, matching
+prebuilt helper on the same held provider:
+
+```sh
+/absolute/staged/p11scope-discover --module /absolute/provider.so -o /absolute/helper-output.json
+```
+
+The controller verifies helper/source and arrival identity before execution.
+The harness pins each manifest, checks its module path and provider object hash
+against the pinned workload provider, forwards the explicit choice unchanged,
+and records `discovery_mode=explicit-manifest` with input identities. The
+observer validates the complete manifest/offset contract. This qualifies output
+under explicit operator attestation; it does not qualify default discovery of
+that provider. Never infer a passing capture from a zero-probe run.
+
 Omit `--cells` for all27 requested cells. Select ancillary controls explicitly,
 for example `--cells 4M-slowpipe-midcapture --control child-held-stdout`.
 The16MiB file bound limits retained input memory: each file read requests at

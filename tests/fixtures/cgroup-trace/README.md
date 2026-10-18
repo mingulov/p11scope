@@ -178,3 +178,22 @@ authorized by this documentation.
 
 Successful first-package cells close only the facts they actually demonstrate.
 The complete N3/U2b/U6 installed gate remains open until that matrix is exercised.
+
+The installed driver accepts repeatable absolute `--manifest` inputs for a
+provider whose supported entry points were attested by the actual trusted
+`p11scope-discover --module PROVIDER -o MANIFEST` helper. In this mode also supply
+`--manifest-helper /absolute/preverified/p11scope-discover` and
+`--helper-source-revision` with that helper's exact 40-digit source commit.
+The controller must verify the helper/compiler source and arrival bytes and
+actually generate the manifest against the same held provider before starting
+the live lane; supplying these arguments is not proof of helper execution.
+The harness holds and hashes the helper, manifests and provider, checks the
+manifest schema/module/provider hash, rejects pathname replacement, and records
+this separate helper source pin and the `explicit_trusted_manifest` mode in each
+receipt and the summary. It forwards manifests to both real `trace` and `run
+--trace` commands, before the run child `--` boundary. The runtime still checks
+the complete manifest authority/offset contract. No-manifest mode remains
+`default_discovery`; a successful explicit-manifest cell does not qualify
+unsupported default scanning. Neither mode changes the independent caller,
+scope, naming, false-name, privacy or teardown oracles. These source controls
+have not yet supplied an installed G22 positive on the replacement candidate.

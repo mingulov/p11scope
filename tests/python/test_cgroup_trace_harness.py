@@ -21,6 +21,108 @@ ROOT = Path(__file__).resolve().parents[2]
 HARNESS = runpy.run_path(str(ROOT / 'scripts/qualify-cgroup-trace.py'))
 
 
+class ManifestInputTests(unittest.TestCase):
+    def test_explicit_helper_bound_manifests_and_both_real_argv_boundaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = [root / name for name in ('provider.so', 'trusted-helper', 'manifest.json')]
+            paths[0].write_bytes(b'owned provider input')
+            paths[1].write_bytes(b'owned preverified helper input')
+            provider, helper = (HARNESS['FilePin'](path) for path in paths[:2])
+            manifest = None
+            try:
+                document = dict(schema='p11scope-manifest/5', module_path=str(provider.path),
+                    objects=[dict(path=str(provider.path), identity=dict(sha256=provider.digest))])
+                paths[2].write_text(json.dumps(document))
+                manifest = HARNESS['FilePin'](paths[2])
+                arguments = HARNESS['manifest_arguments']([manifest], provider, helper, 'a' * 40)
+                self.assertEqual(arguments, ['--manifest', str(paths[2])])
+                binary, caller = mock.Mock(path=root / 'p11scope'), mock.Mock(path=root / 'caller')
+                trace = HARNESS['trace_capture_argv'](binary, provider, root / 'selected',
+                    root / 'trace', dict(duration_seconds=20), arguments)
+                run = HARNESS['run_trace_argv'](binary, provider, caller, root / 'trace', root / 'gate', arguments)
+                self.assertEqual(trace[trace.index('--manifest') + 1], str(paths[2]))
+                self.assertNotIn('--', trace)
+                boundary = run.index('--')
+                self.assertLess(run.index('--manifest'), boundary)
+                self.assertEqual(run[boundary + 1:boundary + 3], [str(caller.path), str(provider.path)])
+                self.assertEqual(trace[trace.index('--cgroup') + 1], str(root / 'selected'))
+                self.assertNotIn(str(helper.path), trace + run, 'helper is not an observer CLI option')
+                for h, revision in ((None, 'a' * 40), (helper, None), (helper, 'wrong')):
+                    with self.assertRaises(ValueError):
+                        HARNESS['manifest_arguments']([manifest], provider, h, revision)
+                with self.assertRaises(ValueError):
+                    HARNESS['manifest_arguments']([], provider, helper, 'a' * 40)
+                self.assertEqual(HARNESS['manifest_arguments']([], provider, None, None), [])
+                replacement = root / 'other-helper'
+                replacement.write_bytes(paths[1].read_bytes())
+                replacement.replace(paths[1])
+                with self.assertRaises(ValueError):
+                    HARNESS['manifest_arguments']([manifest], provider, helper, 'a' * 40)
+            finally:
+                if manifest:
+                    manifest.close()
+                provider.close()
+                helper.close()
+
+    def test_repeated_manifests_and_replaced_provider_or_manifest_are_checked(self):
+        for replaced in ('provider.so', 'first.json'):
+            with self.subTest(replaced=replaced), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / 'provider.so').write_bytes(b'provider')
+                (root / 'helper').write_bytes(b'helper')
+                provider, helper = (HARNESS['FilePin'](root / name) for name in ('provider.so', 'helper'))
+                manifests = []
+                try:
+                    document = dict(schema='p11scope-manifest/5', module_path=str(provider.path),
+                        objects=[dict(path=str(provider.path), identity=dict(sha256=provider.digest))])
+                    for name in ('first.json', 'second.json'):
+                        path = root / name
+                        path.write_text(json.dumps(document))
+                        manifests.append(HARNESS['FilePin'](path))
+                    self.assertEqual(HARNESS['manifest_arguments'](manifests, provider, helper, 'b' * 40),
+                        [item for pin in manifests for item in ('--manifest', str(pin.path))])
+                    replacement = root / 'replacement'
+                    replacement.write_bytes((root / replaced).read_bytes())
+                    replacement.replace(root / replaced)
+                    with self.assertRaises(ValueError):
+                        HARNESS['manifest_arguments'](manifests, provider, helper, 'b' * 40)
+                finally:
+                    for pin in manifests:
+                        pin.close()
+                    helper.close()
+                    provider.close()
+
+    def test_wrong_provider_or_manifest_content_is_rejected_before_argv(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ('provider.so', 'helper'):
+                (root / name).write_bytes(name.encode())
+            provider, helper = (HARNESS['FilePin'](root / name) for name in ('provider.so', 'helper'))
+            try:
+                document = dict(schema='p11scope-manifest/5', module_path=str(provider.path),
+                    objects=[dict(path=str(provider.path), identity=dict(sha256=provider.digest))])
+                for mutation in ('hash', 'path', 'duplicate', 'schema', 'shape', 'oversize'):
+                    value = json.loads(json.dumps(document))
+                    if mutation == 'hash': value['objects'][0]['identity']['sha256'] = '0' * 64
+                    elif mutation == 'path': value['module_path'] = '/other/provider'
+                    elif mutation == 'duplicate': value['objects'].append(dict(value['objects'][0]))
+                    elif mutation == 'schema': value['schema'] = 'wrong'
+                    elif mutation == 'shape': value = []
+                    path = root / 'manifest.json'
+                    path.write_bytes(b' ' * (16 * 1024 * 1024 + 1) if mutation == 'oversize'
+                                     else json.dumps(value).encode())
+                    pin = HARNESS['FilePin'](path)
+                    try:
+                        with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                            HARNESS['manifest_arguments']([pin], provider, helper, 'a' * 40)
+                    finally:
+                        pin.close()
+            finally:
+                provider.close()
+                helper.close()
+
+
 class CellTimingTests(unittest.TestCase):
     def test_long_sparse_waits_cover_the_real_span_and_final_drain(self):
         for name, span in (('sparse1', 4), ('sparse10', 30), ('sparse59', 118), ('sparse61', 122)):

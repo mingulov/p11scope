@@ -421,6 +421,57 @@ class FilePin:
         os.close(self.fd)
 
 
+def verify_input_path(pin):
+    pin.verify()
+    current = pin.path.stat()
+    if (current.st_dev, current.st_ino) != (pin.initial.st_dev, pin.initial.st_ino):
+        raise ValueError('held manifest/provider/helper pathname was replaced')
+
+
+def manifest_arguments(manifests, provider, helper, helper_revision):
+    if not manifests:
+        if helper is not None or helper_revision is not None:
+            raise ValueError('manifest helper provenance requires explicit manifests')
+        return []
+    if helper is None or not isinstance(helper_revision, str) or not re.fullmatch(r'[0-9a-f]{40}', helper_revision):
+        raise ValueError('explicit manifests require the held trusted helper and exact helper source revision')
+    for pin in (provider, helper, *manifests):
+        verify_input_path(pin)
+    arguments = []
+    for pin in manifests:
+        # Read from the held object with a fixed bound before decoding/allocation.
+        payload = os.pread(pin.fd, 16 * 1024 * 1024 + 1, 0)
+        if len(payload) > 16 * 1024 * 1024:
+            raise ValueError('manifest exceeds the bounded input limit')
+        try:
+            document = json.loads(payload)
+        except (ValueError, UnicodeError) as error:
+            raise ValueError('invalid manifest JSON') from error
+        if not isinstance(document, dict):
+            raise ValueError('manifest must be an object')
+        objects = document.get('objects')
+        if (document.get('schema') != 'p11scope-manifest/5'
+                or document.get('module_path') != str(provider.path)
+                or not isinstance(objects, list) or len(objects) != 1
+                or not isinstance(objects[0], dict) or objects[0].get('path') != str(provider.path)
+                or not isinstance(objects[0].get('identity'), dict)
+                or objects[0]['identity'].get('sha256') != provider.digest):
+            raise ValueError('explicit manifest does not bind the held actual provider')
+        arguments.extend(('--manifest', str(pin.path)))
+    return arguments
+
+
+def trace_capture_argv(binary, provider, scope_path, trace_path, budget, manifest_argv):
+    return [str(binary.path), 'trace', '--cgroup', str(scope_path), '--module', str(provider.path),
+            *manifest_argv, '--duration', f"{budget['duration_seconds']}s", '-o', str(trace_path)]
+
+
+def run_trace_argv(binary, provider, caller, trace_path, gate, manifest_argv):
+    return [str(binary.path), 'run', '--trace', '--module', str(provider.path), *manifest_argv,
+            '--pause', 'auto', '--duration', '20s', '-o', str(trace_path), '--', str(caller.path),
+            str(provider.path), '0', 'selected', '--auto-gate', str(gate), '--canary', CANARIES[2]]
+
+
 class Reader:
     def __init__(self, stream, path):
         self.stream, self.path = stream, path
@@ -647,12 +698,18 @@ def initialize_tokens(directory, uid, gid):
     return env
 
 
-def run_cell(args, name, directory, env, provider, binary, callers, cgroups, scope_created_ns):
+def run_cell(args, name, directory, env, provider, binary, callers, cgroups, scope_created_ns,
+             manifests=(), manifest_helper=None, helper_revision=None):
     selected, outside = cgroups
     owners, readers, images, sampler = [], [], [], None
     observer = caller = None
     budget = cell_timing(name)
-    receipt = dict(cell=name, require_named=name in ('stable', 'migrate', 'exec', 'run',
+    manifest_argv = manifest_arguments(manifests, provider, manifest_helper, helper_revision)
+    mode = dict(mode='explicit_trusted_manifest' if manifests else 'default_discovery',
+                manifests=[pin.metadata() for pin in manifests],
+                helper=manifest_helper.metadata() if manifest_helper else None,
+                helper_source_revision=helper_revision)
+    receipt = dict(cell=name, discovery_input=mode, require_named=name in ('stable', 'migrate', 'exec', 'run',
                                                    'sparse1', 'sparse10', 'reexec', 'nonleader'),
                    fresh_observer=True, scope_created_ns=scope_created_ns,
                    pid_namespace=process_identity(os.getpid())['pid_namespace'],
@@ -693,13 +750,10 @@ def run_cell(args, name, directory, env, provider, binary, callers, cgroups, sco
             receipt['selected_initial_pids'] = selected.members()
             if receipt['selected_initial_pids'] != [caller.pid]:
                 raise ValueError('selected cgroup contains a process other than the owned caller')
-            argv = [str(binary.path), 'trace', '--cgroup', str(selected.path), '--module', str(provider.path),
-                    '--duration', f"{budget['duration_seconds']}s", '-o', str(trace_path)]
+            argv = trace_capture_argv(binary, provider, selected.path, trace_path, budget, manifest_argv)
         else:
             gate = directory / 'run-gate'
-            argv = [str(binary.path), 'run', '--trace', '--module', str(provider.path), '--pause', 'auto',
-                    '--duration', '20s', '-o', str(trace_path), '--', str(callers[0].path),
-                    str(provider.path), '0', 'selected', '--auto-gate', str(gate), '--canary', CANARIES[2]]
+            argv = run_trace_argv(binary, provider, callers[0], trace_path, gate, manifest_argv)
         receipt['observer_started_ns'] = time.monotonic_ns()
         observer = spawn_owned(owners, argv, uid=0, stdin=subprocess.DEVNULL,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -795,6 +849,7 @@ def run_cell(args, name, directory, env, provider, binary, callers, cgroups, sco
         receipt['resources'] = sampler.finish()
         sampler = None
         receipt['provider_after'] = pin_fd(provider.fd)
+        manifest_arguments(manifests, provider, manifest_helper, helper_revision)
         binary.verify()
         for pin in callers:
             pin.verify()
@@ -827,6 +882,9 @@ def _main():
     parser.add_argument('--provider', type=Path, required=True)
     parser.add_argument('--caller', type=Path, required=True)
     parser.add_argument('--source-revision', required=True)
+    parser.add_argument('--manifest', type=Path, action='append', default=[])
+    parser.add_argument('--manifest-helper', type=Path)
+    parser.add_argument('--helper-source-revision')
     parser.add_argument('--uid', type=int, required=True)
     parser.add_argument('--gid', type=int, required=True)
     parser.add_argument('--cells', default=','.join(INITIAL_CELLS))
@@ -840,6 +898,13 @@ def _main():
     if not args.out.is_absolute() or any(not path.is_absolute() for path in
                                         (args.binary, args.provider, args.caller)):
         parser.error('all input/output paths must be absolute')
+    if (any(not path.is_absolute() for path in args.manifest)
+            or (args.manifest_helper is not None and not args.manifest_helper.is_absolute())):
+        parser.error('manifest and helper paths must be absolute')
+    if bool(args.manifest) != bool(args.manifest_helper) or bool(args.manifest) != bool(args.helper_source_revision):
+        parser.error('explicit manifests require both helper provenance arguments')
+    if args.helper_source_revision and not re.fullmatch(r'[0-9a-f]{40}', args.helper_source_revision):
+        parser.error('supply the exact trusted helper source commit')
     args.out.mkdir(mode=0o755)  # new-only; refuse accidental reuse
     workload = args.out / 'workload'
     workload.mkdir(mode=0o755)
@@ -855,6 +920,16 @@ def _main():
             pins.append(binary)
             provider = FilePin(args.provider)
             pins.append(provider)
+        manifests, manifest_helper = [], None
+        with cleanup_section():
+            for path in args.manifest:
+                pin = FilePin(path)
+                pins.append(pin)
+                manifests.append(pin)
+            if args.manifest_helper:
+                manifest_helper = FilePin(args.manifest_helper)
+                pins.append(manifest_helper)
+        manifest_arguments(manifests, provider, manifest_helper, args.helper_source_revision)
         callers = []
         for name in ('trace-a', 'trace-b'):
             path = args.out / name
@@ -876,12 +951,18 @@ def _main():
         for name in names:
             directory = args.out / name
             directory.mkdir(mode=0o755)
-            result = run_cell(args, name, directory, env, provider, binary, callers, cgroups, created)
+            result = run_cell(args, name, directory, env, provider, binary, callers, cgroups, created,
+                              manifests, manifest_helper, args.helper_source_revision)
             results.append(result)
             print(json.dumps({key: result.get(key) for key in
                               ('cell', 'pass', 'calls', 'named', 'unknown', 'false_names', 'errors')}), flush=True)
         summary = dict(source_revision=args.source_revision, candidate=binary.metadata(),
-                       provider=provider.metadata(), abi='Linux x86-64 LP64', kernel=os.uname().release,
+                       provider=provider.metadata(),
+                       discovery_input=dict(mode='explicit_trusted_manifest' if manifests else 'default_discovery',
+                           manifests=[pin.metadata() for pin in manifests],
+                           helper=manifest_helper.metadata() if manifest_helper else None,
+                           helper_source_revision=args.helper_source_revision),
+                       abi='Linux x86-64 LP64', kernel=os.uname().release,
                        cells=results, remaining=list(REMAINING) +
                        [f'unexecuted prepared cell: {name}' for name in MATRIX_CELLS if name not in names],
                        resource_qualification='exploratory shared loaded build host')

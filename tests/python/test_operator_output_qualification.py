@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 import runpy
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 ORACLE = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/oracle.py'))
@@ -321,6 +322,30 @@ class NativeWrapControls(unittest.TestCase):
                         value['acks'][2]['t'] = calls[0]['before_call_ns']
                     with self.assertRaises(ValueError):
                         validate(value)
+
+
+class LiveMetadataControls(unittest.TestCase):
+    def test_events_capacity_queries_only_owned_ring_fds_with_real_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            files = []
+            for identity, kind in ((1, 1), (2, 27), (3, 27)):
+                path = Path(temporary) / str(identity)
+                path.write_text(f'map_id:\t{identity}\nmap_type:\t{kind}\n')
+                files.append(path)
+            def answer(argv, **unused):
+                identity = int(argv[-1])
+                row = dict(name='EVENTS' if identity == 2 else 'DISCOVERY',
+                           type='ringbuf', max_entries=4194304)
+                return subprocess.CompletedProcess(argv, 0, json.dumps(row).encode())
+            with mock.patch.object(Path, 'iterdir', return_value=iter(files)), \
+                    mock.patch.object(subprocess, 'run', side_effect=answer) as query:
+                self.assertEqual(HARNESS['events_ring_capacity'](123), 4194304)
+            self.assertEqual([call.args[0][-1] for call in query.call_args_list], ['2', '3'])
+            with mock.patch.object(Path, 'iterdir', return_value=iter(files[:1])), \
+                    mock.patch.object(subprocess, 'run', side_effect=answer) as query:
+                with self.assertRaises(ValueError):
+                    HARNESS['events_ring_capacity'](123)
+            query.assert_not_called()
 
 
 class ManifestControls(unittest.TestCase):

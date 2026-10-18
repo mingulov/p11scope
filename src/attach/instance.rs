@@ -315,6 +315,25 @@ impl InstanceTracking {
         coverage: &super::image_query::CoverageControl,
         prepared: PreparedInstanceTracking,
     ) -> Self {
+        Self::start_with_failure_ownership(ebpf, coverage, prepared, false)
+    }
+
+    /// Selected preparation owns every partial hook acquisition through the
+    /// actual terminal cleanup worker. A refused hook never detaches inline.
+    pub(super) fn start_selected(
+        ebpf: &mut Ebpf,
+        coverage: &super::image_query::CoverageControl,
+        prepared: PreparedInstanceTracking,
+    ) -> Self {
+        Self::start_with_failure_ownership(ebpf, coverage, prepared, true)
+    }
+
+    fn start_with_failure_ownership(
+        ebpf: &mut Ebpf,
+        coverage: &super::image_query::CoverageControl,
+        prepared: PreparedInstanceTracking,
+        retain_failed_hooks: bool,
+    ) -> Self {
         let mut tracking = Self::default();
         let loaded = match prepared.programs {
             Ok(loaded) => loaded,
@@ -342,6 +361,9 @@ impl InstanceTracking {
         if let Err(error) = activation {
             coverage.fail();
             tracking.refused = Some(format!("instance continuity hooks unavailable: {error:#}"));
+            if retain_failed_hooks {
+                return tracking;
+            }
             for (program, link) in std::mem::take(&mut tracking.links) {
                 let Some(hook) = ebpf.program_mut(program) else {
                     continue;

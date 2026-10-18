@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import resource
 import runpy
+import select
 import signal
 import subprocess
 import sys
@@ -50,6 +51,21 @@ class OutputPipe:
         count = array.array('i', [0])
         fcntl.ioctl(self.read_fd, termios.FIONREAD, count, True)
         return count[0] >= self.capacity
+
+    def stalled(self):
+        """Kernel write readiness, including atomic-write pressure below capacity."""
+        if self.write_fd is None:
+            raise ValueError('pressure witness requires the original owned write descriptor')
+        count = array.array('i', [0])
+        fcntl.ioctl(self.read_fd, termios.FIONREAD, count, True)
+        if not count[0]:
+            return False
+        poll = select.poll()
+        poll.register(self.write_fd, select.POLLOUT)
+        events = poll.poll(0)
+        if any(mask & (select.POLLERR | select.POLLNVAL | select.POLLHUP) for _, mask in events):
+            raise ValueError('owned output pressure descriptor is unavailable')
+        return not any(mask & select.POLLOUT for _, mask in events)
 
     def read(self, amount=65536):
         try:
@@ -192,6 +208,7 @@ def cell(args, label, directory, env, binary, provider, caller_pin, manifests=()
         if sink == 'slowpipe':
             pipe = OutputPipe()
             pipes.append(pipe)
+            receipt['stdout_pipe_capacity'] = pipe.capacity
             stdout_fd = pipe.write_fd
         else:
             path = directory / 'stdout.txt' if sink == 'file' else Path('/dev/null')
@@ -214,8 +231,8 @@ def cell(args, label, directory, env, binary, provider, caller_pin, manifests=()
                 [sys.executable, '-I', '-c', 'import time; time.sleep(90)'], 0,
                 stdin=subprocess.DEVNULL, stdout=pipe.write_fd,
                 stderr=subprocess.DEVNULL, start_new_session=True)
-        if pipe:
-            pipe.close_writer()
+        # Keep the original stdout writer solely as the kernel POLLOUT
+        # witness, closing it at bounded observer completion. Never wait EOF.
         # Parent keeps stderr writer only for the explicit blocked-stderr fill.
         if args.control != 'blocked-stderr':
             stderr_pipe.close_writer()
@@ -256,10 +273,10 @@ def cell(args, label, directory, env, binary, provider, caller_pin, manifests=()
                 receipt['workload_complete_ns'] = time.monotonic_ns()
                 ack_complete = True
             if pipe:
-                receipt['stdout_stalled'] |= pipe.full()
-                # Hold completely until full has actually been observed. Slow
-                # draining then preserves pressure without substituting sleep
-                # alone for proof that an output really filled.
+                receipt['stdout_stalled'] |= pipe.stalled()
+                # Hold until positive buffered bytes and kernel nonwritability
+                # are observed on the live observer's original owned pipe.
+                # The oracle also requires actual product sink timeouts.
                 if receipt['stdout_stalled'] and now - last_read > 0.05:
                     pipe.read(256)
                     last_read = now
@@ -303,6 +320,7 @@ def cell(args, label, directory, env, binary, provider, caller_pin, manifests=()
         errors = stderr_pipe.received
         (directory / 'observer.stderr').write_bytes(errors)
         if pipe:
+            pipe.close_writer()
             stdout = pipe.drain_available()  # no EOF wait, even with held writer
             (directory / 'stdout.txt').write_bytes(stdout)
         elif sink == 'file':

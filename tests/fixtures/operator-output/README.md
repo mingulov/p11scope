@@ -12,7 +12,7 @@ The matrix contains exactly27 cells:
 | Dimension | Values |
 | --- | --- |
 | Requested and measured EVENTS map capacity |4KiB,4MiB,16MiB |
-| stdout | regular file, `/dev/null`, genuinely full4KiB slow pipe |
+| stdout | regular file, `/dev/null`, genuinely backpressured4KiB slow pipe |
 | Cancellation | none, after acknowledged capture workload, during observed finalization |
 
 The prebuilt `tests/fixtures/cgroup-trace/caller.c` fixture calls real SoftHSM
@@ -38,6 +38,15 @@ partial terminal content that cannot be verified stays unqualified/nonzero. `/de
 has no invented delivered-byte measurement: it must report zero shedding and
 zero timeouts. An absent terminal, nonzero observer exit, failed saved output,
 malformed record or watchdog invalidates authoritative totals.
+
+Slow-pipe pressure requires positive buffered bytes, kernel `POLLOUT`
+nonwritability on the original owned writer while the observer is alive, and
+actual product sink timeouts. A4096-byte atomic write can stall behind a169-byte
+prefix in the4096-byte pipe; byte occupancy need not equal capacity. The harness
+retains that writer only as a readiness witness, closes it at bounded observer
+completion, and measures cleanup without waiting for EOF. The independent
+regression proves a real child blocked at this partial occupancy and completes
+it by draining the pipe; an empty/nonstalled pipe cannot qualify pressure.
 
 The actual observer's held map FDs are inspected through `/proc/PID/fdinfo` and
 `bpftool -j map show id`; EVENTS must really be a ringbuf with the selected

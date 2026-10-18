@@ -167,6 +167,16 @@ separately. Fixture/runtime changes and installed execution remain open.
 
 ## Paired default-ring useful wrap
 
+The current common-ELF fixture is **not acceptance ready**. Its first installed
+run stopped at the original900-second bound after two32-call rounds: the native
+counter reached64 while the public A count remained32, with the second range
+withheld for unproven current physical ownership. The startup-fence explanation
+is under investigation; production ownership guards must remain intact.
+Separately, a caller/object pair excludes function offset, so32entry bodies in
+one common ELF do not establish32diagnostic pairs. The schedule and pair/wrap
+predicates below describe the intended cell and need revision before another
+long run. The original ten-call installed control is independent.
+
 The new `diagnostics-wrap-ledger.c` physical entry-count fixture uses one PID,
 two2.40 tables and one common ELF with32 distinct real entry bodies at slots4–35.
 Those bodies have the exact fixture type `CK_RV(void)` and return0. This tests
@@ -193,7 +203,8 @@ The ignored Rust selector is
 Supply `P11SCOPE_DIAGNOSTICS_WRAP_PREBUILT_DIR` pointing at the controller-verified
 four-file payload; no runtime compilation fallback exists. Match the prebuilt
 Rust test binary/source and arrival hashes, hold the authorized host lane, and
-use disk TMPDIR. Compilation and live execution remain separately queued.
+use disk TMPDIR. A compiled test and the failed installed attempt do not qualify
+the intended cell.
 
 Each disabled/enabled run issues exactly400counted rounds,258shared rounds,
 then one fence and one proof round, each32per-slot calls. Native ACKs and an

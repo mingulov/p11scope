@@ -825,3 +825,35 @@ regressions, count-only/aggregate no-read twins, partial failures,
 ring/map pressure and stop cleanup, through the `object-lp64` /
 `object-ia32` canary cells. Any new read site, broader set, longer
 retention or public projection needs a new explicit review.
+
+## DR04 caller metadata (proposed, 2026-10-18)
+
+**Status: PROPOSED; implementation, publication and installed acceptance
+pending.** This subsection adds no capture until its owner wires the
+opt-in, qualifies the reads and activates the fields. Every other
+section keeps its own status; v1/v2 bytes and exclusions are unchanged,
+and there is no global v3 activation.
+
+When the operator explicitly opts in (proposed
+`inventory --caller-metadata=cgroup`, default `none`), the allowlisted
+display context from retained `/proc`/cgroup filesystem observations is
+exactly: finite cgroup2 directory inode plus capture-local
+mount-context identifier, canonical 64-hex container ID, canonical
+36-character pod UID, fixed parser/runtime/source/status enums,
+observation times/revision and refresh/loss counters. New u64
+identifiers, times and revisions travel as exact decimal strings so
+values above 2^53 round-trip. Full cgroup paths, member names, labels,
+service names, command line, environment, credentials and key material
+stay private; no engine/CRI/Kubernetes API, network access, namespace
+entry or new BPF target read is authorized. Metrics, profile and trace
+gain nothing through this Inventory option, and the default capture
+gains no new target-memory read.
+
+Lexical container/pod hints carry provenance `cgroup_path_pattern` and
+are display hints only: they never prove orchestrator ownership, never
+authorize admission, scope, provider identity or counts, and never join
+callers across captures. Numeric provenance stays withheld as
+`namespace_unresolved` until a mount-proofed resolver proves the held
+cgroup2 root and namespace-coordinate agreement. Missing, refused or
+stale observations remain explicitly unknown/stale/historical, never
+silent.

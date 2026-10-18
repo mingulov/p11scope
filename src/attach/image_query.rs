@@ -620,6 +620,7 @@ const _: fn() = || {
     require_send::<super::Session>();
     require_send::<super::selected_detailed::PreparedSelectedSession>();
     require_send::<crate::inventory_semantics::selected::ProvisionalSelectedLane>();
+    require_send::<super::SessionNativeCompletion>();
 };
 
 impl CoverageControl {

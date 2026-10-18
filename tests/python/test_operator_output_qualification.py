@@ -586,6 +586,38 @@ class ReporterProbeTests(unittest.TestCase):
             os.close(fd)
 
 
+class InventorySavedCaptureTests(unittest.TestCase):
+    def test_only_committed_owned_positive_milestones_release_calls(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/capture_inventory_pair.py'))
+        view = module['CaptureView'](123, '/owned/provider-A.so')
+        edge = dict(kind='edge_observed', event=dict(capture='armed', presence='mapped',
+            entries=dict(count=None), identity_context=dict(caller=dict(pid=123),
+            module=dict(path='/owned/provider-A.so'))))
+        self.assertFalse(view.consume([edge]))
+        self.assertIsNone(view.edge)
+        self.assertTrue(view.consume([dict(kind='pass_committed')]))
+        self.assertEqual(view.edge['capture'], 'armed')
+        for row in (dict(edge, event={**edge['event'], 'identity_context':dict(caller=dict(pid=124), module=dict(path='/owned/provider-A.so'))}),
+                    dict(edge, event={**edge['event'], 'identity_context':dict(caller=dict(pid=123), module=dict(path='/foreign/provider-A.so'))})):
+            other = module['CaptureView'](123, '/owned/provider-A.so')
+            other.consume([row, dict(kind='pass_committed')])
+            self.assertIsNone(other.edge)
+
+    def test_saved_capture_population_and_exact_primary_count_controls(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/capture_inventory_pair.py'))
+        document = dict(schema='p11scope/inventory/v1',callers=[dict(pid=123)],modules=[dict(id='m0')],
+            edges=[dict(entries=dict(count=5))],observation=dict(lane='native',retirement='closed'))
+        self.assertEqual(module['check_snapshot'](document), 5)
+        for mutation in ('empty', 'count', 'lane', 'retirement'):
+            changed = copy.deepcopy(document)
+            if mutation == 'empty': changed['edges'] = []
+            elif mutation == 'count': changed['edges'][0]['entries']['count'] = 4
+            elif mutation == 'lane': changed['observation']['lane'] = 'scan'
+            else: changed['observation']['retirement'] = 'open'
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                module['check_snapshot'](changed)
+
+
 class CancellationMarkerTests(unittest.TestCase):
     def test_only_sent_first_signal_gets_one_conservative_arrival_timestamp(self):
         receipt = dict(signals=[], cancellation_ack_ns=None)

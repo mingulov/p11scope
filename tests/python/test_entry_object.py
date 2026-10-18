@@ -104,16 +104,27 @@ class EntryObjectTests(unittest.TestCase):
                     _, scalar_insns = instructions(variant, scalar)
                     # Each mutant changes actual emitted wrapper instructions;
                     # unknown/private callees and malformed summaries stay closed.
-                    for index, replacement in [(0, "r1 = r2"), (2, "call 0x70"),
-                            (3, "r0 = *(u32 *)(r10 - 0x18)"),
-                            (5, "if r1 == 0x0 goto +0x1"), (6, "r0 = 0x1")]:
-                        pc, old = scalar_insns[index]
-                        with self.subTest(scalar_mutation=index):
+                    scalar_texts = dict(scalar_insns)
+                    flag_pc, flag_text = next((pc, text) for pc, text in scalar_insns
+                        if text == "r0 = *(u64 *)(r10 - 0x18)")
+                    tag_pc, tag_text = next((pc, text) for pc, text in scalar_insns
+                        if text == "r1 = *(u64 *)(r10 - 0x20)")
+                    guard_pc, guard_text = next((pc, text) for pc, text in scalar_insns
+                        if re.fullmatch(r"if r1 (==|!=) 0x0 goto .*", text))
+                    zero_pc, zero_text = next((pc, text) for pc, text in scalar_insns if text == "r0 = 0x0")
+                    for pc, replacement in [(scalar_insns[0][0], "r1 = r2"),
+                            (scalar_insns[2][0], "call 0x70"),
+                            (flag_pc, "r0 = *(u32 *)(r10 - 0x18)"),
+                            (guard_pc, guard_text.replace(" == ", " != ") if " == " in guard_text
+                                else guard_text.replace(" != ", " == ")),
+                            (guard_pc, "goto +0x0"), (tag_pc, flag_text), (zero_pc, "r0 = 0x1")]:
+                        with self.subTest(scalar_mutation=pc):
                             with self.assertRaisesRegex(RuntimeError, "scalar scope flags"):
-                                CHECKER["seeded_start_contract"](mutate(disassembly, scalar, pc, old, replacement))
-                    pc, old = scalar_insns[6]
+                                CHECKER["seeded_start_contract"](mutate(disassembly, scalar, pc,
+                                    scalar_texts[pc], replacement))
                     with self.assertRaisesRegex(RuntimeError, "scalar scope flags"):
-                        CHECKER["seeded_start_contract"](mutate(disassembly, scalar, pc, old, scalar_insns[2][1]))
+                        CHECKER["seeded_start_contract"](mutate(disassembly, scalar, zero_pc,
+                            zero_text, scalar_insns[2][1]))
                 memset_name, memset_insns = instructions(variant, "memset")
                 zero_store, zero_text = next((pc, text) for pc, text in memset_insns
                                             if text == "*(u8 *)(r5 + 0x0) = w2")

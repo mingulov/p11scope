@@ -176,6 +176,7 @@ def run(args):
     require(digest_text(args.candidate, 40), 'candidate must be a full nonzero revision')
     require(not os.environ.get('LD_PRELOAD') and 'P11SCOPE_VERIFIER_STATS_FD' not in os.environ,
             'refuse an existing preload/probe environment')
+    require('P11SCOPE_VERIFIER_STATS_OWNER_PID' not in os.environ, 'refuse an inherited probe owner')
     require(args.command and args.command[0] == '--' and len(args.command) >= 2,
             'supply -- followed by the actual prebuilt observer command')
     executable = prebuilt(args.command[1], args.executable_sha256)
@@ -314,7 +315,9 @@ def self_test(probe=None):
             for name, binary, extra, timeout, message in (
                     ('empty', '/bin/true', [], '3', 'missing or oversized'),
                     ('failed', '/bin/false', [], '3', 'missing or oversized'),
-                    ('timeout', '/bin/sleep', ['60'], '.1', 'timed out')):
+                    ('timeout', '/bin/sleep', ['60'], '.1', 'timed out'),
+                    ('descendant-fd', str(probe.with_name('verifier-stats-probe-forwarding-test')),
+                     [], '3', 'missing or oversized')):
                 output = Path(temporary) / (name + '.jsonl')
                 binary_hash = hashlib.sha256(Path(binary).read_bytes()).hexdigest()
                 command = [*prefix, '--executable-sha256', binary_hash, '--output', str(output),
@@ -323,6 +326,9 @@ def self_test(probe=None):
                 require(result.returncode == 1 and message in result.stderr, f'{name} observer qualified')
                 require(len(output.read_text().splitlines()) == (1 if name == 'timeout' else 3),
                         f'{name} failure did not preserve the expected incomplete measurement')
+                if name == 'descendant-fd':
+                    require('descendant exec and reused FD remain byte-empty PASS' in result.stdout,
+                            'inherited/reused descriptor control did not run')
                 print(f'{name} observer: refused; owned child reaped')
 
 
@@ -333,7 +339,7 @@ def main():
     builder.add_argument('output')
     builder.set_defaults(function=build)
     checker = commands.add_parser('self-test', help='unprivileged finite oracle checks')
-    checker.add_argument('--probe', help='also test prebuilt-only empty/failure/timeout acquisition')
+    checker.add_argument('--probe', help='also test prebuilt-only acquisition and adjacent forwarding fixture')
     checker.set_defaults(function=lambda args: self_test(args.probe))
     runner = commands.add_parser('run', help='prebuilt-only real loader measurement')
     for flag in ('probe', 'probe-sha256', 'executable-sha256', 'kernel', 'candidate', 'output'):

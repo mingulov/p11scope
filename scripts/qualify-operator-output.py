@@ -24,6 +24,7 @@ from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 NATIVE = SimpleNamespace(**runpy.run_path(str(ROOT / 'scripts/qualify-cgroup-trace.py')))
+PIN_PROVIDER = runpy.run_path(str(ROOT / 'scripts/mapped-provider-pin.py'))['pin_fd']
 ORACLE = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/oracle.py'))['evaluate']
 RINGS = ('4K', '4M', '16M')
 SINKS = ('file', 'discard', 'slowpipe')
@@ -106,6 +107,14 @@ def events_ring_capacity(pid):
     return capacities.pop()
 
 
+def bounded_read(path, limit=LIMIT):
+    with path.open('rb') as stream:
+        data = stream.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError('owned file exceeded the retained-input memory bound')
+    return data
+
+
 def file_limit():
     # Only this direct exec child; regular-file output failure is a negative
     # control, never evidence of interruptibility of kernel-blocked file I/O.
@@ -132,6 +141,7 @@ def cell(args, label, directory, env, binary, provider, caller_pin):
     trace_path = directory / 'trace.txt'
     start = time.monotonic()
     try:
+        receipt['provider_before'] = PIN_PROVIDER(provider.fd)
         caller = NATIVE.spawn_owned(owners,
             [str(caller_pin.path), str(provider.path), '0', 'selected'], args.uid,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -141,7 +151,7 @@ def cell(args, label, directory, env, binary, provider, caller_pin):
         caller_errors = NATIVE.Reader(caller.popen.stderr, directory / 'caller.stderr')
         readers.extend((ledger_reader, caller_errors))
         ledger_reader.record('ready')
-        caller_pin.image_receipt(ledger_reader.record('image'), caller)
+        receipt['image'] = caller_pin.image_receipt(ledger_reader.record('image'), caller)
         receipt['pid'] = caller.pid
         pipe = None
         if sink == 'slowpipe':
@@ -206,7 +216,7 @@ def cell(args, label, directory, env, binary, provider, caller_pin):
                     caller.popen.stdin.flush()
                 elif now - start > 15:
                     raise TimeoutError('no positive provider-probe readiness')
-            if ready and not ack_complete and any(row.get('kind') == 'ack' and row.get('phase') == 'e17'
+            if ready and not ack_complete and any(row.get('kind') == 'ack' and row.get('phase') == 'e17' and row.get('image') == 0
                                                    for row in ledger_reader.records):
                 receipt['workload_complete_ns'] = time.monotonic_ns()
                 ack_complete = True
@@ -262,7 +272,7 @@ def cell(args, label, directory, env, binary, provider, caller_pin):
             (directory / 'stdout.txt').write_bytes(stdout)
         elif sink == 'file':
             stdout_file.flush()
-            stdout = (directory / 'stdout.txt').read_bytes()
+            stdout = bounded_read(directory / 'stdout.txt')
         else:
             stdout = None
         if receipt['cancellation_ack_ns'] is None and b'p11scope: cancel: loop exited on signal ' in errors:
@@ -276,9 +286,8 @@ def cell(args, label, directory, env, binary, provider, caller_pin):
             raise ValueError('actual provider caller failed')
         for reader in readers:
             reader.finish()
-        trace = trace_path.read_bytes()
-        if len(trace) > LIMIT:
-            raise ValueError('saved trace exceeded bounded fixture limit')
+        receipt['provider_after'] = PIN_PROVIDER(provider.fd)
+        trace = bounded_read(trace_path)
         result = ORACLE(trace, stdout, ledger_reader.records, receipt)
         if args.control == 'repeated-signals' and len(receipt['signals']) < 2:
             result.update({'pass': False, 'status': 'NOT_RUN'})

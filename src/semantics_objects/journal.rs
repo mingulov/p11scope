@@ -20,6 +20,9 @@
 //! newtypes; this module adds no target-memory read, pointer output or
 //! capture beyond allowlist v1/v2 and the six approved v3 attributes.
 
+#[path = "joint_driver.rs"]
+pub(crate) mod joint_driver;
+
 // ---------------------------------------------------------------------------
 // Frozen effect-neutral S1 vocabulary
 // ---------------------------------------------------------------------------

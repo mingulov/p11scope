@@ -1034,6 +1034,25 @@ impl SemanticCapture {
         anyhow::ensure!(targets.len() <= MAX_PENDING, "semantic target capacity");
         self.tick_with(&mut SessionIo { session, targets })
     }
+    /// Route the original retained quantum through all existing Session I/O
+    /// and H0 decisions, replacing only the ring collection leaf.
+    pub(crate) fn tick_collected(
+        &mut self,
+        session: &mut Session,
+        targets: &[Arc<PidPin>],
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+    ) -> anyhow::Result<TickReport> {
+        anyhow::ensure!(targets.len() <= MAX_PENDING, "semantic target capacity");
+        let producers = session
+            .drain_producers()
+            .ok_or_else(|| anyhow::anyhow!("semantic Session has no retained native domain"))?;
+        anyhow::ensure!(
+            quantum.matches_producers(&producers),
+            "foreign retained quantum"
+        );
+        self.tick_collected_with(&mut SessionIo { session, targets }, quantum)
+    }
+
     /// One bounded no-call refresh through the same owned Session, endpoint
     /// and original pin. The freshly selected image comes only from the seal.
     pub(crate) fn refresh(
@@ -1455,30 +1474,50 @@ impl SemanticCapture {
         }
     }
     fn tick_with(&mut self, io: &mut impl CaptureIo) -> anyhow::Result<TickReport> {
-        let mut report = self.tick_with_inner(io)?;
+        let mut report = self.tick_with_inner(io, None)?;
         self.stamp_disposition(&mut report);
         Ok(report)
     }
 
-    // RED scaffold for the absent retained collection leaf. It deliberately
-    // follows today's independent collector until the real seam tests fail.
-    #[cfg(test)]
     fn tick_collected_with(
         &mut self,
         io: &mut impl CaptureIo,
-        _quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
+        quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
     ) -> anyhow::Result<TickReport> {
-        self.tick_with(io)
+        anyhow::ensure!(
+            io.domain() == Some(self.router.domain()),
+            "foreign semantic Session"
+        );
+        anyhow::ensure!(!self.stopped, "semantic capture stopped");
+        let (records, failed) = quantum
+            .take_h0_input(self.router.domain(), self.limits.records)
+            .map_err(|reason| anyhow::anyhow!("retained semantic collection: {reason:?}"))?;
+        let collection = Collection {
+            records,
+            status: if failed {
+                CollectionStatus::ReadError
+            } else {
+                CollectionStatus::Complete
+            },
+        };
+        let mut report = self.tick_with_inner(io, Some(collection))?;
+        self.stamp_disposition(&mut report);
+        quantum.note_h0_report(&report);
+        Ok(report)
     }
 
-    fn tick_with_inner(&mut self, io: &mut impl CaptureIo) -> anyhow::Result<TickReport> {
+    fn tick_with_inner(
+        &mut self,
+        io: &mut impl CaptureIo,
+        collected: Option<Collection>,
+    ) -> anyhow::Result<TickReport> {
         anyhow::ensure!(
             io.domain() == Some(self.router.domain()),
             "foreign semantic Session"
         );
         anyhow::ensure!(!self.stopped, "semantic capture stopped");
         let mut report = TickReport::default();
-        let mut collected = io.collect(self.limits.records);
+        let mut collected = collected.unwrap_or_else(|| io.collect(self.limits.records));
         let collection_failed = collected.status != CollectionStatus::Complete
             || collected.records.len() > self.limits.records;
         collected.records.truncate(self.limits.records);
@@ -3523,6 +3562,59 @@ mod tests {
     #[test]
     fn joint_collected_leaf_pending_timeout_keeps_original_quantum() {
         joint_collected_pending_case(true);
+    }
+
+    #[test]
+    fn joint_collected_leaf_foreign_quantum_is_nonconsuming() {
+        let mut source = ScriptIo::small(NativeDomainId::mint());
+        source.semantic_call("C_SignInit", 0, 0);
+        let (mut quantum, drain, _pool) = retained_joint_quantum(&mut source);
+        let mut foreign_io = ScriptIo::small(NativeDomainId::mint());
+        let mut foreign = capture(&foreign_io);
+        foreign_io.semantic_call("C_Sign", 1, 0);
+        assert!(
+            foreign
+                .tick_collected_with(&mut foreign_io, &mut quantum)
+                .is_err()
+        );
+        assert_eq!(foreign.next_token, 1);
+        assert!(foreign.awaiting.is_empty());
+        assert_eq!(foreign_io.records.len(), 1);
+        assert_eq!(quantum.pending_h0_records(), 1);
+        assert_eq!(drain.source().remaining(), 1);
+        let mut actual = capture(&source);
+        let report = actual
+            .tick_collected_with(&mut source, &mut quantum)
+            .unwrap();
+        assert_eq!(report.calls().count(), 1);
+        assert!(matches!(
+            report.calls().next().unwrap().route(),
+            Route::Joined(_)
+        ));
+    }
+
+    #[test]
+    fn joint_collected_leaf_pending_fault_preserves_original_call_position() {
+        let mut io = ScriptIo::small(NativeDomainId::mint());
+        let mut capture = capture(&io);
+        capture.limits.scans = 0;
+        io.semantic_call("C_SignInit", 0, 0);
+        let (mut quantum, drain, pool) = retained_joint_quantum(&mut io);
+        let held = pool.snapshot().charged_bytes;
+        let pending = capture.tick_collected_with(&mut io, &mut quantum).unwrap();
+        assert_eq!(pending.awaiting_floor(), Some(1));
+        io.last_health.fault = 1;
+        io.semantic_call("C_Sign", 1, 1);
+        let lost = capture.tick_collected_with(&mut io, &mut quantum).unwrap();
+        assert!(capture.awaiting.is_empty());
+        assert_eq!(lost.calls().count(), 1);
+        let call = lost.calls().next().unwrap();
+        assert_eq!(call.position(), Some(1));
+        assert_eq!(call.route(), Route::Unknown(UnknownReason::FaultEra));
+        assert_eq!(lost.awaiting_floor(), None);
+        assert_eq!(io.records.len(), 1);
+        assert_eq!(drain.source().remaining(), 1);
+        assert_eq!(pool.snapshot().charged_bytes, held);
     }
 
     #[test]

@@ -66,6 +66,63 @@ const DOC_ID: &str = "p11scope/inventory/v1";
 /// Rescan interval inside a `--duration` observation window.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+// G21's explicit engine pilot can accelerate scans without changing the
+// production cadence, clock, native lane, coordinator, or recorder capacities.
+// Thread-local scoped custody prevents concurrent tests from changing each other.
+#[cfg(test)]
+std::thread_local! {
+    static TEST_INVENTORY_POLL_INTERVAL: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn inventory_test_poll_interval() -> Duration {
+    TEST_INVENTORY_POLL_INTERVAL.with(|value| value.get().unwrap_or(POLL_INTERVAL))
+}
+
+#[cfg(test)]
+fn with_inventory_test_poll_interval<T>(interval: Duration, action: impl FnOnce() -> T) -> T {
+    assert!(
+        !interval.is_zero(),
+        "the real engine pilot needs a positive cadence"
+    );
+    struct Restore(Option<Duration>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_INVENTORY_POLL_INTERVAL.with(|value| value.set(self.0));
+        }
+    }
+    let _restore =
+        Restore(TEST_INVENTORY_POLL_INTERVAL.with(|value| value.replace(Some(interval))));
+    action()
+}
+
+#[cfg(test)]
+#[test]
+fn inventory_test_poll_interval_is_scoped_and_thread_local() {
+    assert_eq!(inventory_test_poll_interval(), POLL_INTERVAL);
+    with_inventory_test_poll_interval(Duration::from_millis(10), || {
+        assert_eq!(inventory_test_poll_interval(), Duration::from_millis(10));
+        assert_eq!(
+            std::thread::spawn(inventory_test_poll_interval)
+                .join()
+                .unwrap(),
+            POLL_INTERVAL
+        );
+        with_inventory_test_poll_interval(Duration::from_millis(20), || {
+            assert_eq!(inventory_test_poll_interval(), Duration::from_millis(20));
+        });
+        assert_eq!(inventory_test_poll_interval(), Duration::from_millis(10));
+        let failed = std::panic::catch_unwind(|| {
+            with_inventory_test_poll_interval(Duration::from_millis(30), || {
+                std::panic::resume_unwind(Box::new("controlled cadence unwind"));
+            });
+        });
+        assert!(failed.is_err());
+        assert_eq!(inventory_test_poll_interval(), Duration::from_millis(10));
+    });
+    assert_eq!(inventory_test_poll_interval(), POLL_INTERVAL);
+}
+
 /// Maximum wait for staged semantic evidence without current receipts.
 /// Receipt-bearing batches publish during the tick that stages them.
 const STAGED_SEMANTIC_MAX_AGE: Duration = Duration::from_secs(1);
@@ -985,7 +1042,10 @@ fn run_with_terminal_budget(
     let clock = LoopClock {
         deadline,
         stop,
+        #[cfg(not(test))]
         interval: POLL_INTERVAL,
+        #[cfg(test)]
+        interval: inventory_test_poll_interval(),
         tick: SERVICE_TICK,
         collection_tick: SERVICE_TICK,
     };

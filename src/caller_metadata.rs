@@ -180,7 +180,7 @@ pub fn parse_cgroup_membership(input: &[u8]) -> CgroupMembership {
         Ok(components) => components,
         Err(reason) => return CgroupMembership::refused(reason),
     };
-    let (container, pod) = match recognize_components(&components) {
+    let ParsedHints { container, pod } = match recognize_components(&components) {
         Ok(Some(hints)) => hints,
         Ok(None) => {
             return CgroupMembership {
@@ -211,7 +211,7 @@ fn valid_controller_list(controllers: &[u8]) -> bool {
 }
 
 fn validate_path(path: &[u8]) -> Result<Vec<&[u8]>, ParseReason> {
-    if !path.starts_with(b"/") || path.len() == 0 {
+    if !path.starts_with(b"/") || path.is_empty() {
         return Err(ParseReason::Malformed);
     }
     if path.len() == 1 {
@@ -265,9 +265,13 @@ struct PodCandidate {
     container: ContainerCandidate,
 }
 
-fn recognize_components(
-    components: &[&[u8]],
-) -> Result<Option<(Option<ContainerHint>, Option<PodHint>)>, ParseReason> {
+#[derive(Clone, Copy)]
+struct ParsedHints {
+    container: Option<ContainerHint>,
+    pod: Option<PodHint>,
+}
+
+fn recognize_components(components: &[&[u8]]) -> Result<Option<ParsedHints>, ParseReason> {
     let mut containers = Vec::new();
     let mut pods = Vec::new();
     for start in 0..components.len() {
@@ -309,14 +313,17 @@ fn recognize_components(
             return Err(ParseReason::AmbiguousPattern);
         }
     }
-    Ok(Some((container.map(|c| c.hint), pod.map(|p| p.hint))))
+    Ok(Some(ParsedHints {
+        container: container.map(|c| c.hint),
+        pod: pod.map(|p| p.hint),
+    }))
 }
 
 fn parse_docker_cgroupfs(components: &[&[u8]], start: usize) -> Option<ContainerCandidate> {
     if components.get(start).copied() != Some(&b"docker"[..]) {
         return None;
     }
-    let id = parse_container_id(*components.get(start + 1)?)?;
+    let id = parse_container_id(components.get(start + 1).copied()?)?;
     Some(ContainerCandidate {
         hint: ContainerHint {
             id,
@@ -367,9 +374,9 @@ fn parse_k8s_cgroupfs(components: &[&[u8]], start: usize) -> Option<PodCandidate
     ) {
         pod_index += 1;
     }
-    let pod_uid = parse_pod_component(*components.get(pod_index)?)?;
+    let pod_uid = parse_pod_component(components.get(pod_index).copied()?)?;
     let container_index = pod_index + 1;
-    let id = parse_container_id(*components.get(container_index)?)?;
+    let id = parse_container_id(components.get(container_index).copied()?)?;
     let container = ContainerCandidate {
         hint: ContainerHint {
             id,
@@ -404,9 +411,9 @@ fn parse_k8s_systemd(components: &[&[u8]], start: usize) -> Option<PodCandidate>
         }
         _ => None,
     };
-    let pod_uid = parse_systemd_pod_component(*components.get(pod_index)?, qos)?;
+    let pod_uid = parse_systemd_pod_component(components.get(pod_index).copied()?, qos)?;
     let runtime_index = pod_index + 1;
-    let hint = parse_runtime_unit(*components.get(runtime_index)?)?;
+    let hint = parse_runtime_unit(components.get(runtime_index).copied()?)?;
     let container = ContainerCandidate {
         hint,
         start,

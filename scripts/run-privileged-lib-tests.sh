@@ -214,6 +214,7 @@ attach::instance_tests::privileged_instance_continuity_experiment_softhsm
 attach::inventory::activation::privileged_tests::privileged_bench_overhead_detailed_calls
 attach::inventory::activation::privileged_tests::privileged_t7_inventory_n4097_lp64
 attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6530_lp64
+attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6531_lp64
 attach::inventory::activation::privileged_tests::privileged_t7_inventory_n8192_boundary_lp64
 )
 

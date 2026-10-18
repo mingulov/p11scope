@@ -48,11 +48,13 @@ exact 2-call denominator. `C_GetInfo` returns a fixed 3.2 structure;
 ## Ledger role and bounds
 
 `scripts/qualify-loader-lifetimes.py run` pins the provider (held FD hash
-plus private mapping, following `scripts/mapped-provider-pin.py`), runs
-`N` sequential lifetimes, binds each row's `pid` to its held child
-handle, and writes header + `N` lifetime rows + done as JSONL. Bounds:
-20,000 rows, 4,096 bytes per line, 16 MiB total, at most 16,385
-lifetimes, sequential launch (live 1, within the required at most 4).
+plus private mapping, following `scripts/mapped-provider-pin.py`),
+retains that FD across the workload, executes each lifetime via the
+FD-backed path, re-hashes the same FD afterwards and fails on mutation.
+It binds each row's `pid` to its held child handle, and writes header +
+`N` lifetime rows + done as JSONL. Bounds: 20,000 rows, 4,096 bytes per
+line, 16 MiB total, at most 16,385 lifetimes, sequential launch (live 1,
+within the required at most 4).
 
 Driver `provider_dev`/`provider_ino` are the stat (file) domain. The
 header pin carries both the file identity (checked against driver rows)

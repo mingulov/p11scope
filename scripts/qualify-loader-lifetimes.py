@@ -153,13 +153,25 @@ def read_jsonl(stream, *, max_rows=MAX_ROWS, max_line=MAX_LINE_BYTES,
 
 
 def read_bounded_text(path, limit):
-    info = Path(path).stat()
-    if not stat.S_ISREG(info.st_mode):
-        raise JudgeFail("evidence must be a regular file")
-    if info.st_size > limit:
-        raise JudgeFail("evidence exceeds size limit")
-    with open(path, encoding="utf-8") as stream:
-        return stream.read()
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise JudgeFail("evidence must be a regular file")
+        chunks = []
+        remaining = limit + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) > limit:
+            raise JudgeFail("evidence exceeds size limit")
+        return data.decode("utf-8")
+    finally:
+        os.close(fd)
 
 
 def parse_bounded_json(text, what):
@@ -230,31 +242,68 @@ def _mapping_from_fd(fd, size):
             raise OSError(error, os.strerror(error))
 
 
+def _pin_fd(fd):
+    """Pin one held FD: hash its content and anchor mapping identity."""
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
+        raise LedgerError("provider must be a nonempty regular file")
+    anchor = _mapping_from_fd(fd, before.st_size)
+    digest = hashlib.sha256()
+    offset = 0
+    while chunk := os.pread(fd, 1024 * 1024, offset):
+        digest.update(chunk)
+        offset += len(chunk)
+        if offset > before.st_size:
+            raise LedgerError("provider grew during hash")
+    after = os.fstat(fd)
+    if offset != before.st_size or _file_identity(before) != _file_identity(after):
+        raise LedgerError("provider changed or short read during pin")
+    if anchor["ino"] != before.st_ino:
+        raise LedgerError("provider inode changed during mapping")
+    return {"dev": anchor["dev"], "ino": anchor["ino"],
+            "sha256": digest.hexdigest(), "mapping": anchor,
+            "file_identity": _file_identity(before)}
+
+
 def pin_provider(path):
     """Hash the held provider FD and anchor its mapping identity."""
     fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)
     try:
-        before = os.fstat(fd)
-        if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
-            raise LedgerError("provider must be a nonempty regular file")
-        anchor = _mapping_from_fd(fd, before.st_size)
-        digest = hashlib.sha256()
-        offset = 0
-        while chunk := os.pread(fd, 1024 * 1024, offset):
-            digest.update(chunk)
-            offset += len(chunk)
-            if offset > before.st_size:
-                raise LedgerError("provider grew during hash")
-        after = os.fstat(fd)
-        if offset != before.st_size or _file_identity(before) != _file_identity(after):
-            raise LedgerError("provider changed or short read during pin")
-        if anchor["ino"] != before.st_ino:
-            raise LedgerError("provider inode changed during mapping")
-        return {"dev": anchor["dev"], "ino": anchor["ino"],
-                "sha256": digest.hexdigest(), "mapping": anchor,
-                "file_identity": _file_identity(before)}
+        return _pin_fd(fd)
     finally:
         os.close(fd)
+
+
+def _retained_identity(info):
+    # Device, inode and size only. Timestamps are excluded: unlinking the
+    # pathname (a replacement that the held FD survives) updates ctime
+    # without changing bytes, and content is re-hashed below.
+    return ([os.major(info.st_dev), os.minor(info.st_dev)],
+            info.st_ino, info.st_size)
+
+
+def _revalidate_fd(fd, pin):
+    """Re-hash the same held FD; fail if it changed during the workload."""
+    current = os.fstat(fd)
+    wanted = pin["file_identity"]
+    if _retained_identity(current) != (wanted["dev"], wanted["ino"],
+                                       wanted["size"]):
+        raise LedgerError("provider changed during workload")
+    expected = wanted["size"]
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        chunk = os.pread(fd, 1024 * 1024, offset)
+        if not chunk:
+            break
+        digest.update(chunk)
+        offset += len(chunk)
+        if offset > expected:
+            raise LedgerError("provider grew during workload")
+    if offset != expected:
+        raise LedgerError("provider changed during workload")
+    if digest.hexdigest() != pin["sha256"]:
+        raise LedgerError("provider content changed during workload")
 
 
 def _check_pin_shape(pin):
@@ -402,7 +451,13 @@ def validate_ledger(rows, cell, expected_lifetimes):
 # --- Workload harness: sequential real lifetimes with held custody. ---
 
 def run_lifetimes(*, cell, lifetimes, provider, driver, output):
-    """Run N sequential lifetimes and write a validated independent ledger."""
+    """Run N sequential lifetimes and write a validated independent ledger.
+
+    The provider FD stays open across the workload. Each lifetime executes
+    the FD-backed path so a pathname replacement cannot swap bytes, and the
+    same FD is re-hashed after the workload to fail on same-inode mutation.
+    The ledger hash describes the held bytes only, never native observation.
+    """
     if cell not in ("g16", "g17"):
         raise LedgerError("unknown lifetime cell")
     if type(lifetimes) is not int or not 1 <= lifetimes <= MAX_LIFETIMES:
@@ -416,69 +471,85 @@ def run_lifetimes(*, cell, lifetimes, provider, driver, output):
         raise LedgerError("driver is not executable")
     if not output_path.parent.is_dir():
         raise LedgerError("output directory is missing")
-    pin = pin_provider(str(provider_path))
-    header = {"seq": 1, "kind": "header", "version": 1, "cell": cell,
-              "expected_lifetimes": lifetimes,
-              "calls_per_lifetime": CALLS_PER_LIFETIME, "max_live": 1,
-              "provider": pin}
-    rows = [header]
-    counts = {name: 0 for name in EXPECTED_FUNCTIONS}
-    for label in range(1, lifetimes + 1):
-        # Held custody: the Popen handle (never a bare PID) owns signals
-        # and reaping. The row pid must equal this held child's pid.
-        child = subprocess.Popen(
-            [str(driver_path), str(provider_path), str(label)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        try:
+    provider_fd = os.open(provider_path,
+                          os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)
+    try:
+        pin = _pin_fd(provider_fd)
+        provider_arg = f"/dev/fd/{provider_fd}"
+        header = {"seq": 1, "kind": "header", "version": 1, "cell": cell,
+                  "expected_lifetimes": lifetimes,
+                  "calls_per_lifetime": CALLS_PER_LIFETIME, "max_live": 1,
+                  "provider": pin}
+        rows = [header]
+        counts = {name: 0 for name in EXPECTED_FUNCTIONS}
+        for label in range(1, lifetimes + 1):
+            wanted = pin["file_identity"]
+            if _retained_identity(os.fstat(provider_fd)) != (
+                    wanted["dev"], wanted["ino"], wanted["size"]):
+                raise LedgerError("provider changed during workload")
+            # Held custody: the Popen handle (never a bare PID) owns signals
+            # and reaping. The row pid must equal this held child's pid.
+            # The FD-backed path keeps the driver's stat/dlopen on the held
+            # file; pass_fds preserves the number in the child.
+            child = subprocess.Popen(
+                [str(driver_path), provider_arg, str(label)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                pass_fds=(provider_fd,))
             try:
-                stdout, _stderr = child.communicate(timeout=PER_LIFETIME_SECONDS)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait()
-                raise LedgerError(f"lifetime {label} exceeded its deadline")
-            held_pid = child.pid
-            if child.returncode != 0:
-                raise LedgerError(f"lifetime {label} exited {child.returncode}")
-        finally:
-            if child.poll() is None:
-                child.kill()
-                child.wait()
-            else:
-                child.wait()
-            for stream in (child.stdout, child.stderr):
-                if stream is not None:
-                    stream.close()
-        if len(stdout.encode("utf-8")) > MAX_LINE_BYTES:
-            raise LedgerError(f"lifetime {label} output exceeds line limit")
-        lines = stdout.splitlines()
-        if len(lines) != 1:
-            raise LedgerError(f"lifetime {label} must emit exactly one row")
-        try:
-            body = json.loads(lines[0], object_pairs_hook=_unique_object,
-                              parse_constant=_invalid_constant)
-        except (ValueError, RecursionError) as error:
-            raise LedgerError(f"lifetime {label} emitted invalid JSON") from error
-        if type(body) is not dict:
-            raise LedgerError(f"lifetime {label} row must be an object")
-        if body.get("pid") != held_pid:
-            raise LedgerError(f"lifetime {label} pid does not match held child")
-        row = {"seq": label + 1, "kind": "lifetime"}
-        row.update(body)
-        rows.append(row)
-    for row in rows[1:]:
-        for call in row.get("calls", []):
-            if isinstance(call, dict) and call.get("fn") in counts:
-                counts[call["fn"]] += 1
-    rows.append({"seq": lifetimes + 2, "kind": "done", "lifetimes": lifetimes,
-                 "api_calls": sum(counts.values()),
-                 "calls_by_function": dict(counts)})
-    summary = validate_ledger(rows, cell, lifetimes)
-    text = "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
-    if len(text.encode("utf-8")) > MAX_LEDGER_BYTES:
-        raise LedgerError("ledger byte limit")
-    with open(output_path, "w", encoding="utf-8") as stream:
-        stream.write(text)
-    return summary
+                try:
+                    stdout, _stderr = child.communicate(
+                        timeout=PER_LIFETIME_SECONDS)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.wait()
+                    raise LedgerError(f"lifetime {label} exceeded its deadline")
+                held_pid = child.pid
+                if child.returncode != 0:
+                    raise LedgerError(f"lifetime {label} exited {child.returncode}")
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait()
+                else:
+                    child.wait()
+                for stream in (child.stdout, child.stderr):
+                    if stream is not None:
+                        stream.close()
+            if len(stdout.encode("utf-8")) > MAX_LINE_BYTES:
+                raise LedgerError(f"lifetime {label} output exceeds line limit")
+            lines = stdout.splitlines()
+            if len(lines) != 1:
+                raise LedgerError(f"lifetime {label} must emit exactly one row")
+            try:
+                body = json.loads(lines[0], object_pairs_hook=_unique_object,
+                                  parse_constant=_invalid_constant)
+            except (ValueError, RecursionError) as error:
+                raise LedgerError(f"lifetime {label} emitted invalid JSON") from error
+            if type(body) is not dict:
+                raise LedgerError(f"lifetime {label} row must be an object")
+            if body.get("pid") != held_pid:
+                raise LedgerError(f"lifetime {label} pid does not match held child")
+            row = {"seq": label + 1, "kind": "lifetime"}
+            row.update(body)
+            rows.append(row)
+        _revalidate_fd(provider_fd, pin)
+        for row in rows[1:]:
+            for call in row.get("calls", []):
+                if isinstance(call, dict) and call.get("fn") in counts:
+                    counts[call["fn"]] += 1
+        rows.append({"seq": lifetimes + 2, "kind": "done",
+                     "lifetimes": lifetimes,
+                     "api_calls": sum(counts.values()),
+                     "calls_by_function": dict(counts)})
+        summary = validate_ledger(rows, cell, lifetimes)
+        text = "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
+        if len(text.encode("utf-8")) > MAX_LEDGER_BYTES:
+            raise LedgerError("ledger byte limit")
+        with open(output_path, "w", encoding="utf-8") as stream:
+            stream.write(text)
+        return summary
+    finally:
+        os.close(provider_fd)
 
 
 # --- Installed judging against public output. Never manufactures native

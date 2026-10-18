@@ -323,6 +323,50 @@ class NativeWrapControls(unittest.TestCase):
                         validate(value)
 
 
+class ManifestControls(unittest.TestCase):
+    def test_explicit_manifest_uses_held_matching_provider_and_rejects_mutations(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            provider = root / 'provider.so'
+            provider.write_bytes(b'owned provider')
+            manifest = root / 'manifest.json'
+            provider_pin = HARNESS['NATIVE'].FilePin(provider)
+            try:
+                document = dict(schema='p11scope-manifest/5', module_path=str(provider),
+                    objects=[dict(path=str(provider), identity=dict(sha256=provider_pin.digest))])
+                manifest.write_text(json.dumps(document))
+                pin = HARNESS['NATIVE'].FilePin(manifest)
+                try:
+                    self.assertEqual(HARNESS['manifest_arguments']([pin], provider_pin),
+                                     ['--manifest', str(manifest)])
+                    replacement = root / 'replacement'
+                    replacement.write_bytes(manifest.read_bytes())
+                    replacement.replace(manifest)
+                    with self.assertRaises(ValueError):
+                        HARNESS['manifest_arguments']([pin], provider_pin)
+                finally:
+                    pin.close()
+                for mutation in ('hash', 'path', 'duplicate', 'schema', 'malformed'):
+                    value = copy.deepcopy(document)
+                    if mutation == 'hash':
+                        value['objects'][0]['identity']['sha256'] = '0' * 64
+                    elif mutation == 'path':
+                        value['module_path'] = str(root / 'other.so')
+                    elif mutation == 'duplicate':
+                        value['objects'].append(copy.deepcopy(value['objects'][0]))
+                    elif mutation == 'schema':
+                        value['schema'] = 'wrong'
+                    manifest.write_text('{' if mutation == 'malformed' else json.dumps(value))
+                    pin = HARNESS['NATIVE'].FilePin(manifest)
+                    try:
+                        with self.assertRaises(ValueError):
+                            HARNESS['manifest_arguments']([pin], provider_pin)
+                    finally:
+                        pin.close()
+            finally:
+                provider_pin.close()
+
+
 class FdControls(unittest.TestCase):
     def test_real_writer_stalls_and_drain_counts_exact_bytes(self):
         pipe = HARNESS['OutputPipe']()

@@ -3335,6 +3335,51 @@ fn pty_promotion_gaps_page_never_requests() {
 }
 
 #[test]
+fn pty_promotion_buffered_edge_switch_requires_a_viewed_edge_frame() {
+    let mut terminal = PromoPty::open();
+    assert!(terminal.display.promotion_enable(CaptureId::new(5)));
+    terminal.display.offer(varied_presentation());
+    terminal.display.tick();
+    terminal.shown(b"promotion: idle; selected");
+    terminal.key(b"\t\t");
+    assert_eq!(terminal.display.state.detail, DetailPage::Gaps);
+    assert!(terminal.display.writer.last_frame_written());
+
+    let mut newer = varied_presentation();
+    newer.passes += 1;
+    let newer_passes = newer.passes;
+    terminal.display.offer(newer);
+    terminal.display.next_redraw = std::time::Instant::now();
+    terminal.display.tick();
+    assert_eq!(terminal.display.state.detail, DetailPage::Gaps);
+    assert!(terminal.display.writer.last_frame_written());
+
+    // The keys share one service turn: switching back to an edge page
+    // has not painted it when the following promotion key is consumed.
+    terminal.key(b"\td");
+    assert_eq!(terminal.display.state.detail, DetailPage::Summary);
+    assert!(
+        terminal.display.take_promotion_request().is_none(),
+        "the last wholly written Gaps frame contains no selected edge"
+    );
+    assert_eq!(terminal.display.promotion_state(), PromotionState::Idle);
+    assert!(terminal.display.writer.last_frame_written());
+    terminal.shown(b"q quit");
+
+    // That turn has now painted the edge page in full; a later key can
+    // request the exact pair the operator has actually been shown.
+    terminal.key(b"d");
+    terminal.shown(b"promotion: request 1 queued");
+    let request = terminal.display.take_promotion_request().unwrap();
+    assert_eq!(request.viewed().presentation().passes, newer_passes);
+    assert_eq!(
+        terminal.display.viewed_pair,
+        Some(PromotionPair::new(request.caller().0, request.provider().0))
+    );
+    terminal.display.restore();
+}
+
+#[test]
 fn pty_promotion_disabled_display_ignores_promotion_keys() {
     let mut terminal = PromoPty::open();
     terminal.display.offer(varied_presentation());
@@ -3389,6 +3434,9 @@ fn pty_promotion_selection_follows_identity_across_reorder() {
     let mut second = first;
     second.edges.rotate_left(1);
     terminal.display.offer(second);
+    // Offers coalesce until the next scheduled redraw. Exercise the
+    // new frame deliberately rather than relying on wall-clock delay.
+    terminal.display.next_redraw = std::time::Instant::now();
     terminal.display.tick();
     terminal.shown(b"q quit");
     assert_eq!(
@@ -3423,6 +3471,7 @@ fn pty_promotion_missing_pair_clears_without_replacement() {
     let mut second = first;
     second.edges.remove(0);
     terminal.display.offer(second);
+    terminal.display.next_redraw = std::time::Instant::now();
     terminal.display.tick();
     terminal.shown(b"q quit");
     assert_eq!(terminal.display.state.promotion.selected, None);

@@ -2970,7 +2970,11 @@ impl Display {
         };
         self.viewed_presentation = Some(Arc::clone(&frame.presentation));
         self.viewed_revision = self.last_view_revision;
-        self.viewed_pair = self.state.promotion.selected;
+        self.viewed_pair = if self.state.detail == DetailPage::Gaps {
+            None
+        } else {
+            self.state.promotion.selected
+        };
     }
 
     /// Clear promotion authority after any shed or cut: the candidate

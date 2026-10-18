@@ -477,9 +477,21 @@ fn scope_auth() -> Option<ScopeAuth> {
     None
 }
 
+// A valid scope receipt always carries one nonzero scope bit. Keep its
+// full flags as a scalar across the call boundary, so the entry/return
+// callers do not each materialize Option<ScopeAuth>'s 32-byte output.
+// Receipt consumers still call scope_auth directly for tgid/generation.
 #[cfg(not(feature = "inventory-only"))]
+#[inline(never)]
+fn scope_flags_word() -> u64 {
+    scope_auth().map_or(0, |scope| scope.flags)
+}
+
+#[cfg(not(feature = "inventory-only"))]
+#[inline(always)]
 fn scope_flags() -> Option<u64> {
-    scope_auth().map(|scope| scope.flags)
+    let flags = scope_flags_word();
+    (flags != 0).then_some(flags)
 }
 
 fn bump_discovery_counter(index: u32) {

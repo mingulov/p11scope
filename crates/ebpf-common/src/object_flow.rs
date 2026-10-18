@@ -54,8 +54,10 @@ pub struct ReturnEventFacts {
 /// Initialize every Event byte from retained entry facts and captured scalars.
 /// # Safety
 /// `out` must point to an exclusively writable, aligned Event reservation;
-/// it must not alias `start` or `facts`. The caller retains START ownership
-/// through this call and ends its borrow before any mutation or retirement.
+/// it must not alias `start` or `facts`. `start` must remain valid and
+/// immutable through this call: an ordinary return may use its owned snapshot
+/// after retirement. For a map-backed START, the caller retains ownership
+/// and ends the borrow before any helper mutates or retires that row.
 #[inline(always)]
 pub unsafe fn fill_call_event(
     out: *mut Event,

@@ -18,7 +18,10 @@ The matrix contains exactly27 cells:
 The prebuilt `tests/fixtures/cgroup-trace/caller.c` fixture calls real SoftHSM
 `C_GenerateRandom` and records each successful invocation separately on its own
 ledger pipe. Provider setup precedes capture readiness and teardown follows
-observer reap. The observer selects exactly this single-threaded PID; the caller
+observer reap. The oracle retains independently verified executable identity and mapped held-
+provider identity, matches the image0 GenerateRandom target, and requires exactly
+one phase ACK after all calls and before independently observed completion.
+The observer selects exactly this single-threaded PID; the caller
 performs no fork/exec while attached. All issued calls must complete before the
 first signal. Setup/teardown cannot substitute for the mandatory main calls.
 
@@ -28,7 +31,10 @@ bytes. STATS entry/return counts equal issued calls. Raw CALLs equal rendered
 rows; issued minus raw equals EVENTS loss in this controlled no-fork population.
 Cumulative LOST records agree with final event loss. For readable stdout, complete
 saved-trace bytes minus delivered bytes equals the final sink byte counter,
-including terminal records. Lossless output must be byte-identical. `/dev/null`
+including terminal records. Lossless output must be byte-identical. Lossy
+ordinary bytes must remain an ordered subsequence of offered bytes. A complete
+stdout terminal may differ only in its three monotone pre-flush sink counters;
+partial terminal content that cannot be verified stays unqualified/nonzero. `/dev/null`
 has no invented delivered-byte measurement: it must report zero shedding and
 zero timeouts. An absent terminal, nonzero observer exit, failed saved output,
 malformed record or watchdog invalidates authoritative totals.
@@ -69,7 +75,7 @@ prebuilt observer and LP64 caller. On Fedora, read `~/AGENTS.md`, check load and
 values. No build, container, controller change or shared cleanup occurs here.
 `softhsm2-util`, SoftHSM, Python3 and bpftool must already be available. Copy the
 script plus its existing source dependencies (`qualify-cgroup-trace.py`,
-`cgroup-trace-oracle.py` and this directory); no Cargo target is needed.
+`cgroup-trace-oracle.py`, `mapped-provider-pin.py` and this directory); no Cargo target is needed.
 
 ```sh
 sudo -n python3 -I scripts/qualify-operator-output.py \
@@ -83,6 +89,8 @@ sudo -n python3 -I scripts/qualify-operator-output.py \
 
 Omit `--cells` for all27 requested cells. Select ancillary controls explicitly,
 for example `--cells 4M-slowpipe-midcapture --control child-held-stdout`.
+The16MiB file bound limits retained input memory: each file read requests at
+most LIMIT+1 bytes before rejecting oversize. It does not impose a disk quota.
 Run output is temporary debugging material. The summary distinguishes PASS,
 FAIL and NOT_RUN; every unqualified requested cell makes the command nonzero.
 Nothing here qualifies G21 diagnostics wrap/cost, installed saved-inventory diff,

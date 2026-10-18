@@ -1,18 +1,22 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Pre-activation visibility at the genuine owner-consumption boundary.
-//! Until the private stage exists, these diagnostics exercise the current
-//! immediate consumer and expose exactly why it cannot serve as that stage.
+//! Ordinary and private consumers share the same real evidence validator;
+//! only the destination of its history/binding effects differs.
 
 use super::*;
 use crate::discovery::engine::inventory_coordinator::semantics::{
-    SemanticAdmissionCandidate, SemanticBindingRefusal,
+    PromotionAdmissionReservation, SemanticAdmissionCandidate, SemanticBindingRefusal,
 };
 use crate::inventory_semantics::{PreparedSemanticAdmission, SemanticRefusal};
 
 fn prepare_owner(
     scene: &mut AdmissionScene,
     refuse_provider_storage: bool,
-) -> (SemanticAdmissionCandidate, PreparedSemanticAdmission) {
+) -> (
+    SemanticAdmissionCandidate,
+    PreparedSemanticAdmission,
+    PromotionAdmissionReservation,
+) {
     scene.prepare_without_cookie();
     scene.observe_entry();
     prepare_owner_after_catalog(scene, refuse_provider_storage)
@@ -21,13 +25,21 @@ fn prepare_owner(
 fn prepare_owner_after_catalog(
     scene: &mut AdmissionScene,
     refuse_provider_storage: bool,
-) -> (SemanticAdmissionCandidate, PreparedSemanticAdmission) {
+) -> (
+    SemanticAdmissionCandidate,
+    PreparedSemanticAdmission,
+    PromotionAdmissionReservation,
+) {
     let caller = scene.caller();
     let lane = scene.lane.as_mut().unwrap();
     let candidate = scene
         .coordinator
         .prepare_legacy_semantic_candidate(caller, lane.domain())
         .expect("the actual catalog retains the original eligible caller");
+    let reservation = scene
+        .coordinator
+        .reserve_promotion_admission(&candidate)
+        .unwrap();
     let pin = lane.subset().pins().pinned().next().unwrap();
     let module = ModuleKey::physical(
         pin.key.device.major,
@@ -58,7 +70,7 @@ fn prepare_owner_after_catalog(
     assert!(scene.h0.0.borrow().accepted > 0);
     assert_eq!(scene.coordinator.semantic_bindings().len(), 0);
     assert_eq!(scene.coordinator.registry().instances().count(), 0);
-    (candidate, prepared)
+    (candidate, prepared, reservation)
 }
 
 #[test]
@@ -74,7 +86,7 @@ fn promotion_stage_first_candidate_rejects_divergent_h0_original_arc() {
         .shared_semantic_custody(scene.caller())
         .unwrap();
     assert!(!Arc::ptr_eq(&original, &divergent));
-    let (candidate, prepared) = prepare_owner_after_catalog(&mut scene, false);
+    let (candidate, prepared, _reservation) = prepare_owner_after_catalog(&mut scene, false);
     assert!(Arc::ptr_eq(&candidate.pin(), &original));
     let (receipt, result) = scene
         .coordinator
@@ -96,7 +108,7 @@ fn promotion_stage_first_candidate_rejects_divergent_h0_original_arc() {
 #[test]
 fn promotion_stage_immediate_consumer_healthy_control() {
     let mut scene = AdmissionScene::new(Selection::Pid);
-    let (candidate, prepared) = prepare_owner(&mut scene, false);
+    let (candidate, prepared, _reservation) = prepare_owner(&mut scene, false);
     let (receipt, result) = scene
         .coordinator
         .consume_semantic_admission(candidate, prepared, None);
@@ -119,13 +131,12 @@ fn promotion_stage_immediate_consumer_healthy_control() {
 #[test]
 fn promotion_stage_accepted_evidence_is_private_before_activation() {
     let mut scene = AdmissionScene::new(Selection::Pid);
-    let (candidate, prepared) = prepare_owner(&mut scene, false);
-    // RED diagnostic: the old immediate consumer is deliberately used here.
-    // The implementation replaces this call with the genuine private stage;
-    // no native success or activation receipt is manufactured by the fixture.
-    let (receipt, result) = scene
-        .coordinator
-        .consume_semantic_admission(candidate, prepared, None);
+    let (candidate, prepared, reservation) = prepare_owner(&mut scene, false);
+    let staged =
+        scene
+            .coordinator
+            .stage_promotion_admission(reservation, candidate, prepared, None);
+    let result = staged.result();
     assert_eq!(result, Ok(()));
     assert_eq!(
         scene.coordinator.semantic_bindings().len(),
@@ -133,7 +144,7 @@ fn promotion_stage_accepted_evidence_is_private_before_activation() {
         "a prepared owner receipt cannot publish a binding before native activation"
     );
     assert_eq!(scene.coordinator.registry().instances().count(), 0);
-    drop(receipt);
+    drop(staged);
     assert!(
         scene
             .coordinator
@@ -146,10 +157,12 @@ fn promotion_stage_accepted_evidence_is_private_before_activation() {
 #[test]
 fn promotion_stage_refused_provider_leaves_no_global_admission_history() {
     let mut scene = AdmissionScene::new(Selection::Pid);
-    let (candidate, prepared) = prepare_owner(&mut scene, true);
-    let (receipt, result) = scene
-        .coordinator
-        .consume_semantic_admission(candidate, prepared, None);
+    let (candidate, prepared, reservation) = prepare_owner(&mut scene, true);
+    let staged =
+        scene
+            .coordinator
+            .stage_promotion_admission(reservation, candidate, prepared, None);
+    let result = staged.result();
     assert_eq!(
         result,
         Err(SemanticBindingRefusal::OwnerRefused(
@@ -158,7 +171,7 @@ fn promotion_stage_refused_provider_leaves_no_global_admission_history() {
     );
     assert_eq!(scene.coordinator.semantic_bindings().len(), 0);
     assert_eq!(scene.coordinator.registry().instances().count(), 0);
-    drop(receipt);
+    drop(staged);
     assert!(
         scene
             .coordinator
@@ -166,4 +179,31 @@ fn promotion_stage_refused_provider_leaves_no_global_admission_history() {
             .is_some(),
         "a provisional provider refusal cannot install negative history in the live coordinator"
     );
+}
+
+#[test]
+fn promotion_stage_budget_refuses_before_copy_or_owner_scan() {
+    let mut scene = AdmissionScene::new(Selection::Pid);
+    scene.prepare_without_cookie();
+    let candidate = scene
+        .coordinator
+        .prepare_legacy_semantic_candidate(scene.caller(), scene.lane.as_ref().unwrap().domain())
+        .unwrap();
+    let baseline = scene.coordinator.registry().semantic_resource_snapshot();
+    scene
+        .coordinator
+        .registry_mut()
+        .reference_semantic_resource_limit(baseline.charged_bytes);
+    let (result, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
+        scene.coordinator.reserve_promotion_admission(&candidate)
+    });
+    assert!(matches!(result, Err(SemanticBindingRefusal::Capacity)));
+    assert_eq!((allocations, bytes), (0, 0));
+    assert_eq!(scene.h0.0.borrow().accepted, 0);
+    assert_eq!(scene.coordinator.semantic_bindings().len(), 0);
+    assert_eq!(scene.coordinator.registry().instances().count(), 0);
+    let after = scene.coordinator.registry().semantic_resource_snapshot();
+    assert_eq!(after.charged_bytes, baseline.charged_bytes);
+    assert_eq!(after.peak_charged_bytes, baseline.peak_charged_bytes);
+    assert_eq!(after.refused, baseline.refused + 1);
 }

@@ -2,6 +2,8 @@
 //! Sole subset minter over the coordinator's retained, accepted sources.
 
 use super::*;
+
+mod promotion;
 #[cfg(test)]
 use crate::discovery::caller_registry::OsProcessSource;
 use crate::discovery::caller_registry::instance_input::{
@@ -19,6 +21,9 @@ use crate::semantic_capture::{
 };
 use crate::semantics_edge::resources::{OWNED_ALLOCATION_PADDING, ResourceLease};
 use p11scope_ebpf_common::ImageIdentity;
+pub(crate) use promotion::{
+    PromotionAdmissionReservation, PromotionInstallCapacity, StagedPromotionAdmission,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -1174,6 +1179,39 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         )
     }
 
+    /// Pay for fixed private admission state before owner preparation or copies.
+    pub(crate) fn reserve_promotion_admission(
+        &self,
+        candidate: &SemanticAdmissionCandidate,
+    ) -> Result<PromotionAdmissionReservation, SemanticBindingRefusal> {
+        PromotionAdmissionReservation::reserve(&self.registry, candidate)
+    }
+
+    pub(crate) fn reserve_promotion_install(
+        &self,
+    ) -> Result<PromotionInstallCapacity, SemanticBindingRefusal> {
+        PromotionInstallCapacity::reserve(&self.registry)
+    }
+
+    /// Run the ordinary consumer against fixed private storage. No registry
+    /// diagnostic, history, registration or binding is published by this call.
+    pub(crate) fn stage_promotion_admission(
+        &self,
+        reservation: PromotionAdmissionReservation,
+        candidate: SemanticAdmissionCandidate,
+        prepared: PreparedSemanticAdmission,
+        permit: Option<crate::inspect_system::inventory_cgroup::CgroupAdmissionPermit<'_>>,
+    ) -> StagedPromotionAdmission {
+        StagedPromotionAdmission::consume(
+            &self.adapter,
+            &self.registry,
+            reservation,
+            candidate,
+            prepared,
+            permit,
+        )
+    }
+
     /// Consume unchanged owner evidence under the exact current scope guard.
     /// All provider/owner I/O precedes this call. After the final guard, only
     /// retained-record matching and bounded insertion remain.
@@ -1193,193 +1231,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .as_ref()
             .ok()
             .and_then(|provider| self.registry.module_id_for(provider.module()));
-        // The accepted H0 scan consumes the published handoff even when the
-        // provider or final scope proof refuses positive admission below.
-        let bridge = self.semantic_bindings.successors.remove(&caller);
-        let result = (|| {
-            use SemanticBindingRefusal as Refusal;
-            if candidate.from_successor != bridge.is_some() {
-                return Err(Refusal::ImageUnproven(UnboundReason::ExecAmbiguous));
-            }
-            if let Some(bridge) = &bridge
-                && (!bridge.matches(candidate.incarnation, &candidate.generation)
-                    || !bridge.custody.is_exact()
-                    || bridge.custody.domain != candidate.domain
-                    || !Arc::ptr_eq(&bridge.custody.pin, &candidate.pin))
-            {
-                return Err(Refusal::ImageUnproven(UnboundReason::ExecAmbiguous));
-            }
-            if receipt.original_pin().pid() != candidate.pin.pid()
-                || receipt.original_pin().start_time() != candidate.generation.start_time
-            {
-                return Err(Refusal::NoLiveCaller);
-            }
-            if receipt.domain() != candidate.domain
-                || candidate
-                    .expected_pin
-                    .as_ref()
-                    .is_some_and(|expected| !Arc::ptr_eq(expected, receipt.original_pin()))
-            {
-                return Err(Refusal::ImageUnproven(UnboundReason::ExecAmbiguous));
-            }
-            let observed = (receipt.domain(), receipt.image());
-            if let Some(previous) = self.semantic_bindings.admission_images.get(&caller) {
-                if (previous.domain, previous.image) != observed
-                    || previous.incarnation != candidate.incarnation
-                    || previous.generation != candidate.generation
-                    || !Arc::ptr_eq(&previous.pin, receipt.original_pin())
-                {
-                    return Err(Refusal::ImageUnproven(UnboundReason::ExecAmbiguous));
-                }
-            } else {
-                if self.semantic_bindings.admission_images.len() >= self.semantic_bindings.limit {
-                    return Err(Refusal::Capacity);
-                }
-                self.semantic_bindings.admission_images.insert(
-                    caller,
-                    SemanticAdmissionHistory {
-                        domain: observed.0,
-                        image: observed.1,
-                        incarnation: candidate.incarnation,
-                        generation: candidate.generation.clone(),
-                        pin: receipt.original_pin().clone(),
-                        initial_scope_cut: false,
-                        pending_gap: None,
-                    },
-                );
-            }
-            let guarded = match (candidate.scope, permit) {
-                (AdmissionScope::Cgroup, Some(permit)) => {
-                    candidate.pin.pid() == permit.pid()
-                        && candidate.generation == *permit.generation()
-                        && permit.check()
-                        && candidate.pin.still_the_same()
-                        && receipt.original_pin().still_the_same()
-                        && permit.finish_check()
-                }
-                (AdmissionScope::Pid(pid), None) if pid == candidate.pin.pid() => {
-                    candidate.pin.still_the_same() && receipt.original_pin().still_the_same()
-                }
-                (AdmissionScope::System, None) => {
-                    candidate.pin.still_the_same() && receipt.original_pin().still_the_same()
-                }
-                _ => false,
-            };
-            if !guarded {
-                // H0 already accepted this exact original-Arc association,
-                // even though no coordinator binding exists yet. A genuine
-                // final-scope refusal must fence that association before old
-                // unread returns can meet a later fresh coverage receipt.
-                if candidate.scope == AdmissionScope::Cgroup
-                    && self.semantic_bindings.get(caller).is_none()
-                {
-                    let history = self
-                        .semantic_bindings
-                        .admission_images
-                        .get_mut(&caller)
-                        .expect("the accepted owner scan was recorded above");
-                    if !history.initial_scope_cut {
-                        history.pending_gap = Some(PhysicalSemanticGap::adjudicated(
-                            receipt.domain(),
-                            receipt.image(),
-                            receipt.original_pin().clone(),
-                        ));
-                        history.initial_scope_cut = true;
-                    }
-                }
-                return Err(Refusal::NoLiveCaller);
-            }
-            let record = self.adapter.record(caller).ok_or(Refusal::NoLiveCaller)?;
-            if record.retired
-                || record.incarnation != candidate.incarnation
-                || record.pid != candidate.pin.pid()
-                || record.start_time != candidate.generation.start_time
-                || record.exe != candidate.generation.exe
-                || self.adapter.live_id(record.pid) != Some(caller)
-                || receipt.original_pin().pid() != candidate.pin.pid()
-                || receipt.original_pin().start_time() != candidate.generation.start_time
-            {
-                return Err(Refusal::NoLiveCaller);
-            }
-            let existing_at = self.semantic_bindings.index.get(&caller).copied();
-            if let Some(at) = existing_at {
-                let existing = &mut self.semantic_bindings.bindings[at];
-                if existing.domain != receipt.domain() {
-                    return Err(Refusal::DomainConflict);
-                }
-                if existing.image != receipt.image()
-                    || !Arc::ptr_eq(&existing.pin, receipt.original_pin())
-                {
-                    return Err(Refusal::ImageUnproven(UnboundReason::ExecAmbiguous));
-                }
-                if candidate.scope == AdmissionScope::Cgroup {
-                    // Re-arm negative loss tracking under this exact binding's
-                    // fresh scope proof. Provider refusal below must keep its
-                    // positive scope eligibility suspended.
-                    existing.suspension_cut = false;
-                }
-            }
-            // Proven current membership ends the previous scope-loss episode
-            // independently of provider permission. An expired owner receipt
-            // still grants no positive authority, but a later genuine leave
-            // must mint its own cut instead of reusing the old episode latch.
-            if candidate.scope == AdmissionScope::Cgroup {
-                self.semantic_bindings
-                    .admission_images
-                    .get_mut(&caller)
-                    .expect("the scope proof retained its accepted owner scan")
-                    .initial_scope_cut = false;
-            }
-            let provider = provider.map_err(Refusal::OwnerRefused)?;
-            let exact_reproof = existing_at.is_some_and(|at| {
-                self.semantic_bindings.bindings[at]
-                    .providers
-                    .iter()
-                    .any(|old| old.same_association(&provider))
-            });
-            if !exact_reproof
-                && self.semantic_bindings.provider_count() >= self.semantic_bindings.provider_limit
-            {
-                return Err(Refusal::Capacity);
-            }
-            if let Some(at) = existing_at {
-                let existing = &mut self.semantic_bindings.bindings[at];
-                existing.providers.insert(provider, &self.registry)?;
-                existing.scope_current = true;
-                existing.suspension_cut = false;
-                return Ok(());
-            }
-            if self.semantic_bindings.bindings.len() >= self.semantic_bindings.limit {
-                return Err(Refusal::Capacity);
-            }
-            let mut providers = SemanticProviderAssociations::new();
-            providers.insert(provider, &self.registry)?;
-            self.semantic_bindings.insert(SemanticCallerBinding {
-                caller,
-                domain: receipt.domain(),
-                image: receipt.image(),
-                pin: receipt.original_pin().clone(),
-                scope_current: true,
-                suspension_cut: false,
-                providers,
-                #[cfg(test)]
-                reference_module: None,
-            })
-        })();
+        let result = promotion::consume(
+            &self.adapter,
+            &self.registry,
+            &mut self.semantic_bindings,
+            candidate,
+            &receipt,
+            provider,
+            permit,
+        );
         if let Err(reason) = result {
-            if let Some(mut bridge) = bridge
-                && !self
-                    .semantic_bindings
-                    .admission_images
-                    .contains_key(&caller)
-            {
-                // An accepted scan with divergent custody or exhausted
-                // history cannot later retry through a fresh duplicate.
-                bridge.custody.refuse(reason);
-                self.semantic_bindings
-                    .refused_successors
-                    .insert(caller, bridge);
-            }
             self.semantic_admission_refused(caller, reason.code());
             if matches!(
                 reason,

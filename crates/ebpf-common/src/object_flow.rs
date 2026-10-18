@@ -28,8 +28,8 @@ use crate::object_policy::ScalarDeriveMechanism;
 use crate::object_wire::{
     ObjectAttributeListWire, ObjectCallWire, ObjectDescriptorWire, ObjectStart,
     OBJECT_ACTION_DERIVE, OBJECT_ACTION_FIND, OBJECT_ACTION_GET, OBJECT_ACTION_MAX,
-    OBJECT_ACTION_NONE, OBJECT_ATTR_LIST_UNINSPECTED, OBJECT_DERIVE_UNAVAILABLE, OBJECT_GUARD_NONE,
-    OBJECT_GUARD_SCALAR_DERIVE,
+    OBJECT_ACTION_NONE, OBJECT_ATTR_LIST_UNINSPECTED, OBJECT_DERIVE_UNAVAILABLE, OBJECT_FLAGS_MASK,
+    OBJECT_GUARD_NONE, OBJECT_GUARD_SCALAR_DERIVE,
 };
 use crate::{target_word_end, InstanceContinuity, LinuxLayout, ARG_NONE};
 
@@ -102,14 +102,10 @@ pub fn adapter_derive_entry(
     true
 }
 
-/// H7-E4 wiring switch: false while attribute capture is unwired. The
-/// entry adapter returns after custody while false — fetching nothing,
-/// since the no-op seams consume nothing — so the unwired BPF path
-/// performs zero argument acquisition (no probe register/stack reads
-/// for zero attributes). A budgeted E4 flips this to true AND implements
-/// the seams below; G05 passes unmodified when it does. The unwired
-/// regression pins the false state explicitly, so a flipped switch with
-/// unimplemented seams fails loudly instead of silently fetching.
+/// H7-E4 shipping gate. The scalar production seams below are implemented
+/// and exercised directly by host spies; adapters remain closed until actual
+/// compiled-stack, verifier, privacy and installed qualification pass. While
+/// false, entry acquires no template arguments and Get emission reads nothing.
 pub const ATTRIBUTE_CAPTURE_WIRED: bool = false;
 
 /// Production entry attribute adapter body (H7-E4): inspect authorized
@@ -131,9 +127,7 @@ pub const ATTRIBUTE_CAPTURE_WIRED: bool = false;
 /// directly, so host tests observe wiring through this function — no
 /// caller hand-writes the inspected outcomes. While E4 is unwired the
 /// adapter returns after custody without acquiring arguments (see
-/// `ATTRIBUTE_CAPTURE_WIRED`), the seams retain nothing and the side
-/// keeps its allocated-zero attribute state (as the live blocked oracle
-/// requires).
+/// `ATTRIBUTE_CAPTURE_WIRED`), so the side keeps its allocated-zero state.
 #[inline(always)]
 // Closure plus scalar parameters map to the BPF wrapper's register-passed
 // arguments; bundling them into a struct would risk wrapper stack the
@@ -162,7 +156,7 @@ pub fn adapter_attributes_entry(
     {
         return false;
     }
-    // Unwired: the seams below consume nothing, so acquire nothing. Every
+    // Closed shipping gate: acquire nothing. Every
     // `fetch_arg` below this line evaporates while the switch is false
     // (the BPF wrapper keeps only its descriptor lookup); the drivers
     // assert zero acquisition while unwired, so reintroduced fetches fail
@@ -505,7 +499,7 @@ pub unsafe fn adapter_tail_fill(
         core::ptr::addr_of_mut!((*tail).version).write(1);
         core::ptr::addr_of_mut!((*tail).bytes).write(240);
         core::ptr::addr_of_mut!((*tail).descriptor_index).write(descriptor);
-        core::ptr::addr_of_mut!((*tail).flags).write(u32::from(side.flags));
+        core::ptr::addr_of_mut!((*tail).flags).write(u32::from(side.flags) & OBJECT_FLAGS_MASK);
         core::ptr::addr_of_mut!((*tail).layout).write(side.layout);
         core::ptr::addr_of_mut!((*tail).action).write(row.action);
         core::ptr::addr_of_mut!((*tail).entry_derive).write(side.derive);
@@ -524,9 +518,8 @@ pub unsafe fn adapter_tail_fill(
             core::ptr::addr_of_mut!((*tail).result_status).write(side.result_statuses);
         }
     }
-    // Requested lists: BPF performs no entry template inspection (no
-    // chain budget for it), so present pairs carry the honest
-    // uninspected marker; absent pairs stay all-zero.
+    // Closed shipping gate marks present pairs uninspected. Once qualified,
+    // entry's inspected lists pass through; absent pairs stay all-zero.
     let mut p = 0;
     while p < 2 {
         let present =
@@ -536,7 +529,9 @@ pub unsafe fn adapter_tail_fill(
             unsafe {
                 let dst = core::ptr::addr_of_mut!((*tail).requested[p]);
                 dst.write(side.requested[p]);
-                core::ptr::addr_of_mut!((*dst).flags).write(OBJECT_ATTR_LIST_UNINSPECTED);
+                if !ATTRIBUTE_CAPTURE_WIRED {
+                    core::ptr::addr_of_mut!((*dst).flags).write(OBJECT_ATTR_LIST_UNINSPECTED);
+                }
             }
         }
         p += 1;
@@ -822,6 +817,15 @@ pub unsafe fn adapter_emit_get_attributes(
     if !return_accepts_get_results(rv) {
         return true;
     }
+    // Shipping stays closed until the implemented seams pass compiled and
+    // installed qualification. Direct seam tests execute the decoder itself.
+    if !ATTRIBUTE_CAPTURE_WIRED {
+        // SAFETY: `tail` is the exclusively owned reserved tail.
+        unsafe {
+            (*tail).result_attributes.flags = OBJECT_ATTR_LIST_UNINSPECTED;
+        }
+        return true;
+    }
     // Authority from the adapter's own custody plus the threaded verdict:
     // the side row is live, the fill advanced it to RETURNING, and the
     // root joined continuity — the same trust the fill adapter places in
@@ -894,13 +898,9 @@ pub fn emission_finalize(emitted: bool, remove: impl FnOnce() -> bool) -> Emissi
 /// Returns the inspection's `object_flag` contributions for the adapter
 /// to merge into the side flags.
 ///
-/// TODAY (E4 unwired): inspects nothing — performs zero reads, leaves
-/// `*out` untouched and returns zero, so the side pair keeps its
-/// allocated-zero state (as the live blocked oracle requires). Present
-/// pairs then carry the UNINSPECTED marking at emission (see
-/// `adapter_tail_fill`). A budgeted E4 implements the approved bounded
-/// in-place inspection HERE with this exact signature and flips
-/// `ATTRIBUTE_CAPTURE_WIRED`; G05 passes unmodified when it does.
+/// Uses bounded selector-first header rescans for all stated-span alias
+/// checks, followed by one value read and a stable header recheck. The
+/// shipping adapter invokes this only after capture qualification.
 #[inline(always)]
 pub fn production_inspect_request_template(
     template_ptr: u64,
@@ -911,10 +911,15 @@ pub fn production_inspect_request_template(
     read_word: impl FnMut(u64) -> Result<u64, ()>,
     read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
 ) -> u32 {
-    let _ = (template_ptr, count, peer, layout);
-    let _ = out;
-    let _ = (read_word, read_bytes);
-    0
+    crate::object_capture::inspect_request_template_into(
+        template_ptr,
+        count,
+        peer,
+        layout,
+        out,
+        read_word,
+        read_bytes,
+    )
 }
 
 /// Production GetAttributeValue entry path (H7-E4 seam).
@@ -927,17 +932,9 @@ pub fn production_inspect_request_template(
 /// fit the 512 B chain), so the seam takes the side row itself. Host
 /// oracles keep using `GetEntryState`; the G05 sim bridges it.
 ///
-/// TODAY (E4 unwired): retains nothing — performs zero reads, leaves the
-/// side row untouched (allocated-zero, as the live blocked oracle
-/// requires) and returns the zero verdict. A budgeted E4 retains the
-/// approved bounded header facts HERE with this exact signature and
-/// flips `ATTRIBUTE_CAPTURE_WIRED`; G05 passes unmodified when it does.
-///
-/// Retained slots pack densely (`slots[0..count]` selected, the rest
-/// zero — the shared protocol only appends), so the return path derives
-/// the retained count as the leading selected-slot prefix. Entry list
-/// flags (truncation/header failure) have no side field today: E4 must
-/// pack them; the G05 vectors carry none.
+/// Retained slots pack densely; the return path derives their count from
+/// the leading selected-slot prefix. The four entry-list flags occupy
+/// private side bits8–11 and are masked out of every public tail copy.
 #[inline(always)]
 pub fn production_capture_get_entry(
     template_ptr: u64,
@@ -946,10 +943,7 @@ pub fn production_capture_get_entry(
     side: &mut ObjectStart,
     read_word: impl FnMut(u64) -> Result<u64, ()>,
 ) -> GetEntryVerdict {
-    let _ = (template_ptr, count, layout);
-    let _ = side;
-    let _ = read_word;
-    GetEntryVerdict::default()
+    crate::object_capture::capture_get_entry_into(template_ptr, count, layout, side, read_word)
 }
 
 /// Production GetAttributeValue return path (H7-E4 seam).
@@ -961,13 +955,10 @@ pub fn production_capture_get_entry(
 /// inspection's `object_flag` contributions for the adapter to merge
 /// into the tail flags.
 ///
-/// TODAY (E4 unwired): establishes nothing — performs zero reads,
-/// returns zero, and marks `out` UNINSPECTED (cells/inspected already
-/// zero: the adapter runs after the tail zeroing, which the shared Find
-/// emission relies on too). A Get tail therefore still carries the
-/// honest marked-only result list. A budgeted E4 establishes the
-/// approved bounded results HERE with this exact signature and flips
-/// `ATTRIBUTE_CAPTURE_WIRED`; G05 passes unmodified when it does.
+/// Reads the side row immutably, checks every retained entry capacity for
+/// aliases, then classifies one approved value and rechecks its header.
+/// The shipping adapter supplies the marked-only no-read behavior while
+/// capture qualification remains open.
 #[inline(always)]
 pub fn production_capture_get_return(
     side: &ObjectStart,
@@ -978,8 +969,7 @@ pub fn production_capture_get_return(
     read_word: impl FnMut(u64) -> Result<u64, ()>,
     read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
 ) -> u32 {
-    let _ = (side, rv, authority, layout);
-    let _ = (read_word, read_bytes);
-    out.flags = OBJECT_ATTR_LIST_UNINSPECTED;
-    0
+    crate::object_capture::capture_get_return_into(
+        side, rv, authority, layout, out, read_word, read_bytes,
+    )
 }

@@ -10,6 +10,7 @@ use super::presentation::{
     MetadataStatus,
 };
 use crate::discovery::caller_registry::CallerId;
+use crate::discovery::native_binding::BinderMetadataKey;
 #[path = "runtime/job.rs"]
 pub(crate) mod job;
 
@@ -34,8 +35,9 @@ pub(crate) const WORKER_STORAGE_BYTES: usize = 4096;
 pub(crate) struct MetadataCaller {
     pub(crate) id: CallerId,
     pub(crate) incarnation: u32,
-    /// Only the admitted native identity; a later query cannot upgrade a scan.
-    pub(crate) image: Option<(u64, u64)>,
+    /// Non-authoritative scheduling key from a genuine post-coverage binding.
+    /// A raw key alone can never qualify a sample or upgrade admission.
+    pub(crate) image: Option<BinderMetadataKey>,
     pub(crate) retired: bool,
 }
 
@@ -293,7 +295,11 @@ impl MetadataRuntime {
                         slot.metadata = slot.metadata.to_historical();
                     } else if slot.caller.image != caller.image {
                         slot.metadata = CallerMetadata::unknown(
-                            MetadataReason::GenerationChanged,
+                            if caller.image.is_none() {
+                                MetadataReason::IdentityUnavailable
+                            } else {
+                                MetadataReason::GenerationChanged
+                            },
                             slot.metadata.revision.saturating_add(1),
                         );
                     }
@@ -346,7 +352,7 @@ impl MetadataRuntime {
                 continue;
             };
             slot.sequence = sequence;
-            if slot.caller.image.is_none_or(|(cookie, _)| cookie == 0) {
+            if slot.caller.image.is_none() {
                 slot.metadata = CallerMetadata::unknown(
                     MetadataReason::IdentityUnavailable,
                     slot.metadata.revision.saturating_add(1),

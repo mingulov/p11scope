@@ -861,8 +861,10 @@ silent.
 
 The full64 native task/image checks bracket the two retained-original proc
 reads. They reuse the Inventory identity-only query and add no application
-argument/pointer reads. A scan-only image cannot be upgraded by a later
-metadata query. Equal membership endpoints remain `endpoint_sample_only`;
+argument/pointer reads. The expected image comes from a genuine native caller-use binding whose
+admission follows the capture's coverage start; pre-coverage, unbound, changed
+or unprovable callers remain unknown. A scan-based CallerRecord is never
+upgraded to native admission authority by this display proof or a later query. Equal membership endpoints remain `endpoint_sample_only`;
 A-to-B-to-A excursions are not excluded. Raw membership is temporary private
 scratch, zeroed/discarded on job completion. One cancellable worker,4096 retained
 caller slots,64 starts/100ms,25ms cooperative job budget,1s target refresh and

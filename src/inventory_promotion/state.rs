@@ -13,14 +13,14 @@
 /// run and bound at enable time. Requests stamp it; the runtime rejects
 /// replays naming a foreign capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CaptureId(u64);
+pub(crate) struct CaptureId(u64);
 
 impl CaptureId {
-    pub fn new(raw: u64) -> Self {
+    pub(crate) fn new(raw: u64) -> Self {
         Self(raw)
     }
 
-    pub fn get(self) -> u64 {
+    pub(crate) fn get(self) -> u64 {
         self.0
     }
 }
@@ -29,14 +29,14 @@ impl CaptureId {
 /// (each frame actually viewed gets a unique revision). The request
 /// binds the viewed revision, never a redrawn row index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ViewRevision(u64);
+pub(crate) struct ViewRevision(u64);
 
 impl ViewRevision {
-    pub fn new(raw: u64) -> Self {
+    pub(crate) fn new(raw: u64) -> Self {
         Self(raw)
     }
 
-    pub fn get(self) -> u64 {
+    pub(crate) fn get(self) -> u64 {
         self.0
     }
 }
@@ -45,18 +45,18 @@ impl ViewRevision {
 /// issued; [`RequestId::EXHAUSTED`] is never issued either and marks
 /// the exhausted counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RequestId(u64);
+pub(crate) struct RequestId(u64);
 
 impl RequestId {
     /// Reserved marker: the counter reached it, so no further request
     /// can take a serial. Compared, never issued.
-    pub const EXHAUSTED: u64 = u64::MAX;
+    pub(crate) const EXHAUSTED: u64 = u64::MAX;
 
-    pub fn new(raw: u64) -> Self {
+    pub(crate) fn new(raw: u64) -> Self {
         Self(raw)
     }
 
-    pub fn get(self) -> u64 {
+    pub(crate) fn get(self) -> u64 {
         self.0
     }
 }
@@ -65,21 +65,21 @@ impl RequestId {
 /// IDs (`c{caller}/m{provider}`). Display data, not authority: the
 /// runtime re-resolves both against live state before doing anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PromotionPair {
+pub(crate) struct PromotionPair {
     caller: u32,
     provider: u32,
 }
 
 impl PromotionPair {
-    pub fn new(caller: u32, provider: u32) -> Self {
+    pub(crate) fn new(caller: u32, provider: u32) -> Self {
         Self { caller, provider }
     }
 
-    pub fn caller(self) -> u32 {
+    pub(crate) fn caller(self) -> u32 {
         self.caller
     }
 
-    pub fn provider(self) -> u32 {
+    pub(crate) fn provider(self) -> u32 {
         self.provider
     }
 }
@@ -91,7 +91,7 @@ impl PromotionPair {
 #[cfg_attr(not(test), allow(dead_code))]
 // STAGED (DR37): runtime-side variants are constructed by the runtime owner via status updates; labels render today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromotionRefusal {
+pub(crate) enum PromotionRefusal {
     /// The control was never enabled for this run.
     Disabled,
     /// Other promotion work is outstanding (a different pair, or the
@@ -133,7 +133,7 @@ pub enum PromotionRefusal {
 
 impl PromotionRefusal {
     /// Plain static words for the status line (ASCII, no escapes).
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Disabled => "control disabled",
             Self::Busy => "another promotion is outstanding",
@@ -161,7 +161,7 @@ impl PromotionRefusal {
 #[cfg_attr(not(test), allow(dead_code))]
 // STAGED (DR37): LaneClosed is reported by the runtime owner; Cancelled/RunStopped are produced here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromotionEnd {
+pub(crate) enum PromotionEnd {
     /// The operator cancelled the request.
     Cancelled,
     /// The run stopped with promotion work outstanding.
@@ -172,7 +172,7 @@ pub enum PromotionEnd {
 
 impl PromotionEnd {
     /// Plain static words for the status line (ASCII, no escapes).
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Cancelled => "cancelled by operator",
             Self::RunStopped => "run stopped",
@@ -187,7 +187,7 @@ impl PromotionEnd {
 #[cfg_attr(not(test), allow(dead_code))]
 // STAGED (DR37): Preparing/Validating/Active/Refused/Ended are entered via runtime status updates; Queued/Stopping/Idle transitions run today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromotionState {
+pub(crate) enum PromotionState {
     /// Nothing requested (or the control is disabled).
     Idle,
     /// A request is accepted and awaits (or awaits acknowledgement of)
@@ -212,7 +212,7 @@ pub enum PromotionState {
 /// mailbox (the runtime evidently holds the request).
 #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): constructed by the runtime owner; consumed by set_status today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromotionOutcome {
+pub(crate) enum PromotionOutcome {
     Preparing,
     Validating,
     /// Activation is genuine only for the outstanding pair; a
@@ -233,28 +233,28 @@ pub enum PromotionOutcome {
 /// and ignored.
 #[cfg_attr(not(test), allow(dead_code))] // STAGED (DR37): constructed by the runtime owner; consumed by set_status today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PromotionStatusUpdate {
-    pub request: RequestId,
-    pub outcome: PromotionOutcome,
+pub(crate) struct PromotionStatusUpdate {
+    pub(crate) request: RequestId,
+    pub(crate) outcome: PromotionOutcome,
 }
 
 impl PromotionStatusUpdate {
-    pub fn new(request: RequestId, outcome: PromotionOutcome) -> Self {
+    pub(crate) fn new(request: RequestId, outcome: PromotionOutcome) -> Self {
         Self { request, outcome }
     }
 }
 
 /// The accepted request ticket held by the one-slot mailbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RequestTicket {
-    pub id: RequestId,
-    pub view: ViewRevision,
-    pub pair: PromotionPair,
+pub(crate) struct RequestTicket {
+    pub(crate) id: RequestId,
+    pub(crate) view: ViewRevision,
+    pub(crate) pair: PromotionPair,
 }
 
 /// What an operator cancel did, honestly distinguished.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromotionCancel {
+pub(crate) enum PromotionCancel {
     /// Nothing outstanding: no state changed.
     NothingToCancel,
     /// The pending request had not reached the runtime: dropped
@@ -269,7 +269,7 @@ pub enum PromotionCancel {
 /// survives frame coalescing until superseded by the next accepted
 /// request, status update or key outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromotionNote {
+pub(crate) enum PromotionNote {
     Busy,
     Duplicate,
     AlreadyDetailed,
@@ -283,7 +283,7 @@ impl PromotionNote {
     /// Map a request refusal to its sticky note, if it has one.
     /// Runtime-only and disabled refusals are unreachable from the key
     /// path and map to nothing.
-    pub fn for_refusal(refusal: PromotionRefusal) -> Option<Self> {
+    pub(crate) fn for_refusal(refusal: PromotionRefusal) -> Option<Self> {
         match refusal {
             PromotionRefusal::Busy => Some(Self::Busy),
             PromotionRefusal::Duplicate => Some(Self::Duplicate),
@@ -294,7 +294,7 @@ impl PromotionNote {
     }
 
     /// Plain static words for the status line (ASCII, no escapes).
-    pub fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Busy => "busy",
             Self::Duplicate => "duplicate of in-flight request",
@@ -311,7 +311,7 @@ impl PromotionNote {
 /// mailbox slot and the visible state machine. Single-threaded: the
 /// sole driver polls it between normal capture work.
 #[derive(Debug)]
-pub struct PromotionControl {
+pub(crate) struct PromotionControl {
     enabled: bool,
     capture: Option<CaptureId>,
     next_serial: u64,
@@ -326,7 +326,7 @@ pub struct PromotionControl {
 impl PromotionControl {
     /// Disabled, idle, serials from 1. The runtime/CLI enables the
     /// control explicitly per run; default behavior stays unchanged.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             enabled: false,
             capture: None,
@@ -338,30 +338,30 @@ impl PromotionControl {
         }
     }
 
-    pub fn enabled(&self) -> bool {
+    pub(crate) fn enabled(&self) -> bool {
         self.enabled
     }
 
     /// The bound capture, if enabled.
-    pub fn capture(&self) -> Option<CaptureId> {
+    pub(crate) fn capture(&self) -> Option<CaptureId> {
         self.capture
     }
 
-    pub fn state(&self) -> PromotionState {
+    pub(crate) fn state(&self) -> PromotionState {
         self.state
     }
 
     /// The current (or, after a terminal transition, last) request
     /// ticket. Displayed, never re-issued.
-    pub fn outstanding(&self) -> Option<RequestTicket> {
+    pub(crate) fn outstanding(&self) -> Option<RequestTicket> {
         self.outstanding
     }
 
-    pub fn note(&self) -> Option<PromotionNote> {
+    pub(crate) fn note(&self) -> Option<PromotionNote> {
         self.note
     }
 
-    pub fn set_note(&mut self, note: Option<PromotionNote>) {
+    pub(crate) fn set_note(&mut self, note: Option<PromotionNote>) {
         self.note = note;
     }
 
@@ -370,7 +370,7 @@ impl PromotionControl {
     /// a repeat of the in-flight pair is [`Duplicate`](PromotionRefusal::Duplicate),
     /// and a repeat of the active pair is [`AlreadyDetailed`](PromotionRefusal::AlreadyDetailed).
     /// Terminal states accept a fresh serial; the exhausted counter refuses.
-    pub fn request(
+    pub(crate) fn request(
         &mut self,
         view: ViewRevision,
         pair: PromotionPair,
@@ -414,7 +414,7 @@ impl PromotionControl {
     /// runtime (including an active lane) requests `Stopping` and waits
     /// for runtime confirmation. Never fabricates an end for work in
     /// runtime hands.
-    pub fn cancel(&mut self) -> PromotionCancel {
+    pub(crate) fn cancel(&mut self) -> PromotionCancel {
         match self.state {
             PromotionState::Idle | PromotionState::Refused(_) | PromotionState::Ended(_) => {
                 PromotionCancel::NothingToCancel
@@ -442,7 +442,7 @@ impl PromotionControl {
     /// The run stopped: outstanding work ends honestly as run-stopped
     /// without waiting for a runtime that is gone. Returns true when it
     /// ended outstanding work.
-    pub fn note_run_stopped(&mut self) -> bool {
+    pub(crate) fn note_run_stopped(&mut self) -> bool {
         match self.state {
             PromotionState::Idle | PromotionState::Refused(_) | PromotionState::Ended(_) => false,
             PromotionState::Queued
@@ -459,7 +459,7 @@ impl PromotionControl {
 
     /// Test seam: park the serial counter (exhaustion tests).
     #[cfg(test)]
-    pub fn test_set_next_serial(&mut self, serial: u64) {
+    pub(crate) fn test_set_next_serial(&mut self, serial: u64) {
         self.next_serial = serial;
     }
 }
@@ -468,7 +468,7 @@ impl PromotionControl {
 impl PromotionControl {
     /// Bind the control to one capture run. Idempotent for the same
     /// capture; a different capture never silently rebinds.
-    pub fn enable(&mut self, capture: CaptureId) -> bool {
+    pub(crate) fn enable(&mut self, capture: CaptureId) -> bool {
         if !self.enabled {
             self.enabled = true;
             self.capture = Some(capture);
@@ -480,7 +480,7 @@ impl PromotionControl {
     /// Yield the pending request ticket at most once. A second take
     /// (or a take after the runtime already reported on the request)
     /// yields nothing and never duplicates custody.
-    pub fn take_ticket(&mut self) -> Option<RequestTicket> {
+    pub(crate) fn take_ticket(&mut self) -> Option<RequestTicket> {
         if self.taken {
             return None;
         }
@@ -499,7 +499,7 @@ impl PromotionControl {
     /// requested, no refusal after activation, and an activation pair
     /// must match the requested pair. Returns the new state, or `None`
     /// for a stale/foreign/illegal update (state unchanged).
-    pub fn set_status(&mut self, update: PromotionStatusUpdate) -> Option<PromotionState> {
+    pub(crate) fn set_status(&mut self, update: PromotionStatusUpdate) -> Option<PromotionState> {
         let outstanding = self.outstanding?;
         if outstanding.id != update.request {
             return None;

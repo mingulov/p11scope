@@ -50,6 +50,7 @@ pub(crate) mod inventory_event_identity;
 pub mod inventory_events;
 pub(crate) mod inventory_output;
 pub mod inventory_present;
+pub(crate) mod inventory_promotion;
 pub(crate) mod inventory_semantics;
 pub(crate) mod key_operation_projection;
 pub mod kinds;

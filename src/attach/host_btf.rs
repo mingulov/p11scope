@@ -22,7 +22,8 @@
 //! path), so the cache cannot shadow a fixture. The tests below drive
 //! local cells with injected loaders and never touch the production cell.
 
-use std::sync::OnceLock;
+use std::error::Error as _;
+use std::sync::{Arc, OnceLock};
 
 /// Selector probe shared by the baseline and bootstrap iterators.
 const PIDFD_SELECTOR_TYPE: &str = "bpf_iter_attach_task";
@@ -44,37 +45,42 @@ impl HostBtf {
     }
 }
 
-/// Owned snapshot of the `aya::BtfError` captured at load time. It preserves
-/// the original Display/Debug renderings exactly, so the cached refusal reads
-/// identically to the uncached one.
+/// Owned snapshot of the `aya::BtfError` captured at load time. It shares the
+/// original error, so Display/Debug renderings and the `source()` chain below
+/// the BTF level (e.g. the `io::Error` under `FileError`) read exactly as the
+/// uncached refusal: `{error:#}` chains and errno traversal are unchanged.
+/// The snapshot is its own type: `downcast_ref::<aya::BtfError>()` does not
+/// resolve through it.
 #[derive(Clone)]
 pub(crate) struct CachedError {
-    display: String,
-    debug: String,
+    inner: Arc<aya::BtfError>,
 }
 
 impl CachedError {
     fn capture(error: aya::BtfError) -> Self {
         Self {
-            display: error.to_string(),
-            debug: format!("{error:?}"),
+            inner: Arc::new(error),
         }
     }
 }
 
 impl std::fmt::Display for CachedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.display)
+        std::fmt::Display::fmt(&self.inner, f)
     }
 }
 
 impl std::fmt::Debug for CachedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.debug)
+        std::fmt::Debug::fmt(&self.inner, f)
     }
 }
 
-impl std::error::Error for CachedError {}
+impl std::error::Error for CachedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.inner.source()
+    }
+}
 
 static HOST_BTF: OnceLock<Result<HostBtf, CachedError>> = OnceLock::new();
 
@@ -255,5 +261,88 @@ mod tests {
         let raw = malformed().expect_err("the malformed loader must fail");
         assert_eq!(first.to_string(), raw.to_string());
         assert_eq!(format!("{first:?}"), format!("{raw:?}"));
+    }
+
+    #[test]
+    fn cached_error_preserves_chain_rendering_and_errno() {
+        fn missing() -> Result<aya::Btf, aya::BtfError> {
+            aya::Btf::parse_file("/nonexistent-p11scope-host-btf", aya::Endianness::default())
+        }
+        let raw = missing().expect_err("the absence loader must fail");
+        assert!(raw.source().is_some(), "the fixture must carry a source");
+        let cell = OnceLock::new();
+        let snapshot = match cached(&cell, missing) {
+            Err(error) => error,
+            Ok(_) => panic!("absence must fail closed"),
+        };
+        // The contextual alternate rendering matches the uncached chain exactly.
+        let uncached = anyhow::Error::new(raw).context("loading required vmlinux BTF");
+        let cached = anyhow::Error::new(snapshot).context("loading required vmlinux BTF");
+        assert_eq!(format!("{cached:#}"), format!("{uncached:#}"));
+        let uncached_chain: Vec<String> = uncached.chain().map(ToString::to_string).collect();
+        let cached_chain: Vec<String> = cached.chain().map(ToString::to_string).collect();
+        assert_eq!(cached_chain, uncached_chain);
+        assert!(
+            cached_chain.len() > 2,
+            "the chain must keep its source level"
+        );
+        // Errno traversal (the doctor `raw_errno` shape) reaches the same
+        // `io::Error` on both paths.
+        fn raw_errno(mut error: &(dyn std::error::Error + 'static)) -> Option<i32> {
+            loop {
+                if let Some(error) = error.downcast_ref::<std::io::Error>()
+                    && error.raw_os_error().is_some()
+                {
+                    return error.raw_os_error();
+                }
+                error = error.source()?;
+            }
+        }
+        fn io_kind(mut error: &(dyn std::error::Error + 'static)) -> Option<std::io::ErrorKind> {
+            loop {
+                if let Some(error) = error.downcast_ref::<std::io::Error>() {
+                    return Some(error.kind());
+                }
+                error = error.source()?;
+            }
+        }
+        let uncached_head = uncached.chain().next().expect("chain is nonempty");
+        let cached_head = cached.chain().next().expect("chain is nonempty");
+        assert_eq!(raw_errno(cached_head), raw_errno(uncached_head));
+        assert_eq!(io_kind(cached_head), Some(std::io::ErrorKind::NotFound));
+        assert_eq!(io_kind(uncached_head), Some(std::io::ErrorKind::NotFound));
+    }
+
+    #[test]
+    fn concurrent_first_access_parses_once_and_shares_one_allocation() {
+        use std::sync::Barrier;
+        const WORKERS: usize = 8;
+        let cell = OnceLock::new();
+        let calls = AtomicUsize::new(0);
+        let barrier = Barrier::new(WORKERS);
+        std::thread::scope(|scope| {
+            let mut workers = Vec::with_capacity(WORKERS);
+            for _ in 0..WORKERS {
+                workers.push(scope.spawn(|| {
+                    barrier.wait();
+                    let host = cached(&cell, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        parse_fixture(true)
+                    })
+                    .expect("byte fixture parses");
+                    assert!(host.supports_pidfd_iter_selector());
+                    std::ptr::from_ref(host) as usize
+                }));
+            }
+            let mut addresses = Vec::with_capacity(WORKERS);
+            for worker in workers {
+                addresses.push(worker.join().expect("worker panicked"));
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "one parse per cell");
+            assert!(
+                addresses.iter().all(|address| *address == addresses[0]),
+                "one shared allocation"
+            );
+        });
     }
 }

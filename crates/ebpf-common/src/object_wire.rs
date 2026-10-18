@@ -57,6 +57,10 @@ pub const OBJECT_ATTR_STATUS_MAX: u8 = 10;
 pub const OBJECT_HANDLE_STATUS_MAX: u8 = 9;
 /// Only object-flags bits 0..=7 and find-flags bits 0..=5 are defined.
 pub const OBJECT_FLAGS_MASK: u32 = 0xFF;
+/// Private side-row bits for the four Get entry-list flags. These never
+/// cross the public object tail and do not change any layout or wire code.
+pub const GET_ENTRY_FLAGS_SHIFT: u32 = 8;
+pub const GET_ENTRY_FLAGS_MASK: u16 = 0x0F << GET_ENTRY_FLAGS_SHIFT;
 pub const OBJECT_FIND_FLAGS_MASK: u8 = 0x3F;
 /// Attribute-list flags bit 4: the list's inspection never ran, so its
 /// all-zero cells are uninspected, never inspected-empty. Slice-D

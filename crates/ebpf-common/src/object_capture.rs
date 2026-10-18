@@ -12,8 +12,9 @@
 //!   readers: `read_word(addr)` reads one target word (`W` bytes,
 //!   zero-extended) and `read_bytes(addr, buf)` reads exactly `buf.len()`
 //!   bytes. `Err(())` is a failed read, distinct from any value including
-//!   zero. Readers are invoked at most once per address per protocol step;
-//!   nothing is read speculatively.
+//!   zero. Value readers are invoked at most once per eligible slot; the streamed
+//!   production path may reread bounded headers for alias checks. Nothing
+//!   is read speculatively.
 //! - Ownership, teardown, phase and S1 evidence arrive as data parameters
 //!   (`ReturnAuthority`, retained pointers/state, RV, mechanism status).
 //!   This core consults no maps and keeps no shared-mutable walker state
@@ -387,6 +388,7 @@ pub const fn return_accepts_get_results(rv: u64) -> bool {
     )
 }
 
+#[inline(always)]
 fn safe_kind_code(kind: SafeAttributeKind) -> u8 {
     match kind {
         SafeAttributeKind::Class => attr_kind::CLASS,
@@ -398,6 +400,7 @@ fn safe_kind_code(kind: SafeAttributeKind) -> u8 {
     }
 }
 
+#[inline(always)]
 fn kind_from_code(code: u8) -> Option<SafeAttributeKind> {
     match code {
         attr_kind::CLASS => Some(SafeAttributeKind::Class),
@@ -420,6 +423,7 @@ fn safe_curve_code(curve: SafeCurve) -> u16 {
 
 /// Smallest exact length that can carry a value: entry capacities below this
 /// are insufficient regardless of the returned length.
+#[inline(always)]
 fn min_exact_len(kind: SafeAttributeKind, layout: LinuxLayout) -> u64 {
     match kind {
         SafeAttributeKind::Token => 1,
@@ -432,6 +436,7 @@ fn min_exact_len(kind: SafeAttributeKind, layout: LinuxLayout) -> u64 {
 /// length (token 1, EC 7/10, scalar `W`). Returns the classified code or the
 /// failure status; unreadable means the read failed, unsupported means the
 /// bytes were read but classify to nothing.
+#[inline(always)]
 fn read_classified_value(
     kind: SafeAttributeKind,
     ptr: u64,
@@ -1644,6 +1649,475 @@ pub fn capture_get_return(
         i += 1;
     }
     outcome
+}
+
+/// Scan bounded selected header spans without reading values. A reread keeps
+/// request inspection scalar: rejected-length neighbors still protect their
+/// entire stated span. Unknown selectors never authorize pointer/length reads.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn request_alias_scan(
+    base: u64,
+    count: u64,
+    skip: u64,
+    ptr: u64,
+    len: u64,
+    layout: LinuxLayout,
+    read_word: &mut impl FnMut(u64) -> Result<u64, ()>,
+) -> (bool, u8) {
+    let Some(table) = attribute_table_span(count, layout) else {
+        return (false, 0);
+    };
+    if validate_target_span(base, table, layout).is_none() {
+        return (false, 0);
+    }
+    let n = count.min(MAX_ATTRIBUTE_SLOTS);
+    let mut alias = spans_overlap(ptr, len, base, n * 3 * layout.word_bytes() as u64);
+    let mut flags = 0;
+    let mut j = 0;
+    while j < n {
+        if j != skip {
+            if let Some((sel_addr, ptr_addr, len_addr)) =
+                attribute_header_addresses(base, j, layout)
+            {
+                match read_word(sel_addr) {
+                    Ok(sel) if safe_attribute_kind(sel).is_some() => {
+                        match (read_word(ptr_addr), read_word(len_addr)) {
+                            (Ok(other_ptr), Ok(other_len)) => {
+                                if other_ptr != 0
+                                    && other_len != 0
+                                    && validate_target_span(other_ptr, other_len, layout).is_some()
+                                    && spans_overlap(ptr, len, other_ptr, other_len)
+                                {
+                                    alias = true;
+                                }
+                            }
+                            _ => flags |= attr_list_flag::HEADER_READ_FAILURE,
+                        }
+                    }
+                    Err(()) => flags |= attr_list_flag::HEADER_READ_FAILURE,
+                    _ => {}
+                }
+            } else {
+                flags |= attr_list_flag::HEADER_READ_FAILURE;
+            }
+        }
+        j += 1;
+    }
+    (alias, flags)
+}
+
+/// Read exactly one already-authorized value, then recheck its header before
+/// publishing the finite classification. No target word is stored in output.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn stable_attribute_cell(
+    base: u64,
+    index: u64,
+    kind: SafeAttributeKind,
+    ptr: u64,
+    len: u64,
+    layout: LinuxLayout,
+    out: &mut ObjectAttributeWire,
+    read_word: &mut impl FnMut(u64) -> Result<u64, ()>,
+    read_bytes: &mut impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
+) -> u32 {
+    let classified = read_classified_value(kind, ptr, len, layout, read_word, read_bytes);
+    let value = match classified {
+        Ok(value) => value,
+        Err(attr_status::UNSUPPORTED) => 0,
+        Err(status) => {
+            out.status = status;
+            return 0;
+        }
+    };
+    let Some((sel_addr, ptr_addr, len_addr)) = attribute_header_addresses(base, index, layout)
+    else {
+        out.status = attr_status::INVALID_SPAN;
+        return 0;
+    };
+    match (
+        read_word(sel_addr),
+        read_word(ptr_addr),
+        read_word(len_addr),
+    ) {
+        (Ok(sel), Ok(ptr2), Ok(len2))
+            if safe_attribute_kind(sel) == Some(kind) && ptr2 == ptr && len2 == len =>
+        {
+            out.status = if classified.is_ok() {
+                attr_status::VALUE
+            } else {
+                attr_status::UNSUPPORTED
+            };
+            out.value = value;
+        }
+        (Ok(_), Ok(_), Ok(_)) => {
+            out.status = attr_status::CHANGED;
+            return object_flag::CHANGED_METADATA;
+        }
+        _ => out.status = attr_status::UNREADABLE,
+    }
+    0
+}
+
+// Volatile field stores keep list clearing leaf-flat on BPF. A synthesized
+// memset would add a call level to the tightly bounded Get-return chain.
+#[inline(always)]
+fn clear_attribute_list(out: &mut ObjectAttributeListWire) {
+    let mut i = 0;
+    while i < 8 {
+        // SAFETY: every pointer projects an initialized, exclusively borrowed
+        // field. Field stores respect the list's two-byte alignment.
+        unsafe {
+            core::ptr::addr_of_mut!(out.cells[i].kind).write_volatile(0);
+            core::ptr::addr_of_mut!(out.cells[i].status).write_volatile(0);
+            core::ptr::addr_of_mut!(out.cells[i].value).write_volatile(0);
+        }
+        i += 1;
+    }
+    unsafe {
+        core::ptr::addr_of_mut!(out.inspected).write_volatile(0);
+        core::ptr::addr_of_mut!(out.flags).write_volatile(0);
+        core::ptr::addr_of_mut!(out.reserved).write_volatile(0);
+    }
+}
+
+/// Scalar in-place request protocol for the BPF path. Header rescans are
+/// bounded by eight slots per pair; each eligible value is read once. The
+/// array-based reference above remains independent for differential tests.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn inspect_request_template_into(
+    template_ptr: u64,
+    count: u64,
+    peer: Option<(u64, u64)>,
+    layout: LinuxLayout,
+    out: &mut ObjectAttributeListWire,
+    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    mut read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
+) -> u32 {
+    clear_attribute_list(out);
+    let Some(table) = attribute_table_span(count, layout) else {
+        out.flags = attr_list_flag::INVALID_SPAN;
+        return 0;
+    };
+    if validate_target_span(template_ptr, table, layout).is_none() {
+        out.flags = attr_list_flag::INVALID_SPAN;
+        return 0;
+    }
+    let n = count.min(MAX_ATTRIBUTE_SLOTS);
+    if template_ptr
+        .checked_add(n * 3 * layout.word_bytes() as u64)
+        .is_none()
+    {
+        out.flags = attr_list_flag::INVALID_SPAN;
+        return 0;
+    }
+    out.inspected = n as u8;
+    if n > 0 {
+        out.flags |= attr_list_flag::PRESENT;
+    }
+    if count > MAX_ATTRIBUTE_SLOTS {
+        out.flags |= attr_list_flag::TRUNCATED;
+    }
+    if n == 0 {
+        return 0;
+    }
+    // Keep peer header failures visible even if no own value is viable.
+    if let Some((base, count)) = peer {
+        out.flags |= request_alias_scan(base, count, u64::MAX, 0, 0, layout, &mut read_word).1;
+    }
+    let mut contributed = 0;
+    let mut i = 0;
+    while i < n {
+        let Some((sel_addr, ptr_addr, len_addr)) =
+            attribute_header_addresses(template_ptr, i, layout)
+        else {
+            out.flags |= attr_list_flag::HEADER_READ_FAILURE;
+            i += 1;
+            continue;
+        };
+        let selector = match read_word(sel_addr) {
+            Ok(sel) => sel,
+            Err(()) => {
+                out.flags |= attr_list_flag::HEADER_READ_FAILURE;
+                i += 1;
+                continue;
+            }
+        };
+        let Some(kind) = safe_attribute_kind(selector) else {
+            i += 1;
+            continue;
+        };
+        let cell = &mut out.cells[i as usize];
+        cell.kind = safe_kind_code(kind);
+        let ptr = match read_word(ptr_addr) {
+            Ok(ptr) => ptr,
+            Err(()) => {
+                cell.status = attr_status::UNREADABLE;
+                out.flags |= attr_list_flag::HEADER_READ_FAILURE;
+                i += 1;
+                continue;
+            }
+        };
+        let len = match read_word(len_addr) {
+            Ok(len) => len,
+            Err(()) => {
+                cell.status = attr_status::UNREADABLE;
+                out.flags |= attr_list_flag::HEADER_READ_FAILURE;
+                i += 1;
+                continue;
+            }
+        };
+        if ptr == 0 {
+            cell.status = attr_status::UNAVAILABLE;
+        } else if !valid_safe_attribute_length(kind, len, layout) {
+            cell.status = attr_status::INVALID_LENGTH;
+        } else if validate_target_span(ptr, len, layout).is_none() {
+            cell.status = attr_status::INVALID_SPAN;
+        } else {
+            let (mut alias, flags) =
+                request_alias_scan(template_ptr, count, i, ptr, len, layout, &mut read_word);
+            out.flags |= flags;
+            if let Some((base, count)) = peer {
+                let (a, f) =
+                    request_alias_scan(base, count, u64::MAX, ptr, len, layout, &mut read_word);
+                alias |= a;
+                out.flags |= f;
+            }
+            if alias {
+                cell.status = attr_status::ALIAS;
+                contributed |= object_flag::ALIAS;
+            } else {
+                contributed |= stable_attribute_cell(
+                    template_ptr,
+                    i,
+                    kind,
+                    ptr,
+                    len,
+                    layout,
+                    cell,
+                    &mut read_word,
+                    &mut read_bytes,
+                );
+            }
+        }
+        i += 1;
+    }
+    contributed
+}
+
+/// Retain selected Get headers directly in the owned side row. The four
+/// entry-list flags use private bits, never the public object flag vocabulary.
+#[inline(always)]
+pub fn capture_get_entry_into(
+    template_ptr: u64,
+    count: u64,
+    layout: LinuxLayout,
+    side: &mut crate::object_wire::ObjectStart,
+    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+) -> GetEntryVerdict {
+    use crate::object_wire::{ObjectAttributeSlot, GET_ENTRY_FLAGS_MASK, GET_ENTRY_FLAGS_SHIFT};
+    side.get_template_base = 0;
+    side.inspected_header_end = 0;
+    side.get_inspected = 0;
+    side.flags &= !GET_ENTRY_FLAGS_MASK;
+    let mut i = 0;
+    while i < 8 {
+        side.slots[i] = ObjectAttributeSlot::default();
+        i += 1;
+    }
+    let mut verdict = GetEntryVerdict::default();
+    let valid = attribute_table_span(count, layout)
+        .and_then(|len| validate_target_span(template_ptr, len, layout));
+    if valid.is_none() {
+        verdict.entry_flags = attr_list_flag::INVALID_SPAN;
+    } else {
+        let n = count.min(MAX_ATTRIBUTE_SLOTS);
+        if let Some(end) = template_ptr.checked_add(n * 3 * layout.word_bytes() as u64) {
+            side.get_template_base = template_ptr;
+            side.inspected_header_end = end;
+            side.get_inspected = n as u8;
+            verdict.inspected = n as u8;
+            if count > MAX_ATTRIBUTE_SLOTS {
+                verdict.entry_flags |= attr_list_flag::TRUNCATED;
+            }
+            let mut i = 0;
+            while i < n {
+                let Some((sel_addr, ptr_addr, len_addr)) =
+                    attribute_header_addresses(template_ptr, i, layout)
+                else {
+                    verdict.entry_flags |= attr_list_flag::HEADER_READ_FAILURE;
+                    i += 1;
+                    continue;
+                };
+                let selector = match read_word(sel_addr) {
+                    Ok(sel) => sel,
+                    Err(()) => {
+                        verdict.entry_flags |= attr_list_flag::HEADER_READ_FAILURE;
+                        i += 1;
+                        continue;
+                    }
+                };
+                let Some(kind) = safe_attribute_kind(selector) else {
+                    i += 1;
+                    continue;
+                };
+                let ptr = match read_word(ptr_addr) {
+                    Ok(ptr) => ptr,
+                    Err(()) => {
+                        verdict.entry_flags |= attr_list_flag::HEADER_READ_FAILURE;
+                        i += 1;
+                        continue;
+                    }
+                };
+                let len = match read_word(len_addr) {
+                    Ok(len) => len,
+                    Err(()) => {
+                        verdict.entry_flags |= attr_list_flag::HEADER_READ_FAILURE;
+                        i += 1;
+                        continue;
+                    }
+                };
+                let slot = &mut side.slots[verdict.slot_count as usize];
+                slot.value_ptr = ptr;
+                slot.entry_capacity = len;
+                slot.kind = safe_kind_code(kind);
+                slot.slot_index = i as u8;
+                verdict.slot_count += 1;
+                i += 1;
+            }
+        } else {
+            verdict.entry_flags = attr_list_flag::INVALID_SPAN;
+        }
+    }
+    side.flags |= u16::from(verdict.entry_flags) << GET_ENTRY_FLAGS_SHIFT;
+    verdict
+}
+
+/// Read-only streamed Get return. Alias checks cover every retained entry
+/// capacity, including neighbors whose returned length would be rejected.
+/// No mutable reference or returned-length scratch is fabricated from `side`.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn capture_get_return_into(
+    side: &crate::object_wire::ObjectStart,
+    rv: u64,
+    authority: ReturnAuthority,
+    layout: LinuxLayout,
+    out: &mut ObjectAttributeListWire,
+    mut read_word: impl FnMut(u64) -> Result<u64, ()>,
+    mut read_bytes: impl FnMut(u64, &mut [u8]) -> Result<(), ()>,
+) -> u32 {
+    use crate::object_wire::{GET_ENTRY_FLAGS_MASK, GET_ENTRY_FLAGS_SHIFT};
+    clear_attribute_list(out);
+    if !return_accepts_get_results(rv) || !authority.is_authorized() {
+        return 0;
+    }
+    let n = side.get_inspected.min(8);
+    out.inspected = n;
+    out.flags = ((side.flags & GET_ENTRY_FLAGS_MASK) >> GET_ENTRY_FLAGS_SHIFT) as u8;
+    if n > 0 {
+        out.flags |= attr_list_flag::PRESENT;
+    }
+    let mut contributed = 0;
+    let mut k = 0;
+    while k < 8 {
+        let slot = &side.slots[k];
+        // Dense selected prefix is produced by entry; do not inspect or read
+        // beyond the first unused slot even if stale trailing bytes exist.
+        let Some(kind) = kind_from_code(slot.kind) else {
+            break;
+        };
+        let i = u64::from(slot.slot_index);
+        if i >= u64::from(n) {
+            k += 1;
+            continue;
+        }
+        let cell = &mut out.cells[i as usize];
+        // Preserve the reference protocol's first retained slot per index.
+        if cell.kind != 0 {
+            k += 1;
+            continue;
+        }
+        cell.kind = slot.kind;
+        let Some((sel_addr, ptr_addr, len_addr)) =
+            attribute_header_addresses(side.get_template_base, i, layout)
+        else {
+            cell.status = attr_status::INVALID_SPAN;
+            k += 1;
+            continue;
+        };
+        let header = (
+            read_word(sel_addr),
+            read_word(ptr_addr),
+            read_word(len_addr),
+        );
+        let (Ok(sel), Ok(ptr), Ok(len)) = header else {
+            cell.status = attr_status::UNREADABLE;
+            k += 1;
+            continue;
+        };
+        if safe_attribute_kind(sel) != Some(kind) {
+            cell.status = attr_status::CHANGED;
+            contributed |= object_flag::CHANGED_METADATA;
+        } else if slot.value_ptr == 0 {
+            cell.status = attr_status::SIZE_ONLY;
+        } else if ptr != slot.value_ptr {
+            cell.status = attr_status::CHANGED;
+            contributed |= object_flag::CHANGED_METADATA;
+        } else if len == unavailable_len(layout) {
+            cell.status = attr_status::UNAVAILABLE;
+        } else if slot.entry_capacity < min_exact_len(kind, layout) {
+            cell.status = attr_status::INSUFFICIENT_CAPACITY;
+        } else if len > slot.entry_capacity || !valid_safe_attribute_length(kind, len, layout) {
+            cell.status = attr_status::INVALID_LENGTH;
+        } else if validate_target_span(ptr, len, layout).is_none() {
+            cell.status = attr_status::INVALID_SPAN;
+        } else {
+            let mut alias = spans_overlap(
+                ptr,
+                len,
+                side.get_template_base,
+                side.inspected_header_end
+                    .saturating_sub(side.get_template_base),
+            );
+            let mut j = 0;
+            while j < 8 {
+                let other = &side.slots[j];
+                if kind_from_code(other.kind).is_none() {
+                    break;
+                }
+                if j != k
+                    && other.value_ptr != 0
+                    && other.entry_capacity != 0
+                    && validate_target_span(other.value_ptr, other.entry_capacity, layout).is_some()
+                    && spans_overlap(ptr, len, other.value_ptr, other.entry_capacity)
+                {
+                    alias = true;
+                }
+                j += 1;
+            }
+            if alias {
+                cell.status = attr_status::ALIAS;
+                contributed |= object_flag::ALIAS;
+            } else {
+                contributed |= stable_attribute_cell(
+                    side.get_template_base,
+                    i,
+                    kind,
+                    ptr,
+                    len,
+                    layout,
+                    cell,
+                    &mut read_word,
+                    &mut read_bytes,
+                );
+            }
+        }
+        k += 1;
+    }
+    contributed
 }
 
 #[cfg(test)]

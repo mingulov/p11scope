@@ -3680,3 +3680,599 @@ fn object_producer_continuity_denied_authority_reads_nothing() {
         }
     }
 }
+
+// E4 executes the actual in-place production seams. The array implementation
+// above remains an independent reference; neither driver copies its outcome
+// into production state.
+fn streamed_program_six(target: &RefCell<FakeTarget>, layout: LinuxLayout) {
+    let w = layout.word_bytes() as u64;
+    for (i, (selector, len, value)) in [
+        (SEL_CLASS, w, 4),
+        (SEL_KEYTYPE, w, 0x1f),
+        (SEL_TOKEN, 1, 1),
+        (SEL_VALUELEN, w, 32),
+        (SEL_MODBITS, w, 4096),
+        (SEL_ECPARAMS, 10, 0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ptr = 0x8000 + i as u64 * 32;
+        prog_attr(target, 0x4000, i as u64, w, selector, ptr, len);
+        if selector == SEL_TOKEN {
+            target.borrow_mut().set_bytes(ptr, &[1]);
+        } else if selector == SEL_ECPARAMS {
+            target.borrow_mut().set_bytes(ptr, EC_P256);
+        } else {
+            target.borrow_mut().set_word(ptr, value);
+        }
+    }
+    // Unknown/private selectors must never authorize pointer/length reads.
+    target.borrow_mut().set_word(0x4000 + 6 * 3 * w, 0x0011);
+    target.borrow_mut().set_word(0x4000 + 7 * 3 * w, 0x0102);
+}
+
+fn streamed_assert_list(
+    out: &crate::object_wire::ObjectAttributeListWire,
+    oracle: AttributeListOutcome,
+) {
+    assert_eq!(out.inspected, oracle.inspected);
+    assert_eq!(out.flags, oracle.flags);
+    assert_eq!(out.reserved, 0);
+    for i in 0..8 {
+        assert_eq!(
+            (out.cells[i].kind, out.cells[i].status, out.cells[i].value),
+            (
+                oracle.cells[i].kind,
+                oracle.cells[i].status,
+                oracle.cells[i].value
+            ),
+            "slot {i}"
+        );
+    }
+}
+
+#[test]
+fn streamed_request_six_fields_match_reference_and_privacy() {
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let target = fresh(layout.word_bytes() as u64);
+        streamed_program_six(&target, layout);
+        let (r, b) = readers(&target);
+        let oracle = inspect_request_template(0x4000, 8, None, layout, r, b);
+        target.borrow_mut().log_len = 0;
+        let mut out = crate::object_wire::ObjectAttributeListWire::default();
+        let (r, b) = readers(&target);
+        let flags = crate::object_flow::production_inspect_request_template(
+            0x4000, 8, None, layout, &mut out, r, b,
+        );
+        streamed_assert_list(&out, oracle);
+        assert_eq!(flags, oracle.object_flags);
+        assert_eq!(
+            out.cells[..6]
+                .iter()
+                .filter(|c| c.status == ast::VALUE)
+                .count(),
+            6
+        );
+        for i in 0..6 {
+            assert_eq!(
+                target
+                    .borrow()
+                    .log()
+                    .iter()
+                    .filter(|entry| entry.1 == 0x8000 + i * 32)
+                    .count(),
+                1,
+                "one authorized value read per slot"
+            );
+        }
+        let w = layout.word_bytes() as u64;
+        for i in 6..8 {
+            assert_no_read_of(&target, 0x4000 + i * 3 * w + w);
+            assert_no_read_of(&target, 0x4000 + i * 3 * w + 2 * w);
+        }
+    }
+}
+
+#[test]
+fn streamed_request_alias_inexact_neighbor_and_peer_never_read_values() {
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        for peer in [false, true] {
+            let target = fresh(w);
+            prog_attr(&target, 0x4000, 0, w, SEL_CLASS, 0x8000, w);
+            prog_attr(
+                &target,
+                if peer { 0x6000 } else { 0x4000 },
+                if peer { 0 } else { 1 },
+                w,
+                SEL_TOKEN,
+                0x8000,
+                2,
+            );
+            let mut out = crate::object_wire::ObjectAttributeListWire::default();
+            let (r, b) = readers(&target);
+            let flags = crate::object_flow::production_inspect_request_template(
+                0x4000,
+                if peer { 1 } else { 2 },
+                if peer { Some((0x6000, 1)) } else { None },
+                layout,
+                &mut out,
+                r,
+                b,
+            );
+            assert_eq!(out.cells[0].status, ast::ALIAS);
+            assert_ne!(flags & ofl::ALIAS, 0);
+            assert_no_read_of(&target, 0x8000);
+            assert_no_bytes_reads(&target);
+        }
+    }
+}
+
+#[test]
+fn streamed_request_header_recheck_discards_classified_value() {
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        let target = fresh(w);
+        prog_attr(&target, 0x4000, 0, w, SEL_CLASS, 0x8000, w);
+        target.borrow_mut().set_word(0x8000, 3);
+        let seen = core::cell::Cell::new(false);
+        let mut out = crate::object_wire::ObjectAttributeListWire::default();
+        let flags = crate::object_flow::production_inspect_request_template(
+            0x4000,
+            1,
+            None,
+            layout,
+            &mut out,
+            |addr| {
+                if addr == 0x8000 {
+                    seen.set(true);
+                }
+                if addr == 0x4000 && seen.get() {
+                    Ok(SEL_KEYTYPE)
+                } else {
+                    target.borrow_mut().read_word(addr)
+                }
+            },
+            |addr, buf| target.borrow_mut().read_bytes(addr, buf),
+        );
+        assert!(seen.get());
+        assert_eq!(out.cells[0].status, ast::CHANGED);
+        assert_eq!(out.cells[0].value, 0);
+        assert_ne!(flags & ofl::CHANGED_METADATA, 0);
+    }
+}
+
+#[test]
+fn streamed_get_entry_retains_selected_headers_and_failure_flags() {
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        let target = fresh(w);
+        streamed_program_six(&target, layout);
+        target.borrow_mut().set_fail(0x4000 + w);
+        let mut reference = GetEntryState::default();
+        let expected = capture_get_entry(0x4000, 9, layout, &mut reference, word_reader(&target));
+        target.borrow_mut().log_len = 0;
+        let mut side = crate::object_wire::ObjectStart::default();
+        side.flags = ofl::PARTIAL_RESULT as u16;
+        let actual = crate::object_flow::production_capture_get_entry(
+            0x4000,
+            9,
+            layout,
+            &mut side,
+            word_reader(&target),
+        );
+        assert_eq!(actual, expected);
+        assert_eq!(side.get_inspected, 8);
+        assert_eq!(side.get_template_base, reference.template_base);
+        assert_eq!(side.inspected_header_end, reference.header_end);
+        assert_eq!(side.flags & 0xff, ofl::PARTIAL_RESULT as u16);
+        assert_eq!((side.flags >> 8) & 15, u16::from(expected.entry_flags));
+        for i in 0..usize::from(expected.slot_count) {
+            let a = &side.slots[i];
+            let b = &reference.slots[i];
+            assert_eq!(
+                (a.kind, a.slot_index, a.value_ptr, a.entry_capacity),
+                (b.kind, b.slot_index, b.value_ptr, b.entry_capacity)
+            );
+            assert_eq!(a.returned_len, 0);
+            assert_eq!(a.status, 0);
+            assert_eq!(a.reserved, [0; 5]);
+        }
+        for i in 6..8 {
+            assert_no_read_of(&target, 0x4000 + i * 3 * w + w);
+            assert_no_read_of(&target, 0x4000 + i * 3 * w + 2 * w);
+        }
+        for i in 0..6 {
+            assert_no_read_of(&target, 0x8000 + i * 32);
+        }
+    }
+}
+
+#[test]
+fn streamed_get_return_six_fields_and_authority_twins() {
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let target = fresh(layout.word_bytes() as u64);
+        streamed_program_six(&target, layout);
+        let mut side = crate::object_wire::ObjectStart::default();
+        crate::object_flow::production_capture_get_entry(
+            0x4000,
+            8,
+            layout,
+            &mut side,
+            word_reader(&target),
+        );
+        let mut reference = GetEntryState::default();
+        capture_get_entry(0x4000, 8, layout, &mut reference, word_reader(&target));
+        let (r, b) = readers(&target);
+        let oracle = capture_get_return(
+            &reference,
+            CKR_OK,
+            ReturnAuthority::AUTHORIZED,
+            layout,
+            r,
+            b,
+        );
+        let mut out = crate::object_wire::ObjectAttributeListWire::default();
+        let (r, b) = readers(&target);
+        let flags = crate::object_flow::production_capture_get_return(
+            &side,
+            CKR_OK,
+            ReturnAuthority::AUTHORIZED,
+            layout,
+            &mut out,
+            r,
+            b,
+        );
+        streamed_assert_list(&out, oracle);
+        assert_eq!(flags, oracle.object_flags);
+        for (rv, authority) in [
+            (CKR_PENDING, ReturnAuthority::AUTHORIZED),
+            (6, ReturnAuthority::AUTHORIZED),
+            (
+                CKR_OK,
+                ReturnAuthority {
+                    owner_live: false,
+                    phase_ready: true,
+                    continuity_joined: true,
+                },
+            ),
+            (
+                CKR_OK,
+                ReturnAuthority {
+                    owner_live: true,
+                    phase_ready: false,
+                    continuity_joined: true,
+                },
+            ),
+            (
+                CKR_OK,
+                ReturnAuthority {
+                    owner_live: true,
+                    phase_ready: true,
+                    continuity_joined: false,
+                },
+            ),
+        ] {
+            target.borrow_mut().log_len = 0;
+            let mut out = crate::object_wire::ObjectAttributeListWire::default();
+            let (r, b) = readers(&target);
+            crate::object_flow::production_capture_get_return(
+                &side, rv, authority, layout, &mut out, r, b,
+            );
+            assert_eq!(target.borrow().log_len, 0);
+            assert!(out == crate::object_wire::ObjectAttributeListWire::default());
+        }
+    }
+}
+
+#[test]
+fn streamed_get_return_entry_capacity_alias_and_race_controls() {
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        for mode in 0..5 {
+            let target = fresh(w);
+            prog_attr(
+                &target,
+                0x4000,
+                0,
+                w,
+                SEL_CLASS,
+                0x8000,
+                if mode == 0 { w - 1 } else { w },
+            );
+            if mode == 1 {
+                prog_attr(&target, 0x4000, 1, w, SEL_TOKEN, 0x8000, 2);
+            }
+            target.borrow_mut().set_word(0x8000, 3);
+            let mut side = crate::object_wire::ObjectStart::default();
+            crate::object_flow::production_capture_get_entry(
+                0x4000,
+                if mode == 1 { 2 } else { 1 },
+                layout,
+                &mut side,
+                word_reader(&target),
+            );
+            if mode == 0 {
+                target.borrow_mut().set_word(0x4000 + 2 * w, w);
+            }
+            if mode == 2 {
+                target
+                    .borrow_mut()
+                    .set_word(0x4000 + 2 * w, unavailable_len(layout));
+            }
+            if mode == 3 {
+                target.borrow_mut().set_word(0x4000 + w, 0x9000);
+            }
+            target.borrow_mut().log_len = 0;
+            let seen = core::cell::Cell::new(false);
+            let mut out = crate::object_wire::ObjectAttributeListWire::default();
+            crate::object_flow::production_capture_get_return(
+                &side,
+                CKR_ATTRIBUTE_SENSITIVE,
+                ReturnAuthority::AUTHORIZED,
+                layout,
+                &mut out,
+                |addr| {
+                    if addr == 0x8000 {
+                        seen.set(true);
+                    }
+                    if mode == 4 && addr == 0x4000 && seen.get() {
+                        Ok(SEL_KEYTYPE)
+                    } else {
+                        target.borrow_mut().read_word(addr)
+                    }
+                },
+                |addr, buf| target.borrow_mut().read_bytes(addr, buf),
+            );
+            assert_eq!(
+                out.cells[0].status,
+                [
+                    ast::INSUFFICIENT_CAPACITY,
+                    ast::ALIAS,
+                    ast::UNAVAILABLE,
+                    ast::CHANGED,
+                    ast::CHANGED
+                ][mode]
+            );
+            assert_eq!(out.cells[0].value, 0);
+            if mode < 4 {
+                assert_no_read_of(&target, 0x8000);
+            } else {
+                assert!(seen.get());
+            }
+        }
+    }
+}
+
+#[test]
+fn streamed_request_policy_and_span_corpus_matches_reference() {
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        for selector in [
+            SEL_CLASS,
+            SEL_KEYTYPE,
+            SEL_TOKEN,
+            SEL_VALUELEN,
+            SEL_MODBITS,
+            SEL_ECPARAMS,
+            0x11,
+        ] {
+            for mode in 0..11 {
+                let target = fresh(w);
+                let len = if selector == SEL_TOKEN {
+                    1
+                } else if selector == SEL_ECPARAMS {
+                    10
+                } else {
+                    w
+                };
+                let ptr = if mode == 1 {
+                    0
+                } else if mode == 2 {
+                    u64::MAX - 1
+                } else {
+                    0x8000
+                };
+                prog_attr(
+                    &target,
+                    0x4000,
+                    0,
+                    w,
+                    selector,
+                    ptr,
+                    if mode == 3 { len + 1 } else { len },
+                );
+                let value = match selector {
+                    SEL_KEYTYPE => 0x1f,
+                    SEL_TOKEN => 1,
+                    SEL_VALUELEN => 32,
+                    SEL_MODBITS => 4096,
+                    _ => 3,
+                };
+                target
+                    .borrow_mut()
+                    .set_word(0x8000, if mode == 4 { u64::MAX } else { value });
+                target.borrow_mut().set_bytes(
+                    0x8000,
+                    if selector == SEL_ECPARAMS {
+                        EC_P256
+                    } else {
+                        &[1]
+                    },
+                );
+                if mode == 5 {
+                    target.borrow_mut().set_fail(0x4000);
+                }
+                if mode == 6 {
+                    target.borrow_mut().set_fail(0x4000 + w);
+                }
+                if mode == 7 {
+                    target.borrow_mut().set_fail(0x4000 + 2 * w);
+                }
+                if mode == 8 {
+                    target.borrow_mut().set_fail(ptr);
+                }
+                if mode == 9 {
+                    target.borrow_mut().set_bytes(0x8000, &[0xff; 10]);
+                }
+                if mode == 10 {
+                    prog_attr(&target, 0x4000, 1, w, SEL_TOKEN, 0x8000, 2);
+                }
+                let count = if mode == 10 { 2 } else { 1 };
+                let (r, b) = readers(&target);
+                let expected = inspect_request_template(0x4000, count, None, layout, r, b);
+                target.borrow_mut().log_len = 0;
+                let mut out = crate::object_wire::ObjectAttributeListWire::default();
+                let (r, b) = readers(&target);
+                let flags = crate::object_flow::production_inspect_request_template(
+                    0x4000, count, None, layout, &mut out, r, b,
+                );
+                streamed_assert_list(&out, expected);
+                assert_eq!(flags, expected.object_flags);
+                if selector == 0x11 {
+                    assert_no_read_of(&target, 0x4000 + w);
+                    assert_no_read_of(&target, 0x4000 + 2 * w);
+                }
+                if [ast::UNAVAILABLE, ast::INVALID_LENGTH, ast::INVALID_SPAN]
+                    .contains(&out.cells[0].status)
+                {
+                    assert_no_read_of(&target, ptr);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn streamed_empty_and_overflow_templates_read_nothing_including_peer() {
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        for (base, count) in [(0, 0), (0x4000, u64::MAX), (u64::MAX - 23, 1), (0, 1)] {
+            let target = fresh(layout.word_bytes() as u64);
+            let mut out = crate::object_wire::ObjectAttributeListWire::default();
+            let (r, b) = readers(&target);
+            crate::object_flow::production_inspect_request_template(
+                base,
+                count,
+                Some((0x8000, 8)),
+                layout,
+                &mut out,
+                r,
+                b,
+            );
+            assert_eq!(target.borrow().log_len, 0);
+            assert_eq!(out.inspected, 0);
+            assert_eq!(out.flags, if count == 0 { 0 } else { alf::INVALID_SPAN });
+        }
+    }
+}
+
+#[test]
+fn streamed_get_private_flags_never_enter_public_tail() {
+    use crate::object_wire::{
+        canonical_object_wire, ObjectCallWire, ObjectStart, GET_ENTRY_FLAGS_MASK,
+    };
+    let function = fid("C_GetAttributeValue");
+    let row = canonical_object_wire(function);
+    let side = ObjectStart {
+        phase: 3,
+        descriptor_index: function + 1,
+        flags: GET_ENTRY_FLAGS_MASK | ofl::PARTIAL_RESULT as u16,
+        ..Default::default()
+    };
+    let mut tail = ObjectCallWire::default();
+    assert!(unsafe {
+        crate::object_flow::adapter_tail_fill(&mut tail, Some(&side), function + 1, Some(&row))
+    });
+    assert_eq!(tail.flags, ofl::PARTIAL_RESULT);
+}
+
+#[test]
+fn streamed_get_partial_result_corpus_matches_reference() {
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        for rv in [
+            CKR_OK,
+            CKR_ATTRIBUTE_SENSITIVE,
+            CKR_ATTRIBUTE_TYPE_INVALID,
+            CKR_BUFFER_TOO_SMALL,
+        ] {
+            for mode in 0..13 {
+                let target = fresh(w);
+                streamed_program_six(&target, layout);
+                if mode == 1 {
+                    target.borrow_mut().set_word(0x4000 + w, 0);
+                }
+                if mode == 2 {
+                    target.borrow_mut().set_word(0x4000 + 2 * w, w - 1);
+                }
+                if mode == 9 {
+                    target.borrow_mut().set_word(0x4000 + w, u64::MAX - 1);
+                }
+                if mode == 10 {
+                    prog_attr(&target, 0x4000, 1, w, SEL_TOKEN, 0x8000, 2);
+                }
+                if mode == 12 {
+                    target.borrow_mut().set_word(0x4000, 0x11);
+                }
+                let mut reference = GetEntryState::default();
+                capture_get_entry(0x4000, 9, layout, &mut reference, word_reader(&target));
+                let mut side = crate::object_wire::ObjectStart::default();
+                crate::object_flow::production_capture_get_entry(
+                    0x4000,
+                    9,
+                    layout,
+                    &mut side,
+                    word_reader(&target),
+                );
+                match mode {
+                    1 | 4 => target.borrow_mut().set_word(0x4000 + w, 0x9000),
+                    2 => target.borrow_mut().set_word(0x4000 + 2 * w, w),
+                    3 => target
+                        .borrow_mut()
+                        .set_word(0x4000 + 2 * w, unavailable_len(layout)),
+                    5 => target.borrow_mut().set_word(0x4000, SEL_KEYTYPE),
+                    6 => target.borrow_mut().set_word(0x4000 + 2 * w, w + 1),
+                    7 => target.borrow_mut().set_fail(0x8000),
+                    8 => target.borrow_mut().set_fail(0x4000),
+                    11 => target.borrow_mut().set_word(0x8000, u64::MAX),
+                    _ => {}
+                }
+                let (r, b) = readers(&target);
+                let expected =
+                    capture_get_return(&reference, rv, ReturnAuthority::AUTHORIZED, layout, r, b);
+                target.borrow_mut().log_len = 0;
+                let mut out = crate::object_wire::ObjectAttributeListWire::default();
+                let (r, b) = readers(&target);
+                let flags = crate::object_flow::production_capture_get_return(
+                    &side,
+                    rv,
+                    ReturnAuthority::AUTHORIZED,
+                    layout,
+                    &mut out,
+                    r,
+                    b,
+                );
+                streamed_assert_list(&out, expected);
+                assert_eq!(flags, expected.object_flags);
+                if [
+                    ast::SIZE_ONLY,
+                    ast::UNAVAILABLE,
+                    ast::INVALID_LENGTH,
+                    ast::CHANGED,
+                    ast::ALIAS,
+                    ast::INVALID_SPAN,
+                    ast::INSUFFICIENT_CAPACITY,
+                ]
+                .contains(&out.cells[0].status)
+                {
+                    assert_no_read_of(&target, 0x8000);
+                }
+                if mode == 12 {
+                    assert_no_read_of(&target, 0x4000 + w);
+                    assert_no_read_of(&target, 0x4000 + 2 * w);
+                }
+            }
+        }
+    }
+}

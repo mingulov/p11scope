@@ -280,3 +280,42 @@ marker does not change the recorded capture-loop end reason. These parser
 controls do not qualify any new installed candidate or repair the remaining
 partial stdout terminal-content cells. Blocked stderr still needs the separately
 reviewed, candidate-bound external reporter witness and remains unqualified.
+
+`reporter-probe.c` and `reporter_probe.py` prepare the independent blocked-stderr
+measurement. They are not yet activated by `qualify-operator-output.py` and do
+not change its unqualified blocked-stderr result. Build the small C helper on
+the development host with `cc -std=c11 -O2 -Wall -Wextra -Werror`, supply it as a
+verified prebuilt input, and keep its output in the owned disk task directory.
+Fedora must not compile it.
+
+The Python primitives resolve exactly one actual outlined Rust reporter symbol
+from the held candidate, validate ELF64/x86-64 executable `PT_LOAD` file-offset
+translation, and bind the runtime IP through the actual original observer's
+executable mapping. Mapped device identity comes from a read-only mapping of the
+held FD through `mapped-provider-pin.py`, separately from `fstat` identity (they
+can differ on Btrfs). Missing/stripped/ambiguous symbols or unsupported ELF
+surfaces are blockers; no offset may be guessed from another binary.
+
+The helper's live API is `--probe EXE_FD PID BIRTH FILE_OFFSET LIMIT_MS`; the
+controller must pass the original held candidate FD into the helper, retain the
+unreaped observer and its pidfd, and derive all arguments from those primitives.
+It checks the actual executable and birth, attaches a task-bound entry uprobe on
+that FD/offset with inheritance disabled, and emits readiness only after enable.
+The independent bounded perf ring records only IP, main PID/TID and
+`CLOCK_MONOTONIC` time. Malformed, foreign, duplicate, lost or overrun records
+fail. Final kernel event count must equal decoded samples, kernel lost count
+must be zero, and enabled/running times must agree. Explicit bounded `stop\n`
+closes the owned event; task-exit hangup does not supply an acknowledgement.
+This creates no global tracefs probe and does not consume product EVENTS.
+
+`--decode-fixture` is a separate unprivileged wire control and always labels its
+rows `decode_fixture`; the actual witness validator rejects that mode. Local
+controls also compile a small unrelated ELF with the same symbol spelling and
+inspect its real PIE mapping to test resolution. They establish neither product
+reporter presence nor a kernel attachment positive. The source-restricted real
+reporter/first-signal binding (without guessing private Rust argument registers)
+still needs critical review and actual matching candidate controls before live
+activation: readable marker agreement, no signal, main blocked after handler
+only, wrong ELF/process/thread, delayed observation and repeated signals. Kernel
+permission/PMU/symbol/clock/loss blockers keep the response unqualified. Cleanup,
+pressure, output content and identity-settlement requirements remain separate.

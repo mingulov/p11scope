@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import subprocess
+import struct
 import tempfile
 import sys
 import time
@@ -428,6 +429,140 @@ class ManifestControls(unittest.TestCase):
                         pin.close()
             finally:
                 provider_pin.close()
+
+
+class ReporterProbeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temporary = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.temporary.name)
+        cls.probe = cls.root / 'reporter-probe'
+        result = subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+            str(ROOT / 'tests/fixtures/operator-output/reporter-probe.c'), '-o', str(cls.probe)],
+            capture_output=True, text=True, timeout=20)
+        if result.returncode:
+            cls.temporary.cleanup()
+            raise AssertionError(result.stderr)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temporary.cleanup()
+
+    def decode(self, payload, tail=0, head=None):
+        path = self.root / 'records.bin'
+        path.write_bytes(payload)
+        return subprocess.run([str(self.probe), '--decode-fixture', '123', str(tail),
+            str(tail + len(payload) if head is None else head), str(path)],
+            capture_output=True, text=True, timeout=3)
+
+    def test_actual_c_decoder_accepts_only_one_loss_free_main_tid_sample(self):
+        sample = struct.pack('<IHHQIIQ', 9, 0, 32, 0x1234, 123, 123, 700)
+        for tail in (0, 250):
+            result = self.decode(sample, tail)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rows = [json.loads(line) for line in result.stdout.splitlines()]
+            self.assertEqual(rows[0], dict(kind='reporter', mode='decode_fixture',
+                ip=0x1234, pid=123, tid=123, t_ns=700))
+            self.assertEqual(rows[1]['samples'], 1)
+        for name, payload, head in (
+                ('duplicate', sample * 2, None),
+                ('foreign-tid', struct.pack('<IHHQIIQ', 9, 0, 32, 0x1234, 123, 124, 700), None),
+                ('foreign-pid', struct.pack('<IHHQIIQ', 9, 0, 32, 0x1234, 124, 123, 700), None),
+                ('lost', struct.pack('<IHHQQ', 2, 0, 24, 1, 1), None),
+                ('lost-samples', struct.pack('<IHHQ', 13, 0, 16, 1), None),
+                ('short', sample[:-1], None),
+                ('unknown', struct.pack('<IHH', 99, 0, 8), None),
+                ('overrun', sample, 300),
+                ('backward-head', sample, 0)):
+            with self.subTest(mutation=name):
+                result = self.decode(payload, 1 if name == 'backward-head' else 0, head)
+                self.assertNotEqual(result.returncode, 0, 'invalid evidence must not become an ACK')
+
+    def test_actual_elf_symbol_resolution_and_offset_reject_foreign_surfaces(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/reporter_probe.py'))
+        source = self.root / 'reporter.c'
+        target = self.root / 'reporter-target'
+        source.write_text('#include <unistd.h>\nvoid reporter(int) __asm__("_ZN8p11scope3run21report_capture_cancel17h0123456789abcdefE");\n'
+            '__attribute__((noinline,used)) void reporter(int x) { __asm__ volatile("" : : "r"(x)); }\n'
+            'int main(int argc, char **argv) { (void)argv; if (argc > 1) pause(); reporter(2); return 0; }\n')
+        result = subprocess.run(['cc', '-O2', '-fPIE', '-pie', str(source), '-o', str(target)],
+            capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pin = HARNESS['NATIVE'].FilePin(target)
+        foreign = HARNESS['NATIVE'].FilePin(self.probe)
+        try:
+            resolved = module['resolve_reporter'](pin)
+            self.assertEqual(resolved['symbol'], 'p11scope::run::report_capture_cancel')
+            self.assertGreater(resolved['file_offset'], 0)
+            self.assertEqual(module['symbol_file_offset'](pin.fd, resolved['virtual_address']), resolved['file_offset'])
+            child = subprocess.Popen([str(target), 'hold'])
+            owner = None
+            try:
+                owner = HARNESS['NATIVE'].OwnedProcess(child.pid, os.getpid(), os.getuid())
+                expected = module['expected_witness'](pin, owner, resolved)
+                self.assertEqual(expected['pid'], child.pid)
+                self.assertEqual(expected['tid'], child.pid)
+                self.assertGreater(expected['ip'], 0)
+                with self.assertRaises(ValueError):
+                    module['expected_witness'](foreign, owner, resolved)
+            finally:
+                child.terminate()
+                child.wait(timeout=3)
+                if owner:
+                    owner.close()
+            with self.assertRaises(ValueError):
+                module['symbol_file_offset'](pin.fd, 0)
+            with self.assertRaises(ValueError):
+                module['resolve_reporter'](foreign)
+        finally:
+            foreign.close()
+            pin.close()
+
+    def test_wire_witness_requires_actual_mode_identity_and_loss_free_causal_once(self):
+        module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/reporter_probe.py'))
+        expected = dict(pid=123, tid=123, start_time=9, dev=2, ino=3, file_offset=80, ip=0x1234)
+        ready = dict(kind='ready', mode='perf_uprobe', clock='CLOCK_MONOTONIC', t_ns=400,
+                     **{key: value for key, value in expected.items() if key != 'ip'})
+        event = dict(kind='reporter', mode='perf_uprobe', pid=123, tid=123, ip=0x1234, t_ns=700)
+        final = dict(kind='final', mode='perf_uprobe', samples=1, lost=0, kernel_count=1,
+                     time_enabled=500, time_running=500)
+        records, signals = [ready, event, final], [dict(signal='SIGINT', t_ns=600)]
+        self.assertEqual(module['validate_witness'](records, expected, signals)['ack_ns'], 700)
+        for mutation in ('fixture', 'birth', 'inode', 'offset', 'thread', 'ip', 'lost',
+                         'kernel-count', 'multiplex', 'duplicate', 'pre-signal', 'slow', 'not-ready',
+                         'bool-kernel-count', 'bool-enabled', 'bool-lost'):
+            changed = copy.deepcopy(records)
+            if mutation == 'fixture': changed[1]['mode'] = 'decode_fixture'
+            elif mutation == 'birth': changed[0]['start_time'] += 1
+            elif mutation == 'inode': changed[0]['ino'] += 1
+            elif mutation == 'offset': changed[0]['file_offset'] += 1
+            elif mutation == 'thread': changed[1]['tid'] += 1
+            elif mutation == 'ip': changed[1]['ip'] += 1
+            elif mutation == 'lost': changed[2]['lost'] = 1
+            elif mutation == 'kernel-count': changed[2]['kernel_count'] = 2
+            elif mutation == 'multiplex': changed[2]['time_running'] = 499
+            elif mutation == 'duplicate': changed.insert(2, copy.deepcopy(changed[1]))
+            elif mutation == 'pre-signal': changed[1]['t_ns'] = 599
+            elif mutation == 'slow': changed[1]['t_ns'] = 100000600
+            elif mutation == 'bool-kernel-count': changed[2]['kernel_count'] = True
+            elif mutation == 'bool-enabled': changed[2].update(time_enabled=True, time_running=True)
+            elif mutation == 'bool-lost': changed[2]['lost'] = False
+            else: changed[0]['t_ns'] = 601
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                module['validate_witness'](changed, expected, signals)
+        with self.assertRaises(ValueError):
+            module['validate_witness'](records, expected, [])
+
+    def test_live_mode_refuses_a_foreign_executable_before_attaching(self):
+        fd = os.open(self.probe, os.O_RDONLY)
+        try:
+            result = subprocess.run([str(self.probe), '--probe', str(fd), str(os.getpid()),
+                '1', '0', '1000'], pass_fds=(fd,), capture_output=True, text=True, timeout=3)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('observer executable differs', result.stderr)
+            self.assertNotIn('"kind":"ready"', result.stdout)
+        finally:
+            os.close(fd)
 
 
 class CancellationMarkerTests(unittest.TestCase):

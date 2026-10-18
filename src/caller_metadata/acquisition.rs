@@ -31,7 +31,7 @@ use std::time::Instant;
 
 /// Maximum membership bytes the parser accepts; the probe adds one byte so a
 /// truncated prefix can never be mistaken for the whole file.
-pub(crate) const MEMBERSHIP_MAX_BYTES: usize = 16 * 1024;
+pub(crate) const MEMBERSHIP_MAX_BYTES: usize = MAX_CGROUP_BYTES;
 /// Per-read probe capacity: [`MEMBERSHIP_MAX_BYTES`] plus the EOF witness byte.
 pub(crate) const MEMBERSHIP_PROBE_BYTES: usize = MEMBERSHIP_MAX_BYTES + 1;
 /// Complete membership reads per sample.

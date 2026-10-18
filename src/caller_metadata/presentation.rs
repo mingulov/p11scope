@@ -542,9 +542,10 @@ impl CallerMetadata {
 
     /// Mark the last sample stale: status and `refresh_overdue` change,
     /// while revision, times, validity and every component claim are
-    /// preserved verbatim. Historical rows are terminal and unchanged.
+    /// preserved verbatim. Pending, failed and historical rows are unchanged:
+    /// only an actual sample can become an aged sample.
     pub(crate) fn to_stale(self) -> Self {
-        if self.status == MetadataStatus::Historical {
+        if !matches!(self.status, MetadataStatus::Sampled | MetadataStatus::Stale) {
             return self;
         }
         Self {
@@ -1162,6 +1163,18 @@ mod tests {
         assert_eq!(MountContext::new(12).index(), 12);
         let rendered = serde_json::to_value(MountContext::new(12)).expect("ctx");
         assert_eq!(rendered, "cg12");
+    }
+
+    #[test]
+    fn never_sampled_pending_does_not_become_stale() {
+        let pending = CallerMetadata::pending();
+        assert_eq!(pending.to_stale(), pending);
+    }
+
+    #[test]
+    fn failed_refresh_keeps_unknown_reason_when_age_is_checked() {
+        let unknown = CallerMetadata::from_refusal(SampleRefusal::MembershipReadFailed, 7);
+        assert_eq!(unknown.to_stale(), unknown);
     }
 
     #[test]

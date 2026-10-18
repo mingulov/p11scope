@@ -5,6 +5,7 @@
 //! of parsing and is never copied into the returned value.
 
 pub(crate) mod acquisition;
+pub(crate) mod presentation;
 
 /// Maximum complete cgroup-file size accepted by the parser.
 pub const MAX_CGROUP_BYTES: usize = 16 * 1024;

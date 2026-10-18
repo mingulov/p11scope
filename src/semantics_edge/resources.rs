@@ -53,6 +53,8 @@ const _: () = {
     assert!(std::mem::size_of::<super::PendingCall>() == 144);
     assert!(std::mem::size_of::<super::AsyncId>() == 160);
     assert!(std::mem::size_of::<ResourceLease>() == 16);
+    assert!(std::mem::align_of::<crate::inventory_semantics::SemanticProviderTarget>() <= 8);
+    assert!(std::mem::size_of::<crate::inventory_semantics::SemanticProviderTarget>() <= 1024);
     assert!(std::mem::size_of::<(u16, Option<u64>)>() == 24);
     assert!(std::mem::size_of::<String>() == 24);
     // H9 adds the `id_exhaustions` u64 (368 = 360 + 8); the base
@@ -95,6 +97,14 @@ pub(super) const SCRATCH_PROVEN_BYTES: usize = 2304 * 256                       
     + 8 * 4096                       // largest node split/right-border chain
     + 16 * 256                       // bounded touched-mechanism temporary set
     + 16 * 24 + 32                   // maximum operation-bit origin temporary
+    // Cgroup's bounded four-slot owner preparation Vec can coexist with
+    // reduction. Charge the final real candidate/receipt/provider/lease type,
+    // including empty or refused slots. Provider-owned copied strings and
+    // accepted boxed capacity have separate persistent leases.
+    + 4 * std::mem::size_of::<(
+        crate::discovery::engine::inventory_coordinator::semantics::SemanticAdmissionCandidate,
+        crate::inventory_semantics::PreparedSemanticAdmission,
+    )>() + 32
     + 4096; // fixed padding/stack-independent slack
 const _: () = assert!(SCRATCH_PROVEN_BYTES <= SEMANTIC_TRANSITION_SCRATCH);
 
@@ -169,7 +179,7 @@ impl SemanticResourcePool {
             .snapshot()
     }
 
-    pub(super) fn reserve(&self, bytes: usize) -> Result<ResourceLease, SemanticResourceRefusal> {
+    pub(crate) fn reserve(&self, bytes: usize) -> Result<ResourceLease, SemanticResourceRefusal> {
         ResourceLease::acquire(&self.shared, bytes)
     }
 }
@@ -196,7 +206,7 @@ impl SharedPool {
 /// The only persistent charge owner. In particular an async lease will move
 /// with its original call through pending, detached and local completion.
 /// No Clone/Copy or scalar constructor can duplicate its ownership.
-pub(super) struct ResourceLease {
+pub(crate) struct ResourceLease {
     shared: Arc<Mutex<SharedPool>>,
     bytes: usize,
 }

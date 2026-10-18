@@ -1180,12 +1180,81 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         )
     }
 
-    /// Pay for fixed private admission state before owner preparation or copies.
-    pub(crate) fn reserve_promotion_admission(
+    /// Reserve before the SAME candidate factory clones generation identity.
+    /// Looking up borrowed source facts and sharing the original Arc allocate
+    /// no storage and grant no owner/provider authority.
+    pub(crate) fn prepare_legacy_promotion_candidate(
         &self,
-        candidate: &SemanticAdmissionCandidate,
-    ) -> Result<PromotionAdmissionReservation, SemanticBindingRefusal> {
-        PromotionAdmissionReservation::reserve(&self.registry, candidate)
+        caller: CallerId,
+        domain: NativeDomainId,
+    ) -> Result<(SemanticAdmissionCandidate, PromotionAdmissionReservation), SemanticBindingRefusal>
+    {
+        let record = self
+            .adapter
+            .record(caller)
+            .ok_or(SemanticBindingRefusal::NoLiveCaller)?;
+        let pin = self
+            .adapter
+            .shared_semantic_custody(caller)
+            .ok_or(SemanticBindingRefusal::NoLiveCaller)?;
+        let path_bytes = record
+            .exe
+            .as_ref()
+            .and_then(|exe| exe.path.as_ref())
+            .map_or(0, String::len);
+        let reservation = PromotionAdmissionReservation::reserve(
+            &self.registry,
+            caller,
+            domain,
+            pin,
+            path_bytes,
+        )?;
+        let candidate = self
+            .prepare_legacy_semantic_candidate(caller, domain)
+            .ok_or(SemanticBindingRefusal::NoLiveCaller)?;
+        if !reservation.matches(&candidate) {
+            return Err(SemanticBindingRefusal::NoLiveCaller);
+        }
+        Ok((candidate, reservation))
+    }
+
+    pub(crate) fn prepare_scoped_promotion_candidate(
+        &self,
+        prepared: &crate::discovery::caller_registry::PreparedScopedCaller<Source::Pin>,
+        domain: NativeDomainId,
+    ) -> Result<(SemanticAdmissionCandidate, PromotionAdmissionReservation), SemanticBindingRefusal>
+    {
+        let caller = prepared
+            .existing()
+            .ok_or(SemanticBindingRefusal::NoLiveCaller)?;
+        let pin = self
+            .adapter
+            .scoped_shared_semantic_custody(prepared)
+            .ok_or(SemanticBindingRefusal::NoLiveCaller)?;
+        // The shared factory clones the current record before comparing it
+        // with the preparation; size that actual copy even on a mismatch.
+        let path_bytes = self
+            .adapter
+            .record(caller)
+            .ok_or(SemanticBindingRefusal::NoLiveCaller)?
+            .exe
+            .as_ref()
+            .and_then(|exe| exe.path.as_ref())
+            .map_or(0, String::len);
+        let reservation = PromotionAdmissionReservation::reserve(
+            &self.registry,
+            caller,
+            domain,
+            pin,
+            path_bytes,
+        )?;
+        let candidate = self
+            .prepare_scoped_semantic_candidate(prepared, domain)
+            .ok_or(SemanticBindingRefusal::NoLiveCaller)?;
+        if !reservation.matches(&candidate) {
+            return Err(SemanticBindingRefusal::NoLiveCaller);
+        }
+        Ok((candidate, reservation))
     }
 
     pub(crate) fn reserve_promotion_install(

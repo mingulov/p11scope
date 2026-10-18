@@ -80,11 +80,36 @@ issues. This does not require an evidence archive.
 
 ## Verification
 
-Run the checks relevant to the change. Code and dependency changes require
-the canonical Rust gates below; BPF, privacy, discovery and packaging changes
-also need their affected documented lanes. For documentation-only changes,
-check links, commands, source-export boundaries and whitespace; do not claim
-runtime qualification from those checks.
+Use the [tiered verification cadence](CONTRIBUTING.md#verification): focused
+regressions for each subtask, affected integration checks for a coherent batch,
+and the complete canonical Rust gates below on the assembled candidate. A
+production-code edit does not require a full workspace run after every fix.
+BPF, privacy, discovery and packaging changes also need their affected documented
+lanes. For documentation-only changes, check links, commands, source-export
+boundaries and whitespace; do not claim runtime qualification from those checks.
+
+- Implementers self-review each subtask before committing. Review shared
+  authority, privacy, wire and concurrency boundaries before dependent activation.
+  Independent reviews cover coherent integration milestones and the final
+  candidate; residual reviews cover fixes and affected neighbors. Batch related
+  fixes instead of restarting a whole-task review for every item.
+- Run affected named `artifact_contracts` cases while iterating; run the complete
+  target at the assembled gate, or earlier when changed global contracts warrant
+  it. Do not blanket-exclude failing tests or mistake a zero-match selector for
+  coverage. Keep expected positive, refused, ignored and unrun results distinct.
+- A complete equivalent CI run on the candidate can satisfy the host gate;
+  verify its SHA, configuration and required jobs/shards instead of duplicating
+  it locally. Installed/kernel-specific acceptance remains separate. Later
+  changes invalidate affected checks, not every unrelated historical result.
+- Preserve warm build caches and keep one Cargo-heavy lane per shared build
+  host unless resource isolation is established. Compiler job limits do not
+  limit test threads/subprocesses. Bound fixture concurrency and diagnose
+  timing failures in a quiet lane; isolated success alone does not clear the
+  failed full gate or prove a flake. Do not remove genuine concurrency controls.
+- Parallel source workers use disjoint file ownership and isolated worktrees;
+  one integrator serializes shared interfaces and schedules expensive checks.
+  Keep briefs/results concise with links to prior context, rather than repeated
+  full reports or permanent logs. Commit verified increments with their scope.
 
 Before tests, export `TMPDIR` to a private writable directory on a disk
 filesystem with enough space and a short path for Unix-domain sockets.
@@ -103,6 +128,11 @@ When adding or changing CI, design for parallel jobs: split long checks
 (test shards, coverage shards, lint, audit, scripts) into separate jobs that
 run concurrently, within a reasonable job count (under the runner concurrency
 limit, about 20). Every split must still prove it ran the full test set.
+Prefer the existing `rest` plus contract-shard pipeline before adding another
+runner. Batch authorized temporary-branch pushes at integration checkpoints;
+each push already triggers CI. Avoid duplicate dispatches and keep a candidate
+ref stable while its run is needed. Check actual runner capacity before queuing
+self-hosted jobs. Testing authorization does not imply deployment/publication.
 
 Privileged, container and VM experiments need the host owner's authorization.
 Honor authorization already given for the task, check ownership of resources,

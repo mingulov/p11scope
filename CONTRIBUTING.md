@@ -66,12 +66,46 @@ experiments only with the host owner's authorization.
 
 ## Verification
 
+Choose checks by changed behavior and integration stage:
+
+| Tier | Cadence | Checks |
+| --- | --- | --- |
+| V0 | Documentation/process only | Links, commands, public source/export boundaries and whitespace |
+| V1 | Each fix/subtask | Regression at the real seam, healthy/failure controls and affected module/target tests; enumerate selectors and require actual execution |
+| V2 | Coherent integration batch | fmt/check/clippy, affected library/integration suites and consumers of changed interfaces |
+| V3 | Assembled candidate | Complete canonical host gates below, locally or in equivalent complete CI at that revision |
+| V4 | Relevant installed behavior ready | Required native/BPF, ABI, privacy, platform, performance and installed/package acceptance |
+
+Use V1 while iterating and self-review each subtask before committing. Use
+independent review at integration milestones and the final candidate; review
+residual fixes against their affected boundaries. A production edit alone does
+not require V3 on every round. Broaden early for global wire/privacy contracts,
+dependency/build changes or an unexplained failure, with the reason recorded.
+Run affected named `artifact_contracts` tests during iteration and the complete
+target at V3. Do not reduce final required test membership.
+
+Remote CI can satisfy equivalent V3 checks without a second local full run.
+Verify the tested SHA, flags and every required job/shard. A prior successful
+run does not qualify changed behavior; rerun affected checks. Privileged/live
+acceptance has its own environment and authorization requirements.
+
 Run Rust checks through the repository wrapper so pinned dependency sources
 are prepared consistently. For test temporary files, choose a private
 writable directory on a disk filesystem with enough free space; a small
 memory-backed `/tmp` can exhaust its quota during the native suites. Set
 and export `TMPDIR` with that absolute path before running tests. Keep it short enough
 for the operating system's Unix-domain socket path limit.
+
+For example, enumerate and run an existing focused module before broadening:
+
+```sh
+mise exec -- ./scripts/cargo.sh +1.98.1 test --locked -p p11scope --lib key_operation_tests:: -- --list
+mise exec -- ./scripts/cargo.sh +1.98.1 test --locked -p p11scope --lib key_operation_tests::
+```
+
+Check the output: libtest may exit successfully when a filter matches nothing.
+The following is the complete V3 gate. Use `--no-fail-fast` on `test` when
+collecting failures across targets; failed and timed-out targets remain failed.
 
 ```sh
 mise exec -- ./scripts/cargo.sh +1.98.1 fmt --all -- --check
@@ -80,7 +114,15 @@ mise exec -- ./scripts/cargo.sh +1.98.1 test --locked --workspace --all-targets
 mise exec -- ./scripts/cargo.sh +1.98.1 clippy --locked --workspace --all-targets -- -D warnings
 ```
 
-Record the commands, source revision and results with a change. Commit
+Keep incremental caches warm and serialize Cargo-heavy jobs on a shared host.
+`CARGO_BUILD_JOBS` limits compilation, not test threads or subprocesses. Bound
+fixture concurrency where necessary and diagnose load-sensitive failures in a
+quiet lane; do not increase deadlines or rerun until green without a cause.
+Separate CI runners can run the existing shards concurrently. Process-local
+fixture locks do not protect shared paths across separate test binaries.
+
+Record concise commands, source revision, counts, elapsed time and remaining
+limitations with a change; no permanent log archive is required. Commit
 messages use an area followed by an imperative summary, for example
 `fix: preserve unavailable discovery evidence` or `docs: clarify capture
 limits`. Release qualification follows [RELEASING.md](RELEASING.md).

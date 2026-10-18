@@ -564,6 +564,7 @@ struct JointScene {
     proof: JournalDomainProof,
     thread: u64,
     sequence: u64,
+    admission_sequence: u64,
 }
 
 impl JointScene {
@@ -587,6 +588,7 @@ impl JointScene {
             proof,
             thread: 1,
             sequence: 0,
+            admission_sequence: 0,
         }
     }
 
@@ -641,7 +643,7 @@ impl JointScene {
             audit_epoch,
             None,
             0,
-            H3DispositionEvidence::scripted_clean(self.adapter.consumed_through_for_test()),
+            H3DispositionEvidence::scripted_clean(self.fixture.h0_allocated_below() - 1),
             self.fixture.attachment().generation(),
         );
         let fresh = SessionBirthEvidence::scripted_for_receipt(&bootstrap);
@@ -675,7 +677,7 @@ impl JointScene {
             7,
             None,
             0,
-            H3DispositionEvidence::scripted_clean(self.adapter.consumed_through_for_test()),
+            H3DispositionEvidence::scripted_clean(self.fixture.h0_allocated_below() - 1),
             self.fixture.attachment().generation(),
         );
         let cell = SteadyFaultCell(7);
@@ -757,14 +759,7 @@ fn attest_and_stage(
     staging: &mut JointStaging,
     call: &ShapedS1,
 ) -> (SemanticCall, u64) {
-    let admitted = scene.fixture.admit_shaped(
-        call.session.unwrap_or(SESSION),
-        call.name,
-        call.rv,
-        call.mechanism,
-        call.capture,
-        call.flags,
-    );
+    let admitted = admit_call_input(scene, call);
     scene.adapter.attest_key(&admitted).expect("call attests");
     let facts = admitted.s1_facts().clone();
     let origin = EffectOrigin::from(&facts);
@@ -778,25 +773,30 @@ fn attest_and_stage(
 /// Attest (no stage) + ingest one call: the seal settles a call H9
 /// never staged.
 fn attest_and_ingest(scene: &mut JointScene, call: &ShapedS1) {
-    let admitted = scene.fixture.admit_shaped(
-        call.session.unwrap_or(SESSION),
-        call.name,
-        call.rv,
-        call.mechanism,
-        call.capture,
-        call.flags,
-    );
+    let admitted = admit_call_input(scene, call);
     scene.adapter.attest_key(&admitted).expect("call attests");
     ingest_call(scene, call);
 }
 
-/// Ingest one call's begin/end records.
-fn ingest_call(scene: &mut JointScene, call: &ShapedS1) {
-    scene.sequence += 1;
+/// One explicit paired native/Event input before routed admission.
+fn admit_call_input(scene: &mut JointScene, call: &ShapedS1) -> AdmittedInstanceCall {
+    scene.admission_sequence = scene.admission_sequence.max(scene.sequence) + 1;
+    let begin = begin_for_call(scene, call, scene.admission_sequence);
+    let end = end_for_call(&begin, call);
+    let record = decode_journal_record(&end, &scene.descriptors).expect("paired END decodes");
+    let p11scope_ebpf_common::object_journal::JournalRecord::End(end) = record else {
+        panic!("END input")
+    };
+    scene
+        .fixture
+        .admit_original_event(call.name, end.payload_base().event)
+}
+
+fn begin_for_call(scene: &JointScene, call: &ShapedS1, sequence: u64) -> [u8; 224] {
     let fid = crate::kinds::function_id(call.name).unwrap();
-    let begin = begin_bytes_shaped(
+    begin_bytes_shaped(
         scene.thread,
-        scene.sequence,
+        sequence,
         fid,
         0,
         (COOKIE, EXEC),
@@ -806,29 +806,39 @@ fn ingest_call(scene: &mut JointScene, call: &ShapedS1) {
         call.input0,
         call.input1,
         call.flags,
-    );
+    )
+}
+
+fn end_for_call(begin: &[u8; 224], call: &ShapedS1) -> [u8; 632] {
+    match call.name {
+        "C_CreateObject" => match call.result {
+            Some(result) => {
+                end_bytes_result(begin, OBJECT_ACTION_CREATE, call.rv, ENTRY_NS + 50, result)
+            }
+            None => end_bytes(begin, OBJECT_ACTION_CREATE, call.rv, ENTRY_NS + 50),
+        },
+        "C_SignInit" | "C_VerifyInit" | "C_MessageSignInit" | "C_WrapKey" => {
+            end_bytes(begin, OBJECT_ACTION_ACCESS, call.rv, ENTRY_NS + 50)
+        }
+        "C_DestroyObject" => end_bytes(begin, OBJECT_ACTION_DESTROY, call.rv, ENTRY_NS + 50),
+        "C_GetAttributeValue" => {
+            end_bytes_getattr(begin, call.rv, ENTRY_NS + 50, &call.getattr_cells)
+        }
+        _ => end_bytes_absent(begin, call.rv, ENTRY_NS + 50),
+    }
+}
+
+/// Ingest the paired call's native records in their original order.
+fn ingest_call(scene: &mut JointScene, call: &ShapedS1) {
+    scene.sequence = (scene.sequence + 1).max(scene.admission_sequence);
+    let begin = begin_for_call(scene, call, scene.sequence);
     assert_eq!(
         scene.ingest(&begin),
         JournalDisposition::BeginAdmitted,
         "{} begin admits",
         call.name
     );
-    let end = match call.name {
-        "C_CreateObject" => match call.result {
-            Some(result) => {
-                end_bytes_result(&begin, OBJECT_ACTION_CREATE, call.rv, ENTRY_NS + 50, result)
-            }
-            None => end_bytes(&begin, OBJECT_ACTION_CREATE, call.rv, ENTRY_NS + 50),
-        },
-        "C_SignInit" | "C_VerifyInit" | "C_MessageSignInit" | "C_WrapKey" => {
-            end_bytes(&begin, OBJECT_ACTION_ACCESS, call.rv, ENTRY_NS + 50)
-        }
-        "C_DestroyObject" => end_bytes(&begin, OBJECT_ACTION_DESTROY, call.rv, ENTRY_NS + 50),
-        "C_GetAttributeValue" => {
-            end_bytes_getattr(&begin, call.rv, ENTRY_NS + 50, &call.getattr_cells)
-        }
-        _ => end_bytes_absent(&begin, call.rv, ENTRY_NS + 50),
-    };
+    let end = end_for_call(&begin, call);
     assert_eq!(
         scene.ingest(&end),
         JournalDisposition::EndStaged,
@@ -1684,11 +1694,9 @@ fn key_operation_fallback_invalidates_before_replay() {
         )),
         "non-vacuous: invalidation retires the key"
     );
-    let failure = SealFailure {
-        gap: JournalGap::ClosureStale,
-        effects,
-        h3_voided: None,
-    };
+    let failure = scene
+        .adapter
+        .scripted_failure(JournalGap::ClosureStale, &bootstrap, effects);
     let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     let (outcome, _) = staging.apply_failure(
         &failure,
@@ -1830,11 +1838,11 @@ fn key_operation_n3_held_multicall_applies_invalidations() {
     );
 
     // The eventual primary outcome still routes once (fallback).
-    let failure = SealFailure {
-        gap: JournalGap::ClosureStale,
-        effects: crate::semantics_objects::ObjectEffects::default(),
-        h3_voided: None,
-    };
+    let failure = scene.adapter.scripted_failure(
+        JournalGap::ClosureStale,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
     let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     let (outcome, _) = staging.apply_failure(
         &failure,
@@ -1922,11 +1930,9 @@ fn key_operation_n3_held_failure_paths_apply_invalidations() {
         )),
         "non-vacuous: invalidation retires the key"
     );
-    let failure = SealFailure {
-        gap: JournalGap::ClosureStale,
-        effects,
-        h3_voided: None,
-    };
+    let failure = scene
+        .adapter
+        .scripted_failure(JournalGap::ClosureStale, &bootstrap, effects);
     let mut pending = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean_pending(
         u64::MAX,
         Some(1),
@@ -1963,11 +1969,11 @@ fn key_operation_n3_held_failure_paths_apply_invalidations() {
     );
     // The later fallback still routes the primary outcome once.
     let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
-    let failure = SealFailure {
-        gap: JournalGap::ClosureStale,
-        effects: crate::semantics_objects::ObjectEffects::default(),
-        h3_voided: None,
-    };
+    let failure = scene.adapter.scripted_failure(
+        JournalGap::ClosureStale,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
     let (outcome, _) = staging.apply_failure(
         &failure,
         &mut clean,
@@ -2032,11 +2038,9 @@ fn key_operation_n3_held_failure_paths_apply_invalidations() {
         crate::semantics_objects::ObjectGap::Loss,
         scene.adapter.ledger_mut(),
     );
-    let failure = SealFailure {
-        gap: JournalGap::H3Pending,
-        effects,
-        h3_voided: None,
-    };
+    let failure = scene
+        .adapter
+        .scripted_failure(JournalGap::H3Pending, &bootstrap, effects);
     let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     let (outcome, refused) = staging.apply_failure(
         &failure,
@@ -4987,6 +4991,434 @@ fn key_operation_n9_lost_unknown_metadata_keeps_zero_replacement() {
 /// names the second invocation, not the head) with staging and S1
 /// untouched — then in-order delivery replays each exactly once.
 #[test]
+fn key_operation_c2_foreign_namespace_seal_never_replays() {
+    let mut own = JointScene::new();
+    let receipt = own.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&receipt));
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let (_, own_position) = prepare_call(&mut own, &mut staging, &init);
+    let mut foreign = JointScene::new();
+    let foreign_receipt = foreign.bootstrap();
+    let mut foreign_staging = JointStaging::select_joint(Some(&foreign_receipt));
+    let (_, foreign_position) = prepare_call(&mut foreign, &mut foreign_staging, &init);
+    assert_eq!(
+        own_position, foreign_position,
+        "independent H0 namespaces restart their ordinals"
+    );
+    let foreign_seal = foreign
+        .seal()
+        .expect("the foreign Session legitimately seals its own call");
+    let mut reducer = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let (outcome, _) = staging.apply_seal(
+        &foreign_seal,
+        &foreign.model,
+        own.adapter.ledger_mut(),
+        &mut reducer,
+        &mut keyuse,
+        RegistryInstanceId::from_raw(3),
+        &mut sink,
+        None,
+    );
+    assert_eq!(
+        outcome,
+        SealApplyOutcome::Held,
+        "numeric H0 equality cannot substitute for the selected namespace"
+    );
+    assert_eq!(staging.staged_len(), 1);
+    assert_eq!(reducer.calls(), 0);
+    assert!(keyuse.open().is_empty());
+}
+
+#[test]
+fn key_operation_c2_foreign_namespace_failure_preserves_live_history() {
+    let mut own = JointScene::new();
+    let receipt = own.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&receipt));
+    let mut reducer = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    drive_quantum(
+        &mut own,
+        &mut staging,
+        &mut reducer,
+        &mut keyuse,
+        &mut sink,
+        &init,
+    );
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    prepare_call(&mut own, &mut staging, &sign);
+    let before = (
+        reducer.calls(),
+        reducer.started(),
+        reducer.completed(),
+        reducer.unknown(),
+        sink.len(),
+    );
+    assert!(reducer.has_live_operations());
+    let mut foreign = JointScene::new();
+    let receipt = foreign.bootstrap();
+    let mut foreign_staging = JointStaging::select_joint(Some(&receipt));
+    prepare_call(&mut foreign, &mut foreign_staging, &init);
+    let failure = foreign
+        .seal_with_fault(7, 8)
+        .expect_err("the foreign adapter really observes native loss");
+    assert_eq!(failure.gap, JournalGap::FaultChanged);
+    let mut finalizer = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_failure(
+        &failure,
+        &mut finalizer,
+        &foreign.model,
+        own.adapter.ledger_mut(),
+        &mut reducer,
+        &mut keyuse,
+        RegistryInstanceId::from_raw(3),
+        &mut sink,
+        None,
+    );
+    assert_eq!(outcome, FailureApplyOutcome::Ignored);
+    assert_eq!(staging.mode(), FeedMode::Joint);
+    assert_eq!(staging.staged_len(), 1);
+    assert!(matches!(
+        crate::semantics_objects::journal::H3EvidenceSource::take_h3_disposition(&mut finalizer),
+        H3DispositionEvidence::Clean {
+            staged_max: u64::MAX,
+            pending_floor: None
+        }
+    ));
+    assert_eq!(
+        (
+            reducer.calls(),
+            reducer.started(),
+            reducer.completed(),
+            reducer.unknown(),
+            sink.len()
+        ),
+        before
+    );
+    assert!(
+        reducer.has_live_operations(),
+        "foreign loss has no authority over the selected feed"
+    );
+    let seal = own.seal().expect("the selected namespace still seals");
+    assert_eq!(
+        staging
+            .apply_seal(
+                &seal,
+                &own.model,
+                own.adapter.ledger_mut(),
+                &mut reducer,
+                &mut keyuse,
+                RegistryInstanceId::from_raw(3),
+                &mut sink,
+                None
+            )
+            .0,
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(reducer.completed(), 1);
+}
+
+#[test]
+fn key_operation_c2_foreign_namespace_registry_delivery_keeps_projection() {
+    for loss in [false, true] {
+        let mut own = GuardedScene::new();
+        let receipt = own.scene.bootstrap();
+        let key = own.key(1);
+        own.registry.install_joint_receipt(key.clone(), receipt);
+        let (_, id) = own.register(1);
+        let create = ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0);
+        let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+        for shape in [&create, &init] {
+            assert_eq!(
+                own.drive_joint(&key, id, shape),
+                SealApplyOutcome::ReplayedOne
+            );
+        }
+        let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+        let (facts, position) = own.admit_shape(&sign);
+        own.observe(&key, position, facts);
+        own.registry
+            .publish_with_ledger(own.scene.adapter.ledger_mut());
+        ingest_call(&mut own.scene, &sign);
+        let before = own.registry.joint_observations(9);
+        let staged = own.scene.adapter.ledger().staged();
+        let mut foreign = JointScene::new();
+        let receipt = foreign.bootstrap();
+        let mut foreign_staging = JointStaging::select_joint(Some(&receipt));
+        prepare_call(&mut foreign, &mut foreign_staging, &init);
+        let mut finalizer = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+        if loss {
+            let failure = foreign
+                .seal_with_fault(7, 8)
+                .expect_err("genuine foreign loss");
+            assert_eq!(
+                own.registry.deliver_joint_failure(
+                    id,
+                    &failure,
+                    &mut finalizer,
+                    &foreign.model,
+                    own.scene.adapter.ledger_mut()
+                ),
+                FailureApplyOutcome::Ignored
+            );
+        } else {
+            let seal = foreign.seal().expect("foreign call seals");
+            assert_eq!(
+                own.registry.deliver_joint_seal(
+                    id,
+                    &seal,
+                    &foreign.model,
+                    own.scene.adapter.ledger_mut()
+                ),
+                SealApplyOutcome::Held
+            );
+        }
+        assert_eq!(
+            own.registry.joint_observations(9),
+            before,
+            "foreign delivery cannot replace a retained object projection or S1 history"
+        );
+        assert_eq!(own.scene.adapter.ledger().staged(), staged);
+        assert!(
+            matches!(
+                crate::semantics_objects::journal::H3EvidenceSource::take_h3_disposition(
+                    &mut finalizer
+                ),
+                H3DispositionEvidence::Clean {
+                    staged_max: u64::MAX,
+                    pending_floor: None
+                }
+            ),
+            "foreign delivery never takes completeness"
+        );
+        let seal = own
+            .scene
+            .seal()
+            .expect("own queued terminal remains healthy");
+        assert_eq!(
+            own.registry.deliver_joint_seal(
+                id,
+                &seal,
+                &own.scene.model,
+                own.scene.adapter.ledger_mut()
+            ),
+            SealApplyOutcome::ReplayedOne
+        );
+        assert_eq!(own.edge_calls(id), 3);
+        let observations = own.registry.joint_observations(10);
+        assert_eq!(
+            observations
+                .unknown_key_operations
+                .iter()
+                .map(|row| row.completed)
+                .sum::<u64>(),
+            1
+        );
+    }
+}
+
+#[test]
+fn key_operation_c2_early_loss_scope_comes_from_adapter_not_request() {
+    let mut own = JointScene::new();
+    let receipt = own.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&receipt));
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    prepare_call(&mut own, &mut staging, &init);
+    let mut foreign = JointScene::new();
+    let foreign_receipt = foreign.bootstrap();
+    let mut foreign_staging = JointStaging::select_joint(Some(&foreign_receipt));
+    prepare_call(&mut foreign, &mut foreign_staging, &init);
+    let audit = JournalAuditReceipt::scripted(
+        7,
+        8,
+        None,
+        0,
+        H3DispositionEvidence::scripted_clean(u64::MAX),
+        own.fixture.attachment().generation(),
+    );
+    let frontier = own.adapter.consumed_frontier();
+    let mut births =
+        ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(&foreign_receipt));
+    let failure = own
+        .adapter
+        .seal(
+            &mut own.model,
+            &audit,
+            &foreign_receipt,
+            frontier,
+            &mut births,
+            &SteadyFaultCell(8),
+        )
+        .expect_err("real loss precedes the wrong bootstrap check");
+    assert_eq!(failure.gap, JournalGap::FaultChanged);
+    assert!(
+        failure.affects_domain(receipt.domain()),
+        "an admitted, not-yet-model-registered key is affected"
+    );
+    assert!(
+        !failure.affects_domain(foreign_receipt.domain()),
+        "the request cannot retarget an adapter loss"
+    );
+    let mut reducer = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let mut finalizer = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    assert_eq!(
+        foreign_staging
+            .apply_failure(
+                &failure,
+                &mut finalizer,
+                &own.model,
+                foreign.adapter.ledger_mut(),
+                &mut reducer,
+                &mut keyuse,
+                RegistryInstanceId::from_raw(4),
+                &mut sink,
+                None
+            )
+            .0,
+        FailureApplyOutcome::Ignored
+    );
+    assert_eq!(foreign_staging.staged_len(), 1);
+    assert_eq!(
+        staging
+            .apply_failure(
+                &failure,
+                &mut finalizer,
+                &own.model,
+                own.adapter.ledger_mut(),
+                &mut reducer,
+                &mut keyuse,
+                RegistryInstanceId::from_raw(3),
+                &mut sink,
+                None
+            )
+            .0,
+        FailureApplyOutcome::Degraded { disposed: 1 }
+    );
+    assert_eq!(staging.history_disposed(), 1);
+    assert_eq!(
+        staging
+            .apply_failure(
+                &failure,
+                &mut finalizer,
+                &own.model,
+                own.adapter.ledger_mut(),
+                &mut reducer,
+                &mut keyuse,
+                RegistryInstanceId::from_raw(3),
+                &mut sink,
+                None
+            )
+            .0,
+        FailureApplyOutcome::Ignored,
+        "the same scoped loss disposes once"
+    );
+}
+
+#[test]
+fn key_operation_c2_unknown_request_is_inert_and_own_receipt_refresh_keeps_frontier() {
+    let mut own = JointScene::new();
+    let receipt = own.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&receipt));
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    prepare_call(&mut own, &mut staging, &init);
+    let foreign = JointScene::new();
+    let foreign_receipt = foreign.bootstrap();
+    let audit = JournalAuditReceipt::scripted(
+        7,
+        7,
+        None,
+        0,
+        H3DispositionEvidence::scripted_clean(u64::MAX),
+        own.fixture.attachment().generation(),
+    );
+    let frontier = own.adapter.consumed_frontier();
+    let mut births =
+        ScriptedBirthSource::once(SessionBirthEvidence::scripted_for_receipt(&foreign_receipt));
+    let failure = own
+        .adapter
+        .seal(
+            &mut own.model,
+            &audit,
+            &foreign_receipt,
+            frontier,
+            &mut births,
+            &SteadyFaultCell(7),
+        )
+        .expect_err("unknown key never selects this adapter's domain");
+    assert_eq!(failure.gap, JournalGap::BootstrapMismatch);
+    assert!(!failure.affects_domain(receipt.domain()));
+    let mut reducer = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let mut finalizer = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    assert_eq!(
+        staging
+            .apply_failure(
+                &failure,
+                &mut finalizer,
+                &own.model,
+                own.adapter.ledger_mut(),
+                &mut reducer,
+                &mut keyuse,
+                RegistryInstanceId::from_raw(3),
+                &mut sink,
+                None
+            )
+            .0,
+        FailureApplyOutcome::Ignored
+    );
+    assert_eq!(staging.staged_len(), 1);
+    let refreshed = own.bootstrap();
+    assert_eq!(refreshed.domain(), receipt.domain());
+    let seal = own
+        .seal()
+        .expect("same-domain refreshed birth seals existing input");
+    assert_eq!(
+        staging
+            .apply_seal(
+                &seal,
+                &own.model,
+                own.adapter.ledger_mut(),
+                &mut reducer,
+                &mut keyuse,
+                RegistryInstanceId::from_raw(3),
+                &mut sink,
+                None
+            )
+            .0,
+        SealApplyOutcome::ReplayedOne
+    );
+    let count = reducer.calls();
+    let refreshed = own.bootstrap();
+    assert_eq!(refreshed.domain(), receipt.domain());
+    assert_eq!(
+        staging
+            .apply_seal(
+                &seal,
+                &own.model,
+                own.adapter.ledger_mut(),
+                &mut reducer,
+                &mut keyuse,
+                RegistryInstanceId::from_raw(3),
+                &mut sink,
+                None
+            )
+            .0,
+        SealApplyOutcome::Held
+    );
+    assert_eq!(
+        reducer.calls(),
+        count,
+        "refresh cannot reset consumed identity or replay history"
+    );
+}
+
+#[test]
 fn key_operation_c2_reordered_seal_refuses_then_recovers_in_order() {
     use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
 
@@ -5256,7 +5688,17 @@ fn key_operation_n1_genuine_birth_bootstrap() {
 
     let publisher = NativePublisher::build();
     let mut scene = JointScene::new();
-    let admitted = scene.fixture.admit_function("C_CreateObject");
+    let create = function_id("C_CreateObject");
+    let begin = begin_bytes(9, 1, create, 0);
+    let paired_end = end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50);
+    let p11scope_ebpf_common::object_journal::JournalRecord::End(paired_end) =
+        decode_journal_record(&paired_end, &scene.descriptors).expect("paired sighting END")
+    else {
+        panic!("END input")
+    };
+    let admitted = scene
+        .fixture
+        .admit_original_event("C_CreateObject", paired_end.payload_base().event);
     let proof = scene
         .adapter
         .attest_key(&admitted)
@@ -5284,8 +5726,6 @@ fn key_operation_n1_genuine_birth_bootstrap() {
     );
     // The sighting ingest T3 runs before attesting, on a spare
     // thread so the Joint flow's own sequencing stays untouched.
-    let create = function_id("C_CreateObject");
-    let begin = begin_bytes(9, 1, create, 0);
     scene.ingest(&begin);
     scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
     let birth = BootstrapReceipt::attest(&scene.adapter, &grant).expect("observed grant attests");
@@ -6118,11 +6558,11 @@ fn key_operation_g29_delivery_equivalence_matrix() {
     guarded
         .registry
         .publish_with_ledger(guarded.scene.adapter.ledger_mut());
-    let failure = SealFailure {
-        gap: JournalGap::ClosureStale,
-        effects: crate::semantics_objects::ObjectEffects::default(),
-        h3_voided: None,
-    };
+    let failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::ClosureStale,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
     let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     assert_eq!(
         guarded.registry.deliver_joint_failure(
@@ -6169,11 +6609,11 @@ fn key_operation_g29_delivery_equivalence_matrix() {
         guarded.drive_joint(&joint_key, joint_id, &sign),
         SealApplyOutcome::ReplayedOne
     );
-    let failure = SealFailure {
-        gap: JournalGap::FaultChanged,
-        effects: crate::semantics_objects::ObjectEffects::default(),
-        h3_voided: None,
-    };
+    let failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::FaultChanged,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
     let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     assert_eq!(
         guarded.registry.deliver_joint_failure(
@@ -7054,11 +7494,11 @@ fn key_operation_schema_contract() {
     for call in sign_flow()[0..3].iter() {
         prepare_call(&mut fall_scene, &mut fall_staging, call);
     }
-    let failure = SealFailure {
-        gap: JournalGap::BootstrapMismatch,
-        effects: crate::semantics_objects::ObjectEffects::default(),
-        h3_voided: None,
-    };
+    let failure = fall_scene.adapter.scripted_failure(
+        JournalGap::BootstrapMismatch,
+        &fall_bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
     let clean = H3DispositionEvidence::scripted_clean(u64::MAX);
     let mut h3 = ScriptedH3Source::once(clean);
     let (outcome, _) = fall_staging.apply_failure(
@@ -7103,11 +7543,11 @@ fn key_operation_schema_contract() {
         &mut loss_staging,
         &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
     );
-    let loss_failure = SealFailure {
-        gap: JournalGap::H3Loss,
-        effects: crate::semantics_objects::ObjectEffects::default(),
-        h3_voided: None,
-    };
+    let loss_failure = loss_scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &loss_bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
     // HistoryLoss never consults the finalizer: any scripted source will do.
     let mut loss_h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     let (outcome, _) = loss_staging.apply_failure(
@@ -8432,25 +8872,12 @@ impl GuardedScene {
     /// (admission flags set — they never participate in the C2
     /// fingerprint) and its H0 position.
     fn admit_shape(&mut self, call: &ShapedS1) -> (SemanticCall, u64) {
-        let admitted = self.scene.fixture.admit_shaped(
-            call.session.unwrap_or(SESSION),
-            call.name,
-            call.rv,
-            call.mechanism,
-            call.capture,
-            call.flags,
-        );
+        let admitted = admit_call_input(&mut self.scene, call);
         self.scene
             .adapter
             .attest_key(&admitted)
             .expect("call attests");
-        let mut facts = admitted.s1_facts().clone();
-        facts.authorized = true;
-        facts.unambiguous = true;
-        facts.attributable = true;
-        facts.count_only = false;
-        let position = admitted.h0_ordinal();
-        (facts, position)
+        (admitted.s1_facts().clone(), admitted.h0_ordinal())
     }
 
     fn edge_calls(&self, id: RegistryInstanceId) -> u64 {
@@ -8512,8 +8939,15 @@ impl GuardedScene {
     /// Drive one S1Only-direct call for `key`: admit, observe,
     /// publish (no ledger). Effects tee while Joint evidence exists.
     fn drive_s1only(&mut self, key: &InstanceKey, shape: &ShapedS1) {
-        let (facts, position) = self.admit_shape(shape);
-        self.observe(key, position, facts);
+        let admitted = self.scene.fixture.admit_shaped(
+            shape.session.unwrap_or(SESSION),
+            shape.name,
+            shape.rv,
+            shape.mechanism,
+            shape.capture,
+            shape.flags,
+        );
+        self.observe(key, admitted.h0_ordinal(), admitted.s1_facts().clone());
         self.registry.publish();
     }
 }
@@ -9062,11 +9496,11 @@ fn key_operation_n14_fallback_replay_reserves_and_disposes_on_refusal() {
             .publish_with_ledger(guarded.scene.adapter.ledger_mut());
     }
     assert_eq!(guarded.scene.adapter.ledger().staged(), 2);
-    let failure = SealFailure {
-        gap: JournalGap::ClosureStale,
-        effects: crate::semantics_objects::ObjectEffects::default(),
-        h3_voided: None,
-    };
+    let failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::ClosureStale,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
     let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     let before = guarded.registry.semantic_resource_snapshot().charged_bytes;
     let outcome = guarded.registry.deliver_joint_failure(
@@ -9130,11 +9564,11 @@ fn key_operation_n14_fallback_replay_reserves_and_disposes_on_refusal() {
             .registry
             .publish_with_ledger(guarded.scene.adapter.ledger_mut());
     }
-    let failure = SealFailure {
-        gap: JournalGap::ClosureStale,
-        effects: crate::semantics_objects::ObjectEffects::default(),
-        h3_voided: None,
-    };
+    let failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::ClosureStale,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
     let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     let outcome = guarded.registry.deliver_joint_failure(
         joint_id,
@@ -9449,11 +9883,11 @@ fn key_operation_n15_post_fallback_terminals_still_accounted() {
     guarded
         .registry
         .publish_with_ledger(guarded.scene.adapter.ledger_mut());
-    let failure = SealFailure {
-        gap: JournalGap::ClosureStale,
-        effects: crate::semantics_objects::ObjectEffects::default(),
-        h3_voided: None,
-    };
+    let failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::ClosureStale,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
     let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     assert_eq!(
         guarded.registry.deliver_joint_failure(
@@ -9507,11 +9941,11 @@ fn key_operation_n15_post_loss_s1_still_accounted() {
     guarded
         .registry
         .publish_with_ledger(guarded.scene.adapter.ledger_mut());
-    let failure = SealFailure {
-        gap: JournalGap::FaultChanged,
-        effects: crate::semantics_objects::ObjectEffects::default(),
-        h3_voided: None,
-    };
+    let failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::FaultChanged,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
     let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
     assert_eq!(
         guarded.registry.deliver_joint_failure(

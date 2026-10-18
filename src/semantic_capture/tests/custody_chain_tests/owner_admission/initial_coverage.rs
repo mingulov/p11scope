@@ -368,7 +368,9 @@ fn prepare_scoped_first_receipt(scene: &mut AdmissionScene) {
         .unwrap();
     let slot = scene.h0.0.borrow().io.held.slot(0, "C_SignInit");
     let owner = lane
-        .prepare_caller_admission(candidate.pin(), slot, &module)
+        .prepare_caller_admission(candidate.pin(), slot, &module, |bytes| {
+            scene.coordinator.registry().reserve_semantic_storage(bytes)
+        })
         .unwrap();
     collection.sample_end(&std::collections::BTreeSet::from([pid]));
     let (receipt, result) =

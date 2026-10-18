@@ -1865,6 +1865,30 @@ fn bound_object_tail(
     }
 }
 
+/// Select only a retained physical association. The explicit legacy
+/// fixture seam has no production build and never applies to an owner
+/// binding with real provider targets, including a bad endpoint.
+fn provider_module_for_endpoint(
+    binding: &SemanticCallerBinding,
+    endpoint: Endpoint,
+) -> Option<&ModuleKey> {
+    let module = binding
+        .provider_for_endpoint(endpoint)
+        .map(|provider| provider.module());
+    #[cfg(test)]
+    let module = module.or_else(|| binding.reference_fixture_module());
+    module
+}
+
+fn provider_module_for_file(binding: &SemanticCallerBinding, file_slot: u32) -> Option<&ModuleKey> {
+    let module = binding
+        .provider_for_file(file_slot)
+        .map(|provider| provider.module());
+    #[cfg(test)]
+    let module = module.or_else(|| binding.reference_fixture_module());
+    module
+}
+
 /// Convert one owned call: assemble the full key from proofs, decode the
 /// verbatim record facts, and decide current versus historical-only
 /// reduction. `barrier` is the narrowest staged loss ordinal covering
@@ -1887,11 +1911,12 @@ pub(crate) fn admit_call_from_evidence(
     if evidence.token == 0 {
         return Err(ConversionRefusal::Position);
     }
-    let module = binding.module();
+    let endpoint = evidence.endpoint.ok_or(ConversionRefusal::Slot)?;
+    let module =
+        provider_module_for_endpoint(binding, endpoint).ok_or(ConversionRefusal::Module)?;
     if matches!(module, ModuleKey::Unidentified { .. }) {
         return Err(ConversionRefusal::Module);
     }
-    let endpoint = evidence.endpoint.ok_or(ConversionRefusal::Slot)?;
     let plan = subset.plan();
     let slot = plan
         .slots
@@ -1901,8 +1926,7 @@ pub(crate) fn admit_call_from_evidence(
     if slot.object != endpoint.object || slot.file_offset != endpoint.offset {
         return Err(ConversionRefusal::Slot);
     }
-    if !subset.proves_provider_module(endpoint.object, module) || !binding.proves_endpoint(endpoint)
-    {
+    if !subset.proves_provider_module(endpoint.object, module) {
         return Err(ConversionRefusal::Module);
     }
     // Descriptor authority comes only from the attested plan: one
@@ -2001,10 +2025,10 @@ pub(crate) fn admit_registration_from_coverage(
     if !coverage.instances().contains(&router) {
         return Err(ConversionRefusal::Coverage);
     }
-    let module = binding.module();
+    let module = provider_module_for_endpoint(binding, coverage.endpoint())
+        .ok_or(ConversionRefusal::Module)?;
     if !binding.scope_current()
         || !subset.proves_provider_module(coverage.endpoint().object, module)
-        || !binding.proves_endpoint(coverage.endpoint())
     {
         return Err(ConversionRefusal::Module);
     }
@@ -2085,9 +2109,7 @@ pub(crate) fn finalize_invalidation(
         position: Some(at),
         reason,
     };
-    let bound_image = binding
-        .filter(|proof| proof.domain() == domain)
-        .map(|proof| (proof.image(), proof.module().clone()));
+    let bound = binding.filter(|proof| proof.domain() == domain);
     match scope {
         InvalidationScope::CoverageFailed => Ok((
             vec![loss(
@@ -2132,12 +2154,13 @@ pub(crate) fn finalize_invalidation(
             )],
             Vec::new(),
         )),
-        InvalidationScope::File { image, .. } => {
-            let scope = match &bound_image {
-                Some((bound, module)) if *bound == *image => {
-                    InstanceScope::Module(domain, *image, module.clone())
-                }
-                _ => InstanceScope::Image(domain, *image),
+        InvalidationScope::File { image, file_slot } => {
+            let module = bound
+                .filter(|proof| proof.image() == *image)
+                .and_then(|proof| provider_module_for_file(proof, *file_slot));
+            let scope = match module {
+                Some(module) => InstanceScope::Module(domain, *image, module.clone()),
+                None => InstanceScope::Image(domain, *image),
             };
             Ok((vec![loss(scope, InstanceReason::SemanticLoss)], Vec::new()))
         }
@@ -2146,15 +2169,22 @@ pub(crate) fn finalize_invalidation(
             file_slot,
             ids,
         } => {
+            let binding = bound.filter(|proof| proof.image() == *image);
+            let module = binding.and_then(|proof| provider_module_for_file(proof, *file_slot));
             let fresh_partition = fresh.iter().any(|coverage| {
                 coverage.domain() == domain
                     && coverage.image() == *image
                     && coverage.endpoint().file_slot == *file_slot
+                    && module.is_some_and(|module| {
+                        binding.is_some_and(|proof| {
+                            provider_module_for_endpoint(proof, coverage.endpoint()) == Some(module)
+                        })
+                    })
                     && !coverage.instances().is_empty()
                     && coverage.instances().iter().all(|id| !ids.contains(id))
             });
-            match (&bound_image, fresh_partition) {
-                (Some((bound, module)), true) if *bound == *image => {
+            match (module, fresh_partition) {
+                (Some(module), true) => {
                     let retirements = ids
                         .iter()
                         .map(|id| InstanceRetirement {
@@ -2170,7 +2200,7 @@ pub(crate) fn finalize_invalidation(
                         .collect();
                     Ok((Vec::new(), retirements))
                 }
-                (Some((bound, module)), _) if *bound == *image => {
+                (Some(module), _) => {
                     let losses = ids
                         .iter()
                         .map(|id| {

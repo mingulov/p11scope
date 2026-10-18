@@ -138,3 +138,57 @@ checked after export; guessed records-per-call cannot satisfy either threshold.
 Use the identical independently issued schedule with diagnostics disabled and
 enabled, compare primary per-edge/API/count/loss facts, and report measured cost
 separately. Fixture/runtime changes and installed execution remain open.
+
+## Paired default-ring useful wrap
+
+The new `diagnostics-wrap-ledger.c` physical entry-count fixture uses one PID,
+two2.40 tables and one common ELF with32 distinct real entry bodies at slots4–35.
+Those bodies have the exact fixture type `CK_RV(void)` and return0. This tests
+physical entry counting/ownership; it does not qualify PKCS#11 semantics, API
+behavior or the104-slot ABI. Review its table alignment through the matching
+real manifest before live execution. The original ten-call control remains.
+
+Build/check on the development host:
+
+```sh
+TMPDIR=/var/tmp/p11scope-ws-tmp python3 -I \
+  tests/fixtures/operator-output/prepare-diagnostics-wrap.py \
+  --out /var/tmp/p11scope-ws-tmp/NEW_G21_WRAP_INPUTS
+```
+
+The helper reuses the original C clock/VMA/hash/FIFO helpers, disables compiler
+identical-function folding, verifies32distinct physical targets against an
+independently mapped common FD, and runs192real calls over a small schedule.
+Its missing/duplicate/wrong-slot/clock/return/target/ACK controls are fixture
+oracle checks. They do not qualify diagnostics or BPF ring wrap.
+
+The ignored Rust selector is
+`inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_wrap_and_primary_parity_lp64`.
+Supply `P11SCOPE_DIAGNOSTICS_WRAP_PREBUILT_DIR` pointing at the controller-verified
+four-file payload; no runtime compilation fallback exists. Match the prebuilt
+Rust test binary/source and arrival hashes, hold the authorized host lane, and
+use disk TMPDIR. Compilation and live execution remain separately queued.
+
+Each disabled/enabled run issues exactly400counted rounds,258shared rounds,
+then one fence and one proof round, each32per-slot calls. Native ACKs and an
+independent per-slot ledger bind all21120calls. Each next round waits for an
+actual committed production count or withheld-range milestone; load-B remains
+inside the existing observer callback between passes. Expected primary totals
+are A12800, B32 and8288withheld entries. Actual32Bplacements and their selected
+withheld fence prefixes must remain useful in the exported diagnostics.
+
+Both default rings must really evict: CountObservation eviction proves the
+ordinary ring filled, and OwnershipTransition/CaptureHealth eviction proves
+the exceptional ring filled. These categories have fixed routing. Their actual
+evictions establish produced lower bounds of24576+ordinary-evicted and
+8192+exceptional-evicted, without guessing records per call or treating mixed
+CountDecision totals as per-ring counters. All footer kind totals must reconcile,
+references must report retained/not-retained truthfully and recent B placement
+must cover all32distinct pairs. Partial/unrun/failed cells cannot pass.
+
+Run the same independent schedule with diagnostics disabled/enabled and compare
+primary count, entry observation, saturation/inflight, capture, presence,
+coverage/loss and settlement facts after normalizing run-local IDs/timestamps.
+Each run has an explicit900s bound; the pair is approximately22minutes at the
+current one-second pass cadence. Report actual runtime/output bytes. Controlled
+RSS/CPU/performance cost is a separate T10 gate.

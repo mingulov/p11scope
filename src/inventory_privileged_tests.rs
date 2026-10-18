@@ -912,6 +912,9 @@ struct DemotionWorkload {
     dir: tempfile::TempDir,
 }
 
+#[cfg(test)]
+mod operator_diagnostics_wrap;
+
 const DEMOTION_PREBUILT_FILES: [&str; 4] = [
     "libdemotion-common.so",
     "provider-A.so",

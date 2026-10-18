@@ -400,27 +400,18 @@ class ManifestControls(unittest.TestCase):
 class FdControls(unittest.TestCase):
     def test_atomic_writer_stalls_before_pipe_byte_capacity_is_full(self):
         pipe = HARNESS['OutputPipe']()
-        child = None
         try:
-            os.write(pipe.write_fd, b'H' * 169)
-            child = subprocess.Popen([sys.executable, '-I', '-c',
-                'import os; os.write(1, b"X" * 4096)'], stdout=pipe.write_fd)
-            time.sleep(0.05)
-            self.assertIsNone(child.poll(), 'atomic writer must actually remain blocked')
+            os.set_blocking(pipe.write_fd, False)
+            self.assertEqual(os.write(pipe.write_fd, b'H' * 169), 169)
+            with self.assertRaises(BlockingIOError):
+                os.write(pipe.write_fd, b'X' * 4096)
             self.assertFalse(pipe.full(), 'this regression requires occupancy below4096')
-            self.assertTrue(pipe.stalled(), 'owned kernel write readiness must show pressure')
-            deadline = time.monotonic() + 3
-            while child.poll() is None:
-                pipe.drain_available()
-                self.assertLess(time.monotonic(), deadline)
-                time.sleep(0.001)
-            child.wait(timeout=1)
-            self.assertEqual(pipe.drain_available(), b'H' * 169 + b'X' * 4096)
+            self.assertTrue(pipe.stalled(), 'actual atomic write returned EAGAIN')
+            self.assertEqual(pipe.drain_available(), b'H' * 169)
             self.assertFalse(pipe.stalled(), 'empty pipe cannot qualify pressure')
+            self.assertEqual(os.write(pipe.write_fd, b'X' * 4096), 4096)
+            self.assertEqual(pipe.drain_available(), b'H' * 169 + b'X' * 4096)
         finally:
-            if child and child.poll() is None:
-                child.kill()
-                child.wait(timeout=1)
             pipe.close()
 
     def test_real_writer_stalls_and_drain_counts_exact_bytes(self):

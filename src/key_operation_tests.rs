@@ -10932,7 +10932,7 @@ fn joint_capture_owner_single_ledger_accounts_staged_and_assoc() {
     use crate::semantics_objects::journal::joint_driver::JointCaptureOwner;
 
     let pool = SemanticResourcePool::default();
-    let mut owner = JointCaptureOwner::new(pool.reserver());
+    let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
     assert_eq!(owner.ledger().census(), 0);
     assert_eq!(owner.ledger().charged_bytes(), 0);
     owner.ledger_mut().charge(7, 40).expect("staged charges");
@@ -11025,5 +11025,80 @@ fn joint_capture_owner_commit_batch_stages_into_owned_ledger() {
     assert!(
         coordinator.joint_capture().ledger().charged_bytes() > 0,
         "the staged call charges the owner's bytes"
+    );
+}
+
+/// The owner holds ONE ledger behind its adapter: a genuine origin
+/// minted by raw collection through the owner's adapter survives the
+/// bridge into a publication-side charge, and the adapter observes the
+/// publication's census. The failure twin charges the same genuine
+/// origin against a second owner's ledger and must refuse, proving
+/// the generation check is real and the pass is not vacuous.
+#[test]
+fn joint_capture_owner_adapter_origins_survive_the_owner_bridge() {
+    use crate::attach::SessionDrainProducers;
+    use crate::attach::capture::NativeDomainId;
+    use crate::events::{EventDrain, EventsDomain, ScriptedRecords};
+    use crate::semantics_edge::resources::SemanticResourcePool;
+    use crate::semantics_objects::journal::LedgerRefusal;
+    use crate::semantics_objects::journal::joint_driver::{JointCaptureOwner, RawJointQuantum};
+
+    let rows = publish_object_descriptors();
+    assert!(verify_object_descriptors(&rows));
+    let begin = begin_bytes(1, 1, function_id("C_Sign"), 0);
+    let end = end_bytes_absent(&begin, 0, ENTRY_NS + 100);
+    let events = EventsDomain::test_standin(0xf201);
+    let producers = SessionDrainProducers::test_pair(NativeDomainId::mint(), events.clone());
+    let mut drain = EventDrain::over_domain(
+        ScriptedRecords::records([begin.to_vec(), end.to_vec()], 2),
+        events,
+    );
+    let pool = SemanticResourcePool::default();
+    let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
+    let fault = SteadyFaultCell(7);
+    let quantum = RawJointQuantum::collect_with_adapter(
+        &mut drain,
+        &rows,
+        2,
+        &fault,
+        &producers,
+        |bytes| pool.reserve(bytes),
+        owner.adapter_mut(),
+    )
+    .expect("a genuine BEGIN+END quantum collects through the owner's adapter");
+    let (h0, _) = quantum
+        .h0_input(producers.native_domain(), 2)
+        .expect("the completed quantum lends its H0 input");
+    let origin = h0
+        .iter()
+        .find_map(|record| record.joint_resource.as_ref())
+        .expect("the completed END projects a genuine adapter origin");
+    assert!(
+        origin.matches_native(producers.native_domain()),
+        "the origin names its actual native domain"
+    );
+    owner
+        .ledger_mut()
+        .charge_collected(producers.native_domain(), 1, 300, Some(origin))
+        .expect("the owner's ledger honors its own adapter's origins");
+    assert_eq!(
+        owner.adapter().ledger().staged(),
+        1,
+        "one ledger: the adapter observes the publication-side charge"
+    );
+    assert_eq!(
+        owner.ledger().census(),
+        owner.adapter().ledger().census(),
+        "one census across the bridge"
+    );
+    let mut foreign = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
+    assert!(
+        matches!(
+            foreign
+                .ledger_mut()
+                .charge_collected(producers.native_domain(), 1, 300, Some(origin)),
+            Err(LedgerRefusal::ReplayRefused)
+        ),
+        "a foreign ledger still refuses the genuine origin"
     );
 }

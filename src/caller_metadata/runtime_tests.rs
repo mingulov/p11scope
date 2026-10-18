@@ -408,3 +408,40 @@ fn final_frame_ages_sample_without_mutating_table_or_unknown_causes() {
         MetadataStatus::Sampled
     );
 }
+
+#[test]
+fn first_binding_availability_is_not_reported_as_an_observed_exec() {
+    let mut runtime = MetadataRuntime::new(7);
+    let unbound = MetadataCaller {
+        image: None,
+        ..caller(0)
+    };
+    runtime.synchronize([unbound], 0);
+    assert!(runtime.next(0).is_none());
+    assert_eq!(
+        runtime.frame().metadata(CallerId(0)).unwrap().reason,
+        Some(MetadataReason::IdentityUnavailable)
+    );
+    runtime.synchronize([caller(0)], 1);
+    assert_eq!(
+        runtime.frame().metadata(CallerId(0)).unwrap().reason,
+        Some(MetadataReason::IdentityUnavailable),
+        "the first binding must not invent an execution transition"
+    );
+    let ticket = runtime.next(REFRESH_NS).unwrap();
+    runtime.finish(ticket, caller(0), Ok(sample()), REFRESH_NS + 20);
+    runtime.synchronize([unbound], REFRESH_NS + 30);
+    assert_eq!(
+        runtime.frame().metadata(CallerId(0)).unwrap().reason,
+        Some(MetadataReason::IdentityUnavailable)
+    );
+    assert!(
+        runtime
+            .frame()
+            .metadata(CallerId(0))
+            .unwrap()
+            .container
+            .id
+            .is_none()
+    );
+}

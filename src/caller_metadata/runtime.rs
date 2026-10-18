@@ -293,7 +293,7 @@ impl MetadataRuntime {
                 Some(slot) => {
                     if slot.caller.retired || caller.retired {
                         slot.metadata = slot.metadata.to_historical();
-                    } else if slot.caller.image != caller.image {
+                    } else if slot.caller.image.is_some() && slot.caller.image != caller.image {
                         slot.metadata = CallerMetadata::unknown(
                             if caller.image.is_none() {
                                 MetadataReason::IdentityUnavailable
@@ -303,6 +303,8 @@ impl MetadataRuntime {
                             slot.metadata.revision.saturating_add(1),
                         );
                     }
+                    // Gaining the first genuine binding is proof becoming
+                    // available, not evidence that this caller executed again.
                     // Retirement is monotone, even a bad later source cannot
                     // revive an old caller's pending job or historical row.
                     let retired = slot.caller.retired || caller.retired;

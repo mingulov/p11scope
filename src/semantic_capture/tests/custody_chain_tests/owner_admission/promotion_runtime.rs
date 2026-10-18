@@ -5,32 +5,39 @@
 use super::*;
 
 #[test]
-fn promotion_runtime_first_candidate_shares_original_inventory_pin() {
-    for selection in [Selection::Pid, Selection::System] {
-        let mut scene = AdmissionScene::new(selection);
-        scene.prepare_without_cookie();
-        let caller = scene.caller();
-        let candidate = scene
-            .coordinator
-            .prepare_legacy_semantic_candidate(caller, scene.lane.as_ref().unwrap().domain())
-            .expect("actual mapped caller is eligible for first owner preparation");
-        let pin = candidate.pin();
-        let original = scene
-            .coordinator
-            .adapter()
-            .semantic_custody_ref(caller)
-            .expect("Inventory retains its original process pin");
-        assert_eq!(pin.pid(), original.pid());
-        assert_eq!(pin.start_time(), original.start_time());
-        assert!(pin.still_the_same() && original.still_the_same());
-        assert!(
-            std::ptr::eq(pin.as_ref(), original),
-            "{selection:?}: first Detailed candidate must share Inventory's original allocation, not a duplicated pidfd or replacement Arc"
-        );
-        assert_eq!(scene.coordinator.semantic_bindings().len(), 0);
-        assert_eq!(scene.coordinator.registry().instances().count(), 0);
-        assert_eq!(scene.h0.0.borrow().accepted, 0);
-    }
+fn promotion_runtime_pid_candidate_shares_original_inventory_pin() {
+    assert_first_candidate_shares_original(Selection::Pid);
+}
+
+#[test]
+fn promotion_runtime_system_candidate_shares_original_inventory_pin() {
+    assert_first_candidate_shares_original(Selection::System);
+}
+
+fn assert_first_candidate_shares_original(selection: Selection) {
+    let mut scene = AdmissionScene::new(selection);
+    scene.prepare_without_cookie();
+    let caller = scene.caller();
+    let candidate = scene
+        .coordinator
+        .prepare_legacy_semantic_candidate(caller, scene.lane.as_ref().unwrap().domain())
+        .expect("actual mapped caller is eligible for first owner preparation");
+    let pin = candidate.pin();
+    let original = scene
+        .coordinator
+        .adapter()
+        .semantic_custody_ref(caller)
+        .expect("Inventory retains its original process pin");
+    assert_eq!(pin.pid(), original.pid());
+    assert_eq!(pin.start_time(), original.start_time());
+    assert!(pin.still_the_same() && original.still_the_same());
+    assert!(
+        std::ptr::eq(pin.as_ref(), original),
+        "{selection:?}: first Detailed candidate must share Inventory's original allocation, not a duplicated pidfd or replacement Arc"
+    );
+    assert_eq!(scene.coordinator.semantic_bindings().len(), 0);
+    assert_eq!(scene.coordinator.registry().instances().count(), 0);
+    assert_eq!(scene.h0.0.borrow().accepted, 0);
 }
 
 #[test]

@@ -129,6 +129,9 @@ struct HeldIo {
     endpoints: Vec<(u32, String, Endpoint)>,
     watched: Vec<RetainedInventoryTarget>,
     targets: HashMap<u32, (Arc<PidPin>, ImageIdentity)>,
+    /// Scripted native input only, installed before H0 observes a scan.
+    /// Each file can move independently while sibling proofs stay current.
+    scan_inputs: HashMap<u32, (u64, u32)>,
 }
 
 impl HeldIo {
@@ -160,7 +163,15 @@ impl HeldIo {
             endpoints,
             watched,
             targets: HashMap::new(),
+            scan_inputs: HashMap::new(),
         }
+    }
+
+    fn scan_input(&self, file: u32) -> (u64, u32) {
+        self.scan_inputs.get(&file).copied().unwrap_or((
+            0x1000_0000 + u64::from(file) * 0x100_0000,
+            self.script.local,
+        ))
     }
 
     fn slot(&self, file: u32, name: &str) -> u32 {
@@ -176,6 +187,7 @@ impl HeldIo {
         let slot = self.slot(file, name);
         let endpoint = self.endpoint(slot).unwrap();
         let fault = u32::try_from(self.script.last_health.fault).unwrap();
+        let (base, local) = self.scan_input(file);
         self.script.call(image.task_cookie, fault);
         let ts_ns = 10 + self.script.records.len() as u64;
         let record = self.script.records.back_mut().unwrap();
@@ -194,8 +206,9 @@ impl HeldIo {
         record.base.event.ts_ns = ts_ns;
         record.base.continuity.entry_stamp.file_slot_plus1 = (file + 1) as u16;
         record.base.continuity.return_stamp.file_slot_plus1 = (file + 1) as u16;
-        record.base.continuity.entry_ip =
-            0x1000_0000 + u64::from(file) * 0x100_0000 + endpoint.offset;
+        record.base.continuity.entry_stamp.epoch = local;
+        record.base.continuity.return_stamp.epoch = local;
+        record.base.continuity.entry_ip = base + endpoint.offset;
     }
 
     fn scan_proof(
@@ -205,13 +218,13 @@ impl HeldIo {
         fence: u64,
     ) -> Result<ImageScanProof, ImageQueryRefusal> {
         let page = endpoint.offset & !0xfff;
-        let base = 0x1000_0000 + u64::from(endpoint.file_slot) * 0x100_0000;
+        let (base, local) = self.scan_input(endpoint.file_slot);
         acquire_test_scan(
             self.script.domain,
             image,
             endpoint.file_slot,
             CompleteEpochs {
-                local: u64::from(self.script.local),
+                local: u64::from(local),
                 global: 0,
                 fault: self.script.last_health.fault,
                 sticky: self.script.last_health.sticky,
@@ -265,7 +278,7 @@ impl CaptureIo for HeldIo {
         Ok(ReceiptState {
             image: self.targets[&pin.pid()].1,
             epochs: CompleteEpochs {
-                local: u64::from(self.script.local),
+                local: u64::from(self.scan_input(endpoint.file_slot).1),
                 global: 0,
                 fault: self.script.last_health.fault,
                 sticky: self.script.last_health.sticky,

@@ -34,6 +34,33 @@ CELLS = tuple('-'.join(parts) for parts in itertools.product(RINGS, SINKS, STAGE
 LIMIT = 16 * 1024 * 1024
 
 
+def cancellation_marker(data, expected_signal):
+    """A complete real reporter line; arrival time is only an upper bound."""
+    pattern = (rb'^p11scope: cancel: (?:loop exited on signal ([0-9]+) after ([0-9]+) ticks'
+               rb'|signal ([0-9]+) observed during finalization after ([0-9]+) ticks)\n')
+    matches = list(re.finditer(pattern, data, re.MULTILINE))
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise ValueError('duplicate once-only cancellation acknowledgement')
+    groups = matches[0].groups()
+    signum, ticks = (int(value) for value in (groups[:2] if groups[0] else groups[2:]))
+    if signum != expected_signal or ticks > 2**64 - 1:
+        raise ValueError('cancellation marker differs from the independently sent first signal')
+    return dict(signal=signum, ticks=ticks, phase='capture' if groups[0] else 'finalization',
+                channel='readable_stderr')
+
+
+def record_cancellation_marker(receipt, data):
+    if not receipt['signals']:
+        return
+    expected = int(signal.Signals[receipt['signals'][0]['signal']])
+    marker = cancellation_marker(data, expected)
+    if marker is not None and receipt['cancellation_ack_ns'] is None:
+        receipt['cancellation_ack_ns'] = time.monotonic_ns()
+        receipt['cancellation_ack'] = marker
+
+
 class OutputPipe:
     """Bounded, truly stalled output; measurement ends at observer reap, not EOF."""
     def __init__(self):
@@ -253,8 +280,8 @@ def cell(args, label, directory, env, binary, provider, caller_pin, manifests=()
                 errors = stderr_pipe.received
             # Each chunk arrival provides an upper bound on marker emission;
             # it is never called a kernel accepted-write or handler timestamp.
-            if receipt['signals'] and receipt['cancellation_ack_ns'] is None and b'p11scope: cancel: loop exited on signal ' in errors:
-                receipt['cancellation_ack_ns'] = time.monotonic_ns()
+            if receipt['cancellation_ack_ns'] is None:
+                record_cancellation_marker(receipt, errors)
             if not ready:
                 if re.search(rb'p11scope: capturing: [1-9][0-9]* probe\(s\) attached; stop with Ctrl-C\n', errors):
                     observer.verify()
@@ -328,8 +355,7 @@ def cell(args, label, directory, env, binary, provider, caller_pin, manifests=()
             stdout = bounded_read(directory / 'stdout.txt')
         else:
             stdout = None
-        if receipt['cancellation_ack_ns'] is None and b'p11scope: cancel: loop exited on signal ' in errors:
-            receipt['cancellation_ack_ns'] = time.monotonic_ns()
+        record_cancellation_marker(receipt, errors)
         if not ack_complete:
             raise ValueError('independent provider workload did not acknowledge every issued call')
         caller.popen.stdin.write('stop\n')

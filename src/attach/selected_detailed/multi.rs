@@ -1,6 +1,9 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 //! Native leaves enter Session custody before bisect can encounter another error.
-pub(super) fn retain_success<T, E>(result: Result<T, E>, retain: impl FnOnce(T)) -> Result<(), E> {
+pub(in crate::attach) fn retain_success<T, E>(
+    result: Result<T, E>,
+    retain: impl FnOnce(T),
+) -> Result<(), E> {
     result.map(retain)
 }
 

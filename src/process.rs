@@ -10,6 +10,10 @@ use crate::semantics_edge::resources::{
 use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+
+// Staged DR04 backend; no live caller metadata publication is wired yet.
+#[allow(dead_code)]
+pub(crate) mod cgroup_context;
 use std::sync::{Arc, Weak};
 
 pub(crate) const MAX_TRACKED: usize = 16_384;

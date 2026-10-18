@@ -29,6 +29,10 @@ macro_rules! eprint {
 }
 
 pub mod attach;
+// DR04's private parser/acquisition packet is staged; the opt-in coordinator
+// must validate image/sample authority before these values can be published.
+#[allow(dead_code)]
+pub(crate) mod caller_metadata;
 pub mod capacity;
 pub(crate) mod cgroup_stop_acceptance;
 pub mod cli;

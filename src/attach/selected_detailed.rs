@@ -390,6 +390,19 @@ impl SelectedConstructionPermit {
     pub(crate) fn baseline(&self) -> &baseline::PromotionImageBaseline {
         &self.baseline
     }
+    pub(crate) fn validate_conversion(
+        &self,
+        session: &super::Session,
+        attached: &super::AttachedSemanticSet,
+        convert: &crate::inventory_semantics::AttestedSubset,
+    ) -> Result<()> {
+        self.validate(session, attached)?;
+        ensure!(
+            attached.subset.same_retained_envelope(convert),
+            "selected conversion envelope differs from sealed retained closure"
+        );
+        Ok(())
+    }
     pub(crate) fn validate(
         &self,
         session: &super::Session,

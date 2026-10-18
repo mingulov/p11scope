@@ -4,6 +4,8 @@
 //! This module performs no I/O. The input path is borrowed only for the duration
 //! of parsing and is never copied into the returned value.
 
+pub(crate) mod acquisition;
+
 /// Maximum complete cgroup-file size accepted by the parser.
 pub const MAX_CGROUP_BYTES: usize = 16 * 1024;
 /// Maximum number of complete membership rows accepted.

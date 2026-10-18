@@ -8876,6 +8876,15 @@ fn key_operation_s1only_capture_stays_unavailable() {
     assert_eq!(observations.status, ObsStatus::Unavailable);
     assert_eq!(observations.reason, "bootstrap_unavailable");
     assert!(observations.key_operations.is_empty());
+    assert!(guarded.registry.keyuse_for_test().open().is_empty());
+    assert!(
+        guarded
+            .registry
+            .keyuse_for_test()
+            .unknown_counters()
+            .iter()
+            .all(|r| r.active == 0 && r.completed == 0)
+    );
 }
 
 /// N14: Joint seal replay reserves H3 resources: the shared charge
@@ -9153,6 +9162,267 @@ fn key_operation_n14_fallback_replay_reserves_and_disposes_on_refusal() {
         .find(|row| row.category == "sign" && row.reason == "unbound")
         .expect("the replayed start's terminal routes to unknown-key");
     assert_eq!((row.unknown, row.active), (1, 0));
+}
+
+#[test]
+fn key_operation_n1_ledger_contact_releases_before_new_staging() {
+    use crate::semantics_objects::journal::MAX_UNSETTLED_STAGED;
+    let mut g = GuardedScene::new();
+    let bootstrap = g.scene.bootstrap();
+    let key = g.key(1);
+    g.registry.install_joint_receipt(key.clone(), bootstrap);
+    let (_, id) = g.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    assert_eq!(
+        g.drive_joint(&key, id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    g.drive_s1only(&key, &sign);
+    assert!(g.registry.keyuse_for_test().open().is_empty());
+    assert_eq!(
+        g.scene.adapter.ledger().census(),
+        1,
+        "the ended shared ticket awaits contact"
+    );
+    for token in 0..MAX_UNSETTLED_STAGED - 1 {
+        g.scene
+            .adapter
+            .ledger_mut()
+            .charge_model(10_000 + token as u64, 1)
+            .unwrap();
+    }
+    let (facts, pos) = g.admit_shape(&init);
+    g.observe(&key, pos, facts);
+    g.registry.publish_with_ledger(g.scene.adapter.ledger_mut());
+    assert_eq!(
+        g.registry.feed_mode_for_test(id),
+        Some(FeedMode::Joint),
+        "an already-ended association cannot force a false capacity fallback"
+    );
+    assert_eq!(g.scene.adapter.ledger().staged(), 1);
+    assert_eq!(g.scene.adapter.ledger().census(), MAX_UNSETTLED_STAGED);
+}
+
+#[test]
+fn key_operation_n1_empty_ledger_publish_releases_ended_association() {
+    let mut g = GuardedScene::new();
+    let bootstrap = g.scene.bootstrap();
+    let key = g.key(1);
+    g.registry.install_joint_receipt(key.clone(), bootstrap);
+    let (_, id) = g.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    assert_eq!(
+        g.drive_joint(&key, id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(g.scene.adapter.ledger().census(), 1);
+    // Without a ledger, a proof fallback followed by Sign ends the
+    // shared association and defers its release until ledger contact.
+    let update = ShapedS1::shaped("C_SignUpdate", CkRv::OK.0, 0, op_capture());
+    let (facts, pos) = g.admit_shape(&update);
+    g.observe(&key, pos, facts);
+    g.registry.publish_with_ledger(g.scene.adapter.ledger_mut());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    g.drive_s1only(&key, &sign);
+    assert!(g.registry.keyuse_for_test().open().is_empty());
+    assert_eq!(
+        g.scene.adapter.ledger().census(),
+        2,
+        "staging and association releases pend"
+    );
+    g.registry.publish_with_ledger(g.scene.adapter.ledger_mut());
+    assert_eq!(
+        g.scene.adapter.ledger().census(),
+        0,
+        "an empty ledger-bearing publish must release all eligible tickets"
+    );
+    assert_eq!(g.scene.adapter.ledger().charged_bytes(), 0);
+}
+
+/// Ordered fallback precedes all seal/failure delivery: accounting must
+/// survive independently of the still-missing object publication proof.
+fn first_fallback_accounting(capacity: bool, invalidate: bool, retire: bool) {
+    use crate::discovery::caller_registry::instance_input::{
+        InstanceReason, Retirement, Scope, loss, position, retirement,
+    };
+    let mut g = GuardedScene::new();
+    let bootstrap = g.scene.bootstrap();
+    let key = g.key(1);
+    g.registry.install_joint_receipt(key.clone(), bootstrap);
+    let (_, id) = g.register(1);
+    let (sibling, sibling_id) = g.register(2);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let update = ShapedS1::shaped("C_SignUpdate", CkRv::OK.0, 0, op_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    g.drive_s1only(&sibling, &init);
+    let (facts, pos) = g.admit_shape(&init);
+    g.observe(&key, pos, facts);
+    g.registry.publish_with_ledger(g.scene.adapter.ledger_mut());
+    assert_eq!(g.scene.adapter.ledger().staged(), 1);
+    if capacity {
+        let limit = g.scene.adapter.ledger().charged_bytes();
+        g.scene.adapter.ledger_mut().set_byte_limit(limit);
+    }
+    let (facts, pos) = g.admit_shape(&update);
+    g.observe(&key, pos, facts);
+    if capacity {
+        g.registry.publish_with_ledger(g.scene.adapter.ledger_mut());
+        g.scene.adapter.ledger_mut().set_byte_limit(u64::MAX);
+    } else {
+        g.registry.publish();
+    }
+    assert_eq!(g.registry.joint_feeds(), 0);
+    assert_eq!(g.registry.feed_mode_for_test(id), Some(FeedMode::S1Only));
+    assert_eq!(g.registry.keyuse_for_test().open().len(), 2);
+    assert_eq!(
+        g.registry.joint_observations(1).reason,
+        "bootstrap_unavailable"
+    );
+    if invalidate {
+        let barrier = g.scene.fixture.admit_function("C_Sign").h0_ordinal();
+        if retire {
+            g.registry.retire_instance(retirement(
+                Retirement::Exact(key.clone()),
+                position(g.domain, barrier),
+                InstanceReason::InstanceRetired,
+            ));
+        } else {
+            g.registry.note_instance_semantic_loss(loss(
+                Scope::Exact(key.clone()),
+                position(g.domain, barrier),
+                InstanceReason::SemanticLoss,
+            ));
+        }
+        g.registry.publish_with_ledger(g.scene.adapter.ledger_mut());
+        // The healthy sibling still owns its open.
+        assert_eq!(g.registry.keyuse_for_test().open().len(), 1);
+    } else {
+        let (facts, pos) = g.admit_shape(&sign);
+        g.observe(&key, pos, facts);
+        g.registry.publish_with_ledger(g.scene.adapter.ledger_mut());
+        assert_eq!(g.edge_completed(id), 1);
+        assert_eq!(
+            g.registry.keyuse_for_test().open().len(),
+            1,
+            "the ordinary terminal closes the fallback open"
+        );
+    }
+    g.drive_s1only(&sibling, &sign);
+    assert_eq!(g.edge_completed(sibling_id), 1);
+    // A repeated pair (or a new sibling after retirement) still accounts once.
+    let repeat_key = if retire { g.register(3).0 } else { key.clone() };
+    g.drive_s1only(&repeat_key, &init);
+    g.drive_s1only(&repeat_key, &sign);
+    assert_eq!(g.registry.keyuse_for_test().open().len(), 0);
+    assert!(g.registry.keyuse_for_test().refused_opens().is_empty());
+    let counters = g.registry.keyuse_for_test().unknown_counters();
+    assert_eq!(
+        counters.iter().map(|r| r.completed).sum::<u64>(),
+        if invalidate { 2 } else { 3 }
+    );
+    assert_eq!(
+        counters.iter().map(|r| r.unknown).sum::<u64>(),
+        u64::from(invalidate)
+    );
+    assert_eq!(counters.iter().map(|r| r.active).sum::<u64>(), 0);
+    assert!(
+        g.registry.keyuse_for_test().aggregates().is_empty(),
+        "no object authority invented"
+    );
+    assert_eq!(
+        g.registry.joint_observations(2).reason,
+        "bootstrap_unavailable"
+    );
+    assert_eq!(
+        g.scene.adapter.ledger().census(),
+        0,
+        "eligible shared charges returned"
+    );
+    if !invalidate {
+        ingest_call(&mut g.scene, &init);
+        let seal = g.scene.seal().expect("the delayed original Init seals");
+        assert_eq!(
+            g.registry
+                .deliver_joint_seal(id, &seal, &g.scene.model, g.scene.adapter.ledger_mut()),
+            SealApplyOutcome::Held
+        );
+        assert!(g.registry.keyuse_for_test().open().is_empty());
+        assert_eq!(
+            g.registry.joint_observations(3).reason,
+            "bootstrap_unavailable",
+            "inert late delivery creates no object authority"
+        );
+    }
+}
+
+#[test]
+fn key_operation_n15_first_unsealable_fallback_keeps_accounting() {
+    let mut g = GuardedScene::new();
+    let bootstrap = g.scene.bootstrap();
+    let key = g.key(1);
+    g.registry.install_joint_receipt(key.clone(), bootstrap);
+    let (_, id) = g.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let (facts, pos) = g.admit_shape(&init);
+    g.observe(&key, pos, facts.clone());
+    g.registry.publish_with_ledger(g.scene.adapter.ledger_mut());
+    // S1's synthetic async completion is outside H8's sealable table.
+    // It cannot overtake the queued Init and it cannot end that Init.
+    let minted = g.scene.fixture.admit_function("C_SignInit");
+    g.observe(
+        &key,
+        minted.h0_ordinal(),
+        SemanticCall {
+            function: "C_AsyncComplete".into(),
+            session: facts.session,
+            target_function: crate::kinds::function_id("C_Sign").unwrap(),
+            capture: op_capture(),
+            ts_ns: facts.ts_ns + 100,
+            authorized: true,
+            unambiguous: true,
+            attributable: true,
+            ..SemanticCall::default()
+        },
+    );
+    g.registry.publish_with_ledger(g.scene.adapter.ledger_mut());
+    assert_eq!(g.registry.joint_feeds(), 0);
+    assert_eq!(g.registry.keyuse_for_test().open().len(), 1);
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    let (facts, pos) = g.admit_shape(&sign);
+    g.observe(&key, pos, facts);
+    g.registry.publish_with_ledger(g.scene.adapter.ledger_mut());
+    assert_eq!(g.edge_completed(id), 1);
+    assert!(g.registry.keyuse_for_test().open().is_empty());
+    assert_eq!(
+        g.scene.adapter.ledger().census(),
+        0,
+        "the eligible association charge returns"
+    );
+    assert_eq!(
+        g.registry.joint_observations(1).reason,
+        "bootstrap_unavailable"
+    );
+}
+
+#[test]
+fn key_operation_n15_first_capacity_fallback_keeps_accounting() {
+    first_fallback_accounting(true, false, false);
+}
+
+#[test]
+fn key_operation_n15_first_missing_ledger_fallback_keeps_accounting() {
+    first_fallback_accounting(false, false, false);
+}
+
+#[test]
+fn key_operation_n15_first_fallback_loss_keeps_accounting() {
+    first_fallback_accounting(false, true, false);
+}
+
+#[test]
+fn key_operation_n15_first_fallback_retirement_keeps_accounting() {
+    first_fallback_accounting(false, true, true);
 }
 
 /// N15: capture-wide effect accounting continues after the final

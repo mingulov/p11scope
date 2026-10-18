@@ -1171,9 +1171,25 @@ fn run_with_terminal_budget(
     outcome.notices(previously_reported.as_deref(), &mut |line| {
         let _ = crate::sink::try_stderr_line(line);
     });
+    finish_caller_metadata_cleanup(&mut coordinator, request.second_signal);
     let cleanup = finish_semantic_native_cleanup(semantic_lane, request.second_signal);
     combine_semantic_terminal_errors(capture_error, cleanup)?;
     Ok(outcome.exit_code())
+}
+
+fn finish_caller_metadata_cleanup(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    second_signal: &dyn Fn() -> bool,
+) {
+    // Outputs have already been attempted. Join the cancelled optional job
+    // through its real owner; another operator signal leaves owned custody
+    // in the helper's process-lifetime slot rather than detaching its thread.
+    while !coordinator.poll_caller_metadata_stop(now_ns()) {
+        if second_signal() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn finish_semantic_native_cleanup(
@@ -3109,6 +3125,7 @@ fn run_dashboard(
         outputs_attempted,
         &mut |line| display_notices.borrow_mut().notice(&line),
     );
+    finish_caller_metadata_cleanup(&mut coordinator, second_signal);
     let cleanup = finish_semantic_native_cleanup(semantic_lane, second_signal);
     // A restore the terminal shed (Ctrl-S then `q`) leaves the shell in
     // the alternate screen: after output attempts, it can wait longer.

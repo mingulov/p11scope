@@ -859,6 +859,14 @@ cgroup2 root and namespace-coordinate agreement. Missing, refused or
 stale observations remain explicitly unknown/stale/historical, never
 silent.
 
+The systemd pod grammar accepts the exact `kubepods.slice` stem or the
+exact `kubelet.slice/kubelet-kubepods.slice` stem. An optional burstable or
+besteffort slice and the pod slice must use that same complete stem and
+matching QoS. The pod UID uses the fixed underscore-separated UUID form;
+the next component must be an exact recognized runtime container unit.
+No generic prefix stripping or substring recognition is allowed. This adds
+no public value beyond the canonical container ID and pod UID above.
+
 The full64 native task/image checks bracket the two retained-original proc
 reads. They reuse the Inventory identity-only query and add no application
 argument/pointer reads. The expected image comes from a genuine native caller-use binding whose

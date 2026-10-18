@@ -5,6 +5,9 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::Command;
 use std::sync::Mutex;
 
+#[path = "support/transport_boundaries.rs"]
+mod transport_boundaries;
+
 #[test]
 fn owner_retry_boundaries_are_the_only_owner_exports_requested_by_the_build() {
     let source = std::fs::read_to_string("build.rs").expect("read build script");
@@ -12980,32 +12983,10 @@ fn semantic_capture_private_record_test_children_remain_test_only() {
     }
 }
 
-fn source_uses_private_record_fields(source: &str) -> bool {
-    // Preserve the two sanctioned lane identifiers: the counts-only summary
-    // and the same-consumer drain spelling.
-    let scan = source
-        .replace("continuity_cuts", "")
-        .replace("poll_records_to_position", "");
-    [
-        "entry_ip",
-        "entry_stamp",
-        "return_stamp",
-        "poll_records",
-        "decode_record",
-    ]
-    .iter()
-    .any(|field| scan.contains(field))
-        || scan.match_indices(".continuity").any(|(offset, field)| {
-            scan[offset + field.len()..]
-                .chars()
-                .next()
-                .is_none_or(|next| !next.is_alphanumeric() && next != '_')
-        })
-}
-
 /// Task 3 Stage A privacy contract: the private entry IP and the continuity
 /// stamps are read from CALL records only by the instance router plumbing and
-/// its tests. A renderer, reducer, or report that names them is a leak path.
+/// its tests, plus the journal's two exact internal corroboration guards.
+/// Other reducer reads and any rendering/reporting use remain leak paths.
 #[test]
 fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
     let allowed = [
@@ -13025,7 +13006,7 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
         "src/s1_tests.rs",
     ];
     let refuses = |path: &str, source: &str| {
-        !allowed.contains(&path) && source_uses_private_record_fields(source)
+        !allowed.contains(&path) && transport_boundaries::uses_private_record_fields(path, source)
     };
     for path in [
         SEMANTIC_VALIDATION_TEST_CHILD,
@@ -13118,7 +13099,7 @@ fn instance_entry_ip_and_stamps_have_no_rendering_consumers() {
                 "{} references a private semantic fixture outside its canonical test inclusion",
                 path.display(),
             );
-            if source_uses_private_record_fields(&source) {
+            if transport_boundaries::uses_private_record_fields(&path.to_string_lossy(), &source) {
                 users.push(path.to_string_lossy().into_owned());
             }
         }

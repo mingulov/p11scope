@@ -15,6 +15,8 @@ use std::process::Command;
 
 #[path = "support/object_adapter.rs"]
 mod adapter;
+#[path = "support/transport_boundaries.rs"]
+mod transport_boundaries;
 
 fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     let from = source
@@ -209,7 +211,9 @@ fn object_producer_publication_lifts_gate_only_on_attested_lane() {
 /// The private validated tail accompanies the owned H3 routed call into
 /// the consuming admission result, but it cannot construct the H9 model:
 /// no ObjectDomain, OriginFact, RefCut, CallToken, CompleteInputPrefix,
-/// and no ObjectSemantics::{begin,complete,settle} in the transport.
+/// and no ObjectSemantics::{begin,complete,settle} in the transport. Only the
+/// three exact borrowed model parameters on Joint delivery callbacks may name
+/// ObjectSemantics; their bodies and other transport remain construction-free.
 #[test]
 fn object_producer_tail_builds_no_model() {
     // Existence: the transport carries the tail end to end.
@@ -231,41 +235,28 @@ fn object_producer_tail_builds_no_model() {
     // Absence: no model construction in the H7 transport windows.
     for (name, body) in [
         (
-            "events",
+            "src/events.rs",
             std::fs::read_to_string("src/events.rs").expect("read events"),
         ),
-        ("capture", capture),
-        ("evidence", input),
+        ("src/semantic_capture.rs", capture),
+        ("src/discovery/caller_registry/instance_input.rs", input),
     ] {
-        for marker in [
-            "ObjectDomain",
-            "OriginFact",
-            "RefCut",
-            "CallToken",
-            "CompleteInputPrefix",
-            "ObjectSemantics",
-        ] {
-            assert!(
-                !body.contains(marker),
-                "{name} transport must not name the H9 model ({marker})"
-            );
-        }
+        assert_eq!(
+            transport_boundaries::model_marker(name, &body),
+            None,
+            "{name} transport must not name the H9 model outside sanctioned borrowed parameters"
+        );
     }
     let coordinator = std::fs::read_to_string("src/discovery/inventory_coordinator/semantics.rs")
         .expect("read coordinator");
-    for marker in [
-        "ObjectDomain",
-        "OriginFact",
-        "RefCut",
-        "CallToken",
-        "CompleteInputPrefix",
-        "ObjectSemantics",
-    ] {
-        assert!(
-            !coordinator.contains(marker),
-            "coordinator transport must not name the H9 model ({marker})"
-        );
-    }
+    assert_eq!(
+        transport_boundaries::model_marker(
+            "src/discovery/inventory_coordinator/semantics.rs",
+            &coordinator
+        ),
+        None,
+        "coordinator transport must not name the H9 model"
+    );
 }
 
 /// The tail and its envelopes carry raw target words: no raw-value

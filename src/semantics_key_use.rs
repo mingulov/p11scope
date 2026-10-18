@@ -497,6 +497,16 @@ impl JointStaging {
         let head = self.staged.pop_front().expect("head verified above");
         self.frontier = self.frontier.max(head.position);
         let receipts = keyuse.receipts_for_call(seal, &settled[0], model, head.position);
+        // Legacy heads carry no resource custody: release the staged
+        // charge before replay so the replayed open can mint its
+        // association at a byte limit (same N15 capacity order as
+        // fallback replay). Collected heads hold custody through
+        // replay: the assoc mint joins the live staged
+        // reservation.
+        let legacy = head.resource_origin.is_none();
+        if legacy {
+            ledger.release(head.position, head.charged_bytes());
+        }
         // The seal's retirements already applied above (H9 §66),
         // before this replay: a terminal the replay emits can never
         // complete a binding this seal just unproved.
@@ -532,7 +542,11 @@ impl JointStaging {
                 }
             }
         };
-        head.release(ledger);
+        if legacy {
+            drop(head);
+        } else {
+            head.release(ledger);
+        }
         outcome
     }
 
@@ -816,6 +830,15 @@ impl JointStaging {
             let position = head.position;
             let native = head.resource_native;
             self.frontier = self.frontier.max(position);
+            // Legacy heads carry no resource custody: release the
+            // staged charge before replay so the replayed open can
+            // mint its association at a byte limit (N15 capacity
+            // fallback). Collected heads hold custody through replay:
+            // the assoc mint joins the live staged reservation.
+            let legacy = head.resource_origin.is_none();
+            if legacy {
+                self.release_or_pend(ledger.as_deref_mut(), position, bytes, native);
+            }
             let failed = {
                 let mut tee = KeyUseTee {
                     outer: &mut *sink,
@@ -841,7 +864,9 @@ impl JointStaging {
                 }
             };
             drop(head);
-            self.release_or_pend(ledger.as_deref_mut(), position, bytes, native);
+            if !legacy {
+                self.release_or_pend(ledger.as_deref_mut(), position, bytes, native);
+            }
             if failed {
                 self.drain_staged(ledger);
                 break;
